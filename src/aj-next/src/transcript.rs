@@ -1322,6 +1322,10 @@ impl TranscriptView {
         // re-lays the new transcript's entries rather than reading the previous
         // session's rows.
         self.entry_text.clear();
+        // The reused list holds a different session whose entries reuse indices,
+        // so a geometry carried over from the previous session would missize the
+        // new session's thumb. Drop it so the next draw rebuilds it.
+        self.list.borrow_mut().reset_geometry();
         self.follow_tail = true;
         // A fresh session's entries are unrelated to the old selection's anchor
         // entry, so drop it rather than highlight stale content.
@@ -3976,8 +3980,10 @@ mod tests {
         });
         let surface = view.draw(&ctx);
         let grid = crate::test_support::flatten(&surface);
-        let rows = crate::test_support::rows(&surface);
-        assert_eq!(rows[2], " row 1", "text under the highlight is preserved");
+        // Read the text of the highlighted cells directly, so the assertion is
+        // about the covered text and not the scrollbar thumb in the last column.
+        let covered: String = grid[2][0..6].iter().map(|c| c.char.grapheme()).collect();
+        assert_eq!(covered, " row 1", "text under the highlight is preserved");
 
         // The covered cells carry the selection background.
         for c in 0..6 {

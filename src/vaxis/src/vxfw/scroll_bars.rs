@@ -11,6 +11,12 @@
 //! extent. When no estimate is given we fall back to the number and width of the
 //! children the [`ScrollView`] actually rendered, which is less stable across
 //! frames but needs no caller input.
+//!
+//! A view may expose a measured line-based geometry (see
+//! [`ScrollableView::content_extent`]). When it does, the vertical thumb is
+//! sized and placed in that line space instead, which tracks real content
+//! height for items of widely differing height. The estimate/item-count path
+//! stays the fallback for views without a geometry.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -71,6 +77,23 @@ pub trait ScrollableView: Widget {
     fn has_more_right(&self) -> bool;
     /// Jumps the viewport to start at column `left`.
     fn set_scroll_left(&mut self, left: u32);
+
+    /// Total content extent in the line-based space the thumb uses, measured
+    /// where items have been laid out and estimated elsewhere. `None` when the
+    /// view keeps no such geometry (the bars fall back to item-count sizing).
+    fn content_extent(&self) -> Option<u32> {
+        None
+    }
+    /// Line offset of the viewport top in the `content_extent` space, as of the
+    /// last draw. `None` when no geometry.
+    fn viewport_top_line(&self) -> Option<u32> {
+        None
+    }
+    /// Item index to anchor the top at so the viewport top lands at `line`, for
+    /// drag-to-jump in the geometry's line space. `None` when no geometry.
+    fn item_at_line(&self, _line: u32) -> Option<u32> {
+        None
+    }
 }
 
 /// A scrollable view with draggable, hoverable scroll bars.
@@ -229,9 +252,14 @@ impl<V: ScrollableView + 'static> Widget for ScrollBars<V> {
 
         // Vertical scroll bar. Read the reconciled scroll state through the
         // shared handle, the bar and thumb geometry derive from it.
-        let (scroll_top, has_more_vertical) = {
+        let (scroll_top, has_more_vertical, content_extent, viewport_top_line) = {
             let view = self.view.borrow();
-            (view.scroll_top(), view.has_more_below())
+            (
+                view.scroll_top(),
+                view.has_more_below(),
+                view.content_extent(),
+                view.viewport_top_line(),
+            )
         };
         if self.draw_vertical_scrollbar && !(scroll_top == 0 && !has_more_vertical) {
             // The bar spans the scroll view, which is one row shorter than the
@@ -242,27 +270,54 @@ impl<V: ScrollableView + 'static> Widget for ScrollBars<V> {
                 .height
                 .saturating_sub(u16::from(self.draw_horizontal_scrollbar));
             let widget_height_f = f32::from(scroll_view_height);
-            let total_num_children_f = num::usize_to_f32(self.view.borrow().total_item_count());
 
-            let thumb_height: u16 = if let Some(h) = self.estimated_content_height {
-                let content_height_f = num::u32_to_f32(h);
-                let thumb_height_f = widget_height_f * widget_height_f / content_height_f;
-                num::f32_to_u16(thumb_height_f.max(1.0))
-            } else {
-                let num_children_rendered_f = num::usize_to_f32(rendered_children);
-                let thumb_height_f =
-                    widget_height_f * num_children_rendered_f / total_num_children_f;
-                num::f32_to_u16(thumb_height_f.max(1.0))
+            // When the view exposes a measured content extent we size and place
+            // the thumb in that line space, which tracks real content height far
+            // better than the item count for entries of wildly differing height.
+            // Otherwise fall back to the estimate/item-count sizing below.
+            let geometry = match (content_extent, viewport_top_line) {
+                (Some(total), Some(top_line)) if total > 0 => Some((total, top_line)),
+                _ => None,
             };
 
-            let thumb_top: u32 = if scroll_top == 0 {
-                0
-            } else if has_more_vertical {
-                let top_child_idx_f = num::u32_to_f32(scroll_top);
-                let thumb_top_f = widget_height_f * top_child_idx_f / total_num_children_f;
-                num::f32_to_u32(thumb_top_f)
+            let (thumb_height, thumb_top): (u16, u32) = if let Some((total, top_line)) = geometry {
+                let content_extent_f = num::u32_to_f32(total);
+                let thumb_height_f = (widget_height_f * widget_height_f / content_extent_f).round();
+                let thumb_height = num::f32_to_u16(thumb_height_f.max(1.0));
+                let thumb_top = if scroll_top == 0 {
+                    0
+                } else if has_more_vertical {
+                    let top_line_f = num::u32_to_f32(top_line);
+                    let thumb_top_f = (widget_height_f * top_line_f / content_extent_f).round();
+                    num::f32_to_u32(thumb_top_f)
+                } else {
+                    u32::from(bar_height.saturating_sub(thumb_height))
+                };
+                // Never let the thumb overrun the bar's bottom edge.
+                let thumb_top = thumb_top.min(u32::from(bar_height.saturating_sub(thumb_height)));
+                (thumb_height, thumb_top)
             } else {
-                u32::from(bar_height.saturating_sub(thumb_height))
+                let total_num_children_f = num::usize_to_f32(self.view.borrow().total_item_count());
+                let thumb_height: u16 = if let Some(h) = self.estimated_content_height {
+                    let content_height_f = num::u32_to_f32(h);
+                    let thumb_height_f = widget_height_f * widget_height_f / content_height_f;
+                    num::f32_to_u16(thumb_height_f.max(1.0))
+                } else {
+                    let num_children_rendered_f = num::usize_to_f32(rendered_children);
+                    let thumb_height_f =
+                        widget_height_f * num_children_rendered_f / total_num_children_f;
+                    num::f32_to_u16(thumb_height_f.max(1.0))
+                };
+                let thumb_top: u32 = if scroll_top == 0 {
+                    0
+                } else if has_more_vertical {
+                    let top_child_idx_f = num::u32_to_f32(scroll_top);
+                    let thumb_top_f = widget_height_f * top_child_idx_f / total_num_children_f;
+                    num::f32_to_u32(thumb_top_f)
+                } else {
+                    u32::from(bar_height.saturating_sub(thumb_height))
+                };
+                (thumb_height, thumb_top)
             };
 
             let mut scroll_bar = Surface::with_size(Size {
@@ -396,6 +451,21 @@ impl<V: ScrollableView + 'static> Widget for ScrollBars<V> {
                 }
                 let new_thumb_top_f = f32::from(new_thumb_top);
                 let widget_height_f = f32::from(self.last_frame_size.height);
+                // With a geometry the thumb sits in line space, so map the
+                // thumb-top row to a target line, then to the item index whose
+                // top lands there. Read the geometry, drop the borrow, then
+                // write, so we never hold a borrow across the borrow_mut.
+                let content_extent = self.view.borrow().content_extent();
+                if let Some(total) = content_extent.filter(|&t| t > 0) {
+                    let total_f = num::u32_to_f32(total);
+                    let target_line_f = (new_thumb_top_f * total_f / widget_height_f).round();
+                    let target_line = num::f32_to_u32(target_line_f);
+                    let idx = self.view.borrow().item_at_line(target_line);
+                    if let Some(idx) = idx {
+                        self.view.borrow_mut().set_scroll_top(idx);
+                    }
+                    return ctx.consume_and_redraw();
+                }
                 let total_num_children_f = num::usize_to_f32(self.view.borrow().total_item_count());
                 let new_top_child_idx_f = new_thumb_top_f * total_num_children_f / widget_height_f;
                 self.view
@@ -824,5 +894,163 @@ mod tests {
         // The inner view advanced away from the top.
         let sv = inner.borrow();
         assert!(sv.scroll.top > 0 || sv.scroll.vertical_offset > 0);
+    }
+
+    /// A geometry-backed `ListView` with tall early items and short later ones
+    /// places the vertical thumb by measured line offset, not item index, so
+    /// the thumb top differs from the pure item-count position.
+    #[test]
+    fn scroll_bars_vertical_thumb_uses_list_geometry() {
+        use crate::vxfw::ListView;
+
+        // Three tall items (10 rows each) then a long run of one-row items. The
+        // geometry sees a top-heavy content extent that the item-count formula,
+        // which weights every item the same, cannot.
+        let mut items: Vec<WidgetRef> = Vec::new();
+        for _ in 0..3 {
+            items.push(text("a\nb\nc\nd\ne\nf\ng\nh\ni\nj"));
+        }
+        for _ in 0..18 {
+            items.push(text("x"));
+        }
+        let mut lv = ListView::new(Source::Slice(items));
+        lv.draw_cursor = false;
+        let mut sb = ScrollBars::new(lv);
+        sb.draw_horizontal_scrollbar = false;
+        let inner = Rc::clone(&sb.view);
+
+        let ctx = DrawContext {
+            min: Size {
+                width: 0,
+                height: 0,
+            },
+            max: MaxSize {
+                width: Some(16),
+                height: Some(10),
+            },
+            cell_size: Size {
+                width: 10,
+                height: 20,
+            },
+            width_method: gwidth::Method::Unicode,
+        };
+
+        // First draw establishes item_count and seeds the geometry.
+        sb.draw(&ctx);
+        // Scroll past the three tall items so the top lands on the short run.
+        inner.borrow_mut().scroll_lines(30);
+        let surface = sb.draw(&ctx);
+
+        let bar_height: u16 = 10; // No horizontal bar reserved.
+        let widget_h_f = f32::from(bar_height);
+
+        let (extent, top_line, scroll_top, total_items) = {
+            let v = inner.borrow();
+            (
+                v.content_extent().expect("geometry-backed extent"),
+                v.viewport_top_line().expect("geometry-backed top line"),
+                v.scroll_top(),
+                v.total_item_count(),
+            )
+        };
+        assert!(scroll_top > 0, "the scroll left the top");
+
+        // The geometry places the thumb by line-space fraction, rounded.
+        let extent_f = num::u32_to_f32(extent);
+        let thumb_height = num::f32_to_u16((widget_h_f * widget_h_f / extent_f).round().max(1.0));
+        let geom_top = num::f32_to_u32((widget_h_f * num::u32_to_f32(top_line) / extent_f).round())
+            .min(u32::from(bar_height.saturating_sub(thumb_height)));
+
+        // The item-count formula places it by index-space fraction, truncated.
+        let count_top = num::f32_to_u32(
+            widget_h_f * num::u32_to_f32(scroll_top) / num::usize_to_f32(total_items),
+        );
+
+        assert_ne!(
+            geom_top, count_top,
+            "the tall early items move the thumb off the item-count position"
+        );
+
+        let bar = surface
+            .children
+            .iter()
+            .find(|c| c.surface.size.width == 1 && c.origin.col == 15)
+            .expect("the vertical bar was drawn");
+        let first_thumb_row = (0..bar_height)
+            .find(|&r| bar.surface.read_cell(0, r).char.grapheme() == "▐")
+            .expect("the thumb glyph is present");
+        assert_eq!(u32::from(first_thumb_row), geom_top);
+    }
+
+    /// With all-equal item heights the geometry's line space matches the item
+    /// index space, so the thumb lands where the item-count formula would put
+    /// it. No regression for uniform lists.
+    #[test]
+    fn scroll_bars_vertical_thumb_matches_item_count_for_uniform_list() {
+        use crate::vxfw::ListView;
+
+        let items: Vec<WidgetRef> = (0..20).map(|i| text(&i.to_string())).collect();
+        let mut lv = ListView::new(Source::Slice(items));
+        lv.draw_cursor = false;
+        let mut sb = ScrollBars::new(lv);
+        sb.draw_horizontal_scrollbar = false;
+        let inner = Rc::clone(&sb.view);
+
+        let ctx = DrawContext {
+            min: Size {
+                width: 0,
+                height: 0,
+            },
+            max: MaxSize {
+                width: Some(8),
+                height: Some(5),
+            },
+            cell_size: Size {
+                width: 10,
+                height: 20,
+            },
+            width_method: gwidth::Method::Unicode,
+        };
+
+        sb.draw(&ctx);
+        inner.borrow_mut().scroll_lines(8);
+        let surface = sb.draw(&ctx);
+
+        let bar_height: u16 = 5;
+        let widget_h_f = f32::from(bar_height);
+        let (extent, top_line, scroll_top, total_items) = {
+            let v = inner.borrow();
+            (
+                v.content_extent().expect("geometry-backed extent"),
+                v.viewport_top_line().expect("geometry-backed top line"),
+                v.scroll_top(),
+                v.total_item_count(),
+            )
+        };
+        // One-row items: the line space equals the index space.
+        assert_eq!(extent, u32::try_from(total_items).expect("count fits u32"));
+        assert_eq!(u64::from(top_line), u64::from(scroll_top));
+
+        let extent_f = num::u32_to_f32(extent);
+        let thumb_height = num::f32_to_u16((widget_h_f * widget_h_f / extent_f).round().max(1.0));
+        let geom_top = num::f32_to_u32((widget_h_f * num::u32_to_f32(top_line) / extent_f).round())
+            .min(u32::from(bar_height.saturating_sub(thumb_height)));
+        let count_top = num::f32_to_u32(
+            widget_h_f * num::u32_to_f32(scroll_top) / num::usize_to_f32(total_items),
+        );
+        assert_eq!(
+            geom_top, count_top,
+            "uniform heights keep the geometry thumb at the item-count position"
+        );
+
+        let bar = surface
+            .children
+            .iter()
+            .find(|c| c.surface.size.width == 1 && c.origin.col == 7)
+            .expect("the vertical bar was drawn");
+        let first_thumb_row = (0..bar_height)
+            .find(|&r| bar.surface.read_cell(0, r).char.grapheme() == "▐")
+            .expect("the thumb glyph is present");
+        assert_eq!(u32::from(first_thumb_row), geom_top);
     }
 }

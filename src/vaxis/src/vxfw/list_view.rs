@@ -125,6 +125,235 @@ fn cursor_indicator() -> Cell {
     }
 }
 
+/// A binary-indexed (Fenwick) tree over `i64` values with O(log n) prefix
+/// sums, point updates, and append.
+///
+/// Internally 1-indexed with a dummy slot at index 0, so `tree.len() - 1` is
+/// the element count. Values are `i64` so a point update can subtract (a
+/// re-measured item whose height shrank), even though the sums we take are
+/// non-negative in practice.
+struct Fenwick {
+    tree: Vec<i64>,
+}
+
+/// Lowest set bit of `i`, the span a Fenwick node at index `i` covers.
+fn lowbit(i: usize) -> usize {
+    i & i.wrapping_neg()
+}
+
+impl Fenwick {
+    fn new() -> Fenwick {
+        Fenwick { tree: vec![0] }
+    }
+
+    fn len(&self) -> usize {
+        self.tree.len() - 1
+    }
+
+    /// Appends one slot initialized to 0.
+    ///
+    /// The appended node covers a range that may include existing non-zero
+    /// elements, so we seed it with the sum of the child nodes below it. That
+    /// keeps prefix queries correct without re-touching the whole tree.
+    fn push(&mut self) {
+        let n = self.tree.len();
+        self.tree.push(0);
+        let lb = lowbit(n);
+        let mut i = 1;
+        while i < lb {
+            self.tree[n] += self.tree[n - i];
+            i <<= 1;
+        }
+    }
+
+    /// Adds `delta` to the 0-based element `i`.
+    fn add(&mut self, i: usize, delta: i64) {
+        let n = self.len();
+        let mut pos = i + 1;
+        while pos <= n {
+            self.tree[pos] += delta;
+            pos += lowbit(pos);
+        }
+    }
+
+    /// Sum of the 0-based elements `[0, i)`, so `prefix(0)` is 0 and
+    /// `prefix(len)` is the whole sum. `i` is clamped to `len`.
+    fn prefix(&self, i: usize) -> i64 {
+        let mut pos = i.min(self.len());
+        let mut sum = 0;
+        while pos > 0 {
+            sum += self.tree[pos];
+            pos -= lowbit(pos);
+        }
+        sum
+    }
+
+    /// Shrinks to `len` elements, rebuilding from the retained values.
+    ///
+    /// Retained values are recovered from prefix diffs before the shrink, so
+    /// the caller need not hand them in. A no-op when `len >= self.len()`.
+    fn truncate(&mut self, len: usize) {
+        if len >= self.len() {
+            return;
+        }
+        let values: Vec<i64> = (0..len)
+            .map(|i| self.prefix(i + 1) - self.prefix(i))
+            .collect();
+        let mut rebuilt = Fenwick::new();
+        for &v in &values {
+            rebuilt.push();
+            let last = rebuilt.len() - 1;
+            rebuilt.add(last, v);
+        }
+        *self = rebuilt;
+    }
+}
+
+/// Per-item extent model that drives the scrollbar thumb. The scroll core is
+/// index-anchored, so this never affects what is drawn, only the thumb.
+///
+/// An item counts as an estimated extent until it is laid out, then its
+/// measured height replaces the estimate. The estimate is the running mean of
+/// the measured heights, so the total sharpens as items scroll into view. Two
+/// Fenwick trees give O(log n) prefix queries: one over measured heights (0 for
+/// unmeasured), one over the measured flag (0/1), so `offset_for_index` can add
+/// the exact measured heights below `i` plus the estimated heights of the
+/// unmeasured items below `i`.
+struct ListGeometry {
+    heights: Vec<Option<u32>>,
+    height_prefix: Fenwick,
+    measured_prefix: Fenwick,
+    measured_sum: u64,
+    measured_count: usize,
+}
+
+impl ListGeometry {
+    fn new() -> ListGeometry {
+        ListGeometry {
+            heights: Vec::new(),
+            height_prefix: Fenwick::new(),
+            measured_prefix: Fenwick::new(),
+            measured_sum: 0,
+            measured_count: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.heights.len()
+    }
+
+    /// Resizes to `n` items, preserving existing measurements.
+    ///
+    /// Growing appends unmeasured slots, which is the common append case for a
+    /// transcript, so we must never wholesale-clear here or every appended
+    /// entry would wipe the measurements. Shrinking drops the tail and rebuilds
+    /// the running counters and Fenwicks from the retained heights.
+    fn set_len(&mut self, n: usize) {
+        let len = self.len();
+        if n > len {
+            for _ in len..n {
+                self.heights.push(None);
+                self.height_prefix.push();
+                self.measured_prefix.push();
+            }
+        } else if n < len {
+            self.heights.truncate(n);
+            self.measured_sum = 0;
+            self.measured_count = 0;
+            for h in &self.heights {
+                if let Some(height) = h {
+                    self.measured_sum += u64::from(*height);
+                    self.measured_count += 1;
+                }
+            }
+            self.height_prefix.truncate(n);
+            self.measured_prefix.truncate(n);
+        }
+    }
+
+    /// Records item `i`'s measured `height`, replacing any prior measurement.
+    ///
+    /// A no-op when `i` is out of range. Re-measuring an already-measured index
+    /// (its height changed after a re-layout) adjusts the running sum by the
+    /// height delta without double-counting it.
+    fn set_measured(&mut self, i: usize, height: u32) {
+        if i >= self.len() {
+            return;
+        }
+        let old = self.heights[i];
+        let delta = i64::from(height) - old.map_or(0, i64::from);
+        self.heights[i] = Some(height);
+        self.height_prefix.add(i, delta);
+        match old {
+            Some(prev) => {
+                self.measured_sum = self.measured_sum - u64::from(prev) + u64::from(height);
+            }
+            None => {
+                self.measured_prefix.add(i, 1);
+                self.measured_count += 1;
+                self.measured_sum += u64::from(height);
+            }
+        }
+    }
+
+    /// Estimated height of an unmeasured item: the mean of the measured
+    /// heights, at least 1. Falls back to 1 before anything is measured.
+    fn estimate(&self) -> u32 {
+        if self.measured_count == 0 {
+            return 1;
+        }
+        let count = u64::try_from(self.measured_count).expect("count fits u64");
+        let mean = (self.measured_sum / count).max(1);
+        u32::try_from(mean).unwrap_or(u32::MAX)
+    }
+
+    /// Line offset of the top of item `i`: the exact measured heights below `i`
+    /// plus the estimate for each unmeasured item below `i`. `i` is clamped to
+    /// `len`.
+    fn offset_for_index(&self, i: usize) -> u64 {
+        let i = i.min(self.len());
+        let measured_height =
+            u64::try_from(self.height_prefix.prefix(i)).expect("prefix sum is non-negative");
+        let measured_below =
+            usize::try_from(self.measured_prefix.prefix(i)).expect("count is non-negative");
+        let unmeasured = u64::try_from(i - measured_below).expect("index fits u64");
+        measured_height + unmeasured * u64::from(self.estimate())
+    }
+
+    /// Total content extent in lines.
+    fn total(&self) -> u64 {
+        self.offset_for_index(self.len())
+    }
+
+    /// Item index whose top is the largest offset `<= line`, clamped to a valid
+    /// item index. `offset_for_index(0)` is 0, so a candidate always exists.
+    fn item_at_line(&self, line: u64) -> usize {
+        let n = self.len();
+        if n == 0 {
+            return 0;
+        }
+        let mut lo = 0usize;
+        let mut hi = n;
+        while lo < hi {
+            let mid = lo + (hi - lo + 1) / 2;
+            if self.offset_for_index(mid) <= line {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        lo.min(n - 1)
+    }
+
+    fn reset(&mut self) {
+        self.heights.clear();
+        self.height_prefix = Fenwick::new();
+        self.measured_prefix = Fenwick::new();
+        self.measured_sum = 0;
+        self.measured_count = 0;
+    }
+}
+
 /// A vertically scrolling list with a movable cursor.
 ///
 /// Construct with [`ListView::new`] and tweak the public fields. The widget is
@@ -145,6 +374,10 @@ pub struct ListView {
     /// against. `None` before the first draw. Page-scroll callers scale this
     /// to scroll by whole viewports (see [`viewport_height`](Self::viewport_height)).
     last_viewport_height: Option<u16>,
+    /// Read-model of per-item extents, updated during draw and used only to
+    /// size and place the scrollbar thumb. Layered on top of the index-anchored
+    /// scroll core, so it never affects what is drawn.
+    geometry: ListGeometry,
 }
 
 impl ListView {
@@ -158,6 +391,7 @@ impl ListView {
             item_count: None,
             scroll: Scroll::default(),
             last_viewport_height: None,
+            geometry: ListGeometry::new(),
         }
     }
 
@@ -361,6 +595,16 @@ impl ListView {
         self.scroll.offset
     }
 
+    /// Clears the scrollbar-thumb geometry so the next draw rebuilds it.
+    ///
+    /// For a wholesale content swap where an index no longer maps to the same
+    /// item (a session switch). The append/truncate logic in
+    /// [`set_len`](ListGeometry::set_len) cannot detect that from length alone,
+    /// so it would carry the previous content's measurements into the new one.
+    pub fn reset_geometry(&mut self) {
+        self.geometry.reset();
+    }
+
     /// Inserts children at the front of `child_list` until `add_height` lines
     /// are filled above the current top, walking upward from `top - 1`.
     fn insert_children(
@@ -394,6 +638,12 @@ impl ListView {
                 },
             );
             let surf = draw_widget(&child, &child_ctx);
+            // Record the measured height for the thumb geometry. See the
+            // matching site in draw_builder for why stale off-screen heights
+            // are acceptable after a resize.
+            if top < self.geometry.len() {
+                self.geometry.set_measured(top, u32::from(surf.size.height));
+            }
             // Traversing backward, so accumulate before setting the origin.
             upheight -= i32::from(surf.size.height);
             child_list.insert(
@@ -437,6 +687,19 @@ impl ListView {
         // Record the viewport height so viewport-relative scrolls (page
         // up/down) can read it back after this draw.
         self.last_viewport_height = Some(max_size.height);
+
+        // Size the thumb geometry to the known item count. We read
+        // `self.item_count` directly rather than `known_item_count()` because
+        // `draw` swaps `children` out for the default empty slice while we run,
+        // so `known_item_count()` would walk that empty slice and report 0 for
+        // a builder-backed list. `draw` has already resolved a slice's count
+        // into `item_count`, so this covers slices and builders that know their
+        // count, and leaves an unbounded builder's geometry empty (thumb falls
+        // back to item-count sizing).
+        if let Some(n) = self.item_count {
+            self.geometry
+                .set_len(usize::try_from(n).expect("item count fits usize"));
+        }
         let cursor = usize::try_from(self.cursor).expect("cursor fits usize");
 
         // Assume there is more below; we only learn otherwise by running out of
@@ -493,6 +756,15 @@ impl ListView {
             );
             let surf = draw_widget(&child, &child_ctx);
             let height = i32::from(surf.size.height);
+            // Record the measured height for the thumb geometry, keyed by the
+            // item index `i`. Heights are measured at the current draw width and
+            // the geometry is not keyed by width, so after a resize off-screen
+            // entries carry stale heights until re-measured on scroll. That only
+            // sizes the thumb (cosmetic) and the visible window is re-measured
+            // every draw, so it is fine.
+            if i < self.geometry.len() {
+                self.geometry.set_measured(i, u32::from(surf.size.height));
+            }
             child_list.push(SubSurface {
                 origin: RelativePoint {
                     col: i32::from(child_offset),
@@ -707,6 +979,37 @@ impl ScrollableView for ListView {
     }
 
     fn set_scroll_left(&mut self, _left: u32) {}
+
+    // Geometry-backed thumb sizing. Empty geometry (an unbounded builder with
+    // no item_count) reports `None` so the bars fall back to item-count sizing.
+
+    fn content_extent(&self) -> Option<u32> {
+        if self.geometry.len() == 0 {
+            None
+        } else {
+            Some(u32::try_from(self.geometry.total()).unwrap_or(u32::MAX))
+        }
+    }
+
+    fn viewport_top_line(&self) -> Option<u32> {
+        if self.geometry.len() == 0 {
+            return None;
+        }
+        let top = usize::try_from(self.scroll.top).expect("top fits usize");
+        // `offset` is reconciled to `>= 0` after a draw. Clamp defensively.
+        let offset = u64::try_from(self.scroll.offset.max(0)).expect("offset fits u64");
+        let line = self.geometry.offset_for_index(top) + offset;
+        Some(u32::try_from(line).unwrap_or(u32::MAX))
+    }
+
+    fn item_at_line(&self, line: u32) -> Option<u32> {
+        if self.geometry.len() == 0 {
+            None
+        } else {
+            let idx = self.geometry.item_at_line(u64::from(line));
+            Some(u32::try_from(idx).unwrap_or(u32::MAX))
+        }
+    }
 }
 
 impl Widget for ListView {
@@ -1156,5 +1459,159 @@ mod tests {
             mods: mouse::Modifiers::empty(),
             kind: mouse::Type::Press,
         }
+    }
+
+    #[test]
+    fn fenwick_prefix_sums_adds_pushes_and_truncate() {
+        let mut f = Fenwick::new();
+        assert_eq!(f.len(), 0);
+        assert_eq!(f.prefix(0), 0);
+
+        for _ in 0..5 {
+            f.push();
+        }
+        assert_eq!(f.len(), 5);
+        assert_eq!(f.prefix(5), 0);
+
+        f.add(0, 3);
+        f.add(2, 7);
+        f.add(4, 5);
+        // Values [3, 0, 7, 0, 5] give prefix sums [0, 3, 3, 10, 10, 15].
+        assert_eq!(f.prefix(0), 0);
+        assert_eq!(f.prefix(1), 3);
+        assert_eq!(f.prefix(2), 3);
+        assert_eq!(f.prefix(3), 10);
+        assert_eq!(f.prefix(4), 10);
+        assert_eq!(f.prefix(5), 15);
+        // `i` beyond len clamps to the whole sum.
+        assert_eq!(f.prefix(100), 15);
+
+        // A negative delta (a re-measured item that shrank) subtracts.
+        f.add(2, -2);
+        assert_eq!(f.prefix(3), 8);
+        assert_eq!(f.prefix(5), 13);
+
+        // Append preserves existing values, the new slot holds 0.
+        f.push();
+        assert_eq!(f.len(), 6);
+        assert_eq!(f.prefix(6), 13);
+        f.add(5, 4);
+        assert_eq!(f.prefix(6), 17);
+
+        // Truncate drops the tail, retaining the earlier prefix sums.
+        f.truncate(3);
+        assert_eq!(f.len(), 3);
+        assert_eq!(f.prefix(1), 3);
+        assert_eq!(f.prefix(3), 8);
+        // Truncate to a length at or above the current one is a no-op.
+        f.truncate(10);
+        assert_eq!(f.len(), 3);
+        assert_eq!(f.prefix(3), 8);
+    }
+
+    #[test]
+    fn list_geometry_measured_and_estimated_extents() {
+        let mut g = ListGeometry::new();
+        g.set_len(5);
+        // Before any measurement every item estimates at 1.
+        assert_eq!(g.estimate(), 1);
+        assert_eq!(g.total(), 5);
+        assert_eq!(g.offset_for_index(3), 3);
+
+        g.set_measured(0, 10);
+        g.set_measured(1, 4);
+        // Mean of {10, 4} is 7.
+        assert_eq!(g.estimate(), 7);
+        // Measured items contribute exact heights.
+        assert_eq!(g.offset_for_index(2), 14);
+        // Below index 4: measured 14 plus two unmeasured items at 7 each.
+        assert_eq!(g.offset_for_index(4), 28);
+        // Total: measured 14 plus three unmeasured items at 7 each.
+        assert_eq!(g.total(), 35);
+
+        // item_at_line finds the item whose top is the largest offset <= line.
+        assert_eq!(g.item_at_line(0), 0);
+        assert_eq!(g.item_at_line(13), 1);
+        assert_eq!(g.item_at_line(14), 2);
+        // Beyond the total clamps to the last item.
+        assert_eq!(g.item_at_line(10_000), 4);
+    }
+
+    #[test]
+    fn list_geometry_set_len_grow_preserves_and_shrink_drops() {
+        let mut g = ListGeometry::new();
+        g.set_len(3);
+        g.set_measured(0, 5);
+        g.set_measured(1, 6);
+        g.set_measured(2, 7);
+        assert_eq!(g.total(), 18);
+
+        // Growing preserves existing measurements. New slots estimate at the
+        // mean (18 / 3 = 6).
+        g.set_len(5);
+        assert_eq!(g.len(), 5);
+        assert_eq!(g.estimate(), 6);
+        assert_eq!(g.offset_for_index(3), 18);
+        assert_eq!(g.total(), 30);
+
+        // Shrinking drops the tail and recomputes the mean over the retained
+        // items ({5, 6} -> 11 / 2 = 5).
+        g.set_len(2);
+        assert_eq!(g.len(), 2);
+        assert_eq!(g.estimate(), 5);
+        assert_eq!(g.total(), 11);
+    }
+
+    #[test]
+    fn list_geometry_remeasure_updates_without_double_counting() {
+        let mut g = ListGeometry::new();
+        g.set_len(3);
+        g.set_measured(0, 5);
+        g.set_measured(1, 5);
+        assert_eq!(g.offset_for_index(2), 10);
+        assert_eq!(g.estimate(), 5);
+
+        // A re-layout gives index 0 a new height.
+        g.set_measured(0, 20);
+        assert_eq!(g.offset_for_index(1), 20);
+        assert_eq!(g.offset_for_index(2), 25);
+        // Mean is (20 + 5) / 2 = 12, measured count still 2.
+        assert_eq!(g.estimate(), 12);
+        // Item 2 stays unmeasured, contributing the estimate.
+        assert_eq!(g.total(), 25 + 12);
+    }
+
+    /// The list records each drawn child's height into the geometry, so
+    /// `content_extent` reflects the measured visible heights plus the
+    /// estimated remainder, and `viewport_top_line` tracks the top item's line
+    /// offset after a scroll.
+    #[test]
+    fn list_view_geometry_tracks_measured_and_estimated_extent() {
+        let mut list_view = ListView::new(Source::Slice(vec![
+            text("0\n1\n2"), // 3 rows
+            text("3"),       // 1 row
+            text("4\n5"),    // 2 rows
+            text("6"),       // 1 row
+            text("7"),       // 1 row
+        ]));
+        list_view.draw_cursor = false;
+
+        let ctx = draw_ctx(16, 4);
+        list_view.draw(&ctx);
+
+        // Visible items 0 (h3) and 1 (h1) are measured, so the mean is 2 and
+        // the three unmeasured items each estimate at 2: 4 + 3 * 2 = 10.
+        assert_eq!(list_view.content_extent(), Some(10));
+        assert_eq!(list_view.viewport_top_line(), Some(0));
+
+        // Scroll past the 3-row first item: the top lands on item 1 at line 3.
+        list_view.scroll_lines(3);
+        list_view.draw(&ctx);
+        assert_eq!(list_view.scroll_top(), 1);
+        assert_eq!(list_view.scroll_offset(), 0);
+        assert_eq!(list_view.viewport_top_line(), Some(3));
+        // Items 0..=3 are now measured (3 + 1 + 2 + 1 = 7), item 4 estimates at
+        // 7 / 4 = 1, so the extent is 7 + 1 = 8.
+        assert_eq!(list_view.content_extent(), Some(8));
     }
 }
