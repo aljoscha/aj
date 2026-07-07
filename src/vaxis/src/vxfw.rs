@@ -930,7 +930,7 @@ mod tests {
     #[test]
     fn all_widgets_have_a_doctest() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/vxfw");
-        let excludes = ["app", "app_core", "async_app", "loop_event"];
+        let excludes = ["app", "app_core", "async_app", "loop_event", "render_debug"];
         let entries = std::fs::read_dir(&dir).expect("read src/vxfw");
         for entry in entries {
             let path = entry.expect("dir entry").path();
