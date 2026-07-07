@@ -337,6 +337,7 @@ impl<'s> Window<'s> {
 
     /// Fills the window with `cell`.
     pub fn fill(&self, cell: Cell) {
+        cell.debug_assert_blank_if_default();
         let mut screen = self.screen.borrow_mut();
         if self.x_off + i32::from(self.width) < 0
             || self.y_off + i32::from(self.height) < 0

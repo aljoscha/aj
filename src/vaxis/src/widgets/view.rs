@@ -219,6 +219,7 @@ impl View {
 
     /// Fills the whole view with `cell`.
     pub fn fill(&self, cell: Cell) {
+        cell.debug_assert_blank_if_default();
         self.screen.borrow_mut().buf.fill(cell);
     }
 

@@ -82,6 +82,7 @@ impl Screen {
         if col >= self.width || row >= self.height {
             return;
         }
+        cell.debug_assert_blank_if_default();
         let i = usize::from(row) * usize::from(self.width) + usize::from(col);
         debug_assert!(i < self.buf.len());
         self.buf[i] = cell;
@@ -163,5 +164,40 @@ mod tests {
                 assert_eq!(screen.read_cell(col, row), Some(Cell::default()));
             }
         }
+    }
+
+    #[test]
+    fn blank_default_cell_writes_fine() {
+        // The blank cell `Window::clear` and vxfw surfaces fill with carries
+        // `default: true`, and must not trip the guard.
+        let mut screen = Screen::new(winsize(2, 2));
+        screen.write_cell(
+            0,
+            0,
+            Cell {
+                default: true,
+                ..Cell::default()
+            },
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must equal the blank cell")]
+    fn default_cell_with_a_background_trips_the_guard() {
+        // A `default` cell carrying a style is the invariant violation the
+        // diff's fast-path silently mishandles; writing one must fail loudly.
+        let mut screen = Screen::new(winsize(2, 2));
+        screen.write_cell(
+            0,
+            0,
+            Cell {
+                default: true,
+                style: crate::cell::Style {
+                    bg: crate::cell::Color::Rgb([232, 232, 240]),
+                    ..Default::default()
+                },
+                ..Cell::default()
+            },
+        );
     }
 }

@@ -32,6 +32,41 @@ pub struct Cell {
     pub scale: Scale,
 }
 
+impl Cell {
+    /// Whether this cell equals the blank default cell: default style, a
+    /// single space, no hyperlink or image, and default scale.
+    ///
+    /// This is the contract behind the `default` flag. The diff's fast-path
+    /// ([`InternalCell::eql`](crate::internal_screen::InternalCell::eql)) treats
+    /// two `default` cells as equal without comparing their contents, and
+    /// `pretty_print` skips `default` cells entirely, so a cell flagged
+    /// `default` while carrying anything but the blank contents renders wrong
+    /// (a tint that never repaints, a glyph that never prints). Producers must
+    /// clear `default` the moment they give a cell real content or style.
+    ///
+    /// We compare against the blank cell on every field but `default` itself,
+    /// so the check can't drift as fields are added.
+    pub fn is_blank_default(&self) -> bool {
+        *self
+            == Cell {
+                default: self.default,
+                ..Cell::default()
+            }
+    }
+
+    /// Debug-asserts the [`is_blank_default`](Self::is_blank_default) contract
+    /// at a buffer-write boundary, so a producer that sets a style or glyph
+    /// without clearing `default` fails a test rather than shipping a
+    /// stale-tint artifact. Compiles away in release.
+    #[inline]
+    pub(crate) fn debug_assert_blank_if_default(&self) {
+        debug_assert!(
+            !self.default || self.is_blank_default(),
+            "a `default` cell must equal the blank cell, got {self:?}"
+        );
+    }
+}
+
 /// A contiguous run of text with a constant style. Used as print input.
 ///
 /// NOTE: Upstream `Segment.text` is a borrowed `[]const u8`. We own a `String`
