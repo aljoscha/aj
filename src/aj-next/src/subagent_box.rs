@@ -264,11 +264,10 @@ impl Widget for SubAgentBox {
         }
         for (r, row) in content.iter().enumerate() {
             for (c, cell) in row.iter().enumerate() {
-                // Untouched (`default`) cells are transparent here: we leave
-                // the box tint already filling this row showing through, the
-                // way the renderer treats a default cell as "nothing here".
-                // Writing one would punch a default-background hole, and
-                // re-tinting that hole in place would leave a `default`-flagged
+                // Untouched (`default`) cells are transparent here: skip them
+                // so the box tint we already wrote into this row stays, rather
+                // than overwriting it with a default-background hole. Writing
+                // one and re-tinting it in place would leave a `default`-flagged
                 // cell carrying our tint. The diff's default fast-path then
                 // treats it as blank and never repaints it, stranding stale
                 // gray when the box later shrinks or moves.

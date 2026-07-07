@@ -28,7 +28,7 @@ use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::cell::Color;
 use crate::internal_screen::InternalScreen;
@@ -64,17 +64,23 @@ struct Speckle {
 /// Scans `bg` (one row of background colors) for a color whose occurrences
 /// span a range with a default-bg hole inside it. Returns one entry per such
 /// color.
+///
+/// NOTE: This assumes a flagged color fills its row contiguously, which the
+/// full-width transcript boxes do. Two genuinely separate regions of the same
+/// tint on one row (side-by-side elements, or an overlay floating over the
+/// transcript) with default background between them would read as a false
+/// speckle. Acceptable for a diagnostic that only appends to a file.
 fn scan_row(row: usize, bg: &[Color]) -> Vec<Speckle> {
     let mut colors: Vec<Color> = Vec::new();
     for c in bg {
-        if *c != Color::Default && !colors.iter().any(|k| k.eql(c)) {
+        if *c != Color::Default && !colors.contains(c) {
             colors.push(*c);
         }
     }
     let mut out = Vec::new();
     for color in colors {
-        let first = bg.iter().position(|c| c.eql(&color));
-        let last = bg.iter().rposition(|c| c.eql(&color));
+        let first = bg.iter().position(|c| *c == color);
+        let last = bg.iter().rposition(|c| *c == color);
         let (Some(first), Some(last)) = (first, last) else {
             continue;
         };
@@ -314,8 +320,19 @@ pub(crate) fn inspect_frame(surface: &Surface, front: &Screen, last: &InternalSc
         }
     }
 
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = file.write_all(report.as_bytes());
+    match OpenOptions::new().create(true).append(true).open(path) {
+        Ok(mut file) => {
+            let _ = file.write_all(report.as_bytes());
+        }
+        Err(e) => {
+            // Warn once so a bad `AJ_RENDER_DEBUG` path isn't silently inert.
+            // Guarded so we don't spam stderr (and scramble the alt screen)
+            // every frame.
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                eprintln!("render_debug: cannot open {}: {e}", path.display());
+            }
+        }
     }
 }
 
