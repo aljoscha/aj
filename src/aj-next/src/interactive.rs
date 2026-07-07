@@ -3281,6 +3281,17 @@ async fn drive(
     // dialog overlay it pushed.
     let mut login_session: Option<LoginSession> = None;
     let exit = loop {
+        // Paint current state before blocking on the next event: whenever the
+        // loop is about to wait, the screen must already reflect current
+        // state. This flushes redraws requested while reacting to the previous
+        // event (the arms below and the post-select sync block), and,
+        // crucially, state changed before we entered the loop with nothing
+        // else to wake us: a session the outer loop just rebuilt, or the
+        // startup color-mode reconcile. Without it the latch sits set until some unrelated event wakes the select. It
+        // is a no-op when the latch is clean, and `init` drew the first frame,
+        // so this never double-draws. Cross-thread wakers still ping their own
+        // channels (e.g. the login redraw ping) to get us back here.
+        app.render_if_needed(root)?;
         // Compute the tick deadline before the select so no arm holds
         // a borrow of `app` another arm needs. The sleep expression is
         // evaluated even when the guard is false, hence the fallback.
@@ -3752,7 +3763,6 @@ async fn drive(
             app.request_redraw();
         }
         quit_was_armed = quit_armed;
-        app.render_if_needed(root)?;
     };
 
     exit
