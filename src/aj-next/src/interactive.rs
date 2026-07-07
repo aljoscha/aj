@@ -989,6 +989,7 @@ fn handle_host_action(world: &mut World, shell: &Rc<RefCell<Shell>>, action: AjA
         | AjAction::CloseAllOverlays
         | AjAction::ChatPageUp
         | AjAction::ChatPageDown
+        | AjAction::TranscriptFocus
         | AjAction::Quit => false,
     }
 }
@@ -2501,6 +2502,7 @@ impl Shell {
             let fetch_slot_for_actions = Rc::clone(&fetch_slot);
             let settings_ui_for_actions = Rc::clone(&settings_ui);
             let transcript_for_actions = Rc::clone(&transcript);
+            let transcript_widget: WidgetRef = to_widget_ref(Rc::clone(&transcript));
             let action_slot = Rc::clone(&host_action);
             Box::new(move |ctx, action| match action {
                 AjAction::ThinkingToggle => {
@@ -2548,6 +2550,14 @@ impl Shell {
                     transcript_for_actions.borrow_mut().page_down();
                     ctx.redraw = true;
                 }
+                AjAction::TranscriptFocus => {
+                    // Move keyboard focus onto the transcript. Its `FocusIn`
+                    // shows the item cursor and enters focus mode; the Esc the
+                    // transcript handles then returns focus to the editor. The
+                    // binding's predicate gates this to "no overlay open".
+                    ctx.request_focus(Rc::clone(&transcript_widget));
+                    ctx.redraw = true;
+                }
                 AjAction::CancelTurn
                 | AjAction::Steer
                 | AjAction::Dequeue
@@ -2580,6 +2590,18 @@ impl Shell {
                     ctx,
                 );
             }));
+        }
+        // Wire the transcript's Esc-to-exit callback to move focus back to the
+        // editor. The resulting `FocusOut` clears the item cursor, exiting
+        // transcript-focus mode (Spec E section 1).
+        {
+            let editor_widget: WidgetRef = to_widget_ref(Rc::clone(&editor));
+            transcript
+                .borrow_mut()
+                .set_on_exit_focus(Box::new(move |ctx| {
+                    ctx.request_focus(Rc::clone(&editor_widget));
+                    ctx.redraw = true;
+                }));
         }
         let keymap =
             KeymapController::new(build_keymap(), Rc::clone(&keymap_ctx), layout, on_action);

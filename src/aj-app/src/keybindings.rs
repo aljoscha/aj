@@ -126,6 +126,16 @@ pub const ACTION_CHAT_PAGE_UP: &str = "aj.chat.page_up";
 /// re-engages follow-tail.
 pub const ACTION_CHAT_PAGE_DOWN: &str = "aj.chat.page_down";
 
+/// Action ID for the "focus the transcript for keyboard navigation" chord.
+///
+/// Bound by default to `ctrl+up`. It moves keyboard focus from the editor
+/// onto the chat transcript and shows its item cursor (Spec E section 1,
+/// transcript-focus mode). Unlike the other global chords this one is a
+/// bubble-phase binding: the editor does not bind `ctrl+up`, so it declines
+/// the key and the chord bubbles up to the keymap. Inert while a capturing
+/// overlay is up. Esc returns focus to the editor.
+pub const ACTION_TRANSCRIPT_FOCUS: &str = "aj.transcript.focus";
+
 /// Action ID for the "clear the selected project override" chord in
 /// the project settings window.
 ///
@@ -199,6 +209,11 @@ pub const AJ_KEYBINDINGS: &[(&str, &str, &str)] = &[
         ACTION_CHAT_PAGE_DOWN,
         "pagedown",
         "Scroll the transcript down a page",
+    ),
+    (
+        ACTION_TRANSCRIPT_FOCUS,
+        "ctrl+up",
+        "Focus the transcript for keyboard navigation",
     ),
     (
         ACTION_SETTINGS_CLEAR,

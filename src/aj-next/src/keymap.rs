@@ -141,8 +141,8 @@ pub(crate) fn build_keymap() -> Keymap<AjAction, HostCtx> {
         // (Ctrl+U/Ctrl+D) as chat-scroll keys, but those are editor chords in
         // the Emacs-style `TextArea` (line start/end, kill-to-start,
         // delete-forward), so they can't double as editor-focused chat-scroll
-        // chords. They land in transcript-focus mode (a later chunk), where
-        // the editor is not focused.
+        // chords. Home/End are handled by transcript-focus mode, where the
+        // editor is not focused. Half-page scroll is not bound yet.
         let enabled: fn(&HostCtx) -> bool = match binding.action {
             AjAction::CloseAllOverlays => overlay_open_no_login,
             AjAction::PaletteOpen
@@ -151,7 +151,8 @@ pub(crate) fn build_keymap() -> Keymap<AjAction, HostCtx> {
             | AjAction::Steer
             | AjAction::Dequeue
             | AjAction::ChatPageUp
-            | AjAction::ChatPageDown => no_overlay,
+            | AjAction::ChatPageDown
+            | AjAction::TranscriptFocus => no_overlay,
             _ => |_| true,
         };
         entries.push(
@@ -328,6 +329,41 @@ mod tests {
             keymap.match_single(&page_down, BindingPhase::Capture, &modal),
             None,
             "an open overlay owns its own PageDown",
+        );
+    }
+
+    /// Transcript-focus resolves in the bubble phase (the editor declines
+    /// `ctrl+up`), and is inert while a capturing overlay is up.
+    #[test]
+    fn transcript_focus_matches_in_bubble_and_is_gated_by_overlays() {
+        let keymap = build_keymap();
+        let ctrl_up = key(Key::UP, Modifiers::CTRL);
+
+        let idle = ctx(false);
+        assert_eq!(
+            keymap.match_single(&ctrl_up, BindingPhase::Bubble, &idle),
+            Some(&AjAction::TranscriptFocus),
+            "ctrl+up bubbles to transcript-focus once the editor declines it",
+        );
+        assert_eq!(
+            keymap.match_single(&ctrl_up, BindingPhase::Capture, &idle),
+            None,
+            "transcript-focus is not a capture-phase chord",
+        );
+
+        let modal = ctx(false);
+        modal
+            .overlays
+            .borrow_mut()
+            .push(crate::overlay::OpenOverlay {
+                widget: Rc::new(RefCell::new(crate::overlay::Scrim)),
+                focus: Rc::new(RefCell::new(crate::overlay::Scrim)),
+                placement: crate::overlay::OverlayPlacement::Small,
+            });
+        assert_eq!(
+            keymap.match_single(&ctrl_up, BindingPhase::Bubble, &modal),
+            None,
+            "transcript-focus is inert while an overlay is open",
         );
     }
 

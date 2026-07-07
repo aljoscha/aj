@@ -28,6 +28,7 @@ use aj_models::types::AssistantContent;
 use aj_tools::sanitize_terminal_output;
 use serde_json::Value;
 use vaxis::cell::{Cell, Character, Color, Style};
+use vaxis::key::{Key, Modifiers};
 use vaxis::mouse;
 use vaxis::vxfw::{
     Builder, DrawContext, Event, EventContext, ListView, RelativePoint, RichText, ScrollBars,
@@ -204,12 +205,16 @@ struct CachedEntry {
 /// [`TranscriptView::set_styles`]). Width is a per-slot key.
 ///
 /// Storing surfaces is safe today: no transcript entry participates in event
-/// dispatch and the list draws no cursor, so replaying a stored surface
-/// (whose `widget` stamp is `None`, then re-stamped onto the outer
-/// [`CachingEntry`] by `draw_widget`) does not break hit-testing.
-/// NOTE(aljoscha): a later transcript-focus mode would make entries
-/// interactive, at which point the wrapper must forward events to the real
-/// widget or the cache must store widgets for those kinds.
+/// dispatch, so replaying a stored surface (whose `widget` stamp is `None`,
+/// then re-stamped onto the outer [`CachingEntry`] by `draw_widget`) does not
+/// break hit-testing.
+///
+/// Transcript-focus mode does not change this. Turning the list's
+/// `draw_cursor` on draws a cursor gutter and lays entries out two columns
+/// narrower, which the width-keyed slots absorb as a one-frame width miss then
+/// a correct rebuild. The gutter is a `ListView`-level indicator, not an entry
+/// widget, so entries stay non-interactive and the "no interactive entries"
+/// assumption still holds.
 struct EntryRenderCache {
     slots: HashMap<(AgentId, EntryId), CachedEntry>,
     /// Monotonic lookup counter stamped onto a slot's `last_used` on every
@@ -1012,8 +1017,14 @@ pub struct TranscriptView {
     /// While true, every draw pins the viewport to the bottom so a
     /// streaming turn stays in view. Wheel-up and thumb drags
     /// disengage, a scroll that lands back at the bottom re-engages
-    /// (Spec E section 1).
+    /// (Spec E section 1). Suspended while the transcript is focused: the
+    /// item cursor then owns the viewport, so [`draw`](Widget::draw) neither
+    /// pins the bottom nor re-engages while focus mode is active.
     follow_tail: bool,
+    /// Called from the Esc branch of transcript-focus mode to hand focus
+    /// back to the editor. `None` until the host wires it in `Shell::new`.
+    /// The resulting `FocusOut` clears the item cursor, exiting the mode.
+    on_exit_focus: Option<Box<dyn FnMut(&mut EventContext)>>,
 }
 
 /// The session-wide render inputs the transcript cache does not fingerprint
@@ -1047,8 +1058,9 @@ impl TranscriptView {
             cache: Rc::clone(&cache),
         };
         let mut list = ListView::new(Source::Builder(Box::new(builder)));
-        // Free-scroll mode: no item cursor while the editor owns the
-        // keyboard. Transcript-focus mode arrives in a later phase.
+        // Free-scroll mode at construction: no item cursor while the editor
+        // owns the keyboard. `FocusIn` turns the cursor on for transcript-focus
+        // mode, `FocusOut` turns it back off.
         list.draw_cursor = false;
         let mut bars = ScrollBars::new(list);
         bars.draw_horizontal_scrollbar = false;
@@ -1062,6 +1074,7 @@ impl TranscriptView {
             cache,
             last_globals,
             follow_tail: true,
+            on_exit_focus: None,
         }
     }
 
@@ -1091,6 +1104,100 @@ impl TranscriptView {
         // clear here is redundant but harmless.
         self.cache.borrow_mut().clear();
         self.follow_tail = true;
+    }
+
+    /// Install the callback invoked when Esc leaves transcript-focus mode.
+    /// The host wires it to move focus back to the editor (see `Shell::new`),
+    /// whose `FocusOut` then clears the item cursor and exits the mode.
+    pub(crate) fn set_on_exit_focus(&mut self, on_exit: Box<dyn FnMut(&mut EventContext)>) {
+        self.on_exit_focus = Some(on_exit);
+    }
+
+    /// Entry count of the active view's transcript, or 0 when it has none.
+    fn entry_count(&self) -> usize {
+        let chat = self.chat.borrow();
+        chat.transcript(chat.active_view())
+            .map(|t| t.entries().len())
+            .unwrap_or(0)
+    }
+
+    /// Whether the transcript is in focus mode. The mode lives entirely on
+    /// focus, and is exactly when the list draws its item cursor, which
+    /// `FocusIn`/`FocusOut` toggle. We keep no parallel flag.
+    fn in_focus_mode(&self) -> bool {
+        self.list.borrow().draw_cursor
+    }
+
+    /// Move the item cursor onto the last entry and anchor the viewport to the
+    /// bottom, so the cursor lands on the bottom item with its tail in view.
+    /// Used on entering focus mode and for the End / G jump.
+    ///
+    /// We refresh `item_count` first so both `jump_to_item` and
+    /// `scroll_to_bottom` see the current length even before the focused
+    /// view's first draw. We deliberately do not follow with `ensure_scroll`:
+    /// it would re-anchor the viewport to the top of the last item, hiding the
+    /// tail of an oversized final entry, which is exactly what
+    /// `scroll_to_bottom` avoids.
+    fn cursor_to_bottom(&self) {
+        let count = self.entry_count();
+        let mut list = self.list.borrow_mut();
+        list.item_count = Some(u32::try_from(count).expect("entry count fits u32"));
+        let last = u32::try_from(count.saturating_sub(1)).expect("index fits u32");
+        list.jump_to_item(last);
+        list.scroll_to_bottom();
+    }
+
+    /// Enter transcript-focus mode (Spec E section 1): show the item cursor,
+    /// suspend follow-tail so the cursor is not fought by auto-scroll, and land
+    /// the cursor on the bottom item. Driven by `Event::FocusIn`, so the mode
+    /// is exactly "the transcript is the focused widget".
+    fn enter_focus_mode(&mut self, ctx: &mut EventContext) {
+        self.list.borrow_mut().draw_cursor = true;
+        self.follow_tail = false;
+        self.cursor_to_bottom();
+        ctx.redraw = true;
+    }
+
+    /// Leave transcript-focus mode: hide the item cursor. Driven by
+    /// `Event::FocusOut`, so it also fires when an opening overlay steals focus
+    /// (the overlay's `request_focus` sends this a `FocusOut`).
+    fn exit_focus_mode(&self, ctx: &mut EventContext) {
+        self.list.borrow_mut().draw_cursor = false;
+        ctx.redraw = true;
+    }
+
+    /// Handle a key press while the transcript is focused, delegating item
+    /// navigation to the inner [`ListView`]. A no-op when not focused (the key
+    /// then falls through unconsumed). PageUp/PageDown are left to the
+    /// capture-phase chat-scroll chords, which work in focus mode too.
+    fn handle_focus_key(&mut self, ctx: &mut EventContext, key: &Key) {
+        if !self.in_focus_mode() {
+            return;
+        }
+        let empty = Modifiers::empty();
+        let ctrl = Modifiers::CTRL;
+        if key.matches(Key::UP, empty)
+            || key.matches(u32::from('k'), empty)
+            || key.matches(u32::from('p'), ctrl)
+        {
+            self.list.borrow_mut().prev_item(ctx);
+        } else if key.matches(Key::DOWN, empty)
+            || key.matches(u32::from('j'), empty)
+            || key.matches(u32::from('n'), ctrl)
+        {
+            self.list.borrow_mut().next_item(ctx);
+        } else if key.matches(Key::HOME, empty) || key.matches(u32::from('g'), empty) {
+            self.list.borrow_mut().jump_to_item(0);
+            ctx.consume_and_redraw();
+        } else if key.matches(Key::END, empty) || key.matches(u32::from('g'), Modifiers::SHIFT) {
+            self.cursor_to_bottom();
+            ctx.consume_and_redraw();
+        } else if key.matches(Key::ESCAPE, empty) {
+            if let Some(on_exit) = self.on_exit_focus.as_mut() {
+                on_exit(ctx);
+            }
+            ctx.consume_and_redraw();
+        }
     }
 
     /// Scroll the transcript up by one viewport page (Spec E section 1).
@@ -1201,19 +1308,18 @@ impl Widget for TranscriptView {
             self.cache.borrow_mut().clear();
             self.last_globals = globals;
         }
-        let count = {
-            let chat = self.chat.borrow();
-            chat.transcript(chat.active_view())
-                .map(|t| t.entries().len())
-                .unwrap_or(0)
-        };
+        let count = self.entry_count();
+        // Focus mode hands the viewport to the item cursor, so follow-tail
+        // must neither pin the bottom nor re-engage while it is active, or the
+        // auto-scroll fights the cursor navigation (Spec E section 1).
+        let focus_mode = self.in_focus_mode();
         {
             let mut list = self.list.borrow_mut();
             // The builder has no inherent end-of-list knowledge worth
             // walking for, so refresh the exact count every draw. It also
             // makes `scroll_to_bottom` cheap (no builder walk).
             list.item_count = Some(u32::try_from(count).expect("entry count fits u32"));
-            if self.follow_tail {
+            if self.follow_tail && !focus_mode {
                 list.scroll_to_bottom();
             }
         }
@@ -1222,8 +1328,9 @@ impl Widget for TranscriptView {
         let bars_surface = self.bars.draw(ctx);
         // The draw reconciled any pending wheel scroll, so "we are at
         // the bottom" is now accurate. Landing there re-engages
-        // follow-tail.
-        if self.list.borrow().is_at_bottom() {
+        // follow-tail (except in focus mode, where the cursor owns the
+        // viewport).
+        if !focus_mode && self.list.borrow().is_at_bottom() {
             self.follow_tail = true;
         }
         // Wrap the bars in an opaque full-size surface: the list draws
@@ -1266,6 +1373,14 @@ impl Widget for TranscriptView {
             }
             // The bars cancel an in-flight drag when the mouse leaves.
             Event::MouseLeave => self.bars.handle_event(ctx, event),
+            // Focus in/out drive transcript-focus mode: the transcript is "in
+            // focus mode" exactly when it is the focused widget (Spec E
+            // section 1). FocusOut also fires when an opening overlay steals
+            // focus, which cleanly exits the mode.
+            Event::FocusIn => self.enter_focus_mode(ctx),
+            Event::FocusOut => self.exit_focus_mode(ctx),
+            // Item navigation, live only while focused (see `handle_focus_key`).
+            Event::KeyPress(key) => self.handle_focus_key(ctx, key),
             _ => {}
         }
     }
@@ -1954,6 +2069,173 @@ mod tests {
             rows.join("\n").contains("sub row 49"),
             "shows the sub view's last row: {rows:?}"
         );
+    }
+
+    // ---- Transcript-focus mode (Spec E section 1) ------------------------
+
+    fn key_press(codepoint: u32, mods: Modifiers) -> Event {
+        Event::KeyPress(Key {
+            codepoint,
+            mods,
+            ..Key::default()
+        })
+    }
+
+    /// FocusIn shows the item cursor and disengages follow-tail (so cursor
+    /// navigation is not fought by auto-scroll); FocusOut hides it again.
+    #[test]
+    fn focus_in_shows_cursor_and_disengages_follow_tail() {
+        let chat = chat_with_notices(20);
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(40, 10);
+        let _ = view.draw(&ctx);
+        assert!(view.follow_tail, "opens following the tail");
+        assert!(!view.list.borrow().draw_cursor, "no cursor while unfocused");
+
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &Event::FocusIn);
+        assert!(view.list.borrow().draw_cursor, "FocusIn shows the cursor");
+        assert!(!view.follow_tail, "FocusIn disengages follow-tail");
+        // The cursor lands on the last item, and a draw keeps follow-tail off
+        // even though the viewport sits at the bottom.
+        let _ = view.draw(&ctx);
+        assert!(!view.follow_tail, "focus mode keeps follow-tail disengaged");
+        assert_eq!(view.list.borrow().cursor, 19, "cursor on the last item");
+
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &Event::FocusOut);
+        assert!(!view.list.borrow().draw_cursor, "FocusOut hides the cursor");
+    }
+
+    /// While focused, the arrow / j-k keys move the item cursor and Home / End
+    /// jump to the first / last item. The same keys are ignored while the
+    /// transcript is not focused.
+    #[test]
+    fn nav_keys_move_the_cursor_only_while_focused() {
+        let chat = chat_with_notices(20);
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(40, 10);
+        let _ = view.draw(&ctx);
+
+        // Not focused: nav keys are ignored (no cursor, nothing moves).
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &key_press(Key::UP, Modifiers::empty()));
+        assert!(!ec.consume_event, "unfocused: the key falls through");
+        assert_eq!(view.list.borrow().cursor, 0, "unfocused: cursor unmoved");
+
+        // Enter focus mode: the cursor lands on the last item.
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &Event::FocusIn);
+        let _ = view.draw(&ctx);
+        assert_eq!(view.list.borrow().cursor, 19);
+
+        // Up / k / Ctrl+P move the cursor toward the top.
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &key_press(Key::UP, Modifiers::empty()));
+        assert_eq!(
+            view.list.borrow().cursor,
+            18,
+            "Up moves to the previous item"
+        );
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &key_press(u32::from('k'), Modifiers::empty()));
+        assert_eq!(
+            view.list.borrow().cursor,
+            17,
+            "k moves to the previous item"
+        );
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &key_press(u32::from('p'), Modifiers::CTRL));
+        assert_eq!(
+            view.list.borrow().cursor,
+            16,
+            "Ctrl+P moves to the previous item"
+        );
+
+        // Down / j / Ctrl+N move it back toward the bottom.
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &key_press(u32::from('j'), Modifiers::empty()));
+        assert_eq!(view.list.borrow().cursor, 17, "j moves to the next item");
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &key_press(Key::DOWN, Modifiers::empty()));
+        assert_eq!(view.list.borrow().cursor, 18, "Down moves to the next item");
+
+        // Home / g jump to the first item.
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &key_press(Key::HOME, Modifiers::empty()));
+        assert_eq!(view.list.borrow().cursor, 0, "Home jumps to the first item");
+
+        // End / G jump to the last item.
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &key_press(Key::END, Modifiers::empty()));
+        assert_eq!(view.list.borrow().cursor, 19, "End jumps to the last item");
+    }
+
+    /// Esc while focused invokes the exit callback (the host wires it to
+    /// refocus the editor). It is inert while the transcript is not focused.
+    #[test]
+    fn esc_invokes_the_exit_focus_callback_while_focused() {
+        let chat = chat_with_notices(5);
+        let mut view = transcript_view(&chat);
+        let fired = Rc::new(std::cell::Cell::new(0u32));
+        {
+            let fired = Rc::clone(&fired);
+            view.set_on_exit_focus(Box::new(move |_ctx| {
+                fired.set(fired.get() + 1);
+            }));
+        }
+        let ctx = draw_ctx(40, 10);
+        let _ = view.draw(&ctx);
+
+        // Unfocused: Esc is ignored, the callback does not fire.
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &key_press(Key::ESCAPE, Modifiers::empty()));
+        assert_eq!(fired.get(), 0, "unfocused Esc does not fire the callback");
+
+        // Focus, then Esc fires the callback exactly once.
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &Event::FocusIn);
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &key_press(Key::ESCAPE, Modifiers::empty()));
+        assert_eq!(fired.get(), 1, "focused Esc fires the exit callback");
+        assert!(ec.consume_event, "Esc is consumed");
+    }
+
+    /// Entering focus mode and navigating an empty transcript must not
+    /// underflow the item index or panic. `cursor_to_bottom` and the nav keys
+    /// all clamp to 0 when the count is 0.
+    #[test]
+    fn focus_mode_on_an_empty_transcript_is_safe() {
+        let chat = chat_with_notices(0);
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(40, 10);
+        let _ = view.draw(&ctx);
+        assert_eq!(view.entry_count(), 0, "the transcript is empty");
+
+        // FocusIn lands the cursor on item 0 (there is nothing else to land
+        // on) and a draw of the empty, cursor-on list does not panic.
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &Event::FocusIn);
+        assert!(view.list.borrow().draw_cursor, "FocusIn shows the cursor");
+        assert_eq!(
+            view.list.borrow().cursor,
+            0,
+            "cursor clamps to 0 when empty"
+        );
+        let _ = view.draw(&ctx);
+
+        // Every nav key is a clamped no-op on an empty list, none underflow.
+        for k in [
+            key_press(Key::UP, Modifiers::empty()),
+            key_press(Key::DOWN, Modifiers::empty()),
+            key_press(Key::HOME, Modifiers::empty()),
+            key_press(Key::END, Modifiers::empty()),
+        ] {
+            let mut ec = EventContext::new();
+            view.handle_event(&mut ec, &k);
+            assert_eq!(view.list.borrow().cursor, 0, "cursor stays at 0 when empty");
+        }
+        let _ = view.draw(&ctx);
     }
 
     // ---- Render cache: helpers -------------------------------------------

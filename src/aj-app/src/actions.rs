@@ -18,7 +18,8 @@
 use crate::keybindings::{
     ACTION_AGENT_PICKER, ACTION_CHAT_PAGE_DOWN, ACTION_CHAT_PAGE_UP, ACTION_CLIPBOARD_PASTE_IMAGE,
     ACTION_DEQUEUE, ACTION_HISTORY_OPEN, ACTION_OVERLAY_CLOSE_ALL, ACTION_PALETTE_OPEN,
-    ACTION_SUBMIT_STEERING, ACTION_THINKING_TOGGLE, ACTION_TOOLS_EXPAND, default_chord,
+    ACTION_SUBMIT_STEERING, ACTION_THINKING_TOGGLE, ACTION_TOOLS_EXPAND, ACTION_TRANSCRIPT_FOCUS,
+    default_chord,
 };
 
 /// A global keymap action, the typed counterpart of the `aj.*` action-ID
@@ -58,6 +59,9 @@ pub enum AjAction {
     /// Scroll the chat transcript down one viewport page
     /// (`aj.chat.page_down`).
     ChatPageDown,
+    /// Focus the chat transcript for keyboard navigation
+    /// (`aj.transcript.focus`).
+    TranscriptFocus,
     /// Cancel the viewed agent's running turn (the Ctrl+C ladder's first
     /// rung).
     CancelTurn,
@@ -216,34 +220,43 @@ pub struct GlobalBinding {
 /// The default global bindings, compiled from the `AJ_KEYBINDINGS` chord
 /// strings so the two can't drift apart.
 ///
-/// Every entry is capture-phase: these are exactly the chords `aj`
-/// intercepts before its editor sees the keystroke. The Ctrl+C ladder
+/// Most entries are capture-phase: these are the chords `aj` intercepts
+/// before its editor sees the keystroke. The one exception is
+/// [`AjAction::TranscriptFocus`], a bubble-phase binding: the editor does
+/// not bind its `ctrl+up` chord, so it declines the key and the chord
+/// bubbles up to the keymap (Spec E section 1). The Ctrl+C ladder
 /// (`CancelTurn`, `Quit`) is not in the table, see [`AjAction`].
 ///
 /// TODO(aljoscha): merge the user's `[keybindings]` config over these
 /// defaults (replace-not-extend per action, like `aj`'s manager).
 /// Defaults only for now.
 pub fn default_global_bindings() -> Vec<GlobalBinding> {
-    let compiled = |action: AjAction, action_id: &str| {
+    let compiled = |action: AjAction, action_id: &str, phase: ChordPhase| {
         let chord = default_chord(action_id).expect("every global action has a default chord");
         GlobalBinding {
             action,
             chord: parse_chord(chord).expect("the default chords parse"),
-            phase: ChordPhase::Capture,
+            phase,
         }
     };
+    use ChordPhase::{Bubble, Capture};
     vec![
-        compiled(AjAction::ThinkingToggle, ACTION_THINKING_TOGGLE),
-        compiled(AjAction::ToolsExpand, ACTION_TOOLS_EXPAND),
-        compiled(AjAction::PasteImage, ACTION_CLIPBOARD_PASTE_IMAGE),
-        compiled(AjAction::PaletteOpen, ACTION_PALETTE_OPEN),
-        compiled(AjAction::CloseAllOverlays, ACTION_OVERLAY_CLOSE_ALL),
-        compiled(AjAction::HistoryOpen, ACTION_HISTORY_OPEN),
-        compiled(AjAction::AgentPickerOpen, ACTION_AGENT_PICKER),
-        compiled(AjAction::Steer, ACTION_SUBMIT_STEERING),
-        compiled(AjAction::Dequeue, ACTION_DEQUEUE),
-        compiled(AjAction::ChatPageUp, ACTION_CHAT_PAGE_UP),
-        compiled(AjAction::ChatPageDown, ACTION_CHAT_PAGE_DOWN),
+        compiled(AjAction::ThinkingToggle, ACTION_THINKING_TOGGLE, Capture),
+        compiled(AjAction::ToolsExpand, ACTION_TOOLS_EXPAND, Capture),
+        compiled(AjAction::PasteImage, ACTION_CLIPBOARD_PASTE_IMAGE, Capture),
+        compiled(AjAction::PaletteOpen, ACTION_PALETTE_OPEN, Capture),
+        compiled(
+            AjAction::CloseAllOverlays,
+            ACTION_OVERLAY_CLOSE_ALL,
+            Capture,
+        ),
+        compiled(AjAction::HistoryOpen, ACTION_HISTORY_OPEN, Capture),
+        compiled(AjAction::AgentPickerOpen, ACTION_AGENT_PICKER, Capture),
+        compiled(AjAction::Steer, ACTION_SUBMIT_STEERING, Capture),
+        compiled(AjAction::Dequeue, ACTION_DEQUEUE, Capture),
+        compiled(AjAction::ChatPageUp, ACTION_CHAT_PAGE_UP, Capture),
+        compiled(AjAction::ChatPageDown, ACTION_CHAT_PAGE_DOWN, Capture),
+        compiled(AjAction::TranscriptFocus, ACTION_TRANSCRIPT_FOCUS, Bubble),
     ]
 }
 
@@ -330,6 +343,28 @@ mod tests {
             spec(AjAction::ChatPageDown),
             chord(ChordKey::Named("page_down"), false, false, false, false)
         );
+        assert_eq!(
+            spec(AjAction::TranscriptFocus),
+            chord(ChordKey::Named("up"), true, false, false, false)
+        );
+    }
+
+    /// Transcript-focus is the sole bubble-phase default: the editor does not
+    /// bind `ctrl+up`, so the chord bubbles past it to the keymap.
+    #[test]
+    fn transcript_focus_is_the_only_bubble_phase_binding() {
+        for binding in default_global_bindings() {
+            let expected = if binding.action == AjAction::TranscriptFocus {
+                ChordPhase::Bubble
+            } else {
+                ChordPhase::Capture
+            };
+            assert_eq!(
+                binding.phase, expected,
+                "unexpected phase for {:?}",
+                binding.action
+            );
+        }
     }
 
     #[test]
