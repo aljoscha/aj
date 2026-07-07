@@ -264,11 +264,22 @@ impl Widget for SubAgentBox {
         }
         for (r, row) in content.iter().enumerate() {
             for (c, cell) in row.iter().enumerate() {
+                // Untouched (`default`) cells are transparent here: we leave
+                // the box tint already filling this row showing through, the
+                // way the renderer treats a default cell as "nothing here".
+                // Writing one would punch a default-background hole, and
+                // re-tinting that hole in place would leave a `default`-flagged
+                // cell carrying our tint. The diff's default fast-path then
+                // treats it as blank and never repaints it, stranding stale
+                // gray when the box later shrinks or moves.
+                if cell.default {
+                    continue;
+                }
+                // Painted content is already non-default, so tinting its
+                // background can't violate that invariant. Cells that carry
+                // their own bg (an inner user bubble) keep it, matching how the
+                // box paints its background under already-styled inner rows.
                 let mut cell = cell.clone();
-                // The box tint fills every untinted cell. Cells that
-                // carry their own bg (an inner user bubble) keep it,
-                // matching how `aj` paints the box background under
-                // already-styled inner rows.
                 if cell.style.bg == Color::Default {
                     cell.style.bg = self.bg;
                 }
@@ -491,6 +502,29 @@ mod tests {
                 .any(|c| c.style.bg == s.user_message_bg),
             "the task prompt's user bubble tint survives the box paint",
         );
+    }
+
+    #[test]
+    fn box_never_tints_a_default_cell() {
+        // A tinted cell must not stay flagged `default`. The render diff's
+        // default fast-path treats two `default` cells as equal regardless of
+        // background, so a `default` cell carrying the box tint reads as blank
+        // and is never repainted, stranding stale gray when the box moves or
+        // shrinks. The inner user bubble's blank spacer row is the cell that
+        // used to slip through the box paint.
+        let mut chat = chat();
+        let mut life = AgentLifecycle::default();
+        reduce_sub_run(&mut chat, &mut life);
+        let grid = flatten(&draw_box(&chat, 60));
+        for (r, row) in grid.iter().enumerate() {
+            for (c, cell) in row.iter().enumerate() {
+                assert!(
+                    !(cell.default && cell.style.bg != Color::Default),
+                    "cell ({r},{c}) is flagged default but carries a {:?} background",
+                    cell.style.bg,
+                );
+            }
+        }
     }
 
     #[test]
