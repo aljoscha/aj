@@ -65,15 +65,33 @@ follow-tail, scroll-input, or selection model above.
 
 **Scroll input routing.** The editor is normally focused (it wants arrows and
 line-editing keys), so transcript scrolling must work without stealing the
-editor's keys:
+editor's keys. Only keys the `TextArea` does not already bind can drive
+chat-scroll while the editor is focused. The rest are reachable from
+transcript-focus mode below, where the editor is not focused.
 
 - **Mouse wheel** over the chat area scrolls it. This routes by hit-test: the
   wheel event lands on the `ListView` under the pointer, per Spec A's mouse
   dispatch, regardless of keyboard focus.
-- **PageUp / PageDown / Home / End** (and optionally Ctrl-U / Ctrl-D for
-  half-page) are host-intercepted as chat-scroll commands even while the editor
-  is focused, because they are not editor line-editing keys. The host translates
-  them into scroll calls on the chat view.
+- **PageUp / PageDown** page the transcript up and down. They are host-intercepted
+  ahead of the editor (whose `TextArea` would otherwise consume them for its own
+  multi-line scroll), so a page turn works even while composing.
+- **Shift+Home / Shift+End** jump to the top and bottom of the transcript. Plain
+  Home / End are the editor's line-start / line-end chords (`Ctrl-A` / `Ctrl-E`),
+  so we take the Shift-modified variants, which the editor does not bind, for the
+  absolute top / bottom jump. This gives keyboard users a scroll-to-top /
+  scroll-to-bottom without first entering transcript-focus mode.
+- **Alt+k / Alt+j** scroll the transcript up and down one line, for fine reading
+  of a long message without paging. The editor's Alt chords are word-motion and
+  word-kill (`Alt-b` / `Alt-f` / `Alt-d` / `Alt-Backspace`) plus `Alt-y`. It does
+  not bind `Alt-j` / `Alt-k`, so they are free for line-scroll. (`Ctrl-j` is the
+  editor's newline, so the line-scroll keys are the Alt variants, not the Ctrl
+  ones.)
+
+Plain Home / End and half-page (`Ctrl-U` / `Ctrl-D`) cannot double as
+editor-focused chat-scroll keys, because they are editor chords (line start / end,
+kill-to-start, delete-forward). Home / End are handled inside transcript-focus
+mode instead, and half-page scroll is deferred until there is a free binding for
+it.
 
 **Transcript-focus mode.** A keyboard mode, entered from the editor (e.g. a chord
 or PageUp from an empty editor) and left with Esc, moves focus to the `ListView`
