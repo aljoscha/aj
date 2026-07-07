@@ -1902,6 +1902,13 @@ impl TranscriptView {
                     if let Some(cc) = c.checked_sub(gutter) {
                         if cc >= from && cc < to {
                             cell.style.bg = selection_bg;
+                            // A highlighted cell is painted, not blank, so
+                            // clear `default`. Otherwise the diff's default
+                            // fast-path mistakes a highlighted blank cell (a
+                            // trailing space or gap inside the selection) for
+                            // an untouched one and skips repainting it, which
+                            // leaves the highlight torn as the drag redraws.
+                            cell.default = false;
                         }
                     }
                 }
