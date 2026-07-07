@@ -51,19 +51,22 @@ pads the top with the unused height (or anchors its layout to the bottom edge)
 until the content is tall enough to fill the slot and scroll. Follow-tail keeps
 the bottom pinned once the content overflows.
 
-**Scroll geometry.** The `ListView` tracks an absolute scroll offset in lines, not
-just a top-item index, so the thumb, scroll-to-item, and follow-tail all read one
-position. It cannot know an entry's height without laying it out, so it keeps a
-per-entry extent model: an entry counts as an estimated extent until it is laid
-out at the current width, and its measured height replaces the estimate once it
-scrolls through the realized window. A prefix-sum (Fenwick) tree over the extents
-maps offset to index and back in `O(log n)`, so the list resolves which entry sits
-at a given offset without walking the whole transcript. Only entries within the
-viewport plus a small cache margin are built and measured each frame (the lazy
-windowing above); the rest ride on their estimate. When a correction lands on an
-entry above the viewport, the offset is nudged by the same delta so the visible
-content does not jump. This is the amp scroll model: an absolute position over
-estimated-then-measured extents, never a full-transcript layout.
+**Scroll geometry.** The `ListView` scroll position stays index-anchored (the
+top in-view entry plus a line offset into it), which pins the viewport to an
+entry so an off-screen height change never shifts what the user is reading. On
+top of that it keeps a measured-extent geometry purely to size and place the
+scrollbar thumb: each entry counts as an estimated extent (the running mean of
+the measured entries) until it is laid out at the current width, and its
+measured height replaces the estimate as it scrolls through the viewport. A
+prefix-sum (Fenwick) tree over the extents answers total-extent and
+top-of-viewport offset in `O(log n)`, so the thumb reflects real content height
+and position rather than a coarse entry count, and never lays the whole
+transcript out. Only the entries drawn each frame (the visible window) are
+measured, the rest ride on the estimate and sharpen as they are scrolled into
+view. We keep the index-anchored core rather than the absolute-offset one the
+reference uses, because index anchoring gives viewport stability for free, and
+the absolute model's other benefits (offset-precise scroll-to-match, sub-entry
+scroll animation) have no consumer here now that search is out.
 
 **Scrollbar thumb.** The chat view shows a vertical scrollbar thumb so the
 user can see how much transcript is above and below the viewport, and drag
