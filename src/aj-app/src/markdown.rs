@@ -22,6 +22,11 @@
 //! nested), blockquotes, top-level horizontal rules, and GFM tables as
 //! their native box-drawing column layout (see [`render_table`]).
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::rc::Rc;
 use std::sync::OnceLock;
 
 use pulldown_cmark::{
@@ -320,14 +325,15 @@ fn render_block(block: &Block, width: usize, opts: &RenderOpts) -> Vec<Vec<Style
             // break because a split span copies the `syntax` field. This
             // matches the styled renderer, which wraps every emitted line
             // uniformly.
-            for line_runs in highlight_code(code, lang.as_deref()) {
+            let highlighted = highlight_code(code, lang.as_deref());
+            for line_runs in highlighted.iter() {
                 let mut spans = vec![StyledSpan::plain(CODE_BLOCK_INDENT, SpanKind::CodeBlock)];
                 for (category, text) in line_runs {
                     spans.push(StyledSpan {
-                        text,
+                        text: text.clone(),
                         kind: SpanKind::CodeBlock,
                         emphasis: Emphasis::default(),
-                        syntax: category,
+                        syntax: *category,
                         link: None,
                     });
                 }
@@ -1011,7 +1017,18 @@ fn classify_scope(
 /// we fall back to plain-text syntax, which matches no category, so every
 /// run comes back `None`. On a tokenizer error for a line we emit that line
 /// as a single plain run so it still renders.
-fn highlight_code(code: &str, lang: Option<&str>) -> Vec<Vec<(Option<SyntaxCategory>, String)>> {
+///
+/// The result is memoized per thread keyed by `(lang, code)`. Syntect parsing
+/// is the dominant width-independent render cost, so caching it keeps a
+/// re-layout at a new width (a resize, or the transcript-focus gutter shift,
+/// both of which re-lay-out every visible entry) from re-running syntect on
+/// unchanged code. Callers get a shared handle, so a hit is a refcount bump.
+fn highlight_code(code: &str, lang: Option<&str>) -> Highlighted {
+    let key = highlight_key(code, lang);
+    if let Some(hit) = HIGHLIGHT_CACHE.with(|cache| cache.borrow_mut().get(key)) {
+        return hit;
+    }
+
     let syntax_set = syntax_set();
     let syntax = lang
         .and_then(|l| syntax_set.find_syntax_by_token(l))
@@ -1052,7 +1069,115 @@ fn highlight_code(code: &str, lang: Option<&str>) -> Vec<Vec<(Option<SyntaxCateg
             lines.push(runs);
         }
     }
-    lines
+
+    let highlighted = Rc::new(lines);
+    HIGHLIGHT_CACHE.with(|cache| cache.borrow_mut().insert(key, Rc::clone(&highlighted)));
+    highlighted
+}
+
+/// Highlighted code: one entry per source line, each a list of `(category,
+/// text)` runs. Shared out of [`HighlightCache`] so a hit is a refcount bump
+/// rather than a deep copy.
+type Highlighted = Rc<Vec<Vec<(Option<SyntaxCategory>, String)>>>;
+
+/// Distinct code blocks remembered per thread. Comfortably covers a viewport's
+/// worth of code, which is all a resize or gutter shift re-lays-out at once.
+const HIGHLIGHT_CACHE_CAPACITY: usize = 128;
+
+thread_local! {
+    /// Per-thread memo for [`highlight_code`]. Thread-local rather than a
+    /// shared static: rendering runs on a single thread, so the memo needs no
+    /// lock and can hold `Rc`. A test thread gets its own, so a warm cache
+    /// cannot leak across tests.
+    static HIGHLIGHT_CACHE: RefCell<HighlightCache> = RefCell::new(HighlightCache::new());
+}
+
+/// A bounded LRU memo keyed by a hash of `(lang, code)`.
+///
+/// The key is a hash, not the source, so a lookup allocates nothing. A slot
+/// holds the highlighted runs of whatever code first populated the key, so a
+/// 64-bit collision would render that other block's text in place of this one.
+/// That is astronomically unlikely and stays bounded (no crash, no corruption
+/// of unrelated state), so we accept it rather than storing the source to
+/// verify against.
+struct HighlightCache {
+    slots: HashMap<u64, HighlightSlot>,
+    /// Monotonic counter stamped onto a slot on every access, so eviction can
+    /// drop the coldest slot.
+    tick: u64,
+}
+
+struct HighlightSlot {
+    highlighted: Highlighted,
+    last_used: u64,
+}
+
+impl HighlightCache {
+    fn new() -> HighlightCache {
+        HighlightCache {
+            slots: HashMap::new(),
+            tick: 0,
+        }
+    }
+
+    /// The cached highlight for `key`, marking the slot most-recently-used.
+    fn get(&mut self, key: u64) -> Option<Highlighted> {
+        self.tick += 1;
+        let tick = self.tick;
+        let slot = self.slots.get_mut(&key)?;
+        slot.last_used = tick;
+        Some(Rc::clone(&slot.highlighted))
+    }
+
+    /// Store `highlighted` for `key`, evicting the coldest slot past capacity.
+    fn insert(&mut self, key: u64, highlighted: Highlighted) {
+        let last_used = self.tick;
+        self.slots.insert(
+            key,
+            HighlightSlot {
+                highlighted,
+                last_used,
+            },
+        );
+        if self.slots.len() > HIGHLIGHT_CACHE_CAPACITY {
+            self.evict_coldest();
+        }
+    }
+
+    /// Remove the least-recently-used slot. O(n) over the map, but only fires
+    /// on an insert past capacity, and the map is bounded.
+    fn evict_coldest(&mut self) {
+        if let Some(key) = self
+            .slots
+            .iter()
+            .min_by_key(|(_, slot)| slot.last_used)
+            .map(|(key, _)| *key)
+        {
+            self.slots.remove(&key);
+        }
+    }
+}
+
+/// Hash `(lang, code)` into the [`HighlightCache`] key.
+fn highlight_key(code: &str, lang: Option<&str>) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    lang.hash(&mut hasher);
+    code.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[cfg(test)]
+fn highlight_cache_len() -> usize {
+    HIGHLIGHT_CACHE.with(|cache| cache.borrow().slots.len())
+}
+
+#[cfg(test)]
+fn reset_highlight_cache() {
+    HIGHLIGHT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.slots.clear();
+        cache.tick = 0;
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -2537,6 +2662,76 @@ mod tests {
 
     fn opts() -> RenderOpts {
         RenderOpts::default()
+    }
+
+    /// A repeated `(lang, code)` returns the very same cached handle (a hit,
+    /// not a recompute) and adds no slot, while a different key adds one.
+    #[test]
+    fn highlight_code_memoizes_by_lang_and_code() {
+        reset_highlight_cache();
+        let code = "let x = 1;\nfn main() {}\n";
+
+        let first = highlight_code(code, Some("rust"));
+        assert_eq!(highlight_cache_len(), 1, "miss populated one slot");
+
+        let second = highlight_code(code, Some("rust"));
+        assert!(Rc::ptr_eq(&first, &second), "hit returns the cached handle");
+        assert_eq!(highlight_cache_len(), 1, "hit adds no slot");
+
+        // Same source, different language is a distinct key.
+        let _python = highlight_code(code, Some("python"));
+        assert_eq!(highlight_cache_len(), 2, "distinct key adds a slot");
+    }
+
+    /// The memo is bounded: past capacity it evicts, so a long code-heavy
+    /// session cannot grow it without limit.
+    #[test]
+    fn highlight_cache_is_bounded() {
+        reset_highlight_cache();
+        for i in 0..(HIGHLIGHT_CACHE_CAPACITY + 32) {
+            let code = format!("const N{i}: usize = {i};");
+            let _ = highlight_code(&code, Some("rust"));
+        }
+        assert_eq!(
+            highlight_cache_len(),
+            HIGHLIGHT_CACHE_CAPACITY,
+            "cache stays at capacity"
+        );
+    }
+
+    /// Eviction drops the coldest slot: a key kept warm by a recent lookup
+    /// survives an over-capacity insert, while the least-recently-used one is
+    /// dropped and recomputed on its next lookup.
+    #[test]
+    fn highlight_cache_evicts_the_coldest_slot() {
+        reset_highlight_cache();
+        let cold_src = "const COLD: u8 = 0;";
+        let warm_src = "const WARM: u8 = 1;";
+        // `cold` is inserted first, so it starts as the least-recently-used.
+        let cold = highlight_code(cold_src, Some("rust"));
+        let warm = highlight_code(warm_src, Some("rust"));
+        for i in 0..(HIGHLIGHT_CACHE_CAPACITY - 2) {
+            let code = format!("const N{i}: u8 = 2;");
+            let _ = highlight_code(&code, Some("rust"));
+        }
+        assert_eq!(highlight_cache_len(), HIGHLIGHT_CACHE_CAPACITY);
+
+        // Touch `warm` so `cold` is now the coldest, then insert one more
+        // distinct key to force exactly one eviction.
+        let _ = highlight_code(warm_src, Some("rust"));
+        let _ = highlight_code("const EXTRA: u8 = 3;", Some("rust"));
+        assert_eq!(highlight_cache_len(), HIGHLIGHT_CACHE_CAPACITY);
+
+        // `warm` is still the same cached allocation (a hit), `cold` was
+        // evicted and comes back as a fresh allocation (a miss).
+        assert!(
+            Rc::ptr_eq(&warm, &highlight_code(warm_src, Some("rust"))),
+            "warm key survived eviction"
+        );
+        assert!(
+            !Rc::ptr_eq(&cold, &highlight_code(cold_src, Some("rust"))),
+            "cold key was evicted"
+        );
     }
 
     #[test]
