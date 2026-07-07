@@ -495,6 +495,31 @@ green with the implementer/reviewer loop and its own commit:
     - **Eviction.** The transcript is append-only and unbounded, so the map is
       bounded (the working set is the viewport). The policy is correctness-neutral
       since a stale-key miss just rebuilds.
+  - **`ListView` scroll geometry (estimated + measured extents).** The chat scroll
+    switches from a purely index-anchored position (top item + line offset) to an
+    absolute line offset over a per-entry extent model, the amp model (Spec E
+    section 1). Each entry counts as an estimated extent until it is laid out at
+    the current width, then its measured height replaces the estimate; a prefix-sum
+    (Fenwick) tree maps offset to index and back in `O(log n)`. Only viewport ±
+    cache-margin entries are built and measured per frame, and an above-viewport
+    correction nudges the offset so the viewport does not jump. This buys an
+    accurate scrollbar thumb and precise scroll-to-item without ever laying out the
+    whole transcript. It also lets the full-transcript copy/search layout go: with
+    entry-relative selection (Spec E section 2) and search dropped (E-5), the
+    `RenderedTextLayout` grid, `transcript_signature`, and the absolute `(row, col)`
+    coordinate helpers in `transcript.rs` are removed. Selection extraction walks
+    only the spanned entries through per-entry text providers laid out on demand
+    from `ChatState` (which holds every entry independent of the view), so no
+    `ListView` keep-alive is needed.
+  - **Markdown parse / wrap split (width-independent cache).** `render_markdown`
+    bundles parse (tabs → block AST → styled logical lines) with the width-only
+    `wrap_spans`, so a width change re-parses every visible entry from scratch. The
+    amp model separates the two: parse once into width-independent styled lines and
+    cache them per entry, then run only the wrap in a width-keyed after pass (amp
+    parses in `build`, which reruns only on a content change, and wraps in the text
+    render object's layout, cached by width). This mainly sharpens resize and the
+    focus-mode gutter shift. It does not help streaming, where the entry's text
+    changes each frame and must re-parse regardless.
 - **9-Endgame.** Decide whether to keep both binaries or cut `aj-next` over.
 
 ## Design decisions (resolved in companion specs)

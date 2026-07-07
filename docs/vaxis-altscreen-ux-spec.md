@@ -4,7 +4,7 @@
 
 Companion to `docs/aj-next-vaxis-plan.md`. This spec covers the user-facing
 consequences of moving from `aj-tui`'s native-scrollback model to `aj-next`'s
-alternate-screen model: how the transcript scrolls, how copy and search work, how
+alternate-screen model: how the transcript scrolls, how copy works, how
 overlays and modal selectors are composed on a fixed viewport, the focus model
 across the editor, overlays, and the transcript, and what is left on the terminal
 after exit.
@@ -51,10 +51,24 @@ pads the top with the unused height (or anchors its layout to the bottom edge)
 until the content is tall enough to fill the slot and scroll. Follow-tail keeps
 the bottom pinned once the content overflows.
 
+**Scroll geometry.** The `ListView` tracks an absolute scroll offset in lines, not
+just a top-item index, so the thumb, scroll-to-item, and follow-tail all read one
+position. It cannot know an entry's height without laying it out, so it keeps a
+per-entry extent model: an entry counts as an estimated extent until it is laid
+out at the current width, and its measured height replaces the estimate once it
+scrolls through the realized window. A prefix-sum (Fenwick) tree over the extents
+maps offset to index and back in `O(log n)`, so the list resolves which entry sits
+at a given offset without walking the whole transcript. Only entries within the
+viewport plus a small cache margin are built and measured each frame (the lazy
+windowing above); the rest ride on their estimate. When a correction lands on an
+entry above the viewport, the offset is nudged by the same delta so the visible
+content does not jump. This is the amp scroll model: an absolute position over
+estimated-then-measured extents, never a full-transcript layout.
+
 **Scrollbar thumb.** The chat view shows a vertical scrollbar thumb so the
 user can see how much transcript is above and below the viewport, and drag
 it to jump. `vxfw`'s `ScrollBars` widget already wraps a scrollable view
-with a draggable thumb sized from an estimated content extent, so the chat
+with a draggable thumb sized from the scroll geometry's total extent, so the chat
 `ListView` is wrapped in one. The thumb is only drawn when the transcript
 overflows the viewport (content taller than the slot), matching how a
 native scrollbar hides itself for short content. Dragging the thumb moves
@@ -114,11 +128,14 @@ click-drag selection is captured by the app, so we provide selection and copy
 in-app. We build the full thing: free-form selection over the transcript, plus
 structured copy affordances, plus the native escape hatch.
 
-**Selection model.** A selection is an anchor and a caret, each an absolute
-transcript position `(row, col)` where `row` is the line index within the fully
-laid-out active transcript at the current chat width (0 = first line of the first
-entry), not a screen row. Storing absolute positions means the selection tracks
-the content across scrolling and follow-tail, not the viewport.
+**Selection model.** A selection is an anchor and a caret, each an entry-relative
+position `(entry_id, offset)`: the entry it lands in and a grapheme offset into
+that entry's text laid out at the current chat width. Anchoring to the entry, not
+a screen row or a global line number, means the selection tracks the content
+across scrolling and follow-tail (the entry keeps its identity as the viewport
+moves) and needs no global coordinate space over the whole transcript. This is
+the amp selection model: a selection is expressed against the entries it touches,
+not a materialized grid.
 
 **Mouse.** A plain click-drag in the chat area sets the anchor on press and moves
 the caret on drag. Dragging past the top or bottom edge auto-scrolls the
@@ -131,21 +148,24 @@ it.
 selection from the item cursor and a copy key (e.g. `y`) copies it. This is a
 mouse-free path to the same selection model.
 
-**Rendering the highlight.** For each visible line whose absolute row falls in
-`[min(anchor, caret), max(anchor, caret)]`, the chat view draws those cells with
-the selection style. Only visible lines are painted; off-screen selected lines
-need no highlight.
+**Rendering the highlight.** The selected span covers the entries from the anchor
+entry to the caret entry, with a partial run at the offset boundary in the first
+and last entry. For each visible line the chat view maps its screen row back to
+the entry and offset it renders, and paints the covered cells with the selection
+style. Only visible lines are painted; off-screen selected entries need no
+highlight, so the highlight costs nothing beyond the viewport.
 
-**Extracting the text.** The selection may span off-screen lines that the lazy
-`ListView` did not render, so we cannot read the text back from the visible cells
-alone. On copy we lay out the active transcript into an off-screen surface at the
-chat width (reusing the exact entry-drawing code, so wrapping matches the visible
-render with no drift), then read the graphemes of the selected cell range row by
-row, trimming trailing blanks per line. Copy is a rare, user-initiated action, so
-a one-shot full-transcript layout at copy time is an acceptable cost and keeps a
-single source of truth for wrapping. `vaxis` already supports drawing into an
-oversized off-screen surface. This rendered-text layout is cached and shared with
-search (section 3), which matches over the same rows.
+**Extracting the text.** A selection spans a known, contiguous run of entries
+(anchor entry through caret entry), so copy materializes only those entries, not
+the whole transcript. Each entry exposes a text provider that lays its own content
+out at the chat width into plain rows (the same wrap the visible render uses, so
+there is no drift), cached per `(entry, width)`. Copy walks the spanned entries in
+order, takes the covered offset range out of each, and joins them. Unlike amp,
+which must keep off-screen selected render objects alive to read their text, our
+entries are laid out on demand from `ChatState`, which holds every entry
+independent of what the view has realized, so a selection spanning off-screen
+entries needs no keep-alive. The cost is bounded by the selection length, not the
+transcript length.
 
 **Structured copy.** On top of free-form selection, a copy-message action (copy
 the cursored or clicked entry's text) and a copy-code-block action (copy a fenced
@@ -159,37 +179,19 @@ essentially every modern terminal, so users retain the terminal's own selection
 
 ## 3. In-transcript search
 
-Native scrollback gave search over history. On the alt screen the app provides it,
-as a find-over-the-transcript rather than a modal.
+**Not planned for now.** Earlier drafts specified an in-app find-bar over the
+transcript. We are not building it in the first cut, and it is the reason the
+selection model no longer materializes the whole transcript: search wanted a
+single global coordinate space to match over, which pushed section 2 toward a
+full-transcript grid. With search out, selection is entry-relative (section 2) and
+nothing needs a whole-transcript layout.
 
-**The find-bar.** Triggering search reveals a slim one-row find-bar, a conditional
-layout slot below the chat (not an overlay), so the transcript stays visible and
-highlighted underneath. It holds the query input and a match counter (`3/12`) and
-takes focus while open.
-
-**Matching.** Search runs over the transcript's rendered-text layout: the active
-transcript's rows as plain text at the chat width, the same representation section
-2 uses to extract selected text. It is computed when search opens (and on a
-transcript or width change) and cached, so each keystroke matches against the
-cache instead of re-laying-out the transcript. A match is a range in the same
-absolute `(row, col)` space as a selection, so highlighting and scrolling reuse
-the selection machinery. Matching is case-insensitive substring with smart-case:
-an uppercase character in the query makes it case-sensitive.
-
-**Navigation and highlight.** All matches are highlighted, and the current match
-is highlighted distinctly. Next and previous move the current match and scroll the
-`ListView` to bring it into view, disengaging follow-tail while searching. Closing
-search clears the highlights, restores focus to the previous owner (the editor or
-transcript-focus mode), and re-engages follow-tail if the viewport is back at the
-bottom.
-
-**Bindings.** Not Ctrl+F: that is `forward-char` in the `TextArea` (Spec B). The
-default global trigger is Alt+S (Emacs `M-s` is the search prefix, and it does not
-collide with the editor's word-motion chords), rebindable through the keymap (Spec
-F). Inside transcript-focus mode (section 1) the editor is not focused, so the
-less/vim keys are free: `/` opens forward search, `?` reverse, and `n` / `N` step
-through matches. Inside the find-bar, Enter jumps to the next match, Shift+Enter
-to the previous, and Esc closes.
+The reference amp CLI ships no in-transcript search either. Reading back through
+history is served by scrolling (section 1) and by selection plus the native
+Shift+drag escape hatch (section 2), and every session is on disk for external
+tools. If we add search later it should match over the same per-entry text the
+selection extraction already produces (walking entries, not a global grid), so it
+does not reintroduce the full-transcript layout.
 
 ## 4. The base layout
 
@@ -200,7 +202,6 @@ The root widget is a `vxfw::FlexColumn` of fixed slots, the alt-screen analog of
 |---|---|---|
 | Header | one-line banner (session id + transient notice) | 1 |
 | Chat | the scroll container over the active transcript | flex (fills remaining) |
-| Search | slim find-bar (only while searching) | 0 or 1 |
 | Status | loader/spinner line (empty when idle) | 0 or 1 |
 | Pending | pending-message box (empty when none) | auto |
 | Editor | the `TextArea` (Spec B) | auto, capped |
@@ -353,8 +354,8 @@ as PageUp / PageDown / Home / End. The sections are:
   global chords (open palette, paste image, thinking toggle, tools-expand,
   edit-in-`$EDITOR`).
 - **Scrolling & navigation**: the chat-scroll and transcript keys from sections
-  1 to 3 (PageUp / PageDown, half-page, Home / End, mouse wheel, transcript-focus
-  mode, search).
+  1 and 2 (PageUp / PageDown, half-page, Home / End, mouse wheel, transcript-focus
+  mode).
 - **Command palette commands**: one row per entry in the command catalog (Spec D
   `commands.rs`), grouped by category, each with its bound shortcut in the
   right-hand column when the action has one.
@@ -455,9 +456,8 @@ Aligns with the plan's phases 5-9.
 - **E2 (with components, plan phase 7):** per-view scroll on `active_view` switch,
   the status/pending/header/footer slots wired to the model, in-app selection
   (mouse drag + auto-scroll, Shift+arrow keyboard selection, select-to-copy via
-  OSC 52, off-screen text extraction) plus the structured copy-message /
-  copy-code actions, and in-transcript search (the find-bar, match highlighting,
-  next/prev) sharing the rendered-text layout. It also brings the splash
+  OSC 52, entry-relative text extraction with off-screen keep-alive) plus the
+  structured copy-message / copy-code actions. It also brings the splash
   empty-state: the animated `aj` logo, the `Ctrl+O for commands` hint, and the
   bordered startup-notices box.
 - **E3 (plan phase 8):** the overlay stack (host `Vec` + scrim + anchored draw +
@@ -476,9 +476,11 @@ Aligns with the plan's phases 5-9.
   in the first cut.
 - **E-2. Copy. Resolved: full in-app selection now, not deferred.** Free-form
   selection (mouse drag with auto-scroll, keyboard Shift+arrow), select-to-copy
-  and structured copy-message / copy-code via OSC 52, off-screen text extraction
-  via a copy-time off-screen layout, plus Shift+drag native selection as the
-  escape hatch.
+  and structured copy-message / copy-code via OSC 52, plus Shift+drag native
+  selection as the escape hatch. Selection is entry-relative (`(entry_id,
+  offset)`) and text extraction materializes only the spanned entries via
+  per-entry text providers laid out on demand from `ChatState`, so copy never
+  lays out the whole transcript and needs no off-screen keep-alive.
 - **E-3. After-exit screen. Resolved: clean exit + banner + resume hint.** Leave
   the alternate screen and print the shutdown usage banner and the
   `aj continue <id>` resume command to the normal screen, as `aj` does today.
@@ -486,17 +488,22 @@ Aligns with the plan's phases 5-9.
   in transcript-focus mode), for line-level scrolling, lazy item windowing on
   long transcripts, and the built-in cursor that keyboard navigation and selection
   use.
-- **E-5. In-transcript search. Resolved: build it.** A non-modal find-bar over the
-  transcript's rendered-text layout, sharing the selection coordinate space and
-  highlight machinery. Default trigger Alt+S (not Ctrl+F, which is `forward-char`
-  in the editor), plus `/` `?` `n` `N` in transcript-focus mode. Case-insensitive
-  smart-case substring, next/prev with scroll-to-match.
+- **E-5. In-transcript search. Resolved: not now.** Earlier drafts specified a
+  find-bar sharing a global transcript coordinate space. That coordinate space is
+  what forced select-to-copy to materialize the whole transcript, so with the
+  entry-relative selection model (E-2) we drop search rather than keep the
+  full-transcript layout alive for it. The reference amp CLI has no in-transcript
+  search either; scrolling plus selection and the native Shift+drag escape hatch
+  cover reading history. If revisited, search matches over the same per-entry text
+  the selection extraction produces, not a rebuilt global grid.
 - **E-6. Scrollbar thumb. Resolved: build it.** The chat view shows a vertical
   scrollbar thumb, via the `vxfw` `ScrollBars` widget wrapping the chat
   `ListView`. It is drawn only when the transcript overflows the viewport, gives a
   position affordance and drag-to-jump, and reuses the follow-tail engage/disengage
-  rules. Part of E1 so the position affordance ships with the first chat view, not
-  deferred to polish.
+  rules. The thumb is sized from the scroll geometry's estimated-then-measured
+  total extent (section 1), so it sharpens as entries are measured rather than
+  staying a coarse item-count guess. Part of E1 so the position affordance ships
+  with the first chat view, not deferred to polish.
 - **E-7. Selection marker style. Resolved: full-width `selectedBg` band.** The
   selected row in list-style overlays is a full-width band painted over the
   theme's existing `selectedBg` token, with normal foreground colors on top,
