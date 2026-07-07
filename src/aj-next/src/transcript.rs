@@ -172,6 +172,15 @@ const USER_COLLAPSED_LINES: usize = 10;
 /// long append-only session from growing it without limit.
 const ENTRY_CACHE_CAPACITY: usize = 512;
 
+/// Rows kept in common between two page-scroll steps, so a reader keeps a
+/// little context across a page turn rather than jumping a full viewport.
+const PAGE_OVERLAP: u16 = 2;
+
+/// Page size (in lines) used before the first draw has measured the real
+/// viewport height. A page-scroll issued that early is rare, so a sane
+/// constant is enough until the next draw records the true height.
+const DEFAULT_PAGE_LINES: i32 = 20;
+
 /// One cached per-entry render: the drawn surface plus the
 /// `(fingerprint, width)` it was drawn for. A lookup hits only when both
 /// match the live entry, so a slot never serves stale content.
@@ -1057,12 +1066,15 @@ impl TranscriptView {
     }
 
     /// Re-engage follow-tail so the next draw pins the viewport to the
-    /// bottom. Used on a session rebuild: the view's `chat` cell keeps its
-    /// identity across the swap (the outer loop overwrites its contents in
-    /// place), so the fresh session's transcript opens at the tail rather
-    /// than wherever the previous session was scrolled. The draw path
-    /// refreshes `item_count` before scrolling, so we needn't touch the
-    /// list's scroll offset here.
+    /// bottom, and drop the render cache.
+    ///
+    /// Two callers use it. On a session rebuild the view's `chat` cell keeps
+    /// its identity across the swap (the outer loop overwrites its contents
+    /// in place), so the fresh session's transcript must open at the tail
+    /// rather than wherever the previous session was scrolled. On an
+    /// `active_view` switch each view opens at its bottom (Spec E section 1,
+    /// per-view scroll). The draw path refreshes `item_count` before
+    /// scrolling, so we needn't touch the list's scroll offset here.
     pub(crate) fn reset_to_tail(&mut self) {
         // Clear the cache: the reused `chat` cell now holds a different
         // session whose transcript restarts `EntryId` at 0, so its entries
@@ -1073,8 +1085,48 @@ impl TranscriptView {
         // a coincidental fingerprint+width match would then replay the old
         // session's surface. Length-proxy fingerprints make that coincidence
         // easy (two same-length prompts collide), so we drop every slot here.
+        //
+        // On a view switch the keys don't collide (different `AgentId`) and
+        // the draw's global-input clear catches the change anyway, so the
+        // clear here is redundant but harmless.
         self.cache.borrow_mut().clear();
         self.follow_tail = true;
+    }
+
+    /// Scroll the transcript up by one viewport page (Spec E section 1).
+    ///
+    /// A manual scroll up means the reader wants history, so follow-tail
+    /// disengages and new content stops yanking the viewport to the bottom.
+    /// (Paging up on a transcript that fits the viewport can't move it, so
+    /// the draw re-engages follow-tail right away, leaving it pinned.)
+    pub(crate) fn page_up(&mut self) {
+        self.follow_tail = false;
+        let lines = self.page_lines();
+        self.list.borrow_mut().scroll_lines(-lines);
+    }
+
+    /// Scroll the transcript down by one viewport page (Spec E section 1).
+    ///
+    /// Unlike [`page_up`](Self::page_up) this takes `&self`: it never touches
+    /// `follow_tail` directly. If the scroll lands back at the bottom the next
+    /// draw re-engages follow-tail (see [`draw`](Widget::draw)), so paging
+    /// down to the end resumes following streamed content.
+    pub(crate) fn page_down(&self) {
+        let lines = self.page_lines();
+        self.list.borrow_mut().scroll_lines(lines);
+    }
+
+    /// One page of scroll in lines: the last-drawn viewport height minus a
+    /// small overlap so a page turn keeps a couple of rows of context. Falls
+    /// back to [`DEFAULT_PAGE_LINES`] before the first draw has measured the
+    /// viewport.
+    fn page_lines(&self) -> i32 {
+        match self.list.borrow().viewport_height() {
+            Some(h) if h > PAGE_OVERLAP => i32::from(h - PAGE_OVERLAP),
+            // A viewport too short to overlap still pages by at least one row.
+            Some(h) if h > 0 => i32::from(h),
+            _ => DEFAULT_PAGE_LINES,
+        }
     }
 
     /// Rebuild the transcript's styles from a fresh palette, for a
@@ -1797,6 +1849,111 @@ mod tests {
         view.capture_event(&mut ec, &wheel_up);
         assert!(!ec.consume_event, "the wheel still reaches the list");
         assert!(!view.follow_tail, "capture path disengages");
+    }
+
+    /// PageUp disengages follow-tail and scrolls the transcript up; paging
+    /// back down to the bottom re-engages it (Spec E section 1).
+    #[test]
+    fn page_up_disengages_and_page_down_reengages_follow_tail() {
+        // Fifty two-row entries over a 10-row viewport, so the transcript is
+        // much taller than the page.
+        let chat = chat_with_notices(50);
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(40, 10);
+        let _ = view.draw(&ctx);
+        assert!(view.follow_tail, "opens following the tail");
+        let bottom = crate::test_support::rows(&view.draw(&ctx));
+
+        // Page up: follow-tail disengages and the viewport moves.
+        view.page_up();
+        assert!(!view.follow_tail, "paging up disengages follow-tail");
+        let scrolled = crate::test_support::rows(&view.draw(&ctx));
+        assert_ne!(scrolled, bottom, "the viewport moved up off the bottom");
+        assert!(
+            !view.list.borrow().is_at_bottom(),
+            "no longer at the bottom"
+        );
+        assert!(!view.follow_tail, "still scrolled up, still disengaged");
+
+        // Page back down to the bottom. A page turn that lands exactly on the
+        // last row keeps the list's `has_more` set (it reports "at bottom"
+        // only once a scroll overshoots the end, matching the wheel), so page
+        // down until it re-engages, the way a user holding PageDown does.
+        for _ in 0..4 {
+            view.page_down();
+            let _ = view.draw(&ctx);
+            if view.follow_tail {
+                break;
+            }
+        }
+        assert!(
+            view.follow_tail,
+            "returning to the bottom re-engages follow-tail"
+        );
+        let returned = crate::test_support::rows(&view.draw(&ctx));
+        assert_eq!(returned, bottom, "back at the bottom frame");
+    }
+
+    /// Switching the active view opens the switched-to view at its bottom
+    /// with follow-tail engaged (Spec E section 1, per-view scroll). The host
+    /// runs `set_active_view` then `reset_to_tail` on the switch; this drives
+    /// that sequence from a scrolled-up main view and checks the switched-to
+    /// view opens pinned to its own bottom.
+    #[test]
+    fn switching_active_view_reengages_follow_tail() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        // A tall main transcript.
+        for i in 0..50 {
+            apply(
+                &chat,
+                &mut life,
+                AgentEvent::Notice {
+                    agent_id: AgentId::Main,
+                    text: format!("main row {i}"),
+                },
+            );
+        }
+        // A sub-agent with an equally tall transcript to switch to.
+        spawn_sub(&chat, &mut life);
+        for i in 0..50 {
+            apply(
+                &chat,
+                &mut life,
+                AgentEvent::Notice {
+                    agent_id: AgentId::Sub(0),
+                    text: format!("sub row {i}"),
+                },
+            );
+        }
+
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(40, 10);
+        let _ = view.draw(&ctx);
+        assert!(view.follow_tail);
+
+        // Scroll the main view up so follow-tail is off; a plain redraw does
+        // not re-engage it, so only an explicit reset can.
+        view.page_up();
+        let _ = view.draw(&ctx);
+        assert!(!view.follow_tail, "paged up on the main view");
+        let _ = view.draw(&ctx);
+        assert!(!view.follow_tail, "a plain redraw does not re-engage");
+
+        // The host's switch sequence: swap the model's view, then reset the
+        // transcript to the tail so the switched-to view opens at its bottom.
+        chat.borrow_mut().set_active_view(AgentId::Sub(0));
+        view.reset_to_tail();
+        let rows = crate::test_support::rows(&view.draw(&ctx));
+        assert!(view.follow_tail, "reset_to_tail re-engages on the switch");
+        assert!(
+            view.list.borrow().is_at_bottom(),
+            "at the sub view's bottom"
+        );
+        assert!(
+            rows.join("\n").contains("sub row 49"),
+            "shows the sub view's last row: {rows:?}"
+        );
     }
 
     // ---- Render cache: helpers -------------------------------------------

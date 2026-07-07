@@ -141,6 +141,10 @@ pub struct ListView {
     /// jumps avoid walking the builder.
     pub item_count: Option<u32>,
     scroll: Scroll,
+    /// Viewport height (rows) the last [`draw`](Widget::draw) laid out
+    /// against. `None` before the first draw. Page-scroll callers scale this
+    /// to scroll by whole viewports (see [`viewport_height`](Self::viewport_height)).
+    last_viewport_height: Option<u16>,
 }
 
 impl ListView {
@@ -153,6 +157,7 @@ impl ListView {
             wheel_scroll: 3,
             item_count: None,
             scroll: Scroll::default(),
+            last_viewport_height: None,
         }
     }
 
@@ -311,6 +316,28 @@ impl ListView {
         !self.scroll.has_more
     }
 
+    /// Scroll the viewport by `delta` lines on the next draw: a negative
+    /// `delta` moves toward the top, a positive one toward the bottom.
+    ///
+    /// The amount feeds the same `pending_lines` accumulator the mouse wheel
+    /// uses, so several scrolls between frames accumulate and the next
+    /// [`draw`](Widget::draw) reconciles them into a concrete layout. The
+    /// draw clamps at both ends, so an oversized `delta` (a page taller than
+    /// the content remaining in that direction) simply lands on the end
+    /// rather than overscrolling. Whether a downward scroll reached the end
+    /// shows up in [`is_at_bottom`](Self::is_at_bottom) after that draw.
+    pub fn scroll_lines(&mut self, delta: i32) {
+        self.scroll.pending_lines += delta;
+    }
+
+    /// The viewport height (rows) the last [`draw`](Widget::draw) laid out
+    /// against, or `None` before the first draw.
+    ///
+    /// A page-scroll caller scales this to scroll by whole viewports.
+    pub fn viewport_height(&self) -> Option<u16> {
+        self.last_viewport_height
+    }
+
     /// Inserts children at the front of `child_list` until `add_height` lines
     /// are filled above the current top, walking upward from `top - 1`.
     fn insert_children(
@@ -384,6 +411,9 @@ impl ListView {
     /// This is the heart of the state machine described in the module docs.
     fn draw_builder(&mut self, ctx: &DrawContext, builder: &dyn Builder) -> Surface {
         let max_size = ctx.max.size();
+        // Record the viewport height so viewport-relative scrolls (page
+        // up/down) can read it back after this draw.
+        self.last_viewport_height = Some(max_size.height);
         let cursor = usize::try_from(self.cursor).expect("cursor fits usize");
 
         // Assume there is more below; we only learn otherwise by running out of
@@ -965,6 +995,65 @@ mod tests {
         assert_eq!(list_view.scroll.top, 0);
         assert_eq!(list_view.scroll.offset, 0);
         assert!(list_view.is_at_bottom());
+    }
+
+    /// A huge `scroll_lines` in either direction lands on the end, never past
+    /// it: the draw clamps at both the top and the bottom.
+    #[test]
+    fn list_view_scroll_lines_clamps_at_both_ends() {
+        let mut list_view = ListView::new(Source::Slice(vec![
+            text("0"),
+            text("1"),
+            text("2"),
+            text("3"),
+            text("4"),
+            text("5"),
+            text("6"),
+        ]));
+        list_view.draw_cursor = false;
+
+        let ctx = draw_ctx(16, 4);
+        // Establish item_count and the initial (top) scroll state.
+        list_view.draw(&ctx);
+        assert_eq!(list_view.scroll.top, 0);
+        assert!(!list_view.is_at_bottom());
+
+        // A page taller than the remaining content lands on the bottom.
+        list_view.scroll_lines(100);
+        let surface = list_view.draw(&ctx);
+        assert!(list_view.is_at_bottom());
+        assert_eq!(list_view.scroll.top, 3);
+        assert_eq!(surface.children.len(), 4);
+
+        // Scrolling down again from the bottom does not move past it.
+        list_view.scroll_lines(100);
+        list_view.draw(&ctx);
+        assert!(list_view.is_at_bottom());
+        assert_eq!(list_view.scroll.top, 3);
+
+        // A huge upward scroll lands on the top, not above it.
+        list_view.scroll_lines(-100);
+        list_view.draw(&ctx);
+        assert_eq!(list_view.scroll.top, 0);
+        assert_eq!(list_view.scroll.offset, 0);
+        assert!(!list_view.is_at_bottom());
+
+        // Scrolling up again from the top does not move past it.
+        list_view.scroll_lines(-100);
+        list_view.draw(&ctx);
+        assert_eq!(list_view.scroll.top, 0);
+        assert_eq!(list_view.scroll.offset, 0);
+    }
+
+    /// The list records the viewport height it last drew against, so a
+    /// page-scroll caller can scale by whole viewports. `None` before the
+    /// first draw.
+    #[test]
+    fn list_view_records_viewport_height_after_draw() {
+        let mut list_view = ListView::new(Source::Slice(vec![text("0"), text("1")]));
+        assert_eq!(list_view.viewport_height(), None);
+        list_view.draw(&draw_ctx(16, 7));
+        assert_eq!(list_view.viewport_height(), Some(7));
     }
 
     #[test]

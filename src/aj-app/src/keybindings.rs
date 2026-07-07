@@ -109,6 +109,23 @@ pub const ACTION_SUBMIT_STEERING: &str = "aj.message.steer";
 /// chord yanks regardless of editor contents.
 pub const ACTION_DEQUEUE: &str = "aj.message.dequeue";
 
+/// Action ID for the "scroll the transcript up a page" chord.
+///
+/// Bound by default to `pageup`. The chord is intercepted before the
+/// editor sees it (the editor's own PageUp scroll is superseded by
+/// chat page-scroll), so the transcript scrolls up a page even while
+/// the editor is focused. Inert while a capturing overlay is up, which
+/// then owns its own PageUp.
+pub const ACTION_CHAT_PAGE_UP: &str = "aj.chat.page_up";
+
+/// Action ID for the "scroll the transcript down a page" chord.
+///
+/// Bound by default to `pagedown`. The counterpart of
+/// [`ACTION_CHAT_PAGE_UP`]: intercepted before the editor and inert
+/// while a capturing overlay is up. Scrolling back to the bottom
+/// re-engages follow-tail.
+pub const ACTION_CHAT_PAGE_DOWN: &str = "aj.chat.page_down";
+
 /// Action ID for the "clear the selected project override" chord in
 /// the project settings window.
 ///
@@ -172,6 +189,16 @@ pub const AJ_KEYBINDINGS: &[(&str, &str, &str)] = &[
         ACTION_DEQUEUE,
         "alt+up",
         "Pull the queued message back into the editor",
+    ),
+    (
+        ACTION_CHAT_PAGE_UP,
+        "pageup",
+        "Scroll the transcript up a page",
+    ),
+    (
+        ACTION_CHAT_PAGE_DOWN,
+        "pagedown",
+        "Scroll the transcript down a page",
     ),
     (
         ACTION_SETTINGS_CLEAR,
@@ -317,6 +344,14 @@ mod tests {
         assert_eq!(
             default_action_shortcut(ACTION_SUBMIT_STEERING).as_deref(),
             Some("Alt+Enter")
+        );
+        assert_eq!(
+            default_action_shortcut(ACTION_CHAT_PAGE_UP).as_deref(),
+            Some("PgUp")
+        );
+        assert_eq!(
+            default_action_shortcut(ACTION_CHAT_PAGE_DOWN).as_deref(),
+            Some("PgDn")
         );
         assert_eq!(default_action_shortcut("aj.unknown"), None);
     }

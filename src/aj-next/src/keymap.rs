@@ -125,14 +125,33 @@ pub(crate) fn build_keymap() -> Keymap<AjAction, HostCtx> {
         // The predicates mirror aj's host conditionals: the overlay
         // openers and the queue gestures are inert while a modal is up,
         // close-all only exists while one is, and the render toggles
-        // plus the clipboard paste work regardless.
+        // plus the clipboard paste work regardless. Chat page-scroll is
+        // inert under a modal too, because an open overlay owns its own
+        // PageUp/PageDown (Spec E section 1 routes the page keys to the
+        // chat only when nothing is capturing).
+        //
+        // NOTE(aljoscha): the `default_global_bindings` phase puts the page
+        // chords in the capture phase, ahead of the focused editor, whose
+        // `TextArea` otherwise consumes PageUp/PageDown for its own multi-line
+        // scroll. That editor scroll is deliberately superseded by chat
+        // page-scroll: the editor is a compose box that auto-scrolls to the
+        // cursor, and the arrow keys still move within it.
+        //
+        // NOTE(aljoscha): Spec E.1 also lists Home/End and half-page
+        // (Ctrl+U/Ctrl+D) as chat-scroll keys, but those are editor chords in
+        // the Emacs-style `TextArea` (line start/end, kill-to-start,
+        // delete-forward), so they can't double as editor-focused chat-scroll
+        // chords. They land in transcript-focus mode (a later chunk), where
+        // the editor is not focused.
         let enabled: fn(&HostCtx) -> bool = match binding.action {
             AjAction::CloseAllOverlays => overlay_open_no_login,
             AjAction::PaletteOpen
             | AjAction::HistoryOpen
             | AjAction::AgentPickerOpen
             | AjAction::Steer
-            | AjAction::Dequeue => no_overlay,
+            | AjAction::Dequeue
+            | AjAction::ChatPageUp
+            | AjAction::ChatPageDown => no_overlay,
             _ => |_| true,
         };
         entries.push(
@@ -269,6 +288,46 @@ mod tests {
         assert_eq!(
             keymap.match_single(&alt_enter, BindingPhase::Capture, &idle),
             Some(&AjAction::Steer)
+        );
+    }
+
+    /// The chat page-scroll chords match in the capture phase (before the
+    /// editor's own PageUp/PageDown scroll) and go inert while a modal is up,
+    /// where the overlay owns its own page keys.
+    #[test]
+    fn chat_page_scroll_matches_in_capture_and_is_gated_by_overlays() {
+        let keymap = build_keymap();
+        let page_up = key(Key::PAGE_UP, Modifiers::empty());
+        let page_down = key(Key::PAGE_DOWN, Modifiers::empty());
+
+        let idle = ctx(false);
+        assert_eq!(
+            keymap.match_single(&page_up, BindingPhase::Capture, &idle),
+            Some(&AjAction::ChatPageUp),
+        );
+        assert_eq!(
+            keymap.match_single(&page_down, BindingPhase::Capture, &idle),
+            Some(&AjAction::ChatPageDown),
+        );
+
+        let modal = ctx(false);
+        modal
+            .overlays
+            .borrow_mut()
+            .push(crate::overlay::OpenOverlay {
+                widget: Rc::new(RefCell::new(crate::overlay::Scrim)),
+                focus: Rc::new(RefCell::new(crate::overlay::Scrim)),
+                placement: crate::overlay::OverlayPlacement::Small,
+            });
+        assert_eq!(
+            keymap.match_single(&page_up, BindingPhase::Capture, &modal),
+            None,
+            "an open overlay owns its own PageUp",
+        );
+        assert_eq!(
+            keymap.match_single(&page_down, BindingPhase::Capture, &modal),
+            None,
+            "an open overlay owns its own PageDown",
         );
     }
 

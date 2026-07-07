@@ -987,6 +987,8 @@ fn handle_host_action(world: &mut World, shell: &Rc<RefCell<Shell>>, action: AjA
         | AjAction::ToolsExpand
         | AjAction::PaletteOpen
         | AjAction::CloseAllOverlays
+        | AjAction::ChatPageUp
+        | AjAction::ChatPageDown
         | AjAction::Quit => false,
     }
 }
@@ -1367,6 +1369,11 @@ fn apply_picker_outcome(
             // per-iteration status/keymap sync picks up the new view, so
             // switching plus a redraw is all it takes.
             world.chat.borrow_mut().set_active_view(id);
+            // Each view opens at its bottom with follow-tail engaged (Spec E
+            // section 1, per-view scroll). `reset_to_tail` also clears the
+            // render cache, which the draw's active-view clear would do
+            // anyway, so the two don't fight.
+            shell.borrow().transcript.borrow_mut().reset_to_tail();
             ActionEffect::Redraw
         }
         AgentPickerOutcome::OpenTask(id) => {
@@ -2493,6 +2500,7 @@ impl Shell {
             let command_slot_for_actions = Rc::clone(&command_slot);
             let fetch_slot_for_actions = Rc::clone(&fetch_slot);
             let settings_ui_for_actions = Rc::clone(&settings_ui);
+            let transcript_for_actions = Rc::clone(&transcript);
             let action_slot = Rc::clone(&host_action);
             Box::new(move |ctx, action| match action {
                 AjAction::ThinkingToggle => {
@@ -2529,6 +2537,17 @@ impl Shell {
                     ctx.redraw = true;
                 }
                 AjAction::Quit => ctx.quit = true,
+                AjAction::ChatPageUp => {
+                    // Chat scroll is reachable from widget land (the transcript
+                    // owns its scroll state), so it runs here in dispatch rather
+                    // than parking for the host loop.
+                    transcript_for_actions.borrow_mut().page_up();
+                    ctx.redraw = true;
+                }
+                AjAction::ChatPageDown => {
+                    transcript_for_actions.borrow_mut().page_down();
+                    ctx.redraw = true;
+                }
                 AjAction::CancelTurn
                 | AjAction::Steer
                 | AjAction::Dequeue

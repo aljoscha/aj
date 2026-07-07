@@ -16,9 +16,9 @@
 //! widget's data, not part of the global action vocabulary.
 
 use crate::keybindings::{
-    ACTION_AGENT_PICKER, ACTION_CLIPBOARD_PASTE_IMAGE, ACTION_DEQUEUE, ACTION_HISTORY_OPEN,
-    ACTION_OVERLAY_CLOSE_ALL, ACTION_PALETTE_OPEN, ACTION_SUBMIT_STEERING, ACTION_THINKING_TOGGLE,
-    ACTION_TOOLS_EXPAND, default_chord,
+    ACTION_AGENT_PICKER, ACTION_CHAT_PAGE_DOWN, ACTION_CHAT_PAGE_UP, ACTION_CLIPBOARD_PASTE_IMAGE,
+    ACTION_DEQUEUE, ACTION_HISTORY_OPEN, ACTION_OVERLAY_CLOSE_ALL, ACTION_PALETTE_OPEN,
+    ACTION_SUBMIT_STEERING, ACTION_THINKING_TOGGLE, ACTION_TOOLS_EXPAND, default_chord,
 };
 
 /// A global keymap action, the typed counterpart of the `aj.*` action-ID
@@ -52,6 +52,12 @@ pub enum AjAction {
     /// Pull the queued message back into the editor
     /// (`aj.message.dequeue`).
     Dequeue,
+    /// Scroll the chat transcript up one viewport page
+    /// (`aj.chat.page_up`).
+    ChatPageUp,
+    /// Scroll the chat transcript down one viewport page
+    /// (`aj.chat.page_down`).
+    ChatPageDown,
     /// Cancel the viewed agent's running turn (the Ctrl+C ladder's first
     /// rung).
     CancelTurn,
@@ -236,6 +242,8 @@ pub fn default_global_bindings() -> Vec<GlobalBinding> {
         compiled(AjAction::AgentPickerOpen, ACTION_AGENT_PICKER),
         compiled(AjAction::Steer, ACTION_SUBMIT_STEERING),
         compiled(AjAction::Dequeue, ACTION_DEQUEUE),
+        compiled(AjAction::ChatPageUp, ACTION_CHAT_PAGE_UP),
+        compiled(AjAction::ChatPageDown, ACTION_CHAT_PAGE_DOWN),
     ]
 }
 
@@ -313,6 +321,14 @@ mod tests {
         assert_eq!(
             spec(AjAction::Dequeue),
             chord(ChordKey::Named("up"), false, true, false, false)
+        );
+        assert_eq!(
+            spec(AjAction::ChatPageUp),
+            chord(ChordKey::Named("page_up"), false, false, false, false)
+        );
+        assert_eq!(
+            spec(AjAction::ChatPageDown),
+            chord(ChordKey::Named("page_down"), false, false, false, false)
         );
     }
 
