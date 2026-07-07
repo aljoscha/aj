@@ -72,7 +72,7 @@ use crate::overlay::{OverlayChrome, OverlayStack, Scrim};
 use crate::palette::{FetchKind, PendingFetch, open_palette};
 use crate::pending::PendingBox;
 use crate::prompt_history::{HistoryFetch, HistoryScope, MAX_ENTRIES, open_prompt_history};
-use crate::session_selector::{SessionScan, fill_session_scan, open_session_selector};
+use crate::session_selector::{SessionScan, extend_session_scan, open_session_selector};
 use crate::settings_ui::{
     MODEL_SETTING_ID, SelectorActivity, SettingsCatalogs, SettingsUi, SettingsValues, SkillRow,
     UNSET_VALUE, open_model, open_settings, open_skills, open_thinking,
@@ -2078,53 +2078,68 @@ fn spawn_overlay_fetch(
 }
 
 /// Spawn the prompt-history scan for `scope` on a blocking thread,
-/// delivering its entries back to the drive loop over `tx`.
+/// streaming its per-file entry batches back to the drive loop over `tx`
+/// and closing with [`ScanMsg::Done`].
 ///
 /// The scan walks on-disk JSONL logs (blocking IO), so it runs on the
 /// blocking pool rather than the loop. The select widget it fills is
-/// `!Send`, so it stays on the host side; only the `Send` entries and
-/// the scope tag cross the task boundary. The scope tag lets the fill
-/// arm drop a superseded toggle's late result.
+/// `!Send`, so it stays on the host side; only the `Send` entries cross
+/// the task boundary. Each open or scope toggle gets its own channel, so
+/// a superseded scan's batches land on a dropped receiver and are
+/// ignored, no scope tag needed to filter stale results.
 fn spawn_history_scan(
     world: &World,
     scope: HistoryScope,
-    tx: &UnboundedSender<(HistoryScope, Vec<PromptEntry>)>,
+    tx: UnboundedSender<ScanMsg<PromptEntry>>,
 ) {
-    let tx = tx.clone();
     let persistence = world.persistence.clone();
     tokio::task::spawn_blocking(move || {
-        let entries = match scope {
-            HistoryScope::Workspace => aj_session::workspace_history(&persistence, MAX_ENTRIES),
-            HistoryScope::All => match Config::get_sessions_base_dir_path() {
-                Ok(base) => aj_session::all_workspaces_history(&base, MAX_ENTRIES),
-                // Fall back to the current workspace so the toggle still
-                // shows something when the base dir can't be resolved.
-                Err(err) => {
-                    tracing::debug!("could not resolve sessions base dir: {err}");
-                    aj_session::workspace_history(&persistence, MAX_ENTRIES)
+        {
+            let mut emit = |batch: Vec<PromptEntry>| {
+                let _ = tx.send(ScanMsg::Batch(batch));
+            };
+            match scope {
+                HistoryScope::Workspace => {
+                    aj_session::workspace_history_streaming(&persistence, MAX_ENTRIES, &mut emit)
                 }
-            },
-        };
-        let _ = tx.send((scope, entries));
+                HistoryScope::All => match Config::get_sessions_base_dir_path() {
+                    Ok(base) => {
+                        aj_session::all_workspaces_history_streaming(&base, MAX_ENTRIES, &mut emit)
+                    }
+                    // Fall back to the current workspace so the toggle still
+                    // shows something when the base dir can't be resolved.
+                    Err(err) => {
+                        tracing::debug!("could not resolve sessions base dir: {err}");
+                        aj_session::workspace_history_streaming(
+                            &persistence,
+                            MAX_ENTRIES,
+                            &mut emit,
+                        )
+                    }
+                },
+            }
+        }
+        let _ = tx.send(ScanMsg::Done);
     });
 }
 
-/// Scan the project's session previews on a blocking thread, delivering
-/// them to the drive loop over `tx`.
+/// Scan the project's session previews on a blocking thread, streaming
+/// per-file preview batches to the drive loop over `tx` and closing with
+/// [`ScanMsg::Done`].
 ///
 /// The scan walks on-disk JSONL logs (blocking IO), so it runs on the
 /// blocking pool rather than the loop. The select it fills is `!Send`, so
 /// it stays on the host side; only the `Send` previews cross the task
-/// boundary. Previews are collected newest-first (the streaming walk's
-/// order) and delivered in one batch, matching the loop's fill-once
-/// overlay pattern.
-fn spawn_session_scan(world: &World, tx: &UnboundedSender<Vec<SessionPreview>>) {
-    let tx = tx.clone();
+/// boundary. [`ConversationPersistence::list_session_previews_streaming`]
+/// emits one batch per session file, newest-first, and the host appends
+/// each as it lands, matching the loop's progressive-fill overlay pattern.
+fn spawn_session_scan(world: &World, tx: UnboundedSender<ScanMsg<SessionPreview>>) {
     let persistence = world.persistence.clone();
     tokio::task::spawn_blocking(move || {
-        let mut previews = Vec::new();
-        persistence.list_session_previews_streaming(&mut |batch| previews.extend(batch));
-        let _ = tx.send(previews);
+        persistence.list_session_previews_streaming(&mut |batch| {
+            let _ = tx.send(ScanMsg::Batch(batch));
+        });
+        let _ = tx.send(ScanMsg::Done);
     });
 }
 
@@ -2218,6 +2233,50 @@ async fn recv_prompt_history(
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
     }
+}
+
+/// One message from a streaming overlay scan: a batch of rows in scan
+/// order, then a single terminal [`ScanMsg::Done`]. A dropped sender
+/// (superseded scan) closes the channel without a `Done`, which the fill
+/// arm treats the same as `Done`.
+enum ScanMsg<T> {
+    Batch(Vec<T>),
+    Done,
+}
+
+/// Await the next message from an optional scan receiver, pending forever
+/// when there is no scan in flight. Mirrors [`recv_prompt_history`] so a
+/// `tokio::select!` arm can poll an `Option<Receiver>` without a nested
+/// match.
+async fn recv_scan<T>(rx: Option<&mut UnboundedReceiver<ScanMsg<T>>>) -> Option<ScanMsg<T>> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The in-flight prompt-history scan the drive loop streams into. Holds the
+/// `!Send` select on the host side, paired with the scan's own receiver so
+/// a superseded scope toggle's channel is simply dropped.
+struct HistoryFill {
+    select: Rc<RefCell<FilterableSelect>>,
+    rx: UnboundedReceiver<ScanMsg<PromptEntry>>,
+    /// The first batch replaces the loading placeholder; later batches
+    /// append in place.
+    first: bool,
+}
+
+/// The in-flight session-preview scan the drive loop streams into. Holds
+/// the `!Send` [`SessionScan`] plus the scan's own receiver.
+struct SessionFill {
+    scan: SessionScan,
+    rx: UnboundedReceiver<ScanMsg<SessionPreview>>,
+    /// The first batch replaces the loading placeholder; later batches
+    /// append in place.
+    first: bool,
+    /// Chase the active session's row until it streams in, then stop so a
+    /// late batch can't yank the cursor away from the user's navigation.
+    select_current_pending: bool,
 }
 
 /// The editor's visible-row cap from the terminal height, `aj`'s
@@ -3189,18 +3248,18 @@ async fn drive(
     // sends only the rendered rows back over the channel.
     let (fetch_tx, mut fetch_rx) = unbounded_channel::<(FetchKind, Vec<String>)>();
     let mut pending_fills: Vec<(FetchKind, Rc<RefCell<ListView>>)> = Vec::new();
-    // Prompt-history scans deliver their entries here. The select handle
-    // is `!Send`, so it stays paired with the requested scope on the host
-    // side while the blocking scan sends only the (Send) entries back. A
-    // result fills only when its scope still matches the pending request,
-    // so a scope toggle's stale scan can't overwrite the current view.
-    let (history_tx, mut history_rx) = unbounded_channel::<(HistoryScope, Vec<PromptEntry>)>();
-    let mut pending_history: Option<(HistoryScope, Rc<RefCell<FilterableSelect>>)> = None;
-    // Session-selector preview scans deliver their previews here. The
-    // `SessionScan` (holding the `!Send` select) stays on the host side
-    // while the blocking scan sends only the (Send) previews back.
-    let (session_tx, mut session_rx) = unbounded_channel::<Vec<SessionPreview>>();
-    let mut pending_session: Option<SessionScan> = None;
+    // Prompt-history scans stream their per-file entry batches here. The
+    // select handle is `!Send`, so it stays paired with the scan's own
+    // receiver on the host side (`pending_history`) while the blocking scan
+    // sends only the (Send) entries back. Each open or scope toggle gets a
+    // fresh channel, so a superseded scan's batches land on a dropped
+    // receiver and never touch the current view.
+    let mut pending_history: Option<HistoryFill> = None;
+    // Session-selector preview scans stream their per-file preview batches
+    // here. The `SessionScan` (holding the `!Send` select) stays on the host
+    // side in `pending_session` while the blocking scan sends only the
+    // (Send) previews back.
+    let mut pending_session: Option<SessionFill> = None;
     // Skills discovery for the skills window runs off the loop. The walk reads
     // `SKILL.md` files (blocking IO); only the discovered skills (Send) come
     // back, and the host builds the `!Send` window in the fill arm below.
@@ -3278,30 +3337,70 @@ async fn drive(
             }
 
             // --- Prompt-history scan fill ---
-            // Fill only when the result's scope still matches the pending
-            // request. A superseded toggle's late scan is dropped, so the
-            // list never flips back to a stale scope's rows.
-            maybe_history = history_rx.recv() => {
-                if let Some((scope, entries)) = maybe_history
-                    && let Some((pending_scope, select)) = &pending_history
-                    && *pending_scope == scope
-                {
-                    select.borrow().set_items(crate::prompt_history::build_items(&entries));
-                    pending_history = None;
-                    app.request_redraw();
+            // Stream the scan's per-file batches into the overlay list: the
+            // first batch replaces the loading placeholder, later batches
+            // append. Superseded scans (a scope toggle) sit on a dropped
+            // channel, so their batches never reach here.
+            maybe_history = recv_scan(pending_history.as_mut().map(|f| &mut f.rx)) => {
+                if let Some(fill) = pending_history.as_mut() {
+                    match maybe_history {
+                        Some(ScanMsg::Batch(entries)) => {
+                            let items = crate::prompt_history::build_items(&entries);
+                            if fill.first {
+                                fill.select.borrow().set_items(items);
+                                fill.first = false;
+                            } else {
+                                fill.select.borrow().extend_items(items);
+                            }
+                            app.request_redraw();
+                        }
+                        // Done, or the sender was dropped: clear the loading
+                        // placeholder if nothing streamed in, then retire the
+                        // scan.
+                        Some(ScanMsg::Done) | None => {
+                            if fill.first {
+                                fill.select.borrow().set_items(Vec::new());
+                            }
+                            pending_history = None;
+                            app.request_redraw();
+                        }
+                    }
                 }
             }
 
             // --- Session-selector preview fill ---
-            // Fill once the scan lands: build the rows, pre-select the
-            // active session, and tag it. A late result with no pending
-            // scan (the overlay was closed) is dropped.
-            maybe_sessions = session_rx.recv() => {
-                if let Some(previews) = maybe_sessions
-                    && let Some(scan) = pending_session.take()
-                {
-                    fill_session_scan(&scan, &previews, Utc::now());
-                    app.request_redraw();
+            // Stream the scan's per-file preview batches into the selector:
+            // build the rows, append them (the first batch replaces the
+            // loading placeholder), and chase the active session's row until
+            // it appears so a late batch can't yank the cursor.
+            maybe_sessions = recv_scan(pending_session.as_mut().map(|f| &mut f.rx)) => {
+                if let Some(fill) = pending_session.as_mut() {
+                    match maybe_sessions {
+                        Some(ScanMsg::Batch(previews)) => {
+                            let selected = extend_session_scan(
+                                &fill.scan,
+                                &previews,
+                                Utc::now(),
+                                fill.first,
+                                fill.select_current_pending,
+                            );
+                            fill.first = false;
+                            if selected {
+                                fill.select_current_pending = false;
+                            }
+                            app.request_redraw();
+                        }
+                        // Done, or the sender was dropped: clear the loading
+                        // placeholder if nothing streamed in, then retire the
+                        // scan.
+                        Some(ScanMsg::Done) | None => {
+                            if fill.first {
+                                extend_session_scan(&fill.scan, &[], Utc::now(), true, false);
+                            }
+                            pending_session = None;
+                            app.request_redraw();
+                        }
+                    }
                 }
             }
 
@@ -3461,17 +3560,31 @@ async fn drive(
                             app.request_redraw();
                         }
                         // A prompt-history scan request (open or scope
-                        // toggle): run the scan off the loop on a blocking
-                        // thread and remember the select to fill.
+                        // toggle): give it a fresh channel, run the scan off
+                        // the loop on a blocking thread, and remember the
+                        // select to stream into. A prior in-flight scan's
+                        // channel is dropped here, so its batches are ignored.
                         if let Some(fetch) = shell.borrow().take_history_fetch() {
-                            spawn_history_scan(world, fetch.scope, &history_tx);
-                            pending_history = Some((fetch.scope, fetch.select));
+                            let (tx, rx) = unbounded_channel();
+                            spawn_history_scan(world, fetch.scope, tx);
+                            pending_history = Some(HistoryFill {
+                                select: fetch.select,
+                                rx,
+                                first: true,
+                            });
                         }
-                        // A session-selector open: run the preview scan off
-                        // the loop and remember the selector to fill.
+                        // A session-selector open: give it a fresh channel,
+                        // run the preview scan off the loop, and remember the
+                        // selector to stream into.
                         if let Some(scan) = shell.borrow().take_session_scan() {
-                            spawn_session_scan(world, &session_tx);
-                            pending_session = Some(scan);
+                            let (tx, rx) = unbounded_channel();
+                            spawn_session_scan(world, tx);
+                            pending_session = Some(SessionFill {
+                                scan,
+                                rx,
+                                first: true,
+                                select_current_pending: true,
+                            });
                         }
                         // A confirmed login/logout provider pick from the
                         // auth picker. Bind out of the borrow first so no
@@ -6681,7 +6794,7 @@ mod tests {
             "alpha + the current session are on disk: {}",
             previews.len()
         );
-        fill_session_scan(&scan, &previews, Utc::now());
+        extend_session_scan(&scan, &previews, Utc::now(), true, true);
         app.render(&root).expect("render");
 
         let rows = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
@@ -6724,7 +6837,7 @@ mod tests {
         world
             .persistence
             .list_session_previews_streaming(&mut |batch| previews.extend(batch));
-        fill_session_scan(&scan, &previews, Utc::now());
+        extend_session_scan(&scan, &previews, Utc::now(), true, true);
         app.render(&root).expect("render");
         writer.write_all(b"\r").expect("enter on the current row");
         let event = app.next_input().await.expect("input event");

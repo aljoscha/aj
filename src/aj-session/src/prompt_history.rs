@@ -42,17 +42,33 @@ pub struct PromptEntry {
 /// Collect the current workspace's submitted prompts, newest-first and
 /// deduplicated, capped at `max`.
 pub fn workspace_history(persistence: &ConversationPersistence, max: usize) -> Vec<PromptEntry> {
+    let mut out = Vec::new();
+    workspace_history_streaming(persistence, max, &mut |batch| out.extend(batch));
+    out
+}
+
+/// Stream the current workspace's submitted prompts to `emit`, one
+/// per-file batch at a time, in the same newest-first, deduplicated,
+/// `max`-capped order as [`workspace_history`].
+///
+/// A batch carries a single session file's new (not-yet-seen) prompts so
+/// a UI rendering the list incrementally can append rows as the scan
+/// walks the on-disk logs rather than blocking on the whole walk. Empty
+/// batches (a file with no new prompts) are not emitted.
+pub fn workspace_history_streaming(
+    persistence: &ConversationPersistence,
+    max: usize,
+    emit: &mut dyn FnMut(Vec<PromptEntry>),
+) {
     let mut seen = HashSet::new();
     let mut remaining = max;
-    let mut out = Vec::new();
     collect_dir(
         persistence.sessions_dir(),
         None,
         &mut seen,
         &mut remaining,
-        &mut out,
+        emit,
     );
-    out
 }
 
 /// Collect submitted prompts across every project under `sessions_base`
@@ -66,6 +82,20 @@ pub fn workspace_history(persistence: &ConversationPersistence, max: usize) -> V
 /// deterministic, so the tag on a prompt shared across projects is
 /// stable but not a "most recent workspace" guarantee.
 pub fn all_workspaces_history(sessions_base: &Path, max: usize) -> Vec<PromptEntry> {
+    let mut out = Vec::new();
+    all_workspaces_history_streaming(sessions_base, max, &mut |batch| out.extend(batch));
+    out
+}
+
+/// Stream submitted prompts across every project under `sessions_base` to
+/// `emit`, one per-file batch at a time, in the same order, dedup, and
+/// `max`-cap as [`all_workspaces_history`]. See
+/// [`workspace_history_streaming`] for the batching contract.
+pub fn all_workspaces_history_streaming(
+    sessions_base: &Path,
+    max: usize,
+    emit: &mut dyn FnMut(Vec<PromptEntry>),
+) {
     let read_dir = match std::fs::read_dir(sessions_base) {
         Ok(rd) => rd,
         Err(e) => {
@@ -73,7 +103,7 @@ pub fn all_workspaces_history(sessions_base: &Path, max: usize) -> Vec<PromptEnt
                 "could not read sessions base {}: {e}",
                 sessions_base.display()
             );
-            return Vec::new();
+            return;
         }
     };
 
@@ -90,7 +120,6 @@ pub fn all_workspaces_history(sessions_base: &Path, max: usize) -> Vec<PromptEnt
 
     let mut seen = HashSet::new();
     let mut remaining = max;
-    let mut out = Vec::new();
     for dir in &projects {
         if remaining == 0 {
             break;
@@ -99,22 +128,22 @@ pub fn all_workspaces_history(sessions_base: &Path, max: usize) -> Vec<PromptEnt
             .file_name()
             .and_then(|n| n.to_str())
             .map(|s| s.to_string());
-        collect_dir(dir, project, &mut seen, &mut remaining, &mut out);
+        collect_dir(dir, project, &mut seen, &mut remaining, emit);
     }
-    out
 }
 
-/// Walk every `*.jsonl` file in `dir`, newest file first, appending
-/// that file's new prompts (newest-first, skipping bodies already in
-/// `seen`) into `out`. `project` tags every entry. `remaining` is the
-/// shared budget, decremented as entries are produced. The walk stops
-/// once it hits zero.
+/// Walk every `*.jsonl` file in `dir`, newest file first, emitting each
+/// file's new prompts (newest-first, skipping bodies already in `seen`)
+/// as one batch through `emit`. `project` tags every entry. `remaining`
+/// is the shared budget, decremented as entries are produced. The walk
+/// stops once it hits zero. A file that yields no new prompts emits
+/// nothing.
 fn collect_dir(
     dir: &Path,
     project: Option<String>,
     seen: &mut HashSet<String>,
     remaining: &mut usize,
-    out: &mut Vec<PromptEntry>,
+    emit: &mut dyn FnMut(Vec<PromptEntry>),
 ) {
     let read_dir = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
@@ -141,17 +170,21 @@ fn collect_dir(
         // recent prompt in this file lands first.
         let mut prompts = load_file_prompts(path);
         prompts.reverse();
+        let mut batch = Vec::new();
         for text in prompts {
             if *remaining == 0 {
                 break;
             }
             if seen.insert(text.clone()) {
-                out.push(PromptEntry {
+                batch.push(PromptEntry {
                     text,
                     project: project.clone(),
                 });
                 *remaining -= 1;
             }
+        }
+        if !batch.is_empty() {
+            emit(batch);
         }
     }
 }
@@ -348,6 +381,31 @@ mod tests {
         // older files; `second` deduped to its newest position.
         assert_eq!(texts, vec!["third", "second", "first"]);
         assert!(entries.iter().all(|e| e.project.is_none()));
+    }
+
+    #[test]
+    fn workspace_history_streaming_emits_per_file_batches_deduped() {
+        let dir = scratch_dir("workspace-stream");
+        write_jsonl(
+            &dir,
+            "2024-01-01-00-00-00",
+            &[user_line("first", "1"), user_line("second", "2")],
+        );
+        write_jsonl(
+            &dir,
+            "2024-02-01-00-00-00",
+            // `second` repeats. The newer file's batch drops it as seen.
+            &[user_line("second", "1"), user_line("third", "2")],
+        );
+
+        let persistence = ConversationPersistence::new(dir);
+        let mut batches: Vec<Vec<String>> = Vec::new();
+        workspace_history_streaming(&persistence, 2000, &mut |batch| {
+            batches.push(batch.into_iter().map(|e| e.text).collect());
+        });
+        // One batch per file (newest file first); within a batch newest
+        // prompt first; `second` deduped out of the older file's batch.
+        assert_eq!(batches, vec![vec!["third", "second"], vec!["first"]]);
     }
 
     #[test]

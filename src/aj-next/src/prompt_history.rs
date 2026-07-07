@@ -7,10 +7,12 @@
 //! first). Esc cancels.
 //!
 //! The scan is off the drive loop: the overlay opens showing a loading
-//! placeholder and the host fills the list once the scan (run on a
-//! blocking thread) lands. The overlay-local `Ctrl+T`
-//! ([`ACTION_HISTORY_TOGGLE_SCOPE`]) flips the scope between the current
-//! workspace and all workspaces, re-parking a fetch for the host.
+//! placeholder and the host streams rows in as the scan (run on a
+//! blocking thread) emits per-file batches, so the list fills
+//! progressively rather than blocking on the whole walk. The
+//! overlay-local `Ctrl+T` ([`ACTION_HISTORY_TOGGLE_SCOPE`]) flips the
+//! scope between the current workspace and all workspaces, re-parking a
+//! fetch for the host.
 //!
 //! Filter key: a row's filter key is the full prompt text, which is both
 //! what the fuzzy filter matches and the value recalled on confirm. The

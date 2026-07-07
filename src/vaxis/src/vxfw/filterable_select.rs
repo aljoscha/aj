@@ -422,9 +422,10 @@ impl FilterableSelect {
     }
 
     /// Move the cursor onto the first visible item matching `pred`, used to
-    /// pre-select the currently-active row on open. A no-op when nothing
-    /// matches.
-    pub fn select_matching(&self, pred: impl Fn(&SelectItem) -> bool) {
+    /// pre-select the currently-active row on open. Returns whether a match
+    /// was found and the cursor moved. A no-op returning `false` when
+    /// nothing visible matches.
+    pub fn select_matching(&self, pred: impl Fn(&SelectItem) -> bool) -> bool {
         let pos = {
             let state = self.state.borrow();
             state
@@ -436,6 +437,9 @@ impl FilterableSelect {
             self.list
                 .borrow_mut()
                 .jump_to_item(u32::try_from(pos).expect("pos fits u32"));
+            true
+        } else {
+            false
         }
     }
 

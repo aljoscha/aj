@@ -39,7 +39,8 @@ pub use log::{
 };
 pub use persistence::{ConversationPersistence, SessionMetadata, SessionPreview};
 pub use prompt_history::{
-    PromptEntry, all_workspaces_history, scan_file_user_prompts, workspace_history,
+    PromptEntry, all_workspaces_history, all_workspaces_history_streaming, scan_file_user_prompts,
+    workspace_history, workspace_history_streaming,
 };
 pub use repair::repair_interrupted_tool_uses;
 pub use replay::replay;

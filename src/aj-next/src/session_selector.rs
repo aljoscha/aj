@@ -6,10 +6,11 @@
 //! session already active is a no-op close, and Esc cancels.
 //!
 //! The preview scan is off the drive loop: the overlay opens showing a
-//! loading placeholder and the host fills the list once the scan (run on a
+//! loading placeholder and the host streams rows in as the scan (run on a
 //! blocking thread over [`ConversationPersistence`](aj_session::ConversationPersistence))
-//! lands. Rows are newest-first, the active session pre-selected and
-//! tagged `(current)`.
+//! emits per-file batches, so the list fills progressively rather than
+//! blocking on the whole walk. Rows are newest-first, the active session
+//! pre-selected and tagged `(current)`.
 //!
 //! A row's filter key is `"{first_user_message} {session_id}"` so typing
 //! either the prompt or the id finds it, matching aj's selector. The
@@ -113,18 +114,25 @@ pub(crate) fn open_session_selector(
     });
 }
 
-/// Fill the selector's list from a completed preview scan: build one row
-/// per preview (newest-first, as scanned), record the filter-key -> id map
-/// for confirm, and pre-select the active session's row.
-pub(crate) fn fill_session_scan(
+/// Append a streamed batch of previews to the selector's list: build one
+/// row per preview (newest-first, as scanned), record the filter-key -> id
+/// map for confirm, and chase the active session's row until it appears.
+///
+/// `first` replaces the loading placeholder with this batch (the initial
+/// fill), later batches append in place keeping the cursor. `chase_current`
+/// asks to pre-select the active session's row this batch. Returns whether
+/// that row was found and selected, so the host can stop chasing (a late
+/// batch must not yank the cursor once the user is navigating).
+pub(crate) fn extend_session_scan(
     scan: &SessionScan,
     previews: &[SessionPreview],
     now: DateTime<Utc>,
-) {
-    {
+    first: bool,
+    chase_current: bool,
+) -> bool {
+    let items: Vec<SelectItem> = {
         let mut ids = scan.ids.borrow_mut();
-        ids.clear();
-        let items: Vec<SelectItem> = previews
+        previews
             .iter()
             .map(|preview| {
                 let is_current = preview.session_id == scan.current;
@@ -132,11 +140,17 @@ pub(crate) fn fill_session_scan(
                 ids.insert(item.filter_key.clone(), preview.session_id.clone());
                 item
             })
-            .collect();
+            .collect()
         // Drop the map borrow before touching the select: the confirm
         // callback (fired from the widget's own dispatch) reads the map.
-        drop(ids);
+    };
+    if first {
         scan.select.borrow().set_items(items);
+    } else {
+        scan.select.borrow().extend_items(items);
+    }
+    if !chase_current {
+        return false;
     }
     // Pre-select the active session's row wherever it landed. The confirm
     // map resolves each row's filter key back to its id.
@@ -144,7 +158,7 @@ pub(crate) fn fill_session_scan(
     let current = scan.current.clone();
     scan.select
         .borrow()
-        .select_matching(|item| ids.borrow().get(&item.filter_key) == Some(&current));
+        .select_matching(|item| ids.borrow().get(&item.filter_key) == Some(&current))
 }
 
 /// Build one row: the truncated first user message (tagged `(current)` for
@@ -307,7 +321,7 @@ mod tests {
             current: current.to_string(),
             ids,
         };
-        fill_session_scan(&scan, &previews, Utc::now());
+        extend_session_scan(&scan, &previews, Utc::now(), true, true);
         (scan, request_slot)
     }
 
