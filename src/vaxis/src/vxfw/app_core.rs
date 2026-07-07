@@ -23,6 +23,7 @@ use crate::key::Key;
 use crate::mouse::Mouse;
 use crate::tty::Tty;
 use crate::vaxis::Vaxis;
+use crate::vxfw::render_debug;
 use crate::vxfw::{
     Command, DrawContext, Event, EventContext, HitResult, MaxSize, Phase, Point, Size, Surface,
     Tick, WidgetRef, draw_widget, widget_eq,
@@ -94,6 +95,9 @@ impl AppCore {
             // render call below.
         }
         self.vx.render(&mut self.tty.writer())?;
+        if render_debug::enabled() {
+            render_debug::inspect_frame(surface, &self.vx.screen.borrow(), &self.vx.screen_last);
+        }
         Ok(())
     }
 

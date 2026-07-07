@@ -62,6 +62,7 @@ mod list_view;
 mod loop_event;
 mod overlay_window;
 mod padding;
+mod render_debug;
 mod rich_text;
 mod scroll_bars;
 mod scroll_view;
