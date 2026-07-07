@@ -3340,88 +3340,6 @@ async fn drive(
                 }
             }
 
-            // --- Prompt-history scan fill ---
-            // Stream the scan's per-file batches into the overlay list: the
-            // first batch replaces the loading placeholder, later batches
-            // append. Superseded scans (a scope toggle) sit on a dropped
-            // channel, so their batches never reach here.
-            maybe_history = recv_scan(pending_history.as_mut().map(|f| &mut f.rx)) => {
-                if let Some(fill) = pending_history.as_mut() {
-                    match maybe_history {
-                        Some(ScanMsg::Batch(entries)) => {
-                            let items = crate::prompt_history::build_items(&entries);
-                            if fill.first {
-                                fill.select.borrow().set_items(items);
-                                fill.first = false;
-                            } else {
-                                fill.select.borrow().extend_items(items);
-                            }
-                            app.request_redraw();
-                        }
-                        // Done, or the sender was dropped: clear the loading
-                        // placeholder if nothing streamed in, then retire the
-                        // scan.
-                        Some(ScanMsg::Done) | None => {
-                            if fill.first {
-                                fill.select.borrow().set_items(Vec::new());
-                            }
-                            pending_history = None;
-                            app.request_redraw();
-                        }
-                    }
-                }
-            }
-
-            // --- Session-selector preview fill ---
-            // Stream the scan's per-file preview batches into the selector:
-            // build the rows, append them (the first batch replaces the
-            // loading placeholder), and chase the active session's row until
-            // it appears, giving up once the user has navigated so a late
-            // batch can't yank the cursor.
-            maybe_sessions = recv_scan(pending_session.as_mut().map(|f| &mut f.rx)) => {
-                if let Some(fill) = pending_session.as_mut() {
-                    match maybe_sessions {
-                        Some(ScanMsg::Batch(previews)) => {
-                            // If the user moved the selection off where the
-                            // chase last parked it, stop chasing so this batch's
-                            // pre-select can't yank the cursor back. Skipped on
-                            // the first batch, which establishes the anchor.
-                            if !fill.first
-                                && fill.select_current_pending
-                                && fill.scan.selected_filter_key() != fill.anchor
-                            {
-                                fill.select_current_pending = false;
-                            }
-                            let selected = extend_session_scan(
-                                &fill.scan,
-                                &previews,
-                                Utc::now(),
-                                fill.first,
-                                fill.select_current_pending,
-                            );
-                            fill.first = false;
-                            if selected {
-                                fill.select_current_pending = false;
-                            }
-                            // Re-anchor to wherever the selection now sits so
-                            // later user movement is measured against it.
-                            fill.anchor = fill.scan.selected_filter_key();
-                            app.request_redraw();
-                        }
-                        // Done, or the sender was dropped: clear the loading
-                        // placeholder if nothing streamed in, then retire the
-                        // scan.
-                        Some(ScanMsg::Done) | None => {
-                            if fill.first {
-                                extend_session_scan(&fill.scan, &[], Utc::now(), true, false);
-                            }
-                            pending_session = None;
-                            app.request_redraw();
-                        }
-                    }
-                }
-            }
-
             // --- Skills window fill ---
             // Discovery finished off the loop. An empty result means nothing
             // was found, so fold the same notice the synchronous path used.
@@ -3696,6 +3614,97 @@ async fn drive(
                     }
                 }
                 app.request_redraw();
+            }
+
+            // --- Prompt-history scan fill ---
+            // Sits BELOW the input arm on purpose. A scan of a large project
+            // streams many per-file batches, and under `biased` an arm above
+            // input would keep winning and starve typing until the scan
+            // finished, so a keystroke in the filter field would render late.
+            // Below input, typing always wins and the list still fills between
+            // keystrokes.
+            //
+            // The first batch replaces the loading placeholder, later batches
+            // append. Superseded scans (a scope toggle) sit on a dropped
+            // channel, so their batches never reach here.
+            maybe_history = recv_scan(pending_history.as_mut().map(|f| &mut f.rx)) => {
+                if let Some(fill) = pending_history.as_mut() {
+                    match maybe_history {
+                        Some(ScanMsg::Batch(entries)) => {
+                            let items = crate::prompt_history::build_items(&entries);
+                            if fill.first {
+                                fill.select.borrow().set_items(items);
+                                fill.first = false;
+                            } else {
+                                fill.select.borrow().extend_items(items);
+                            }
+                            app.request_redraw();
+                        }
+                        // Done, or the sender was dropped: clear the loading
+                        // placeholder if nothing streamed in, then retire the
+                        // scan.
+                        Some(ScanMsg::Done) | None => {
+                            if fill.first {
+                                fill.select.borrow().set_items(Vec::new());
+                            }
+                            pending_history = None;
+                            app.request_redraw();
+                        }
+                    }
+                }
+            }
+
+            // --- Session-selector preview fill ---
+            // Sits BELOW the input arm on purpose, for the same reason as the
+            // prompt-history fill above: many streamed batches must not starve
+            // typing in the filter field under `biased`.
+            //
+            // Build the rows and append them (the first batch replaces the
+            // loading placeholder), and chase the active session's row until it
+            // appears, giving up once the user has navigated so a late batch
+            // can't yank the cursor.
+            maybe_sessions = recv_scan(pending_session.as_mut().map(|f| &mut f.rx)) => {
+                if let Some(fill) = pending_session.as_mut() {
+                    match maybe_sessions {
+                        Some(ScanMsg::Batch(previews)) => {
+                            // If the user moved the selection off where the
+                            // chase last parked it, stop chasing so this batch's
+                            // pre-select can't yank the cursor back. Skipped on
+                            // the first batch, which establishes the anchor.
+                            if !fill.first
+                                && fill.select_current_pending
+                                && fill.scan.selected_filter_key() != fill.anchor
+                            {
+                                fill.select_current_pending = false;
+                            }
+                            let selected = extend_session_scan(
+                                &fill.scan,
+                                &previews,
+                                Utc::now(),
+                                fill.first,
+                                fill.select_current_pending,
+                            );
+                            fill.first = false;
+                            if selected {
+                                fill.select_current_pending = false;
+                            }
+                            // Re-anchor to wherever the selection now sits so
+                            // later user movement is measured against it.
+                            fill.anchor = fill.scan.selected_filter_key();
+                            app.request_redraw();
+                        }
+                        // Done, or the sender was dropped: clear the loading
+                        // placeholder if nothing streamed in, then retire the
+                        // scan.
+                        Some(ScanMsg::Done) | None => {
+                            if fill.first {
+                                extend_session_scan(&fill.scan, &[], Utc::now(), true, false);
+                            }
+                            pending_session = None;
+                            app.request_redraw();
+                        }
+                    }
+                }
             }
 
             _ = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now).into()),
