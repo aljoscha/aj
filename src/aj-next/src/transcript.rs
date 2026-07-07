@@ -76,6 +76,10 @@ pub(crate) struct TranscriptStyles {
     pub(crate) tool_error_bg: Color,
     /// The user-message bubble tint.
     pub(crate) user_message_bg: Color,
+    /// Background tint for a transcript selection's highlight, the app's
+    /// selection color (see Spec E section 2). Only the background is
+    /// restyled over the composed frame, so the selected text stays readable.
+    pub(crate) selection_bg: Color,
     /// Foreground mapper for markdown span roles, consumed by
     /// [`MarkdownView`]. Rebuilt from the theme here so a runtime swap
     /// re-tints markdown through the same `set_styles` path.
@@ -136,6 +140,7 @@ impl TranscriptStyles {
             tool_success_bg: bg(ThemeBg::ToolSuccessBg),
             tool_error_bg: bg(ThemeBg::ToolErrorBg),
             user_message_bg: bg(ThemeBg::UserMessageBg),
+            selection_bg: bg(ThemeBg::SelectedBg),
             markdown: MarkdownStyles::from_theme(theme),
             hyperlinks: TERMINAL_HYPERLINKS,
         }
@@ -990,6 +995,18 @@ fn compaction_header(tokens_before: u64, tokens_after: u64) -> String {
     )
 }
 
+/// A free-form transcript selection: an anchor and a caret, each an absolute
+/// `(row, col)` in the rendered-text layout space (row 0 = the first line of
+/// the first entry). Storing absolute positions means the highlight tracks the
+/// content across scrolling and follow-tail, not the viewport (Spec E section
+/// 2). A zero-width selection (`anchor == caret`) is a plain click with nothing
+/// highlighted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Selection {
+    anchor: (usize, usize),
+    caret: (usize, usize),
+}
+
 /// The chat area: a follow-tail `ListView` over the active transcript,
 /// wrapped in [`ScrollBars`] for the vertical scrollbar thumb (Spec E
 /// section 1). The bar reserves the rightmost column and hides its
@@ -1048,6 +1065,16 @@ pub struct TranscriptView {
     /// back to the editor. `None` until the host wires it in `Shell::new`.
     /// The resulting `FocusOut` clears the item cursor, exiting the mode.
     on_exit_focus: Option<Box<dyn FnMut(&mut EventContext)>>,
+    /// The active free-form selection, if any (Spec E section 2). Set on a
+    /// left-button press-drag over the content and kept highlighted after the
+    /// release copies it, until the next plain click or Esc clears it.
+    selection: Option<Selection>,
+    /// Viewport size the last completed [`draw`](Widget::draw) laid out
+    /// against. The mouse handlers run between draws with no `DrawContext`, so
+    /// they read the geometry back from here to map widget-local coordinates
+    /// and screen rows into the absolute layout space. Zero before the first
+    /// draw.
+    last_view: Size,
 }
 
 /// The session-wide render inputs the transcript cache does not fingerprint
@@ -1078,6 +1105,11 @@ impl GlobalRenderInputs {
 struct RenderedTextLayout {
     key: RenderedTextKey,
     lines: Vec<Vec<Cell>>,
+    /// Absolute start row of each entry in `lines`, in transcript order:
+    /// `entry_starts[i]` is the cumulative line count of entries `[0, i)`, so
+    /// entry `i`'s first row. Backs [`TranscriptView::entry_start_row`], which
+    /// maps the `ListView`'s top item index into the layout's line space.
+    entry_starts: Vec<usize>,
 }
 
 /// The identity of a cached [`RenderedTextLayout`]. A lookup hits only when the
@@ -1198,6 +1230,11 @@ impl TranscriptView {
             last_globals,
             follow_tail: true,
             on_exit_focus: None,
+            selection: None,
+            last_view: Size {
+                width: 0,
+                height: 0,
+            },
         }
     }
 
@@ -1233,6 +1270,9 @@ impl TranscriptView {
         // transcript out rather than reading the previous session's grid.
         self.rendered_layout = None;
         self.follow_tail = true;
+        // A fresh session's transcript is unrelated to the old selection's
+        // absolute coordinates, so drop it rather than highlight stale rows.
+        self.selection = None;
     }
 
     /// Install the callback invoked when Esc leaves transcript-focus mode.
@@ -1387,13 +1427,14 @@ impl TranscriptView {
 }
 
 /// The full-transcript rendered-text layout API (Spec E sections 2 and 3): the
-/// off-screen layout plus text extraction over it in the absolute `(row, col)`
-/// coordinate space.
+/// off-screen layout plus text extraction and the screen<->absolute coordinate
+/// mapping over it in the absolute `(row, col)` space.
 ///
-/// NOTE(aljoscha): these are `dead_code` for now. They are the shared substrate
-/// in-app selection/copy and in-transcript search build on, landed and unit
-/// tested on their own ahead of those consumers, so nothing calls them outside
-/// the tests yet.
+/// Free-form selection (section 2) now drives most of this: the highlight and
+/// select-to-copy read positions and text out of the shared grid. In-transcript
+/// search (section 3) is the other planned consumer. A couple of helpers
+/// (`line_text`) are still exercised only by tests, hence the module-wide
+/// `dead_code` allowance.
 #[allow(dead_code)]
 impl TranscriptView {
     /// The active transcript laid out at content width `width` into one grid of
@@ -1432,9 +1473,13 @@ impl TranscriptView {
             .as_ref()
             .is_some_and(|layout| layout.key == key);
         if !hit {
-            let lines = self.build_rendered_lines(width);
+            let (lines, entry_starts) = self.build_rendered_lines(width);
             self.rendered_layout_rebuilds += 1;
-            self.rendered_layout = Some(RenderedTextLayout { key, lines });
+            self.rendered_layout = Some(RenderedTextLayout {
+                key,
+                lines,
+                entry_starts,
+            });
         }
         &self
             .rendered_layout
@@ -1480,8 +1525,52 @@ impl TranscriptView {
         extract_from_lines(self.rendered_lines(width), start, end)
     }
 
+    /// Absolute start row of entry `idx` in the layout at `width`.
+    ///
+    /// Entry `idx` begins at the sum of the prior entries' line counts (the
+    /// concatenation order the layout builds in). An `idx` at or past the entry
+    /// count returns the total line count (one past the last row), so the top
+    /// item's start row stays well defined even when the list momentarily
+    /// anchors one past the end. See [`rendered_lines`](Self::rendered_lines)
+    /// for the coordinate space.
+    pub(crate) fn entry_start_row(&mut self, width: u16, idx: usize) -> usize {
+        let line_count = self.line_count(width);
+        self.rendered_layout
+            .as_ref()
+            .expect("layout populated by line_count")
+            .entry_starts
+            .get(idx)
+            .copied()
+            .unwrap_or(line_count)
+    }
+
+    /// Absolute layout row shown at the top of the viewport as of the last
+    /// draw, at content width `width`.
+    ///
+    /// The `ListView`'s item index equals the transcript entry index, so the
+    /// top item is entry `scroll_top`, whose start row plus the reconciled
+    /// `scroll_offset` is the line at the viewport top. Clamped to
+    /// `[0, line_count]`.
+    pub(crate) fn first_visible_row(&mut self, width: u16) -> usize {
+        let (top, offset) = {
+            let list = self.list.borrow();
+            (
+                usize::try_from(list.scroll_top()).unwrap_or(0),
+                list.scroll_offset(),
+            )
+        };
+        let start = self.entry_start_row(width, top);
+        let line_count = self.line_count(width);
+        let row = i64::try_from(start)
+            .unwrap_or(0)
+            .saturating_add(i64::from(offset))
+            .clamp(0, i64::try_from(line_count).unwrap_or(i64::MAX));
+        usize::try_from(row).unwrap_or(0)
+    }
+
     /// Lay every entry of the active view out at `width` and concatenate their
-    /// composited rows, top to bottom. The miss path behind
+    /// composited rows, top to bottom, returning the rows and the absolute
+    /// start row of each entry. The miss path behind
     /// [`rendered_lines`](Self::rendered_lines).
     ///
     /// This wraps identically to the visible `ListView` because it builds each
@@ -1490,7 +1579,7 @@ impl TranscriptView {
     /// visible draw. The list places entries back to back at col 0 and pads a
     /// short row to the list width, both of which we reproduce below, so the
     /// concatenated rows land at the same absolute coordinates as the render.
-    fn build_rendered_lines(&self, width: u16) -> Vec<Vec<Cell>> {
+    fn build_rendered_lines(&self, width: u16) -> (Vec<Vec<Cell>>, Vec<usize>) {
         // The per-entry constraints the visible `ListView` draws each child
         // under: min and max width both `width`, height unbounded so an entry
         // yields every one of its rows rather than a viewport-clipped window.
@@ -1506,10 +1595,13 @@ impl TranscriptView {
         let chat = self.chat.borrow();
         let agent = chat.active_view();
         let mut lines: Vec<Vec<Cell>> = Vec::new();
+        let mut entry_starts: Vec<usize> = Vec::new();
         let Some(transcript) = chat.transcript(agent) else {
-            return lines;
+            return (lines, entry_starts);
         };
         for entry in transcript.entries() {
+            // The next entry begins where the rows accumulated so far end.
+            entry_starts.push(lines.len());
             // Bypass the visible render cache (`CachingEntry`): this is a
             // distinct full-transcript pass, like the sub-agent box's own child
             // layout, not the viewport-windowed one the list keeps warm.
@@ -1525,7 +1617,7 @@ impl TranscriptView {
                 lines.push(row);
             }
         }
-        lines
+        (lines, entry_starts)
     }
 }
 
@@ -1547,6 +1639,184 @@ impl TranscriptView {
             self.follow_tail = false;
         }
     }
+
+    /// The cursor gutter width: the two columns the list shifts content right
+    /// by in transcript-focus mode to draw its item cursor, zero otherwise.
+    /// The selection coordinate mapping strips this so an absolute column is a
+    /// content column, independent of the focus mode (see the coordinate
+    /// contract on [`rendered_lines`](Self::rendered_lines)).
+    fn gutter(&self) -> u16 {
+        if self.in_focus_mode() { 2 } else { 0 }
+    }
+
+    /// The content width the list lays entries out at: the last viewport width
+    /// minus the reserved scrollbar column and the cursor gutter. This is the
+    /// width the off-screen layout must be queried at to align with the render.
+    fn content_width(&self) -> u16 {
+        self.last_view
+            .width
+            .saturating_sub(1)
+            .saturating_sub(self.gutter())
+    }
+
+    /// Map a widget-local mouse position to an absolute layout `(row, col)`.
+    ///
+    /// `m_row`/`m_col` are TranscriptView-local (row 0 = the chat slot's top,
+    /// col 0 = its left edge). The absolute row is `first_visible_row + m_row`
+    /// with `m_row` first clamped into the viewport, so a drag past an edge
+    /// still resolves to the edge row (the caller auto-scrolls to reveal more).
+    /// The absolute col is `m_col - gutter`: the scrollbar owns the last
+    /// column, so we clamp into `[0, content_width]`, where the far edge is
+    /// end-of-line. Both coordinates are clamped into the grid.
+    fn point_to_abs(&mut self, m_row: i16, m_col: i16) -> (usize, usize) {
+        let gutter = i32::from(self.gutter());
+        let width = self.content_width();
+        let first = self.first_visible_row(width);
+        let line_count = self.line_count(width);
+
+        let height = i32::from(self.last_view.height);
+        let local_row = i32::from(m_row).clamp(0, (height - 1).max(0));
+        let abs_row = usize::try_from(local_row)
+            .unwrap_or(0)
+            .saturating_add(first)
+            .min(line_count.saturating_sub(1));
+
+        let content_col = (i32::from(m_col) - gutter).clamp(0, i32::from(width));
+        let abs_col = usize::try_from(content_col).unwrap_or(0);
+
+        (abs_row, abs_col)
+    }
+
+    /// Drive the free-form selection from a left-button mouse event (Spec E
+    /// section 2). Called only after the bars declined the event, so a
+    /// scrollbar-thumb drag scrolls rather than selects.
+    fn handle_selection_mouse(&mut self, ctx: &mut EventContext, m: &mouse::Mouse) {
+        match m.kind {
+            mouse::Type::Press => {
+                // A press anchors a fresh (zero-width) selection and stops the
+                // viewport chasing the tail so the anchor stays put.
+                let pos = self.point_to_abs(m.row, m.col);
+                self.selection = Some(Selection {
+                    anchor: pos,
+                    caret: pos,
+                });
+                self.follow_tail = false;
+                ctx.redraw = true;
+            }
+            mouse::Type::Drag => {
+                // Dragging past the top or bottom edge auto-scrolls by the
+                // overshoot so a selection can span more than one screen; the
+                // revealed rows extend the selection on subsequent frames.
+                let height = i16::try_from(self.last_view.height).unwrap_or(i16::MAX);
+                if m.row < 0 {
+                    self.list.borrow_mut().scroll_lines(i32::from(m.row));
+                } else if m.row >= height {
+                    self.list
+                        .borrow_mut()
+                        .scroll_lines(i32::from(m.row - height + 1));
+                }
+                let caret = self.point_to_abs(m.row, m.col);
+                match self.selection.as_mut() {
+                    Some(sel) => sel.caret = caret,
+                    // A drag with no prior press is not expected, but start a
+                    // selection at the caret rather than drop the interaction.
+                    None => {
+                        self.selection = Some(Selection {
+                            anchor: caret,
+                            caret,
+                        })
+                    }
+                }
+                ctx.redraw = true;
+            }
+            mouse::Type::Release => {
+                if let Some(sel) = self.selection {
+                    if sel.anchor == sel.caret {
+                        // A plain click (no drag) clears the selection.
+                        self.selection = None;
+                    } else {
+                        // Select-to-copy: a real range copies to the clipboard
+                        // via OSC 52 and stays highlighted until the next click
+                        // or Esc.
+                        let width = self.content_width();
+                        let text = self.extract_text(width, sel.anchor, sel.caret);
+                        ctx.copy_to_clipboard(text);
+                    }
+                    ctx.redraw = true;
+                }
+            }
+            mouse::Type::Motion => {}
+        }
+    }
+
+    /// Paint the active selection's highlight over the composed frame.
+    ///
+    /// Runs after the bars surface is composed into `surface`. We read the
+    /// composited cells back out and push a top-most overlay that copies every
+    /// cell verbatim except the selected ones, whose background is set to the
+    /// selection color. The cached entry surfaces are never touched: the
+    /// highlight lives only on this per-frame copy, so it is never baked in and
+    /// tracks the content as the viewport scrolls.
+    fn paint_selection(&mut self, surface: &mut Surface, sel: Selection) {
+        let (min, max) = if sel.anchor <= sel.caret {
+            (sel.anchor, sel.caret)
+        } else {
+            (sel.caret, sel.anchor)
+        };
+        let width = usize::from(self.content_width());
+        let gutter = usize::from(self.gutter());
+        let first = self.first_visible_row(width_u16(width));
+        let selection_bg = self.styles.selection_bg;
+
+        let grid = surface_rows(surface);
+        let height = grid.len();
+        // Nothing to paint when the selected rows lie entirely off-screen.
+        if height == 0 || max.0 < first || min.0 >= first + height {
+            return;
+        }
+
+        let mut overlay = Surface::with_size(surface.size);
+        for (r, row) in grid.iter().enumerate() {
+            let abs_row = first + r;
+            // The content-column span covered on this absolute row: from the
+            // anchor col on the first row, up to the caret col on the last,
+            // whole rows between.
+            let (from, to) = if abs_row < min.0 || abs_row > max.0 {
+                (0, 0)
+            } else {
+                let from = if abs_row == min.0 { min.1 } else { 0 };
+                let to = if abs_row == max.0 { max.1 } else { width };
+                (from.min(width), to.min(width))
+            };
+            for (c, cell) in row.iter().enumerate() {
+                let mut cell = cell.clone();
+                if to > from {
+                    // Screen col `c` maps to content col `c - gutter`; the
+                    // scrollbar column sits past `width` and so is never hit.
+                    if let Some(cc) = c.checked_sub(gutter) {
+                        if cc >= from && cc < to {
+                            cell.style.bg = selection_bg;
+                        }
+                    }
+                }
+                let (Ok(col), Ok(row_u16)) = (u16::try_from(c), u16::try_from(r)) else {
+                    continue;
+                };
+                overlay.write_cell(col, row_u16, cell);
+            }
+        }
+        surface.children.push(SubSurface {
+            origin: RelativePoint { row: 0, col: 0 },
+            surface: overlay,
+            z_index: 1,
+        });
+    }
+}
+
+/// `usize` back to the `u16` width the layout API takes, saturating a value
+/// too large for a terminal width rather than wrapping.
+fn width_u16(width: usize) -> u16 {
+    u16::try_from(width).unwrap_or(u16::MAX)
 }
 
 /// Set the scrollbar's muted-thumb tints from the transcript palette:
@@ -1625,6 +1895,16 @@ impl Widget for TranscriptView {
             surface: bars_surface,
             z_index: 0,
         });
+        // Record the viewport this draw laid out against, so the between-draw
+        // mouse handlers can map screen coordinates into the layout space.
+        self.last_view = ctx.max.size();
+        // Paint the selection highlight over the composed frame (Spec E
+        // section 2). A zero-width selection (a plain click) shows nothing.
+        if let Some(sel) = self.selection {
+            if sel.anchor != sel.caret {
+                self.paint_selection(&mut surface, sel);
+            }
+        }
         surface
     }
 
@@ -1649,6 +1929,15 @@ impl Widget for TranscriptView {
                 if ctx.consume_event {
                     return;
                 }
+                // Free-form selection over the content area (Spec E section 2).
+                // Runs only for the left button and only now that the bars
+                // declined the event, so a scrollbar-thumb drag scrolls rather
+                // than selects. The inner list ignores the left button, so we
+                // needn't forward it on.
+                if m.button == mouse::Button::Left {
+                    self.handle_selection_mouse(ctx, m);
+                    return;
+                }
                 if m.button == mouse::Button::WheelUp {
                     self.follow_tail = false;
                 }
@@ -1662,8 +1951,18 @@ impl Widget for TranscriptView {
             // focus, which cleanly exits the mode.
             Event::FocusIn => self.enter_focus_mode(ctx),
             Event::FocusOut => self.exit_focus_mode(ctx),
-            // Item navigation, live only while focused (see `handle_focus_key`).
-            Event::KeyPress(key) => self.handle_focus_key(ctx, key),
+            Event::KeyPress(key) => {
+                // Esc clears a live selection first (Spec E section 2), before
+                // the focus-mode Esc would leave the mode, so one Esc drops the
+                // highlight and a second exits focus.
+                if key.matches(Key::ESCAPE, Modifiers::empty()) && self.selection.is_some() {
+                    self.selection = None;
+                    return ctx.consume_and_redraw();
+                }
+                // Item navigation, live only while focused (see
+                // `handle_focus_key`).
+                self.handle_focus_key(ctx, key);
+            }
             _ => {}
         }
     }
@@ -3554,6 +3853,301 @@ mod tests {
         assert!(
             sub_text.contains("starting"),
             "the switched-to view's content is laid out: {sub_text:?}",
+        );
+    }
+
+    // ---- Free-form selection (Spec E section 2) --------------------------
+
+    /// Rows any cell of which carries the selection background.
+    fn highlighted_rows(grid: &[Vec<Cell>], bg: Color) -> Vec<usize> {
+        grid.iter()
+            .enumerate()
+            .filter(|(_, row)| row.iter().any(|cell| cell.style.bg == bg))
+            .map(|(r, _)| r)
+            .collect()
+    }
+
+    /// The screen<->absolute coordinate mapping is the crux of selection: at
+    /// several scroll positions `first_visible_row` and `point_to_abs` return
+    /// the expected absolute coordinates, and `entry_start_row` matches the
+    /// concatenated layout (entry N starts at the sum of prior entry line
+    /// counts). Twenty notices give a deterministic 40-row grid (entry `i` at
+    /// rows `[2i, 2i+1]`) taller than the 10-row viewport.
+    #[test]
+    fn coordinate_mapping_over_scroll_positions() {
+        let chat = chat_with_notices(20);
+        let mut view = transcript_view(&chat);
+        let (vw, vh) = (40u16, 10u16);
+        // The bars reserve the last column and there is no cursor gutter, so
+        // the content width the entries wrap at is vw - 1.
+        let content_w = vw - 1;
+        let ctx = draw_ctx(vw, vh);
+
+        // entry_start_row is the concatenated line offset, and one row past the
+        // last entry for an out-of-range index.
+        assert_eq!(view.entry_start_row(content_w, 0), 0);
+        assert_eq!(view.entry_start_row(content_w, 5), 10);
+        assert_eq!(view.entry_start_row(content_w, 19), 38);
+        assert_eq!(view.line_count(content_w), 40);
+        assert_eq!(view.entry_start_row(content_w, 20), 40, "past the end");
+
+        // Scrolled to the very top: the viewport top is absolute row 0.
+        view.follow_tail = false;
+        view.list.borrow_mut().scroll_lines(-1000);
+        let _ = view.draw(&ctx);
+        assert_eq!(view.first_visible_row(content_w), 0);
+        assert_eq!(view.point_to_abs(0, 1), (0, 1));
+        assert_eq!(view.point_to_abs(3, 5), (3, 5));
+
+        // Five lines down: the viewport top lands on absolute row 5.
+        view.list.borrow_mut().scroll_lines(5);
+        let _ = view.draw(&ctx);
+        assert_eq!(view.first_visible_row(content_w), 5);
+        assert_eq!(view.point_to_abs(0, 2), (5, 2));
+        assert_eq!(view.point_to_abs(2, 0), (7, 0));
+
+        // At the bottom (follow-tail): the last ten rows (30..=39) are shown.
+        view.follow_tail = true;
+        let _ = view.draw(&ctx);
+        assert_eq!(view.first_visible_row(content_w), 30);
+        assert_eq!(view.point_to_abs(0, 1), (30, 1));
+        assert_eq!(view.point_to_abs(9, 0), (39, 0));
+    }
+
+    /// `point_to_abs` clamps a click into the grid: past the bottom row clamps
+    /// to the last line, and the scrollbar column clamps to end-of-line rather
+    /// than past the content.
+    #[test]
+    fn point_to_abs_clamps_out_of_bounds_clicks() {
+        let chat = chat_with_notices(20);
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(40, 10);
+        view.follow_tail = false;
+        view.list.borrow_mut().scroll_lines(-1000);
+        let _ = view.draw(&ctx);
+
+        // A row past the viewport clamps to the last visible row's absolute
+        // line; the scrollbar column (39) clamps to the content width (39).
+        assert_eq!(view.point_to_abs(100, 39), (9, 39));
+        // A negative column clamps to col 0.
+        assert_eq!(view.point_to_abs(0, -5), (0, 0));
+    }
+
+    /// A selection over a known absolute range extracts exactly the copied
+    /// string (the range the release hands to OSC 52).
+    #[test]
+    fn selection_extracts_the_copied_text() {
+        let chat = chat_with_notices(3);
+        let mut view = transcript_view(&chat);
+        let w = 40u16;
+        view.selection = Some(Selection {
+            anchor: (0, 1),
+            caret: (2, 6),
+        });
+        let sel = view.selection.expect("selection set");
+        // " row 0" from col 1, the blank spacer, then " row 1" up to col 6.
+        assert_eq!(
+            view.extract_text(w, sel.anchor, sel.caret),
+            "row 0\n\n row 1",
+        );
+    }
+
+    /// A drawn selection highlights only the covered cells (the background is
+    /// restyled, the text preserved) and leaves every other cell untouched.
+    #[test]
+    fn selection_highlights_only_the_covered_cells() {
+        let chat = chat_with_notices(20);
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(40, 10);
+        let bg = view.styles.selection_bg;
+
+        // Top of the transcript, so absolute rows equal screen rows.
+        view.follow_tail = false;
+        view.list.borrow_mut().scroll_lines(-1000);
+        let _ = view.draw(&ctx);
+        assert_eq!(view.first_visible_row(39), 0);
+
+        // Highlight " row 1" (absolute row 2), content cols [0, 6).
+        view.selection = Some(Selection {
+            anchor: (2, 0),
+            caret: (2, 6),
+        });
+        let surface = view.draw(&ctx);
+        let grid = crate::test_support::flatten(&surface);
+        let rows = crate::test_support::rows(&surface);
+        assert_eq!(rows[2], " row 1", "text under the highlight is preserved");
+
+        // The covered cells carry the selection background.
+        for c in 0..6 {
+            assert_eq!(grid[2][c].style.bg, bg, "cell (2,{c}) is highlighted");
+        }
+        // Cells past the caret on that row are untouched.
+        for c in 6..40 {
+            assert_ne!(grid[2][c].style.bg, bg, "cell (2,{c}) is not highlighted");
+        }
+        // No other row is highlighted.
+        assert_eq!(highlighted_rows(&grid, bg), vec![2]);
+    }
+
+    /// A selection whose rows lie entirely off-screen paints nothing.
+    #[test]
+    fn offscreen_selection_paints_nothing() {
+        let chat = chat_with_notices(20);
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(40, 10);
+        let bg = view.styles.selection_bg;
+
+        // Top of the transcript shows rows 0..=9; select rows well below it.
+        view.follow_tail = false;
+        view.list.borrow_mut().scroll_lines(-1000);
+        let _ = view.draw(&ctx);
+        assert_eq!(view.first_visible_row(39), 0);
+        view.selection = Some(Selection {
+            anchor: (30, 0),
+            caret: (31, 4),
+        });
+        let grid = crate::test_support::flatten(&view.draw(&ctx));
+        assert!(
+            highlighted_rows(&grid, bg).is_empty(),
+            "off-screen selection painted on screen",
+        );
+    }
+
+    /// The same absolute range highlights different screen rows as the
+    /// viewport scrolls: the selection tracks content, not the viewport.
+    #[test]
+    fn highlight_tracks_content_across_scroll() {
+        let chat = chat_with_notices(20);
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(40, 10);
+        let bg = view.styles.selection_bg;
+
+        // Bottom: rows 30..=39 visible. Highlight " row 16" (absolute row 32).
+        let _ = view.draw(&ctx);
+        assert_eq!(view.first_visible_row(39), 30);
+        view.selection = Some(Selection {
+            anchor: (32, 0),
+            caret: (32, 6),
+        });
+        let surface = view.draw(&ctx);
+        let rows = crate::test_support::rows(&surface);
+        let grid = crate::test_support::flatten(&surface);
+        assert_eq!(rows[2], " row 16", "abs row 32 is screen row 2 at bottom");
+        assert_eq!(highlighted_rows(&grid, bg), vec![2]);
+
+        // Scroll up two lines: the viewport top is now absolute row 28, so the
+        // same range moves to screen row 4.
+        view.follow_tail = false;
+        view.list.borrow_mut().scroll_lines(-2);
+        let surface = view.draw(&ctx);
+        assert_eq!(view.first_visible_row(39), 28);
+        let rows = crate::test_support::rows(&surface);
+        let grid = crate::test_support::flatten(&surface);
+        assert_eq!(rows[4], " row 16", "the same content moved down two rows");
+        assert_eq!(highlighted_rows(&grid, bg), vec![4]);
+    }
+
+    /// A left press-drag-release over a real range copies the extracted text to
+    /// the clipboard via OSC 52 and keeps the range highlighted.
+    #[test]
+    fn press_drag_release_copies_and_keeps_the_highlight() {
+        let chat = chat_with_notices(20);
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(40, 10);
+        view.follow_tail = false;
+        view.list.borrow_mut().scroll_lines(-1000);
+        let _ = view.draw(&ctx);
+
+        // Press on " row 1" (screen row 2, col 0): a fresh anchor, follow-tail
+        // off.
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &mouse(0, 2, mouse::Type::Press));
+        assert!(view.selection.is_some(), "press anchors a selection");
+        assert!(!view.follow_tail, "press disengages follow-tail");
+
+        // Drag to col 6: the caret follows.
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &mouse(6, 2, mouse::Type::Drag));
+        let sel = view.selection.expect("selection present");
+        assert_eq!(sel.anchor, (2, 0));
+        assert_eq!(sel.caret, (2, 6));
+
+        // Release copies the extracted range via OSC 52 and keeps the
+        // highlight.
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &mouse(6, 2, mouse::Type::Release));
+        let copied = ec.cmds.iter().find_map(|cmd| match cmd {
+            vaxis::vxfw::Command::CopyToClipboard(text) => Some(text.clone()),
+            _ => None,
+        });
+        assert_eq!(copied.as_deref(), Some(" row 1"), "copied the selection");
+        assert!(
+            view.selection.is_some(),
+            "a real range stays highlighted after copy",
+        );
+    }
+
+    /// A drag past the bottom edge auto-scrolls the list so the selection can
+    /// span more than one screen.
+    #[test]
+    fn drag_past_the_bottom_edge_autoscrolls() {
+        let chat = chat_with_notices(20);
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(40, 10);
+        // Start scrolled up so there is room to scroll down.
+        view.follow_tail = false;
+        view.list.borrow_mut().scroll_lines(-1000);
+        let _ = view.draw(&ctx);
+        let before = view.first_visible_row(39);
+
+        // Press inside the viewport, then drag below its bottom row.
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &mouse(2, 5, mouse::Type::Press));
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &mouse(2, 20, mouse::Type::Drag));
+        let _ = view.draw(&ctx);
+        assert!(
+            view.first_visible_row(39) > before,
+            "dragging past the bottom scrolled the viewport down",
+        );
+    }
+
+    /// Esc clears a live selection (and is consumed), and a plain click (press
+    /// then release at the same point, no drag) clears it too.
+    #[test]
+    fn esc_and_plain_click_clear_the_selection() {
+        let chat = chat_with_notices(20);
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(40, 10);
+        view.follow_tail = false;
+        view.list.borrow_mut().scroll_lines(-1000);
+        let _ = view.draw(&ctx);
+
+        // Esc clears.
+        view.selection = Some(Selection {
+            anchor: (2, 0),
+            caret: (2, 6),
+        });
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &key_press(Key::ESCAPE, Modifiers::empty()));
+        assert!(view.selection.is_none(), "Esc cleared the selection");
+        assert!(ec.consume_event, "Esc was consumed");
+
+        // A plain click clears: a press re-anchors a zero-width selection, and
+        // the release with no drag drops it.
+        view.selection = Some(Selection {
+            anchor: (2, 0),
+            caret: (2, 6),
+        });
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &mouse(4, 5, mouse::Type::Press));
+        let sel = view.selection.expect("press re-anchored");
+        assert_eq!(sel.anchor, sel.caret, "a press is a zero-width selection");
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &mouse(4, 5, mouse::Type::Release));
+        assert!(
+            view.selection.is_none(),
+            "a plain click cleared the selection"
         );
     }
 }

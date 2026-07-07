@@ -338,6 +338,29 @@ impl ListView {
         self.last_viewport_height
     }
 
+    /// Item index of the first in-view widget as of the last completed draw.
+    ///
+    /// Together with [`scroll_offset`](Self::scroll_offset) this pins the
+    /// viewport top: the top item begins `scroll_offset` lines above the
+    /// viewport edge, so the absolute line shown at the top is that item's
+    /// start line plus the offset. Reflects the last draw's reconciliation,
+    /// not any scroll input queued since. Mirrors the `ScrollableView`
+    /// accessor of the same name, exposed inherently so callers holding a
+    /// concrete `ListView` need not import the trait.
+    pub fn scroll_top(&self) -> u32 {
+        self.scroll.top
+    }
+
+    /// Lines of the top item scrolled above the viewport edge as of the last
+    /// completed draw.
+    ///
+    /// Always `>= 0`: the draw reconciles the offset to the count of the top
+    /// item's rows sitting above the viewport top. See
+    /// [`scroll_top`](Self::scroll_top) for the pairing.
+    pub fn scroll_offset(&self) -> i32 {
+        self.scroll.offset
+    }
+
     /// Inserts children at the front of `child_list` until `add_height` lines
     /// are filled above the current top, walking upward from `top - 1`.
     fn insert_children(
@@ -1054,6 +1077,36 @@ mod tests {
         assert_eq!(list_view.viewport_height(), None);
         list_view.draw(&draw_ctx(16, 7));
         assert_eq!(list_view.viewport_height(), Some(7));
+    }
+
+    /// `scroll_top` / `scroll_offset` report the viewport top the last draw
+    /// reconciled, so a caller can map screen rows into the content's line
+    /// space. Scrolling a few lines into a multi-line first item advances the
+    /// offset without changing the top item; scrolling past it advances the
+    /// top.
+    #[test]
+    fn list_view_reports_reconciled_scroll_top_and_offset() {
+        let mut list_view = ListView::new(Source::Slice(vec![
+            text("0\n1\n2\n3\n4"),
+            text("5"),
+            text("6"),
+            text("7"),
+        ]));
+        list_view.draw_cursor = false;
+        let ctx = draw_ctx(16, 3);
+        list_view.draw(&ctx);
+        assert_eq!((list_view.scroll_top(), list_view.scroll_offset()), (0, 0));
+
+        // Two lines into the five-line first item: same top, offset 2.
+        list_view.scroll_lines(2);
+        list_view.draw(&ctx);
+        assert_eq!((list_view.scroll_top(), list_view.scroll_offset()), (0, 2));
+
+        // Past the first item: the top advances to the second item.
+        list_view.scroll_lines(4);
+        list_view.draw(&ctx);
+        assert_eq!(list_view.scroll_top(), 1);
+        assert_eq!(list_view.scroll_offset(), 0);
     }
 
     #[test]
