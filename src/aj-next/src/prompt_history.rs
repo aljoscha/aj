@@ -194,6 +194,8 @@ pub(crate) fn open_prompt_history(
     let focus = select.borrow().focus_target();
     {
         let mut sel = select.borrow_mut();
+        // The history list can run long, so show the vertical scroll bar.
+        sel.set_show_scrollbar(true);
         let recall_c = Rc::clone(recall_slot);
         let stack_c = Rc::clone(stack);
         let editor_c = Rc::clone(editor);

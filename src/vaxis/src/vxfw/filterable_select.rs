@@ -32,13 +32,13 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::cell::{Color, Style};
+use crate::cell::{Cell, Character, Color, Style};
 use crate::fuzzy::FuzzyMatcher;
 use crate::key::{Key, Modifiers};
 use crate::vxfw::{
-    Builder, DrawContext, Event, EventContext, ListView, MaxSize, RelativePoint, RichText, Size,
-    Source, SubSurface, Surface, TextField, TextSpan, Widget, WidgetRef, WidthBasis, draw_widget,
-    to_widget_ref,
+    Builder, DrawContext, Event, EventContext, ListView, MaxSize, RelativePoint, RichText,
+    ScrollBars, Size, Source, SubSurface, Surface, TextField, TextSpan, Widget, WidgetRef,
+    WidthBasis, draw_widget, to_widget_ref,
 };
 
 /// Theme styles for the pick list's rows, threaded from the host's palette so
@@ -56,6 +56,9 @@ pub struct SelectStyles {
     pub label: Style,
     /// Foreground for the secondary (description) column, typically dimmed.
     pub secondary: Style,
+    /// Foreground of the vertical scroll-bar thumb, for selectors that show
+    /// one ([`FilterableSelect::set_show_scrollbar`]). Ignored otherwise.
+    pub scrollbar_thumb: Style,
 }
 
 impl Default for SelectStyles {
@@ -66,6 +69,7 @@ impl Default for SelectStyles {
             selected_bg: Color::Default,
             label: Style::default(),
             secondary: Style::default(),
+            scrollbar_thumb: Style::default(),
         }
     }
 }
@@ -300,11 +304,38 @@ fn merge_ranked(a: Vec<(usize, u32)>, b: Vec<(usize, u32)>) -> Vec<(usize, u32)>
     out
 }
 
+/// Tint the vertical scroll-bar thumb cells from `style`.
+///
+/// Applied on each draw so a runtime restyle (theme swap) is reflected
+/// without rebuilding the bars. The hover and drag cells are set for
+/// completeness. The pick list forwards no mouse events to the bars, so
+/// only the base thumb is ever drawn.
+fn apply_thumb_style(bars: &mut ScrollBars<ListView>, style: Style) {
+    let cell = |grapheme: &str| Cell {
+        char: Character::new(grapheme, 1),
+        style,
+        ..Cell::default()
+    };
+    bars.vertical_scrollbar_thumb = cell("\u{2590}");
+    bars.vertical_scrollbar_hover_thumb = cell("\u{2588}");
+    bars.vertical_scrollbar_drag_thumb = cell("\u{2588}");
+}
+
 /// A fuzzy-filterable select list: a [`TextField`] filter row, a blank
 /// separator row, and a [`ListView`] of the matching rows below.
 pub struct FilterableSelect {
     filter: Rc<RefCell<TextField>>,
     list: Rc<RefCell<ListView>>,
+    /// Scroll bars wrapping the list (sharing its `Rc` via `bars.view`), for
+    /// the vertical thumb. `draw` enables the vertical bar per frame only
+    /// when [`Self::show_scrollbar`] is set and the list actually overflows,
+    /// so a list that fits keeps the full width and shows no bar. The
+    /// horizontal bar is always off (a pick list has no horizontal axis).
+    bars: ScrollBars<ListView>,
+    /// Whether the caller wants a vertical scroll bar when the list overflows
+    /// ([`Self::set_show_scrollbar`]). The bar is still hidden while the list
+    /// fits.
+    show_scrollbar: bool,
     state: Rc<RefCell<SelectState>>,
     styles: Rc<RefCell<SelectStyles>>,
     /// Fires on Enter/Ctrl+J with the highlighted item. No-op while the
@@ -325,19 +356,24 @@ impl FilterableSelect {
             matcher: FuzzyMatcher::new(),
         }));
         let styles = Rc::new(RefCell::new(styles));
-        let list = Rc::new(RefCell::new(ListView::new(Source::Builder(Box::new(
-            RowBuilder {
-                state: Rc::clone(&state),
-                styles: Rc::clone(&styles),
-            },
-        )))));
-        {
-            let mut list = list.borrow_mut();
-            // The band replaces the arrow gutter, so the list draws no cursor
-            // indicator of its own.
-            list.draw_cursor = false;
-            full_filter(&mut state.borrow_mut(), &mut list);
-        }
+        let mut list_view = ListView::new(Source::Builder(Box::new(RowBuilder {
+            state: Rc::clone(&state),
+            styles: Rc::clone(&styles),
+        })));
+        // The band replaces the arrow gutter, so the list draws no cursor
+        // indicator of its own.
+        list_view.draw_cursor = false;
+
+        // Wrap the list in scroll bars for the vertical thumb. The bars own
+        // the list behind their shared `view` handle, which we keep a clone
+        // of for the widget's own accessors. A pick list has no horizontal
+        // axis, and the vertical bar is opt-in so selectors that don't want
+        // it stay pixel-identical (`draw` reserves no column while it is off).
+        let mut bars = ScrollBars::new(list_view);
+        bars.draw_horizontal_scrollbar = false;
+        bars.draw_vertical_scrollbar = false;
+        let list = Rc::clone(&bars.view);
+        full_filter(&mut state.borrow_mut(), &mut list.borrow_mut());
 
         let filter = Rc::new(RefCell::new(TextField::new()));
         {
@@ -368,11 +404,23 @@ impl FilterableSelect {
         FilterableSelect {
             filter,
             list,
+            bars,
+            show_scrollbar: false,
             state,
             styles,
             on_confirm: None,
             on_cancel: None,
         }
+    }
+
+    /// Opt into a vertical scroll bar for a list that can overflow. Off by
+    /// default. Even when on, `draw` shows the bar only while the list has
+    /// more rows than fit, so a short or filtered-down list keeps the full
+    /// width and no bar. Wheel and arrow keys drive the scroll (the thumb is
+    /// a position indicator, not a drag handle), matching the read-only
+    /// content overlays.
+    pub fn set_show_scrollbar(&mut self, show: bool) {
+        self.show_scrollbar = show;
     }
 
     /// The widget the host should focus while this select is active: the
@@ -499,9 +547,22 @@ impl Widget for FilterableSelect {
                     height: Some(list_height),
                 },
             );
+            // Show the vertical bar only when the caller opted in and the
+            // list overflows the viewport. Rows are single-line
+            // (softwrap off), so overflow is exactly "more visible rows than
+            // fit", knowable here without a trial draw and stable under the
+            // one-column narrowing the bar adds (the row count can't change).
+            let overflow = self.state.borrow().visible.len() > usize::from(list_height);
+            self.bars.draw_vertical_scrollbar = self.show_scrollbar && overflow;
+            // Tint the thumb from the live styles so a runtime restyle (theme
+            // swap) is reflected without rebuilding the bars. The bars draw
+            // the inner list (stamping its identity for wheel/key routing) and
+            // reserve the rightmost column for the thumb only while the
+            // vertical bar is enabled.
+            apply_thumb_style(&mut self.bars, self.styles.borrow().scrollbar_thumb);
             surface.children.push(SubSurface {
                 origin: RelativePoint { row: 2, col: 0 },
-                surface: draw_widget(&to_widget_ref(Rc::clone(&self.list)), &list_ctx),
+                surface: self.bars.draw(&list_ctx),
                 z_index: 0,
             });
         }
@@ -734,14 +795,16 @@ mod tests {
                 selected_bg: band,
                 label: Style::default(),
                 secondary: Style::default(),
+                scrollbar_thumb: Style::default(),
             },
         );
 
         let row_bgs = |select: &mut FilterableSelect| -> Vec<Vec<Color>> {
             let surface = select.draw(&draw_ctx(30, 10));
-            // The list sub-surface sits at row 2; read each of its rows'
-            // backgrounds across the full width.
-            let list = &surface.children[1].surface;
+            // The scroll-bars wrapper sits at row 2; its first child is the
+            // inner list, whose children are the row sub-surfaces.
+            let bars = &surface.children[1].surface;
+            let list = &bars.children[0].surface;
             // The list wraps each row in a child sub-surface; flatten one
             // level to read the row cells.
             list.children
@@ -789,6 +852,66 @@ mod tests {
             bgs[1].iter().all(|c| *c == band),
             "band moved to the second row: {:?}",
             bgs[1]
+        );
+    }
+
+    /// The opt-in vertical scroll bar reserves the rightmost column and
+    /// draws a thumb once the list overflows the viewport; while it is off
+    /// the list keeps the full width and no thumb column appears.
+    #[test]
+    fn scrollbar_reserves_a_column_and_shows_a_thumb_on_overflow() {
+        let labels: Vec<String> = (0..20).map(|i| format!("row{i}")).collect();
+        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let mut select = FilterableSelect::new(items(&refs), SelectStyles::default());
+
+        // Off by default: the bars draw the list at full width, no thumb.
+        let surface = select.draw(&draw_ctx(30, 10));
+        let bars = &surface.children[1].surface;
+        assert_eq!(
+            bars.children.len(),
+            1,
+            "no thumb column while the bar is off"
+        );
+        assert_eq!(
+            bars.children[0].surface.size.width, 30,
+            "list spans the full width with the bar off"
+        );
+
+        // On: 20 rows overflow the 8-row list viewport, so the list narrows
+        // by one column and a one-column thumb bar is drawn on the right.
+        select.set_show_scrollbar(true);
+        let surface = select.draw(&draw_ctx(30, 10));
+        let bars = &surface.children[1].surface;
+        assert_eq!(
+            bars.children[0].surface.size.width, 29,
+            "list left a column for the bar"
+        );
+        let thumb = bars
+            .children
+            .iter()
+            .find(|c| c.origin.col == 29)
+            .expect("thumb bar drawn on the rightmost column");
+        assert_eq!(thumb.surface.size.width, 1, "thumb bar is one column wide");
+    }
+
+    /// With the bar on but the list fitting the viewport, no bar is drawn and
+    /// the list keeps the full width. The column is reclaimed until the list
+    /// actually overflows.
+    #[test]
+    fn scrollbar_hidden_while_the_list_fits() {
+        let mut select = FilterableSelect::new(items(&["a0", "a1", "a2"]), SelectStyles::default());
+        select.set_show_scrollbar(true);
+        // Three rows in an 8-row list viewport: nothing overflows.
+        let surface = select.draw(&draw_ctx(30, 10));
+        let bars = &surface.children[1].surface;
+        assert_eq!(
+            bars.children.len(),
+            1,
+            "no thumb column while the list fits, only the inner view"
+        );
+        assert_eq!(
+            bars.children[0].surface.size.width, 30,
+            "the list keeps the full width until it overflows"
         );
     }
 

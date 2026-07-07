@@ -85,6 +85,8 @@ pub(crate) fn open_session_selector(
     let ids: Rc<RefCell<HashMap<String, String>>> = Rc::new(RefCell::new(HashMap::new()));
     {
         let mut sel = select.borrow_mut();
+        // A project can hold many sessions, so show the vertical scroll bar.
+        sel.set_show_scrollbar(true);
         let ids_c = Rc::clone(&ids);
         let current_c = current.clone();
         let request_c = Rc::clone(request_slot);

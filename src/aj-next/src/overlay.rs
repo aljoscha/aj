@@ -245,6 +245,7 @@ pub(crate) fn select_styles_from_theme(theme: &Theme) -> SelectStyles {
         selected_bg: vaxis_color(theme.bg_color(ThemeBg::SelectedBg), mode),
         label: fg(ThemeColor::Text),
         secondary: fg(ThemeColor::Muted),
+        scrollbar_thumb: fg(ThemeColor::Dim),
     }
 }
 
