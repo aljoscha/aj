@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aj_agent::TurnError;
 use aj_agent::events::{AgentEvent, AgentId, CompactionReason};
@@ -3309,6 +3309,29 @@ async fn recv_theme(rx: Option<&mut UnboundedReceiver<Theme>>) -> Option<Theme> 
 /// input ends, `New` / `Switch(id)` when a session change is requested (only
 /// ever with no turn in flight). The outer loop in [`run`] tears the session
 /// down and, for a change, builds the next one over the same Shell.
+/// Upper bound on interactive redraws per second. The drive loop paces
+/// `render_if_needed` to this rate so a fast redraw source (a streaming turn's
+/// `MessageUpdate`s, say) cannot drive more than one full-tree relayout and
+/// paint per frame budget. 60 keeps the UI smooth while capping the redundant
+/// paints a burst would otherwise trigger.
+const REDRAW_FPS_CAP: u32 = 60;
+
+/// Whether the frame budget has elapsed since the last paint. A `None` last
+/// paint (nothing painted yet this loop) always counts as elapsed, so the
+/// first pending redraw paints immediately rather than waiting out a budget
+/// measured from an arbitrary start point.
+fn frame_budget_elapsed(last_render: Option<Instant>, interval: Duration) -> bool {
+    last_render.is_none_or(|t| t.elapsed() >= interval)
+}
+
+/// The earlier of two optional deadlines, or whichever one is set.
+fn earliest_deadline(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
 async fn drive(
     app: &mut AsyncApp,
     root: &WidgetRef,
@@ -3363,22 +3386,44 @@ async fn drive(
     // stack) because it is async and long-running, but paired with the
     // dialog overlay it pushed.
     let mut login_session: Option<LoginSession> = None;
+    // Frame pacing: cap redraws at `REDRAW_FPS_CAP`. Requests that arrive
+    // within a frame budget coalesce into one paint (the redraw latch is a
+    // single bool), and a request landing inside the current budget is
+    // deferred, not dropped: the merged `deadline` below wakes the loop at the
+    // budget expiry so the coalesced paint lands then.
+    let frame_interval = Duration::from_secs(1) / REDRAW_FPS_CAP;
+    // `None` means nothing has painted in this loop yet, so the first pending
+    // redraw paints without waiting.
+    let mut last_render: Option<Instant> = None;
     let exit = loop {
-        // Paint current state before blocking on the next event: whenever the
-        // loop is about to wait, the screen must already reflect current
-        // state. This flushes redraws requested while reacting to the previous
-        // event (the arms below and the post-select sync block), and,
-        // crucially, state changed before we entered the loop with nothing
-        // else to wake us: a session the outer loop just rebuilt, or the
-        // startup color-mode reconcile. Without it the latch sits set until some unrelated event wakes the select. It
-        // is a no-op when the latch is clean, and `init` drew the first frame,
-        // so this never double-draws. Cross-thread wakers still ping their own
-        // channels (e.g. the login redraw ping) to get us back here.
-        app.render_if_needed(root)?;
-        // Compute the tick deadline before the select so no arm holds
-        // a borrow of `app` another arm needs. The sleep expression is
-        // evaluated even when the guard is false, hence the fallback.
-        let deadline = app.next_tick_deadline();
+        // Paint current state before blocking on the next event, subject to
+        // the frame cap: whenever the loop is about to wait, the screen must
+        // already reflect current state. This flushes redraws requested while
+        // reacting to the previous event (the arms below and the post-select
+        // sync block), and, crucially, state changed before we entered the
+        // loop with nothing else to wake us: a session the outer loop just
+        // rebuilt, or the startup color-mode reconcile. When a redraw is
+        // pending but the frame budget has not elapsed, we leave the latch set
+        // and let the frame arm of the select below wake us at budget expiry.
+        // We paint only when the latch is set, so a clean iteration and
+        // `init`'s already-drawn first frame never repaint. Cross-thread wakers
+        // still ping their own channels (e.g. the login redraw ping) to get us
+        // back here.
+        if app.needs_redraw() && frame_budget_elapsed(last_render, frame_interval) {
+            app.render(root)?;
+            last_render = Some(Instant::now());
+        }
+        // Compute the wake deadline before the select so no arm holds a borrow
+        // of `app` another arm needs. It merges the soonest widget tick with
+        // the budget expiry of a redraw the cap is holding back, so a paced
+        // redraw is never stranded waiting for an unrelated event. The sleep
+        // expression is evaluated even when the guard is false, hence the
+        // fallback.
+        let tick_deadline = app.next_tick_deadline();
+        let frame_deadline = app
+            .needs_redraw()
+            .then(|| last_render.map_or_else(Instant::now, |t| t + frame_interval));
+        let deadline = earliest_deadline(tick_deadline, frame_deadline);
         tokio::select! {
             biased;
 
@@ -3840,6 +3885,10 @@ async fn drive(
             _ = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now).into()),
                 if deadline.is_some() =>
             {
+                // The merged deadline fires for a widget tick, a paced redraw
+                // held back by the frame cap, or both. Firing due timers is a
+                // no-op when none are due (a pure frame wake), and the paint at
+                // the top of the loop flushes the deferred redraw.
                 if app.fire_due_timers().quit {
                     break Ok(SessionExit::Quit);
                 }
