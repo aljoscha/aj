@@ -170,6 +170,12 @@ pub struct SelectListLayout {
     /// — used by the read-only help overlay where there is no
     /// interactive selection to highlight.
     pub show_selection_indicator: bool,
+    /// When `true`, a read-only list (`show_selection_indicator: false`)
+    /// drops the 2-column leading gutter so rows start flush at column 0.
+    /// Ignored for interactive lists, which always reserve the gutter for
+    /// their `→ ` selection cue. Defaults to `false` (gutter present), so
+    /// every existing caller keeps its current indentation.
+    pub flush_left: bool,
     /// When `true` (default), Up at the first row wraps to the last row
     /// and Down at the last row wraps to the first. When `false`,
     /// navigation clamps at the ends so holding a key settles on the
@@ -191,6 +197,7 @@ impl Default for SelectListLayout {
             truncate_primary: None,
             max_prefix_column_width: None,
             show_selection_indicator: true,
+            flush_left: false,
             wrap_selection: true,
             filter_mode: FilterMode::Fuzzy,
             empty_message: "No matching commands".to_string(),
@@ -587,8 +594,14 @@ impl SelectList {
         prefix_column_width: usize,
     ) -> String {
         let show_indicator = self.layout.show_selection_indicator;
+        // A read-only list may opt out of the 2-column leading gutter so
+        // its rows start flush at column 0. Gated on `!show_indicator` so
+        // an interactive list always keeps the space for its `→ ` cue and
+        // selected row, even if the flag were set.
         let arrow = if show_indicator && is_selected {
             "→ "
+        } else if !show_indicator && self.layout.flush_left {
+            ""
         } else {
             "  "
         };
@@ -1122,6 +1135,82 @@ mod tests {
         let lines = list.render(40);
         assert!(!lines[0].contains('→'), "row 0: {:?}", lines[0]);
         assert!(lines[0].starts_with("  "), "row 0: {:?}", lines[0]);
+    }
+
+    /// `flush_left` drops the 2-column leading gutter, but only for a
+    /// read-only list (`show_selection_indicator: false`). Without the
+    /// flag the gutter stays, and an interactive list ignores it (the
+    /// `→ ` / `  ` cue always occupies the gutter).
+    #[test]
+    fn flush_left_drops_gutter_only_for_read_only_lists() {
+        // A header row (no leading spaces) and a key/value row that
+        // carries its own 2-space indent, mirroring the session-info rows.
+        let items = || {
+            vec![
+                SelectItem::new("", "Session"),
+                SelectItem::new("", "  id  42"),
+            ]
+        };
+
+        // Read-only + flush_left: the header starts flush at column 0 and
+        // the kv row one level in at column 2.
+        let layout = SelectListLayout {
+            show_selection_indicator: false,
+            flush_left: true,
+            ..Default::default()
+        };
+        let mut list = SelectList::new(items(), 5, identity_theme(), layout);
+        let lines = list.render(40);
+        assert!(
+            lines[0].starts_with("Session"),
+            "flushed header at column 0: {:?}",
+            lines[0]
+        );
+        assert!(
+            lines[1].starts_with("  id"),
+            "flushed kv one level in: {:?}",
+            lines[1]
+        );
+
+        // Read-only without flush_left: the 2-space gutter is kept, so the
+        // header lands at column 2 and the kv row at column 4.
+        let layout = SelectListLayout {
+            show_selection_indicator: false,
+            flush_left: false,
+            ..Default::default()
+        };
+        let mut list = SelectList::new(items(), 5, identity_theme(), layout);
+        let lines = list.render(40);
+        assert!(
+            lines[0].starts_with("  Session"),
+            "gutter header at column 2: {:?}",
+            lines[0]
+        );
+        assert!(
+            lines[1].starts_with("    id"),
+            "gutter kv at column 4: {:?}",
+            lines[1]
+        );
+
+        // Interactive list: flush_left is a no-op. The selected (first)
+        // row keeps its `→ ` cue and the rest keep the `  ` gutter.
+        let layout = SelectListLayout {
+            show_selection_indicator: true,
+            flush_left: true,
+            ..Default::default()
+        };
+        let mut list = SelectList::new(items(), 5, identity_theme(), layout);
+        let lines = list.render(40);
+        assert!(
+            lines[0].starts_with("→ Session"),
+            "arrow cue preserved: {:?}",
+            lines[0]
+        );
+        assert!(
+            lines[1].starts_with("  "),
+            "non-selected gutter preserved: {:?}",
+            lines[1]
+        );
     }
 
     #[test]

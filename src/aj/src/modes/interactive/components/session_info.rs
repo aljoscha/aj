@@ -23,6 +23,9 @@ pub type SessionInfoOutcomeHandle = ReadOnlyCloseHandle;
 pub fn build_overlay(list_theme: SelectListTheme, stats: SessionStats) -> ReadOnlyListOverlay {
     let layout = SelectListLayout {
         show_selection_indicator: false,
+        // Flatten the overlay: section headers sit flush-left at column 0
+        // and the 2-space-indented key/value rows one level in at column 2.
+        flush_left: true,
         ..Default::default()
     };
     let items = render_rows(&digest(&stats));
@@ -128,12 +131,12 @@ mod tests {
     #[test]
     fn renders_identity_counts_and_tool_breakdown() {
         let mut c = build_overlay(identity_theme(), sample_stats());
-        let body = c
+        let lines: Vec<String> = c
             .render(120)
             .iter()
-            .map(|l| l.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
+            .map(|l| l.as_str().to_string())
+            .collect();
+        let body = lines.join("\n");
         assert!(body.contains("2026-06-19-14-22-03-512"), "{body}");
         assert!(body.contains("home-u-proj"), "{body}");
         assert!(body.contains("anthropic / claude-sonnet-4-5"), "{body}");
@@ -146,6 +149,24 @@ mod tests {
         assert!(body.contains("Usage"), "{body}");
         assert!(body.contains("total tokens"), "{body}");
         assert!(body.contains("$0.3300"), "{body}");
+
+        // The overlay is flattened: section headers sit flush-left at
+        // column 0 (no leading gutter).
+        assert!(lines.iter().any(|l| l == "Session"), "{body}");
+        assert!(lines.iter().any(|l| l == "Settings"), "{body}");
+        assert!(lines.iter().any(|l| l == "Usage"), "{body}");
+        assert!(lines.iter().any(|l| l == "Tool calls (31)"), "{body}");
+
+        // Key/value rows sit one level in at column 2, not the old column 4.
+        let id_row = lines
+            .iter()
+            .find(|l| l.starts_with("  id"))
+            .unwrap_or_else(|| panic!("id row present: {body}"));
+        assert!(id_row.starts_with("  id"), "kv at column 2: {id_row:?}");
+        assert!(
+            !id_row.starts_with("    id"),
+            "kv not at column 4: {id_row:?}"
+        );
     }
 
     #[test]
