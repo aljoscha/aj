@@ -5,6 +5,9 @@
 //! and one blank padding row above and below the child. All input, focus, and
 //! outcome behavior belongs to the child.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use crate::cell::{Cell, Character, Style};
 use crate::vxfw::{
     DrawContext, MaxSize, RelativePoint, Size, SubSurface, Surface, Widget, WidgetRef, draw_widget,
@@ -31,6 +34,14 @@ pub struct OverlayWindow {
     /// Inline label on the bottom edge, inset one dash from the right corner.
     /// Empty means no subtitle.
     pub subtitle: String,
+    /// A live subtitle read from this shared cell on each draw, overriding
+    /// the static `subtitle` while set (`None` uses `subtitle`).
+    ///
+    /// The window only reads the cell, and does so after it draws the child,
+    /// so keeping the cell current is the child's job: a child that wants a
+    /// phase-dependent footer in the border writes its hint into this cell
+    /// during its own draw and sees it the same frame.
+    pub subtitle_source: Option<Rc<RefCell<String>>>,
     pub border_style: Style,
     pub title_style: Style,
     pub subtitle_style: Style,
@@ -43,6 +54,7 @@ impl OverlayWindow {
             child,
             title: title.into(),
             subtitle: String::new(),
+            subtitle_source: None,
             border_style: Style::default(),
             title_style: Style::default(),
             subtitle_style: Style::default(),
@@ -187,7 +199,13 @@ impl Widget for OverlayWindow {
             );
         }
         if size.height >= 2 {
-            let subtitle = self.subtitle.clone();
+            // The child's draw already ran above, so a live `subtitle_source`
+            // it wrote this frame is fresh here.
+            let subtitle = self
+                .subtitle_source
+                .as_ref()
+                .map(|s| s.borrow().clone())
+                .unwrap_or_else(|| self.subtitle.clone());
             self.write_edge(
                 &mut surf,
                 ctx,
@@ -295,6 +313,41 @@ mod tests {
         let top = row_text(&surf, 0);
         assert!(top.contains('…'), "top: {top:?}");
         assert!(top.starts_with('╭') && top.ends_with('╮'), "top: {top:?}");
+    }
+
+    #[test]
+    fn subtitle_source_is_reread_each_draw() {
+        let child: WidgetRef = Rc::new(RefCell::new(Text::new("x")));
+        let mut win = OverlayWindow::new("Title", child);
+        // The static subtitle is set but must be overridden by the source.
+        win.subtitle = "static".to_string();
+        let cell = Rc::new(RefCell::new("first".to_string()));
+        win.subtitle_source = Some(Rc::clone(&cell));
+
+        let ctx = draw_ctx(40, 10);
+        let surf = win.draw(&ctx);
+        let bottom = row_text(&surf, 9);
+        assert!(bottom.ends_with("─ first ─╯"), "bottom: {bottom:?}");
+        assert!(!bottom.contains("static"), "bottom: {bottom:?}");
+
+        // Mutating the shared cell and re-drawing surfaces the new value,
+        // proving it is read per draw rather than snapshotted at push.
+        *cell.borrow_mut() = "second".to_string();
+        let surf = win.draw(&ctx);
+        let bottom = row_text(&surf, 9);
+        assert!(bottom.ends_with("─ second ─╯"), "bottom: {bottom:?}");
+    }
+
+    #[test]
+    fn absent_subtitle_source_uses_static_subtitle() {
+        let child: WidgetRef = Rc::new(RefCell::new(Text::new("x")));
+        let mut win = OverlayWindow::new("Title", child);
+        win.subtitle = "static".to_string();
+        assert!(win.subtitle_source.is_none());
+
+        let surf = win.draw(&draw_ctx(40, 10));
+        let bottom = row_text(&surf, 9);
+        assert!(bottom.ends_with("─ static ─╯"), "bottom: {bottom:?}");
     }
 
     #[test]

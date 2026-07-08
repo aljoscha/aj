@@ -40,8 +40,8 @@ use vaxis::cell::{Segment, Style};
 use vaxis::key::{Key, Modifiers};
 use vaxis::vxfw::{
     Builder, DrawContext, Event, EventContext, ListView, MaxSize, RelativePoint, RichText,
-    ScrollBars, SelectStyles, Size, Source, SubSurface, Surface, Text, Widget, WidgetRef,
-    WidthBasis, draw_widget, to_widget_ref,
+    ScrollBars, SelectStyles, Size, Source, SubSurface, Surface, Widget, WidgetRef, WidthBasis,
+    to_widget_ref,
 };
 
 use crate::content_overlay::{ContentStyles, Row, plain, usage_rows};
@@ -109,11 +109,6 @@ impl MenuItem {
     }
 }
 
-/// PgUp/PgDn step is not offered here: the read-only page scrolls with the
-/// wheel and the menu phases are short. The overlay's own footer reserves
-/// the bottom row of the interior surface.
-const FOOTER_ROWS: u16 = 1;
-
 /// The interactive usage overlay: a phase machine over the usage report
 /// with the in-overlay reset-credit action.
 ///
@@ -159,6 +154,10 @@ pub(crate) struct UsageOverlay {
     /// Closes this overlay and restores focus to the parent. Runs inside
     /// key dispatch, where the live [`EventContext`] can move focus.
     on_close: Box<dyn FnMut(&mut EventContext)>,
+    /// The window's live subtitle cell. Written at the top of each `draw`
+    /// with the current phase hint, so the window chrome renders it in the
+    /// border (its draw reads this cell after the child's draw has run).
+    footer_source: Rc<RefCell<String>>,
 }
 
 impl UsageOverlay {
@@ -173,6 +172,7 @@ impl UsageOverlay {
         runtime: tokio::runtime::Handle,
         redraw: UnboundedSender<()>,
         on_close: Box<dyn FnMut(&mut EventContext)>,
+        footer_source: Rc<RefCell<String>>,
     ) -> UsageOverlay {
         let mut list = ListView::new(Source::Slice(row_widgets(&[loading_row()])));
         list.item_count = Some(1);
@@ -200,13 +200,15 @@ impl UsageOverlay {
             runtime,
             redraw,
             on_close,
+            footer_source,
         };
         overlay.start_fetch();
         overlay
     }
 
-    /// The footer hint for the current phase, drawn on the widget's own
-    /// bottom row. Resolved every frame so it tracks the state machine.
+    /// The footer hint for the current phase, surfaced in the window's
+    /// border subtitle. Resolved every frame so it tracks the state
+    /// machine.
     ///
     /// The reset chord resolves through the shared keybinding data, never a
     /// literal, so a rebind flows through to the label (Spec F). Esc/Enter
@@ -618,6 +620,11 @@ impl Widget for UsageOverlay {
         self.poll_statuses();
         self.poll_consume();
 
+        // Publish the phase hint into the window's live subtitle cell. The
+        // window's draw reads it after this child's draw returns, so it
+        // lands in the border chrome this same frame.
+        *self.footer_source.borrow_mut() = self.footer_hint();
+
         let size = ctx.max.size();
         // An opaque full-size surface so a shorter phase can't leave stale
         // cells from a taller previous frame.
@@ -627,7 +634,7 @@ impl Widget for UsageOverlay {
             height: 0,
         };
 
-        let body_height = size.height.saturating_sub(FOOTER_ROWS);
+        let body_height = size.height;
         if body_height > 0 {
             let body_ctx = ctx.with_constraints(
                 zero,
@@ -642,29 +649,6 @@ impl Widget for UsageOverlay {
                 z_index: 0,
             });
         }
-
-        // The phased footer is the widget's own bottom row: an overlay
-        // child can't set the window's border subtitle per frame (that
-        // would re-borrow the window mid-draw).
-        let mut footer = Text::new(self.footer_hint());
-        footer.style = self.styles.dim;
-        footer.width_basis = WidthBasis::Parent;
-        let footer_ref = to_widget_ref(Rc::new(RefCell::new(footer)));
-        let one_row = ctx.with_constraints(
-            zero,
-            MaxSize {
-                width: Some(size.width),
-                height: Some(1),
-            },
-        );
-        surface.children.push(SubSurface {
-            origin: RelativePoint {
-                row: i32::from(body_height),
-                col: 0,
-            },
-            surface: draw_widget(&footer_ref, &one_row),
-            z_index: 0,
-        });
         surface
     }
 
@@ -709,6 +693,10 @@ pub(crate) fn open_usage_overlay(
         let editor = Rc::clone(editor);
         Box::new(move |ctx| close_top(&stack, ctx, &editor))
     };
+    // The window's subtitle is fed from this shared cell: the overlay writes
+    // the current phase hint into it during its draw, and the window renders
+    // it in the border afterwards.
+    let footer_source = Rc::new(RefCell::new(String::new()));
     let overlay = Rc::new(RefCell::new(UsageOverlay::new(
         auth,
         reset_sources,
@@ -717,11 +705,12 @@ pub(crate) fn open_usage_overlay(
         runtime,
         redraw,
         on_close,
+        Rc::clone(&footer_source),
     )));
     let focus = to_widget_ref(Rc::clone(&overlay));
-    // The window carries no subtitle: the phased footer lives inside this
-    // widget (see `UsageOverlay::draw`).
-    push_window(
+    // The static subtitle stays empty. The live `footer_source` overrides it,
+    // so the border shows the phase-appropriate hint like every other window.
+    let window = push_window(
         stack,
         chrome,
         "Usage",
@@ -730,6 +719,7 @@ pub(crate) fn open_usage_overlay(
         focus,
         OverlayPlacement::Large,
     );
+    window.borrow_mut().subtitle_source = Some(footer_source);
 }
 
 /// The single-row "Loading…" seed.
@@ -991,6 +981,7 @@ mod tests {
             runtime_handle(),
             tokio::sync::mpsc::unbounded_channel().0,
             on_close,
+            Rc::new(RefCell::new(String::new())),
         );
         overlay.seed_statuses(statuses);
         (overlay, closed)
@@ -1239,6 +1230,38 @@ mod tests {
         // The literal chord is not what shows: the default `r` formats to
         // `R`, so the hint must not carry a bare `r use a reset`.
         assert!(!hint.contains("r use a reset"), "{hint}");
+    }
+
+    /// A `draw` publishes the phase hint into `footer_source` (the window's
+    /// live subtitle cell) rather than rendering it as a body row: the
+    /// inline footer is gone and the list uses the full height.
+    #[test]
+    fn draw_publishes_footer_hint_to_chrome_not_body() {
+        // Not eligible: the display footer is the bare "Esc close".
+        let (mut overlay, _) = overlay_with(vec![codex_status(None)], vec![]);
+        let out = body(&mut overlay);
+        assert_eq!(overlay.footer_hint(), "Esc close");
+        assert_eq!(*overlay.footer_source.borrow(), "Esc close");
+        // The inline footer is gone: the child draw no longer carries the
+        // hint as a row.
+        assert!(
+            !out.contains("Esc close"),
+            "footer leaked into body:\n{out}"
+        );
+
+        // Eligible: the footer carries the resolved reset chord, and the
+        // shared cell matches `footer_hint()` exactly.
+        let (mut overlay, _) = overlay_with(
+            vec![codex_status(Some(2))],
+            vec![fake_source(Ok(ResetOutcome::Reset))],
+        );
+        let out = body(&mut overlay);
+        let hint = overlay.footer_hint();
+        let reset =
+            default_action_shortcut(ACTION_USAGE_RESET).expect("usage-reset has a default chord");
+        assert!(hint.contains(&reset), "{hint}");
+        assert_eq!(*overlay.footer_source.borrow(), hint);
+        assert!(!out.contains(&hint), "footer leaked into body:\n{out}");
     }
 
     /// The Display rows keep the P4a tinting: the provider-id column in the
