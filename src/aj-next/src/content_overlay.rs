@@ -392,144 +392,35 @@ pub(crate) fn usage_rows(statuses: &[ProviderUsageStatus]) -> Vec<Row> {
     rows
 }
 
-/// One session-info row: a section header, a key/value pair, or a blank
-/// spacer.
-enum InfoRow {
-    Header(String),
-    Kv { key: String, value: String },
-    Blank,
-}
-
-fn kv(key: &str, value: &str) -> InfoRow {
-    InfoRow::Kv {
-        key: key.to_string(),
-        value: value.to_string(),
-    }
-}
-
-/// Session-info rows: identity, recorded settings, activity, message
-/// counts, aggregate usage, and the per-tool call breakdown. Ported from
-/// `aj`'s session-info overlay so both frontends show the same digest.
+/// One session-info row rendered from the shared `aj_app` digest.
+/// Section headers indent to 2 columns and key/value pairs to 4, and a
+/// blank spacer is emitted as a single-space row so it occupies a real
+/// line instead of collapsing to zero height in the [`ListView`].
+///
+/// Ported layout from `aj`'s session-info overlay so both frontends
+/// show the same digest with the same indentation.
 pub(crate) fn session_info_rows(stats: &SessionStats) -> Vec<Row> {
-    let total_messages = stats.user_messages + stats.assistant_messages + stats.tool_results;
-
-    let mut rows: Vec<InfoRow> = vec![
-        InfoRow::Header("Session".to_string()),
-        kv("id", &stats.session_id),
-        kv("file", &stats.path.display().to_string()),
-        kv("project", &project_name(stats)),
-        InfoRow::Blank,
-        InfoRow::Header("Settings".to_string()),
-        kv("model", &model_label(stats)),
-        kv(
-            "thinking",
-            stats.settings.thinking.as_deref().unwrap_or("(default)"),
-        ),
-        kv(
-            "speed",
-            stats.settings.speed.as_deref().unwrap_or("(default)"),
-        ),
-        kv(
-            "verbosity",
-            stats.settings.verbosity.as_deref().unwrap_or("(default)"),
-        ),
-        InfoRow::Blank,
-        InfoRow::Header("Activity".to_string()),
-        kv("created", &timestamp(stats.created_at, "(unknown)")),
-        kv("last activity", &timestamp(stats.last_activity, "(none)")),
-        kv("size on disk", &size_label(stats.size_bytes)),
-        InfoRow::Blank,
-        InfoRow::Header("Messages".to_string()),
-        kv("total", &total_messages.to_string()),
-        kv("user", &stats.user_messages.to_string()),
-        kv("assistant", &stats.assistant_messages.to_string()),
-        kv("tool results", &stats.tool_results.to_string()),
-        kv("sub-agents", &stats.subagents.to_string()),
-        kv("compactions", &stats.compactions.to_string()),
-        kv("log entries", &stats.total_entries.to_string()),
-        InfoRow::Blank,
-        InfoRow::Header("Usage".to_string()),
-        kv("input", &stats.usage.input.to_string()),
-        kv("output", &stats.usage.output.to_string()),
-        kv("cache read", &stats.usage.cache_read.to_string()),
-        kv("cache write", &stats.usage.cache_write.to_string()),
-        kv("total tokens", &stats.usage.total_tokens.to_string()),
-        kv("cost", &cost_label(stats.usage.cost.total)),
-        InfoRow::Blank,
-        InfoRow::Header(format!("Tool calls ({})", stats.tool_calls)),
-    ];
-
-    if stats.tool_call_counts.is_empty() {
-        rows.push(kv("(none)", ""));
-    } else {
-        for (name, count) in &stats.tool_call_counts {
-            rows.push(kv(name, &count.to_string()));
-        }
-    }
-
-    render_info_rows(&rows)
-}
-
-/// Align every key/value pair against one shared key column so values
-/// line up across sections.
-fn render_info_rows(rows: &[InfoRow]) -> Vec<Row> {
+    let rows = aj_app::session_info::digest(stats);
     let key_width = rows
         .iter()
         .filter_map(|row| match row {
-            InfoRow::Kv { key, .. } => Some(key.chars().count()),
+            aj_app::session_info::InfoRow::Kv { key, .. } => Some(key.chars().count()),
             _ => None,
         })
         .max()
         .unwrap_or(0);
     rows.iter()
         .map(|row| match row {
-            InfoRow::Header(title) => plain(title.clone()),
-            InfoRow::Kv { key, value } => plain(format!("  {key:<key_width$}  {value}")),
-            InfoRow::Blank => plain(""),
+            aj_app::session_info::InfoRow::Header(title) => plain(format!("  {title}")),
+            aj_app::session_info::InfoRow::Kv { key, value } => {
+                plain(format!("    {key:<key_width$}  {value}"))
+            }
+            // A single space, not the empty string: an empty `RichText`
+            // row collapses to zero height in the `ListView`, which would
+            // erase the gap between sections. One space forces a line.
+            aj_app::session_info::InfoRow::Blank => plain(" "),
         })
         .collect()
-}
-
-/// Project name = the per-project sessions directory the file lives in
-/// (`~/.aj/sessions/<project>/<id>.jsonl`). Derived from the path since
-/// the log itself does not carry it.
-fn project_name(stats: &SessionStats) -> String {
-    stats
-        .path
-        .parent()
-        .and_then(|p| p.file_name())
-        .and_then(|s| s.to_str())
-        .unwrap_or("(unknown)")
-        .to_string()
-}
-
-fn model_label(stats: &SessionStats) -> String {
-    match &stats.settings.model {
-        Some((provider, model_id)) => format!("{provider} / {model_id}"),
-        None => "(unset)".to_string(),
-    }
-}
-
-fn timestamp(value: Option<chrono::DateTime<chrono::Utc>>, fallback: &str) -> String {
-    match value {
-        Some(dt) => dt.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
-        None => fallback.to_string(),
-    }
-}
-
-fn size_label(bytes: Option<u64>) -> String {
-    match bytes {
-        None => "(not written yet)".to_string(),
-        Some(b) if b < 1024 => format!("{b} B"),
-        Some(b) if b < 1024 * 1024 => format!("{} KB", b / 1024),
-        Some(b) => format!("{} MB", b / (1024 * 1024)),
-    }
-}
-
-/// Aggregate session cost as a dollar figure, four decimals so a
-/// sub-cent session still shows a non-zero amount.
-fn cost_label(total: f64) -> String {
-    format!("${total:.4}")
 }
 
 #[cfg(test)]
@@ -733,15 +624,44 @@ mod tests {
 
     #[test]
     fn session_info_rows_render_identity_counts_and_tools() {
-        let rows = rows_text(&session_info_rows(&sample_stats()));
-        assert!(rows.contains("2026-06-19-14-22-03-512"), "{rows}");
-        assert!(rows.contains("home-u-proj"), "{rows}");
-        assert!(rows.contains("anthropic / claude-sonnet-4-5"), "{rows}");
-        assert!(rows.contains("48 KB"), "{rows}");
-        assert!(rows.contains("read_file"), "{rows}");
-        assert!(rows.contains("Tool calls (31)"), "{rows}");
-        assert!(rows.contains("total tokens"), "{rows}");
-        assert!(rows.contains("$0.3300"), "{rows}");
+        let rows = session_info_rows(&sample_stats());
+        let blob = rows_text(&rows);
+        assert!(blob.contains("2026-06-19-14-22-03-512"), "{blob}");
+        assert!(blob.contains("home-u-proj"), "{blob}");
+        assert!(blob.contains("anthropic / claude-sonnet-4-5"), "{blob}");
+        assert!(blob.contains("48 KB"), "{blob}");
+        assert!(blob.contains("read_file"), "{blob}");
+        assert!(blob.contains("Tool calls (31)"), "{blob}");
+        assert!(blob.contains("total tokens"), "{blob}");
+        assert!(blob.contains("$0.3300"), "{blob}");
+
+        // Section headers indent to 2 columns, key/value rows to 4,
+        // matching `aj`'s layout.
+        let texts: Vec<String> = rows.iter().map(row_text).collect();
+        assert!(
+            texts.iter().any(|t| t == "  Session"),
+            "header at 2-col indent: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.starts_with("    id ")),
+            "key/value at 4-col indent: {texts:?}"
+        );
+
+        // The blank spacer between sections occupies a real line: the row
+        // before the "Settings" header is blank but not the empty string.
+        // An empty `RichText` collapses to zero height in the `ListView`,
+        // so a non-empty (whitespace) line is what keeps the gap visible.
+        let settings = texts
+            .iter()
+            .position(|t| t == "  Settings")
+            .expect("Settings header present");
+        assert!(settings >= 1, "Settings not first: {texts:?}");
+        let spacer = &texts[settings - 1];
+        assert!(
+            !spacer.is_empty() && spacer.trim().is_empty(),
+            "spacer row before Settings is a real blank line, not an empty \
+             string that would collapse to zero height: {spacer:?}"
+        );
     }
 
     /// A plain builder produces single-span, default-styled rows, pinning

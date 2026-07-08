@@ -1,0 +1,252 @@
+//! Frontend-agnostic session-info digest.
+//!
+//! Turns a [`SessionStats`] into an ordered list of [`InfoRow`]s:
+//! labelled sections, key/value pairs, and blank spacers between
+//! sections. Both frontends build from this one digest and only differ
+//! in how they render the rows (aj -> `SelectList` strings, aj-next ->
+//! styled spans), so the content stays identical across binaries.
+
+use aj_session::SessionStats;
+use chrono::{DateTime, Utc};
+
+/// One digest row: a section header, a key/value pair, or a blank
+/// spacer between sections.
+pub enum InfoRow {
+    Header(String),
+    Kv { key: String, value: String },
+    Blank,
+}
+
+fn kv(key: &str, value: &str) -> InfoRow {
+    InfoRow::Kv {
+        key: key.to_string(),
+        value: value.to_string(),
+    }
+}
+
+/// Build the session-info digest: identity, recorded settings, activity
+/// timing, message counts, aggregate usage, and the per-tool call
+/// breakdown, grouped into labelled sections separated by blank rows.
+pub fn digest(stats: &SessionStats) -> Vec<InfoRow> {
+    let total_messages = stats.user_messages + stats.assistant_messages + stats.tool_results;
+
+    let mut rows: Vec<InfoRow> = vec![
+        InfoRow::Header("Session".to_string()),
+        kv("id", &stats.session_id),
+        kv("file", &stats.path.display().to_string()),
+        kv("project", &project_name(stats)),
+        InfoRow::Blank,
+        InfoRow::Header("Settings".to_string()),
+        kv("model", &model_label(stats)),
+        kv(
+            "thinking",
+            stats.settings.thinking.as_deref().unwrap_or("(default)"),
+        ),
+        kv(
+            "speed",
+            stats.settings.speed.as_deref().unwrap_or("(default)"),
+        ),
+        kv(
+            "verbosity",
+            stats.settings.verbosity.as_deref().unwrap_or("(default)"),
+        ),
+        InfoRow::Blank,
+        InfoRow::Header("Activity".to_string()),
+        kv("created", &timestamp(stats.created_at, "(unknown)")),
+        kv("last activity", &timestamp(stats.last_activity, "(none)")),
+        kv("size on disk", &size_label(stats.size_bytes)),
+        InfoRow::Blank,
+        InfoRow::Header("Messages".to_string()),
+        kv("total", &total_messages.to_string()),
+        kv("user", &stats.user_messages.to_string()),
+        kv("assistant", &stats.assistant_messages.to_string()),
+        kv("tool results", &stats.tool_results.to_string()),
+        kv("sub-agents", &stats.subagents.to_string()),
+        kv("compactions", &stats.compactions.to_string()),
+        kv("log entries", &stats.total_entries.to_string()),
+        InfoRow::Blank,
+        InfoRow::Header("Usage".to_string()),
+        kv("input", &stats.usage.input.to_string()),
+        kv("output", &stats.usage.output.to_string()),
+        kv("cache read", &stats.usage.cache_read.to_string()),
+        kv("cache write", &stats.usage.cache_write.to_string()),
+        kv("total tokens", &stats.usage.total_tokens.to_string()),
+        kv("cost", &cost_label(stats.usage.cost.total)),
+        InfoRow::Blank,
+        InfoRow::Header(format!("Tool calls ({})", stats.tool_calls)),
+    ];
+
+    if stats.tool_call_counts.is_empty() {
+        rows.push(kv("(none)", ""));
+    } else {
+        for (name, count) in &stats.tool_call_counts {
+            rows.push(kv(name, &count.to_string()));
+        }
+    }
+
+    rows
+}
+
+/// Project name = the per-project sessions directory the file lives in
+/// (`~/.aj/sessions/<project>/<id>.jsonl`). Derived from the path since
+/// the log itself does not carry it.
+fn project_name(stats: &SessionStats) -> String {
+    stats
+        .path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or("(unknown)")
+        .to_string()
+}
+
+fn model_label(stats: &SessionStats) -> String {
+    match &stats.settings.model {
+        Some((provider, model_id)) => format!("{provider} / {model_id}"),
+        None => "(unset)".to_string(),
+    }
+}
+
+fn timestamp(value: Option<DateTime<Utc>>, fallback: &str) -> String {
+    match value {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+        None => fallback.to_string(),
+    }
+}
+
+fn size_label(bytes: Option<u64>) -> String {
+    match bytes {
+        None => "(not written yet)".to_string(),
+        Some(b) if b < 1024 => format!("{b} B"),
+        Some(b) if b < 1024 * 1024 => format!("{} KB", b / 1024),
+        Some(b) => format!("{} MB", b / (1024 * 1024)),
+    }
+}
+
+/// Format the aggregate session cost as a dollar figure. Four decimal
+/// places so a sub-cent session still shows a non-zero amount, matching
+/// the HTML export's cost line.
+fn cost_label(total: f64) -> String {
+    format!("${total:.4}")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use aj_models::types::{Usage, UsageCost};
+    use aj_session::SessionSettings;
+
+    use super::*;
+
+    fn sample_stats() -> SessionStats {
+        SessionStats {
+            session_id: "2026-06-19-14-22-03-512".to_string(),
+            path: PathBuf::from("/home/u/.aj/sessions/home-u-proj/2026-06-19-14-22-03-512.jsonl"),
+            created_at: None,
+            last_activity: None,
+            size_bytes: Some(48 * 1024),
+            total_entries: 127,
+            user_messages: 15,
+            assistant_messages: 18,
+            tool_results: 30,
+            tool_calls: 31,
+            tool_call_counts: vec![("read_file".to_string(), 12), ("Bash".to_string(), 8)],
+            subagents: 2,
+            compactions: 1,
+            usage: Usage {
+                input: 1_000,
+                output: 2_000,
+                cache_read: 500,
+                cache_write: 250,
+                total_tokens: 3_750,
+                cost: UsageCost {
+                    input: 0.10,
+                    output: 0.20,
+                    cache_read: 0.01,
+                    cache_write: 0.02,
+                    total: 0.33,
+                },
+            },
+            settings: SessionSettings {
+                model: Some(("anthropic".to_string(), "claude-sonnet-4-5".to_string())),
+                thinking: Some("medium".to_string()),
+                speed: None,
+                verbosity: None,
+            },
+        }
+    }
+
+    /// Render the digest to a `(kind, key, value)` view so the order,
+    /// section headers, formatted values, and the blank spacers between
+    /// sections can all be asserted from one pass.
+    #[derive(Debug, PartialEq)]
+    enum RowView {
+        Header(String),
+        Kv(String, String),
+        Blank,
+    }
+
+    fn view(rows: &[InfoRow]) -> Vec<RowView> {
+        rows.iter()
+            .map(|r| match r {
+                InfoRow::Header(t) => RowView::Header(t.clone()),
+                InfoRow::Kv { key, value } => RowView::Kv(key.clone(), value.clone()),
+                InfoRow::Blank => RowView::Blank,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn digest_sections_values_and_spacers_in_order() {
+        let rows = view(&digest(&sample_stats()));
+
+        // The section headers appear in order, each preceded by a blank
+        // spacer once the first section is done.
+        let expected = [
+            RowView::Header("Session".to_string()),
+            RowView::Kv("id".to_string(), "2026-06-19-14-22-03-512".to_string()),
+            RowView::Kv(
+                "file".to_string(),
+                "/home/u/.aj/sessions/home-u-proj/2026-06-19-14-22-03-512.jsonl".to_string(),
+            ),
+            RowView::Kv("project".to_string(), "home-u-proj".to_string()),
+            RowView::Blank,
+            RowView::Header("Settings".to_string()),
+            RowView::Kv(
+                "model".to_string(),
+                "anthropic / claude-sonnet-4-5".to_string(),
+            ),
+            RowView::Kv("thinking".to_string(), "medium".to_string()),
+            RowView::Kv("speed".to_string(), "(default)".to_string()),
+            RowView::Kv("verbosity".to_string(), "(default)".to_string()),
+            RowView::Blank,
+            RowView::Header("Activity".to_string()),
+            RowView::Kv("created".to_string(), "(unknown)".to_string()),
+            RowView::Kv("last activity".to_string(), "(none)".to_string()),
+            RowView::Kv("size on disk".to_string(), "48 KB".to_string()),
+            RowView::Blank,
+            RowView::Header("Messages".to_string()),
+            RowView::Kv("total".to_string(), "63".to_string()),
+            RowView::Kv("user".to_string(), "15".to_string()),
+            RowView::Kv("assistant".to_string(), "18".to_string()),
+            RowView::Kv("tool results".to_string(), "30".to_string()),
+            RowView::Kv("sub-agents".to_string(), "2".to_string()),
+            RowView::Kv("compactions".to_string(), "1".to_string()),
+            RowView::Kv("log entries".to_string(), "127".to_string()),
+            RowView::Blank,
+            RowView::Header("Usage".to_string()),
+            RowView::Kv("input".to_string(), "1000".to_string()),
+            RowView::Kv("output".to_string(), "2000".to_string()),
+            RowView::Kv("cache read".to_string(), "500".to_string()),
+            RowView::Kv("cache write".to_string(), "250".to_string()),
+            RowView::Kv("total tokens".to_string(), "3750".to_string()),
+            RowView::Kv("cost".to_string(), "$0.3300".to_string()),
+            RowView::Blank,
+            RowView::Header("Tool calls (31)".to_string()),
+            RowView::Kv("read_file".to_string(), "12".to_string()),
+            RowView::Kv("Bash".to_string(), "8".to_string()),
+        ];
+        assert_eq!(rows, expected);
+    }
+}
