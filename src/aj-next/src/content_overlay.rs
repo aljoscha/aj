@@ -308,8 +308,9 @@ pub(crate) fn help_rows() -> Vec<Row> {
 /// Each row is three columns: the provider id in `styles.dim`, the summary
 /// in the default style, and the optional detail in `styles.muted`. The
 /// muted tint separates the detail column, so it reads as its own field
-/// without the parentheses `aj` also omits. The id column stays
-/// left-aligned, a deliberate divergence from `aj`'s right-aligned prefix.
+/// without the parentheses `aj` also omits. The id column is right-aligned
+/// and the summary is padded to a shared width on rows that carry a detail,
+/// so every detail value starts at the same column and lines up.
 pub(crate) fn auth_rows(statuses: &[ProviderAuthStatus], styles: &ContentStyles) -> Vec<Row> {
     if statuses.is_empty() {
         return vec![plain("No providers configured.")];
@@ -319,15 +320,27 @@ pub(crate) fn auth_rows(statuses: &[ProviderAuthStatus], styles: &ContentStyles)
         .map(|s| s.provider_id.chars().count())
         .max()
         .unwrap_or(0);
+    // Only rows that carry a detail need a fixed summary column: padding
+    // the summary to this width lands every detail value in the same
+    // place. A detail-less row leaves its summary unpadded (no trailing
+    // spaces), since it has no detail column to align to.
+    let summary_w = statuses
+        .iter()
+        .filter(|s| s.detail.is_some())
+        .map(|s| s.summary.chars().count())
+        .max()
+        .unwrap_or(0);
     statuses
         .iter()
         .map(|s| {
+            let summary = if s.detail.is_some() {
+                format!("  {summary:<summary_w$}", summary = s.summary)
+            } else {
+                format!("  {summary}", summary = s.summary)
+            };
             let mut row = vec![
-                span(format!("{id:<id_w$}", id = s.provider_id), styles.dim),
-                span(
-                    format!("  {summary}", summary = s.summary),
-                    Style::default(),
-                ),
+                span(format!("{id:>id_w$}", id = s.provider_id), styles.dim),
+                span(summary, Style::default()),
             ];
             if let Some(detail) = &s.detail {
                 row.push(span(format!("  {detail}"), styles.muted));
@@ -337,65 +350,94 @@ pub(crate) fn auth_rows(statuses: &[ProviderAuthStatus], styles: &ContentStyles)
         .collect()
 }
 
+/// The `(label, detail)` rows one provider contributes to the usage
+/// page, in display order. The detail is the per-window status shown in
+/// its own aligned column, `None` for rows that are just a label (notes,
+/// "not configured", errors).
+fn usage_status_rows(status: &ProviderUsageStatus, now_ms: i64) -> Vec<(String, Option<String>)> {
+    let mut out = Vec::new();
+    match &status.outcome {
+        UsageOutcome::Usage(usage) => {
+            if usage.windows.is_empty() && usage.notes.is_empty() && usage.reset_credits.is_none() {
+                out.push(("no usage data reported".to_string(), None));
+            }
+            for window in &usage.windows {
+                let desc = format_window_status(window.used, window.resets_at, now_ms);
+                out.push((window.label.clone(), Some(desc)));
+            }
+            for note in &usage.notes {
+                out.push((note.clone(), None));
+            }
+            if let Some(available) = usage.reset_credits {
+                let desc = if available > 0 {
+                    format!("{available} available")
+                } else {
+                    "no resets available".to_string()
+                };
+                out.push(("Rate-limit resets".to_string(), Some(desc)));
+            }
+        }
+        UsageOutcome::Unsupported { reason } => {
+            out.push((format!("usage not available \u{2014} {reason}"), None));
+        }
+        UsageOutcome::NotConfigured => out.push(("not configured".to_string(), None)),
+        UsageOutcome::NoSource => out.push(("usage reporting not supported".to_string(), None)),
+        UsageOutcome::Error(err) => out.push((format!("error: {err}"), None)),
+    }
+    out
+}
+
 /// Usage rows: one group per provider. Only a provider's first row
 /// carries its id, continuation rows leave it blank so the id column
 /// groups the windows visually (matching `aj`'s usage page).
 ///
 /// Each row is up to three columns, tinted like [`auth_rows`]: the
-/// fixed 12-col provider-id prefix in `styles.dim` (blank on
-/// continuation rows), the window/status label in the default style,
-/// and the per-window status detail in `styles.muted`.
+/// right-aligned provider-id column in `styles.dim` (blank but still
+/// `id_w` wide on continuation rows), the window/status label in the
+/// default style, and the per-window status detail in `styles.muted`.
+/// The label is padded to a shared width on rows that carry a detail, so
+/// every detail value starts at the same column and lines up.
 pub(crate) fn usage_rows(statuses: &[ProviderUsageStatus], styles: &ContentStyles) -> Vec<Row> {
     let now_ms = now_unix_ms();
+    // Materialize each provider's rows first so we can size the id and
+    // detail columns to the whole set before emitting spans.
+    let groups: Vec<(&str, Vec<(String, Option<String>)>)> = statuses
+        .iter()
+        .map(|status| {
+            (
+                status.provider_id.as_str(),
+                usage_status_rows(status, now_ms),
+            )
+        })
+        .collect();
+    let id_w = groups
+        .iter()
+        .map(|(id, _)| id.chars().count())
+        .max()
+        .unwrap_or(0);
+    let label_w = groups
+        .iter()
+        .flat_map(|(_, group)| group.iter())
+        .filter(|(_, detail)| detail.is_some())
+        .map(|(label, _)| label.chars().count())
+        .max()
+        .unwrap_or(0);
+
     let mut rows = Vec::new();
-    for status in statuses {
-        let id = status.provider_id.as_str();
-        let mut prefix = id.to_string();
-        let mut push = |rows: &mut Vec<Row>, label: &str, detail: Option<&str>| {
-            let mut row = vec![
-                span(format!("{prefix:<12}"), styles.dim),
-                span(format!("  {label}"), Style::default()),
-            ];
-            if let Some(detail) = detail {
-                row.push(span(format!("  {detail}"), styles.muted));
+    for (id, group) in &groups {
+        for (i, (label, detail)) in group.iter().enumerate() {
+            // The id shows only on a provider's first row. Continuation
+            // rows keep the column width so the label column stays put.
+            let prefix = if i == 0 { *id } else { "" };
+            let mut row = vec![span(format!("{prefix:>id_w$}"), styles.dim)];
+            match detail {
+                Some(detail) => {
+                    row.push(span(format!("  {label:<label_w$}"), Style::default()));
+                    row.push(span(format!("  {detail}"), styles.muted));
+                }
+                None => row.push(span(format!("  {label}"), Style::default())),
             }
             rows.push(row);
-            prefix = String::new();
-        };
-        match &status.outcome {
-            UsageOutcome::Usage(usage) => {
-                if usage.windows.is_empty()
-                    && usage.notes.is_empty()
-                    && usage.reset_credits.is_none()
-                {
-                    push(&mut rows, "no usage data reported", None);
-                }
-                for window in &usage.windows {
-                    let desc = format_window_status(window.used, window.resets_at, now_ms);
-                    push(&mut rows, &window.label, Some(&desc));
-                }
-                for note in &usage.notes {
-                    push(&mut rows, note, None);
-                }
-                if let Some(available) = usage.reset_credits {
-                    let desc = if available > 0 {
-                        format!("{available} available")
-                    } else {
-                        "no resets available".to_string()
-                    };
-                    push(&mut rows, "Rate-limit resets", Some(&desc));
-                }
-            }
-            UsageOutcome::Unsupported { reason } => {
-                push(
-                    &mut rows,
-                    &format!("usage not available \u{2014} {reason}"),
-                    None,
-                );
-            }
-            UsageOutcome::NotConfigured => push(&mut rows, "not configured", None),
-            UsageOutcome::NoSource => push(&mut rows, "usage reporting not supported", None),
-            UsageOutcome::Error(err) => push(&mut rows, &format!("error: {err}"), None),
         }
     }
     if rows.is_empty() {
@@ -405,12 +447,10 @@ pub(crate) fn usage_rows(statuses: &[ProviderUsageStatus], styles: &ContentStyle
 }
 
 /// One session-info row rendered from the shared `aj_app` digest.
-/// Section headers indent to 2 columns and key/value pairs to 4, and a
-/// blank spacer is emitted as a single-space row so it occupies a real
-/// line instead of collapsing to zero height in the [`ListView`].
-///
-/// Ported layout from `aj`'s session-info overlay so both frontends
-/// show the same digest with the same indentation.
+/// Section headers sit at column 0 and key/value pairs indent to 2
+/// columns, and a blank spacer is emitted as a single-space row so it
+/// occupies a real line instead of collapsing to zero height in the
+/// [`ListView`].
 pub(crate) fn session_info_rows(stats: &SessionStats) -> Vec<Row> {
     let rows = aj_app::session_info::digest(stats);
     let key_width = rows
@@ -423,9 +463,9 @@ pub(crate) fn session_info_rows(stats: &SessionStats) -> Vec<Row> {
         .unwrap_or(0);
     rows.iter()
         .map(|row| match row {
-            aj_app::session_info::InfoRow::Header(title) => plain(format!("  {title}")),
+            aj_app::session_info::InfoRow::Header(title) => plain(title.as_str()),
             aj_app::session_info::InfoRow::Kv { key, value } => {
-                plain(format!("    {key:<key_width$}  {value}"))
+                plain(format!("  {key:<key_width$}  {value}"))
             }
             // A single space, not the empty string: an empty `RichText`
             // row collapses to zero height in the `ListView`, which would
@@ -569,6 +609,57 @@ mod tests {
         assert_eq!(rows[0].len(), 2, "{:?}", rows[0]);
     }
 
+    /// The id column is right-aligned to the widest id, so a shorter id
+    /// carries leading spaces and every id ends at the same column. The
+    /// summary is padded on detail rows so the detail column starts at
+    /// one shared position across rows.
+    #[test]
+    fn auth_rows_right_align_id_and_align_detail_column() {
+        let styles = test_styles();
+        let rows = auth_rows(
+            &[
+                ProviderAuthStatus {
+                    provider_id: "anthropic".into(), // widest id (9)
+                    configured: true,
+                    summary: "subscription".into(),
+                    detail: Some("expires in 1h".into()),
+                },
+                ProviderAuthStatus {
+                    provider_id: "openai".into(), // shorter id (6)
+                    configured: true,
+                    summary: "api key".into(),
+                    detail: Some("no expiry".into()),
+                },
+            ],
+            &styles,
+        );
+        assert_eq!(rows.len(), 2);
+
+        // Both id spans share the widest id's width, and the shorter id
+        // is right-aligned so it carries leading spaces.
+        let id0 = &rows[0][0];
+        let id1 = &rows[1][0];
+        assert_eq!(id0.text, "anthropic");
+        assert_eq!(id1.text, "   openai");
+        assert_eq!(id0.text.chars().count(), id1.text.chars().count());
+
+        // The detail span begins at the same column on both rows: the
+        // text up to (but not including) the detail is equal in width, so
+        // the expiry values line up.
+        let prefix_width = |row: &Row| -> usize {
+            row[..row.len() - 1]
+                .iter()
+                .map(|s| s.text.chars().count())
+                .sum()
+        };
+        assert_eq!(prefix_width(&rows[0]), prefix_width(&rows[1]));
+
+        // Tints preserved: id dim, summary default, detail muted.
+        assert_eq!(rows[0][0].style, styles.dim);
+        assert_eq!(rows[0][1].style, Style::default());
+        assert_eq!(rows[0][2].style, styles.muted);
+    }
+
     #[test]
     fn usage_rows_group_windows_under_the_provider() {
         use aj_models::usage::{ProviderUsage, UsageWindow};
@@ -612,6 +703,9 @@ mod tests {
             &[ProviderUsageStatus {
                 provider_id: "anthropic".into(),
                 outcome: UsageOutcome::Usage(ProviderUsage {
+                    // Labels of different widths (6 vs 5) so the
+                    // detail-column alignment below genuinely exercises
+                    // the label padding, not just equal-length labels.
                     windows: vec![
                         UsageWindow {
                             label: "5-hour".into(),
@@ -619,7 +713,7 @@ mod tests {
                             resets_at: None,
                         },
                         UsageWindow {
-                            label: "weekly".into(),
+                            label: "7-day".into(),
                             used: 0.25,
                             resets_at: None,
                         },
@@ -654,9 +748,64 @@ mod tests {
             "continuation id column is blank: {second:?}"
         );
         assert_eq!(second[0].style, styles.dim);
-        assert!(second[1].text.contains("weekly"), "{second:?}");
+        assert!(second[1].text.contains("7-day"), "{second:?}");
         assert_eq!(second[1].style, Style::default());
         assert_eq!(second[2].style, styles.muted);
+
+        // The blank continuation id still occupies the id column width,
+        // so the label column doesn't shift between the two rows.
+        assert_eq!(
+            first[0].text.chars().count(),
+            second[0].text.chars().count(),
+            "continuation id occupies id_w: {rows:?}"
+        );
+
+        // The detail column aligns even though the labels differ in
+        // width: the text up to (but not including) the detail span is
+        // equal width on both detail rows because the label is padded to
+        // the shared width. This fails if the label weren't padded.
+        let prefix_width = |row: &Row| -> usize {
+            row[..row.len() - 1]
+                .iter()
+                .map(|s| s.text.chars().count())
+                .sum()
+        };
+        assert_eq!(prefix_width(first), prefix_width(second));
+    }
+
+    /// The provider-id column is right-aligned to the widest id across
+    /// providers, so a shorter id carries leading spaces and every id
+    /// ends at the same column.
+    #[test]
+    fn usage_rows_right_align_id_across_providers() {
+        use aj_models::usage::{ProviderUsage, UsageWindow};
+        let rows = usage_rows(
+            &[
+                ProviderUsageStatus {
+                    provider_id: "anthropic".into(), // widest id (9)
+                    outcome: UsageOutcome::Usage(ProviderUsage {
+                        windows: vec![UsageWindow {
+                            label: "5-hour".into(),
+                            used: 0.5,
+                            resets_at: None,
+                        }],
+                        notes: Vec::new(),
+                        reset_credits: None,
+                    }),
+                },
+                ProviderUsageStatus {
+                    provider_id: "openai".into(), // shorter id (6)
+                    outcome: UsageOutcome::NotConfigured,
+                },
+            ],
+            &test_styles(),
+        );
+        assert_eq!(rows[0][0].text, "anthropic");
+        assert_eq!(rows[1][0].text, "   openai");
+        assert_eq!(
+            rows[0][0].text.chars().count(),
+            rows[1][0].text.chars().count()
+        );
     }
 
     fn sample_stats() -> SessionStats {
@@ -710,32 +859,32 @@ mod tests {
         assert!(blob.contains("total tokens"), "{blob}");
         assert!(blob.contains("$0.3300"), "{blob}");
 
-        // Section headers indent to 2 columns, key/value rows to 4,
-        // matching `aj`'s layout.
+        // Section headers sit at column 0 and key/value rows indent to 2
+        // columns.
         let texts: Vec<String> = rows.iter().map(row_text).collect();
         assert!(
-            texts.iter().any(|t| t == "  Session"),
-            "header at 2-col indent: {texts:?}"
+            texts.iter().any(|t| t == "Session"),
+            "header at column 0 (no leading space): {texts:?}"
         );
         assert!(
-            texts.iter().any(|t| t.starts_with("    id ")),
-            "key/value at 4-col indent: {texts:?}"
+            texts.iter().any(|t| t.starts_with("  id ")),
+            "key/value at column 2: {texts:?}"
         );
 
         // The blank spacer between sections occupies a real line: the row
-        // before the "Settings" header is blank but not the empty string.
-        // An empty `RichText` collapses to zero height in the `ListView`,
-        // so a non-empty (whitespace) line is what keeps the gap visible.
+        // before the "Settings" header is a single space, not the empty
+        // string. An empty `RichText` collapses to zero height in the
+        // `ListView`, so a single-space line is what keeps the gap visible.
         let settings = texts
             .iter()
-            .position(|t| t == "  Settings")
+            .position(|t| t == "Settings")
             .expect("Settings header present");
         assert!(settings >= 1, "Settings not first: {texts:?}");
-        let spacer = &texts[settings - 1];
-        assert!(
-            !spacer.is_empty() && spacer.trim().is_empty(),
-            "spacer row before Settings is a real blank line, not an empty \
-             string that would collapse to zero height: {spacer:?}"
+        assert_eq!(
+            texts[settings - 1],
+            " ",
+            "spacer row before Settings is a non-collapsing single-space \
+             line, not an empty string: {texts:?}"
         );
     }
 
