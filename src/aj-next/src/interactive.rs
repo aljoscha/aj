@@ -76,7 +76,8 @@ use crate::prompt_history::{HistoryFetch, HistoryScope, MAX_ENTRIES, open_prompt
 use crate::session_selector::{SessionScan, extend_session_scan, open_session_selector};
 use crate::settings_ui::{
     MODEL_SETTING_ID, SelectorActivity, SettingsCatalogs, SettingsUi, SettingsValues, SkillRow,
-    UNSET_VALUE, open_model, open_settings, open_skills, open_thinking,
+    SkillsFill, UNSET_VALUE, build_skill_rows, open_model, open_settings, open_skills,
+    open_thinking, skills_placeholder_row,
 };
 use crate::status::{STATUS_WAKE_EVENT, StatusLine, StatusState};
 use crate::task_output::open_task_output;
@@ -1044,14 +1045,14 @@ enum ActionEffect {
 /// focus onto them.
 ///
 /// Skills discovery and HTML export do blocking work, so they don't run here.
-/// They spawn off the loop via `skills_tx` / `export_tx` and land in the drive
-/// loop's fill arms, which open the skills window (posting the same refocus
-/// event) or fold the export notice.
+/// Skills opens its window up front (with a loading placeholder) and parks a
+/// fill handle the drive loop streams the discovered rows into once the
+/// off-loop walk lands. HTML export spawns off the loop via `export_tx` and
+/// its result notice comes back to the drive loop's fill arm.
 async fn apply_command_action(
     world: &mut World,
     shell: &Rc<RefCell<Shell>>,
     action: CommandAction,
-    skills_tx: &UnboundedSender<Vec<Skill>>,
     export_tx: &UnboundedSender<String>,
     redraw_tx: &UnboundedSender<()>,
 ) -> ActionEffect {
@@ -1185,15 +1186,23 @@ async fn apply_command_action(
             ActionEffect::OpenedOverlay
         }
         CommandAction::OpenSkills => {
-            // Rediscover skills at open time so the window reflects the on-disk
-            // state (and the current `disabled_skills`) rather than the frozen
-            // session snapshot. The walk reads `SKILL.md` files up to the git
-            // root (blocking IO), so we run it off the loop via
-            // `spawn_skills_discovery` and open the window in the skills fill
-            // arm when it lands. The action just spawns and returns, keeping
-            // the loop responsive while discovery runs.
-            spawn_skills_discovery(world, skills_tx);
-            ActionEffect::None
+            // Open the skills window NOW, on top of the kept palette, showing a
+            // loading placeholder, and park its fill handle. Discovery walks
+            // the `SKILL.md` files up to the git root (blocking IO), so it runs
+            // off the loop: the drive loop's drain spawns the walk and streams
+            // the discovered rows into the parked handle once it lands. The
+            // window shows up immediately and the UI stays responsive
+            // meanwhile. Uniform with every other opener. Esc (`close_top`)
+            // returns to the palette underneath.
+            let handles = shell.borrow().overlay_handles();
+            open_skills(
+                &handles.stack,
+                &handles.editor,
+                &handles.chrome,
+                &handles.activity,
+                &handles.skills_fill,
+            );
+            ActionEffect::OpenedOverlay
         }
         // Session-changing commands tear down the current world and rebuild
         // it, which must never abort in-flight work, so refuse them mid-turn
@@ -1351,32 +1360,42 @@ async fn apply_command_action(
     }
 }
 
-/// Build the skills-window rows from discovered skills and open the window
-/// over `shell`'s overlay stack.
+/// The guidance shown in the skills window when discovery finds nothing. The
+/// empty window conveys it as an inert placeholder row rather than a transcript
+/// notice, so the open window is self-explanatory.
+const NO_SKILLS_GUIDANCE: &str =
+    "No skills found. Put skills in ~/.agents/skills/ or .agents/skills/ (also: .aj/, .claude/).";
+
+/// Fill the open skills window once discovery lands, replacing its loading
+/// placeholder with the discovered rows.
+///
+/// The window is already on the stack (opened up front with a loading
+/// placeholder), so we target the captured `list` handle directly rather than
+/// the stack's `top()`. That is what makes the open-then-fill flow safe. A
+/// confirm of another opener from the still-interactive palette can't
+/// misdirect this fill. An empty result fills a "no skills" placeholder so the
+/// window conveys the guidance itself, the same way prompt history shows an
+/// empty list, rather than folding a transcript notice.
 ///
 /// The rows and the window widget are `!Send`, so they are built here on the
-/// host after the discovery walk delivered the (Send) skills. The caller (the
-/// drive loop's skills fill arm) posts the refocus event and requests the
-/// redraw, matching how a host-opened overlay takes focus.
-fn open_skills_window(shell: &Rc<RefCell<Shell>>, skills: Vec<Skill>) {
-    let rows: Vec<SkillRow> = skills
-        .into_iter()
-        .map(|s| SkillRow {
-            name: s.name,
-            description: s.description,
-            path: aj_conf::display_path(&s.path),
-            enabled: s.enabled,
-            disable_model_invocation: s.disable_model_invocation,
-        })
-        .collect();
-    let handles = shell.borrow().overlay_handles();
-    open_skills(
-        &handles.stack,
-        &handles.editor,
-        &handles.chrome,
-        &handles.activity,
-        rows,
-    );
+/// host after the discovery walk delivered the (Send) skills.
+fn fill_skills_window(list: &SkillsFill, skills: Vec<Skill>) {
+    let rows = if skills.is_empty() {
+        vec![skills_placeholder_row(NO_SKILLS_GUIDANCE)]
+    } else {
+        let display: Vec<SkillRow> = skills
+            .into_iter()
+            .map(|s| SkillRow {
+                name: s.name,
+                description: s.description,
+                path: aj_conf::display_path(&s.path),
+                enabled: s.enabled,
+                disable_model_invocation: s.disable_model_invocation,
+            })
+            .collect();
+        build_skill_rows(display)
+    };
+    list.borrow().set_rows(rows);
 }
 
 /// Apply an agent-picker outcome the widget parked. Observing an agent
@@ -2400,6 +2419,9 @@ struct OverlayHandles {
     picker_outcome: Rc<RefCell<Option<AgentPickerOutcome>>>,
     /// Where the prompt-history overlay parks a scan request.
     history_fetch: Rc<RefCell<Option<HistoryFetch>>>,
+    /// Where the skills window parks its fill handle on open, for the drive
+    /// loop to stream discovered rows into.
+    skills_fill: Rc<RefCell<Option<SkillsFill>>>,
     /// Where the prompt-history overlay parks a recalled prompt.
     recall_slot: Rc<RefCell<Option<String>>>,
     /// Where the session selector parks its preview-scan request.
@@ -2477,6 +2499,11 @@ struct Shell {
     /// A prompt-history scan request parked by the overlay (on open and
     /// on scope toggle) for the drive loop to run and fill.
     history_fetch: Rc<RefCell<Option<HistoryFetch>>>,
+    /// The skills window's fill handle, parked on open. The drive loop's
+    /// skills fill arm replaces its loading placeholder with the discovered
+    /// rows through this captured handle (never the stack's `top()`) once the
+    /// off-loop walk lands.
+    skills_fill: Rc<RefCell<Option<SkillsFill>>>,
     /// A recalled prompt parked by the prompt-history overlay, collected
     /// by the drive loop and dropped into the editor.
     recall_slot: Rc<RefCell<Option<String>>>,
@@ -2582,6 +2609,7 @@ impl Shell {
         let settings_ui: Rc<RefCell<Option<SettingsUi>>> = Rc::new(RefCell::new(None));
         let picker_outcome: Rc<RefCell<Option<AgentPickerOutcome>>> = Rc::new(RefCell::new(None));
         let history_fetch: Rc<RefCell<Option<HistoryFetch>>> = Rc::new(RefCell::new(None));
+        let skills_fill: Rc<RefCell<Option<SkillsFill>>> = Rc::new(RefCell::new(None));
         let recall_slot: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let session_scan: Rc<RefCell<Option<SessionScan>>> = Rc::new(RefCell::new(None));
         let session_request: Rc<RefCell<Option<SessionRequest>>> = Rc::new(RefCell::new(None));
@@ -2730,6 +2758,7 @@ impl Shell {
             settings_ui,
             picker_outcome,
             history_fetch,
+            skills_fill,
             recall_slot,
             header: header_line,
             session_scan,
@@ -2774,6 +2803,13 @@ impl Shell {
         self.history_fetch.borrow_mut().take()
     }
 
+    /// Collect the skills window's fill handle parked on open, if any. The
+    /// drive loop drains it to kick off discovery and remember the list to
+    /// fill.
+    fn take_skills_fetch(&self) -> Option<SkillsFill> {
+        self.skills_fill.borrow_mut().take()
+    }
+
     /// Collect a recalled prompt parked by the prompt-history overlay, if any.
     fn take_recall(&self) -> Option<String> {
         self.recall_slot.borrow_mut().take()
@@ -2810,6 +2846,7 @@ impl Shell {
             settings_ui: Rc::clone(&self.settings_ui),
             picker_outcome: Rc::clone(&self.picker_outcome),
             history_fetch: Rc::clone(&self.history_fetch),
+            skills_fill: Rc::clone(&self.skills_fill),
             recall_slot: Rc::clone(&self.recall_slot),
             session_scan: Rc::clone(&self.session_scan),
             session_request: Rc::clone(&self.session_request),
@@ -3307,8 +3344,11 @@ async fn drive(
     let mut pending_session: Option<SessionFill> = None;
     // Skills discovery for the skills window runs off the loop. The walk reads
     // `SKILL.md` files (blocking IO); only the discovered skills (Send) come
-    // back, and the host builds the `!Send` window in the fill arm below.
+    // back. The window is already open (with a loading placeholder) and its
+    // `!Send` list handle stays here in `pending_skills`, so the fill arm below
+    // targets that captured handle rather than the stack's `top()`.
     let (skills_tx, mut skills_rx) = unbounded_channel::<Vec<Skill>>();
+    let mut pending_skills: Option<SkillsFill> = None;
     // Session HTML export renders and writes off the loop, delivering only its
     // result notice string back here.
     let (export_tx, mut export_rx) = unbounded_channel::<String>();
@@ -3395,27 +3435,19 @@ async fn drive(
             }
 
             // --- Skills window fill ---
-            // Discovery finished off the loop. An empty result means nothing
-            // was found, so fold the same notice the synchronous path used.
-            // Otherwise open the window here (the host owns the overlay stack)
-            // and move focus onto it, the same way a host-opened overlay takes
-            // focus. The window appears when discovery completes. The UI stayed
-            // responsive meanwhile.
+            // Discovery finished off the loop. The window is already open (with
+            // a loading placeholder) over the palette, so we fill its captured
+            // list handle (`pending_skills`) rather than touching the stack's
+            // `top()`. That is what keeps the flow safe. A confirm of another
+            // opener from the still-interactive palette can't misdirect it.
+            // `fill_skills_window` handles the empty result with a "no skills"
+            // placeholder, so the window conveys that itself and the palette
+            // stays underneath either way.
             maybe_skills = skills_rx.recv() => {
-                if let Some(skills) = maybe_skills {
-                    if skills.is_empty() {
-                        fold_notice(
-                            world,
-                            "No skills found. Put skills in ~/.agents/skills/ or \
-                             .agents/skills/ (also: .aj/, .claude/).",
-                        );
-                    } else {
-                        open_skills_window(shell, skills);
-                        app.post_app_event(UserEvent {
-                            name: REFOCUS_OVERLAY_EVENT.to_string(),
-                            data: None,
-                        });
-                    }
+                if let Some(skills) = maybe_skills
+                    && let Some(list) = pending_skills.take()
+                {
+                    fill_skills_window(&list, skills);
                     app.request_redraw();
                 }
             }
@@ -3495,15 +3527,37 @@ async fn drive(
                         // RefCell ref is held across the await below.
                         let command = shell.borrow().take_command();
                         if let Some(action) = command {
-                            match apply_command_action(world, shell, action, &skills_tx, &export_tx, &redraw_tx)
+                            match apply_command_action(world, shell, action, &export_tx, &redraw_tx)
                                 .await
                             {
-                                ActionEffect::None => {}
-                                ActionEffect::Redraw => app.request_redraw(),
                                 ActionEffect::OpenedOverlay => {
-                                    // The overlay was pushed from the host,
-                                    // which has no event context; hand the
-                                    // focus move to the shell via an app event.
+                                    // The host pushed the overlay ON TOP of
+                                    // the still-open palette, which the confirm
+                                    // callback left on the stack. The refocus
+                                    // event lands on `top()`, the new overlay,
+                                    // so cancel from it returns to the palette.
+                                    app.post_app_event(UserEvent {
+                                        name: REFOCUS_OVERLAY_EVENT.to_string(),
+                                        data: None,
+                                    });
+                                    app.request_redraw();
+                                }
+                                ActionEffect::None | ActionEffect::Redraw => {
+                                    // The command opened no overlay (a pure
+                                    // action, or an opener that declined and
+                                    // folded a notice), so pop the palette the
+                                    // confirm left on the stack and return to
+                                    // the transcript. Within this one input
+                                    // turn nothing else touched the stack, so
+                                    // `top()` is the palette. A `back()` on an
+                                    // empty stack is a safe no-op (it never
+                                    // runs for the direct-chord entry, which
+                                    // returns `OpenedOverlay`). Bind and drop
+                                    // the borrow in this statement so no
+                                    // RefCell ref outlives it.
+                                    shell.borrow().overlays.borrow_mut().back();
+                                    // Focus `top()` (now the uncovered parent,
+                                    // or the editor when the stack emptied).
                                     app.post_app_event(UserEvent {
                                         name: REFOCUS_OVERLAY_EVENT.to_string(),
                                         data: None,
@@ -3541,6 +3595,10 @@ async fn drive(
                         // as a host-opened selector.
                         if let Some(outcome) = shell.borrow().take_picker_outcome() {
                             match apply_picker_outcome(world, shell, outcome) {
+                                // The picker resolves synchronously (it never
+                                // defers a fill), so its outcome is one of
+                                // these three. `OpenTask` opens the viewer
+                                // overlay; observe/kill just redraw or no-op.
                                 ActionEffect::None => {}
                                 ActionEffect::Redraw => app.request_redraw(),
                                 ActionEffect::OpenedOverlay => {
@@ -3571,6 +3629,15 @@ async fn drive(
                                 rx,
                                 first: true,
                             });
+                        }
+                        // A just-opened skills window: kick off discovery off
+                        // the loop and remember the captured list handle to fill
+                        // (never the stack's `top()`). The window is already up
+                        // with a loading placeholder; the fill arm streams the
+                        // discovered rows in when the walk lands.
+                        if let Some(fill) = shell.borrow().take_skills_fetch() {
+                            spawn_skills_discovery(world, &skills_tx);
+                            pending_skills = Some(fill);
                         }
                         // A session-selector open: give it a fresh channel,
                         // run the preview scan off the loop, and remember the
@@ -4957,20 +5024,19 @@ mod tests {
         (world, shell)
     }
 
-    /// Invoke [`apply_command_action`] with throwaway skills/export delivery
-    /// channels, for the tests that exercise actions other than `OpenSkills`
-    /// and `ExportHtml` (which never send on those channels). Tests that do
-    /// exercise the offload keep the receivers and call `apply_command_action`
+    /// Invoke [`apply_command_action`] with a throwaway export delivery
+    /// channel, for the tests that exercise actions other than `ExportHtml`
+    /// (which is the only arm that sends on it). Tests that exercise the
+    /// export offload keep the receiver and call `apply_command_action`
     /// directly.
     async fn apply_command(
         world: &mut World,
         shell: &Rc<RefCell<Shell>>,
         action: CommandAction,
     ) -> ActionEffect {
-        let (skills_tx, _skills_rx) = unbounded_channel();
         let (export_tx, _export_rx) = unbounded_channel();
         let (redraw_tx, _redraw_rx) = unbounded_channel();
-        apply_command_action(world, shell, action, &skills_tx, &export_tx, &redraw_tx).await
+        apply_command_action(world, shell, action, &export_tx, &redraw_tx).await
     }
     /// bound to it, so tests can exercise the host arms that need all three
     /// of the app, the world, and the shell (the login/logout flow).
@@ -5431,8 +5497,9 @@ mod tests {
     }
 
     /// Typing narrows the palette rows and Enter confirms the highlighted
-    /// one. Confirming a host-applied command (compact) parks its action
-    /// for the drive loop, closes the overlay, and returns focus.
+    /// one. Confirming a host-applied command (compact) parks its action for
+    /// the drive loop and leaves the palette on the stack. The drive loop's
+    /// no-overlay path then pops the palette back to the editor.
     #[tokio::test]
     async fn palette_filter_narrows_and_enter_confirms() {
         let (mut app, mut writer, shell, root) = init_app().await;
@@ -5450,13 +5517,25 @@ mod tests {
             app.handle_input(event);
         }
 
+        // The confirm callback only parks the command now: the palette stays
+        // on the stack for the drive loop to resolve.
+        assert_eq!(
+            shell.borrow().overlays.borrow().depth(),
+            1,
+            "palette stays open after parking a host command"
+        );
         let action = shell
             .borrow()
             .take_command()
             .expect("confirm parked a host command");
         assert_eq!(action, CommandAction::Compact, "confirmed the compact row");
-        assert!(!shell.borrow().overlays.borrow().is_open());
         app.render(&root).expect("render");
+
+        // Compact opens no overlay (a pure action, drive-loop `Redraw`), so the
+        // loop's no-overlay path pops the palette and returns to the editor.
+        shell.borrow().overlays.borrow_mut().back();
+        focus_overlay(&mut app, &root);
+        assert!(!shell.borrow().overlays.borrow().is_open());
 
         writer.write_all(b"x").expect("write key");
         let event = app.next_input().await.expect("input event");
@@ -5523,6 +5602,199 @@ mod tests {
             shell.borrow().editor.borrow().cursor(),
             (0, 1),
             "focus is back in the editor"
+        );
+    }
+
+    /// A non-content selector confirmed from the palette chains like Help: the
+    /// drive loop pushes it over the palette so Esc/cancel (`close_top`)
+    /// returns to the palette, while confirming a value (`close_all`) tears the
+    /// whole stack down to the transcript.
+    #[tokio::test]
+    async fn palette_selector_cancel_returns_to_palette_confirm_returns_to_editor() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+
+        // Open the palette (depth 1).
+        writer.write_all(&[0x0f]).expect("write ctrl+o");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        app.render(&root).expect("render");
+        assert_eq!(shell.borrow().overlays.borrow().depth(), 1, "palette open");
+
+        // Confirm the thinking row. The callback only parks the opener and
+        // leaves the palette on the stack (no pop in the callback).
+        writer
+            .write_all(b"thinking\r")
+            .expect("write query + enter");
+        for _ in 0..9 {
+            let event = app.next_input().await.expect("input event");
+            app.handle_input(event);
+        }
+        assert_eq!(
+            shell.borrow().overlays.borrow().depth(),
+            1,
+            "palette stays open under the parked opener"
+        );
+        let action = shell.borrow().take_command().expect("opener parked");
+        assert_eq!(action, CommandAction::OpenThinkingSelector);
+
+        // Drive-loop `OpenedOverlay`: the host opens the selector ON TOP of the
+        // palette (depth 2) and refocuses it.
+        assert!(matches!(
+            apply_command(&mut world, &shell, action).await,
+            ActionEffect::OpenedOverlay
+        ));
+        focus_overlay(&mut app, &root);
+        assert_eq!(
+            shell.borrow().overlays.borrow().depth(),
+            2,
+            "selector pushed over the palette"
+        );
+
+        // Esc/cancel from the selector uses `close_top`: it returns to the
+        // palette underneath, not to the transcript.
+        writer.write_all(b"\x1b").expect("write esc");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        assert_eq!(
+            shell.borrow().overlays.borrow().depth(),
+            1,
+            "esc returned to the palette"
+        );
+        app.render(&root).expect("render");
+
+        // Focus really landed on the palette: pressing Enter on the still
+        // "thinking"-filtered palette re-parks the opener (an editor-focused
+        // Enter would park nothing).
+        writer.write_all(b"\r").expect("write enter");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        let action = shell
+            .borrow()
+            .take_command()
+            .expect("palette had focus and re-parked the opener");
+        assert_eq!(action, CommandAction::OpenThinkingSelector);
+
+        // Re-open the selector over the palette (depth 2) and confirm a value.
+        assert!(matches!(
+            apply_command(&mut world, &shell, action).await,
+            ActionEffect::OpenedOverlay
+        ));
+        focus_overlay(&mut app, &root);
+        assert_eq!(shell.borrow().overlays.borrow().depth(), 2);
+
+        // Confirm "high": the selector's `close_all` tears the whole stack down
+        // (palette included) back to the transcript.
+        writer.write_all(b"high\r").expect("write query + enter");
+        for _ in 0..5 {
+            let event = app.next_input().await.expect("input event");
+            app.handle_input(event);
+        }
+        assert!(
+            !shell.borrow().overlays.borrow().is_open(),
+            "confirm tore the whole stack down to the transcript"
+        );
+
+        // The pick was recorded for the drive loop to apply.
+        let activity = shell.borrow().take_activity();
+        assert!(
+            activity
+                .iter()
+                .any(|a| matches!(a, SelectorActivity::ThinkingConfirmed { .. })),
+            "confirm parked a thinking change"
+        );
+
+        // Focus is back in the editor.
+        app.render(&root).expect("render");
+        writer.write_all(b"x").expect("write key");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        assert_eq!(shell.borrow().editor.borrow().cursor(), (0, 1));
+    }
+
+    /// The agent picker chains under the palette like the other selectors:
+    /// cancel (`close_top`) returns to the palette, confirm (`close_all`) tears
+    /// the whole stack down. Because confirm clears the palette too, a drilled
+    /// task viewer the drive loop opens afterward stands alone (its Esc returns
+    /// to the transcript, not to a parent overlay).
+    #[tokio::test]
+    async fn palette_agent_picker_cancel_returns_to_palette_confirm_clears_stack() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        seed_sub_and_task(&mut world);
+
+        // Open the palette (depth 1) and confirm the agent-picker row.
+        writer.write_all(&[0x0f]).expect("write ctrl+o");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        app.render(&root).expect("render");
+        writer.write_all(b"switch\r").expect("write query + enter");
+        for _ in 0..7 {
+            let event = app.next_input().await.expect("input event");
+            app.handle_input(event);
+        }
+        let action = shell.borrow().take_command().expect("opener parked");
+        assert_eq!(action, CommandAction::OpenAgentPicker);
+        assert_eq!(
+            shell.borrow().overlays.borrow().depth(),
+            1,
+            "palette stays open under the parked opener"
+        );
+
+        // Drive-loop `OpenedOverlay`: the picker pushes over the palette.
+        assert!(matches!(
+            apply_command(&mut world, &shell, action).await,
+            ActionEffect::OpenedOverlay
+        ));
+        focus_overlay(&mut app, &root);
+        assert_eq!(
+            shell.borrow().overlays.borrow().depth(),
+            2,
+            "picker over palette"
+        );
+
+        // Cancel returns to the palette (close_top), not the transcript.
+        writer.write_all(b"\x1b").expect("write esc");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        assert_eq!(
+            shell.borrow().overlays.borrow().depth(),
+            1,
+            "esc returned to the palette"
+        );
+        app.render(&root).expect("render");
+
+        // The palette kept focus: Enter re-parks the opener (still filtered to
+        // "switch"). Re-open the picker over the palette.
+        writer.write_all(b"\r").expect("write enter");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        let action = shell
+            .borrow()
+            .take_command()
+            .expect("palette had focus and re-parked the opener");
+        assert_eq!(action, CommandAction::OpenAgentPicker);
+        assert!(matches!(
+            apply_command(&mut world, &shell, action).await,
+            ActionEffect::OpenedOverlay
+        ));
+        focus_overlay(&mut app, &root);
+        assert_eq!(shell.borrow().overlays.borrow().depth(), 2);
+
+        // Confirm the highlighted row (the active agent): `close_all` tears the
+        // whole stack down (palette and picker) to the transcript.
+        writer.write_all(b"\r").expect("write enter");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        assert!(
+            !shell.borrow().overlays.borrow().is_open(),
+            "confirm cleared the whole stack"
+        );
+        assert!(
+            shell.borrow().take_picker_outcome().is_some(),
+            "confirm parked the pick"
         );
     }
 
@@ -5858,50 +6130,48 @@ mod tests {
         assert!(!filled.contains("Loading"), "loading replaced: {filled}");
     }
 
-    /// `OpenSkills` no longer walks the skill tree on the loop: the action
-    /// spawns discovery off the loop and returns immediately, and the walk
-    /// delivers its skills back over the channel the drive loop's fill arm
-    /// drains. We assert the offload (the spawn delivered exactly one result)
-    /// rather than a specific skill set, which depends on the environment.
+    /// Confirming skills from the palette opens the window immediately, on top
+    /// of the palette (depth 2), showing a loading placeholder and returning a
+    /// plain `OpenedOverlay` like every other opener. Delivering the discovered
+    /// skills via the fill path replaces the placeholder with the skill rows,
+    /// and Esc returns to the palette underneath.
     #[tokio::test]
-    async fn open_skills_spawns_discovery_off_the_loop() {
+    async fn open_skills_opens_loading_over_palette_and_fills() {
         let dir = TempDir::new().expect("tempdir");
-        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
-        let (skills_tx, mut skills_rx) = unbounded_channel();
-        let (export_tx, _export_rx) = unbounded_channel();
-        let (redraw_tx, _redraw_rx) = unbounded_channel();
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
 
-        let effect = apply_command_action(
-            &mut world,
-            &shell,
-            CommandAction::OpenSkills,
-            &skills_tx,
-            &export_tx,
-            &redraw_tx,
-        )
-        .await;
+        // Open the palette (depth 1).
+        writer.write_all(&[0x0f]).expect("write ctrl+o");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        app.render(&root).expect("render");
+        assert_eq!(shell.borrow().overlays.borrow().depth(), 1, "palette open");
 
-        // The action just spawns: nothing opens synchronously.
-        assert!(matches!(effect, ActionEffect::None));
-        assert_eq!(shell.borrow().overlays.borrow().depth(), 0, "no window yet");
-        // Discovery runs off the loop and delivers exactly one result.
-        assert!(
-            skills_rx.recv().await.is_some(),
-            "discovery delivered a result"
+        // Confirm skills: the window opens NOW over the palette (depth 2).
+        let effect = apply_command(&mut world, &shell, CommandAction::OpenSkills).await;
+        assert!(matches!(effect, ActionEffect::OpenedOverlay));
+        focus_overlay(&mut app, &root);
+        assert_eq!(
+            shell.borrow().overlays.borrow().depth(),
+            2,
+            "skills window opened over the palette"
         );
-    }
+        let loading = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+        assert!(
+            loading.contains("Loading skills"),
+            "loading state: {loading}"
+        );
 
-    /// The skills fill arm's non-empty branch: given discovered skills, the
-    /// host builds the rows and opens the window over the overlay stack. This
-    /// is the open logic the arm runs when discovery lands.
-    #[tokio::test]
-    async fn open_skills_window_opens_the_overlay() {
-        let dir = TempDir::new().expect("tempdir");
-        let (_world, shell) = world_and_shell(&dir, "streaming-text").await;
-        assert_eq!(shell.borrow().overlays.borrow().depth(), 0);
+        // The window parked its fill handle for the drive loop.
+        let fill = shell
+            .borrow()
+            .take_skills_fetch()
+            .expect("skills window parked a fill handle");
 
-        open_skills_window(
-            &shell,
+        // Deliver discovered skills the way the drive loop's fill arm does.
+        fill_skills_window(
+            &fill,
             vec![Skill {
                 name: "demo".to_string(),
                 description: "a demo skill".to_string(),
@@ -5910,11 +6180,92 @@ mod tests {
                 disable_model_invocation: false,
             }],
         );
+        let filled = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+        assert!(filled.contains("demo"), "filled state: {filled}");
+        assert!(
+            !filled.contains("Loading skills"),
+            "placeholder replaced: {filled}"
+        );
 
+        // Esc from the skills window uses `close_top`: it returns to the palette
+        // underneath, not to the transcript.
+        writer.write_all(b"\x1b").expect("write esc");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
         assert_eq!(
             shell.borrow().overlays.borrow().depth(),
             1,
-            "skills window opened"
+            "esc returned to the palette"
+        );
+    }
+
+    /// An empty discovery result fills the "No skills found" placeholder: the
+    /// window stays open over the palette and no transcript notice is folded
+    /// (the open window conveys the guidance itself, matching how prompt
+    /// history shows an empty list).
+    #[tokio::test]
+    async fn open_skills_empty_discovery_fills_the_no_skills_placeholder() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+
+        writer.write_all(&[0x0f]).expect("write ctrl+o");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        app.render(&root).expect("render");
+
+        let effect = apply_command(&mut world, &shell, CommandAction::OpenSkills).await;
+        assert!(matches!(effect, ActionEffect::OpenedOverlay));
+        focus_overlay(&mut app, &root);
+        assert_eq!(shell.borrow().overlays.borrow().depth(), 2);
+        let fill = shell
+            .borrow()
+            .take_skills_fetch()
+            .expect("fill handle parked");
+
+        let before = main_notices(&world).len();
+        fill_skills_window(&fill, Vec::new());
+        let rendered = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+        assert!(
+            rendered.contains("No skills found"),
+            "empty state: {rendered}"
+        );
+        assert_eq!(
+            shell.borrow().overlays.borrow().depth(),
+            2,
+            "window still open over the palette"
+        );
+        assert_eq!(
+            main_notices(&world).len(),
+            before,
+            "no transcript notice folded"
+        );
+    }
+
+    /// The drive loop's drain kicks off discovery off the loop once the window
+    /// parked its fill handle: `spawn_skills_discovery` delivers exactly one
+    /// result over the shared channel (the walk runs on the blocking pool). We
+    /// assert the offload, not a specific skill set, which depends on the
+    /// environment.
+    #[tokio::test]
+    async fn open_skills_drain_spawns_discovery_off_the_loop() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let (skills_tx, mut skills_rx) = unbounded_channel();
+
+        // Opening the skills window parks a fill handle for the drive loop.
+        let effect = apply_command(&mut world, &shell, CommandAction::OpenSkills).await;
+        assert!(matches!(effect, ActionEffect::OpenedOverlay));
+        assert!(
+            shell.borrow().take_skills_fetch().is_some(),
+            "the window parked a fill handle"
+        );
+
+        // The drain then spawns discovery off the loop; it delivers one result.
+        spawn_skills_discovery(&world, &skills_tx);
+        assert!(
+            skills_rx.recv().await.is_some(),
+            "discovery delivered a result"
         );
     }
 
@@ -5929,7 +6280,6 @@ mod tests {
         // the tempdir rather than the real home.
         let _home = HomeGuard::set(dir.path());
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
-        let (skills_tx, _skills_rx) = unbounded_channel();
         let (export_tx, mut export_rx) = unbounded_channel();
         let (redraw_tx, _redraw_rx) = unbounded_channel();
 
@@ -5937,7 +6287,6 @@ mod tests {
             &mut world,
             &shell,
             CommandAction::ExportHtml,
-            &skills_tx,
             &export_tx,
             &redraw_tx,
         )

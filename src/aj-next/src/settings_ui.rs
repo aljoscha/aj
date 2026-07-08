@@ -56,8 +56,8 @@ use vaxis::vxfw::{
 };
 
 use crate::overlay::{
-    OpenOverlay, OverlayChrome, OverlayPlacement, OverlayStack, close_top, subtitle_confirm_close,
-    subtitle_edit_close,
+    OpenOverlay, OverlayChrome, OverlayPlacement, OverlayStack, close_all, close_top,
+    subtitle_confirm_close, subtitle_edit_close,
 };
 
 /// The synthetic settings row folding `model_api` + `model_name` into one
@@ -193,7 +193,10 @@ pub(crate) fn open_thinking(
                     .borrow_mut()
                     .push(SelectorActivity::ThinkingConfirmed { target, level });
             }
-            close_top(&stack_c, ctx, &editor_c);
+            // A confirmed pick is terminal: tear the whole stack down
+            // (palette included) back to the transcript. Cancel below uses
+            // `close_top`, which returns to the palette underneath.
+            close_all(&stack_c, ctx, &editor_c);
         }));
         let stack_cancel = Rc::clone(stack);
         let editor_cancel = Rc::clone(editor);
@@ -290,7 +293,10 @@ pub(crate) fn open_model(
                         info: Box::new(info.clone()),
                     });
             }
-            close_top(&stack_c, ctx, &editor_c);
+            // A confirmed pick is terminal: tear the whole stack down
+            // (palette included) back to the transcript. Cancel below uses
+            // `close_top`, which returns to the palette underneath.
+            close_all(&stack_c, ctx, &editor_c);
         }));
         let stack_cancel = Rc::clone(stack);
         let editor_cancel = Rc::clone(editor);
@@ -558,6 +564,25 @@ impl SettingList {
         }
     }
 
+    /// Replace the whole row set (an async fill once discovery lands),
+    /// recompute the label column width, and re-apply the active filter.
+    ///
+    /// Safe to call while the window is open and focused: it keeps the filter
+    /// field and list widgets, so focus survives, and resets the list cursor
+    /// to the top exactly as construction does. The recompute of
+    /// `label_width` and the filter re-derivation mirror [`SettingList::new`]
+    /// and [`apply_setting_filter`].
+    pub(crate) fn set_rows(&self, rows: Vec<SettingRow>) {
+        let mut state = self.state.borrow_mut();
+        state.label_width = rows
+            .iter()
+            .map(|r| r.label.chars().count())
+            .max()
+            .unwrap_or(0);
+        state.rows = rows;
+        apply_setting_filter(&mut state, &mut self.list.borrow_mut());
+    }
+
     /// A row's current displayed value, for host reconciliation and tests.
     #[cfg(test)]
     pub(crate) fn value_of(&self, id: &str) -> Option<String> {
@@ -681,13 +706,18 @@ impl Widget for SettingList {
         {
             if let Some(sel) = self.selected() {
                 match sel.cycle {
-                    Some(values) => {
+                    // A non-empty cycle set advances in place and fires the
+                    // change. An empty set is an inert placeholder row (the
+                    // skills window's loading and "no skills" states), so Enter
+                    // neither changes a value nor fires a spurious `on_change`.
+                    Some(values) if !values.is_empty() => {
                         let next = next_cycle_value(&values, &sel.value);
                         self.set_value(&sel.id, &next);
                         if let Some(cb) = self.on_change.as_mut() {
                             cb(ctx, &sel.id, &next);
                         }
                     }
+                    Some(_) => {}
                     None => {
                         if let Some(cb) = self.on_open.as_mut() {
                             cb(ctx, &sel.id, &sel.value);
@@ -1492,16 +1522,17 @@ pub(crate) struct SkillRow {
     pub(crate) disable_model_invocation: bool,
 }
 
-/// Open the skills window over `skills`. Each Enter toggles the highlighted
-/// skill and stages a [`SelectorActivity::SkillToggle`]; the window stays open.
-pub(crate) fn open_skills(
-    stack: &Rc<RefCell<OverlayStack>>,
-    editor: &WidgetRef,
-    chrome: &OverlayChrome,
-    activity: &Rc<RefCell<Vec<SelectorActivity>>>,
-    skills: Vec<SkillRow>,
-) {
-    let rows: Vec<SettingRow> = skills
+/// The skills window's fill handle: the drive loop replaces the loading
+/// placeholder with the discovered rows through it once the off-loop
+/// discovery walk lands. Parked on open so the fill targets this captured
+/// list, never the stack's `top()`.
+pub(crate) type SkillsFill = Rc<RefCell<SettingList>>;
+
+/// Build one skills-window row per discovered skill. Each Enter toggles the
+/// highlighted skill (see [`open_skills`]'s `on_change`), so every row is a
+/// bool cycle. Shared by the drive loop's skills fill arm.
+pub(crate) fn build_skill_rows(skills: Vec<SkillRow>) -> Vec<SettingRow> {
+    skills
         .into_iter()
         .map(|skill| {
             let mut description = String::new();
@@ -1524,9 +1555,45 @@ pub(crate) fn open_skills(
                 clear_to: String::new(),
             }
         })
-        .collect();
+        .collect()
+}
+
+/// A non-interactive placeholder row for the skills window (the loading
+/// state, and the empty "no skills" state). The empty cycle set makes Enter
+/// inert (see the [`SettingList`] Enter handler), so the placeholder never
+/// toggles or fires a change, and its blank id keeps any stray toggle from
+/// naming a real skill.
+pub(crate) fn skills_placeholder_row(label: &str) -> SettingRow {
+    SettingRow {
+        id: String::new(),
+        label: label.to_string(),
+        value: String::new(),
+        description: String::new(),
+        kind: RowKind::Cycle(Vec::new()),
+        inherited: false,
+        clear_to: String::new(),
+    }
+}
+
+/// Open the skills window with a loading placeholder and park its fill handle
+/// for the drive loop.
+///
+/// The window opens immediately (on top of whatever is on the stack, e.g. the
+/// palette) so the user sees it right away. Discovery walks the skill tree off
+/// the loop, and the drive loop replaces the placeholder with the discovered
+/// rows through the parked fill handle once the walk lands. The `on_change`
+/// (toggle) and `on_close` wiring operates by row id/name, so it works
+/// unchanged once real rows replace the placeholder. Does not move focus: the
+/// caller (host) posts the refocus event.
+pub(crate) fn open_skills(
+    stack: &Rc<RefCell<OverlayStack>>,
+    editor: &WidgetRef,
+    chrome: &OverlayChrome,
+    activity: &Rc<RefCell<Vec<SelectorActivity>>>,
+    fill_slot: &Rc<RefCell<Option<SkillsFill>>>,
+) {
     let list = Rc::new(RefCell::new(SettingList::new(
-        rows,
+        vec![skills_placeholder_row("Loading skills\u{2026}")],
         chrome.select.clone(),
         false,
     )));
@@ -1553,10 +1620,15 @@ pub(crate) fn open_skills(
         chrome,
         "Skills",
         subtitle_edit_close("toggle"),
-        to_widget_ref(list),
+        to_widget_ref(Rc::clone(&list)),
         focus,
         OverlayPlacement::Large,
     );
+    // Park the fill handle so the drive loop can replace the placeholder with
+    // the discovered rows. The fill targets this captured list, never the
+    // stack's `top()`, so a confirm of another opener from the still-open
+    // palette can't misdirect it.
+    *fill_slot.borrow_mut() = Some(list);
 }
 
 #[cfg(test)]
@@ -1692,6 +1764,47 @@ mod tests {
         list.on_close = Some(Box::new(move |_ctx| *closed_c.borrow_mut() = true));
         send(&mut list, &key(Key::ESCAPE, Modifiers::empty()));
         assert!(*closed.borrow());
+    }
+
+    /// `set_rows` swaps the whole row set (the skills window's async fill) and
+    /// re-applies the filter: the old rows are gone, the new rows show, the
+    /// cursor resets to the first re-derived row, and the refreshed item count
+    /// makes every new row reachable. Navigating to the second row is the part
+    /// that fails on a stale filter: without the re-derivation the item count
+    /// still reflects the single pre-swap row and clamps the cursor to the top.
+    #[test]
+    fn set_rows_replaces_rows_and_reapplies_the_filter() {
+        let mut list = SettingList::new(vec![cycle_row("old", "true")], styles(), false);
+        list.set_rows(vec![cycle_row("a", "true"), cycle_row("b", "false")]);
+        assert_eq!(list.value_of("old"), None, "old row gone");
+        assert_eq!(list.value_of("a").as_deref(), Some("true"));
+        assert_eq!(list.value_of("b").as_deref(), Some("false"));
+        assert_eq!(
+            list.selected().map(|r| r.id),
+            Some("a".to_string()),
+            "cursor reset to the first re-derived row"
+        );
+        send(&mut list, &key(Key::DOWN, Modifiers::empty()));
+        assert_eq!(
+            list.selected().map(|r| r.id),
+            Some("b".to_string()),
+            "the second re-derived row is reachable via the refreshed item count"
+        );
+    }
+
+    /// The skills placeholder row is inert on Enter: its empty cycle set fires
+    /// no change and does not panic.
+    #[test]
+    fn skills_placeholder_row_is_inert_on_enter() {
+        let mut list = SettingList::new(
+            vec![skills_placeholder_row("Loading skills\u{2026}")],
+            styles(),
+            false,
+        );
+        list.on_change = Some(Box::new(|_ctx, _id, _v| {
+            panic!("placeholder row must not fire a change")
+        }));
+        send(&mut list, &enter());
     }
 
     /// Every schema option surfaces as a row, with the `model_api` /

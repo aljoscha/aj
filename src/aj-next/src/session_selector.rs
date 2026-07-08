@@ -29,7 +29,8 @@ use chrono::{DateTime, Datelike, Utc};
 use vaxis::vxfw::{FilterableSelect, SelectItem, WidgetRef, to_widget_ref};
 
 use crate::overlay::{
-    OverlayChrome, OverlayPlacement, OverlayStack, close_key_label, close_top, confirm_key_label,
+    OverlayChrome, OverlayPlacement, OverlayStack, close_all, close_key_label, close_top,
+    confirm_key_label,
 };
 use crate::settings_ui::push_window;
 
@@ -105,7 +106,10 @@ pub(crate) fn open_session_selector(
             if session_id != current_c {
                 *request_c.borrow_mut() = Some(SessionRequest::Resume(session_id));
             }
-            close_top(&stack_c, ctx, &editor_c);
+            // A confirmed pick is terminal: tear the whole stack down
+            // (palette included) back to the transcript. Cancel below uses
+            // `close_top`, which returns to the palette underneath.
+            close_all(&stack_c, ctx, &editor_c);
         }));
         let stack_cancel = Rc::clone(stack);
         let editor_cancel = Rc::clone(editor);

@@ -265,6 +265,19 @@ pub(crate) fn close_top(
     ctx.redraw = true;
 }
 
+/// Tears the whole overlay stack down and moves focus to `fallback`
+/// (the editor). A terminal confirm returns to the transcript, not to
+/// any parent overlay, so it clears the stack rather than popping one.
+pub(crate) fn close_all(
+    stack: &Rc<RefCell<OverlayStack>>,
+    ctx: &mut EventContext,
+    fallback: &WidgetRef,
+) {
+    stack.borrow_mut().close_all();
+    ctx.request_focus(Rc::clone(fallback));
+    ctx.redraw = true;
+}
+
 // ============================================================================
 // Overlay subtitles (key-hint labels)
 // ============================================================================

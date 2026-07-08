@@ -51,7 +51,7 @@ use vaxis::vxfw::{
 };
 
 use crate::overlay::{
-    OverlayChrome, OverlayPlacement, OverlayStack, close_top, subtitle_confirm_close,
+    OverlayChrome, OverlayPlacement, OverlayStack, close_all, close_top, subtitle_confirm_close,
     subtitle_login,
 };
 use crate::settings_ui::push_window;
@@ -679,7 +679,11 @@ fn open_auth_picker(
             if let Some(request) = auth_request_for(&map, mode, &item.filter_key) {
                 *request_c.borrow_mut() = Some(request);
             }
-            close_top(&stack_c, ctx, &editor_c);
+            // A confirmed pick is terminal: tear the whole stack down
+            // (palette and picker) back to the transcript. The host's login
+            // flow then pushes the dialog as the sole overlay. Cancel below
+            // uses `close_top`, which returns to the palette underneath.
+            close_all(&stack_c, ctx, &editor_c);
         }));
         let stack_cancel = Rc::clone(stack);
         let editor_cancel = Rc::clone(editor);

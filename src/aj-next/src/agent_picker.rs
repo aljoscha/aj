@@ -34,7 +34,8 @@ use vaxis::vxfw::{
 };
 
 use crate::overlay::{
-    OverlayChrome, OverlayPlacement, OverlayStack, close_key_label, close_top, confirm_key_label,
+    OverlayChrome, OverlayPlacement, OverlayStack, close_all, close_key_label, close_top,
+    confirm_key_label,
 };
 use crate::settings_ui::push_window;
 
@@ -445,7 +446,12 @@ pub(crate) fn open_agent_picker(
             if let Some(chosen) = chosen {
                 *outcome_c.borrow_mut() = Some(chosen);
             }
-            close_top(&stack_c, ctx, &editor_c);
+            // A confirmed pick is terminal: tear the whole stack down
+            // (palette and picker) back to the transcript. When it drills into
+            // a task the host opens the viewer as a lone overlay, so Esc from
+            // there returns to the transcript. Cancel below uses `close_top`,
+            // which returns to the palette underneath.
+            close_all(&stack_c, ctx, &editor_c);
         }));
         let stack_cancel = Rc::clone(stack);
         let editor_cancel = Rc::clone(editor);

@@ -11,8 +11,10 @@
 //!   the host fills once its fetch lands.
 //! - `Quit` sets [`EventContext::quit`].
 //! - Everything else is parked in the command slot for the host loop
-//!   (which owns the turn machinery and can fold notices), and the palette
-//!   closes back to the editor.
+//!   (which owns the turn machinery and can fold notices). The palette
+//!   stays on the stack underneath, and the drive loop decides its fate:
+//!   an opener pushes its overlay on top (so cancel returns to the palette),
+//!   a pure action or a declined opener pops the palette back to the editor.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -148,12 +150,14 @@ fn dispatch_from_palette(
         // no-op that leaves it in place.
         CommandAction::OpenCommandPalette => {}
         CommandAction::Quit => ctx.quit = true,
-        // Host-applied commands (compact, export, and the not-yet-wired
-        // selectors) open no child, so the palette closes back to the
-        // editor and the host applies the effect.
+        // Host-applied commands (compact, export, and the config-editing
+        // selectors) run in the drive loop, which owns the turn machinery and
+        // the session world. We only park the action and leave the palette on
+        // the stack. The drive loop pushes any child overlay on top of the
+        // palette (so cancel returns here) or pops the palette back to the
+        // editor when the command opened nothing.
         other => {
             *command_slot.borrow_mut() = Some(other);
-            close_top(stack, ctx, editor);
         }
     }
 }
