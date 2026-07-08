@@ -2070,9 +2070,9 @@ async fn apply_setting_change(
 /// remembers it and fills it when the result lands). Only the fetched
 /// data crosses the task boundary, all of which is `Send`.
 ///
-/// `styles` is the content-column tint snapshot for the auth page. It is
-/// `Copy`, so the auth task captures it directly. See the call site for
-/// the theme-reload staleness note.
+/// `styles` is the content-column tint snapshot for the auth and usage
+/// pages. It is `Copy`, so those tasks capture it directly. See the call
+/// site for the theme-reload staleness note.
 fn spawn_overlay_fetch(
     world: &World,
     kind: FetchKind,
@@ -2091,7 +2091,7 @@ fn spawn_overlay_fetch(
         FetchKind::Usage => {
             let auth = world.auth.clone();
             tokio::spawn(async move {
-                let rows = usage_rows(&aj_app::usage::collect_usage(&auth).await);
+                let rows = usage_rows(&aj_app::usage::collect_usage(&auth).await, &styles);
                 let _ = tx.send((FetchKind::Usage, rows));
             });
         }

@@ -336,18 +336,26 @@ pub(crate) fn auth_rows(statuses: &[ProviderAuthStatus], styles: &ContentStyles)
 /// Usage rows: one group per provider. Only a provider's first row
 /// carries its id, continuation rows leave it blank so the id column
 /// groups the windows visually (matching `aj`'s usage page).
-pub(crate) fn usage_rows(statuses: &[ProviderUsageStatus]) -> Vec<Row> {
+///
+/// Each row is up to three columns, tinted like [`auth_rows`]: the
+/// fixed 12-col provider-id prefix in `styles.dim` (blank on
+/// continuation rows), the window/status label in the default style,
+/// and the per-window status detail in `styles.muted`.
+pub(crate) fn usage_rows(statuses: &[ProviderUsageStatus], styles: &ContentStyles) -> Vec<Row> {
     let now_ms = now_unix_ms();
     let mut rows = Vec::new();
     for status in statuses {
         let id = status.provider_id.as_str();
         let mut prefix = id.to_string();
         let mut push = |rows: &mut Vec<Row>, label: &str, detail: Option<&str>| {
-            let mut line = format!("{prefix:<12}  {label}");
+            let mut row = vec![
+                span(format!("{prefix:<12}"), styles.dim),
+                span(format!("  {label}"), Style::default()),
+            ];
             if let Some(detail) = detail {
-                line.push_str(&format!("  {detail}"));
+                row.push(span(format!("  {detail}"), styles.muted));
             }
-            rows.push(plain(line));
+            rows.push(row);
             prefix = String::new();
         };
         match &status.outcome {
@@ -560,28 +568,91 @@ mod tests {
     #[test]
     fn usage_rows_group_windows_under_the_provider() {
         use aj_models::usage::{ProviderUsage, UsageWindow};
-        let rows = rows_text(&usage_rows(&[
-            ProviderUsageStatus {
-                provider_id: "anthropic".into(),
-                outcome: UsageOutcome::Usage(ProviderUsage {
-                    windows: vec![UsageWindow {
-                        label: "5-hour".into(),
-                        used: 0.5,
-                        resets_at: None,
-                    }],
-                    notes: Vec::new(),
-                    reset_credits: None,
-                }),
-            },
-            ProviderUsageStatus {
-                provider_id: "openai".into(),
-                outcome: UsageOutcome::NotConfigured,
-            },
-        ]));
+        let rows = rows_text(&usage_rows(
+            &[
+                ProviderUsageStatus {
+                    provider_id: "anthropic".into(),
+                    outcome: UsageOutcome::Usage(ProviderUsage {
+                        windows: vec![UsageWindow {
+                            label: "5-hour".into(),
+                            used: 0.5,
+                            resets_at: None,
+                        }],
+                        notes: Vec::new(),
+                        reset_credits: None,
+                    }),
+                },
+                ProviderUsageStatus {
+                    provider_id: "openai".into(),
+                    outcome: UsageOutcome::NotConfigured,
+                },
+            ],
+            &test_styles(),
+        ));
         assert!(rows.contains("anthropic"), "{rows}");
         assert!(rows.contains("5-hour"), "{rows}");
         assert!(rows.contains("50% used"), "{rows}");
         assert!(rows.contains("not configured"), "{rows}");
+    }
+
+    /// The usage page tints its columns like the auth page: the provider
+    /// id in the dim style, the window label in the default style, and the
+    /// status detail in the muted style. A provider's continuation rows
+    /// leave the id column blank so the group reads as one provider. This
+    /// fails if a column is left at the default fg.
+    #[test]
+    fn usage_rows_tint_columns_from_styles() {
+        use aj_models::usage::{ProviderUsage, UsageWindow};
+        let styles = test_styles();
+        let rows = usage_rows(
+            &[ProviderUsageStatus {
+                provider_id: "anthropic".into(),
+                outcome: UsageOutcome::Usage(ProviderUsage {
+                    windows: vec![
+                        UsageWindow {
+                            label: "5-hour".into(),
+                            used: 0.5,
+                            resets_at: None,
+                        },
+                        UsageWindow {
+                            label: "weekly".into(),
+                            used: 0.25,
+                            resets_at: None,
+                        },
+                    ],
+                    notes: Vec::new(),
+                    reset_credits: None,
+                }),
+            }],
+            &styles,
+        );
+        assert_eq!(rows.len(), 2, "one row per window: {rows:?}");
+
+        // First row: id, label, and detail spans.
+        let first = &rows[0];
+        assert_eq!(first.len(), 3, "id, label, and detail spans: {first:?}");
+        // Provider id in the dim tint, on the first row of the group.
+        assert!(first[0].text.contains("anthropic"), "{first:?}");
+        assert_eq!(first[0].style, styles.dim);
+        // Window label in the default style.
+        assert!(first[1].text.contains("5-hour"), "{first:?}");
+        assert_eq!(first[1].style, Style::default());
+        // Status detail in the muted tint.
+        assert!(first[2].text.contains("50% used"), "{first:?}");
+        assert_eq!(first[2].style, styles.muted);
+
+        // Continuation row: id column is blank (no provider id), still in
+        // the dim tint, and the label/detail carry the same tints.
+        let second = &rows[1];
+        assert_eq!(second.len(), 3, "id, label, and detail spans: {second:?}");
+        assert!(
+            second[0].text.trim().is_empty(),
+            "continuation id column is blank: {second:?}"
+        );
+        assert_eq!(second[0].style, styles.dim);
+        assert!(second[1].text.contains("weekly"), "{second:?}");
+        assert_eq!(second[1].style, Style::default());
+        assert_eq!(second[2].style, styles.muted);
     }
 
     fn sample_stats() -> SessionStats {
