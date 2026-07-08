@@ -55,7 +55,10 @@ use vaxis::vxfw::{
     TextField, TextSpan, Widget, WidgetRef, WidthBasis, draw_widget, to_widget_ref,
 };
 
-use crate::overlay::{OpenOverlay, OverlayChrome, OverlayPlacement, OverlayStack, close_top};
+use crate::overlay::{
+    OpenOverlay, OverlayChrome, OverlayPlacement, OverlayStack, close_top, subtitle_confirm_close,
+    subtitle_edit_close,
+};
 
 /// The synthetic settings row folding `model_api` + `model_name` into one
 /// picker-backed entry. Its change value is a `provider/id` string.
@@ -142,13 +145,6 @@ pub(crate) fn push_window(
     window
 }
 
-/// The confirm/close subtitle the pick-list overlays share. Enter and Esc are
-/// the widget's built-in keys, not rebindable actions, so they keep the fixed
-/// convention (Spec F).
-fn confirm_close_subtitle() -> String {
-    "Enter to confirm  \u{2022}  Esc to close".to_string()
-}
-
 // ============================================================================
 // Thinking selector
 // ============================================================================
@@ -209,7 +205,7 @@ pub(crate) fn open_thinking(
         stack,
         chrome,
         "Thinking effort",
-        confirm_close_subtitle(),
+        subtitle_confirm_close(),
         to_widget_ref(select),
         focus,
         OverlayPlacement::Small,
@@ -306,7 +302,7 @@ pub(crate) fn open_model(
         stack,
         chrome,
         "Select model",
-        confirm_close_subtitle(),
+        subtitle_confirm_close(),
         to_widget_ref(select),
         focus,
         OverlayPlacement::Small,
@@ -1135,9 +1131,9 @@ pub(crate) fn open_settings(
 }
 
 /// The settings window's key-hint subtitle. The project window advertises the
-/// clear chord, resolved from keybinding data (Spec F).
+/// clear chord, all labels resolved from keybinding data (Spec F).
 fn settings_subtitle(project_mode: bool) -> String {
-    let mut hint = "Enter to edit  \u{2022}  Esc to close".to_string();
+    let mut hint = subtitle_edit_close("edit");
     if project_mode && let Some(clear) = default_action_shortcut(ACTION_SETTINGS_CLEAR) {
         hint.push_str(&format!("  \u{2022}  {clear} to clear"));
     }
@@ -1474,7 +1470,7 @@ fn push_submenu(
         stack,
         chrome,
         title,
-        confirm_close_subtitle(),
+        subtitle_confirm_close(),
         child,
         Rc::clone(&focus),
         OverlayPlacement::Small,
@@ -1556,7 +1552,7 @@ pub(crate) fn open_skills(
         stack,
         chrome,
         "Skills",
-        "Enter to toggle  \u{2022}  Esc to close".to_string(),
+        subtitle_edit_close("toggle"),
         to_widget_ref(list),
         focus,
         OverlayPlacement::Large,

@@ -15,6 +15,9 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use aj_app::keybindings::{
+    ACTION_OVERLAY_CLOSE_ALL, default_action_shortcut, fixed_keys, format_keybinding,
+};
 use aj_app::theme::{Theme, ThemeBg, ThemeColor};
 use vaxis::cell::Style;
 use vaxis::vxfw::{
@@ -262,6 +265,90 @@ pub(crate) fn close_top(
     ctx.redraw = true;
 }
 
+// ============================================================================
+// Overlay subtitles (key-hint labels)
+// ============================================================================
+//
+// The single source for every overlay's key-hint subtitle, so the palette,
+// the read-only content pages, the login dialog, and the selectors read one
+// wording rather than each formatting its own literal (Spec F: hint labels
+// resolved, never hardcoded).
+//
+// NOTE: Esc/Enter are FIXED `vxfw` widget conventions here. The overlay
+// widgets (`ContentOverlay`, `FilterableSelect`, `LoginDialog`) hardcode Esc
+// to dismiss and Enter to confirm/submit, so those chords are not registered
+// as rebindable actions in `aj_app`'s vocabulary. We still resolve the
+// *labels* through `format_keybinding`, a single formatting source, so a
+// display spelling can't drift from a raw "Esc"/"Enter" literal. The close-all
+// chord IS a keymap action (see `crate::keymap`), so it resolves through
+// `default_action_shortcut`, and the copy chord is the fixed Ctrl+Y
+// convention. Making the in-widget Esc/Enter *handling* rebindable is a
+// tracked follow-up.
+
+/// Subtitle for the read-only content pages (help, auth status, session
+/// info, usage): just how to close.
+///
+/// Reads `"{cancel} to close"`, or a `"{cancel} back  \u{2022}  {close} close"`
+/// split when a distinct close-all chord resolves (the content overlay is a
+/// modal, so the close-all chord tears the whole stack down while Esc returns
+/// to the parent).
+pub(crate) fn subtitle_close() -> String {
+    let cancel = format_keybinding("escape");
+    match default_action_shortcut(ACTION_OVERLAY_CLOSE_ALL) {
+        Some(close_all) if close_all != cancel => {
+            format!("{cancel} back  \u{2022}  {close_all} close")
+        }
+        _ => format!("{cancel} to close"),
+    }
+}
+
+/// Subtitle for confirmable pick-list overlays (command palette, selectors):
+/// how to confirm the highlighted row and how to close.
+///
+/// Reads `"{confirm} to confirm  \u{2022}  {cancel} to close"`, splitting the
+/// close hint into `"{cancel} back  \u{2022}  {close} close"` when a distinct
+/// close-all chord resolves. The `close` wording is shared with every
+/// confirmable overlay so the visual language stays uniform.
+pub(crate) fn subtitle_confirm_close() -> String {
+    let confirm = format_keybinding("enter");
+    let cancel = format_keybinding("escape");
+    match default_action_shortcut(ACTION_OVERLAY_CLOSE_ALL) {
+        Some(close_all) if close_all != cancel => {
+            format!("{confirm} to confirm  \u{2022}  {cancel} back  \u{2022}  {close_all} close")
+        }
+        _ => format!("{confirm} to confirm  \u{2022}  {cancel} to close"),
+    }
+}
+
+/// Subtitle for the OAuth login dialog: how to copy the URL, submit a pasted
+/// code, and cancel. Ctrl+Y is the fixed copy convention, submit/cancel resolve
+/// through `format_keybinding`.
+pub(crate) fn subtitle_login() -> String {
+    let copy = fixed_keys::CTRL_Y;
+    let submit = format_keybinding("enter");
+    let cancel = format_keybinding("escape");
+    format!(
+        "{copy} to copy URL  \u{2022}  {submit} to submit pasted code  \u{2022}  {cancel} to cancel"
+    )
+}
+
+/// Subtitle for the stay-open editing windows (settings, skills): how to act
+/// on the highlighted row and how to close. `verb` is the per-window
+/// activation word (`"edit"`, `"toggle"`).
+///
+/// Reads `"{confirm} to {verb}  \u{2022}  {cancel} to close"`.
+pub(crate) fn subtitle_edit_close(verb: &str) -> String {
+    // NOTE: unlike the dismissable modals above, these windows keep the simple
+    // "to close" form even though the close-all chord also tears them down.
+    // Surfacing the `{cancel} back  \u{2022}  {close} close` split here is a
+    // deferred wording decision, not a label-resolution gap. Space is not an
+    // activation alias in `SettingList`, so the hint names only the resolved
+    // confirm chord.
+    let confirm = format_keybinding("enter");
+    let cancel = format_keybinding("escape");
+    format!("{confirm} to {verb}  \u{2022}  {cancel} to close")
+}
+
 #[cfg(test)]
 mod tests {
     use vaxis::mouse;
@@ -376,5 +463,53 @@ mod tests {
             }),
         );
         assert!(!ctx.consume_event, "keys route by focus, not by the scrim");
+    }
+
+    /// The subtitle builders resolve their labels through the keybinding
+    /// data, never a raw literal. The expectations are themselves derived
+    /// from `format_keybinding`/`default_action_shortcut`, so a rebind moves
+    /// both the rendered label and the assertion together.
+    #[test]
+    fn subtitle_builders_resolve_labels_from_binding_data() {
+        let cancel = format_keybinding("escape");
+        let confirm = format_keybinding("enter");
+        let close_all = default_action_shortcut(ACTION_OVERLAY_CLOSE_ALL);
+
+        // Read-only pages: the content overlay's close hint.
+        let close = subtitle_close();
+        assert!(!close.is_empty());
+        assert!(close.contains(&cancel), "{close}");
+        match &close_all {
+            Some(k) if *k != cancel => {
+                assert_eq!(close, format!("{cancel} back  \u{2022}  {k} close"));
+                assert!(close.contains(k), "{close}");
+            }
+            _ => assert_eq!(close, format!("{cancel} to close")),
+        }
+
+        // Command palette / selectors: confirm plus close.
+        let confirm_close = subtitle_confirm_close();
+        assert!(!confirm_close.is_empty());
+        assert!(confirm_close.contains(&confirm), "{confirm_close}");
+        assert!(confirm_close.contains(&cancel), "{confirm_close}");
+        if let Some(k) = &close_all
+            && *k != cancel
+        {
+            assert!(confirm_close.contains(k), "{confirm_close}");
+        }
+
+        // Login dialog: the fixed copy label plus the resolved submit/cancel.
+        let login = subtitle_login();
+        assert!(!login.is_empty());
+        assert!(login.contains(fixed_keys::CTRL_Y), "{login}");
+        assert!(login.contains(&confirm), "{login}");
+        assert!(login.contains(&cancel), "{login}");
+
+        // Stay-open editing windows: the resolved verb plus close labels.
+        let edit = subtitle_edit_close("edit");
+        assert_eq!(
+            edit,
+            format!("{confirm} to edit  \u{2022}  {cancel} to close")
+        );
     }
 }

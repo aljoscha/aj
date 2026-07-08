@@ -25,7 +25,9 @@ use vaxis::vxfw::{
 };
 
 use crate::content_overlay::{help_rows, loading_rows, open_content_overlay};
-use crate::overlay::{OpenOverlay, OverlayChrome, OverlayPlacement, OverlayStack, close_top};
+use crate::overlay::{
+    OpenOverlay, OverlayChrome, OverlayPlacement, OverlayStack, close_top, subtitle_confirm_close,
+};
 
 /// A read-only overlay whose content the host fetches asynchronously.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,11 +97,11 @@ pub(crate) fn open_palette(
         }));
     }
     let mut window = OverlayWindow::new("Commands", to_widget_ref(select));
-    // TODO(aljoscha): resolve the confirm/cancel subtitle labels through
-    // keybinding data (Spec F's hint-label rule). Enter/Esc are the
-    // FilterableSelect's built-in keys, not rebindable actions in
-    // `aj_app`'s vocabulary, so for now they keep the fixed convention.
-    window.subtitle = "Enter to confirm  \u{2022}  Esc to close".to_string();
+    // The confirm/close hint resolves through the shared keybinding data
+    // (Spec F): Enter/Esc labels from `format_keybinding`, the close-all label
+    // from the keymap action. The Enter/Esc *handling* stays a fixed
+    // `FilterableSelect` convention (see the NOTE in `crate::overlay`).
+    window.subtitle = subtitle_confirm_close();
     {
         let ch = chrome.borrow();
         window.border_style = ch.border;

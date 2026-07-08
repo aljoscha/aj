@@ -28,7 +28,9 @@ use vaxis::vxfw::{
     SubSurface, Surface, Text, Widget, WidgetRef, to_widget_ref,
 };
 
-use crate::overlay::{OpenOverlay, OverlayChrome, OverlayPlacement, OverlayStack, close_top};
+use crate::overlay::{
+    OpenOverlay, OverlayChrome, OverlayPlacement, OverlayStack, close_top, subtitle_close,
+};
 
 /// PgUp/PgDn step, in rows. A fixed jump rather than a viewport-derived
 /// one keeps the widget from needing to know its drawn height.
@@ -174,10 +176,11 @@ pub(crate) fn open_content_overlay(
     // border and title chrome around it.
     let focus: WidgetRef = to_widget_ref(Rc::clone(&content));
     let mut window = OverlayWindow::new(title, to_widget_ref(content));
-    // NOTE: Esc/Enter are the ContentOverlay's built-in dismiss keys, not
-    // rebindable actions in `aj_app`'s vocabulary, so the subtitle keeps
-    // the fixed convention rather than resolving through keybinding data.
-    window.subtitle = "Esc to close".to_string();
+    // The close hint resolves through the shared keybinding data (Spec F):
+    // Esc's label from `format_keybinding`, the close-all label from the
+    // keymap action. The Esc/Enter *handling* stays a fixed `ContentOverlay`
+    // convention (see the NOTE in `crate::overlay`).
+    window.subtitle = subtitle_close();
     window.border_style = chrome.border;
     window.title_style = chrome.title;
     window.subtitle_style = chrome.subtitle;

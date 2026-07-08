@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use aj_app::auth::{LoginLine, auth_lines, browser_available, copy_to_clipboard, open_browser};
-use aj_app::keybindings::fixed_keys;
+use aj_app::keybindings::{fixed_keys, format_keybinding};
 use aj_app::theme::{Theme, ThemeColor};
 use aj_models::oauth::{OAuthAuthInfo, OAuthCallbacks, OAuthError};
 use async_trait::async_trait;
@@ -50,7 +50,10 @@ use vaxis::vxfw::{
     WidthBasis, draw_widget, to_widget_ref,
 };
 
-use crate::overlay::{OverlayChrome, OverlayPlacement, OverlayStack, close_top};
+use crate::overlay::{
+    OverlayChrome, OverlayPlacement, OverlayStack, close_top, subtitle_confirm_close,
+    subtitle_login,
+};
 use crate::settings_ui::push_window;
 use crate::transcript::vaxis_color;
 
@@ -518,12 +521,14 @@ impl OAuthCallbacks for DialogCallbacks {
     }
 
     async fn on_manual_code_input(&self) -> Result<String, OAuthError> {
-        // Enter is the field's built-in submit key, not a rebindable
-        // action in aj_app's vocabulary, so the prompt names it literally.
-        self.await_input(
+        // Enter is the field's built-in submit key. Its handling is a fixed
+        // convention, but the label resolves through `format_keybinding` so it
+        // reads from one source (see the NOTE in `crate::overlay`).
+        let submit = format_keybinding("enter");
+        self.await_input(&format!(
             "On another machine? Paste the code shown after login (or the full redirect URL), \
-             then press Enter:",
-        )
+             then press {submit}:"
+        ))
         .await
     }
 
@@ -645,9 +650,10 @@ fn open_auth_picker(
         stack,
         chrome,
         title,
-        // Enter/Esc are the FilterableSelect's built-in keys, not
-        // rebindable actions, so the subtitle keeps the fixed convention.
-        "Enter to confirm  \u{2022}  Esc to close".to_string(),
+        // The confirm/close hint resolves through the shared keybinding data
+        // (Spec F). Enter/Esc *handling* stays a fixed `FilterableSelect`
+        // convention (see the NOTE in `crate::overlay`).
+        subtitle_confirm_close(),
         to_widget_ref(Rc::clone(&select)),
         focus,
         OverlayPlacement::Small,
@@ -692,14 +698,6 @@ pub(crate) fn open_logout_picker(
     );
 }
 
-/// The login dialog's confirm/copy/cancel subtitle. Ctrl+Y resolves from
-/// the fixed-keys table; Enter/Esc are the field's built-in keys and keep
-/// the fixed convention.
-pub(crate) fn login_subtitle() -> String {
-    let copy = fixed_keys::CTRL_Y;
-    format!("{copy} to copy URL  \u{2022}  Enter to submit  \u{2022}  Esc to cancel")
-}
-
 /// Build the login dialog over the shared handles and push it as the top
 /// overlay. The caller spawns the login task over the same `state` /
 /// `pending_input` and stores the `cancel` flag, then posts the refocus
@@ -724,7 +722,7 @@ pub(crate) fn open_login_dialog(
         stack,
         chrome,
         &format!("Log in \u{2014} {provider_name}"),
-        login_subtitle(),
+        subtitle_login(),
         to_widget_ref(dialog),
         focus,
         OverlayPlacement::Small,
