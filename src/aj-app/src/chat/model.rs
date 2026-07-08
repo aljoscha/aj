@@ -350,6 +350,8 @@ pub struct ChatState {
     pub hide_thinking_block: bool,
     pub tools_expanded: bool,
     pub show_image_in_terminal: bool,
+    /// Whether fenced code blocks in rendered markdown are syntax-highlighted.
+    pub syntax_highlight: bool,
 }
 
 impl ChatState {
@@ -376,6 +378,7 @@ impl ChatState {
             hide_thinking_block: false,
             tools_expanded: false,
             show_image_in_terminal: true,
+            syntax_highlight: false,
         }
     }
 

@@ -201,6 +201,13 @@ pub struct RenderOpts {
     /// only decoration on quoted prose), matching the paragraph-only scope
     /// of the styling it stands in for.
     pub default_emphasis: Emphasis,
+    /// Whether fenced and indented code blocks are syntax-highlighted. When
+    /// `true`, code-block spans carry the [`SyntaxCategory`] the classifier
+    /// assigned, which the frontend maps to a color. When `false`, every
+    /// code line renders as one uncategorized span (`syntax: None`) that
+    /// takes the frontend's plain code-block color, and the syntect
+    /// classifier is skipped entirely. Off by default.
+    pub syntax_highlight: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -325,19 +332,32 @@ fn render_block(block: &Block, width: usize, opts: &RenderOpts) -> Vec<Vec<Style
             // break because a split span copies the `syntax` field. This
             // matches the styled renderer, which wraps every emitted line
             // uniformly.
-            let highlighted = highlight_code(code, lang.as_deref());
-            for line_runs in highlighted.iter() {
-                let mut spans = vec![StyledSpan::plain(CODE_BLOCK_INDENT, SpanKind::CodeBlock)];
-                for (category, text) in line_runs {
-                    spans.push(StyledSpan {
-                        text: text.clone(),
-                        kind: SpanKind::CodeBlock,
-                        emphasis: Emphasis::default(),
-                        syntax: *category,
-                        link: None,
-                    });
+            //
+            // With highlighting off we skip the syntect classifier and emit
+            // each source line as a single uncategorized run, which the
+            // frontend styles with its plain code-block color.
+            if opts.syntax_highlight {
+                let highlighted = highlight_code(code, lang.as_deref());
+                for line_runs in highlighted.iter() {
+                    let mut spans = vec![StyledSpan::plain(CODE_BLOCK_INDENT, SpanKind::CodeBlock)];
+                    for (category, text) in line_runs {
+                        spans.push(StyledSpan {
+                            text: text.clone(),
+                            kind: SpanKind::CodeBlock,
+                            emphasis: Emphasis::default(),
+                            syntax: *category,
+                            link: None,
+                        });
+                    }
+                    lines.push(spans);
                 }
-                lines.push(spans);
+            } else {
+                for line in code.lines() {
+                    lines.push(vec![
+                        StyledSpan::plain(CODE_BLOCK_INDENT, SpanKind::CodeBlock),
+                        StyledSpan::plain(line, SpanKind::CodeBlock),
+                    ]);
+                }
             }
             lines.push(vec![StyledSpan::plain("```", SpanKind::CodeBlockBorder)]);
             lines
@@ -2661,7 +2681,11 @@ mod tests {
     // -----------------------------------------------------------------
 
     fn opts() -> RenderOpts {
-        RenderOpts::default()
+        // Highlighting on so the code-block tests exercise the classifier.
+        RenderOpts {
+            syntax_highlight: true,
+            ..Default::default()
+        }
     }
 
     /// A repeated `(lang, code)` returns the very same cached handle (a hit,
@@ -3309,6 +3333,24 @@ mod tests {
         let rows = render_markdown("```\nlet y = 2;\n```", 80, &opts());
         assert!(categories(&rows).is_empty());
         assert_eq!(row_text(&rows[1]), "  let y = 2;");
+    }
+
+    #[test]
+    fn syntax_highlight_off_leaves_code_uncategorized() {
+        // With `syntax_highlight` off the syntect classifier is skipped, so a
+        // recognized language that would otherwise carry categories renders as
+        // plain code-block spans with the body preserved verbatim.
+        let opts = RenderOpts {
+            syntax_highlight: false,
+            ..Default::default()
+        };
+        let rows = render_markdown("```rust\n// note\nlet y = 2;\n```", 80, &opts);
+        assert!(
+            categories(&rows).is_empty(),
+            "no categories when highlighting is off",
+        );
+        assert_eq!(row_text(&rows[1]), "  // note");
+        assert_eq!(row_text(&rows[2]), "  let y = 2;");
     }
 
     #[test]

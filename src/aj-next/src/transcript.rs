@@ -205,9 +205,9 @@ struct CachedEntry {
 /// Owned by [`TranscriptView`] and shared into the [`EntryBuilder`] by
 /// `Rc<RefCell<..>>`. One slot per key, so stale `(fingerprint, width)`
 /// variants never accumulate. Session-wide render inputs (the theme,
-/// `tools_expanded`, `hide_thinking_block`, the active view) are handled by
-/// clearing the whole cache when they change rather than folding them into
-/// every fingerprint (see [`TranscriptView::draw`] and
+/// `tools_expanded`, `hide_thinking_block`, `syntax_highlight`, the active
+/// view) are handled by clearing the whole cache when they change rather than
+/// folding them into every fingerprint (see [`TranscriptView::draw`] and
 /// [`TranscriptView::set_styles`]). Width is a per-slot key.
 ///
 /// Storing surfaces is safe today: no transcript entry participates in event
@@ -481,9 +481,9 @@ impl Widget for CachingEntry {
 /// Philosophy: over-fingerprint. A field we forget shows stale content (a real
 /// bug); a field we include that doesn't affect rendering only costs a
 /// harmless rebuild. Session-wide render inputs (`tools_expanded`,
-/// `hide_thinking_block`, the active view, the theme, the draw width) are NOT
-/// hashed here: the cache clears wholesale when they change, and width is a
-/// per-slot key.
+/// `hide_thinking_block`, `syntax_highlight`, the active view, the theme, the
+/// draw width) are NOT hashed here: the cache clears wholesale when they
+/// change, and width is a per-slot key.
 fn entry_fingerprint(entry: &Entry, chat: &ChatState) -> u64 {
     let mut hasher = DefaultHasher::new();
     fingerprint_into(entry, chat, &mut hasher);
@@ -864,11 +864,15 @@ pub(crate) fn build_entry_widget(
         EntryKind::Assistant(a) => EntryWidget::Markdown(build_assistant_markdown(
             a,
             chat.hide_thinking_block,
+            chat.syntax_highlight,
             styles,
         )),
-        EntryKind::Compaction(c) => {
-            EntryWidget::Markdown(build_compaction_markdown(c, chat.tools_expanded, styles))
-        }
+        EntryKind::Compaction(c) => EntryWidget::Markdown(build_compaction_markdown(
+            c,
+            chat.tools_expanded,
+            chat.syntax_highlight,
+            styles,
+        )),
         _ => EntryWidget::Rich(RichText::new(entry_spans(entry, styles))),
     }
 }
@@ -984,11 +988,13 @@ fn entry_spans(entry: &Entry, styles: &TranscriptStyles) -> Vec<TextSpan> {
 fn build_assistant_markdown(
     a: &AssistantEntry,
     hide_thinking: bool,
+    syntax_highlight: bool,
     styles: &TranscriptStyles,
 ) -> MarkdownView {
     let text_opts = RenderOpts {
         hyperlinks: styles.hyperlinks,
         default_emphasis: Emphasis::default(),
+        syntax_highlight,
     };
     // Thinking prose renders italic by default, the same emphasis `aj` applies
     // to a thinking block's markdown.
@@ -998,6 +1004,7 @@ fn build_assistant_markdown(
             italic: true,
             ..Emphasis::default()
         },
+        syntax_highlight,
     };
     let mut segments = Vec::new();
     for block in &a.message.content {
@@ -1041,6 +1048,7 @@ fn build_assistant_markdown(
 fn build_compaction_markdown(
     c: &CompactionEntry,
     tools_expanded: bool,
+    syntax_highlight: bool,
     styles: &TranscriptStyles,
 ) -> MarkdownView {
     let mut header = format!(" {}", compaction_header(c.tokens_before, c.tokens_after));
@@ -1060,6 +1068,7 @@ fn build_compaction_markdown(
             opts: RenderOpts {
                 hyperlinks: styles.hyperlinks,
                 default_emphasis: Emphasis::default(),
+                syntax_highlight,
             },
             base_style: styles.text,
         });
@@ -1190,6 +1199,7 @@ struct GlobalRenderInputs {
     active_view: AgentId,
     tools_expanded: bool,
     hide_thinking_block: bool,
+    syntax_highlight: bool,
 }
 
 impl GlobalRenderInputs {
@@ -1198,6 +1208,7 @@ impl GlobalRenderInputs {
             active_view: chat.active_view(),
             tools_expanded: chat.tools_expanded,
             hide_thinking_block: chat.hide_thinking_block,
+            syntax_highlight: chat.syntax_highlight,
         }
     }
 }
@@ -2161,7 +2172,7 @@ mod tests {
         let EntryKind::Assistant(a) = &t.entries()[0].kind else {
             panic!("expected an assistant entry");
         };
-        let mut view = build_assistant_markdown(a, hide_thinking, &styles());
+        let mut view = build_assistant_markdown(a, hide_thinking, false, &styles());
         let surface = view.draw(&crate::test_support::draw_ctx(width, None));
         crate::test_support::rows(&surface)
     }
@@ -2172,7 +2183,7 @@ mod tests {
         let EntryKind::Compaction(c) = &t.entries()[0].kind else {
             panic!("expected a compaction entry");
         };
-        let mut view = build_compaction_markdown(c, expanded, &styles());
+        let mut view = build_compaction_markdown(c, expanded, false, &styles());
         let surface = view.draw(&crate::test_support::draw_ctx(width, None));
         let rows = crate::test_support::rows(&surface);
         let grid = crate::test_support::flatten(&surface);
@@ -3656,6 +3667,33 @@ mod tests {
         assert!(
             rows.join("\n").contains("Thinking…"),
             "placeholder shown: {rows:?}"
+        );
+    }
+
+    /// Toggling `syntax_highlight` clears the whole cache, so a live change
+    /// re-renders code blocks with the new coloring.
+    #[test]
+    fn toggling_syntax_highlight_clears_the_cache() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        apply(
+            &chat,
+            &mut life,
+            assistant_text_delta("```rust\nlet y = 2;\n```"),
+        );
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(60, 24);
+        let _ = view.draw(&ctx);
+        let _ = view.draw(&ctx);
+        let misses_before = view.cache.borrow().misses;
+        assert!(view.cache.borrow().hits > 0, "second draw hit");
+
+        // Seeded off (the `ChatState` default), so flip it on.
+        chat.borrow_mut().syntax_highlight = true;
+        let _ = view.draw(&ctx);
+        assert!(
+            view.cache.borrow().misses > misses_before,
+            "toggling syntax_highlight forced misses",
         );
     }
 

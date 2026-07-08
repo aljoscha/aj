@@ -53,9 +53,10 @@ pub(crate) struct MarkdownStyles {
     link_text: Style,
     link_url: Style,
     hr: Style,
-    /// Foreground per syntax category, indexed by [`syntax_index`]. Wired now
-    /// even though the current renderer always leaves [`StyledSpan::syntax`]
-    /// `None`, so code-block highlighting lights up here with no view change.
+    /// Foreground per syntax category, indexed by [`syntax_index`]. Consumed
+    /// when a code-block span carries a category, which the shared renderer
+    /// emits only while syntax highlighting is enabled (see
+    /// [`RenderOpts::syntax_highlight`]).
     syntax: [Color; 9],
 }
 
@@ -372,6 +373,7 @@ mod tests {
         RenderOpts {
             hyperlinks,
             default_emphasis: emphasis,
+            syntax_highlight: false,
         }
     }
 
@@ -419,6 +421,54 @@ mod tests {
         // Plain body text keeps the segment's base style.
         let body = cell_with(&surface, "x");
         assert_eq!(body.style.fg, fg(ThemeColor::Text), "body text color");
+    }
+
+    /// With `syntax_highlight` on, a recognized-language code block colors its
+    /// tokens by category (a `let` keyword takes the keyword syntax color).
+    /// With it off, the same token stays the plain code-block color.
+    #[test]
+    fn syntax_highlight_toggles_code_token_color() {
+        let src = "```rust\nlet y = 2;\n```".to_string();
+
+        let mut on = MarkdownView::new(
+            vec![MarkdownSegment {
+                text: src.clone(),
+                opts: RenderOpts {
+                    hyperlinks: false,
+                    default_emphasis: Emphasis::default(),
+                    syntax_highlight: true,
+                },
+                base_style: text_style(),
+            }],
+            Vec::new(),
+            styles(),
+        );
+        let on_surface = draw(&mut on, 40);
+        assert_eq!(
+            cell_with(&on_surface, "l").style.fg,
+            fg(ThemeColor::SyntaxKeyword),
+            "`let` keyword takes the keyword syntax color when highlighting is on",
+        );
+
+        let mut off = MarkdownView::new(
+            vec![MarkdownSegment {
+                text: src,
+                opts: RenderOpts {
+                    hyperlinks: false,
+                    default_emphasis: Emphasis::default(),
+                    syntax_highlight: false,
+                },
+                base_style: text_style(),
+            }],
+            Vec::new(),
+            styles(),
+        );
+        let off_surface = draw(&mut off, 40);
+        assert_eq!(
+            cell_with(&off_surface, "l").style.fg,
+            fg(ThemeColor::MdCodeBlock),
+            "same token stays the plain code-block color when highlighting is off",
+        );
     }
 
     /// With hyperlinks off the visible ` (url)` fallback appears and no OSC-8

@@ -197,6 +197,7 @@ async fn build_world(
     let mut chat = ChatState::new(seed.settings, seed.context_window, Arc::clone(&catalog));
     chat.hide_thinking_block = config.hide_thinking_block;
     chat.show_image_in_terminal = config.image_show_in_terminal;
+    chat.syntax_highlight = config.syntax_highlighting;
 
     // Replay a resumed session's history through the same reducer the
     // live events go through. Replay never hits the bus, so nothing is
@@ -349,6 +350,7 @@ async fn build_next_session(
     );
     chat.hide_thinking_block = config.hide_thinking_block;
     chat.show_image_in_terminal = config.image_show_in_terminal;
+    chat.syntax_highlight = config.syntax_highlighting;
     {
         let log = Arc::clone(&core.log);
         let log = log.lock().await;
@@ -1528,7 +1530,7 @@ fn user_settings_values(world: &World) -> SettingsValues {
         image_show_in_terminal: chat.show_image_in_terminal,
         image_block: cfg.image_block,
         bash_rtk: cfg.bash_rtk,
-        syntax_highlighting: cfg.syntax_highlighting,
+        syntax_highlighting: chat.syntax_highlight,
         auto_compact: cfg.auto_compact,
         compact_threshold: cfg.compact_threshold.to_string(),
         compact_keep_recent: cfg.compact_keep_recent.to_string(),
@@ -1972,6 +1974,25 @@ async fn apply_setting_change(
                 format!(
                     "Thinking blocks {}.",
                     if hide { "hidden" } else { "expanded" }
+                ),
+                save,
+            ))
+        }
+        "syntax_highlighting" => {
+            let on = value == "true";
+            world.chat.borrow_mut().syntax_highlight = on;
+            let save = aj_app::settings::persist_setting(
+                &world.config_layers,
+                &world.config,
+                persist,
+                "syntax_highlighting",
+                Some(value),
+                |c| c.syntax_highlighting = on,
+            );
+            Some(join_notice(
+                format!(
+                    "Syntax highlighting {}.",
+                    if on { "enabled" } else { "disabled" }
                 ),
                 save,
             ))

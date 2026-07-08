@@ -251,6 +251,7 @@ fn shared_visible_rows(text: &str, width: usize) -> Vec<String> {
     let opts = RenderOpts {
         hyperlinks: false,
         default_emphasis: Emphasis::default(),
+        syntax_highlight: true,
     };
     render_markdown(text, width, &opts)
         .iter()
@@ -595,6 +596,7 @@ fn shared_run_rows(text: &str, width: usize) -> Vec<Vec<Run>> {
     let opts = RenderOpts {
         hyperlinks: false,
         default_emphasis: Emphasis::default(),
+        syntax_highlight: true,
     };
     render_markdown(text, width, &opts)
         .iter()
@@ -707,6 +709,7 @@ fn level2_inline_code_emphasis_composition_deviation() {
             italic: true,
             ..Default::default()
         },
+        syntax_highlight: true,
     };
     let shared_rows: Vec<Vec<Run>> = render_markdown(para, 200, &opts)
         .iter()
@@ -869,6 +872,7 @@ fn level2_code_syntax_category_parity() {
         &RenderOpts {
             hyperlinks: false,
             default_emphasis: Emphasis::default(),
+            syntax_highlight: true,
         },
     );
     let mut md = Markdown::new(doc, 0, 0, sentinel_theme(), None);
@@ -893,6 +897,64 @@ fn level2_code_syntax_category_parity() {
             parse_syntax_runs(aj_row),
             shared_syntax_runs(shared_row),
             "syntax-category run mismatch on code body row {aj_row:?}"
+        );
+        compared += 1;
+    }
+    assert!(
+        compared >= 3,
+        "expected to compare the three code body lines, compared {compared}"
+    );
+}
+
+#[test]
+fn level2_code_no_syntax_highlight_parity() {
+    force_no_hyperlinks();
+
+    // Same corpus as the highlighting-on case, but with highlighting off on
+    // both sides. Every code body row should collapse to a single
+    // uncategorized run, and the visible text (indent included) must agree.
+    let doc = "```rust\nfn add(a: i32) -> i32 { a + 1 }\nlet s = \"hi\";\n// a note\n```";
+    let width = 1000;
+
+    let shared_rows = render_markdown(
+        doc,
+        width,
+        &RenderOpts {
+            hyperlinks: false,
+            default_emphasis: Emphasis::default(),
+            syntax_highlight: false,
+        },
+    );
+    // The reference's code-block closure still wraps each line (in `CBK`
+    // markers), which `parse_syntax_runs` treats as uncategorized, matching
+    // the shared renderer's plain spans.
+    let mut theme = sentinel_theme();
+    theme.syntax_highlight = false;
+    let mut md = Markdown::new(doc, 0, 0, theme, None);
+    let aj_rows = plain_lines_trim_end(&md.render(width));
+
+    assert_eq!(
+        aj_rows.len(),
+        shared_rows.len(),
+        "row counts must match for index-aligned comparison"
+    );
+
+    let mut compared = 0;
+    for (aj_row, shared_row) in aj_rows.iter().zip(shared_rows.iter()) {
+        let is_body =
+            !shared_row.is_empty() && shared_row.iter().all(|sp| sp.kind == SpanKind::CodeBlock);
+        if !is_body {
+            continue;
+        }
+        let shared = shared_syntax_runs(shared_row);
+        assert!(
+            shared.iter().all(|(cat, _)| cat.is_none()),
+            "highlighting off leaves the shared body uncategorized: {shared:?}"
+        );
+        assert_eq!(
+            parse_syntax_runs(aj_row),
+            shared,
+            "code body row mismatch with highlighting off {aj_row:?}"
         );
         compared += 1;
     }
