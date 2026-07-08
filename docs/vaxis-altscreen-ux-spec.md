@@ -294,10 +294,11 @@ build on one reusable `vxfw` filterable-select overlay widget (a `TextField`
 filter plus a `ListView`, themed from the shared palette). The filter box shows a
 `search: ` prefix before the typed query, matching `aj`. The settings window is
 a settings-list widget that shows the selected item's help text below the list in
-a muted tone, updating as the selection moves, as `aj` does. The login dialog and read-only pages (auth status, usage,
-session info) are simple content overlays. The help screen is a read-only page
-too, with its own grouped layout (see "The help screen" below). Each is a `vxfw`
-widget in `aj-next`.
+a muted tone, updating as the selection moves, as `aj` does. The login dialog
+and the read-only content pages (auth status, usage, session info) are content
+overlays, detailed under "The read-only content pages" below. The help screen is
+a read-only page too, with its own grouped layout (see "The help screen" below).
+Each is a `vxfw` widget in `aj-next`.
 
 Across list overlays, metadata columns (a command's category, a usage row's
 provider) are right-aligned and drawn in a dim tone (`aj`'s dim prefix column),
@@ -339,6 +340,53 @@ selected row, and the shortcut uses a dedicated keybinding-hint color, `#275DD0`
 literal, so it themes and downsamples like every other color, and the splash
 reuses it for its `Ctrl+O` hint. This is the command palette's styling, and the
 same shortcut-column treatment applies to any list overlay that shows one.
+
+**The read-only content pages.** Auth status, usage, and session info are content
+overlays over a scrollable, non-interactive row list wrapped in the standard
+overlay window. They read like `aj` under a few rules:
+
+- **Column tinting.** Auth and usage rows are styled spans, not one default-fg
+  string. The provider-id column is drawn in the dim tone and the detail or
+  status column in `Muted`, the same two-gray split the list overlays use, so a
+  provider id, its summary, and its expiry or usage read as three distinct
+  columns. Session info stays uncolored in the body, the way `aj` draws it, its
+  structure carried by section headers and indentation.
+- **Session-info layout.** The digest is grouped into sections (`Session`,
+  `Settings`, `Activity`, `Messages`, `Usage`, `Tool calls (N)`) separated by a
+  blank spacer row that occupies a real line rather than collapsing, with the
+  section header at one indent and its key/value rows a step deeper, matching
+  `aj`. Keys are padded to a shared column so values line up across sections.
+- **Subtitle from keybinding data.** The window subtitle (`Esc to close`, and the
+  back / close split when a distinct close-all chord exists) is built by
+  resolving labels through `aj-app`'s keybinding resolver (`format_keybinding` /
+  `default_action_shortcut`, `fixed_keys` for the two fixed chords), never a
+  free-form literal, the same rule the palette shortcut column already follows
+  (Spec F). The overlay's Esc-back and Enter-confirm are fixed `vxfw` widget
+  conventions, so their labels come from `format_keybinding` on the canonical
+  chord the widget handles. Making those in-widget keys rebindable stays the
+  tracked intra-widget-keys follow-up. This fixes only the label so it cannot
+  drift from what the widget does.
+- **Shared formatting.** The data these pages show already comes from `aj-app`
+  (`auth::collect_statuses`, `usage::collect_usage`). The session-info digest's
+  row formatting (section order, labels, the token and cost formatting) moves to
+  `aj-app` as well, so both binaries render the same digest from one source
+  rather than a per-binary copy.
+- **Deliberate divergences.** `aj-next` renders these pages at the larger
+  centered `Large` placement and shows a scrollbar thumb, rather than `aj`'s
+  fixed 22-row frame and `(a-b/total)` text indicator. Both are intentional
+  `aj-next` choices (more room for read-only content, a thumb consistent with the
+  chat), not parity misses.
+
+**The usage reset flow.** The usage page is not purely read-only. It carries
+`aj`'s rate-limit-reset action, so it is an interactive overlay with its own
+small state machine rather than the shared read-only content widget. When a
+provider reports available resets and has a matching reset source, a bound chord
+(default `r`, a rebindable action resolved through the keymap so its footer-hint
+label and its handling stay in sync) starts an in-overlay flow that selects the
+provider (when more than one is eligible), confirms, consumes the reset off the
+UI thread the way the initial usage fetch runs, and reports the outcome. The
+eligibility check, the consume call, and the result wording reuse the `aj-app`
+usage helpers, so both binaries behave identically.
 
 **The help screen.** The help overlay is a read-only, scrollable page in the same
 grouped style as the reference amp help. A bordered window titled "Help & Keymap"
@@ -393,7 +441,10 @@ its own callbacks impl (the aj-tui `TuiOAuthCallbacks` does not port). The
 verification URL is rendered as an OSC 8 hyperlink so it is clickable, gated on
 the terminal advertising hyperlink support and falling back to the plain styled
 URL otherwise, and it is auto-copied to the clipboard on display and on the copy
-chord, matching `aj`.
+chord, matching `aj`. The dialog subtitle and the input prompts resolve their key
+labels through the same keybinding resolver as the other overlays (submit and
+cancel through the keymap, the copy chord through `fixed_keys::CTRL_Y`), never a
+hardcoded literal.
 
 ## 6. Focus model
 
@@ -536,3 +587,19 @@ Aligns with the plan's phases 5-9.
   shortcut in a new keybinding-hint palette token, `#275DD0` (RGB 39, 93, 208),
   added to the shared palette and both bundled themes (Spec D). The splash
   `Ctrl+O` hint reuses the token.
+- **E-11. Read-only overlay parity. Resolved.** The read-only content pages (auth
+  status, usage, session info) and the login dialog match `aj` on body styling
+  and label resolution, with two ratified `aj-next` divergences. Auth and usage
+  tint the provider-id column dim and the detail / status column `Muted` (styled
+  spans, not a default-fg dump). Session info keeps `aj`'s uncolored body but
+  restores the section spacer rows and indent, and its digest formatting moves to
+  `aj-app` alongside the auth and usage data builders it already shares. Every
+  overlay subtitle and the login dialog's hints resolve their key labels through
+  the keybinding resolver, never literals (Spec F). The login URL is an OSC 8
+  hyperlink with a plain fallback (already required in section 5). Ratified
+  divergences: these pages keep `aj-next`'s larger `Large` placement (more room
+  for read-only content) and the scrollbar thumb rather than `aj`'s 22-row frame
+  and `(a-b/total)` indicator. The usage page
+  additionally ports `aj`'s rate-limit-reset flow: a bound chord opens an
+  in-overlay provider-select / confirm / consume state machine, so the usage
+  overlay is interactive rather than a plain content page.

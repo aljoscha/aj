@@ -409,13 +409,28 @@ green with the implementer/reviewer loop and its own commit:
     through the host `select!`.
 - **9-Markdown.** A markdown renderer for assistant, user, and compaction text
   (plain-wrapped today). The single biggest visual-parity gap.
-- **9-Transcript (Spec E, remaining).** In-transcript search (not on Ctrl+F),
-  free-form selection and copy over the transcript, and the transcript-focus
-  keyboard mode.
+- **9-Transcript (Spec E, remaining).** The alt-screen transcript UX: the chat
+  scroll model (page keys done, Shift+Home/End and Alt+j/k line-scroll
+  remaining), the transcript-focus keyboard mode (done), entry-relative selection
+  and copy (mouse select-to-copy done, keyboard Shift+arrow selection and the
+  structured copy-message / copy-code actions remaining), and the splash empty
+  state. In-transcript search is dropped (Spec E, E-5).
 - **9-Chrome.** Image protocols (kitty/iTerm2), remaining mouse interactions,
   terminal title, tmux notice, and the small wired-up stubs (launch-prompt input,
   clipboard image paste, palette subtitle labels, palette-to-selector Esc
   chaining, the E-8 grouped help screen).
+- **9-Overlay-parity.** Bring the read-only content pages (auth status, usage,
+  session info) and the login dialog to parity with `aj` (Spec E section 5,
+  decision E-11). Tint the auth and usage id / detail columns (dim / `Muted`,
+  which needs the content overlay to carry styled row spans rather than plain
+  default-fg strings), restore the session-info section spacers and indent,
+  resolve every overlay subtitle and hint through the keybinding resolver rather
+  than a literal, move the session-info digest formatting into `aj-app`, and
+  render the login URL as an OSC 8 hyperlink with a plain fallback. Port `aj`'s
+  usage rate-limit-reset flow so the usage page is interactive (a bound,
+  keymap-resolved chord drives a provider-select / confirm / consume state
+  machine off the UI thread). Two divergences are kept by decision: the larger
+  `Large` placement and the scrollbar thumb.
 - **9-Debug-overlay.** A small, opt-in frame-statistics box for diagnosing
   render-loop health. Off by default, toggled by a new `show_frame_stats` `bool`
   in `aj-conf`'s `Config` + `Config::OPTIONS` (so the settings window picks it up
