@@ -29,6 +29,7 @@ mod settings_ui;
 mod status;
 mod subagent_box;
 mod task_output;
+mod terminal;
 #[cfg(test)]
 mod test_support;
 mod tool_cell;

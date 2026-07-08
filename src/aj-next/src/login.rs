@@ -42,12 +42,12 @@ use aj_models::oauth::{OAuthAuthInfo, OAuthCallbacks, OAuthError};
 use async_trait::async_trait;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
-use vaxis::cell::Style;
+use vaxis::cell::{Hyperlink, Segment, Style};
 use vaxis::key::{Key, Modifiers};
 use vaxis::vxfw::{
     Builder, CursorState, DrawContext, Event, EventContext, FilterableSelect, ListView, MaxSize,
-    RelativePoint, SelectItem, Size, Source, SubSurface, Surface, Text, Widget, WidgetRef,
-    WidthBasis, draw_widget, to_widget_ref,
+    RelativePoint, RichText, SelectItem, Size, Source, SubSurface, Surface, Text, Widget,
+    WidgetRef, WidthBasis, draw_widget, to_widget_ref,
 };
 
 use crate::overlay::{
@@ -55,6 +55,7 @@ use crate::overlay::{
     subtitle_login,
 };
 use crate::settings_ui::push_window;
+use crate::terminal::TERMINAL_HYPERLINKS;
 use crate::transcript::vaxis_color;
 
 /// PgUp/PgDn step, in rows. A fixed jump rather than a viewport-derived
@@ -123,19 +124,59 @@ struct LineBuilder {
 impl Builder for LineBuilder {
     fn item_at_idx(&self, idx: usize, _cursor: usize) -> Option<WidgetRef> {
         let st = self.state.lock().expect("login dialog state poisoned");
-        let (text, style) = match st.lines.get(idx)? {
-            LoginLine::Info(t) => (t.clone(), self.styles.info),
-            LoginLine::Progress(t) => (t.clone(), self.styles.progress),
-            LoginLine::Url(t) => (t.clone(), self.styles.url),
+        let widget = match st.lines.get(idx)? {
+            // The authorize URL is a `RichText` so a single soft-wrapped
+            // `Segment` can carry the OSC 8 link (`Text` has no link field).
+            // The whole wrapped URL then reads as one clickable link and
+            // stays fully visible and copyable.
+            LoginLine::Url(url) => {
+                let mut widget =
+                    RichText::new(vec![url_segment(url, self.styles.url, TERMINAL_HYPERLINKS)]);
+                widget.softwrap = true;
+                widget.width_basis = WidthBasis::Parent;
+                to_widget_ref(Rc::new(RefCell::new(widget)))
+            }
+            // Info and the headless instructions stay plain `Text`, wrapping
+            // to the overlay width instead of truncating.
+            LoginLine::Info(t) => text_line(t.clone(), self.styles.info),
+            LoginLine::Progress(t) => text_line(t.clone(), self.styles.progress),
         };
-        let mut widget = Text::new(text);
-        widget.style = style;
-        // Long lines (the authorize URL, the headless instructions) wrap
-        // to the overlay width instead of truncating, so the whole URL
-        // stays visible and copyable.
-        widget.softwrap = true;
-        widget.width_basis = WidthBasis::Parent;
-        Some(to_widget_ref(Rc::new(RefCell::new(widget))))
+        Some(widget)
+    }
+}
+
+/// A soft-wrapping, parent-width [`Text`] row for the dialog's non-URL lines.
+fn text_line(text: String, style: Style) -> WidgetRef {
+    let mut widget = Text::new(text);
+    widget.style = style;
+    widget.softwrap = true;
+    widget.width_basis = WidthBasis::Parent;
+    to_widget_ref(Rc::new(RefCell::new(widget)))
+}
+
+/// Build the styled [`Segment`] for a [`LoginLine::Url`] row.
+///
+/// When `hyperlinks` is set the segment carries an OSC 8 target with the
+/// shared `id=aj-oauth` param. A single linked segment soft-wraps into a
+/// multi-row URL that terminals treat as one logical link (the shared id),
+/// so clicking any row opens the whole URL. With hyperlinks off the segment
+/// is the plain styled URL text, still fully visible and copyable.
+///
+/// The URI has control bytes stripped so a stray byte can't break out of the
+/// escape. The OAuth URL is well-formed, this is defensive.
+fn url_segment(url: &str, style: Style, hyperlinks: bool) -> Segment {
+    let link = if hyperlinks {
+        Hyperlink {
+            uri: url.chars().filter(|c| !c.is_control()).collect(),
+            params: "id=aj-oauth".to_string(),
+        }
+    } else {
+        Hyperlink::default()
+    };
+    Segment {
+        text: url.to_string(),
+        style,
+        link,
     }
 }
 
@@ -925,6 +966,82 @@ mod tests {
             Err(OAuthError::Cancelled) => {}
             other => panic!("expected Cancelled, got {other:?}"),
         }
+    }
+
+    /// The Url row's segment carries the OSC 8 link with the shared
+    /// `id=aj-oauth` param when hyperlinks are enabled, so the soft-wrapped
+    /// URL reads as one clickable link.
+    #[test]
+    fn url_segment_links_when_hyperlinks_on() {
+        let url = "https://auth.example.com/authorize?client_id=abc&state=xyz";
+        let seg = url_segment(url, Style::default(), true);
+        assert_eq!(seg.text, url);
+        assert_eq!(seg.link.uri, url);
+        assert_eq!(seg.link.params, "id=aj-oauth");
+    }
+
+    /// With hyperlinks off the segment is the plain styled URL: no OSC 8
+    /// target, but the full URL text still shows so it stays copyable.
+    #[test]
+    fn url_segment_plain_when_hyperlinks_off() {
+        let url = "https://auth.example.com/authorize";
+        let seg = url_segment(url, Style::default(), false);
+        assert_eq!(seg.text, url);
+        assert_eq!(seg.link, Hyperlink::default());
+    }
+
+    /// A stray control byte in the URL is stripped from the emitted OSC 8
+    /// uri so it can't break out of the escape. The display text is left
+    /// untouched (the OAuth URL is well-formed in practice).
+    #[test]
+    fn url_segment_strips_control_bytes_from_uri() {
+        let seg = url_segment("https://x/\u{1b}evil", Style::default(), true);
+        assert_eq!(seg.link.uri, "https://x/evil");
+        assert!(!seg.link.uri.contains('\u{1b}'));
+    }
+
+    /// At a narrow width the long spaceless URL soft-wraps across rows
+    /// rather than truncating, so the whole URL stays visible and copyable,
+    /// and every drawn cell carries the shared-id link (that shared id is
+    /// what keeps a wrapped run one logical link).
+    #[test]
+    fn url_row_wraps_full_url_and_carries_link() {
+        let url =
+            "https://auth.example.com/authorize?client_id=abcdef123456&scope=read+write&state=xyz";
+        let state = Arc::new(StdMutex::new(LoginDialogState::default()));
+        state
+            .lock()
+            .unwrap()
+            .lines
+            .push(LoginLine::Url(url.to_string()));
+        let builder = LineBuilder {
+            state: Arc::clone(&state),
+            styles: LoginStyles::from_theme(&theme()),
+        };
+        let widget = builder.item_at_idx(0, 0).expect("url row widget");
+
+        // Narrow enough to force several wrapped rows, tall enough that all
+        // of them are visible.
+        let ctx = crate::test_support::draw_ctx(20, Some(20));
+        let surface = draw_widget(&widget, &ctx);
+
+        // The token is spaceless, so a correct soft-wrap loses no
+        // characters: concatenating the trimmed rows reassembles the URL.
+        let joined = crate::test_support::rows(&surface).concat();
+        assert_eq!(joined, url, "full URL must survive the wrap");
+
+        let linked: Vec<_> = crate::test_support::flatten(&surface)
+            .into_iter()
+            .flatten()
+            .filter(|c| !c.char.grapheme().trim().is_empty())
+            .collect();
+        assert!(!linked.is_empty(), "URL cells present");
+        assert!(
+            linked
+                .iter()
+                .all(|c| c.link.uri == url && c.link.params == "id=aj-oauth"),
+            "every URL cell carries the shared-id link"
+        );
     }
 
     fn sample_rows() -> Vec<AuthRow> {

@@ -39,6 +39,7 @@ use vaxis::vxfw::{
 use crate::bubble::Bubble;
 use crate::markdown_view::{MarkdownSegment, MarkdownStyles, MarkdownView};
 use crate::subagent_box::{SubAgentBox, build_subagent_box, surface_rows};
+use crate::terminal::TERMINAL_HYPERLINKS;
 use crate::tool_cell::{EXPAND_KEY_LABEL, HintKind, build_tool_cell, expand_hint};
 
 /// Pre-resolved vaxis styles for the transcript's row kinds. The
@@ -85,18 +86,9 @@ pub(crate) struct TranscriptStyles {
     /// re-tints markdown through the same `set_styles` path.
     pub(crate) markdown: MarkdownStyles,
     /// Whether markdown links emit OSC-8 hyperlinks. See
-    /// [`TERMINAL_HYPERLINKS`].
+    /// [`TERMINAL_HYPERLINKS`](crate::terminal::TERMINAL_HYPERLINKS).
     pub(crate) hyperlinks: bool,
 }
-
-/// Whether the markdown renderer emits OSC-8 hyperlinks.
-///
-/// vaxis's `Capabilities` surfaces no hyperlink probe, so there is nothing to
-/// read from `app.vaxis().caps`: we optimistically enable OSC-8. vaxis writes
-/// the escape unconditionally and terminals that lack support ignore the
-/// bytes. TODO(aljoscha): thread a real capability once vaxis detects
-/// hyperlink support, wiring it through `from_theme` the way `ColorMode` is.
-const TERMINAL_HYPERLINKS: bool = true;
 
 /// The SGR-2 faint attribute over the default foreground: the exact analogue of
 /// `aj-tui`'s `style::dim`, which every dim transcript row, tool-cell detail, and
