@@ -1044,6 +1044,113 @@ mod tests {
         );
     }
 
+    /// End-to-end: the real [`LoginDialog`], rendered through the real
+    /// `vaxis` alt-screen diff, emits the URL's OSC 8 open with the shared
+    /// `id=aj-oauth` param, and keeps emitting it after a redraw that adds a
+    /// progress line above the URL (the login task streams these constantly).
+    ///
+    /// This drives the whole path the interactive login uses: the
+    /// `LineBuilder` -> `ListView` -> `RichText` widget tree, surface
+    /// compositing, and the renderer's cell-diff. It guards against the diff
+    /// stripping the link or drowning the stream in redundant link-close
+    /// escapes when the blank cells below the URL are skipped.
+    #[test]
+    fn login_url_emits_osc8_open_through_real_render_across_redraw() {
+        use vaxis::Winsize;
+        use vaxis::vaxis::{Options as VaxisOptions, Vaxis};
+
+        let url =
+            "https://auth.example.com/authorize?client_id=abcdef123456&scope=read+write&state=xyz";
+
+        let state = Arc::new(StdMutex::new(LoginDialogState::default()));
+        {
+            let mut st = state.lock().unwrap();
+            st.lines
+                .push(LoginLine::Progress("Starting login\u{2026}".to_string()));
+            st.lines.push(LoginLine::Url(url.to_string()));
+        }
+        let pending: PendingInput = Arc::new(StdMutex::new(None));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let dialog = Rc::new(RefCell::new(LoginDialog::new(
+            &theme(),
+            Arc::clone(&state),
+            pending,
+            cancel,
+        )));
+        let dialog_ref = to_widget_ref(Rc::clone(&dialog));
+
+        // A window taller than the drawn dialog so the diff has blank rows to
+        // skip below the URL, which is where the close-escape spam surfaced.
+        let winsize = Winsize {
+            rows: 40,
+            cols: 40,
+            x_pixel: 0,
+            y_pixel: 0,
+        };
+        let mut vx = Vaxis::new(VaxisOptions::default());
+        let mut sink: Vec<u8> = Vec::new();
+        vx.enter_alt_screen(&mut sink).expect("alt");
+        vx.resize(&mut sink, winsize).expect("resize");
+
+        let ctx = crate::test_support::draw_ctx(40, Some(14));
+
+        let render_frame = |vx: &mut Vaxis| -> Vec<u8> {
+            let surface = draw_widget(&dialog_ref, &ctx);
+            surface.render(vx.window(), None);
+            let mut out = Vec::new();
+            vx.render(&mut out).expect("render");
+            out
+        };
+
+        let open: Vec<u8> = {
+            let mut o = b"\x1b]8;id=aj-oauth;".to_vec();
+            o.extend_from_slice(url.as_bytes());
+            o.extend_from_slice(b"\x1b\\");
+            o
+        };
+        let count = |haystack: &[u8], needle: &[u8]| -> usize {
+            if needle.is_empty() || haystack.len() < needle.len() {
+                return 0;
+            }
+            let (mut n, mut i) = (0usize, 0usize);
+            while i + needle.len() <= haystack.len() {
+                if &haystack[i..i + needle.len()] == needle {
+                    n += 1;
+                    i += needle.len();
+                } else {
+                    i += 1;
+                }
+            }
+            n
+        };
+
+        let first = render_frame(&mut vx);
+        assert!(
+            count(&first, &open) >= 1,
+            "the first render emits the URL's OSC 8 open"
+        );
+
+        // A progress line accretes above the URL, pushing it down. Insert it
+        // before the URL line so the URL genuinely shifts to new rows.
+        state.lock().unwrap().lines.insert(
+            1,
+            LoginLine::Progress("Waiting for the browser\u{2026}".to_string()),
+        );
+
+        let second = render_frame(&mut vx);
+        assert!(
+            count(&second, &open) >= 1,
+            "the URL's OSC 8 open survives the redraw that shifts it down"
+        );
+        // The link closes a bounded number of times, not once per blank cell
+        // below the URL (that would be hundreds on this grid).
+        let clears = count(&second, vaxis::ctlseqs::OSC8_CLEAR.as_bytes());
+        assert!(
+            clears <= 8,
+            "expected a bounded number of link closes, got {clears}"
+        );
+    }
+
     fn sample_rows() -> Vec<AuthRow> {
         vec![
             AuthRow {

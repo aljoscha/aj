@@ -613,9 +613,17 @@ impl Vaxis {
             };
             if skip {
                 reposition = true;
-                // Close any open OSC 8 hyperlink before we move on.
+                // Close any open OSC 8 hyperlink before we move on, and clear
+                // the running link so it matches what the terminal now holds.
+                // Without this reset every later skipped cell would still see a
+                // non-empty `link` and re-emit the close, one OSC8_CLEAR per
+                // skipped cell for the rest of the frame. The next drawn cell
+                // re-opens the link through the reposition reset below (the skip
+                // sets `reposition`), so this is purely about not repeating the
+                // close.
                 if !link.uri.is_empty() {
                     w.write_all(ctlseqs::OSC8_CLEAR.as_bytes())?;
+                    link = Hyperlink::default();
                 }
                 advance_cell(&mut self.screen_last, &mut i, &mut col, cw);
                 continue;
@@ -1683,6 +1691,144 @@ mod tests {
             x_pixel: 0,
             y_pixel: 0,
         }
+    }
+
+    fn linked_cell(ch: &str, uri: &str) -> Cell {
+        Cell {
+            char: Character::new(ch, 1),
+            link: Hyperlink {
+                uri: uri.to_string(),
+                params: "id=aj-oauth".to_string(),
+            },
+            ..Cell::default()
+        }
+    }
+
+    /// Number of non-overlapping occurrences of `needle` in `haystack`.
+    fn count(haystack: &[u8], needle: &[u8]) -> usize {
+        if needle.is_empty() || haystack.len() < needle.len() {
+            return 0;
+        }
+        let mut n = 0;
+        let mut i = 0;
+        while i + needle.len() <= haystack.len() {
+            if &haystack[i..i + needle.len()] == needle {
+                n += 1;
+                i += needle.len();
+            } else {
+                i += 1;
+            }
+        }
+        n
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        count(haystack, needle) > 0
+    }
+
+    /// The login dialog draws its authorization URL as a run of cells each
+    /// carrying the same `id=aj-oauth` OSC 8 link, and it redraws constantly:
+    /// progress lines accrete above the URL, pushing it to new rows. This
+    /// exercises the real alt-screen diff across such a redraw and pins two
+    /// properties the diff must hold for the URL to stay clickable:
+    ///
+    /// 1. The URL text is emitted with its OSC 8 open in front of it, never
+    ///    left closed where the characters print.
+    /// 2. Closing the link once past the run is enough: the diff must not
+    ///    re-emit `OSC8_CLEAR` for every trailing blank cell. That spam is the
+    ///    symptom of the running-link state going stale after a close, which
+    ///    is the same staleness that can strip the link off a later same-uri
+    ///    cell.
+    #[test]
+    fn render_link_survives_redraw_and_does_not_spam_osc8_clear() {
+        let uri = "https://ex.example.com/oauth?code=wxyz";
+        let open: Vec<u8> = {
+            let mut o = b"\x1b]8;id=aj-oauth;".to_vec();
+            o.extend_from_slice(uri.as_bytes());
+            o.extend_from_slice(b"\x1b\\");
+            o
+        };
+        let clear = ctlseqs::OSC8_CLEAR.as_bytes();
+
+        let mut vx = Vaxis::new(Options::default());
+        let mut out: Vec<u8> = Vec::new();
+        vx.enter_alt_screen(&mut out).expect("alt");
+        vx.resize(&mut out, winsize()).expect("resize");
+
+        let draw_url_at = |vx: &Vaxis, row: u16| {
+            let win = vx.window();
+            for (k, ch) in uri.chars().enumerate() {
+                let col = u16::try_from(k).expect("col fits u16");
+                win.write_cell(col, row, linked_cell(&ch.to_string(), uri));
+            }
+        };
+        let draw_plain = |vx: &Vaxis, row: u16, text: &str| {
+            let win = vx.window();
+            for (k, ch) in text.chars().enumerate() {
+                win.write_cell(
+                    u16::try_from(k).expect("col fits u16"),
+                    row,
+                    Cell {
+                        char: Character::new(ch.to_string(), 1),
+                        ..Cell::default()
+                    },
+                );
+            }
+        };
+
+        // Frame 1: an info line, then the linked URL below it.
+        draw_plain(&vx, 0, "Authorize in your browser:");
+        draw_url_at(&vx, 1);
+        out.clear();
+        vx.render(&mut out).expect("render1");
+        let f1 = out.clone();
+        assert!(contains(&f1, &open), "frame 1 opens the URL link");
+        // The URL characters follow the open directly (the run prints linked).
+        let mut open_then_text = open.clone();
+        open_then_text.extend_from_slice("https".as_bytes());
+        assert!(
+            contains(&f1, &open_then_text),
+            "frame 1 prints the URL text right after the open, not closed"
+        );
+
+        // Frame 2: a progress line accretes at the top, shifting everything
+        // down one row. The URL moves from row 1 to row 2, so the diff redraws
+        // the top rows and the URL's new row while skipping the untouched
+        // blank cells below.
+        {
+            let win = vx.window();
+            win.write_cell(
+                0,
+                0,
+                Cell {
+                    char: Character::new("W", 1),
+                    ..Cell::default()
+                },
+            );
+        }
+        draw_plain(&vx, 0, "Working on it, please wait...");
+        draw_plain(&vx, 1, "Authorize in your browser:");
+        draw_url_at(&vx, 2);
+        out.clear();
+        vx.render(&mut out).expect("render2");
+        let f2 = out.clone();
+
+        assert!(contains(&f2, &open), "frame 2 re-opens the URL link");
+        assert!(
+            contains(&f2, &open_then_text),
+            "frame 2 prints the URL text right after the open, not closed"
+        );
+
+        // The whole back buffer below the URL is blank and unchanged, so the
+        // diff skips it. Before the running-link reset, each skipped blank cell
+        // re-emitted OSC8_CLEAR (hundreds per frame on an 80x40 grid). A
+        // correct diff closes the link once and then stays quiet, so a small
+        // constant bound holds regardless of grid size.
+        let clears = count(&f2, clear);
+        assert!(
+            clears <= 4,
+            "expected the link to close a bounded number of times, got {clears} OSC8_CLEAR"
+        );
     }
 
     /// The ported upstream test: a fresh render with no changes emits nothing.
