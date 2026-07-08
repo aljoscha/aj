@@ -45,7 +45,9 @@ use vaxis::vxfw::{
 };
 
 use crate::content_overlay::{ContentStyles, Row, plain, usage_rows};
-use crate::overlay::{OverlayChrome, OverlayPlacement, OverlayStack, close_top};
+use crate::overlay::{
+    OverlayChrome, OverlayPlacement, OverlayStack, close_top, confirm_key_label, subtitle_close,
+};
 use crate::settings_ui::push_window;
 
 /// Where the overlay is in the reset-credit interaction. `Display` is the
@@ -210,24 +212,34 @@ impl UsageOverlay {
     /// border subtitle. Resolved every frame so it tracks the state
     /// machine.
     ///
-    /// The reset chord resolves through the shared keybinding data, never a
-    /// literal, so a rebind flows through to the label (Spec F). Esc/Enter
-    /// stay literal here to match `aj`'s wording.
+    /// The read-only Display and terminal Done phases share the same
+    /// `subtitle_close` "back  \u{2022}  close" convention every other overlay
+    /// uses, resolved through the keybinding data: Esc pops this overlay
+    /// (`close_top`, i.e. "back") and the close-all chord tears the whole
+    /// stack down. The reset chord and the refresh label resolve through the
+    /// binding data too. The interactive menu phases keep their own literal
+    /// Esc/Enter wording.
     pub(crate) fn footer_hint(&self) -> String {
         match &self.phase {
             Phase::Display => {
                 if self.has_eligible_provider() {
                     let reset = default_action_shortcut(ACTION_USAGE_RESET).unwrap_or_default();
-                    format!("{reset} use a reset \u{00b7} Esc close")
+                    format!("{reset} use a reset  \u{2022}  {}", subtitle_close())
                 } else {
-                    "Esc close".to_string()
+                    subtitle_close()
                 }
             }
             Phase::SelectProvider | Phase::Confirm { .. } | Phase::Failed { .. } => {
                 "\u{2191}\u{2193} select \u{00b7} Enter confirm \u{00b7} Esc back".to_string()
             }
             Phase::Consuming { .. } => "resetting\u{2026}".to_string(),
-            Phase::Done { .. } => "Enter refresh \u{00b7} Esc close".to_string(),
+            Phase::Done { .. } => {
+                format!(
+                    "{} refresh  \u{2022}  {}",
+                    confirm_key_label(),
+                    subtitle_close()
+                )
+            }
         }
     }
 
@@ -1225,11 +1237,37 @@ mod tests {
         let reset =
             default_action_shortcut(ACTION_USAGE_RESET).expect("usage-reset has a default chord");
         let hint = overlay.footer_hint();
-        assert_eq!(hint, format!("{reset} use a reset \u{00b7} Esc close"));
+        assert_eq!(
+            hint,
+            format!("{reset} use a reset  \u{2022}  {}", subtitle_close())
+        );
         assert!(hint.contains(&reset), "{hint}");
         // The literal chord is not what shows: the default `r` formats to
         // `R`, so the hint must not carry a bare `r use a reset`.
         assert!(!hint.contains("r use a reset"), "{hint}");
+    }
+
+    /// The usage Display/Done footers share the exact `subtitle_close`
+    /// convention every other overlay uses. Tying the assertions to
+    /// `subtitle_close` (rather than a literal) means a future change to the
+    /// shared convention flows through to the usage footer automatically.
+    #[test]
+    fn usage_footer_shares_close_convention() {
+        // Display, not eligible: the footer is exactly the shared close
+        // convention.
+        let (overlay, _) = overlay_with(vec![codex_status(None)], vec![]);
+        assert_eq!(overlay.footer_hint(), subtitle_close());
+
+        // Done: the footer ends with the shared close convention.
+        let (mut overlay, _) = overlay_with(
+            vec![codex_status(Some(2))],
+            vec![fake_source(Ok(ResetOutcome::Reset))],
+        );
+        overlay.set_phase(Phase::Done {
+            message: "Usage reset.".into(),
+        });
+        let hint = overlay.footer_hint();
+        assert!(hint.ends_with(&subtitle_close()), "{hint}");
     }
 
     /// A `draw` publishes the phase hint into `footer_source` (the window's
@@ -1237,15 +1275,15 @@ mod tests {
     /// inline footer is gone and the list uses the full height.
     #[test]
     fn draw_publishes_footer_hint_to_chrome_not_body() {
-        // Not eligible: the display footer is the bare "Esc close".
+        // Not eligible: the display footer is the shared close convention.
         let (mut overlay, _) = overlay_with(vec![codex_status(None)], vec![]);
         let out = body(&mut overlay);
-        assert_eq!(overlay.footer_hint(), "Esc close");
-        assert_eq!(*overlay.footer_source.borrow(), "Esc close");
+        assert_eq!(overlay.footer_hint(), subtitle_close());
+        assert_eq!(*overlay.footer_source.borrow(), subtitle_close());
         // The inline footer is gone: the child draw no longer carries the
         // hint as a row.
         assert!(
-            !out.contains("Esc close"),
+            !out.contains(&subtitle_close()),
             "footer leaked into body:\n{out}"
         );
 

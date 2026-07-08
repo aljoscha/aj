@@ -2809,7 +2809,7 @@ fn subtitle_prompt_history(child: &dyn aj_tui::component::Component) -> String {
 
 /// Subtitle for read-only overlays (the help screen): just the
 /// resolved cancel key + `"to close"`.
-fn subtitle_close() -> String {
+pub(crate) fn subtitle_close() -> String {
     let cancel = aj_tui::keybindings::format_action_shortcut("tui.select.cancel")
         .unwrap_or_else(|| "Esc".to_string());
     let close_all = aj_tui::keybindings::format_action_shortcut(

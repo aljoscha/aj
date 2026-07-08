@@ -30,6 +30,7 @@ use aj_tui::tui::RenderHandle;
 use tokio::sync::oneshot;
 
 use crate::modes::interactive::components::outcome::OutcomeSlot;
+use crate::modes::interactive::subtitle_close;
 use crate::usage::{ProviderUsageStatus, UsageOutcome, format_window_status, now_unix_ms};
 
 /// Outcome of a single usage-overlay session. The overlay is read-only
@@ -136,20 +137,27 @@ impl UsageStatusComponent {
 
     /// The bottom-border hint for the current phase. Resolved every frame
     /// by the overlay frame, so it tracks the state machine.
+    ///
+    /// The read-only Display and terminal Done phases share the same
+    /// `subtitle_close` "back  \u{2022}  close" convention every other overlay
+    /// uses: Esc pops this overlay (back) and the close-all chord tears the
+    /// whole stack down. The `r`/`Enter` prefixes stay literal here (a
+    /// separate pre-existing hardcode). The interactive menu phases keep
+    /// their own literal wording.
     pub fn footer_hint(&self) -> String {
         match &self.phase {
             Phase::Display => {
                 if self.has_eligible_provider() {
-                    "r use a reset · Esc close".to_string()
+                    format!("r use a reset  \u{2022}  {}", subtitle_close())
                 } else {
-                    "Esc close".to_string()
+                    subtitle_close()
                 }
             }
             Phase::SelectProvider | Phase::Confirm { .. } | Phase::Failed { .. } => {
                 "↑↓ select · Enter confirm · Esc back".to_string()
             }
             Phase::Consuming { .. } => "resetting…".to_string(),
-            Phase::Done { .. } => "Enter refresh · Esc close".to_string(),
+            Phase::Done { .. } => format!("Enter refresh  \u{2022}  {}", subtitle_close()),
         }
     }
 
@@ -939,6 +947,29 @@ mod tests {
         let h = c.outcome_handle();
         c.handle_input(&Key::escape());
         assert!(matches!(h.take(), Some(UsageStatusOutcome::Closed)));
+    }
+
+    /// The usage Display/Done footers share the exact `subtitle_close`
+    /// convention every other overlay uses. Tying the assertions to
+    /// `subtitle_close` (rather than a literal) means a future change to the
+    /// shared convention flows through to the usage footer automatically.
+    #[test]
+    fn usage_footer_shares_close_convention() {
+        // Display, not eligible: the footer is exactly the shared close
+        // convention.
+        let c = component_with(vec![codex_status(None)], vec![]);
+        assert_eq!(c.footer_hint(), subtitle_close());
+
+        // Done: the footer ends with the shared close convention.
+        let mut c = component_with(
+            vec![codex_status(Some(2))],
+            vec![fake_source(Ok(ResetOutcome::Reset))],
+        );
+        c.set_phase(Phase::Done {
+            message: "Usage reset.".into(),
+        });
+        let hint = c.footer_hint();
+        assert!(hint.ends_with(&subtitle_close()), "{hint}");
     }
 
     #[test]
