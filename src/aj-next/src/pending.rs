@@ -32,13 +32,17 @@ const MAX_BODY_LINES: usize = 6;
 /// Display label of the edit gesture in the hint line: the editor's up key,
 /// which recalls the queued message for editing when the editor is empty.
 ///
-/// Kept as a concise literal on purpose. The gesture is the editor's
-/// cursor-up keystroke, but the editor's chord table
-/// ([`vaxis::vxfw::TextArea::bindings`]) documents it with a verbose
-/// help-screen label (`↑ / Ctrl-P`) that overflows an inline hint. `aj`
-/// renders the concise `Up` here, resolved through its keybindings manager
-/// rather than the editor's fixed chords, so we spell the same concise label.
-const EDIT_KEY_LABEL: &str = "Up";
+/// The gesture is the editor's cursor-up keystroke, a fixed `vxfw` convention
+/// rather than a rebindable action, so we resolve the label from the canonical
+/// `"up"` chord rather than a keymap action. The separate `alt+up`
+/// `ACTION_DEQUEUE` chord yanks regardless of editor contents and is not what
+/// this hint names. The editor's own chord table
+/// ([`vaxis::vxfw::TextArea::bindings`]) documents the keystroke with a verbose
+/// help-screen label (`↑ / Ctrl-P`) that overflows an inline hint, so we render
+/// the concise `Up`. Resolving even this fixed label through `format_keybinding`
+/// keeps one formatting source, so the spelling can't drift from a raw literal.
+static EDIT_KEY_LABEL: LazyLock<String> =
+    LazyLock::new(|| aj_app::keybindings::format_keybinding("up"));
 
 /// Display label of the steer chord, resolved from the shared default
 /// binding table. Follows user `[keybindings]` overrides once those
@@ -96,7 +100,8 @@ impl PendingBox {
                 span("queued".to_string(), self.styles.accent),
                 span(
                     format!(
-                        "  \u{2022}  sends when the turn ends  \u{2022}  {EDIT_KEY_LABEL} to edit  \u{2022}  {steer} to steer",
+                        "  \u{2022}  sends when the turn ends  \u{2022}  {edit} to edit  \u{2022}  {steer} to steer",
+                        edit = EDIT_KEY_LABEL.as_str(),
                         steer = STEER_KEY_LABEL.as_str(),
                     ),
                     self.styles.dim,
@@ -106,7 +111,8 @@ impl PendingBox {
                 span("steering".to_string(), self.styles.accent),
                 span(
                     format!(
-                        "  \u{2022}  sends at the next tool call  \u{2022}  {EDIT_KEY_LABEL} to edit"
+                        "  \u{2022}  sends at the next tool call  \u{2022}  {edit} to edit",
+                        edit = EDIT_KEY_LABEL.as_str(),
                     ),
                     self.styles.dim,
                 ),
@@ -232,7 +238,11 @@ mod tests {
         assert_eq!(r.len(), 5, "{r:?}");
         assert_eq!(
             r[1],
-            " queued  •  sends when the turn ends  •  Up to edit  •  Alt+Enter to steer",
+            format!(
+                " queued  •  sends when the turn ends  •  {edit} to edit  •  {steer} to steer",
+                edit = EDIT_KEY_LABEL.as_str(),
+                steer = STEER_KEY_LABEL.as_str(),
+            ),
         );
         assert_eq!(r[2], "");
         assert_eq!(r[3], " do the thing");
@@ -256,9 +266,12 @@ mod tests {
         let r = crate::test_support::rows(&draw(&mut b, 80));
         assert_eq!(
             r[1],
-            " steering  •  sends at the next tool call  •  Up to edit",
+            format!(
+                " steering  •  sends at the next tool call  •  {edit} to edit",
+                edit = EDIT_KEY_LABEL.as_str(),
+            ),
         );
-        assert!(!r.join("\n").contains("Alt+Enter"), "{r:?}");
+        assert!(!r.join("\n").contains(STEER_KEY_LABEL.as_str()), "{r:?}");
     }
 
     #[test]

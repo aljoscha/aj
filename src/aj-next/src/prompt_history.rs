@@ -29,7 +29,9 @@ use vaxis::vxfw::{
     SubSurface, Surface, Widget, WidgetRef, draw_widget, to_widget_ref,
 };
 
-use crate::overlay::{OverlayChrome, OverlayPlacement, OverlayStack, close_top};
+use crate::overlay::{
+    OverlayChrome, OverlayPlacement, OverlayStack, close_key_label, close_top, confirm_key_label,
+};
 use crate::settings_ui::push_window;
 
 /// Cap on how many prompts a scope retains. Generous enough to cover any
@@ -172,7 +174,9 @@ fn subtitle(scope: HistoryScope) -> String {
         HistoryScope::All => "this workspace",
         HistoryScope::Workspace => "all workspaces",
     };
-    format!("Enter to recall  \u{2022}  {toggle} {scope_target}  \u{2022}  Esc to close")
+    let confirm = confirm_key_label();
+    let close = close_key_label();
+    format!("{confirm} to recall  \u{2022}  {toggle} {scope_target}  \u{2022}  {close} to close")
 }
 
 /// Open the prompt-history overlay, showing a loading placeholder and
@@ -273,6 +277,9 @@ mod tests {
         assert!(ws.contains(&toggle), "toggle hint resolved from data: {ws}");
         assert!(ws.contains("all workspaces"), "{ws}");
         assert!(subtitle(HistoryScope::All).contains("this workspace"));
+        // The confirm/close labels track the keybinding data, not a literal.
+        assert!(ws.contains(&confirm_key_label()), "{ws}");
+        assert!(ws.contains(&close_key_label()), "{ws}");
     }
 
     /// Ctrl+T flips the scope, shows the loading placeholder, and parks a

@@ -20,7 +20,7 @@ use std::rc::Rc;
 
 use aj_agent::TaskRegistry;
 use aj_agent::tool::{TaskId, TaskRead, TaskStatus};
-use aj_app::keybindings::{ACTION_TASK_KILL, default_action_shortcut};
+use aj_app::keybindings::{ACTION_TASK_KILL, default_action_shortcut, format_keybinding};
 use vaxis::cell::Style;
 use vaxis::key::{Key, Modifiers};
 use vaxis::vxfw::{
@@ -28,7 +28,7 @@ use vaxis::vxfw::{
     SubSurface, Surface, Text, Widget, WidgetRef, to_widget_ref,
 };
 
-use crate::overlay::{OverlayChrome, OverlayPlacement, OverlayStack, close_top};
+use crate::overlay::{OverlayChrome, OverlayPlacement, OverlayStack, close_key_label, close_top};
 use crate::settings_ui::push_window;
 use crate::transcript::faint;
 
@@ -363,7 +363,10 @@ fn human_bytes(n: u64) -> String {
 /// they keep the fixed convention.
 fn subtitle() -> String {
     let kill = default_action_shortcut(ACTION_TASK_KILL).expect("aj.task.kill has a default chord");
-    format!("Up/Down scroll  \u{2022}  {kill} kill  \u{2022}  Esc to close")
+    let up = format_keybinding("up");
+    let down = format_keybinding("down");
+    let close = close_key_label();
+    format!("{up}/{down} scroll  \u{2022}  {kill} kill  \u{2022}  {close} to close")
 }
 
 /// Open the task-output viewer for task `id`, pushing it onto `stack`.
@@ -576,5 +579,20 @@ mod tests {
         assert_eq!(decode_line("10%\r50%\r100%"), "100%");
         assert_eq!(decode_line("plain"), "plain");
         assert_eq!(decode_line("text\r"), "text");
+    }
+
+    /// The scroll/kill/close subtitle resolves every key label from the
+    /// keybinding data, so a rebind moves both the rendered hint and the
+    /// assertion together rather than tracking a literal.
+    #[test]
+    fn subtitle_resolves_scroll_kill_and_close_labels() {
+        let s = subtitle();
+        assert!(s.contains(&format_keybinding("up")), "{s}");
+        assert!(s.contains(&format_keybinding("down")), "{s}");
+        assert!(
+            s.contains(&default_action_shortcut(ACTION_TASK_KILL).unwrap()),
+            "{s}"
+        );
+        assert!(s.contains(&close_key_label()), "{s}");
     }
 }

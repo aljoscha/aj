@@ -28,7 +28,9 @@ use aj_session::SessionPreview;
 use chrono::{DateTime, Datelike, Utc};
 use vaxis::vxfw::{FilterableSelect, SelectItem, WidgetRef, to_widget_ref};
 
-use crate::overlay::{OverlayChrome, OverlayPlacement, OverlayStack, close_top};
+use crate::overlay::{
+    OverlayChrome, OverlayPlacement, OverlayStack, close_key_label, close_top, confirm_key_label,
+};
 use crate::settings_ui::push_window;
 
 /// How much of the first user message a row's primary column shows before
@@ -192,9 +194,12 @@ fn haystack(preview: &SessionPreview) -> String {
 }
 
 /// The confirm/close subtitle. Enter and Esc are the widget's built-in
-/// keys (not rebindable actions), so they keep the fixed convention.
+/// keys (not rebindable actions), so they keep the fixed convention. Only
+/// the labels resolve through the keybinding data.
 fn subtitle() -> String {
-    "Enter to resume  \u{2022}  Esc to close".to_string()
+    let confirm = confirm_key_label();
+    let close = close_key_label();
+    format!("{confirm} to resume  \u{2022}  {close} to close")
 }
 
 /// The primary (left) column: the first user message, truncated, with a
@@ -529,5 +534,15 @@ mod tests {
         let primary = format_primary(&p, false);
         assert!(primary.ends_with('\u{2026}'), "{primary}");
         assert_eq!(primary.chars().count(), PREVIEW_MAX_CHARS);
+    }
+
+    /// The confirm/close subtitle resolves its key labels from the
+    /// keybinding data, so a rebind moves both the rendered hint and the
+    /// assertion together rather than tracking a literal.
+    #[test]
+    fn subtitle_resolves_confirm_and_close_labels() {
+        let s = subtitle();
+        assert!(s.contains(&confirm_key_label()), "{s}");
+        assert!(s.contains(&close_key_label()), "{s}");
     }
 }

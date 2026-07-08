@@ -285,6 +285,23 @@ pub(crate) fn close_top(
 // convention. Making the in-widget Esc/Enter *handling* rebindable is a
 // tracked follow-up.
 
+/// The fixed confirm-action label (`Enter`), resolved through the keybinding
+/// data. Enter is a fixed `vxfw` widget convention (see the NOTE above), so
+/// only the label resolves here, never the handling. This is the single home
+/// for the confirm-label spelling and its canonical `"enter"` chord string.
+pub(crate) fn confirm_key_label() -> String {
+    format_keybinding("enter")
+}
+
+/// The fixed close/cancel-action label (`Esc`), resolved through the
+/// keybinding data. Esc is a fixed `vxfw` widget convention (see the NOTE
+/// above), so only the label resolves here, never the handling. This is the
+/// single home for the close-label spelling and its canonical `"escape"`
+/// chord string.
+pub(crate) fn close_key_label() -> String {
+    format_keybinding("escape")
+}
+
 /// Subtitle for the read-only content pages (help, auth status, session
 /// info, usage): just how to close.
 ///
@@ -293,7 +310,7 @@ pub(crate) fn close_top(
 /// modal, so the close-all chord tears the whole stack down while Esc returns
 /// to the parent).
 pub(crate) fn subtitle_close() -> String {
-    let cancel = format_keybinding("escape");
+    let cancel = close_key_label();
     match default_action_shortcut(ACTION_OVERLAY_CLOSE_ALL) {
         Some(close_all) if close_all != cancel => {
             format!("{cancel} back  \u{2022}  {close_all} close")
@@ -310,8 +327,8 @@ pub(crate) fn subtitle_close() -> String {
 /// close-all chord resolves. The `close` wording is shared with every
 /// confirmable overlay so the visual language stays uniform.
 pub(crate) fn subtitle_confirm_close() -> String {
-    let confirm = format_keybinding("enter");
-    let cancel = format_keybinding("escape");
+    let confirm = confirm_key_label();
+    let cancel = close_key_label();
     match default_action_shortcut(ACTION_OVERLAY_CLOSE_ALL) {
         Some(close_all) if close_all != cancel => {
             format!("{confirm} to confirm  \u{2022}  {cancel} back  \u{2022}  {close_all} close")
@@ -325,8 +342,8 @@ pub(crate) fn subtitle_confirm_close() -> String {
 /// through `format_keybinding`.
 pub(crate) fn subtitle_login() -> String {
     let copy = fixed_keys::CTRL_Y;
-    let submit = format_keybinding("enter");
-    let cancel = format_keybinding("escape");
+    let submit = confirm_key_label();
+    let cancel = close_key_label();
     format!(
         "{copy} to copy URL  \u{2022}  {submit} to submit pasted code  \u{2022}  {cancel} to cancel"
     )
@@ -344,8 +361,8 @@ pub(crate) fn subtitle_edit_close(verb: &str) -> String {
     // deferred wording decision, not a label-resolution gap. Space is not an
     // activation alias in `SettingList`, so the hint names only the resolved
     // confirm chord.
-    let confirm = format_keybinding("enter");
-    let cancel = format_keybinding("escape");
+    let confirm = confirm_key_label();
+    let cancel = close_key_label();
     format!("{confirm} to {verb}  \u{2022}  {cancel} to close")
 }
 

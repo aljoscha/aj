@@ -33,7 +33,9 @@ use vaxis::vxfw::{
     SubSurface, Surface, Widget, WidgetRef, draw_widget, to_widget_ref,
 };
 
-use crate::overlay::{OverlayChrome, OverlayPlacement, OverlayStack, close_top};
+use crate::overlay::{
+    OverlayChrome, OverlayPlacement, OverlayStack, close_key_label, close_top, confirm_key_label,
+};
 use crate::settings_ui::push_window;
 
 /// Filter-key prefix marking a task row, so the confirm path can decode
@@ -158,13 +160,16 @@ impl AgentPicker {
             Scope::All => "running agents",
             Scope::Running => "all agents",
         };
-        let mut hint = format!("Enter to observe  \u{2022}  {scope} {scope_target}  \u{2022}  ");
+        let confirm = confirm_key_label();
+        let close = close_key_label();
+        let mut hint =
+            format!("{confirm} to observe  \u{2022}  {scope} {scope_target}  \u{2022}  ");
         if self.has_killable_tasks() {
             let kill = default_action_shortcut(ACTION_TASK_KILL)
                 .expect("aj.task.kill has a default chord");
             hint.push_str(&format!("{kill} kill task  \u{2022}  "));
         }
-        hint.push_str("Esc to close");
+        hint.push_str(&format!("{close} to close"));
         hint
     }
 
@@ -629,6 +634,15 @@ mod tests {
         let sub = no_tasks.subtitle();
         assert!(sub.contains(&scope), "scope hint resolved from data: {sub}");
         assert!(!sub.contains(&kill), "no kill hint without tasks: {sub}");
+        // The confirm/close labels track the keybinding data, not a literal.
+        assert!(
+            sub.contains(&confirm_key_label()),
+            "confirm label resolved from data: {sub}"
+        );
+        assert!(
+            sub.contains(&close_key_label()),
+            "close label resolved from data: {sub}"
+        );
 
         let with_task = make(vec![task_row(1, TaskStatus::Running, 1)]);
         assert!(
