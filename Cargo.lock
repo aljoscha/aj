@@ -157,6 +157,7 @@ dependencies = [
  "dotenv",
  "ignore",
  "nucleo",
+ "rand 0.9.4",
  "serde_json",
  "serial_test",
  "tempfile",

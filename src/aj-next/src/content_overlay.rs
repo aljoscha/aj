@@ -1,4 +1,4 @@
-//! Read-only content overlays: help, auth status, session info, usage.
+//! Read-only content overlays: help, auth status, and session info.
 //!
 //! A [`ContentOverlay`] is a scrollable, non-interactive list of text
 //! rows shown inside an [`OverlayWindow`]. Esc or Enter close it
@@ -6,9 +6,13 @@
 //! PgUp/PgDn scroll the body, and every other key is swallowed so
 //! nothing leaks to the layout behind the modal. Each row is a list of
 //! styled spans ([`Row`]) the host builds from the shared `aj_app` data,
-//! so the one widget backs all four read-only overlays.
+//! so the one widget backs all three read-only overlays.
 //!
-//! Async overlays (auth, session info, usage) open showing a single
+//! The usage row builder ([`usage_rows`]) also lives here, but the usage
+//! page is interactive ([`crate::usage_overlay`]) and reuses only the row
+//! layout, not the [`ContentOverlay`] widget.
+//!
+//! Async overlays (auth, session info) open showing a single
 //! "Loading…" row and are refilled through the [`ListView`] handle
 //! [`open_content_overlay`] returns once the host's fetch lands. That
 //! keeps the fetch off the open path so a slow network probe never

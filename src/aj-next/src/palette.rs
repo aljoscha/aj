@@ -5,8 +5,8 @@
 //! dispatch inside its confirm callback, where the live [`EventContext`]
 //! can open a child overlay or move focus:
 //!
-//! - Commands that open a read-only overlay (help, auth, session info,
-//!   usage) push the child on top of the palette (it stays underneath, so
+//! - Commands that open a read-only overlay (help, auth, session info)
+//!   push the child on top of the palette (it stays underneath, so
 //!   Esc returns to it) and, for the async ones, park a [`PendingFetch`]
 //!   the host fills once its fetch lands.
 //! - `Quit` sets [`EventContext::quit`].
@@ -30,11 +30,13 @@ use crate::overlay::{
 };
 
 /// A read-only overlay whose content the host fetches asynchronously.
+///
+/// Usage is not here: it is an interactive overlay ([`crate::usage_overlay`])
+/// the host opens directly, not a read-only content fill.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FetchKind {
     Auth,
     SessionInfo,
-    Usage,
 }
 
 /// A request the palette parks for the host loop: fetch `kind` and fill
@@ -142,7 +144,6 @@ fn dispatch_from_palette(
         }
         CommandAction::OpenAuthStatus => open_fetch(FetchKind::Auth, "Auth status", ctx),
         CommandAction::OpenSessionInfo => open_fetch(FetchKind::SessionInfo, "Session info", ctx),
-        CommandAction::OpenUsageStatus => open_fetch(FetchKind::Usage, "Usage", ctx),
         // The palette is already the top overlay, so re-opening is a
         // no-op that leaves it in place.
         CommandAction::OpenCommandPalette => {}

@@ -41,6 +41,7 @@ use aj_conf::{
 use aj_models::auth::{AuthError, AuthStorage};
 use aj_models::registry::ModelInfo;
 use aj_models::types::Speed;
+use aj_models::usage::default_reset_sources;
 use aj_models::{
     ThinkingConfig, speed_from_name, speed_name, thinking_config_from_name, verbosity_name,
 };
@@ -61,9 +62,7 @@ use vaxis::vxfw::{
 };
 
 use crate::agent_picker::{AgentPickerOutcome, PickerSnapshot, open_agent_picker};
-use crate::content_overlay::{
-    ContentStyles, Row, auth_rows, session_info_rows, set_rows, usage_rows,
-};
+use crate::content_overlay::{ContentStyles, Row, auth_rows, session_info_rows, set_rows};
 use crate::footer::FooterLine;
 use crate::keymap::{HostCtx, build_keymap};
 use crate::login::{
@@ -82,6 +81,7 @@ use crate::settings_ui::{
 use crate::status::{STATUS_WAKE_EVENT, StatusLine, StatusState};
 use crate::task_output::open_task_output;
 use crate::transcript::{TranscriptStyles, TranscriptView, vaxis_color};
+use crate::usage_overlay::open_usage_overlay;
 
 /// App-event name the drive loop posts after opening an overlay outside
 /// dispatch. The Shell handles it by moving focus onto the top overlay: the
@@ -1053,6 +1053,7 @@ async fn apply_command_action(
     action: CommandAction,
     skills_tx: &UnboundedSender<Vec<Skill>>,
     export_tx: &UnboundedSender<String>,
+    redraw_tx: &UnboundedSender<()>,
 ) -> ActionEffect {
     match action {
         CommandAction::Compact => {
@@ -1319,11 +1320,30 @@ async fn apply_command_action(
             );
             ActionEffect::OpenedOverlay
         }
+        // The usage overlay is interactive (it carries the rate-limit-reset
+        // flow), so it can't ride the read-only content-fill path. The host
+        // builds it here where it owns the deps the widget needs: the
+        // credential store, the theme snapshot, the shared redraw ping, and
+        // the runtime handle it spawns its fetch/consume onto.
+        CommandAction::OpenUsageStatus => {
+            let handles = shell.borrow().overlay_handles();
+            let styles = ContentStyles::from_theme(&shell.borrow().theme.read());
+            open_usage_overlay(
+                &handles.stack,
+                &handles.editor,
+                &handles.chrome,
+                styles,
+                world.auth.clone(),
+                default_reset_sources(),
+                tokio::runtime::Handle::current(),
+                redraw_tx.clone(),
+            );
+            ActionEffect::OpenedOverlay
+        }
         // Handled in the palette confirm (overlay openers, quit, re-open)
         // or never a catalog command (`OpenTaskOutput`). Nothing to do.
         CommandAction::Help
         | CommandAction::OpenAuthStatus
-        | CommandAction::OpenUsageStatus
         | CommandAction::OpenSessionInfo
         | CommandAction::OpenCommandPalette
         | CommandAction::Quit
@@ -2070,9 +2090,9 @@ async fn apply_setting_change(
 /// remembers it and fills it when the result lands). Only the fetched
 /// data crosses the task boundary, all of which is `Send`.
 ///
-/// `styles` is the content-column tint snapshot for the auth and usage
-/// pages. It is `Copy`, so those tasks capture it directly. See the call
-/// site for the theme-reload staleness note.
+/// `styles` is the content-column tint snapshot for the auth page. It is
+/// `Copy`, so the task captures it directly. See the call site for the
+/// theme-reload staleness note.
 fn spawn_overlay_fetch(
     world: &World,
     kind: FetchKind,
@@ -2086,13 +2106,6 @@ fn spawn_overlay_fetch(
             tokio::spawn(async move {
                 let rows = auth_rows(&aj_app::auth::collect_statuses(&auth).await, &styles);
                 let _ = tx.send((FetchKind::Auth, rows));
-            });
-        }
-        FetchKind::Usage => {
-            let auth = world.auth.clone();
-            tokio::spawn(async move {
-                let rows = usage_rows(&aj_app::usage::collect_usage(&auth).await, &styles);
-                let _ = tx.send((FetchKind::Usage, rows));
             });
         }
         FetchKind::SessionInfo => {
@@ -3299,11 +3312,13 @@ async fn drive(
     // Session HTML export renders and writes off the loop, delivering only its
     // result notice string back here.
     let (export_tx, mut export_rx) = unbounded_channel::<String>();
-    // OAuth login redraw pings. The login task runs on tokio, off this
-    // `!Send` thread, so it can't call `request_redraw` itself. Each ping
-    // it sends turns into one repaint via the select arm below. The sender
-    // lives for the whole loop, so the receiver never observes a close.
-    let (login_redraw_tx, mut login_redraw_rx) = unbounded_channel::<()>();
+    // Shared UI redraw pings from off-thread work. Widgets that spawn
+    // their own tasks (the OAuth login, the usage overlay's fetch and
+    // consume) run on tokio, off this `!Send` thread, so they can't call
+    // `request_redraw` themselves. Each ping they send turns into one
+    // repaint via the select arm below. The sender lives for the whole
+    // loop, so the receiver never observes a close.
+    let (redraw_tx, mut redraw_rx) = unbounded_channel::<()>();
     // The in-flight OAuth login, if any. Tracked here (not on the overlay
     // stack) because it is async and long-running, but paired with the
     // dialog overlay it pushed.
@@ -3414,11 +3429,12 @@ async fn drive(
                 }
             }
 
-            // --- Login dialog redraw ping ---
-            // The login task pushed a line (or revealed the paste prompt)
-            // and pinged for a repaint. This is the cross-thread redraw
-            // wake: the task can't call `request_redraw`, so it sends here.
-            maybe_ping = login_redraw_rx.recv() => {
+            // --- UI redraw ping ---
+            // An off-thread widget task (the login flow pushing a line, the
+            // usage overlay's fetch or consume landing) pinged for a
+            // repaint. This is the cross-thread redraw wake: the task can't
+            // call `request_redraw`, so it sends here.
+            maybe_ping = redraw_rx.recv() => {
                 if maybe_ping.is_some() {
                     app.request_redraw();
                 }
@@ -3479,7 +3495,7 @@ async fn drive(
                         // RefCell ref is held across the await below.
                         let command = shell.borrow().take_command();
                         if let Some(action) = command {
-                            match apply_command_action(world, shell, action, &skills_tx, &export_tx)
+                            match apply_command_action(world, shell, action, &skills_tx, &export_tx, &redraw_tx)
                                 .await
                             {
                                 ActionEffect::None => {}
@@ -3580,7 +3596,7 @@ async fn drive(
                                 shell,
                                 app,
                                 &mut login_session,
-                                &login_redraw_tx,
+                                &redraw_tx,
                                 request,
                             )
                             .await;
@@ -4953,7 +4969,8 @@ mod tests {
     ) -> ActionEffect {
         let (skills_tx, _skills_rx) = unbounded_channel();
         let (export_tx, _export_rx) = unbounded_channel();
-        apply_command_action(world, shell, action, &skills_tx, &export_tx).await
+        let (redraw_tx, _redraw_rx) = unbounded_channel();
+        apply_command_action(world, shell, action, &skills_tx, &export_tx, &redraw_tx).await
     }
     /// bound to it, so tests can exercise the host arms that need all three
     /// of the app, the world, and the shell (the login/logout flow).
@@ -5852,6 +5869,7 @@ mod tests {
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         let (skills_tx, mut skills_rx) = unbounded_channel();
         let (export_tx, _export_rx) = unbounded_channel();
+        let (redraw_tx, _redraw_rx) = unbounded_channel();
 
         let effect = apply_command_action(
             &mut world,
@@ -5859,6 +5877,7 @@ mod tests {
             CommandAction::OpenSkills,
             &skills_tx,
             &export_tx,
+            &redraw_tx,
         )
         .await;
 
@@ -5912,6 +5931,7 @@ mod tests {
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         let (skills_tx, _skills_rx) = unbounded_channel();
         let (export_tx, mut export_rx) = unbounded_channel();
+        let (redraw_tx, _redraw_rx) = unbounded_channel();
 
         let effect = apply_command_action(
             &mut world,
@@ -5919,6 +5939,7 @@ mod tests {
             CommandAction::ExportHtml,
             &skills_tx,
             &export_tx,
+            &redraw_tx,
         )
         .await;
 

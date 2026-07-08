@@ -147,6 +147,18 @@ pub const ACTION_TRANSCRIPT_FOCUS: &str = "aj.transcript.focus";
 /// already-inherited rows and in the user settings window.
 pub const ACTION_SETTINGS_CLEAR: &str = "aj.settings.clear";
 
+/// Action ID for the "spend a rate-limit reset credit" chord in the usage
+/// overlay.
+///
+/// Bound by default to `r`. The usage overlay intercepts it on its
+/// read-only page to start the reset flow, when a provider reports
+/// available resets and has a matching source. Handled inside that
+/// overlay only (contextual). Like [`ACTION_HISTORY_TOGGLE_SCOPE`] it is a
+/// table-only row: it is not compiled into the global keymap, so it exists
+/// purely to resolve the footer-hint label through the shared binding
+/// data. The in-overlay handling is a fixed convention for now.
+pub const ACTION_USAGE_RESET: &str = "aj.usage.reset";
+
 /// The `aj.*` actions with their default chord and description, in the
 /// order help screens and the keybindings manager list them.
 ///
@@ -219,6 +231,11 @@ pub const AJ_KEYBINDINGS: &[(&str, &str, &str)] = &[
         ACTION_SETTINGS_CLEAR,
         "ctrl+x",
         "Clear the selected project override",
+    ),
+    (
+        ACTION_USAGE_RESET,
+        "r",
+        "Spend a rate-limit reset credit (usage overlay)",
     ),
 ];
 

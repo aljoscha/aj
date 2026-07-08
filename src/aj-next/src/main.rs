@@ -34,6 +34,7 @@ mod terminal;
 mod test_support;
 mod tool_cell;
 mod transcript;
+mod usage_overlay;
 
 #[tokio::main]
 async fn main() -> Result<()> {
