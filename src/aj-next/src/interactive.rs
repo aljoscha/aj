@@ -61,7 +61,9 @@ use vaxis::vxfw::{
 };
 
 use crate::agent_picker::{AgentPickerOutcome, PickerSnapshot, open_agent_picker};
-use crate::content_overlay::{auth_rows, session_info_rows, set_rows, usage_rows};
+use crate::content_overlay::{
+    ContentStyles, Row, auth_rows, session_info_rows, set_rows, usage_rows,
+};
 use crate::footer::FooterLine;
 use crate::keymap::{HostCtx, build_keymap};
 use crate::login::{
@@ -2067,17 +2069,22 @@ async fn apply_setting_change(
 /// The row list is `!Send`, so it stays with the caller (the drive loop
 /// remembers it and fills it when the result lands). Only the fetched
 /// data crosses the task boundary, all of which is `Send`.
+///
+/// `styles` is the content-column tint snapshot for the auth page. It is
+/// `Copy`, so the auth task captures it directly. See the call site for
+/// the theme-reload staleness note.
 fn spawn_overlay_fetch(
     world: &World,
     kind: FetchKind,
-    tx: &UnboundedSender<(FetchKind, Vec<String>)>,
+    styles: ContentStyles,
+    tx: &UnboundedSender<(FetchKind, Vec<Row>)>,
 ) {
     let tx = tx.clone();
     match kind {
         FetchKind::Auth => {
             let auth = world.auth.clone();
             tokio::spawn(async move {
-                let rows = auth_rows(&aj_app::auth::collect_statuses(&auth).await);
+                let rows = auth_rows(&aj_app::auth::collect_statuses(&auth).await, &styles);
                 let _ = tx.send((FetchKind::Auth, rows));
             });
         }
@@ -3271,7 +3278,7 @@ async fn drive(
     // Async read-only overlay fills. The list handle is `!Send`, so it
     // stays here (paired with its `FetchKind`) while the detached fetch
     // sends only the rendered rows back over the channel.
-    let (fetch_tx, mut fetch_rx) = unbounded_channel::<(FetchKind, Vec<String>)>();
+    let (fetch_tx, mut fetch_rx) = unbounded_channel::<(FetchKind, Vec<Row>)>();
     let mut pending_fills: Vec<(FetchKind, Rc<RefCell<ListView>>)> = Vec::new();
     // Prompt-history scans stream their per-file entry batches here. The
     // select handle is `!Send`, so it stays paired with the scan's own
@@ -3492,7 +3499,15 @@ async fn drive(
                         // A just-opened async read-only overlay: kick off
                         // its fetch and remember the list to fill.
                         if let Some(fetch) = shell.borrow().take_fetch() {
-                            spawn_overlay_fetch(world, fetch.kind, &fetch_tx);
+                            // NOTE: Snapshot the content-column tints at
+                            // fetch time. A theme hot-reload while the overlay
+                            // is open won't re-tint its rows, the overlay
+                            // re-tints on next open. This matches the chrome,
+                            // which is also snapshotted at open. Acceptable for
+                            // a transient read-only overlay.
+                            let styles =
+                                ContentStyles::from_theme(&shell.borrow().theme.read());
+                            spawn_overlay_fetch(world, fetch.kind, styles, &fetch_tx);
                             pending_fills.push((fetch.kind, fetch.list));
                         }
                         // Config edits parked by a selector or settings
@@ -5817,7 +5832,10 @@ mod tests {
 
         // Fill the overlay the way the drive loop does once the fetch
         // returns.
-        crate::content_overlay::set_rows(&fetch.list, vec!["id  session-xyz".to_string()]);
+        crate::content_overlay::set_rows(
+            &fetch.list,
+            vec![crate::content_overlay::plain("id  session-xyz")],
+        );
         let filled = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
         assert!(filled.contains("session-xyz"), "filled state: {filled}");
         assert!(!filled.contains("Loading"), "loading replaced: {filled}");

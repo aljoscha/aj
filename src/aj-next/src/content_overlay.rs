@@ -4,9 +4,9 @@
 //! rows shown inside an [`OverlayWindow`]. Esc or Enter close it
 //! (returning to the parent overlay or the editor), Up/Down and
 //! PgUp/PgDn scroll the body, and every other key is swallowed so
-//! nothing leaks to the layout behind the modal. The rows are plain
-//! strings the host builds from the shared `aj_app` data, so the one
-//! widget backs all four read-only overlays.
+//! nothing leaks to the layout behind the modal. Each row is a list of
+//! styled spans ([`Row`]) the host builds from the shared `aj_app` data,
+//! so the one widget backs all four read-only overlays.
 //!
 //! Async overlays (auth, session info, usage) open showing a single
 //! "Loading…" row and are refilled through the [`ListView`] handle
@@ -20,17 +20,65 @@ use std::rc::Rc;
 use aj_app::auth::ProviderAuthStatus;
 use aj_app::commands::COMMANDS;
 use aj_app::keybindings::{AJ_KEYBINDINGS, default_action_shortcut};
+use aj_app::theme::{Theme, ThemeColor};
 use aj_app::usage::{ProviderUsageStatus, UsageOutcome, format_window_status, now_unix_ms};
 use aj_session::SessionStats;
+use vaxis::cell::{Segment, Style};
 use vaxis::key::{Key, Modifiers};
 use vaxis::vxfw::{
-    DrawContext, Event, EventContext, ListView, OverlayWindow, RelativePoint, ScrollBars, Source,
-    SubSurface, Surface, Text, Widget, WidgetRef, to_widget_ref,
+    DrawContext, Event, EventContext, ListView, OverlayWindow, RelativePoint, RichText, ScrollBars,
+    Source, SubSurface, Surface, Widget, WidgetRef, to_widget_ref,
 };
 
 use crate::overlay::{
     OpenOverlay, OverlayChrome, OverlayPlacement, OverlayStack, close_top, subtitle_close,
 };
+use crate::transcript::vaxis_color;
+
+/// A single content-overlay row: styled spans laid out as one line.
+///
+/// A plain row is one default-styled span. Because [`RichText::new`]'s
+/// layout defaults match [`Text`](vaxis::vxfw::Text)'s, a plain row draws
+/// exactly like a plain-string row would, so converting the plain builders
+/// to this model is appearance-preserving.
+pub(crate) type Row = Vec<Segment>;
+
+/// A single default-styled span carrying `text`.
+pub(crate) fn plain(text: impl Into<String>) -> Row {
+    vec![span(text, Style::default())]
+}
+
+/// A styled span for one column of a row.
+fn span(text: impl Into<String>, style: Style) -> Segment {
+    Segment {
+        text: text.into(),
+        style,
+        ..Segment::default()
+    }
+}
+
+/// Column tints for the read-only content pages, resolved once from the
+/// theme like [`OverlayChrome`]. `dim` tints the provider-id column and
+/// `muted` the secondary detail column, matching `aj`'s auth page.
+#[derive(Clone, Copy)]
+pub(crate) struct ContentStyles {
+    pub(crate) dim: Style,
+    pub(crate) muted: Style,
+}
+
+impl ContentStyles {
+    pub(crate) fn from_theme(theme: &Theme) -> ContentStyles {
+        let mode = theme.color_mode();
+        let fg = |token: ThemeColor| Style {
+            fg: vaxis_color(theme.fg_color(token), mode),
+            ..Style::default()
+        };
+        ContentStyles {
+            dim: fg(ThemeColor::Dim),
+            muted: fg(ThemeColor::Muted),
+        }
+    }
+}
 
 /// PgUp/PgDn step, in rows. A fixed jump rather than a viewport-derived
 /// one keeps the widget from needing to know its drawn height.
@@ -54,7 +102,7 @@ pub(crate) struct ContentOverlay {
 }
 
 impl ContentOverlay {
-    pub(crate) fn new(rows: Vec<String>) -> ContentOverlay {
+    pub(crate) fn new(rows: Vec<Row>) -> ContentOverlay {
         let mut list = ListView::new(Source::Slice(row_widgets(&rows)));
         list.item_count = Some(u32::try_from(rows.len()).expect("row count fits u32"));
         // Document scroll with no visible cursor: the list moves its
@@ -127,11 +175,11 @@ impl Widget for ContentOverlay {
     }
 }
 
-/// Build the list-row widgets for a set of text rows.
-fn row_widgets(rows: &[String]) -> Vec<WidgetRef> {
+/// Build the list-row widgets for a set of rows.
+fn row_widgets(rows: &[Row]) -> Vec<WidgetRef> {
     rows.iter()
         .map(|r| {
-            let text: WidgetRef = Rc::new(RefCell::new(Text::new(r)));
+            let text: WidgetRef = Rc::new(RefCell::new(RichText::new(r.clone())));
             text
         })
         .collect()
@@ -140,7 +188,7 @@ fn row_widgets(rows: &[String]) -> Vec<WidgetRef> {
 /// Replace an open overlay's rows, for an async overlay whose fetch has
 /// landed. Resets the scroll to the top so the filled content reads from
 /// its first row.
-pub(crate) fn set_rows(list: &Rc<RefCell<ListView>>, rows: Vec<String>) {
+pub(crate) fn set_rows(list: &Rc<RefCell<ListView>>, rows: Vec<Row>) {
     let mut list = list.borrow_mut();
     list.item_count = Some(u32::try_from(rows.len()).expect("row count fits u32"));
     list.children = Source::Slice(row_widgets(&rows));
@@ -159,7 +207,7 @@ pub(crate) fn open_content_overlay(
     editor: &WidgetRef,
     chrome: &OverlayChrome,
     title: &str,
-    rows: Vec<String>,
+    rows: Vec<Row>,
     ctx: &mut EventContext,
 ) -> Rc<RefCell<ListView>> {
     let content = Rc::new(RefCell::new(ContentOverlay::new(rows)));
@@ -199,17 +247,17 @@ pub(crate) fn open_content_overlay(
 // ============================================================================
 
 /// The single-row "Loading…" seed an async overlay opens with.
-pub(crate) fn loading_rows() -> Vec<String> {
-    vec!["Loading\u{2026}".to_string()]
+pub(crate) fn loading_rows() -> Vec<Row> {
+    vec![plain("Loading\u{2026}")]
 }
 
 /// Help overlay rows: the keybinding table and the command catalog, each
 /// with its shortcut resolved from the keybinding data so a rebind flows
 /// through to the label (Spec F's hint-label rule).
-pub(crate) fn help_rows() -> Vec<String> {
+pub(crate) fn help_rows() -> Vec<Row> {
     let mut rows = Vec::new();
 
-    rows.push("Keybindings".to_string());
+    rows.push(plain("Keybindings"));
     let short_w = AJ_KEYBINDINGS
         .iter()
         .filter_map(|(id, _, _)| default_action_shortcut(id))
@@ -220,11 +268,11 @@ pub(crate) fn help_rows() -> Vec<String> {
         // Resolve through `default_action_shortcut`, never the raw chord
         // literal in the table, so the label tracks the binding.
         let short = default_action_shortcut(id).unwrap_or_default();
-        rows.push(format!("  {short:<short_w$}  {desc}"));
+        rows.push(plain(format!("  {short:<short_w$}  {desc}")));
     }
 
-    rows.push(String::new());
-    rows.push("Commands".to_string());
+    rows.push(plain(""));
+    rows.push(plain("Commands"));
     let cat_w = COMMANDS
         .iter()
         .map(|c| c.category.chars().count())
@@ -245,16 +293,22 @@ pub(crate) fn help_rows() -> Vec<String> {
         if let Some(short) = cmd.action_id.and_then(default_action_shortcut) {
             line.push_str(&format!("  ({short})"));
         }
-        rows.push(line);
+        rows.push(plain(line));
     }
     rows
 }
 
 /// Auth-status rows: one per provider, its credential summary and any
 /// secondary detail (e.g. token expiry).
-pub(crate) fn auth_rows(statuses: &[ProviderAuthStatus]) -> Vec<String> {
+///
+/// Each row is three columns: the provider id in `styles.dim`, the summary
+/// in the default style, and the optional detail in `styles.muted`. The
+/// muted tint separates the detail column, so it reads as its own field
+/// without the parentheses `aj` also omits. The id column stays
+/// left-aligned, a deliberate divergence from `aj`'s right-aligned prefix.
+pub(crate) fn auth_rows(statuses: &[ProviderAuthStatus], styles: &ContentStyles) -> Vec<Row> {
     if statuses.is_empty() {
-        return vec!["No providers configured.".to_string()];
+        return vec![plain("No providers configured.")];
     }
     let id_w = statuses
         .iter()
@@ -264,15 +318,17 @@ pub(crate) fn auth_rows(statuses: &[ProviderAuthStatus]) -> Vec<String> {
     statuses
         .iter()
         .map(|s| {
-            let mut line = format!(
-                "{id:<id_w$}  {summary}",
-                id = s.provider_id,
-                summary = s.summary
-            );
+            let mut row = vec![
+                span(format!("{id:<id_w$}", id = s.provider_id), styles.dim),
+                span(
+                    format!("  {summary}", summary = s.summary),
+                    Style::default(),
+                ),
+            ];
             if let Some(detail) = &s.detail {
-                line.push_str(&format!("  ({detail})"));
+                row.push(span(format!("  {detail}"), styles.muted));
             }
-            line
+            row
         })
         .collect()
 }
@@ -280,18 +336,18 @@ pub(crate) fn auth_rows(statuses: &[ProviderAuthStatus]) -> Vec<String> {
 /// Usage rows: one group per provider. Only a provider's first row
 /// carries its id, continuation rows leave it blank so the id column
 /// groups the windows visually (matching `aj`'s usage page).
-pub(crate) fn usage_rows(statuses: &[ProviderUsageStatus]) -> Vec<String> {
+pub(crate) fn usage_rows(statuses: &[ProviderUsageStatus]) -> Vec<Row> {
     let now_ms = now_unix_ms();
     let mut rows = Vec::new();
     for status in statuses {
         let id = status.provider_id.as_str();
         let mut prefix = id.to_string();
-        let mut push = |rows: &mut Vec<String>, label: &str, detail: Option<&str>| {
+        let mut push = |rows: &mut Vec<Row>, label: &str, detail: Option<&str>| {
             let mut line = format!("{prefix:<12}  {label}");
             if let Some(detail) = detail {
                 line.push_str(&format!("  {detail}"));
             }
-            rows.push(line);
+            rows.push(plain(line));
             prefix = String::new();
         };
         match &status.outcome {
@@ -331,7 +387,7 @@ pub(crate) fn usage_rows(statuses: &[ProviderUsageStatus]) -> Vec<String> {
         }
     }
     if rows.is_empty() {
-        rows.push("No usage sources.".to_string());
+        rows.push(plain("No usage sources."));
     }
     rows
 }
@@ -354,7 +410,7 @@ fn kv(key: &str, value: &str) -> InfoRow {
 /// Session-info rows: identity, recorded settings, activity, message
 /// counts, aggregate usage, and the per-tool call breakdown. Ported from
 /// `aj`'s session-info overlay so both frontends show the same digest.
-pub(crate) fn session_info_rows(stats: &SessionStats) -> Vec<String> {
+pub(crate) fn session_info_rows(stats: &SessionStats) -> Vec<Row> {
     let total_messages = stats.user_messages + stats.assistant_messages + stats.tool_results;
 
     let mut rows: Vec<InfoRow> = vec![
@@ -416,7 +472,7 @@ pub(crate) fn session_info_rows(stats: &SessionStats) -> Vec<String> {
 
 /// Align every key/value pair against one shared key column so values
 /// line up across sections.
-fn render_info_rows(rows: &[InfoRow]) -> Vec<String> {
+fn render_info_rows(rows: &[InfoRow]) -> Vec<Row> {
     let key_width = rows
         .iter()
         .filter_map(|row| match row {
@@ -427,9 +483,9 @@ fn render_info_rows(rows: &[InfoRow]) -> Vec<String> {
         .unwrap_or(0);
     rows.iter()
         .map(|row| match row {
-            InfoRow::Header(title) => title.clone(),
-            InfoRow::Kv { key, value } => format!("  {key:<key_width$}  {value}"),
-            InfoRow::Blank => String::new(),
+            InfoRow::Header(title) => plain(title.clone()),
+            InfoRow::Kv { key, value } => plain(format!("  {key:<key_width$}  {value}")),
+            InfoRow::Blank => plain(""),
         })
         .collect()
 }
@@ -483,12 +539,39 @@ mod tests {
     use aj_app::keybindings::ACTION_PALETTE_OPEN;
     use aj_models::types::{Usage, UsageCost};
     use aj_session::SessionSettings;
+    use vaxis::cell::Color;
 
     use super::*;
 
+    /// Concatenate a row's span texts, so the plain-text `.contains(...)`
+    /// assertions keep working on a styled row.
+    fn row_text(row: &Row) -> String {
+        row.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    /// Join a set of rows into one plain-text blob for `.contains(...)`.
+    fn rows_text(rows: &[Row]) -> String {
+        rows.iter().map(row_text).collect::<Vec<_>>().join("\n")
+    }
+
+    /// Distinct dim/muted tints so a column left at the default fg fails the
+    /// tinting assertions.
+    fn test_styles() -> ContentStyles {
+        ContentStyles {
+            dim: Style {
+                fg: Color::Index(1),
+                ..Style::default()
+            },
+            muted: Style {
+                fg: Color::Index(2),
+                ..Style::default()
+            },
+        }
+    }
+
     #[test]
     fn help_rows_resolve_shortcuts_from_binding_data() {
-        let rows = help_rows().join("\n");
+        let rows = rows_text(&help_rows());
         // The command catalog and keybinding table are both present.
         assert!(rows.contains("Keybindings"), "{rows}");
         assert!(rows.contains("Commands"), "{rows}");
@@ -509,31 +592,84 @@ mod tests {
 
     #[test]
     fn auth_rows_render_summary_and_detail() {
-        let rows = auth_rows(&[
-            ProviderAuthStatus {
-                provider_id: "anthropic".into(),
-                configured: true,
-                summary: "subscription".into(),
-                detail: Some("expires in 1h".into()),
-            },
-            ProviderAuthStatus {
-                provider_id: "openai".into(),
-                configured: false,
-                summary: "not configured".into(),
-                detail: None,
-            },
-        ])
-        .join("\n");
+        let rows = rows_text(&auth_rows(
+            &[
+                ProviderAuthStatus {
+                    provider_id: "anthropic".into(),
+                    configured: true,
+                    summary: "subscription".into(),
+                    detail: Some("expires in 1h".into()),
+                },
+                ProviderAuthStatus {
+                    provider_id: "openai".into(),
+                    configured: false,
+                    summary: "not configured".into(),
+                    detail: None,
+                },
+            ],
+            &test_styles(),
+        ));
         assert!(rows.contains("anthropic"), "{rows}");
         assert!(rows.contains("subscription"), "{rows}");
         assert!(rows.contains("expires in 1h"), "{rows}");
         assert!(rows.contains("not configured"), "{rows}");
     }
 
+    /// The auth page tints its columns: the provider id in the dim style,
+    /// the summary in the default style, and the detail in the muted style,
+    /// with no parentheses around the detail. This fails if a column is
+    /// left at the default fg.
+    #[test]
+    fn auth_rows_tint_columns_from_styles() {
+        let styles = test_styles();
+        let rows = auth_rows(
+            &[ProviderAuthStatus {
+                provider_id: "anthropic".into(),
+                configured: true,
+                summary: "subscription".into(),
+                detail: Some("expires in 1h".into()),
+            }],
+            &styles,
+        );
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.len(), 3, "id, summary, and detail spans: {row:?}");
+        // Provider id in the dim tint.
+        assert!(row[0].text.contains("anthropic"), "{row:?}");
+        assert_eq!(row[0].style, styles.dim);
+        // Summary in the default style.
+        assert!(row[1].text.contains("subscription"), "{row:?}");
+        assert_eq!(row[1].style, Style::default());
+        // Detail in the muted tint, and no parentheses.
+        assert!(row[2].text.contains("expires in 1h"), "{row:?}");
+        assert_eq!(row[2].style, styles.muted);
+        assert!(
+            !row_text(row).contains('('),
+            "detail carries no parentheses: {row:?}"
+        );
+    }
+
+    /// A provider with no detail yields a two-span row (id + summary), so
+    /// the empty case doesn't leave a stray muted span.
+    #[test]
+    fn auth_rows_without_detail_have_no_muted_span() {
+        let styles = test_styles();
+        let rows = auth_rows(
+            &[ProviderAuthStatus {
+                provider_id: "openai".into(),
+                configured: false,
+                summary: "not configured".into(),
+                detail: None,
+            }],
+            &styles,
+        );
+        assert_eq!(rows[0].len(), 2, "{:?}", rows[0]);
+    }
+
     #[test]
     fn usage_rows_group_windows_under_the_provider() {
         use aj_models::usage::{ProviderUsage, UsageWindow};
-        let rows = usage_rows(&[
+        let rows = rows_text(&usage_rows(&[
             ProviderUsageStatus {
                 provider_id: "anthropic".into(),
                 outcome: UsageOutcome::Usage(ProviderUsage {
@@ -550,8 +686,7 @@ mod tests {
                 provider_id: "openai".into(),
                 outcome: UsageOutcome::NotConfigured,
             },
-        ])
-        .join("\n");
+        ]));
         assert!(rows.contains("anthropic"), "{rows}");
         assert!(rows.contains("5-hour"), "{rows}");
         assert!(rows.contains("50% used"), "{rows}");
@@ -598,7 +733,7 @@ mod tests {
 
     #[test]
     fn session_info_rows_render_identity_counts_and_tools() {
-        let rows = session_info_rows(&sample_stats()).join("\n");
+        let rows = rows_text(&session_info_rows(&sample_stats()));
         assert!(rows.contains("2026-06-19-14-22-03-512"), "{rows}");
         assert!(rows.contains("home-u-proj"), "{rows}");
         assert!(rows.contains("anthropic / claude-sonnet-4-5"), "{rows}");
@@ -607,5 +742,20 @@ mod tests {
         assert!(rows.contains("Tool calls (31)"), "{rows}");
         assert!(rows.contains("total tokens"), "{rows}");
         assert!(rows.contains("$0.3300"), "{rows}");
+    }
+
+    /// A plain builder produces single-span, default-styled rows, pinning
+    /// the appearance-preserving path: a plain row is one default span, so
+    /// it draws exactly as a plain-string row would.
+    #[test]
+    fn plain_builder_rows_are_single_default_spans() {
+        for row in session_info_rows(&sample_stats()) {
+            assert_eq!(row.len(), 1, "plain row is one span: {row:?}");
+            assert_eq!(
+                row[0].style,
+                Style::default(),
+                "plain row default-styled: {row:?}"
+            );
+        }
     }
 }
