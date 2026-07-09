@@ -724,20 +724,17 @@ fn to_chat_tool_choice(choice: Option<&ToolChoice>, has_tools: bool) -> Option<C
 // ---------------------------------------------------------------------------
 
 /// Map the unified [`ThinkingLevel`] onto the OpenAI `reasoning_effort`
-/// enum one-to-one. `Max` has no OpenAI equivalent and is rejected by
-/// [`validate_thinking_level`] before we get here; it's folded onto
-/// `XHigh` defensively to keep the match total.
-/// Map the unified [`ThinkingLevel`] onto the OpenAI `reasoning_effort`
-/// enum one-to-one. `Max` has no OpenAI equivalent and is rejected by
-/// [`validate_thinking_level`] before we get here; it's folded onto
-/// `XHigh` defensively to keep the match total.
+/// enum one-to-one. Every rung has a wire equivalent, including `max`
+/// and `ultra` on the models that expose them.
 fn map_reasoning_effort(level: &ThinkingLevel) -> ReasoningEffort {
     match level {
         ThinkingLevel::Minimal => ReasoningEffort::Minimal,
         ThinkingLevel::Low => ReasoningEffort::Low,
         ThinkingLevel::Medium => ReasoningEffort::Medium,
         ThinkingLevel::High => ReasoningEffort::High,
-        ThinkingLevel::XHigh | ThinkingLevel::Max => ReasoningEffort::XHigh,
+        ThinkingLevel::XHigh => ReasoningEffort::XHigh,
+        ThinkingLevel::Max => ReasoningEffort::Max,
+        ThinkingLevel::Ultra => ReasoningEffort::Ultra,
     }
 }
 

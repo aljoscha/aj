@@ -45,13 +45,14 @@ pub enum ThinkingConfig {
     High,
     XHigh,
     Max,
+    Ultra,
 }
 
 /// Render an optional [`ThinkingConfig`] as its canonical name:
 /// `"off"` for `None`, otherwise one of `"minimal"`, `"low"`,
-/// `"medium"`, `"high"`, `"xhigh"`, `"max"`. This vocabulary is
-/// shared by the session log's settings entries, the event protocol,
-/// and the binary's level selector.
+/// `"medium"`, `"high"`, `"xhigh"`, `"max"`, `"ultra"`. This
+/// vocabulary is shared by the session log's settings entries, the
+/// event protocol, and the binary's level selector.
 pub fn thinking_config_name(level: Option<&ThinkingConfig>) -> &'static str {
     match level {
         None => "off",
@@ -61,6 +62,7 @@ pub fn thinking_config_name(level: Option<&ThinkingConfig>) -> &'static str {
         Some(ThinkingConfig::High) => "high",
         Some(ThinkingConfig::XHigh) => "xhigh",
         Some(ThinkingConfig::Max) => "max",
+        Some(ThinkingConfig::Ultra) => "ultra",
     }
 }
 
@@ -77,6 +79,7 @@ pub fn thinking_config_from_name(name: &str) -> Option<Option<ThinkingConfig>> {
         "high" => Some(Some(ThinkingConfig::High)),
         "xhigh" => Some(Some(ThinkingConfig::XHigh)),
         "max" => Some(Some(ThinkingConfig::Max)),
+        "ultra" => Some(Some(ThinkingConfig::Ultra)),
         _ => None,
     }
 }
@@ -173,6 +176,7 @@ mod tests {
             Some(ThinkingConfig::High),
             Some(ThinkingConfig::XHigh),
             Some(ThinkingConfig::Max),
+            Some(ThinkingConfig::Ultra),
         ] {
             assert_eq!(
                 thinking_config_from_name(thinking_config_name(level.as_ref())),

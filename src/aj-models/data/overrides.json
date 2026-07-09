@@ -75,26 +75,6 @@
     {
       "target": {
         "provider": "anthropic",
-        "id": "claude-3-7-sonnet-20250219"
-      },
-      "patch": {
-        "supports_adaptive_thinking": false
-      },
-      "reason": "Pre-adaptive model: budget-based extended thinking only."
-    },
-    {
-      "target": {
-        "provider": "anthropic",
-        "id": "claude-opus-4-0"
-      },
-      "patch": {
-        "supports_adaptive_thinking": false
-      },
-      "reason": "Pre-adaptive model: budget-based extended thinking only."
-    },
-    {
-      "target": {
-        "provider": "anthropic",
         "id": "claude-opus-4-1"
       },
       "patch": {
@@ -106,36 +86,6 @@
       "target": {
         "provider": "anthropic",
         "id": "claude-opus-4-1-20250805"
-      },
-      "patch": {
-        "supports_adaptive_thinking": false
-      },
-      "reason": "Pre-adaptive model: budget-based extended thinking only."
-    },
-    {
-      "target": {
-        "provider": "anthropic",
-        "id": "claude-opus-4-20250514"
-      },
-      "patch": {
-        "supports_adaptive_thinking": false
-      },
-      "reason": "Pre-adaptive model: budget-based extended thinking only."
-    },
-    {
-      "target": {
-        "provider": "anthropic",
-        "id": "claude-sonnet-4-0"
-      },
-      "patch": {
-        "supports_adaptive_thinking": false
-      },
-      "reason": "Pre-adaptive model: budget-based extended thinking only."
-    },
-    {
-      "target": {
-        "provider": "anthropic",
-        "id": "claude-sonnet-4-20250514"
       },
       "patch": {
         "supports_adaptive_thinking": false

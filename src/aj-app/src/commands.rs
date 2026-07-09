@@ -365,6 +365,11 @@ pub const THINKING_LEVELS: &[ThinkingLevel] = &[
         description: "Maximum thinking effort",
         config: Some(ThinkingConfig::Max),
     },
+    ThinkingLevel {
+        name: "ultra",
+        description: "Highest thinking effort, for the hardest problems",
+        config: Some(ThinkingConfig::Ultra),
+    },
 ];
 
 /// Look up the [`ThinkingConfig`] for a level name. Returns

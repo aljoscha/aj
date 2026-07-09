@@ -335,9 +335,9 @@ pub struct Context {
 /// Controls the depth of extended thinking / reasoning.
 ///
 /// Serialized in lower-case form: `"minimal"`, `"low"`, `"medium"`,
-/// `"high"`, `"xhigh"`, `"max"`. Each variant is sent to the provider
-/// verbatim — there is no remapping or silent downgrade. A level the
-/// target model's wire vocabulary doesn't accept is rejected before
+/// `"high"`, `"xhigh"`, `"max"`, `"ultra"`. Each variant is sent to the
+/// provider verbatim — there is no remapping or silent downgrade. A level
+/// the target model's wire vocabulary doesn't accept is rejected before
 /// the request is sent (see
 /// [`crate::registry::validate_thinking_level`]).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -349,9 +349,14 @@ pub enum ThinkingLevel {
     High,
     /// Anthropic `effort: "xhigh"` / OpenAI `reasoning_effort: "xhigh"`.
     XHigh,
-    /// Anthropic adaptive `effort: "max"`. Anthropic-only — the
-    /// OpenAI-family APIs have no `max` reasoning effort and reject it.
+    /// Anthropic adaptive `effort: "max"` / OpenAI `reasoning_effort:
+    /// "max"`. Accepted by adaptive Anthropic models and by the OpenAI
+    /// reasoning models that expose a `max` rung.
     Max,
+    /// OpenAI `reasoning_effort: "ultra"`. OpenAI-only — the highest
+    /// rung on the models that expose it. Anthropic has no `ultra`
+    /// effort and rejects it.
+    Ultra,
 }
 
 // ---------------------------------------------------------------------------
@@ -987,6 +992,14 @@ mod tests {
         assert_eq!(
             serde_json::to_value(ThinkingLevel::Medium).unwrap(),
             "medium"
+        );
+        // `max` and `ultra` are the two highest rungs; both round-trip
+        // as single lower-case tokens.
+        assert_eq!(serde_json::to_value(ThinkingLevel::Max).unwrap(), "max");
+        assert_eq!(serde_json::to_value(ThinkingLevel::Ultra).unwrap(), "ultra");
+        assert_eq!(
+            serde_json::from_str::<ThinkingLevel>("\"ultra\"").unwrap(),
+            ThinkingLevel::Ultra
         );
     }
 

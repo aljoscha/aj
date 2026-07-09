@@ -807,16 +807,17 @@ fn to_anthropic_display(display: &ThinkingDisplay) -> AThinkingDisplay {
 }
 
 /// Map the unified [`ThinkingLevel`] onto the Anthropic adaptive
-/// `effort` enum one-to-one. `Minimal` has no adaptive rung and is
-/// rejected by [`validate_thinking_level`] before we get here; it's
-/// folded onto `Low` defensively to keep the match total.
+/// `effort` enum one-to-one. `Minimal` and `Ultra` have no adaptive
+/// rung and are rejected by [`validate_thinking_level`] before we get
+/// here; they fold onto `Low` and `Max` respectively to keep the match
+/// total.
 fn adaptive_effort_for(level: &ThinkingLevel) -> OutputEffort {
     match level {
         ThinkingLevel::Minimal | ThinkingLevel::Low => OutputEffort::Low,
         ThinkingLevel::Medium => OutputEffort::Medium,
         ThinkingLevel::High => OutputEffort::High,
         ThinkingLevel::XHigh => OutputEffort::XHigh,
-        ThinkingLevel::Max => OutputEffort::Max,
+        ThinkingLevel::Max | ThinkingLevel::Ultra => OutputEffort::Max,
     }
 }
 
@@ -827,7 +828,9 @@ fn budget_for(level: &ThinkingLevel) -> u64 {
         ThinkingLevel::Medium => 8192,
         // Budget-based (legacy) models have no separate effort tiers
         // above `high`; the higher rungs share the top budget.
-        ThinkingLevel::High | ThinkingLevel::XHigh | ThinkingLevel::Max => 16_384,
+        ThinkingLevel::High | ThinkingLevel::XHigh | ThinkingLevel::Max | ThinkingLevel::Ultra => {
+            16_384
+        }
     }
 }
 

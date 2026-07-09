@@ -260,19 +260,23 @@ struct Context {
 ### 1.6 Thinking Level
 
 ```rust
-/// Serialized in lower-case kebab form: `"minimal"`, `"low"`, `"medium"`,
-/// `"high"`, `"xhigh"`. The wire value for `XHigh` matches OpenAI's
-/// `reasoning_effort: "xhigh"` exactly.
+/// Serialized in lower-case form: `"minimal"`, `"low"`, `"medium"`,
+/// `"high"`, `"xhigh"`, `"max"`, `"ultra"`. Each variant is sent to
+/// the provider verbatim.
 enum ThinkingLevel {
     Minimal,
     Low,
     Medium,
     High,
-    /// Maximum reasoning effort. Maps to Anthropic adaptive
-    /// `output_config: {effort: "max"}` (Opus 4.6 only) and OpenAI
-    /// `reasoning_effort: "xhigh"` (GPT-5.2+ only). For models that
-    /// don't support this level, falls back to `High`.
+    /// Anthropic adaptive `effort: "xhigh"` / OpenAI `reasoning_effort: "xhigh"`.
     XHigh,
+    /// Anthropic adaptive `effort: "max"` / OpenAI `reasoning_effort:
+    /// "max"`. Accepted by adaptive Anthropic models and by the OpenAI
+    /// models that expose a `max` rung.
+    Max,
+    /// OpenAI `reasoning_effort: "ultra"`. OpenAI-only. Anthropic has no
+    /// `ultra` effort and rejects it.
+    Ultra,
 }
 ```
 
@@ -660,10 +664,11 @@ fn models_are_equal(a: &ModelInfo, b: &ModelInfo) -> bool;
 /// can't be honoured. aj sends the chosen effort verbatim — there is
 /// no remapping or silent downgrade — so an out-of-vocabulary level is
 /// rejected before the request is built: adaptive Anthropic models
-/// reject `Minimal` (no adaptive rung), and the OpenAI-family APIs
-/// reject `Max` (they cap at `xhigh`). Per-model effort support
-/// *within* a provider's vocabulary is left to the provider API,
-/// which returns its own 400.
+/// reject `Minimal` (no adaptive rung), and Anthropic rejects `Ultra`
+/// (OpenAI-only). The OpenAI-family APIs accept the full
+/// `minimal`..`ultra` range. Per-model effort support *within* a
+/// provider's vocabulary is left to the provider API, which returns
+/// its own 400.
 fn validate_thinking_level(model: &ModelInfo, level: &ThinkingLevel) -> Result<(), String>;
 
 /// Whether the model uses Anthropic's adaptive thinking API
@@ -868,16 +873,17 @@ already contain only filtered entries, so the load path does not
 re-filter.
 
 **Codex models are seeded by hand, not from models.dev.** The
-`openai-codex` provider's model list (`gpt-5.1`, `gpt-5.1-codex-max`,
-`gpt-5.1-codex-mini`, `gpt-5.2`, `gpt-5.2-codex`, `gpt-5.3-codex`,
-`gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5`, plus any free preview models
-like `gpt-5.3-codex-spark`) is not exposed by models.dev. The
-refresh CLI (§3.4.5) preserves the existing Codex entries on every
-run: it filters them out of the upstream diff and re-emits them
-from a small seed list maintained alongside the overrides file.
-`context_window` is set to `272000` (the observed server cap, not
-the marketing number) and `max_tokens` to `128000`; pricing is
-hand-curated in the seed.
+`openai-codex` provider's model list (`gpt-5.2`, `gpt-5.4`,
+`gpt-5.4-mini`, `gpt-5.5`, and the `gpt-5.6-sol`/`gpt-5.6-terra`/
+`gpt-5.6-luna` family) is not exposed by models.dev. The refresh CLI
+(§3.4.5) preserves the existing Codex entries on every run: it filters
+them out of the upstream diff and re-emits them from a small seed list
+maintained alongside the overrides file. The seed tracks the codex
+backend's own model manifest, so it changes as models are added or
+retired. `context_window` is the observed server cap per model (the
+`gpt-5.6` family reports `372000`, the rest `272000`) and `max_tokens`
+is `128000`; pricing is hand-curated in the seed, mirroring the
+models.dev base rates for the matching `openai` model.
 
 ---
 
@@ -1150,8 +1156,8 @@ caching, and short prompts simply produce zero cache activity.
 - Adaptive models (`supports_adaptive_thinking(model) == true`): set top-level `thinking: {type: "adaptive"}` and top-level `output_config: {effort: "low"|"medium"|"high"|"max"}` (both are sibling request fields, not nested).
 - Non-adaptive reasoning models (`model.reasoning == true && !supports_adaptive_thinking(model)`): use `thinking: {type: "enabled", budget_tokens: N}`.
 - Non-reasoning or thinking disabled by caller: `thinking: {type: "disabled"}`.
-- ThinkingLevel mapping for adaptive: each level maps one-to-one to the wire `effort` enum (Low→`"low"`, Medium→`"medium"`, High→`"high"`, XHigh→`"xhigh"`, Max→`"max"`). `Minimal` has no adaptive rung and is rejected by `validate_thinking_level` before the request is built. Whether a given adaptive model accepts `xhigh` vs `max` is left to the provider API (a rejected effort surfaces as a 400).
-- ThinkingLevel mapping for budget-based: Minimal→1024, Low→2048, Medium→8192, High/XHigh/Max→16384 (the legacy budget API has no effort tiers above `high`, so the top rungs share the max budget).
+- ThinkingLevel mapping for adaptive: each level maps one-to-one to the wire `effort` enum (Low→`"low"`, Medium→`"medium"`, High→`"high"`, XHigh→`"xhigh"`, Max→`"max"`). `Minimal` has no adaptive rung and `Ultra` is OpenAI-only; both are rejected by `validate_thinking_level` before the request is built. Whether a given adaptive model accepts `xhigh` vs `max` is left to the provider API (a rejected effort surfaces as a 400).
+- ThinkingLevel mapping for budget-based: Minimal→1024, Low→2048, Medium→8192, High/XHigh/Max→16384 (the legacy budget API has no effort tiers above `high`, so the top rungs share the max budget). `Ultra` is rejected pre-flight for Anthropic and never reaches this mapping.
 
 **Temperature + extended thinking:** When extended thinking is enabled
 (adaptive or budget-based), `temperature` must be omitted from the request.
@@ -1245,7 +1251,7 @@ conversations are never stored server-side even if the default changes.
 
 **Reasoning effort:**
 - Set `reasoning_effort` on the request for models that support it
-- ThinkingLevel mapping is one-to-one: Minimal→"minimal", Low→"low", Medium→"medium", High→"high", XHigh→"xhigh". `Max` has no OpenAI equivalent and is rejected by `validate_thinking_level` before the request is built; per-model effort support (e.g. `xhigh` on an older model) is left to the provider API.
+- ThinkingLevel mapping is one-to-one across the full range: Minimal→"minimal", Low→"low", Medium→"medium", High→"high", XHigh→"xhigh", Max→"max", Ultra→"ultra". Per-model effort support (e.g. `max`/`ultra` on an older model that lacks them) is left to the provider API, which returns its own 400.
 - "off" (no requested level) floors to `minimal` for reasoning models: a reasoning model can't be told not to reason (`reasoning_effort: "none"` is rejected by most GPT-5 models), so off is treated like minimal. Non-reasoning models omit the field entirely.
 - Temperature is set normally (not incompatible with reasoning_effort like Anthropic's thinking)
 
@@ -1427,8 +1433,8 @@ Both are Responses-specific concerns and do not belong in the base
   (same `effort: "minimal"`, summary, and `include`). A reasoning
   model can't disable reasoning — `reasoning: {effort: "none"}` is
   rejected by most GPT-5 models — so off is not a distinct wire shape.
-- ThinkingLevel mapping: same as §7.2 (one-to-one; Minimal→"minimal",
-  …, XHigh→"xhigh"; `Max` rejected pre-flight)
+- ThinkingLevel mapping: same as §7.2 (one-to-one across the full
+  range; Minimal→"minimal", …, XHigh→"xhigh", Max→"max", Ultra→"ultra")
 
 **Tool choice mapping:** same wire format as Chat Completions (§7.2).
 

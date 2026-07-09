@@ -66,6 +66,10 @@ pub enum ReasoningEffort {
     High,
     #[serde(rename = "xhigh")]
     XHigh,
+    #[serde(rename = "max")]
+    Max,
+    #[serde(rename = "ultra")]
+    Ultra,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]

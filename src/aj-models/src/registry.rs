@@ -406,17 +406,18 @@ pub fn supports_verbosity(model: &ModelInfo) -> bool {
 /// lacks is rejected here before the request is built:
 ///
 /// - Anthropic adaptive models take an `effort` enum with no `minimal`
-///   rung, so `Minimal` is rejected. Legacy budget-based Anthropic
-///   models translate every level to a token budget and accept all of
-///   them.
-/// - The OpenAI-family APIs (Responses, Chat Completions, Codex) cap
-///   at `xhigh`; `Max` is rejected.
+///   rung, so `Minimal` is rejected. `Ultra` is OpenAI-only, so it is
+///   rejected for Anthropic regardless of thinking mode. Legacy
+///   budget-based Anthropic models translate every level to a token
+///   budget and accept the rest.
+/// - The OpenAI-family APIs (Responses, Chat Completions, Codex) accept
+///   the full `minimal`..`ultra` range.
 ///
 /// Per-model effort support *within* a provider's vocabulary (e.g.
-/// which adaptive Anthropic model accepts `max` vs `xhigh`, or whether
-/// a given reasoning model supports `xhigh` at all) is deliberately
-/// not modelled here: those requests are sent through and the provider
-/// API returns its own 400.
+/// which adaptive Anthropic model accepts `max` vs `xhigh`, or which
+/// OpenAI model exposes `max` / `ultra`) is deliberately not modelled
+/// here: those requests are sent through and the provider API returns
+/// its own 400.
 ///
 /// Non-reasoning models ignore the level entirely (the providers omit
 /// the thinking parameter), so any level is accepted as a no-op.
@@ -433,18 +434,16 @@ pub fn validate_thinking_level(model: &ModelInfo, level: &ThinkingLevel) -> Resu
                     model.id
                 ));
             }
-            Ok(())
-        }
-        _ => {
-            if matches!(level, ThinkingLevel::Max) {
+            if matches!(level, ThinkingLevel::Ultra) {
                 return Err(format!(
-                    "model '{}' does not support thinking level 'max'; \
-                     supported: minimal, low, medium, high, xhigh",
+                    "model '{}' does not support thinking level 'ultra'; \
+                     supported: minimal, low, medium, high, xhigh, max",
                     model.id
                 ));
             }
             Ok(())
         }
+        _ => Ok(()),
     }
 }
 
@@ -815,22 +814,26 @@ mod tests {
         assert!(validate_thinking_level(&adaptive, &ThinkingLevel::Minimal).is_err());
         assert!(validate_thinking_level(&adaptive, &ThinkingLevel::Max).is_ok());
         assert!(validate_thinking_level(&adaptive, &ThinkingLevel::XHigh).is_ok());
+        // `ultra` is OpenAI-only; Anthropic rejects it.
+        assert!(validate_thinking_level(&adaptive, &ThinkingLevel::Ultra).is_err());
 
         // Legacy budget-based Anthropic model accepts every level
-        // (each maps to a token budget).
+        // (each maps to a token budget), except the OpenAI-only `ultra`.
         let mut budget = sample_model("anthropic", "claude-sonnet-4-5");
         budget.reasoning = true;
         budget.supports_adaptive_thinking = false;
         assert!(validate_thinking_level(&budget, &ThinkingLevel::Minimal).is_ok());
         assert!(validate_thinking_level(&budget, &ThinkingLevel::Max).is_ok());
+        assert!(validate_thinking_level(&budget, &ThinkingLevel::Ultra).is_err());
 
-        // OpenAI-family model: caps at `xhigh`, rejects `max`.
-        let mut openai = sample_model("openai", "gpt-5.2");
+        // OpenAI-family model: accepts the full minimal..ultra range.
+        let mut openai = sample_model("openai", "gpt-5.6-sol");
         openai.api = "openai-responses".into();
         openai.reasoning = true;
-        assert!(validate_thinking_level(&openai, &ThinkingLevel::Max).is_err());
-        assert!(validate_thinking_level(&openai, &ThinkingLevel::XHigh).is_ok());
         assert!(validate_thinking_level(&openai, &ThinkingLevel::Minimal).is_ok());
+        assert!(validate_thinking_level(&openai, &ThinkingLevel::XHigh).is_ok());
+        assert!(validate_thinking_level(&openai, &ThinkingLevel::Max).is_ok());
+        assert!(validate_thinking_level(&openai, &ThinkingLevel::Ultra).is_ok());
 
         // Non-reasoning model ignores the level entirely.
         let plain = sample_model("openai", "gpt-4o");
@@ -927,28 +930,31 @@ mod tests {
         // headline entries.
         let ids: std::collections::HashSet<&str> = seed.iter().map(|m| m.id.as_str()).collect();
         for expected in [
-            "gpt-5.1",
-            "gpt-5.1-codex-max",
-            "gpt-5.1-codex-mini",
             "gpt-5.2",
-            "gpt-5.2-codex",
-            "gpt-5.3-codex",
             "gpt-5.4",
             "gpt-5.4-mini",
             "gpt-5.5",
-            "gpt-5.3-codex-spark",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
         ] {
             assert!(ids.contains(expected), "codex seed missing {expected}");
         }
 
-        // context_window is 272_000 for the canonical entries
-        // (the observed server cap). The free-preview spark model is
-        // narrower; assert the bulk are at the canonical value.
-        let canonical_window_count = seed.iter().filter(|m| m.context_window == 272_000).count();
-        assert!(
-            canonical_window_count >= seed.len() - 1,
-            "at least all but the spark preview should sit at the 272k cap"
-        );
+        // Context windows track the observed server cap per model, not the
+        // marketing number: the gpt-5.6 family reports 372k, the rest sit at
+        // the 272k cap.
+        for m in &seed {
+            let expected = match m.id.as_str() {
+                "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" => 372_000,
+                _ => 272_000,
+            };
+            assert_eq!(
+                m.context_window, expected,
+                "unexpected context_window for {}",
+                m.id
+            );
+        }
     }
 
     /// `splice_codex_seed` must be additive only: entries already in
@@ -957,8 +963,8 @@ mod tests {
     #[test]
     fn splice_codex_seed_is_additive_only() {
         let mut models = vec![ModelInfo {
-            id: "gpt-5.1".into(),
-            name: "gpt-5.1 (from cache)".into(),
+            id: "gpt-5.5".into(),
+            name: "gpt-5.5 (from cache)".into(),
             api: "openai-codex-responses".into(),
             provider: CODEX_PROVIDER_ID.into(),
             base_url: "https://chatgpt.com/backend-api".into(),
@@ -981,17 +987,17 @@ mod tests {
         let total_seed = seed.len();
         let appended = splice_codex_seed(&mut models, seed);
 
-        // The seed entry for gpt-5.1 should not have been re-applied.
+        // The seed entry for gpt-5.5 should not have been re-applied.
         assert_eq!(appended, total_seed - 1);
         assert_eq!(models.len(), total_seed);
 
         // The pre-existing entry's cost is preserved.
-        let gpt51 = models
+        let gpt55 = models
             .iter()
-            .find(|m| m.id == "gpt-5.1")
-            .expect("gpt-5.1 present");
-        assert_eq!(gpt51.name, "gpt-5.1 (from cache)");
-        assert!((gpt51.cost.input - 9.99).abs() < 1e-9);
+            .find(|m| m.id == "gpt-5.5")
+            .expect("gpt-5.5 present");
+        assert_eq!(gpt55.name, "gpt-5.5 (from cache)");
+        assert!((gpt55.cost.input - 9.99).abs() < 1e-9);
 
         // A second splice with the same seed appends nothing.
         let appended_again = splice_codex_seed(&mut models, bundled_codex_seed());
