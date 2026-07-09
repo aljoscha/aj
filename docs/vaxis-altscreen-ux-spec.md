@@ -29,10 +29,11 @@ built from `ChatState` (Spec C). `ListView` is the substrate for three reasons:
 it scrolls by line (smooth reading of long messages), it materializes items
 lazily through `Source::Builder` (a long transcript only builds the visible entry
 widgets each frame), and it has a movable item cursor we use for keyboard
-navigation and selection. The cursor is hidden (`draw_cursor = false`) in the
-default editor-focused mode, so the chat reads as plain free-scroll, and shown
-in transcript-focus mode. Scroll position, follow-tail, and the mode are view
-state, not terminal state.
+navigation. In the default editor-focused mode the chat reads as plain
+free-scroll with no visible cursor. In transcript-focus mode the item cursor
+tracks the focused user message and is drawn as a border around it (section 2),
+not a cursor gutter. Scroll position, follow-tail, and the mode are view state,
+not terminal state.
 
 **Follow-tail.** The view tracks `follow_tail: bool`, true when the viewport is
 at (or within a small threshold of) the bottom. While `follow_tail` is true, new
@@ -92,30 +93,32 @@ transcript-focus mode below, where the editor is not focused.
 - **PageUp / PageDown** page the transcript up and down. They are host-intercepted
   ahead of the editor (whose `TextArea` would otherwise consume them for its own
   multi-line scroll), so a page turn works even while composing.
-- **Shift+Home / Shift+End** jump to the top and bottom of the transcript. Plain
-  Home / End are the editor's line-start / line-end chords (`Ctrl-A` / `Ctrl-E`),
-  so we take the Shift-modified variants, which the editor does not bind, for the
-  absolute top / bottom jump. This gives keyboard users a scroll-to-top /
-  scroll-to-bottom without first entering transcript-focus mode.
-- **Alt+k / Alt+j** scroll the transcript up and down one line, for fine reading
-  of a long message without paging. The editor's Alt chords are word-motion and
-  word-kill (`Alt-b` / `Alt-f` / `Alt-d` / `Alt-Backspace`) plus `Alt-y`. It does
-  not bind `Alt-j` / `Alt-k`, so they are free for line-scroll. (`Ctrl-j` is the
-  editor's newline, so the line-scroll keys are the Alt variants, not the Ctrl
-  ones.)
+- **Home / End** jump to the top and bottom of the transcript. They are
+  host-intercepted in the capture phase ahead of the editor, so they work while
+  composing. We deliberately take them from the editor, whose line-start /
+  line-end stay on `Ctrl-A` / `Ctrl-E`, because scroll-to-extremes is the more
+  useful binding for those keys here. Since they dispatch to the transcript, they
+  are mode-aware: in editor mode they scroll the viewport (End re-engages
+  follow-tail), in transcript-focus mode they move the message cursor to the
+  first / last user message.
 
-Plain Home / End and half-page (`Ctrl-U` / `Ctrl-D`) cannot double as
-editor-focused chat-scroll keys, because they are editor chords (line start / end,
-kill-to-start, delete-forward). Home / End are handled inside transcript-focus
-mode instead, and half-page scroll is deferred until there is a free binding for
-it.
+**Transcript-focus mode.** A keyboard mode for stepping through past user
+messages, entered with Tab from an empty editor and left with Esc. Entering moves
+focus to the chat `ListView` and lands on the last (newest) user message. In the
+mode the navigation unit is the user message, not the individual entry: Tab and
+Up (and `k`) step to the next-older user message, Shift+Tab and Down (and `j`)
+step to the next-newer one, and Home / End jump to the first / last. Assistant,
+tool, and other entries are skipped by the cursor. Wheel and page-key scrolling
+still work, so the replies between the user messages the reader steps through
+stay readable. Leaving the mode returns focus to the editor. This is part of the
+first cut, not a later add.
 
-**Transcript-focus mode.** A keyboard mode, entered from the editor (e.g. a chord
-or PageUp from an empty editor) and left with Esc, moves focus to the `ListView`
-and shows its cursor. In it, the arrow keys / j-k move the item cursor, and
-Shift+arrows extend a selection (section 2). Leaving the mode returns focus to the
-editor. This gives keyboard-only users full navigation and selection without a
-mouse, and it is part of the first cut, not a later add.
+Tab is the editor's autocomplete key when the editor has content, so the
+enter-focus binding is gated to an empty editor and matches in the capture phase,
+the same empty-editor guard the `/` palette trigger and the queued-message yank
+use. With text in the editor, Tab stays autocomplete. The focused message is
+marked by a border rather than a cursor gutter (section 2), so `draw_cursor` is
+not used for this mode.
 
 **Resize.** The scroll container re-lays-out on `Event::Winsize`; `follow_tail`
 keeps the bottom pinned across the resize.
@@ -128,8 +131,8 @@ which is the simplest coherent behavior.
 
 On the alternate screen with mouse reporting enabled, the terminal's own
 click-drag selection is captured by the app, so we provide selection and copy
-in-app. We build the full thing: free-form selection over the transcript, plus
-structured copy affordances, plus the native escape hatch.
+in-app. We build free-form mouse selection over the transcript, a whole-message
+copy in transcript-focus mode, and the native escape hatch.
 
 **Selection model.** A selection is an anchor and a caret, each an entry-relative
 position `(entry_id, offset)`: the entry it lands in and a grapheme offset into
@@ -147,9 +150,11 @@ is copied to the system clipboard via OSC 52 (select-to-copy, matching how most
 terminals behave), and it stays highlighted until the next click or Esc clears
 it.
 
-**Keyboard.** In transcript-focus mode (section 1), Shift+arrows extend the
-selection from the item cursor and a copy key (e.g. `y`) copies it. This is a
-mouse-free path to the same selection model.
+**Keyboard.** There is no character-level keyboard selection. In
+transcript-focus mode (section 1) the copy key copies the whole focused user
+message (see "Focused-message marker and copy" below), which covers the common
+mouse-free case. Arbitrary sub-message copy is the mouse's job, or the native
+Shift+drag escape hatch.
 
 **Rendering the highlight.** The selected span covers the entries from the anchor
 entry to the caret entry, with a partial run at the offset boundary in the first
@@ -170,11 +175,18 @@ independent of what the view has realized, so a selection spanning off-screen
 entries needs no keep-alive. The cost is bounded by the selection length, not the
 transcript length.
 
-**Structured copy.** On top of free-form selection, a copy-message action (copy
-the cursored or clicked entry's text) and a copy-code-block action (copy a fenced
-block's contents) give exact one-keystroke copies of the things users most often
-want. Both go through the same OSC 52 path. The OSC 52 helpers already exist in
-`aj` (`auth.rs` / `clipboard.rs`) and move to `aj-app`.
+**Focused-message marker and copy.** In transcript-focus mode the focused user
+message is drawn inside a semi-thick border in the app's highlight color, with a
+copy-key hint on the border's bottom edge, the same way an overlay shows its key
+hints in its chrome. Pressing that key copies the whole message through the same
+OSC 52 path the mouse selection uses. The key label in the border resolves
+through the keybinding data (Spec F), never a literal. The border is the `vxfw`
+`Border` widget with a bottom `BorderLabel`, wrapping the entry widget only when
+that entry is the focused one, so it costs nothing on the other rows. The OSC 52
+helpers already exist in `aj` (`auth.rs` / `clipboard.rs`) and move to `aj-app`.
+
+There is no copy-code-block action: reading and copying code out of assistant
+replies is served by the mouse selection and the native Shift+drag escape hatch.
 
 **Native escape hatch.** Shift+drag still bypasses application mouse capture in
 essentially every modern terminal, so users retain the terminal's own selection
@@ -182,19 +194,14 @@ essentially every modern terminal, so users retain the terminal's own selection
 
 ## 3. In-transcript search
 
-**Not planned for now.** Earlier drafts specified an in-app find-bar over the
-transcript. We are not building it in the first cut, and it is the reason the
-selection model no longer materializes the whole transcript: search wanted a
-single global coordinate space to match over, which pushed section 2 toward a
-full-transcript grid. With search out, selection is entry-relative (section 2) and
-nothing needs a whole-transcript layout.
-
-The reference amp CLI ships no in-transcript search either. Reading back through
-history is served by scrolling (section 1) and by selection plus the native
-Shift+drag escape hatch (section 2), and every session is on disk for external
-tools. If we add search later it should match over the same per-entry text the
-selection extraction already produces (walking entries, not a global grid), so it
-does not reintroduce the full-transcript layout.
+**Not built, not planned.** The reference has none either, and reading back
+through history is served by scrolling (section 1) plus mouse selection and the
+native Shift+drag escape hatch (section 2). Search is the reason the selection
+model stays entry-relative rather than a whole-transcript grid: it was the only
+consumer that wanted a single global coordinate space, and with it out nothing
+needs a whole-transcript layout. If it is ever revisited it must match over the
+same per-entry text the selection extraction produces, walking entries, not a
+rebuilt global grid.
 
 ## 4. The base layout
 
@@ -224,7 +231,9 @@ three parts:
 
 - An animated `aj` logo that drifts slowly around the slot and pulses larger and
   smaller, driven off the frame tick the async driver already runs (Spec A), so
-  it costs a periodic redraw and no extra thread.
+  it costs a periodic redraw and no extra thread. It is colored in a ramp of
+  lavender / purple shades that cycle with the pulse, defined as named splash
+  colors (a decorative gradient, not keybinding-resolved data).
 - A hint line, `Ctrl+O for commands`, with `Ctrl+O` bold and in the
   keybinding-hint palette color (the same `#275DD0` token the command palette's
   shortcut column uses).
@@ -405,8 +414,7 @@ as PageUp / PageDown / Home / End. The sections are:
   global chords (open palette, paste image, thinking toggle, tools-expand,
   edit-in-`$EDITOR`).
 - **Scrolling & navigation**: the chat-scroll and transcript keys from sections
-  1 and 2 (PageUp / PageDown, half-page, Home / End, mouse wheel, transcript-focus
-  mode).
+  1 and 2 (PageUp / PageDown, Home / End, mouse wheel, transcript-focus mode).
 - **Command palette commands**: one row per entry in the command catalog (Spec D
   `commands.rs`), grouped by category, each with its bound shortcut in the
   right-hand column when the action has one.
@@ -454,10 +462,11 @@ hardcoded literal.
   `ctx.request_focus`. Keyboard events route along the focus path to the overlay
   (Spec A's focus dispatch). Closing returns focus to the parent overlay or the
   editor.
-- **Transcript-focus mode moves focus to the chat `ListView`** (cursor shown) for
-  keyboard navigation and selection (section 1); Esc returns focus to the editor.
-  Overlays take priority: the chord that enters transcript-focus is inert while an
-  overlay is open.
+- **Transcript-focus mode moves focus to the chat `ListView`** for stepping
+  through past user messages (section 1). Esc returns focus to the editor. Entered
+  with Tab from an empty editor and matched in the capture phase, the chord is
+  inert while an overlay is open and while the editor has content, where Tab is
+  autocomplete.
 - **Global chords go through the `KeymapController`** in vxfw's capture and bubble
   phases (Spec F), not host-side interception. Pre-empting chords (the cancel/quit
   ladder, close-all, leader prefixes) match in the capture phase before the focused
@@ -508,12 +517,11 @@ Aligns with the plan's phases 5-9.
   navigation). Exit behavior (clean exit + usage banner + resume hint). No
   overlays yet.
 - **E2 (with components, plan phase 7):** per-view scroll on `active_view` switch,
-  the status/pending/header/footer slots wired to the model, in-app selection
-  (mouse drag + auto-scroll, Shift+arrow keyboard selection, select-to-copy via
-  OSC 52, entry-relative text extraction with off-screen keep-alive) plus the
-  structured copy-message / copy-code actions. It also brings the splash
-  empty-state: the animated `aj` logo, the `Ctrl+O for commands` hint, and the
-  bordered startup-notices box.
+  the status/pending/header/footer slots wired to the model, in-app mouse
+  selection (drag + auto-scroll, select-to-copy via OSC 52, entry-relative text
+  extraction) plus the focused-message border and copy key in transcript-focus
+  mode. It also brings the splash empty-state: the animated, lavender/purple `aj`
+  logo, the `Ctrl+O for commands` hint, and the bordered startup-notices box.
 - **E3 (plan phase 8):** the overlay stack (host `Vec` + scrim + anchored draw +
   focus), the reusable filterable-select overlay (with the full-width `selectedBg`
   selection band), and each selector / dialog on top of it, including the grouped
@@ -525,23 +533,29 @@ Aligns with the plan's phases 5-9.
 ## Decisions
 
 - **E-1. Transcript keyboard focus. Resolved: build it from the start.**
-  Editor-focused wheel + page-key scrolling, plus a transcript-focus mode (focus
-  the chat `ListView`, show its cursor, arrow navigation, Shift+arrow selection)
-  in the first cut.
-- **E-2. Copy. Resolved: full in-app selection now, not deferred.** Free-form
-  selection (mouse drag with auto-scroll, keyboard Shift+arrow), select-to-copy
-  and structured copy-message / copy-code via OSC 52, plus Shift+drag native
-  selection as the escape hatch. Selection is entry-relative (`(entry_id,
-  offset)`) and text extraction materializes only the spanned entries via
-  per-entry text providers laid out on demand from `ChatState`, so copy never
-  lays out the whole transcript and needs no off-screen keep-alive.
+  Editor-focused wheel + page-key scrolling and Home / End top / bottom (Home /
+  End are taken from the editor for this, its line motions stay on Ctrl-A /
+  Ctrl-E), plus a transcript-focus mode entered with Tab from an empty editor that
+  steps between past user messages (Tab / Up older, Shift+Tab / Down newer, Home /
+  End first / last). The focused message is marked by a highlight-colored border,
+  not a cursor gutter. No keyboard character selection.
+- **E-2. Copy. Resolved: mouse selection plus focused-message copy.** Free-form
+  mouse selection with auto-scroll and select-to-copy via OSC 52, plus Shift+drag
+  native selection as the escape hatch. On the keyboard the only copy is the whole
+  focused user message, triggered by the copy key shown in that message's border.
+  There is no character-level keyboard selection and no copy-code-block action.
+  Selection is entry-relative (`(entry_id, offset)`) and text extraction
+  materializes only the spanned entries (or the single focused message) via
+  per-entry text providers laid out on demand from `ChatState`, so copy never lays
+  out the whole transcript and needs no off-screen keep-alive.
 - **E-3. After-exit screen. Resolved: clean exit + banner + resume hint.** Leave
   the alternate screen and print the shutdown usage banner and the
   `aj continue <id>` resume command to the normal screen, as `aj` does today.
-- **E-4. Chat container. Resolved: `ListView`** (`draw_cursor` off by default, on
-  in transcript-focus mode), for line-level scrolling, lazy item windowing on
-  long transcripts, and the built-in cursor that keyboard navigation and selection
-  use.
+- **E-4. Chat container. Resolved: `ListView`** for line-level scrolling, lazy
+  item windowing on long transcripts, and a movable item cursor. The cursor tracks
+  the focused user message in transcript-focus mode and is drawn as a border around
+  that message (`draw_cursor` stays off, the gutter is not used), and it drives the
+  keyboard navigation.
 - **E-5. In-transcript search. Resolved: not now.** Earlier drafts specified a
   find-bar sharing a global transcript coordinate space. That coordinate space is
   what forced select-to-copy to materialize the whole transcript, so with the
@@ -573,14 +587,14 @@ Aligns with the plan's phases 5-9.
   descriptor table exposed by the `TextArea` for editor chords), never a static
   label snapshot, per Spec F's "resolved, never hardcoded" rule. This widens
   `aj`'s flat command list into a full keymap reference.
-- **E-9. Splash / empty state. Resolved: build it.** Before the first user or
-  assistant message, the chat slot shows an animated `aj` logo (slow drift plus a
-  grow / shrink pulse off the frame tick), a `Ctrl+O for commands` hint (Ctrl+O
-  bold, in the keybinding-hint palette color), and a bordered box surfacing the
-  startup notices and warnings (config diagnostics, context files, sandbox /
-  no-permissions, auth, tmux options, skills). The box presents the transcript's
-  leading `Notice` entries, so they become the normal leading rows once the
-  splash is dismissed.
+- **E-9. Splash / empty state. Resolved: build it, animated and colored.** Before
+  the first user or assistant message, the chat slot shows an animated `aj` logo
+  (slow drift plus a grow / shrink pulse off the frame tick, colored in a cycling
+  lavender / purple ramp), a `Ctrl+O for commands` hint (Ctrl+O bold, in the
+  keybinding-hint palette color), and a bordered box surfacing the startup notices
+  and warnings (config diagnostics, context files, sandbox / no-permissions, auth,
+  tmux options, skills). The box presents the transcript's leading `Notice`
+  entries, so they become the normal leading rows once the splash is dismissed.
 - **E-10. List row styling and the keybinding-hint color. Resolved.** List rows
   keep `aj`'s column layout (right-aligned dim category / metadata, label,
   right-aligned shortcut). `aj-next` draws the label and shortcut bold, and the
