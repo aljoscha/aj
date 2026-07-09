@@ -994,6 +994,8 @@ fn handle_host_action(world: &mut World, shell: &Rc<RefCell<Shell>>, action: AjA
         | AjAction::CloseAllOverlays
         | AjAction::ChatPageUp
         | AjAction::ChatPageDown
+        | AjAction::ChatScrollToTop
+        | AjAction::ChatScrollToBottom
         | AjAction::TranscriptFocus
         | AjAction::Quit => false,
     }
@@ -2680,6 +2682,14 @@ impl Shell {
                 }
                 AjAction::ChatPageDown => {
                     transcript_for_actions.borrow_mut().page_down();
+                    ctx.redraw = true;
+                }
+                AjAction::ChatScrollToTop => {
+                    transcript_for_actions.borrow_mut().scroll_to_top();
+                    ctx.redraw = true;
+                }
+                AjAction::ChatScrollToBottom => {
+                    transcript_for_actions.borrow_mut().scroll_to_bottom();
                     ctx.redraw = true;
                 }
                 AjAction::TranscriptFocus => {

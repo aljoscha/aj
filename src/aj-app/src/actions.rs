@@ -16,10 +16,10 @@
 //! widget's data, not part of the global action vocabulary.
 
 use crate::keybindings::{
-    ACTION_AGENT_PICKER, ACTION_CHAT_PAGE_DOWN, ACTION_CHAT_PAGE_UP, ACTION_CLIPBOARD_PASTE_IMAGE,
-    ACTION_DEQUEUE, ACTION_HISTORY_OPEN, ACTION_OVERLAY_CLOSE_ALL, ACTION_PALETTE_OPEN,
-    ACTION_SUBMIT_STEERING, ACTION_THINKING_TOGGLE, ACTION_TOOLS_EXPAND, ACTION_TRANSCRIPT_FOCUS,
-    default_chord,
+    ACTION_AGENT_PICKER, ACTION_CHAT_PAGE_DOWN, ACTION_CHAT_PAGE_UP, ACTION_CHAT_SCROLL_BOTTOM,
+    ACTION_CHAT_SCROLL_TOP, ACTION_CLIPBOARD_PASTE_IMAGE, ACTION_DEQUEUE, ACTION_HISTORY_OPEN,
+    ACTION_OVERLAY_CLOSE_ALL, ACTION_PALETTE_OPEN, ACTION_SUBMIT_STEERING, ACTION_THINKING_TOGGLE,
+    ACTION_TOOLS_EXPAND, ACTION_TRANSCRIPT_FOCUS, default_chord,
 };
 
 /// A global keymap action, the typed counterpart of the `aj.*` action-ID
@@ -59,6 +59,10 @@ pub enum AjAction {
     /// Scroll the chat transcript down one viewport page
     /// (`aj.chat.page_down`).
     ChatPageDown,
+    /// Scroll the chat transcript to the top (`aj.chat.scroll_top`).
+    ChatScrollToTop,
+    /// Scroll the chat transcript to the bottom (`aj.chat.scroll_bottom`).
+    ChatScrollToBottom,
     /// Focus the chat transcript for keyboard navigation
     /// (`aj.transcript.focus`).
     TranscriptFocus,
@@ -256,6 +260,12 @@ pub fn default_global_bindings() -> Vec<GlobalBinding> {
         compiled(AjAction::Dequeue, ACTION_DEQUEUE, Capture),
         compiled(AjAction::ChatPageUp, ACTION_CHAT_PAGE_UP, Capture),
         compiled(AjAction::ChatPageDown, ACTION_CHAT_PAGE_DOWN, Capture),
+        compiled(AjAction::ChatScrollToTop, ACTION_CHAT_SCROLL_TOP, Capture),
+        compiled(
+            AjAction::ChatScrollToBottom,
+            ACTION_CHAT_SCROLL_BOTTOM,
+            Capture,
+        ),
         compiled(AjAction::TranscriptFocus, ACTION_TRANSCRIPT_FOCUS, Bubble),
     ]
 }
@@ -342,6 +352,14 @@ mod tests {
         assert_eq!(
             spec(AjAction::ChatPageDown),
             chord(ChordKey::Named("page_down"), false, false, false, false)
+        );
+        assert_eq!(
+            spec(AjAction::ChatScrollToTop),
+            chord(ChordKey::Named("home"), false, false, false, false)
+        );
+        assert_eq!(
+            spec(AjAction::ChatScrollToBottom),
+            chord(ChordKey::Named("end"), false, false, false, false)
         );
         assert_eq!(
             spec(AjAction::TranscriptFocus),

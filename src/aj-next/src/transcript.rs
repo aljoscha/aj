@@ -1397,8 +1397,14 @@ impl TranscriptView {
 
     /// Handle a key press while the transcript is focused, delegating item
     /// navigation to the inner [`ListView`]. A no-op when not focused (the key
-    /// then falls through unconsumed). PageUp/PageDown are left to the
-    /// capture-phase chat-scroll chords, which work in focus mode too.
+    /// then falls through unconsumed).
+    ///
+    /// Only the `g` / `G` jumps are served here. PageUp/PageDown and Home/End
+    /// are globally-bound capture-phase chat-scroll chords, so they are
+    /// consumed ahead of the focused transcript and dispatch to the
+    /// mode-aware [`scroll_to_top`](Self::scroll_to_top) /
+    /// [`scroll_to_bottom`](Self::scroll_to_bottom), which move the item
+    /// cursor while in focus mode.
     fn handle_focus_key(&mut self, ctx: &mut EventContext, key: &Key) {
         if !self.in_focus_mode() {
             return;
@@ -1415,10 +1421,10 @@ impl TranscriptView {
             || key.matches(u32::from('n'), ctrl)
         {
             self.list.borrow_mut().next_item(ctx);
-        } else if key.matches(Key::HOME, empty) || key.matches(u32::from('g'), empty) {
+        } else if key.matches(u32::from('g'), empty) {
             self.list.borrow_mut().jump_to_item(0);
             ctx.consume_and_redraw();
-        } else if key.matches(Key::END, empty) || key.matches(u32::from('g'), Modifiers::SHIFT) {
+        } else if key.matches(u32::from('g'), Modifiers::SHIFT) {
             self.cursor_to_bottom();
             ctx.consume_and_redraw();
         } else if key.matches(Key::ESCAPE, empty) {
@@ -1450,6 +1456,36 @@ impl TranscriptView {
     pub(crate) fn page_down(&self) {
         let lines = self.page_lines();
         self.list.borrow_mut().scroll_lines(lines);
+    }
+
+    /// Scroll the transcript to the top (Spec E section 1, Home), mode-aware.
+    pub(crate) fn scroll_to_top(&mut self) {
+        if self.in_focus_mode() {
+            // Focus mode: move the item cursor onto the first item, matching
+            // the `g` jump.
+            self.list.borrow_mut().jump_to_item(0);
+            return;
+        }
+        // Reaching the top means the reader left the tail, so follow-tail
+        // disengages. `jump_to_item(0)` pins the scroll window to item 0 at
+        // offset 0, the very first line, rather than only moving the hidden
+        // cursor.
+        self.follow_tail = false;
+        self.list.borrow_mut().jump_to_item(0);
+    }
+
+    /// Scroll the transcript to the bottom (Spec E section 1, End), mode-aware.
+    pub(crate) fn scroll_to_bottom(&mut self) {
+        if self.in_focus_mode() {
+            // Focus mode: move the item cursor onto the last item, matching
+            // the `G` jump.
+            self.cursor_to_bottom();
+            return;
+        }
+        // Re-engaging follow-tail is the whole gesture: the next draw runs the
+        // inner list's `scroll_to_bottom` and the transcript resumes following
+        // the tail (see [`draw`](Widget::draw)).
+        self.follow_tail = true;
     }
 
     /// One page of scroll in lines: the last-drawn viewport height minus a
@@ -2707,6 +2743,76 @@ mod tests {
         assert_eq!(returned, bottom, "back at the bottom frame");
     }
 
+    /// Editor-mode Home pins the viewport to the absolute top and disengages
+    /// follow-tail, and End re-engages follow-tail so the viewport lands back
+    /// at the bottom (Spec E section 1, the global Home/End chords).
+    #[test]
+    fn scroll_to_top_and_bottom_move_the_viewport_in_editor_mode() {
+        let chat = chat_with_notices(50);
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(40, 10);
+        let _ = view.draw(&ctx);
+        assert!(view.follow_tail, "opens following the tail");
+        assert!(!view.in_focus_mode(), "editor mode: no item cursor");
+
+        // Home jumps to the absolute top: the first row is item 0's first line
+        // and follow-tail is off.
+        view.scroll_to_top();
+        assert!(!view.follow_tail, "Home disengages follow-tail");
+        let rows = crate::test_support::rows(&view.draw(&ctx));
+        assert!(rows[0].contains("row 0"), "top of the transcript: {rows:?}");
+        assert_eq!(
+            view.list.borrow().scroll_top(),
+            0,
+            "pinned to the first item"
+        );
+        assert_eq!(view.list.borrow().scroll_offset(), 0, "at its first line");
+        assert!(
+            !view.list.borrow().is_at_bottom(),
+            "the top of a tall transcript is not the bottom"
+        );
+
+        // End re-engages follow-tail and the next draw lands back at the
+        // bottom's last row.
+        view.scroll_to_bottom();
+        assert!(view.follow_tail, "End re-engages follow-tail");
+        let rows = crate::test_support::rows(&view.draw(&ctx));
+        assert!(view.list.borrow().is_at_bottom(), "back at the bottom");
+        assert!(
+            rows.join("\n").contains("row 49"),
+            "shows the last row: {rows:?}"
+        );
+    }
+
+    /// In focus mode the same Home/End chords move the item cursor to the
+    /// first / last item rather than scrolling the viewport, matching the
+    /// `g` / `G` jumps (Spec E section 1).
+    #[test]
+    fn scroll_to_top_and_bottom_move_the_item_cursor_in_focus_mode() {
+        let chat = chat_with_notices(20);
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(40, 10);
+        let _ = view.draw(&ctx);
+
+        // Enter focus mode: the cursor lands on the last item.
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &Event::FocusIn);
+        let _ = view.draw(&ctx);
+        assert!(view.in_focus_mode(), "focus mode is on");
+        assert_eq!(view.list.borrow().cursor, 19, "cursor on the last item");
+
+        // Home moves the cursor to the first item; follow-tail stays off (the
+        // cursor owns the viewport in focus mode).
+        view.scroll_to_top();
+        assert_eq!(view.list.borrow().cursor, 0, "Home moves to the first item");
+        assert!(!view.follow_tail, "focus mode keeps follow-tail disengaged");
+
+        // End moves the cursor back to the last item.
+        view.scroll_to_bottom();
+        assert_eq!(view.list.borrow().cursor, 19, "End moves to the last item");
+        assert!(!view.follow_tail, "focus mode keeps follow-tail disengaged");
+    }
+
     /// Switching the active view opens the switched-to view at its bottom
     /// with follow-tail engaged (Spec E section 1, per-view scroll). The host
     /// runs `set_active_view` then `reset_to_tail` on the switch; this drives
@@ -2805,9 +2911,10 @@ mod tests {
         assert!(!view.list.borrow().draw_cursor, "FocusOut hides the cursor");
     }
 
-    /// While focused, the arrow / j-k keys move the item cursor and Home / End
+    /// While focused, the arrow / j-k keys move the item cursor and `g` / `G`
     /// jump to the first / last item. The same keys are ignored while the
-    /// transcript is not focused.
+    /// transcript is not focused. (Home/End reach focus mode through the
+    /// global chord, tested via `scroll_to_top` / `scroll_to_bottom`.)
     #[test]
     fn nav_keys_move_the_cursor_only_while_focused() {
         let chat = chat_with_notices(20);
@@ -2858,15 +2965,14 @@ mod tests {
         view.handle_event(&mut ec, &key_press(Key::DOWN, Modifiers::empty()));
         assert_eq!(view.list.borrow().cursor, 18, "Down moves to the next item");
 
-        // Home / g jump to the first item.
+        // g / G jump to the first / last item.
         let mut ec = EventContext::new();
-        view.handle_event(&mut ec, &key_press(Key::HOME, Modifiers::empty()));
-        assert_eq!(view.list.borrow().cursor, 0, "Home jumps to the first item");
+        view.handle_event(&mut ec, &key_press(u32::from('g'), Modifiers::empty()));
+        assert_eq!(view.list.borrow().cursor, 0, "g jumps to the first item");
 
-        // End / G jump to the last item.
         let mut ec = EventContext::new();
-        view.handle_event(&mut ec, &key_press(Key::END, Modifiers::empty()));
-        assert_eq!(view.list.borrow().cursor, 19, "End jumps to the last item");
+        view.handle_event(&mut ec, &key_press(u32::from('g'), Modifiers::SHIFT));
+        assert_eq!(view.list.borrow().cursor, 19, "G jumps to the last item");
     }
 
     /// Esc while focused invokes the exit callback (the host wires it to
@@ -2923,16 +3029,22 @@ mod tests {
         let _ = view.draw(&ctx);
 
         // Every nav key is a clamped no-op on an empty list, none underflow.
+        // Home/End reach focus mode through the global chord, so exercise the
+        // methods it dispatches to rather than the widget's own keys.
         for k in [
             key_press(Key::UP, Modifiers::empty()),
             key_press(Key::DOWN, Modifiers::empty()),
-            key_press(Key::HOME, Modifiers::empty()),
-            key_press(Key::END, Modifiers::empty()),
+            key_press(u32::from('g'), Modifiers::empty()),
+            key_press(u32::from('g'), Modifiers::SHIFT),
         ] {
             let mut ec = EventContext::new();
             view.handle_event(&mut ec, &k);
             assert_eq!(view.list.borrow().cursor, 0, "cursor stays at 0 when empty");
         }
+        view.scroll_to_top();
+        assert_eq!(view.list.borrow().cursor, 0, "scroll_to_top stays at 0");
+        view.scroll_to_bottom();
+        assert_eq!(view.list.borrow().cursor, 0, "scroll_to_bottom stays at 0");
         let _ = view.draw(&ctx);
     }
 

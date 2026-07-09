@@ -126,6 +126,27 @@ pub const ACTION_CHAT_PAGE_UP: &str = "aj.chat.page_up";
 /// re-engages follow-tail.
 pub const ACTION_CHAT_PAGE_DOWN: &str = "aj.chat.page_down";
 
+/// Action ID for the "scroll the transcript to the top" chord.
+///
+/// Bound by default to `home`. Intercepted in the capture phase before
+/// the editor sees it, so it scrolls the transcript even while composing.
+/// The editor's own line-start motion stays on Ctrl+A, which this chord
+/// does not touch. Mode-aware: in editor mode it pins the viewport to the
+/// absolute top and disengages follow-tail, in transcript-focus mode it
+/// moves the item cursor to the first item. Inert while a capturing
+/// overlay is up, which then owns its own Home.
+pub const ACTION_CHAT_SCROLL_TOP: &str = "aj.chat.scroll_top";
+
+/// Action ID for the "scroll the transcript to the bottom" chord.
+///
+/// Bound by default to `end`. The counterpart of
+/// [`ACTION_CHAT_SCROLL_TOP`]: intercepted before the editor (the
+/// editor's line-end motion stays on Ctrl+E) and inert while a capturing
+/// overlay is up. In editor mode it re-engages follow-tail so the
+/// viewport lands at the end and tracks streamed content, in
+/// transcript-focus mode it moves the item cursor to the last item.
+pub const ACTION_CHAT_SCROLL_BOTTOM: &str = "aj.chat.scroll_bottom";
+
 /// Action ID for the "focus the transcript for keyboard navigation" chord.
 ///
 /// Bound by default to `ctrl+up`. It moves keyboard focus from the editor
@@ -221,6 +242,16 @@ pub const AJ_KEYBINDINGS: &[(&str, &str, &str)] = &[
         ACTION_CHAT_PAGE_DOWN,
         "pagedown",
         "Scroll the transcript down a page",
+    ),
+    (
+        ACTION_CHAT_SCROLL_TOP,
+        "home",
+        "Scroll the transcript to the top",
+    ),
+    (
+        ACTION_CHAT_SCROLL_BOTTOM,
+        "end",
+        "Scroll the transcript to the bottom",
     ),
     (
         ACTION_TRANSCRIPT_FOCUS,

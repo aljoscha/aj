@@ -131,18 +131,18 @@ pub(crate) fn build_keymap() -> Keymap<AjAction, HostCtx> {
         // chat only when nothing is capturing).
         //
         // NOTE(aljoscha): the `default_global_bindings` phase puts the page
-        // chords in the capture phase, ahead of the focused editor, whose
-        // `TextArea` otherwise consumes PageUp/PageDown for its own multi-line
-        // scroll. That editor scroll is deliberately superseded by chat
-        // page-scroll: the editor is a compose box that auto-scrolls to the
-        // cursor, and the arrow keys still move within it.
+        // and Home/End chords in the capture phase, ahead of the focused
+        // editor, whose `TextArea` otherwise consumes PageUp/PageDown for its
+        // own multi-line scroll and Home/End for line start/end. That editor
+        // scroll is deliberately superseded by chat scroll: the editor is a
+        // compose box that auto-scrolls to the cursor, its line-start/line-end
+        // motion stays on the Emacs-style Ctrl+A/Ctrl+E, and the arrow keys
+        // still move within it.
         //
-        // NOTE(aljoscha): Spec E.1 also lists Home/End and half-page
-        // (Ctrl+U/Ctrl+D) as chat-scroll keys, but those are editor chords in
-        // the Emacs-style `TextArea` (line start/end, kill-to-start,
-        // delete-forward), so they can't double as editor-focused chat-scroll
-        // chords. Home/End are handled by transcript-focus mode, where the
-        // editor is not focused. Half-page scroll is not bound yet.
+        // NOTE(aljoscha): Spec E.1 also lists half-page (Ctrl+U/Ctrl+D) as
+        // chat-scroll keys, but those are editor chords in the Emacs-style
+        // `TextArea` (kill-to-start, delete-forward), so they can't double as
+        // editor-focused chat-scroll chords. Half-page scroll is not bound yet.
         let enabled: fn(&HostCtx) -> bool = match binding.action {
             AjAction::CloseAllOverlays => overlay_open_no_login,
             AjAction::PaletteOpen
@@ -152,6 +152,8 @@ pub(crate) fn build_keymap() -> Keymap<AjAction, HostCtx> {
             | AjAction::Dequeue
             | AjAction::ChatPageUp
             | AjAction::ChatPageDown
+            | AjAction::ChatScrollToTop
+            | AjAction::ChatScrollToBottom
             | AjAction::TranscriptFocus => no_overlay,
             _ => |_| true,
         };
@@ -329,6 +331,47 @@ mod tests {
             keymap.match_single(&page_down, BindingPhase::Capture, &modal),
             None,
             "an open overlay owns its own PageDown",
+        );
+    }
+
+    /// The Home/End chat-scroll chords match in the capture phase (before
+    /// the editor's own line-start/line-end motion, which stays on
+    /// Ctrl+A/Ctrl+E) and go inert while a modal is up, where the overlay
+    /// owns its own Home/End.
+    #[test]
+    fn chat_scroll_home_end_matches_in_capture_and_is_gated_by_overlays() {
+        let keymap = build_keymap();
+        let home = key(Key::HOME, Modifiers::empty());
+        let end = key(Key::END, Modifiers::empty());
+
+        let idle = ctx(false);
+        assert_eq!(
+            keymap.match_single(&home, BindingPhase::Capture, &idle),
+            Some(&AjAction::ChatScrollToTop),
+        );
+        assert_eq!(
+            keymap.match_single(&end, BindingPhase::Capture, &idle),
+            Some(&AjAction::ChatScrollToBottom),
+        );
+
+        let modal = ctx(false);
+        modal
+            .overlays
+            .borrow_mut()
+            .push(crate::overlay::OpenOverlay {
+                widget: Rc::new(RefCell::new(crate::overlay::Scrim)),
+                focus: Rc::new(RefCell::new(crate::overlay::Scrim)),
+                placement: crate::overlay::OverlayPlacement::Small,
+            });
+        assert_eq!(
+            keymap.match_single(&home, BindingPhase::Capture, &modal),
+            None,
+            "an open overlay owns its own Home",
+        );
+        assert_eq!(
+            keymap.match_single(&end, BindingPhase::Capture, &modal),
+            None,
+            "an open overlay owns its own End",
         );
     }
 
