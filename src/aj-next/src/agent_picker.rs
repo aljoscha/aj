@@ -292,14 +292,20 @@ fn agent_item(entry: &AgentEntry, active: AgentId, scope: Scope) -> SelectItem {
     if entry.id == active {
         label.push_str(" (current)");
     }
+    // A sub-agent's task is a free-form prompt that can span several lines. The
+    // row widget truncates to the row width but still breaks on hard newlines,
+    // so a raw multi-line task would spill onto extra rows and blow up the row
+    // height. Flatten it to a single line first, leaving width to the row's own
+    // truncation.
+    let task = entry.task.as_deref().map(single_line);
     // Sub rows carry their task in the filter key so a query matches it,
     // and in the description so it shows.
-    let filter_key = match &entry.task {
+    let filter_key = match &task {
         Some(task) => format!("{name} {task}"),
         None => name,
     };
     let mut item = SelectItem::new(label, filter_key);
-    if let Some(task) = &entry.task {
+    if let Some(task) = &task {
         let description = match (scope, entry.status) {
             (Scope::All, Some(status)) => format!("{task} \u{b7} {}", sub_status_label(status)),
             _ => task.clone(),
@@ -381,6 +387,29 @@ fn sub_status_label(status: SubAgentStatus) -> &'static str {
         SubAgentStatus::Running => "running",
         SubAgentStatus::Done => "done",
     }
+}
+
+/// Flatten a free-form task string to a single display line: collapse each run
+/// of `\r`/`\n` into one space and trim the ends. Interior spaces are left
+/// as-is (only line breaks are touched). Row widgets truncate to the row width
+/// but still break on hard newlines, so a raw multi-line task would render
+/// across extra rows.
+fn single_line(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut last_was_newline = false;
+    for ch in text.chars() {
+        if matches!(ch, '\n' | '\r') {
+            // Collapse a run of line breaks to a single space.
+            if !last_was_newline {
+                out.push(' ');
+                last_was_newline = true;
+            }
+        } else {
+            out.push(ch);
+            last_was_newline = false;
+        }
+    }
+    out.trim().to_string()
 }
 
 /// Cap a task's command for the description column, keeping the tail:
@@ -595,6 +624,81 @@ mod tests {
             Some(AgentId::Sub(1)),
             "the active sub-agent starts highlighted"
         );
+    }
+
+    #[test]
+    fn single_line_flattens_multiline_and_carriage_returns() {
+        assert_eq!(
+            single_line("Investigate the login flow.\nFind where tokens refresh"),
+            "Investigate the login flow. Find where tokens refresh"
+        );
+        // Runs of line breaks collapse to one space; ends are trimmed.
+        assert_eq!(single_line("\r\na\n\n\r\nb\n"), "a b");
+        // Interior spaces are preserved (only line breaks are touched).
+        assert_eq!(single_line("a  b"), "a  b");
+        // A single-line task is unchanged.
+        assert_eq!(single_line("do the thing"), "do the thing");
+    }
+
+    #[test]
+    fn agent_item_flattens_a_multiline_sub_task_into_one_row() {
+        let entry = AgentEntry {
+            id: AgentId::Sub(1),
+            task: Some("line one\nline two\nline three".to_string()),
+            status: Some(SubAgentStatus::Running),
+        };
+        let item = agent_item(&entry, AgentId::Main, Scope::Running);
+        let description = item.description.as_deref().expect("sub row has a task");
+        assert!(
+            !description.contains('\n'),
+            "the description is a single line: {description:?}"
+        );
+        assert_eq!(description, "line one line two line three");
+        // The flattened task rides in the filter key too, and the row still
+        // decodes back to its agent id.
+        assert!(!item.filter_key.contains('\n'), "{:?}", item.filter_key);
+        assert_eq!(decode_agent(&item.filter_key), Some(AgentId::Sub(1)));
+    }
+
+    /// The rendered picker draws one screen row per agent even when a
+    /// sub-agent's task spans several lines. `RichText` breaks on hard
+    /// newlines, so without the flatten the task would spill onto extra rows;
+    /// this asserts the rendered surface directly, in both scopes (the
+    /// `All`-scope status suffix must stay on the row too).
+    #[test]
+    fn multiline_sub_task_renders_on_a_single_row() {
+        use vaxis::vxfw::Widget;
+
+        let agents = vec![
+            main_entry(),
+            AgentEntry {
+                id: AgentId::Sub(1),
+                task: Some("line one\nline two\nline three".to_string()),
+                status: Some(SubAgentStatus::Running),
+            },
+        ];
+        for scope in [Scope::Running, Scope::All] {
+            let items = build_items(&agents, &[], AgentId::Main, scope);
+            let mut select = FilterableSelect::new(items, SelectStyles::default());
+            let ctx = crate::test_support::draw_ctx(72, Some(16));
+            let rows = crate::test_support::rows(&select.draw(&ctx));
+            // The whole task sits on exactly one row, carrying every line.
+            let task_rows: Vec<&String> = rows.iter().filter(|r| r.contains("line one")).collect();
+            assert_eq!(task_rows.len(), 1, "one task row in {scope:?}: {rows:?}");
+            assert!(
+                task_rows[0].contains("line one line two line three"),
+                "the flattened task is on that row in {scope:?}: {rows:?}"
+            );
+            // The trailing lines never spilled onto rows of their own.
+            assert!(
+                !rows.iter().any(|r| r.trim() == "line two"),
+                "no spill row in {scope:?}: {rows:?}"
+            );
+            assert!(
+                !rows.iter().any(|r| r.trim() == "line three"),
+                "no spill row in {scope:?}: {rows:?}"
+            );
+        }
     }
 
     #[test]
