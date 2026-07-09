@@ -103,7 +103,8 @@ transcript-focus mode below, where the editor is not focused.
   first / last user message.
 
 **Transcript-focus mode.** A keyboard mode for stepping through past user
-messages, entered with Tab from an empty editor and left with Esc. Entering moves
+messages, entered with Tab (whenever the autocomplete popup is closed) and left
+with Esc. Entering moves
 focus to the chat `ListView` and lands on the last (newest) user message. In the
 mode the navigation unit is the user message, not the individual entry: Tab and
 Up (and `k`) step to the next-older user message, Shift+Tab and Down (and `j`)
@@ -113,12 +114,14 @@ still work, so the replies between the user messages the reader steps through
 stay readable. Leaving the mode returns focus to the editor. This is part of the
 first cut, not a later add.
 
-Tab is the editor's autocomplete key when the editor has content, so the
-enter-focus binding is gated to an empty editor and matches in the capture phase,
-the same empty-editor guard the `/` palette trigger and the queued-message yank
-use. With text in the editor, Tab stays autocomplete. The focused message is
-marked by a border rather than a cursor gutter (section 2), so `draw_cursor` is
-not used for this mode.
+Tab is the editor's accept key while the autocomplete popup is open, so the
+enter-focus binding is gated to the popup being closed and matches in the capture
+phase. With the popup open Tab applies the highlighted completion. With it closed
+Tab focuses the transcript even when the editor holds a draft, so a draft does not
+block peeking at history. Typing `@` opens the popup implicitly, so the editor
+does not need Tab to request completions. The focused message is marked by a
+border rather than a cursor gutter (section 2), so `draw_cursor` is not used for
+this mode.
 
 **Resize.** The scroll container re-lays-out on `Event::Winsize`; `follow_tail`
 keeps the bottom pinned across the resize.
@@ -464,9 +467,8 @@ hardcoded literal.
   editor.
 - **Transcript-focus mode moves focus to the chat `ListView`** for stepping
   through past user messages (section 1). Esc returns focus to the editor. Entered
-  with Tab from an empty editor and matched in the capture phase, the chord is
-  inert while an overlay is open and while the editor has content, where Tab is
-  autocomplete.
+  with Tab, matched in the capture phase, the chord is inert while an overlay is
+  open and while the autocomplete popup is open, where Tab applies the completion.
 - **Global chords go through the `KeymapController`** in vxfw's capture and bubble
   phases (Spec F), not host-side interception. Pre-empting chords (the cancel/quit
   ladder, close-all, leader prefixes) match in the capture phase before the focused
@@ -535,7 +537,8 @@ Aligns with the plan's phases 5-9.
 - **E-1. Transcript keyboard focus. Resolved: build it from the start.**
   Editor-focused wheel + page-key scrolling and Home / End top / bottom (Home /
   End are taken from the editor for this, its line motions stay on Ctrl-A /
-  Ctrl-E), plus a transcript-focus mode entered with Tab from an empty editor that
+  Ctrl-E), plus a transcript-focus mode entered with Tab (whenever the autocomplete
+  popup is closed) that
   steps between past user messages (Tab / Up older, Shift+Tab / Down newer, Home /
   End first / last). The focused message is marked by a highlight-colored border,
   not a cursor gutter. No keyboard character selection.
