@@ -269,7 +269,7 @@ fn build_items(
     let mut items: Vec<SelectItem> = agents
         .iter()
         .filter(|entry| agent_visible(entry, scope))
-        .map(|entry| agent_item(entry, active, scope))
+        .map(|entry| agent_item(entry, active))
         .collect();
     items.extend(
         tasks
@@ -280,15 +280,23 @@ fn build_items(
     items
 }
 
-/// One agent row. The label carries the `(current)` tag. The filter key
-/// stays clean so it both decodes unambiguously and fuzzy-matches the
-/// human name (and, for a sub, its task text).
-fn agent_item(entry: &AgentEntry, active: AgentId, scope: Scope) -> SelectItem {
+/// One agent row. A sub-agent's label leads with its run-state glyph so the
+/// status shows at a glance and is never truncated away by a long task (the
+/// status used to ride at the end of the description, which a long prompt
+/// pushed off the row). The label also carries the `(current)` tag. The filter
+/// key stays clean so it both decodes unambiguously and fuzzy-matches the human
+/// name (and, for a sub, its task text).
+fn agent_item(entry: &AgentEntry, active: AgentId) -> SelectItem {
     let name = match entry.id {
         AgentId::Main => MAIN_KEY.to_string(),
         AgentId::Sub(n) => format!("{AGENT_PREFIX}{n}"),
     };
-    let mut label = name.clone();
+    // Main has no tracked run status, so it carries no glyph. A sub-agent leads
+    // with its glyph, matching the transcript's sub-agent box.
+    let mut label = match entry.status {
+        Some(status) => format!("{} {name}", sub_status_glyph(status)),
+        None => name.clone(),
+    };
     if entry.id == active {
         label.push_str(" (current)");
     }
@@ -298,19 +306,15 @@ fn agent_item(entry: &AgentEntry, active: AgentId, scope: Scope) -> SelectItem {
     // height. Flatten it to a single line first, leaving width to the row's own
     // truncation.
     let task = entry.task.as_deref().map(single_line);
-    // Sub rows carry their task in the filter key so a query matches it,
-    // and in the description so it shows.
+    // The task rides in the filter key so a query matches it, and in the
+    // description so it shows.
     let filter_key = match &task {
         Some(task) => format!("{name} {task}"),
         None => name,
     };
     let mut item = SelectItem::new(label, filter_key);
     if let Some(task) = &task {
-        let description = match (scope, entry.status) {
-            (Scope::All, Some(status)) => format!("{task} \u{b7} {}", sub_status_label(status)),
-            _ => task.clone(),
-        };
-        item = item.with_description(description);
+        item = item.with_description(task.clone());
     }
     item
 }
@@ -381,11 +385,12 @@ fn task_status_label(status: TaskStatus) -> String {
     }
 }
 
-/// Human-readable status word for a sub-agent row's description.
-fn sub_status_label(status: SubAgentStatus) -> &'static str {
+/// Status glyph leading a sub-agent row's label, mirroring the transcript's
+/// sub-agent box so the two views read the same.
+fn sub_status_glyph(status: SubAgentStatus) -> &'static str {
     match status {
-        SubAgentStatus::Running => "running",
-        SubAgentStatus::Done => "done",
+        SubAgentStatus::Running => "\u{25b8}", // ▸
+        SubAgentStatus::Done => "\u{2713}",    // ✓
     }
 }
 
@@ -557,11 +562,16 @@ mod tests {
         ];
         let items = build_items(&agents, &[], AgentId::Main, Scope::Running);
         let labels = labels(&items);
-        assert!(labels.iter().any(|l| l.starts_with("main agent")));
-        assert!(labels.iter().any(|l| l.starts_with("agent 1")));
-        assert!(!labels.iter().any(|l| l.starts_with("agent 2")));
-        // The active agent is tagged.
+        assert!(labels.iter().any(|l| l.contains("main agent")));
+        assert!(labels.iter().any(|l| l.contains("agent 1")));
+        assert!(!labels.iter().any(|l| l.contains("agent 2")));
+        // The active agent is tagged; a running sub leads with its glyph while
+        // main (no tracked status) carries none.
         assert!(labels.iter().any(|l| l == "main agent (current)"));
+        assert!(
+            labels.iter().any(|l| l == "\u{25b8} agent 1"),
+            "running sub leads with the glyph: {labels:?}"
+        );
     }
 
     #[test]
@@ -572,25 +582,21 @@ mod tests {
             task_row(2, TaskStatus::Exited(Some(0)), 5),
         ];
         let running = build_items(&agents, &tasks, AgentId::Main, Scope::Running);
-        assert!(!labels(&running).iter().any(|l| l.starts_with("agent 2")));
+        assert!(!labels(&running).iter().any(|l| l.contains("agent 2")));
         // Only the running task shows in the running scope.
         assert!(labels(&running).iter().any(|l| l.contains("task #1")));
         assert!(!labels(&running).iter().any(|l| l.contains("task #2")));
 
         let all = build_items(&agents, &tasks, AgentId::Main, Scope::All);
-        assert!(labels(&all).iter().any(|l| l.starts_with("agent 2")));
+        assert!(labels(&all).iter().any(|l| l.contains("agent 2")));
         assert!(labels(&all).iter().any(|l| l.contains("task #2")));
-        // Finished sub surfaces its status in the description.
+        // Finished sub surfaces its status as the leading glyph on the label,
+        // not in the description (a long task would truncate a trailing word).
         let sub2 = all
             .iter()
-            .find(|i| i.label.starts_with("agent 2"))
+            .find(|i| i.label.contains("agent 2"))
             .expect("sub 2 row");
-        assert!(
-            sub2.description
-                .as_deref()
-                .is_some_and(|d| d.contains("done")),
-            "{sub2:?}"
-        );
+        assert!(sub2.label.starts_with('\u{2713}'), "{sub2:?}");
     }
 
     #[test]
@@ -647,7 +653,7 @@ mod tests {
             task: Some("line one\nline two\nline three".to_string()),
             status: Some(SubAgentStatus::Running),
         };
-        let item = agent_item(&entry, AgentId::Main, Scope::Running);
+        let item = agent_item(&entry, AgentId::Main);
         let description = item.description.as_deref().expect("sub row has a task");
         assert!(
             !description.contains('\n'),
@@ -699,6 +705,44 @@ mod tests {
                 "no spill row in {scope:?}: {rows:?}"
             );
         }
+    }
+
+    /// The whole point of the leading glyph: a sub-agent's status stays visible
+    /// even when its task is long enough to fill and truncate the row. The
+    /// status used to ride at the end of the description, where a long task
+    /// pushed it off the row entirely.
+    #[test]
+    fn agent_status_glyph_survives_a_long_task() {
+        use vaxis::vxfw::Widget;
+
+        let long = "x".repeat(200);
+        let agents = vec![
+            AgentEntry {
+                id: AgentId::Sub(1),
+                task: Some(long.clone()),
+                status: Some(SubAgentStatus::Running),
+            },
+            AgentEntry {
+                id: AgentId::Sub(2),
+                task: Some(long),
+                status: Some(SubAgentStatus::Done),
+            },
+        ];
+        let items = build_items(&agents, &[], AgentId::Main, Scope::All);
+        let mut select = FilterableSelect::new(items, SelectStyles::default());
+        // A narrow width guarantees the task fills and truncates the row.
+        let rows =
+            crate::test_support::rows(&select.draw(&crate::test_support::draw_ctx(40, Some(8))));
+        let sub1 = rows.iter().find(|r| r.contains("agent 1")).expect("sub 1");
+        let sub2 = rows.iter().find(|r| r.contains("agent 2")).expect("sub 2");
+        // The glyph leads the row and the task got ellipsis-truncated, so the
+        // status is readable regardless of task length.
+        assert!(
+            sub1.starts_with('\u{25b8}'),
+            "running glyph leads: {sub1:?}"
+        );
+        assert!(sub2.starts_with('\u{2713}'), "done glyph leads: {sub2:?}");
+        assert!(sub1.ends_with('\u{2026}'), "long task truncated: {sub1:?}");
     }
 
     #[test]
@@ -834,7 +878,7 @@ mod tests {
                 .borrow()
                 .visible_labels()
                 .iter()
-                .any(|l| l.starts_with("agent 2"))
+                .any(|l| l.contains("agent 2"))
         );
 
         let ctrl_t = Event::KeyPress(Key {
@@ -851,7 +895,7 @@ mod tests {
                 .borrow()
                 .visible_labels()
                 .iter()
-                .any(|l| l.starts_with("agent 2")),
+                .any(|l| l.contains("agent 2")),
             "finished sub revealed after toggle"
         );
     }
