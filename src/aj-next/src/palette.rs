@@ -162,33 +162,22 @@ fn dispatch_from_palette(
     }
 }
 
-/// One palette row per command: a `category`-padded, `title`-padded
-/// label with the bound shortcut appended (resolved from keybinding data
-/// per Spec F), and a `"{category} {title}"` filter key so typing a
-/// category surfaces its whole group.
+/// One palette row per command: the `title` as the label, the `category` as
+/// the dim prefix column, and the bound shortcut (resolved from keybinding
+/// data per Spec F) in the right slot when the command carries an action. The
+/// filter key is `"{category} {title}"` so typing a category surfaces its
+/// whole group. The widget lays out the columns, so the label carries only
+/// the title.
 fn palette_items() -> Vec<SelectItem> {
-    let cat_w = COMMANDS
-        .iter()
-        .map(|c| c.category.chars().count())
-        .max()
-        .unwrap_or(0);
-    let title_w = COMMANDS
-        .iter()
-        .map(|c| c.title.chars().count())
-        .max()
-        .unwrap_or(0);
     COMMANDS
         .iter()
         .map(|cmd| {
-            let mut label = format!(
-                "{cat:<cat_w$}  {title:<title_w$}",
-                cat = cmd.category,
-                title = cmd.title
-            );
+            let mut item = SelectItem::new(cmd.title, format!("{} {}", cmd.category, cmd.title))
+                .with_prefix(cmd.category);
             if let Some(short) = cmd.action_id.and_then(default_action_shortcut) {
-                label.push_str(&format!("  ({short})"));
+                item = item.with_shortcut(short);
             }
-            SelectItem::new(label, format!("{} {}", cmd.category, cmd.title))
+            item
         })
         .collect()
 }
@@ -202,21 +191,23 @@ mod tests {
         let items = palette_items();
         assert_eq!(items.len(), COMMANDS.len());
         for (item, cmd) in items.iter().zip(COMMANDS) {
-            assert!(item.label.contains(cmd.title), "{item:?}");
-            assert!(item.label.contains(cmd.category), "{item:?}");
+            assert_eq!(item.label, cmd.title, "{item:?}");
+            assert_eq!(item.prefix.as_deref(), Some(cmd.category), "{item:?}");
             assert_eq!(item.filter_key, format!("{} {}", cmd.category, cmd.title));
         }
     }
 
     #[test]
     fn palette_rows_resolve_shortcuts_from_binding_data() {
-        // The palette-open command carries a bound action, so its row
-        // shows the data-derived shortcut rather than a literal.
+        // The palette-open command carries a bound action, so its row's
+        // shortcut column holds the data-derived chord rather than a literal.
         let items = palette_items();
         let resolved = default_action_shortcut(aj_app::keybindings::ACTION_PALETTE_OPEN)
             .expect("palette-open has a default chord");
         assert!(
-            items.iter().any(|i| i.label.contains(&resolved)),
+            items
+                .iter()
+                .any(|i| i.shortcut.as_deref() == Some(resolved.as_str())),
             "expected a row with resolved shortcut {resolved:?}"
         );
     }

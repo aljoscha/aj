@@ -45,15 +45,21 @@ use crate::vxfw::{
 /// the widget carries no theme dependency of its own.
 ///
 /// The selection band fills the cursored row's full inner width with
-/// `selected_bg`; `label` and `secondary` style the two text columns, and get
-/// their background overpainted with `selected_bg` on the banded row so the
-/// text sits on the band rather than punching a hole in it.
+/// `selected_bg`. The column styles (`prefix`, `label`, `shortcut`,
+/// `secondary`) get their background overpainted with `selected_bg` on the
+/// banded row so the text sits on the band rather than punching a hole in it.
 #[derive(Clone)]
 pub struct SelectStyles {
     /// Background of the full-width band painted behind the cursored row.
     pub selected_bg: Color,
     /// Foreground for the primary label column.
     pub label: Style,
+    /// Style for the right-aligned metadata column ([`SelectItem::prefix`]),
+    /// typically dim.
+    pub prefix: Style,
+    /// Style for the key-hint column ([`SelectItem::shortcut`]), typically the
+    /// keybinding-hint color, bold.
+    pub shortcut: Style,
     /// Foreground for the secondary (description) column, typically dimmed.
     pub secondary: Style,
     /// Foreground of the vertical scroll-bar thumb, for selectors that show
@@ -68,6 +74,8 @@ impl Default for SelectStyles {
         SelectStyles {
             selected_bg: Color::Default,
             label: Style::default(),
+            prefix: Style::default(),
+            shortcut: Style::default(),
             secondary: Style::default(),
             scrollbar_thumb: Style::default(),
         }
@@ -76,34 +84,59 @@ impl Default for SelectStyles {
 
 /// One selectable row: what the list shows and what the filter matches.
 ///
-/// The `label` and `filter_key` are separate on purpose: a row's display label
-/// is often a column-formatted composite while the filter should match a
-/// curated key (a category plus a human title, say) rather than layout
-/// padding. `description` is an optional dim secondary column shown after the
-/// label.
+/// The `label` and `filter_key` are separate on purpose: the display label is
+/// the human title while the filter should match a curated key (a category
+/// plus a title, say) rather than the rendered columns. The widget lays out
+/// the columns itself, so the label carries only the title, never padding.
+///
+/// A row can carry three optional columns around the label: a `prefix`
+/// (right-aligned metadata column, e.g. a command category), a `shortcut` (a
+/// key hint), and a `description`. The shortcut and the description share the
+/// right slot, and a shortcut wins when both are set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectItem {
     /// Row text shown in the list.
     pub label: String,
     /// Text the fuzzy filter matches and ranks against.
     pub filter_key: String,
+    /// Optional right-aligned metadata column drawn to the left of the label
+    /// (a command category, say), styled with [`SelectStyles::prefix`].
+    pub prefix: Option<String>,
+    /// Optional key hint drawn in the right slot in
+    /// [`SelectStyles::shortcut`]. Wins the slot over `description`.
+    pub shortcut: Option<String>,
     /// Optional dim secondary column (a wire-level id, a one-line
-    /// description), rendered to the right of the label.
+    /// description), rendered in the right slot when no `shortcut` is set.
     pub description: Option<String>,
 }
 
 impl SelectItem {
-    /// Builds an item from its display label and filter key, with no
-    /// description column.
+    /// Builds an item from its display label and filter key, with no extra
+    /// columns.
     pub fn new(label: impl Into<String>, filter_key: impl Into<String>) -> SelectItem {
         SelectItem {
             label: label.into(),
             filter_key: filter_key.into(),
+            prefix: None,
+            shortcut: None,
             description: None,
         }
     }
 
-    /// Adds a dim secondary column shown after the label.
+    /// Adds a right-aligned metadata column drawn to the left of the label.
+    pub fn with_prefix(mut self, prefix: impl Into<String>) -> SelectItem {
+        self.prefix = Some(prefix.into());
+        self
+    }
+
+    /// Adds a key hint drawn in the right slot. Wins the slot over a
+    /// description.
+    pub fn with_shortcut(mut self, shortcut: impl Into<String>) -> SelectItem {
+        self.shortcut = Some(shortcut.into());
+        self
+    }
+
+    /// Adds a dim secondary column shown in the right slot after the label.
     pub fn with_description(mut self, description: impl Into<String>) -> SelectItem {
         self.description = Some(description.into());
         self
@@ -111,8 +144,8 @@ impl SelectItem {
 }
 
 /// The model shared between the widget, the row [`Builder`], and the filter's
-/// `on_change` callback: the full item set, the filtered view onto it, and the
-/// matcher.
+/// `on_change` callback: the full item set, the filtered view onto it, the
+/// matcher, and the column widths the row layout aligns to.
 struct SelectState {
     items: Vec<SelectItem>,
     /// Indices into `items`, filtered and ranked best-first, each paired with
@@ -124,6 +157,49 @@ struct SelectState {
     /// The current filter text, mirrored from the `TextField` on change.
     query: String,
     matcher: FuzzyMatcher,
+    /// Widest `prefix` across all items (0 when none set), the width of the
+    /// right-aligned metadata column.
+    prefix_width: usize,
+    /// Widest `label` across all items plus [`LABEL_COLUMN_PADDING`], the
+    /// width the label column pads to when a shortcut follows.
+    ///
+    /// Both widths come from the full item set, not the filtered view, so the
+    /// columns hold a stable horizontal position as the filter narrows the
+    /// visible rows.
+    label_width: usize,
+}
+
+/// Gap between the right-aligned prefix column and the label.
+const PREFIX_COLUMN_GAP: usize = 2;
+/// Padding added past the widest label, so a shortcut in the right slot sits
+/// clear of the longest label rather than flush against it.
+const LABEL_COLUMN_PADDING: usize = 2;
+
+/// Recomputes the prefix and label column widths from the full item set.
+///
+/// Called wherever `items` changes (construction, `set_items`, `extend_items`)
+/// so the columns stay sized to the widest content even as batches stream in.
+///
+/// NOTE: widths count chars, not grapheme display width. Padding and width use
+/// the same measure so it is internally consistent, but a wide or combining
+/// char in a prefix or a shortcut-bearing label would misalign the shortcut
+/// column against the `RichText` layout. Every caller today is ASCII. Switch to
+/// gwidth here and in `build_row` if a non-ASCII prefix/shortcut caller appears.
+fn recompute_widths(state: &mut SelectState) {
+    state.prefix_width = state
+        .items
+        .iter()
+        .filter_map(|item| item.prefix.as_deref())
+        .map(|prefix| prefix.chars().count())
+        .max()
+        .unwrap_or(0);
+    state.label_width = state
+        .items
+        .iter()
+        .map(|item| item.label.chars().count())
+        .max()
+        .unwrap_or(0)
+        + LABEL_COLUMN_PADDING;
 }
 
 /// Builds one banded row widget per visible index, restyling the row the
@@ -139,7 +215,13 @@ impl Builder for RowBuilder {
         let state = self.state.borrow();
         let &(item_idx, _) = state.visible.get(idx)?;
         let styles = self.styles.borrow();
-        Some(build_row(&state.items[item_idx], idx == cursor, &styles))
+        Some(build_row(
+            &state.items[item_idx],
+            idx == cursor,
+            &styles,
+            state.prefix_width,
+            state.label_width,
+        ))
     }
 }
 
@@ -148,7 +230,20 @@ impl Builder for RowBuilder {
 /// the text. `WidthBasis::Parent` gives the surface the full list width; the
 /// span backgrounds are tinted too so text cells sit on the band rather than
 /// leaving default-colored holes.
-fn build_row(item: &SelectItem, selected: bool, styles: &SelectStyles) -> WidgetRef {
+///
+/// Columns (left to right): a right-aligned prefix in `prefix_width` plus a
+/// gap, the label, then the right slot. The shortcut wins the right slot over
+/// the description, matching the columns `aj` draws. When a shortcut follows,
+/// the label is padded to `label_width` so shortcuts line up in a column. A
+/// description keeps its original layout (label plus a two-cell gap) so rows
+/// that carry no prefix or shortcut render exactly as they did before columns.
+fn build_row(
+    item: &SelectItem,
+    selected: bool,
+    styles: &SelectStyles,
+    prefix_width: usize,
+    label_width: usize,
+) -> WidgetRef {
     let band = selected.then_some(styles.selected_bg);
     let tint = |mut style: Style| -> Style {
         if let Some(bg) = band {
@@ -156,12 +251,42 @@ fn build_row(item: &SelectItem, selected: bool, styles: &SelectStyles) -> Widget
         }
         style
     };
-    let mut spans = vec![TextSpan {
-        text: item.label.clone(),
-        style: tint(styles.label),
-        ..TextSpan::default()
-    }];
-    if let Some(description) = &item.description {
+    let mut spans = Vec::new();
+    // Right-aligned metadata column plus its gap, only when some item carries
+    // a prefix. An item without one still fills the column with spaces so the
+    // label stays in its aligned position.
+    if prefix_width > 0 {
+        let prefix = item.prefix.as_deref().unwrap_or("");
+        let pad = prefix_width.saturating_sub(prefix.chars().count());
+        spans.push(TextSpan {
+            text: format!(
+                "{}{}{}",
+                " ".repeat(pad),
+                prefix,
+                " ".repeat(PREFIX_COLUMN_GAP)
+            ),
+            style: tint(styles.prefix),
+            ..TextSpan::default()
+        });
+    }
+    if let Some(shortcut) = &item.shortcut {
+        let pad = label_width.saturating_sub(item.label.chars().count());
+        spans.push(TextSpan {
+            text: format!("{}{}", item.label, " ".repeat(pad)),
+            style: tint(styles.label),
+            ..TextSpan::default()
+        });
+        spans.push(TextSpan {
+            text: shortcut.clone(),
+            style: tint(styles.shortcut),
+            ..TextSpan::default()
+        });
+    } else if let Some(description) = &item.description {
+        spans.push(TextSpan {
+            text: item.label.clone(),
+            style: tint(styles.label),
+            ..TextSpan::default()
+        });
         spans.push(TextSpan {
             text: "  ".to_string(),
             style: tint(styles.secondary),
@@ -170,6 +295,12 @@ fn build_row(item: &SelectItem, selected: bool, styles: &SelectStyles) -> Widget
         spans.push(TextSpan {
             text: description.clone(),
             style: tint(styles.secondary),
+            ..TextSpan::default()
+        });
+    } else {
+        spans.push(TextSpan {
+            text: item.label.clone(),
+            style: tint(styles.label),
             ..TextSpan::default()
         });
     }
@@ -201,6 +332,7 @@ fn full_filter(state: &mut SelectState, list: &mut ListView) {
         visible,
         query,
         matcher,
+        ..
     } = state;
     // Enumerate all items in order, so `filter_scored`'s positional tiebreak
     // is the original index.
@@ -234,6 +366,7 @@ fn narrow_filter(state: &mut SelectState, list: &mut ListView) {
         visible,
         query,
         matcher,
+        ..
     } = state;
     // Sort the candidate indices ascending before rescoring so that
     // `filter_scored`'s positional tiebreak (its internal enumeration order)
@@ -265,6 +398,7 @@ fn merge_extend(state: &mut SelectState, list: &mut ListView, old_len: usize) {
         visible,
         query,
         matcher,
+        ..
     } = state;
     // Score just the new tail. `filter_scored` enumerates the tail from 0, so
     // its positional tiebreak matches ascending real index (`old_len + pos`),
@@ -349,12 +483,16 @@ impl FilterableSelect {
     /// A select over `items` styled by `styles`, initially unfiltered with the
     /// cursor on the first row.
     pub fn new(items: Vec<SelectItem>, styles: SelectStyles) -> FilterableSelect {
-        let state = Rc::new(RefCell::new(SelectState {
+        let mut initial = SelectState {
             visible: Vec::new(),
             items,
             query: String::new(),
             matcher: FuzzyMatcher::new(),
-        }));
+            prefix_width: 0,
+            label_width: 0,
+        };
+        recompute_widths(&mut initial);
+        let state = Rc::new(RefCell::new(initial));
         let styles = Rc::new(RefCell::new(styles));
         let mut list_view = ListView::new(Source::Builder(Box::new(RowBuilder {
             state: Rc::clone(&state),
@@ -447,6 +585,7 @@ impl FilterableSelect {
     pub fn set_items(&self, items: Vec<SelectItem>) {
         let mut state = self.state.borrow_mut();
         state.items = items;
+        recompute_widths(&mut state);
         full_filter(&mut state, &mut self.list.borrow_mut());
     }
 
@@ -465,6 +604,7 @@ impl FilterableSelect {
         let mut state = self.state.borrow_mut();
         let old_len = state.items.len();
         state.items.extend(items);
+        recompute_widths(&mut state);
         // Score only the new tail and merge it into the ranking, rather
         // than rescoring the whole accumulated set.
         merge_extend(&mut state, &mut self.list.borrow_mut(), old_len);
@@ -794,6 +934,8 @@ mod tests {
             SelectStyles {
                 selected_bg: band,
                 label: Style::default(),
+                prefix: Style::default(),
+                shortcut: Style::default(),
                 secondary: Style::default(),
                 scrollbar_thumb: Style::default(),
             },
@@ -852,6 +994,187 @@ mod tests {
             bgs[1].iter().all(|c| *c == band),
             "band moved to the second row: {:?}",
             bgs[1]
+        );
+    }
+
+    /// Draw the select and return each visible row's laid-out cells. Rows are
+    /// full-width (`WidthBasis::Parent`), so a row is `width` cells including
+    /// the trailing fill.
+    fn row_cells(select: &mut FilterableSelect, width: u16, height: u16) -> Vec<Vec<Cell>> {
+        let surface = select.draw(&draw_ctx(width, height));
+        // The scroll-bars wrapper sits at row 2; its first child is the inner
+        // list, whose children are the row sub-surfaces.
+        let bars = &surface.children[1].surface;
+        let list = &bars.children[0].surface;
+        list.children
+            .iter()
+            .map(|row| row.surface.buffer.clone())
+            .collect()
+    }
+
+    /// The row's graphemes concatenated, for locating a column by its text.
+    fn row_text(cells: &[Cell]) -> String {
+        cells.iter().map(|c| c.char.grapheme()).collect()
+    }
+
+    /// The prefix column is right-aligned within the widest prefix and drawn
+    /// in the prefix style.
+    #[test]
+    fn prefix_is_right_aligned_and_dim() {
+        let dim = Style {
+            fg: Color::Index(8),
+            dim: true,
+            ..Style::default()
+        };
+        let mut select = FilterableSelect::new(
+            vec![
+                SelectItem::new("alpha", "alpha").with_prefix("Long"),
+                SelectItem::new("bravo", "bravo").with_prefix("X"),
+            ],
+            SelectStyles {
+                prefix: dim,
+                ..SelectStyles::default()
+            },
+        );
+        // Read the second (non-cursored) row so no band tint colors the cells.
+        let rows = row_cells(&mut select, 40, 10);
+        let bravo = &rows[1];
+        // "X" is right-aligned within the 4-wide column, so three pad spaces
+        // precede it and the label starts after the two-cell gap.
+        assert_eq!(&row_text(bravo)[..8], "   X  br");
+        assert_eq!(bravo[3].char.grapheme(), "X");
+        assert_eq!(bravo[3].style, dim, "prefix cell carries the prefix style");
+        // The right-alignment padding shares the prefix style.
+        assert!(bravo[..3].iter().all(|c| c.style == dim));
+    }
+
+    /// The shortcut in the right slot is drawn in the shortcut style, distinct
+    /// from the label style.
+    #[test]
+    fn shortcut_uses_the_shortcut_style_not_the_label_style() {
+        let label_style = Style {
+            fg: Color::Index(1),
+            bold: true,
+            ..Style::default()
+        };
+        let shortcut_style = Style {
+            fg: Color::Index(4),
+            bold: true,
+            ..Style::default()
+        };
+        let mut select = FilterableSelect::new(
+            vec![
+                SelectItem::new("run", "run")
+                    .with_prefix("Cat")
+                    .with_shortcut("Ctrl+R"),
+                SelectItem::new("stop", "stop")
+                    .with_prefix("Cat")
+                    .with_shortcut("Ctrl+S"),
+            ],
+            SelectStyles {
+                label: label_style,
+                shortcut: shortcut_style,
+                ..SelectStyles::default()
+            },
+        );
+        let rows = row_cells(&mut select, 40, 10);
+        // Second row, so no band tint on the cells.
+        let stop = &rows[1];
+        let text = row_text(stop);
+        let short_at = text.find("Ctrl+S").expect("shortcut rendered");
+        let label_at = text.find("stop").expect("label rendered");
+        assert_eq!(
+            stop[short_at].style, shortcut_style,
+            "shortcut cell uses the shortcut style"
+        );
+        assert_eq!(
+            stop[label_at].style, label_style,
+            "label cell uses the label style"
+        );
+        assert_ne!(
+            shortcut_style.fg, label_style.fg,
+            "the two styles are actually distinct"
+        );
+    }
+
+    /// The label column is sized from the widest label across all items, so
+    /// the shortcut column stays put as the filter narrows the visible set.
+    #[test]
+    fn label_column_width_is_stable_under_filtering() {
+        let mut select = FilterableSelect::new(
+            vec![
+                SelectItem::new("short", "short")
+                    .with_prefix("P")
+                    .with_shortcut("A"),
+                SelectItem::new("muchlongerlabel", "muchlongerlabel")
+                    .with_prefix("P")
+                    .with_shortcut("B"),
+            ],
+            SelectStyles::default(),
+        );
+        // prefix column "P" (1) + gap (2) + label padded to 15 + 2 = 17.
+        // The shortcut therefore starts at column 3 + 17 = 20.
+        let rows = row_cells(&mut select, 40, 10);
+        assert_eq!(
+            row_text(&rows[0]).find('A'),
+            Some(20),
+            "shortcut aligned to the widest label's column"
+        );
+
+        // Filtering down to only the short-label row must not pull the column
+        // in: the width comes from the full item set, not the visible subset.
+        for c in "short".chars() {
+            send(&mut select, &typed(c));
+        }
+        assert_eq!(select.visible_labels(), ["short"]);
+        let rows = row_cells(&mut select, 40, 10);
+        assert_eq!(
+            row_text(&rows[0]).find('A'),
+            Some(20),
+            "the label column did not shift while filtering"
+        );
+    }
+
+    /// A shortcut wins the right slot over a description, and takes the
+    /// shortcut style.
+    #[test]
+    fn shortcut_wins_over_description_in_the_right_slot() {
+        let shortcut_style = Style {
+            fg: Color::Index(4),
+            bold: true,
+            ..Style::default()
+        };
+        let secondary = Style {
+            fg: Color::Index(5),
+            ..Style::default()
+        };
+        let mut select = FilterableSelect::new(
+            vec![
+                SelectItem::new("cmd", "cmd")
+                    .with_prefix("C")
+                    .with_shortcut("Ctrl+X")
+                    .with_description("should not show"),
+                SelectItem::new("other", "other")
+                    .with_prefix("C")
+                    .with_shortcut("Ctrl+Y"),
+            ],
+            SelectStyles {
+                shortcut: shortcut_style,
+                secondary,
+                ..SelectStyles::default()
+            },
+        );
+        let rows = row_cells(&mut select, 40, 10);
+        let text = row_text(&rows[0]);
+        assert!(text.contains("Ctrl+X"), "shortcut rendered: {text:?}");
+        assert!(
+            !text.contains("should not show"),
+            "description suppressed when a shortcut is set: {text:?}"
+        );
+        let at = text.find("Ctrl+X").expect("shortcut rendered");
+        assert_eq!(
+            rows[0][at].style.fg, shortcut_style.fg,
+            "the right slot carries the shortcut style"
         );
     }
 

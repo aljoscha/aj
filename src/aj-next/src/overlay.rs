@@ -238,6 +238,12 @@ impl OverlayChrome {
 /// `ThemeBg::SelectedBg` with normal text on top, and a muted secondary column.
 /// The secondary column is the description column, which `aj` draws in `Muted`
 /// (`#808080`), distinct from the `Dim` (`#666666`) it uses for the subtitle.
+///
+/// The prefix (category) column is `Dim`, and the shortcut column is the
+/// `KeybindingHint` token drawn bold. The label is bold on every row, not only
+/// the selected one. Bolding the label (and coloring the shortcut with the
+/// hint token) is the ratified E-10 aj-next divergence from `aj`, and it
+/// applies to every list overlay, not just the palette.
 pub(crate) fn select_styles_from_theme(theme: &Theme) -> SelectStyles {
     let mode = theme.color_mode();
     let fg = |token: ThemeColor| Style {
@@ -246,7 +252,15 @@ pub(crate) fn select_styles_from_theme(theme: &Theme) -> SelectStyles {
     };
     SelectStyles {
         selected_bg: vaxis_color(theme.bg_color(ThemeBg::SelectedBg), mode),
-        label: fg(ThemeColor::Text),
+        label: Style {
+            bold: true,
+            ..fg(ThemeColor::Text)
+        },
+        prefix: fg(ThemeColor::Dim),
+        shortcut: Style {
+            bold: true,
+            ..fg(ThemeColor::KeybindingHint)
+        },
         secondary: fg(ThemeColor::Muted),
         scrollbar_thumb: fg(ThemeColor::Dim),
     }
