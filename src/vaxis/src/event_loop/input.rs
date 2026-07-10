@@ -239,19 +239,28 @@ mod tests {
 
     #[test]
     fn resync_byte_at_a_time() {
-        // Drip a multi-byte CSI one byte per feed, starting from the "\x1b["
-        // intro. We cannot split the leading ESC from the "[": a lone "\x1b" is
-        // the Escape key, not a sequence start (the parser's deliberate
-        // disambiguation). The bracketed-paste-start "\x1b[200~" completes only
-        // on the final byte.
+        // Drip a full bracketed paste one byte per feed. We cannot split the
+        // leading ESC from the "[": a lone "\x1b" is the Escape key, not a
+        // sequence start (the parser's deliberate disambiguation). The parser
+        // coalesces the paste, so no event surfaces until the end marker's final
+        // byte completes "\x1b[200~hi\x1b[201~".
         let mut core = core();
         let mut events: Vec<Event> = Vec::new();
-        let mut sink = |event: Event| events.push(event);
 
-        for byte in [&b"\x1b["[..], b"2", b"0", b"0", b"~"] {
-            core.feed(byte, &mut sink).expect("feed");
+        let bytes: &[&[u8]] = &[
+            b"\x1b[", b"2", b"0", b"0", b"~", b"h", b"i", b"\x1b[", b"2", b"0", b"1", b"~",
+        ];
+        for (i, byte) in bytes.iter().enumerate() {
+            core.feed(byte, &mut |event: Event| events.push(event))
+                .expect("feed");
+            if i < bytes.len() - 1 {
+                assert!(
+                    events.is_empty(),
+                    "the paste is incomplete until the end marker"
+                );
+            }
         }
-        assert_eq!(events, vec![Event::PasteStart]);
+        assert_eq!(events, vec![Event::Paste("hi".to_string())]);
         assert_eq!(core.pending(), 0);
     }
 

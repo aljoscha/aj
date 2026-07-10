@@ -200,11 +200,8 @@ pub enum Event {
     FocusIn,
     /// The window lost focus.
     FocusOut,
-    /// Bracketed-paste start.
-    PasteStart,
-    /// Bracketed-paste end.
-    PasteEnd,
-    /// OSC 52 paste payload.
+    /// A bracketed paste (coalesced into the full pasted text) or an OSC 52
+    /// clipboard payload.
     Paste(String),
     /// OSC 4/10/11/12 color response.
     ColorReport(cell::Report),

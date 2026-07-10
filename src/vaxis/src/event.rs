@@ -18,11 +18,8 @@ pub enum Event {
     MouseLeave,
     FocusIn,
     FocusOut,
-    /// Bracketed-paste start.
-    PasteStart,
-    /// Bracketed-paste end.
-    PasteEnd,
-    /// OSC 52 paste payload. Owned heap data, since clipboard contents are of
+    /// A bracketed paste (coalesced by the parser into the full pasted text) or
+    /// an OSC 52 clipboard payload. Owned heap data, since paste contents are of
     /// arbitrary length and outlive the parse.
     Paste(String),
     /// OSC 4, 10, 11, or 12 color response.

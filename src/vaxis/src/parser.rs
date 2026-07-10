@@ -385,6 +385,40 @@ fn parse_osc(input: &[u8]) -> Result<ParseResult, ParseError> {
     }
 }
 
+/// The bracketed-paste end marker. A start marker's content runs up to the
+/// first occurrence of these bytes.
+const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+
+/// Coalesces a bracketed paste into a single [`Event::Paste`].
+///
+/// `content_start` is the offset just past the `\x1b[200~` start marker. We scan
+/// from there for [`BRACKETED_PASTE_END`] and return the bytes between the two
+/// markers as the paste text. Terminals filter the end marker out of pasted
+/// content, so the first occurrence is always the true end.
+///
+/// When the end marker is not yet in `input` we return `n == 0` so the caller
+/// retains the buffer and retries once more bytes arrive. NOTE: while a paste is
+/// incomplete every read re-scans the accumulated buffer from the start, which
+/// is O(n^2) in the total paste size. Terminal pastes arrive in a burst and are
+/// clipboard-bounded, so this is acceptable in practice. Tracking a resume
+/// offset in the byte pump would make it linear if large pastes ever matter.
+fn coalesce_bracketed_paste(input: &[u8], content_start: usize) -> ParseResult {
+    let Some(rel) = input[content_start..]
+        .windows(BRACKETED_PASTE_END.len())
+        .position(|w| w == BRACKETED_PASTE_END)
+    else {
+        return ParseResult { event: None, n: 0 };
+    };
+    let content = &input[content_start..content_start + rel];
+    // Pasted content is normally text, so we decode lossily rather than fail the
+    // whole parse on a stray non-UTF-8 byte. This matches the OSC 52 paste path.
+    let text = String::from_utf8_lossy(content).into_owned();
+    ParseResult {
+        event: Some(Event::Paste(text)),
+        n: content_start + rel + BRACKETED_PASTE_END.len(),
+    }
+}
+
 /// Parses a `CSI` (`ESC [`) sequence. This is the dispatch on the final byte:
 /// legacy cursor/function keys, kitty keyboard, mouse, focus, and the various
 /// capability probes.
@@ -479,18 +513,13 @@ fn parse_csi(input: &[u8]) -> ParseResult {
                 21 => Key::F10,
                 23 => Key::F11,
                 24 => Key::F12,
-                200 => {
-                    return ParseResult {
-                        event: Some(Event::PasteStart),
-                        n: seq_len,
-                    };
-                }
-                201 => {
-                    return ParseResult {
-                        event: Some(Event::PasteEnd),
-                        n: seq_len,
-                    };
-                }
+                // A bracketed paste coalesces its whole content (everything up
+                // to the matching end marker) into one `Event::Paste`, so a
+                // downstream widget receives the paste as a single bulk insert.
+                200 => return coalesce_bracketed_paste(input, seq_len),
+                // A lone end marker cannot occur once the start marker consumes
+                // its whole paste, so a stray one is a terminal quirk we skip.
+                201 => return skip(),
                 57427 => Key::KP_BEGIN,
                 _ => return skip(),
             };
@@ -1027,17 +1056,52 @@ mod tests {
     }
 
     #[test]
-    fn parse_paste_start() {
-        let result = parse(b"\x1b[200~");
-        assert_eq!(result.n, 6);
-        assert_eq!(result.event, Some(Event::PasteStart));
+    fn parse_bracketed_paste_coalesced() {
+        // The whole content between the start and end markers becomes one Paste.
+        let result = parse(b"\x1b[200~hello\x1b[201~");
+        assert_eq!(result.n, 6 + 5 + 6);
+        assert_eq!(result.event, Some(Event::Paste("hello".to_string())));
     }
 
     #[test]
-    fn parse_paste_end() {
+    fn parse_bracketed_paste_preserves_content_bytes() {
+        // Newlines and other control bytes in the paste are carried through
+        // verbatim. Normalization is the consumer's job.
+        let result = parse(b"\x1b[200~a\nb\tc\x1b[201~");
+        assert_eq!(result.event, Some(Event::Paste("a\nb\tc".to_string())));
+    }
+
+    #[test]
+    fn parse_bracketed_paste_empty() {
+        let result = parse(b"\x1b[200~\x1b[201~");
+        assert_eq!(result.n, 12);
+        assert_eq!(result.event, Some(Event::Paste(String::new())));
+    }
+
+    #[test]
+    fn parse_bracketed_paste_incomplete_waits() {
+        // Without the end marker the paste is incomplete: n == 0 signals the
+        // caller to retain the buffer and retry once more bytes arrive.
+        let result = parse(b"\x1b[200~hel");
+        assert_eq!(result.n, 0);
+        assert_eq!(result.event, None);
+    }
+
+    #[test]
+    fn parse_bracketed_paste_leaves_trailing_bytes() {
+        // The consumed count stops one past the end marker, so a byte typed
+        // right after the paste stays in the buffer for the next parse.
+        let result = parse(b"\x1b[200~hi\x1b[201~x");
+        assert_eq!(result.n, 6 + 2 + 6);
+        assert_eq!(result.event, Some(Event::Paste("hi".to_string())));
+    }
+
+    #[test]
+    fn parse_stray_paste_end_is_skipped() {
+        // A lone end marker (no matching start) is consumed and produces nothing.
         let result = parse(b"\x1b[201~");
         assert_eq!(result.n, 6);
-        assert_eq!(result.event, Some(Event::PasteEnd));
+        assert_eq!(result.event, None);
     }
 
     #[test]

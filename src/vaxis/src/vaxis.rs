@@ -1200,8 +1200,9 @@ impl Vaxis {
         Ok(())
     }
 
-    /// Turns bracketed paste on or off. While on, paste start/end events bracket
-    /// the pasted keystrokes.
+    /// Turns bracketed paste on or off. While on, a paste is delivered as a
+    /// single [`Event::Paste`](crate::event::Event::Paste) carrying the whole
+    /// pasted text, rather than as individual key presses.
     pub fn set_bracketed_paste<W: Write>(&mut self, w: &mut W, enable: bool) -> Result<(), Error> {
         let seq = if enable {
             ctlseqs::BP_SET

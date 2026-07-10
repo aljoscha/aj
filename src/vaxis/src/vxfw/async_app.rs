@@ -415,6 +415,7 @@ mod tests {
     struct Recorder {
         keys: Vec<u32>,
         ticks: usize,
+        pastes: Vec<String>,
     }
 
     impl Widget for Recorder {
@@ -429,6 +430,10 @@ mod tests {
                 }
                 Event::Tick => {
                     self.ticks += 1;
+                    ctx.consume_and_redraw();
+                }
+                Event::Paste(text) => {
+                    self.pastes.push(text.clone());
                     ctx.consume_and_redraw();
                 }
                 _ => {}
@@ -481,6 +486,27 @@ mod tests {
         assert!(!frame.quit);
         assert!(app.needs_redraw());
         assert_eq!(recorder.borrow().keys, vec![u32::from('j')]);
+    }
+
+    #[tokio::test]
+    async fn bracketed_paste_reaches_the_widget_as_one_coalesced_event() {
+        // The regression guard for the whole seam: raw bracketed-paste bytes go
+        // in at the pipe, and the widget must see a single Paste carrying the
+        // content, not a burst of per-character key presses.
+        let (mut app, write_fd, recorder, _root) = init_app().await;
+
+        write_all(&write_fd, b"\x1b[200~line one\nline two\x1b[201~");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+
+        assert_eq!(
+            recorder.borrow().pastes,
+            vec!["line one\nline two".to_string()]
+        );
+        assert!(
+            recorder.borrow().keys.is_empty(),
+            "paste content must not leak as key presses"
+        );
     }
 
     #[tokio::test]
