@@ -534,10 +534,22 @@ fn map_model(fixed: &ProviderFixedValues, id: &str, m: &RawModel) -> ModelInfo {
         input.push(InputModality::Image);
     }
 
+    // Base per-million rates. An absent rate means the model does not
+    // bill that category, so it defaults to 0.
+    let base_input = cost.and_then(|c| c.input).unwrap_or(0.0);
+    let base_output = cost.and_then(|c| c.output).unwrap_or(0.0);
+    let base_cache_read = cost.and_then(|c| c.cache_read).unwrap_or(0.0);
+    let base_cache_write = cost.and_then(|c| c.cache_write).unwrap_or(0.0);
+
     // Map models.dev context tiers onto our step-function pricing.
     // Only `type == "context"` tiers with a size become a
     // `ModelCostTier`. Other tier kinds or sizeless entries are
     // skipped. Source order is preserved.
+    //
+    // A tier replaces the base rates wholesale, so a category the tier
+    // leaves unspecified falls back to the base rate rather than 0.
+    // Otherwise a partial tier would silently make a base-priced
+    // category free above the threshold.
     let tiers: Vec<ModelCostTier> = cost
         .and_then(|c| c.tiers.as_ref())
         .into_iter()
@@ -549,10 +561,10 @@ fn map_model(fixed: &ProviderFixedValues, id: &str, m: &RawModel) -> ModelInfo {
             match (is_context, size) {
                 (true, Some(size)) => Some(ModelCostTier {
                     input_tokens_above: size,
-                    input: t.input.unwrap_or(0.0),
-                    output: t.output.unwrap_or(0.0),
-                    cache_read: t.cache_read.unwrap_or(0.0),
-                    cache_write: t.cache_write.unwrap_or(0.0),
+                    input: t.input.unwrap_or(base_input),
+                    output: t.output.unwrap_or(base_output),
+                    cache_read: t.cache_read.unwrap_or(base_cache_read),
+                    cache_write: t.cache_write.unwrap_or(base_cache_write),
                 }),
                 _ => None,
             }
@@ -582,10 +594,10 @@ fn map_model(fixed: &ProviderFixedValues, id: &str, m: &RawModel) -> ModelInfo {
         supports_verbosity: fixed.api == "openai-responses" && id.starts_with("gpt-5"),
         input,
         cost: ModelCost {
-            input: cost.and_then(|c| c.input).unwrap_or(0.0),
-            output: cost.and_then(|c| c.output).unwrap_or(0.0),
-            cache_read: cost.and_then(|c| c.cache_read).unwrap_or(0.0),
-            cache_write: cost.and_then(|c| c.cache_write).unwrap_or(0.0),
+            input: base_input,
+            output: base_output,
+            cache_read: base_cache_read,
+            cache_write: base_cache_write,
             tiers,
         },
         context_window: limit.and_then(|l| l.context).unwrap_or(4096),

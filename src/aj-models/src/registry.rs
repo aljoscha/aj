@@ -87,7 +87,8 @@ pub struct ModelCostTier {
     /// tier applies when the total input-side usage is strictly greater
     /// than this value. Among all tiers that apply, the one with the
     /// largest `input_tokens_above` wins and its rates replace the base
-    /// rates for the whole request.
+    /// rates for the whole request. If two tiers share a threshold the
+    /// later one in the list wins, but well-formed data has no such ties.
     pub input_tokens_above: u64,
     pub input: f64,
     pub output: f64,

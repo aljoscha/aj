@@ -2084,6 +2084,40 @@ mod tests {
     }
 
     #[test]
+    fn finalize_usage_composes_context_tier_with_multiplier() {
+        // A large request on a gpt-5.6-sol-shaped model: the context tier
+        // replaces the base rates, then the service-tier multiplier scales
+        // the resulting cost. The two must compose (tier picks the rates,
+        // multiplier scales the dollars) without double-application.
+        let cost = ModelCost {
+            input: 5.0,
+            output: 30.0,
+            cache_read: 0.5,
+            cache_write: 6.25,
+            tiers: vec![crate::registry::ModelCostTier {
+                input_tokens_above: 272_000,
+                input: 10.0,
+                output: 45.0,
+                cache_read: 1.0,
+                cache_write: 12.5,
+            }],
+        };
+        // input_side = 300k > 272k, so the tier fires.
+        let mut usage = crate::types::Usage {
+            input: 300_000,
+            output: 100_000,
+            ..Default::default()
+        };
+        // Priority multiplier for the top codex tier is 2.0.
+        finalize_usage(&mut usage, &cost, 2.0);
+        // Tier rates: input 10/Mtok * 0.3M = 3.0, output 45/Mtok * 0.1M = 4.5.
+        // Base total 7.5, scaled by 2.0 = 15.0.
+        assert!((usage.cost.input - 6.0).abs() < 1e-9);
+        assert!((usage.cost.output - 9.0).abs() < 1e-9);
+        assert!((usage.cost.total - 15.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn records_requested_model_id_not_wire_model() {
         // The server echoes a dated snapshot id, but the produced message must
         // record the requested catalog id so a same-session continuation stays

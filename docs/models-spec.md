@@ -651,8 +651,16 @@ and reasoning capability flag.
 
 ```rust
 fn calculate_cost(cost: &ModelCost, usage: &mut Usage) {
-    // Pick the rate set first, then apply per-million once.
-    let (input, output, cache_read, cache_write) = select_rates(cost, usage);
+    let input_side = usage.input + usage.cache_read + usage.cache_write;
+    // Highest tier whose threshold the request clears, else the base rates.
+    let rates = cost
+        .tiers
+        .iter()
+        .filter(|t| t.input_tokens_above < input_side)
+        .max_by_key(|t| t.input_tokens_above)
+        .map(|t| (t.input, t.output, t.cache_read, t.cache_write))
+        .unwrap_or((cost.input, cost.output, cost.cache_read, cost.cache_write));
+    let (input, output, cache_read, cache_write) = rates;
     usage.cost.input = (input / 1_000_000.0) * usage.input as f64;
     usage.cost.output = (output / 1_000_000.0) * usage.output as f64;
     usage.cost.cache_read = (cache_read / 1_000_000.0) * usage.cache_read as f64;
@@ -920,6 +928,14 @@ retired. `context_window` is the observed server cap per model (the
 `gpt-5.6` family reports `372000`, the rest `272000`) and `max_tokens`
 is `128000`; pricing is hand-curated in the seed, mirroring the
 models.dev base rates for the matching `openai` model.
+
+Context pricing tiers (§3.3) are hand-added only to the `gpt-5.6`
+family, whose `372000` window lets a request clear the `272000` tier
+threshold. The `272000`-capped models carry no tier: a request can
+never exceed the threshold there, and the tier requires strictly more,
+so it could never fire. This assumes the codex backend enforces the
+declared `context_window`, `calculate_cost` does not itself clamp usage
+to the window.
 
 ---
 
