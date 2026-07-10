@@ -6962,6 +6962,7 @@ mod tests {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 task: "do the thing".into(),
+                background: false,
                 settings,
             },
             AgentEvent::TaskStart {

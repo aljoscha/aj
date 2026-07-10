@@ -4034,6 +4034,7 @@ mod tests {
                 parent: AgentId::Main,
                 child: AgentId::Sub(0),
                 task: "scout the code".into(),
+                background: false,
                 settings: cache_settings(),
             },
         );
@@ -4119,6 +4120,7 @@ mod tests {
                 parent: AgentId::Main,
                 child: AgentId::Sub(0),
                 task: "scout".into(),
+                background: false,
                 settings: cache_settings(),
             },
         );

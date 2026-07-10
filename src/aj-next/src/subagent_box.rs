@@ -358,6 +358,7 @@ mod tests {
                 parent: AgentId::Main,
                 child: sub,
                 task: "check the build setup".into(),
+                background: false,
                 settings: AgentSettings {
                     provider: "scripted".into(),
                     model_id: "scripted".into(),
@@ -583,6 +584,7 @@ mod tests {
                 parent: AgentId::Main,
                 child: AgentId::Sub(0),
                 task: long_task,
+                background: false,
                 settings: AgentSettings {
                     provider: "scripted".into(),
                     model_id: "scripted".into(),

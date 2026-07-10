@@ -181,12 +181,19 @@ fn fallback_settings() -> AgentSettings {
 }
 
 /// Build the synthesized [`AgentEvent::SubAgentStart`] for sub-agent
-/// `n`.
-fn sub_start_event(n: usize, task: String, settings: AgentSettings) -> AgentEvent {
+/// `n`. `background` is the persisted run mode (foreground for legacy
+/// logs and for balancing synthetic starts, which carry no mode).
+fn sub_start_event(
+    n: usize,
+    task: String,
+    background: bool,
+    settings: AgentSettings,
+) -> AgentEvent {
     AgentEvent::SubAgentStart {
         parent: AgentId::Main,
         child: AgentId::Sub(n),
         task,
+        background,
         settings,
     }
 }
@@ -228,17 +235,28 @@ impl ReplayState {
             return;
         }
         match &entry.entry {
-            ConversationEntryKind::SubAgentSpawn { task, settings } => {
-                out.push(sub_start_event(n, task.clone(), settings.clone()));
+            ConversationEntryKind::SubAgentSpawn {
+                task,
+                background,
+                settings,
+            } => {
+                out.push(sub_start_event(
+                    n,
+                    task.clone(),
+                    *background,
+                    settings.clone(),
+                ));
                 self.open_sub_started = true;
             }
             ConversationEntryKind::Message { .. } => {
                 // Legacy fallback: no spawn entry preceded this
                 // message, so the run's first message (the task
-                // user prompt) opens the bracket.
+                // user prompt) opens the bracket. Legacy logs carry
+                // no run mode, so the sub reads as foreground.
                 out.push(sub_start_event(
                     n,
                     subagent_task(entry),
+                    false,
                     fallback_settings(),
                 ));
                 self.open_sub_started = true;
@@ -263,7 +281,12 @@ impl ReplayState {
     fn close_open_sub(&mut self, out: &mut Vec<AgentEvent>) {
         if let Some(k) = self.open_sub.take() {
             if !self.open_sub_started {
-                out.push(sub_start_event(k, String::new(), fallback_settings()));
+                out.push(sub_start_event(
+                    k,
+                    String::new(),
+                    false,
+                    fallback_settings(),
+                ));
             }
             self.open_sub_started = false;
             out.push(AgentEvent::SubAgentEnd {
@@ -1436,7 +1459,7 @@ mod tests {
             speed: "fast".into(),
             verbosity: "high".into(),
         };
-        log.append_subagent_spawn(1, user_head, "subtask", &settings)
+        log.append_subagent_spawn(1, user_head, "subtask", true, &settings)
             .expect("spawn entry");
         {
             let sub_head = log
@@ -1467,11 +1490,13 @@ mod tests {
             AgentEvent::SubAgentStart {
                 child,
                 task,
+                background,
                 settings: s,
                 ..
             } => {
                 assert_eq!(*child, AgentId::Sub(1));
                 assert_eq!(task, "subtask");
+                assert!(*background, "spawn entry's background mode replays");
                 assert_eq!(*s, settings);
             }
             other => panic!("expected SubAgentStart, got {other:?}"),
@@ -1488,6 +1513,54 @@ mod tests {
             .expect("SubAgentEnd present")
         {
             AgentEvent::SubAgentEnd { report, .. } => assert_eq!(report, "reply"),
+            _ => unreachable!(),
+        }
+    }
+
+    /// A foreground (blocking) spawn entry replays as foreground. Paired
+    /// with the background case above, this pins that replay reads the
+    /// entry's stored mode rather than hardcoding a value.
+    #[test]
+    fn replay_foreground_spawn_entry_stays_foreground() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("sp");
+
+        let user_head = {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_message(user_msg("hi")).expect("u");
+            view.head().cloned().expect("head present")
+        };
+        let settings = AgentSettings {
+            provider: "anthropic".into(),
+            model_id: "claude-x".into(),
+            thinking: "high".into(),
+            speed: "fast".into(),
+            verbosity: "high".into(),
+        };
+        log.append_subagent_spawn(1, user_head, "subtask", false, &settings)
+            .expect("spawn entry");
+        {
+            let sub_head = log
+                .latest_leaf(crate::log::ThreadFilter::subagent(1))
+                .expect("sub leaf");
+            let mut view = ConversationView::subagent(&mut log, sub_head, 1);
+            view.add_message(user_msg("subtask")).expect("u");
+        }
+
+        let events: Vec<AgentEvent> = replay(&log).collect();
+        let start = events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::SubAgentStart { .. }))
+            .expect("SubAgentStart present");
+        match start {
+            AgentEvent::SubAgentStart { background, .. } => {
+                assert!(
+                    !background,
+                    "foreground spawn entry must replay as foreground"
+                );
+            }
             _ => unreachable!(),
         }
     }
@@ -1557,11 +1630,13 @@ mod tests {
             AgentEvent::SubAgentStart {
                 child,
                 task,
+                background,
                 settings,
                 ..
             } => {
                 assert_eq!(*child, AgentId::Sub(1));
                 assert_eq!(task, "subtask");
+                assert!(!background, "a legacy log carries no mode, so foreground");
                 assert_eq!(*settings, super::fallback_settings());
             }
             other => panic!("expected SubAgentStart, got {other:?}"),
@@ -1608,8 +1683,14 @@ mod tests {
             .find(|e| matches!(e, AgentEvent::SubAgentStart { .. }))
             .expect("SubAgentStart present")
         {
-            AgentEvent::SubAgentStart { task, settings, .. } => {
+            AgentEvent::SubAgentStart {
+                task,
+                background,
+                settings,
+                ..
+            } => {
                 assert_eq!(task, "subtask");
+                assert!(!background, "a legacy log carries no mode, so foreground");
                 assert_eq!(*settings, super::fallback_settings());
             }
             _ => unreachable!(),

@@ -65,6 +65,7 @@ pub fn persistence_listener(log: Arc<TokioMutex<ConversationLog>>) -> Listener {
                     parent,
                     child,
                     task,
+                    background,
                     settings,
                 } => {
                     let AgentId::Sub(child_n) = child else {
@@ -77,7 +78,13 @@ pub fn persistence_listener(log: Arc<TokioMutex<ConversationLog>>) -> Listener {
                             "SubAgentStart: parent {parent:?} thread has no head entry to anchor child {child:?} at"
                         ))
                     })?;
-                    log_guard.append_subagent_spawn(child_n, parent_head, &task, &settings)?;
+                    log_guard.append_subagent_spawn(
+                        child_n,
+                        parent_head,
+                        &task,
+                        background,
+                        &settings,
+                    )?;
                 }
                 AgentEvent::MessageEnd { agent_id, message } => {
                     let mut log_guard = log.lock().await;
@@ -196,6 +203,7 @@ mod tests {
             parent: AgentId::Main,
             child: AgentId::Sub(n),
             task: task.to_string(),
+            background: false,
             settings: AgentSettings {
                 provider: "anthropic".to_string(),
                 model_id: "claude-x".to_string(),
@@ -349,7 +357,7 @@ mod tests {
         // One spawn entry followed by the two messages.
         assert_eq!(entries.len(), 3, "got entries: {entries:#?}");
         match &entries[0].entry {
-            ConversationEntryKind::SubAgentSpawn { task, settings } => {
+            ConversationEntryKind::SubAgentSpawn { task, settings, .. } => {
                 assert_eq!(task, "do thing");
                 assert_eq!(settings.provider, "anthropic");
                 assert_eq!(settings.model_id, "claude-x");

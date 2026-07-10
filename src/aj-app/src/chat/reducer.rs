@@ -319,6 +319,7 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
             parent,
             child,
             task,
+            background,
             settings,
         } => {
             if let AgentId::Sub(n) = child {
@@ -340,6 +341,7 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
                                 report: None,
                                 started_at: Instant::now(),
                                 finished_at: None,
+                                background,
                             }));
                     state.sub_boxes.insert(n, (parent, id));
                 }
@@ -827,6 +829,7 @@ mod tests {
             parent: AgentId::Main,
             child: AgentId::Sub(n),
             task: format!("task {n}"),
+            background: false,
             settings: sub_settings(provider, model_id),
         }
     }
@@ -1519,11 +1522,12 @@ mod tests {
     }
 
     #[test]
-    fn agents_flag_background_subs_from_the_task_registry() {
+    fn agents_flag_background_subs_from_the_spawn_event() {
         let mut s = state();
         let mut life = AgentLifecycle::default();
-        // Sub 1 blocking (no task registered); Sub 2 background (a
-        // `TaskKind::Agent` task tracks it).
+        // Sub 1 spawned blocking (foreground), sub 2 spawned background.
+        // The flag comes from each sub's own `SubAgentStart`, so it does
+        // not depend on the transient task registry and survives a resume.
         apply(
             &mut s,
             &mut life,
@@ -1532,40 +1536,30 @@ mod tests {
         apply(
             &mut s,
             &mut life,
-            sub_agent_start(2, "scripted", "scripted"),
-        );
-        apply(
-            &mut s,
-            &mut life,
-            AgentEvent::TaskStart {
-                agent_id: AgentId::Main,
-                task_id: 2,
-                call_id: "c2".into(),
-                kind: TaskKind::Agent {
-                    agent_id: 2,
-                    task: "task 2".into(),
-                },
-                label: "agent 2".into(),
+            AgentEvent::SubAgentStart {
+                parent: AgentId::Main,
+                child: AgentId::Sub(2),
+                task: "task 2".into(),
+                background: true,
+                settings: sub_settings("scripted", "scripted"),
             },
         );
         assert!(!agent_row(&s, AgentId::Sub(1)).background, "blocking sub");
         assert!(agent_row(&s, AgentId::Sub(2)).background, "background sub");
 
-        // The classification survives the task finishing (the entry is kept).
+        // The classification survives the sub finishing.
         apply(
             &mut s,
             &mut life,
-            AgentEvent::TaskEnd {
-                agent_id: AgentId::Main,
-                task_id: 2,
-                call_id: "c2".into(),
-                status: TaskStatus::Exited(Some(0)),
-                label: "agent 2".into(),
+            AgentEvent::SubAgentEnd {
+                parent: AgentId::Main,
+                child: AgentId::Sub(2),
+                report: "done".into(),
             },
         );
         assert!(
             agent_row(&s, AgentId::Sub(2)).background,
-            "still background after the task ends"
+            "still background after it ends"
         );
     }
 

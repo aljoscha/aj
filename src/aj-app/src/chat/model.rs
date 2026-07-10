@@ -158,6 +158,11 @@ pub struct SubAgentEntry {
     /// displayed runtime. `None` while it is still running. A continuation
     /// re-run clears it (and resets `started_at`) so timing starts fresh.
     pub finished_at: Option<Instant>,
+    /// Whether the sub was spawned to run in the background, concurrent with
+    /// the parent's turn, rather than blocking it. Set from `SubAgentStart`,
+    /// which carries the persisted run mode, so it stays accurate after a
+    /// resume.
+    pub background: bool,
 }
 
 /// A completed compaction's summary row.
@@ -323,10 +328,9 @@ pub struct AgentEntry {
     /// `None` for the main agent.
     pub runtime: Option<Duration>,
     /// Whether the sub runs as a background task (concurrent with the
-    /// parent) rather than blocking the parent's turn. Derived from the
-    /// live task registry, so it is `false` for the main agent, for a
-    /// blocking sub, and for any sub restored from a resumed session
-    /// (whose transient task events are never replayed).
+    /// parent) rather than blocking the parent's turn. Sourced from the
+    /// sub's `SubAgentStart`, so it is accurate live and after a resume.
+    /// `false` for the main agent.
     pub background: bool,
 }
 
@@ -472,22 +476,11 @@ impl ChatState {
                             .unwrap_or(now)
                             .duration_since(sub.started_at),
                     ),
-                    background: self.is_background_sub(n),
+                    background: sub.background,
                 });
             }
         }
         out
-    }
-
-    /// Whether sub-agent `n` runs as a background task. A background spawn
-    /// registers a `TaskKind::Agent` task (kept in the map even after it
-    /// finishes, so the classification survives for the whole session), a
-    /// blocking spawn registers none. Task events are transient and never
-    /// replayed, so a sub restored from a resumed session reads as `false`.
-    fn is_background_sub(&self, n: usize) -> bool {
-        self.tasks
-            .values()
-            .any(|t| matches!(t.kind, TaskKind::Agent { agent_id, .. } if agent_id == n))
     }
 
     /// The per-agent footer store.

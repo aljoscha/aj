@@ -402,6 +402,7 @@ mod tests {
             parent: AgentId::Main,
             child: AgentId::Sub(3),
             task: "synthetic task".to_string(),
+            background: false,
             settings: AgentSettings {
                 provider: "scripted".into(),
                 model_id: "scripted-model".into(),
@@ -453,6 +454,7 @@ mod tests {
                 parent: AgentId::Main,
                 child: AgentId::Sub(n),
                 task: format!("task {n}"),
+                background: false,
                 settings: AgentSettings {
                     provider: "scripted".into(),
                     model_id: "scripted-model".into(),

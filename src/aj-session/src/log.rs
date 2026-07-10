@@ -149,11 +149,17 @@ pub enum ConversationEntryKind {
     /// The structural root of a sub-agent thread, written when the
     /// sub-agent is spawned and anchored at the parent thread's head
     /// (the assistant message carrying the spawning tool call). It
-    /// carries the task and the child's settings snapshot, so the
-    /// log is self-describing about what each sub-agent ran with and
+    /// carries the task, the child's run mode, and its settings snapshot,
+    /// so the log is self-describing about what each sub-agent ran with and
     /// replay can synthesize the spawn event without look-ahead.
     SubAgentSpawn {
         task: String,
+        /// Whether the sub was spawned to run in the background, concurrent
+        /// with the parent's turn, rather than blocking it. `#[serde(default)]`
+        /// so logs written before mode tracking still deserialize (missing ->
+        /// `false`, i.e. foreground).
+        #[serde(default)]
+        background: bool,
         settings: AgentSettings,
     },
     /// A compaction checkpoint: the thread's history before
@@ -1004,6 +1010,7 @@ impl ConversationLog {
         agent_id: usize,
         parent_head: EntryId,
         task: &str,
+        background: bool,
         settings: &AgentSettings,
     ) -> Result<EntryId, ConversationError> {
         self.append(
@@ -1012,6 +1019,7 @@ impl ConversationLog {
             Some(agent_id),
             ConversationEntryKind::SubAgentSpawn {
                 task: task.to_string(),
+                background,
                 settings: settings.clone(),
             },
         )
@@ -1815,7 +1823,7 @@ mod tests {
                 let mut view = ConversationView::user(&mut log, None);
                 view.add_message(user_text("hi")).expect("u")
             };
-            log.append_subagent_spawn(1, user_id, "subtask", &spawn_settings())
+            log.append_subagent_spawn(1, user_id, "subtask", true, &spawn_settings())
                 .expect("spawn entry");
             {
                 let sub_head = log
@@ -1833,9 +1841,53 @@ mod tests {
             .expect("sub leaf");
         let convo = resumed.linearize(&sub_head, ThreadFilter::subagent(1));
         match &convo.entries()[0].entry {
-            ConversationEntryKind::SubAgentSpawn { task, settings } => {
+            ConversationEntryKind::SubAgentSpawn {
+                task,
+                background,
+                settings,
+            } => {
                 assert_eq!(task, "subtask");
+                assert!(*background, "background mode round-trips through resume");
                 assert_eq!(*settings, spawn_settings());
+            }
+            other => panic!("expected SubAgentSpawn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subagent_spawn_without_background_defaults_to_foreground() {
+        // A log written before mode tracking has no `background` key on the
+        // spawn line. Resume deserializes whole `ConversationEntry` lines, and
+        // the spawn kind is `#[serde(flatten)]`-ed into that wrapper over an
+        // internally-tagged enum. That flatten + tag + `#[serde(default)]`
+        // combination is the real read path (and a known serde trap), so we
+        // exercise it through the wrapper rather than the kind in isolation: a
+        // missing `background` must yield foreground, not an error.
+        let record = ConversationEntry {
+            id: "0000abcd".to_string(),
+            parent_id: Some("00000001".to_string()),
+            timestamp: None,
+            thread: ThreadKind::Subagent,
+            agent_id: Some(1),
+            entry: ConversationEntryKind::SubAgentSpawn {
+                task: "t".to_string(),
+                background: true,
+                settings: spawn_settings(),
+            },
+        };
+        let mut json = serde_json::to_value(&record).expect("serialize entry");
+        assert!(
+            json.as_object_mut()
+                .expect("entry is a JSON object")
+                .remove("background")
+                .is_some(),
+            "background sits at the flattened top level before removal"
+        );
+        let restored: ConversationEntry =
+            serde_json::from_value(json).expect("legacy line deserializes");
+        match restored.entry {
+            ConversationEntryKind::SubAgentSpawn { background, .. } => {
+                assert!(!background, "missing background must default to foreground");
             }
             other => panic!("expected SubAgentSpawn, got {other:?}"),
         }
@@ -1847,6 +1899,7 @@ mod tests {
         // must not materialize the log file on their own.
         let spawn = ConversationEntryKind::SubAgentSpawn {
             task: "t".to_string(),
+            background: false,
             settings: spawn_settings(),
         };
         assert!(!spawn.is_punctuation());
@@ -1864,7 +1917,7 @@ mod tests {
             let mut view = ConversationView::user(&mut log, None);
             view.add_message(user_text("hi")).expect("u")
         };
-        log.append_subagent_spawn(1, user_id, "subtask", &spawn_settings())
+        log.append_subagent_spawn(1, user_id, "subtask", false, &spawn_settings())
             .expect("spawn entry");
 
         let sub_head = log

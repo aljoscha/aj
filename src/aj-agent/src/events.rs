@@ -256,6 +256,12 @@ pub enum AgentEvent {
         parent: AgentId,
         child: AgentId,
         task: String,
+        /// Whether the sub was spawned to run in the background,
+        /// concurrent with the parent's turn, rather than blocking it.
+        /// The persistence listener writes it to the log's `SubAgentSpawn`
+        /// entry so a picker can still show the run mode after a resume,
+        /// when the transient task registry that reveals it live is empty.
+        background: bool,
         /// The child's bundle identity at spawn. Today sub-agents
         /// mirror the parent's bundle. Flattened so the JSON wire
         /// shape keeps the four settings fields at the top level of
@@ -440,6 +446,7 @@ mod tests {
             parent: AgentId::Main,
             child: AgentId::Sub(0),
             task: "test".into(),
+            background: false,
             settings: AgentSettings {
                 provider: "scripted".into(),
                 model_id: "scripted-model".into(),
@@ -526,6 +533,7 @@ mod tests {
             parent: AgentId::Main,
             child: AgentId::Sub(2),
             task: "explore".into(),
+            background: true,
             settings: AgentSettings {
                 provider: "anthropic".into(),
                 model_id: "claude-x".into(),
@@ -537,6 +545,7 @@ mod tests {
         let json = serde_json::to_value(&spawn).expect("SubAgentStart serializes");
         assert_eq!(json["type"], "sub_agent_start");
         assert_eq!(json["task"], "explore");
+        assert_eq!(json["background"], true);
         assert_eq!(json["provider"], "anthropic");
         assert_eq!(json["model_id"], "claude-x");
         assert_eq!(json["thinking"], "medium");

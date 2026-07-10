@@ -1770,6 +1770,7 @@ mod tests {
             parent: AgentId::Main,
             child: AgentId::Sub(n),
             task: format!("task {n}"),
+            background: false,
             settings: AgentSettings {
                 provider: provider.into(),
                 model_id: model_id.into(),
@@ -2970,6 +2971,7 @@ mod tests {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 task: "explore".into(),
+                background: false,
                 settings: AgentSettings {
                     provider: "scripted".into(),
                     model_id: "scripted-model".into(),
@@ -3038,6 +3040,7 @@ mod tests {
                     parent: AgentId::Main,
                     child: AgentId::Sub(n),
                     task: format!("task {n}"),
+                    background: false,
                     settings: AgentSettings {
                         provider: "scripted".into(),
                         model_id: "scripted-model".into(),
@@ -3512,6 +3515,7 @@ mod tests {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 task: "explore".into(),
+                background: false,
                 settings: AgentSettings {
                     provider: "scripted".into(),
                     model_id: "scripted-model".into(),
@@ -3593,6 +3597,7 @@ mod tests {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 task: "summarize".into(),
+                background: false,
                 settings: AgentSettings {
                     provider: "scripted".into(),
                     model_id: "scripted-model".into(),
@@ -3683,6 +3688,7 @@ mod tests {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 task: "explore".into(),
+                background: false,
                 settings: AgentSettings {
                     provider: "scripted".into(),
                     model_id: "scripted-model".into(),
@@ -3769,6 +3775,7 @@ mod tests {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 task: "explore".into(),
+                background: false,
                 settings: AgentSettings {
                     provider: "scripted".into(),
                     model_id: "scripted-model".into(),

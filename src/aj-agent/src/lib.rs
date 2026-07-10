@@ -2708,6 +2708,7 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
                     parent: self.parent_agent_id,
                     child: child_id,
                     task: task.clone(),
+                    background: matches!(mode, SpawnMode::Background),
                     settings: AgentSettings {
                         provider: self.model_info.provider.clone(),
                         model_id: self.model_info.id.clone(),
