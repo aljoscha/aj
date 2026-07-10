@@ -87,7 +87,7 @@ pub(crate) fn build_subagent_box(
         .map(|t| {
             t.entries()
                 .iter()
-                .map(|e| build_entry_widget(e, chat, styles, true).into_boxed())
+                .map(|e| build_entry_widget(e, chat, styles, true, None).into_boxed())
                 .collect()
         })
         .unwrap_or_default();
@@ -635,7 +635,11 @@ mod tests {
         reduce_sub_end(&mut chat, &mut life);
         let chat = Rc::new(RefCell::new(chat));
         let theme = Theme::bundled_dark_with_mode(ColorMode::Truecolor);
-        let mut view = TranscriptView::new(Rc::clone(&chat), &theme);
+        let mut view = TranscriptView::new(
+            Rc::clone(&chat),
+            &theme,
+            std::rc::Rc::new(std::cell::Cell::new(false)),
+        );
         let ctx = DrawContext {
             max: MaxSize {
                 width: Some(60),

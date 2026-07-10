@@ -158,6 +158,15 @@ pub const ACTION_CHAT_SCROLL_BOTTOM: &str = "aj.chat.scroll_bottom";
 /// focus to the editor.
 pub const ACTION_TRANSCRIPT_FOCUS: &str = "aj.transcript.focus";
 
+/// Action ID for the "copy the focused message" chord.
+///
+/// Bound by default to `y`. Live only in transcript-focus mode (Spec E
+/// section 2): the frontend gates it on the transcript being focused, so with
+/// the editor focused `y` types normally. Pressing it copies the whole focused
+/// user message to the system clipboard through the same OSC 52 path the mouse
+/// select-to-copy uses.
+pub const ACTION_COPY_MESSAGE: &str = "aj.transcript.copy_message";
+
 /// Action ID for the "clear the selected project override" chord in
 /// the project settings window.
 ///
@@ -259,6 +268,7 @@ pub const AJ_KEYBINDINGS: &[(&str, &str, &str)] = &[
         "tab",
         "Focus the transcript to step through past messages",
     ),
+    (ACTION_COPY_MESSAGE, "y", "Copy the focused message"),
     (
         ACTION_SETTINGS_CLEAR,
         "ctrl+x",

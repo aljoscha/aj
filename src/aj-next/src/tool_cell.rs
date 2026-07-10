@@ -1292,7 +1292,11 @@ mod tests {
         );
         let chat = Rc::new(RefCell::new(chat));
         let theme = Theme::bundled_dark_with_mode(ColorMode::Truecolor);
-        let mut view = TranscriptView::new(Rc::clone(&chat), &theme);
+        let mut view = TranscriptView::new(
+            Rc::clone(&chat),
+            &theme,
+            std::rc::Rc::new(std::cell::Cell::new(false)),
+        );
         let ctx = DrawContext {
             min: Size {
                 width: 0,

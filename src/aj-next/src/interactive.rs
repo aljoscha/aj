@@ -997,6 +997,7 @@ fn handle_host_action(world: &mut World, shell: &Rc<RefCell<Shell>>, action: AjA
         | AjAction::ChatScrollToTop
         | AjAction::ChatScrollToBottom
         | AjAction::TranscriptFocus
+        | AjAction::CopyMessage
         | AjAction::Quit => false,
     }
 }
@@ -2564,12 +2565,20 @@ impl Shell {
         // The footer shows the working directory as text. The provider owns the
         // path itself.
         let cwd_display = cwd.display().to_string();
+        // The transcript-focus flag, shared between the transcript (its single
+        // writer, via focus in/out) and the keymap host context (which reads it
+        // to gate the copy chord). Created here so both get the same cell.
+        let focus_mode = Rc::new(std::cell::Cell::new(false));
         // Resolve the initial styles and chrome from a single snapshot of
         // the theme, then keep the handle for the runtime re-style path.
         let (styles, transcript, chrome) = {
             let t = theme.read();
             let styles = Rc::new(TranscriptStyles::from_theme(&t));
-            let transcript = Rc::new(RefCell::new(TranscriptView::new(Rc::clone(&chat), &t)));
+            let transcript = Rc::new(RefCell::new(TranscriptView::new(
+                Rc::clone(&chat),
+                &t,
+                Rc::clone(&focus_mode),
+            )));
             editor.borrow_mut().set_theme(editor_theme_from_theme(&t));
             (styles, transcript, OverlayChrome::from_theme(&t))
         };
@@ -2619,6 +2628,7 @@ impl Shell {
         let keymap_ctx = Rc::new(RefCell::new(HostCtx {
             overlays: Rc::clone(&overlays),
             editor: Rc::clone(&editor),
+            focus_mode: Rc::clone(&focus_mode),
             turn_running: false,
             login_active: false,
         }));
@@ -2709,6 +2719,15 @@ impl Shell {
                         drop(transcript);
                         ctx.request_focus(Rc::clone(&transcript_widget));
                         ctx.redraw = true;
+                    }
+                }
+                AjAction::CopyMessage => {
+                    // The keymap gate guarantees the transcript is focused, but
+                    // resolve the message defensively rather than assume it: a
+                    // miss is a no-op. Copy goes through the same OSC 52 path
+                    // the mouse select-to-copy uses.
+                    if let Some(text) = transcript_for_actions.borrow().focused_message_text() {
+                        ctx.copy_to_clipboard(text);
                     }
                 }
                 AjAction::CancelTurn
@@ -4808,6 +4827,7 @@ mod tests {
         let mut view = TranscriptView::new(
             Rc::clone(&world.chat),
             &Theme::bundled_dark_with_mode(aj_app::theme::ColorMode::Truecolor),
+            Rc::new(std::cell::Cell::new(false)),
         );
         let ctx = DrawContext {
             min: Size {

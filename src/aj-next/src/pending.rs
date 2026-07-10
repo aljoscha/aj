@@ -176,6 +176,7 @@ impl Widget for PendingBox {
             base: self.styles.text,
             softwrap: false,
             trailing_spacer: false,
+            border: None,
         }
         .draw(ctx)
     }

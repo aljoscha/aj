@@ -22,6 +22,7 @@ use aj_app::chat::{
     SubAgentEntry, SubAgentStatus, ToolEntry, ToolStatus, UserEntry,
 };
 use aj_app::footer::format_tokens;
+use aj_app::keybindings::{ACTION_COPY_MESSAGE, default_action_shortcut};
 use aj_app::markdown::{Emphasis, RenderOpts};
 use aj_app::theme::{ColorMode, Theme, ThemeBg, ThemeColor, ThemeRgb, rgb_to_256};
 use aj_models::types::AssistantContent;
@@ -36,7 +37,7 @@ use vaxis::vxfw::{
     ScrollBars, Size, Source, SubSurface, Surface, TextSpan, Widget, WidgetRef,
 };
 
-use crate::bubble::Bubble;
+use crate::bubble::{Bubble, BubbleBorder};
 use crate::markdown_view::{MarkdownSegment, MarkdownStyles, MarkdownView};
 use crate::subagent_box::{SubAgentBox, build_subagent_box, surface_rows};
 use crate::terminal::TERMINAL_HYPERLINKS;
@@ -77,6 +78,9 @@ pub(crate) struct TranscriptStyles {
     pub(crate) tool_error_bg: Color,
     /// The user-message bubble tint.
     pub(crate) user_message_bg: Color,
+    /// Border glyph color for the focused user message's marker in
+    /// transcript-focus mode, the theme's `borderAccent` (Spec E section 2).
+    pub(crate) border_accent: Color,
     /// Background tint for a transcript selection's highlight, the app's
     /// selection color (see Spec E section 2). Only the background is
     /// restyled over the composed frame, so the selected text stays readable.
@@ -132,6 +136,7 @@ impl TranscriptStyles {
             tool_success_bg: bg(ThemeBg::ToolSuccessBg),
             tool_error_bg: bg(ThemeBg::ToolErrorBg),
             user_message_bg: bg(ThemeBg::UserMessageBg),
+            border_accent: vaxis_color(theme.fg_color(ThemeColor::BorderAccent), mode),
             selection_bg: bg(ThemeBg::SelectedBg),
             markdown: MarkdownStyles::from_theme(theme),
             hyperlinks: TERMINAL_HYPERLINKS,
@@ -207,12 +212,11 @@ struct CachedEntry {
 /// then re-stamped onto the outer [`CachingEntry`] by `draw_widget`) does not
 /// break hit-testing.
 ///
-/// Transcript-focus mode does not change this. Turning the list's
-/// `draw_cursor` on draws a cursor gutter and lays entries out two columns
-/// narrower, which the width-keyed slots absorb as a one-frame width miss then
-/// a correct rebuild. The gutter is a `ListView`-level indicator, not an entry
-/// widget, so entries stay non-interactive and the "no interactive entries"
-/// assumption still holds.
+/// Transcript-focus mode does not change this. The focused user message's
+/// marker is a border painted into the bubble's own padding (Spec E section
+/// 2), so it is per-entry render output folded into that entry's fingerprint,
+/// not a `ListView`-level gutter. Entries stay non-interactive and the "no
+/// interactive entries" assumption still holds.
 struct EntryRenderCache {
     slots: HashMap<(AgentId, EntryId), CachedEntry>,
     /// Monotonic lookup counter stamped onto a slot's `last_used` on every
@@ -392,16 +396,32 @@ struct EntryBuilder {
     chat: Rc<RefCell<ChatState>>,
     styles: Rc<TranscriptStyles>,
     cache: Rc<RefCell<EntryRenderCache>>,
+    /// The transcript-focus flag, shared with [`TranscriptView`] and the
+    /// keymap host context. Read live so the focus border tracks the current
+    /// mode. The transcript is the single writer.
+    focus_mode: Rc<std::cell::Cell<bool>>,
+    /// The pre-styled copy-key hint (`y to copy`) the focused bubble's border
+    /// shows, resolved once through the keybinding data. Shared by `Rc` so
+    /// each `CachingEntry` clones a handle rather than the spans.
+    copy_label: Rc<Vec<TextSpan>>,
 }
 
 impl Builder for EntryBuilder {
-    fn item_at_idx(&self, idx: usize, _cursor: usize) -> Option<WidgetRef> {
+    fn item_at_idx(&self, idx: usize, cursor: usize) -> Option<WidgetRef> {
         let chat = self.chat.borrow();
         let agent = chat.active_view();
         let entry = chat.transcript(agent)?.entries().get(idx)?;
-        // Cheap, layout-free fingerprint of the live entry. The wrapper's
-        // draw compares it against the cached slot to decide hit vs miss.
-        let fingerprint = entry_fingerprint(entry, &chat);
+        // The focus border is per-cursor chrome, not entry content, so fold it
+        // into the fingerprint. Without this the cache would replay a stale
+        // bordered or unbordered surface when focus moves. Folding `focused`
+        // in re-renders exactly the entry gaining and the entry losing focus
+        // and leaves the rest cache hits.
+        let focused =
+            self.focus_mode.get() && idx == cursor && matches!(entry.kind, EntryKind::User(_));
+        let mut hasher = DefaultHasher::new();
+        fingerprint_into(entry, &chat, &mut hasher);
+        focused.hash(&mut hasher);
+        let fingerprint = hasher.finish();
         Some(Rc::new(RefCell::new(CachingEntry {
             cache: Rc::clone(&self.cache),
             chat: Rc::clone(&self.chat),
@@ -409,6 +429,8 @@ impl Builder for EntryBuilder {
             agent,
             entry_id: entry.id,
             fingerprint,
+            focused,
+            copy_label: Rc::clone(&self.copy_label),
         })))
     }
 }
@@ -427,6 +449,12 @@ struct CachingEntry {
     agent: AgentId,
     entry_id: EntryId,
     fingerprint: u64,
+    /// Whether this entry is the focused user message, so its bubble gets the
+    /// focus border on the miss-path build. Already folded into `fingerprint`.
+    focused: bool,
+    /// The copy-key hint shown on the border's bottom edge, used only when
+    /// `focused`.
+    copy_label: Rc<Vec<TextSpan>>,
 }
 
 impl Widget for CachingEntry {
@@ -455,7 +483,11 @@ impl Widget for CachingEntry {
                 // an empty surface defensively rather than panic.
                 return Surface::empty();
             };
-            let mut widget = build_entry_widget(entry, &chat, &self.styles, false).into_boxed();
+            // The focus border is threaded only when this entry is the focused
+            // user message. Every other entry builds unbordered.
+            let focus = self.focused.then(|| self.copy_label.as_slice());
+            let mut widget =
+                build_entry_widget(entry, &chat, &self.styles, false, focus).into_boxed();
             widget.draw(ctx)
         };
         self.cache
@@ -830,11 +862,16 @@ impl EntryWidget {
 /// `SubAgent` entry then renders as the dim stub line instead of
 /// recursing. Sub-agents can't spawn sub-agents (the `agent` tool is
 /// excluded from their tool list), so that arm is defensive only.
+///
+/// `focus` carries the pre-styled copy-key hint when this entry is the focused
+/// user message, marking its bubble with the focus border (Spec E section 2).
+/// It is `None` for every other entry and every non-`User` kind ignores it.
 pub(crate) fn build_entry_widget(
     entry: &Entry,
     chat: &ChatState,
     styles: &TranscriptStyles,
     nested: bool,
+    focus: Option<&[TextSpan]>,
 ) -> EntryWidget {
     match &entry.kind {
         EntryKind::Tool(tool) => EntryWidget::Bubble(build_tool_cell(
@@ -844,7 +881,7 @@ pub(crate) fn build_entry_widget(
             styles,
         )),
         EntryKind::User(user) => {
-            EntryWidget::Bubble(build_user_bubble(user, chat.tools_expanded, styles))
+            EntryWidget::Bubble(build_user_bubble(user, chat.tools_expanded, styles, focus))
         }
         EntryKind::SubAgent(s) if !nested => {
             EntryWidget::SubAgent(build_subagent_box(s, chat, styles))
@@ -877,7 +914,16 @@ pub(crate) fn build_entry_widget(
 /// first [`USER_COLLAPSED_LINES`] source lines plus an italic expand
 /// hint, and expand together with tool output under the session-wide
 /// `tools_expanded` flag. Typed prompts always render in full.
-fn build_user_bubble(user: &UserEntry, expanded: bool, styles: &TranscriptStyles) -> Bubble {
+///
+/// When `focus` is `Some`, the bubble carries the focus border in the
+/// `borderAccent` color, with the supplied copy-key hint on its bottom edge
+/// (Spec E section 2).
+fn build_user_bubble(
+    user: &UserEntry,
+    expanded: bool,
+    styles: &TranscriptStyles,
+    focus: Option<&[TextSpan]>,
+) -> Bubble {
     let span = |text: String, style: Style| TextSpan {
         text,
         style,
@@ -913,7 +959,34 @@ fn build_user_bubble(user: &UserEntry, expanded: bool, styles: &TranscriptStyles
             },
         ));
     }
-    Bubble::entry(spans, Some(styles.user_message_bg), styles.text)
+    let bubble = Bubble::entry(spans, Some(styles.user_message_bg), styles.text);
+    match focus {
+        Some(label) => bubble.with_border(BubbleBorder {
+            color: styles.border_accent,
+            label: label.to_vec(),
+        }),
+        None => bubble,
+    }
+}
+
+/// The pre-styled copy-key hint shown on the focused-message border's bottom
+/// edge, resolved through the keybinding data so the key is never a literal
+/// (Spec E section 2). The key renders in the accent color and the rest muted,
+/// the way an overlay styles the key hints in its chrome.
+fn copy_label_spans(styles: &TranscriptStyles) -> Vec<TextSpan> {
+    let key = default_action_shortcut(ACTION_COPY_MESSAGE).unwrap_or_default();
+    vec![
+        TextSpan {
+            text: key,
+            style: styles.accent,
+            ..TextSpan::default()
+        },
+        TextSpan {
+            text: " to copy".into(),
+            style: styles.dim,
+            ..TextSpan::default()
+        },
+    ]
 }
 
 /// Build the styled spans for one entry that renders through [`RichText`]
@@ -1167,9 +1240,16 @@ pub struct TranscriptView {
     /// item cursor then owns the viewport, so [`draw`](Widget::draw) neither
     /// pins the bottom nor re-engages while focus mode is active.
     follow_tail: bool,
+    /// Whether the transcript is in focus mode (Spec E section 1), shared by
+    /// `Rc` with the [`EntryBuilder`] (so the focus border tracks the mode)
+    /// and the keymap host context (so the copy chord is gated on it). This
+    /// view is the single writer: [`enter_focus_mode`](Self::enter_focus_mode)
+    /// and [`exit_focus_mode`](Self::exit_focus_mode), driven by focus in/out,
+    /// set it.
+    focused: Rc<std::cell::Cell<bool>>,
     /// Called from the Esc branch of transcript-focus mode to hand focus
     /// back to the editor. `None` until the host wires it in `Shell::new`.
-    /// The resulting `FocusOut` clears the item cursor, exiting the mode.
+    /// The resulting `FocusOut` clears the focus flag, exiting the mode.
     on_exit_focus: Option<Box<dyn FnMut(&mut EventContext)>>,
     /// The active free-form selection, if any (Spec E section 2). Set on a
     /// left-button press-drag over the content and kept highlighted after the
@@ -1251,18 +1331,28 @@ fn extract_from_lines(lines: &[Vec<Cell>], a: (usize, usize), b: (usize, usize))
 }
 
 impl TranscriptView {
-    pub fn new(chat: Rc<RefCell<ChatState>>, theme: &Theme) -> TranscriptView {
+    /// Build the view over `chat`. `focused` is the transcript-focus flag,
+    /// shared with the keymap host context so the copy chord and the focus
+    /// border read the same state (this view is its single writer).
+    pub fn new(
+        chat: Rc<RefCell<ChatState>>,
+        theme: &Theme,
+        focused: Rc<std::cell::Cell<bool>>,
+    ) -> TranscriptView {
         let styles = Rc::new(TranscriptStyles::from_theme(theme));
         let cache = Rc::new(RefCell::new(EntryRenderCache::new()));
         let builder = EntryBuilder {
             chat: Rc::clone(&chat),
             styles: Rc::clone(&styles),
             cache: Rc::clone(&cache),
+            focus_mode: Rc::clone(&focused),
+            copy_label: Rc::new(copy_label_spans(&styles)),
         };
         let mut list = ListView::new(Source::Builder(Box::new(builder)));
-        // Free-scroll mode at construction: no item cursor while the editor
-        // owns the keyboard. `FocusIn` turns the cursor on for transcript-focus
-        // mode, `FocusOut` turns it back off.
+        // `draw_cursor` stays off in every mode: the focused-message marker is
+        // the border painted into the bubble padding (Spec E section 2), not a
+        // cursor gutter. The list cursor still exists and moves under focus
+        // navigation. `draw_cursor` only controls the gutter drawing.
         list.draw_cursor = false;
         let mut bars = ScrollBars::new(list);
         bars.draw_horizontal_scrollbar = false;
@@ -1285,6 +1375,7 @@ impl TranscriptView {
             width_method: gwidth::Method::Unicode,
             last_globals,
             follow_tail: true,
+            focused,
             on_exit_focus: None,
             selection: None,
             last_view: Size {
@@ -1350,11 +1441,10 @@ impl TranscriptView {
             .unwrap_or(0)
     }
 
-    /// Whether the transcript is in focus mode. The mode lives entirely on
-    /// focus, and is exactly when the list draws its item cursor, which
-    /// `FocusIn`/`FocusOut` toggle. We keep no parallel flag.
+    /// Whether the transcript is in focus mode. The mode lives on the shared
+    /// [`focused`](Self::focused) flag, set by `FocusIn`/`FocusOut`.
     pub(crate) fn in_focus_mode(&self) -> bool {
-        self.list.borrow().draw_cursor
+        self.focused.get()
     }
 
     /// The entry indices of the active view's user messages, ascending
@@ -1437,25 +1527,46 @@ impl TranscriptView {
         }
     }
 
-    /// Enter transcript-focus mode (Spec E section 1): show the item cursor,
-    /// suspend follow-tail so the cursor is not fought by auto-scroll, and land
-    /// the cursor on the newest user message. Driven by `Event::FocusIn`, so
-    /// the mode is exactly "the transcript is the focused widget".
+    /// The text of the focused user message, for the copy chord (Spec E
+    /// section 2). `None` when not in focus mode or the cursor is not on a
+    /// user message.
+    ///
+    /// Returns the message's own content (`joined_text`), which is the whole
+    /// message the copy action promises, not the rendered cells (that would
+    /// carry the border glyphs and padding).
+    pub(crate) fn focused_message_text(&self) -> Option<String> {
+        if !self.in_focus_mode() {
+            return None;
+        }
+        let idx = usize::try_from(self.list.borrow().cursor).ok()?;
+        let chat = self.chat.borrow();
+        let entry = chat.transcript(chat.active_view())?.entries().get(idx)?;
+        match &entry.kind {
+            EntryKind::User(user) => Some(user.joined_text()),
+            _ => None,
+        }
+    }
+
+    /// Enter transcript-focus mode (Spec E section 1): set the shared focus
+    /// flag, suspend follow-tail so the cursor is not fought by auto-scroll,
+    /// and land the cursor on the newest user message. Driven by
+    /// `Event::FocusIn`, so the mode is exactly "the transcript is the focused
+    /// widget".
     fn enter_focus_mode(&mut self, ctx: &mut EventContext) {
-        // INTERIM: `draw_cursor` paints the cursor gutter, which marks the
-        // focused message so the step is observable. The highlight-colored
-        // border that replaces it is a later change (Spec E section 2).
-        self.list.borrow_mut().draw_cursor = true;
+        // The focus flag drives the per-entry border (via the shared cell the
+        // `EntryBuilder` reads) that marks the focused message. `draw_cursor`
+        // stays off (Spec E section 2).
+        self.focused.set(true);
         self.follow_tail = false;
         self.focus_last_user_message();
         ctx.redraw = true;
     }
 
-    /// Leave transcript-focus mode: hide the item cursor. Driven by
+    /// Leave transcript-focus mode: clear the shared focus flag. Driven by
     /// `Event::FocusOut`, so it also fires when an opening overlay steals focus
     /// (the overlay's `request_focus` sends this a `FocusOut`).
     fn exit_focus_mode(&self, ctx: &mut EventContext) {
-        self.list.borrow_mut().draw_cursor = false;
+        self.focused.set(false);
         ctx.redraw = true;
     }
 
@@ -1582,6 +1693,8 @@ impl TranscriptView {
             chat: Rc::clone(&self.chat),
             styles: Rc::clone(&styles),
             cache: Rc::clone(&self.cache),
+            focus_mode: Rc::clone(&self.focused),
+            copy_label: Rc::new(copy_label_spans(&styles)),
         };
         self.list.borrow_mut().children = Source::Builder(Box::new(builder));
         apply_scrollbar_thumbs(&mut self.bars, &styles);
@@ -1633,7 +1746,8 @@ impl TranscriptView {
             let Some(entry) = chat.transcript(agent).and_then(|t| t.get(id)) else {
                 return Rc::new(Vec::new());
             };
-            let mut widget = build_entry_widget(entry, &chat, &self.styles, false).into_boxed();
+            let mut widget =
+                build_entry_widget(entry, &chat, &self.styles, false, None).into_boxed();
             let surface = widget.draw(&ctx);
             let mut rows = surface_rows(&surface);
             for row in &mut rows {
@@ -1744,22 +1858,15 @@ impl TranscriptView {
         }
     }
 
-    /// The cursor gutter width: the two columns the list shifts content right
-    /// by in transcript-focus mode to draw its item cursor, zero otherwise.
-    /// The selection coordinate mapping strips this so a selection column is a
-    /// content column, independent of the focus mode.
-    fn gutter(&self) -> u16 {
-        if self.in_focus_mode() { 2 } else { 0 }
-    }
-
     /// The content width the list lays entries out at: the last viewport width
-    /// minus the reserved scrollbar column and the cursor gutter. Per-entry
-    /// layout must be queried at this width to align with the render.
+    /// minus the reserved scrollbar column. Per-entry layout must be queried
+    /// at this width to align with the render.
+    ///
+    /// There is no cursor gutter to subtract: the focus marker is a border
+    /// inside the bubble padding, so entries are laid out at the same width in
+    /// every mode (Spec E section 2).
     fn content_width(&self) -> u16 {
-        self.last_view
-            .width
-            .saturating_sub(1)
-            .saturating_sub(self.gutter())
+        self.last_view.width.saturating_sub(1)
     }
 
     /// Map a widget-local mouse position to an entry-relative [`SelPos`].
@@ -1768,12 +1875,11 @@ impl TranscriptView {
     /// We clamp `m_row` into the viewport, add the top entry's hidden-line
     /// offset to get the line from the top entry's start, then walk realized
     /// entries top to bottom (each at most a viewport of rows) until that line
-    /// lands inside one. `col` is `m_col - gutter` clamped into `[0, width]`
-    /// (the scrollbar owns the last column, the far edge is end-of-line).
+    /// lands inside one. `col` is `m_col` clamped into `[0, width]` (the
+    /// scrollbar owns the last column, the far edge is end-of-line).
     /// Returns `None` on an empty transcript, where there is nothing to select.
     fn point_to_sel(&mut self, m_row: i16, m_col: i16) -> Option<SelPos> {
         let width = self.content_width();
-        let gutter = i32::from(self.gutter());
         let (top_idx, off) = {
             let list = self.list.borrow();
             (
@@ -1788,7 +1894,7 @@ impl TranscriptView {
         let target = usize::try_from(off)
             .unwrap_or(0)
             .saturating_add(usize::try_from(local_row).unwrap_or(0));
-        let content_col = (i32::from(m_col) - gutter).clamp(0, i32::from(width));
+        let content_col = i32::from(m_col).clamp(0, i32::from(width));
         let col = usize::try_from(content_col).unwrap_or(0);
 
         // Walk entries from the top, subtracting each entry's height until the
@@ -1955,7 +2061,6 @@ impl TranscriptView {
             (sel.caret, sel.anchor)
         };
         let width = usize::from(self.content_width());
-        let gutter = usize::from(self.gutter());
         let selection_bg = self.styles.selection_bg;
 
         let grid = surface_rows(surface);
@@ -2003,19 +2108,18 @@ impl TranscriptView {
             for (c, cell) in row.iter().enumerate() {
                 let mut cell = cell.clone();
                 if to > from {
-                    // Screen col `c` maps to content col `c - gutter`. The
-                    // scrollbar column sits past `width` and so is never hit.
-                    if let Some(cc) = c.checked_sub(gutter) {
-                        if cc >= from && cc < to {
-                            cell.style.bg = selection_bg;
-                            // A highlighted cell is painted, not blank, so
-                            // clear `default`. Otherwise the diff's default
-                            // fast-path mistakes a highlighted blank cell (a
-                            // trailing space or gap inside the selection) for
-                            // an untouched one and skips repainting it, which
-                            // leaves the highlight torn as the drag redraws.
-                            cell.default = false;
-                        }
+                    // Screen col `c` is the content col directly (no gutter).
+                    // The scrollbar column sits past `width` and so is never
+                    // hit.
+                    if c >= from && c < to {
+                        cell.style.bg = selection_bg;
+                        // A highlighted cell is painted, not blank, so
+                        // clear `default`. Otherwise the diff's default
+                        // fast-path mistakes a highlighted blank cell (a
+                        // trailing space or gap inside the selection) for
+                        // an untouched one and skips repainting it, which
+                        // leaves the highlight torn as the drag redraws.
+                        cell.default = false;
                     }
                 }
                 let (Ok(col), Ok(row_u16)) = (u16::try_from(c), u16::try_from(r)) else {
@@ -2321,7 +2425,7 @@ mod tests {
     }
 
     fn bubble_rows(user: &UserEntry, expanded: bool, width: u16) -> Vec<String> {
-        let mut bubble = build_user_bubble(user, expanded, &styles());
+        let mut bubble = build_user_bubble(user, expanded, &styles(), None);
         let surface = bubble.draw(&crate::test_support::draw_ctx(width, None));
         crate::test_support::rows(&surface)
     }
@@ -2333,7 +2437,7 @@ mod tests {
             collapsible: false,
         };
         let s = styles();
-        let mut bubble = build_user_bubble(&user, false, &s);
+        let mut bubble = build_user_bubble(&user, false, &s, None);
         let surface = bubble.draw(&crate::test_support::draw_ctx(40, None));
         let r = crate::test_support::rows(&surface);
         // One padding row above and below the content, then the
@@ -2368,7 +2472,7 @@ mod tests {
         assert_eq!(r.len(), 10 + 1 + 2 + 1, "{r:?}");
         // The hint row is italic.
         let s = styles();
-        let mut bubble = build_user_bubble(&user, false, &s);
+        let mut bubble = build_user_bubble(&user, false, &s, None);
         let surface = bubble.draw(&crate::test_support::draw_ctx(80, None));
         let grid = crate::test_support::flatten(&surface);
         let hint_row = &grid[11];
@@ -2388,6 +2492,56 @@ mod tests {
         let body = r.join("\n");
         assert!(body.contains("SECRET_TAIL_MARKER"), "{r:?}");
         assert!(!body.contains("to expand"), "{r:?}");
+    }
+
+    /// The focus border paints into the bubble's existing padding, so a
+    /// focused bubble has the exact same surface size as an unfocused one.
+    /// Gaining or losing focus therefore never reflows the transcript (Spec E
+    /// section 2).
+    #[test]
+    fn focus_border_reuses_the_padding_and_keeps_the_bubble_size() {
+        let user = UserEntry {
+            content: vec![UserContent::text("ciao?")],
+            collapsible: false,
+        };
+        let s = styles();
+        let label = copy_label_spans(&s);
+        let ctx = crate::test_support::draw_ctx(40, None);
+        let plain = build_user_bubble(&user, false, &s, None).draw(&ctx);
+        let bordered = build_user_bubble(&user, false, &s, Some(&label)).draw(&ctx);
+        assert_eq!(
+            plain.size, bordered.size,
+            "the border reuses reserved padding, so no reflow"
+        );
+
+        // The bordered bubble draws the heavy corners and the copy hint. The
+        // plain one has none of it.
+        let grid = crate::test_support::flatten(&bordered);
+        let last_col = usize::from(bordered.size.width) - 1;
+        let last_row = usize::from(bordered.size.height) - 2; // above the spacer row
+        assert_eq!(grid[0][0].char.grapheme(), "\u{250f}", "top-left corner");
+        assert_eq!(grid[0][last_col].char.grapheme(), "\u{2513}", "top-right");
+        assert_eq!(grid[last_row][0].char.grapheme(), "\u{2517}", "bottom-left");
+        assert_eq!(
+            grid[last_row][last_col].char.grapheme(),
+            "\u{251b}",
+            "bottom-right"
+        );
+        let key = default_action_shortcut(ACTION_COPY_MESSAGE).expect("copy chord bound");
+        assert!(
+            crate::test_support::rows(&bordered)[last_row].contains(&format!("{key} to copy")),
+            "copy hint on the bottom edge: {:?}",
+            crate::test_support::rows(&bordered),
+        );
+
+        let plain_grid = crate::test_support::flatten(&plain);
+        assert!(
+            plain_grid
+                .iter()
+                .flatten()
+                .all(|c| c.char.grapheme() != "\u{250f}"),
+            "the unfocused bubble draws no border",
+        );
     }
 
     #[test]
@@ -2649,7 +2803,11 @@ mod tests {
 
     fn transcript_view(chat: &Rc<RefCell<ChatState>>) -> TranscriptView {
         let theme = Theme::bundled_dark_with_mode(aj_app::theme::ColorMode::Truecolor);
-        TranscriptView::new(Rc::clone(chat), &theme)
+        TranscriptView::new(
+            Rc::clone(chat),
+            &theme,
+            Rc::new(std::cell::Cell::new(false)),
+        )
     }
 
     /// A chat whose Main transcript alternates user and assistant messages:
@@ -2985,21 +3143,31 @@ mod tests {
         })
     }
 
-    /// FocusIn shows the item cursor and disengages follow-tail (so cursor
-    /// navigation is not fought by auto-scroll); FocusOut hides it again.
+    /// FocusIn enters focus mode and disengages follow-tail (so cursor
+    /// navigation is not fought by auto-scroll). FocusOut leaves it again.
+    /// The mode lives on the shared flag (`in_focus_mode`), not `draw_cursor`,
+    /// which stays off in every mode (the border is the marker).
     #[test]
-    fn focus_in_shows_cursor_and_disengages_follow_tail() {
+    fn focus_in_enters_focus_mode_and_disengages_follow_tail() {
         // User messages at indices 0, 2, 4, 6, 8; assistant replies between.
         let chat = chat_with_user_messages(5);
         let mut view = transcript_view(&chat);
         let ctx = draw_ctx(40, 10);
         let _ = view.draw(&ctx);
         assert!(view.follow_tail, "opens following the tail");
-        assert!(!view.list.borrow().draw_cursor, "no cursor while unfocused");
+        assert!(!view.in_focus_mode(), "not focused at construction");
+        assert!(
+            !view.list.borrow().draw_cursor,
+            "the cursor gutter stays off"
+        );
 
         let mut ec = EventContext::new();
         view.handle_event(&mut ec, &Event::FocusIn);
-        assert!(view.list.borrow().draw_cursor, "FocusIn shows the cursor");
+        assert!(view.in_focus_mode(), "FocusIn enters focus mode");
+        assert!(
+            !view.list.borrow().draw_cursor,
+            "focus mode does not turn the gutter on"
+        );
         assert!(!view.follow_tail, "FocusIn disengages follow-tail");
         // The cursor lands on the last user message (index 8, not the trailing
         // assistant reply), and a draw keeps follow-tail off even though the
@@ -3014,7 +3182,7 @@ mod tests {
 
         let mut ec = EventContext::new();
         view.handle_event(&mut ec, &Event::FocusOut);
-        assert!(!view.list.borrow().draw_cursor, "FocusOut hides the cursor");
+        assert!(!view.in_focus_mode(), "FocusOut leaves focus mode");
     }
 
     /// While focused, the step keys (arrows, j/k, Ctrl+P/N, Shift+Tab) move
@@ -3158,10 +3326,10 @@ mod tests {
         assert!(!view.has_user_message(), "no user message to step to");
 
         // FocusIn lands the cursor on item 0 (there is nothing else to land
-        // on) and a draw of the empty, cursor-on list does not panic.
+        // on) and a draw of the empty, focused list does not panic.
         let mut ec = EventContext::new();
         view.handle_event(&mut ec, &Event::FocusIn);
-        assert!(view.list.borrow().draw_cursor, "FocusIn shows the cursor");
+        assert!(view.in_focus_mode(), "FocusIn enters focus mode");
         assert_eq!(
             view.list.borrow().cursor,
             0,
@@ -3240,6 +3408,110 @@ mod tests {
         assert_eq!(view.list.borrow().cursor, 0, "nothing newer to step to");
     }
 
+    /// The number of top-left corner glyphs in a drawn view: one per bordered
+    /// (focused) bubble.
+    fn border_count(view: &mut TranscriptView, ctx: &DrawContext) -> usize {
+        crate::test_support::rows(&view.draw(ctx))
+            .join("\n")
+            .matches('\u{250f}')
+            .count()
+    }
+
+    /// Focusing marks the newest user message with the border (and no other
+    /// entry), stepping moves the border message-to-message, and leaving focus
+    /// drops it. The transcript's row count never changes across any of it, so
+    /// the marker never reflows the transcript (Spec E section 2).
+    #[test]
+    fn focus_border_marks_one_message_and_never_reflows() {
+        // Users at 0, 2, 4, with assistant replies between. Tall viewport so
+        // the whole transcript fits and the row comparison is exact.
+        let chat = chat_with_user_messages(3);
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(48, 40);
+
+        let unfocused_rows = crate::test_support::rows(&view.draw(&ctx));
+        assert_eq!(
+            border_count(&mut view, &ctx),
+            0,
+            "no border while the editor is focused"
+        );
+
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &Event::FocusIn);
+        let focused_rows = crate::test_support::rows(&view.draw(&ctx));
+        assert_eq!(
+            border_count(&mut view, &ctx),
+            1,
+            "exactly the focused message is bordered"
+        );
+        assert_eq!(
+            focused_rows.len(),
+            unfocused_rows.len(),
+            "focusing does not change the transcript height",
+        );
+        // The focused entry is the newest user message. Its text still reads
+        // "user 2" (the border sits in the padding, not over the content).
+        assert!(
+            focused_rows.iter().any(|r| r.contains("user 2")),
+            "focused message content intact: {focused_rows:?}",
+        );
+
+        // Step older (Tab / Up): the border moves to the previous user message,
+        // still exactly one, still the same total height.
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &key_press(Key::UP, Modifiers::empty()));
+        let stepped_rows = crate::test_support::rows(&view.draw(&ctx));
+        assert_eq!(
+            border_count(&mut view, &ctx),
+            1,
+            "still exactly one bordered message after stepping"
+        );
+        assert_eq!(
+            stepped_rows.len(),
+            unfocused_rows.len(),
+            "stepping does not reflow the transcript",
+        );
+
+        // Leaving focus drops the border.
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &Event::FocusOut);
+        assert_eq!(
+            border_count(&mut view, &ctx),
+            0,
+            "no border after leaving focus mode"
+        );
+    }
+
+    /// `focused_message_text` returns the focused user message's own content
+    /// while focused, and `None` otherwise.
+    #[test]
+    fn focused_message_text_reads_the_focused_user_message() {
+        let chat = chat_with_user_messages(3);
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(48, 40);
+        let _ = view.draw(&ctx);
+
+        assert_eq!(
+            view.focused_message_text(),
+            None,
+            "no focused message while the editor is focused"
+        );
+
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &Event::FocusIn);
+        let _ = view.draw(&ctx);
+        assert_eq!(
+            view.focused_message_text().as_deref(),
+            Some("user 2"),
+            "the newest user message's content"
+        );
+
+        // Step to the previous user message and re-read.
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &key_press(Key::UP, Modifiers::empty()));
+        assert_eq!(view.focused_message_text().as_deref(), Some("user 1"),);
+    }
+
     // ---- Render cache: helpers -------------------------------------------
 
     fn cache_settings() -> aj_agent::events::AgentSettings {
@@ -3268,10 +3540,14 @@ mod tests {
     /// instance the uncached reference reuses, so cached and uncached renders
     /// are byte-comparable.
     fn caching_builder(chat: &Rc<RefCell<ChatState>>) -> EntryBuilder {
+        let styles = Rc::new(styles());
+        let copy_label = Rc::new(copy_label_spans(&styles));
         EntryBuilder {
             chat: Rc::clone(chat),
-            styles: Rc::new(styles()),
+            styles,
             cache: Rc::new(RefCell::new(EntryRenderCache::new())),
+            focus_mode: Rc::new(std::cell::Cell::new(false)),
+            copy_label,
         }
     }
 
@@ -3285,12 +3561,27 @@ mod tests {
             .draw(&crate::test_support::draw_ctx(width, None))
     }
 
+    /// Like [`draw_cached`] but with an explicit `cursor`, so a test can move
+    /// focus (`item_at_idx` folds `idx == cursor` into the fingerprint).
+    fn draw_cached_cursor(
+        builder: &EntryBuilder,
+        idx: usize,
+        cursor: usize,
+        width: u16,
+    ) -> Surface {
+        let widget = builder.item_at_idx(idx, cursor).expect("entry present");
+        widget
+            .borrow_mut()
+            .draw(&crate::test_support::draw_ctx(width, None))
+    }
+
     /// Draw entry `idx` of `agent` with a fresh, uncached widget: the
     /// reference a cached render must match byte-for-byte.
     fn draw_uncached(builder: &EntryBuilder, agent: AgentId, idx: usize, width: u16) -> Surface {
         let chat = builder.chat.borrow();
         let entry = &chat.transcript(agent).expect("transcript").entries()[idx];
-        let mut widget = build_entry_widget(entry, &chat, &builder.styles, false).into_boxed();
+        let mut widget =
+            build_entry_widget(entry, &chat, &builder.styles, false, None).into_boxed();
         widget.draw(&crate::test_support::draw_ctx(width, None))
     }
 
@@ -3671,6 +3962,34 @@ mod tests {
         draw_cached(&builder, 0, 60);
         assert_eq!(misses(&builder), 1, "second draw hit");
         assert_eq!(hits(&builder), 1);
+    }
+
+    /// Moving focus re-renders exactly the entry gaining and the entry losing
+    /// the border, and leaves the rest cache hits, because `focused` is folded
+    /// into the fingerprint (Spec E section 2).
+    #[test]
+    fn moving_focus_rerenders_only_the_two_affected_user_entries() {
+        // Users at 0 and 2, assistant replies at 1 and 3.
+        let chat = chat_with_user_messages(2);
+        let builder = caching_builder(&chat);
+        builder.focus_mode.set(true);
+        let width = 60;
+
+        // First pass with the cursor on the last user message (index 2): every
+        // entry is a fresh build.
+        for idx in 0..4 {
+            draw_cached_cursor(&builder, idx, 2, width);
+        }
+        assert_eq!(misses(&builder), 4, "first pass builds every entry");
+        assert_eq!(hits(&builder), 0);
+
+        // Move focus to the first user message (index 0): only the two user
+        // entries change border state. The assistant entries are unaffected.
+        for idx in 0..4 {
+            draw_cached_cursor(&builder, idx, 0, width);
+        }
+        assert_eq!(misses(&builder), 6, "only the two user entries rebuilt");
+        assert_eq!(hits(&builder), 2, "the two assistant entries hit");
     }
 
     /// The fingerprint tracks a compaction entry's summary length and both

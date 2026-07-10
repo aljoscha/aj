@@ -7,7 +7,7 @@
 //! over the flattened span content and the tint. The builders in
 //! `tool_cell` and `transcript` decide what goes inside.
 
-use vaxis::cell::{Cell, Color, Style};
+use vaxis::cell::{Cell, Character, Color, Style};
 use vaxis::vxfw::{
     DrawContext, MaxSize, RelativePoint, RichText, Size, SubSurface, Surface, TextSpan, Widget,
     WidthBasis,
@@ -26,6 +26,19 @@ pub(crate) const PADDING_Y: u16 = 1;
 /// pipeline (two cells of horizontal padding plus at least one cell
 /// of content) doesn't paint a degenerate row.
 pub(crate) const MIN_BUBBLE_WIDTH: u16 = 3;
+
+/// A heavy box-drawing border painted into a bubble's existing padding
+/// frame (Spec E section 2). It marks the focused user message in
+/// transcript-focus mode without reflowing the transcript: the glyphs
+/// overwrite the one-cell tinted frame the bubble already reserves rather
+/// than wrapping the bubble in a widget that would add a frame of its own.
+pub(crate) struct BubbleBorder {
+    /// Border glyph color, the theme's `borderAccent`.
+    pub(crate) color: Color,
+    /// Copy-key hint shown on the bottom edge (`┗━ y to copy ━┛`),
+    /// pre-styled by the caller so the key and the rest can differ.
+    pub(crate) label: Vec<TextSpan>,
+}
 
 /// A full-width tinted bubble entry in the transcript. Built fresh
 /// per draw by the transcript's entry builders.
@@ -48,6 +61,9 @@ pub(crate) struct Bubble {
     /// the pending-message box sits flush above the editor and skips
     /// it.
     pub(crate) trailing_spacer: bool,
+    /// The focus border, painted into the padding frame when the real
+    /// (tinted) bubble path runs. `None` on every non-focused bubble.
+    pub(crate) border: Option<BubbleBorder>,
 }
 
 impl Bubble {
@@ -60,7 +76,15 @@ impl Bubble {
             base,
             softwrap: true,
             trailing_spacer: true,
+            border: None,
         }
+    }
+
+    /// Attach the focus border painted into the padding frame. Only the real
+    /// (tinted) bubble path honors it. The plain fallback ignores it.
+    pub(crate) fn with_border(mut self, border: BubbleBorder) -> Bubble {
+        self.border = Some(border);
+        self
     }
 
     /// Plain fallback: wrapped text with no bubble or background,
@@ -144,6 +168,12 @@ impl Widget for Bubble {
                 surface.write_cell(col, row, bg_cell.clone());
             }
         }
+        // Overwrite the reserved padding cells with the focus border, keeping
+        // the bubble tint underneath. The content sub-surface below is inset
+        // by the padding, so it never covers these frame cells.
+        if let Some(border) = &self.border {
+            self.paint_border(&mut surface, ctx, border, width, bubble_height, bg);
+        }
         surface.children.push(SubSurface {
             origin: RelativePoint {
                 col: i32::from(PADDING_X),
@@ -153,5 +183,114 @@ impl Widget for Bubble {
             z_index: 0,
         });
         surface
+    }
+}
+
+impl Bubble {
+    /// Repaint the reserved padding frame as a heavy box-drawing border in
+    /// `border.color` over the bubble tint, the copy label on the bottom edge.
+    ///
+    /// The frame is the one-cell padding the bubble already reserves, so the
+    /// border adds no rows or columns and focusing a message cannot reflow the
+    /// transcript. `bubble_height` excludes the untinted `trailing_spacer`
+    /// row below it, so that row stays outside the border.
+    fn paint_border(
+        &self,
+        surface: &mut Surface,
+        ctx: &DrawContext,
+        border: &BubbleBorder,
+        width: u16,
+        bubble_height: u16,
+        bg: Color,
+    ) {
+        let glyph = |g: &str| Cell {
+            char: Character::new(g, 1),
+            style: Style {
+                fg: border.color,
+                bg,
+                ..Style::default()
+            },
+            ..Cell::default()
+        };
+        // width >= MIN_BUBBLE_WIDTH (3) and bubble_height >= 2*PADDING_Y (2),
+        // so both `last` indices are in range and the corners never collide.
+        let last_col = width - 1;
+        let last_row = bubble_height - 1;
+        surface.write_cell(0, 0, glyph("\u{250f}"));
+        surface.write_cell(last_col, 0, glyph("\u{2513}"));
+        for col in 1..last_col {
+            surface.write_cell(col, 0, glyph("\u{2501}"));
+        }
+        for row in 1..last_row {
+            surface.write_cell(0, row, glyph("\u{2503}"));
+            surface.write_cell(last_col, row, glyph("\u{2503}"));
+        }
+        surface.write_cell(0, last_row, glyph("\u{2517}"));
+        surface.write_cell(last_col, last_row, glyph("\u{251b}"));
+        self.paint_bottom_edge(surface, ctx, border, last_col, last_row, bg);
+    }
+
+    /// Paint the bottom edge between the corners: one `━`, a space, the label,
+    /// a space, then `━` fill, matching the mock `┗━ y to copy ━…┛`.
+    ///
+    /// When the bubble is too narrow for the label plus its chrome cells we
+    /// fill the whole edge with `━`, degrading to a plain heavy frame rather
+    /// than clipping the hint.
+    fn paint_bottom_edge(
+        &self,
+        surface: &mut Surface,
+        ctx: &DrawContext,
+        border: &BubbleBorder,
+        last_col: u16,
+        last_row: u16,
+        bg: Color,
+    ) {
+        let border_cell = |g: &str| Cell {
+            char: Character::new(g, 1),
+            style: Style {
+                fg: border.color,
+                bg,
+                ..Style::default()
+            },
+            ..Cell::default()
+        };
+        let interior = usize::from(last_col.saturating_sub(1));
+        let label_width: usize = border.label.iter().map(|s| ctx.string_width(&s.text)).sum();
+        // Lead `━`, a space, the label, a space: `label_width + 3` cells, with
+        // the rest of the interior filled with `━`.
+        let fits = label_width > 0 && label_width + 3 <= interior;
+        let mut col = 1u16;
+        if fits {
+            surface.write_cell(col, last_row, border_cell("\u{2501}"));
+            col += 1;
+            surface.write_cell(col, last_row, border_cell(" "));
+            col += 1;
+            for span in &border.label {
+                for item in ctx.grapheme_iterator(&span.text) {
+                    if col >= last_col {
+                        break;
+                    }
+                    let grapheme = item.bytes(&span.text);
+                    let w = u8::try_from(ctx.string_width(grapheme)).unwrap_or(1).max(1);
+                    let style = Style { bg, ..span.style };
+                    surface.write_cell(
+                        col,
+                        last_row,
+                        Cell {
+                            char: Character::new(grapheme, w),
+                            style,
+                            ..Cell::default()
+                        },
+                    );
+                    col = col.saturating_add(u16::from(w));
+                }
+            }
+            surface.write_cell(col, last_row, border_cell(" "));
+            col += 1;
+        }
+        while col < last_col {
+            surface.write_cell(col, last_row, border_cell("\u{2501}"));
+            col += 1;
+        }
     }
 }

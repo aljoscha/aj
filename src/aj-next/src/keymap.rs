@@ -32,6 +32,12 @@ pub(crate) struct HostCtx {
     /// mirror. The transcript-focus chord gates on the autocomplete popup being
     /// closed (see [`focus_enabled`]).
     pub(crate) editor: Rc<RefCell<TextArea>>,
+    /// Whether the transcript is in focus mode, the same cell the
+    /// [`crate::transcript::TranscriptView`] writes (its `FocusIn`/`FocusOut`
+    /// are the single writer). Read live so the copy chord is gated on the
+    /// current mode: `y` is captured only while the transcript is focused, so
+    /// with the editor focused it types normally (see [`in_transcript_focus`]).
+    pub(crate) focus_mode: Rc<std::cell::Cell<bool>>,
     /// Whether the viewed agent is busy (a binary-driven turn or a
     /// running initial sub-agent spawn), i.e. whether Ctrl+C has
     /// something to cancel.
@@ -60,6 +66,16 @@ fn no_overlay(cx: &HostCtx) -> bool {
 /// to the editor, so the editor is not already borrowed.
 fn focus_enabled(cx: &HostCtx) -> bool {
     no_overlay(cx) && !cx.editor.borrow().is_showing_autocomplete()
+}
+
+/// The copy chord is live only while the transcript is focused. Gating it here
+/// (not by phase) is what keeps `y` an ordinary character in the editor: with
+/// the editor focused the flag is false, so the capture-phase binding declines
+/// and the key descends to the editor. When an overlay opens it steals focus
+/// from the transcript, whose `FocusOut` clears the flag, so this is already
+/// false under overlays.
+fn in_transcript_focus(cx: &HostCtx) -> bool {
+    cx.focus_mode.get()
 }
 
 fn can_cancel(cx: &HostCtx) -> bool {
@@ -174,6 +190,9 @@ pub(crate) fn build_keymap() -> Keymap<AjAction, HostCtx> {
             // so Tab focuses the transcript with the popup down and stays the
             // editor's accept key with it up (see `focus_enabled`).
             AjAction::TranscriptFocus => focus_enabled,
+            // The copy chord is live only while the transcript is focused (see
+            // `in_transcript_focus`), so `y` types normally in the editor.
+            AjAction::CopyMessage => in_transcript_focus,
             _ => |_| true,
         };
         entries.push(
@@ -194,6 +213,7 @@ mod tests {
         HostCtx {
             overlays: Rc::new(RefCell::new(OverlayStack::default())),
             editor: TextArea::new(),
+            focus_mode: Rc::new(std::cell::Cell::new(false)),
             turn_running,
             login_active: false,
         }
@@ -440,6 +460,30 @@ mod tests {
             keymap.match_single(&tab, BindingPhase::Capture, &modal),
             None,
             "transcript-focus is inert while an overlay is open",
+        );
+    }
+
+    /// The copy chord (`y`) matches in the capture phase only while the
+    /// transcript-focus flag is set. With it clear (the editor focused) it
+    /// declines, so `y` descends to the editor and types normally.
+    #[test]
+    fn copy_message_matches_on_y_only_in_transcript_focus() {
+        let keymap = build_keymap();
+        let y = key(u32::from('y'), Modifiers::empty());
+
+        let editor_focused = ctx(false);
+        assert_eq!(
+            keymap.match_single(&y, BindingPhase::Capture, &editor_focused),
+            None,
+            "not in focus mode: y is not captured and types in the editor",
+        );
+
+        let transcript_focused = ctx(false);
+        transcript_focused.focus_mode.set(true);
+        assert_eq!(
+            keymap.match_single(&y, BindingPhase::Capture, &transcript_focused),
+            Some(&AjAction::CopyMessage),
+            "focus mode: y copies the focused message",
         );
     }
 
