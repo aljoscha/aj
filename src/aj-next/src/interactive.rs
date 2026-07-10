@@ -40,7 +40,7 @@ use aj_conf::{
 };
 use aj_models::auth::{AuthError, AuthStorage};
 use aj_models::registry::ModelInfo;
-use aj_models::types::Speed;
+use aj_models::types::{Speed, UserContent};
 use aj_models::usage::default_reset_sources;
 use aj_models::{
     ThinkingConfig, speed_from_name, speed_name, thinking_config_from_name, verbosity_name,
@@ -292,17 +292,6 @@ async fn build_world(
     }
     for notice in std::mem::take(&mut core.restore_notices) {
         let _ = reduce(&mut chat, &mut core.lifecycle, notice_event(&notice));
-    }
-    // Launch positionals (`aj-next <msg>` / `continue <id> <msg>`) are
-    // not auto-submitted yet. Say so instead of silently dropping them.
-    let has_launch_input = !args.prompt.is_empty()
-        || matches!(&args.command, Some(Command::Continue { prompt, .. }) if !prompt.is_empty());
-    if has_launch_input {
-        let _ = reduce(
-            &mut chat,
-            &mut core.lifecycle,
-            notice_event("Launch prompt input is not wired up yet. Type it below."),
-        );
     }
 
     Ok(World {
@@ -796,6 +785,29 @@ fn handle_submit(world: &mut World, text: String) {
     if !spawned {
         fold_notice(world, "This agent can't be prompted.");
     }
+}
+
+/// Auto-submit the launch prompt (`aj-next <msg>` / `@file ...`) as the
+/// initial session's first Main turn. Empty content spawns nothing.
+///
+/// Kept as a standalone step called from `run` outside the outer session
+/// loop, so only the initial session submits and an in-process session
+/// switch never resubmits. The launch turn is not recorded into the
+/// editor's prompt history, matching `aj`.
+fn auto_submit_launch(world: &mut World, content: Vec<UserContent>) {
+    if content.is_empty() {
+        return;
+    }
+    let policy = turn_policy(AgentId::Main, &world.config);
+    spawn_turn(
+        &world.core,
+        &world.run_config,
+        AgentId::Main,
+        TurnStart::Content(content),
+        policy,
+        &mut world.turns,
+        &mut world.turn_cancels,
+    );
 }
 
 /// Handle one completed turn from the join set. Returns `Err` only for
@@ -3207,6 +3219,15 @@ fn sync_keymap_ctx(world: &World, shell: &Rc<RefCell<Shell>>) {
 /// run on a top-level `block_on` (the `#[tokio::main]` future), not a
 /// spawned task.
 pub async fn run(args: Args) -> Result<()> {
+    // Resolve the launch positionals (`aj-next <msg>` / `continue <id>
+    // <msg>`, plus `@file` attachments) into the content to auto-submit.
+    // We resolve here, before any terminal setup, so a missing `@file`
+    // aborts via `?` while the terminal is still in its normal state
+    // rather than leaving the user stranded on the alt screen.
+    let launch_content =
+        aj_app::cli::initial_input(&args, &std::env::current_dir().unwrap_or_default())?
+            .into_content();
+
     // Configuration mirrors `aj`: user config overlaid with the
     // per-project layer, CLI > env > config precedence downstream. The
     // layers are kept editable behind [`ConfigLayers`] so the settings
@@ -3226,6 +3247,11 @@ pub async fn run(args: Args) -> Result<()> {
     let persistence = ConversationPersistence::new(sessions_dir);
 
     let mut world = build_world(&args, layers, &diagnostics, &auth, &persistence).await?;
+
+    // Auto-submit the launch prompt as the initial session's first turn.
+    // This sits before the outer session loop below, so an in-process
+    // session switch rebuilds the world but never resubmits, matching `aj`.
+    auto_submit_launch(&mut world, launch_content);
 
     // Resolve the configured theme (default `light`, matching `aj`) and
     // load it at the env-detected color mode. `AsyncApp::init` runs the
@@ -4960,6 +4986,35 @@ mod tests {
 
     fn lifecycle_running(world: &World) -> bool {
         world.core.is_running(AgentId::Main)
+    }
+
+    /// A non-empty launch prompt spawns a Main turn, so the initial
+    /// session drives it without the user typing anything. The auto-submit
+    /// registers a cancel token for `Main`, mirroring `handle_submit`.
+    #[tokio::test]
+    async fn launch_prompt_spawns_a_main_turn() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut world = scripted_world(&dir, "streaming-text").await;
+
+        auto_submit_launch(&mut world, vec![UserContent::text("launch me")]);
+        assert!(world.turn_cancels.contains_key(&AgentId::Main));
+
+        // Settle the turn so world teardown is clean.
+        cancel_viewed_turn(&world);
+        let joined = join_next_or_pending(&mut world.turns).await;
+        handle_turn_join(&mut world, joined).expect("abort is non-fatal");
+    }
+
+    /// An empty launch prompt (no positionals, no `@file`) spawns nothing,
+    /// so a bare `aj-next` starts on the idle splash.
+    #[tokio::test]
+    async fn empty_launch_prompt_spawns_nothing() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut world = scripted_world(&dir, "streaming-text").await;
+
+        auto_submit_launch(&mut world, Vec::new());
+        assert!(world.turn_cancels.is_empty());
+        assert!(world.turns.is_empty());
     }
 
     /// `drain_events` reports the wake targets `aj` triggers on
