@@ -7,42 +7,63 @@
 
 use aj_conf::{AgentEnv, SystemPromptSource, display_path};
 
-/// Build the chat-scrollback "Context:" notice listing the base system
-/// prompt (builtin or override file), every agents.md-style instruction
-/// file, and every discovered skill, one row each formatted as
-/// `  - <tildified path> (<label>)`. Skill rows carry the skill name
-/// and a marker when the skill is excluded from the model's listing,
-/// either `disabled` (the user's `disabled_skills` config) or
-/// `model-invocation disabled` (the skill's own frontmatter).
+/// One row of the `Context:` listing, split so a frontend can strike a
+/// disabled skill's content without striking its bullet.
 ///
-/// The assembly is frontend-agnostic. The one visual choice, setting a
-/// disabled skill's row apart, is injected as `strike`: each frontend
-/// supplies its own rendering (ANSI strikethrough for aj-tui, identity
-/// for a plain-text frontend that styles by level instead).
-pub fn build_context_notice(env: &AgentEnv, strike: fn(&str) -> String) -> String {
-    let mut lines = String::from("Context:");
+/// We keep the row structured rather than pre-formatted because the aj-next
+/// splash renders a disabled skill row with strikethrough on the content only,
+/// matching aj, which never strikes the `  - ` bullet. A flat string could not
+/// express that distinction, so the split lives here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextLine {
+    /// Leading bullet or indent, never struck. `  - ` for a listed row, empty
+    /// for the `Context:` header.
+    pub bullet: String,
+    /// The row content, rendered struck when `struck` is set.
+    pub text: String,
+    /// True only for a disabled skill row (`!skill.enabled`), the only rows aj
+    /// renders struck.
+    pub struck: bool,
+}
+
+/// The structured `Context:` listing: the header, the base system prompt
+/// (builtin or override file), every agents.md-style instruction file, and
+/// every discovered skill, one [`ContextLine`] each.
+///
+/// Rows carry a tildified path and a label; skill rows also carry a marker
+/// when the skill is excluded from the model's listing, either `disabled`
+/// (the user's `disabled_skills` config) or `model-invocation disabled` (the
+/// skill's own frontmatter). A disabled skill row is marked `struck`, the one
+/// visual distinction. Same content and order as [`build_context_notice`],
+/// which joins this.
+pub fn context_lines(env: &AgentEnv) -> Vec<ContextLine> {
+    let bullet = "  - ".to_string();
+    let mut lines = vec![ContextLine {
+        bullet: String::new(),
+        text: "Context:".to_string(),
+        struck: false,
+    }];
     let source = &env.system_prompt.source;
-    match source {
-        SystemPromptSource::Builtin => {
-            lines.push_str(&format!(
-                "\n  - builtin ({}; override with ~/.agents/SYSTEM_PROMPT.md)",
-                source.label()
-            ));
-        }
+    let prompt = match source {
+        SystemPromptSource::Builtin => format!(
+            "builtin ({}; override with ~/.agents/SYSTEM_PROMPT.md)",
+            source.label()
+        ),
         SystemPromptSource::Override(path) => {
-            lines.push_str(&format!(
-                "\n  - {} ({})",
-                display_path(path),
-                source.label()
-            ));
+            format!("{} ({})", display_path(path), source.label())
         }
-    }
+    };
+    lines.push(ContextLine {
+        bullet: bullet.clone(),
+        text: prompt,
+        struck: false,
+    });
     for file in &env.context_files {
-        lines.push_str(&format!(
-            "\n  - {} ({})",
-            display_path(&file.path),
-            file.kind.label()
-        ));
+        lines.push(ContextLine {
+            bullet: bullet.clone(),
+            text: format!("{} ({})", display_path(&file.path), file.kind.label()),
+            struck: false,
+        });
     }
     for skill in &env.skills {
         let marker = if !skill.enabled {
@@ -52,15 +73,40 @@ pub fn build_context_notice(env: &AgentEnv, strike: fn(&str) -> String) -> Strin
         } else {
             ""
         };
-        let row = format!(
-            "{} (skill: {}{marker})",
-            display_path(&skill.path),
-            skill.name,
-        );
-        let row = if skill.enabled { row } else { strike(&row) };
-        lines.push_str(&format!("\n  - {row}"));
+        lines.push(ContextLine {
+            bullet: bullet.clone(),
+            text: format!(
+                "{} (skill: {}{marker})",
+                display_path(&skill.path),
+                skill.name
+            ),
+            struck: !skill.enabled,
+        });
     }
     lines
+}
+
+/// Build the chat-scrollback "Context:" notice by joining [`context_lines`]
+/// into one flat string, one row per line as `  - <tildified path> (<label>)`.
+///
+/// The assembly is frontend-agnostic. The one visual choice, setting a
+/// disabled skill's row apart, is injected as `strike`: each frontend
+/// supplies its own rendering (ANSI strikethrough for aj-tui, identity
+/// for a plain-text frontend that styles by level instead). `strike` applies
+/// to the row content only, never the bullet, matching the structured split.
+pub fn build_context_notice(env: &AgentEnv, strike: fn(&str) -> String) -> String {
+    context_lines(env)
+        .into_iter()
+        .map(|line| {
+            let content = if line.struck {
+                strike(&line.text)
+            } else {
+                line.text
+            };
+            format!("{}{content}", line.bullet)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The exact sandbox-warning string the binary emits at startup
@@ -88,7 +134,7 @@ mod tests {
         AgentEnv, ContextFile, ContextFileKind, SystemPrompt, SystemPromptSource, skills::Skill,
     };
 
-    use super::{SANDBOX_WARNING, build_context_notice, sandbox_warning_enabled};
+    use super::{SANDBOX_WARNING, build_context_notice, context_lines, sandbox_warning_enabled};
 
     /// Sentinel `strike` hook: wraps the row in a visible marker so a
     /// test can assert exactly which rows the hook fires on.
@@ -200,6 +246,40 @@ mod tests {
         );
         assert_eq!(notice, expected);
         assert_eq!(notice.matches("<s>").count(), 1);
+    }
+
+    #[test]
+    fn context_lines_mark_only_disabled_skill_rows_struck() {
+        let skill = |name: &str, enabled: bool, dmi: bool| Skill {
+            name: name.to_string(),
+            description: format!("{name} description"),
+            path: PathBuf::from(format!("/var/skills/{name}/SKILL.md")),
+            enabled,
+            disable_model_invocation: dmi,
+        };
+        let mut env = env_with(Vec::new());
+        env.skills = vec![
+            skill("alpha", true, false),
+            skill("beta", false, false),
+            skill("gamma", true, true),
+        ];
+
+        let lines = context_lines(&env);
+        // Only the disabled skill row is struck; the enabled and the
+        // model-invocation-disabled rows are not.
+        let struck: Vec<&str> = lines
+            .iter()
+            .filter(|l| l.struck)
+            .map(|l| l.text.as_str())
+            .collect();
+        assert_eq!(
+            struck,
+            vec!["/var/skills/beta/SKILL.md (skill: beta, disabled)"]
+        );
+        // The header carries no bullet; every listed row carries `  - `.
+        assert_eq!(lines[0].bullet, "");
+        assert_eq!(lines[0].text, "Context:");
+        assert!(lines[1..].iter().all(|l| l.bullet == "  - "));
     }
 
     #[test]

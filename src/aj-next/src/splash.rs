@@ -1,5 +1,5 @@
 //! The empty-state splash: an animated `aj` wordmark, a command-palette hint,
-//! and a bordered box of the startup notices (Spec E-9).
+//! and two bordered boxes below it, a Context box and a Notices box (Spec E-9).
 //!
 //! Shown in the chat slot before the conversation has any user or assistant
 //! entry. The animation is tick-driven off the frame clock the async driver
@@ -15,6 +15,7 @@ use std::time::Instant;
 
 use aj_app::chat::{ChatState, EntryKind, NoticeLevel};
 use aj_app::keybindings::{ACTION_PALETTE_OPEN, default_action_shortcut};
+use aj_app::notices::ContextLine;
 use aj_app::theme::{ColorMode, ThemeRgb};
 use vaxis::cell::{Cell, Character, Color, Style};
 use vaxis::vxfw::{
@@ -98,6 +99,24 @@ const GAP_SWING: u16 = 2;
 /// Period of the spacing oscillation, in seconds.
 const GAP_PERIOD: f64 = 5.0;
 
+/// Box chrome: 2 border columns plus 1 padding column on each side.
+const BOX_CHROME: u16 = 4;
+/// Horizontal gap between the two side-by-side boxes.
+const BOX_GAP: u16 = 2;
+/// Minimum readable inner width for a box. Below this the boxes hide rather
+/// than cramming content into an unreadable sliver.
+const MIN_BOX_INNER: u16 = 20;
+/// Cap on a box's inner width, so the pair stays a centered group rather than
+/// stretching across a very wide terminal.
+const MAX_BOX_INNER: u16 = 48;
+/// Minimum box height, borders included. Below this the boxes hide.
+const MIN_BOX_HEIGHT: u16 = 5;
+/// Blank rows kept below the boxes so they do not touch the slot's bottom edge.
+const BOX_BOTTOM_MARGIN: u16 = 1;
+/// Top margin above the logo when the boxes are shown. With the boxes hidden
+/// the logo+hint block is vertically centered instead.
+const TOP_MARGIN: u16 = 1;
+
 /// The empty-state splash widget. Non-interactive: it takes no focus and
 /// consumes no keys, only self-targeted ticks and the startup wake.
 pub(crate) struct Splash {
@@ -106,6 +125,10 @@ pub(crate) struct Splash {
     me: Weak<RefCell<Splash>>,
     chat: Rc<RefCell<ChatState>>,
     styles: Rc<TranscriptStyles>,
+    /// The structured `Context:` listing shown in the left box, set per session
+    /// via [`Splash::set_context`]. Empty for a resumed session, which shows no
+    /// splash, and for the default state before the first session is wired up.
+    context: Vec<ContextLine>,
     /// The lavender ramp resolved to vaxis colors for the theme's color mode,
     /// so a non-truecolor terminal gets palette indices. Rebuilt on a swap.
     ramp: Vec<Color>,
@@ -132,6 +155,7 @@ impl Splash {
                 me: Weak::clone(me),
                 chat,
                 styles,
+                context: Vec::new(),
                 ramp: build_ramp(mode),
                 started: Instant::now(),
                 tick_armed: false,
@@ -145,6 +169,16 @@ impl Splash {
     pub(crate) fn set_styles(&mut self, styles: Rc<TranscriptStyles>, mode: ColorMode) {
         self.styles = styles;
         self.ramp = build_ramp(mode);
+    }
+
+    /// Replace the structured context shown in the left box.
+    ///
+    /// Called after the world is built and again on each session switch: the
+    /// splash persists across sessions while the context is per session, so the
+    /// host pushes the new session's context in rather than the splash reading
+    /// it from a shared cell.
+    pub(crate) fn set_context(&mut self, context: Vec<ContextLine>) {
+        self.context = context;
     }
 
     /// Schedule the next animation tick if none is pending, and latch a redraw
@@ -244,13 +278,55 @@ impl Splash {
         self.ramp[ramp_index(wave, n)]
     }
 
-    /// The bordered notices box, or `None` when the active view has no leading
-    /// `Notice` entries. Only the leading run counts: once a user or assistant
-    /// entry lands the splash is gone, so in practice this is every notice.
-    fn draw_notices_box(&self, ctx: &DrawContext, slot_w: u16) -> Option<Surface> {
+    /// The left "Context" box spans, or `None` when there is no context (a
+    /// resumed session, which shows no splash anyway).
+    ///
+    /// Context lives here, in the prominent splash box, rather than folded into
+    /// scrollback. A disabled skill row is struck to match aj, with the
+    /// strikethrough on the row content only, never on the `  - ` bullet.
+    fn context_spans(&self) -> Option<Vec<TextSpan>> {
+        if self.context.is_empty() {
+            return None;
+        }
+        let struck = Style {
+            strikethrough: true,
+            ..self.styles.dim
+        };
+        let mut spans = Vec::new();
+        for line in &self.context {
+            if !line.bullet.is_empty() {
+                spans.push(TextSpan {
+                    text: line.bullet.clone(),
+                    style: self.styles.dim,
+                    ..TextSpan::default()
+                });
+            }
+            // The header (empty bullet) reads as a label, struck rows are
+            // disabled skills, every other row is a dim listing entry.
+            let style = if line.struck {
+                struck
+            } else if line.bullet.is_empty() {
+                self.styles.text
+            } else {
+                self.styles.dim
+            };
+            spans.push(TextSpan {
+                text: format!("{}\n", line.text),
+                style,
+                ..TextSpan::default()
+            });
+        }
+        Some(spans)
+    }
+
+    /// The right "Notices" box spans, or `None` when the active view has no
+    /// leading `Notice` entries. Only the leading run counts: once a user or
+    /// assistant entry lands the splash is gone, so in practice this is every
+    /// notice.
+    fn notice_spans(&self) -> Option<Vec<TextSpan>> {
         let chat = self.chat.borrow();
         let transcript = chat.transcript(chat.active_view())?;
-        let mut lines: Vec<(String, Style)> = Vec::new();
+        let mut spans = Vec::new();
         for entry in transcript.entries() {
             let EntryKind::Notice(notice) = &entry.kind else {
                 break;
@@ -260,56 +336,110 @@ impl Splash {
                 NoticeLevel::Warning => self.styles.warning,
                 NoticeLevel::Error => self.styles.error,
             };
-            for line in notice.text.lines() {
-                lines.push((line.to_string(), style));
-            }
+            spans.push(TextSpan {
+                text: format!("{}\n", notice.text),
+                style,
+                ..TextSpan::default()
+            });
         }
-        if lines.is_empty() {
+        if spans.is_empty() { None } else { Some(spans) }
+    }
+
+    /// Geometry for the box row, or `None` when the slot cannot fit readable
+    /// boxes. `count` is 1 or 2 (a 0 count short-circuits before calling).
+    ///
+    /// The hide thresholds are deliberate: two boxes need room for two readable
+    /// inner widths plus the gap, and every box needs a minimum height below
+    /// the hint. Below either, only the logo and hint show.
+    fn plan_boxes(&self, slot_w: u16, slot_h: u16, box_top: u16, count: u16) -> Option<BoxRow> {
+        let box_h = slot_h
+            .checked_sub(box_top)?
+            .checked_sub(BOX_BOTTOM_MARGIN)?;
+        if box_h < MIN_BOX_HEIGHT {
             return None;
         }
+        let inner_w = if count >= 2 {
+            let each = slot_w.checked_sub(2 * BOX_CHROME + BOX_GAP)? / 2;
+            if each < MIN_BOX_INNER {
+                return None;
+            }
+            each.min(MAX_BOX_INNER)
+        } else {
+            let usable = slot_w.checked_sub(BOX_CHROME)?;
+            if usable < MIN_BOX_INNER {
+                return None;
+            }
+            usable.min(MAX_BOX_INNER)
+        };
+        let box_outer = inner_w + BOX_CHROME;
+        let group_w = if count >= 2 {
+            2 * box_outer + BOX_GAP
+        } else {
+            box_outer
+        };
+        Some(BoxRow {
+            box_top,
+            box_h,
+            inner_w,
+            box_outer,
+            left: center_offset(slot_w, group_w),
+        })
+    }
 
-        // 2 border columns plus 1 padding column on each side.
-        const CHROME: u16 = 4;
-        let max_inner = slot_w.saturating_sub(CHROME).max(1);
-        let mut inner_w = 0u16;
-        for (line, _) in &lines {
-            let w = u16::try_from(ctx.string_width(line))
-                .unwrap_or(u16::MAX)
-                .min(max_inner);
-            inner_w = inner_w.max(w);
-        }
-        let box_w = inner_w + CHROME;
-        let box_h = u16::try_from(lines.len()).unwrap_or(u16::MAX) + 2;
+    /// A bordered box `inner_w` + [`BOX_CHROME`] wide and `box_h` tall, with
+    /// `spans` soft-wrapped to the inner width.
+    ///
+    /// Content wraps rather than truncating. When the wrapped content is taller
+    /// than the inner height we draw a scrollbar thumb on the right inner edge
+    /// as an overflow indicator. The splash takes no focus and no keys, so it
+    /// is only an indicator, never a draggable scrollbar.
+    fn render_box(
+        &self,
+        ctx: &DrawContext,
+        spans: Vec<TextSpan>,
+        inner_w: u16,
+        box_h: u16,
+    ) -> Surface {
+        let box_w = inner_w + BOX_CHROME;
         let mut surface = Surface::with_size(Size {
             width: box_w,
             height: box_h,
         });
         self.paint_box_frame(&mut surface, box_w, box_h);
 
-        let content_end = 2 + inner_w;
-        for (i, (line, style)) in lines.iter().enumerate() {
-            let Ok(offset) = u16::try_from(i) else {
-                break;
-            };
-            let row = 1 + offset;
-            let mut col = 2u16;
-            for item in ctx.grapheme_iterator(line) {
-                if col >= content_end {
-                    // The line is wider than the box: mark the clip with an
-                    // ellipsis in the last content cell and stop.
-                    surface.write_cell(content_end - 1, row, glyph_cell("…", *style));
-                    break;
-                }
-                let grapheme = item.bytes(line);
-                let w = u8::try_from(ctx.string_width(grapheme)).unwrap_or(1).max(1);
-                surface.write_cell(col, row, glyph_cell(grapheme, *style));
-                col = col.saturating_add(u16::from(w));
+        // Wrap to the inner width with the height unbounded, so the drawn
+        // height is the full wrapped extent and overflow past the box shows.
+        let inner_h = box_h - 2;
+        let content_ctx = ctx.with_constraints(
+            Size::default(),
+            MaxSize {
+                width: Some(inner_w),
+                height: None,
+            },
+        );
+        let content = RichText::new(spans).draw(&content_ctx);
+        let total_rows = content.size.height;
+        let visible = inner_h.min(total_rows);
+        let content_w = content.size.width.min(inner_w);
+        for row in 0..visible {
+            for col in 0..content_w {
+                surface.write_cell(2 + col, 1 + row, content.read_cell(col, row));
             }
         }
-        Some(surface)
+        if total_rows > inner_h {
+            let thumb_col = box_w - 2;
+            for row in 0..thumb_height(inner_h, total_rows) {
+                surface.write_cell(
+                    thumb_col,
+                    1 + row,
+                    glyph_cell("\u{2590}", self.styles.scrollbar_thumb),
+                );
+            }
+        }
+        surface
     }
 
-    /// Paint the light rounded frame of the notices box in the muted style.
+    /// Paint the light rounded frame of a box in the muted style.
     fn paint_box_frame(&self, surface: &mut Surface, box_w: u16, box_h: u16) {
         let border = self.styles.dim;
         // box_w >= CHROME (4) and box_h >= 2, so the corners never collide.
@@ -344,20 +474,31 @@ impl Widget for Splash {
         let region_w = logo_w + 2 * DRIFT_X;
         let region_h = LOGO_HEIGHT + 2 * DRIFT_Y;
 
-        let notices = self.draw_notices_box(ctx, slot_w);
+        // Present boxes, left to right: context then notices. A box with no
+        // content is dropped here, so an empty box leaves no frame.
+        let context = self.context_spans();
+        let notices = self.notice_spans();
+        let count = u16::from(context.is_some()) + u16::from(notices.is_some());
 
-        // Vertical layout: region, blank, hint, then (if present) blank + box.
-        let mut content_h = region_h + 2;
-        if let Some(box_surface) = &notices {
-            content_h += 1 + box_surface.size.height;
-        }
-        let slot_h = ctx.max.height.unwrap_or(content_h);
+        let slot_h = ctx.max.height.unwrap_or(region_h + 2);
+        // With boxes the logo+hint sit near the top and the boxes fill the
+        // space below the hint; with none, the logo+hint block is centered.
+        let box_top = TOP_MARGIN + region_h + 3;
+        let plan = if count == 0 {
+            None
+        } else {
+            self.plan_boxes(slot_w, slot_h, box_top, count)
+        };
+        let top = if plan.is_some() {
+            TOP_MARGIN
+        } else {
+            center_offset(slot_h, region_h + 2)
+        };
 
         let mut surface = Surface::with_size(Size {
             width: slot_w,
             height: slot_h,
         });
-        let top = center_offset(slot_h, content_h);
 
         // The logo, centered horizontally in its region and drifting within it.
         let region_left = center_offset(slot_w, region_w);
@@ -393,16 +534,22 @@ impl Widget for Splash {
             z_index: 0,
         });
 
-        if let Some(box_surface) = notices {
-            let box_row = top + region_h + 3;
-            surface.children.push(SubSurface {
-                origin: RelativePoint {
-                    col: i32::from(center_offset(slot_w, box_surface.size.width)),
-                    row: i32::from(box_row),
-                },
-                surface: box_surface,
-                z_index: 0,
-            });
+        // The two boxes side by side, centered as a group and tall enough to
+        // fill the space below the hint.
+        if let Some(row) = plan {
+            let mut col = row.left;
+            for spans in [context, notices].into_iter().flatten() {
+                let box_surface = self.render_box(ctx, spans, row.inner_w, row.box_h);
+                surface.children.push(SubSurface {
+                    origin: RelativePoint {
+                        col: i32::from(col),
+                        row: i32::from(row.box_top),
+                    },
+                    surface: box_surface,
+                    z_index: 0,
+                });
+                col += row.box_outer + BOX_GAP;
+            }
         }
 
         surface
@@ -440,6 +587,26 @@ fn glyph_cell(grapheme: &str, style: Style) -> Cell {
         style,
         ..Cell::default()
     }
+}
+
+/// Geometry for the side-by-side box row: where the leftmost box starts, the
+/// shared inner and outer widths, and the shared height. Computed by
+/// [`Splash::plan_boxes`].
+struct BoxRow {
+    box_top: u16,
+    box_h: u16,
+    inner_w: u16,
+    box_outer: u16,
+    left: u16,
+}
+
+/// Height of the overflow thumb: the visible fraction of the wrapped content,
+/// at least one row and at most the inner height.
+fn thumb_height(inner_h: u16, total_rows: u16) -> u16 {
+    let inner = usize::from(inner_h);
+    let total = usize::from(total_rows).max(1);
+    let h = (inner * inner / total).max(1);
+    u16::try_from(h).unwrap_or(inner_h).min(inner_h)
 }
 
 /// Resolve the lavender ramp to vaxis colors for `mode`, downsampling `Rgb`
@@ -580,6 +747,120 @@ mod tests {
         let joined = crate::test_support::rows(&surface).join("\n");
         assert!(joined.contains('╭') && joined.contains('╯'), "box frame");
         assert!(joined.contains("startup warning"), "notice text");
+    }
+
+    /// A ContextLine for the disabled-skill row aj strikes.
+    fn ctx_line(bullet: &str, text: &str, struck: bool) -> ContextLine {
+        ContextLine {
+            bullet: bullet.to_string(),
+            text: text.to_string(),
+            struck,
+        }
+    }
+
+    /// The context box renders the listing and strikes the disabled skill's
+    /// row content, never the bullet.
+    #[test]
+    fn context_box_strikes_disabled_skill_rows() {
+        let splash = splash(chat());
+        splash.borrow_mut().set_context(vec![
+            ctx_line("", "Context:", false),
+            ctx_line("  - ", "alpha (skill: alpha)", false),
+            ctx_line("  - ", "beta (skill: beta, disabled)", true),
+        ]);
+        let surface = splash
+            .borrow_mut()
+            .draw(&crate::test_support::draw_ctx(80, Some(30)));
+        let joined = crate::test_support::rows(&surface).join("\n");
+        assert!(joined.contains("Context:"), "context header: {joined}");
+        assert!(
+            joined.contains("beta (skill: beta, disabled)"),
+            "disabled skill row: {joined}"
+        );
+        // The struck cells are exactly the disabled row's content: the word
+        // "beta" appears there but the `-` of any bullet never does.
+        let struck: String = crate::test_support::flatten(&surface)
+            .iter()
+            .flatten()
+            .filter(|c| c.style.strikethrough)
+            .map(|c| c.char.grapheme())
+            .collect();
+        assert!(
+            struck.contains("beta"),
+            "the disabled row content is struck: {struck:?}"
+        );
+        assert!(
+            !struck.contains('-'),
+            "the bullet is never struck: {struck:?}"
+        );
+    }
+
+    /// With both context and notices, the splash draws two boxes side by side.
+    #[test]
+    fn renders_two_boxes_side_by_side() {
+        let chat = chat();
+        append_notice(&chat, "startup warning");
+        let splash = splash(chat);
+        splash.borrow_mut().set_context(vec![
+            ctx_line("", "Context:", false),
+            ctx_line("  - ", "builtin (system prompt)", false),
+        ]);
+        let surface = splash
+            .borrow_mut()
+            .draw(&crate::test_support::draw_ctx(90, Some(30)));
+        let rows = crate::test_support::rows(&surface);
+        let joined = rows.join("\n");
+        assert!(joined.contains("Context:"), "context box: {rows:?}");
+        assert!(joined.contains("startup warning"), "notices box: {rows:?}");
+        assert!(
+            rows.iter().any(|r| r.matches('╭').count() == 2),
+            "two top-left corners on the box row: {rows:?}"
+        );
+    }
+
+    /// A slot too narrow for two readable boxes, or too short to fit a box
+    /// under the hint, hides the boxes and keeps only the logo and hint.
+    #[test]
+    fn hides_boxes_when_slot_is_too_small() {
+        let chat = chat();
+        append_notice(&chat, "startup warning");
+        let splash = splash(chat);
+        splash
+            .borrow_mut()
+            .set_context(vec![ctx_line("", "Context:", false)]);
+
+        let narrow = splash
+            .borrow_mut()
+            .draw(&crate::test_support::draw_ctx(40, Some(30)));
+        let narrow = crate::test_support::rows(&narrow).join("\n");
+        assert!(narrow.contains("for commands"), "hint remains: {narrow}");
+        assert!(!narrow.contains('╭'), "boxes hidden when narrow: {narrow}");
+
+        let short = splash
+            .borrow_mut()
+            .draw(&crate::test_support::draw_ctx(80, Some(14)));
+        let short = crate::test_support::rows(&short).join("\n");
+        assert!(short.contains("for commands"), "hint remains: {short}");
+        assert!(!short.contains('╭'), "boxes hidden when short: {short}");
+    }
+
+    /// Content taller than the box draws the overflow thumb on the right inner
+    /// edge, a non-interactive indicator (the splash takes no focus or keys).
+    #[test]
+    fn overflow_draws_a_scrollbar_thumb() {
+        let splash = splash(chat());
+        let lines: Vec<ContextLine> = (0..40)
+            .map(|i| ctx_line("  - ", &format!("row {i}"), false))
+            .collect();
+        splash.borrow_mut().set_context(lines);
+        let surface = splash
+            .borrow_mut()
+            .draw(&crate::test_support::draw_ctx(80, Some(24)));
+        let joined = crate::test_support::rows(&surface).join("\n");
+        assert!(
+            joined.contains('\u{2590}'),
+            "overflow thumb on the right inner edge: {joined}"
+        );
     }
 
     /// The wake kicks exactly one tick chain, each tick re-arms while the

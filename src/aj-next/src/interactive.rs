@@ -24,6 +24,7 @@ use aj_app::chat::{ChatState, reduce};
 use aj_app::cli::args::{Args, Command};
 use aj_app::commands::{CommandAction, load_model_catalog};
 use aj_app::keybindings::fixed_keys;
+use aj_app::notices::ContextLine;
 use aj_app::session::{SessionCore, SessionEntry, SessionExit, SessionRequest, SessionSpec};
 use aj_app::session_setup::{RestoreContext, RunConfigSnapshot, build_initial_run_config};
 use aj_app::settings::{
@@ -134,6 +135,11 @@ struct World {
     /// resumed session's recorded model/thinking/speed are restored the
     /// same way the process's first session's are. `None` in scripted mode.
     restore: Option<RestoreContext>,
+    /// The structured `Context:` listing for the splash's left box, populated
+    /// for a fresh session and empty for a resumed one (which shows no splash).
+    /// Context lives in the splash, not in scrollback, so it is threaded to the
+    /// splash rather than folded through the reducer.
+    context: Vec<ContextLine>,
 }
 
 /// Build the session world: run config, session core, and the chat
@@ -216,8 +222,9 @@ async fn build_world(
 
     // Startup notices, after replay so resumed history stays on top.
     // Order mirrors aj: config diagnostics, then (fresh session only)
-    // the context notice and skill warnings, then sandbox, auth, tmux,
-    // then the resume-restore notices.
+    // the skill warnings, then sandbox, auth, tmux, then the
+    // resume-restore notices. The context is not folded here: it lives in
+    // the splash's left box, not in scrollback (see `World::context`).
     for d in diagnostics {
         let text = d.to_string();
         let event = match d.severity() {
@@ -232,17 +239,11 @@ async fn build_world(
         };
         let _ = reduce(&mut chat, &mut core.lifecycle, event);
     }
-    // The context notice and skill warnings describe the freshly-loaded
-    // env, which only governs a fresh session. A resumed session keeps
-    // its assembled prompt in the log, so we skip them there.
-    if matches!(spec, SessionSpec::Create { .. }) {
-        // aj-next notices are plain text styled by level, so the
-        // disabled-skill row hook is the identity: no embedded ANSI.
-        fn identity(s: &str) -> String {
-            s.to_string()
-        }
-        let context = aj_app::notices::build_context_notice(&core.env, identity);
-        let _ = reduce(&mut chat, &mut core.lifecycle, notice_event(&context));
+    // The context listing and skill warnings describe the freshly-loaded
+    // env, which only governs a fresh session. A resumed session keeps its
+    // assembled prompt in the log, so we skip them there. The context is
+    // handed to the splash rather than folded into scrollback.
+    let context = if matches!(spec, SessionSpec::Create { .. }) {
         for d in &core.env.skill_diagnostics {
             let _ = reduce(
                 &mut chat,
@@ -250,7 +251,10 @@ async fn build_world(
                 warning_event(&d.to_string()),
             );
         }
-    }
+        aj_app::notices::context_lines(&core.env)
+    } else {
+        Vec::new()
+    };
     if aj_app::notices::sandbox_warning_enabled() {
         let _ = reduce(
             &mut chat,
@@ -307,6 +311,7 @@ async fn build_world(
         auth: auth.clone(),
         persistence: persistence.clone(),
         restore,
+        context,
     })
 }
 
@@ -317,6 +322,9 @@ struct NextSession {
     core: SessionCore,
     chat: ChatState,
     notices: Vec<String>,
+    /// The structured `Context:` listing for the splash's left box, populated
+    /// only when the built session is a fresh one (see `World::context`).
+    context: Vec<ContextLine>,
 }
 
 /// Build the session a new-session or resume request asks for, reusing the
@@ -334,7 +342,7 @@ async fn build_next_session(
     previous_id: &str,
 ) -> Result<NextSession> {
     let config = world.config.lock().expect("config mutex poisoned").clone();
-    let (mut core, seed, notice) = match SessionCore::build(
+    let (mut core, seed, notice, is_fresh) = match SessionCore::build(
         &config,
         &world.run_config,
         &world.persistence,
@@ -343,7 +351,12 @@ async fn build_next_session(
     ) {
         Ok((core, seed)) => {
             let notice = switch_notice(&spec, &core.session_id);
-            (core, seed, notice)
+            (
+                core,
+                seed,
+                notice,
+                matches!(spec, SessionSpec::Create { .. }),
+            )
         }
         Err(err) => {
             // The requested build failed. Fall back to the session that
@@ -360,7 +373,8 @@ async fn build_next_session(
                 &fallback,
                 world.restore.as_ref(),
             )?;
-            (core, seed, failure)
+            // The fallback resumes an existing session, so it is never fresh.
+            (core, seed, failure, false)
         }
     };
 
@@ -389,10 +403,18 @@ async fn build_next_session(
     // replayed history.
     let mut notices = vec![notice];
     notices.append(&mut core.restore_notices);
+    // Context is shown only in the splash's left box, so a fresh session
+    // assembles it here for the caller to push into the splash.
+    let context = if is_fresh {
+        aj_app::notices::context_lines(&core.env)
+    } else {
+        Vec::new()
+    };
     Ok(NextSession {
         core,
         chat,
         notices,
+        context,
     })
 }
 
@@ -435,6 +457,14 @@ fn install_next_session(world: &mut World, shell: &Rc<RefCell<Shell>>, next: Nex
     // loop shut the outgoing turns down, and the guard refuses mid-turn
     // requests), so this is already empty; clear defensively.
     world.turn_cancels.clear();
+    // Repoint the splash at the new session's context (empty for a resumed
+    // one), which the splash owns per session across the switch.
+    world.context = next.context;
+    shell
+        .borrow()
+        .splash
+        .borrow_mut()
+        .set_context(world.context.clone());
     shell.borrow().rebind(world);
     // Folded after the install so they land in the new session's chat, on
     // top of any replayed history.
@@ -3272,6 +3302,14 @@ pub async fn run(args: Args) -> Result<()> {
         header,
         cwd,
     )));
+    // Hand the first session's context to the splash's left box. The splash
+    // persists across session switches, so `install_next_session` repoints it
+    // on each change (see there).
+    shell
+        .borrow()
+        .splash
+        .borrow_mut()
+        .set_context(world.context.clone());
     let root: WidgetRef = to_widget_ref(Rc::clone(&shell));
 
     let tty = PosixTty::new()?;
