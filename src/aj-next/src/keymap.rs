@@ -13,7 +13,7 @@ use std::rc::Rc;
 
 use aj_app::actions::{AjAction, ChordKey, ChordPhase, ChordSpec, default_global_bindings};
 use vaxis::key::{Modifiers, name_map};
-use vaxis::vxfw::{Activator, BindingPhase, Entry, Keymap};
+use vaxis::vxfw::{Activator, BindingPhase, Entry, Keymap, TextArea};
 
 use crate::overlay::OverlayStack;
 
@@ -27,6 +27,11 @@ use crate::overlay::OverlayStack;
 /// reach. The drive loop is its single writer.
 pub(crate) struct HostCtx {
     pub(crate) overlays: Rc<RefCell<OverlayStack>>,
+    /// The compose editor, shared with the base layout. Read live (like
+    /// `overlays`) so its autocomplete state is current at match time, no
+    /// mirror. The transcript-focus chord gates on the autocomplete popup being
+    /// closed (see [`focus_enabled`]).
+    pub(crate) editor: Rc<RefCell<TextArea>>,
     /// Whether the viewed agent is busy (a binary-driven turn or a
     /// running initial sub-agent spawn), i.e. whether Ctrl+C has
     /// something to cancel.
@@ -44,6 +49,17 @@ fn overlay_open(cx: &HostCtx) -> bool {
 
 fn no_overlay(cx: &HostCtx) -> bool {
     !overlay_open(cx)
+}
+
+/// Transcript focus is entered with Tab whenever the autocomplete popup is
+/// closed: the chord matches in the capture phase, ahead of the editor, so
+/// gating it on the popup lets Tab stay the editor's accept key while the popup
+/// is open, and focus the transcript otherwise, draft text and all (Spec E
+/// section 1). Reading the editor here is safe even though it is a focused
+/// widget: the capture-phase match runs at the root before the event descends
+/// to the editor, so the editor is not already borrowed.
+fn focus_enabled(cx: &HostCtx) -> bool {
+    no_overlay(cx) && !cx.editor.borrow().is_showing_autocomplete()
 }
 
 fn can_cancel(cx: &HostCtx) -> bool {
@@ -153,8 +169,11 @@ pub(crate) fn build_keymap() -> Keymap<AjAction, HostCtx> {
             | AjAction::ChatPageUp
             | AjAction::ChatPageDown
             | AjAction::ChatScrollToTop
-            | AjAction::ChatScrollToBottom
-            | AjAction::TranscriptFocus => no_overlay,
+            | AjAction::ChatScrollToBottom => no_overlay,
+            // Transcript focus is gated to the autocomplete popup being closed,
+            // so Tab focuses the transcript with the popup down and stays the
+            // editor's accept key with it up (see `focus_enabled`).
+            AjAction::TranscriptFocus => focus_enabled,
             _ => |_| true,
         };
         entries.push(
@@ -174,9 +193,19 @@ mod tests {
     fn ctx(turn_running: bool) -> HostCtx {
         HostCtx {
             overlays: Rc::new(RefCell::new(OverlayStack::default())),
+            editor: TextArea::new(),
             turn_running,
             login_active: false,
         }
+    }
+
+    /// A context whose editor holds a draft but has no autocomplete popup open,
+    /// so the transcript-focus chord (Tab) still matches: a draft does not block
+    /// focusing the transcript.
+    fn drafting_ctx() -> HostCtx {
+        let cx = ctx(false);
+        cx.editor.borrow_mut().set_text("hello");
+        cx
     }
 
     fn key(codepoint: u32, mods: Modifiers) -> Key {
@@ -375,23 +404,27 @@ mod tests {
         );
     }
 
-    /// Transcript-focus resolves in the bubble phase (the editor declines
-    /// `ctrl+up`), and is inert while a capturing overlay is up.
+    /// Transcript-focus resolves in the capture phase (ahead of the editor)
+    /// whenever the autocomplete popup is closed, including with a draft in the
+    /// editor, and is inert while a capturing overlay is up. Only an open popup
+    /// keeps Tab for the editor (to apply a completion).
     #[test]
-    fn transcript_focus_matches_in_bubble_and_is_gated_by_overlays() {
+    fn transcript_focus_matches_on_tab_when_the_autocomplete_popup_is_closed() {
         let keymap = build_keymap();
-        let ctrl_up = key(Key::UP, Modifiers::CTRL);
+        let tab = key(Key::TAB, Modifiers::empty());
 
         let idle = ctx(false);
         assert_eq!(
-            keymap.match_single(&ctrl_up, BindingPhase::Bubble, &idle),
+            keymap.match_single(&tab, BindingPhase::Capture, &idle),
             Some(&AjAction::TranscriptFocus),
-            "ctrl+up bubbles to transcript-focus once the editor declines it",
+            "Tab enters transcript-focus in the capture phase with an empty editor",
         );
+
+        let drafting = drafting_ctx();
         assert_eq!(
-            keymap.match_single(&ctrl_up, BindingPhase::Capture, &idle),
-            None,
-            "transcript-focus is not a capture-phase chord",
+            keymap.match_single(&tab, BindingPhase::Capture, &drafting),
+            Some(&AjAction::TranscriptFocus),
+            "a draft with no popup still enters transcript-focus",
         );
 
         let modal = ctx(false);
@@ -404,7 +437,7 @@ mod tests {
                 placement: crate::overlay::OverlayPlacement::Small,
             });
         assert_eq!(
-            keymap.match_single(&ctrl_up, BindingPhase::Bubble, &modal),
+            keymap.match_single(&tab, BindingPhase::Capture, &modal),
             None,
             "transcript-focus is inert while an overlay is open",
         );

@@ -224,12 +224,13 @@ pub struct GlobalBinding {
 /// The default global bindings, compiled from the `AJ_KEYBINDINGS` chord
 /// strings so the two can't drift apart.
 ///
-/// Most entries are capture-phase: these are the chords `aj` intercepts
-/// before its editor sees the keystroke. The one exception is
-/// [`AjAction::TranscriptFocus`], a bubble-phase binding: the editor does
-/// not bind its `ctrl+up` chord, so it declines the key and the chord
-/// bubbles up to the keymap (Spec E section 1). The Ctrl+C ladder
-/// (`CancelTurn`, `Quit`) is not in the table, see [`AjAction`].
+/// Every entry is capture-phase: these are the chords `aj` intercepts before
+/// its editor sees the keystroke. [`AjAction::TranscriptFocus`] (bound to
+/// `tab`) is capture-phase too, but its frontend predicate gates it to the
+/// autocomplete popup being closed, so Tab focuses the transcript even with a
+/// draft, and only an open popup keeps Tab for the editor to apply a completion
+/// (Spec E section 1). The Ctrl+C ladder (`CancelTurn`, `Quit`) is not in the
+/// table, see [`AjAction`].
 ///
 /// TODO(aljoscha): merge the user's `[keybindings]` config over these
 /// defaults (replace-not-extend per action, like `aj`'s manager).
@@ -243,7 +244,7 @@ pub fn default_global_bindings() -> Vec<GlobalBinding> {
             phase,
         }
     };
-    use ChordPhase::{Bubble, Capture};
+    use ChordPhase::Capture;
     vec![
         compiled(AjAction::ThinkingToggle, ACTION_THINKING_TOGGLE, Capture),
         compiled(AjAction::ToolsExpand, ACTION_TOOLS_EXPAND, Capture),
@@ -266,7 +267,7 @@ pub fn default_global_bindings() -> Vec<GlobalBinding> {
             ACTION_CHAT_SCROLL_BOTTOM,
             Capture,
         ),
-        compiled(AjAction::TranscriptFocus, ACTION_TRANSCRIPT_FOCUS, Bubble),
+        compiled(AjAction::TranscriptFocus, ACTION_TRANSCRIPT_FOCUS, Capture),
     ]
 }
 
@@ -363,22 +364,19 @@ mod tests {
         );
         assert_eq!(
             spec(AjAction::TranscriptFocus),
-            chord(ChordKey::Named("up"), true, false, false, false)
+            chord(ChordKey::Named("tab"), false, false, false, false)
         );
     }
 
-    /// Transcript-focus is the sole bubble-phase default: the editor does not
-    /// bind `ctrl+up`, so the chord bubbles past it to the keymap.
+    /// Every default global binding is capture-phase. Transcript-focus (bound
+    /// to Tab) is capture-phase too, gated to the autocomplete popup being
+    /// closed by its frontend predicate rather than by phase.
     #[test]
-    fn transcript_focus_is_the_only_bubble_phase_binding() {
+    fn every_default_binding_is_capture_phase() {
         for binding in default_global_bindings() {
-            let expected = if binding.action == AjAction::TranscriptFocus {
-                ChordPhase::Bubble
-            } else {
-                ChordPhase::Capture
-            };
             assert_eq!(
-                binding.phase, expected,
+                binding.phase,
+                ChordPhase::Capture,
                 "unexpected phase for {:?}",
                 binding.action
             );

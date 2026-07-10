@@ -149,12 +149,13 @@ pub const ACTION_CHAT_SCROLL_BOTTOM: &str = "aj.chat.scroll_bottom";
 
 /// Action ID for the "focus the transcript for keyboard navigation" chord.
 ///
-/// Bound by default to `ctrl+up`. It moves keyboard focus from the editor
-/// onto the chat transcript and shows its item cursor (Spec E section 1,
-/// transcript-focus mode). Unlike the other global chords this one is a
-/// bubble-phase binding: the editor does not bind `ctrl+up`, so it declines
-/// the key and the chord bubbles up to the keymap. Inert while a capturing
-/// overlay is up. Esc returns focus to the editor.
+/// Bound by default to `tab`. It moves keyboard focus from the editor onto the
+/// chat transcript and steps through past user messages (Spec E section 1,
+/// transcript-focus mode). It matches in the capture phase but is gated to the
+/// autocomplete popup being closed, so Tab focuses the transcript even with a
+/// draft in the editor, and only an open popup keeps Tab for applying the
+/// highlighted completion. Inert while a capturing overlay is up. Esc returns
+/// focus to the editor.
 pub const ACTION_TRANSCRIPT_FOCUS: &str = "aj.transcript.focus";
 
 /// Action ID for the "clear the selected project override" chord in
@@ -255,8 +256,8 @@ pub const AJ_KEYBINDINGS: &[(&str, &str, &str)] = &[
     ),
     (
         ACTION_TRANSCRIPT_FOCUS,
-        "ctrl+up",
-        "Focus the transcript for keyboard navigation",
+        "tab",
+        "Focus the transcript to step through past messages",
     ),
     (
         ACTION_SETTINGS_CLEAR,

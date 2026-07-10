@@ -1353,37 +1353,101 @@ impl TranscriptView {
     /// Whether the transcript is in focus mode. The mode lives entirely on
     /// focus, and is exactly when the list draws its item cursor, which
     /// `FocusIn`/`FocusOut` toggle. We keep no parallel flag.
-    fn in_focus_mode(&self) -> bool {
+    pub(crate) fn in_focus_mode(&self) -> bool {
         self.list.borrow().draw_cursor
     }
 
-    /// Move the item cursor onto the last entry and anchor the viewport to the
-    /// bottom, so the cursor lands on the bottom item with its tail in view.
-    /// Used on entering focus mode and for the End / G jump.
-    ///
-    /// We refresh `item_count` first so both `jump_to_item` and
-    /// `scroll_to_bottom` see the current length even before the focused
-    /// view's first draw. We deliberately do not follow with `ensure_scroll`:
-    /// it would re-anchor the viewport to the top of the last item, hiding the
-    /// tail of an oversized final entry, which is exactly what
-    /// `scroll_to_bottom` avoids.
-    fn cursor_to_bottom(&self) {
+    /// The entry indices of the active view's user messages, ascending
+    /// (document order). Transcript-focus navigation steps between these,
+    /// skipping assistant, tool, and other entries (Spec E section 1).
+    fn user_message_indices(&self) -> Vec<usize> {
+        let chat = self.chat.borrow();
+        let Some(transcript) = chat.transcript(chat.active_view()) else {
+            return Vec::new();
+        };
+        transcript
+            .entries()
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| matches!(entry.kind, EntryKind::User(_)))
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    /// Whether the active view has at least one user message. Guards the
+    /// enter-focus chord: with none there is nothing to step to.
+    pub(crate) fn has_user_message(&self) -> bool {
+        !self.user_message_indices().is_empty()
+    }
+
+    /// Move the item cursor onto entry `idx` and bring it into view with a
+    /// minimal scroll (`ensure_scroll`), so a step to a nearby user message
+    /// keeps the surrounding replies on screen rather than jumping the
+    /// viewport. `idx` must be a valid entry index. `item_count` is refreshed
+    /// first so the move sees the current length even before the focused
+    /// view's first draw.
+    fn focus_item(&self, idx: usize) {
         let count = self.entry_count();
         let mut list = self.list.borrow_mut();
         list.item_count = Some(u32::try_from(count).expect("entry count fits u32"));
-        let last = u32::try_from(count.saturating_sub(1)).expect("index fits u32");
-        list.jump_to_item(last);
-        list.scroll_to_bottom();
+        list.cursor = u32::try_from(idx).expect("index fits u32");
+        list.ensure_scroll();
+    }
+
+    /// Move the cursor onto the newest (last) user message. Used on entering
+    /// focus mode and for the End / G jump. A no-op with no user message.
+    fn focus_last_user_message(&self) {
+        if let Some(&idx) = self.user_message_indices().last() {
+            self.focus_item(idx);
+        }
+    }
+
+    /// Move the cursor onto the oldest (first) user message. Home / g jump.
+    /// A no-op with no user message.
+    fn focus_first_user_message(&self) {
+        if let Some(&idx) = self.user_message_indices().first() {
+            self.focus_item(idx);
+        }
+    }
+
+    /// Step to the next-older user message (toward index 0 from the current
+    /// cursor). Clamps at the first, so a no-op once there is none older. It
+    /// finds the nearest user message strictly above the cursor, which is
+    /// defensive against a cursor that ever sits on a non-user entry.
+    pub(crate) fn focus_prev_user_message(&self) {
+        let cursor = usize::try_from(self.list.borrow().cursor).expect("cursor fits usize");
+        if let Some(&idx) = self
+            .user_message_indices()
+            .iter()
+            .rev()
+            .find(|&&i| i < cursor)
+        {
+            self.focus_item(idx);
+        }
+    }
+
+    /// Step to the next-newer user message (toward the end). Clamps at the
+    /// last, so a no-op once there is none newer. It finds the nearest user
+    /// message strictly below the cursor, defensive the same way
+    /// [`focus_prev_user_message`](Self::focus_prev_user_message) is.
+    fn focus_next_user_message(&self) {
+        let cursor = usize::try_from(self.list.borrow().cursor).expect("cursor fits usize");
+        if let Some(&idx) = self.user_message_indices().iter().find(|&&i| i > cursor) {
+            self.focus_item(idx);
+        }
     }
 
     /// Enter transcript-focus mode (Spec E section 1): show the item cursor,
     /// suspend follow-tail so the cursor is not fought by auto-scroll, and land
-    /// the cursor on the bottom item. Driven by `Event::FocusIn`, so the mode
-    /// is exactly "the transcript is the focused widget".
+    /// the cursor on the newest user message. Driven by `Event::FocusIn`, so
+    /// the mode is exactly "the transcript is the focused widget".
     fn enter_focus_mode(&mut self, ctx: &mut EventContext) {
+        // INTERIM: `draw_cursor` paints the cursor gutter, which marks the
+        // focused message so the step is observable. The highlight-colored
+        // border that replaces it is a later change (Spec E section 2).
         self.list.borrow_mut().draw_cursor = true;
         self.follow_tail = false;
-        self.cursor_to_bottom();
+        self.focus_last_user_message();
         ctx.redraw = true;
     }
 
@@ -1395,16 +1459,16 @@ impl TranscriptView {
         ctx.redraw = true;
     }
 
-    /// Handle a key press while the transcript is focused, delegating item
-    /// navigation to the inner [`ListView`]. A no-op when not focused (the key
-    /// then falls through unconsumed).
+    /// Handle a key press while the transcript is focused, stepping the item
+    /// cursor between user messages (Spec E section 1). A no-op when not
+    /// focused (the key then falls through unconsumed).
     ///
-    /// Only the `g` / `G` jumps are served here. PageUp/PageDown and Home/End
-    /// are globally-bound capture-phase chat-scroll chords, so they are
-    /// consumed ahead of the focused transcript and dispatch to the
+    /// Tab is not handled here: the global capture-phase chord owns it and
+    /// dispatches to [`focus_prev_user_message`](Self::focus_prev_user_message).
+    /// PageUp/PageDown and Home/End are likewise globally-bound capture-phase
+    /// chords, consumed ahead of the focused transcript and dispatched to the
     /// mode-aware [`scroll_to_top`](Self::scroll_to_top) /
-    /// [`scroll_to_bottom`](Self::scroll_to_bottom), which move the item
-    /// cursor while in focus mode.
+    /// [`scroll_to_bottom`](Self::scroll_to_bottom).
     fn handle_focus_key(&mut self, ctx: &mut EventContext, key: &Key) {
         if !self.in_focus_mode() {
             return;
@@ -1415,17 +1479,20 @@ impl TranscriptView {
             || key.matches(u32::from('k'), empty)
             || key.matches(u32::from('p'), ctrl)
         {
-            self.list.borrow_mut().prev_item(ctx);
+            self.focus_prev_user_message();
+            ctx.consume_and_redraw();
         } else if key.matches(Key::DOWN, empty)
             || key.matches(u32::from('j'), empty)
             || key.matches(u32::from('n'), ctrl)
+            || key.matches(Key::TAB, Modifiers::SHIFT)
         {
-            self.list.borrow_mut().next_item(ctx);
+            self.focus_next_user_message();
+            ctx.consume_and_redraw();
         } else if key.matches(u32::from('g'), empty) {
-            self.list.borrow_mut().jump_to_item(0);
+            self.focus_first_user_message();
             ctx.consume_and_redraw();
         } else if key.matches(u32::from('g'), Modifiers::SHIFT) {
-            self.cursor_to_bottom();
+            self.focus_last_user_message();
             ctx.consume_and_redraw();
         } else if key.matches(Key::ESCAPE, empty) {
             if let Some(on_exit) = self.on_exit_focus.as_mut() {
@@ -1461,9 +1528,9 @@ impl TranscriptView {
     /// Scroll the transcript to the top (Spec E section 1, Home), mode-aware.
     pub(crate) fn scroll_to_top(&mut self) {
         if self.in_focus_mode() {
-            // Focus mode: move the item cursor onto the first item, matching
-            // the `g` jump.
-            self.list.borrow_mut().jump_to_item(0);
+            // Focus mode: move the item cursor onto the first user message,
+            // matching the `g` jump.
+            self.focus_first_user_message();
             return;
         }
         // Reaching the top means the reader left the tail, so follow-tail
@@ -1477,9 +1544,9 @@ impl TranscriptView {
     /// Scroll the transcript to the bottom (Spec E section 1, End), mode-aware.
     pub(crate) fn scroll_to_bottom(&mut self) {
         if self.in_focus_mode() {
-            // Focus mode: move the item cursor onto the last item, matching
-            // the `G` jump.
-            self.cursor_to_bottom();
+            // Focus mode: move the item cursor onto the last user message,
+            // matching the `G` jump.
+            self.focus_last_user_message();
             return;
         }
         // Re-engaging follow-tail is the whole gesture: the next draw runs the
@@ -2585,6 +2652,25 @@ mod tests {
         TranscriptView::new(Rc::clone(chat), &theme)
     }
 
+    /// A chat whose Main transcript alternates user and assistant messages:
+    /// `user 0`, `assistant 0`, `user 1`, ..., for `n` user messages. The user
+    /// entries land at the even indices (0, 2, 4, ...) with an assistant reply
+    /// between them, so transcript-focus stepping must skip the assistant
+    /// entries to move message to message.
+    fn chat_with_user_messages(n: usize) -> Rc<RefCell<ChatState>> {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        for i in 0..n {
+            apply(&chat, &mut life, user_end(&format!("user {i}")));
+            apply(
+                &chat,
+                &mut life,
+                assistant_message_end(text_message(&format!("assistant {i}"))),
+            );
+        }
+        chat
+    }
+
     fn mouse(col: i16, row: i16, kind: mouse::Type) -> Event {
         Event::Mouse(mouse::Mouse {
             col,
@@ -2784,32 +2870,46 @@ mod tests {
         );
     }
 
-    /// In focus mode the same Home/End chords move the item cursor to the
-    /// first / last item rather than scrolling the viewport, matching the
+    /// In focus mode the Home/End chords move the item cursor to the first /
+    /// last user message rather than scrolling the viewport, matching the
     /// `g` / `G` jumps (Spec E section 1).
     #[test]
     fn scroll_to_top_and_bottom_move_the_item_cursor_in_focus_mode() {
-        let chat = chat_with_notices(20);
+        // User messages at indices 0, 2, 4, 6, 8; assistant replies between.
+        let chat = chat_with_user_messages(5);
         let mut view = transcript_view(&chat);
         let ctx = draw_ctx(40, 10);
         let _ = view.draw(&ctx);
 
-        // Enter focus mode: the cursor lands on the last item.
+        // Enter focus mode: the cursor lands on the last user message (index
+        // 8), skipping the assistant reply after it.
         let mut ec = EventContext::new();
         view.handle_event(&mut ec, &Event::FocusIn);
         let _ = view.draw(&ctx);
         assert!(view.in_focus_mode(), "focus mode is on");
-        assert_eq!(view.list.borrow().cursor, 19, "cursor on the last item");
+        assert_eq!(
+            view.list.borrow().cursor,
+            8,
+            "cursor on the last user message"
+        );
 
-        // Home moves the cursor to the first item; follow-tail stays off (the
-        // cursor owns the viewport in focus mode).
+        // Home moves the cursor to the first user message; follow-tail stays
+        // off (the cursor owns the viewport in focus mode).
         view.scroll_to_top();
-        assert_eq!(view.list.borrow().cursor, 0, "Home moves to the first item");
+        assert_eq!(
+            view.list.borrow().cursor,
+            0,
+            "Home moves to the first user message"
+        );
         assert!(!view.follow_tail, "focus mode keeps follow-tail disengaged");
 
-        // End moves the cursor back to the last item.
+        // End moves the cursor back to the last user message.
         view.scroll_to_bottom();
-        assert_eq!(view.list.borrow().cursor, 19, "End moves to the last item");
+        assert_eq!(
+            view.list.borrow().cursor,
+            8,
+            "End moves to the last user message"
+        );
         assert!(!view.follow_tail, "focus mode keeps follow-tail disengaged");
     }
 
@@ -2889,7 +2989,8 @@ mod tests {
     /// navigation is not fought by auto-scroll); FocusOut hides it again.
     #[test]
     fn focus_in_shows_cursor_and_disengages_follow_tail() {
-        let chat = chat_with_notices(20);
+        // User messages at indices 0, 2, 4, 6, 8; assistant replies between.
+        let chat = chat_with_user_messages(5);
         let mut view = transcript_view(&chat);
         let ctx = draw_ctx(40, 10);
         let _ = view.draw(&ctx);
@@ -2900,24 +3001,31 @@ mod tests {
         view.handle_event(&mut ec, &Event::FocusIn);
         assert!(view.list.borrow().draw_cursor, "FocusIn shows the cursor");
         assert!(!view.follow_tail, "FocusIn disengages follow-tail");
-        // The cursor lands on the last item, and a draw keeps follow-tail off
-        // even though the viewport sits at the bottom.
+        // The cursor lands on the last user message (index 8, not the trailing
+        // assistant reply), and a draw keeps follow-tail off even though the
+        // viewport sits at the bottom.
         let _ = view.draw(&ctx);
         assert!(!view.follow_tail, "focus mode keeps follow-tail disengaged");
-        assert_eq!(view.list.borrow().cursor, 19, "cursor on the last item");
+        assert_eq!(
+            view.list.borrow().cursor,
+            8,
+            "cursor on the last user message"
+        );
 
         let mut ec = EventContext::new();
         view.handle_event(&mut ec, &Event::FocusOut);
         assert!(!view.list.borrow().draw_cursor, "FocusOut hides the cursor");
     }
 
-    /// While focused, the arrow / j-k keys move the item cursor and `g` / `G`
-    /// jump to the first / last item. The same keys are ignored while the
-    /// transcript is not focused. (Home/End reach focus mode through the
-    /// global chord, tested via `scroll_to_top` / `scroll_to_bottom`.)
+    /// While focused, the step keys (arrows, j/k, Ctrl+P/N, Shift+Tab) move
+    /// the cursor between user messages, skipping the assistant entries, and
+    /// `g` / `G` jump to the first / last user message. The step keys clamp at
+    /// the ends and are ignored while the transcript is not focused. (Tab and
+    /// Home/End reach focus mode through the global chords, tested elsewhere.)
     #[test]
-    fn nav_keys_move_the_cursor_only_while_focused() {
-        let chat = chat_with_notices(20);
+    fn nav_keys_step_between_user_messages_only_while_focused() {
+        // User messages at indices 0, 2, 4, 6, 8; assistant replies between.
+        let chat = chat_with_user_messages(5);
         let mut view = transcript_view(&chat);
         let ctx = draw_ctx(40, 10);
         let _ = view.draw(&ctx);
@@ -2928,51 +3036,83 @@ mod tests {
         assert!(!ec.consume_event, "unfocused: the key falls through");
         assert_eq!(view.list.borrow().cursor, 0, "unfocused: cursor unmoved");
 
-        // Enter focus mode: the cursor lands on the last item.
+        // Enter focus mode: the cursor lands on the last user message.
         let mut ec = EventContext::new();
         view.handle_event(&mut ec, &Event::FocusIn);
         let _ = view.draw(&ctx);
-        assert_eq!(view.list.borrow().cursor, 19);
+        assert_eq!(view.list.borrow().cursor, 8);
 
-        // Up / k / Ctrl+P move the cursor toward the top.
+        // Up / k / Ctrl+P step to the next-older user message, skipping the
+        // assistant reply between (index 8 -> 6 -> 4 -> 2).
         let mut ec = EventContext::new();
         view.handle_event(&mut ec, &key_press(Key::UP, Modifiers::empty()));
         assert_eq!(
             view.list.borrow().cursor,
-            18,
-            "Up moves to the previous item"
+            6,
+            "Up steps to the previous user message"
         );
         let mut ec = EventContext::new();
         view.handle_event(&mut ec, &key_press(u32::from('k'), Modifiers::empty()));
         assert_eq!(
             view.list.borrow().cursor,
-            17,
-            "k moves to the previous item"
+            4,
+            "k steps to the previous user message"
         );
         let mut ec = EventContext::new();
         view.handle_event(&mut ec, &key_press(u32::from('p'), Modifiers::CTRL));
         assert_eq!(
             view.list.borrow().cursor,
-            16,
-            "Ctrl+P moves to the previous item"
+            2,
+            "Ctrl+P steps to the previous user message"
         );
 
-        // Down / j / Ctrl+N move it back toward the bottom.
+        // Down / j / Ctrl+N / Shift+Tab step to the next-newer user message.
         let mut ec = EventContext::new();
         view.handle_event(&mut ec, &key_press(u32::from('j'), Modifiers::empty()));
-        assert_eq!(view.list.borrow().cursor, 17, "j moves to the next item");
+        assert_eq!(
+            view.list.borrow().cursor,
+            4,
+            "j steps to the next user message"
+        );
         let mut ec = EventContext::new();
         view.handle_event(&mut ec, &key_press(Key::DOWN, Modifiers::empty()));
-        assert_eq!(view.list.borrow().cursor, 18, "Down moves to the next item");
+        assert_eq!(
+            view.list.borrow().cursor,
+            6,
+            "Down steps to the next user message"
+        );
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &key_press(Key::TAB, Modifiers::SHIFT));
+        assert_eq!(
+            view.list.borrow().cursor,
+            8,
+            "Shift+Tab steps to the next user message"
+        );
+        // At the last user message, stepping newer clamps.
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &key_press(Key::DOWN, Modifiers::empty()));
+        assert_eq!(view.list.borrow().cursor, 8, "Down clamps at the last");
 
-        // g / G jump to the first / last item.
+        // g / G jump to the first / last user message.
         let mut ec = EventContext::new();
         view.handle_event(&mut ec, &key_press(u32::from('g'), Modifiers::empty()));
-        assert_eq!(view.list.borrow().cursor, 0, "g jumps to the first item");
+        assert_eq!(
+            view.list.borrow().cursor,
+            0,
+            "g jumps to the first user message"
+        );
+        // At the first user message, stepping older clamps.
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &key_press(Key::UP, Modifiers::empty()));
+        assert_eq!(view.list.borrow().cursor, 0, "Up clamps at the first");
 
         let mut ec = EventContext::new();
         view.handle_event(&mut ec, &key_press(u32::from('g'), Modifiers::SHIFT));
-        assert_eq!(view.list.borrow().cursor, 19, "G jumps to the last item");
+        assert_eq!(
+            view.list.borrow().cursor,
+            8,
+            "G jumps to the last user message"
+        );
     }
 
     /// Esc while focused invokes the exit callback (the host wires it to
@@ -3006,8 +3146,8 @@ mod tests {
     }
 
     /// Entering focus mode and navigating an empty transcript must not
-    /// underflow the item index or panic. `cursor_to_bottom` and the nav keys
-    /// all clamp to 0 when the count is 0.
+    /// underflow the item index or panic. The user-message scan finds nothing,
+    /// so every step is a no-op that leaves the cursor at 0.
     #[test]
     fn focus_mode_on_an_empty_transcript_is_safe() {
         let chat = chat_with_notices(0);
@@ -3015,6 +3155,7 @@ mod tests {
         let ctx = draw_ctx(40, 10);
         let _ = view.draw(&ctx);
         assert_eq!(view.entry_count(), 0, "the transcript is empty");
+        assert!(!view.has_user_message(), "no user message to step to");
 
         // FocusIn lands the cursor on item 0 (there is nothing else to land
         // on) and a draw of the empty, cursor-on list does not panic.
@@ -3046,6 +3187,57 @@ mod tests {
         view.scroll_to_bottom();
         assert_eq!(view.list.borrow().cursor, 0, "scroll_to_bottom stays at 0");
         let _ = view.draw(&ctx);
+    }
+
+    /// A notices-only transcript (splash / startup warnings, no user message)
+    /// reports no user message, so the enter-focus chord (guarded on
+    /// [`has_user_message`](TranscriptView::has_user_message)) does not engage.
+    /// Even if focus were forced, landing on the last user message is a no-op.
+    #[test]
+    fn no_user_message_does_not_engage_focus() {
+        let chat = chat_with_notices(5);
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(40, 10);
+        let _ = view.draw(&ctx);
+        assert!(
+            !view.has_user_message(),
+            "notices are not user messages, so nothing to step to"
+        );
+
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &Event::FocusIn);
+        let _ = view.draw(&ctx);
+        assert_eq!(
+            view.list.borrow().cursor,
+            0,
+            "no user message: landing is a no-op, cursor stays at 0"
+        );
+    }
+
+    /// One user message: entering lands on it and prev/next are no-ops that
+    /// keep the cursor on it (nothing older or newer to step to).
+    #[test]
+    fn one_user_message_prev_next_are_no_ops() {
+        // Index 0: user, index 1: assistant reply.
+        let chat = chat_with_user_messages(1);
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(40, 10);
+        let _ = view.draw(&ctx);
+        assert!(view.has_user_message(), "the transcript has a user message");
+
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &Event::FocusIn);
+        let _ = view.draw(&ctx);
+        assert_eq!(
+            view.list.borrow().cursor,
+            0,
+            "lands on the only user message"
+        );
+
+        view.focus_prev_user_message();
+        assert_eq!(view.list.borrow().cursor, 0, "nothing older to step to");
+        view.focus_next_user_message();
+        assert_eq!(view.list.borrow().cursor, 0, "nothing newer to step to");
     }
 
     // ---- Render cache: helpers -------------------------------------------

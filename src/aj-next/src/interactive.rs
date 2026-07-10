@@ -2618,6 +2618,7 @@ impl Shell {
         let auth_request: Rc<RefCell<Option<AuthPickerRequest>>> = Rc::new(RefCell::new(None));
         let keymap_ctx = Rc::new(RefCell::new(HostCtx {
             overlays: Rc::clone(&overlays),
+            editor: Rc::clone(&editor),
             turn_running: false,
             login_active: false,
         }));
@@ -2693,12 +2694,22 @@ impl Shell {
                     ctx.redraw = true;
                 }
                 AjAction::TranscriptFocus => {
-                    // Move keyboard focus onto the transcript. Its `FocusIn`
-                    // shows the item cursor and enters focus mode; the Esc the
-                    // transcript handles then returns focus to the editor. The
-                    // binding's predicate gates this to "no overlay open".
-                    ctx.request_focus(Rc::clone(&transcript_widget));
-                    ctx.redraw = true;
+                    // Tab has two meanings while the autocomplete popup is
+                    // closed (its gate), split by whether the transcript is
+                    // already focused (Spec E section 1). When focused, Tab
+                    // steps to the next-older user message. Otherwise it engages
+                    // focus mode, but only if there is a user message to land
+                    // on: its `FocusIn` lands on the newest one. No user
+                    // messages means Tab is a no-op and stays in the editor.
+                    let transcript = transcript_for_actions.borrow_mut();
+                    if transcript.in_focus_mode() {
+                        transcript.focus_prev_user_message();
+                        ctx.redraw = true;
+                    } else if transcript.has_user_message() {
+                        drop(transcript);
+                        ctx.request_focus(Rc::clone(&transcript_widget));
+                        ctx.redraw = true;
+                    }
                 }
                 AjAction::CancelTurn
                 | AjAction::Steer
