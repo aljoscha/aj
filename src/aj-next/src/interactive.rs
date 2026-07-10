@@ -79,6 +79,7 @@ use crate::settings_ui::{
     SkillsFill, UNSET_VALUE, build_skill_rows, open_model, open_settings, open_skills,
     open_thinking, skills_placeholder_row,
 };
+use crate::splash::{SPLASH_WAKE_EVENT, Splash};
 use crate::status::{STATUS_WAKE_EVENT, StatusLine, StatusState};
 use crate::task_output::open_task_output;
 use crate::transcript::{TranscriptStyles, TranscriptView, vaxis_color};
@@ -2435,6 +2436,41 @@ struct OverlayHandles {
     auth_request: Rc<RefCell<Option<AuthPickerRequest>>>,
 }
 
+/// The chat slot: draws the empty-state [`Splash`] until the active view has a
+/// user or assistant entry, then the [`TranscriptView`].
+///
+/// A thin wrapper so the flex-1 child can pick per draw without disturbing the
+/// transcript's focus and scroll wiring. Whichever child it picks is drawn
+/// through [`draw_widget`], so that child's stamped widget identity (and thus
+/// its hit-testing and focus) survives on the surface tree exactly as if it
+/// were the direct flex child. The slot itself is inert, so it stays off the
+/// hit list.
+struct ChatSlot {
+    chat: Rc<RefCell<ChatState>>,
+    splash: Rc<RefCell<Splash>>,
+    transcript: Rc<RefCell<TranscriptView>>,
+}
+
+impl Widget for ChatSlot {
+    fn draw(&mut self, ctx: &DrawContext) -> Surface {
+        let child = if self.chat.borrow().has_conversation() {
+            draw_widget(&to_widget_ref(Rc::clone(&self.transcript)), ctx)
+        } else {
+            draw_widget(&to_widget_ref(Rc::clone(&self.splash)), ctx)
+        };
+        // Wrap the child's surface rather than returning it, so the caller's
+        // `draw_widget` re-stamps this slot's identity onto the wrapper and
+        // leaves the child's stamp intact underneath.
+        let mut surface = Surface::with_size(child.size);
+        surface.children.push(SubSurface {
+            origin: RelativePoint { row: 0, col: 0 },
+            surface: child,
+            z_index: 0,
+        });
+        surface
+    }
+}
+
 /// The root widget: the keymap controller wrapping the base layout, the
 /// editor submit plumbing, and the overlay stack drawn above everything
 /// while it is open.
@@ -2485,6 +2521,11 @@ struct Shell {
     /// Typed handles to the palette-consuming widgets, kept so
     /// [`Shell::restyle`] can push rebuilt styles into them.
     transcript: Rc<RefCell<TranscriptView>>,
+    /// The empty-state splash, kept so [`Shell::restyle`] can re-tint it and
+    /// [`Shell::capture_event`] can forward the wake that starts its animation.
+    /// Not on the focus path (it is non-interactive), so the Shell forwards to
+    /// it the same way it does the loader.
+    splash: Rc<RefCell<Splash>>,
     pending: Rc<RefCell<PendingBox>>,
     footer: Rc<RefCell<FooterLine>>,
     /// Confirmed config edits parked by the selector and settings overlays
@@ -2592,9 +2633,18 @@ impl Shell {
         let footer = Rc::new(RefCell::new(FooterLine::new(
             Rc::clone(&chat),
             status,
-            styles,
+            Rc::clone(&styles),
             cwd_display,
         )));
+        // The empty-state splash and the transcript share the chat slot. The
+        // `ChatSlot` wrapper draws whichever fits the current state, so the
+        // transcript's focus and scroll wiring is untouched while it is shown.
+        let splash = Splash::new(Rc::clone(&chat), styles, theme.color_mode());
+        let chat_slot = Rc::new(RefCell::new(ChatSlot {
+            chat: Rc::clone(&chat),
+            splash: Rc::clone(&splash),
+            transcript: Rc::clone(&transcript),
+        }));
         // Slot order mirrors `aj`'s layout: header, chat (flex),
         // status, pending, editor, footer. The status and pending
         // slots collapse to zero height while idle/empty, so the
@@ -2603,7 +2653,7 @@ impl Shell {
         let layout: WidgetRef = Rc::new(RefCell::new(FlexColumn {
             children: vec![
                 FlexItem::init(to_widget_ref(Rc::clone(&header_line)), 0),
-                FlexItem::init(to_widget_ref(Rc::clone(&transcript)), 1),
+                FlexItem::init(to_widget_ref(Rc::clone(&chat_slot)), 1),
                 FlexItem::init(to_widget_ref(Rc::clone(&status_line)), 0),
                 FlexItem::init(to_widget_ref(Rc::clone(&pending)), 0),
                 FlexItem::init(to_widget_ref(Rc::clone(&editor)), 0),
@@ -2792,6 +2842,7 @@ impl Shell {
             theme,
             chrome,
             transcript,
+            splash,
             pending,
             footer,
             selector_activity,
@@ -2905,6 +2956,9 @@ impl Shell {
         let styles = Rc::new(TranscriptStyles::from_theme(&t));
         self.transcript.borrow_mut().set_styles(Rc::clone(&styles));
         self.status_line.borrow_mut().set_styles(Rc::clone(&styles));
+        self.splash
+            .borrow_mut()
+            .set_styles(Rc::clone(&styles), t.color_mode());
         self.pending.borrow_mut().set_styles(Rc::clone(&styles));
         self.footer.borrow_mut().set_styles(styles);
         self.editor
@@ -3072,7 +3126,12 @@ impl Widget for Shell {
                 ctx.request_focus(target);
                 ctx.redraw = true;
             } else {
+                // The loader and the splash both animate off host-posted
+                // wakes and neither sits on the focus path, so the Shell (the
+                // focus-path root) forwards App events to both. Each ignores
+                // the wake meant for the other.
                 self.status_line.borrow_mut().handle_event(ctx, event);
+                self.splash.borrow_mut().handle_event(ctx, event);
             }
         }
     }
@@ -3435,6 +3494,16 @@ async fn drive(
     // `None` means nothing has painted in this loop yet, so the first pending
     // redraw paints without waiting.
     let mut last_render: Option<Instant> = None;
+    // Kick the splash animation for this session's empty state. Widgets can
+    // only schedule ticks from an event handler, so the host posts the wake
+    // and the Shell forwards it to the splash (see `Shell::capture_event`),
+    // mirroring the loader's busy-edge wake. A session that opens with a
+    // populated transcript shows it instead, so the splash's first tick finds
+    // it hidden and the chain stops at once.
+    let _ = app.post_app_event(UserEvent {
+        name: SPLASH_WAKE_EVENT.to_string(),
+        data: None,
+    });
     let exit = loop {
         // Paint current state before blocking on the next event, subject to
         // the frame cap: whenever the loop is about to wait, the screen must
@@ -5414,7 +5483,21 @@ mod tests {
     /// Fold `count` numbered notice rows into `chat` so the transcript
     /// overflows the 40-row test viewport.
     fn fold_lines(chat: &Rc<RefCell<ChatState>>, count: usize) {
+        use aj_agent::message::AgentMessage;
+        use aj_models::types::{Message, UserMessage};
+
         let mut lifecycle = aj_app::session::AgentLifecycle::default();
+        // Seed a user message so the chat slot shows the transcript rather than
+        // the empty-state splash. The notice rows below are the scroll content
+        // these callers assert on.
+        let _ = reduce(
+            &mut chat.borrow_mut(),
+            &mut lifecycle,
+            AgentEvent::MessageEnd {
+                agent_id: AgentId::Main,
+                message: AgentMessage::wire(Message::User(UserMessage::text("session start"))),
+            },
+        );
         for i in 0..count {
             let _ = reduce(
                 &mut chat.borrow_mut(),

@@ -70,6 +70,10 @@ pub(crate) struct TranscriptStyles {
     pub(crate) accent: Style,
     /// Bold tool name in a tool cell's header.
     pub(crate) bold: Style,
+    /// Bold key label in the keybinding-hint palette color (`keybindingHint`),
+    /// used by the splash's `{key} for commands` hint (and, per Spec E-10, the
+    /// list-row shortcut column).
+    pub(crate) keybinding_hint: Style,
     pub(crate) diff_add: Style,
     pub(crate) diff_remove: Style,
     /// Tool-bubble tints per visual status.
@@ -129,6 +133,10 @@ impl TranscriptStyles {
             bold: Style {
                 bold: true,
                 ..fg(ThemeColor::ToolTitle)
+            },
+            keybinding_hint: Style {
+                bold: true,
+                ..fg(ThemeColor::KeybindingHint)
             },
             diff_add: fg(ThemeColor::ToolDiffAdded),
             diff_remove: fg(ThemeColor::ToolDiffRemoved),

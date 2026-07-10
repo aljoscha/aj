@@ -570,7 +570,7 @@ mod tests {
                 "syntaxType": "", "syntaxOperator": "", "syntaxPunctuation": "",
                 "thinkingOff": "", "thinkingMinimal": "", "thinkingLow": "",
                 "thinkingMedium": "", "thinkingHigh": "", "thinkingXhigh": "",
-                "bashMode": ""
+                "bashMode": "", "keybindingHint": ""
             }
         }"#;
         let theme = Theme::from_json_with_mode("indexed", json, ColorMode::Truecolor)

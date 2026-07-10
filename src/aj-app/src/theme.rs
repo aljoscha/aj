@@ -187,6 +187,10 @@ pub enum ThemeColor {
 
     /// Editor border in bash quick-command mode.
     BashMode,
+
+    /// Keybinding-hint accent: the shortcut column in list rows and the
+    /// splash's `{key} for commands` hint.
+    KeybindingHint,
 }
 
 impl ThemeColor {
@@ -238,6 +242,7 @@ impl ThemeColor {
             ThemeColor::ThinkingHigh => "thinkingHigh",
             ThemeColor::ThinkingXhigh => "thinkingXhigh",
             ThemeColor::BashMode => "bashMode",
+            ThemeColor::KeybindingHint => "keybindingHint",
         }
     }
 
@@ -290,6 +295,7 @@ impl ThemeColor {
             ThemeColor::ThinkingHigh,
             ThemeColor::ThinkingXhigh,
             ThemeColor::BashMode,
+            ThemeColor::KeybindingHint,
         ]
     }
 }
@@ -1109,7 +1115,7 @@ mod tests {
                 "syntaxType": "", "syntaxOperator": "", "syntaxPunctuation": "",
                 "thinkingOff": "", "thinkingMinimal": "", "thinkingLow": "",
                 "thinkingMedium": "", "thinkingHigh": "", "thinkingXhigh": "",
-                "bashMode": "" }
+                "bashMode": "", "keybindingHint": "" }
         }"#;
         let err = Theme::from_json_with_mode("cyclic", json, ColorMode::Truecolor)
             .expect_err("cyclic var refs must fail to load");
@@ -1151,7 +1157,7 @@ mod tests {
                 "syntaxType": "", "syntaxOperator": "", "syntaxPunctuation": "",
                 "thinkingOff": "", "thinkingMinimal": "", "thinkingLow": "",
                 "thinkingMedium": "", "thinkingHigh": "", "thinkingXhigh": "",
-                "bashMode": "" }
+                "bashMode": "", "keybindingHint": "" }
         }"#;
         let err = Theme::from_json_with_mode("broken", json, ColorMode::Truecolor)
             .expect_err("unknown var ref must fail to load");
@@ -1299,7 +1305,7 @@ mod tests {
                     "syntaxType": "", "syntaxOperator": "", "syntaxPunctuation": "",
                     "thinkingOff": "", "thinkingMinimal": "", "thinkingLow": "",
                     "thinkingMedium": "", "thinkingHigh": "", "thinkingXhigh": "",
-                    "bashMode": ""
+                    "bashMode": "", "keybindingHint": ""
                 }}
             }}"#
         )

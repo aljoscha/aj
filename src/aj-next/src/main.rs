@@ -26,6 +26,7 @@ mod pending;
 mod prompt_history;
 mod session_selector;
 mod settings_ui;
+mod splash;
 mod status;
 mod subagent_box;
 mod task_output;

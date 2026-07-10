@@ -413,6 +413,21 @@ impl ChatState {
         self.active_view
     }
 
+    /// Whether the active view holds any real conversation, meaning at least
+    /// one user or assistant entry.
+    ///
+    /// Leading `Notice` rows (the startup config, restore, and auth
+    /// diagnostics) are chrome, not conversation, so a transcript that holds
+    /// only notices still reads as empty. The empty-state splash gate reads
+    /// this to choose between the splash and the transcript view.
+    pub fn has_conversation(&self) -> bool {
+        self.transcripts.get(&self.active_view).is_some_and(|t| {
+            t.entries()
+                .iter()
+                .any(|e| matches!(e.kind, EntryKind::User(_) | EntryKind::Assistant(_)))
+        })
+    }
+
     /// Switch the viewed transcript to `id`, reconciling the
     /// `header_only` hints: a sub-agent's tool entries render
     /// header-only exactly when that sub is not the active full view.
@@ -646,5 +661,49 @@ mod tests {
             EntryKind::Notice(n) => assert_eq!(n.text, "two"),
             other => panic!("unexpected kind: {other:?}"),
         }
+    }
+
+    fn chat_state() -> ChatState {
+        ChatState::new(
+            AgentSettings {
+                provider: "scripted".into(),
+                model_id: "scripted".into(),
+                thinking: "off".into(),
+                speed: "standard".into(),
+                verbosity: "default".into(),
+            },
+            0,
+            Arc::new(Vec::new()),
+        )
+    }
+
+    #[test]
+    fn has_conversation_ignores_leading_notices() {
+        let mut chat = chat_state();
+        assert!(!chat.has_conversation(), "a fresh model is empty");
+
+        chat.transcripts
+            .get_mut(&AgentId::Main)
+            .expect("main transcript")
+            .append(EntryKind::Notice(NoticeEntry {
+                level: NoticeLevel::Warning,
+                text: "startup warning".into(),
+            }));
+        assert!(
+            !chat.has_conversation(),
+            "leading notices are chrome, not conversation"
+        );
+
+        chat.transcripts
+            .get_mut(&AgentId::Main)
+            .expect("main transcript")
+            .append(EntryKind::User(UserEntry {
+                content: Vec::new(),
+                collapsible: false,
+            }));
+        assert!(
+            chat.has_conversation(),
+            "a user entry after the notices counts as conversation"
+        );
     }
 }

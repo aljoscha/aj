@@ -75,6 +75,8 @@
     "thinkingHigh": "#b294bb",
     "thinkingXhigh": "#d183e8",
 
-    "bashMode": "green"
+    "bashMode": "green",
+
+    "keybindingHint": "#275DD0"
   }
 }
