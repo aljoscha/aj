@@ -179,14 +179,19 @@ entries needs no keep-alive. The cost is bounded by the selection length, not th
 transcript length.
 
 **Focused-message marker and copy.** In transcript-focus mode the focused user
-message is drawn inside a semi-thick border in the app's highlight color, with a
-copy-key hint on the border's bottom edge, the same way an overlay shows its key
-hints in its chrome. Pressing that key copies the whole message through the same
-OSC 52 path the mouse selection uses. The key label in the border resolves
-through the keybinding data (Spec F), never a literal. The border is the `vxfw`
-`Border` widget with a bottom `BorderLabel`, wrapping the entry widget only when
-that entry is the focused one, so it costs nothing on the other rows. The OSC 52
+message is marked by a semi-thick border in the theme's `borderAccent` color,
+with a copy-key hint on the border's bottom edge (`┗━ y to copy ━┛`), the same
+way an overlay shows its key hints in its chrome. Pressing that key copies the
+whole message through the same OSC 52 path the mouse selection uses. The key
+label resolves through the keybinding data (Spec F), never a literal. The OSC 52
 helpers already exist in `aj` (`auth.rs` / `clipboard.rs`) and move to `aj-app`.
+
+The border is drawn into the user bubble's existing padding frame, not a
+wrapping widget. Every user bubble already reserves a one-cell tinted frame (a
+blank row above and below, a column on each side), so the focused message
+repaints those cells as the border glyphs over the same bubble background. We
+reuse space that is always reserved, so focusing a message never reflows the
+transcript. The border spans the full bubble width, matching the bubble.
 
 There is no copy-code-block action: reading and copying code out of assistant
 replies is served by the mouse selection and the native Shift+drag escape hatch.
