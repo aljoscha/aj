@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aj_agent::events::{AgentId, AgentSettings, CompactionPhase};
 use aj_agent::tool::{TaskId, TaskKind, TaskStatus, ToolDetails};
@@ -150,6 +150,14 @@ pub struct SubAgentEntry {
     pub status: SubAgentStatus,
     /// Final report, set on `SubAgentEnd`.
     pub report: Option<String>,
+    /// Start of the current run: set on `SubAgentStart` and reset on a
+    /// continuation re-run, so the runtime measures the active run rather than
+    /// the wall-clock since first spawn.
+    pub started_at: Instant,
+    /// When the sub finished (`SubAgentEnd` or `AgentEnd`), freezing the
+    /// displayed runtime. `None` while it is still running. A continuation
+    /// re-run clears it (and resets `started_at`) so timing starts fresh.
+    pub finished_at: Option<Instant>,
 }
 
 /// A completed compaction's summary row.
@@ -311,6 +319,15 @@ pub struct AgentEntry {
     pub task: Option<String>,
     /// The sub-agent's run status. `None` for the main agent.
     pub status: Option<SubAgentStatus>,
+    /// Elapsed run time, frozen at the sub's end for a finished sub.
+    /// `None` for the main agent.
+    pub runtime: Option<Duration>,
+    /// Whether the sub runs as a background task (concurrent with the
+    /// parent) rather than blocking the parent's turn. Derived from the
+    /// live task registry, so it is `false` for the main agent, for a
+    /// blocking sub, and for any sub restored from a resumed session
+    /// (whose transient task events are never replayed).
+    pub background: bool,
 }
 
 /// The chat view's data model. Mutated only by [`crate::chat::reduce`]
@@ -427,10 +444,15 @@ impl ChatState {
     /// status are read from that [`SubAgentEntry`], which the reducer
     /// keeps current.
     pub fn agents(&self) -> Vec<AgentEntry> {
+        // A single `now` for every still-running sub's elapsed time, so the
+        // snapshot's runtimes are consistent with each other.
+        let now = Instant::now();
         let mut out = vec![AgentEntry {
             id: AgentId::Main,
             task: None,
             status: None,
+            runtime: None,
+            background: false,
         }];
         let mut subs: Vec<usize> = self.sub_boxes.keys().copied().collect();
         subs.sort_unstable();
@@ -445,10 +467,27 @@ impl ChatState {
                     id: AgentId::Sub(n),
                     task: Some(sub.task.clone()),
                     status: Some(sub.status),
+                    runtime: Some(
+                        sub.finished_at
+                            .unwrap_or(now)
+                            .duration_since(sub.started_at),
+                    ),
+                    background: self.is_background_sub(n),
                 });
             }
         }
         out
+    }
+
+    /// Whether sub-agent `n` runs as a background task. A background spawn
+    /// registers a `TaskKind::Agent` task (kept in the map even after it
+    /// finishes, so the classification survives for the whole session), a
+    /// blocking spawn registers none. Task events are transient and never
+    /// replayed, so a sub restored from a resumed session reads as `false`.
+    fn is_background_sub(&self, n: usize) -> bool {
+        self.tasks
+            .values()
+            .any(|t| matches!(t.kind, TaskKind::Agent { agent_id, .. } if agent_id == n))
     }
 
     /// The per-agent footer store.

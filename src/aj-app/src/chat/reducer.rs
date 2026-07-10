@@ -53,6 +53,14 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
                 && let Some(b) = state.sub_box_mut(n)
             {
                 b.status = SubAgentStatus::Running;
+                // A continuation re-run (the box already has an end recorded)
+                // restarts the clock so the runtime times the new run, not the
+                // wall-clock since first spawn. The initial run has no end yet,
+                // so its `started_at` is left untouched.
+                if b.finished_at.is_some() {
+                    b.started_at = Instant::now();
+                    b.finished_at = None;
+                }
             }
             Redraw(true)
         }
@@ -70,6 +78,7 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
                 && let Some(b) = state.sub_box_mut(n)
             {
                 b.status = SubAgentStatus::Done;
+                b.finished_at = Some(Instant::now());
             }
             Redraw(true)
         }
@@ -329,6 +338,8 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
                                 task,
                                 status: SubAgentStatus::Running,
                                 report: None,
+                                started_at: Instant::now(),
+                                finished_at: None,
                             }));
                     state.sub_boxes.insert(n, (parent, id));
                 }
@@ -346,6 +357,7 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
             {
                 b.status = SubAgentStatus::Done;
                 b.report = Some(report);
+                b.finished_at = Some(Instant::now());
             }
             Redraw(true)
         }
@@ -663,6 +675,7 @@ fn append_notice(state: &mut ChatState, agent_id: AgentId, level: NoticeLevel, t
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat::model::AgentEntry;
 
     use std::sync::Mutex;
     use std::time::Duration;
@@ -1427,6 +1440,147 @@ mod tests {
             );
             assert_eq!(box_status(&mut s), SubAgentStatus::Done);
         }
+    }
+
+    fn agent_row(s: &ChatState, id: AgentId) -> AgentEntry {
+        s.agents()
+            .into_iter()
+            .find(|a| a.id == id)
+            .expect("agent row present")
+    }
+
+    #[test]
+    fn sub_agent_end_freezes_the_runtime() {
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        apply(
+            &mut s,
+            &mut life,
+            sub_agent_start(1, "scripted", "scripted"),
+        );
+
+        // Running: no end recorded, and the snapshot reports a (ticking) runtime.
+        assert!(s.sub_box_mut(1).expect("box").finished_at.is_none());
+        assert!(
+            agent_row(&s, AgentId::Sub(1)).runtime.is_some(),
+            "a running sub has a runtime"
+        );
+
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::SubAgentEnd {
+                parent: AgentId::Main,
+                child: AgentId::Sub(1),
+                report: "done".into(),
+            },
+        );
+        // Ended: the end is stamped and the reported runtime no longer moves.
+        assert!(s.sub_box_mut(1).expect("box").finished_at.is_some());
+        let r1 = agent_row(&s, AgentId::Sub(1)).runtime;
+        let r2 = agent_row(&s, AgentId::Sub(1)).runtime;
+        assert_eq!(r1, r2, "a finished sub's runtime is frozen");
+    }
+
+    #[test]
+    fn continuation_rerun_restarts_the_runtime_clock() {
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        apply(
+            &mut s,
+            &mut life,
+            sub_agent_start(1, "scripted", "scripted"),
+        );
+        let spawn_start = s.sub_box_mut(1).expect("box").started_at;
+
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::AgentEnd {
+                agent_id: AgentId::Sub(1),
+                messages: Vec::new(),
+            },
+        );
+        assert!(s.sub_box_mut(1).expect("box").finished_at.is_some());
+
+        // Idle, then a continuation re-run. The clock restarts (start advances,
+        // end cleared) so the runtime times the new run, not the idle gap.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::AgentStart {
+                agent_id: AgentId::Sub(1),
+            },
+        );
+        let b = s.sub_box_mut(1).expect("box");
+        assert!(b.finished_at.is_none(), "re-run clears the frozen end");
+        assert!(b.started_at > spawn_start, "re-run resets the start");
+    }
+
+    #[test]
+    fn agents_flag_background_subs_from_the_task_registry() {
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        // Sub 1 blocking (no task registered); Sub 2 background (a
+        // `TaskKind::Agent` task tracks it).
+        apply(
+            &mut s,
+            &mut life,
+            sub_agent_start(1, "scripted", "scripted"),
+        );
+        apply(
+            &mut s,
+            &mut life,
+            sub_agent_start(2, "scripted", "scripted"),
+        );
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::TaskStart {
+                agent_id: AgentId::Main,
+                task_id: 2,
+                call_id: "c2".into(),
+                kind: TaskKind::Agent {
+                    agent_id: 2,
+                    task: "task 2".into(),
+                },
+                label: "agent 2".into(),
+            },
+        );
+        assert!(!agent_row(&s, AgentId::Sub(1)).background, "blocking sub");
+        assert!(agent_row(&s, AgentId::Sub(2)).background, "background sub");
+
+        // The classification survives the task finishing (the entry is kept).
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::TaskEnd {
+                agent_id: AgentId::Main,
+                task_id: 2,
+                call_id: "c2".into(),
+                status: TaskStatus::Exited(Some(0)),
+                label: "agent 2".into(),
+            },
+        );
+        assert!(
+            agent_row(&s, AgentId::Sub(2)).background,
+            "still background after the task ends"
+        );
+    }
+
+    #[test]
+    fn agents_main_row_has_no_runtime_or_background() {
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        apply(
+            &mut s,
+            &mut life,
+            sub_agent_start(1, "scripted", "scripted"),
+        );
+        let main = agent_row(&s, AgentId::Main);
+        assert_eq!(main.runtime, None);
+        assert!(!main.background);
     }
 
     #[test]

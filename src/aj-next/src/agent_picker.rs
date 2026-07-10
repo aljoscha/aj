@@ -281,11 +281,11 @@ fn build_items(
 }
 
 /// One agent row. A sub-agent's label leads with its run-state glyph so the
-/// status shows at a glance and is never truncated away by a long task (the
-/// status used to ride at the end of the description, which a long prompt
-/// pushed off the row). The label also carries the `(current)` tag. The filter
+/// status shows at a glance, and carries the `(current)` tag. Its description is
+/// `mode · runtime · task`: the metadata leads so a long task truncates off the
+/// right edge rather than pushing the mode and runtime off the row. The filter
 /// key stays clean so it both decodes unambiguously and fuzzy-matches the human
-/// name (and, for a sub, its task text).
+/// name (and, for a sub, its full task text).
 fn agent_item(entry: &AgentEntry, active: AgentId) -> SelectItem {
     let name = match entry.id {
         AgentId::Main => MAIN_KEY.to_string(),
@@ -300,21 +300,26 @@ fn agent_item(entry: &AgentEntry, active: AgentId) -> SelectItem {
     if entry.id == active {
         label.push_str(" (current)");
     }
-    // A sub-agent's task is a free-form prompt that can span several lines. The
-    // row widget truncates to the row width but still breaks on hard newlines,
-    // so a raw multi-line task would spill onto extra rows and blow up the row
-    // height. Flatten it to a single line first, leaving width to the row's own
-    // truncation.
+    // A sub-agent's task is a free-form prompt that can span several lines.
+    // Flatten it so the row widget's hard-newline break can't spill it onto
+    // extra rows. The full flattened task rides in the filter key for matching.
     let task = entry.task.as_deref().map(single_line);
-    // The task rides in the filter key so a query matches it, and in the
-    // description so it shows.
     let filter_key = match &task {
         Some(task) => format!("{name} {task}"),
         None => name,
     };
     let mut item = SelectItem::new(label, filter_key);
     if let Some(task) = &task {
-        item = item.with_description(task.clone());
+        // Metadata leads, task trails: the row truncates from the right, so a
+        // long task is what gets clipped while the mode and runtime stay
+        // visible. Task rows do the reverse because their command is short and
+        // tail-capped, unlike a free-form prompt.
+        let mut desc = mode_label(entry.background).to_string();
+        if let Some(runtime) = entry.runtime {
+            desc.push_str(&format!(" \u{b7} {}", format_runtime(runtime)));
+        }
+        desc.push_str(&format!(" \u{b7} {task}"));
+        item = item.with_description(desc);
     }
     item
 }
@@ -415,6 +420,15 @@ fn single_line(text: &str) -> String {
         }
     }
     out.trim().to_string()
+}
+
+/// Foreground/background label for a sub-agent row's description.
+fn mode_label(background: bool) -> &'static str {
+    if background {
+        "background"
+    } else {
+        "foreground"
+    }
 }
 
 /// Cap a task's command for the description column, keeping the tail:
@@ -529,6 +543,8 @@ mod tests {
             id: AgentId::Main,
             task: None,
             status: None,
+            runtime: None,
+            background: false,
         }
     }
 
@@ -537,6 +553,8 @@ mod tests {
             id: AgentId::Sub(n),
             task: Some(format!("task {n}")),
             status: Some(status),
+            runtime: Some(Duration::from_secs(5)),
+            background: false,
         }
     }
 
@@ -652,6 +670,8 @@ mod tests {
             id: AgentId::Sub(1),
             task: Some("line one\nline two\nline three".to_string()),
             status: Some(SubAgentStatus::Running),
+            runtime: None,
+            background: false,
         };
         let item = agent_item(&entry, AgentId::Main);
         let description = item.description.as_deref().expect("sub row has a task");
@@ -659,18 +679,57 @@ mod tests {
             !description.contains('\n'),
             "the description is a single line: {description:?}"
         );
-        assert_eq!(description, "line one line two line three");
+        // The flattened task appears after the mode; the description leads
+        // with the mode so a long task can't push it off the row.
+        assert!(
+            description.ends_with("line one line two line three"),
+            "{description:?}"
+        );
+        assert!(description.starts_with("foreground"), "{description:?}");
         // The flattened task rides in the filter key too, and the row still
         // decodes back to its agent id.
         assert!(!item.filter_key.contains('\n'), "{:?}", item.filter_key);
         assert_eq!(decode_agent(&item.filter_key), Some(AgentId::Sub(1)));
     }
 
+    /// The row description pins the `task tail \u{b7} mode \u{b7} runtime` layout for a
+    /// running background sub and a finished foreground sub.
+    #[test]
+    fn agent_row_shows_mode_and_runtime() {
+        let running_bg = AgentEntry {
+            id: AgentId::Sub(1),
+            task: Some("do the thing".to_string()),
+            status: Some(SubAgentStatus::Running),
+            runtime: Some(Duration::from_secs(83)),
+            background: true,
+        };
+        let item = agent_item(&running_bg, AgentId::Main);
+        assert_eq!(item.label, "\u{25b8} agent 1");
+        assert_eq!(
+            item.description.as_deref(),
+            Some("background \u{b7} 1m 23s \u{b7} do the thing")
+        );
+
+        let done_fg = AgentEntry {
+            id: AgentId::Sub(2),
+            task: Some("other work".to_string()),
+            status: Some(SubAgentStatus::Done),
+            runtime: Some(Duration::from_secs(5)),
+            background: false,
+        };
+        let item = agent_item(&done_fg, AgentId::Main);
+        assert_eq!(item.label, "\u{2713} agent 2");
+        assert_eq!(
+            item.description.as_deref(),
+            Some("foreground \u{b7} 5s \u{b7} other work")
+        );
+    }
+
     /// The rendered picker draws one screen row per agent even when a
     /// sub-agent's task spans several lines. `RichText` breaks on hard
     /// newlines, so without the flatten the task would spill onto extra rows;
-    /// this asserts the rendered surface directly, in both scopes (the
-    /// `All`-scope status suffix must stay on the row too).
+    /// this asserts the rendered surface directly, in both scopes (the trailing
+    /// mode and runtime stay on the same row too).
     #[test]
     fn multiline_sub_task_renders_on_a_single_row() {
         use vaxis::vxfw::Widget;
@@ -681,6 +740,8 @@ mod tests {
                 id: AgentId::Sub(1),
                 task: Some("line one\nline two\nline three".to_string()),
                 status: Some(SubAgentStatus::Running),
+                runtime: Some(Duration::from_secs(5)),
+                background: false,
             },
         ];
         for scope in [Scope::Running, Scope::All] {
@@ -707,10 +768,10 @@ mod tests {
         }
     }
 
-    /// The whole point of the leading glyph: a sub-agent's status stays visible
-    /// even when its task is long enough to fill and truncate the row. The
-    /// status used to ride at the end of the description, where a long task
-    /// pushed it off the row entirely.
+    /// The leading glyph plus the metadata-first description keep a sub-agent's
+    /// status, mode, and runtime visible even at the picker's narrowest overlay
+    /// width and even when the task is long: the row truncates the trailing
+    /// task, not the metadata.
     #[test]
     fn agent_status_glyph_survives_a_long_task() {
         use vaxis::vxfw::Widget;
@@ -721,28 +782,36 @@ mod tests {
                 id: AgentId::Sub(1),
                 task: Some(long.clone()),
                 status: Some(SubAgentStatus::Running),
+                runtime: Some(Duration::from_secs(83)),
+                background: true,
             },
             AgentEntry {
                 id: AgentId::Sub(2),
                 task: Some(long),
                 status: Some(SubAgentStatus::Done),
+                runtime: Some(Duration::from_secs(5)),
+                background: false,
             },
         ];
         let items = build_items(&agents, &[], AgentId::Main, Scope::All);
         let mut select = FilterableSelect::new(items, SelectStyles::default());
-        // A narrow width guarantees the task fills and truncates the row.
+        // Inner width 68 is the `Small` overlay floor; the metadata still fits.
         let rows =
-            crate::test_support::rows(&select.draw(&crate::test_support::draw_ctx(40, Some(8))));
+            crate::test_support::rows(&select.draw(&crate::test_support::draw_ctx(68, Some(8))));
         let sub1 = rows.iter().find(|r| r.contains("agent 1")).expect("sub 1");
         let sub2 = rows.iter().find(|r| r.contains("agent 2")).expect("sub 2");
-        // The glyph leads the row and the task got ellipsis-truncated, so the
-        // status is readable regardless of task length.
+        // Status via the leading glyph, then mode and runtime, all before the
+        // long task, so all survive on a narrow row. The task is what clips.
         assert!(
             sub1.starts_with('\u{25b8}'),
             "running glyph leads: {sub1:?}"
         );
         assert!(sub2.starts_with('\u{2713}'), "done glyph leads: {sub2:?}");
-        assert!(sub1.ends_with('\u{2026}'), "long task truncated: {sub1:?}");
+        assert!(sub1.contains("background"), "mode shown: {sub1:?}");
+        assert!(sub1.contains("1m 23s"), "runtime shown: {sub1:?}");
+        assert!(sub2.contains("foreground"), "mode shown: {sub2:?}");
+        assert!(sub2.contains("5s"), "runtime shown: {sub2:?}");
+        assert!(sub1.ends_with('\u{2026}'), "long task clipped: {sub1:?}");
     }
 
     #[test]
