@@ -891,12 +891,14 @@ mod tests {
     fn load_real_registry_applies_overrides() {
         let reg = ModelRegistry::load();
         assert!(!reg.providers().is_empty());
-        // Pick a model the overrides file flips: opus-4-7 should have
-        // both flags set after override application.
-        if let Some(m) = reg.get("anthropic", "claude-opus-4-7") {
+        // Pick a model the overrides file pins: opus-4-5 is a
+        // pre-adaptive reasoning model, so the override forces adaptive
+        // off. The refresh heuristic would otherwise default an
+        // Anthropic reasoning model to adaptive on.
+        if let Some(m) = reg.get("anthropic", "claude-opus-4-5") {
             assert!(
-                supports_adaptive_thinking(m),
-                "opus-4-7 should use adaptive thinking"
+                !supports_adaptive_thinking(m),
+                "opus-4-5 override should pin adaptive thinking off"
             );
         }
         // gpt-5.2 is a legacy budget? no — OpenAI model; just assert it

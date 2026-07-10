@@ -6,15 +6,9 @@
         "id": "claude-opus-4-5"
       },
       "patch": {
-        "cost": {
-          "input": 5.0,
-          "output": 25.0,
-          "cache_read": 0.5,
-          "cache_write": 6.25
-        },
         "supports_adaptive_thinking": false
       },
-      "reason": "models.dev lists 3x cache pricing (1.5/18.75); correct values are 0.5/6.25. Pre-adaptive model: budget-based thinking only."
+      "reason": "Pre-adaptive model: budget-based extended thinking only. The refresh heuristic defaults Anthropic reasoning models to adaptive, so we pin it off."
     },
     {
       "target": {
@@ -22,55 +16,9 @@
         "id": "claude-opus-4-5-20251101"
       },
       "patch": {
-        "cost": {
-          "input": 5.0,
-          "output": 25.0,
-          "cache_read": 0.5,
-          "cache_write": 6.25
-        },
         "supports_adaptive_thinking": false
       },
-      "reason": "models.dev lists 3x cache pricing (1.5/18.75); correct values are 0.5/6.25. Pre-adaptive model: budget-based thinking only."
-    },
-    {
-      "target": {
-        "provider": "anthropic",
-        "id": "claude-opus-4-6"
-      },
-      "patch": {
-        "supports_adaptive_thinking": true
-      },
-      "reason": "Adaptive thinking recommended (thinking:{type:adaptive} + effort); manual budget mode deprecated but still functional. Not in models.dev."
-    },
-    {
-      "target": {
-        "provider": "anthropic",
-        "id": "claude-opus-4-7"
-      },
-      "patch": {
-        "supports_adaptive_thinking": true
-      },
-      "reason": "Adaptive thinking only; manual budget mode returns 400. Not in models.dev."
-    },
-    {
-      "target": {
-        "provider": "anthropic",
-        "id": "claude-opus-4-8"
-      },
-      "patch": {
-        "supports_adaptive_thinking": true
-      },
-      "reason": "Adaptive thinking only; manual budget mode returns 400. Not in models.dev."
-    },
-    {
-      "target": {
-        "provider": "anthropic",
-        "id": "claude-sonnet-4-6"
-      },
-      "patch": {
-        "supports_adaptive_thinking": true
-      },
-      "reason": "Adaptive thinking recommended; manual budget mode deprecated but still functional. Not in models.dev."
+      "reason": "Pre-adaptive model: budget-based extended thinking only. The refresh heuristic defaults Anthropic reasoning models to adaptive, so we pin it off."
     },
     {
       "target": {
