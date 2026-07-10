@@ -215,6 +215,9 @@ async fn build_world(
     }
 
     // Startup notices, after replay so resumed history stays on top.
+    // Order mirrors aj: config diagnostics, then (fresh session only)
+    // the context notice and skill warnings, then sandbox, auth, tmux,
+    // then the resume-restore notices.
     for d in diagnostics {
         let text = d.to_string();
         let event = match d.severity() {
@@ -229,8 +232,31 @@ async fn build_world(
         };
         let _ = reduce(&mut chat, &mut core.lifecycle, event);
     }
-    for notice in std::mem::take(&mut core.restore_notices) {
-        let _ = reduce(&mut chat, &mut core.lifecycle, notice_event(&notice));
+    // The context notice and skill warnings describe the freshly-loaded
+    // env, which only governs a fresh session. A resumed session keeps
+    // its assembled prompt in the log, so we skip them there.
+    if matches!(spec, SessionSpec::Create { .. }) {
+        // aj-next notices are plain text styled by level, so the
+        // disabled-skill row hook is the identity: no embedded ANSI.
+        fn identity(s: &str) -> String {
+            s.to_string()
+        }
+        let context = aj_app::notices::build_context_notice(&core.env, identity);
+        let _ = reduce(&mut chat, &mut core.lifecycle, notice_event(&context));
+        for d in &core.env.skill_diagnostics {
+            let _ = reduce(
+                &mut chat,
+                &mut core.lifecycle,
+                warning_event(&d.to_string()),
+            );
+        }
+    }
+    if aj_app::notices::sandbox_warning_enabled() {
+        let _ = reduce(
+            &mut chat,
+            &mut core.lifecycle,
+            warning_event(aj_app::notices::SANDBOX_WARNING),
+        );
     }
     // Apply a `--api-key` runtime override to the resolved provider, then
     // nudge toward logging in when no credential is configured. Both are
@@ -260,6 +286,12 @@ async fn build_world(
             };
             let _ = reduce(&mut chat, &mut core.lifecycle, event);
         }
+    }
+    if let Some(warning) = aj_app::tmux::options().and_then(aj_app::tmux::build_warning) {
+        let _ = reduce(&mut chat, &mut core.lifecycle, warning_event(&warning));
+    }
+    for notice in std::mem::take(&mut core.restore_notices) {
+        let _ = reduce(&mut chat, &mut core.lifecycle, notice_event(&notice));
     }
     // Launch positionals (`aj-next <msg>` / `continue <id> <msg>`) are
     // not auto-submitted yet. Say so instead of silently dropping them.
@@ -426,6 +458,15 @@ fn install_next_session(world: &mut World, shell: &Rc<RefCell<Shell>>, next: Nex
 /// folds through the same reducer arm as bus notices.
 fn notice_event(text: &str) -> AgentEvent {
     AgentEvent::Notice {
+        agent_id: AgentId::Main,
+        text: text.to_string(),
+    }
+}
+
+/// Wrap a host-side warning in the [`AgentEvent::Warning`] shape so it
+/// folds through the same reducer arm as bus warnings.
+fn warning_event(text: &str) -> AgentEvent {
+    AgentEvent::Warning {
         agent_id: AgentId::Main,
         text: text.to_string(),
     }

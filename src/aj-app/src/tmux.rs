@@ -9,9 +9,12 @@
 //!
 //! Given a probed [`TmuxOptions`], [`build_warning`] turns whatever is
 //! still off into a user-facing warning naming it plus the
-//! `~/.tmux.conf` lines that fix it. The live probe that fills
-//! [`TmuxOptions`] is a backend concern (it also feeds capability
-//! detection), so it stays with the frontend that consumes it.
+//! `~/.tmux.conf` lines that fix it. [`options`] runs the live probe
+//! that fills [`TmuxOptions`]. A frontend whose backend already probes
+//! tmux (for capability detection) can pass that result to
+//! [`build_warning`] directly instead of probing again.
+
+use std::process::Command;
 
 /// The tmux options that govern whether aj's escape sequences reach the
 /// outer terminal. Each field is the resolved state for the attached
@@ -77,6 +80,42 @@ pub fn build_warning(opts: TmuxOptions) -> Option<String> {
     Some(msg)
 }
 
+/// Probe the running tmux server, or `None` when we're not inside tmux
+/// or the server can't be queried.
+///
+/// Gated on `$TMUX` (set only by a genuine tmux client, and naming the
+/// socket to talk to) with `$CMUX_WORKSPACE_ID` unset: cmux is
+/// tmux-derived but rewraps escapes unreliably, so we refuse to probe
+/// it and callers fall back to conservative defaults.
+///
+/// We deliberately duplicate this probe rather than share the one in
+/// `aj-tui`, so `aj-app` stays independent of any TUI backend (the same
+/// reason [`TmuxOptions`] is duplicated). It is a live probe of the
+/// server, not a snapshot, so each frontend gets the current state.
+pub fn options() -> Option<TmuxOptions> {
+    if std::env::var_os("TMUX").is_none() || std::env::var_os("CMUX_WORKSPACE_ID").is_some() {
+        return None;
+    }
+    let termfeatures = query(&["display-message", "-p", "#{client_termfeatures}"])?;
+    let allow_passthrough = query(&["show-options", "-gv", "allow-passthrough"])?;
+    let features: Vec<&str> = termfeatures.split(',').map(str::trim).collect();
+    Some(TmuxOptions {
+        sync: features.contains(&"sync"),
+        hyperlinks: features.contains(&"hyperlinks"),
+        allow_passthrough: allow_passthrough.trim() == "on",
+    })
+}
+
+/// Run `tmux <args>` and return its trimmed stdout, or `None` if the
+/// command can't be spawned or exits non-zero.
+fn query(args: &[&str]) -> Option<String> {
+    let output = Command::new("tmux").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +162,23 @@ mod tests {
         assert!(warning.contains("set -as terminal-features '*:sync'"));
         assert!(warning.contains("set -as terminal-features '*:hyperlinks'"));
         assert!(warning.contains("set -g allow-passthrough on"));
+    }
+
+    #[test]
+    fn options_returns_none_outside_tmux() {
+        // SAFETY: this crate's tests run single-threaded per `cargo
+        // test`, so mutating the process env here races nothing. We
+        // save and restore `$TMUX` so other tests aren't disturbed.
+        let prev = std::env::var_os("TMUX");
+        unsafe {
+            std::env::remove_var("TMUX");
+        }
+        assert!(options().is_none(), "no probe when $TMUX is unset");
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("TMUX", v),
+                None => std::env::remove_var("TMUX"),
+            }
+        }
     }
 }

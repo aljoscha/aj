@@ -31,6 +31,7 @@ pub mod footer;
 pub mod keybindings;
 pub mod markdown;
 pub mod model;
+pub mod notices;
 pub mod print;
 pub mod scripted;
 pub mod session;

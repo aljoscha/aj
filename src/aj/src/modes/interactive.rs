@@ -39,8 +39,7 @@ use aj_app::settings::{
     persist_setting, persist_user,
 };
 use aj_conf::{
-    AgentEnv, Config, ConfigSpeed, ConfigThinkingDisplay, ConfigVerbosity, Severity,
-    SystemPromptSource, display_path,
+    Config, ConfigSpeed, ConfigThinkingDisplay, ConfigVerbosity, Severity, display_path,
 };
 use aj_models::auth::AuthStorage;
 use aj_models::registry::ModelInfo;
@@ -508,7 +507,8 @@ impl InteractiveMode {
                 .iter()
                 .map(|d| d.to_string())
                 .collect();
-            let context_notice = build_context_notice(env);
+            let context_notice =
+                aj_app::notices::build_context_notice(env, aj_tui::style::strikethrough);
             world.pump.handle(
                 &mut world.core.lifecycle,
                 &mut tui,
@@ -520,11 +520,11 @@ impl InteractiveMode {
                     .handle(&mut world.core.lifecycle, &mut tui, &warning_event(warning));
             }
         }
-        if sandbox_warning_enabled() {
+        if aj_app::notices::sandbox_warning_enabled() {
             world.pump.handle(
                 &mut world.core.lifecycle,
                 &mut tui,
-                &warning_event(SANDBOX_WARNING),
+                &warning_event(aj_app::notices::SANDBOX_WARNING),
             );
         }
         if let Some(warning) = &startup_auth_warning {
@@ -2484,86 +2484,6 @@ impl ThemeWatch {
             },
         }
     }
-}
-
-/// Build the chat-scrollback "Context:" notice listing everything
-/// stitched into the agent's system prompt: the base prompt (builtin
-/// or override file), every agents.md-style instruction file, and
-/// every discovered skill, one row each formatted as
-/// `  - <tildified path> (<label>)` so the user can verify which
-/// guidance is actually active. Skill rows carry the skill name and a
-/// marker when the skill is excluded from the model's listing — either
-/// `disabled` (the user's `disabled_skills` config) or
-/// `model-invocation disabled` (the skill's own frontmatter). Disabled
-/// rows are additionally struck through so they read as inactive at a
-/// glance.
-fn build_context_notice(env: &AgentEnv) -> String {
-    let mut lines = String::from("Context:");
-    let source = &env.system_prompt.source;
-    match source {
-        SystemPromptSource::Builtin => {
-            lines.push_str(&format!(
-                "\n  - builtin ({}; override with ~/.agents/SYSTEM_PROMPT.md)",
-                source.label()
-            ));
-        }
-        SystemPromptSource::Override(path) => {
-            lines.push_str(&format!(
-                "\n  - {} ({})",
-                display_path(path),
-                source.label()
-            ));
-        }
-    }
-    for file in &env.context_files {
-        lines.push_str(&format!(
-            "\n  - {} ({})",
-            display_path(&file.path),
-            file.kind.label()
-        ));
-    }
-    for skill in &env.skills {
-        let marker = if !skill.enabled {
-            ", disabled"
-        } else if skill.disable_model_invocation {
-            ", model-invocation disabled"
-        } else {
-            ""
-        };
-        let row = format!(
-            "{} (skill: {}{marker})",
-            display_path(&skill.path),
-            skill.name,
-        );
-        // A disabled skill is excluded from the model's listing
-        // entirely, so we strike its row through to set it apart at a
-        // glance. The notice renderer's dim wrap and this strikethrough
-        // are independent SGR attributes, so they nest cleanly; the
-        // `, disabled` marker stays legible through the line.
-        let row = if skill.enabled {
-            row
-        } else {
-            aj_tui::style::strikethrough(&row)
-        };
-        lines.push_str(&format!("\n  - {row}"));
-    }
-    lines
-}
-
-/// The exact sandbox-warning string the binary emits at startup
-/// unless `AJ_DISABLE_SANDBOX_WARNING` is set in the environment.
-/// Kept in a `const` so it's easy to assert on in tests.
-const SANDBOX_WARNING: &str = "WARNING: AJ has no sandboxing or permission checks. The agent can execute \
-     arbitrary commands on your system. Do not use AJ if you don't understand what \
-     this means. Set AJ_DISABLE_SANDBOX_WARNING=1 to suppress this warning.";
-
-/// Returns `true` when the sandbox warning should be shown — i.e.
-/// when `AJ_DISABLE_SANDBOX_WARNING` is unset in the environment.
-/// Uses an `std::env::var("AJ_DISABLE_SANDBOX_WARNING").is_err()`
-/// check: setting the var to *any* value (including the empty
-/// string) suppresses the warning.
-fn sandbox_warning_enabled() -> bool {
-    std::env::var("AJ_DISABLE_SANDBOX_WARNING").is_err()
 }
 
 /// Push the editor's border tint for the given thinking level.
@@ -4685,7 +4605,7 @@ async fn handle_selector_outcome(
 mod tests {
     use std::path::PathBuf;
 
-    use aj_conf::{AgentEnv, ContextFile, ContextFileKind, SystemPrompt, SystemPromptSource};
+    use aj_conf::{AgentEnv, ContextFile, SystemPrompt, SystemPromptSource};
     use aj_models::types::StreamOptions;
     use tempfile::TempDir;
     use tokio::sync::Mutex as TokioMutex;
@@ -4698,9 +4618,9 @@ mod tests {
     use crate::turn::apply_turn_config;
 
     /// Build an [`AgentEnv`] for use in the helper tests below.
-    /// Working directory / OS / date / git root are all stubbed —
-    /// only `system_prompt` and `context_files` matter for the
-    /// startup-notice builders.
+    /// Working directory / OS / date / git root are stubbed: only
+    /// `system_prompt`, `context_files`, and `skills` matter for the
+    /// startup-notice builder.
     fn env_with(context_files: Vec<ContextFile>) -> AgentEnv {
         AgentEnv {
             working_directory: PathBuf::from("/tmp"),
@@ -4849,63 +4769,7 @@ mod tests {
     }
 
     #[test]
-    fn build_context_notice_without_files_lists_only_the_system_prompt() {
-        let env = env_with(Vec::new());
-        assert_eq!(
-            build_context_notice(&env),
-            "Context:\n  - builtin (system prompt; override with ~/.agents/SYSTEM_PROMPT.md)"
-        );
-    }
-
-    #[test]
-    fn build_context_notice_lists_files_with_label_and_tildified_path() {
-        // `display_path` tildifies under `$HOME`, so build the path
-        // off the live `HOME` env var to keep the assertion stable
-        // across machines.
-        let home = std::env::var("HOME").expect("HOME set in test env");
-        let user_path = PathBuf::from(&home).join(".agents/AGENTS.md");
-        let project_path = PathBuf::from("/var/project/AGENTS.md");
-        let env = env_with(vec![
-            ContextFile {
-                path: user_path,
-                kind: ContextFileKind::UserInstructions,
-                content: String::new(),
-            },
-            ContextFile {
-                path: project_path,
-                kind: ContextFileKind::ProjectInstructions,
-                content: String::new(),
-            },
-        ]);
-
-        let notice = build_context_notice(&env);
-        let expected = "Context:\n  \
-             - builtin (system prompt; override with ~/.agents/SYSTEM_PROMPT.md)\n  \
-             - ~/.agents/AGENTS.md (user instructions)\n  \
-             - /var/project/AGENTS.md (project instructions)";
-        assert_eq!(notice, expected);
-    }
-
-    #[test]
-    fn build_context_notice_override_shows_tildified_prompt_path() {
-        // `display_path` tildifies under `$HOME`, so build the path
-        // off the live `HOME` env var to keep the assertion stable
-        // across machines.
-        let home = std::env::var("HOME").expect("HOME set in test env");
-        let path = PathBuf::from(&home).join(".agents/SYSTEM_PROMPT.md");
-        let mut env = env_with(Vec::new());
-        env.system_prompt = SystemPrompt {
-            content: "override prompt".to_string(),
-            source: SystemPromptSource::Override(path),
-        };
-        assert_eq!(
-            build_context_notice(&env),
-            "Context:\n  - ~/.agents/SYSTEM_PROMPT.md (system prompt)"
-        );
-    }
-
-    #[test]
-    fn build_context_notice_lists_skills_with_status_markers() {
+    fn build_context_notice_strikes_disabled_skill_rows_through_the_tui_hook() {
         let skill = |name: &str, enabled: bool, dmi: bool| aj_conf::skills::Skill {
             name: name.to_string(),
             description: format!("{name} description"),
@@ -4914,70 +4778,18 @@ mod tests {
             disable_model_invocation: dmi,
         };
         let mut env = env_with(Vec::new());
-        env.skills = vec![
-            skill("alpha", true, false),
-            skill("beta", false, false),
-            skill("gamma", true, true),
-        ];
+        env.skills = vec![skill("alpha", true, false), skill("beta", false, false)];
 
-        let notice = build_context_notice(&env);
+        // aj passes its ANSI strikethrough as the `strike` hook, so the
+        // disabled row carries the `\x1b[9m` SGR pair and the enabled
+        // row stays plain. This is aj's rendering choice, so it can't
+        // live with the frontend-agnostic builder in `aj-app`.
+        let notice = aj_app::notices::build_context_notice(&env, aj_tui::style::strikethrough);
         let beta =
             aj_tui::style::strikethrough("/var/skills/beta/SKILL.md (skill: beta, disabled)");
-        let expected = format!(
-            "Context:\n  \
-             - builtin (system prompt; override with ~/.agents/SYSTEM_PROMPT.md)\n  \
-             - /var/skills/alpha/SKILL.md (skill: alpha)\n  \
-             - {beta}\n  \
-             - /var/skills/gamma/SKILL.md (skill: gamma, model-invocation disabled)"
-        );
-        assert_eq!(notice, expected);
-    }
-
-    #[test]
-    fn sandbox_warning_enabled_tracks_env_var_presence() {
-        // SAFETY: tests in this module run on a single thread so
-        // mutating the process env is fine. We save/restore the
-        // pre-existing value so other tests aren't disturbed.
-        let prev = std::env::var("AJ_DISABLE_SANDBOX_WARNING").ok();
-
-        // SAFETY: single-threaded test runner per `cargo test`'s
-        // default; no other test reads this var concurrently.
-        unsafe {
-            std::env::remove_var("AJ_DISABLE_SANDBOX_WARNING");
-        }
-        assert!(
-            sandbox_warning_enabled(),
-            "warning should show when the var is absent"
-        );
-
-        // SAFETY: same scope as above.
-        unsafe {
-            std::env::set_var("AJ_DISABLE_SANDBOX_WARNING", "1");
-        }
-        assert!(
-            !sandbox_warning_enabled(),
-            "warning should be suppressed when the var is set"
-        );
-
-        // `is_err()` semantics: even an empty value counts as "set"
-        // and suppresses the warning.
-        // SAFETY: same scope as above.
-        unsafe {
-            std::env::set_var("AJ_DISABLE_SANDBOX_WARNING", "");
-        }
-        assert!(
-            !sandbox_warning_enabled(),
-            "warning should stay suppressed when the var is set to the empty string"
-        );
-
-        // Restore.
-        // SAFETY: same scope as above.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("AJ_DISABLE_SANDBOX_WARNING", v),
-                None => std::env::remove_var("AJ_DISABLE_SANDBOX_WARNING"),
-            }
-        }
+        assert!(notice.contains(&beta));
+        assert!(notice.contains("/var/skills/alpha/SKILL.md (skill: alpha)"));
+        assert_eq!(notice.matches("\x1b[9m").count(), 1);
     }
 
     #[test]
@@ -4994,11 +4806,11 @@ mod tests {
 
     #[test]
     fn warning_event_carries_main_agent_id() {
-        let evt = warning_event(SANDBOX_WARNING);
+        let evt = warning_event(aj_app::notices::SANDBOX_WARNING);
         match evt {
             AgentEvent::Warning { agent_id, text } => {
                 assert_eq!(agent_id, aj_agent::events::AgentId::Main);
-                assert_eq!(text, SANDBOX_WARNING);
+                assert_eq!(text, aj_app::notices::SANDBOX_WARNING);
             }
             other => panic!("expected Warning, got {other:?}"),
         }
