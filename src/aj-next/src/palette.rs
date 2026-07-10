@@ -23,7 +23,8 @@ use std::rc::Rc;
 use aj_app::commands::{COMMANDS, CommandAction};
 use aj_app::keybindings::default_action_shortcut;
 use vaxis::vxfw::{
-    EventContext, FilterableSelect, ListView, OverlayWindow, SelectItem, WidgetRef, to_widget_ref,
+    EventContext, FilterableSelect, ListView, OverlayWindow, SelectItem, SelectStyles, WidgetRef,
+    to_widget_ref,
 };
 
 use crate::content_overlay::{help_rows, loading_rows, open_content_overlay};
@@ -65,7 +66,7 @@ pub(crate) fn open_palette(
 ) {
     let select = Rc::new(RefCell::new(FilterableSelect::new(
         palette_items(),
-        chrome.borrow().select.clone(),
+        palette_select_styles(&chrome.borrow().select),
     )));
     let focus = select.borrow().focus_target();
     // Recover the action from the confirmed row via its filter key, which
@@ -168,6 +169,15 @@ fn dispatch_from_palette(
 /// filter key is `"{category} {title}"` so typing a category surfaces its
 /// whole group. The widget lays out the columns, so the label carries only
 /// the title.
+/// The palette's row styles: the shared chrome styles with a bold label. The
+/// bold label is a palette-only divergence, so we clone and bold here rather
+/// than in `select_styles_from_theme`, leaving the other list overlays plain.
+fn palette_select_styles(base: &SelectStyles) -> SelectStyles {
+    let mut styles = base.clone();
+    styles.label.bold = true;
+    styles
+}
+
 fn palette_items() -> Vec<SelectItem> {
     COMMANDS
         .iter()
@@ -210,5 +220,25 @@ mod tests {
                 .any(|i| i.shortcut.as_deref() == Some(resolved.as_str())),
             "expected a row with resolved shortcut {resolved:?}"
         );
+    }
+
+    #[test]
+    fn palette_bolds_labels_while_shared_styles_stay_plain() {
+        use aj_app::theme::{ColorMode, Theme};
+
+        use crate::overlay::select_styles_from_theme;
+
+        let shared = select_styles_from_theme(&Theme::bundled_dark_with_mode(ColorMode::Truecolor));
+        assert!(
+            !shared.label.bold,
+            "shared list-row label must stay plain so other overlays are not bold"
+        );
+        let palette = palette_select_styles(&shared);
+        assert!(palette.label.bold, "palette must bold its own row labels");
+        // Only the label diverges; the palette leaves the other columns alone,
+        // so the shortcut keeps the shared bold hint styling.
+        assert_eq!(palette.shortcut, shared.shortcut);
+        assert_eq!(palette.prefix, shared.prefix);
+        assert_eq!(palette.secondary, shared.secondary);
     }
 }
