@@ -71,6 +71,28 @@ pub struct ModelCost {
     pub output: f64,
     pub cache_read: f64,
     pub cache_write: f64,
+    /// Context-based pricing tiers. Empty for flat-rate models.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tiers: Vec<ModelCostTier>,
+}
+
+/// A context-based pricing tier: a step function that replaces the base
+/// [`ModelCost`] rates for the whole request once the request is large
+/// enough. Tiers are not marginal, the selected tier's rates apply to
+/// every token category of the entire request.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct ModelCostTier {
+    /// Total input-side token threshold for this tier, compared against
+    /// `input + cache_read + cache_write` of the request's usage. The
+    /// tier applies when the total input-side usage is strictly greater
+    /// than this value. Among all tiers that apply, the one with the
+    /// largest `input_tokens_above` wins and its rates replace the base
+    /// rates for the whole request.
+    pub input_tokens_above: u64,
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
 }
 
 /// Static metadata for a known model. Each entry is the result of
@@ -357,6 +379,14 @@ impl ModelRegistry {
 /// Compute dollar costs per token category and the running total, and
 /// store them in `usage.cost`. Rates in `cost` are
 /// dollars-per-million-tokens; the function divides through by 1e6.
+///
+/// When `cost` carries context-based tiers, the rate set is chosen up
+/// front: the total input-side usage (`input + cache_read +
+/// cache_write`) selects the highest tier whose `input_tokens_above` it
+/// strictly exceeds, and that tier's rates replace the base rates for
+/// every token category. With no matching tier the base rates apply.
+/// The selected rates are applied to the usage tokens exactly once, so
+/// the per-category math does not branch on whether a tier was chosen.
 //
 // `u64 → f64` is exact for any value below 2^53; token counts stay
 // safely below that ceiling, so the `as` cast loses no precision in
@@ -365,10 +395,23 @@ impl ModelRegistry {
 #[allow(clippy::as_conversions)]
 pub fn calculate_cost(cost: &ModelCost, usage: &mut Usage) {
     const PER_MILLION: f64 = 1_000_000.0;
-    usage.cost.input = (cost.input / PER_MILLION) * usage.input as f64;
-    usage.cost.output = (cost.output / PER_MILLION) * usage.output as f64;
-    usage.cost.cache_read = (cost.cache_read / PER_MILLION) * usage.cache_read as f64;
-    usage.cost.cache_write = (cost.cache_write / PER_MILLION) * usage.cache_write as f64;
+
+    let input_side = usage.input + usage.cache_read + usage.cache_write;
+    let rates = cost
+        .tiers
+        .iter()
+        .filter(|tier| tier.input_tokens_above < input_side)
+        .max_by_key(|tier| tier.input_tokens_above)
+        .map_or(
+            (cost.input, cost.output, cost.cache_read, cost.cache_write),
+            |tier| (tier.input, tier.output, tier.cache_read, tier.cache_write),
+        );
+    let (input_rate, output_rate, cache_read_rate, cache_write_rate) = rates;
+
+    usage.cost.input = (input_rate / PER_MILLION) * usage.input as f64;
+    usage.cost.output = (output_rate / PER_MILLION) * usage.output as f64;
+    usage.cost.cache_read = (cache_read_rate / PER_MILLION) * usage.cache_read as f64;
+    usage.cost.cache_write = (cache_write_rate / PER_MILLION) * usage.cache_write as f64;
     usage.cost.total =
         usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
 }
@@ -659,6 +702,7 @@ mod tests {
                 output: 15.0,
                 cache_read: 0.3,
                 cache_write: 3.75,
+                tiers: Vec::new(),
             },
             context_window: 200_000,
             max_tokens: 64_000,
@@ -736,6 +780,7 @@ mod tests {
                         output: 25.0,
                         cache_read: 0.5,
                         cache_write: 6.25,
+                        tiers: Vec::new(),
                     }),
                     ..Default::default()
                 },
@@ -795,6 +840,143 @@ mod tests {
         assert!((usage.cost.cache_write - 0.1875).abs() < 1e-9);
         let expected_total = 3.0 + 7.5 + 0.03 + 0.1875;
         assert!((usage.cost.total - expected_total).abs() < 1e-9);
+    }
+
+    /// A `ModelCost` with one context tier at 272k. Base rates are 1/1/1/1,
+    /// the tier doubles them once the input side clears the threshold.
+    fn tiered_cost() -> ModelCost {
+        ModelCost {
+            input: 1.0,
+            output: 1.0,
+            cache_read: 1.0,
+            cache_write: 1.0,
+            tiers: vec![ModelCostTier {
+                input_tokens_above: 272_000,
+                input: 2.0,
+                output: 2.0,
+                cache_read: 2.0,
+                cache_write: 2.0,
+            }],
+        }
+    }
+
+    #[test]
+    fn calculate_cost_tier_below_threshold_uses_base() {
+        // input_side = 200_000 + 0 + 0, below the 272k threshold, so base
+        // rates apply to every category.
+        let cost = tiered_cost();
+        let mut usage = Usage {
+            input: 200_000,
+            output: 100_000,
+            cache_read: 0,
+            cache_write: 0,
+            total_tokens: 0,
+            cost: Default::default(),
+        };
+        calculate_cost(&cost, &mut usage);
+        assert!((usage.cost.input - 0.2).abs() < 1e-9);
+        assert!((usage.cost.output - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn calculate_cost_tier_above_threshold_applies_to_all_categories() {
+        // input_side = 200_000 + 50_000 + 30_000 = 280_000 > 272k, so the
+        // tier's 2x rates apply to input, output, and both cache figures.
+        let cost = tiered_cost();
+        let mut usage = Usage {
+            input: 200_000,
+            output: 100_000,
+            cache_read: 50_000,
+            cache_write: 30_000,
+            total_tokens: 0,
+            cost: Default::default(),
+        };
+        calculate_cost(&cost, &mut usage);
+        assert!((usage.cost.input - 0.4).abs() < 1e-9);
+        assert!((usage.cost.output - 0.2).abs() < 1e-9);
+        assert!((usage.cost.cache_read - 0.1).abs() < 1e-9);
+        assert!((usage.cost.cache_write - 0.06).abs() < 1e-9);
+    }
+
+    #[test]
+    fn calculate_cost_tier_boundary_is_strict() {
+        // input_side exactly equals input_tokens_above, so the tier does
+        // not fire (strict >). Base rates apply.
+        let cost = tiered_cost();
+        let mut usage = Usage {
+            input: 272_000,
+            output: 10_000,
+            cache_read: 0,
+            cache_write: 0,
+            total_tokens: 0,
+            cost: Default::default(),
+        };
+        calculate_cost(&cost, &mut usage);
+        assert!((usage.cost.input - 0.272).abs() < 1e-9);
+        assert!((usage.cost.output - 0.01).abs() < 1e-9);
+    }
+
+    #[test]
+    fn calculate_cost_highest_matching_tier_wins() {
+        // Two tiers. input_side clears both, so the higher threshold (and
+        // its 5x rate) wins over the lower (3x). Tier order in the vec is
+        // deliberately non-monotonic to prove selection is by value, not
+        // position.
+        let cost = ModelCost {
+            input: 1.0,
+            output: 1.0,
+            cache_read: 1.0,
+            cache_write: 1.0,
+            tiers: vec![
+                ModelCostTier {
+                    input_tokens_above: 400_000,
+                    input: 5.0,
+                    output: 5.0,
+                    cache_read: 5.0,
+                    cache_write: 5.0,
+                },
+                ModelCostTier {
+                    input_tokens_above: 272_000,
+                    input: 3.0,
+                    output: 3.0,
+                    cache_read: 3.0,
+                    cache_write: 3.0,
+                },
+            ],
+        };
+        let mut usage = Usage {
+            input: 500_000,
+            output: 100_000,
+            cache_read: 0,
+            cache_write: 0,
+            total_tokens: 0,
+            cost: Default::default(),
+        };
+        calculate_cost(&cost, &mut usage);
+        assert!((usage.cost.input - 2.5).abs() < 1e-9);
+        assert!((usage.cost.output - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn model_cost_serde_omits_empty_tiers() {
+        let flat = ModelCost {
+            input: 1.0,
+            output: 2.0,
+            cache_read: 0.5,
+            cache_write: 1.0,
+            tiers: Vec::new(),
+        };
+        let json = serde_json::to_string(&flat).expect("serializes");
+        assert!(
+            !json.contains("tiers"),
+            "empty tiers must be omitted, got: {json}"
+        );
+
+        let tiered = tiered_cost();
+        let round: ModelCost =
+            serde_json::from_str(&serde_json::to_string(&tiered).expect("serializes"))
+                .expect("deserializes");
+        assert_eq!(round, tiered);
     }
 
     #[test]
@@ -957,6 +1139,33 @@ mod tests {
                 m.id
             );
         }
+
+        // Only the gpt-5.6 family carries a context tier, and it fires
+        // above 272k. The 272k-capped models must have no tiers: their
+        // context can never strictly exceed the threshold, so a tier would
+        // be dead config.
+        for m in &seed {
+            match m.id.as_str() {
+                "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" => {
+                    assert_eq!(
+                        m.cost.tiers.len(),
+                        1,
+                        "{} must have exactly one context tier",
+                        m.id
+                    );
+                    assert_eq!(
+                        m.cost.tiers[0].input_tokens_above, 272_000,
+                        "{} tier threshold",
+                        m.id
+                    );
+                }
+                _ => assert!(
+                    m.cost.tiers.is_empty(),
+                    "{} must have no tiers (272k cap == threshold)",
+                    m.id
+                ),
+            }
+        }
     }
 
     /// `splice_codex_seed` must be additive only: entries already in
@@ -979,6 +1188,7 @@ mod tests {
                 output: 9.99,
                 cache_read: 9.99,
                 cache_write: 9.99,
+                tiers: Vec::new(),
             },
             context_window: 272_000,
             max_tokens: 128_000,

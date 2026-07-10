@@ -1,5 +1,5 @@
 {
-  "updated_at": 1783626102979,
+  "updated_at": 1783662544128,
   "source": "models.dev",
   "models": [
     {
@@ -920,7 +920,16 @@
         "input": 2.5,
         "output": 15.0,
         "cache_read": 0.25,
-        "cache_write": 0.0
+        "cache_write": 0.0,
+        "tiers": [
+          {
+            "input_tokens_above": 272000,
+            "input": 5.0,
+            "output": 22.5,
+            "cache_read": 0.5,
+            "cache_write": 0.0
+          }
+        ]
       },
       "context_window": 1050000,
       "max_tokens": 128000
@@ -986,7 +995,16 @@
         "input": 30.0,
         "output": 180.0,
         "cache_read": 0.0,
-        "cache_write": 0.0
+        "cache_write": 0.0,
+        "tiers": [
+          {
+            "input_tokens_above": 272000,
+            "input": 60.0,
+            "output": 270.0,
+            "cache_read": 0.0,
+            "cache_write": 0.0
+          }
+        ]
       },
       "context_window": 1050000,
       "max_tokens": 128000
@@ -1008,7 +1026,16 @@
         "input": 5.0,
         "output": 30.0,
         "cache_read": 0.5,
-        "cache_write": 0.0
+        "cache_write": 0.0,
+        "tiers": [
+          {
+            "input_tokens_above": 272000,
+            "input": 10.0,
+            "output": 45.0,
+            "cache_read": 1.0,
+            "cache_write": 0.0
+          }
+        ]
       },
       "context_window": 1050000,
       "max_tokens": 128000
@@ -1030,7 +1057,16 @@
         "input": 30.0,
         "output": 180.0,
         "cache_read": 0.0,
-        "cache_write": 0.0
+        "cache_write": 0.0,
+        "tiers": [
+          {
+            "input_tokens_above": 272000,
+            "input": 60.0,
+            "output": 270.0,
+            "cache_read": 0.0,
+            "cache_write": 0.0
+          }
+        ]
       },
       "context_window": 1050000,
       "max_tokens": 128000
@@ -1052,7 +1088,16 @@
         "input": 5.0,
         "output": 30.0,
         "cache_read": 0.5,
-        "cache_write": 6.25
+        "cache_write": 6.25,
+        "tiers": [
+          {
+            "input_tokens_above": 272000,
+            "input": 10.0,
+            "output": 45.0,
+            "cache_read": 1.0,
+            "cache_write": 12.5
+          }
+        ]
       },
       "context_window": 1050000,
       "max_tokens": 128000
@@ -1074,7 +1119,16 @@
         "input": 1.0,
         "output": 6.0,
         "cache_read": 0.1,
-        "cache_write": 1.25
+        "cache_write": 1.25,
+        "tiers": [
+          {
+            "input_tokens_above": 272000,
+            "input": 2.0,
+            "output": 9.0,
+            "cache_read": 0.2,
+            "cache_write": 2.5
+          }
+        ]
       },
       "context_window": 1050000,
       "max_tokens": 128000
@@ -1096,7 +1150,16 @@
         "input": 5.0,
         "output": 30.0,
         "cache_read": 0.5,
-        "cache_write": 6.25
+        "cache_write": 6.25,
+        "tiers": [
+          {
+            "input_tokens_above": 272000,
+            "input": 10.0,
+            "output": 45.0,
+            "cache_read": 1.0,
+            "cache_write": 12.5
+          }
+        ]
       },
       "context_window": 1050000,
       "max_tokens": 128000
@@ -1118,7 +1181,16 @@
         "input": 2.5,
         "output": 15.0,
         "cache_read": 0.25,
-        "cache_write": 3.125
+        "cache_write": 3.125,
+        "tiers": [
+          {
+            "input_tokens_above": 272000,
+            "input": 5.0,
+            "output": 22.5,
+            "cache_read": 0.5,
+            "cache_write": 6.25
+          }
+        ]
       },
       "context_window": 1050000,
       "max_tokens": 128000

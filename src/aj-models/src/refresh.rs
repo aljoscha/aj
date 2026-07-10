@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::registry::{
-    CODEX_PROVIDER_ID, Catalog, InputModality, ModelCost, ModelInfo, apply_override,
+    CODEX_PROVIDER_ID, Catalog, InputModality, ModelCost, ModelCostTier, ModelInfo, apply_override,
     bundled_codex_seed, bundled_overrides, splice_codex_seed, user_cache_path,
 };
 
@@ -162,6 +162,33 @@ struct RawCost {
     cache_read: Option<f64>,
     #[serde(default)]
     cache_write: Option<f64>,
+    #[serde(default)]
+    tiers: Option<Vec<RawCostTier>>,
+}
+
+/// A models.dev pricing tier. Only `tier.kind == "context"` tiers with a
+/// `tier.size` map onto our [`ModelCostTier`]. Other tier kinds are
+/// skipped.
+#[derive(Deserialize, Debug, Default)]
+struct RawCostTier {
+    #[serde(default)]
+    input: Option<f64>,
+    #[serde(default)]
+    output: Option<f64>,
+    #[serde(default)]
+    cache_read: Option<f64>,
+    #[serde(default)]
+    cache_write: Option<f64>,
+    #[serde(default)]
+    tier: Option<RawCostTierKind>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct RawCostTierKind {
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    #[serde(default)]
+    size: Option<u64>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -507,6 +534,31 @@ fn map_model(fixed: &ProviderFixedValues, id: &str, m: &RawModel) -> ModelInfo {
         input.push(InputModality::Image);
     }
 
+    // Map models.dev context tiers onto our step-function pricing.
+    // Only `type == "context"` tiers with a size become a
+    // `ModelCostTier`. Other tier kinds or sizeless entries are
+    // skipped. Source order is preserved.
+    let tiers: Vec<ModelCostTier> = cost
+        .and_then(|c| c.tiers.as_ref())
+        .into_iter()
+        .flatten()
+        .filter_map(|t| {
+            let kind = t.tier.as_ref();
+            let is_context = kind.and_then(|k| k.kind.as_deref()) == Some("context");
+            let size = kind.and_then(|k| k.size);
+            match (is_context, size) {
+                (true, Some(size)) => Some(ModelCostTier {
+                    input_tokens_above: size,
+                    input: t.input.unwrap_or(0.0),
+                    output: t.output.unwrap_or(0.0),
+                    cache_read: t.cache_read.unwrap_or(0.0),
+                    cache_write: t.cache_write.unwrap_or(0.0),
+                }),
+                _ => None,
+            }
+        })
+        .collect();
+
     ModelInfo {
         id: id.to_string(),
         name: m.name.clone().unwrap_or_else(|| id.to_string()),
@@ -534,6 +586,7 @@ fn map_model(fixed: &ProviderFixedValues, id: &str, m: &RawModel) -> ModelInfo {
             output: cost.and_then(|c| c.output).unwrap_or(0.0),
             cache_read: cost.and_then(|c| c.cache_read).unwrap_or(0.0),
             cache_write: cost.and_then(|c| c.cache_write).unwrap_or(0.0),
+            tiers,
         },
         context_window: limit.and_then(|l| l.context).unwrap_or(4096),
         max_tokens: limit.and_then(|l| l.output).unwrap_or(4096),
@@ -582,6 +635,8 @@ fn map_openrouter_model(m: &OpenRouterModel) -> ModelInfo {
             cache_write: openrouter_price_per_million(
                 pricing.and_then(|p| p.input_cache_write.as_deref()),
             ),
+            // OpenRouter's schema here carries no context tiers.
+            tiers: Vec::new(),
         },
         context_window: m.context_length.unwrap_or(4096),
         max_tokens: m
@@ -752,7 +807,15 @@ mod tests {
                     "tool_call": true,
                     "reasoning": false,
                     "limit": {"context": 128000, "output": 16000},
-                    "cost": {"input": 2.5, "output": 10.0, "cache_read": 0.25, "cache_write": 0.0},
+                    "cost": {
+                        "input": 2.5, "output": 10.0, "cache_read": 0.25, "cache_write": 0.0,
+                        "tiers": [
+                            {"input": 5.0, "output": 20.0, "cache_read": 0.5, "cache_write": 1.0,
+                             "tier": {"type": "context", "size": 272000}},
+                            {"input": 9.0, "output": 9.0, "tier": {"type": "batch", "size": 100}},
+                            {"input": 8.0, "output": 8.0, "tier": {"type": "context"}}
+                        ]
+                    },
                     "modalities": {"input": ["text"]}
                 }
             }
@@ -843,6 +906,35 @@ mod tests {
             assert_eq!(m.api, "openai-codex-responses");
             assert_eq!(m.base_url, "https://chatgpt.com/backend-api");
         }
+    }
+
+    #[test]
+    fn build_catalog_maps_context_tiers() {
+        let cat = build_catalog_from_json(FIXTURE, None).expect("parses");
+        let gpt = cat
+            .models
+            .iter()
+            .find(|m| m.id == "gpt-test")
+            .expect("gpt entry present");
+
+        // The fixture carries three raw tiers: one context tier with a
+        // size, one non-context ("batch") tier, and one context tier
+        // without a size. Only the first maps.
+        assert_eq!(gpt.cost.tiers.len(), 1, "only the sized context tier maps");
+        let tier = &gpt.cost.tiers[0];
+        assert_eq!(tier.input_tokens_above, 272_000);
+        assert!((tier.input - 5.0).abs() < 1e-9);
+        assert!((tier.output - 20.0).abs() < 1e-9);
+        assert!((tier.cache_read - 0.5).abs() < 1e-9);
+        assert!((tier.cache_write - 1.0).abs() < 1e-9);
+
+        // A model with no `tiers` key maps to an empty tier list.
+        let claude = cat
+            .models
+            .iter()
+            .find(|m| m.id == "claude-test-tool")
+            .expect("claude entry present");
+        assert!(claude.cost.tiers.is_empty());
     }
 
     #[test]

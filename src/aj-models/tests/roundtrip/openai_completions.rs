@@ -68,6 +68,7 @@ fn fixture_model() -> ModelInfo {
             output: 10.0,
             cache_read: 1.25,
             cache_write: 0.0,
+            tiers: Vec::new(),
         },
         context_window: 128_000,
         max_tokens: 16_000,

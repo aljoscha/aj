@@ -808,6 +808,7 @@ mod tests {
                 output: 2.0,
                 cache_read: 0.1,
                 cache_write: 0.0,
+                tiers: Vec::new(),
             },
             context_window: 200_000,
             max_tokens: 16_000,

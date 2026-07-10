@@ -595,6 +595,16 @@ struct ModelCost {
     output: f64,
     cache_read: f64,
     cache_write: f64,
+    /// Context-based pricing tiers, empty for flat-rate models. See §3.3.
+    tiers: Vec<ModelCostTier>,
+}
+
+struct ModelCostTier {
+    input_tokens_above: u64,  // threshold, compared against input-side usage
+    input: f64,               // $/million tokens
+    output: f64,
+    cache_read: f64,
+    cache_write: f64,
 }
 
 enum InputModality {
@@ -640,15 +650,34 @@ and reasoning capability flag.
 ### 3.3 Cost Calculation
 
 ```rust
-fn calculate_cost(model: &ModelInfo, usage: &mut Usage) {
-    usage.cost.input = (model.cost.input / 1_000_000.0) * usage.input as f64;
-    usage.cost.output = (model.cost.output / 1_000_000.0) * usage.output as f64;
-    usage.cost.cache_read = (model.cost.cache_read / 1_000_000.0) * usage.cache_read as f64;
-    usage.cost.cache_write = (model.cost.cache_write / 1_000_000.0) * usage.cache_write as f64;
+fn calculate_cost(cost: &ModelCost, usage: &mut Usage) {
+    // Pick the rate set first, then apply per-million once.
+    let (input, output, cache_read, cache_write) = select_rates(cost, usage);
+    usage.cost.input = (input / 1_000_000.0) * usage.input as f64;
+    usage.cost.output = (output / 1_000_000.0) * usage.output as f64;
+    usage.cost.cache_read = (cache_read / 1_000_000.0) * usage.cache_read as f64;
+    usage.cost.cache_write = (cache_write / 1_000_000.0) * usage.cache_write as f64;
     usage.cost.total = usage.cost.input + usage.cost.output
                      + usage.cost.cache_read + usage.cost.cache_write;
 }
 ```
+
+Rates are `$/million tokens`. When `cost.tiers` is non-empty, a tier
+can replace the base rates for the whole request. This is a step
+function applied request-wide, not a marginal rate on the tokens past
+the threshold:
+
+- Threshold basis is the total input-side usage
+  `input + cache_read + cache_write`.
+- A tier applies when this total is strictly greater than its
+  `input_tokens_above`. At the exact boundary the tier does not fire.
+- Among all applying tiers the one with the largest `input_tokens_above`
+  wins. Its four rates replace the base rates for every token category
+  of the request (input, output, cache_read, cache_write).
+- With no matching tier the base `ModelCost` rates apply.
+
+Providers apply the service-tier multiplier (flex, priority) after
+`calculate_cost`, so that composition is unaffected.
 
 ### 3.3.1 Registry Helpers & Capability Probes
 
@@ -769,8 +798,15 @@ overrides (§3.4.4), and writes the result to `~/.aj/models.json`.
 | `cost.output` | `cost.output` |
 | `cost.cache_read` | `cost.cache_read` |
 | `cost.cache_write` | `cost.cache_write` |
+| `cost.tiers[]` (where `tier.type == "context"`) | `cost.tiers[]` |
 | `limit.context` | `context_window` |
 | `limit.output` | `max_tokens` |
+
+Only models.dev tiers of `tier.type == "context"` that carry a
+`tier.size` map onto `ModelCostTier` (`input_tokens_above = size`, with
+the tier's four rates). Other tier kinds and sizeless tiers are skipped,
+and source order is preserved. OpenRouter entries carry no context
+tiers.
 
 `supports_adaptive_thinking` is not in models.dev; it defaults to
 `true` for Anthropic reasoning models in the mapper and is pinned per
