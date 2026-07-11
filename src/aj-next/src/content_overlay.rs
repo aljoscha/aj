@@ -23,7 +23,12 @@ use std::rc::Rc;
 
 use aj_app::auth::ProviderAuthStatus;
 use aj_app::commands::COMMANDS;
-use aj_app::keybindings::{AJ_KEYBINDINGS, default_action_shortcut};
+use aj_app::keybindings::{
+    ACTION_AGENT_PICKER, ACTION_CHAT_PAGE_DOWN, ACTION_CHAT_PAGE_UP, ACTION_CHAT_SCROLL_BOTTOM,
+    ACTION_CHAT_SCROLL_TOP, ACTION_CLIPBOARD_PASTE_IMAGE, ACTION_COPY_MESSAGE, ACTION_DEQUEUE,
+    ACTION_HISTORY_OPEN, ACTION_PALETTE_OPEN, ACTION_SUBMIT_STEERING, ACTION_THINKING_TOGGLE,
+    ACTION_TOOLS_EXPAND, ACTION_TRANSCRIPT_FOCUS, AJ_KEYBINDINGS, default_action_shortcut,
+};
 use aj_app::theme::{Theme, ThemeColor};
 use aj_app::usage::{ProviderUsageStatus, UsageOutcome, format_window_status, now_unix_ms};
 use aj_session::SessionStats;
@@ -31,7 +36,7 @@ use vaxis::cell::{Segment, Style};
 use vaxis::key::{Key, Modifiers};
 use vaxis::vxfw::{
     DrawContext, Event, EventContext, ListView, OverlayWindow, RelativePoint, RichText, ScrollBars,
-    Source, SubSurface, Surface, Widget, WidgetRef, to_widget_ref,
+    Source, SubSurface, Surface, TextArea, Widget, WidgetRef, to_widget_ref,
 };
 
 use crate::overlay::{
@@ -64,10 +69,12 @@ fn span(text: impl Into<String>, style: Style) -> Segment {
 /// Column tints for the read-only content pages, resolved once from the
 /// theme like [`OverlayChrome`]. `dim` tints the provider-id column and
 /// `muted` the secondary detail column, matching `aj`'s auth page.
+/// `heading` colors the help page's section headings.
 #[derive(Clone, Copy)]
 pub(crate) struct ContentStyles {
     pub(crate) dim: Style,
     pub(crate) muted: Style,
+    pub(crate) heading: Style,
 }
 
 impl ContentStyles {
@@ -80,6 +87,16 @@ impl ContentStyles {
         ContentStyles {
             dim: fg(ThemeColor::Dim),
             muted: fg(ThemeColor::Muted),
+            // `Accent` is the overlay title's emphasis token (a lavender in
+            // both bundled themes), so a section heading reads with the same
+            // colored emphasis as the window title above it, drawn bold on
+            // top. We avoid `MdHeading` here: it is empty in the bundled
+            // palettes, so it would render bold-only with no color and miss
+            // the spec's colored-heading requirement.
+            heading: Style {
+                bold: true,
+                ..fg(ThemeColor::Accent)
+            },
         }
     }
 }
@@ -255,49 +272,199 @@ pub(crate) fn loading_rows() -> Vec<Row> {
     vec![plain("Loading\u{2026}")]
 }
 
-/// Help overlay rows: the keybinding table and the command catalog, each
-/// with its shortcut resolved from the keybinding data so a rebind flows
-/// through to the label (Spec F's hint-label rule).
-pub(crate) fn help_rows() -> Vec<Row> {
-    let mut rows = Vec::new();
+/// The compose-time global chords listed under section 1 (editor
+/// shortcuts). These are the app-level chords a user can fire while the
+/// editor is focused (open the palette, paste an image, toggle thinking
+/// or tool output, recall or steer a message, open the pickers).
+///
+/// Resolved through [`default_action_shortcut`] at render time, never a
+/// literal, so a rebind relabels the row.
+const COMPOSE_GLOBAL_ACTIONS: &[&str] = &[
+    ACTION_PALETTE_OPEN,
+    ACTION_CLIPBOARD_PASTE_IMAGE,
+    ACTION_THINKING_TOGGLE,
+    ACTION_TOOLS_EXPAND,
+    ACTION_HISTORY_OPEN,
+    ACTION_AGENT_PICKER,
+    ACTION_SUBMIT_STEERING,
+    ACTION_DEQUEUE,
+];
 
-    rows.push(plain("Keybindings"));
-    let short_w = AJ_KEYBINDINGS
-        .iter()
-        .filter_map(|(id, _, _)| default_action_shortcut(id))
-        .map(|s| s.chars().count())
-        .max()
-        .unwrap_or(0);
-    for (id, _default_chord, desc) in AJ_KEYBINDINGS {
-        // Resolve through `default_action_shortcut`, never the raw chord
-        // literal in the table, so the label tracks the binding.
-        let short = default_action_shortcut(id).unwrap_or_default();
-        rows.push(plain(format!("  {short:<short_w$}  {desc}")));
-    }
+/// The chat-scroll and transcript-navigation chords listed under section 2.
+/// `ACTION_COPY_MESSAGE` lives in transcript-focus mode, so it belongs with
+/// the transcript keys rather than the compose-time chords.
+///
+/// The overlay-management chord `ACTION_OVERLAY_CLOSE_ALL` and the
+/// overlay-local chords (agent/history scope toggles, task kill, settings
+/// clear, usage reset) are deliberately absent: each is surfaced by the
+/// overlay it acts on (the close-all label rides every overlay subtitle),
+/// not by this keymap reference.
+const SCROLL_NAV_ACTIONS: &[&str] = &[
+    ACTION_CHAT_PAGE_UP,
+    ACTION_CHAT_PAGE_DOWN,
+    ACTION_CHAT_SCROLL_TOP,
+    ACTION_CHAT_SCROLL_BOTTOM,
+    ACTION_TRANSCRIPT_FOCUS,
+    ACTION_COPY_MESSAGE,
+];
 
-    rows.push(plain(""));
-    rows.push(plain("Commands"));
-    let cat_w = COMMANDS
+/// One line of the help page before layout: a colored section heading, a
+/// dim sub-group label, a key/description entry, or a spacer.
+enum HelpLine {
+    /// Top-level section heading, drawn in the heading color.
+    Heading(&'static str),
+    /// Sub-group label within a section (editor chord group, or command
+    /// category), drawn muted.
+    Group(String),
+    /// A key/label column and its description.
+    Entry { key: String, desc: String },
+    /// A visible blank line separating groups and sections.
+    Blank,
+}
+
+/// The `(resolved key label, description)` for a global action, resolving
+/// the label through [`default_action_shortcut`] so it tracks a rebind.
+/// `None` for an action ID absent from [`AJ_KEYBINDINGS`].
+fn global_chord(action_id: &str) -> Option<(String, &'static str)> {
+    AJ_KEYBINDINGS
         .iter()
-        .map(|c| c.category.chars().count())
-        .max()
-        .unwrap_or(0);
-    let title_w = COMMANDS
-        .iter()
-        .map(|c| c.title.chars().count())
-        .max()
-        .unwrap_or(0);
-    for cmd in COMMANDS {
-        let mut line = format!(
-            "  {cat:<cat_w$}  {title:<title_w$}  {desc}",
-            cat = cmd.category,
-            title = cmd.title,
-            desc = cmd.description
-        );
-        if let Some(short) = cmd.action_id.and_then(default_action_shortcut) {
-            line.push_str(&format!("  ({short})"));
+        .find(|(id, _, _)| *id == action_id)
+        .map(|(id, _, desc)| (default_action_shortcut(id).unwrap_or_default(), *desc))
+}
+
+/// Section 1: the fixed editor editing chords (grouped by their own
+/// `ChordDoc` group) plus the compose-time global chords.
+///
+/// The editor chords are the single source of truth exposed by
+/// [`TextArea::bindings`], so their labels are the fixed `ChordDoc.keys`
+/// literals (those chords are not rebindable). The global chords resolve
+/// their labels through the keybinding data.
+fn editor_shortcut_lines() -> Vec<HelpLine> {
+    let mut lines = vec![HelpLine::Heading("Editor shortcuts")];
+    // Bucket the editor chords by their display group, in first-appearance
+    // order, so the reference reads Movement, Editing, Kill ring, Autocomplete.
+    let mut groups: Vec<&'static str> = Vec::new();
+    for chord in TextArea::bindings() {
+        if !groups.contains(&chord.group) {
+            groups.push(chord.group);
         }
-        rows.push(plain(line));
+    }
+    for (i, group) in groups.iter().enumerate() {
+        if i > 0 {
+            lines.push(HelpLine::Blank);
+        }
+        lines.push(HelpLine::Group((*group).to_string()));
+        for chord in TextArea::bindings().iter().filter(|c| c.group == *group) {
+            lines.push(HelpLine::Entry {
+                key: chord.keys.to_string(),
+                desc: chord.description.to_string(),
+            });
+        }
+    }
+    lines.push(HelpLine::Blank);
+    lines.push(HelpLine::Group("Global".to_string()));
+    for id in COMPOSE_GLOBAL_ACTIONS {
+        if let Some((key, desc)) = global_chord(id) {
+            lines.push(HelpLine::Entry {
+                key,
+                desc: desc.to_string(),
+            });
+        }
+    }
+    lines
+}
+
+/// Section 2: the chat-scroll and transcript-navigation keys, with a
+/// trailing descriptive row for the mouse wheel.
+fn scroll_nav_lines() -> Vec<HelpLine> {
+    let mut lines = vec![HelpLine::Heading("Scrolling & navigation")];
+    for id in SCROLL_NAV_ACTIONS {
+        if let Some((key, desc)) = global_chord(id) {
+            lines.push(HelpLine::Entry {
+                key,
+                desc: desc.to_string(),
+            });
+        }
+    }
+    // The wheel is implicit pointer input, not a keybinding, so it carries
+    // a plain label and its description says so, rather than a resolved chord.
+    lines.push(HelpLine::Entry {
+        key: "Mouse wheel".to_string(),
+        desc: "Scroll the transcript (mouse input)".to_string(),
+    });
+    lines
+}
+
+/// Section 3: one row per [`COMMANDS`] entry, grouped by category, with the
+/// bound shortcut resolved from each command's `action_id` and appended to
+/// the description (matching the palette's shortcut resolution).
+fn command_lines() -> Vec<HelpLine> {
+    let mut lines = vec![HelpLine::Heading("Command palette commands")];
+    // COMMANDS is authored in category order, so consecutive-run grouping
+    // yields one labeled block per category.
+    let mut current: Option<&str> = None;
+    for cmd in COMMANDS {
+        if current != Some(cmd.category) {
+            if current.is_some() {
+                lines.push(HelpLine::Blank);
+            }
+            lines.push(HelpLine::Group(cmd.category.to_string()));
+            current = Some(cmd.category);
+        }
+        let mut desc = cmd.description.to_string();
+        if let Some(short) = cmd.action_id.and_then(default_action_shortcut) {
+            desc.push_str(&format!("  ({short})"));
+        }
+        lines.push(HelpLine::Entry {
+            key: cmd.title.to_string(),
+            desc,
+        });
+    }
+    lines
+}
+
+/// Render one section's [`HelpLine`]s into styled rows, sizing the key
+/// column to the widest entry key in that section so the description
+/// column lines up within the section.
+fn render_section(lines: &[HelpLine], styles: &ContentStyles) -> Vec<Row> {
+    let key_w = lines
+        .iter()
+        .filter_map(|line| match line {
+            HelpLine::Entry { key, .. } => Some(key.chars().count()),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    lines
+        .iter()
+        .map(|line| match line {
+            HelpLine::Heading(text) => vec![span(*text, styles.heading)],
+            HelpLine::Group(text) => vec![span(format!("  {text}"), styles.muted)],
+            HelpLine::Entry { key, desc } => plain(format!("    {key:<key_w$}  {desc}")),
+            // A single space, not the empty string: an empty `RichText` row
+            // collapses to zero height in the `ListView` (see
+            // `session_info_rows`).
+            HelpLine::Blank => plain(" "),
+        })
+        .collect()
+}
+
+/// Help overlay rows: a grouped keymap reference in three sections, each
+/// under a colored heading (editor shortcuts, scrolling & navigation, and
+/// the command palette catalog).
+///
+/// Every displayed label is generated from authoritative data, never a
+/// static snapshot: editor chords come from [`TextArea::bindings`], and
+/// global-chord and command labels resolve through the keybinding data
+/// (Spec F's hint-label rule), so a rebind flows through to the label.
+pub(crate) fn help_rows(styles: &ContentStyles) -> Vec<Row> {
+    let sections = [editor_shortcut_lines(), scroll_nav_lines(), command_lines()];
+    let mut rows = Vec::new();
+    for (i, section) in sections.iter().enumerate() {
+        if i > 0 {
+            rows.push(plain(" "));
+        }
+        rows.extend(render_section(section, styles));
     }
     rows
 }
@@ -480,6 +647,7 @@ mod tests {
     use std::path::PathBuf;
 
     use aj_app::keybindings::ACTION_PALETTE_OPEN;
+    use aj_app::theme::ColorMode;
     use aj_models::types::{Usage, UsageCost};
     use aj_session::SessionSettings;
     use vaxis::cell::Color;
@@ -497,8 +665,8 @@ mod tests {
         rows.iter().map(row_text).collect::<Vec<_>>().join("\n")
     }
 
-    /// Distinct dim/muted tints so a column left at the default fg fails the
-    /// tinting assertions.
+    /// Distinct dim/muted/heading tints so a column left at the default fg
+    /// fails the tinting assertions.
     fn test_styles() -> ContentStyles {
         ContentStyles {
             dim: Style {
@@ -509,28 +677,172 @@ mod tests {
                 fg: Color::Index(2),
                 ..Style::default()
             },
+            heading: Style {
+                fg: Color::Index(3),
+                bold: true,
+                ..Style::default()
+            },
+        }
+    }
+
+    /// The plain-text of the first row containing `needle`, so a test can
+    /// pin the key and description that share one entry row.
+    fn row_containing(rows: &[Row], needle: &str) -> String {
+        rows.iter()
+            .map(row_text)
+            .find(|t| t.contains(needle))
+            .unwrap_or_else(|| panic!("no row contains {needle:?}"))
+    }
+
+    #[test]
+    fn help_rows_has_three_colored_section_headings() {
+        let styles = test_styles();
+        let rows = help_rows(&styles);
+        for heading in [
+            "Editor shortcuts",
+            "Scrolling & navigation",
+            "Command palette commands",
+        ] {
+            let row = rows
+                .iter()
+                .find(|r| row_text(r) == heading)
+                .unwrap_or_else(|| panic!("missing heading {heading:?}"));
+            // A heading is one span carrying the heading style, not the
+            // default: dropping a section removes its heading and fails the
+            // `find`, and leaving a heading default-styled fails here.
+            assert_eq!(row.len(), 1, "heading is one span: {row:?}");
+            assert_eq!(row[0].style, styles.heading, "heading {heading:?} tint");
+            assert_ne!(row[0].style, Style::default());
+        }
+
+        // The injected `test_styles` above only proves the render applies
+        // whatever heading style it is handed. The spec asks for a *colored*
+        // heading out of the box, so the token `from_theme` picks must resolve
+        // to a real foreground in the bundled palettes, not the terminal
+        // default. Pointing `heading` back at an empty/uncolored token (which
+        // renders bold-only) fails here for both themes.
+        for (name, theme) in [
+            ("dark", Theme::bundled_dark_with_mode(ColorMode::Truecolor)),
+            (
+                "light",
+                Theme::bundled_light_with_mode(ColorMode::Truecolor),
+            ),
+        ] {
+            let heading = ContentStyles::from_theme(&theme).heading;
+            assert!(heading.bold, "{name}: heading must stay bold");
+            assert_ne!(
+                heading.fg,
+                Color::Default,
+                "{name}: heading must resolve to a real color, not the terminal default"
+            );
         }
     }
 
     #[test]
-    fn help_rows_resolve_shortcuts_from_binding_data() {
-        let rows = rows_text(&help_rows());
-        // The command catalog and keybinding table are both present.
-        assert!(rows.contains("Keybindings"), "{rows}");
-        assert!(rows.contains("Commands"), "{rows}");
-        for cmd in COMMANDS {
-            assert!(rows.contains(cmd.title), "missing command {}", cmd.title);
+    fn help_section_one_combines_editor_chords_and_resolved_globals() {
+        let rows = help_rows(&test_styles());
+        // Every editor chord flows straight from `TextArea::bindings()` as its
+        // fixed `ChordDoc.keys` literal (these chords are not rebindable), so
+        // each chord's keys and description share one row in section 1.
+        // Iterating the whole table (like the section-3 command test iterates
+        // `COMMANDS`) means dropping a whole chord group fails here: its
+        // descriptions vanish and `row_containing` panics, rather than a lone
+        // first-entry check staying green.
+        for chord in TextArea::bindings() {
+            assert!(
+                row_containing(&rows, chord.description).contains(chord.keys),
+                "editor chord {:?} must carry its keys {:?}",
+                chord.description,
+                chord.keys
+            );
         }
-        // The palette-open shortcut is data-derived: the assertion value
-        // itself comes from the binding table, so a rebind changes both
-        // this expectation and the rendered label together (never a
-        // literal).
+
+        // A compose-time global flows from the keybinding data: the label on
+        // the palette-open row equals `default_action_shortcut`, so both
+        // sources feed section 1.
         let resolved =
             default_action_shortcut(ACTION_PALETTE_OPEN).expect("palette-open has a default chord");
         assert!(
-            rows.contains(&resolved),
-            "expected resolved shortcut {resolved:?} in help body: {rows}"
+            row_containing(&rows, "Open command palette").contains(&resolved),
+            "palette-open row must carry the resolved label {resolved:?}"
         );
+    }
+
+    #[test]
+    fn help_section_one_pins_spec_named_globals() {
+        let rows = help_rows(&test_styles());
+        // The spec names these compose-time globals for section 1. We pin each
+        // by its action-id constant directly, not by iterating
+        // `COMPOSE_GLOBAL_ACTIONS`, so dropping a const entry drops its row and
+        // fails this named test (its description no longer appears, so
+        // `row_containing` panics) rather than only tripping the unused-import
+        // lint. Each expected label is resolved through `default_action_shortcut`,
+        // never a literal, so a rebind updates the row and the expectation
+        // together.
+        for id in [
+            ACTION_PALETTE_OPEN,
+            ACTION_CLIPBOARD_PASTE_IMAGE,
+            ACTION_THINKING_TOGGLE,
+            ACTION_TOOLS_EXPAND,
+        ] {
+            let (key, desc) = global_chord(id).expect("spec-named global in the keybinding table");
+            assert!(
+                row_containing(&rows, desc).contains(&key),
+                "section-1 global {desc:?} must carry the resolved label {key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_section_two_lists_scroll_nav_with_resolved_labels() {
+        let rows = help_rows(&test_styles());
+        // Each scroll/nav action's row carries its resolved label next to its
+        // description, so a hardcoded wrong label fails this assertion (the
+        // expectation itself is data-derived).
+        for id in SCROLL_NAV_ACTIONS {
+            let (key, desc) = global_chord(id).expect("scroll/nav action in the table");
+            assert!(
+                row_containing(&rows, desc).contains(&key),
+                "row for {desc:?} must carry the resolved label {key:?}"
+            );
+        }
+        // The descriptive mouse-wheel row is present and marked as input.
+        assert!(
+            rows_text(&rows).contains("Mouse wheel"),
+            "wheel row present"
+        );
+    }
+
+    #[test]
+    fn help_section_three_lists_every_command() {
+        let rows = help_rows(&test_styles());
+        let blob = rows_text(&rows);
+        for cmd in COMMANDS {
+            assert!(blob.contains(cmd.title), "missing command {}", cmd.title);
+            // A command with a bound action carries its resolved shortcut.
+            if let Some(short) = cmd.action_id.and_then(default_action_shortcut) {
+                assert!(
+                    row_containing(&rows, cmd.description).contains(&short),
+                    "command {} must carry its resolved shortcut {short:?}",
+                    cmd.title
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn help_labels_are_resolved_not_hardcoded() {
+        let rows = help_rows(&test_styles());
+        // Every compose-time global label equals `default_action_shortcut`,
+        // so the expectation is generated from the same data the row is. A
+        // literal that drifts from the binding fails here.
+        for id in COMPOSE_GLOBAL_ACTIONS {
+            let (key, desc) = global_chord(id).expect("compose-time action in the table");
+            assert!(
+                row_containing(&rows, desc).contains(&key),
+                "global {desc:?} must carry the resolved label {key:?}"
+            );
+        }
     }
 
     #[test]

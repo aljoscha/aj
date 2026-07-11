@@ -27,7 +27,7 @@ use vaxis::vxfw::{
     to_widget_ref,
 };
 
-use crate::content_overlay::{help_rows, loading_rows, open_content_overlay};
+use crate::content_overlay::{ContentStyles, help_rows, loading_rows, open_content_overlay};
 use crate::overlay::{
     OpenOverlay, OverlayChrome, OverlayPlacement, OverlayStack, close_top, subtitle_confirm_close,
 };
@@ -56,12 +56,20 @@ pub(crate) struct PendingFetch {
 /// during dispatch, so it must not re-enter it. `command_slot` and
 /// `fetch_slot` are the host's pickup points, `chrome` is read live so a
 /// runtime theme swap tints child overlays with the current palette.
+///
+/// `content_styles` is the tint snapshot for the synchronously-built help
+/// page (`Help` opens fully populated, unlike the async auth/session
+/// overlays the host fills). It is `Copy`, so the confirm closure captures
+/// it directly, matching how the host hands `ContentStyles` to
+/// `auth_rows`/`usage_rows`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn open_palette(
     stack: &Rc<RefCell<OverlayStack>>,
     editor: &WidgetRef,
     chrome: &Rc<RefCell<OverlayChrome>>,
     command_slot: &Rc<RefCell<Option<CommandAction>>>,
     fetch_slot: &Rc<RefCell<Option<PendingFetch>>>,
+    content_styles: ContentStyles,
     ctx: &mut EventContext,
 ) {
     let select = Rc::new(RefCell::new(FilterableSelect::new(
@@ -91,6 +99,7 @@ pub(crate) fn open_palette(
                     &chrome_c,
                     &command_slot_c,
                     &fetch_slot_c,
+                    content_styles,
                     ctx,
                 );
             }
@@ -131,6 +140,7 @@ fn dispatch_from_palette(
     chrome: &Rc<RefCell<OverlayChrome>>,
     command_slot: &Rc<RefCell<Option<CommandAction>>>,
     fetch_slot: &Rc<RefCell<Option<PendingFetch>>>,
+    content_styles: ContentStyles,
     ctx: &mut EventContext,
 ) {
     let open_fetch = |kind: FetchKind, title: &str, ctx: &mut EventContext| {
@@ -143,7 +153,14 @@ fn dispatch_from_palette(
         // "Loading…" overlay the host fills after its async fetch.
         CommandAction::Help => {
             let ch = chrome.borrow();
-            open_content_overlay(stack, editor, &ch, "Help", help_rows(), ctx);
+            open_content_overlay(
+                stack,
+                editor,
+                &ch,
+                "Help & Keymap",
+                help_rows(&content_styles),
+                ctx,
+            );
         }
         CommandAction::OpenAuthStatus => open_fetch(FetchKind::Auth, "Auth status", ctx),
         CommandAction::OpenSessionInfo => open_fetch(FetchKind::SessionInfo, "Session info", ctx),

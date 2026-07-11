@@ -2807,6 +2807,7 @@ impl Shell {
             let transcript_for_actions = Rc::clone(&transcript);
             let transcript_widget: WidgetRef = to_widget_ref(Rc::clone(&transcript));
             let action_slot = Rc::clone(&host_action);
+            let theme_for_actions = theme.clone();
             Box::new(move |ctx, action| match action {
                 AjAction::ThinkingToggle => {
                     // Matches aj's `aj.thinking.toggle` handler: flip the
@@ -2824,12 +2825,14 @@ impl Shell {
                 AjAction::PaletteOpen => {
                     // The binding's predicate already gates on "no overlay
                     // open", matching aj's inert-while-modal behavior.
+                    let content_styles = ContentStyles::from_theme(&theme_for_actions.read());
                     open_palette(
                         &overlays_for_actions,
                         &editor_widget,
                         &chrome_for_actions,
                         &command_slot_for_actions,
                         &fetch_slot_for_actions,
+                        content_styles,
                         ctx,
                     );
                 }
@@ -2910,13 +2913,16 @@ impl Shell {
             let chrome_c = Rc::clone(&chrome);
             let command_slot_c = Rc::clone(&command_slot);
             let fetch_slot_c = Rc::clone(&fetch_slot);
+            let theme_c = theme.clone();
             editor.borrow_mut().on_palette_trigger = Some(Box::new(move |ctx| {
+                let content_styles = ContentStyles::from_theme(&theme_c.read());
                 open_palette(
                     &overlays_c,
                     &editor_widget,
                     &chrome_c,
                     &command_slot_c,
                     &fetch_slot_c,
+                    content_styles,
                     ctx,
                 );
             }));
@@ -6195,12 +6201,14 @@ mod tests {
         {
             let shell = shell.borrow();
             let editor: WidgetRef = to_widget_ref(Rc::clone(&shell.editor));
+            let content_styles = ContentStyles::from_theme(&shell.theme.read());
             open_palette(
                 &shell.overlays,
                 &editor,
                 &shell.chrome,
                 &shell.command_slot,
                 &shell.fetch_slot,
+                content_styles,
                 &mut ev_ctx,
             );
         }

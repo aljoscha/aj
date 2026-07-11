@@ -912,6 +912,11 @@ mod tests {
                 fg: Color::Index(2),
                 ..Style::default()
             },
+            heading: Style {
+                fg: Color::Index(3),
+                bold: true,
+                ..Style::default()
+            },
         }
     }
 
