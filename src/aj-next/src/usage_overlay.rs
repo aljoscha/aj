@@ -45,6 +45,7 @@ use vaxis::vxfw::{
 };
 
 use crate::content_overlay::{ContentStyles, Row, plain, usage_rows};
+use crate::keymap::action_matches;
 use crate::overlay::{
     OverlayChrome, OverlayPlacement, OverlayStack, close_top, confirm_key_label, subtitle_close,
 };
@@ -514,10 +515,10 @@ impl UsageOverlay {
     }
 
     fn handle_display_key(&mut self, ctx: &mut EventContext, key: &Key) {
-        // The reset chord's *handling* is a fixed in-widget convention (the
-        // rebindable path is a tracked follow-up); only the footer label
-        // resolves through the binding data.
-        if key.matches(u32::from('r'), Modifiers::empty()) {
+        // The reset chord is overlay-local, matched here at-target rather than
+        // through the global keymap. Both the match and the footer label
+        // resolve through the shared binding data, so they cannot drift.
+        if action_matches(key, ACTION_USAGE_RESET) {
             self.begin_reset_flow();
         } else if key.matches(Key::ESCAPE, Modifiers::empty())
             || key.matches(Key::ENTER, Modifiers::empty())

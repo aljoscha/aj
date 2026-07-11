@@ -12,7 +12,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use aj_app::actions::{AjAction, ChordKey, ChordPhase, ChordSpec, default_global_bindings};
-use vaxis::key::{Modifiers, name_map};
+use vaxis::key::{Key, Modifiers, name_map};
 use vaxis::vxfw::{Activator, BindingPhase, Entry, Keymap, TextArea};
 
 use crate::overlay::OverlayStack;
@@ -124,6 +124,24 @@ fn activator(spec: &ChordSpec) -> Activator {
         mods |= Modifiers::SUPER;
     }
     Activator::new(codepoint, mods)
+}
+
+/// Whether `key` activates `action_id`'s default chord.
+///
+/// Overlay-local chords (Spec F) are matched at-target rather than through the
+/// global keymap, but they must still read the same source of truth as their
+/// hint labels. Resolving the action's default chord here (the same data
+/// [`aj_app::keybindings::default_action_shortcut`] renders) keeps match and
+/// label from drifting. Keybindings are not user-configurable, so the default
+/// chord is the effective binding.
+///
+/// Panics if `action_id` has no default chord, since these callers pass
+/// compile-time action constants whose chords the data layer guarantees.
+pub(crate) fn action_matches(key: &Key, action_id: &str) -> bool {
+    let chord = aj_app::keybindings::default_chord(action_id)
+        .and_then(aj_app::actions::parse_chord)
+        .unwrap_or_else(|| panic!("aj knows the default chord for {action_id}"));
+    activator(&chord).accepts(key)
 }
 
 /// Build the global keymap: the fixed Ctrl+C ladder plus the compiled
@@ -484,6 +502,32 @@ mod tests {
             keymap.match_single(&y, BindingPhase::Capture, &transcript_focused),
             Some(&AjAction::CopyMessage),
             "focus mode: y copies the focused message",
+        );
+    }
+
+    /// `action_matches` resolves an action's chord from the shared keybinding
+    /// data, so the overlay-local matchers read the same source of truth as
+    /// their hint labels. `ACTION_TASK_KILL` defaults to ctrl+k: the matching
+    /// key activates it and a different key does not.
+    #[test]
+    fn action_matches_resolves_the_default_chord() {
+        use aj_app::keybindings::ACTION_TASK_KILL;
+
+        let ctrl_k = key(u32::from('k'), Modifiers::CTRL);
+        assert!(
+            action_matches(&ctrl_k, ACTION_TASK_KILL),
+            "ctrl+k is the default chord for the task-kill action",
+        );
+
+        let ctrl_j = key(u32::from('j'), Modifiers::CTRL);
+        assert!(
+            !action_matches(&ctrl_j, ACTION_TASK_KILL),
+            "a different key does not match the resolved chord",
+        );
+        let plain_k = key(u32::from('k'), Modifiers::empty());
+        assert!(
+            !action_matches(&plain_k, ACTION_TASK_KILL),
+            "the modifiers must match too",
         );
     }
 

@@ -27,12 +27,12 @@ use aj_agent::events::AgentId;
 use aj_agent::tool::{TaskId, TaskKind, TaskStatus};
 use aj_app::chat::{AgentEntry, ChatState, SubAgentStatus};
 use aj_app::keybindings::{ACTION_AGENT_TOGGLE_SCOPE, ACTION_TASK_KILL, default_action_shortcut};
-use vaxis::key::Modifiers;
 use vaxis::vxfw::{
     DrawContext, Event, EventContext, FilterableSelect, OverlayWindow, RelativePoint, SelectItem,
     SubSurface, Surface, Widget, WidgetRef, draw_widget, to_widget_ref,
 };
 
+use crate::keymap::action_matches;
 use crate::overlay::{
     OverlayChrome, OverlayPlacement, OverlayStack, close_all, close_key_label, close_top,
     confirm_key_label,
@@ -209,7 +209,7 @@ impl Widget for AgentPicker {
         };
         // Overlay-local scope toggle (Spec F): matched here at-target,
         // ahead of the inner select, and rebuilds the rows in place.
-        if key.matches(u32::from('t'), Modifiers::CTRL) {
+        if action_matches(key, ACTION_AGENT_TOGGLE_SCOPE) {
             self.scope = match self.scope {
                 Scope::Running => Scope::All,
                 Scope::All => Scope::Running,
@@ -221,7 +221,7 @@ impl Widget for AgentPicker {
         // Overlay-local kill: acts only on a selected, still-running task
         // row. On anything else the chord is consumed but inert, matching
         // the capturing overlay's swallow-everything contract.
-        if key.matches(u32::from('k'), Modifiers::CTRL) {
+        if action_matches(key, ACTION_TASK_KILL) {
             if let Some(id) = self
                 .select
                 .borrow()
@@ -533,7 +533,7 @@ pub(crate) fn open_agent_picker(
 
 #[cfg(test)]
 mod tests {
-    use vaxis::key::Key;
+    use vaxis::key::{Key, Modifiers};
     use vaxis::vxfw::{Phase, SelectStyles};
 
     use super::*;

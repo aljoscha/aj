@@ -55,6 +55,7 @@ use vaxis::vxfw::{
     TextField, TextSpan, Widget, WidgetRef, WidthBasis, draw_widget, to_widget_ref,
 };
 
+use crate::keymap::action_matches;
 use crate::overlay::{
     OpenOverlay, OverlayChrome, OverlayPlacement, OverlayStack, close_all, close_top,
     subtitle_confirm_close, subtitle_edit_close,
@@ -686,7 +687,7 @@ impl Widget for SettingList {
         // The clear chord is overlay-local (Spec F): matched here at-target
         // rather than by the global keymap, and only in project mode over an
         // actual override.
-        if self.project_mode && key.matches(u32::from('x'), Modifiers::CTRL) {
+        if self.project_mode && action_matches(key, ACTION_SETTINGS_CLEAR) {
             if self.selected_is_override()
                 && let Some(sel) = self.selected()
             {

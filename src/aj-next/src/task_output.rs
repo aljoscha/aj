@@ -28,6 +28,7 @@ use vaxis::vxfw::{
     SubSurface, Surface, Text, Widget, WidgetRef, to_widget_ref,
 };
 
+use crate::keymap::action_matches;
 use crate::overlay::{OverlayChrome, OverlayPlacement, OverlayStack, close_key_label, close_top};
 use crate::settings_ui::push_window;
 use crate::transcript::faint;
@@ -235,7 +236,7 @@ impl Widget for TaskOutputView {
         // Overlay-local kill (Spec F): in place through the registry. The
         // status flip arrives via the task's `TaskEnd` and repaints the
         // header. Inert once the task is terminal.
-        if key.matches(u32::from('k'), Modifiers::CTRL) {
+        if action_matches(key, ACTION_TASK_KILL) {
             if self.status == TaskStatus::Running {
                 self.registry.kill(self.id);
             }

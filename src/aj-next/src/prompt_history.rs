@@ -23,12 +23,12 @@ use std::rc::Rc;
 
 use aj_app::keybindings::{ACTION_HISTORY_TOGGLE_SCOPE, default_action_shortcut};
 use aj_session::PromptEntry;
-use vaxis::key::Modifiers;
 use vaxis::vxfw::{
     DrawContext, Event, EventContext, FilterableSelect, OverlayWindow, RelativePoint, SelectItem,
     SubSurface, Surface, Widget, WidgetRef, draw_widget, to_widget_ref,
 };
 
+use crate::keymap::action_matches;
 use crate::overlay::{
     OverlayChrome, OverlayPlacement, OverlayStack, close_all, close_key_label, close_top,
     confirm_key_label,
@@ -104,7 +104,7 @@ impl Widget for PromptHistoryView {
         };
         // Overlay-local scope toggle (Spec F): flip, re-parks a fetch,
         // and refresh the subtitle to name the scope it would switch to.
-        if key.matches(u32::from('t'), Modifiers::CTRL) {
+        if action_matches(key, ACTION_HISTORY_TOGGLE_SCOPE) {
             self.scope = match self.scope {
                 HistoryScope::Workspace => HistoryScope::All,
                 HistoryScope::All => HistoryScope::Workspace,
@@ -244,7 +244,7 @@ pub(crate) fn open_prompt_history(
 
 #[cfg(test)]
 mod tests {
-    use vaxis::key::Key;
+    use vaxis::key::{Key, Modifiers};
     use vaxis::vxfw::{Phase, SelectStyles};
 
     use super::*;
