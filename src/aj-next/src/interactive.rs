@@ -73,6 +73,7 @@ use crate::overlay::{OverlayChrome, OverlayStack, Scrim};
 use crate::palette::{FetchKind, PendingFetch, open_palette};
 use crate::pending::PendingBox;
 use crate::prompt_history::{HistoryFetch, HistoryScope, MAX_ENTRIES, open_prompt_history};
+use crate::quit_hint::QuitHint;
 use crate::session_selector::{SessionScan, extend_session_scan, open_session_selector};
 use crate::settings_ui::{
     MODEL_SETTING_ID, SelectorActivity, SettingsCatalogs, SettingsUi, SettingsValues, SkillRow,
@@ -940,11 +941,10 @@ fn running_work_counts(driven_turns: usize, tasks: &[aj_agent::TaskSummary]) -> 
     (agents, bash)
 }
 
-/// Quit-arming notice for a Ctrl+C while other work runs, `aj`'s exact
-/// wording: `"N agents / M tasks still running — press Ctrl+C again to
-/// quit"`, each part present only when nonzero. Callers ensure at
-/// least one count is nonzero.
-fn quit_arm_notice(agents: usize, tasks: usize) -> String {
+/// Summarize the background work a quit would tear down, for the quit-arm
+/// hint: `"N agents / M tasks still running"`, each part present only when
+/// nonzero. `None` when nothing runs, so the hint shows only the ladder.
+fn running_work_summary(agents: usize, tasks: usize) -> Option<String> {
     let mut parts = Vec::new();
     if agents > 0 {
         parts.push(format!(
@@ -955,28 +955,19 @@ fn quit_arm_notice(agents: usize, tasks: usize) -> String {
     if tasks > 0 {
         parts.push(format!("{tasks} task{}", if tasks == 1 { "" } else { "s" }));
     }
-    let quit = fixed_keys::CTRL_C;
-    format!(
-        "{} still running — press {quit} again to quit",
-        parts.join(" / ")
-    )
+    if parts.is_empty() {
+        return None;
+    }
+    Some(format!("{} still running", parts.join(" / ")))
 }
 
-/// The notice folded into chat when the first Ctrl+C of the quit
-/// sequence lands: `aj`'s running-work warning when a quit would tear
-/// work down, a bare press-again hint otherwise.
-///
-/// NOTE: `aj` quits immediately when nothing runs anywhere. The keymap
-/// ladder (Spec F) always arms, using the two-press sequence as the
-/// confirm, so the bare hint covers the case `aj` never renders.
-fn quit_arm_text(world: &World) -> String {
+/// The quit-arm hint's running-work warning for the current world: the
+/// background agents and bash tasks a quit would tear down, or `None` when
+/// nothing runs.
+fn quit_arm_running_work(world: &World) -> Option<String> {
     let (agents, tasks) =
         running_work_counts(world.turns.len(), &world.core.task_registry.snapshot());
-    if agents + tasks > 0 {
-        quit_arm_notice(agents, tasks)
-    } else {
-        format!("Press {} again to quit", fixed_keys::CTRL_C)
-    }
+    running_work_summary(agents, tasks)
 }
 
 /// Pull the viewed agent's queued message back into the editor,
@@ -2575,6 +2566,13 @@ struct Shell {
     /// busy-edge wake, see [`drive`]) reach it. The loader is not on
     /// the focus path, so the Shell forwards from its capturing phase.
     status_line: Rc<RefCell<StatusLine>>,
+    /// The Ctrl+C quit-arm hint, floated above the editor while the quit
+    /// sequence is armed. Drawn straight from the live keymap state.
+    quit_hint: Rc<RefCell<QuitHint>>,
+    /// The quit-arm hint's running-work warning, refreshed by the drive
+    /// loop on the arming edge (it owns the task registry the widgets
+    /// can't reach). Shared with the [`QuitHint`], which reads it at draw.
+    quit_hint_warning: Rc<RefCell<Option<String>>>,
     /// Latest submitted editor text, parked by the `on_submit`
     /// callback for the host loop to collect after dispatch. The
     /// callback can't spawn turns itself (it has no session access).
@@ -2710,6 +2708,12 @@ impl Shell {
         };
         let chrome = Rc::new(RefCell::new(chrome));
         let status_line = StatusLine::new(Rc::clone(&chat), Rc::clone(&status), Rc::clone(&styles));
+        let quit_hint_warning: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let quit_hint = Rc::new(RefCell::new(QuitHint::new(
+            Rc::clone(&styles),
+            Rc::clone(&chrome),
+            Rc::clone(&quit_hint_warning),
+        )));
         let pending = Rc::new(RefCell::new(PendingBox::new(
             Rc::clone(&chat),
             queues,
@@ -2918,6 +2922,8 @@ impl Shell {
             keymap_ctx,
             editor,
             status_line,
+            quit_hint,
+            quit_hint_warning,
             submitted,
             host_action,
             overlays,
@@ -3041,6 +3047,7 @@ impl Shell {
         let styles = Rc::new(TranscriptStyles::from_theme(&t));
         self.transcript.borrow_mut().set_styles(Rc::clone(&styles));
         self.status_line.borrow_mut().set_styles(Rc::clone(&styles));
+        self.quit_hint.borrow_mut().set_styles(Rc::clone(&styles));
         self.splash
             .borrow_mut()
             .set_styles(Rc::clone(&styles), t.color_mode());
@@ -3138,6 +3145,43 @@ impl Widget for Shell {
                     },
                     surface: popup,
                     // z 1 draws over the base `FlexColumn` (z 0), like the scrim.
+                    z_index: 1,
+                });
+            }
+        }
+
+        // Ctrl+C quit-arm hint. While the quit sequence is armed (the first
+        // Ctrl+C landed, the second is pending), float a small box above the
+        // editor, flush to the right edge, spelling out the ladder. Read live
+        // from the keymap so the box appears and clears with the armed state,
+        // no mirror. Suppressed under a modal, where a quit never arms anyway.
+        //
+        // The keymap's only sequence is the ctrl+c/ctrl+c quit chord, so a
+        // pending sequence is exactly this armed state. Safe to borrow the
+        // keymap here: `draw_widget` above already released its mutable borrow.
+        let quit_armed = self.keymap.borrow().pending_sequence().is_some();
+        if quit_armed && self.overlays.borrow().top().is_none() {
+            let term = ctx.max.size();
+            let editor_top = term
+                .height
+                .saturating_sub(FOOTER_ROWS)
+                .saturating_sub(self.editor.borrow().drawn_height());
+            // Bound the box to the room above the editor, keeping the header
+            // row on screen. `QuitHint::draw` returns `None` when it can't fit.
+            let avail = Size {
+                width: term.width,
+                height: editor_top.saturating_sub(HEADER_ROWS),
+            };
+            if let Some(hint) = self.quit_hint.borrow().draw(ctx, avail) {
+                let anchor_row = editor_top.saturating_sub(hint.size.height);
+                let anchor_col = term.width.saturating_sub(hint.size.width);
+                inner.children.push(SubSurface {
+                    origin: RelativePoint {
+                        row: i32::from(anchor_row),
+                        col: i32::from(anchor_col),
+                    },
+                    surface: hint,
+                    // z 1 draws over the base `FlexColumn` (z 0), like the popup.
                     z_index: 1,
                 });
             }
@@ -3542,9 +3586,10 @@ async fn drive(
     // Rising-edge tracker for the loader's animation: the tick chain
     // is armed once per idle-to-busy transition, not per iteration.
     let mut was_busy = false;
-    // Rising-edge tracker for the quit-arm notice: the keymap's only
-    // sequence is the ctrl+c ctrl+c quit chord, so a pending sequence
-    // means the quit is armed and the arm notice folds once per arm.
+    // Edge tracker for the quit-arm hint's warning: the keymap's only
+    // sequence is the ctrl+c/ctrl+c quit chord, so a pending sequence means the
+    // quit is armed. We refresh the hint's running-work warning on each edge
+    // (set it on arm, clear it on disarm).
     let mut quit_was_armed = false;
     // Async read-only overlay fills. The list handle is `!Send`, so it
     // stays here (paired with its `FetchKind`) while the detached fetch
@@ -4128,14 +4173,17 @@ async fn drive(
             });
         }
         was_busy = busy;
-        // Surface the quit arming: the sequence-start is consumed
-        // silently by the keymap engine, so the host folds the arm
-        // notice (aj's wording) when a quit sequence newly pends. The
-        // engine handles the disarm side (timeout or another key), no
-        // notice needed there.
+        // Surface the quit arming: the sequence-start is consumed silently by
+        // the keymap engine, so on the arming edge the host refreshes the
+        // hint's running-work warning (the background work a quit would tear
+        // down) and asks for a repaint. The box itself is drawn by the Shell
+        // straight from the live keymap state. The engine handles the disarm
+        // side (timeout or another key); on that edge we clear the warning so a
+        // later arm recomputes it.
         let quit_armed = shell.borrow().keymap.borrow().pending_sequence().is_some();
-        if quit_armed && !quit_was_armed {
-            fold_notice(world, &quit_arm_text(world));
+        if quit_armed != quit_was_armed {
+            let warning = quit_armed.then(|| quit_arm_running_work(world)).flatten();
+            *shell.borrow().quit_hint_warning.borrow_mut() = warning;
             app.request_redraw();
         }
         quit_was_armed = quit_armed;
@@ -5098,36 +5146,38 @@ mod tests {
         );
     }
 
-    /// The quit-arm notice strings, aj's wording plus the bare hint for
-    /// the nothing-running arm that aj never renders (it quits at once).
+    /// The quit-arm running-work summary: aj's wording without the
+    /// press-again suffix (the hint box's ladder spells that out), and `None`
+    /// when nothing runs.
     #[test]
-    fn quit_arm_notice_wording() {
+    fn running_work_summary_wording() {
         assert_eq!(
-            quit_arm_notice(1, 0),
-            "1 agent still running — press Ctrl+C again to quit"
+            running_work_summary(1, 0).as_deref(),
+            Some("1 agent still running")
         );
         assert_eq!(
-            quit_arm_notice(2, 1),
-            "2 agents / 1 task still running — press Ctrl+C again to quit"
+            running_work_summary(2, 1).as_deref(),
+            Some("2 agents / 1 task still running")
         );
         assert_eq!(
-            quit_arm_notice(0, 3),
-            "3 tasks still running — press Ctrl+C again to quit"
+            running_work_summary(0, 3).as_deref(),
+            Some("3 tasks still running")
         );
+        assert_eq!(running_work_summary(0, 0), None);
     }
 
-    /// `quit_arm_text` picks the running-work notice when a quit would
-    /// tear work down and the bare press-again hint otherwise.
+    /// `quit_arm_running_work` names the background work a quit would tear
+    /// down when a turn runs, and is `None` when nothing runs.
     #[tokio::test]
-    async fn quit_arm_text_reflects_running_work() {
+    async fn quit_arm_running_work_reflects_running_work() {
         let dir = TempDir::new().expect("tempdir");
         let mut world = scripted_world(&dir, "streaming-text").await;
-        assert_eq!(quit_arm_text(&world), "Press Ctrl+C again to quit");
+        assert_eq!(quit_arm_running_work(&world), None);
 
         handle_submit(&mut world, "go".to_string());
         assert_eq!(
-            quit_arm_text(&world),
-            "1 agent still running — press Ctrl+C again to quit"
+            quit_arm_running_work(&world).as_deref(),
+            Some("1 agent still running")
         );
 
         // Settle the turn so world teardown is clean.

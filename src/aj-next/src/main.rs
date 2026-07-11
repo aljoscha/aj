@@ -24,6 +24,7 @@ mod overlay;
 mod palette;
 mod pending;
 mod prompt_history;
+mod quit_hint;
 mod session_selector;
 mod settings_ui;
 mod splash;
