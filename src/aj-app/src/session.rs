@@ -34,6 +34,24 @@ use crate::session_setup::{
     freeze_and_seed, prepare_log,
 };
 
+/// The application name shown in the terminal window title.
+const APP_TITLE: &str = "AJ";
+
+/// Terminal window title: `"AJ - <session id> - <cwd basename>"`,
+/// dropping the session-id segment (`"AJ - <cwd basename>"`) when
+/// `session_id` is empty.
+pub fn window_title(session_id: &str, cwd: &std::path::Path) -> String {
+    let cwd = cwd
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if session_id.is_empty() {
+        format!("{APP_TITLE} - {cwd}")
+    } else {
+        format!("{APP_TITLE} - {session_id} - {cwd}")
+    }
+}
+
 /// How a session comes into being and what the user sees announced
 /// when it is installed.
 pub enum SessionSpec {
@@ -450,5 +468,37 @@ impl SessionCore {
     /// Clear `id`'s compacting mark. Idempotent.
     pub fn clear_compacting(&mut self, id: AgentId) {
         self.lifecycle.clear_compacting(id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+
+    #[test]
+    fn window_title_includes_session_id() {
+        assert_eq!(
+            window_title("abc123", Path::new("/home/user/project")),
+            "AJ - abc123 - project"
+        );
+    }
+
+    #[test]
+    fn window_title_drops_empty_session_id() {
+        assert_eq!(
+            window_title("", Path::new("/home/user/project")),
+            "AJ - project"
+        );
+    }
+
+    #[test]
+    fn window_title_uses_cwd_basename() {
+        // A nested path yields only its last component.
+        assert_eq!(
+            window_title("s", Path::new("/a/b/c/deep/leaf")),
+            "AJ - s - leaf"
+        );
     }
 }
