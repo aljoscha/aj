@@ -9,7 +9,7 @@
   "colors": {
     "accent": "brightCyan",
     "border": "blue",
-    "borderAccent": "brightCyan",
+    "borderAccent": "brightMagenta",
     "borderMuted": "brightBlack",
     "success": "green",
     "error": "red",

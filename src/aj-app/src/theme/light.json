@@ -4,6 +4,7 @@
     "teal": "#5a8080",
     "blue": "#547da7",
     "lightBlue": "#5277a3",
+    "lavender": "#9D7DF5",
     "green": "#588458",
     "red": "#aa5555",
     "diffAdded": "#009900",
@@ -20,7 +21,7 @@
   "colors": {
     "accent": "lightBlue",
     "border": "blue",
-    "borderAccent": "teal",
+    "borderAccent": "lavender",
     "borderMuted": "lightGray",
     "success": "green",
     "error": "red",

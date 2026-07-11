@@ -13,6 +13,7 @@
     "darkGray": "#505050",
     "accent": "#8abeb7",
     "lightBlue": "#9cdcfe",
+    "lavender": "#9D7DF5",
     "selectedBg": "#3a3a4a",
     "userMsgBg": "#343541",
     "toolBg": "#282832",
@@ -21,7 +22,7 @@
   "colors": {
     "accent": "lightBlue",
     "border": "blue",
-    "borderAccent": "cyan",
+    "borderAccent": "lavender",
     "borderMuted": "darkGray",
     "success": "green",
     "error": "red",
