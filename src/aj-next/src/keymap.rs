@@ -11,6 +11,8 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use aj_agent::events::AgentId;
+use aj_agent::queue::MessageQueues;
 use aj_app::actions::{AjAction, ChordKey, ChordPhase, ChordSpec, default_global_bindings};
 use vaxis::key::{Key, Modifiers, name_map};
 use vaxis::vxfw::{Activator, BindingPhase, Entry, Keymap, TextArea};
@@ -47,6 +49,13 @@ pub(crate) struct HostCtx {
     /// drive loop polls, so the close-all chord must not pre-empt it.
     /// The drive loop is this field's single writer.
     pub(crate) login_active: bool,
+    /// The active view's message-queue handle, read live by the recall gesture
+    /// (plain Up / Ctrl+P) so it sees the current pending state. The drive loop
+    /// re-sets it each iteration, since the handle is swapped on session change.
+    pub(crate) message_queues: MessageQueues,
+    /// The agent whose transcript is in view, keying [`Self::message_queues`].
+    /// A mirror the drive loop refreshes at its sync point, like `turn_running`.
+    pub(crate) active_view: AgentId,
 }
 
 fn overlay_open(cx: &HostCtx) -> bool {
@@ -84,6 +93,26 @@ fn can_cancel(cx: &HostCtx) -> bool {
 
 fn can_arm_quit(cx: &HostCtx) -> bool {
     no_overlay(cx) && !cx.turn_running
+}
+
+/// The plain Up / Ctrl+P recall gesture: with the editor empty and a message
+/// pending for the active view, these keys yank the pending message into the
+/// editor rather than navigating history (mirroring `aj`). Stricter than the
+/// `alt+up` dequeue gate ([`no_overlay`], fires regardless of editor contents),
+/// so with any draft in the editor the key falls through to the editor's own
+/// history / cursor nav. Reading the editor here is safe for the same reason
+/// [`focus_enabled`] gives: the capture-phase match runs at the root before the
+/// event descends to the editor, so the editor is not already borrowed.
+///
+/// Also gated off while the transcript is focused: there Up / Ctrl+P step
+/// through the user messages (`handle_focus_key`), and that stepping is
+/// bubble-phase, so without this gate the capture-phase recall would pre-empt
+/// it. Declining here lets the key descend to the transcript's focus stepping.
+fn can_recall_pending(cx: &HostCtx) -> bool {
+    no_overlay(cx)
+        && !in_transcript_focus(cx)
+        && cx.editor.borrow().text().is_empty()
+        && cx.message_queues.has_pending(cx.active_view)
 }
 
 /// Close-all is inert while a login dialog is up: the dialog owns its own
@@ -217,6 +246,24 @@ pub(crate) fn build_keymap() -> Keymap<AjAction, HostCtx> {
             Entry::single(activator(&binding.chord), binding.action, phase).with_enabled(enabled),
         );
     }
+
+    // Plain Up / Ctrl+P recall a pending message, mirroring `aj`. These are not
+    // rebindable bindings but the editor's own cursor-up keys (see `TextArea`),
+    // intercepted in the capture phase ahead of it under a stricter gate than
+    // the `alt+up` dequeue: only an empty editor with a message pending yanks.
+    // When the gate declines, the capture single does not fire, so the key
+    // descends to the editor for normal history / cursor nav (a declined
+    // capture single consumes nothing, and no sequence starts on these keys).
+    // Both fire the same `Dequeue` action the drive loop already handles.
+    for recall in [
+        Activator::new(Key::UP, Modifiers::empty()),
+        Activator::new(u32::from('p'), Modifiers::CTRL),
+    ] {
+        entries.push(
+            Entry::single(recall, AjAction::Dequeue, BindingPhase::Capture)
+                .with_enabled(can_recall_pending),
+        );
+    }
     Keymap::new(entries)
 }
 
@@ -234,7 +281,39 @@ mod tests {
             focus_mode: Rc::new(std::cell::Cell::new(false)),
             turn_running,
             login_active: false,
+            message_queues: MessageQueues::default(),
+            active_view: AgentId::Main,
         }
+    }
+
+    /// A context for the recall gesture: an editor holding `editor_text` and,
+    /// when `pending`, a queued message for the active view.
+    fn recall_ctx(editor_text: &str, pending: bool) -> HostCtx {
+        let cx = ctx(false);
+        if !editor_text.is_empty() {
+            cx.editor.borrow_mut().set_text(editor_text);
+        }
+        if pending {
+            cx.message_queues.append_follow_up(cx.active_view, "queued");
+        }
+        cx
+    }
+
+    /// A recall context in transcript-focus mode with a message pending: the
+    /// setup where plain Up / Ctrl+P must step through user messages rather
+    /// than recall.
+    fn focus_recall_ctx() -> HostCtx {
+        let cx = recall_ctx("", true);
+        cx.focus_mode.set(true);
+        cx
+    }
+
+    fn push_scrim(cx: &HostCtx) {
+        cx.overlays.borrow_mut().push(crate::overlay::OpenOverlay {
+            widget: Rc::new(RefCell::new(crate::overlay::Scrim)),
+            focus: Rc::new(RefCell::new(crate::overlay::Scrim)),
+            placement: crate::overlay::OverlayPlacement::Small,
+        });
     }
 
     /// A context whose editor holds a draft but has no autocomplete popup open,
@@ -528,6 +607,128 @@ mod tests {
         assert!(
             !action_matches(&plain_k, ACTION_TASK_KILL),
             "the modifiers must match too",
+        );
+    }
+
+    /// Plain Up / Ctrl+P recall a pending message only when the editor is empty
+    /// and something is pending, mirroring `aj`'s gating. Otherwise the capture
+    /// single declines and the key falls through to the editor.
+    #[test]
+    fn up_and_ctrl_p_recall_pending_only_when_editor_empty_and_pending() {
+        let keymap = build_keymap();
+        let up = key(Key::UP, Modifiers::empty());
+        let ctrl_p = key(u32::from('p'), Modifiers::CTRL);
+
+        // Empty editor + pending: both keys fire Dequeue in the capture phase.
+        let ready = recall_ctx("", true);
+        assert_eq!(
+            keymap.match_single(&up, BindingPhase::Capture, &ready),
+            Some(&AjAction::Dequeue),
+            "Up recalls with an empty editor and a pending message",
+        );
+        assert_eq!(
+            keymap.match_single(&ctrl_p, BindingPhase::Capture, &ready),
+            Some(&AjAction::Dequeue),
+            "Ctrl+P recalls the same way",
+        );
+
+        // A draft in the editor: the recall declines and, crucially, neither a
+        // capture single nor a sequence consumes the key, so it descends to the
+        // editor for normal history / cursor nav.
+        let drafting = recall_ctx("draft", true);
+        assert_eq!(
+            keymap.match_single(&up, BindingPhase::Capture, &drafting),
+            None,
+            "a draft in the editor falls through to the editor",
+        );
+        assert!(
+            !keymap.starts_sequence(&up, &drafting),
+            "no sequence starts on Up, so a declined recall does not swallow it",
+        );
+
+        // Nothing pending: the recall declines even with an empty editor.
+        let idle = recall_ctx("", false);
+        assert_eq!(
+            keymap.match_single(&up, BindingPhase::Capture, &idle),
+            None,
+            "no pending message: Up is normal history nav",
+        );
+        assert_eq!(
+            keymap.match_single(&ctrl_p, BindingPhase::Capture, &idle),
+            None,
+        );
+
+        // An open overlay gates the recall off, like the other queue gestures.
+        let modal = recall_ctx("", true);
+        push_scrim(&modal);
+        assert_eq!(
+            keymap.match_single(&up, BindingPhase::Capture, &modal),
+            None,
+            "an open overlay owns its own Up",
+        );
+    }
+
+    /// In transcript focus, plain Up / Ctrl+P step through the user messages
+    /// (bubble-phase `handle_focus_key`), not recall. The capture-phase recall
+    /// single must therefore decline while focused, so the key descends to the
+    /// transcript's stepping. Without the focus gate the capture recall would
+    /// pre-empt the bubble-phase stepping.
+    #[test]
+    fn recall_declines_in_transcript_focus() {
+        let keymap = build_keymap();
+        let up = key(Key::UP, Modifiers::empty());
+        let ctrl_p = key(u32::from('p'), Modifiers::CTRL);
+
+        let focused = focus_recall_ctx();
+        assert_eq!(
+            keymap.match_single(&up, BindingPhase::Capture, &focused),
+            None,
+            "Up steps messages in focus mode, it does not recall",
+        );
+        assert_eq!(
+            keymap.match_single(&ctrl_p, BindingPhase::Capture, &focused),
+            None,
+            "Ctrl+P steps messages in focus mode too",
+        );
+    }
+
+    /// A queued steering message (the Alt+Enter-with-text path) is recalled by
+    /// Up just like a follow-up: `has_pending` ORs both slots, so the recall
+    /// gate fires for either kind. This pins the "queued/steering" case.
+    #[test]
+    fn up_recalls_a_queued_steering_message() {
+        let keymap = build_keymap();
+        let up = key(Key::UP, Modifiers::empty());
+
+        let cx = ctx(false);
+        cx.message_queues.append_steering(cx.active_view, "steered");
+        assert_eq!(
+            keymap.match_single(&up, BindingPhase::Capture, &cx),
+            Some(&AjAction::Dequeue),
+            "Up recalls a queued steering message",
+        );
+    }
+
+    /// The alt+up dequeue fires regardless of editor contents or pending state:
+    /// its only gate is that no overlay is open. It must not inherit the
+    /// stricter recall gate.
+    #[test]
+    fn alt_up_dequeue_ignores_editor_and_pending() {
+        let keymap = build_keymap();
+        let alt_up = key(Key::UP, Modifiers::ALT);
+
+        let empty = recall_ctx("", false);
+        assert_eq!(
+            keymap.match_single(&alt_up, BindingPhase::Capture, &empty),
+            Some(&AjAction::Dequeue),
+            "alt+up fires even with an empty editor and nothing pending",
+        );
+
+        let drafting = recall_ctx("draft", true);
+        assert_eq!(
+            keymap.match_single(&alt_up, BindingPhase::Capture, &drafting),
+            Some(&AjAction::Dequeue),
+            "alt+up fires with a draft in the editor too",
         );
     }
 

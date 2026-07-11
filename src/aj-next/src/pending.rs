@@ -29,18 +29,21 @@ use crate::transcript::TranscriptStyles;
 /// the editor off-screen.
 const MAX_BODY_LINES: usize = 6;
 
-/// Display label of the edit gesture in the hint line: the editor's up key,
-/// which recalls the queued message for editing when the editor is empty.
+/// Display label of the edit gesture in the hint line: the up key, which
+/// recalls the queued message into the editor for editing when the editor is
+/// empty.
 ///
-/// The gesture is the editor's cursor-up keystroke, a fixed `vxfw` convention
-/// rather than a rebindable action, so we resolve the label from the canonical
-/// `"up"` chord rather than a keymap action. The separate `alt+up`
-/// `ACTION_DEQUEUE` chord yanks regardless of editor contents and is not what
-/// this hint names. The editor's own chord table
-/// ([`vaxis::vxfw::TextArea::bindings`]) documents the keystroke with a verbose
-/// help-screen label (`↑ / Ctrl-P`) that overflows an inline hint, so we render
-/// the concise `Up`. Resolving even this fixed label through `format_keybinding`
-/// keeps one formatting source, so the spelling can't drift from a raw literal.
+/// Plain Up (and Ctrl+P) is a capture-phase keymap binding that fires the same
+/// `AjAction::Dequeue` as the `alt+up` chord, but under a stricter gate: only
+/// an empty editor with a message pending recalls (see `can_recall_pending`).
+/// We resolve the label from the canonical `"up"` chord rather than from the
+/// dequeue action, because the action's default chord is `alt+up` and the hint
+/// names the single concise key the user actually presses to recall. The
+/// editor's own chord table ([`vaxis::vxfw::TextArea::bindings`]) documents the
+/// keystroke with a verbose help-screen label (`↑ / Ctrl-P`) that overflows an
+/// inline hint, so we render the concise `Up`. Resolving the label through
+/// `format_keybinding` keeps one formatting source, so the spelling can't drift
+/// from a raw literal.
 static EDIT_KEY_LABEL: LazyLock<String> =
     LazyLock::new(|| aj_app::keybindings::format_keybinding("up"));
 

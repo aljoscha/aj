@@ -2716,7 +2716,7 @@ impl Shell {
         )));
         let pending = Rc::new(RefCell::new(PendingBox::new(
             Rc::clone(&chat),
-            queues,
+            queues.clone(),
             Rc::clone(&styles),
         )));
         let footer = Rc::new(RefCell::new(FooterLine::new(
@@ -2770,6 +2770,8 @@ impl Shell {
             focus_mode: Rc::clone(&focus_mode),
             turn_running: false,
             login_active: false,
+            message_queues: queues.clone(),
+            active_view: chat.borrow().active_view(),
         }));
 
         // The controller's action handler. Actions whose effects are
@@ -3284,7 +3286,13 @@ impl Widget for Shell {
 fn sync_keymap_ctx(world: &World, shell: &Rc<RefCell<Shell>>) {
     let active = world.chat.borrow().active_view();
     let busy = world.turn_cancels.contains_key(&active) || world.core.is_running(active);
-    shell.borrow().keymap_ctx.borrow_mut().turn_running = busy;
+    let shell = shell.borrow();
+    let mut ctx = shell.keymap_ctx.borrow_mut();
+    ctx.turn_running = busy;
+    // The queue handle is swapped on session change (`world.core` is replaced),
+    // so re-clone it here rather than relying on the one captured at Shell::new.
+    ctx.message_queues = world.core.message_queues.clone();
+    ctx.active_view = active;
 }
 
 /// Runs the interactive shell until the user quits.
@@ -5023,6 +5031,114 @@ mod tests {
             shell.borrow().editor.borrow().cursor(),
             (0, 0),
             "none of the chords leaked into the editor"
+        );
+    }
+
+    /// Plain Up with an empty editor and a pending message recalls it (the same
+    /// `Dequeue` yank alt+up does), mirroring `aj`. Ctrl+P recalls the same way.
+    /// Driven through the app so the capture-phase intercept ahead of the editor
+    /// runs.
+    #[tokio::test]
+    async fn up_and_ctrl_p_recall_pending_when_editor_empty() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut app, mut writer, mut world, shell, _root) =
+            init_app_with_world(&dir, "streaming-text").await;
+
+        let mut press = async |bytes: &[u8]| {
+            writer.write_all(bytes).expect("write key");
+            let event = app.next_input().await.expect("input event");
+            app.handle_input(event);
+        };
+
+        // Queue a pending follow-up for the viewed agent, editor left empty.
+        world
+            .core
+            .message_queues
+            .append_follow_up(AgentId::Main, "queued");
+
+        // Plain Up (CSI A) parks Dequeue in the capture phase without touching
+        // the editor, then the drive-loop handler performs the yank.
+        press(b"\x1b[A").await;
+        assert_eq!(shell.borrow().take_host_action(), Some(AjAction::Dequeue));
+        assert_eq!(
+            shell.borrow().editor.borrow().cursor(),
+            (0, 0),
+            "the recall chord never reached the editor",
+        );
+        assert!(handle_host_action(&mut world, &shell, AjAction::Dequeue));
+        assert_eq!(shell.borrow().editor.borrow().text(), "queued");
+        assert!(!world.core.message_queues.has_pending(AgentId::Main));
+
+        // Ctrl+P (0x10) does the same. Re-queue and clear the editor first.
+        world
+            .core
+            .message_queues
+            .append_follow_up(AgentId::Main, "again");
+        shell.borrow().editor.borrow_mut().clear();
+        press(&[0x10]).await;
+        assert_eq!(shell.borrow().take_host_action(), Some(AjAction::Dequeue));
+        assert!(handle_host_action(&mut world, &shell, AjAction::Dequeue));
+        assert_eq!(shell.borrow().editor.borrow().text(), "again");
+    }
+
+    /// With a draft in the editor, plain Up does NOT recall: the stricter gate
+    /// declines, so the key falls through to the editor and the pending message
+    /// stays queued (mirroring `aj`).
+    #[tokio::test]
+    async fn up_does_not_recall_with_a_draft_in_the_editor() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut app, mut writer, world, shell, _root) =
+            init_app_with_world(&dir, "streaming-text").await;
+
+        world
+            .core
+            .message_queues
+            .append_follow_up(AgentId::Main, "queued");
+        shell.borrow().editor.borrow_mut().insert_at_cursor("draft");
+
+        writer.write_all(b"\x1b[A").expect("write up");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+
+        assert_eq!(
+            shell.borrow().take_host_action(),
+            None,
+            "the recall did not fire with a draft in the editor",
+        );
+        assert!(
+            world.core.message_queues.has_pending(AgentId::Main),
+            "the pending message is still queued, not recalled",
+        );
+    }
+
+    /// With nothing pending, plain Up is normal history navigation: the recall
+    /// gate declines and the key descends to the editor, which recalls the
+    /// newest history entry. This is the end-to-end proof that a declined
+    /// capture single does not swallow the key.
+    #[tokio::test]
+    async fn up_navigates_history_when_nothing_pending() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut app, mut writer, _world, shell, _root) =
+            init_app_with_world(&dir, "streaming-text").await;
+        shell
+            .borrow()
+            .editor
+            .borrow_mut()
+            .seed_history(&["older".to_string(), "newer".to_string()]);
+
+        writer.write_all(b"\x1b[A").expect("write up");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+
+        assert_eq!(
+            shell.borrow().take_host_action(),
+            None,
+            "no recall fired, the key descended to the editor",
+        );
+        assert_eq!(
+            shell.borrow().editor.borrow().text(),
+            "newer",
+            "the editor handled Up as history navigation",
         );
     }
 
