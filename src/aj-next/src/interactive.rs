@@ -5081,7 +5081,49 @@ mod tests {
         assert!(shell.borrow().keymap.borrow().pending_sequence().is_none());
     }
 
-    /// The quit sequence's timeout disarms it through the real timer
+    /// While the quit sequence is armed, the Shell floats the hint box above
+    /// the editor: it shows the ladder and, when work runs, the running-work
+    /// warning read from the shared cell. Disarming clears it.
+    #[tokio::test]
+    async fn armed_quit_renders_the_hint_box() {
+        let (mut app, mut writer, shell, _root) = init_app().await;
+        let ctx = draw_ctx(80, 24);
+
+        // Idle: no hint box.
+        let idle = crate::test_support::rows(&shell.borrow_mut().draw(&ctx)).join("\n");
+        assert!(!idle.contains("Ctrl+C then"), "no hint while idle: {idle}");
+
+        // Seed the running-work warning the drive loop would compute on the
+        // arming edge, then arm with the first Ctrl+C.
+        *shell.borrow().quit_hint_warning.borrow_mut() =
+            Some("2 agents / 1 task still running".to_string());
+        writer.write_all(&[0x03]).expect("write ctrl+c");
+        let event = app.next_input().await.expect("input event");
+        assert!(!app.handle_input(event).quit);
+        assert!(shell.borrow().keymap.borrow().pending_sequence().is_some());
+
+        let armed = crate::test_support::rows(&shell.borrow_mut().draw(&ctx)).join("\n");
+        assert!(
+            armed.contains("Ctrl+C then"),
+            "hint box present when armed: {armed}"
+        );
+        assert!(armed.contains("Quit"), "the quit rung: {armed}");
+        assert!(
+            armed.contains("2 agents / 1 task still running"),
+            "the warning row reads the shared cell: {armed}"
+        );
+
+        // A non-Ctrl+C key disarms the sequence, so the box clears.
+        writer.write_all(b"x").expect("write key");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        assert!(shell.borrow().keymap.borrow().pending_sequence().is_none());
+        let disarmed = crate::test_support::rows(&shell.borrow_mut().draw(&ctx)).join("\n");
+        assert!(
+            !disarmed.contains("Ctrl+C then"),
+            "hint cleared on disarm: {disarmed}"
+        );
+    }
     /// machinery: after the tick fires, the next ctrl+c re-arms instead
     /// of quitting.
     #[tokio::test]

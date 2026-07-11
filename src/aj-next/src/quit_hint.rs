@@ -105,8 +105,8 @@ impl QuitHint {
 
         // Interior content extent. The widest rung, or the warning if longer,
         // sets the width; the ladder plus an optional warning set the height.
-        let content_width = (key_col + KEY_LABEL_GAP + QUIT_LABEL.len())
-            .max(key_col + KEY_LABEL_GAP + CANCEL_LABEL.len())
+        let content_width = (key_col + KEY_LABEL_GAP + ctx.string_width(QUIT_LABEL))
+            .max(key_col + KEY_LABEL_GAP + ctx.string_width(CANCEL_LABEL))
             .max(warning.as_ref().map_or(0, |w| ctx.string_width(w)));
         let content_rows = 2 + usize::from(warning.is_some());
 
@@ -157,7 +157,7 @@ mod tests {
     use aj_app::theme::{ColorMode, Theme};
 
     use super::*;
-    use crate::test_support::{draw_ctx, rows};
+    use crate::test_support::{draw_ctx, flatten, rows};
 
     fn theme() -> Theme {
         Theme::bundled_dark_with_mode(ColorMode::Truecolor)
@@ -218,6 +218,37 @@ mod tests {
             r[4].contains(&format!("{} cancel", close_key_label())),
             "{r:?}"
         );
+    }
+
+    #[test]
+    fn keys_use_the_keybinding_hint_style_and_labels_are_dim() {
+        let t = theme();
+        let styles = TranscriptStyles::from_theme(&t);
+        let hint = QuitHint::new(
+            Rc::new(TranscriptStyles::from_theme(&t)),
+            Rc::new(RefCell::new(OverlayChrome::from_theme(&t))),
+            Rc::new(RefCell::new(None)),
+        );
+        let surf = hint
+            .draw(&draw_ctx(200, Some(50)), roomy())
+            .expect("box fits");
+        let grid = flatten(&surf);
+        // The quit rung sits at content row 2. Row 0 is the titled border,
+        // which also carries the key text, so we scan the rung, not the box.
+        let rung = &grid[2];
+        // The `+` occurs only in "Ctrl+C": the key uses the keybinding-hint
+        // style, matching the splash's `ctrl+o` hint.
+        let key = rung
+            .iter()
+            .find(|c| c.char.grapheme() == "+")
+            .expect("the key's '+'");
+        assert_eq!(key.style, styles.keybinding_hint);
+        // The `Q` occurs only in "Quit": the action word is dimmed.
+        let label = rung
+            .iter()
+            .find(|c| c.char.grapheme() == "Q")
+            .expect("the label's 'Q'");
+        assert_eq!(label.style, styles.dim);
     }
 
     #[test]
