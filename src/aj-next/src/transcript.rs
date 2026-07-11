@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
+use std::sync::LazyLock;
 
 use aj_agent::events::AgentId;
 use aj_agent::tool::{
@@ -22,7 +23,7 @@ use aj_app::chat::{
     SubAgentEntry, SubAgentStatus, ToolEntry, ToolStatus, UserEntry,
 };
 use aj_app::footer::format_tokens;
-use aj_app::keybindings::{ACTION_COPY_MESSAGE, default_action_shortcut};
+use aj_app::keybindings::{ACTION_COPY_MESSAGE, ACTION_THINKING_TOGGLE, default_action_shortcut};
 use aj_app::markdown::{Emphasis, RenderOpts};
 use aj_app::theme::{ColorMode, Theme, ThemeBg, ThemeColor, ThemeRgb, rgb_to_256};
 use aj_models::types::AssistantContent;
@@ -1056,6 +1057,14 @@ fn entry_spans(entry: &Entry, styles: &TranscriptStyles) -> Vec<TextSpan> {
     spans
 }
 
+/// Display label of the thinking-toggle chord shown on collapsed thinking
+/// blocks, resolved from the shared default binding table. This is the
+/// `aj.thinking.toggle` chord (default `alt+t`), distinct from the tools-expand
+/// chord in [`crate::tool_cell::EXPAND_KEY_LABEL`].
+static THINKING_EXPAND_KEY_LABEL: LazyLock<String> = LazyLock::new(|| {
+    default_action_shortcut(ACTION_THINKING_TOGGLE).expect("aj.thinking.toggle has a default chord")
+});
+
 /// Build the [`MarkdownView`] for an assistant entry: one segment per content
 /// block, in order.
 ///
@@ -1099,11 +1108,23 @@ fn build_assistant_markdown(
                 opts: thinking_opts.clone(),
                 base_style: styles.thinking,
             },
-            AssistantContent::Thinking(_) if hide_thinking => MarkdownSegment {
-                text: "Thinking…".to_string(),
-                opts: thinking_opts.clone(),
-                base_style: styles.thinking,
-            },
+            // A collapsed thinking block carries the expand-key hint only when
+            // it has a body worth revealing. A body-less block (signed-but-empty
+            // thinking, or a provider that omits the transcript) collapses to a
+            // bare placeholder so we do not advertise a toggle that reveals
+            // nothing.
+            AssistantContent::Thinking(t) if hide_thinking => {
+                let text = if t.thinking.is_empty() {
+                    "Thinking…".to_string()
+                } else {
+                    format!("Thinking… ({} to expand)", *THINKING_EXPAND_KEY_LABEL)
+                };
+                MarkdownSegment {
+                    text,
+                    opts: thinking_opts.clone(),
+                    base_style: styles.thinking,
+                }
+            }
             AssistantContent::Thinking(t) => MarkdownSegment {
                 text: format!("Thinking: {}", t.thinking),
                 opts: thinking_opts.clone(),
@@ -2624,6 +2645,35 @@ mod tests {
         let t = transcript_with(EntryKind::Assistant(AssistantEntry {
             message: assistant_message(vec![AssistantContent::Thinking(ThinkingContent {
                 thinking: "secret".into(),
+                thinking_signature: None,
+                redacted: false,
+            })]),
+            finalized: true,
+        }));
+        let rows = assistant_markdown_rows(&t, true, 80);
+        // A collapsed block with a body advertises the expand chord, resolved
+        // from the shared binding data (the thinking-toggle chord, alt+t by
+        // default), not the tools-expand chord (alt+o).
+        let key = default_action_shortcut(ACTION_THINKING_TOGGLE).unwrap();
+        assert_eq!(
+            rows,
+            vec![format!("Thinking… ({key} to expand)"), String::new()]
+        );
+        let tools_key = default_action_shortcut(aj_app::keybindings::ACTION_TOOLS_EXPAND).unwrap();
+        assert_ne!(key, tools_key, "the two chords differ by default");
+        assert!(
+            !rows[0].contains(&tools_key),
+            "the hint uses the thinking-toggle chord, not tools-expand: {rows:?}",
+        );
+    }
+
+    #[test]
+    fn hidden_thinking_without_body_suppresses_the_hint() {
+        // A body-less collapsed block has nothing to reveal, so it stays a bare
+        // placeholder with no expand hint.
+        let t = transcript_with(EntryKind::Assistant(AssistantEntry {
+            message: assistant_message(vec![AssistantContent::Thinking(ThinkingContent {
+                thinking: String::new(),
                 thinking_signature: None,
                 redacted: false,
             })]),
