@@ -90,10 +90,10 @@ pub(crate) fn context_lines(env: &AgentEnv) -> Vec<ContextLine> {
 /// into one flat string, one row per line as `  - <tildified path> (<label>)`.
 ///
 /// The assembly is frontend-agnostic. The one visual choice, setting a
-/// disabled skill's row apart, is injected as `strike`: each frontend
-/// supplies its own rendering (ANSI strikethrough for aj-tui, identity
-/// for a plain-text frontend that styles by level instead). `strike` applies
-/// to the row content only, never the bullet, matching the structured split.
+/// disabled skill's row apart, is injected as `strike`: each frontend supplies
+/// its own strike rendering (an ANSI `\x1b[9m..\x1b[29m` strikethrough today).
+/// `strike` applies to the row content only, never the bullet, matching the
+/// structured split.
 pub fn build_context_notice(env: &AgentEnv, strike: fn(&str) -> String) -> String {
     context_lines(env)
         .into_iter()
