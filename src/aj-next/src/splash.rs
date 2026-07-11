@@ -12,8 +12,9 @@
 //! The box surfaces the transcript's leading warning-level `Notice` entries.
 //! It sizes to its content and caps at a small height, staying short by
 //! default and scrolling with the mouse wheel when the warnings overflow. The
-//! logo, hint, and box form one group that is centered vertically in the slot,
-//! so the wordmark sits near the middle with the short box just below it.
+//! logo and hint are centered vertically in the slot with the box hanging
+//! below them, so the wordmark sits near the middle. On a short terminal the
+//! block is pulled up from center only as far as the box needs to fit below it.
 
 use std::cell::RefCell;
 use std::f64::consts::TAU;
@@ -123,10 +124,10 @@ const MIN_BOX_HEIGHT: u16 = 5;
 const MAX_NOTICE_ROWS: u16 = 8;
 /// Blank rows kept below the box so it does not touch the slot's bottom edge.
 const BOX_BOTTOM_MARGIN: u16 = 1;
-/// Vertical margin bounding the centered logo+hint+box group: it caps the
-/// space `plan_box` leaves for the box and, held equal to `BOX_BOTTOM_MARGIN`,
-/// makes a full-height box anchor the group at exactly this margin (see the
-/// centering note in `draw`).
+/// Vertical margin bounding where the centered logo+hint block sits: it caps
+/// the space `plan_box` leaves for the box and, held equal to
+/// `BOX_BOTTOM_MARGIN`, makes a full-height box pull the block up to exactly
+/// this margin (see the centering note in `draw`).
 const TOP_MARGIN: u16 = 1;
 /// Wrapped lines the wheel moves the box per notch. A small step keeps the
 /// scroll legible on a short box.
@@ -336,9 +337,9 @@ impl Splash {
     /// logo and hint show.
     fn plan_box(&self, slot_w: u16, slot_h: u16, header_h: u16) -> Option<BoxPlan> {
         // The box is bounded by the slot minus the header, the top margin, and
-        // the bottom margin. This is the tallest the box may grow before the
-        // centered group would overflow the slot, matching the max box height
-        // the old top-anchored layout allowed.
+        // the bottom margin. This is the tallest the box may grow before it
+        // would overflow the slot below a centered block, matching the max box
+        // height the old top-anchored layout allowed.
         let available_h = slot_h
             .saturating_sub(header_h)
             .saturating_sub(TOP_MARGIN + BOX_BOTTOM_MARGIN);
@@ -497,18 +498,19 @@ impl Widget for Splash {
 
         let slot_h = ctx.max.height.unwrap_or(region_h + 2);
         // The padded logo region, the gap rows, and the hint form the header
-        // above the box. The whole group (header + box) is centered vertically,
-        // so we need the box height before we can place the logo and hint.
+        // above the box. The logo+hint block is centered and the box hangs
+        // below it, so we need the box height before we can place the block.
         let header_h = region_h + 3;
         let plan = notices
             .as_ref()
             .and_then(|_| self.plan_box(slot_w, slot_h, header_h));
 
-        // Size the box up front, since the group's vertical center depends on
-        // its height. We wrap the notice content here and carry the wrapped
-        // surface to the box placement below, so we never wrap twice. `box_h`
-        // is stable per session (the notices are static and `region_h` is
-        // const), so centering the group adds no vertical jitter across frames.
+        // Size the box up front, since where the block anchors depends on the
+        // box height (`max_top` below). We wrap the notice content here and
+        // carry the wrapped surface to the box placement below, so we never
+        // wrap twice. `box_h` is stable per session (the notices are static and
+        // `region_h` is const), so the anchor adds no vertical jitter across
+        // frames.
         let boxed = match (notices, &plan) {
             (Some(spans), Some(plan)) => {
                 let content = self.wrap_content(ctx, spans, plan.inner_w);
@@ -524,15 +526,19 @@ impl Widget for Splash {
             _ => None,
         };
 
-        // Center the whole group vertically. When the box fills `available_h`,
-        // `header_h + box_h == slot_h - (TOP_MARGIN + BOX_BOTTOM_MARGIN)`, and
-        // since we hold `TOP_MARGIN == BOX_BOTTOM_MARGIN`, `center_offset`
-        // lands `top` exactly at `TOP_MARGIN`, reproducing the old top-anchored
-        // layout. A shorter box leaves slack that pushes the group toward the
-        // middle. With no box the logo+hint block centers on its own.
+        // Center the logo+hint block on its own height. This is where the
+        // block sits when the box fits below it.
+        let center_top = center_offset(slot_h, region_h + 2);
+        // Center the logo+hint, but pull the block up from center only as far
+        // as the box needs to fit below it. When the box fills the space this
+        // collapses to the old top-anchored layout: box_h == available_h makes
+        // max_top == TOP_MARGIN, so top pins there.
         let top = match &boxed {
-            Some((_, box_h)) => center_offset(slot_h, header_h + *box_h),
-            None => center_offset(slot_h, region_h + 2),
+            Some((_, box_h)) => {
+                let max_top = slot_h.saturating_sub(BOX_BOTTOM_MARGIN + box_h + header_h);
+                center_top.min(max_top).max(TOP_MARGIN)
+            }
+            None => center_top,
         };
         let box_top = top + header_h;
 
@@ -978,40 +984,49 @@ mod tests {
         );
     }
 
-    /// On a tall slot with a short box the whole group is centered, not pinned
-    /// to the top: the hint sits well below `TOP_MARGIN` and the box still sits
-    /// below the hint. A top-anchored layout would keep the hint near the top.
+    /// On a tall slot where the box fits below a centered block, the logo+hint
+    /// is centered on its own height (not the whole group), so the hint lands
+    /// at the centered offset well below the top-anchored row. The box hangs
+    /// below the hint. A regression to `top = TOP_MARGIN` would put the hint at
+    /// row `TOP_MARGIN + region_h + 1` instead of the centered row, failing the
+    /// exact-position assert.
     #[test]
-    fn short_box_centers_the_group_on_a_tall_slot() {
+    fn short_box_centers_the_logo_and_hint_on_a_tall_slot() {
         let chat = chat();
         append_warning(&chat, "first warning");
         append_warning(&chat, "second warning");
         let splash = splash(chat);
+        let slot_h: u16 = 40;
         let rows = crate::test_support::rows(
             &splash
                 .borrow_mut()
-                .draw(&crate::test_support::draw_ctx(60, Some(40))),
+                .draw(&crate::test_support::draw_ctx(60, Some(slot_h))),
         );
         let hint_row = rows
             .iter()
             .position(|r| r.contains("for commands"))
             .expect("hint row");
         let box_top = rows.iter().position(|r| r.contains('╭')).expect("box top");
-        assert!(
-            hint_row > usize::from(TOP_MARGIN) + 3,
-            "the group is centered, so the hint sits well below the top margin: hint_row={hint_row}"
+        let region_h = LOGO_HEIGHT + 2 * DRIFT_Y;
+        // The box fits below the centered block, so the block sits at exactly
+        // the no-box centered offset and the hint lands at its bottom row.
+        let top = center_offset(slot_h, region_h + 2);
+        assert_eq!(
+            hint_row,
+            usize::from(top + region_h + 1),
+            "the logo+hint is centered, so the hint sits at the centered offset, \
+             not the top-anchored row"
         );
         assert!(
             box_top > hint_row,
-            "the box still sits below the hint: box_top={box_top} hint_row={hint_row}"
+            "the box hangs below the hint: box_top={box_top} hint_row={hint_row}"
         );
     }
 
-    /// When the box fills the available height the group is top-anchored at
-    /// `TOP_MARGIN`: with `box_h == available_h`, `header_h + box_h` equals
-    /// `slot_h - (TOP_MARGIN + BOX_BOTTOM_MARGIN)`, so `center_offset` lands the
-    /// group at `TOP_MARGIN`. Ten warnings on an 18-row slot make `box_h` pin to
-    /// `available_h`, and the header then lands at its top-anchored rows.
+    /// When the box fills the available height the block is pulled all the way
+    /// up to `TOP_MARGIN`: `box_h == available_h` makes `max_top == TOP_MARGIN`,
+    /// so `top` pins there. Ten warnings on an 18-row slot make `box_h` fill
+    /// `available_h`, and the hint then lands at its top-anchored row.
     #[test]
     fn full_box_top_anchors_the_group() {
         let chat = chat();
