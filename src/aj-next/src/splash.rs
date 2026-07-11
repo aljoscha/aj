@@ -316,6 +316,10 @@ impl Splash {
                 NoticeLevel::Warning => self.styles.warning,
                 NoticeLevel::Error => self.styles.error,
             };
+            // NOTE: We push the notice text verbatim, so any raw SGR
+            // strikethrough markers would render literally here. Only the Info
+            // context notice carries them and Info is skipped above, so the box
+            // never sees a marker. The transcript path parses them instead.
             spans.push(TextSpan {
                 text: format!("{}\n", notice.text),
                 style,

@@ -243,7 +243,10 @@ async fn build_world(
         let _ = reduce(
             &mut chat,
             &mut core.lifecycle,
-            notice_event(&aj_app::notices::build_context_notice(&core.env, identity)),
+            notice_event(&aj_app::notices::build_context_notice(
+                &core.env,
+                strikethrough,
+            )),
         );
         for d in &core.env.skill_diagnostics {
             let _ = reduce(
@@ -400,7 +403,10 @@ async fn build_next_session(
     // install so they sit on top of the replayed history.
     let mut notices = vec![notice];
     if is_fresh {
-        notices.push(aj_app::notices::build_context_notice(&core.env, identity));
+        notices.push(aj_app::notices::build_context_notice(
+            &core.env,
+            strikethrough,
+        ));
     }
     notices.append(&mut core.restore_notices);
     Ok(NextSession {
@@ -460,13 +466,13 @@ fn install_next_session(world: &mut World, shell: &Rc<RefCell<Shell>>, next: Nex
     }
 }
 
-/// Identity strike hook for [`aj_app::notices::build_context_notice`].
-///
-/// aj-next styles a notice by level as one plain-text blob rather than per
-/// row, so a disabled skill's row is not struck. The `, disabled` marker in
-/// the row text still conveys the state.
-fn identity(s: &str) -> String {
-    s.to_string()
+/// Strike hook for [`aj_app::notices::build_context_notice`], wrapping a
+/// disabled skill's row in the SGR strikethrough markers (`ESC[9m` on,
+/// `ESC[29m` off). The transcript notice renderer parses these into struck
+/// spans. aj-next cannot depend on `aj_tui`, so we spell the markers out here
+/// rather than reuse `aj_tui::style::strikethrough`.
+fn strikethrough(s: &str) -> String {
+    format!("\x1b[9m{s}\x1b[29m")
 }
 
 /// Wrap a host-side notice in the [`AgentEvent::Notice`] shape so it
@@ -4226,6 +4232,13 @@ mod tests {
     use vaxis::vxfw::{MaxSize, Size};
 
     use super::*;
+
+    /// The context strike hook wraps a disabled skill's row in the SGR
+    /// strikethrough markers the transcript notice renderer parses back out.
+    #[test]
+    fn strikethrough_wraps_input_in_sgr_markers() {
+        assert_eq!(strikethrough("row"), "\x1b[9mrow\x1b[29m");
+    }
 
     fn empty_chat() -> Rc<RefCell<ChatState>> {
         Rc::new(RefCell::new(ChatState::new(

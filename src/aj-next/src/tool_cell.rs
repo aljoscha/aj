@@ -439,12 +439,12 @@ fn push_stream_lines(out: &mut Vec<Line>, stream: &str, expanded: bool, styles: 
     }
 }
 
-/// Split one `format_todo_list` line into spans, translating its SGR
-/// strikethrough markers (`ESC[9m` on, `ESC[29m` off) into the span
-/// style's `strikethrough` attribute. The item content was sanitized
-/// inside `format_todo_list`, so these two markers are the only
-/// escapes that can appear.
-fn strikethrough_spans(text: &str, base: Style) -> Line {
+/// Split `text` into spans, translating its SGR strikethrough markers
+/// (`ESC[9m` on, `ESC[29m` off) into the span style's `strikethrough`
+/// attribute. Callers must pass text whose only escape sequences are those two
+/// markers (todo lists sanitize their content, the context notice carries only
+/// the strike markers), so any other escape renders literally.
+pub(crate) fn strikethrough_spans(text: &str, base: Style) -> Line {
     const ON: &str = "\x1b[9m";
     const OFF: &str = "\x1b[29m";
     let struck = Style {

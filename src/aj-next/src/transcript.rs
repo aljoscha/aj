@@ -41,7 +41,9 @@ use crate::bubble::{Bubble, BubbleBorder};
 use crate::markdown_view::{MarkdownSegment, MarkdownStyles, MarkdownView};
 use crate::subagent_box::{SubAgentBox, build_subagent_box, surface_rows};
 use crate::terminal::TERMINAL_HYPERLINKS;
-use crate::tool_cell::{EXPAND_KEY_LABEL, HintKind, build_tool_cell, expand_hint};
+use crate::tool_cell::{
+    EXPAND_KEY_LABEL, HintKind, build_tool_cell, expand_hint, strikethrough_spans,
+};
 
 /// Pre-resolved vaxis styles for the transcript's row kinds. The
 /// status chrome (loader, footer, pending box) shares the same
@@ -1033,7 +1035,12 @@ fn entry_spans(entry: &Entry, styles: &TranscriptStyles) -> Vec<TextSpan> {
                 NoticeLevel::Warning => styles.warning,
                 NoticeLevel::Error => styles.error,
             };
-            vec![span(format!(" {}", n.text), style)]
+            // Parse any SGR strikethrough markers (the context notice strikes a
+            // disabled skill's row) into struck spans. Text with no markers
+            // yields a single span, so this is safe for every notice.
+            let mut spans = vec![span(" ".to_string(), style)];
+            spans.extend(strikethrough_spans(&n.text, style));
+            spans
         }
         EntryKind::TurnUsage(u) => vec![span(format!(" {}", u.line()), styles.dim)],
     };
@@ -2704,6 +2711,31 @@ mod tests {
         }));
         let spans = entry_spans(&t.entries()[0], &styles());
         assert!(joined(&spans).starts_with(" Token Usage"), "{spans:?}");
+    }
+
+    /// A notice's SGR strikethrough markers are parsed into struck spans: the
+    /// wrapped run is struck while the surrounding text is not. This fails if
+    /// the Notice arm stops parsing markers and emits a single literal span.
+    #[test]
+    fn notice_strikethrough_markers_become_struck_spans() {
+        let t = transcript_with(EntryKind::Notice(NoticeEntry {
+            level: NoticeLevel::Info,
+            text: "pre \x1b[9mstruck\x1b[29m post".into(),
+        }));
+        let spans = entry_spans(&t.entries()[0], &styles());
+        let struck = spans
+            .iter()
+            .find(|s| s.text == "struck")
+            .expect("the struck run is its own span");
+        assert!(struck.style.strikethrough, "the marked run renders struck");
+        for s in &spans {
+            if s.text.contains("pre") || s.text.contains("post") {
+                assert!(
+                    !s.style.strikethrough,
+                    "text outside the markers is not struck: {s:?}"
+                );
+            }
+        }
     }
 
     /// The freed percentage rounds from the token delta and clamps at
