@@ -5107,7 +5107,7 @@ mod tests {
             armed.contains("Ctrl+C then"),
             "hint box present when armed: {armed}"
         );
-        assert!(armed.contains("Quit"), "the quit rung: {armed}");
+        assert!(armed.contains("quit"), "the quit rung: {armed}");
         assert!(
             armed.contains("2 agents / 1 task still running"),
             "the warning row reads the shared cell: {armed}"

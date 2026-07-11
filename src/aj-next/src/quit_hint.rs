@@ -26,8 +26,9 @@ use vaxis::vxfw::{
 use crate::overlay::{OverlayChrome, close_key_label};
 use crate::transcript::TranscriptStyles;
 
-/// The primary action word of the quit rung.
-const QUIT_LABEL: &str = "Quit";
+/// The primary action word of the quit rung. Lower-case to match the cancel
+/// rung and the app's other key hints (`for commands`, `to close`).
+const QUIT_LABEL: &str = "quit";
 /// The action word of the cancel (disarm) rung.
 const CANCEL_LABEL: &str = "cancel";
 /// One column between the key column and its action word.
@@ -191,7 +192,7 @@ mod tests {
         assert_eq!(surf.size.height, 6, "{r:?}");
         assert!(r[0].contains("Ctrl+C then"), "title on top edge: {r:?}");
         assert!(
-            r[2].contains(&format!("{} Quit", fixed_keys::CTRL_C)),
+            r[2].contains(&format!("{} quit", fixed_keys::CTRL_C)),
             "{r:?}"
         );
         assert!(
@@ -211,7 +212,7 @@ mod tests {
         assert_eq!(surf.size.height, 7, "{r:?}");
         assert!(r[2].contains("2 agents / 1 task still running"), "{r:?}");
         assert!(
-            r[3].contains(&format!("{} Quit", fixed_keys::CTRL_C)),
+            r[3].contains(&format!("{} quit", fixed_keys::CTRL_C)),
             "{r:?}"
         );
         assert!(
@@ -243,11 +244,11 @@ mod tests {
             .find(|c| c.char.grapheme() == "+")
             .expect("the key's '+'");
         assert_eq!(key.style, styles.keybinding_hint);
-        // The `Q` occurs only in "Quit": the action word is dimmed.
+        // The `q` occurs only in "quit": the action word is dimmed.
         let label = rung
             .iter()
-            .find(|c| c.char.grapheme() == "Q")
-            .expect("the label's 'Q'");
+            .find(|c| c.char.grapheme() == "q")
+            .expect("the label's 'q'");
         assert_eq!(label.style, styles.dim);
     }
 
