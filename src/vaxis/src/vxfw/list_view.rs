@@ -364,6 +364,14 @@ pub struct ListView {
     pub cursor: u32,
     /// When true, a cursor indicator is drawn next to the cursored widget.
     pub draw_cursor: bool,
+    /// When true, content shorter than the viewport sits at the bottom so the
+    /// last child ends at the viewport bottom, rather than the top.
+    ///
+    /// NOTE: This deviates from the reference, which always top-anchors short
+    /// content. We opt into bottom-anchoring for the chat transcript to give it
+    /// a terminal-scrollback feel: the first message lands just above the editor
+    /// and later messages grow upward.
+    pub anchor_short_to_bottom: bool,
     /// Lines to scroll per mouse-wheel tick.
     pub wheel_scroll: u8,
     /// Set when the exact item count is known, which lets cursor moves and
@@ -387,6 +395,7 @@ impl ListView {
             children,
             cursor: 0,
             draw_cursor: true,
+            anchor_short_to_bottom: false,
             wheel_scroll: 3,
             item_count: None,
             scroll: Scroll::default(),
@@ -872,10 +881,23 @@ impl ListView {
         if !self.scroll.has_more && total < usize::from(max_size.height) {
             debug_assert!(self.scroll.top == 0);
             self.scroll.offset = 0;
-            let mut origin: i32 = 0;
-            for child in child_list.iter_mut() {
-                child.origin.row = origin;
-                origin += i32::from(child.surface.size.height);
+            if self.anchor_short_to_bottom {
+                // Bottom-anchor the short case: lay children so the last one
+                // ends at the viewport bottom, matching the overflow branch's
+                // origin-from-height walk.
+                let mut origin = i32::from(max_size.height);
+                let mut idx = child_list.len();
+                while idx > 0 {
+                    origin -= i32::from(child_list[idx - 1].surface.size.height);
+                    child_list[idx - 1].origin.row = origin;
+                    idx -= 1;
+                }
+            } else {
+                let mut origin: i32 = 0;
+                for child in child_list.iter_mut() {
+                    child.origin.row = origin;
+                    origin += i32::from(child.surface.size.height);
+                }
             }
         } else if !self.scroll.has_more {
             let mut origin = i32::from(max_size.height);
@@ -1320,6 +1342,28 @@ mod tests {
         assert_eq!(surface.children[0].origin.row, 0);
         assert_eq!(list_view.scroll.top, 0);
         assert_eq!(list_view.scroll.offset, 0);
+        assert!(list_view.is_at_bottom());
+    }
+
+    /// With `anchor_short_to_bottom`, content shorter than the viewport sits at
+    /// the bottom: the last child ends at the viewport bottom and the first
+    /// child starts below row 0. The default (top-anchoring) test above is the
+    /// mutation guard for the false case.
+    #[test]
+    fn list_view_short_content_bottom_anchors_when_flag_set() {
+        let mut list_view = ListView::new(Source::Slice(vec![text("a"), text("b"), text("c")]));
+        list_view.anchor_short_to_bottom = true;
+
+        let ctx = draw_ctx(16, 8);
+        list_view.scroll_to_bottom();
+        let surface = list_view.draw(&ctx);
+
+        assert_eq!(surface.children.len(), 3);
+        // Three one-row items pushed to the bottom of an 8-row viewport start at
+        // row 5 and end at row 8.
+        assert_eq!(surface.children[0].origin.row, 5);
+        let last = surface.children.last().expect("visible child");
+        assert_eq!(last.origin.row + i32::from(last.surface.size.height), 8);
         assert!(list_view.is_at_bottom());
     }
 

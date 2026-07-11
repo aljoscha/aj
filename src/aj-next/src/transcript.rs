@@ -1369,6 +1369,10 @@ impl TranscriptView {
         // cursor gutter. The list cursor still exists and moves under focus
         // navigation. `draw_cursor` only controls the gutter drawing.
         list.draw_cursor = false;
+        // Give the transcript a terminal-scrollback feel: when the content is
+        // shorter than the chat slot it sits at the bottom, so the first message
+        // lands right above the editor and later ones grow upward.
+        list.anchor_short_to_bottom = true;
         let mut bars = ScrollBars::new(list);
         bars.draw_horizontal_scrollbar = false;
         apply_scrollbar_thumbs(&mut bars, &styles);
@@ -2843,6 +2847,35 @@ mod tests {
         assert!(view.follow_tail, "short draw at bottom keeps follow-tail");
         // The last visible child is the final entry (spacer included).
         assert!(view.list.borrow().is_at_bottom());
+    }
+
+    /// A fresh short transcript sits at the bottom of the chat slot, so the
+    /// first entry lands just above the editor rather than at row 0. Under
+    /// top-anchoring the content would start at row 0, which is the mutation
+    /// this guards against.
+    #[test]
+    fn short_transcript_bottom_anchors_the_first_entry() {
+        let chat = chat_with_notices(1);
+        let mut view = transcript_view(&chat);
+
+        let surface = view.draw(&draw_ctx(40, 10));
+        let rows = crate::test_support::rows(&surface);
+        assert_eq!(rows.len(), 10, "{rows:?}");
+
+        // The single notice is short, so the top of the slot is blank and the
+        // entry sits at the bottom.
+        assert_eq!(
+            rows[0], "",
+            "top row must be blank, not the entry: {rows:?}"
+        );
+        let content_row = rows
+            .iter()
+            .position(|r| r.contains("row 0"))
+            .expect("the notice renders somewhere");
+        assert!(
+            content_row >= 8,
+            "the first entry sits near the bottom, at row {content_row}: {rows:?}"
+        );
     }
 
     /// A chat model with `n` one-line notice rows (two transcript rows
@@ -4526,8 +4559,9 @@ mod tests {
         let (vw, vh) = (20u16, 40u16);
 
         // Drawing lays entries out through the `ListView` and stashes the cell
-        // size / width method the per-entry provider reuses. A viewport taller
-        // than the content top-anchors it at row 0.
+        // size / width method the per-entry provider reuses. The transcript
+        // bottom-anchors, so content shorter than the viewport ends at the
+        // bottom edge rather than starting at row 0.
         let surface = view.draw(&draw_ctx(vw, vh));
         let grid = crate::test_support::flatten(&surface);
 
@@ -4539,21 +4573,24 @@ mod tests {
         let rows0 = view.entry_rows(id0, content_w);
         let rows1 = view.entry_rows(id1, content_w);
         assert!(rows0.len() > 1 && rows1.len() > 1, "both entries wrapped");
+        let total = rows0.len() + rows1.len();
         assert!(
-            rows0.len() + rows1.len() < usize::from(vh),
-            "content fits, so the list top-anchors it at row 0",
+            total < usize::from(vh),
+            "content fits, so the list bottom-anchors it below row 0",
         );
 
-        // Entry 0 occupies the first `rows0.len()` screen rows, entry 1 the
-        // ones right after it.
+        // Bottom-anchored: the content ends at the viewport bottom, so it
+        // starts at `vh - total`. Entry 0 occupies the first `rows0.len()`
+        // content rows, entry 1 the ones right after it.
+        let start = usize::from(vh) - total;
         for (r, line) in rows0.iter().enumerate() {
             assert_eq!(
-                &grid[r][..usize::from(content_w)],
+                &grid[start + r][..usize::from(content_w)],
                 line.as_slice(),
                 "entry 0 row {r} differs from the visible render",
             );
         }
-        let base = rows0.len();
+        let base = start + rows0.len();
         for (r, line) in rows1.iter().enumerate() {
             assert_eq!(
                 &grid[base + r][..usize::from(content_w)],
@@ -4562,7 +4599,7 @@ mod tests {
             );
         }
         // The reserved scrollbar column stays blank while the transcript fits.
-        for r in 0..(rows0.len() + rows1.len()) {
+        for r in start..usize::from(vh) {
             assert_eq!(grid[r][usize::from(content_w)], Cell::default());
         }
     }
