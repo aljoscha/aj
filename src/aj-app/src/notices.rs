@@ -7,15 +7,15 @@
 
 use aj_conf::{AgentEnv, SystemPromptSource, display_path};
 
-/// One row of the `Context:` listing, split so a frontend can strike a
-/// disabled skill's content without striking its bullet.
+/// One row of the `Context:` listing, split so the bullet and the row content
+/// can be styled apart.
 ///
-/// We keep the row structured rather than pre-formatted because the aj-next
-/// splash renders a disabled skill row with strikethrough on the content only,
-/// matching aj, which never strikes the `  - ` bullet. A flat string could not
-/// express that distinction, so the split lives here.
+/// We keep the row structured rather than pre-formatted because
+/// [`build_context_notice`] strikes a disabled skill's row content without
+/// striking its `  - ` bullet, matching aj. A flat string could not express
+/// that distinction, so the split lives here.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContextLine {
+pub(crate) struct ContextLine {
     /// Leading bullet or indent, never struck. `  - ` for a listed row, empty
     /// for the `Context:` header.
     pub bullet: String,
@@ -36,7 +36,7 @@ pub struct ContextLine {
 /// skill's own frontmatter). A disabled skill row is marked `struck`, the one
 /// visual distinction. Same content and order as [`build_context_notice`],
 /// which joins this.
-pub fn context_lines(env: &AgentEnv) -> Vec<ContextLine> {
+pub(crate) fn context_lines(env: &AgentEnv) -> Vec<ContextLine> {
     let bullet = "  - ".to_string();
     let mut lines = vec![ContextLine {
         bullet: String::new(),
