@@ -2738,6 +2738,40 @@ mod tests {
         }
     }
 
+    /// A realistic context notice in the shape `build_context_notice` emits
+    /// (the `  - ` bullet outside the strike markers, the disabled skill's
+    /// content inside) strikes only the skill content: the bullet and the
+    /// `Context:` and `builtin` rows stay unstruck. This locks the
+    /// bullet-not-struck contract against a real context row, not a synthetic
+    /// marker.
+    #[test]
+    fn context_notice_strikes_skill_content_not_the_bullet() {
+        let t = transcript_with(EntryKind::Notice(NoticeEntry {
+            level: NoticeLevel::Info,
+            text: "Context:\n  - builtin (system prompt)\n  - \
+                   \x1b[9m~/x/SKILL.md (skill: y, disabled)\x1b[29m"
+                .into(),
+        }));
+        let spans = entry_spans(&t.entries()[0], &styles());
+        let struck = spans
+            .iter()
+            .find(|s| s.style.strikethrough)
+            .expect("the disabled skill row is struck");
+        assert!(
+            struck.text.contains("disabled") && struck.text.contains("SKILL.md"),
+            "the struck span carries the skill content and path: {struck:?}"
+        );
+        for s in &spans {
+            if s.text.contains("  - ") || s.text.contains("Context:") || s.text.contains("builtin")
+            {
+                assert!(
+                    !s.style.strikethrough,
+                    "the bullet, header, and builtin rows stay unstruck: {s:?}"
+                );
+            }
+        }
+    }
+
     /// The freed percentage rounds from the token delta and clamps at
     /// 0 when occupancy didn't drop.
     #[test]

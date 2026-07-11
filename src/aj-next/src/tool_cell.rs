@@ -441,9 +441,11 @@ fn push_stream_lines(out: &mut Vec<Line>, stream: &str, expanded: bool, styles: 
 
 /// Split `text` into spans, translating its SGR strikethrough markers
 /// (`ESC[9m` on, `ESC[29m` off) into the span style's `strikethrough`
-/// attribute. Callers must pass text whose only escape sequences are those two
-/// markers (todo lists sanitize their content, the context notice carries only
-/// the strike markers), so any other escape renders literally.
+/// attribute. The caller contract is that the only intended escapes in `text`
+/// are those two markers, so any other escape renders literally. Todo lists
+/// meet this by sanitizing their content. The context notice adds only the
+/// strike markers but does not sanitize the paths and skill names it wraps, so
+/// a stray ESC in one of those would mis-parse.
 pub(crate) fn strikethrough_spans(text: &str, base: Style) -> Line {
     const ON: &str = "\x1b[9m";
     const OFF: &str = "\x1b[29m";
