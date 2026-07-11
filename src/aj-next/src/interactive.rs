@@ -137,8 +137,9 @@ struct World {
     restore: Option<RestoreContext>,
     /// The structured `Context:` listing for the splash's left box, populated
     /// for a fresh session and empty for a resumed one (which shows no splash).
-    /// Context lives in the splash, not in scrollback, so it is threaded to the
-    /// splash rather than folded through the reducer.
+    /// A per-session courier: context lives in the splash, not in scrollback,
+    /// so it is built here and pushed to the splash on startup and on each
+    /// session switch rather than folded through the reducer.
     context: Vec<ContextLine>,
 }
 
@@ -4512,6 +4513,175 @@ mod tests {
         build_world(&args, layers, &[], &auth, &persistence)
             .await
             .expect("build world")
+    }
+
+    /// Drive one scripted turn to completion so the session's log lands on disk
+    /// and can be resumed by the session-switch paths.
+    async fn persist_session(world: &mut World) {
+        handle_submit(world, "persist me".to_string());
+        let joined = join_next_or_pending(&mut world.turns).await;
+        handle_turn_join(world, joined).expect("turn settles cleanly");
+        if let Ok(first) = world.core.event_rx.try_recv() {
+            let _ = drain_events(world, first);
+        }
+    }
+
+    /// A world resumed from `session_id`, reusing `dir`'s persistence so the
+    /// session written by a prior [`scripted_world`] is found on disk.
+    async fn resumed_world(dir: &TempDir, demo: &str, session_id: &str) -> World {
+        let args = Args::parse_from(["aj-next", "--scripted", demo, "continue", session_id]);
+        let auth = AuthStorage::new(dir.path().join("auth.json"));
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        build_world(&args, default_layers(), &[], &auth, &persistence)
+            .await
+            .expect("build resumed world")
+    }
+
+    /// The context listing lives in the splash's left box, not in scrollback:
+    /// after `build_world` for a fresh session, the leading `Notice` run (what
+    /// the splash's notices box shows) carries the startup warnings but not the
+    /// `Context:` listing.
+    #[tokio::test]
+    async fn build_world_keeps_context_out_of_scrollback() {
+        let dir = TempDir::new().expect("tempdir");
+        let args = Args::parse_from(["aj-next", "--scripted", "streaming-text"]);
+        let auth = AuthStorage::new(dir.path().join("auth.json"));
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        // A config diagnostic gives a deterministic startup warning in
+        // scrollback, independent of the sandbox / tmux environment.
+        let diagnostics = vec![ConfigDiagnostic::UnknownKey {
+            path: PathBuf::from("/tmp/config.toml"),
+            key: "themee".to_string(),
+            suggestion: Some("theme"),
+        }];
+        let world = build_world(&args, default_layers(), &diagnostics, &auth, &persistence)
+            .await
+            .expect("build world");
+
+        let chat = world.chat.borrow();
+        let transcript = chat
+            .transcript(chat.active_view())
+            .expect("main transcript");
+        let notices: Vec<String> = transcript
+            .entries()
+            .iter()
+            .map_while(|e| match &e.kind {
+                EntryKind::Notice(n) => Some(n.text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notices.iter().any(|t| t.contains("themee")),
+            "the startup warning is in scrollback: {notices:?}"
+        );
+        assert!(
+            !notices.iter().any(|t| t.contains("Context:")),
+            "the context listing is not folded into scrollback: {notices:?}"
+        );
+    }
+
+    /// `build_world` populates `World.context` for a fresh (`Create`) session
+    /// and leaves it empty for a resumed one (which shows no splash).
+    #[tokio::test]
+    async fn build_world_populates_context_for_create_empty_for_resume() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut world = scripted_world(&dir, "streaming-text").await;
+        assert!(!world.context.is_empty(), "a fresh session has context");
+        assert!(
+            world.context.iter().any(|l| l.text == "Context:"),
+            "the context carries its header row"
+        );
+
+        persist_session(&mut world).await;
+        let resumed = resumed_world(&dir, "streaming-text", &world.core.session_id).await;
+        assert!(
+            resumed.context.is_empty(),
+            "a resumed session carries no context"
+        );
+    }
+
+    /// A session switch threads the new session's context to the splash: a
+    /// fresh switch carries context, a resume (and the resume-fallback path)
+    /// carries none, and `install_next_session` repoints the splash.
+    #[tokio::test]
+    async fn session_switch_threads_context_to_the_splash() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let previous_id = world.core.session_id.clone();
+
+        let fresh = build_next_session(
+            &world,
+            SessionSpec::Create {
+                entry: SessionEntry::Switch,
+            },
+            &previous_id,
+        )
+        .await
+        .expect("build fresh next session");
+        assert!(!fresh.context.is_empty(), "a fresh switch carries context");
+
+        // Persist the session so the resume paths have a log on disk.
+        persist_session(&mut world).await;
+        let resumable = world.core.session_id.clone();
+
+        let resumed = build_next_session(
+            &world,
+            SessionSpec::Resume {
+                session_id: resumable.clone(),
+                entry: SessionEntry::Switch,
+            },
+            &previous_id,
+        )
+        .await
+        .expect("build resumed next session");
+        assert!(resumed.context.is_empty(), "a resume carries no context");
+
+        // The resume-fallback path: the requested resume of a missing session
+        // fails, we fall back to resuming `previous_id`, and that build is
+        // never fresh, so it also carries no context.
+        let fallback = build_next_session(
+            &world,
+            SessionSpec::Resume {
+                session_id: "no-such-session".to_string(),
+                entry: SessionEntry::Switch,
+            },
+            &resumable,
+        )
+        .await
+        .expect("the fallback resumes the previous session");
+        assert!(
+            fallback.context.is_empty(),
+            "the resume fallback carries no context"
+        );
+
+        // Installing a fresh session repoints the splash: the value threaded to
+        // `set_context` (and thereby `World.context`) is non-empty, and the
+        // splash renders the `Context:` header.
+        let fresh = build_next_session(
+            &world,
+            SessionSpec::Create {
+                entry: SessionEntry::Switch,
+            },
+            &previous_id,
+        )
+        .await
+        .expect("build fresh next session");
+        install_next_session(&mut world, &shell, fresh);
+        assert!(
+            !world.context.is_empty(),
+            "install threads the fresh context onto World"
+        );
+        let rows = crate::test_support::rows(
+            &shell
+                .borrow()
+                .splash
+                .borrow_mut()
+                .draw(&crate::test_support::draw_ctx(90, Some(30))),
+        );
+        assert!(
+            rows.join("\n").contains("Context:"),
+            "the splash renders the repointed context: {rows:?}"
+        );
     }
 
     #[tokio::test]
