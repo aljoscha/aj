@@ -14,13 +14,14 @@
     "accent": "#8abeb7",
     "lightBlue": "#9cdcfe",
     "lavender": "#9D7DF5",
+    "lavenderBright": "#B39DFF",
     "selectedBg": "#3d3556",
     "userMsgBg": "#343541",
     "toolBg": "#282832",
     "customMsgBg": "#2d2838"
   },
   "colors": {
-    "accent": "lightBlue",
+    "accent": "lavenderBright",
     "border": "blue",
     "borderAccent": "lavender",
     "borderMuted": "darkGray",

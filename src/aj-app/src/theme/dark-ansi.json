@@ -7,7 +7,7 @@
     "brightBlue": 12, "brightMagenta": 13, "brightCyan": 14, "brightWhite": 15
   },
   "colors": {
-    "accent": "brightCyan",
+    "accent": "brightMagenta",
     "border": "blue",
     "borderAccent": "brightMagenta",
     "borderMuted": "brightBlack",

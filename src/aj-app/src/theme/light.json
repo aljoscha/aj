@@ -5,6 +5,7 @@
     "blue": "#547da7",
     "lightBlue": "#5277a3",
     "lavender": "#9D7DF5",
+    "lavenderDeep": "#7B4FD8",
     "green": "#588458",
     "red": "#aa5555",
     "diffAdded": "#009900",
@@ -19,7 +20,7 @@
     "customMsgBg": "#ede7f6"
   },
   "colors": {
-    "accent": "lightBlue",
+    "accent": "lavenderDeep",
     "border": "blue",
     "borderAccent": "lavender",
     "borderMuted": "lightGray",
