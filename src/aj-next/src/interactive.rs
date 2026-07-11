@@ -24,7 +24,6 @@ use aj_app::chat::{ChatState, reduce};
 use aj_app::cli::args::{Args, Command};
 use aj_app::commands::{CommandAction, load_model_catalog};
 use aj_app::keybindings::fixed_keys;
-use aj_app::notices::ContextLine;
 use aj_app::session::{SessionCore, SessionEntry, SessionExit, SessionRequest, SessionSpec};
 use aj_app::session_setup::{RestoreContext, RunConfigSnapshot, build_initial_run_config};
 use aj_app::settings::{
@@ -135,12 +134,6 @@ struct World {
     /// resumed session's recorded model/thinking/speed are restored the
     /// same way the process's first session's are. `None` in scripted mode.
     restore: Option<RestoreContext>,
-    /// The structured `Context:` listing for the splash's left box, populated
-    /// for a fresh session and empty for a resumed one (which shows no splash).
-    /// A per-session courier: context lives in the splash, not in scrollback,
-    /// so it is built here and pushed to the splash on startup and on each
-    /// session switch rather than folded through the reducer.
-    context: Vec<ContextLine>,
 }
 
 /// Build the session world: run config, session core, and the chat
@@ -222,10 +215,9 @@ async fn build_world(
     }
 
     // Startup notices, after replay so resumed history stays on top.
-    // Order mirrors aj: config diagnostics, then (fresh session only)
-    // the skill warnings, then sandbox, auth, tmux, then the
-    // resume-restore notices. The context is not folded here: it lives in
-    // the splash's left box, not in scrollback (see `World::context`).
+    // Order mirrors aj: config diagnostics, then (fresh session only) the
+    // context listing followed by the skill warnings, then sandbox, auth,
+    // tmux, then the resume-restore notices.
     for d in diagnostics {
         let text = d.to_string();
         let event = match d.severity() {
@@ -242,9 +234,17 @@ async fn build_world(
     }
     // The context listing and skill warnings describe the freshly-loaded
     // env, which only governs a fresh session. A resumed session keeps its
-    // assembled prompt in the log, so we skip them there. The context is
-    // handed to the splash rather than folded into scrollback.
-    let context = if matches!(spec, SessionSpec::Create { .. }) {
+    // assembled prompt in the log, so we skip them there. Context folds as an
+    // Info notice leading the fresh-session block, ahead of the skill and
+    // sandbox warnings, matching aj. Any config diagnostics above still precede
+    // it. The splash box surfaces only warning-level notices, so context lives
+    // in scrollback only, never the box.
+    if matches!(spec, SessionSpec::Create { .. }) {
+        let _ = reduce(
+            &mut chat,
+            &mut core.lifecycle,
+            notice_event(&aj_app::notices::build_context_notice(&core.env, identity)),
+        );
         for d in &core.env.skill_diagnostics {
             let _ = reduce(
                 &mut chat,
@@ -252,10 +252,7 @@ async fn build_world(
                 warning_event(&d.to_string()),
             );
         }
-        aj_app::notices::context_lines(&core.env)
-    } else {
-        Vec::new()
-    };
+    }
     if aj_app::notices::sandbox_warning_enabled() {
         let _ = reduce(
             &mut chat,
@@ -312,20 +309,17 @@ async fn build_world(
         auth: auth.clone(),
         persistence: persistence.clone(),
         restore,
-        context,
     })
 }
 
 /// A freshly built session ready to install over the running one: the new
 /// core, the seeded chat model, and the notices to fold after install (the
-/// switch/create confirmation plus any resume-restore notices).
+/// switch/create confirmation, the fresh session's context listing, plus any
+/// resume-restore notices).
 struct NextSession {
     core: SessionCore,
     chat: ChatState,
     notices: Vec<String>,
-    /// The structured `Context:` listing for the splash's left box, populated
-    /// only when the built session is a fresh one (see `World::context`).
-    context: Vec<ContextLine>,
 }
 
 /// Build the session a new-session or resume request asks for, reusing the
@@ -399,23 +393,20 @@ async fn build_next_session(
         }
     }
 
-    // The switch/create confirmation first, then any resume-restore
-    // notices, folded by the caller after install so they sit on top of the
-    // replayed history.
+    // The switch/create confirmation first, then (for a fresh switch) the
+    // context listing folded as an Info notice right after it, then any
+    // resume-restore notices. The confirmation is the switch acknowledgment, so
+    // context follows it rather than leading. The caller folds these after
+    // install so they sit on top of the replayed history.
     let mut notices = vec![notice];
+    if is_fresh {
+        notices.push(aj_app::notices::build_context_notice(&core.env, identity));
+    }
     notices.append(&mut core.restore_notices);
-    // Context is shown only in the splash's left box, so a fresh session
-    // assembles it here for the caller to push into the splash.
-    let context = if is_fresh {
-        aj_app::notices::context_lines(&core.env)
-    } else {
-        Vec::new()
-    };
     Ok(NextSession {
         core,
         chat,
         notices,
-        context,
     })
 }
 
@@ -458,20 +449,24 @@ fn install_next_session(world: &mut World, shell: &Rc<RefCell<Shell>>, next: Nex
     // loop shut the outgoing turns down, and the guard refuses mid-turn
     // requests), so this is already empty; clear defensively.
     world.turn_cancels.clear();
-    // Repoint the splash at the new session's context (empty for a resumed
-    // one), which the splash owns per session across the switch.
-    world.context = next.context;
-    shell
-        .borrow()
-        .splash
-        .borrow_mut()
-        .set_context(world.context.clone());
+    // Start the switched-to session's splash box at the top: a prior session's
+    // wheel scroll must not carry over.
+    shell.borrow().splash.borrow_mut().reset_scroll();
     shell.borrow().rebind(world);
     // Folded after the install so they land in the new session's chat, on
     // top of any replayed history.
     for notice in next.notices {
         fold_notice(world, &notice);
     }
+}
+
+/// Identity strike hook for [`aj_app::notices::build_context_notice`].
+///
+/// aj-next styles a notice by level as one plain-text blob rather than per
+/// row, so a disabled skill's row is not struck. The `, disabled` marker in
+/// the row text still conveys the state.
+fn identity(s: &str) -> String {
+    s.to_string()
 }
 
 /// Wrap a host-side notice in the [`AgentEvent::Notice`] shape so it
@@ -3303,14 +3298,6 @@ pub async fn run(args: Args) -> Result<()> {
         header,
         cwd,
     )));
-    // Hand the first session's context to the splash's left box. The splash
-    // persists across session switches, so `install_next_session` repoints it
-    // on each change (see there).
-    shell
-        .borrow()
-        .splash
-        .borrow_mut()
-        .set_context(world.context.clone());
     let root: WidgetRef = to_widget_ref(Rc::clone(&shell));
 
     let tty = PosixTty::new()?;
@@ -4230,7 +4217,7 @@ mod tests {
     use std::io::{PipeWriter, Write};
     use std::sync::Arc;
 
-    use aj_app::chat::EntryKind;
+    use aj_app::chat::{EntryKind, NoticeLevel};
     use clap::Parser;
     use tempfile::TempDir;
     use vaxis::gwidth;
@@ -4537,77 +4524,91 @@ mod tests {
             .expect("build resumed world")
     }
 
-    /// The context listing lives in the splash's left box, not in scrollback:
-    /// after `build_world` for a fresh session, the leading `Notice` run (what
-    /// the splash's notices box shows) carries the startup warnings but not the
-    /// `Context:` listing.
+    /// A fresh session folds the context listing as the leading Info notice,
+    /// before the startup warnings. That is what makes it the first transcript
+    /// message once the chat starts, while the warning-level notices below it
+    /// are what the splash box surfaces.
     #[tokio::test]
-    async fn build_world_keeps_context_out_of_scrollback() {
-        let dir = TempDir::new().expect("tempdir");
-        let args = Args::parse_from(["aj-next", "--scripted", "streaming-text"]);
-        let auth = AuthStorage::new(dir.path().join("auth.json"));
-        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
-        // A config diagnostic gives a deterministic startup warning in
-        // scrollback, independent of the sandbox / tmux environment.
-        let diagnostics = vec![ConfigDiagnostic::UnknownKey {
-            path: PathBuf::from("/tmp/config.toml"),
-            key: "themee".to_string(),
-            suggestion: Some("theme"),
-        }];
-        let world = build_world(&args, default_layers(), &diagnostics, &auth, &persistence)
-            .await
-            .expect("build world");
+    #[serial_test::serial]
+    async fn build_world_folds_context_as_leading_info_before_warnings() {
+        // Force the sandbox warning on so a warning-level notice deterministically
+        // follows the context, independent of the ambient environment.
+        let prev = std::env::var("AJ_DISABLE_SANDBOX_WARNING").ok();
+        // SAFETY: `#[serial]` keeps other env-mutating tests out; restored below.
+        unsafe {
+            std::env::remove_var("AJ_DISABLE_SANDBOX_WARNING");
+        }
 
-        let chat = world.chat.borrow();
+        let dir = TempDir::new().expect("tempdir");
+        let world = scripted_world(&dir, "streaming-text").await;
+
+        let leading: Vec<(NoticeLevel, String)> = {
+            let chat = world.chat.borrow();
+            let transcript = chat
+                .transcript(chat.active_view())
+                .expect("main transcript");
+            transcript
+                .entries()
+                .iter()
+                .map_while(|e| match &e.kind {
+                    EntryKind::Notice(n) => Some((n.level, n.text.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // SAFETY: same serial scope as the remove above.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("AJ_DISABLE_SANDBOX_WARNING", v),
+                None => std::env::remove_var("AJ_DISABLE_SANDBOX_WARNING"),
+            }
+        }
+
+        let context_at = leading
+            .iter()
+            .position(|(level, text)| *level == NoticeLevel::Info && text.contains("Context:"))
+            .expect("a leading Info notice carries the context listing");
+        let first_warning = leading
+            .iter()
+            .position(|(level, _)| *level == NoticeLevel::Warning)
+            .expect("a startup warning follows the context");
+        assert!(
+            context_at < first_warning,
+            "context is folded before the warnings: {leading:?}"
+        );
+    }
+
+    /// A resumed session keeps its assembled prompt in the log, so `build_world`
+    /// folds no context notice into its scrollback.
+    #[tokio::test]
+    async fn build_world_resume_folds_no_context() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut world = scripted_world(&dir, "streaming-text").await;
+        persist_session(&mut world).await;
+        let resumed = resumed_world(&dir, "streaming-text", &world.core.session_id).await;
+
+        let chat = resumed.chat.borrow();
         let transcript = chat
             .transcript(chat.active_view())
             .expect("main transcript");
-        let notices: Vec<String> = transcript
+        let has_context = transcript
             .entries()
             .iter()
-            .map_while(|e| match &e.kind {
-                EntryKind::Notice(n) => Some(n.text.clone()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            notices.iter().any(|t| t.contains("themee")),
-            "the startup warning is in scrollback: {notices:?}"
-        );
-        assert!(
-            !notices.iter().any(|t| t.contains("Context:")),
-            "the context listing is not folded into scrollback: {notices:?}"
-        );
+            .any(|e| matches!(&e.kind, EntryKind::Notice(n) if n.text.contains("Context:")));
+        assert!(!has_context, "a resumed session folds no context notice");
     }
 
-    /// `build_world` populates `World.context` for a fresh (`Create`) session
-    /// and leaves it empty for a resumed one (which shows no splash).
+    /// A session switch folds the fresh session's context as an Info notice: a
+    /// fresh switch carries the context string in its deferred notices, a resume
+    /// (and the resume-fallback) does not, and installing a fresh switch folds
+    /// the context notice into the new session's scrollback.
     #[tokio::test]
-    async fn build_world_populates_context_for_create_empty_for_resume() {
-        let dir = TempDir::new().expect("tempdir");
-        let mut world = scripted_world(&dir, "streaming-text").await;
-        assert!(!world.context.is_empty(), "a fresh session has context");
-        assert!(
-            world.context.iter().any(|l| l.text == "Context:"),
-            "the context carries its header row"
-        );
-
-        persist_session(&mut world).await;
-        let resumed = resumed_world(&dir, "streaming-text", &world.core.session_id).await;
-        assert!(
-            resumed.context.is_empty(),
-            "a resumed session carries no context"
-        );
-    }
-
-    /// A session switch threads the new session's context to the splash: a
-    /// fresh switch carries context, a resume (and the resume-fallback path)
-    /// carries none, and `install_next_session` repoints the splash.
-    #[tokio::test]
-    async fn session_switch_threads_context_to_the_splash() {
+    async fn session_switch_folds_context_for_fresh_only() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         let previous_id = world.core.session_id.clone();
+        let has_context = |notices: &[String]| notices.iter().any(|n| n.contains("Context:"));
 
         let fresh = build_next_session(
             &world,
@@ -4618,7 +4619,11 @@ mod tests {
         )
         .await
         .expect("build fresh next session");
-        assert!(!fresh.context.is_empty(), "a fresh switch carries context");
+        assert!(
+            has_context(&fresh.notices),
+            "a fresh switch carries context: {:?}",
+            fresh.notices
+        );
 
         // Persist the session so the resume paths have a log on disk.
         persist_session(&mut world).await;
@@ -4634,7 +4639,11 @@ mod tests {
         )
         .await
         .expect("build resumed next session");
-        assert!(resumed.context.is_empty(), "a resume carries no context");
+        assert!(
+            !has_context(&resumed.notices),
+            "a resume carries no context: {:?}",
+            resumed.notices
+        );
 
         // The resume-fallback path: the requested resume of a missing session
         // fails, we fall back to resuming `previous_id`, and that build is
@@ -4650,13 +4659,13 @@ mod tests {
         .await
         .expect("the fallback resumes the previous session");
         assert!(
-            fallback.context.is_empty(),
-            "the resume fallback carries no context"
+            !has_context(&fallback.notices),
+            "the resume fallback carries no context: {:?}",
+            fallback.notices
         );
 
-        // Installing a fresh session repoints the splash: the value threaded to
-        // `set_context` (and thereby `World.context`) is non-empty, and the
-        // splash renders the `Context:` header.
+        // Installing a fresh switch folds its context notice into the new
+        // session's scrollback.
         let fresh = build_next_session(
             &world,
             SessionSpec::Create {
@@ -4667,20 +4676,10 @@ mod tests {
         .await
         .expect("build fresh next session");
         install_next_session(&mut world, &shell, fresh);
+        let folded = main_notices(&world);
         assert!(
-            !world.context.is_empty(),
-            "install threads the fresh context onto World"
-        );
-        let rows = crate::test_support::rows(
-            &shell
-                .borrow()
-                .splash
-                .borrow_mut()
-                .draw(&crate::test_support::draw_ctx(90, Some(30))),
-        );
-        assert!(
-            rows.join("\n").contains("Context:"),
-            "the splash renders the repointed context: {rows:?}"
+            has_context(&folded),
+            "install folds the fresh context: {folded:?}"
         );
     }
 

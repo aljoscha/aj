@@ -1,5 +1,6 @@
 //! The empty-state splash: an animated `aj` wordmark, a command-palette hint,
-//! and two bordered boxes below it, a Context box and a Notices box (Spec E-9).
+//! and, when there are startup warnings, one bordered notices box below them
+//! (Spec E-9).
 //!
 //! Shown in the chat slot before the conversation has any user or assistant
 //! entry. The animation is tick-driven off the frame clock the async driver
@@ -7,6 +8,10 @@
 //! drift and the color pulse derive from elapsed wall-clock time (an
 //! [`Instant`], like the loader's spinner), so the motion speed is independent
 //! of tick-delivery jitter.
+//!
+//! The box surfaces the transcript's leading warning-level `Notice` entries.
+//! It sizes to its content and caps at a small height, staying short by
+//! default and scrolling with the mouse wheel when the warnings overflow.
 
 use std::cell::RefCell;
 use std::f64::consts::TAU;
@@ -15,7 +20,6 @@ use std::time::Instant;
 
 use aj_app::chat::{ChatState, EntryKind, NoticeLevel};
 use aj_app::keybindings::{ACTION_PALETTE_OPEN, default_action_shortcut};
-use aj_app::notices::ContextLine;
 use aj_app::theme::{ColorMode, ThemeRgb};
 use vaxis::cell::{Cell, Character, Color, Style};
 use vaxis::mouse;
@@ -102,22 +106,25 @@ const GAP_PERIOD: f64 = 5.0;
 
 /// Box chrome: 2 border columns plus 1 padding column on each side.
 const BOX_CHROME: u16 = 4;
-/// Horizontal gap between the two side-by-side boxes.
-const BOX_GAP: u16 = 2;
-/// Minimum readable inner width for a box. Below this the boxes hide rather
-/// than cramming content into an unreadable sliver.
+/// Minimum readable inner width for the box. Below this it hides rather than
+/// cramming content into an unreadable sliver.
 const MIN_BOX_INNER: u16 = 20;
-/// Cap on a box's inner width, so the pair stays a centered group rather than
+/// Cap on the box's inner width, so it stays a centered block rather than
 /// stretching across a very wide terminal.
 const MAX_BOX_INNER: u16 = 48;
-/// Minimum box height, borders included. Below this the boxes hide.
+/// Minimum available height below the hint to show a box at all. The rendered
+/// box is content-sized within that.
 const MIN_BOX_HEIGHT: u16 = 5;
-/// Blank rows kept below the boxes so they do not touch the slot's bottom edge.
+/// Cap on the visible content rows in the box. The box sizes to its content
+/// up to this many rows and scrolls beyond it, keeping the splash short by
+/// default. Tunable: a larger cap trades a taller box for less scrolling.
+const MAX_NOTICE_ROWS: u16 = 8;
+/// Blank rows kept below the box so it does not touch the slot's bottom edge.
 const BOX_BOTTOM_MARGIN: u16 = 1;
-/// Top margin above the logo when the boxes are shown. With the boxes hidden
-/// the logo+hint block is vertically centered instead.
+/// Top margin above the logo when the box is shown. With the box hidden the
+/// logo+hint block is vertically centered instead.
 const TOP_MARGIN: u16 = 1;
-/// Wrapped lines the wheel moves a box per notch. A small step keeps the
+/// Wrapped lines the wheel moves the box per notch. A small step keeps the
 /// scroll legible on a short box.
 const WHEEL_STEP: usize = 3;
 
@@ -129,23 +136,14 @@ pub(crate) struct Splash {
     me: Weak<RefCell<Splash>>,
     chat: Rc<RefCell<ChatState>>,
     styles: Rc<TranscriptStyles>,
-    /// The structured `Context:` listing shown in the left box, set per session
-    /// via [`Splash::set_context`]. Empty for a resumed session, which shows no
-    /// splash, and for the default state before the first session is wired up.
-    context: Vec<ContextLine>,
-    /// Top wrapped-line offset of the left Context box, advanced by the mouse
-    /// wheel while the cursor is over that box. Clamped to the box's content
-    /// every draw. Reset to 0 in [`Splash::set_context`].
-    context_scroll: usize,
-    /// Top wrapped-line offset of the right Notices box, with the same wheel
-    /// behavior as `context_scroll`.
+    /// Top wrapped-line offset of the notices box, advanced by the mouse wheel
+    /// while the cursor is over the box. Clamped to the box's content every
+    /// draw. Reset to 0 by [`Splash::reset_scroll`] on a session switch.
     notices_scroll: usize,
-    /// Splash-local rect and scroll bound of the drawn Context box, recorded
+    /// Splash-local rect and scroll bound of the drawn notices box, recorded
     /// each [`draw`](Widget::draw) so [`handle_event`](Widget::handle_event)
     /// can hit-test the wheel against it. `None` when the box is hidden or
     /// absent.
-    context_hit: Option<BoxHit>,
-    /// Same as `context_hit`, for the Notices box.
     notices_hit: Option<BoxHit>,
     /// The lavender ramp resolved to vaxis colors for the theme's color mode,
     /// so a non-truecolor terminal gets palette indices. Rebuilt on a swap.
@@ -173,10 +171,7 @@ impl Splash {
                 me: Weak::clone(me),
                 chat,
                 styles,
-                context: Vec::new(),
-                context_scroll: 0,
                 notices_scroll: 0,
-                context_hit: None,
                 notices_hit: None,
                 ramp: build_ramp(mode),
                 started: Instant::now(),
@@ -193,16 +188,8 @@ impl Splash {
         self.ramp = build_ramp(mode);
     }
 
-    /// Replace the structured context shown in the left box.
-    ///
-    /// Called after the world is built and again on each session switch: the
-    /// splash persists across sessions while the context is per session, so the
-    /// host pushes the new session's context in rather than the splash reading
-    /// it from a shared cell.
-    pub(crate) fn set_context(&mut self, context: Vec<ContextLine>) {
-        self.context = context;
-        // A new session's context and notices start scrolled to the top.
-        self.context_scroll = 0;
+    /// Return the notices box to the top, for a session switch.
+    pub(crate) fn reset_scroll(&mut self) {
         self.notices_scroll = 0;
     }
 
@@ -303,51 +290,15 @@ impl Splash {
         self.ramp[ramp_index(wave, n)]
     }
 
-    /// The left "Context" box spans, or `None` when there is no context (a
-    /// resumed session, which shows no splash anyway).
+    /// The notices box spans: the leading run of Warning/Error `Notice`
+    /// entries, or `None` when there are none (which hides the box).
     ///
-    /// Context lives here, in the prominent splash box, rather than folded into
-    /// scrollback. A disabled skill row is struck to match aj, with the
-    /// strikethrough on the row content only, never on the `  - ` bullet.
-    fn context_spans(&self) -> Option<Vec<TextSpan>> {
-        if self.context.is_empty() {
-            return None;
-        }
-        let struck = Style {
-            strikethrough: true,
-            ..self.styles.dim
-        };
-        let mut spans = Vec::new();
-        for line in &self.context {
-            if !line.bullet.is_empty() {
-                spans.push(TextSpan {
-                    text: line.bullet.clone(),
-                    style: self.styles.dim,
-                    ..TextSpan::default()
-                });
-            }
-            // The header (empty bullet) reads as a label, struck rows are
-            // disabled skills, every other row is a dim listing entry.
-            let style = if line.struck {
-                struck
-            } else if line.bullet.is_empty() {
-                self.styles.text
-            } else {
-                self.styles.dim
-            };
-            spans.push(TextSpan {
-                text: format!("{}\n", line.text),
-                style,
-                ..TextSpan::default()
-            });
-        }
-        Some(spans)
-    }
-
-    /// The right "Notices" box spans, or `None` when the active view has no
-    /// leading `Notice` entries. Only the leading run counts: once a user or
-    /// assistant entry lands the splash is gone, so in practice this is every
-    /// notice.
+    /// NOTE: We skip Info-level notices here. Context and any other
+    /// informational notice are scrollback content, so the box surfaces only
+    /// attention-worthy warnings. Only the leading run counts: once a user or
+    /// assistant entry lands the splash is gone. An Info notice inside the run
+    /// is skipped without ending the run, so a leading context notice followed
+    /// by warnings still shows the warnings.
     fn notice_spans(&self) -> Option<Vec<TextSpan>> {
         let chat = self.chat.borrow();
         let transcript = chat.transcript(chat.active_view())?;
@@ -357,7 +308,7 @@ impl Splash {
                 break;
             };
             let style = match notice.level {
-                NoticeLevel::Info => self.styles.dim,
+                NoticeLevel::Info => continue,
                 NoticeLevel::Warning => self.styles.warning,
                 NoticeLevel::Error => self.styles.error,
             };
@@ -370,61 +321,58 @@ impl Splash {
         if spans.is_empty() { None } else { Some(spans) }
     }
 
-    /// Geometry for the box row, or `None` when the slot cannot fit readable
-    /// boxes. `count` is 1 or 2 (a 0 count short-circuits before calling).
-    ///
-    /// The hide thresholds are deliberate: two boxes need room for two readable
-    /// inner widths plus the gap, and every box needs a minimum height below
-    /// the hint. Below either, only the logo and hint show.
-    fn plan_boxes(&self, slot_w: u16, slot_h: u16, box_top: u16, count: u16) -> Option<BoxRow> {
-        let box_h = slot_h
+    /// Geometry for the single notices box that does not depend on its content:
+    /// where it starts, its inner and outer widths, and the vertical space
+    /// available below the hint. `None` when the slot is too narrow or too
+    /// short for a readable box, in which case only the logo and hint show.
+    fn plan_box(&self, slot_w: u16, slot_h: u16, box_top: u16) -> Option<BoxPlan> {
+        let available_h = slot_h
             .checked_sub(box_top)?
             .checked_sub(BOX_BOTTOM_MARGIN)?;
-        if box_h < MIN_BOX_HEIGHT {
+        if available_h < MIN_BOX_HEIGHT {
             return None;
         }
-        let inner_w = if count >= 2 {
-            let each = slot_w.checked_sub(2 * BOX_CHROME + BOX_GAP)? / 2;
-            if each < MIN_BOX_INNER {
-                return None;
-            }
-            each.min(MAX_BOX_INNER)
-        } else {
-            let usable = slot_w.checked_sub(BOX_CHROME)?;
-            if usable < MIN_BOX_INNER {
-                return None;
-            }
-            usable.min(MAX_BOX_INNER)
-        };
+        let usable = slot_w.checked_sub(BOX_CHROME)?;
+        if usable < MIN_BOX_INNER {
+            return None;
+        }
+        let inner_w = usable.min(MAX_BOX_INNER);
         let box_outer = inner_w + BOX_CHROME;
-        let group_w = if count >= 2 {
-            2 * box_outer + BOX_GAP
-        } else {
-            box_outer
-        };
-        Some(BoxRow {
+        Some(BoxPlan {
             box_top,
-            box_h,
             inner_w,
             box_outer,
-            left: center_offset(slot_w, group_w),
+            left: center_offset(slot_w, box_outer),
+            available_h,
         })
     }
 
-    /// A bordered box `inner_w` + [`BOX_CHROME`] wide and `box_h` tall, with
-    /// `spans` soft-wrapped to the inner width and windowed at `offset`.
+    /// Soft-wrap `spans` to `inner_w` with the height unbounded, so the wrapped
+    /// surface holds the full content. The caller both sizes the box from its
+    /// height and windows it at the scroll offset, so the wrap happens once.
+    fn wrap_content(&self, ctx: &DrawContext, spans: Vec<TextSpan>, inner_w: u16) -> Surface {
+        let content_ctx = ctx.with_constraints(
+            Size::default(),
+            MaxSize {
+                width: Some(inner_w),
+                height: None,
+            },
+        );
+        RichText::new(spans).draw(&content_ctx)
+    }
+
+    /// A bordered box `inner_w` + [`BOX_CHROME`] wide and `box_h` tall, framing
+    /// the pre-wrapped `content` windowed at `offset`.
     ///
-    /// Content wraps rather than truncating. The returned tuple carries the
-    /// offset clamped to the box's current content and the box's `max_scroll`,
-    /// for the wheel handler to clamp against. When the wrapped content is
-    /// taller than the inner height we draw a scrollbar thumb on the right inner
-    /// edge whose position and size reflect the offset and total. The splash
-    /// takes no focus and no keys, so the thumb is only an indicator, never a
-    /// draggable scrollbar.
+    /// The returned tuple carries the offset clamped to the content and the
+    /// box's `max_scroll`, for the wheel handler to clamp against. When the
+    /// content is taller than the inner height we draw a scrollbar thumb on the
+    /// right inner edge whose position and size reflect the offset and total.
+    /// The splash takes no focus and no keys, so the thumb is only an
+    /// indicator, never a draggable scrollbar.
     fn render_box(
         &self,
-        ctx: &DrawContext,
-        spans: Vec<TextSpan>,
+        content: &Surface,
         inner_w: u16,
         box_h: u16,
         offset: usize,
@@ -436,17 +384,7 @@ impl Splash {
         });
         self.paint_box_frame(&mut surface, box_w, box_h);
 
-        // Wrap to the inner width with the height unbounded, so the wrapped
-        // extent is the full content and we window it ourselves at `offset`.
         let inner_h = box_h.saturating_sub(2);
-        let content_ctx = ctx.with_constraints(
-            Size::default(),
-            MaxSize {
-                width: Some(inner_w),
-                height: None,
-            },
-        );
-        let content = RichText::new(spans).draw(&content_ctx);
         let total_rows = content.size.height;
         // Clamp the offset to the box's current content every draw, so a resize
         // or a content change can never leave it scrolled past the end.
@@ -474,54 +412,9 @@ impl Splash {
         (surface, offset, max_scroll)
     }
 
-    /// Draw one box at splash-local `col` / `row.box_top`, window it at the
-    /// box's stored offset, clamp that offset to the box's current content, and
-    /// record the box rect for wheel hit-testing.
-    fn place_box(
-        &mut self,
-        ctx: &DrawContext,
-        surface: &mut Surface,
-        spans: Vec<TextSpan>,
-        kind: BoxKind,
-        col: u16,
-        row: &BoxRow,
-    ) {
-        let offset = match kind {
-            BoxKind::Context => self.context_scroll,
-            BoxKind::Notices => self.notices_scroll,
-        };
-        let (box_surface, offset, max_scroll) =
-            self.render_box(ctx, spans, row.inner_w, row.box_h, offset);
-        let hit = BoxHit {
-            col,
-            row: row.box_top,
-            width: row.box_outer,
-            height: row.box_h,
-            max_scroll,
-        };
-        match kind {
-            BoxKind::Context => {
-                self.context_scroll = offset;
-                self.context_hit = Some(hit);
-            }
-            BoxKind::Notices => {
-                self.notices_scroll = offset;
-                self.notices_hit = Some(hit);
-            }
-        }
-        surface.children.push(SubSurface {
-            origin: RelativePoint {
-                col: i32::from(col),
-                row: i32::from(row.box_top),
-            },
-            surface: box_surface,
-            z_index: 0,
-        });
-    }
-
-    /// Scroll the box under the cursor by [`WHEEL_STEP`] wrapped lines, clamped
-    /// to the box's content, and consume the event. A wheel over neither box
-    /// (or already at a box's clamp) falls through unconsumed. Never requests
+    /// Scroll the notices box by [`WHEEL_STEP`] wrapped lines when the cursor
+    /// is over it, clamped to its content, and consume the event. A wheel off
+    /// the box (or already at a clamp) falls through unconsumed. Never requests
     /// focus: the editor keeps focus so the user can still type their first
     /// message, the wheel only moves the box under the cursor.
     fn handle_wheel(&mut self, ctx: &mut EventContext, m: &mouse::Mouse) {
@@ -533,40 +426,27 @@ impl Splash {
         let (Ok(col), Ok(row)) = (u16::try_from(m.col), u16::try_from(m.row)) else {
             return;
         };
-        for kind in [BoxKind::Context, BoxKind::Notices] {
-            let hit = match kind {
-                BoxKind::Context => self.context_hit,
-                BoxKind::Notices => self.notices_hit,
-            };
-            let Some(hit) = hit else { continue };
-            if !hit.contains(col, row) {
-                continue;
-            }
-            let offset = match kind {
-                BoxKind::Context => self.context_scroll,
-                BoxKind::Notices => self.notices_scroll,
-            };
-            let next = if up {
-                offset.saturating_sub(WHEEL_STEP)
-            } else {
-                offset.saturating_add(WHEEL_STEP).min(hit.max_scroll)
-            };
-            if next != offset {
-                match kind {
-                    BoxKind::Context => self.context_scroll = next,
-                    BoxKind::Notices => self.notices_scroll = next,
-                }
-                ctx.consume_and_redraw();
-            }
+        let Some(hit) = self.notices_hit else { return };
+        if !hit.contains(col, row) {
             return;
+        }
+        let offset = self.notices_scroll;
+        let next = if up {
+            offset.saturating_sub(WHEEL_STEP)
+        } else {
+            offset.saturating_add(WHEEL_STEP).min(hit.max_scroll)
+        };
+        if next != offset {
+            self.notices_scroll = next;
+            ctx.consume_and_redraw();
         }
     }
 
     /// Paint the light rounded frame of a box in the muted style.
     fn paint_box_frame(&self, surface: &mut Surface, box_w: u16, box_h: u16) {
         let border = self.styles.dim;
-        // `plan_boxes` guarantees box_w >= MIN_BOX_INNER + BOX_CHROME and
-        // box_h >= MIN_BOX_HEIGHT, so the corners never collide. The
+        // `plan_box` guarantees box_w >= MIN_BOX_INNER + BOX_CHROME, and the
+        // content sizing keeps box_h >= 3, so the corners never collide. The
         // `saturating_sub`s only defend a future caller that skips that plan.
         let last_col = box_w.saturating_sub(1);
         let last_row = box_h.saturating_sub(1);
@@ -599,21 +479,17 @@ impl Widget for Splash {
         let region_w = logo_w + 2 * DRIFT_X;
         let region_h = LOGO_HEIGHT + 2 * DRIFT_Y;
 
-        // Present boxes, left to right: context then notices. A box with no
-        // content is dropped here, so an empty box leaves no frame.
-        let context = self.context_spans();
+        // The notices box, shown only when there are warning-level notices. A
+        // run with no warnings yields `None` and leaves only the logo and hint.
         let notices = self.notice_spans();
-        let count = u16::from(context.is_some()) + u16::from(notices.is_some());
 
         let slot_h = ctx.max.height.unwrap_or(region_h + 2);
-        // With boxes the logo+hint sit near the top and the boxes fill the
-        // space below the hint; with none, the logo+hint block is centered.
+        // With the box the logo+hint sit near the top and the box sits below
+        // the hint; with none, the logo+hint block is centered.
         let box_top = TOP_MARGIN + region_h + 3;
-        let plan = if count == 0 {
-            None
-        } else {
-            self.plan_boxes(slot_w, slot_h, box_top, count)
-        };
+        let plan = notices
+            .as_ref()
+            .and_then(|_| self.plan_box(slot_w, slot_h, box_top));
         let top = if plan.is_some() {
             TOP_MARGIN
         } else {
@@ -659,21 +535,39 @@ impl Widget for Splash {
             z_index: 0,
         });
 
-        // The two boxes side by side, centered as a group and tall enough to
-        // fill the space below the hint. Each present box records its
+        // The notices box below the hint, content-sized. It records its
         // splash-local rect so the wheel can hit-test the cursor against it
         // (see `handle_wheel`); a hidden or absent box records `None`.
-        self.context_hit = None;
         self.notices_hit = None;
-        if let Some(row) = plan {
-            let mut col = row.left;
-            if let Some(spans) = context {
-                self.place_box(ctx, &mut surface, spans, BoxKind::Context, col, &row);
-                col += row.box_outer + BOX_GAP;
-            }
-            if let Some(spans) = notices {
-                self.place_box(ctx, &mut surface, spans, BoxKind::Notices, col, &row);
-            }
+        if let (Some(spans), Some(plan)) = (notices, plan) {
+            // Wrap the notices to the inner width once. `total_rows` sizes the
+            // box, and `render_box` windows this same surface at the offset.
+            let content = self.wrap_content(ctx, spans, plan.inner_w);
+            let total_rows = content.size.height;
+            // Content-size the box: as tall as its content plus the two border
+            // rows, capped at MAX_NOTICE_ROWS and the space below the hint. It
+            // stays short by default and scrolls once the notices exceed the
+            // cap.
+            let capped = total_rows.min(MAX_NOTICE_ROWS).saturating_add(2);
+            let box_h = capped.min(plan.available_h);
+            let (box_surface, offset, max_scroll) =
+                self.render_box(&content, plan.inner_w, box_h, self.notices_scroll);
+            self.notices_scroll = offset;
+            self.notices_hit = Some(BoxHit {
+                col: plan.left,
+                row: plan.box_top,
+                width: plan.box_outer,
+                height: box_h,
+                max_scroll,
+            });
+            surface.children.push(SubSurface {
+                origin: RelativePoint {
+                    col: i32::from(plan.left),
+                    row: i32::from(plan.box_top),
+                },
+                surface: box_surface,
+                z_index: 0,
+            });
         }
 
         surface
@@ -684,11 +578,11 @@ impl Widget for Splash {
             // The host posts a wake at startup. The Shell forwards it here so
             // the tick chain starts (widgets can only tick from a handler).
             Event::App(user) if user.name == SPLASH_WAKE_EVENT => self.arm_tick(ctx),
-            // The wheel scrolls whichever box the cursor is over. vxfw hands us
-            // a splash-local position (the splash is a hit target via
-            // `wants_events`), which we hit-test against the box rects `draw`
-            // recorded. Focus is untouched, matching how the transcript scrolls
-            // on the wheel while the editor keeps focus.
+            // The wheel scrolls the notices box when the cursor is over it.
+            // vxfw hands us a splash-local position (the splash is a hit target
+            // via `wants_events`), which we hit-test against the box rect
+            // `draw` recorded. Focus is untouched, matching how the transcript
+            // scrolls on the wheel while the editor keeps focus.
             Event::Mouse(m) => self.handle_wheel(ctx, m),
             Event::Tick => {
                 self.tick_armed = false;
@@ -719,22 +613,16 @@ fn glyph_cell(grapheme: &str, style: Style) -> Cell {
     }
 }
 
-/// Geometry for the side-by-side box row: where the leftmost box starts, the
-/// shared inner and outer widths, and the shared height. Computed by
-/// [`Splash::plan_boxes`].
-struct BoxRow {
+/// Content-independent geometry for the notices box: where it starts, its
+/// inner and outer widths, and the vertical space available below the hint.
+/// Computed by [`Splash::plan_box`]; the box's height is derived from its
+/// content, capped at `available_h`.
+struct BoxPlan {
     box_top: u16,
-    box_h: u16,
     inner_w: u16,
     box_outer: u16,
     left: u16,
-}
-
-/// Which of the two boxes a scroll offset and hit rect belong to.
-#[derive(Clone, Copy)]
-enum BoxKind {
-    Context,
-    Notices,
+    available_h: u16,
 }
 
 /// A drawn box's splash-local rectangle plus its scroll bound, recorded each
@@ -878,6 +766,30 @@ mod tests {
         );
     }
 
+    fn append_warning(chat: &Rc<RefCell<ChatState>>, text: &str) {
+        let mut life = AgentLifecycle::default();
+        let _ = aj_app::chat::reduce(
+            &mut chat.borrow_mut(),
+            &mut life,
+            AgentEvent::Warning {
+                agent_id: AgentId::Main,
+                text: text.to_string(),
+            },
+        );
+    }
+
+    fn append_error(chat: &Rc<RefCell<ChatState>>, text: &str) {
+        let mut life = AgentLifecycle::default();
+        let _ = aj_app::chat::reduce(
+            &mut chat.borrow_mut(),
+            &mut life,
+            AgentEvent::Error {
+                agent_id: AgentId::Main,
+                text: text.to_string(),
+            },
+        );
+    }
+
     fn splash(chat: Rc<RefCell<ChatState>>) -> Rc<RefCell<Splash>> {
         Splash::new(chat, styles(), ColorMode::Truecolor)
     }
@@ -912,11 +824,11 @@ mod tests {
         );
     }
 
-    /// Leading notices render inside a bordered box.
+    /// Leading warnings render inside a bordered box.
     #[test]
     fn renders_notices_in_a_bordered_box() {
         let chat = chat();
-        append_notice(&chat, "startup warning");
+        append_warning(&chat, "startup warning");
         let splash = splash(chat);
         let surface = splash
             .borrow_mut()
@@ -926,110 +838,149 @@ mod tests {
         assert!(joined.contains("startup warning"), "notice text");
     }
 
-    /// A ContextLine for the disabled-skill row aj strikes.
-    fn ctx_line(bullet: &str, text: &str, struck: bool) -> ContextLine {
-        ContextLine {
-            bullet: bullet.to_string(),
-            text: text.to_string(),
-            struck,
-        }
-    }
-
-    /// The context box renders the listing and strikes the disabled skill's
-    /// row content, never the bullet.
+    /// The box surfaces warning-level notices only: a leading Info notice
+    /// carrying the context listing stays out of the box while a Warning shows.
     #[test]
-    fn context_box_strikes_disabled_skill_rows() {
-        let splash = splash(chat());
-        splash.borrow_mut().set_context(vec![
-            ctx_line("", "Context:", false),
-            ctx_line("  - ", "alpha (skill: alpha)", false),
-            ctx_line("  - ", "beta (skill: beta, disabled)", true),
-        ]);
+    fn notice_box_shows_warnings_not_context() {
+        let chat = chat();
+        append_notice(&chat, "Context:\n  - builtin (system prompt)");
+        append_warning(&chat, "sandbox warning");
+        let splash = splash(chat);
         let surface = splash
             .borrow_mut()
-            .draw(&crate::test_support::draw_ctx(80, Some(30)));
+            .draw(&crate::test_support::draw_ctx(60, Some(24)));
         let joined = crate::test_support::rows(&surface).join("\n");
-        assert!(joined.contains("Context:"), "context header: {joined}");
         assert!(
-            joined.contains("beta (skill: beta, disabled)"),
-            "disabled skill row: {joined}"
-        );
-        // The struck cells are exactly the disabled row's content: the word
-        // "beta" appears there but the `-` of any bullet never does.
-        let struck: String = crate::test_support::flatten(&surface)
-            .iter()
-            .flatten()
-            .filter(|c| c.style.strikethrough)
-            .map(|c| c.char.grapheme())
-            .collect();
-        assert!(
-            struck.contains("beta"),
-            "the disabled row content is struck: {struck:?}"
+            joined.contains('╭'),
+            "the box renders for the warning: {joined}"
         );
         assert!(
-            !struck.contains('-'),
-            "the bullet is never struck: {struck:?}"
+            joined.contains("sandbox warning"),
+            "the warning shows in the box: {joined}"
+        );
+        assert!(
+            !joined.contains("Context:"),
+            "the info context is filtered out of the box: {joined}"
         );
     }
 
-    /// With both context and notices, the splash draws two boxes side by side.
+    /// An Error-level notice reaches the box like a Warning does: `notice_spans`
+    /// styles the Error arm rather than skipping it, so the error text shows.
     #[test]
-    fn renders_two_boxes_side_by_side() {
+    fn notice_box_shows_error_level_notices() {
         let chat = chat();
-        append_notice(&chat, "startup warning");
+        append_error(&chat, "config load failed");
         let splash = splash(chat);
-        splash.borrow_mut().set_context(vec![
-            ctx_line("", "Context:", false),
-            ctx_line("  - ", "builtin (system prompt)", false),
-        ]);
         let surface = splash
             .borrow_mut()
-            .draw(&crate::test_support::draw_ctx(90, Some(30)));
-        let rows = crate::test_support::rows(&surface);
-        let joined = rows.join("\n");
-        assert!(joined.contains("Context:"), "context box: {rows:?}");
-        assert!(joined.contains("startup warning"), "notices box: {rows:?}");
+            .draw(&crate::test_support::draw_ctx(60, Some(24)));
+        let joined = crate::test_support::rows(&surface).join("\n");
         assert!(
-            rows.iter().any(|r| r.matches('╭').count() == 2),
-            "two top-left corners on the box row: {rows:?}"
+            joined.contains('╭'),
+            "the box renders for the error: {joined}"
+        );
+        assert!(
+            joined.contains("config load failed"),
+            "the error notice shows in the box: {joined}"
         );
     }
 
-    /// A slot too narrow for two readable boxes, or too short to fit a box
-    /// under the hint, hides the boxes and keeps only the logo and hint.
+    /// On a tall slot the box sizes to its content: with two short warnings its
+    /// frame spans only a handful of rows and does not reach the slot bottom,
+    /// rather than filling the space below the hint.
     #[test]
-    fn hides_boxes_when_slot_is_too_small() {
+    fn notice_box_is_content_sized() {
         let chat = chat();
-        append_notice(&chat, "startup warning");
+        append_warning(&chat, "first warning");
+        append_warning(&chat, "second warning");
         let splash = splash(chat);
-        splash
-            .borrow_mut()
-            .set_context(vec![ctx_line("", "Context:", false)]);
+        let rows = crate::test_support::rows(
+            &splash
+                .borrow_mut()
+                .draw(&crate::test_support::draw_ctx(60, Some(40))),
+        );
+        let top = rows.iter().position(|r| r.contains('╭')).expect("box top");
+        let bottom = rows
+            .iter()
+            .rposition(|r| r.contains('╰'))
+            .expect("box bottom");
+        // Two one-line warnings wrap to two rows, so the frame is content + 2
+        // border rows tall, well under the tall slot. A box that filled
+        // `available_h` would span far more.
+        assert!(
+            bottom - top <= 5,
+            "the box is content-sized, not full-height: top={top} bottom={bottom}"
+        );
+        assert!(
+            bottom < rows.len() - 2,
+            "the box does not reach the slot bottom: bottom={bottom} of {}",
+            rows.len()
+        );
+    }
+
+    /// Many warnings on a tall slot cap the box height rather than growing it:
+    /// the frame pins to `MAX_NOTICE_ROWS` content rows plus the two border
+    /// rows, well under the slot's available height, and the overflow scrolls.
+    #[test]
+    fn notice_box_caps_at_max_notice_rows() {
+        let chat = chat();
+        for i in 0..20 {
+            append_warning(&chat, &format!("warning {i}"));
+        }
+        let splash = splash(chat);
+        let rows = crate::test_support::rows(
+            &splash
+                .borrow_mut()
+                .draw(&crate::test_support::draw_ctx(60, Some(40))),
+        );
+        let top = rows.iter().position(|r| r.contains('╭')).expect("box top");
+        let bottom = rows
+            .iter()
+            .rposition(|r| r.contains('╰'))
+            .expect("box bottom");
+        // Twenty one-line warnings wrap to twenty rows, far past the cap, so the
+        // frame height pins to MAX_NOTICE_ROWS content rows plus two borders.
+        // Neutering the cap (e.g. capping at MAX_NOTICE_ROWS * 100) lets the box
+        // grow to its content or `available_h`, making this span larger.
+        assert_eq!(
+            bottom - top + 1,
+            usize::from(MAX_NOTICE_ROWS) + 2,
+            "the box height caps at MAX_NOTICE_ROWS + borders: top={top} bottom={bottom}"
+        );
+    }
+
+    /// A slot too narrow for a readable box, or too short to fit a box under
+    /// the hint, hides the box and keeps only the logo and hint.
+    #[test]
+    fn hides_box_when_slot_is_too_small() {
+        let chat = chat();
+        append_warning(&chat, "startup warning");
+        let splash = splash(chat);
 
         let narrow = splash
             .borrow_mut()
-            .draw(&crate::test_support::draw_ctx(40, Some(30)));
+            .draw(&crate::test_support::draw_ctx(20, Some(30)));
         let narrow = crate::test_support::rows(&narrow).join("\n");
         assert!(narrow.contains("for commands"), "hint remains: {narrow}");
-        assert!(!narrow.contains('╭'), "boxes hidden when narrow: {narrow}");
+        assert!(!narrow.contains('╭'), "box hidden when narrow: {narrow}");
 
         let short = splash
             .borrow_mut()
             .draw(&crate::test_support::draw_ctx(80, Some(14)));
         let short = crate::test_support::rows(&short).join("\n");
         assert!(short.contains("for commands"), "hint remains: {short}");
-        assert!(!short.contains('╭'), "boxes hidden when short: {short}");
+        assert!(!short.contains('╭'), "box hidden when short: {short}");
     }
 
     /// Content taller than the box draws the overflow thumb on the right inner
     /// edge, a non-interactive indicator (the splash takes no focus or keys).
     #[test]
     fn overflow_draws_a_scrollbar_thumb() {
-        let splash = splash(chat());
-        let lines: Vec<ContextLine> = (0..40)
-            .map(|i| ctx_line("  - ", &format!("row {i}"), false))
-            .collect();
-        splash.borrow_mut().set_context(lines);
+        let chat = chat();
+        for i in 0..40 {
+            append_warning(&chat, &format!("warning {i}"));
+        }
+        let splash = splash(chat);
         let surface = splash
             .borrow_mut()
             .draw(&crate::test_support::draw_ctx(80, Some(24)));
@@ -1069,17 +1020,13 @@ mod tests {
         );
     }
 
-    /// A new session starts scrolled to the top: `set_context` resets both box
-    /// offsets, so a prior session's scroll does not carry over.
+    /// A session switch starts the box at the top: `reset_scroll` zeroes the
+    /// offset, so a prior session's scroll does not carry over.
     #[test]
-    fn set_context_resets_both_scroll_offsets() {
+    fn reset_scroll_zeroes_the_offset() {
         let splash = splash(chat());
-        splash.borrow_mut().context_scroll = 5;
         splash.borrow_mut().notices_scroll = 7;
-        splash
-            .borrow_mut()
-            .set_context(vec![ctx_line("", "Context:", false)]);
-        assert_eq!(splash.borrow().context_scroll, 0, "context offset reset");
+        splash.borrow_mut().reset_scroll();
         assert_eq!(splash.borrow().notices_scroll, 0, "notices offset reset");
     }
 
@@ -1096,12 +1043,12 @@ mod tests {
         })
     }
 
-    /// A splash whose Notices box overflows a 30-row slot, drawn once so its
+    /// A splash whose notices box overflows a 30-row slot, drawn once so its
     /// box rect is recorded. Returns the splash and the recorded box hit.
     fn notices_splash() -> (Rc<RefCell<Splash>>, BoxHit) {
         let chat = chat();
         for i in 0..40 {
-            append_notice(&chat, &format!("notice {i}"));
+            append_warning(&chat, &format!("notice {i}"));
         }
         let splash = splash(chat);
         let _ = splash
@@ -1223,8 +1170,8 @@ mod tests {
         );
     }
 
-    /// A wheel that lands over neither box is ignored: nothing scrolls and the
-    /// event is not consumed, so it falls through to whatever is behind.
+    /// A wheel that lands off the box is ignored: nothing scrolls and the event
+    /// is not consumed, so it falls through to whatever is behind.
     #[test]
     fn wheel_outside_the_boxes_is_ignored() {
         let (splash, _hit) = notices_splash();
@@ -1235,103 +1182,6 @@ mod tests {
             .handle_event(&mut ctx, &wheel(0, 0, mouse::Button::WheelDown));
         assert_eq!(splash.borrow().notices_scroll, 0, "nothing scrolled");
         assert!(!ctx.consume_event, "an off-box wheel falls through");
-    }
-
-    /// A splash with both boxes overflowing a 30-row slot, drawn once so both
-    /// box rects are recorded. Returns the splash and the context and notices
-    /// box hits, in that order.
-    fn two_box_splash() -> (Rc<RefCell<Splash>>, BoxHit, BoxHit) {
-        let chat = chat();
-        for i in 0..40 {
-            append_notice(&chat, &format!("notice {i}"));
-        }
-        let splash = splash(chat);
-        let mut lines = vec![ctx_line("", "Context:", false)];
-        lines.extend((0..40).map(|i| ctx_line("  - ", &format!("row {i}"), false)));
-        splash.borrow_mut().set_context(lines);
-        let _ = splash
-            .borrow_mut()
-            .draw(&crate::test_support::draw_ctx(90, Some(30)));
-        let context_hit = splash.borrow().context_hit.expect("context box drawn");
-        let notices_hit = splash.borrow().notices_hit.expect("notices box drawn");
-        (splash, context_hit, notices_hit)
-    }
-
-    /// The wheel scrolls only the box under the cursor: a notch over the context
-    /// box moves `context_scroll` and leaves `notices_scroll` alone, and vice
-    /// versa. Fails if an arm reads or writes the other box's offset.
-    #[test]
-    fn wheel_routes_to_the_box_under_the_cursor() {
-        let (splash, context_hit, notices_hit) = two_box_splash();
-        assert!(
-            context_hit.max_scroll > 0 && notices_hit.max_scroll > 0,
-            "both boxes overflow"
-        );
-
-        let mut ctx = EventContext::new();
-        splash.borrow_mut().handle_event(
-            &mut ctx,
-            &wheel(
-                context_hit.col + 2,
-                context_hit.row + 1,
-                mouse::Button::WheelDown,
-            ),
-        );
-        assert_eq!(
-            splash.borrow().context_scroll,
-            WHEEL_STEP,
-            "the context wheel moved the context box"
-        );
-        assert_eq!(
-            splash.borrow().notices_scroll,
-            0,
-            "the context wheel left the notices box alone"
-        );
-
-        let mut ctx = EventContext::new();
-        splash.borrow_mut().handle_event(
-            &mut ctx,
-            &wheel(
-                notices_hit.col + 2,
-                notices_hit.row + 1,
-                mouse::Button::WheelDown,
-            ),
-        );
-        assert_eq!(
-            splash.borrow().notices_scroll,
-            WHEEL_STEP,
-            "the notices wheel moved the notices box"
-        );
-        assert_eq!(
-            splash.borrow().context_scroll,
-            WHEEL_STEP,
-            "the notices wheel left the context box unchanged"
-        );
-    }
-
-    /// A long disabled-skill row wrapped across lines keeps the strikethrough
-    /// on the wrapped continuation, not just the first line.
-    #[test]
-    fn struck_context_row_keeps_strikethrough_on_wrapped_continuation() {
-        let splash = splash(chat());
-        let long = "disabled skill row that is long enough to wrap ".repeat(3);
-        splash.borrow_mut().set_context(vec![
-            ctx_line("", "Context:", false),
-            ctx_line("  - ", &long, true),
-        ]);
-        let surface = splash
-            .borrow_mut()
-            .draw(&crate::test_support::draw_ctx(80, Some(30)));
-        let struck_rows: Vec<usize> = crate::test_support::flatten(&surface)
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| row.iter().any(|c| c.style.strikethrough))
-            .map(|(i, _)| i)
-            .collect();
-        assert!(
-            struck_rows.len() >= 2,
-            "strikethrough survives the wrap onto the continuation: {struck_rows:?}"
-        );
     }
 
     /// The wake kicks exactly one tick chain, each tick re-arms while the
