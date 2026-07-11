@@ -42,7 +42,7 @@ where
 /// and at what thinking effort and inference speed.
 ///
 /// `thinking` uses the "off" / "minimal" / "low" / "medium" / "high"
-/// / "xhigh" / "max" / "ultra" vocabulary; `speed` is "standard" or
+/// / "xhigh" / "max" vocabulary; `speed` is "standard" or
 /// "fast". Carried on [`AgentEvent::SubAgentStart`] and persisted
 /// verbatim in the conversation log's sub-agent spawn entries, so the
 /// strings are part of the on-disk contract.
@@ -53,7 +53,7 @@ pub struct AgentSettings {
     /// Catalog id of the model.
     pub model_id: String,
     /// Thinking effort: one of "off", "minimal", "low", "medium",
-    /// "high", "xhigh", "max", "ultra".
+    /// "high", "xhigh", "max".
     pub thinking: String,
     /// Inference speed: "standard" or "fast".
     pub speed: String,

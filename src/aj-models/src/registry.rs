@@ -450,16 +450,15 @@ pub fn supports_verbosity(model: &ModelInfo) -> bool {
 /// lacks is rejected here before the request is built:
 ///
 /// - Anthropic adaptive models take an `effort` enum with no `minimal`
-///   rung, so `Minimal` is rejected. `Ultra` is OpenAI-only, so it is
-///   rejected for Anthropic regardless of thinking mode. Legacy
-///   budget-based Anthropic models translate every level to a token
-///   budget and accept the rest.
+///   rung, so `Minimal` is rejected. Legacy budget-based Anthropic
+///   models translate every level to a token budget and accept the
+///   rest.
 /// - The OpenAI-family APIs (Responses, Chat Completions, Codex) accept
-///   the full `minimal`..`ultra` range.
+///   the full `minimal`..`max` range.
 ///
 /// Per-model effort support *within* a provider's vocabulary (e.g.
 /// which adaptive Anthropic model accepts `max` vs `xhigh`, or which
-/// OpenAI model exposes `max` / `ultra`) is deliberately not modelled
+/// OpenAI model exposes `max`) is deliberately not modelled
 /// here: those requests are sent through and the provider API returns
 /// its own 400.
 ///
@@ -475,13 +474,6 @@ pub fn validate_thinking_level(model: &ModelInfo, level: &ThinkingLevel) -> Resu
                 return Err(format!(
                     "model '{}' does not support thinking level 'minimal'; \
                      supported: low, medium, high, xhigh, max",
-                    model.id
-                ));
-            }
-            if matches!(level, ThinkingLevel::Ultra) {
-                return Err(format!(
-                    "model '{}' does not support thinking level 'ultra'; \
-                     supported: minimal, low, medium, high, xhigh, max",
                     model.id
                 ));
             }
@@ -997,26 +989,22 @@ mod tests {
         assert!(validate_thinking_level(&adaptive, &ThinkingLevel::Minimal).is_err());
         assert!(validate_thinking_level(&adaptive, &ThinkingLevel::Max).is_ok());
         assert!(validate_thinking_level(&adaptive, &ThinkingLevel::XHigh).is_ok());
-        // `ultra` is OpenAI-only; Anthropic rejects it.
-        assert!(validate_thinking_level(&adaptive, &ThinkingLevel::Ultra).is_err());
 
         // Legacy budget-based Anthropic model accepts every level
-        // (each maps to a token budget), except the OpenAI-only `ultra`.
+        // (each maps to a token budget).
         let mut budget = sample_model("anthropic", "claude-sonnet-4-5");
         budget.reasoning = true;
         budget.supports_adaptive_thinking = false;
         assert!(validate_thinking_level(&budget, &ThinkingLevel::Minimal).is_ok());
         assert!(validate_thinking_level(&budget, &ThinkingLevel::Max).is_ok());
-        assert!(validate_thinking_level(&budget, &ThinkingLevel::Ultra).is_err());
 
-        // OpenAI-family model: accepts the full minimal..ultra range.
+        // OpenAI-family model: accepts the full minimal..max range.
         let mut openai = sample_model("openai", "gpt-5.6-sol");
         openai.api = "openai-responses".into();
         openai.reasoning = true;
         assert!(validate_thinking_level(&openai, &ThinkingLevel::Minimal).is_ok());
         assert!(validate_thinking_level(&openai, &ThinkingLevel::XHigh).is_ok());
         assert!(validate_thinking_level(&openai, &ThinkingLevel::Max).is_ok());
-        assert!(validate_thinking_level(&openai, &ThinkingLevel::Ultra).is_ok());
 
         // Non-reasoning model ignores the level entirely.
         let plain = sample_model("openai", "gpt-4o");

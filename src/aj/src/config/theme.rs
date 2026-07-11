@@ -427,7 +427,7 @@ pub fn markdown_theme(theme: &ThemeHandle, syntax_highlight: bool) -> MarkdownTh
 ///
 /// The mapping escalates visually with the model's reasoning
 /// budget: `None` → muted `Off`; `Low` → soft blue; … →
-/// `XHigh` / `Max` / `Ultra` → strong magenta. The JSON theme schema
+/// `XHigh` / `Max` → strong magenta. The JSON theme schema
 /// tops out at `ThinkingXhigh`, so the highest levels share that tint —
 /// they all represent "the strongest reasoning the active model
 /// supports" and the visual cue is the same intent.
@@ -438,9 +438,7 @@ fn thinking_color_token(level: Option<&ThinkingConfig>) -> ThemeColor {
         Some(ThinkingConfig::Low) => ThemeColor::ThinkingLow,
         Some(ThinkingConfig::Medium) => ThemeColor::ThinkingMedium,
         Some(ThinkingConfig::High) => ThemeColor::ThinkingHigh,
-        Some(ThinkingConfig::XHigh) | Some(ThinkingConfig::Max) | Some(ThinkingConfig::Ultra) => {
-            ThemeColor::ThinkingXhigh
-        }
+        Some(ThinkingConfig::XHigh) | Some(ThinkingConfig::Max) => ThemeColor::ThinkingXhigh,
     }
 }
 
@@ -675,7 +673,7 @@ mod tests {
             thinking_color_token(Some(&ThinkingConfig::High)),
             ThemeColor::ThinkingHigh
         );
-        // `XHigh`, `Max`, and `Ultra` all top out at the highest tint
+        // `XHigh` and `Max` both top out at the highest tint
         // the theme schema exposes (`ThinkingXhigh`) — they represent
         // the same "strongest reasoning available" intent.
         assert_eq!(
@@ -684,10 +682,6 @@ mod tests {
         );
         assert_eq!(
             thinking_color_token(Some(&ThinkingConfig::Max)),
-            ThemeColor::ThinkingXhigh
-        );
-        assert_eq!(
-            thinking_color_token(Some(&ThinkingConfig::Ultra)),
             ThemeColor::ThinkingXhigh
         );
     }

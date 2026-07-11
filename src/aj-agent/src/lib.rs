@@ -3187,7 +3187,6 @@ fn thinking_config_to_level(level: &ThinkingConfig) -> ThinkingLevel {
         ThinkingConfig::High => ThinkingLevel::High,
         ThinkingConfig::XHigh => ThinkingLevel::XHigh,
         ThinkingConfig::Max => ThinkingLevel::Max,
-        ThinkingConfig::Ultra => ThinkingLevel::Ultra,
     }
 }
 

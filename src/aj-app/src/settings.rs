@@ -114,7 +114,6 @@ pub fn config_thinking_level(thinking: Option<&aj_models::ThinkingConfig>) -> Co
         Some(ThinkingConfig::High) => ConfigThinkingLevel::High,
         Some(ThinkingConfig::XHigh) => ConfigThinkingLevel::XHigh,
         Some(ThinkingConfig::Max) => ConfigThinkingLevel::Max,
-        Some(ThinkingConfig::Ultra) => ConfigThinkingLevel::Ultra,
     }
 }
 

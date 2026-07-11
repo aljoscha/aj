@@ -466,7 +466,7 @@ fn build_system_item(model: &ModelInfo, prompt: &str) -> ResponseInputItem {
 
 /// Map the unified [`ThinkingLevel`] onto the OpenAI `reasoning_effort`
 /// enum one-to-one. Every rung has a wire equivalent, including `max`
-/// and `ultra` on the models that expose them. Shared by the Responses
+/// on the models that expose it. Shared by the Responses
 /// and Codex providers.
 pub(super) fn map_reasoning_effort(level: &ThinkingLevel) -> ReasoningEffort {
     match level {
@@ -476,7 +476,6 @@ pub(super) fn map_reasoning_effort(level: &ThinkingLevel) -> ReasoningEffort {
         ThinkingLevel::High => ReasoningEffort::High,
         ThinkingLevel::XHigh => ReasoningEffort::XHigh,
         ThinkingLevel::Max => ReasoningEffort::Max,
-        ThinkingLevel::Ultra => ReasoningEffort::Ultra,
     }
 }
 

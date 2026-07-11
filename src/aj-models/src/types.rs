@@ -335,7 +335,7 @@ pub struct Context {
 /// Controls the depth of extended thinking / reasoning.
 ///
 /// Serialized in lower-case form: `"minimal"`, `"low"`, `"medium"`,
-/// `"high"`, `"xhigh"`, `"max"`, `"ultra"`. Each variant is sent to the
+/// `"high"`, `"xhigh"`, and `"max"`. Each variant is sent to the
 /// provider verbatim — there is no remapping or silent downgrade. A level
 /// the target model's wire vocabulary doesn't accept is rejected before
 /// the request is sent (see
@@ -353,10 +353,6 @@ pub enum ThinkingLevel {
     /// "max"`. Accepted by adaptive Anthropic models and by the OpenAI
     /// reasoning models that expose a `max` rung.
     Max,
-    /// OpenAI `reasoning_effort: "ultra"`. OpenAI-only — the highest
-    /// rung on the models that expose it. Anthropic has no `ultra`
-    /// effort and rejects it.
-    Ultra,
 }
 
 // ---------------------------------------------------------------------------
@@ -993,13 +989,12 @@ mod tests {
             serde_json::to_value(ThinkingLevel::Medium).unwrap(),
             "medium"
         );
-        // `max` and `ultra` are the two highest rungs; both round-trip
-        // as single lower-case tokens.
+        // `max` is the highest rung; it round-trips as a single
+        // lower-case token.
         assert_eq!(serde_json::to_value(ThinkingLevel::Max).unwrap(), "max");
-        assert_eq!(serde_json::to_value(ThinkingLevel::Ultra).unwrap(), "ultra");
         assert_eq!(
-            serde_json::from_str::<ThinkingLevel>("\"ultra\"").unwrap(),
-            ThinkingLevel::Ultra
+            serde_json::from_str::<ThinkingLevel>("\"max\"").unwrap(),
+            ThinkingLevel::Max
         );
     }
 

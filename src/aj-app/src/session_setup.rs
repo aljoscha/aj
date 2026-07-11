@@ -187,7 +187,6 @@ pub fn thinking_level_for(level: &ThinkingConfig) -> ThinkingLevel {
         ThinkingConfig::High => ThinkingLevel::High,
         ThinkingConfig::XHigh => ThinkingLevel::XHigh,
         ThinkingConfig::Max => ThinkingLevel::Max,
-        ThinkingConfig::Ultra => ThinkingLevel::Ultra,
     }
 }
 

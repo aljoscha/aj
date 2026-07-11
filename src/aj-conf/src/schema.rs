@@ -27,7 +27,6 @@ pub enum ConfigThinkingLevel {
     High,
     XHigh,
     Max,
-    Ultra,
 }
 
 impl fmt::Display for ConfigThinkingLevel {
@@ -40,7 +39,6 @@ impl fmt::Display for ConfigThinkingLevel {
             ConfigThinkingLevel::High => write!(f, "high"),
             ConfigThinkingLevel::XHigh => write!(f, "xhigh"),
             ConfigThinkingLevel::Max => write!(f, "max"),
-            ConfigThinkingLevel::Ultra => write!(f, "ultra"),
         }
     }
 }
@@ -57,9 +55,8 @@ impl FromStr for ConfigThinkingLevel {
             "high" => Ok(ConfigThinkingLevel::High),
             "xhigh" => Ok(ConfigThinkingLevel::XHigh),
             "max" => Ok(ConfigThinkingLevel::Max),
-            "ultra" => Ok(ConfigThinkingLevel::Ultra),
             _ => Err(format!(
-                "invalid thinking level '{s}': expected off, minimal, low, medium, high, xhigh, max, or ultra"
+                "invalid thinking level '{s}': expected off, minimal, low, medium, high, xhigh, or max"
             )),
         }
     }
@@ -784,9 +781,7 @@ impl Config {
         ConfigOption {
             name: "thinking",
             description: "Default thinking level.",
-            kind: ValueKind::Enum(&[
-                "off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
-            ]),
+            kind: ValueKind::Enum(&["off", "minimal", "low", "medium", "high", "xhigh", "max"]),
             apply_toml_fn: |v, c| {
                 c.thinking = v.try_into()?;
                 Ok(())
@@ -1594,7 +1589,6 @@ mod tests {
             ("high", ConfigThinkingLevel::High),
             ("xhigh", ConfigThinkingLevel::XHigh),
             ("max", ConfigThinkingLevel::Max),
-            ("ultra", ConfigThinkingLevel::Ultra),
         ] {
             let toml_str = format!("thinking = \"{input}\"");
             let (config, diag) = parse_config(&toml_str, Path::new("/tmp/config.toml"));
@@ -1621,10 +1615,6 @@ mod tests {
             "XHigh".parse::<ConfigThinkingLevel>().unwrap(),
             ConfigThinkingLevel::XHigh
         );
-        assert_eq!(
-            "ultra".parse::<ConfigThinkingLevel>().unwrap(),
-            ConfigThinkingLevel::Ultra
-        );
         assert!("invalid".parse::<ConfigThinkingLevel>().is_err());
     }
 
@@ -1637,7 +1627,6 @@ mod tests {
         assert_eq!(ConfigThinkingLevel::High.to_string(), "high");
         assert_eq!(ConfigThinkingLevel::XHigh.to_string(), "xhigh");
         assert_eq!(ConfigThinkingLevel::Max.to_string(), "max");
-        assert_eq!(ConfigThinkingLevel::Ultra.to_string(), "ultra");
     }
 
     #[test]

@@ -341,7 +341,6 @@ pub fn default_thinking_from_config(level: Option<ConfigThinkingLevel>) -> Optio
         ConfigThinkingLevel::High => Some(ThinkingConfig::High),
         ConfigThinkingLevel::XHigh => Some(ThinkingConfig::XHigh),
         ConfigThinkingLevel::Max => Some(ThinkingConfig::Max),
-        ConfigThinkingLevel::Ultra => Some(ThinkingConfig::Ultra),
     })
 }
 
