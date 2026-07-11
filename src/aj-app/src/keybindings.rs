@@ -185,9 +185,10 @@ pub const ACTION_SETTINGS_CLEAR: &str = "aj.settings.clear";
 /// read-only page to start the reset flow, when a provider reports
 /// available resets and has a matching source. Handled inside that
 /// overlay only (contextual). Like [`ACTION_HISTORY_TOGGLE_SCOPE`] it is a
-/// table-only row: it is not compiled into the global keymap, so it exists
-/// purely to resolve the footer-hint label through the shared binding
-/// data. The in-overlay handling is a fixed convention for now.
+/// table-only row: it is not compiled into the global keymap. The overlay
+/// matches its chord at-target and resolves its footer-hint label from this
+/// shared binding data, so the match and the label read one source of truth.
+/// The in-overlay handling is a fixed convention for now.
 pub const ACTION_USAGE_RESET: &str = "aj.usage.reset";
 
 /// The `aj.*` actions with their default chord and description, in the
