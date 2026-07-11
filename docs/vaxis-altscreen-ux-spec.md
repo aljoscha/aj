@@ -245,17 +245,21 @@ three parts:
 - A hint line, `Ctrl+O for commands`, with `Ctrl+O` bold and in the
   keybinding-hint palette color (the same `#275DD0` token the command palette's
   shortcut column uses).
-- A bordered box holding the startup notices and warnings `aj` shows at launch:
-  the config diagnostics, the `Context:` list of stitched-in prompt / AGENTS.md
-  files, the sandbox / no-permissions warning, the auth warning, the tmux options
-  warning, and any skill warnings. These come from the same sources `aj` uses
-  (the `build_warning` tmux helper and the auth / sandbox / context builders in
-  `aj-app`).
+- A bordered box, shown only when there are startup warnings, surfacing the
+  warning-level notices `aj` shows at launch: the config diagnostics, the sandbox
+  / no-permissions warning, the auth warning, the tmux options warning, and any
+  skill warnings. These come from the same sources `aj` uses (the `build_warning`
+  tmux helper and the auth / sandbox builders in `aj-app`). The box sizes to its
+  content and caps at a small height, so it stays short by default and scrolls
+  with the mouse wheel when the warnings overflow the cap.
 
-Those notices are the transcript's leading `Notice` entries (Spec C), so the box
-is just an alternate presentation of them. When the first message dismisses the
-splash, the same notices render as the normal leading rows of the transcript and
-scroll into history, so nothing is stored twice.
+Those warnings are the transcript's leading warning-level `Notice` entries (Spec
+C), so the box is an alternate presentation of them, not a second copy. When the
+first message dismisses the splash, the same notices render as the normal leading
+rows of the transcript. The `Context:` listing of stitched-in prompt / AGENTS.md
+files is a leading `Notice` too, so it is the first transcript message once the
+chat starts, but it is informational rather than a warning, so it lives in
+scrollback only and is not surfaced in the splash box.
 
 ## 5. Overlays and the modal stack
 
@@ -599,10 +603,13 @@ Aligns with the plan's phases 5-9.
   the first user or assistant message, the chat slot shows an animated `aj` logo
   (slow drift plus a grow / shrink pulse off the frame tick, colored in a cycling
   lavender / purple ramp), a `Ctrl+O for commands` hint (Ctrl+O bold, in the
-  keybinding-hint palette color), and a bordered box surfacing the startup notices
-  and warnings (config diagnostics, context files, sandbox / no-permissions, auth,
-  tmux options, skills). The box presents the transcript's leading `Notice`
-  entries, so they become the normal leading rows once the splash is dismissed.
+  keybinding-hint palette color), and, when there are startup warnings, a bordered
+  box surfacing them (config diagnostics, sandbox / no-permissions, auth, tmux
+  options, skills). The box presents the transcript's leading warning-level
+  `Notice` entries and sizes to its content, staying short and scrolling with the
+  wheel on overflow. The `Context:` listing is a leading `Notice` too, so it is
+  the first transcript message once the chat starts, but it is scrollback-only and
+  not shown in the box.
 - **E-10. List row styling and the keybinding-hint color. Resolved.** List rows
   keep `aj`'s column layout (right-aligned dim category / metadata, label,
   right-aligned shortcut). `aj-next` draws the label and shortcut bold, and the
