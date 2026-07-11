@@ -33,8 +33,9 @@ pub use aj_app::session::{
     SubAgentOverrides,
 };
 
-/// The application name shown in the header notice and the terminal
-/// window title.
+/// The application name shown in the header notice. The terminal
+/// window title resolves its own copy through
+/// [`aj_app::session::window_title`].
 const APP_TITLE: &str = "AJ";
 
 /// The header notice announced when a world is installed. The
