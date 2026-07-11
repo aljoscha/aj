@@ -512,7 +512,7 @@ mod tests {
         // Spot check a couple of tokens to make sure the resolver
         // walked the var ref through to a concrete RGB.
         let accent = theme.fg(ThemeColor::Accent, "X");
-        assert!(accent.contains("\x1b[38;2;156;220;254m"));
+        assert!(accent.contains("\x1b[38;2;179;157;255m"));
         // `text` is `""` which means "terminal default" — that
         // encodes as the foreground-reset escape, not a color set.
         let text = theme.fg(ThemeColor::Text, "X");
@@ -523,16 +523,16 @@ mod tests {
     fn light_palette_loads() {
         let theme = Theme::bundled_light_with_mode(ColorMode::Truecolor);
         assert_eq!(theme.name(), "light");
-        // `accent` resolves to `lightBlue` which is `#5277a3` —
+        // `accent` resolves to `lavenderDeep` which is `#7b4fd8` —
         // verifies var refs walk through to a concrete RGB.
         let accent = theme.fg(ThemeColor::Accent, "X");
-        assert!(accent.contains("\x1b[38;2;82;119;163m"));
+        assert!(accent.contains("\x1b[38;2;123;79;216m"));
     }
 
     #[test]
     fn ansi256_falls_back_to_palette_index_in_limited_terminal() {
         // 256-color mode downsamples hex values to palette
-        // indexes. `#9cdcfe` is a light blue — it should land
+        // indexes. `#b39dff` is a lavender — it should land
         // somewhere in the 6x6x6 cube, not in the grayscale ramp.
         let theme = Theme::bundled_dark_with_mode(ColorMode::Color256);
         let accent = theme.fg(ThemeColor::Accent, "X");
@@ -769,24 +769,24 @@ mod tests {
         let paint = handle.fg_closure(ThemeColor::Accent);
 
         let before = paint("X");
-        // Dark's accent resolves through `lightBlue` → `#9cdcfe`.
+        // Dark's accent resolves through `lavenderBright` → `#b39dff`.
         assert!(
-            before.contains("\x1b[38;2;156;220;254m"),
+            before.contains("\x1b[38;2;179;157;255m"),
             "expected dark accent escape before swap, got {before:?}"
         );
 
         // Swap to the light palette in-place.
         handle.replace(Theme::bundled_light_with_mode(ColorMode::Truecolor));
         let after = paint("X");
-        // Light's accent resolves through `lightBlue` → `#5277a3`.
+        // Light's accent resolves through `lavenderDeep` → `#7b4fd8`.
         assert!(
-            after.contains("\x1b[38;2;82;119;163m"),
+            after.contains("\x1b[38;2;123;79;216m"),
             "expected light accent escape after swap, got {after:?}"
         );
         // The dark prefix must be gone — otherwise we'd just be
         // concatenating both.
         assert!(
-            !after.contains("\x1b[38;2;156;220;254m"),
+            !after.contains("\x1b[38;2;179;157;255m"),
             "stale dark escape leaked into post-swap output: {after:?}"
         );
     }
