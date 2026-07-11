@@ -92,6 +92,13 @@ use crate::usage_overlay::open_usage_overlay;
 /// itself, so it delegates the focus move to the shell via this event.
 const REFOCUS_OVERLAY_EVENT: &str = "aj-next.refocus-overlay";
 
+/// App-event name the host posts after a session switch so the Shell
+/// retitles the terminal from its capturing phase. The switch runs in the
+/// drive loop, which has no [`EventContext`] to queue the title command
+/// itself, so it delegates to the shell the same way [`REFOCUS_OVERLAY_EVENT`]
+/// delegates the focus move.
+const SET_TITLE_EVENT: &str = "aj-next.set-title";
+
 /// Everything the select loop mutates besides the `AsyncApp`: the
 /// session core, the shared chat model, and the turn bookkeeping.
 ///
@@ -459,7 +466,7 @@ fn install_next_session(world: &mut World, shell: &Rc<RefCell<Shell>>, next: Nex
     // Start the switched-to session's splash box at the top: a prior session's
     // wheel scroll must not carry over.
     shell.borrow().splash.borrow_mut().reset_scroll();
-    shell.borrow().rebind(world);
+    shell.borrow_mut().rebind(world);
     // Folded after the install so they land in the new session's chat, on
     // top of any replayed history.
     for notice in next.notices {
@@ -2637,6 +2644,11 @@ struct Shell {
     /// Typed handle to the header line, so a session rebuild can refresh
     /// the shown session id in place.
     header: Rc<RefCell<Text>>,
+    /// The terminal window title (`"AJ - <session id> - <cwd basename>"`).
+    /// Recomputed in [`Shell::rebind`] on a session switch and pushed to the
+    /// terminal via [`SET_TITLE_EVENT`] (switch) and the `Init` handler
+    /// (startup), never per draw.
+    window_title: String,
     /// A session-preview scan request parked by the session selector on
     /// open, for the drive loop to run off the loop and fill.
     session_scan: Rc<RefCell<Option<SessionScan>>>,
@@ -2657,6 +2669,7 @@ impl Shell {
         queues: MessageQueues,
         theme: ThemeHandle,
         header: String,
+        session_id: &str,
         cwd: PathBuf,
     ) -> Shell {
         let submitted: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
@@ -2689,6 +2702,10 @@ impl Shell {
         // The footer shows the working directory as text. The provider owns the
         // path itself.
         let cwd_display = cwd.display().to_string();
+        // The terminal window title, matching aj's format. Recomputed on a
+        // session switch in `rebind`, so we only need the initial world's id
+        // and cwd here.
+        let window_title = aj_app::session::window_title(session_id, &cwd);
         // The transcript-focus flag, shared between the transcript (its single
         // writer, via focus in/out) and the keymap host context (which reads it
         // to gate the copy chord). Created here so both get the same cell.
@@ -2945,6 +2962,7 @@ impl Shell {
             skills_fill,
             recall_slot,
             header: header_line,
+            window_title,
             session_scan,
             session_request,
             auth_request,
@@ -3092,11 +3110,15 @@ impl Shell {
     /// left untouched: the app's mouse/focus handlers hold the root Shell Rc
     /// captured at `init`, so rebuilding the root or re-initializing the app
     /// would strand them. We swap the Shell's innards, never the Shell.
-    fn rebind(&self, world: &World) {
+    fn rebind(&mut self, world: &World) {
         self.pending
             .borrow_mut()
             .set_queues(world.core.message_queues.clone());
         self.header.borrow_mut().text = format!("aj-next — {}", world.core.session_id);
+        self.window_title = aj_app::session::window_title(
+            &world.core.session_id,
+            &world.core.env.working_directory,
+        );
         self.transcript.borrow_mut().reset_to_tail();
     }
 }
@@ -3256,6 +3278,10 @@ impl Widget for Shell {
                     .unwrap_or_else(|| to_widget_ref(Rc::clone(&self.editor)));
                 ctx.request_focus(target);
                 ctx.redraw = true;
+            } else if user.name == SET_TITLE_EVENT {
+                // A session switch rebound `window_title` off the loop. Push it
+                // to the terminal now that we have an event context.
+                ctx.set_title(self.window_title.clone());
             } else {
                 // The loader and the splash both animate off host-posted
                 // wakes and neither sits on the focus path, so the Shell (the
@@ -3270,6 +3296,9 @@ impl Widget for Shell {
     fn handle_event(&mut self, ctx: &mut EventContext, event: &Event) {
         if let Event::Init = event {
             ctx.request_focus(to_widget_ref(Rc::clone(&self.editor)));
+            // `Init` dispatch drains the ctx command queue before the first
+            // frame, so the title applies ahead of the initial paint.
+            ctx.set_title(self.window_title.clone());
             ctx.redraw = true;
         }
     }
@@ -3354,6 +3383,7 @@ pub async fn run(args: Args) -> Result<()> {
         world.core.message_queues.clone(),
         theme.clone(),
         header,
+        &world.core.session_id,
         cwd,
     )));
     let root: WidgetRef = to_widget_ref(Rc::clone(&shell));
@@ -3475,6 +3505,13 @@ pub async fn run(args: Args) -> Result<()> {
         match build_next_session(&world, spec, &previous_id).await {
             Ok(next) => {
                 install_next_session(&mut world, &shell, next);
+                // Retitle the terminal for the switched-to session. The switch
+                // ran off the loop with no event context, so we ride an app
+                // event, mirroring the refocus delegation.
+                app.post_app_event(UserEvent {
+                    name: SET_TITLE_EVENT.to_string(),
+                    data: None,
+                });
                 app.request_redraw();
             }
             // Both the requested build and the fallback failed: no session
@@ -4319,8 +4356,93 @@ mod tests {
                 aj_app::theme::ColorMode::Truecolor,
             )),
             "aj-next".to_string(),
+            "",
             PathBuf::from("/tmp"),
         )))
+    }
+
+    /// A `Shell` bound to a known session id and cwd, for the window-title
+    /// tests. The header is irrelevant here, only the title inputs matter.
+    fn titled_shell(session_id: &str, cwd: &str) -> Shell {
+        Shell::new(
+            empty_chat(),
+            Rc::new(RefCell::new(StatusState::default())),
+            MessageQueues::default(),
+            ThemeHandle::new(Theme::bundled_dark_with_mode(
+                aj_app::theme::ColorMode::Truecolor,
+            )),
+            format!("aj-next — {session_id}"),
+            session_id,
+            PathBuf::from(cwd),
+        )
+    }
+
+    /// The title command a handler queued, if any.
+    fn queued_title(cmds: &[vaxis::vxfw::Command]) -> Option<String> {
+        cmds.iter().find_map(|c| match c {
+            vaxis::vxfw::Command::SetTitle(t) => Some(t.clone()),
+            _ => None,
+        })
+    }
+
+    /// `Shell::new` computes the terminal title from the session id and the
+    /// cwd basename, matching aj's format.
+    #[test]
+    fn shell_new_computes_window_title() {
+        let shell = titled_shell("sess-1", "/home/me/myproj");
+        assert_eq!(shell.window_title, "AJ - sess-1 - myproj");
+    }
+
+    /// A session switch reruns [`Shell::rebind`], which recomputes the title
+    /// off the new world's id and cwd.
+    #[tokio::test]
+    async fn rebind_updates_window_title_on_session_switch() {
+        let dir = TempDir::new().expect("tempdir");
+        let world = scripted_world(&dir, "streaming-text").await;
+
+        let mut shell = titled_shell("old-session", "/home/me/oldproj");
+        assert_eq!(shell.window_title, "AJ - old-session - oldproj");
+
+        shell.rebind(&world);
+        let expected = aj_app::session::window_title(
+            &world.core.session_id,
+            &world.core.env.working_directory,
+        );
+        assert_eq!(shell.window_title, expected);
+        assert_ne!(
+            shell.window_title, "AJ - old-session - oldproj",
+            "rebind must retitle for the switched-to session"
+        );
+    }
+
+    /// The `Init` handler queues the terminal title so it applies before the
+    /// first frame.
+    #[test]
+    fn init_sets_terminal_title() {
+        let mut shell = titled_shell("sess-1", "/home/me/myproj");
+        let mut ctx = EventContext::new();
+        shell.handle_event(&mut ctx, &Event::Init);
+        assert_eq!(
+            queued_title(&ctx.cmds).as_deref(),
+            Some("AJ - sess-1 - myproj")
+        );
+    }
+
+    /// The switch path posts [`SET_TITLE_EVENT`]. The Shell's capture handler
+    /// turns it into a title command for the switched-to session.
+    #[test]
+    fn set_title_event_retitles_terminal() {
+        let mut shell = titled_shell("sess-1", "/home/me/myproj");
+        let mut ctx = EventContext::new();
+        let event = Event::App(UserEvent {
+            name: SET_TITLE_EVENT.to_string(),
+            data: None,
+        });
+        shell.capture_event(&mut ctx, &event);
+        assert_eq!(
+            queued_title(&ctx.cmds).as_deref(),
+            Some("AJ - sess-1 - myproj")
+        );
     }
 
     /// Builds and initializes an `AsyncApp` over a `TestTty`, with a
@@ -4368,6 +4490,7 @@ mod tests {
                 aj_app::theme::ColorMode::Truecolor,
             )),
             "aj-next".to_string(),
+            "",
             cwd,
         )));
         let root: WidgetRef = to_widget_ref(Rc::clone(&shell));
@@ -5702,6 +5825,7 @@ mod tests {
                 aj_app::theme::ColorMode::Truecolor,
             )),
             "aj-next".to_string(),
+            "",
             PathBuf::from("/tmp"),
         )));
         (world, shell)
@@ -5738,6 +5862,7 @@ mod tests {
                 aj_app::theme::ColorMode::Truecolor,
             )),
             "aj-next".to_string(),
+            "",
             PathBuf::from("/tmp"),
         )));
         let root: WidgetRef = to_widget_ref(Rc::clone(&shell));
@@ -7037,6 +7162,7 @@ mod tests {
             MessageQueues::default(),
             theme.clone(),
             "aj-next".to_string(),
+            "",
             PathBuf::from("/tmp/project"),
         )));
 
@@ -7148,6 +7274,7 @@ mod tests {
             world.core.message_queues.clone(),
             ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor)),
             "aj-next".to_string(),
+            "",
             PathBuf::from("/tmp"),
         )));
         let root: WidgetRef = to_widget_ref(Rc::clone(&shell));
