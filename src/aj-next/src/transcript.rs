@@ -1912,28 +1912,36 @@ impl TranscriptView {
     /// Map a widget-local mouse position to an entry-relative [`SelPos`].
     ///
     /// `m_row`/`m_col` are TranscriptView-local (row 0 = the chat slot's top).
-    /// We clamp `m_row` into the viewport, add the top entry's hidden-line
-    /// offset to get the line from the top entry's start, then walk realized
-    /// entries top to bottom (each at most a viewport of rows) until that line
-    /// lands inside one. `col` is `m_col` clamped into `[0, width]` (the
-    /// scrollbar owns the last column, the far edge is end-of-line).
+    /// We clamp `m_row` into the viewport, drop the blank top band that
+    /// bottom-anchoring leaves above the first entry, add the top entry's
+    /// hidden-line offset to get the line from the top entry's start, then walk
+    /// realized entries top to bottom (each at most a viewport of rows) until
+    /// that line lands inside one. `col` is `m_col` clamped into `[0, width]`
+    /// (the scrollbar owns the last column, the far edge is end-of-line).
     /// Returns `None` on an empty transcript, where there is nothing to select.
     fn point_to_sel(&mut self, m_row: i16, m_col: i16) -> Option<SelPos> {
         let width = self.content_width();
-        let (top_idx, off) = {
+        let (top_idx, off, top_pad) = {
             let list = self.list.borrow();
             (
                 usize::try_from(list.scroll_top()).unwrap_or(0),
                 list.scroll_offset(),
+                i32::from(list.top_pad()),
             )
         };
         let height = i32::from(self.last_view.height);
         let local_row = i32::from(m_row).clamp(0, (height - 1).max(0));
+        // Map the screen row to a content row by dropping the blank top band
+        // bottom-anchoring leaves above the first entry. A row inside that band
+        // (`local_row < top_pad`) resolves to the first content line rather
+        // than a spurious selection above the text. `top_pad` is 0 in the
+        // normal top-anchored case, so this is a no-op there.
+        let content_row = (local_row - top_pad).max(0);
         // The line from the top entry's first line: the hidden-above offset
-        // plus how far down the viewport the click landed.
+        // plus how far down the content the click landed.
         let target = usize::try_from(off)
             .unwrap_or(0)
-            .saturating_add(usize::try_from(local_row).unwrap_or(0));
+            .saturating_add(usize::try_from(content_row).unwrap_or(0));
         let content_col = i32::from(m_col).clamp(0, i32::from(width));
         let col = usize::try_from(content_col).unwrap_or(0);
 
@@ -2038,19 +2046,28 @@ impl TranscriptView {
     ///
     /// Walks realized entries once from the top, so it is O(viewport) rather
     /// than O(viewport * entries). The top entry's hidden-above offset seeds
-    /// the starting line within that entry.
+    /// the starting line within that entry. When bottom-anchoring leaves a
+    /// blank band above the first entry, that band's rows come out as `None`.
     fn visible_row_positions(&mut self, height: usize) -> Vec<Option<RowPos>> {
         let width = self.content_width();
-        let (top_idx, off) = {
+        let (top_idx, off, top_pad) = {
             let list = self.list.borrow();
             (
                 usize::try_from(list.scroll_top()).unwrap_or(0),
                 usize::try_from(list.scroll_offset()).unwrap_or(0),
+                usize::from(list.top_pad()),
             )
         };
         let mut out: Vec<Option<RowPos>> = Vec::with_capacity(height);
+        // Bottom-anchoring leaves `top_pad` blank rows above the first entry.
+        // Those screen rows show no content, so emit them as `None` before
+        // walking the entries. `top_pad` is 0 in the normal top-anchored case.
+        let pad = top_pad.min(height);
+        for _ in 0..pad {
+            out.push(None);
+        }
         let mut idx = top_idx;
-        // The first visible row shows the top entry's line `off`, the rows
+        // The first content row shows the top entry's line `off`, the rows
         // before it being hidden above the top edge.
         let mut line = off;
         // The current entry and its height, refreshed as the walk crosses
@@ -2060,7 +2077,7 @@ impl TranscriptView {
             Some(id) => Some((id, self.entry_height(id, width))),
             None => None,
         };
-        for _ in 0..height {
+        for _ in 0..(height - pad) {
             // Advance past any entries the running line has walked off the end
             // of. Every entry is at least one row tall, so this consumes at
             // most one entry per screen row and the walk stays O(viewport).
@@ -4931,6 +4948,58 @@ mod tests {
         assert!(
             view.selection.is_some(),
             "a real range stays highlighted after copy",
+        );
+    }
+
+    /// Select-to-copy on a transcript shorter than the viewport. Bottom-anchoring
+    /// leaves a blank band above the first entry, yet a drag over the visible
+    /// text must select that text and paint the highlight on the content rows,
+    /// not the blank band. Without the top-pad offset the screen-row math treats
+    /// row 0 as the first content line, so the drag resolves to the empty rows
+    /// past the end, copies nothing, and highlights the wrong row.
+    #[test]
+    fn select_to_copy_on_short_bottom_anchored_transcript() {
+        let chat = chat_with_notices(2);
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(40, 10);
+        let bg = view.styles.selection_bg;
+
+        // A fresh short transcript bottom-anchors: two 2-row notices sit at
+        // screen rows 6..=9, leaving rows 0..=5 blank. " row 0" lands at row 6.
+        let _ = view.draw(&ctx);
+        let content_row: i16 = 6;
+
+        // Press past the leading space, then drag across " row 0".
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &mouse(1, content_row, mouse::Type::Press));
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &mouse(6, content_row, mouse::Type::Drag));
+
+        let sel = view.selection.expect("drag anchors a selection");
+        assert_eq!(
+            sel.anchor.entry,
+            entry_id(&chat, 0),
+            "anchored on the first entry, not a spurious one past the end",
+        );
+        assert_eq!((sel.anchor.line, sel.anchor.col), (0, 1));
+        assert_eq!((sel.caret.line, sel.caret.col), (0, 6));
+
+        // Release copies the visible text, not the blank band.
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &mouse(6, content_row, mouse::Type::Release));
+        let copied = ec.cmds.iter().find_map(|cmd| match cmd {
+            vaxis::vxfw::Command::CopyToClipboard(text) => Some(text.clone()),
+            _ => None,
+        });
+        assert_eq!(copied.as_deref(), Some("row 0"), "copied the visible text");
+
+        // The highlight lands on the content row; the blank top band is untouched.
+        let surface = view.draw(&ctx);
+        let grid = crate::test_support::flatten(&surface);
+        assert_eq!(
+            highlighted_rows(&grid, bg),
+            vec![6],
+            "highlight on the content row, not the blank band",
         );
     }
 

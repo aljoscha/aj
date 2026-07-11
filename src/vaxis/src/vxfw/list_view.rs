@@ -386,6 +386,10 @@ pub struct ListView {
     /// size and place the scrollbar thumb. Layered on top of the index-anchored
     /// scroll core, so it never affects what is drawn.
     geometry: ListGeometry,
+    /// Blank rows above the first visible child as of the last draw. Non-zero
+    /// only when short content is bottom-anchored, otherwise the first child
+    /// sits at (or above) row 0. See [`top_pad`](Self::top_pad).
+    top_pad: u16,
 }
 
 impl ListView {
@@ -401,6 +405,7 @@ impl ListView {
             scroll: Scroll::default(),
             last_viewport_height: None,
             geometry: ListGeometry::new(),
+            top_pad: 0,
         }
     }
 
@@ -602,6 +607,19 @@ impl ListView {
     /// [`scroll_top`](Self::scroll_top) for the pairing.
     pub fn scroll_offset(&self) -> i32 {
         self.scroll.offset
+    }
+
+    /// Blank rows above the first visible child as of the last completed draw.
+    ///
+    /// Zero in the normal top-anchored and overflow cases. Non-zero only when
+    /// [`anchor_short_to_bottom`](Self::anchor_short_to_bottom) pushes content
+    /// shorter than the viewport to the bottom, in which case it is the count
+    /// of blank rows the layout left above the first entry. Callers doing
+    /// screen-row-to-content math must subtract it, since
+    /// [`scroll_top`](Self::scroll_top) and [`scroll_offset`](Self::scroll_offset)
+    /// both stay zero in that case.
+    pub fn top_pad(&self) -> u16 {
+        self.top_pad
     }
 
     /// Clears the scrollbar-thumb geometry so the next draw rebuilds it.
@@ -925,6 +943,15 @@ impl ListView {
                 break;
             }
         }
+
+        // The blank rows above the first visible child. Zero in the normal
+        // top-anchored and overflow cases (the first child sits at or above
+        // row 0), positive only when short content is bottom-anchored. We read
+        // it straight off the laid-out origin so it tracks whatever the draw
+        // computed, staying correct across resizes.
+        self.top_pad = child_list.get(start).map_or(0, |child| {
+            u16::try_from(child.origin.row.max(0)).unwrap_or(0)
+        });
 
         // Reset the deferred cursor request now that the draw consumed it.
         self.scroll.wants_cursor = false;
