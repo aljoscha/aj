@@ -2,11 +2,13 @@
 //!
 //! A [`ContentOverlay`] is a scrollable, non-interactive list of text
 //! rows shown inside an [`OverlayWindow`]. Esc or Enter close it
-//! (returning to the parent overlay or the editor), Up/Down and
-//! PgUp/PgDn scroll the body, and every other key is swallowed so
-//! nothing leaks to the layout behind the modal. Each row is a list of
-//! styled spans ([`Row`]) the host builds from the shared `aj_app` data,
-//! so the one widget backs all three read-only overlays.
+//! (returning to the parent overlay or the editor). The body scrolls by
+//! line like a pager: Up/Down (and Ctrl+P/Ctrl+N) move a single line,
+//! PgUp/PgDn move a viewport-scaled page, and Home/End jump to the first
+//! and last line. Every other key is swallowed so nothing leaks to the
+//! layout behind the modal. Each row is a list of styled spans ([`Row`])
+//! the host builds from the shared `aj_app` data, so the one widget backs
+//! all three read-only overlays.
 //!
 //! The usage row builder ([`usage_rows`]) also lives here, but the usage
 //! page is interactive ([`crate::usage_overlay`]) and reuses only the row
@@ -101,16 +103,22 @@ impl ContentStyles {
     }
 }
 
-/// PgUp/PgDn step, in rows. A fixed jump rather than a viewport-derived
-/// one keeps the widget from needing to know its drawn height.
-const PAGE_STEP: usize = 10;
+/// Rows kept in common between two page-scroll steps, so a reader keeps a
+/// little context across a page turn rather than jumping a full viewport.
+const PAGE_OVERLAP: u16 = 2;
+
+/// Page size (in lines) used before the first draw has measured the real
+/// viewport height. A page-scroll issued that early is rare, so a sane
+/// constant is enough until the next draw records the true height.
+const DEFAULT_PAGE_LINES: i32 = 20;
 
 /// A scrollable, read-only list of text rows.
 ///
 /// Focus sits on this widget while it is the top overlay, so it
 /// intercepts every key in its capturing phase: Esc/Enter close (via
-/// [`Self::on_close`]), the arrow and page keys scroll, and everything
-/// else is consumed so it can't reach the base layout.
+/// [`Self::on_close`]), the arrow, page, and Home/End keys scroll the
+/// body by line, and everything else is consumed so it can't reach the
+/// base layout.
 pub(crate) struct ContentOverlay {
     /// The row list, shared with `bars` (which draws it) and handed back
     /// by [`open_content_overlay`] so the host can refill an async
@@ -126,8 +134,8 @@ impl ContentOverlay {
     pub(crate) fn new(rows: Vec<Row>) -> ContentOverlay {
         let mut list = ListView::new(Source::Slice(row_widgets(&rows)));
         list.item_count = Some(u32::try_from(rows.len()).expect("row count fits u32"));
-        // Document scroll with no visible cursor: the list moves its
-        // hidden cursor to keep the viewport following the arrow keys.
+        // No visible cursor: the body scrolls as a document via
+        // `scroll_lines`, so there is no item cursor to render.
         list.draw_cursor = false;
         let mut bars = ScrollBars::new(list);
         bars.draw_horizontal_scrollbar = false;
@@ -142,6 +150,19 @@ impl ContentOverlay {
     /// The shared row list, for the host to refill after an async fetch.
     pub(crate) fn list_handle(&self) -> Rc<RefCell<ListView>> {
         Rc::clone(&self.list)
+    }
+
+    /// One page of scroll in lines: the last-drawn viewport height minus a
+    /// small overlap so a page turn keeps a couple of rows of context. Falls
+    /// back to [`DEFAULT_PAGE_LINES`] before the first draw has measured the
+    /// viewport.
+    fn page_lines(&self) -> i32 {
+        match self.list.borrow().viewport_height() {
+            Some(h) if h > PAGE_OVERLAP => i32::from(h - PAGE_OVERLAP),
+            // A viewport too short to overlap still pages by at least one row.
+            Some(h) if h > 0 => i32::from(h),
+            _ => DEFAULT_PAGE_LINES,
+        }
     }
 }
 
@@ -162,30 +183,37 @@ impl Widget for ContentOverlay {
         let Event::KeyPress(key) = event else {
             return;
         };
+        let empty = Modifiers::empty();
+        let ctrl = Modifiers::CTRL;
         // Esc and Enter both close: a read-only view has nothing to
         // confirm, so Enter is just a second "dismiss" key (matching
         // `aj`'s read-only overlays).
-        if key.matches(Key::ESCAPE, Modifiers::empty())
-            || key.matches(Key::ENTER, Modifiers::empty())
-        {
+        if key.matches(Key::ESCAPE, empty) || key.matches(Key::ENTER, empty) {
             if let Some(cb) = self.on_close.as_mut() {
                 cb(ctx);
             }
             ctx.consume_and_redraw();
             return;
         }
-        if key.matches(Key::DOWN, Modifiers::empty()) {
-            self.list.borrow_mut().next_item(ctx);
-        } else if key.matches(Key::UP, Modifiers::empty()) {
-            self.list.borrow_mut().prev_item(ctx);
-        } else if key.matches(Key::PAGE_DOWN, Modifiers::empty()) {
-            for _ in 0..PAGE_STEP {
-                self.list.borrow_mut().next_item(ctx);
-            }
-        } else if key.matches(Key::PAGE_UP, Modifiers::empty()) {
-            for _ in 0..PAGE_STEP {
-                self.list.borrow_mut().prev_item(ctx);
-            }
+        // Document scroll by line: `scroll_lines` moves the viewport
+        // immediately and clamps at both ends, unlike cursor-item nav, which
+        // only shifts the viewport once the hidden cursor leaves it (so the
+        // first viewport-worth of presses looked dead).
+        let page = self.page_lines();
+        if key.matches(Key::DOWN, empty) || key.matches(u32::from('n'), ctrl) {
+            self.list.borrow_mut().scroll_lines(1);
+        } else if key.matches(Key::UP, empty) || key.matches(u32::from('p'), ctrl) {
+            self.list.borrow_mut().scroll_lines(-1);
+        } else if key.matches(Key::PAGE_DOWN, empty) {
+            self.list.borrow_mut().scroll_lines(page);
+        } else if key.matches(Key::PAGE_UP, empty) {
+            self.list.borrow_mut().scroll_lines(-page);
+        } else if key.matches(Key::HOME, empty) {
+            // Pin the scroll to the very first line, matching the transcript's
+            // editor-mode Home.
+            self.list.borrow_mut().jump_to_item(0);
+        } else if key.matches(Key::END, empty) {
+            self.list.borrow_mut().scroll_to_bottom();
         }
         // Read-only: swallow every key so none reaches the base layout.
         ctx.consume_and_redraw();
@@ -1198,6 +1226,111 @@ mod tests {
             "spacer row before Settings is a non-collapsing single-space \
              line, not an empty string: {texts:?}"
         );
+    }
+
+    /// A draw context bounded in both dimensions, so the overlay lays out
+    /// against a real viewport and its scroll math has content to move
+    /// through.
+    fn draw_ctx(width: u16, height: u16) -> DrawContext {
+        crate::test_support::draw_ctx(width, Some(height))
+    }
+
+    /// A content overlay over `n` single-line plain rows, taller than any
+    /// viewport the scroll tests use.
+    fn tall_overlay(n: usize) -> ContentOverlay {
+        ContentOverlay::new((0..n).map(|i| plain(format!("line {i}"))).collect())
+    }
+
+    fn key_press(codepoint: u32, mods: Modifiers) -> Event {
+        Event::KeyPress(Key {
+            codepoint,
+            mods,
+            ..Key::default()
+        })
+    }
+
+    /// The absolute line at the top of the viewport. With single-line rows
+    /// the top item's index is its start line, so the absolute top is that
+    /// index plus how far the item is scrolled above the viewport edge.
+    fn absolute_top(overlay: &ContentOverlay) -> i32 {
+        let list = overlay.list.borrow();
+        i32::try_from(list.scroll_top()).expect("scroll_top fits i32") + list.scroll_offset()
+    }
+
+    /// A single Down advances the viewport by exactly one line. This is the
+    /// regression the bug needed: the old cursor-item nav (`next_item`) moved
+    /// nothing until the hidden cursor left the viewport, so the first
+    /// viewport-worth of Down presses looked dead. Swapping `scroll_lines(1)`
+    /// back for `next_item` leaves the top at 0 here and fails.
+    #[test]
+    fn single_down_scrolls_one_line() {
+        let mut overlay = tall_overlay(50);
+        let ctx = draw_ctx(40, 10);
+        // First draw measures the viewport and pins the top at line 0.
+        let _ = overlay.draw(&ctx);
+        assert_eq!(absolute_top(&overlay), 0);
+
+        let mut ec = EventContext::new();
+        overlay.capture_event(&mut ec, &key_press(Key::DOWN, Modifiers::empty()));
+        let _ = overlay.draw(&ctx);
+        assert_eq!(
+            absolute_top(&overlay),
+            1,
+            "one Down advances the viewport by a single line"
+        );
+    }
+
+    /// PageDown scrolls by one viewport-scaled page, Home returns to the
+    /// first line, and End lands at the bottom.
+    #[test]
+    fn page_down_home_and_end_move_the_viewport() {
+        let mut overlay = tall_overlay(50);
+        let ctx = draw_ctx(40, 10);
+        let _ = overlay.draw(&ctx);
+        // Read the page size the overlay computed against the drawn viewport,
+        // so the expectation tracks whatever height the layout measured.
+        let page = overlay.page_lines();
+
+        let mut ec = EventContext::new();
+        overlay.capture_event(&mut ec, &key_press(Key::PAGE_DOWN, Modifiers::empty()));
+        let _ = overlay.draw(&ctx);
+        assert_eq!(
+            absolute_top(&overlay),
+            page,
+            "PageDown scrolls one viewport-scaled page"
+        );
+        assert!(!overlay.list.borrow().is_at_bottom());
+
+        let mut ec = EventContext::new();
+        overlay.capture_event(&mut ec, &key_press(Key::HOME, Modifiers::empty()));
+        let _ = overlay.draw(&ctx);
+        assert_eq!(absolute_top(&overlay), 0, "Home returns to the top");
+
+        let mut ec = EventContext::new();
+        overlay.capture_event(&mut ec, &key_press(Key::END, Modifiers::empty()));
+        let _ = overlay.draw(&ctx);
+        assert!(
+            overlay.list.borrow().is_at_bottom(),
+            "End lands at the bottom"
+        );
+    }
+
+    /// Ctrl+N and Ctrl+P scroll one line down and up, mirroring Down and Up.
+    #[test]
+    fn ctrl_n_and_ctrl_p_scroll_like_down_and_up() {
+        let mut overlay = tall_overlay(50);
+        let ctx = draw_ctx(40, 10);
+        let _ = overlay.draw(&ctx);
+
+        let mut ec = EventContext::new();
+        overlay.capture_event(&mut ec, &key_press(u32::from('n'), Modifiers::CTRL));
+        let _ = overlay.draw(&ctx);
+        assert_eq!(absolute_top(&overlay), 1, "Ctrl+N scrolls down one line");
+
+        let mut ec = EventContext::new();
+        overlay.capture_event(&mut ec, &key_press(u32::from('p'), Modifiers::CTRL));
+        let _ = overlay.draw(&ctx);
+        assert_eq!(absolute_top(&overlay), 0, "Ctrl+P scrolls up one line");
     }
 
     /// A plain builder produces single-span, default-styled rows, pinning
