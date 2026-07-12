@@ -187,15 +187,6 @@ const USER_COLLAPSED_LINES: usize = 10;
 /// long append-only session from growing it without limit.
 const ENTRY_CACHE_CAPACITY: usize = 512;
 
-/// Rows kept in common between two page-scroll steps, so a reader keeps a
-/// little context across a page turn rather than jumping a full viewport.
-const PAGE_OVERLAP: u16 = 2;
-
-/// Page size (in lines) used before the first draw has measured the real
-/// viewport height. A page-scroll issued that early is rare, so a sane
-/// constant is enough until the next draw records the true height.
-const DEFAULT_PAGE_LINES: i32 = 20;
-
 /// One cached per-entry render: the drawn surface plus the
 /// `(fingerprint, width)` it was drawn for. A lookup hits only when both
 /// match the live entry, so a slot never serves stale content.
@@ -1661,7 +1652,9 @@ impl TranscriptView {
     /// the draw re-engages follow-tail right away, leaving it pinned.)
     pub(crate) fn page_up(&mut self) {
         self.follow_tail = false;
-        let lines = self.page_lines();
+        // Read the viewport under a short immutable borrow that drops at the
+        // end of the statement, before the `borrow_mut` for `scroll_lines`.
+        let lines = crate::scroll::page_scroll_lines(self.list.borrow().viewport_height());
         self.list.borrow_mut().scroll_lines(-lines);
     }
 
@@ -1672,7 +1665,7 @@ impl TranscriptView {
     /// draw re-engages follow-tail (see [`draw`](Widget::draw)), so paging
     /// down to the end resumes following streamed content.
     pub(crate) fn page_down(&self) {
-        let lines = self.page_lines();
+        let lines = crate::scroll::page_scroll_lines(self.list.borrow().viewport_height());
         self.list.borrow_mut().scroll_lines(lines);
     }
 
@@ -1704,19 +1697,6 @@ impl TranscriptView {
         // inner list's `scroll_to_bottom` and the transcript resumes following
         // the tail (see [`draw`](Widget::draw)).
         self.follow_tail = true;
-    }
-
-    /// One page of scroll in lines: the last-drawn viewport height minus a
-    /// small overlap so a page turn keeps a couple of rows of context. Falls
-    /// back to [`DEFAULT_PAGE_LINES`] before the first draw has measured the
-    /// viewport.
-    fn page_lines(&self) -> i32 {
-        match self.list.borrow().viewport_height() {
-            Some(h) if h > PAGE_OVERLAP => i32::from(h - PAGE_OVERLAP),
-            // A viewport too short to overlap still pages by at least one row.
-            Some(h) if h > 0 => i32::from(h),
-            _ => DEFAULT_PAGE_LINES,
-        }
     }
 
     /// Rebuild the transcript's styles from a fresh palette, for a

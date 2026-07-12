@@ -104,15 +104,6 @@ impl ContentStyles {
     }
 }
 
-/// Rows kept in common between two page-scroll steps, so a reader keeps a
-/// little context across a page turn rather than jumping a full viewport.
-const PAGE_OVERLAP: u16 = 2;
-
-/// Page size (in lines) used before the first draw has measured the real
-/// viewport height. A page-scroll issued that early is rare, so a sane
-/// constant is enough until the next draw records the true height.
-const DEFAULT_PAGE_LINES: i32 = 20;
-
 /// A scrollable, read-only list of text rows.
 ///
 /// Focus sits on this widget while it is the top overlay, so it
@@ -152,19 +143,6 @@ impl ContentOverlay {
     pub(crate) fn list_handle(&self) -> Rc<RefCell<ListView>> {
         Rc::clone(&self.list)
     }
-
-    /// One page of scroll in lines: the last-drawn viewport height minus a
-    /// small overlap so a page turn keeps a couple of rows of context. Falls
-    /// back to [`DEFAULT_PAGE_LINES`] before the first draw has measured the
-    /// viewport.
-    fn page_lines(&self) -> i32 {
-        match self.list.borrow().viewport_height() {
-            Some(h) if h > PAGE_OVERLAP => i32::from(h - PAGE_OVERLAP),
-            // A viewport too short to overlap still pages by at least one row.
-            Some(h) if h > 0 => i32::from(h),
-            _ => DEFAULT_PAGE_LINES,
-        }
-    }
 }
 
 impl Widget for ContentOverlay {
@@ -200,7 +178,9 @@ impl Widget for ContentOverlay {
         // immediately and clamps at both ends, unlike cursor-item nav, which
         // only shifts the viewport once the hidden cursor leaves it (so the
         // first viewport-worth of presses looked dead).
-        let page = self.page_lines();
+        // Read the viewport under a short immutable borrow that drops at the
+        // end of the statement, before the `borrow_mut` calls below.
+        let page = crate::scroll::page_scroll_lines(self.list.borrow().viewport_height());
         if key.matches(Key::DOWN, empty) || key.matches(u32::from('n'), ctrl) {
             self.list.borrow_mut().scroll_lines(1);
         } else if key.matches(Key::UP, empty) || key.matches(u32::from('p'), ctrl) {
@@ -1290,7 +1270,7 @@ mod tests {
         let _ = overlay.draw(&ctx);
         // Read the page size the overlay computed against the drawn viewport,
         // so the expectation tracks whatever height the layout measured.
-        let page = overlay.page_lines();
+        let page = crate::scroll::page_scroll_lines(overlay.list.borrow().viewport_height());
 
         let mut ec = EventContext::new();
         overlay.capture_event(&mut ec, &key_press(Key::PAGE_DOWN, Modifiers::empty()));
