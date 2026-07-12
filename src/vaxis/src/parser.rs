@@ -501,6 +501,18 @@ fn parse_csi(input: &[u8]) -> ParseResult {
                 6 => Key::PAGE_DOWN,
                 7 => Key::HOME,
                 8 => Key::END,
+                // NOTE: `1`/`4` are the legacy VT and linux-console Home/End
+                // encodings (`\E[1~`/`\E[4~`), which are what `tmux-256color`,
+                // `screen`, and `linux` terminfo send (`khome`/`kend`). We
+                // recognize them alongside `7~`/`8~`, SS3, and CSI-H/F so
+                // Home/End work under those terminfos. Without these arms the
+                // bytes fall through to `skip()` and Home/End are silently
+                // dropped under tmux/screen/the Linux console. This is a
+                // deviation from the reference parser, which maps only `7`/`8`.
+                // They flow through the same modifier path as `7`/`8`, so a
+                // modified form like `\E[1;5~` carries its mods identically.
+                1 => Key::HOME,
+                4 => Key::END,
                 11 => Key::F1,
                 12 => Key::F2,
                 13 => Key::F3,
@@ -1052,6 +1064,44 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(result.n, 4);
+        assert_eq!(result.event, Some(expected));
+    }
+
+    #[test]
+    fn parse_legacy_home() {
+        // `\E[1~` is the Home form sent by tmux-256color/screen/linux terminfo.
+        // Without the `1` arm these bytes fall through to `skip()`.
+        let result = parse(b"\x1b[1~");
+        let expected = Event::KeyPress(Key {
+            codepoint: Key::HOME,
+            ..Default::default()
+        });
+        assert_eq!(result.n, 4);
+        assert_eq!(result.event, Some(expected));
+    }
+
+    #[test]
+    fn parse_legacy_end() {
+        // `\E[4~` is the matching legacy End form.
+        let result = parse(b"\x1b[4~");
+        let expected = Event::KeyPress(Key {
+            codepoint: Key::END,
+            ..Default::default()
+        });
+        assert_eq!(result.n, 4);
+        assert_eq!(result.event, Some(expected));
+    }
+
+    #[test]
+    fn parse_legacy_home_with_modifier() {
+        // A modified legacy Home carries its mods like `\x1b[7;5~` would.
+        let result = parse(b"\x1b[1;5~");
+        let expected = Event::KeyPress(Key {
+            codepoint: Key::HOME,
+            mods: Modifiers::CTRL,
+            ..Default::default()
+        });
+        assert_eq!(result.n, 6);
         assert_eq!(result.event, Some(expected));
     }
 
