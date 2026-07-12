@@ -89,13 +89,13 @@ pub const ACTION_TASK_KILL: &str = "aj.task.kill";
 
 /// Action ID for the "submit as a steering message" chord.
 ///
-/// Bound by default to `alt+enter`. The interactive loop intercepts
-/// the keystroke before the editor sees it (so it never inserts a
-/// newline). While the viewed agent is busy it queues the editor text
-/// as a steering message (injected right after the next tool call),
-/// escalating any pending follow-up; while idle it starts a normal
-/// turn. Repurposing `alt+enter` drops its editor newline-fallback
-/// role — `shift+enter` and `\`+Enter remain for newline.
+/// Bound by default to `alt+enter`. The interactive loop intercepts the
+/// keystroke before the editor sees it, so it never inserts a newline.
+/// While the viewed agent is busy it queues the editor text as a steering
+/// message (injected right after the next tool call), escalating any
+/// pending follow-up. While idle it starts a normal turn. Reserving
+/// `alt+enter` here costs no newline capability, since the editor keeps
+/// `shift+enter`, `ctrl+j`, and `\`+Enter for newline.
 pub const ACTION_SUBMIT_STEERING: &str = "aj.message.steer";
 
 /// Action ID for the "pull a queued message back into the editor"
