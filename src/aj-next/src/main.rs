@@ -16,6 +16,7 @@ mod autocomplete;
 mod bubble;
 mod content_overlay;
 mod footer;
+mod frame_stats_box;
 mod interactive;
 mod keymap;
 mod login;

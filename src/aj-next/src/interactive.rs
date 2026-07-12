@@ -7,7 +7,7 @@
 //! `aj_app::turn` helpers, agent events fold into the [`ChatState`]
 //! model, and the [`TranscriptView`] renders it with follow-tail.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -56,14 +56,15 @@ use vaxis::tty::PosixTty;
 use vaxis::vaxis::{Options as VaxisOptions, Vaxis};
 use vaxis::vxfw::{
     AsyncApp, AutocompleteDelivery, DrawContext, EditorTheme, Event, EventContext,
-    FilterableSelect, FlexColumn, FlexItem, KeymapController, ListView, MaxSize, Options,
-    PopupStyle, RelativePoint, Size, SubSurface, Surface, Text, TextArea, UserEvent, Widget,
-    WidgetRef, draw_widget, to_widget_ref,
+    FilterableSelect, FlexColumn, FlexItem, FrameStats, KeymapController, ListView, MaxSize,
+    Options, PopupStyle, RelativePoint, Size, SubSurface, Surface, Text, TextArea, UserEvent,
+    Widget, WidgetRef, draw_widget, to_widget_ref,
 };
 
 use crate::agent_picker::{AgentPickerOutcome, PickerSnapshot, open_agent_picker};
 use crate::content_overlay::{ContentStyles, Row, auth_rows, session_info_rows, set_rows};
 use crate::footer::FooterLine;
+use crate::frame_stats_box::FrameStatsBox;
 use crate::keymap::{HostCtx, build_keymap};
 use crate::login::{
     AuthPickerRequest, AuthRow, DialogCallbacks, LoginDialogState, open_login_dialog,
@@ -1657,6 +1658,7 @@ fn user_settings_values(world: &World) -> SettingsValues {
         disabled_tools: cfg.disabled_tools.clone(),
         disabled_skills: cfg.disabled_skills.clone(),
         hide_thinking_block: chat.hide_thinking_block,
+        show_frame_stats: cfg.show_frame_stats,
         image_auto_resize: cfg.image_auto_resize,
         image_show_in_terminal: chat.show_image_in_terminal,
         image_block: cfg.image_block,
@@ -2144,6 +2146,27 @@ async fn apply_setting_change(
                 save,
             ))
         }
+        "show_frame_stats" => {
+            let on = value == "true";
+            // Live-apply by flipping the shared Shell cell the box reads at
+            // draw, so the overlay appears or clears without a restart.
+            shell.borrow().show_frame_stats.set(on);
+            let save = aj_app::settings::persist_setting(
+                &world.config_layers,
+                &world.config,
+                persist,
+                "show_frame_stats",
+                Some(value),
+                |c| c.show_frame_stats = on,
+            );
+            Some(join_notice(
+                format!(
+                    "Frame-stats overlay {}.",
+                    if on { "shown" } else { "hidden" }
+                ),
+                save,
+            ))
+        }
         "model_url" => {
             let url = (!value.is_empty()).then(|| value.to_string());
             let save = aj_app::settings::persist_setting(
@@ -2583,6 +2606,17 @@ struct Shell {
     /// loop on the arming edge (it owns the task registry the widgets
     /// can't reach). Shared with the [`QuitHint`], which reads it at draw.
     quit_hint_warning: Rc<RefCell<Option<String>>>,
+    /// The frame-statistics debug overlay, floated in the top-right corner
+    /// when `show_frame_stats` is on. Reads the `frame_stats` snapshot below.
+    frame_stats_box: Rc<RefCell<FrameStatsBox>>,
+    /// Whether the frame-stats overlay is shown. Seeded from
+    /// `config.show_frame_stats` at build time and flipped live by the
+    /// settings window through `apply_setting_change`, which shares this cell.
+    show_frame_stats: Rc<Cell<bool>>,
+    /// The latest frame-render snapshot, written by the drive loop just before
+    /// each paint so the box shows the previous frame's numbers. `None` before
+    /// the first frame. Copy payload, so a `Cell` rather than a `RefCell`.
+    frame_stats: Rc<Cell<Option<FrameStats>>>,
     /// Latest submitted editor text, parked by the `on_submit`
     /// callback for the host loop to collect after dispatch. The
     /// callback can't spawn turns itself (it has no session access).
@@ -2733,6 +2767,15 @@ impl Shell {
             Rc::clone(&styles),
             Rc::clone(&chrome),
             Rc::clone(&quit_hint_warning),
+        )));
+        // Off by default; the run loop seeds it from `config.show_frame_stats`
+        // after building the Shell, matching the other display toggles.
+        let show_frame_stats = Rc::new(Cell::new(false));
+        let frame_stats: Rc<Cell<Option<FrameStats>>> = Rc::new(Cell::new(None));
+        let frame_stats_box = Rc::new(RefCell::new(FrameStatsBox::new(
+            Rc::clone(&styles),
+            Rc::clone(&chrome),
+            Rc::clone(&frame_stats),
         )));
         let pending = Rc::new(RefCell::new(PendingBox::new(
             Rc::clone(&chat),
@@ -2952,6 +2995,9 @@ impl Shell {
             status_line,
             quit_hint,
             quit_hint_warning,
+            frame_stats_box,
+            show_frame_stats,
+            frame_stats,
             submitted,
             host_action,
             overlays,
@@ -3077,6 +3123,9 @@ impl Shell {
         self.transcript.borrow_mut().set_styles(Rc::clone(&styles));
         self.status_line.borrow_mut().set_styles(Rc::clone(&styles));
         self.quit_hint.borrow_mut().set_styles(Rc::clone(&styles));
+        self.frame_stats_box
+            .borrow_mut()
+            .set_styles(Rc::clone(&styles));
         self.splash
             .borrow_mut()
             .set_styles(Rc::clone(&styles), t.color_mode());
@@ -3216,6 +3265,34 @@ impl Widget for Shell {
                     },
                     surface: hint,
                     // z 1 draws over the base `FlexColumn` (z 0), like the popup.
+                    z_index: 1,
+                });
+            }
+        }
+
+        // Frame-statistics debug overlay. Opt-in (off by default), floated in
+        // the top-right corner above the base content (z 1, like the popup and
+        // quit hint) so it stays visible during interaction. It is
+        // non-interactive: the box surface carries no widget identity, so it
+        // never joins the focus path, and, occupying only its own cells, it
+        // leaves hit-testing elsewhere untouched. It shows the previous frame's
+        // numbers (the drive loop refreshes the snapshot before each paint) and
+        // freezes when idle. When off we append nothing.
+        if self.show_frame_stats.get() {
+            let term = ctx.max.size();
+            // Room below the fixed header row, where the box is anchored.
+            let avail = Size {
+                width: term.width,
+                height: term.height.saturating_sub(HEADER_ROWS),
+            };
+            if let Some(surf) = self.frame_stats_box.borrow().draw(ctx, avail) {
+                let anchor_col = term.width.saturating_sub(surf.size.width);
+                inner.children.push(SubSurface {
+                    origin: RelativePoint {
+                        row: i32::from(HEADER_ROWS),
+                        col: i32::from(anchor_col),
+                    },
+                    surface: surf,
                     z_index: 1,
                 });
             }
@@ -3397,6 +3474,17 @@ pub async fn run(args: Args) -> Result<()> {
         cwd,
     )));
     let root: WidgetRef = to_widget_ref(Rc::clone(&shell));
+
+    // Seed the frame-stats overlay toggle from config (off by default). The
+    // cell lives on the Shell, and `Shell::new` has no config handle, so we
+    // seed it here once. It persists across session rebinds.
+    shell.borrow().show_frame_stats.set(
+        world
+            .config
+            .lock()
+            .expect("config mutex poisoned")
+            .show_frame_stats,
+    );
 
     let tty = PosixTty::new()?;
     let reader = tty.open_reader()?;
@@ -3718,6 +3806,13 @@ async fn drive(
         // still ping their own channels (e.g. the login redraw ping) to get us
         // back here.
         if app.needs_redraw() && frame_budget_elapsed(last_render, frame_interval) {
+            // The frame-stats overlay shows the previous frame's numbers, so we
+            // snapshot before rendering this frame. Only when the overlay is on:
+            // nothing reads the cell otherwise, and skipping the write avoids
+            // churn.
+            if shell.borrow().show_frame_stats.get() {
+                shell.borrow().frame_stats.set(Some(app.frame_stats()));
+            }
             app.render(root)?;
             last_render = Some(Instant::now());
         }
@@ -5374,6 +5469,91 @@ mod tests {
             "hint cleared on disarm: {disarmed}"
         );
     }
+
+    /// The frame-stats overlay is gated on the `show_frame_stats` cell: off
+    /// (the default) the box never appears; on, with a snapshot set, a
+    /// top-right "frame stats" box shows the numbers. The box surface carries
+    /// no widget identity, so it never joins the focus path.
+    #[test]
+    fn frame_stats_overlay_gates_on_the_flag() {
+        let shell = test_shell_with_chat(empty_chat());
+        let ctx = draw_ctx(100, 30);
+
+        // Reconstruct a surface's own (non-composited) cells, row by row.
+        fn own_text(s: &Surface) -> String {
+            let w = usize::from(s.size.width);
+            if w == 0 {
+                return String::new();
+            }
+            s.buffer
+                .chunks(w)
+                .map(|row| row.iter().map(|c| c.char.grapheme()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        // The box's own surface (the `OverlayWindow`) carries the title on its
+        // top border, so we find it by its own buffer rather than composited.
+        fn find_box(s: &Surface) -> Option<&Surface> {
+            if own_text(s).contains("frame stats") {
+                return Some(s);
+            }
+            s.children.iter().find_map(|c| find_box(&c.surface))
+        }
+
+        // Off by default: no box, even with a snapshot available.
+        shell.borrow().frame_stats.set(Some(FrameStats {
+            last: Duration::from_micros(1200),
+            avg: Duration::from_micros(900),
+            max: Duration::from_micros(3400),
+            frames: 120,
+            fps: 62.0,
+            last_cells: 1234,
+            size: (30, 100),
+        }));
+        let off = shell.borrow_mut().draw(&ctx);
+        assert!(
+            find_box(&off).is_none(),
+            "no box while the flag is off: {:?}",
+            crate::test_support::rows(&off)
+        );
+
+        // On, with the snapshot set: the box shows the numbers.
+        shell.borrow().show_frame_stats.set(true);
+        let on = shell.borrow_mut().draw(&ctx);
+        let box_surf = find_box(&on).expect("box present when the flag is on");
+        let body = crate::test_support::rows(&on).join("\n");
+        assert!(body.contains("last  1.2ms"), "{body}");
+        assert!(body.contains("fps   62"), "{body}");
+        // Pin the whole-number fps format: no other row introduces "62.".
+        assert!(
+            !body.contains("62."),
+            "fps renders without decimals: {body}"
+        );
+        assert!(body.contains("cells 1234"), "{body}");
+        assert!(body.contains("size  100x30"), "{body}");
+        assert!(
+            box_surf.widget.is_none(),
+            "the box must be non-interactive (no widget identity)"
+        );
+
+        // The box is flush to the right edge (top-right corner).
+        let composited = crate::test_support::flatten(&on);
+        let title_row = composited
+            .iter()
+            .position(|row| {
+                row.iter()
+                    .map(|c| c.char.grapheme())
+                    .collect::<String>()
+                    .contains("frame stats")
+            })
+            .expect("a row carries the title");
+        let last_col_glyph = composited[title_row]
+            .last()
+            .map(|c| c.char.grapheme())
+            .unwrap_or_default();
+        assert_eq!(last_col_glyph, "╮", "box hugs the right edge: {body}");
+    }
+
     /// machinery: after the tick fires, the next ctrl+c re-arms instead
     /// of quitting.
     #[tokio::test]

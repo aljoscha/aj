@@ -584,6 +584,9 @@ pub struct Config {
     /// Defaults to `true` (collapsed). Toggled at runtime with
     /// `Ctrl+T`.
     pub hide_thinking_block: bool,
+    /// Show a frame-statistics debug overlay in the corner of the
+    /// interactive TUI. Off by default.
+    pub show_frame_stats: bool,
     /// Whether `read_file` resizes images to fit within the inline
     /// image budget before attaching them to tool results. Defaults
     /// to `true`; setting to `false` attaches the raw bytes, which
@@ -651,6 +654,7 @@ impl Default for Config {
             disabled_tools: Vec::new(),
             disabled_skills: Vec::new(),
             hide_thinking_block: true,
+            show_frame_stats: false,
             // Image features: resize and inline-render by default;
             // blocking is opt-in.
             image_auto_resize: true,
@@ -865,6 +869,17 @@ impl Config {
             },
             display_fn: |c| c.hide_thinking_block.to_string(),
             to_toml_fn: |c| bool_item(c.hide_thinking_block, true),
+        },
+        ConfigOption {
+            name: "show_frame_stats",
+            description: "Show a frame-statistics debug overlay in the corner of the TUI.",
+            kind: ValueKind::Bool,
+            apply_toml_fn: |v, c| {
+                c.show_frame_stats = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| c.show_frame_stats.to_string(),
+            to_toml_fn: |c| bool_item(c.show_frame_stats, false),
         },
         ConfigOption {
             name: "image_auto_resize",
@@ -1862,6 +1877,7 @@ theme = "dark"
 disabled_tools = ["bash"]
 disabled_skills = ["scratch"]
 hide_thinking_block = true
+show_frame_stats = true
 bash_rtk = true
 "#;
         let (config, diagnostics) = parse_config(toml_str, Path::new("/tmp/config.toml"));
@@ -1882,6 +1898,7 @@ bash_rtk = true
         assert_eq!(config.disabled_tools, vec!["bash".to_string()]);
         assert_eq!(config.disabled_skills, vec!["scratch".to_string()]);
         assert!(config.hide_thinking_block);
+        assert!(config.show_frame_stats);
         assert!(config.bash_rtk);
     }
 

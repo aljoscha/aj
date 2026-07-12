@@ -838,6 +838,7 @@ pub(crate) struct SettingsValues {
     pub(crate) disabled_tools: Vec<String>,
     pub(crate) disabled_skills: Vec<String>,
     pub(crate) hide_thinking_block: bool,
+    pub(crate) show_frame_stats: bool,
     pub(crate) image_auto_resize: bool,
     pub(crate) image_show_in_terminal: bool,
     pub(crate) image_block: bool,
@@ -895,6 +896,7 @@ impl SettingsValues {
             disabled_tools: config.disabled_tools.clone(),
             disabled_skills: config.disabled_skills.clone(),
             hide_thinking_block: config.hide_thinking_block,
+            show_frame_stats: config.show_frame_stats,
             image_auto_resize: config.image_auto_resize,
             image_show_in_terminal: config.image_show_in_terminal,
             image_block: config.image_block,
@@ -980,6 +982,7 @@ fn row_value_kind(
         "disabled_tools" => (join_names(&values.disabled_tools), RowKind::Submenu),
         "disabled_skills" => (join_names(&values.disabled_skills), RowKind::Submenu),
         "hide_thinking_block" => (values.hide_thinking_block.to_string(), bool_cycle()),
+        "show_frame_stats" => (values.show_frame_stats.to_string(), bool_cycle()),
         "image_auto_resize" => (values.image_auto_resize.to_string(), bool_cycle()),
         "image_show_in_terminal" => (values.image_show_in_terminal.to_string(), bool_cycle()),
         "image_block" => (values.image_block.to_string(), bool_cycle()),
@@ -1831,6 +1834,28 @@ mod tests {
         // The model pair folds to exactly one row.
         assert_eq!(rows.iter().filter(|r| r.id == MODEL_SETTING_ID).count(), 1);
         assert!(!rows.iter().any(|r| r.id == "model_name"));
+    }
+
+    /// `from_config` seeds `show_frame_stats` and it surfaces as a bool cycle
+    /// row carrying the configured value.
+    #[test]
+    fn show_frame_stats_seeds_and_surfaces_as_a_bool_cycle_row() {
+        let mut config = Config::default();
+        config.show_frame_stats = true;
+        let values = SettingsValues::from_config(&config, &[]);
+        assert!(values.show_frame_stats, "from_config seeds the flag");
+
+        let inherited = SettingsValues::from_config(&Config::default(), &[]);
+        let rows = build_setting_rows(&values, &inherited, false, &BTreeSet::new());
+        let row = rows
+            .iter()
+            .find(|r| r.id == "show_frame_stats")
+            .expect("show_frame_stats row is present");
+        assert_eq!(row.value, "true");
+        match &row.kind {
+            RowKind::Cycle(vals) => assert_eq!(vals, &["true".to_string(), "false".to_string()]),
+            RowKind::Submenu => panic!("show_frame_stats must be a bool cycle row"),
+        }
     }
 
     #[test]

@@ -115,6 +115,9 @@ pub struct SettingsCurrentValues {
     pub disabled_tools: Vec<String>,
     pub disabled_skills: Vec<String>,
     pub hide_thinking_block: bool,
+    /// Only consumed by the aj-next interactive TUI; the classic TUI just
+    /// persists it.
+    pub show_frame_stats: bool,
     pub image_auto_resize: bool,
     pub image_show_in_terminal: bool,
     pub image_block: bool,
@@ -517,6 +520,13 @@ fn build_items(
             }
             "hide_thinking_block" => {
                 items.push(bool_item(option, current.hide_thinking_block, None));
+            }
+            "show_frame_stats" => {
+                items.push(bool_item(
+                    option,
+                    current.show_frame_stats,
+                    Some("Only affects the aj-next interactive TUI."),
+                ));
             }
             "image_auto_resize" => {
                 items.push(bool_item(
@@ -957,6 +967,7 @@ mod tests {
             disabled_tools: vec![],
             disabled_skills: vec![],
             hide_thinking_block: false,
+            show_frame_stats: false,
             image_auto_resize: true,
             image_show_in_terminal: true,
             image_block: false,
