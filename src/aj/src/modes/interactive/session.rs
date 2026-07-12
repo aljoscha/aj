@@ -149,7 +149,11 @@ impl SessionWorld {
     /// when the session id is empty. Refreshed by [`Self::install`],
     /// so a session switch retitles the window.
     fn window_title(&self) -> String {
-        aj_app::session::window_title(&self.core.session_id, &self.core.env.working_directory)
+        aj_app::session::window_title(
+            APP_TITLE,
+            &self.core.session_id,
+            &self.core.env.working_directory,
+        )
     }
 
     /// Overwrite each replayed sub-agent's footer entry with the

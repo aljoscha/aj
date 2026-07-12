@@ -34,21 +34,19 @@ use crate::session_setup::{
     freeze_and_seed, prepare_log,
 };
 
-/// The application name shown in the terminal window title.
-const APP_TITLE: &str = "AJ";
-
-/// Terminal window title: `"AJ - <session id> - <cwd basename>"`,
-/// dropping the session-id segment (`"AJ - <cwd basename>"`) when
-/// `session_id` is empty.
-pub fn window_title(session_id: &str, cwd: &std::path::Path) -> String {
+/// Terminal window title: `"<app title> - <session id> - <cwd basename>"`,
+/// dropping the session-id segment (`"<app title> - <cwd basename>"`) when
+/// `session_id` is empty. The `app_title` lets each frontend brand the
+/// title with its own name.
+pub fn window_title(app_title: &str, session_id: &str, cwd: &std::path::Path) -> String {
     let cwd = cwd
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
     if session_id.is_empty() {
-        format!("{APP_TITLE} - {cwd}")
+        format!("{app_title} - {cwd}")
     } else {
-        format!("{APP_TITLE} - {session_id} - {cwd}")
+        format!("{app_title} - {session_id} - {cwd}")
     }
 }
 
@@ -480,7 +478,7 @@ mod tests {
     #[test]
     fn window_title_includes_session_id() {
         assert_eq!(
-            window_title("abc123", Path::new("/home/user/project")),
+            window_title("AJ", "abc123", Path::new("/home/user/project")),
             "AJ - abc123 - project"
         );
     }
@@ -488,7 +486,7 @@ mod tests {
     #[test]
     fn window_title_drops_empty_session_id() {
         assert_eq!(
-            window_title("", Path::new("/home/user/project")),
+            window_title("AJ", "", Path::new("/home/user/project")),
             "AJ - project"
         );
     }
@@ -497,8 +495,22 @@ mod tests {
     fn window_title_uses_cwd_basename() {
         // A nested path yields only its last component.
         assert_eq!(
-            window_title("s", Path::new("/a/b/c/deep/leaf")),
+            window_title("AJ", "s", Path::new("/a/b/c/deep/leaf")),
             "AJ - s - leaf"
+        );
+    }
+
+    #[test]
+    fn window_title_brands_with_the_app_title() {
+        // The app-title argument is what leads the title, so each frontend
+        // brands it with its own name.
+        assert!(
+            window_title("aj", "s", Path::new("/proj")).starts_with("aj - "),
+            "lowercase app title leads the window title"
+        );
+        assert!(
+            window_title("AJ", "s", Path::new("/proj")).starts_with("AJ - "),
+            "uppercase app title leads the window title"
         );
     }
 }

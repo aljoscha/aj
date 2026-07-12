@@ -99,6 +99,9 @@ const REFOCUS_OVERLAY_EVENT: &str = "aj-next.refocus-overlay";
 /// delegates the focus move.
 const SET_TITLE_EVENT: &str = "aj-next.set-title";
 
+/// The app name aj-next brands its terminal window title with, lowercase.
+const APP_TITLE: &str = "aj";
+
 /// Everything the select loop mutates besides the `AsyncApp`: the
 /// session core, the shared chat model, and the turn bookkeeping.
 ///
@@ -2705,7 +2708,7 @@ impl Shell {
         // The terminal window title, matching aj's format. Recomputed on a
         // session switch in `rebind`, so we only need the initial world's id
         // and cwd here.
-        let window_title = aj_app::session::window_title(session_id, &cwd);
+        let window_title = aj_app::session::window_title(APP_TITLE, session_id, &cwd);
         // The transcript-focus flag, shared between the transcript (its single
         // writer, via focus in/out) and the keymap host context (which reads it
         // to gate the copy chord). Created here so both get the same cell.
@@ -3122,6 +3125,7 @@ impl Shell {
             .set_queues(world.core.message_queues.clone());
         self.header.borrow_mut().text = format!("aj-next — {}", world.core.session_id);
         self.window_title = aj_app::session::window_title(
+            APP_TITLE,
             &world.core.session_id,
             &world.core.env.working_directory,
         );
@@ -4396,7 +4400,7 @@ mod tests {
     #[test]
     fn shell_new_computes_window_title() {
         let shell = titled_shell("sess-1", "/home/me/myproj");
-        assert_eq!(shell.window_title, "AJ - sess-1 - myproj");
+        assert_eq!(shell.window_title, "aj - sess-1 - myproj");
     }
 
     /// A session switch reruns [`Shell::rebind`], which recomputes the title
@@ -4407,16 +4411,17 @@ mod tests {
         let world = scripted_world(&dir, "streaming-text").await;
 
         let mut shell = titled_shell("old-session", "/home/me/oldproj");
-        assert_eq!(shell.window_title, "AJ - old-session - oldproj");
+        assert_eq!(shell.window_title, "aj - old-session - oldproj");
 
         shell.rebind(&world);
         let expected = aj_app::session::window_title(
+            APP_TITLE,
             &world.core.session_id,
             &world.core.env.working_directory,
         );
         assert_eq!(shell.window_title, expected);
         assert_ne!(
-            shell.window_title, "AJ - old-session - oldproj",
+            shell.window_title, "aj - old-session - oldproj",
             "rebind must retitle for the switched-to session"
         );
     }
@@ -4430,7 +4435,7 @@ mod tests {
         shell.handle_event(&mut ctx, &Event::Init);
         assert_eq!(
             queued_title(&ctx.cmds).as_deref(),
-            Some("AJ - sess-1 - myproj")
+            Some("aj - sess-1 - myproj")
         );
     }
 
@@ -4447,7 +4452,7 @@ mod tests {
         shell.capture_event(&mut ctx, &event);
         assert_eq!(
             queued_title(&ctx.cmds).as_deref(),
-            Some("AJ - sess-1 - myproj")
+            Some("aj - sess-1 - myproj")
         );
     }
 
