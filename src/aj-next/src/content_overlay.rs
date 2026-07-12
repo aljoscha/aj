@@ -2,10 +2,11 @@
 //!
 //! A [`ContentOverlay`] is a scrollable, non-interactive list of text
 //! rows shown inside an [`OverlayWindow`]. Esc or Enter close it
-//! (returning to the parent overlay or the editor). The body scrolls by
-//! line like a pager: Up/Down (and Ctrl+P/Ctrl+N) move a single line,
-//! PgUp/PgDn move a viewport-scaled page, and Home/End jump to the first
-//! and last line. Every other key is swallowed so nothing leaks to the
+//! (returning to the parent overlay or the editor). The body navigates
+//! like a pager: Up/Down (and Ctrl+P/Ctrl+N) scroll a single line and
+//! PgUp/PgDn scroll a viewport-scaled page, while Home/End jump straight
+//! to the first and last line rather than scrolling. Every other key is
+//! swallowed so nothing leaks to the
 //! layout behind the modal. Each row is a list of styled spans ([`Row`])
 //! the host builds from the shared `aj_app` data, so the one widget backs
 //! all three read-only overlays.
@@ -116,9 +117,9 @@ const DEFAULT_PAGE_LINES: i32 = 20;
 ///
 /// Focus sits on this widget while it is the top overlay, so it
 /// intercepts every key in its capturing phase: Esc/Enter close (via
-/// [`Self::on_close`]), the arrow, page, and Home/End keys scroll the
-/// body by line, and everything else is consumed so it can't reach the
-/// base layout.
+/// [`Self::on_close`]), the arrow and page keys scroll the body (a line
+/// or a page at a time) while Home/End jump to the first and last line,
+/// and everything else is consumed so it can't reach the base layout.
 pub(crate) struct ContentOverlay {
     /// The row list, shared with `bars` (which draws it) and handed back
     /// by [`open_content_overlay`] so the host can refill an async
