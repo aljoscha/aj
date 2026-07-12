@@ -74,7 +74,7 @@ mod text_area;
 mod text_field;
 
 pub use crate::vxfw::app::{App, Options};
-pub use crate::vxfw::app_core::KeystrokeRecord;
+pub use crate::vxfw::app_core::{FrameStats, KeystrokeRecord};
 #[cfg(unix)]
 pub use crate::vxfw::async_app::{AsyncApp, Frame};
 pub use crate::vxfw::autocomplete::{

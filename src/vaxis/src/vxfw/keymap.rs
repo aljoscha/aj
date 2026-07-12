@@ -856,12 +856,10 @@ mod tests {
         assert!(rig.controller.borrow().pending_sequence().is_some());
 
         // Route the scheduled tick through the real timer machinery.
-        let mut core = AppCore {
-            vx: Vaxis::new(VaxisOptions::default()),
-            tty: Box::new(TestTty::new()),
-            timers: Vec::new(),
-            wants_focus: None,
-        };
+        let mut core = AppCore::new(
+            Vaxis::new(VaxisOptions::default()),
+            Box::new(TestTty::new()),
+        );
         let mut cmds = cmds;
         core.handle_command(&mut cmds);
         assert_eq!(core.timers.len(), 1);
@@ -936,12 +934,10 @@ mod tests {
         let mut rig = Rig::new(ladder_keymap(), true);
         rig.controller.borrow_mut().timeout_ms = 0;
         let mut cmds = rig.press(ctrl('c'));
-        let mut core = AppCore {
-            vx: Vaxis::new(VaxisOptions::default()),
-            tty: Box::new(TestTty::new()),
-            timers: Vec::new(),
-            wants_focus: None,
-        };
+        let mut core = AppCore::new(
+            Vaxis::new(VaxisOptions::default()),
+            Box::new(TestTty::new()),
+        );
         core.handle_command(&mut cmds);
         std::thread::sleep(Duration::from_millis(1));
         let mut ctx = EventContext::new();

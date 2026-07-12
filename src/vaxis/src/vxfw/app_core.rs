@@ -15,7 +15,7 @@
 
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::cell::CursorShape;
 use crate::error::Error;
@@ -41,11 +41,87 @@ pub(crate) struct AppCore {
     pub(crate) timers: Vec<Tick>,
     /// A focus request from a handler, applied before the next layout.
     pub(crate) wants_focus: Option<WidgetRef>,
+    /// Recent frame records, newest at the back, capped at [`FRAME_STATS_CAP`].
+    frames: VecDeque<FrameRecord>,
+    /// Layout time accumulated by [`do_layout`](AppCore::do_layout) during the
+    /// current frame. [`render`](AppCore::render) takes it and folds it into
+    /// the frame record, then it resets to zero for the next frame.
+    pending_layout: Duration,
 }
 
+/// A snapshot of recent frame-render statistics, for a host debug overlay.
+///
+/// The profiler behind it runs always-on (it is cheap: two `Instant` reads and
+/// a bounded push per frame). The values describe the frames before the one
+/// being drawn, so an overlay that reads this while drawing is always one frame
+/// behind, which is correct: the current frame's cost is not known until its
+/// render completes.
+#[derive(Debug, Clone, Copy)]
+pub struct FrameStats {
+    /// Wall time of the most recent frame's render call.
+    pub last: Duration,
+    /// Mean render time over the retained window.
+    pub avg: Duration,
+    /// Worst render time over the retained window. This is the number the
+    /// overlay exists to surface: a single slow frame is an input-latency hitch.
+    pub max: Duration,
+    /// Frames retained in the window (<= capacity).
+    pub frames: usize,
+    /// Render rate over the retained window: frames divided by the wall span
+    /// between the oldest and newest retained frame. This is a true redraw
+    /// rate, not a fixed cadence. Because it is computed from two fixed record
+    /// timestamps, when idle (no new frames) it stays frozen at that last
+    /// window rather than decaying.
+    pub fps: f32,
+    /// Cells the last frame's diff actually emitted. In a diff-rendered TUI this
+    /// is the true repaint cost: a small scroll that re-lays-out a large block
+    /// shows up here even when `last` looks cheap.
+    pub last_cells: u32,
+    /// Screen size (rows, cols) at the last frame (rows * cols is the
+    /// worst-case repaint).
+    pub size: (u16, u16),
+}
+
+/// One entry in the frame-stats ring buffer.
+struct FrameRecord {
+    /// When the frame's render call completed.
+    end: Instant,
+    /// Wall time of the layout + blit + diff + write span.
+    draw: Duration,
+    /// Cells the frame's diff emitted.
+    cells: u32,
+    /// Screen size (rows, cols) at the frame.
+    size: (u16, u16),
+}
+
+/// How many frame records the profiler retains (~4s at 60fps).
+///
+/// Exposed to the crate so the async runtime's tests can name the cap.
+pub(crate) const FRAME_STATS_CAP: usize = 240;
+
 impl AppCore {
+    /// Builds the engine over `vx` (the runtime and writer-side `tty`), with no
+    /// pending timers, focus request, or frame history.
+    pub(crate) fn new(vx: Vaxis, tty: Box<dyn Tty>) -> AppCore {
+        AppCore {
+            vx,
+            tty,
+            timers: Vec::new(),
+            wants_focus: None,
+            frames: VecDeque::new(),
+            pending_layout: Duration::ZERO,
+        }
+    }
+
     /// Lays out `widget` as the root, constrained to the full screen.
-    pub(crate) fn do_layout(&self, widget: &WidgetRef) -> Surface {
+    ///
+    /// NOTE: We time the layout here and fold it into `pending_layout` rather
+    /// than in the callers. Every caller is a render sequence and the frame's
+    /// initial and re-layout calls are both real layout work for the same
+    /// frame, so accumulating here attributes the whole span to the frame
+    /// without leaking into the next one (`render` takes it).
+    pub(crate) fn do_layout(&mut self, widget: &WidgetRef) -> Surface {
+        let start = Instant::now();
         let (width, height, width_pix, height_pix, width_method) = {
             let screen = self.vx.screen.borrow();
             (
@@ -75,11 +151,22 @@ impl AppCore {
             cell_size,
             width_method,
         };
-        draw_widget(widget, &ctx)
+        let surface = draw_widget(widget, &ctx);
+        self.pending_layout += start.elapsed();
+        surface
     }
 
     /// Clears the screen, blits `surface`, and diff-renders to the tty.
+    ///
+    /// This is the shared point both runtimes hit, so the frame profiler
+    /// records here: the timed span is layout + blit + diff + write (the
+    /// layout part arrives via `pending_layout`, mouse and focus work is
+    /// excluded), and the record also carries the diff's changed-cell count
+    /// and the screen size.
     pub(crate) fn render(&mut self, surface: &Surface, focused: &WidgetRef) -> Result<(), Error> {
+        // Time the blit + diff + write span. `do_layout` already folded this
+        // frame's layout time into `pending_layout`.
+        let start = Instant::now();
         {
             let win = self.vx.window();
             win.clear();
@@ -94,11 +181,43 @@ impl AppCore {
             // `win` borrows `self.vx`; drop it here before the `&mut self.vx`
             // render call below.
         }
-        self.vx.render(&mut self.tty.writer())?;
+        let render_result = self.vx.render(&mut self.tty.writer());
+        // Take `pending_layout` before the `?` so a failed render does not
+        // leak this frame's layout time into the next frame.
+        let draw = std::mem::take(&mut self.pending_layout) + start.elapsed();
+        render_result?;
+
+        let size = {
+            let screen = self.vx.screen.borrow();
+            (screen.height, screen.width)
+        };
+        self.push_frame(FrameRecord {
+            end: Instant::now(),
+            draw,
+            cells: self.vx.last_render_cells(),
+            size,
+        });
+
         if render_debug::enabled() {
             render_debug::inspect_frame(surface, &self.vx.screen.borrow(), &self.vx.screen_last);
         }
         Ok(())
+    }
+
+    /// Pushes `rec` onto the frame-stats ring buffer, evicting the oldest
+    /// record first when the buffer is at [`FRAME_STATS_CAP`].
+    fn push_frame(&mut self, rec: FrameRecord) {
+        if self.frames.len() == FRAME_STATS_CAP {
+            self.frames.pop_front();
+        }
+        self.frames.push_back(rec);
+    }
+
+    /// A snapshot of recent frame-render statistics for a host debug overlay.
+    ///
+    /// See [`compute_frame_stats`] for the snapshot contract.
+    pub(crate) fn frame_stats(&self) -> FrameStats {
+        compute_frame_stats(&self.frames)
     }
 
     /// Adds `tick`, keeping `timers` sorted so the soonest deadline is last.
@@ -159,6 +278,57 @@ impl AppCore {
             reset_event_state(ctx);
         }
         self.handle_command(&mut ctx.cmds);
+    }
+}
+
+/// Computes a [`FrameStats`] snapshot from a window of frame records.
+///
+/// `last`, `last_cells`, and `size` come from the newest record (zeros and
+/// `(0, 0)` when the window is empty). `avg` and `max` span the retained
+/// window. `fps` is frames over the wall span between the oldest and newest
+/// record, and is `0.0` with fewer than two frames or a zero span.
+fn compute_frame_stats(frames: &VecDeque<FrameRecord>) -> FrameStats {
+    let count = frames.len();
+    let Some(newest) = frames.back() else {
+        return FrameStats {
+            last: Duration::ZERO,
+            avg: Duration::ZERO,
+            max: Duration::ZERO,
+            frames: 0,
+            fps: 0.0,
+            last_cells: 0,
+            size: (0, 0),
+        };
+    };
+
+    let sum: Duration = frames.iter().map(|f| f.draw).sum();
+    // `count >= 1` here (newest exists) and is bounded by the cap, so both
+    // conversions are lossless and the mean divides safely.
+    let avg = sum / u32::try_from(count).expect("frame count fits u32");
+    let max = frames
+        .iter()
+        .map(|f| f.draw)
+        .max()
+        .expect("non-empty window");
+
+    // Guard the division: fewer than two frames or a zero span (both records
+    // share an instant) has no meaningful rate, so report 0.0.
+    let oldest = frames.front().expect("non-empty window");
+    let span = newest.end.duration_since(oldest.end).as_secs_f32();
+    let fps = if count < 2 || span == 0.0 {
+        0.0
+    } else {
+        f32::from(u16::try_from(count).expect("frame count fits u16")) / span
+    };
+
+    FrameStats {
+        last: newest.draw,
+        avg,
+        max,
+        frames: count,
+        fps,
+        last_cells: newest.cells,
+        size: newest.size,
     }
 }
 
@@ -509,16 +679,187 @@ impl FocusHandler {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::collections::VecDeque;
     use std::rc::Rc;
     use std::time::{Duration, Instant};
 
-    use super::{AppCore, FocusHandler};
+    use super::{AppCore, FRAME_STATS_CAP, FocusHandler, FrameRecord, compute_frame_stats};
     use crate::tty::TestTty;
     use crate::vaxis::{Options as VaxisOptions, Vaxis};
     use crate::vxfw::{
         DrawContext, Event, EventContext, MaxSize, Phase, Size, Surface, Tick, Widget, WidgetRef,
         draw_widget, widget_eq,
     };
+
+    /// A minimal engine over a `TestTty` for the frame-stats tests.
+    fn test_core() -> AppCore {
+        AppCore::new(
+            Vaxis::new(VaxisOptions::default()),
+            Box::new(TestTty::new()),
+        )
+    }
+
+    /// A frame record `off` after `base`, drawing for `draw` with `cells`
+    /// changed at a fixed size, for the pure snapshot-math tests.
+    fn rec(base: Instant, off: Duration, draw: Duration, cells: u32) -> FrameRecord {
+        FrameRecord {
+            end: base + off,
+            draw,
+            cells,
+            size: (24, 80),
+        }
+    }
+
+    #[test]
+    fn push_frame_evicts_the_oldest_when_at_capacity() {
+        let mut core = test_core();
+        let base = Instant::now();
+        // Push three past capacity, tagging each with its push index via
+        // `cells` so we can name which records survived.
+        for i in 0..(FRAME_STATS_CAP + 3) {
+            core.push_frame(rec(
+                base,
+                Duration::from_millis(u64::try_from(i).unwrap()),
+                Duration::from_millis(1),
+                u32::try_from(i).unwrap(),
+            ));
+        }
+        assert_eq!(core.frames.len(), FRAME_STATS_CAP);
+        // The oldest three (indices 0, 1, 2) were evicted, so the front is the
+        // fourth-pushed and the back is the last-pushed.
+        assert_eq!(core.frames.front().unwrap().cells, 3);
+        assert_eq!(
+            core.frames.back().unwrap().cells,
+            u32::try_from(FRAME_STATS_CAP + 2).unwrap()
+        );
+    }
+
+    #[test]
+    fn compute_frame_stats_reports_exact_window_values() {
+        let base = Instant::now();
+        // Three frames at t = 0, 10, 30 ms (span 30 ms), draws 2/4/6 ms.
+        let mut frames = VecDeque::new();
+        frames.push_back(rec(base, Duration::ZERO, Duration::from_millis(2), 100));
+        frames.push_back(rec(
+            base,
+            Duration::from_millis(10),
+            Duration::from_millis(4),
+            101,
+        ));
+        frames.push_back(rec(
+            base,
+            Duration::from_millis(30),
+            Duration::from_millis(6),
+            102,
+        ));
+
+        let stats = compute_frame_stats(&frames);
+        assert_eq!(stats.frames, 3);
+        // Mean of 2/4/6 ms.
+        assert_eq!(stats.avg, Duration::from_millis(4));
+        assert_eq!(stats.max, Duration::from_millis(6));
+        // `last`, `last_cells`, `size` come from the newest record.
+        assert_eq!(stats.last, Duration::from_millis(6));
+        assert_eq!(stats.last_cells, 102);
+        assert_eq!(stats.size, (24, 80));
+        // fps = frames / span = 3 / 0.030 s = 100.0, and must be nonzero for a
+        // multi-frame window with a real span.
+        assert!(stats.fps > 0.0);
+        assert!((stats.fps - 100.0).abs() < 1e-3, "fps was {}", stats.fps);
+    }
+
+    #[test]
+    fn compute_frame_stats_reflects_only_the_retained_window() {
+        let mut core = test_core();
+        let base = Instant::now();
+        // Fill the window with cheap frames, then overwrite it entirely with
+        // expensive ones. Every cheap record is evicted, so avg/max reflect
+        // only the retained window rather than an all-time blend.
+        let mut off = 0u64;
+        for _ in 0..FRAME_STATS_CAP {
+            core.push_frame(rec(
+                base,
+                Duration::from_millis(off),
+                Duration::from_millis(1),
+                0,
+            ));
+            off += 1;
+        }
+        for _ in 0..FRAME_STATS_CAP {
+            core.push_frame(rec(
+                base,
+                Duration::from_millis(off),
+                Duration::from_millis(100),
+                0,
+            ));
+            off += 1;
+        }
+
+        let stats = compute_frame_stats(&core.frames);
+        assert_eq!(stats.frames, FRAME_STATS_CAP);
+        assert_eq!(
+            stats.avg,
+            Duration::from_millis(100),
+            "evicted cheap frames must not drag the average"
+        );
+        assert_eq!(stats.max, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn compute_frame_stats_handles_empty_and_degenerate_windows() {
+        // Empty window: all-zero stats, size (0, 0), no panic.
+        let empty: VecDeque<FrameRecord> = VecDeque::new();
+        let stats = compute_frame_stats(&empty);
+        assert_eq!(stats.frames, 0);
+        assert_eq!(stats.last, Duration::ZERO);
+        assert_eq!(stats.avg, Duration::ZERO);
+        assert_eq!(stats.max, Duration::ZERO);
+        assert_eq!(stats.fps, 0.0);
+        assert_eq!(stats.last_cells, 0);
+        assert_eq!(stats.size, (0, 0));
+
+        let base = Instant::now();
+
+        // One frame: no span, so no rate.
+        let mut one = VecDeque::new();
+        one.push_back(rec(base, Duration::ZERO, Duration::from_millis(5), 7));
+        let stats = compute_frame_stats(&one);
+        assert_eq!(stats.frames, 1);
+        assert_eq!(stats.fps, 0.0, "a single frame has no rate");
+
+        // Two frames sharing an instant: zero span, so no rate and no inf/NaN.
+        let mut equal = VecDeque::new();
+        equal.push_back(rec(base, Duration::ZERO, Duration::from_millis(5), 7));
+        equal.push_back(rec(base, Duration::ZERO, Duration::from_millis(5), 7));
+        let stats = compute_frame_stats(&equal);
+        assert_eq!(stats.frames, 2);
+        assert!(stats.fps.is_finite());
+        assert_eq!(stats.fps, 0.0, "a zero span has no rate");
+    }
+
+    #[test]
+    fn render_resets_pending_layout() {
+        struct Blank;
+        impl Widget for Blank {
+            fn draw(&mut self, ctx: &DrawContext) -> Surface {
+                Surface::with_size(ctx.max.size())
+            }
+        }
+
+        let mut core = test_core();
+        // Seed a non-zero layout accumulation so the reset is observable: a
+        // fresh frame must not inherit the previous frame's layout time.
+        core.pending_layout = Duration::from_millis(7);
+
+        let root: WidgetRef = Rc::new(RefCell::new(Blank));
+        let surface = Surface::with_size(Size {
+            width: 0,
+            height: 0,
+        });
+        core.render(&surface, &root).expect("render");
+
+        assert_eq!(core.pending_layout, Duration::ZERO);
+    }
 
     #[test]
     fn timer_consume_does_not_leak_to_the_next_event() {
@@ -539,12 +880,10 @@ mod tests {
         }
 
         let widget: WidgetRef = Rc::new(RefCell::new(TestWidget));
-        let mut core = AppCore {
-            vx: Vaxis::new(VaxisOptions::default()),
-            tty: Box::new(TestTty::new()),
-            timers: Vec::new(),
-            wants_focus: None,
-        };
+        let mut core = AppCore::new(
+            Vaxis::new(VaxisOptions::default()),
+            Box::new(TestTty::new()),
+        );
 
         // A timer already past its deadline fires immediately.
         let now = Instant::now();

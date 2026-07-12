@@ -333,6 +333,14 @@ pub struct Vaxis {
     /// When true the next render redraws the entire screen.
     pub refresh: bool,
 
+    /// Changed cells the last [`render`](Vaxis::render) emitted: the diff's
+    /// non-skipped cell count, zero after a no-op render. The vxfw frame
+    /// profiler reads it through
+    /// [`last_render_cells`](Vaxis::last_render_cells) to record per-frame
+    /// repaint cost. Counting is passive, so it never changes the bytes
+    /// `render` writes.
+    last_render_cells: u32,
+
     pub next_img_id: u32,
 
     /// Enable workarounds for terminal escape-sequence bugs. Currently only the
@@ -366,6 +374,7 @@ impl Vaxis {
             caps: Capabilities::default(),
             opts,
             refresh: false,
+            last_render_cells: 0,
             next_img_id: 1,
             enable_workarounds: true,
             sgr: Sgr::Standard,
@@ -521,6 +530,13 @@ impl Vaxis {
         result
     }
 
+    /// Changed cells the most recent [`render`](Vaxis::render) emitted (the
+    /// diff's non-skipped count). Zero after a no-op render. The vxfw frame
+    /// profiler reads this to record per-frame repaint cost.
+    pub(crate) fn last_render_cells(&self) -> u32 {
+        self.last_render_cells
+    }
+
     fn render_inner<W: Write>(&mut self, w: &mut W, sync_active: &mut bool) -> Result<(), Error> {
         let screen = self.screen.borrow();
         debug_assert_eq!(
@@ -565,6 +581,9 @@ impl Vaxis {
         let mut last_style = Style::default();
         let mut link = Hyperlink::default();
         let mut cursor_pos = CursorPos::default();
+        // Counts cells this render actually emits (non-skipped). Passive: it
+        // never gates any write, so the emitted bytes are unchanged.
+        let mut cells: u32 = 0;
 
         // `skip` is per-render scaled-text coverage and is cleared each frame.
         // `skipped` (wide-grapheme trailing coverage) persists across frames.
@@ -628,6 +647,9 @@ impl Vaxis {
                 advance_cell(&mut self.screen_last, &mut i, &mut col, cw);
                 continue;
             }
+            // Past the skip branch this cell is emitted, so count it once here,
+            // before the two emit paths (scaled and normal) below.
+            cells += 1;
 
             if !started {
                 start_render(
@@ -740,6 +762,14 @@ impl Vaxis {
             link = cell.link.clone();
             advance_cell(&mut self.screen_last, &mut i, &mut col, cw);
         }
+
+        // Both exits pass through here: on the unchanged-frame early return
+        // below `cells` is 0 (nothing emitted), so this records zero for a
+        // no-op render. On a `render_inner` error before this point the field
+        // keeps its prior value, which is safe because the only consumer
+        // (`AppCore::render`) reads it strictly after `vx.render(...)?`
+        // succeeds.
+        self.last_render_cells = cells;
 
         if !started {
             return Ok(());
@@ -1896,11 +1926,20 @@ mod tests {
         out.clear();
         vx.render(&mut out).expect("first render");
         assert!(!out.is_empty(), "first render should emit the cell");
+        assert!(
+            vx.last_render_cells() > 0,
+            "a changed frame reports emitted cells"
+        );
 
         // Nothing changed between renders, so the diff emits zero bytes.
         out.clear();
         vx.render(&mut out).expect("second render");
         assert_eq!(out.len(), 0);
+        assert_eq!(
+            vx.last_render_cells(),
+            0,
+            "an unchanged frame reports zero emitted cells"
+        );
     }
 
     #[test]

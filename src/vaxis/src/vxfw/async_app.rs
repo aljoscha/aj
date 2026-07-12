@@ -37,7 +37,7 @@ use crate::event_loop::{AsyncInput, async_input};
 use crate::tty::Tty;
 use crate::vaxis::Vaxis;
 use crate::vxfw::app_core::{
-    AppCore, FocusHandler, KeystrokeRecord, MouseHandler, reset_event_state,
+    AppCore, FocusHandler, FrameStats, KeystrokeRecord, MouseHandler, reset_event_state,
 };
 use crate::vxfw::loop_event::LoopEvent;
 use crate::vxfw::{Event, EventContext, Options, UserEvent, WidgetRef};
@@ -98,12 +98,7 @@ impl AsyncApp {
     /// dup would flip the writer with it.
     pub fn new(vx: Vaxis, tty: Box<dyn Tty>, source: OwnedFd) -> AsyncApp {
         AsyncApp {
-            core: AppCore {
-                vx,
-                tty,
-                timers: Vec::new(),
-                wants_focus: None,
-            },
+            core: AppCore::new(vx, tty),
             source: Some(source),
             ctx: EventContext::new(),
             running: None,
@@ -285,6 +280,16 @@ impl AsyncApp {
         self.core.timers.last().map(|t| t.deadline)
     }
 
+    /// A snapshot of recent frame-render statistics, for a host debug overlay.
+    ///
+    /// Reads state only and is cheap, so a host can call it from inside the
+    /// overlay widget while drawing. The values describe the frames before the
+    /// one being drawn, so the overlay is always one frame behind, which is
+    /// correct. The profiler runs always-on.
+    pub fn frame_stats(&self) -> FrameStats {
+        self.core.frame_stats()
+    }
+
     /// Fires every due tick, delivering [`Event::Tick`], and applies the
     /// resulting commands and any focus change.
     pub fn fire_due_timers(&mut self) -> Frame {
@@ -405,8 +410,10 @@ mod tests {
 
     use super::*;
     use crate::Winsize;
+    use crate::cell::{Cell, Character};
     use crate::tty::TestTty;
     use crate::vaxis::Options as VaxisOptions;
+    use crate::vxfw::app_core::FRAME_STATS_CAP;
     use crate::vxfw::{DrawContext, Surface, Tick, Widget, to_widget_ref};
 
     /// A root widget that records the keys and ticks it receives, consuming
@@ -438,6 +445,31 @@ mod tests {
                 }
                 _ => {}
             }
+        }
+        fn wants_events(&self) -> bool {
+            true
+        }
+    }
+
+    /// A root widget that paints one glyph into the top-left cell, so changing
+    /// the glyph between renders yields a distinct frame and repainting the
+    /// same glyph yields an unchanged one.
+    struct Painter {
+        glyph: char,
+    }
+
+    impl Widget for Painter {
+        fn draw(&mut self, ctx: &DrawContext) -> Surface {
+            let mut surface = Surface::with_size(ctx.max.size());
+            surface.write_cell(
+                0,
+                0,
+                Cell {
+                    char: Character::new(self.glyph.to_string(), 1),
+                    ..Cell::default()
+                },
+            );
+            surface
         }
         fn wants_events(&self) -> bool {
             true
@@ -569,5 +601,58 @@ mod tests {
         assert!(app.needs_redraw());
         assert_eq!(recorder.borrow().ticks, 1);
         assert!(app.next_tick_deadline().is_none());
+    }
+
+    #[tokio::test]
+    async fn frame_stats_track_renders_and_report_zero_cells_for_unchanged_frames() {
+        let (read_fd, write_fd) = nix::unistd::pipe().expect("pipe");
+        // Answer the DA1 probe up front so init's detection wait returns
+        // promptly instead of after the 1s timeout.
+        write_all(&write_fd, b"\x1b[?c");
+
+        let painter = Rc::new(RefCell::new(Painter { glyph: 'A' }));
+        let root: WidgetRef = to_widget_ref(Rc::clone(&painter));
+        let mut app = AsyncApp::new(
+            Vaxis::new(VaxisOptions::default()),
+            Box::new(TestTty::new()),
+            read_fd,
+        );
+        app.init(Rc::clone(&root), Options::default())
+            .await
+            .expect("init");
+        // Keep the write end alive so the reader does not see EOF.
+        let _write_fd = write_fd;
+
+        // init drew the first frame. A single frame has no meaningful rate.
+        let stats = app.frame_stats();
+        assert_eq!(stats.frames, 1, "init drew one frame");
+        assert_eq!(stats.fps, 0.0, "a single frame reports zero fps");
+
+        // Drive several more distinct frames by changing what the painter draws.
+        let mut count = 1;
+        for glyph in ['B', 'C', 'D'] {
+            painter.borrow_mut().glyph = glyph;
+            app.request_redraw();
+            app.render(&root).expect("render");
+            count += 1;
+        }
+
+        let stats = app.frame_stats();
+        assert_eq!(stats.frames, count, "every render pushes one record");
+        assert!(stats.frames <= FRAME_STATS_CAP);
+        assert!(stats.avg > Duration::ZERO, "avg render time is non-zero");
+        assert!(stats.max > Duration::ZERO, "max render time is non-zero");
+        assert!(stats.last_cells > 0, "a changed frame emits cells");
+        assert_eq!(stats.size, (40, 80), "TestTty reports 40 rows x 80 cols");
+        assert!(stats.fps.is_finite() && stats.fps >= 0.0);
+
+        // Render again without changing the painter: the diff emits nothing.
+        app.render(&root).expect("render");
+        let stats = app.frame_stats();
+        assert_eq!(stats.frames, count + 1);
+        assert_eq!(
+            stats.last_cells, 0,
+            "an unchanged frame reports zero changed cells"
+        );
     }
 }

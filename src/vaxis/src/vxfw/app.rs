@@ -65,12 +65,7 @@ impl App {
     /// the writer in `tty`.
     pub fn new(vx: Vaxis, tty: Box<dyn Tty>, source: Box<dyn ByteSource>) -> App {
         App {
-            core: AppCore {
-                vx,
-                tty,
-                timers: Vec::new(),
-                wants_focus: None,
-            },
+            core: AppCore::new(vx, tty),
             source: Some(source),
         }
     }

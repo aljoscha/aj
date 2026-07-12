@@ -318,8 +318,8 @@ the same data. Only `AsyncApp` exposes an accessor today.
 ### The profiler and the `FrameStats` snapshot
 
 `AppCore` gains a fixed-capacity ring buffer of recent frame records, each
-`{ end: Instant, draw: Duration, cells: u32 }`. `render` times the
-layout+blit+diff+write span, records the changed-cell count the diff reports
+`{ end: Instant, draw: Duration, cells: u32, size: (u16, u16) }`. `render` times
+the layout+blit+diff+write span, records the changed-cell count the diff reports
 (see below), and pushes one record. The buffer holds the last N frames (N ~=
 240). `avg` and `max` are computed over the retained window, so they reflect
 recent behavior rather than an all-time accumulation.
@@ -357,8 +357,9 @@ frame's cost is not known until its render completes.
 
 The async loop is redraw-latch driven, not a fixed-cadence game loop. It draws
 only when something set the latch. So `fps` is renders-per-wall-second over the
-retained window, and when the UI is idle it decays toward zero because no frames
-are produced. This is the honest reading and we keep it. We do not add a periodic
+retained window, and when the UI is idle it stays frozen at that last window
+because no new frames are produced. This is the honest reading and we keep it. We
+do not add a periodic
 redraw to keep the counter "live", because that would pin the rate to the tick
 interval and hide exactly the idle behavior worth seeing. When idle the overlay
 freezes at the last frame's numbers, which is the intended behavior.
@@ -415,7 +416,7 @@ than a few microseconds of self-inclusion.
   `AppCore::render` and records the diff's changed-cell count, so both runtimes
   collect it at one shared point. The host renders it behind a display toggle
   (the plan's 9-Debug-overlay). The reported rate stays a true redraw rate
-  (idle -> 0) rather than being propped up by a periodic redraw.
+  (idle -> frozen) rather than being propped up by a periodic redraw.
 
 ## Out of scope
 
