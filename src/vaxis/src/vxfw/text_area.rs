@@ -3337,10 +3337,9 @@ impl TextArea {
             return;
         }
 
-        // Newline, checked before submit so Shift+Enter and friends never
-        // submit.
+        // Newline, checked before submit so the newline chords (Shift+Enter,
+        // Ctrl+J, raw LF) never submit.
         let is_newline = key.matches(Key::ENTER, Modifiers::SHIFT)
-            || key.matches(Key::ENTER, alt)
             || key.matches(u32::from('j'), ctrl)
             || key.matches(0x0A, empty);
         if is_newline {
@@ -3647,7 +3646,7 @@ static BINDINGS: [ChordDoc; 25] = [
         group: "Editing",
     },
     ChordDoc {
-        keys: "Shift-Enter / Alt-Enter / Ctrl-J",
+        keys: "Shift-Enter / Ctrl-J",
         description: "Insert a newline",
         group: "Editing",
     },
@@ -3995,6 +3994,18 @@ mod tests {
         type_str(&mut ed, "b");
         assert_eq!(ed.text(), "a\nb");
         assert_eq!(ed.cursor(), (1, 1));
+    }
+
+    #[test]
+    fn alt_enter_neither_newlines_nor_submits() {
+        // Alt+Enter is reserved for the app-layer steer gesture, so the bare
+        // editor must leave it alone: it is not in the newline set and does not
+        // match plain-Enter submit.
+        let mut ed = editor();
+        type_str(&mut ed, "a");
+        send(&mut ed, &key(Key::ENTER, Modifiers::ALT));
+        assert_eq!(ed.text(), "a");
+        assert_eq!(ed.take_submitted(), None);
     }
 
     // -- Word motion (three-class emacs feel) --
