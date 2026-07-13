@@ -47,12 +47,12 @@ use aj_app::settings::ConfigTarget;
 use aj_conf::{Config, ValueKind};
 use aj_models::ThinkingConfig;
 use aj_models::registry::ModelInfo;
-use vaxis::cell::Style;
+use vaxis::cell::{Cell, Character, Style};
 use vaxis::key::{Key, Modifiers};
 use vaxis::vxfw::{
     Builder, DrawContext, Event, EventContext, FilterableSelect, ListView, MaxSize, OverlayWindow,
-    RelativePoint, RichText, SelectItem, SelectStyles, Size, Source, SubSurface, Surface,
-    TextField, TextSpan, Widget, WidgetRef, WidthBasis, draw_widget, to_widget_ref,
+    RelativePoint, RichText, ScrollBars, SelectItem, SelectStyles, Size, Source, SubSurface,
+    Surface, TextField, TextSpan, Widget, WidgetRef, WidthBasis, draw_widget, to_widget_ref,
 };
 
 use crate::keymap::action_matches;
@@ -499,7 +499,14 @@ struct SelectedRow {
 /// docs for the edit flow.
 pub(crate) struct SettingList {
     filter: Rc<RefCell<TextField>>,
+    /// The row list, shared with `bars` (which draws it) so event handling and
+    /// the value accessors drive the same list the thumb reflects.
     list: Rc<RefCell<ListView>>,
+    /// Scroll bars wrapping the list (sharing its `Rc` via `bars.view`) for the
+    /// vertical thumb. The horizontal bar is off (a settings list has no
+    /// horizontal axis), and `ScrollBars` draws the thumb only while the list
+    /// overflows its slot.
+    bars: ScrollBars<ListView>,
     state: Rc<RefCell<SettingListState>>,
     styles: Rc<RefCell<SelectStyles>>,
     project_mode: bool,
@@ -534,17 +541,18 @@ impl SettingList {
             project_mode,
         }));
         let styles = Rc::new(RefCell::new(styles));
-        let list = Rc::new(RefCell::new(ListView::new(Source::Builder(Box::new(
-            SettingRowBuilder {
-                state: Rc::clone(&state),
-                styles: Rc::clone(&styles),
-            },
-        )))));
-        {
-            let mut list = list.borrow_mut();
-            list.draw_cursor = false;
-            apply_setting_filter(&mut state.borrow_mut(), &mut list);
-        }
+        let mut list_view = ListView::new(Source::Builder(Box::new(SettingRowBuilder {
+            state: Rc::clone(&state),
+            styles: Rc::clone(&styles),
+        })));
+        list_view.draw_cursor = false;
+        // Wrap the list in scroll bars for the vertical thumb. The bars own the
+        // list behind their shared `view` handle, which we keep a clone of for
+        // the widget's own accessors and event handling.
+        let mut bars = ScrollBars::new(list_view);
+        bars.draw_horizontal_scrollbar = false;
+        let list = Rc::clone(&bars.view);
+        apply_setting_filter(&mut state.borrow_mut(), &mut list.borrow_mut());
         let filter = Rc::new(RefCell::new(TextField::new()));
         {
             let state = Rc::clone(&state);
@@ -559,6 +567,7 @@ impl SettingList {
         SettingList {
             filter,
             list,
+            bars,
             state,
             styles,
             project_mode,
@@ -685,6 +694,22 @@ impl SettingList {
     }
 }
 
+/// Tint the vertical scroll-bar thumb cells from `style`.
+///
+/// Applied on each draw so a runtime restyle (theme swap) is reflected without
+/// rebuilding the bars. The hover and drag cells are set for completeness. The
+/// list forwards no mouse events to the bars, so only the base thumb is drawn.
+fn apply_thumb_style(bars: &mut ScrollBars<ListView>, style: Style) {
+    let cell = |grapheme: &str| Cell {
+        char: Character::new(grapheme, 1),
+        style,
+        ..Cell::default()
+    };
+    bars.vertical_scrollbar_thumb = cell("\u{2590}");
+    bars.vertical_scrollbar_hover_thumb = cell("\u{2588}");
+    bars.vertical_scrollbar_drag_thumb = cell("\u{2588}");
+}
+
 /// The value after `current` in `values`, wrapping around. Falls back to the
 /// first value when `current` isn't in the set.
 fn next_cycle_value(values: &[String], current: &str) -> String {
@@ -747,7 +772,15 @@ impl Widget for SettingList {
             );
             surface.children.push(SubSurface {
                 origin: RelativePoint { row: 2, col: 0 },
-                surface: draw_widget(&to_widget_ref(Rc::clone(&self.list)), &list_ctx),
+                surface: {
+                    // Tint the thumb from the live styles so a theme swap (via
+                    // `set_styles`) is reflected without rebuilding the bars.
+                    // `ScrollBars` draws the inner list (stamping its identity
+                    // for wheel/key routing) and reserves the rightmost column
+                    // for the thumb, which shows only while the list overflows.
+                    apply_thumb_style(&mut self.bars, self.styles.borrow().scrollbar_thumb);
+                    self.bars.draw(&list_ctx)
+                },
                 z_index: 0,
             });
         }
@@ -2072,6 +2105,85 @@ mod tests {
         assert!(
             !text.iter().any(|l| l.contains("First option description.")),
             "the first row's description is no longer shown: {text:?}"
+        );
+    }
+
+    /// Enough no-description rows to overflow a short list slot. Without a
+    /// description the below-list panel is dropped, so the slot spans the whole
+    /// overlay height minus the filter row and its separator.
+    fn plain_rows(n: usize) -> Vec<SettingRow> {
+        (0..n)
+            .map(|i| cycle_row(&format!("row{i}"), "true"))
+            .collect()
+    }
+
+    /// The composited rows carrying the vertical thumb glyph on the list slot's
+    /// right edge.
+    fn thumb_rows(surface: &Surface, width: u16) -> Vec<usize> {
+        let last_col = usize::from(width - 1);
+        crate::test_support::flatten(surface)
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                row.get(last_col)
+                    .is_some_and(|c| c.char.grapheme() == "\u{2590}")
+            })
+            .map(|(r, _)| r)
+            .collect()
+    }
+
+    /// A list that overflows its slot draws the vertical thumb on the right
+    /// edge, in the list slot below the filter row.
+    #[test]
+    fn scrollbar_thumb_appears_when_the_list_overflows() {
+        use crate::test_support::draw_ctx;
+
+        let mut list = SettingList::new(plain_rows(12), styles(), false);
+        let ctx = draw_ctx(30, Some(6));
+        let rows = thumb_rows(&list.draw(&ctx), 30);
+        assert!(!rows.is_empty(), "a thumb is drawn for an overflowing list");
+        assert!(
+            rows.iter().all(|&r| r >= 2),
+            "the thumb stays in the list slot below the filter row: {rows:?}"
+        );
+    }
+
+    /// Scrolling the cursor to the bottom moves the thumb down: its top row
+    /// sits lower than when the list is pinned at the top.
+    #[test]
+    fn scrollbar_thumb_tracks_scrolling() {
+        use crate::test_support::draw_ctx;
+
+        let mut list = SettingList::new(plain_rows(12), styles(), false);
+        let ctx = draw_ctx(30, Some(6));
+        let top = *thumb_rows(&list.draw(&ctx), 30)
+            .first()
+            .expect("thumb drawn at the top");
+        // Drive the cursor to the bottom, redrawing so each move reconciles the
+        // scroll position the thumb reads on the next draw.
+        for _ in 0..12 {
+            send(&mut list, &key(Key::DOWN, Modifiers::empty()));
+            let _ = list.draw(&ctx);
+        }
+        let bottom = *thumb_rows(&list.draw(&ctx), 30)
+            .first()
+            .expect("thumb still drawn at the bottom");
+        assert!(
+            bottom > top,
+            "the thumb moved down as the list scrolled (top {top}, bottom {bottom})"
+        );
+    }
+
+    /// A list that fits its slot draws no thumb, matching the content overlays.
+    #[test]
+    fn scrollbar_thumb_absent_when_the_list_fits() {
+        use crate::test_support::draw_ctx;
+
+        let mut list = SettingList::new(plain_rows(3), styles(), false);
+        let ctx = draw_ctx(30, Some(12));
+        assert!(
+            thumb_rows(&list.draw(&ctx), 30).is_empty(),
+            "no thumb is drawn when the list fits the slot"
         );
     }
 }
