@@ -90,7 +90,7 @@
 //! [`ConversationEntry::timestamp`]: crate::log::ConversationEntry::timestamp
 //! [`ConversationLog::stats`]: crate::log::ConversationLog::stats
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use aj_agent::events::{AgentEvent, AgentId, AgentSettings, CompactionReason};
 use aj_agent::message::AgentMessage;
@@ -104,22 +104,63 @@ use crate::log::{
     ConversationEntry, ConversationEntryKind, ConversationLog, ThreadFilter, ThreadKind,
 };
 
-/// Walk `log` in append order and yield one or more [`AgentEvent`]s
-/// per persisted entry.
+/// Walks `log` in append order and lazily yields its projected [`AgentEvent`]s.
 ///
-/// The returned iterator owns its events (entries are projected at
-/// build time) so the caller can drain it into a listener without
-/// holding a borrow on the log.
-pub fn replay(log: &ConversationLog) -> impl Iterator<Item = AgentEvent> {
-    let mut state = ReplayState::default();
-    let mut events: Vec<AgentEvent> = Vec::new();
-    for entry in log.entries_in_order() {
-        state.bracket_subagent(entry, &mut events);
-        state.project_entry(entry, log, &mut events);
+/// The iterator borrows `log` until it is dropped. It buffers only events from
+/// the current persisted entry, plus events needed to balance an open sub-agent
+/// at EOF.
+pub fn replay(log: &ConversationLog) -> impl Iterator<Item = AgentEvent> + '_ {
+    Replay::new(log)
+}
+
+struct Replay<'a> {
+    log: &'a ConversationLog,
+    next_entry: usize,
+    state: ReplayState,
+    pending: VecDeque<AgentEvent>,
+    finished: bool,
+}
+
+impl<'a> Replay<'a> {
+    fn new(log: &'a ConversationLog) -> Self {
+        Self {
+            log,
+            next_entry: 0,
+            state: ReplayState::default(),
+            pending: VecDeque::new(),
+            finished: false,
+        }
     }
-    // Close a sub-agent run still open at end-of-log.
-    state.close_open_sub(&mut events);
-    events.into_iter()
+}
+
+impl Iterator for Replay<'_> {
+    type Item = AgentEvent;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(event) = self.pending.pop_front() {
+                return Some(event);
+            }
+
+            if self.next_entry < self.log.len() {
+                let index = self.next_entry;
+                self.next_entry += 1;
+                if let Some(entry) = self.log.entry_in_append_order(index) {
+                    self.state.bracket_subagent(entry, &mut self.pending);
+                    self.state.project_entry(entry, self.log, &mut self.pending);
+                }
+                continue;
+            }
+
+            if !self.finished {
+                self.finished = true;
+                self.state.close_open_sub(&mut self.pending);
+                continue;
+            }
+
+            return None;
+        }
+    }
 }
 
 /// Per-walk projection state.
@@ -212,7 +253,7 @@ impl ReplayState {
     /// instead emit it at the run's first `Message` entry, with the
     /// task from its user text and default settings. `Meta` entries
     /// carry no agent id and never transition.
-    fn bracket_subagent(&mut self, entry: &ConversationEntry, out: &mut Vec<AgentEvent>) {
+    fn bracket_subagent(&mut self, entry: &ConversationEntry, out: &mut VecDeque<AgentEvent>) {
         let Some(current) = agent_id_for(entry) else {
             return;
         };
@@ -240,7 +281,7 @@ impl ReplayState {
                 background,
                 settings,
             } => {
-                out.push(sub_start_event(
+                out.push_back(sub_start_event(
                     n,
                     task.clone(),
                     *background,
@@ -253,7 +294,7 @@ impl ReplayState {
                 // message, so the run's first message (the task
                 // user prompt) opens the bracket. Legacy logs carry
                 // no run mode, so the sub reads as foreground.
-                out.push(sub_start_event(
+                out.push_back(sub_start_event(
                     n,
                     subagent_task(entry),
                     false,
@@ -278,10 +319,10 @@ impl ReplayState {
     /// run that produced neither a `SubAgentSpawn` entry nor a
     /// `Message` entry has no start yet; emit one with an empty task
     /// and default settings so the bracketing stays balanced.
-    fn close_open_sub(&mut self, out: &mut Vec<AgentEvent>) {
+    fn close_open_sub(&mut self, out: &mut VecDeque<AgentEvent>) {
         if let Some(k) = self.open_sub.take() {
             if !self.open_sub_started {
-                out.push(sub_start_event(
+                out.push_back(sub_start_event(
                     k,
                     String::new(),
                     false,
@@ -289,7 +330,7 @@ impl ReplayState {
                 ));
             }
             self.open_sub_started = false;
-            out.push(AgentEvent::SubAgentEnd {
+            out.push_back(AgentEvent::SubAgentEnd {
                 parent: AgentId::Main,
                 child: AgentId::Sub(k),
                 report: std::mem::take(&mut self.open_sub_report),
@@ -305,7 +346,7 @@ impl ReplayState {
         &mut self,
         entry: &ConversationEntry,
         log: &ConversationLog,
-        out: &mut Vec<AgentEvent>,
+        out: &mut VecDeque<AgentEvent>,
     ) {
         let agent_id = match agent_id_for(entry) {
             Some(id) => id,
@@ -361,7 +402,7 @@ impl ReplayState {
                 let tokens_after =
                     estimate_conversation_context(&log.linearize(&entry.id, ThreadFilter::USER))
                         .tokens;
-                out.push(AgentEvent::CompactionEnd {
+                out.push_back(AgentEvent::CompactionEnd {
                     agent_id,
                     reason: CompactionReason::Manual,
                     tokens_before: *tokens_before,
@@ -379,11 +420,11 @@ impl ReplayState {
                     Message::User(_) => {
                         // User messages: just a MessageStart/End pair
                         // around the wire message.
-                        out.push(AgentEvent::MessageStart {
+                        out.push_back(AgentEvent::MessageStart {
                             agent_id,
                             message: agent_msg.clone(),
                         });
-                        out.push(AgentEvent::MessageEnd {
+                        out.push_back(AgentEvent::MessageEnd {
                             agent_id,
                             message: agent_msg.clone(),
                         });
@@ -404,9 +445,9 @@ impl ReplayState {
     /// entry — seed entries (session creation) precede any message
     /// on their thread and stay silent, since they never produced a
     /// visible notice live either.
-    fn settings_notice(&self, agent_id: AgentId, text: String, out: &mut Vec<AgentEvent>) {
+    fn settings_notice(&self, agent_id: AgentId, text: String, out: &mut VecDeque<AgentEvent>) {
         if self.seen_message.contains(&agent_id) {
-            out.push(AgentEvent::Notice { agent_id, text });
+            out.push_back(AgentEvent::Notice { agent_id, text });
         }
     }
 
@@ -421,7 +462,7 @@ impl ReplayState {
         agent_id: AgentId,
         agent_msg: &AgentMessage,
         assistant: &aj_models::types::AssistantMessage,
-        out: &mut Vec<AgentEvent>,
+        out: &mut VecDeque<AgentEvent>,
     ) {
         // MessageStart carries an empty placeholder (with identity
         // stamped from the finalized message) so renderers open
@@ -440,11 +481,11 @@ impl ReplayState {
             error: assistant.error.clone(),
             timestamp: assistant.timestamp,
         };
-        out.push(AgentEvent::MessageStart {
+        out.push_back(AgentEvent::MessageStart {
             agent_id,
             message: AgentMessage::wire(Message::Assistant(empty_start)),
         });
-        out.push(AgentEvent::MessageEnd {
+        out.push_back(AgentEvent::MessageEnd {
             agent_id,
             message: agent_msg.clone(),
         });
@@ -482,7 +523,7 @@ impl ReplayState {
             accumulated_cache_read: acc.cache_read,
             turn_cache_read: assistant.usage.cache_read,
         };
-        out.push(AgentEvent::UsageUpdate {
+        out.push_back(AgentEvent::UsageUpdate {
             agent_id,
             usage: turn_usage,
         });
@@ -515,7 +556,7 @@ impl ReplayState {
         agent_id: AgentId,
         agent_msg: &AgentMessage,
         tr: &aj_models::types::ToolResultMessage,
-        out: &mut Vec<AgentEvent>,
+        out: &mut VecDeque<AgentEvent>,
     ) {
         // Look up the tool name and input args captured from the
         // preceding assistant message's tool_call block. Missing
@@ -538,7 +579,7 @@ impl ReplayState {
             None => text_fallback(&tool_name, &tr.content),
         };
 
-        out.push(AgentEvent::ToolExecutionStart {
+        out.push_back(AgentEvent::ToolExecutionStart {
             agent_id,
             call_id: tr.tool_call_id.clone(),
             tool: tool_name.clone(),
@@ -546,15 +587,15 @@ impl ReplayState {
         });
         // MessageStart/End around the tool_result so a replay-driven
         // pump sees the same shape a live agent emits.
-        out.push(AgentEvent::MessageStart {
+        out.push_back(AgentEvent::MessageStart {
             agent_id,
             message: agent_msg.clone(),
         });
-        out.push(AgentEvent::MessageEnd {
+        out.push_back(AgentEvent::MessageEnd {
             agent_id,
             message: agent_msg.clone(),
         });
-        out.push(AgentEvent::ToolExecutionEnd {
+        out.push_back(AgentEvent::ToolExecutionEnd {
             agent_id,
             call_id: tr.tool_call_id.clone(),
             tool: tool_name,
@@ -707,6 +748,30 @@ mod tests {
                 .expect("tool result msg");
         }
         (dir, log)
+    }
+
+    #[test]
+    fn replay_projects_entries_on_demand() {
+        let (_dir, log) = seeded_log();
+        let mut events = Replay::new(&log);
+
+        assert_eq!(events.next_entry, 0);
+        assert!(events.pending.is_empty());
+        assert!(events.state.seen_message.is_empty());
+        assert!(events.state.tool_calls.is_empty());
+        assert!(events.state.usage_accumulators.is_empty());
+
+        assert!(matches!(
+            events.next(),
+            Some(AgentEvent::MessageStart {
+                agent_id: AgentId::Main,
+                ..
+            })
+        ));
+        assert_eq!(events.next_entry, 2);
+        assert_eq!(events.pending.len(), 1);
+        assert!(events.state.tool_calls.is_empty());
+        assert!(events.state.usage_accumulators.is_empty());
     }
 
     #[test]

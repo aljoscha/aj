@@ -847,9 +847,15 @@ impl ConversationLog {
         &self.path
     }
 
-    /// All entries in the order they were appended. Used by
-    /// [`crate::replay`] to walk a freshly-resumed log without having
-    /// to re-derive the head/parent chain.
+    /// Returns the entry at `index` in append order.
+    ///
+    /// An order slot whose map entry is missing is treated the same as an
+    /// out-of-bounds index. Append-order scans must advance past either case.
+    pub(crate) fn entry_in_append_order(&self, index: usize) -> Option<&ConversationEntry> {
+        self.order.get(index).and_then(|id| self.entries.get(id))
+    }
+
+    /// Returns all entries in the order they were appended.
     pub fn entries_in_order(&self) -> Vec<&ConversationEntry> {
         self.order
             .iter()
