@@ -591,10 +591,10 @@ mod tests {
             "expected default foreground escape, got {painted:?}"
         );
         // The inline-code closure carries the `mdCode` color
-        // (`#9cdcfe` light blue in dark), either as a 24-bit triple
+        // (`#c9bcff` lavender in dark), either as a 24-bit triple
         // or a 256-color index depending on the detected color mode.
         let painted = (ml_theme.code)("hi");
-        let has_truecolor = painted.contains("\x1b[38;2;156;220;254m");
+        let has_truecolor = painted.contains("\x1b[38;2;201;188;255m");
         let has_256 = painted.contains("\x1b[38;5;");
         assert!(
             has_truecolor || has_256,
