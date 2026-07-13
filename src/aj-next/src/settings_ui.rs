@@ -381,9 +381,43 @@ impl Builder for SettingRowBuilder {
     }
 }
 
-/// Render one settings row: an override marker (project mode), the aligned
-/// `label  value` primary columns, and the muted description. On the cursored
-/// row every cell carries the band background.
+/// Cap on the reserved description-panel height, in wrapped lines. Long
+/// descriptions truncate rather than shrink the list to nothing.
+const MAX_DESC_PANEL_HEIGHT: u16 = 4;
+
+/// Minimum list rows kept visible when a description panel is reserved. Below
+/// this the panel is dropped so a cramped overlay still shows the list.
+const MIN_LIST_ROWS: u16 = 2;
+
+/// Wrapped height of `text` soft-wrapped to `width`, capped at `cap`. Used to
+/// size the description panel. Style does not affect wrapping, so this measures
+/// with the default style.
+fn wrapped_height(ctx: &DrawContext, text: &str, width: u16, cap: u16) -> u16 {
+    if text.is_empty() || width == 0 || cap == 0 {
+        return 0;
+    }
+    let mut rich = RichText::new(vec![TextSpan {
+        text: text.to_string(),
+        ..TextSpan::default()
+    }]);
+    rich.softwrap = true;
+    let measure_ctx = ctx.with_constraints(
+        Size {
+            width: 0,
+            height: 0,
+        },
+        MaxSize {
+            width: Some(width),
+            height: Some(cap),
+        },
+    );
+    rich.draw(&measure_ctx).size.height
+}
+
+/// Render one settings row: an override marker (project mode) and the aligned
+/// `label  value` primary columns. On the cursored row every cell carries the
+/// band background. The row's description is not shown inline; the widget
+/// draws the cursored row's description in a panel below the list.
 fn build_setting_row(
     row: &SettingRow,
     selected: bool,
@@ -419,10 +453,6 @@ fn build_setting_row(
         tint(primary),
     ));
     spans.push(span(row.value.clone(), tint(primary)));
-    if !row.description.is_empty() {
-        spans.push(span("   ".to_string(), tint(styles.secondary)));
-        spans.push(span(row.description.clone(), tint(styles.secondary)));
-    }
     let mut rich = RichText::new(spans);
     rich.softwrap = false;
     rich.width_basis = WidthBasis::Parent;
@@ -612,6 +642,18 @@ impl SettingList {
         })
     }
 
+    /// The cursored row's description, for the below-list panel. Empty when
+    /// the row carries no description (or there is no cursored row).
+    fn selected_description(&self) -> String {
+        let cursor = usize::try_from(self.list.borrow().cursor).expect("cursor fits usize");
+        let state = self.state.borrow();
+        state
+            .visible
+            .get(cursor)
+            .map(|&i| state.rows[i].description.clone())
+            .unwrap_or_default()
+    }
+
     /// Whether the cursored row is a project override (clearable).
     fn selected_is_override(&self) -> bool {
         let cursor = usize::try_from(self.list.borrow().cursor).expect("cursor fits usize");
@@ -621,6 +663,25 @@ impl SettingList {
             .get(cursor)
             .map(|&i| !state.rows[i].inherited)
             .unwrap_or(false)
+    }
+
+    /// The tallest wrapped description across the filtered rows, capped at
+    /// [`MAX_DESC_PANEL_HEIGHT`]. Sizing the panel to the max (not just the
+    /// cursored row) keeps the list from shifting as the cursor moves.
+    fn description_panel_height(&self, ctx: &DrawContext, width: u16) -> u16 {
+        if width == 0 {
+            return 0;
+        }
+        let state = self.state.borrow();
+        let mut max = 0;
+        for &row_idx in &state.visible {
+            let desc = &state.rows[row_idx].description;
+            max = max.max(wrapped_height(ctx, desc, width, MAX_DESC_PANEL_HEIGHT));
+            if max >= MAX_DESC_PANEL_HEIGHT {
+                return MAX_DESC_PANEL_HEIGHT;
+            }
+        }
+        max
     }
 }
 
@@ -652,7 +713,27 @@ impl Widget for SettingList {
             surface: draw_widget(&to_widget_ref(Rc::clone(&self.filter)), &filter_ctx),
             z_index: 0,
         });
-        let list_height = size.height.saturating_sub(2);
+        // Reserve a description panel below the list: a blank separator plus
+        // the tallest wrapped description across the filtered rows. Wrapped to
+        // `size.width - 4` and drawn at col 2 so each line is indented 2, the
+        // block matches `aj`.
+        let desc_width = size.width.saturating_sub(4);
+        let panel_height = self.description_panel_height(ctx, desc_width);
+        let reserved = if panel_height > 0 {
+            1 + panel_height
+        } else {
+            0
+        };
+        // Keep at least a couple of list rows; on a cramped overlay drop the
+        // panel rather than starve the list.
+        let (list_height, show_panel) = {
+            let with_panel = size.height.saturating_sub(2 + reserved);
+            if reserved > 0 && with_panel >= MIN_LIST_ROWS {
+                (with_panel, true)
+            } else {
+                (size.height.saturating_sub(2), false)
+            }
+        };
         if list_height > 0 {
             let list_ctx = ctx.with_constraints(
                 Size {
@@ -669,6 +750,36 @@ impl Widget for SettingList {
                 surface: draw_widget(&to_widget_ref(Rc::clone(&self.list)), &list_ctx),
                 z_index: 0,
             });
+        }
+        if show_panel {
+            let desc = self.selected_description();
+            if !desc.is_empty() {
+                let panel_ctx = ctx.with_constraints(
+                    Size {
+                        width: 0,
+                        height: 0,
+                    },
+                    MaxSize {
+                        width: Some(desc_width),
+                        height: Some(panel_height),
+                    },
+                );
+                let mut rich = RichText::new(vec![TextSpan {
+                    text: desc,
+                    style: self.styles.borrow().secondary,
+                    ..TextSpan::default()
+                }]);
+                rich.softwrap = true;
+                let widget: WidgetRef = Rc::new(RefCell::new(rich));
+                surface.children.push(SubSurface {
+                    origin: RelativePoint {
+                        row: i32::from(2 + list_height + 1),
+                        col: 2,
+                    },
+                    surface: draw_widget(&widget, &panel_ctx),
+                    z_index: 0,
+                });
+            }
         }
         surface
     }
@@ -1037,7 +1148,7 @@ fn build_setting_rows(
             id: id.clone(),
             label: id,
             value,
-            description: option.description.to_string(),
+            description: aj_app::settings::option_description(option),
             kind,
             inherited: project_mode && !row_is_project_set(row_id_for(option.name), set_keys),
             clear_to,
@@ -1872,5 +1983,86 @@ mod tests {
         let items = thinking_items("high");
         assert!(items.iter().any(|i| i.label == "high (current)"));
         assert!(items.iter().all(|i| i.filter_key != "high (current)"));
+    }
+
+    fn desc_row(id: &str, value: &str, description: &str) -> SettingRow {
+        SettingRow {
+            id: id.to_string(),
+            label: id.to_string(),
+            value: value.to_string(),
+            description: description.to_string(),
+            kind: RowKind::Cycle(vec!["true".to_string(), "false".to_string()]),
+            inherited: false,
+            clear_to: String::new(),
+        }
+    }
+
+    /// The cursored row's description renders in a panel below the list,
+    /// indented 2, and no description text appears inline on the `label  value`
+    /// rows.
+    #[test]
+    fn description_renders_below_the_list_not_inline() {
+        use crate::test_support::{draw_ctx, rows};
+
+        let mut list = SettingList::new(
+            vec![
+                desc_row("alpha", "true", "First option description."),
+                desc_row("bravo", "false", "Second option description."),
+            ],
+            styles(),
+            false,
+        );
+        let ctx = draw_ctx(60, Some(20));
+        let text = rows(&list.draw(&ctx));
+
+        // The list rows carry only `label  value`: no inline description.
+        assert!(
+            text.iter().any(|l| l == "alpha  true"),
+            "first row is label+value only: {text:?}"
+        );
+        assert!(
+            text.iter().any(|l| l == "bravo  false"),
+            "second row is label+value only: {text:?}"
+        );
+        // The cursored row's description sits below the list, indented 2.
+        assert!(
+            text.iter().any(|l| l == "  First option description."),
+            "cursored description below the list, indented 2: {text:?}"
+        );
+        // Only the cursored row's description shows.
+        assert!(
+            !text
+                .iter()
+                .any(|l| l.contains("Second option description.")),
+            "the non-cursored row's description is not shown: {text:?}"
+        );
+    }
+
+    /// Moving the cursor down swaps the panel to the newly cursored row's
+    /// description.
+    #[test]
+    fn description_panel_tracks_the_cursor() {
+        use crate::test_support::{draw_ctx, rows};
+
+        let mut list = SettingList::new(
+            vec![
+                desc_row("alpha", "true", "First option description."),
+                desc_row("bravo", "false", "Second option description."),
+            ],
+            styles(),
+            false,
+        );
+        let ctx = draw_ctx(60, Some(20));
+
+        send(&mut list, &key(Key::DOWN, Modifiers::empty()));
+        let text = rows(&list.draw(&ctx));
+        assert!(
+            text.iter().any(|l| l == "  Second option description."),
+            "the panel follows the cursor to the second row: {text:?}"
+        );
+        assert!(
+            !text.iter().any(|l| l.contains("First option description.")),
+            "the first row's description is no longer shown: {text:?}"
+        );
     }
 }
