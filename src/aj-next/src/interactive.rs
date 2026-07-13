@@ -42,9 +42,7 @@ use aj_models::auth::{AuthError, AuthStorage};
 use aj_models::registry::ModelInfo;
 use aj_models::types::{Speed, UserContent};
 use aj_models::usage::default_reset_sources;
-use aj_models::{
-    ThinkingConfig, speed_from_name, speed_name, thinking_config_from_name, verbosity_name,
-};
+use aj_models::{ThinkingConfig, speed_from_name, speed_name, thinking_config_from_name};
 use aj_session::{ConversationPersistence, PromptEntry, SessionPreview, ThreadFilter, replay};
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
@@ -1235,10 +1233,22 @@ async fn apply_command_action(
             ActionEffect::OpenedOverlay
         }
         CommandAction::OpenSettings => {
-            let values = user_settings_values(world);
-            // The user window has no inherited layer and no project keys;
-            // the clear path is inert there.
-            let inherited = user_settings_values(world);
+            // The global window shows the PERSISTED user-layer config, the
+            // config a fresh session loads as its user layer. That can differ
+            // from an unpersisted runtime toggle, which is intended: this
+            // window edits `~/.aj/config.toml`, it is not a view of the live
+            // session.
+            let user = world
+                .config_layers
+                .lock()
+                .expect("config layers mutex poisoned")
+                .user
+                .clone();
+            let values = SettingsValues::from_config(&user, &world.catalog);
+            // The user window has no inherited layer and no project keys; the
+            // clear path is inert there, so a second view of the same layer is
+            // a valid (unused) `inherited` set.
+            let inherited = SettingsValues::from_config(&user, &world.catalog);
             let handles = shell.borrow().overlay_handles();
             open_settings(
                 &handles.stack,
@@ -1679,39 +1689,6 @@ fn settings_catalogs(world: &World) -> SettingsCatalogs {
         themes: Theme::available(),
         tools,
         skills,
-    }
-}
-
-/// The live settings-window values the user window opens with: model /
-/// thinking / speed / verbosity from the run config (the next-turn truth), the
-/// render toggles from the chat model, the rest from the effective config.
-fn user_settings_values(world: &World) -> SettingsValues {
-    let run_cfg = world.run_config.lock().expect("run config mutex poisoned");
-    let cfg = world.config.lock().expect("config mutex poisoned");
-    let chat = world.chat.borrow();
-    SettingsValues {
-        model_key: run_cfg.model_key.clone(),
-        model_url: cfg.model_url.clone(),
-        thinking: aj_app::commands::thinking_level_name(&run_cfg.thinking).to_string(),
-        thinking_display: cfg.thinking_display.map(|d| d.to_string()),
-        speed: speed_name(run_cfg.speed).to_string(),
-        verbosity: run_cfg
-            .stream_options
-            .verbosity
-            .map(|v| verbosity_name(Some(v)).to_string()),
-        theme: cfg.theme.clone().unwrap_or_else(|| "light".to_string()),
-        disabled_tools: cfg.disabled_tools.clone(),
-        disabled_skills: cfg.disabled_skills.clone(),
-        hide_thinking_block: chat.hide_thinking_block,
-        show_frame_stats: cfg.show_frame_stats,
-        image_auto_resize: cfg.image_auto_resize,
-        image_show_in_terminal: chat.show_image_in_terminal,
-        image_block: cfg.image_block,
-        bash_rtk: cfg.bash_rtk,
-        syntax_highlighting: chat.syntax_highlight,
-        auto_compact: cfg.auto_compact,
-        compact_threshold: cfg.compact_threshold.to_string(),
-        compact_keep_recent: cfg.compact_keep_recent.to_string(),
     }
 }
 
@@ -7859,6 +7836,50 @@ mod tests {
         assert!(contents.contains("thinking = \"high\""), "got: {contents}");
         // The window stays open across an edit.
         assert!(shell.borrow().overlays.borrow().is_open());
+    }
+
+    /// The global settings window shows the PERSISTED user-layer value, not the
+    /// effective (project-overlaid) one. This is the window that edits
+    /// `~/.aj/config.toml`, so it must reflect the user layer even when a
+    /// project override diverges from it.
+    #[tokio::test]
+    async fn global_settings_window_shows_the_user_layer_not_the_effective() {
+        let dir = TempDir::new().expect("tempdir");
+        // User default is `auto_compact = true`; the project overrides it to
+        // `false`, so the user layer and the effective config diverge.
+        let mut project = aj_conf::ConfigLayer::default();
+        project
+            .set_str("auto_compact", "false")
+            .expect("valid override");
+        let layers = ConfigLayers {
+            user: Config::default(),
+            project,
+            project_path: Some(dir.path().join("repo").join(".aj").join("config.toml")),
+        };
+        let (mut world, shell, _app, _writer, _root) =
+            world_shell_app(&dir, "streaming-text", layers).await;
+
+        // Sanity: the layers really do diverge on this option.
+        assert!(
+            world.config_layers.lock().unwrap().user.auto_compact,
+            "user layer default is true"
+        );
+        assert!(
+            !world.config.lock().unwrap().auto_compact,
+            "effective config picks up the project override"
+        );
+
+        apply_command(&mut world, &shell, CommandAction::OpenSettings).await;
+        let shown = {
+            let shell = shell.borrow();
+            let ui = shell.settings_ui.borrow();
+            ui.as_ref().unwrap().list.borrow().value_of("auto_compact")
+        };
+        assert_eq!(
+            shown.as_deref(),
+            Some("true"),
+            "the global window shows the user value, not the effective override"
+        );
     }
 
     /// The project settings window persists an override to the project config

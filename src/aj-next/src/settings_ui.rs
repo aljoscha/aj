@@ -357,7 +357,6 @@ struct SettingListState {
     matcher: vaxis::fuzzy::FuzzyMatcher,
     /// Column width the value is aligned against, from the widest label.
     label_width: usize,
-    project_mode: bool,
 }
 
 /// Builds one banded `label  value` row per visible index.
@@ -375,7 +374,6 @@ impl Builder for SettingRowBuilder {
             &state.rows[row_idx],
             idx == cursor,
             state.label_width,
-            state.project_mode,
             &styles,
         ))
     }
@@ -388,6 +386,12 @@ const MAX_DESC_PANEL_HEIGHT: u16 = 4;
 /// Minimum list rows kept visible when a description panel is reserved. Below
 /// this the panel is dropped so a cramped overlay still shows the list.
 const MIN_LIST_ROWS: u16 = 2;
+
+/// The project-window legend explaining the dim/regular override cue. Rendered
+/// as the bottommost body row in project mode only. Global windows have no
+/// override concept, so they never show it.
+const SETTINGS_OVERRIDE_LEGEND: &str =
+    "Dim rows use the global default. Regular rows are overridden for this project.";
 
 /// Wrapped height of `text` soft-wrapped to `width`, capped at `cap`. Used to
 /// size the description panel. Style does not affect wrapping, so this measures
@@ -414,15 +418,16 @@ fn wrapped_height(ctx: &DrawContext, text: &str, width: u16, cap: u16) -> u16 {
     rich.draw(&measure_ctx).size.height
 }
 
-/// Render one settings row: an override marker (project mode) and the aligned
-/// `label  value` primary columns. On the cursored row every cell carries the
-/// band background. The row's description is not shown inline. The widget
-/// draws the cursored row's description in a panel below the list.
+/// Render one settings row: the aligned `label  value` primary columns. On the
+/// cursored row every cell carries the band background. Both windows lay out
+/// identically, with the label starting at col 0. The dim-vs-regular styling
+/// is what distinguishes an inherited row from an override. The row's
+/// description is not shown inline. The widget draws the cursored row's
+/// description in a panel below the list.
 fn build_setting_row(
     row: &SettingRow,
     selected: bool,
     label_width: usize,
-    project_mode: bool,
     styles: &SelectStyles,
 ) -> WidgetRef {
     let band = selected.then_some(styles.selected_bg);
@@ -443,16 +448,10 @@ fn build_setting_row(
     } else {
         styles.label
     };
-    let mut spans = Vec::new();
-    if project_mode {
-        let marker = if row.inherited { "  " } else { "\u{25cf} " };
-        spans.push(span(marker.to_string(), tint(styles.secondary)));
-    }
-    spans.push(span(
-        format!("{:<label_width$}  ", row.label),
-        tint(primary),
-    ));
-    spans.push(span(row.value.clone(), tint(primary)));
+    let spans = vec![
+        span(format!("{:<label_width$}  ", row.label), tint(primary)),
+        span(row.value.clone(), tint(primary)),
+    ];
     let mut rich = RichText::new(spans);
     rich.softwrap = false;
     rich.width_basis = WidthBasis::Parent;
@@ -538,7 +537,6 @@ impl SettingList {
             query: String::new(),
             matcher: vaxis::fuzzy::FuzzyMatcher::new(),
             label_width,
-            project_mode,
         }));
         let styles = Rc::new(RefCell::new(styles));
         let mut list_view = ListView::new(Source::Builder(Box::new(SettingRowBuilder {
@@ -735,12 +733,18 @@ impl Widget for SettingList {
         };
         // Keep at least a couple of list rows. On a cramped overlay we drop
         // the panel rather than starve the list.
-        let (list_height, show_panel) = {
-            let with_panel = size.height.saturating_sub(2 + reserved);
-            if reserved > 0 && with_panel >= MIN_LIST_ROWS {
-                (with_panel, true)
+        //
+        // In project mode reserve one more row at the very bottom for the
+        // override legend. It shares the panel's height guard: a cramped
+        // overlay drops both rather than starve the list.
+        let legend_height: u16 = u16::from(self.project_mode);
+        let below_list = reserved + legend_height;
+        let (list_height, show_panel, show_legend) = {
+            let with_below = size.height.saturating_sub(2 + below_list);
+            if below_list > 0 && with_below >= MIN_LIST_ROWS {
+                (with_below, reserved > 0, self.project_mode)
             } else {
-                (size.height.saturating_sub(2), false)
+                (size.height.saturating_sub(2), false, false)
             }
         };
         if list_height > 0 {
@@ -808,6 +812,35 @@ impl Widget for SettingList {
                 });
             }
         }
+        if show_legend {
+            // The legend sits directly below the reserved panel block, at the
+            // very bottom of the body (col 2, matching the panel's indent).
+            let legend_ctx = ctx.with_constraints(
+                Size {
+                    width: 0,
+                    height: 0,
+                },
+                MaxSize {
+                    width: Some(desc_width),
+                    height: Some(1),
+                },
+            );
+            let mut rich = RichText::new(vec![TextSpan {
+                text: SETTINGS_OVERRIDE_LEGEND.to_string(),
+                style: self.styles.borrow().secondary,
+                ..TextSpan::default()
+            }]);
+            rich.softwrap = false;
+            let widget: WidgetRef = Rc::new(RefCell::new(rich));
+            surface.children.push(SubSurface {
+                origin: RelativePoint {
+                    row: i32::from(2 + list_height + reserved),
+                    col: 2,
+                },
+                surface: draw_widget(&widget, &legend_ctx),
+                z_index: 0,
+            });
+        }
         surface
     }
 
@@ -852,6 +885,11 @@ impl Widget for SettingList {
                     Some(values) if !values.is_empty() => {
                         let next = next_cycle_value(&values, &sel.value);
                         self.set_value(&sel.id, &next);
+                        // Optimistically mark the row overridden so the
+                        // dim/regular cue flips with the value: an edited row
+                        // is now set on the current layer, not inherited. A
+                        // no-op in the user window (rows are never inherited).
+                        self.set_inherited(&sel.id, false);
                         if let Some(cb) = self.on_change.as_mut() {
                             cb(ctx, &sel.id, &next);
                         }
@@ -1476,6 +1514,7 @@ fn open_picker_submenu(
         sel.on_confirm = Some(Box::new(move |ctx, item| {
             if let Some(value) = resolve(item) {
                 parent_c.borrow().set_value(&id, &value);
+                parent_c.borrow().set_inherited(&id, false);
                 activity_c
                     .borrow_mut()
                     .push(SelectorActivity::SettingChange {
@@ -1518,6 +1557,7 @@ fn open_text_submenu(
         let id_submit = id.clone();
         overlay.borrow().set_on_submit(Box::new(move |ctx, text| {
             parent_c.borrow().set_value(&id_submit, text);
+            parent_c.borrow().set_inherited(&id_submit, false);
             activity_c
                 .borrow_mut()
                 .push(SelectorActivity::SettingChange {
@@ -1897,6 +1937,142 @@ mod tests {
         assert!(
             !*fired.borrow(),
             "the clear chord is inert outside project mode"
+        );
+    }
+
+    /// A `SelectStyles` whose `label` and `secondary` foregrounds differ, so a
+    /// drawn row's dim-vs-regular styling can be read off its cell color.
+    fn styles_label_vs_secondary(label: Color, secondary: Color) -> SelectStyles {
+        SelectStyles {
+            label: Style {
+                fg: label,
+                ..Style::default()
+            },
+            secondary: Style {
+                fg: secondary,
+                ..Style::default()
+            },
+            ..SelectStyles::default()
+        }
+    }
+
+    /// Editing an inherited project row flips it from dim (inherited) to
+    /// regular (overridden) styling on the very next draw, because the edit
+    /// marks the row set on the current layer.
+    ///
+    /// Mutation guard: dropping the `set_inherited(false)` call in the cycle
+    /// edit path leaves the row dim, so the post-edit assertion fails.
+    #[test]
+    fn editing_an_inherited_row_flips_to_overridden_styling() {
+        use crate::test_support::{draw_ctx, flatten};
+
+        let label = Color::Index(40);
+        let secondary = Color::Index(244);
+        let mut inherited = cycle_row("auto_compact", "true");
+        inherited.inherited = true;
+        let mut list = SettingList::new(
+            vec![inherited],
+            styles_label_vs_secondary(label, secondary),
+            true,
+        );
+        let ctx = draw_ctx(60, Some(20));
+
+        // The inherited row starts dim (the first list row is composited at
+        // row 2, its label at col 0).
+        let before = flatten(&list.draw(&ctx));
+        assert_eq!(
+            before[2][0].style.fg, secondary,
+            "an inherited row reads dim before the edit"
+        );
+
+        // Editing it marks the row overridden, so the next draw reads regular.
+        send(&mut list, &enter());
+        let after = flatten(&list.draw(&ctx));
+        assert_eq!(
+            after[2][0].style.fg, label,
+            "the edited row flips to the regular (override) style"
+        );
+    }
+
+    /// Project mode no longer prepends an override glyph, and a project row and
+    /// a global row start their label at the same column.
+    #[test]
+    fn project_and_global_rows_share_indentation_without_a_glyph() {
+        use crate::test_support::{draw_ctx, rows};
+
+        let mut override_row = cycle_row("auto_compact", "true");
+        override_row.inherited = false;
+        let mut project = SettingList::new(vec![override_row], styles(), true);
+        let mut global = SettingList::new(vec![cycle_row("auto_compact", "true")], styles(), false);
+        let ctx = draw_ctx(60, Some(20));
+
+        let project_text = rows(&project.draw(&ctx));
+        let global_text = rows(&global.draw(&ctx));
+
+        assert!(
+            project_text.iter().all(|l| !l.contains('\u{25cf}')),
+            "no override glyph is drawn in project mode: {project_text:?}"
+        );
+        let project_col = project_text
+            .iter()
+            .find_map(|l| l.find("auto_compact"))
+            .expect("project row present");
+        let global_col = global_text
+            .iter()
+            .find_map(|l| l.find("auto_compact"))
+            .expect("global row present");
+        assert_eq!(project_col, 0, "the label starts at col 0 in project mode");
+        assert_eq!(
+            project_col, global_col,
+            "both windows lay the label out at the same column"
+        );
+    }
+
+    /// The project window renders the override legend as the bottommost body
+    /// row, indented at col 2 in the muted secondary style. The global window
+    /// has no override concept, so it never shows the legend.
+    #[test]
+    fn project_window_renders_the_override_legend_global_does_not() {
+        use crate::test_support::{draw_ctx, flatten, rows};
+
+        let secondary = Color::Index(244);
+        let sty = SelectStyles {
+            secondary: Style {
+                fg: secondary,
+                ..Style::default()
+            },
+            ..SelectStyles::default()
+        };
+        // Wide enough for the legend to fit on one line, tall enough to keep
+        // the panel/legend budget above `MIN_LIST_ROWS`.
+        let ctx = draw_ctx(90, Some(20));
+
+        let mut project =
+            SettingList::new(vec![cycle_row("auto_compact", "true")], sty.clone(), true);
+        let project_surface = project.draw(&ctx);
+        let project_text = rows(&project_surface);
+        let last = project_text
+            .iter()
+            .rposition(|l| !l.is_empty())
+            .expect("project body has content");
+        assert_eq!(
+            project_text[last].find(SETTINGS_OVERRIDE_LEGEND),
+            Some(2),
+            "the legend is the bottom body row, indented at col 2: {project_text:?}"
+        );
+        assert_eq!(
+            flatten(&project_surface)[last][2].style.fg,
+            secondary,
+            "the legend reads in the muted secondary style"
+        );
+
+        let mut global = SettingList::new(vec![cycle_row("auto_compact", "true")], sty, false);
+        let global_text = rows(&global.draw(&ctx));
+        assert!(
+            global_text
+                .iter()
+                .all(|l| !l.contains(SETTINGS_OVERRIDE_LEGEND)),
+            "the global window never shows the legend: {global_text:?}"
         );
     }
 
