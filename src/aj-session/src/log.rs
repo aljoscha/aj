@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::{
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::PathBuf,
 };
 use thiserror::Error;
@@ -571,41 +571,92 @@ impl ConversationLog {
     ) -> Result<Self, ConversationError> {
         let path = persistence.session_path(session_id);
 
-        let reader = BufReader::new(File::open(&path)?);
-        let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
-
-        let last_non_empty = lines.iter().rposition(|l| !l.trim().is_empty());
+        let file = File::open(&path)?;
+        // The captured length defines this resume's boundary. Appends after this
+        // snapshot belong to a later resume.
+        let snapshot_len = file.metadata()?.len();
+        let mut reader = BufReader::new(file.take(snapshot_len));
+        let mut pending_line = String::new();
+        let mut current_line = String::new();
+        let mut pending_line_number = None;
+        let mut physical_line_number = 0;
+        let mut corruption = None;
 
         let mut entries: HashMap<EntryId, ConversationEntry> = HashMap::new();
         let mut order: Vec<EntryId> = Vec::new();
 
-        for (i, line) in lines.iter().enumerate() {
-            if line.trim().is_empty() {
+        loop {
+            current_line.clear();
+            if reader.read_line(&mut current_line)? == 0 {
+                break;
+            }
+            physical_line_number += 1;
+
+            if corruption.is_some() {
                 continue;
             }
-            let entry = match serde_json::from_str::<ConversationEntry>(line) {
-                Ok(e) => e,
-                Err(err) => {
-                    if Some(i) == last_non_empty {
-                        tracing::warn!(
-                            "dropping truncated trailing entry in {}: {err}",
-                            path.display()
-                        );
-                        break;
-                    } else {
-                        return Err(ConversationError::Corrupt(format!(
-                            "{}:line {}: {err}",
-                            path.display(),
-                            i + 1
-                        )));
+
+            if current_line.ends_with('\n') {
+                current_line.pop();
+                if current_line.ends_with('\r') {
+                    current_line.pop();
+                }
+            }
+            if current_line.trim().is_empty() {
+                continue;
+            }
+
+            if let Some(line_number) = pending_line_number {
+                match serde_json::from_str::<ConversationEntry>(&pending_line) {
+                    Ok(entry) => {
+                        order.push(entry.id.clone());
+                        entries.insert(entry.id.clone(), entry);
+                    }
+                    Err(err) => {
+                        corruption = Some((line_number, err));
+                        continue;
                     }
                 }
-            };
+            }
 
-            order.push(entry.id.clone());
-            entries.insert(entry.id.clone(), entry);
+            std::mem::swap(&mut pending_line, &mut current_line);
+            pending_line_number = Some(physical_line_number);
         }
 
+        let unread_snapshot_bytes = reader.get_ref().limit();
+        if unread_snapshot_bytes != 0 {
+            return Err(ConversationError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "session log shrank while reading {}: {unread_snapshot_bytes} snapshot bytes missing",
+                    path.display()
+                ),
+            )));
+        }
+
+        if let Some((line_number, err)) = corruption {
+            return Err(ConversationError::Corrupt(format!(
+                "{}:line {line_number}: {err}",
+                path.display()
+            )));
+        }
+
+        if pending_line_number.is_some() {
+            match serde_json::from_str::<ConversationEntry>(&pending_line) {
+                Ok(entry) => {
+                    order.push(entry.id.clone());
+                    entries.insert(entry.id.clone(), entry);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "dropping truncated trailing entry in {}: {err}",
+                        path.display()
+                    );
+                }
+            }
+        }
+
+        drop(reader);
         let file = OpenOptions::new().append(true).open(&path)?;
 
         Ok(Self {
@@ -1194,6 +1245,137 @@ mod tests {
         AgentMessage::wire(Message::ToolResult(ToolResultMessage::text(
             id, name, body, false,
         )))
+    }
+
+    fn resume_fixture() -> (ConversationPersistence, String, Vec<String>) {
+        let persistence = ConversationPersistence::new(fresh_sessions_dir());
+        let session_id = {
+            let mut log = ConversationLog::create(&persistence).expect("create log");
+            log.set_system_prompt("fixture prompt".to_string())
+                .expect("set system prompt");
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_message(user_text("fixture message"))
+                .expect("add user message");
+            log.session_id().to_string()
+        };
+        let records = std::fs::read_to_string(persistence.session_path(&session_id))
+            .expect("read fixture log")
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        (persistence, session_id, records)
+    }
+
+    #[test]
+    fn resume_ignores_blank_and_whitespace_lines_including_crlf() {
+        let (persistence, session_id, records) = resume_fixture();
+        let path = persistence.session_path(&session_id);
+        let expected_ids = records
+            .iter()
+            .map(|record| {
+                serde_json::from_str::<ConversationEntry>(record)
+                    .expect("fixture record")
+                    .id
+            })
+            .collect::<Vec<_>>();
+        std::fs::write(
+            &path,
+            format!("\r\n \t\r\n{}\r\n\n  \n{}\n\t \r\n", records[0], records[1]),
+        )
+        .expect("rewrite fixture log");
+
+        let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume log");
+
+        assert_eq!(resumed.order, expected_ids);
+        assert_eq!(resumed.entries.len(), 2);
+    }
+
+    #[test]
+    fn resume_drops_malformed_trailing_record_followed_by_whitespace() {
+        let (persistence, session_id, records) = resume_fixture();
+        let path = persistence.session_path(&session_id);
+        std::fs::write(
+            &path,
+            format!("{}\n{}\n{{\"id\":\n \t\r\n\r\n", records[0], records[1]),
+        )
+        .expect("rewrite fixture log");
+
+        let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume log");
+
+        assert_eq!(resumed.order.len(), 2);
+        assert_eq!(resumed.entries.len(), 2);
+    }
+
+    #[test]
+    fn resume_reports_physical_line_for_malformed_non_final_record() {
+        let (persistence, session_id, records) = resume_fixture();
+        let path = persistence.session_path(&session_id);
+        std::fs::write(
+            &path,
+            format!(
+                "{}\r\n \t\r\n{{\"id\":\r\n\r\n{}\r\n",
+                records[0], records[1]
+            ),
+        )
+        .expect("rewrite fixture log");
+
+        let err = match ConversationLog::resume(&persistence, &session_id) {
+            Ok(_) => panic!("non-final malformed record must fail"),
+            Err(err) => err,
+        };
+
+        match err {
+            ConversationError::Corrupt(message) => assert!(
+                message.starts_with(&format!("{}:line 3:", path.display())),
+                "unexpected corruption message: {message}"
+            ),
+            other => panic!("expected corrupt log, got {other}"),
+        }
+    }
+
+    #[test]
+    fn resume_surfaces_invalid_utf8_as_invalid_data_io_error() {
+        let (persistence, session_id, records) = resume_fixture();
+        let path = persistence.session_path(&session_id);
+        let mut contents = records[0].as_bytes().to_vec();
+        contents.extend_from_slice(b"\n\xff\n");
+        std::fs::write(&path, contents).expect("rewrite fixture log");
+
+        let err = match ConversationLog::resume(&persistence, &session_id) {
+            Ok(_) => panic!("invalid UTF-8 must fail"),
+            Err(err) => err,
+        };
+
+        match err {
+            ConversationError::Io(err) => {
+                assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            }
+            other => panic!("expected IO error, got {other}"),
+        }
+    }
+
+    #[test]
+    fn resume_io_error_wins_over_earlier_non_final_corruption() {
+        let (persistence, session_id, records) = resume_fixture();
+        let path = persistence.session_path(&session_id);
+        let mut contents = records[0].as_bytes().to_vec();
+        contents.extend_from_slice(b"\n{\"id\":\n");
+        contents.extend_from_slice(records[1].as_bytes());
+        contents.extend_from_slice(b"\n\xff\n");
+        std::fs::write(&path, contents).expect("rewrite fixture log");
+
+        let err = match ConversationLog::resume(&persistence, &session_id) {
+            Ok(_) => panic!("invalid UTF-8 must win over earlier corruption"),
+            Err(err) => err,
+        };
+
+        match err {
+            ConversationError::Io(err) => {
+                assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            }
+            other => panic!("expected IO error, got {other}"),
+        }
     }
 
     #[test]
