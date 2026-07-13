@@ -47,7 +47,7 @@ use aj_app::settings::ConfigTarget;
 use aj_conf::{Config, ValueKind};
 use aj_models::ThinkingConfig;
 use aj_models::registry::ModelInfo;
-use vaxis::cell::{Cell, Character, Style};
+use vaxis::cell::Style;
 use vaxis::key::{Key, Modifiers};
 use vaxis::vxfw::{
     Builder, DrawContext, Event, EventContext, FilterableSelect, ListView, MaxSize, OverlayWindow,
@@ -694,22 +694,6 @@ impl SettingList {
     }
 }
 
-/// Tint the vertical scroll-bar thumb cells from `style`.
-///
-/// Applied on each draw so a runtime restyle (theme swap) is reflected without
-/// rebuilding the bars. The hover and drag cells are set for completeness. The
-/// list forwards no mouse events to the bars, so only the base thumb is drawn.
-fn apply_thumb_style(bars: &mut ScrollBars<ListView>, style: Style) {
-    let cell = |grapheme: &str| Cell {
-        char: Character::new(grapheme, 1),
-        style,
-        ..Cell::default()
-    };
-    bars.vertical_scrollbar_thumb = cell("\u{2590}");
-    bars.vertical_scrollbar_hover_thumb = cell("\u{2588}");
-    bars.vertical_scrollbar_drag_thumb = cell("\u{2588}");
-}
-
 /// The value after `current` in `values`, wrapping around. Falls back to the
 /// first value when `current` isn't in the set.
 fn next_cycle_value(values: &[String], current: &str) -> String {
@@ -779,8 +763,15 @@ impl Widget for SettingList {
                     // for wheel/key routing) and always reserves the rightmost
                     // list column, whether or not a thumb is currently drawn.
                     // The thumb glyph itself appears only while the list
-                    // overflows its slot.
-                    apply_thumb_style(&mut self.bars, self.styles.borrow().scrollbar_thumb);
+                    // overflows its slot. The shared `apply_thumb_style` helper
+                    // also tints the content overlays, and this list's
+                    // `scrollbar_thumb` resolves to the `Dim` token
+                    // (`select_styles_from_theme`), so every overlay thumb is
+                    // Dim.
+                    crate::scroll::apply_thumb_style(
+                        &mut self.bars,
+                        self.styles.borrow().scrollbar_thumb,
+                    );
                     self.bars.draw(&list_ctx)
                 },
                 z_index: 0,

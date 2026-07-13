@@ -5,6 +5,9 @@
 //! raw `viewport_height()` mechanism. Both the transcript and the read-only
 //! content overlay page by the same rule, so they share this one function.
 
+use vaxis::cell::{Cell, Character, Style};
+use vaxis::vxfw::{ListView, ScrollBars};
+
 /// Rows kept in common between two page-scroll steps, so a reader keeps a
 /// little context across a page turn rather than jumping a full viewport.
 const PAGE_OVERLAP: u16 = 2;
@@ -28,6 +31,22 @@ pub(crate) fn page_scroll_lines(viewport_height: Option<u16>) -> i32 {
         Some(h) if h > 0 => i32::from(h),
         _ => DEFAULT_PAGE_LINES,
     }
+}
+
+/// Tint the vertical scroll-bar thumb cells from `style`.
+///
+/// Applied on each draw so a runtime restyle (theme swap) is reflected without
+/// rebuilding the bars. The hover and drag cells are set for completeness. The
+/// list forwards no mouse events to the bars, so only the base thumb is drawn.
+pub(crate) fn apply_thumb_style(bars: &mut ScrollBars<ListView>, style: Style) {
+    let cell = |grapheme: &str| Cell {
+        char: Character::new(grapheme, 1),
+        style,
+        ..Cell::default()
+    };
+    bars.vertical_scrollbar_thumb = cell("\u{2590}");
+    bars.vertical_scrollbar_hover_thumb = cell("\u{2588}");
+    bars.vertical_scrollbar_drag_thumb = cell("\u{2588}");
 }
 
 #[cfg(test)]

@@ -117,6 +117,11 @@ pub(crate) struct ContentOverlay {
     /// overlay's rows after the initial "Loading…" state.
     list: Rc<RefCell<ListView>>,
     bars: ScrollBars<ListView>,
+    /// Tint applied to the scroll-bar thumb on each draw. Defaults to
+    /// [`Style::default`] so a bare [`ContentOverlay::new`] draws an
+    /// untinted thumb. [`open_content_overlay`] sets it to the chrome's
+    /// Dim thumb style.
+    thumb_style: Style,
     /// Closes this overlay and restores focus to the parent. Runs inside
     /// key dispatch, where the live [`EventContext`] can move focus.
     pub(crate) on_close: Option<Box<dyn FnMut(&mut EventContext)>>,
@@ -135,6 +140,7 @@ impl ContentOverlay {
         ContentOverlay {
             list,
             bars,
+            thumb_style: Style::default(),
             on_close: None,
         }
     }
@@ -143,6 +149,11 @@ impl ContentOverlay {
     pub(crate) fn list_handle(&self) -> Rc<RefCell<ListView>> {
         Rc::clone(&self.list)
     }
+
+    /// Set the tint applied to the scroll-bar thumb on each draw.
+    pub(crate) fn set_thumb_style(&mut self, style: Style) {
+        self.thumb_style = style;
+    }
 }
 
 impl Widget for ContentOverlay {
@@ -150,6 +161,11 @@ impl Widget for ContentOverlay {
         // Wrap the bars in an opaque full-size surface so a shorter
         // refill can't leave stale cells from a taller previous frame.
         let mut surface = Surface::with_size(ctx.max.size());
+        // Tint the thumb per-draw so it never goes stale, mirroring the
+        // settings list. The thumb is set from the chrome at open time and
+        // reskins on reopen, consistent with the window border and title
+        // styles (which content overlays also do not live-reskin).
+        crate::scroll::apply_thumb_style(&mut self.bars, self.thumb_style);
         surface.children.push(SubSurface {
             origin: RelativePoint { row: 0, col: 0 },
             surface: self.bars.draw(ctx),
@@ -241,6 +257,12 @@ pub(crate) fn open_content_overlay(
     ctx: &mut EventContext,
 ) -> Rc<RefCell<ListView>> {
     let content = Rc::new(RefCell::new(ContentOverlay::new(rows)));
+    // The chrome's Dim thumb style is applied at open time (and again on
+    // reopen), like the window border and title styles below, rather than
+    // live-reskinned.
+    content
+        .borrow_mut()
+        .set_thumb_style(chrome.select.scrollbar_thumb);
     let list = content.borrow().list_handle();
     {
         let stack_for_close = Rc::clone(stack);
@@ -1312,6 +1334,38 @@ mod tests {
         overlay.capture_event(&mut ec, &key_press(u32::from('p'), Modifiers::CTRL));
         let _ = overlay.draw(&ctx);
         assert_eq!(absolute_top(&overlay), 0, "Ctrl+P scrolls up one line");
+    }
+
+    /// The drawn thumb glyph carries the tint set via `set_thumb_style`,
+    /// applied per-draw. This pins the draw-time apply: dropping the tint (a
+    /// `Style::default()` no-op) fails here rather than passing on the shared
+    /// default glyph, which already matches on its grapheme alone.
+    #[test]
+    fn scrollbar_thumb_carries_the_configured_tint() {
+        let mut overlay = tall_overlay(50);
+        // A distinct fg so a tinted thumb cell can't be confused with any
+        // other column's default color.
+        let tint = Color::Index(200);
+        overlay.set_thumb_style(Style {
+            fg: tint,
+            ..Style::default()
+        });
+        let ctx = draw_ctx(20, 6);
+        let surface = overlay.draw(&ctx);
+        // The thumb sits on the list's right edge, in a child surface, so
+        // composite the tree before reading the cell's style.
+        let last_col = 19;
+        let fg = crate::test_support::flatten(&surface)
+            .iter()
+            .find_map(|row| {
+                let cell = row.get(last_col)?;
+                (cell.char.grapheme() == "\u{2590}").then_some(cell.style.fg)
+            })
+            .expect("a thumb cell is drawn on the list's right edge");
+        assert_eq!(
+            fg, tint,
+            "the content-overlay thumb carries the tint set via set_thumb_style"
+        );
     }
 
     /// A plain builder produces single-span, default-styled rows, pinning
