@@ -105,10 +105,8 @@ pub enum ThemeColor {
     Error,
     /// Warning state.
     Warning,
-    /// Secondary text.
+    /// Secondary, subdued text. The sole grey tier for de-emphasized text.
     Muted,
-    /// Tertiary, even-more-subtle text.
-    Dim,
     /// Default text. Renders as the terminal's foreground color.
     Text,
     /// Thinking block body text.
@@ -206,7 +204,6 @@ impl ThemeColor {
             ThemeColor::Error => "error",
             ThemeColor::Warning => "warning",
             ThemeColor::Muted => "muted",
-            ThemeColor::Dim => "dim",
             ThemeColor::Text => "text",
             ThemeColor::ThinkingText => "thinkingText",
             ThemeColor::UserMessageText => "userMessageText",
@@ -259,7 +256,6 @@ impl ThemeColor {
             ThemeColor::Error,
             ThemeColor::Warning,
             ThemeColor::Muted,
-            ThemeColor::Dim,
             ThemeColor::Text,
             ThemeColor::ThinkingText,
             ThemeColor::UserMessageText,
@@ -1121,7 +1117,7 @@ mod tests {
             "colors": { "accent": "a",
                 "border": "", "borderAccent": "", "borderMuted": "",
                 "success": "", "error": "", "warning": "", "muted": "",
-                "dim": "", "text": "", "thinkingText": "",
+                "text": "", "thinkingText": "",
                 "selectedBg": "", "userMessageBg": "", "userMessageText": "",
                 "customMessageBg": "", "customMessageText": "",
                 "customMessageLabel": "", "toolPendingBg": "",
@@ -1163,7 +1159,7 @@ mod tests {
             "colors": { "accent": "nope",
                 "border": "", "borderAccent": "", "borderMuted": "",
                 "success": "", "error": "", "warning": "", "muted": "",
-                "dim": "", "text": "", "thinkingText": "",
+                "text": "", "thinkingText": "",
                 "selectedBg": "", "userMessageBg": "", "userMessageText": "",
                 "customMessageBg": "", "customMessageText": "",
                 "customMessageLabel": "", "toolPendingBg": "",
@@ -1311,7 +1307,7 @@ mod tests {
                     "accent": "{accent_hex}",
                     "border": "", "borderAccent": "", "borderMuted": "",
                     "success": "", "error": "", "warning": "", "muted": "",
-                    "dim": "", "text": "", "thinkingText": "",
+                    "text": "", "thinkingText": "",
                     "selectedBg": "", "userMessageBg": "", "userMessageText": "",
                     "customMessageBg": "", "customMessageText": "",
                     "customMessageLabel": "", "toolPendingBg": "",

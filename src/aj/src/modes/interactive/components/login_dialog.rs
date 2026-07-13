@@ -107,7 +107,7 @@ impl LoginDialogComponent {
                 url: theme.fg_closure(ThemeColor::Accent),
                 progress: theme.fg_closure(ThemeColor::Muted),
                 info: theme.fg_closure(ThemeColor::Text),
-                hint: theme.fg_closure(ThemeColor::Dim),
+                hint: theme.fg_closure(ThemeColor::Muted),
             },
             focused: true,
             auto_copied: false,

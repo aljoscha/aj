@@ -204,7 +204,7 @@ impl Widget for Scrim {
 
 /// Frame styles for overlay windows, resolved once from the theme with the
 /// same token mapping `aj` uses: a muted border, a bold accent title, and a
-/// dim key-hint subtitle. Carries the pick-list row styles too so a list
+/// muted key-hint subtitle. Carries the pick-list row styles too so a list
 /// overlay (palette, selectors, settings) draws its selection band from the
 /// same palette snapshot.
 #[derive(Clone)]
@@ -228,7 +228,7 @@ impl OverlayChrome {
                 bold: true,
                 ..fg(ThemeColor::Accent)
             },
-            subtitle: fg(ThemeColor::Dim),
+            subtitle: fg(ThemeColor::Muted),
             select: select_styles_from_theme(theme),
         }
     }
@@ -236,16 +236,15 @@ impl OverlayChrome {
 
 /// Shared pick-list row styles from the theme, used by every list overlay via
 /// [`OverlayChrome::select`]: the E-7 full-width band over `ThemeBg::SelectedBg`
-/// with normal text on top, and a muted secondary column. The secondary column
-/// is the description column, which `aj` draws in `Muted` (`#808080`), distinct
-/// from the `Dim` (`#666666`) it uses for the subtitle.
+/// with normal text on top, and a muted secondary column (the description).
 ///
-/// The prefix (category) column is `Dim`, and the shortcut column is the
-/// `KeybindingHint` token drawn bold: coloring the shortcut with the hint token
-/// is the ratified E-10 aj-next divergence from `aj`. Only the palette sets a
-/// prefix or shortcut, so those columns are inert for the other overlays. The
-/// label is plain here (the shared default); the palette bolds its own copy on
-/// top, so bold labels are palette-only (see `crate::palette::open_palette`).
+/// The prefix (category) column and the secondary column both use `Muted`, and
+/// the shortcut column is the `KeybindingHint` token drawn bold: coloring the
+/// shortcut with the hint token is the ratified E-10 aj-next divergence from
+/// `aj`. Only the palette sets a prefix or shortcut, so those columns are inert
+/// for the other overlays. The label is plain here (the shared default); the
+/// palette bolds its own copy on top, so bold labels are palette-only (see
+/// `crate::palette::open_palette`).
 pub(crate) fn select_styles_from_theme(theme: &Theme) -> SelectStyles {
     let mode = theme.color_mode();
     let fg = |token: ThemeColor| Style {
@@ -255,13 +254,13 @@ pub(crate) fn select_styles_from_theme(theme: &Theme) -> SelectStyles {
     SelectStyles {
         selected_bg: vaxis_color(theme.bg_color(ThemeBg::SelectedBg), mode),
         label: fg(ThemeColor::Text),
-        prefix: fg(ThemeColor::Dim),
+        prefix: fg(ThemeColor::Muted),
         shortcut: Style {
             bold: true,
             ..fg(ThemeColor::KeybindingHint)
         },
         secondary: fg(ThemeColor::Muted),
-        scrollbar_thumb: fg(ThemeColor::Dim),
+        scrollbar_thumb: fg(ThemeColor::Muted),
     }
 }
 

@@ -89,7 +89,7 @@ enum PhaseKind {
 }
 
 /// One row of an interactive menu phase: the `value` returned when it is
-/// confirmed, the `label` shown, and an optional dim description column.
+/// confirmed, the `label` shown, and an optional muted description column.
 #[derive(Clone)]
 struct MenuItem {
     value: String,
@@ -656,10 +656,10 @@ impl Widget for UsageOverlay {
                     height: Some(body_height),
                 },
             );
-            // NOTE: tint the thumb Dim per-draw, via the shared helper, so it
-            // matches every other scrollbar. The style is snapshotted at open,
-            // so this is parity with the other lists, not a live restyle.
-            crate::scroll::apply_thumb_style(&mut self.bars, self.styles.dim);
+            // NOTE: tint the thumb Muted per-draw, via the shared helper, so
+            // it matches every other scrollbar. The style is snapshotted at
+            // open, so this is parity with the other lists, not a live restyle.
+            crate::scroll::apply_thumb_style(&mut self.bars, self.styles.muted);
             surface.children.push(SubSurface {
                 origin: RelativePoint { row: 0, col: 0 },
                 surface: self.bars.draw(&body_ctx),
@@ -904,14 +904,10 @@ mod tests {
         AuthStorage::with_providers(dir.join("auth.json"), HashMap::new())
     }
 
-    /// Distinct dim/muted tints so a column left at the default fg fails the
+    /// Distinct muted tint so a column left at the default fg fails the
     /// tinting assertions.
     fn test_styles() -> ContentStyles {
         ContentStyles {
-            dim: Style {
-                fg: Color::Index(1),
-                ..Style::default()
-            },
             muted: Style {
                 fg: Color::Index(2),
                 ..Style::default()
@@ -1312,9 +1308,9 @@ mod tests {
         assert!(!out.contains(&hint), "footer leaked into body:\n{out}");
     }
 
-    /// The Display rows keep the P4a tinting: the provider-id column in the
-    /// dim tint, the status detail in the muted tint. Fails if a column is
-    /// left at the default fg.
+    /// The Display rows keep the P4a tinting: the provider-id column and the
+    /// status detail in the muted tint. Fails if a column is left at the
+    /// default fg.
     #[test]
     fn display_rows_preserve_column_tints() {
         let (overlay, _) = overlay_with(vec![codex_status(Some(2))], vec![]);
@@ -1322,18 +1318,18 @@ mod tests {
         let first = &rows[0];
         assert_eq!(first.len(), 3, "id, label, and detail spans: {first:?}");
         assert!(first[0].text.contains("openai-codex"), "{first:?}");
-        assert_eq!(first[0].style, test_styles().dim);
+        assert_eq!(first[0].style, test_styles().muted);
         assert!(first[1].text.contains("5h limit"), "{first:?}");
         assert_eq!(first[1].style, Style::default());
         assert_eq!(first[2].style, test_styles().muted);
     }
 
-    /// The read-only body's scrollbar thumb is tinted Dim, via the shared
+    /// The read-only body's scrollbar thumb is tinted Muted, via the shared
     /// helper, whenever the content overflows its slot. Dropping the
     /// per-draw `apply_thumb_style` in `draw` leaves the thumb at the
     /// default fg and fails here.
     #[test]
-    fn scrollbar_thumb_carries_the_dim_tint() {
+    fn scrollbar_thumb_carries_the_muted_tint() {
         // Many provider rows so the body overflows the short slot below and a
         // thumb draws.
         let statuses: Vec<ProviderUsageStatus> = (0..20)
@@ -1354,8 +1350,8 @@ mod tests {
             .expect("a thumb cell is drawn on the list's right edge");
         assert_eq!(
             fg,
-            test_styles().dim.fg,
-            "the usage body thumb carries the Dim tint from ContentStyles"
+            test_styles().muted.fg,
+            "the usage body thumb carries the Muted tint from ContentStyles"
         );
     }
 }

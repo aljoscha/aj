@@ -768,10 +768,10 @@ impl Widget for SettingList {
                     // list column, whether or not a thumb is currently drawn.
                     // The thumb glyph itself appears only while the list
                     // overflows its slot. This list's `scrollbar_thumb`
-                    // resolves to the `Dim` token (`select_styles_from_theme`).
+                    // resolves to the `Muted` token (`select_styles_from_theme`).
                     // The content, usage, and task-output overlays tint through
                     // this same shared `crate::scroll::apply_thumb_style`, each
-                    // fed its own dim style, so their thumbs pick up the same
+                    // fed its own thumb style, so their thumbs pick up the same
                     // treatment.
                     crate::scroll::apply_thumb_style(
                         &mut self.bars,

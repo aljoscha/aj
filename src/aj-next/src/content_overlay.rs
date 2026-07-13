@@ -70,12 +70,11 @@ fn span(text: impl Into<String>, style: Style) -> Segment {
 }
 
 /// Column tints for the read-only content pages, resolved once from the
-/// theme like [`OverlayChrome`]. `dim` tints the provider-id column and
-/// `muted` the secondary detail column, matching `aj`'s auth page.
-/// `heading` colors the help page's section headings.
+/// theme like [`OverlayChrome`]. `muted` tints the provider-id and secondary
+/// detail columns, matching `aj`'s auth page. `heading` colors the help
+/// page's section headings.
 #[derive(Clone, Copy)]
 pub(crate) struct ContentStyles {
-    pub(crate) dim: Style,
     pub(crate) muted: Style,
     pub(crate) heading: Style,
 }
@@ -88,7 +87,6 @@ impl ContentStyles {
             ..Style::default()
         };
         ContentStyles {
-            dim: fg(ThemeColor::Dim),
             muted: fg(ThemeColor::Muted),
             // `Accent` is the overlay title's emphasis token (a lavender in
             // both bundled themes), so a section heading reads with the same
@@ -120,7 +118,7 @@ pub(crate) struct ContentOverlay {
     /// Tint applied to the scroll-bar thumb on each draw. Defaults to
     /// [`Style::default`] so a bare [`ContentOverlay::new`] draws an
     /// untinted thumb. [`open_content_overlay`] sets it to the chrome's
-    /// Dim thumb style.
+    /// Muted thumb style.
     thumb_style: Style,
     /// Closes this overlay and restores focus to the parent. Runs inside
     /// key dispatch, where the live [`EventContext`] can move focus.
@@ -256,7 +254,7 @@ pub(crate) fn open_content_overlay(
     ctx: &mut EventContext,
 ) -> Rc<RefCell<ListView>> {
     let content = Rc::new(RefCell::new(ContentOverlay::new(rows)));
-    // The chrome's Dim thumb style is applied at open time (and again on
+    // The chrome's Muted thumb style is applied at open time (and again on
     // reopen), like the window border and title styles below, rather than
     // live-reskinned.
     content
@@ -339,7 +337,7 @@ const SCROLL_NAV_ACTIONS: &[&str] = &[
 ];
 
 /// One line of the help page before layout: a colored section heading, a
-/// dim sub-group label, a key/description entry, or a spacer.
+/// muted sub-group label, a key/description entry, or a spacer.
 enum HelpLine {
     /// Top-level section heading, drawn in the heading color.
     Heading(&'static str),
@@ -502,12 +500,13 @@ pub(crate) fn help_rows(styles: &ContentStyles) -> Vec<Row> {
 /// Auth-status rows: one per provider, its credential summary and any
 /// secondary detail (e.g. token expiry).
 ///
-/// Each row is three columns: the provider id in `styles.dim`, the summary
+/// Each row is three columns: the provider id in `styles.muted`, the summary
 /// in the default style, and the optional detail in `styles.muted`. The
-/// muted tint separates the detail column, so it reads as its own field
-/// without the parentheses `aj` also omits. The id column is right-aligned
-/// and the summary is padded to a shared width on rows that carry a detail,
-/// so every detail value starts at the same column and lines up.
+/// default-styled summary separates the two muted columns, so the detail
+/// reads as its own field without the parentheses `aj` also omits. The id
+/// column is right-aligned and the summary is padded to a shared width on
+/// rows that carry a detail, so every detail value starts at the same column
+/// and lines up.
 pub(crate) fn auth_rows(statuses: &[ProviderAuthStatus], styles: &ContentStyles) -> Vec<Row> {
     if statuses.is_empty() {
         return vec![plain("No providers configured.")];
@@ -536,7 +535,7 @@ pub(crate) fn auth_rows(statuses: &[ProviderAuthStatus], styles: &ContentStyles)
                 format!("  {summary}", summary = s.summary)
             };
             let mut row = vec![
-                span(format!("{id:>id_w$}", id = s.provider_id), styles.dim),
+                span(format!("{id:>id_w$}", id = s.provider_id), styles.muted),
                 span(summary, Style::default()),
             ];
             if let Some(detail) = &s.detail {
@@ -589,7 +588,7 @@ fn usage_status_rows(status: &ProviderUsageStatus, now_ms: i64) -> Vec<(String, 
 /// groups the windows visually (matching `aj`'s usage page).
 ///
 /// Each row is up to three columns, tinted like [`auth_rows`]: the
-/// right-aligned provider-id column in `styles.dim` (blank but still
+/// right-aligned provider-id column in `styles.muted` (blank but still
 /// `id_w` wide on continuation rows), the window/status label in the
 /// default style, and the per-window status detail in `styles.muted`.
 /// The label is padded to a shared width on rows that carry a detail, so
@@ -626,7 +625,7 @@ pub(crate) fn usage_rows(statuses: &[ProviderUsageStatus], styles: &ContentStyle
             // The id shows only on a provider's first row. Continuation
             // rows keep the column width so the label column stays put.
             let prefix = if i == 0 { *id } else { "" };
-            let mut row = vec![span(format!("{prefix:>id_w$}"), styles.dim)];
+            let mut row = vec![span(format!("{prefix:>id_w$}"), styles.muted)];
             match detail {
                 Some(detail) => {
                     row.push(span(format!("  {label:<label_w$}"), Style::default()));
@@ -695,14 +694,10 @@ mod tests {
         rows.iter().map(row_text).collect::<Vec<_>>().join("\n")
     }
 
-    /// Distinct dim/muted/heading tints so a column left at the default fg
+    /// Distinct muted/heading tints so a column left at the default fg
     /// fails the tinting assertions.
     fn test_styles() -> ContentStyles {
         ContentStyles {
-            dim: Style {
-                fg: Color::Index(1),
-                ..Style::default()
-            },
             muted: Style {
                 fg: Color::Index(2),
                 ..Style::default()
@@ -900,9 +895,9 @@ mod tests {
         assert!(rows.contains("not configured"), "{rows}");
     }
 
-    /// The auth page tints its columns: the provider id in the dim style,
-    /// the summary in the default style, and the detail in the muted style,
-    /// with no parentheses around the detail. This fails if a column is
+    /// The auth page tints its columns: the provider id and detail in the
+    /// muted style, the summary in the default style between them, and no
+    /// parentheses around the detail. This fails if a column is
     /// left at the default fg.
     #[test]
     fn auth_rows_tint_columns_from_styles() {
@@ -919,9 +914,9 @@ mod tests {
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
         assert_eq!(row.len(), 3, "id, summary, and detail spans: {row:?}");
-        // Provider id in the dim tint.
+        // Provider id in the muted tint.
         assert!(row[0].text.contains("anthropic"), "{row:?}");
-        assert_eq!(row[0].style, styles.dim);
+        assert_eq!(row[0].style, styles.muted);
         // Summary in the default style.
         assert!(row[1].text.contains("subscription"), "{row:?}");
         assert_eq!(row[1].style, Style::default());
@@ -996,8 +991,8 @@ mod tests {
         };
         assert_eq!(prefix_width(&rows[0]), prefix_width(&rows[1]));
 
-        // Tints preserved: id dim, summary default, detail muted.
-        assert_eq!(rows[0][0].style, styles.dim);
+        // Tints preserved: id muted, summary default, detail muted.
+        assert_eq!(rows[0][0].style, styles.muted);
         assert_eq!(rows[0][1].style, Style::default());
         assert_eq!(rows[0][2].style, styles.muted);
     }
@@ -1033,8 +1028,8 @@ mod tests {
     }
 
     /// The usage page tints its columns like the auth page: the provider
-    /// id in the dim style, the window label in the default style, and the
-    /// status detail in the muted style. A provider's continuation rows
+    /// id and status detail in the muted style, the window label in the
+    /// default style. A provider's continuation rows
     /// leave the id column blank so the group reads as one provider. This
     /// fails if a column is left at the default fg.
     #[test]
@@ -1071,9 +1066,9 @@ mod tests {
         // First row: id, label, and detail spans.
         let first = &rows[0];
         assert_eq!(first.len(), 3, "id, label, and detail spans: {first:?}");
-        // Provider id in the dim tint, on the first row of the group.
+        // Provider id in the muted tint, on the first row of the group.
         assert!(first[0].text.contains("anthropic"), "{first:?}");
-        assert_eq!(first[0].style, styles.dim);
+        assert_eq!(first[0].style, styles.muted);
         // Window label in the default style.
         assert!(first[1].text.contains("5-hour"), "{first:?}");
         assert_eq!(first[1].style, Style::default());
@@ -1082,14 +1077,14 @@ mod tests {
         assert_eq!(first[2].style, styles.muted);
 
         // Continuation row: id column is blank (no provider id), still in
-        // the dim tint, and the label/detail carry the same tints.
+        // the muted tint, and the label/detail carry the same tints.
         let second = &rows[1];
         assert_eq!(second.len(), 3, "id, label, and detail spans: {second:?}");
         assert!(
             second[0].text.trim().is_empty(),
             "continuation id column is blank: {second:?}"
         );
-        assert_eq!(second[0].style, styles.dim);
+        assert_eq!(second[0].style, styles.muted);
         assert!(second[1].text.contains("7-day"), "{second:?}");
         assert_eq!(second[1].style, Style::default());
         assert_eq!(second[2].style, styles.muted);
@@ -1368,7 +1363,7 @@ mod tests {
     }
 
     /// Driving `open_content_overlay` tints the drawn thumb with the chrome's
-    /// Dim color, pinning the open-time wiring. Deleting the `set_thumb_style`
+    /// Muted color, pinning the open-time wiring. Deleting the `set_thumb_style`
     /// call in `open_content_overlay` drops the tint and fails here.
     #[test]
     fn open_content_overlay_tints_the_thumb_from_the_chrome() {
@@ -1393,7 +1388,7 @@ mod tests {
             .expect("a thumb cell is drawn inside the window");
         assert_eq!(
             fg, chrome.select.scrollbar_thumb.fg,
-            "the open path tints the thumb with the chrome's Dim color"
+            "the open path tints the thumb with the chrome's Muted color"
         );
     }
 

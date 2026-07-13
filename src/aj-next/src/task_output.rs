@@ -59,9 +59,9 @@ pub(crate) struct TaskOutputView {
     follow: bool,
     text_style: Style,
     dim_style: Style,
-    /// Scrollbar thumb color, the shared `Dim` token so the thumb matches
+    /// Scrollbar thumb color, the shared `Muted` token so the thumb matches
     /// every other scrollbar. Distinct from `dim_style` (the header's faint
-    /// attribute), which reads dim but is not the `Dim` color.
+    /// attribute), which reads dim but is not the `Muted` color.
     thumb_style: Style,
     on_close: Option<Box<dyn FnMut(&mut EventContext)>>,
 }
@@ -213,9 +213,9 @@ impl Widget for TaskOutputView {
                     height: Some(body_height),
                 },
             );
-            // NOTE: tint the thumb from the shared Dim color token per-draw,
+            // NOTE: tint the thumb from the shared Muted color token per-draw,
             // via the shared helper, so it matches every other scrollbar. This
-            // is the `Dim` color, not the header's faint `dim_style`.
+            // is the `Muted` color, not the header's faint `dim_style`.
             crate::scroll::apply_thumb_style(&mut self.bars, self.thumb_style);
             surface.children.push(SubSurface {
                 origin: RelativePoint {
@@ -613,11 +613,11 @@ mod tests {
     }
 
     /// The tailing body's scrollbar thumb is tinted with the view's
-    /// `thumb_style` (the shared `Dim` color), via the shared helper, whenever
+    /// `thumb_style` (the shared `Muted` color), via the shared helper, whenever
     /// the output overflows its slot. Dropping the per-draw `apply_thumb_style`
     /// in `draw` leaves the thumb at the default fg and fails here.
     #[test]
-    fn scrollbar_thumb_carries_the_dim_tint() {
+    fn scrollbar_thumb_carries_the_muted_tint() {
         let contents: String = (1..=40).map(|n| format!("line{n}\n")).collect();
         let (registry, id, _f) = task(&contents, TaskStatus::Running);
         // A distinct thumb fg so the tinted thumb can't be confused with a

@@ -87,6 +87,9 @@ pub(crate) struct LoginDialogState {
 /// Resolved line colors for the dialog's line kinds and its input/notice
 /// rows. `Copy` (all fields are `vaxis` [`Style`]s) so the row [`Builder`]
 /// and the widget can each hold one.
+///
+/// NOTE: `progress`, `prompt`, and `notice` all resolve to `Muted` today.
+/// They stay separate fields so a future theme can tint them by role.
 #[derive(Clone, Copy)]
 struct LoginStyles {
     info: Style,
@@ -107,8 +110,8 @@ impl LoginStyles {
             info: fg(ThemeColor::Text),
             progress: fg(ThemeColor::Muted),
             url: fg(ThemeColor::Accent),
-            prompt: fg(ThemeColor::Dim),
-            notice: fg(ThemeColor::Dim),
+            prompt: fg(ThemeColor::Muted),
+            notice: fg(ThemeColor::Muted),
         }
     }
 }
@@ -593,7 +596,7 @@ pub(crate) enum AuthPickerRequest {
 
 /// One provider row for a picker: the id returned to the host, the
 /// friendly label shown as the primary column, and a status summary shown
-/// as the dim description.
+/// as the muted description.
 pub(crate) struct AuthRow {
     pub(crate) provider_id: String,
     pub(crate) label: String,
@@ -608,7 +611,7 @@ enum PickerMode {
 }
 
 /// Build one selectable row: the friendly label as the primary column, the
-/// status summary as the dim description, and `"{id} {label}"` as the
+/// status summary as the muted description, and `"{id} {label}"` as the
 /// filter key so typing either the id or the name finds it.
 fn picker_items(rows: &[AuthRow]) -> Vec<SelectItem> {
     rows.iter()

@@ -226,7 +226,7 @@ pub fn select_list_theme(theme: &ThemeHandle) -> SelectListTheme {
         description: theme.fg_closure(ThemeColor::Muted),
         scroll_info: theme.fg_closure(ThemeColor::Muted),
         no_match: theme.fg_closure(ThemeColor::Muted),
-        prefix: theme.fg_closure(ThemeColor::Dim),
+        prefix: theme.fg_closure(ThemeColor::Muted),
         shortcut: theme.fg_closure(ThemeColor::Accent),
     }
 }
@@ -264,7 +264,7 @@ pub fn settings_list_theme(
         label,
         value,
         description: theme.fg_closure(ThemeColor::Muted),
-        hint: theme.fg_closure(ThemeColor::Dim),
+        hint: theme.fg_closure(ThemeColor::Muted),
         // The override marker (project window) reuses the accent so a
         // set row's glyph matches the selected-row accent palette.
         marker: accent_for_marker,
@@ -291,7 +291,7 @@ pub fn overlay_window_theme(
     aj_tui::components::overlay_window::OverlayWindowTheme {
         border: theme.fg_closure(ThemeColor::BorderMuted),
         title,
-        subtitle: theme.fg_closure(ThemeColor::Dim),
+        subtitle: theme.fg_closure(ThemeColor::Muted),
     }
 }
 
@@ -553,7 +553,7 @@ mod tests {
                 "accent": 196,
                 "border": "", "borderAccent": "", "borderMuted": "",
                 "success": "", "error": "", "warning": "", "muted": "",
-                "dim": "", "text": "", "thinkingText": "",
+                "text": "", "thinkingText": "",
                 "selectedBg": "", "userMessageBg": "", "userMessageText": "",
                 "customMessageBg": "", "customMessageText": "",
                 "customMessageLabel": "", "toolPendingBg": "",

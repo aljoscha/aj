@@ -103,8 +103,8 @@ pub(crate) struct TranscriptStyles {
 
 /// The SGR-2 faint attribute over the default foreground: the exact analogue of
 /// `aj-tui`'s `style::dim`, which every dim transcript row, tool-cell detail, and
-/// background-task line uses. It is an attribute, not the `Dim` palette gray
-/// (`#666666`), so it tracks the terminal's own foreground the way `aj` does.
+/// background-task line uses. It is an attribute, not a palette gray, so it
+/// tracks the terminal's own foreground the way `aj` does.
 pub(crate) fn faint() -> Style {
     Style {
         dim: true,
@@ -128,7 +128,7 @@ impl TranscriptStyles {
                 ..fg(ThemeColor::ThinkingText)
             },
             dim: faint(),
-            scrollbar_thumb: fg(ThemeColor::Dim),
+            scrollbar_thumb: fg(ThemeColor::Muted),
             warning: fg(ThemeColor::Warning),
             error: fg(ThemeColor::Error),
             success: fg(ThemeColor::Success),
