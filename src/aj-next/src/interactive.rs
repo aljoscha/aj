@@ -6980,6 +6980,15 @@ mod tests {
         }
         app.render(&root).expect("render");
 
+        // The help is taller than its fixed-height overlay and the palette-open
+        // row sits in a lower section, so scroll to the bottom to bring the
+        // resolved shortcut on screen. End maps to scroll-to-bottom in the
+        // content overlay.
+        writer.write_all(b"\x1bOF").expect("write end");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        app.render(&root).expect("render");
+
         // Draw the whole shell and read the help overlay's rows.
         let ctx = DrawContext {
             min: Size {
