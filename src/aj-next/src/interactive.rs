@@ -1570,6 +1570,25 @@ fn apply_picker_outcome(
     }
 }
 
+/// Drains and applies the picker outcome parked during input dispatch.
+fn apply_pending_picker_outcome(world: &mut World, shell: &Rc<RefCell<Shell>>, app: &mut AsyncApp) {
+    // Drop the Shell borrow before a refocus event dispatches through it.
+    let outcome = shell.borrow().take_picker_outcome();
+    if let Some(outcome) = outcome {
+        match apply_picker_outcome(world, shell, outcome) {
+            ActionEffect::None => {}
+            ActionEffect::Redraw => app.request_redraw(),
+            ActionEffect::OpenedOverlay => {
+                app.post_app_event(UserEvent {
+                    name: REFOCUS_OVERLAY_EVENT.to_string(),
+                    data: None,
+                });
+                app.request_redraw();
+            }
+        }
+    }
+}
+
 /// Recall a prompt-history pick into the editor, replacing whatever is
 /// typed. Recall does not submit, so the user can edit before sending.
 fn recall_into_editor(shell: &Rc<RefCell<Shell>>, text: &str) {
@@ -4041,23 +4060,7 @@ async fn drive(
                         // task / kill). Opening the task viewer pushes a
                         // child overlay, so it takes the same refocus path
                         // as a host-opened selector.
-                        if let Some(outcome) = shell.borrow().take_picker_outcome() {
-                            match apply_picker_outcome(world, shell, outcome) {
-                                // The picker resolves synchronously (it never
-                                // defers a fill), so its outcome is one of
-                                // these three. `OpenTask` opens the viewer
-                                // overlay; observe/kill just redraw or no-op.
-                                ActionEffect::None => {}
-                                ActionEffect::Redraw => app.request_redraw(),
-                                ActionEffect::OpenedOverlay => {
-                                    app.post_app_event(UserEvent {
-                                        name: REFOCUS_OVERLAY_EVENT.to_string(),
-                                        data: None,
-                                    });
-                                    app.request_redraw();
-                                }
-                            }
-                        }
+                        apply_pending_picker_outcome(world, shell, app);
                         // A prompt-history recall: drop the chosen text
                         // into the editor (it does not submit).
                         if let Some(text) = shell.borrow().take_recall() {
@@ -7976,6 +7979,58 @@ mod tests {
         );
         assert!(matches!(effect, ActionEffect::Redraw));
         assert_eq!(world.chat.borrow().active_view(), AgentId::Sub(2));
+    }
+
+    /// A confirmed task pick opens and refocuses its viewer before another
+    /// queued key can dispatch through the closed picker path.
+    #[tokio::test]
+    async fn draining_open_task_outcome_refocuses_the_viewer() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        let id = register_bash_task(&world, "cargo build");
+        seed_sub_and_task(&mut world);
+        assert!(matches!(
+            apply_command(&mut world, &shell, CommandAction::OpenAgentPicker).await,
+            ActionEffect::OpenedOverlay
+        ));
+        focus_overlay(&mut app, &root);
+
+        writer
+            .write_all(b"cargo build\r")
+            .expect("filter and confirm task");
+        for _ in 0..12 {
+            let event = app.next_input().await.expect("input event");
+            app.handle_input(event);
+        }
+        assert!(
+            !shell.borrow().overlays.borrow().is_open(),
+            "confirm closed picker"
+        );
+
+        apply_pending_picker_outcome(&mut world, &shell, &mut app);
+        assert!(shell.borrow().overlays.borrow().is_open(), "viewer open");
+
+        writer.write_all(&[0x0b]).expect("write ctrl+k");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        assert!(
+            shell.borrow().overlays.borrow().is_open(),
+            "viewer handled Ctrl+K without the stale picker closing it"
+        );
+        assert!(
+            shell.borrow().take_picker_outcome().is_none(),
+            "stale picker did not park another outcome"
+        );
+        assert!(world.core.task_registry.summary(id).is_some());
+
+        writer.write_all(b"\x1b").expect("write esc");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        assert!(
+            !shell.borrow().overlays.borrow().is_open(),
+            "focused viewer handled Esc"
+        );
     }
 
     /// Drilling into a task opens the viewer overlay; an id that has left

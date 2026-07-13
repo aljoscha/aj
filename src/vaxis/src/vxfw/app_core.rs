@@ -115,11 +115,9 @@ impl AppCore {
 
     /// Lays out `widget` as the root, constrained to the full screen.
     ///
-    /// NOTE: We time the layout here and fold it into `pending_layout` rather
-    /// than in the callers. Every caller is a render sequence and the frame's
-    /// initial and re-layout calls are both real layout work for the same
-    /// frame, so accumulating here attributes the whole span to the frame
-    /// without leaking into the next one (`render` takes it).
+    /// Layout runs for rendering and when the async runtime must refresh a
+    /// changed focus path between frames. We fold all of that work into
+    /// `pending_layout`, which the next rendered frame records.
     pub(crate) fn do_layout(&mut self, widget: &WidgetRef) -> Surface {
         let start = Instant::now();
         let (width, height, width_pix, height_pix, width_method) = {
@@ -521,8 +519,8 @@ const KEYSTROKE_LOG_CAP: usize = 100;
 pub(crate) struct FocusHandler {
     pub(crate) root: WidgetRef,
     pub(crate) focused: WidgetRef,
-    /// Root-first path to the focused widget, rebuilt each frame by
-    /// [`update`](FocusHandler::update).
+    /// Root-first path to the focused widget, rebuilt after focus changes and
+    /// each frame by [`update`](FocusHandler::update).
     pub(crate) path_to_focused: Vec<WidgetRef>,
     /// The dispatch-debug log of recent key presses, oldest first.
     ///

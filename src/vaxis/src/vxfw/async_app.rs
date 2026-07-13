@@ -64,6 +64,22 @@ struct Running {
     sigwinch: Option<Signal>,
 }
 
+/// Applies a queued focus request and rebuilds its dispatch path immediately.
+///
+/// Focus can move between rendered frames in the host-driven runtime. The
+/// fresh layout prevents the next queued event from walking the old widget
+/// path. It updates dispatch state only, without painting or clearing redraw.
+fn apply_pending_focus(core: &mut AppCore, ctx: &mut EventContext, running: &mut Running) {
+    let Some(widget) = core.wants_focus.take() else {
+        return;
+    };
+    running.focus.focus_widget(ctx, widget);
+    core.handle_command(&mut ctx.cmds);
+    let root = Rc::clone(&running.focus.root);
+    let surface = core.do_layout(&root);
+    running.focus.update(&surface);
+}
+
 /// The host-driven widget-framework driver: the shared vxfw engine behind an
 /// async, per-step API.
 ///
@@ -260,10 +276,7 @@ impl AsyncApp {
 
         // Apply a focus change requested by a handler, and drain the commands
         // the focus events produced.
-        if let Some(widget) = self.core.wants_focus.take() {
-            running.focus.focus_widget(&mut self.ctx, widget);
-            self.core.handle_command(&mut self.ctx.cmds);
-        }
+        apply_pending_focus(&mut self.core, &mut self.ctx, running);
         Frame {
             quit: self.ctx.quit,
         }
@@ -298,10 +311,7 @@ impl AsyncApp {
         // A tick handler may request focus without requesting a redraw, so we
         // apply the change here rather than leaving it to the next input or
         // render.
-        if let Some(widget) = self.core.wants_focus.take() {
-            running.focus.focus_widget(&mut self.ctx, widget);
-            self.core.handle_command(&mut self.ctx.cmds);
-        }
+        apply_pending_focus(&mut self.core, &mut self.ctx, running);
         Frame {
             quit: self.ctx.quit,
         }
@@ -414,7 +424,9 @@ mod tests {
     use crate::tty::TestTty;
     use crate::vaxis::Options as VaxisOptions;
     use crate::vxfw::app_core::FRAME_STATS_CAP;
-    use crate::vxfw::{DrawContext, Surface, Tick, Widget, to_widget_ref};
+    use crate::vxfw::{
+        DrawContext, RelativePoint, SubSurface, Surface, Tick, Widget, draw_widget, to_widget_ref,
+    };
 
     /// A root widget that records the keys and ticks it receives, consuming
     /// each and requesting a redraw.
@@ -446,6 +458,50 @@ mod tests {
                 _ => {}
             }
         }
+        fn wants_events(&self) -> bool {
+            true
+        }
+    }
+
+    /// A root that replaces its focused child when it receives `swap`.
+    struct FocusSwap {
+        first: Rc<RefCell<Recorder>>,
+        second: Rc<RefCell<Recorder>>,
+        swapped: bool,
+    }
+
+    impl Widget for FocusSwap {
+        fn draw(&mut self, ctx: &DrawContext) -> Surface {
+            let child = if self.swapped {
+                Rc::clone(&self.second)
+            } else {
+                Rc::clone(&self.first)
+            };
+            let mut surface = Surface::with_size(ctx.max.size());
+            surface.children.push(SubSurface {
+                origin: RelativePoint { row: 0, col: 0 },
+                surface: draw_widget(&to_widget_ref(child), ctx),
+                z_index: 0,
+            });
+            surface
+        }
+
+        fn capture_event(&mut self, ctx: &mut EventContext, event: &Event) {
+            if let Event::App(user) = event
+                && user.name == "swap"
+            {
+                self.swapped = true;
+                ctx.request_focus(to_widget_ref(Rc::clone(&self.second)));
+                ctx.redraw = true;
+            }
+        }
+
+        fn handle_event(&mut self, ctx: &mut EventContext, event: &Event) {
+            if let Event::Init = event {
+                ctx.request_focus(to_widget_ref(Rc::clone(&self.first)));
+            }
+        }
+
         fn wants_events(&self) -> bool {
             true
         }
@@ -504,6 +560,38 @@ mod tests {
             .await
             .expect("init");
         (app, write_fd, recorder, root)
+    }
+
+    #[tokio::test]
+    async fn focus_change_refreshes_dispatch_path_before_render() {
+        let (read_fd, write_fd) = nix::unistd::pipe().expect("pipe");
+        write_all(&write_fd, b"\x1b[?c");
+        let first = Rc::new(RefCell::new(Recorder::default()));
+        let second = Rc::new(RefCell::new(Recorder::default()));
+        let root: WidgetRef = to_widget_ref(Rc::new(RefCell::new(FocusSwap {
+            first: Rc::clone(&first),
+            second: Rc::clone(&second),
+            swapped: false,
+        })));
+        let mut app = AsyncApp::new(
+            Vaxis::new(VaxisOptions::default()),
+            Box::new(TestTty::new()),
+            read_fd,
+        );
+        app.init(Rc::clone(&root), Options::default())
+            .await
+            .expect("init");
+
+        app.post_app_event(UserEvent {
+            name: "swap".to_string(),
+            data: None,
+        });
+        write_all(&write_fd, b"x");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+
+        assert!(first.borrow().keys.is_empty(), "old child stayed inert");
+        assert_eq!(second.borrow().keys, vec![u32::from('x')]);
     }
 
     #[tokio::test]
