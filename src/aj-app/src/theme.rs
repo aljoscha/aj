@@ -54,6 +54,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use aj_models::ThinkingConfig;
 use notify::{EventKind, RecursiveMode, Watcher};
 use serde::Deserialize;
 use thiserror::Error;
@@ -297,6 +298,26 @@ impl ThemeColor {
             ThemeColor::BashMode,
             ThemeColor::KeybindingHint,
         ]
+    }
+}
+
+/// Map a thinking level onto its dedicated editor-border [`ThemeColor`]
+/// token.
+///
+/// The mapping escalates visually with the model's reasoning budget:
+/// `None` reads as the muted `Off` tint and the levels climb up to the
+/// strongest `XHigh` tint. `XHigh` and `Max` share the `ThinkingXhigh`
+/// token because the theme schema tops out there. Both represent "the
+/// strongest reasoning the active model supports", so one tint is the
+/// right visual cue for both.
+pub fn thinking_color_token(level: Option<&ThinkingConfig>) -> ThemeColor {
+    match level {
+        None => ThemeColor::ThinkingOff,
+        Some(ThinkingConfig::Minimal) => ThemeColor::ThinkingMinimal,
+        Some(ThinkingConfig::Low) => ThemeColor::ThinkingLow,
+        Some(ThinkingConfig::Medium) => ThemeColor::ThinkingMedium,
+        Some(ThinkingConfig::High) => ThemeColor::ThinkingHigh,
+        Some(ThinkingConfig::XHigh) | Some(ThinkingConfig::Max) => ThemeColor::ThinkingXhigh,
     }
 }
 
@@ -1421,5 +1442,40 @@ mod tests {
             .expect("watcher recovered within 5s")
             .expect("channel was open");
         assert_eq!(recovered.name(), "partial");
+    }
+
+    /// Each thinking level (and "off") routes to its dedicated
+    /// `ThemeColor` token. Locks the mapping so a future re-order of
+    /// `ThinkingConfig` variants or a renamed theme token surfaces here
+    /// rather than as a silently-wrong border tint.
+    #[test]
+    fn thinking_color_token_maps_each_level_to_its_token() {
+        assert_eq!(thinking_color_token(None), ThemeColor::ThinkingOff);
+        assert_eq!(
+            thinking_color_token(Some(&ThinkingConfig::Minimal)),
+            ThemeColor::ThinkingMinimal
+        );
+        assert_eq!(
+            thinking_color_token(Some(&ThinkingConfig::Low)),
+            ThemeColor::ThinkingLow
+        );
+        assert_eq!(
+            thinking_color_token(Some(&ThinkingConfig::Medium)),
+            ThemeColor::ThinkingMedium
+        );
+        assert_eq!(
+            thinking_color_token(Some(&ThinkingConfig::High)),
+            ThemeColor::ThinkingHigh
+        );
+        // `XHigh` and `Max` both top out at the highest tint the theme
+        // schema exposes (`ThinkingXhigh`).
+        assert_eq!(
+            thinking_color_token(Some(&ThinkingConfig::XHigh)),
+            ThemeColor::ThinkingXhigh
+        );
+        assert_eq!(
+            thinking_color_token(Some(&ThinkingConfig::Max)),
+            ThemeColor::ThinkingXhigh
+        );
     }
 }
