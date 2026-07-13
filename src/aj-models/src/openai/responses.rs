@@ -353,7 +353,7 @@ fn build_request(
 
     // cross-provider history rewrite first.
     let transformed = transform_messages(&context.messages, model);
-    convert_messages(API_NAME, &transformed, &mut input);
+    convert_messages(&transformed, &mut input);
 
     let tools: Vec<ResponseTool> = context.tools.iter().map(to_response_tool).collect();
     let tool_choice = to_response_tool_choice(options.tool_choice.as_ref(), !tools.is_empty());
@@ -539,21 +539,14 @@ fn to_response_tool_choice(
 
 /// Project the unified message log onto Responses input items.
 ///
-/// `api_name` controls the cross-model check inside
-/// [`append_assistant_message`]: an assistant message tagged with an
-/// `api` that differs from the current provider's identifier is
-/// treated as cross-model replay and its tool-call
-/// `item_id`s are dropped so the server doesn't try to pair them
-/// with reasoning items it never produced.
-pub(super) fn convert_messages(
-    api_name: &str,
-    messages: &[Message],
-    out: &mut Vec<ResponseInputItem>,
-) {
+/// A faithful projection: cross-provider rewriting (reasoning demotion,
+/// tool-call id fate) is already applied by [`transform_messages`] before
+/// this runs. Shared by the Responses and Codex providers.
+pub(super) fn convert_messages(messages: &[Message], out: &mut Vec<ResponseInputItem>) {
     for msg in messages {
         match msg {
             Message::User(u) => append_user_message(u, out),
-            Message::Assistant(a) => append_assistant_message(api_name, a, out),
+            Message::Assistant(a) => append_assistant_message(a, out),
             Message::ToolResult(tr) => out.push(convert_tool_result(tr)),
         }
     }
@@ -591,13 +584,11 @@ pub(super) fn user_content_to_input_part(c: &UserContent) -> ResponseInputConten
 /// `AssistantContent` order. Reasoning items deserialize from
 /// `thinking_signature`; text blocks reuse / split message items by
 /// (id, phase); tool calls split the composite `{call_id}|{item_id}`.
-pub(super) fn append_assistant_message(
-    api_name: &str,
-    m: &AssistantMessage,
-    out: &mut Vec<ResponseInputItem>,
-) {
-    let cross_model = !m.api.is_empty() && m.api != api_name;
-
+///
+/// A faithful projection: cross-model id rewriting (dropping a real item
+/// id, hashing a foreign one) is a [`transform_messages`] concern applied
+/// before this runs.
+pub(super) fn append_assistant_message(m: &AssistantMessage, out: &mut Vec<ResponseInputItem>) {
     let mut pending_parts: Vec<ResponseInputContentPart> = Vec::new();
     let mut pending_id: Option<String> = None;
     let mut pending_phase: Option<MessagePhase> = None;
@@ -661,12 +652,12 @@ pub(super) fn append_assistant_message(
                     &mut pending_id,
                     &mut pending_phase,
                 );
+                // Faithful projection: a composite `{call_id}|{item_id}`
+                // keeps its item id, a bare `call_id` emits none. Whether the
+                // item id survives cross-model replay is decided upstream in
+                // `transform_messages`, which never emits an empty item half,
+                // so this never serializes an empty-string id.
                 let (call_id, item_id) = split_tool_use_id(&tc.id);
-                // cross-model replay: omit `id` when the call
-                // came from a different api/model so the server does
-                // not try to pair it with reasoning items it never
-                // emitted.
-                let item_id = if cross_model { None } else { item_id };
                 out.push(ResponseInputItem::FunctionCall {
                     id: item_id,
                     call_id,
@@ -759,15 +750,14 @@ pub(super) fn convert_tool_result(t: &ToolResultMessage) -> ResponseInputItem {
 ///
 /// One assistant message expands to multiple input items in
 /// `AssistantContent` order — reasoning items, then message items
-/// grouped by `(id, phase)`, interleaved with `function_call` items.
-/// Cross-model replay rules are honoured: `id` on
-/// `function_call` items is omitted when the assistant message came
-/// from a different api so the server doesn't try to pair it with
-/// reasoning items it never produced.
+/// grouped by `(id, phase)`, interleaved with `function_call` items. A
+/// faithful projection: a composite tool-call id keeps its item id, a bare
+/// id emits none. Cross-model id rewriting is a [`transform_messages`]
+/// concern and is not applied here.
 #[cfg(any(test, feature = "test-support"))]
 pub fn assistant_message_to_input_items(message: &AssistantMessage) -> Vec<ResponseInputItem> {
     let mut out = Vec::new();
-    append_assistant_message(API_NAME, message, &mut out);
+    append_assistant_message(message, &mut out);
     out
 }
 
@@ -1788,11 +1778,14 @@ mod tests {
     }
 
     #[test]
-    fn cross_model_tool_call_drops_item_id() {
+    fn tool_call_bare_id_omits_item_id_on_wire() {
+        // A bare call_id (no item half) must serialize with `id` absent, not
+        // `"id": null`: stricter Responses gateways reject the explicit null.
+        // Whether the item id was dropped is decided in `transform_messages`;
+        // the provider just serializes faithfully.
         let mut m = AssistantMessage::empty();
-        m.api = "anthropic-messages".into();
         m.content.push(AssistantContent::ToolCall(ToolCall {
-            id: "call_x|fc_y".into(),
+            id: "call_x".into(),
             name: "ls".into(),
             arguments: serde_json::json!({}),
         }));
@@ -1800,24 +1793,21 @@ mod tests {
         match &items[0] {
             ResponseInputItem::FunctionCall { id, call_id, .. } => {
                 assert_eq!(call_id, "call_x");
-                assert!(id.is_none(), "cross-model item_id should be omitted");
+                assert!(id.is_none(), "bare id should carry no item_id");
             }
             other => panic!("unexpected item: {other:?}"),
         }
-        // The wire shape must OMIT `id`, not emit `"id": null`: stricter
-        // Responses gateways reject an explicit null where they accept an
-        // absent field.
         let wire = serde_json::to_value(&items[0]).unwrap();
         assert!(
             wire.get("id").is_none(),
-            "cross-model function_call must omit id on the wire, got {wire}"
+            "function_call must omit id on the wire, got {wire}"
         );
     }
 
     #[test]
-    fn same_model_tool_call_preserves_composite_id() {
+    fn tool_call_composite_id_emits_item_id() {
+        // A composite `{call_id}|{item_id}` keeps its item id on the wire.
         let mut m = AssistantMessage::empty();
-        m.api = API_NAME.into();
         m.content.push(AssistantContent::ToolCall(ToolCall {
             id: "call_x|fc_y".into(),
             name: "ls".into(),
@@ -1831,6 +1821,8 @@ mod tests {
             }
             other => panic!("unexpected item: {other:?}"),
         }
+        let wire = serde_json::to_value(&items[0]).unwrap();
+        assert_eq!(wire.get("id").and_then(|v| v.as_str()), Some("fc_y"));
     }
 
     #[test]
@@ -1859,7 +1851,7 @@ mod tests {
             timestamp: 0,
         };
         let mut out = Vec::new();
-        convert_messages(API_NAME, &[UnifiedMessage::User(user)], &mut out);
+        convert_messages(&[UnifiedMessage::User(user)], &mut out);
         match &out[0] {
             ResponseInputItem::Message { content, .. } => match content {
                 ResponseInputMessageContent::Array(parts) => {

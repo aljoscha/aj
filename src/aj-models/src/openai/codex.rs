@@ -616,15 +616,12 @@ fn resolve_codex_service_tier<'a>(
 /// Codex endpoint expects on the request side.
 ///
 /// Identical wire shape to the public Responses API
-/// ([`super::responses::assistant_message_to_input_items`]), but tagged
-/// with the Codex `api` identifier so cross-model checks in
-/// [`super::responses::append_assistant_message`] see the right
-/// provider identity (a message produced by `openai-codex-responses`
-/// stays "same-provider" when re-serialized through this helper).
+/// ([`super::responses::assistant_message_to_input_items`]): both share the
+/// same faithful input-item projection.
 #[cfg(any(test, feature = "test-support"))]
 pub fn assistant_message_to_input_items(message: &AssistantMessage) -> Vec<ResponseInputItem> {
     let mut out = Vec::new();
-    append_assistant_message(API_NAME, message, &mut out);
+    append_assistant_message(message, &mut out);
     out
 }
 
@@ -694,7 +691,7 @@ fn build_request(
     // result items.
     let mut input: Vec<ResponseInputItem> = Vec::new();
     let transformed = transform_messages(&context.messages, model);
-    convert_messages(API_NAME, &transformed, &mut input);
+    convert_messages(&transformed, &mut input);
 
     let tools: Vec<ResponseTool> = context.tools.iter().map(to_codex_tool).collect();
 

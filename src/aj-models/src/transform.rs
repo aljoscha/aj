@@ -185,7 +185,14 @@ fn transform_assistant(
                 }
             }
             AssistantContent::ToolCall(tc) => {
-                let new_id = normalize_tool_call_id(&target.api, &a.provider, &tc.id);
+                // The item-id half of a Responses composite id is only valid
+                // paired with its reasoning item. For the Responses-shaped
+                // targets a foreign call (different provider or api) gets a
+                // synthetic id and a same-provider model change drops it.
+                // Other target apis ignore `foreign`. See
+                // `normalize_tool_call_id`.
+                let foreign = a.provider != target.provider || a.api != target.api;
+                let new_id = normalize_tool_call_id(&target.api, foreign, &tc.id);
                 if new_id != tc.id {
                     id_map.insert(tc.id.clone(), new_id.clone());
                 }
@@ -215,9 +222,22 @@ fn transform_assistant(
 // Tool-call ID normalization (rule 3)
 // ---------------------------------------------------------------------------
 
-/// Rewrite a tool-call ID for `target_api`. `source_provider` controls
-/// the foreign-origin branch for `openai-responses` targets.
-fn normalize_tool_call_id(target_api: &str, source_provider: &str, id: &str) -> String {
+/// Rewrite a tool-call ID for replay against `target_api`.
+///
+/// `foreign` is true when the call came from a different provider or api
+/// than the target. It only matters for the Responses-shaped targets
+/// (`openai-responses` and `openai-codex-responses`), where the
+/// `{call_id}|{item_id}` composite carries a Responses item id that the
+/// server pairs with a reasoning item from the same turn:
+///
+/// - Foreign origin: rewrite the item id to a synthetic `fc_<hash>`. The
+///   server never issued it, so it can't be paired with the (demoted,
+///   missing) reasoning and won't trip pairing validation.
+/// - Same provider and api: this is a model-id change (an exact match
+///   returns earlier in [`transform_assistant`]). The item id is a real
+///   server-issued `fc_` whose reasoning item was demoted on the change, so
+///   replaying it would dangle. Drop the item half, keep only `call_id`.
+fn normalize_tool_call_id(target_api: &str, foreign: bool, id: &str) -> String {
     match target_api {
         "openai-completions" => {
             // Composite Responses IDs ({call_id}|{item_id}) collapse to
@@ -229,37 +249,24 @@ fn normalize_tool_call_id(target_api: &str, source_provider: &str, id: &str) -> 
             };
             truncate_bytes(&sanitize(call_id), 40)
         }
-        "openai-responses" => {
-            let foreign_origin = source_provider != "openai";
-            match id.find('|') {
-                Some(i) => {
-                    let (call_id, rest) = (&id[..i], &id[i + 1..]);
-                    let normalized_call = truncate_bytes(&sanitize(call_id), 64);
-                    // Foreign-origin item_ids get a stable hash rewrite
-                    // (the upstream value is provider-specific and won't
-                    // round-trip); same-provider item_ids just sanitize.
-                    let mut normalized_item = if foreign_origin {
-                        format!("fc_{}", short_hash(rest))
-                    } else {
-                        truncate_bytes(&sanitize(rest), 64)
-                    };
-                    // Responses requires the item_id to start with
-                    // `fc_`; inject the prefix when the upstream
-                    // half-ID was missing it.
-                    if !normalized_item.starts_with("fc_") {
-                        normalized_item =
-                            truncate_bytes(&sanitize(&format!("fc_{}", normalized_item)), 64);
-                    } else {
-                        normalized_item = truncate_bytes(&normalized_item, 64);
-                    }
-                    format!("{}|{}", normalized_call, normalized_item)
+        "openai-responses" | "openai-codex-responses" => match id.find('|') {
+            Some(i) => {
+                let (call_id, item_id) = (&id[..i], &id[i + 1..]);
+                let normalized_call = truncate_bytes(&sanitize(call_id), 64);
+                if foreign {
+                    // `fc_<hash>` already carries the `fc_` prefix Responses
+                    // requires; just cap the length.
+                    let item = truncate_bytes(&format!("fc_{}", short_hash(item_id)), 64);
+                    format!("{normalized_call}|{item}")
+                } else {
+                    normalized_call
                 }
-                // Non-composite (e.g. an Anthropic toolu_xxx or a
-                // Completions call_xxx): treat as call_id only. The
-                // serializer will emit `function_call.id = undefined`.
-                None => truncate_bytes(&sanitize(id), 64),
             }
-        }
+            // Non-composite (e.g. an Anthropic toolu_xxx or a Completions
+            // call_xxx): treat as call_id only. The serializer emits a
+            // `function_call` with no `id`.
+            None => truncate_bytes(&sanitize(id), 64),
+        },
         // Default branch covers `anthropic-messages` and any
         // unrecognized future APIs that follow the same character class.
         _ => truncate_bytes(&sanitize(id), 64),
@@ -815,7 +822,7 @@ mod tests {
         let target = model("anthropic", "anthropic-messages", "claude-x", false);
         let long = "x".repeat(80);
         let mixed = format!("call|with/odd:chars-{}", long);
-        let out = normalize_tool_call_id(&target.api, "openai", &mixed);
+        let out = normalize_tool_call_id(&target.api, true, &mixed);
         assert_eq!(out.len(), 64);
         assert!(
             out.chars()
@@ -826,52 +833,43 @@ mod tests {
     #[test]
     fn openai_completions_target_drops_item_id_half() {
         let id = "call_abc|fc_long_item_id";
-        let out = normalize_tool_call_id("openai-completions", "openai", id);
+        let out = normalize_tool_call_id("openai-completions", true, id);
         assert_eq!(out, "call_abc");
     }
 
     #[test]
     fn openai_completions_target_truncates_to_40() {
         let id = "a".repeat(80);
-        let out = normalize_tool_call_id("openai-completions", "openai", &id);
+        let out = normalize_tool_call_id("openai-completions", true, &id);
         assert_eq!(out.len(), 40);
     }
 
     #[test]
-    fn openai_responses_target_keeps_same_provider_composite() {
-        // Same provider (openai), composite ID — both halves sanitize+truncate
-        // and item_id keeps its fc_ prefix.
+    fn openai_responses_target_drops_same_provider_item_id() {
+        // Same provider+api (so a model-id change): the real item id would
+        // dangle without its demoted reasoning item, so drop the item half
+        // and keep only the call_id.
         let id = "call_abc|fc_item_xyz";
-        let out = normalize_tool_call_id("openai-responses", "openai", id);
-        assert_eq!(out, "call_abc|fc_item_xyz");
+        let out = normalize_tool_call_id("openai-responses", false, id);
+        assert_eq!(out, "call_abc");
     }
 
     #[test]
     fn openai_responses_target_rewrites_foreign_item_id_to_fc_hash() {
         let id = "toolu_abc|some_item";
-        let out = normalize_tool_call_id("openai-responses", "anthropic", id);
+        let out = normalize_tool_call_id("openai-responses", true, id);
         let (call, item) = out.split_once('|').unwrap();
         assert_eq!(call, "toolu_abc");
         assert!(item.starts_with("fc_"));
         // Stable hash: same input ⇒ same output.
-        let again = normalize_tool_call_id("openai-responses", "anthropic", id);
+        let again = normalize_tool_call_id("openai-responses", true, id);
         assert_eq!(out, again);
-    }
-
-    #[test]
-    fn openai_responses_target_injects_fc_prefix_when_missing_same_provider() {
-        // Same-provider but item_id half lacks fc_ prefix — Responses
-        // requires it, so we inject.
-        let id = "call_abc|item_no_prefix";
-        let out = normalize_tool_call_id("openai-responses", "openai", id);
-        let (_, item) = out.split_once('|').unwrap();
-        assert!(item.starts_with("fc_"), "got {}", item);
     }
 
     #[test]
     fn openai_responses_target_non_composite_passes_through() {
         let id = "toolu_abc";
-        let out = normalize_tool_call_id("openai-responses", "anthropic", id);
+        let out = normalize_tool_call_id("openai-responses", true, id);
         // No `|` ⇒ treated as call_id only; sanitize+truncate.
         assert_eq!(out, "toolu_abc");
         assert!(!out.contains('|'));
@@ -909,7 +907,203 @@ mod tests {
         assert!(!asst_id.contains('|'), "anthropic ids never carry pipes");
     }
 
+    #[test]
+    fn openai_responses_same_provider_model_change_drops_tool_item_id() {
+        // gpt-5.1 -> gpt-5.6 on the same provider+api. Reasoning is demoted on
+        // the model change, so the real fc_ item id would dangle. Drop it,
+        // leaving a bare call_id.
+        let target = model("openai", "openai-responses", "gpt-5.6", false);
+        let asst = assistant(
+            "openai",
+            "openai-responses",
+            "gpt-5.1",
+            vec![tool_call("call_abc|fc_real", "ls")],
+        );
+        let out = transform_messages(&[Message::Assistant(asst)], &target);
+        let Message::Assistant(a) = &out[0] else {
+            panic!("expected assistant");
+        };
+        match &a.content[0] {
+            AssistantContent::ToolCall(tc) => assert_eq!(tc.id, "call_abc"),
+            _ => panic!("expected tool call"),
+        }
+    }
+
+    #[test]
+    fn openai_responses_foreign_tool_item_id_becomes_synthetic_hash() {
+        // Codex history replayed on OpenRouter: different provider and api.
+        // The item id is rewritten to a synthetic fc_<hash> that is safe to
+        // replay alongside demoted reasoning (the server never issued it).
+        let target = model(
+            "openrouter",
+            "openai-responses",
+            "openai/gpt-5.6-sol",
+            false,
+        );
+        let asst = assistant(
+            "openai-codex",
+            "openai-codex-responses",
+            "gpt-5.6-sol",
+            vec![tool_call("call_abc|fc_real_item", "ls")],
+        );
+        let out = transform_messages(&[Message::Assistant(asst)], &target);
+        let Message::Assistant(a) = &out[0] else {
+            panic!("expected assistant");
+        };
+        match &a.content[0] {
+            AssistantContent::ToolCall(tc) => {
+                let (call, item) = tc.id.split_once('|').unwrap();
+                assert_eq!(call, "call_abc");
+                assert!(item.starts_with("fc_"), "item id should be fc_-prefixed");
+                assert_ne!(item, "fc_real_item", "item id should be a synthetic hash");
+            }
+            _ => panic!("expected tool call"),
+        }
+    }
+
     // -- Orphan synthesis (rule 4) ------------------------------------
+
+    #[test]
+    fn openai_responses_same_api_different_provider_is_foreign() {
+        // openai (responses) -> openrouter (responses): same api, different
+        // provider. The provider disjunct of `foreign` must fire, so the real
+        // item id becomes a synthetic hash rather than being kept (it would
+        // dangle) or dropped. This is the headline replay scenario.
+        let target = model(
+            "openrouter",
+            "openai-responses",
+            "openai/gpt-5.6-sol",
+            false,
+        );
+        let asst = assistant(
+            "openai",
+            "openai-responses",
+            "gpt-5.6",
+            vec![tool_call("call_abc|fc_real", "ls")],
+        );
+        let out = transform_messages(&[Message::Assistant(asst)], &target);
+        let Message::Assistant(a) = &out[0] else {
+            panic!("expected assistant");
+        };
+        match &a.content[0] {
+            AssistantContent::ToolCall(tc) => {
+                let (call, item) = tc.id.split_once('|').unwrap();
+                assert_eq!(call, "call_abc");
+                assert!(item.starts_with("fc_"), "item id should be fc_-prefixed");
+                assert_ne!(item, "fc_real", "item id should be a synthetic hash");
+            }
+            _ => panic!("expected tool call"),
+        }
+    }
+
+    #[test]
+    fn same_provider_model_change_keeps_tool_result_paired() {
+        // Drop case: the assistant call id collapses to bare `call_abc`, and
+        // its tool result must rewrite to the same id via the id_map so pass 2
+        // pairs them. Otherwise `close_pending` would synthesize a bogus
+        // orphan and keep the real result too.
+        let target = model("openai", "openai-responses", "gpt-5.6", false);
+        let asst = assistant(
+            "openai",
+            "openai-responses",
+            "gpt-5.1",
+            vec![tool_call("call_abc|fc_real", "ls")],
+        );
+        let messages = vec![
+            Message::Assistant(asst),
+            tool_result("call_abc|fc_real", "ls", "ok"),
+        ];
+        let out = transform_messages(&messages, &target);
+        // Assistant + exactly one real (non-synthetic) tool result.
+        assert_eq!(out.len(), 2);
+        let Message::ToolResult(tr) = &out[1] else {
+            panic!("expected tool result");
+        };
+        assert_eq!(tr.tool_call_id, "call_abc");
+        assert!(
+            !tr.is_error,
+            "should keep the real result, not a synthetic orphan"
+        );
+        match &tr.content[0] {
+            UserContent::Text(t) => assert_eq!(t.text, "ok"),
+            _ => panic!("expected text result"),
+        }
+    }
+
+    #[test]
+    fn openai_responses_target_composite_with_extra_pipes() {
+        // Only the first `|` splits call_id from item_id; extra pipes stay in
+        // the item half. Foreign hashes the whole item half (no stray pipe in
+        // the result), same-provider drops it.
+        let foreign = normalize_tool_call_id("openai-responses", true, "call_x|foo|bar");
+        let (call, item) = foreign.split_once('|').unwrap();
+        assert_eq!(call, "call_x");
+        assert!(item.starts_with("fc_"));
+        assert!(!item.contains('|'));
+        assert_eq!(
+            normalize_tool_call_id("openai-responses", false, "call_x|foo|bar"),
+            "call_x"
+        );
+    }
+
+    #[test]
+    fn openai_responses_target_empty_item_half() {
+        // A trailing `|` yields an empty item half: foreign still produces a
+        // valid fc_<hash>, same-provider drops to a bare call_id. Neither
+        // emits an empty item id.
+        let foreign = normalize_tool_call_id("openai-responses", true, "call_x|");
+        let (call, item) = foreign.split_once('|').unwrap();
+        assert_eq!(call, "call_x");
+        assert!(item.starts_with("fc_"));
+        assert_eq!(
+            normalize_tool_call_id("openai-responses", false, "call_x|"),
+            "call_x"
+        );
+    }
+
+    #[test]
+    fn codex_responses_target_shares_responses_id_fate() {
+        // `openai-codex-responses` has the same composite wire shape as
+        // `openai-responses`, so it takes the same id fate: a same-provider
+        // model change drops the item half, a foreign call gets a synthetic
+        // hash.
+        assert_eq!(
+            normalize_tool_call_id("openai-codex-responses", false, "call_x|fc_real"),
+            "call_x"
+        );
+        let foreign = normalize_tool_call_id("openai-codex-responses", true, "call_x|fc_real");
+        let (call, item) = foreign.split_once('|').unwrap();
+        assert_eq!(call, "call_x");
+        assert!(item.starts_with("fc_"));
+        assert_ne!(item, "fc_real");
+    }
+
+    #[test]
+    fn codex_same_provider_model_change_drops_tool_item_id() {
+        // gpt-5.5 -> gpt-5.6-sol on the codex endpoint (same provider+api,
+        // different model): the real fc_ item id would dangle, so drop it to a
+        // clean bare call_id rather than mangling it through the default arm.
+        let target = model(
+            "openai-codex",
+            "openai-codex-responses",
+            "gpt-5.6-sol",
+            false,
+        );
+        let asst = assistant(
+            "openai-codex",
+            "openai-codex-responses",
+            "gpt-5.5",
+            vec![tool_call("call_abc|fc_real", "ls")],
+        );
+        let out = transform_messages(&[Message::Assistant(asst)], &target);
+        let Message::Assistant(a) = &out[0] else {
+            panic!("expected assistant");
+        };
+        match &a.content[0] {
+            AssistantContent::ToolCall(tc) => assert_eq!(tc.id, "call_abc"),
+            _ => panic!("expected tool call"),
+        }
+    }
 
     #[test]
     fn orphan_tool_call_gets_synthetic_error_result() {
