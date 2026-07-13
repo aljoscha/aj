@@ -656,6 +656,10 @@ impl Widget for UsageOverlay {
                     height: Some(body_height),
                 },
             );
+            // NOTE: tint the thumb Dim per-draw, via the shared helper, so it
+            // matches every other scrollbar. The style is snapshotted at open,
+            // so this is parity with the other lists, not a live restyle.
+            crate::scroll::apply_thumb_style(&mut self.bars, self.styles.dim);
             surface.children.push(SubSurface {
                 origin: RelativePoint { row: 0, col: 0 },
                 surface: self.bars.draw(&body_ctx),
@@ -1322,5 +1326,36 @@ mod tests {
         assert!(first[1].text.contains("5h limit"), "{first:?}");
         assert_eq!(first[1].style, Style::default());
         assert_eq!(first[2].style, test_styles().muted);
+    }
+
+    /// The read-only body's scrollbar thumb is tinted Dim, via the shared
+    /// helper, whenever the content overflows its slot. Dropping the
+    /// per-draw `apply_thumb_style` in `draw` leaves the thumb at the
+    /// default fg and fails here.
+    #[test]
+    fn scrollbar_thumb_carries_the_dim_tint() {
+        // Many provider rows so the body overflows the short slot below and a
+        // thumb draws.
+        let statuses: Vec<ProviderUsageStatus> = (0..20)
+            .map(|i| usage_status(&format!("prov-{i}"), None))
+            .collect();
+        let (mut overlay, _) = overlay_with(statuses, vec![]);
+        let ctx = crate::test_support::draw_ctx(20, Some(4));
+        let surface = overlay.draw(&ctx);
+        // The thumb sits on the list's right edge, in a child surface, so
+        // composite the tree before reading the cell's style.
+        let last_col = 19;
+        let fg = crate::test_support::flatten(&surface)
+            .iter()
+            .find_map(|row| {
+                let cell = row.get(last_col)?;
+                (cell.char.grapheme() == "\u{2590}").then_some(cell.style.fg)
+            })
+            .expect("a thumb cell is drawn on the list's right edge");
+        assert_eq!(
+            fg,
+            test_styles().dim.fg,
+            "the usage body thumb carries the Dim tint from ContentStyles"
+        );
     }
 }

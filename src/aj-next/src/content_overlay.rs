@@ -161,10 +161,9 @@ impl Widget for ContentOverlay {
         // Wrap the bars in an opaque full-size surface so a shorter
         // refill can't leave stale cells from a taller previous frame.
         let mut surface = Surface::with_size(ctx.max.size());
-        // Tint the thumb per-draw so it never goes stale, mirroring the
-        // settings list. The thumb is set from the chrome at open time and
-        // reskins on reopen, consistent with the window border and title
-        // styles (which content overlays also do not live-reskin).
+        // Apply the tint per-draw for parity with the other lists. The thumb
+        // style is set once from the chrome at open and never mutated after, so
+        // this is parity, not staleness prevention.
         crate::scroll::apply_thumb_style(&mut self.bars, self.thumb_style);
         surface.children.push(SubSurface {
             origin: RelativePoint { row: 0, col: 0 },
@@ -1365,6 +1364,36 @@ mod tests {
         assert_eq!(
             fg, tint,
             "the content-overlay thumb carries the tint set via set_thumb_style"
+        );
+    }
+
+    /// Driving `open_content_overlay` tints the drawn thumb with the chrome's
+    /// Dim color, pinning the open-time wiring. Deleting the `set_thumb_style`
+    /// call in `open_content_overlay` drops the tint and fails here.
+    #[test]
+    fn open_content_overlay_tints_the_thumb_from_the_chrome() {
+        let theme = Theme::bundled_dark_with_mode(ColorMode::Truecolor);
+        let chrome = OverlayChrome::from_theme(&theme);
+        let editor: WidgetRef = Rc::new(RefCell::new(RichText::new(plain(" "))));
+        let stack = Rc::new(RefCell::new(OverlayStack::default()));
+        let mut ctx = EventContext::new();
+        let rows = (0..50).map(|i| plain(format!("line {i}"))).collect();
+        open_content_overlay(&stack, &editor, &chrome, "Title", rows, &mut ctx);
+
+        // Draw the pushed window and composite its child tree, then read the
+        // thumb glyph's tint from wherever it lands inside the border.
+        let draw = draw_ctx(24, 12);
+        let stack_ref = stack.borrow();
+        let window = &stack_ref.top().expect("open pushes an overlay").widget;
+        let surface = window.borrow_mut().draw(&draw);
+        let fg = crate::test_support::flatten(&surface)
+            .iter()
+            .flatten()
+            .find_map(|cell| (cell.char.grapheme() == "\u{2590}").then_some(cell.style.fg))
+            .expect("a thumb cell is drawn inside the window");
+        assert_eq!(
+            fg, chrome.select.scrollbar_thumb.fg,
+            "the open path tints the thumb with the chrome's Dim color"
         );
     }
 

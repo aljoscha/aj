@@ -207,6 +207,9 @@ impl Widget for TaskOutputView {
                     height: Some(body_height),
                 },
             );
+            // NOTE: tint the thumb Dim per-draw, via the shared helper, so it
+            // matches every other scrollbar.
+            crate::scroll::apply_thumb_style(&mut self.bars, self.dim_style);
             surface.children.push(SubSurface {
                 origin: RelativePoint {
                     row: i32::from(HEADER_ROWS),
@@ -595,5 +598,38 @@ mod tests {
             "{s}"
         );
         assert!(s.contains(&close_key_label()), "{s}");
+    }
+
+    /// The tailing body's scrollbar thumb is tinted with the view's
+    /// `dim_style`, via the shared helper, whenever the output overflows its
+    /// slot. Dropping the per-draw `apply_thumb_style` in `draw` leaves the
+    /// thumb at the default fg and fails here.
+    #[test]
+    fn scrollbar_thumb_carries_the_dim_tint() {
+        let contents: String = (1..=40).map(|n| format!("line{n}\n")).collect();
+        let (registry, id, _f) = task(&contents, TaskStatus::Running);
+        // A distinct dim fg so the tinted thumb can't be confused with a
+        // default-styled cell.
+        let dim = Style {
+            fg: vaxis::cell::Color::Index(1),
+            ..Style::default()
+        };
+        let mut view =
+            TaskOutputView::new(registry, id, "echo hi".to_string(), Style::default(), dim);
+        let surface = view.draw(&draw_ctx(20, 8));
+        // The thumb sits on the body's right edge, in a child surface, so
+        // composite the tree before reading the cell's style.
+        let last_col = 19;
+        let fg = crate::test_support::flatten(&surface)
+            .iter()
+            .find_map(|row| {
+                let cell = row.get(last_col)?;
+                (cell.char.grapheme() == "\u{2590}").then_some(cell.style.fg)
+            })
+            .expect("a thumb cell is drawn on the body's right edge");
+        assert_eq!(
+            fg, dim.fg,
+            "the task-output body thumb carries the dim_style tint"
+        );
     }
 }
