@@ -776,8 +776,10 @@ impl Widget for SettingList {
                     // Tint the thumb from the live styles so a theme swap (via
                     // `set_styles`) is reflected without rebuilding the bars.
                     // `ScrollBars` draws the inner list (stamping its identity
-                    // for wheel/key routing) and reserves the rightmost column
-                    // for the thumb, which shows only while the list overflows.
+                    // for wheel/key routing) and always reserves the rightmost
+                    // list column, whether or not a thumb is currently drawn.
+                    // The thumb glyph itself appears only while the list
+                    // overflows its slot.
                     apply_thumb_style(&mut self.bars, self.styles.borrow().scrollbar_thumb);
                     self.bars.draw(&list_ctx)
                 },
@@ -1781,6 +1783,8 @@ pub(crate) fn open_skills(
 
 #[cfg(test)]
 mod tests {
+    use vaxis::cell::Color;
+
     use super::*;
 
     fn styles() -> SelectStyles {
@@ -2184,6 +2188,60 @@ mod tests {
         assert!(
             thumb_rows(&list.draw(&ctx), 30).is_empty(),
             "no thumb is drawn when the list fits the slot"
+        );
+    }
+
+    /// A `SelectStyles` whose only non-default field is the thumb foreground,
+    /// so a tinted thumb cell can't be confused with any other column's color.
+    fn styles_with_thumb(thumb: Color) -> SelectStyles {
+        SelectStyles {
+            scrollbar_thumb: Style {
+                fg: thumb,
+                ..Style::default()
+            },
+            ..SelectStyles::default()
+        }
+    }
+
+    /// The foreground of the first vertical thumb cell on the list slot's right
+    /// edge. Composites the surface tree (the thumb lives in the list slot's
+    /// child) and reads the cell's style, mirroring the `thumb_rows` capture.
+    fn thumb_fg(surface: &Surface, width: u16) -> Color {
+        let last_col = usize::from(width - 1);
+        let row = *thumb_rows(surface, width)
+            .first()
+            .expect("a thumb cell is drawn");
+        crate::test_support::flatten(surface)[row][last_col]
+            .style
+            .fg
+    }
+
+    /// The drawn thumb glyph carries the configured `scrollbar_thumb`
+    /// foreground, and a theme swap via `set_styles` re-tints it on the next
+    /// draw. This pins the `apply_thumb_style` call: dropping the tint (a
+    /// `Style::default()` no-op) fails here rather than passing on the shared
+    /// default glyph, which already matches on its grapheme alone.
+    #[test]
+    fn scrollbar_thumb_carries_the_configured_tint() {
+        use crate::test_support::draw_ctx;
+
+        let first = Color::Index(200);
+        let mut list = SettingList::new(plain_rows(12), styles_with_thumb(first), false);
+        let ctx = draw_ctx(30, Some(6));
+        assert_eq!(
+            thumb_fg(&list.draw(&ctx), 30),
+            first,
+            "the thumb is tinted with the configured scrollbar_thumb color"
+        );
+
+        // A theme reload swaps the styles; the next draw re-tints the thumb
+        // without rebuilding the bars.
+        let second = Color::Index(51);
+        list.set_styles(styles_with_thumb(second));
+        assert_eq!(
+            thumb_fg(&list.draw(&ctx), 30),
+            second,
+            "set_styles re-tints the thumb on the next draw"
         );
     }
 }
