@@ -416,7 +416,7 @@ fn wrapped_height(ctx: &DrawContext, text: &str, width: u16, cap: u16) -> u16 {
 
 /// Render one settings row: an override marker (project mode) and the aligned
 /// `label  value` primary columns. On the cursored row every cell carries the
-/// band background. The row's description is not shown inline; the widget
+/// band background. The row's description is not shown inline. The widget
 /// draws the cursored row's description in a panel below the list.
 fn build_setting_row(
     row: &SettingRow,
@@ -724,8 +724,8 @@ impl Widget for SettingList {
         } else {
             0
         };
-        // Keep at least a couple of list rows; on a cramped overlay drop the
-        // panel rather than starve the list.
+        // Keep at least a couple of list rows. On a cramped overlay we drop
+        // the panel rather than starve the list.
         let (list_height, show_panel) = {
             let with_panel = size.height.saturating_sub(2 + reserved);
             if reserved > 0 && with_panel >= MIN_LIST_ROWS {
@@ -2024,10 +2024,19 @@ mod tests {
             text.iter().any(|l| l == "bravo  false"),
             "second row is label+value only: {text:?}"
         );
-        // The cursored row's description sits below the list, indented 2.
+        // The cursored row's description sits below the list, indented 2. The
+        // position check guards against drawing the panel above the list.
+        let last_list_row = text
+            .iter()
+            .rposition(|l| l == "alpha  true" || l == "bravo  false")
+            .expect("list rows present");
+        let desc_row = text
+            .iter()
+            .position(|l| l == "  First option description.")
+            .expect("cursored description rendered, indented 2");
         assert!(
-            text.iter().any(|l| l == "  First option description."),
-            "cursored description below the list, indented 2: {text:?}"
+            desc_row > last_list_row,
+            "description panel sits below the list rows (desc {desc_row}, last row {last_list_row}): {text:?}"
         );
         // Only the cursored row's description shows.
         assert!(

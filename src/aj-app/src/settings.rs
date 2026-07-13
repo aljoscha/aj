@@ -837,4 +837,47 @@ mod tests {
         assert_eq!(option_description(opt), opt.description);
         assert!(!option_description(opt).contains("aj-next"));
     }
+
+    #[test]
+    fn every_noted_option_appends_its_exact_note() {
+        // Golden table of the settings-specific note each option appends to its
+        // schema description. Guards against a note being dropped or altered,
+        // which would silently thin the settings-window help text.
+        let noted: &[(&str, &str)] = &[
+            (
+                "model_url",
+                "Takes effect on restart. Submit an empty value to unset.",
+            ),
+            (
+                "thinking_display",
+                "\"default\" keeps the provider's stock behavior. Takes effect next turn.",
+            ),
+            ("speed", "Takes effect next turn."),
+            (
+                "verbosity",
+                "\"default\" leaves the server default. Takes effect next turn.",
+            ),
+            (
+                "disabled_tools",
+                "Toggles apply when the picker closes; takes effect for new sessions.",
+            ),
+            (
+                "disabled_skills",
+                "Toggles apply when the picker closes; takes effect for new sessions.",
+            ),
+            ("image_auto_resize", "Takes effect for new sessions."),
+            ("image_block", "Takes effect for new sessions."),
+            ("syntax_highlighting", "Takes effect for new sessions."),
+            ("compact_threshold", "A fraction between 0.0 and 1.0."),
+            ("compact_keep_recent", "A positive number of tokens."),
+        ];
+        for (name, note) in noted {
+            let opt = option(name);
+            assert_eq!(
+                option_description(opt),
+                format!("{} {}", opt.description, note),
+                "option {name} note drifted"
+            );
+        }
+    }
 }
