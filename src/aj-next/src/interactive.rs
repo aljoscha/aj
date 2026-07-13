@@ -9,7 +9,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -1004,6 +1004,32 @@ fn yank_pending_into_editor(world: &World, shell: &Rc<RefCell<Shell>>) -> bool {
     true
 }
 
+/// Handle the clipboard-image paste chord: read the clipboard image to a
+/// tempfile and insert its path at the editor cursor. Returns whether
+/// anything changed.
+///
+/// Silent on failure (no clipboard image, unsupported backend), matching
+/// `aj`.
+fn paste_clipboard_image(shell: &Rc<RefCell<Shell>>) -> bool {
+    let Some(path) = aj_app::clipboard::read_image_to_tempfile() else {
+        tracing::debug!("clipboard: no image to paste");
+        return false;
+    };
+    insert_pasted_image_path(&shell.borrow().editor, &path)
+}
+
+/// Insert a pasted clipboard-image path at the editor cursor as plain text
+/// and return `true` (the editor changed).
+///
+/// NOTE: We insert the bare path, not an inline image attachment. The agent
+/// opens it with `read_file` on submit, matching `aj`.
+fn insert_pasted_image_path(editor: &Rc<RefCell<TextArea>>, path: &Path) -> bool {
+    editor
+        .borrow_mut()
+        .insert_at_cursor(&path.display().to_string());
+    true
+}
+
 /// The steer gesture (Alt+Enter), ported from `aj`: while the viewed
 /// agent is busy, queue the editor text as steering (or promote the
 /// pending follow-up when the editor is empty). While idle there is
@@ -1055,12 +1081,9 @@ fn handle_host_action(world: &mut World, shell: &Rc<RefCell<Shell>>, action: AjA
             true
         }
         AjAction::Dequeue => yank_pending_into_editor(world, shell),
-        // The clipboard paste arrives with the clipboard port in a later
-        // chunk, so it still folds a placeholder notice.
-        AjAction::PasteImage => {
-            fold_notice(world, "Clipboard image paste is not wired up yet.");
-            true
-        }
+        // Read the clipboard image to a tempfile and insert its path at the
+        // editor cursor. Silent when there is no image, matching `aj`.
+        AjAction::PasteImage => paste_clipboard_image(shell),
         // The direct chords (ctrl+r, alt+a) open the same overlays as the
         // palette commands. Park the matching command so the host's
         // `apply_command_action` opens it on the next drive-loop step
@@ -6371,22 +6394,13 @@ mod tests {
         );
     }
 
-    /// The remaining placeholder host action (clipboard paste) folds a
-    /// notice; the two overlay openers instead park their command for the
-    /// host to open the overlay.
+    /// The two overlay openers park their command for the host to open the
+    /// overlay on the next drive-loop step.
     #[tokio::test]
-    async fn placeholder_and_opener_host_actions() {
+    async fn opener_host_actions_park_their_commands() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
 
-        assert!(handle_host_action(&mut world, &shell, AjAction::PasteImage));
-        assert_eq!(
-            shell.borrow().take_command(),
-            None,
-            "paste is not an overlay opener"
-        );
-
-        // The overlay openers park the matching command (opened next step).
         handle_host_action(&mut world, &shell, AjAction::HistoryOpen);
         assert_eq!(
             shell.borrow().take_command(),
@@ -6397,23 +6411,18 @@ mod tests {
             shell.borrow().take_command(),
             Some(CommandAction::OpenAgentPicker)
         );
+    }
 
-        let notices: Vec<String> = world
-            .chat
-            .borrow()
-            .transcript(AgentId::Main)
-            .expect("main transcript")
-            .entries()
-            .iter()
-            .filter_map(|e| match &e.kind {
-                EntryKind::Notice(n) => Some(n.text.clone()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            notices.iter().any(|n| n.contains("image paste")),
-            "{notices:?}"
-        );
+    /// The clipboard-paste insertion drops the tempfile path at the editor
+    /// cursor as a bare reference (no `@` prefix, no attachment) and reports
+    /// the editor changed. We test this against a bare editor because the
+    /// real clipboard read is environment-dependent and cannot run headless.
+    #[test]
+    fn insert_pasted_image_path_inserts_bare_path() {
+        let editor = TextArea::new();
+        let path = PathBuf::from("/tmp/aj-clipboard-test.png");
+        assert!(insert_pasted_image_path(&editor, &path));
+        assert_eq!(editor.borrow().text(), "/tmp/aj-clipboard-test.png");
     }
 
     // ---- Overlay substrate ----
