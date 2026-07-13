@@ -6,13 +6,11 @@
 //! chat scrollback rendered from the captured live events matches
 //! the chat scrollback rendered from `replay(&log)` byte-for-byte.
 //!
-//! Three tool kinds — `bash`, `edit_file`, `todo_write` — exercise
-//! the three structured-rendering paths (`ToolDetails::Bash`,
-//! `ToolDetails::Diff`, `ToolDetails::Todos`). Without this guard a
-//! future refactor of one of these renderers could drift between
-//! the live and resumed paths without any unit test catching it,
-//! re-introducing the "scrollback looks different on resume" class
-//! of bug.
+//! Four tool kinds cover the structured rendering paths: `read_file` uses
+//! `ToolDetails::Text`, `bash` uses `ToolDetails::Bash`, `edit_file` uses
+//! `ToolDetails::Diff`, and `todo_write` uses `ToolDetails::Todos`. The
+//! `read_file` cases also cover compact text references and paginated output
+//! whose display gutters differ from model-facing content.
 //!
 //! ## Why a kill switch instead of letting the agent finish
 //!
@@ -54,9 +52,12 @@ use aj_agent::{Agent, AgentSeed, TurnError};
 use aj_models::provider::Provider;
 use aj_models::registry::{InputModality, ModelCost, ModelInfo};
 use aj_models::scripted::{ExhaustedBehavior, ScriptedProvider};
-use aj_models::types::{AssistantContent, AssistantMessage, StopReason, StreamOptions, ToolCall};
+use aj_models::types::{
+    AssistantContent, AssistantMessage, Message, StopReason, StreamOptions, ToolCall,
+    ToolResultMessage, UserContent,
+};
 use aj_session::{ConversationLog, ConversationPersistence, persistence_listener, replay};
-use aj_tools::{BashTool, EditFileTool, TodoWriteTool};
+use aj_tools::{BashTool, EditFileTool, ReadFileTool, TodoWriteTool};
 use aj_tui::component::Component;
 use aj_tui::tui::Tui;
 use aj_tui_testkit::VirtualTerminal;
@@ -307,6 +308,27 @@ fn render_replay(sessions_dir: &Path, session_id: &str) -> Vec<String> {
     render_chat(&mut tui)
 }
 
+fn persisted_tool_result(
+    sessions_dir: &Path,
+    session_id: &str,
+    call_id: &str,
+) -> ToolResultMessage {
+    let persistence = ConversationPersistence::new(sessions_dir.to_path_buf());
+    let log = ConversationLog::resume(&persistence, session_id).expect("resume log");
+    log.entries_in_order()
+        .into_iter()
+        .find_map(|entry| match &entry.entry {
+            aj_session::ConversationEntryKind::Message { message } => match message.as_wire() {
+                Some(Message::ToolResult(result)) if result.tool_call_id == call_id => {
+                    Some(result.clone())
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("persisted tool result")
+}
+
 /// Side-by-side dump used when the live and replay scrollbacks
 /// diverge. Surfacing both transcripts in the test failure makes
 /// regressions debuggable from the panic message alone rather
@@ -365,6 +387,84 @@ async fn assert_live_matches_replay(
 // ---------------------------------------------------------------------------
 // Per-tool fixtures
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn replay_renders_compact_read_file_identically_to_live() {
+    let sessions_dir = TempDir::new().expect("sessions tempdir");
+    let working_dir = TempDir::new().expect("working tempdir");
+    let sample_path = working_dir.path().join("sample.txt");
+    let contents = (1..=40)
+        .map(|line| format!("line {line}: a reasonably long value"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&sample_path, contents).expect("seed sample.txt");
+
+    let (session_id, live_events) = drive_live_turn(
+        sessions_dir.path(),
+        working_dir.path(),
+        ReadFileTool::default().into(),
+        "tu-read",
+        "read_file",
+        serde_json::json!({"path": sample_path}),
+        "read the sample",
+    )
+    .await;
+
+    let persisted = persisted_tool_result(sessions_dir.path(), &session_id, "tu-read");
+    let details = persisted.details.as_ref().expect("persisted details");
+    assert_eq!(details["body_ref"]["source"], "content_text");
+    assert_eq!(details["body_ref"]["append_newline"], true);
+    assert!(details.get("body").is_none());
+
+    let live = render_live(&live_events);
+    let replay_lines = render_replay(sessions_dir.path(), &session_id);
+    assert!(
+        live == replay_lines,
+        "{}",
+        diff_lines("read_file", &live, &replay_lines)
+    );
+}
+
+#[tokio::test]
+async fn replay_renders_paginated_read_file_identically_and_keeps_body_inline() {
+    let sessions_dir = TempDir::new().expect("sessions tempdir");
+    let working_dir = TempDir::new().expect("working tempdir");
+    let sample_path = working_dir.path().join("sample.txt");
+    let contents = (1..=40)
+        .map(|line| format!("line {line}: a reasonably long value"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&sample_path, contents).expect("seed sample.txt");
+
+    let (session_id, live_events) = drive_live_turn(
+        sessions_dir.path(),
+        working_dir.path(),
+        ReadFileTool::default().into(),
+        "tu-read-offset",
+        "read_file",
+        serde_json::json!({"path": sample_path, "offset": 12, "limit": 10}),
+        "read the middle of the sample",
+    )
+    .await;
+
+    let persisted = persisted_tool_result(sessions_dir.path(), &session_id, "tu-read-offset");
+    let details = persisted.details.as_ref().expect("persisted details");
+    assert!(details.get("body_ref").is_none());
+    let display_body = details["body"].as_str().expect("inline display body");
+    assert!(display_body.starts_with("    1: line 12:"));
+    let [UserContent::Text(model_content)] = persisted.content.as_slice() else {
+        panic!("expected one model-facing text block");
+    };
+    assert!(model_content.text.starts_with("   12: line 12:"));
+
+    let live = render_live(&live_events);
+    let replay_lines = render_replay(sessions_dir.path(), &session_id);
+    assert!(
+        live == replay_lines,
+        "{}",
+        diff_lines("read_file offset", &live, &replay_lines)
+    );
+}
 
 #[tokio::test]
 async fn replay_renders_bash_tool_identically_to_live() {

@@ -21,18 +21,21 @@
 //! helpers (`last_message`, `messages`, etc.) the binary uses to
 //! decide thinking efforts and resume state.
 
-use aj_agent::events::AgentSettings;
-use aj_agent::message::AgentMessage;
-use aj_models::types::Message;
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::{
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Read, Write},
     path::PathBuf,
 };
+
+use aj_agent::events::AgentSettings;
+use aj_agent::message::AgentMessage;
+use aj_models::types::Message;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::tool_details::{compact_message, expand_message};
 
 #[derive(Debug, Error)]
 pub enum ConversationError {
@@ -369,7 +372,9 @@ impl Conversation {
                 .entries
                 .iter()
                 .filter_map(|entry| match &entry.entry {
-                    ConversationEntryKind::Message { message } => Some(message.clone()),
+                    ConversationEntryKind::Message { message } => {
+                        Some(expand_message(message.clone()))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -394,7 +399,7 @@ impl Conversation {
         out.push(crate::compaction::summary_message(&summary));
         for entry in &self.entries[k..] {
             if let ConversationEntryKind::Message { message } = &entry.entry {
-                out.push(message.clone());
+                out.push(expand_message(message.clone()));
             }
         }
         out
@@ -451,13 +456,12 @@ impl Conversation {
 
     /// Get the last message in the view, if any.
     pub fn last_message(&self) -> Option<Message> {
-        self.entries
-            .iter()
-            .rev()
-            .find_map(|entry| match &entry.entry {
-                ConversationEntryKind::Message { message: m } => m.as_wire().cloned(),
-                _ => None,
-            })
+        self.entries.iter().rev().find_map(|entry| {
+            let ConversationEntryKind::Message { message } = &entry.entry else {
+                return None;
+            };
+            expand_message(message.clone()).as_wire().cloned()
+        })
     }
 }
 
@@ -677,6 +681,11 @@ impl ConversationLog {
 
     /// Append one entry to the log. Returns the new entry's id.
     ///
+    /// Message entries pass through the session storage codec before they are
+    /// serialized. The caller has transferred ownership, so this can compact
+    /// duplicate tool-detail bodies without changing live agent messages.
+    /// Other entry kinds are serialized unchanged.
+    ///
     /// Durability depends on the entry's kind (see
     /// [`ConversationEntryKind::is_punctuation`]):
     ///
@@ -752,6 +761,11 @@ impl ConversationLog {
             return Err(ConversationError::InvalidAppend(
                 "log already has a root entry; additional entries must have a parent".to_string(),
             ));
+        }
+
+        let mut entry = entry;
+        if let ConversationEntryKind::Message { message } = &mut entry {
+            compact_message(message);
         }
 
         let id = self.mint_id();
@@ -1166,8 +1180,9 @@ impl<'a> ConversationView<'a> {
         self.head.as_ref()
     }
 
-    /// Append a wire-level message to this thread. Writes one JSONL
-    /// line to disk before advancing the head.
+    /// Append a wire-level message to this thread. The log compacts duplicate
+    /// text details in the owned message, then writes one JSONL line before
+    /// advancing the head.
     pub(crate) fn add_message(
         &mut self,
         message: AgentMessage,
@@ -1245,6 +1260,36 @@ mod tests {
         AgentMessage::wire(Message::ToolResult(ToolResultMessage::text(
             id, name, body, false,
         )))
+    }
+
+    fn detailed_text_tool_result(
+        id: &str,
+        name: &str,
+        content: &str,
+        summary: &str,
+        body: &str,
+    ) -> AgentMessage {
+        let mut result = ToolResultMessage::text(id, name, content, false);
+        result.details = Some(serde_json::json!({
+            "kind": "text",
+            "summary": summary,
+            "body": body,
+        }));
+        AgentMessage::wire(Message::ToolResult(result))
+    }
+
+    fn agent_tool_result_details(message: &AgentMessage) -> &serde_json::Value {
+        let Some(Message::ToolResult(result)) = message.as_wire() else {
+            panic!("expected tool-result agent message");
+        };
+        result.details.as_ref().expect("tool details")
+    }
+
+    fn wire_tool_result_details(message: &Message) -> &serde_json::Value {
+        let Message::ToolResult(result) = message else {
+            panic!("expected tool-result wire message");
+        };
+        result.details.as_ref().expect("tool details")
     }
 
     fn resume_fixture() -> (ConversationPersistence, String, Vec<String>) {
@@ -1637,6 +1682,94 @@ mod tests {
 
         let convo = log.linearize(&sub_id, ThreadFilter::subagent(1));
         assert_eq!(convo.entries().len(), 1);
+    }
+
+    #[test]
+    fn direct_message_append_compacts_storage_and_expands_resume_projections() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("sys".into()).expect("set sp");
+
+        let content = "persisted model-facing content\n".repeat(40);
+        let body = format!("{content}\n");
+        let live_message =
+            detailed_text_tool_result("tu-1", "read_file", &content, "read_file large.txt", &body);
+        {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_message(user_text("read it")).expect("user msg");
+            view.add_message(assistant_tool_use("tu-1", "read_file"))
+                .expect("assistant msg");
+            view.add_message(live_message.clone())
+                .expect("tool result entry");
+        }
+
+        let live_details = agent_tool_result_details(&live_message);
+        assert_eq!(live_details["body"], body);
+        assert!(live_details.get("body_ref").is_none());
+
+        let raw_entry = log
+            .entries_in_order()
+            .into_iter()
+            .find(|entry| {
+                matches!(
+                    &entry.entry,
+                    ConversationEntryKind::Message { message }
+                        if matches!(message.as_wire(), Some(Message::ToolResult(_)))
+                )
+            })
+            .expect("stored tool result");
+        let ConversationEntryKind::Message { message } = &raw_entry.entry else {
+            unreachable!("matched message entry");
+        };
+        let raw_details = agent_tool_result_details(message);
+        assert_eq!(raw_details["body_ref"]["source"], "content_text");
+        assert_eq!(raw_details["body_ref"]["append_newline"], true);
+        assert!(raw_details.get("body").is_none());
+
+        let session_id = log.session_id().to_string();
+        drop(log);
+        let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume log");
+        let head = resumed.latest_leaf(ThreadFilter::USER).expect("head");
+        let conversation = resumed.linearize(&head, ThreadFilter::USER);
+
+        let raw_resumed = conversation
+            .entries()
+            .iter()
+            .find_map(|entry| match &entry.entry {
+                ConversationEntryKind::Message { message }
+                    if matches!(message.as_wire(), Some(Message::ToolResult(_))) =>
+                {
+                    Some(agent_tool_result_details(message))
+                }
+                _ => None,
+            })
+            .expect("raw resumed tool result");
+        assert!(raw_resumed.get("body").is_none());
+        assert_eq!(raw_resumed["body_ref"]["source"], "content_text");
+
+        let agent_messages = conversation.agent_messages();
+        let projected_agent = agent_messages
+            .iter()
+            .find(|message| matches!(message.as_wire(), Some(Message::ToolResult(_))))
+            .expect("projected agent tool result");
+        let projected_agent_details = agent_tool_result_details(projected_agent);
+        assert_eq!(projected_agent_details["summary"], "read_file large.txt");
+        assert_eq!(projected_agent_details["body"], body);
+        assert!(projected_agent_details.get("body_ref").is_none());
+
+        let messages = conversation.messages();
+        let projected_wire = messages
+            .iter()
+            .find(|message| matches!(message, Message::ToolResult(_)))
+            .expect("projected wire tool result");
+        let projected_wire_details = wire_tool_result_details(projected_wire);
+        assert_eq!(projected_wire_details["summary"], "read_file large.txt");
+        assert_eq!(projected_wire_details["body"], body);
+        assert!(projected_wire_details.get("body_ref").is_none());
+
+        let last = conversation.last_message().expect("last message");
+        assert_eq!(wire_tool_result_details(&last)["body"], body);
     }
 
     #[test]
@@ -2279,6 +2412,76 @@ mod tests {
             },
             other => panic!("expected kept assistant message, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn compaction_projection_expands_retained_text_details() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("set sp");
+
+        let content = "retained model-facing result\n".repeat(40);
+        let body = format!("{content}\n");
+        let first_kept = {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_message(user_text("old request"))
+                .expect("old user");
+            view.add_message(assistant_text("old reply"))
+                .expect("old assistant");
+            let first_kept = view
+                .add_message(user_text("retained request"))
+                .expect("retained user");
+            view.add_message(assistant_tool_use("tu-1", "read_file"))
+                .expect("retained assistant");
+            view.add_message(detailed_text_tool_result(
+                "tu-1",
+                "read_file",
+                &content,
+                "read_file retained.txt",
+                &body,
+            ))
+            .expect("retained tool result");
+            first_kept
+        };
+        log.append_compaction(ThreadFilter::USER, "SUMMARY".into(), first_kept, 999, None)
+            .expect("compaction");
+
+        let head = log.latest_leaf(ThreadFilter::USER).expect("head");
+        let conversation = log.linearize(&head, ThreadFilter::USER);
+        let raw_details = conversation
+            .entries()
+            .iter()
+            .find_map(|entry| match &entry.entry {
+                ConversationEntryKind::Message { message }
+                    if matches!(message.as_wire(), Some(Message::ToolResult(_))) =>
+                {
+                    Some(agent_tool_result_details(message))
+                }
+                _ => None,
+            })
+            .expect("raw retained tool result");
+        assert!(raw_details.get("body").is_none());
+        assert_eq!(raw_details["body_ref"]["source"], "content_text");
+
+        let agent_messages = conversation.agent_messages();
+        let projected_agent = agent_messages
+            .iter()
+            .find(|message| matches!(message.as_wire(), Some(Message::ToolResult(_))))
+            .expect("retained agent tool result");
+        let agent_details = agent_tool_result_details(projected_agent);
+        assert_eq!(agent_details["summary"], "read_file retained.txt");
+        assert_eq!(agent_details["body"], body);
+        assert!(agent_details.get("body_ref").is_none());
+
+        let messages = conversation.messages();
+        let projected_wire = messages
+            .iter()
+            .find(|message| matches!(message, Message::ToolResult(_)))
+            .expect("retained wire tool result");
+        let wire_details = wire_tool_result_details(projected_wire);
+        assert_eq!(wire_details["body"], body);
+        assert!(wire_details.get("body_ref").is_none());
     }
 
     #[test]

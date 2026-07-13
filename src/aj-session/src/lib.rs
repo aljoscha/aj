@@ -27,6 +27,7 @@ pub mod prompt_history;
 pub mod repair;
 pub mod replay;
 pub mod stats;
+mod tool_details;
 
 pub use compaction::{
     CompactionDetails, CompactionPlan, ContextEstimate, estimate_context_tokens,
@@ -45,3 +46,4 @@ pub use prompt_history::{
 pub use repair::repair_interrupted_tool_uses;
 pub use replay::replay;
 pub use stats::SessionStats;
+pub use tool_details::resolve_tool_details;

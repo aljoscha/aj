@@ -327,7 +327,11 @@
       case 'text': {
         let html = '';
         if (details.summary) html += '<div class="summary">' + escapeHtml(details.summary) + '</div>';
-        if (details.body) html += outputBlock(details.body, 'head', TEXT_LINES);
+        if (typeof details.body === 'string') {
+          if (details.body) html += outputBlock(details.body, 'head', TEXT_LINES);
+        } else {
+          html += renderToolResultFallback(result);
+        }
         return html;
       }
       case 'diff': {

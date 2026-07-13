@@ -39,9 +39,10 @@
 //! - [`ConversationEntryKind::Message`] (tool_result): one
 //!   [`AgentEvent::ToolExecutionStart`] / [`ToolExecutionEnd`] pair
 //!   pulling the tool name & input args from the tracking map. The
-//!   structured `ToolDetails` payload is reconstructed by
-//!   deserializing [`ToolResultMessage::details`] (falling back to a
-//!   text-only synthesis when absent or corrupt). The
+//!   structured `ToolDetails` payload is resolved through the session
+//!   codec. Text body references are hydrated from content, while normal
+//!   details use regular deserialization. Absent or malformed details fall
+//!   back to a text-only synthesis. The
 //!   [`AgentEvent::MessageStart`] / [`AgentEvent::MessageEnd`] pair
 //!   around the tool_result is also emitted so persistence listeners
 //!   replaying the stream see the same shape live runs produce.
@@ -103,6 +104,7 @@ use crate::compaction::estimate_conversation_context;
 use crate::log::{
     ConversationEntry, ConversationEntryKind, ConversationLog, ThreadFilter, ThreadKind,
 };
+use crate::tool_details::resolve_tool_details;
 
 /// Walks `log` in append order and lazily yields its projected [`AgentEvent`]s.
 ///
@@ -547,10 +549,9 @@ impl ReplayState {
     /// `ToolExecutionStart`/`End` pair (so the renderer paints the
     /// tool component) bracketed by a `MessageStart`/`End` pair (so
     /// persistence/event-tape listeners see the same shape live runs
-    /// produce). The `ToolDetails` payload is recovered by
-    /// deserializing the message's `details` field, falling back to
-    /// a text-only synthesis off the wire content when absent or
-    /// corrupt.
+    /// produce). The `ToolDetails` payload is recovered through the session
+    /// codec, falling back to a text-only synthesis off the wire content when
+    /// absent or malformed.
     fn project_tool_result(
         &self,
         agent_id: AgentId,
@@ -568,14 +569,12 @@ impl ReplayState {
             .cloned()
             .unwrap_or_else(|| ("tool".to_string(), Value::Object(Default::default())));
 
-        // The tool result's [`ToolDetails`] payload was serialized
-        // onto `tr.details` as a JSON `Value`; deserialize it back.
-        // Fall back to a text-only synthesis off the wire content
-        // when the field is absent (legacy logs) or corrupt
-        // (deserialization fails).
+        // The session codec hydrates persisted text references and uses normal
+        // `ToolDetails` deserialization for every other shape. Missing or
+        // malformed details fall back to the model-facing content.
         let result = match tr.details.as_ref() {
-            Some(value) => serde_json::from_value::<ToolDetails>(value.clone())
-                .unwrap_or_else(|_| text_fallback(&tool_name, &tr.content)),
+            Some(value) => resolve_tool_details(value, &tr.content)
+                .unwrap_or_else(|| text_fallback(&tool_name, &tr.content)),
             None => text_fallback(&tool_name, &tr.content),
         };
         let mut normalized_message = agent_msg.clone();
@@ -1030,6 +1029,108 @@ mod tests {
                     .is_some_and(|lines| lines.iter().all(Value::is_string))
             );
         }
+    }
+
+    #[test]
+    fn replay_expands_text_references_in_messages_tool_events_and_print_json() {
+        let events = replay_events_with_raw_tool_details(json!({
+            "kind": "text",
+            "summary": "read_file exact summary",
+            "body_ref": {"source": "content_text", "append_newline": true},
+        }));
+
+        let message_results: Vec<&ToolResultMessage> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::MessageStart { message, .. }
+                | AgentEvent::MessageEnd { message, .. } => match message.as_wire() {
+                    Some(Message::ToolResult(result)) => Some(result),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(message_results.len(), 2);
+        for result in message_results {
+            assert_eq!(
+                result.details,
+                Some(json!({
+                    "kind": "text",
+                    "summary": "read_file exact summary",
+                    "body": "edited\n",
+                })),
+            );
+        }
+
+        let details = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::ToolExecutionEnd { result, .. } => Some(result),
+                _ => None,
+            })
+            .expect("tool execution end");
+        match details {
+            ToolDetails::Text { summary, body } => {
+                assert_eq!(summary, "read_file exact summary");
+                assert_eq!(body, "edited\n");
+            }
+            other => panic!("expected text details, got {other:?}"),
+        }
+
+        let print_json = events
+            .iter()
+            .map(|event| serde_json::to_string(event).expect("event serializes"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!print_json.contains("body_ref"), "{print_json}");
+    }
+
+    #[test]
+    fn replay_keeps_legacy_text_bodies() {
+        let details = replay_raw_tool_details(json!({
+            "kind": "text",
+            "summary": "legacy summary",
+            "body": "legacy display body",
+        }));
+
+        match details {
+            ToolDetails::Text { summary, body } => {
+                assert_eq!(summary, "legacy summary");
+                assert_eq!(body, "legacy display body");
+            }
+            other => panic!("expected legacy text details, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_falls_back_for_malformed_text_references() {
+        let events = replay_events_with_raw_tool_details(json!({
+            "kind": "text",
+            "summary": "must not survive",
+            "body_ref": {"source": "content_text", "append_newline": "yes"},
+        }));
+
+        let mut projected = 0;
+        for event in events {
+            let details = match event {
+                AgentEvent::MessageStart { message, .. }
+                | AgentEvent::MessageEnd { message, .. } => match message.as_wire() {
+                    Some(Message::ToolResult(result)) => result.details.clone(),
+                    _ => continue,
+                },
+                AgentEvent::ToolExecutionEnd { result, .. } => {
+                    Some(serde_json::to_value(result).expect("details serialize"))
+                }
+                _ => continue,
+            }
+            .expect("fallback details");
+            projected += 1;
+            assert_eq!(
+                details,
+                json!({"kind": "text", "summary": "edit_file", "body": "edited"})
+            );
+        }
+        assert_eq!(projected, 3, "both message events and the tool end");
     }
 
     #[test]

@@ -148,11 +148,12 @@ fn filter_for(agent_id: AgentId) -> ThreadFilter {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
-    use aj_agent::bus::EventBus;
+    use aj_agent::bus::{EventBus, listener_from_sync};
     use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
     use aj_agent::message::AgentMessage;
+    use aj_agent::tool::ToolDetails;
     use aj_models::types::{
         AssistantContent, AssistantMessage, Message, TextContent, ToolResultMessage, UserMessage,
     };
@@ -194,6 +195,20 @@ mod tests {
         AgentMessage::wire(Message::ToolResult(ToolResultMessage::text(
             id, name, body, false,
         )))
+    }
+
+    fn count_string(value: &serde_json::Value, target: &str) -> usize {
+        match value {
+            serde_json::Value::String(text) => usize::from(text == target),
+            serde_json::Value::Array(values) => {
+                values.iter().map(|value| count_string(value, target)).sum()
+            }
+            serde_json::Value::Object(object) => object
+                .values()
+                .map(|value| count_string(value, target))
+                .sum(),
+            _ => 0,
+        }
     }
 
     /// A SubAgentStart event carrying a representative bundle
@@ -308,6 +323,72 @@ mod tests {
             },
             other => panic!("expected Message entry, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn persistence_append_compacts_without_mutating_the_event() {
+        let (_dir, log) = fresh_log();
+        let body = "unique tool result body\n".repeat(30);
+        let mut result = ToolResultMessage::text("tu-1", "read_file", &body, false);
+        result.details = Some(
+            serde_json::to_value(ToolDetails::Text {
+                summary: "read_file large.txt".to_string(),
+                body: body.clone(),
+            })
+            .expect("serialize details"),
+        );
+        let event = AgentEvent::MessageEnd {
+            agent_id: AgentId::Main,
+            message: AgentMessage::wire(Message::ToolResult(result)),
+        };
+
+        let bus = EventBus::new();
+        let _persist = bus.subscribe(persistence_listener(Arc::clone(&log)));
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+        let _capture = bus.subscribe(listener_from_sync(move |event| {
+            captured_clone
+                .lock()
+                .expect("capture mutex")
+                .push(event.clone());
+        }));
+
+        bus.emit(event).await.expect("emit tool result");
+
+        let path = log.lock().await.path().to_path_buf();
+        let raw = std::fs::read_to_string(path).expect("read JSONL");
+        let tool_entry: serde_json::Value = raw
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid JSONL entry"))
+            .find(|entry: &serde_json::Value| entry["message"]["role"] == "tool_result")
+            .expect("tool result entry");
+        let persisted = &tool_entry["message"]["details"];
+        assert_eq!(persisted["kind"], "text");
+        assert_eq!(persisted["summary"], "read_file large.txt");
+        assert_eq!(persisted["body_ref"]["source"], "content_text");
+        assert_eq!(persisted["body_ref"]["append_newline"], false);
+        assert!(persisted.get("body").is_none());
+        assert_eq!(
+            count_string(&tool_entry, &body),
+            1,
+            "body stored only in content"
+        );
+
+        let captured = captured.lock().expect("capture mutex");
+        let live_details = captured.iter().find_map(|event| match event {
+            AgentEvent::MessageEnd { message, .. } => match message.as_wire() {
+                Some(Message::ToolResult(result)) => result.details.as_ref(),
+                _ => None,
+            },
+            _ => None,
+        });
+        assert_eq!(
+            live_details
+                .and_then(|details| details.get("body"))
+                .and_then(serde_json::Value::as_str),
+            Some(body.as_str()),
+            "other subscribers retain full details",
+        );
     }
 
     #[tokio::test]

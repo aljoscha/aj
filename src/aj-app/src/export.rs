@@ -10,7 +10,7 @@
 //!
 //! What gets embedded:
 //! - the on-disk entries (`ConversationEntry`), with valid diff details
-//!   normalized to their canonical wire representation one entry at a time,
+//!   normalized and valid text body references expanded one entry at a time,
 //! - the page renderer (`template.js`),
 //! - `marked` (markdown), vendored under `assets/export/vendor` (see its
 //!   `PROVENANCE.md`).
@@ -30,13 +30,14 @@ use aj_agent::tool::ToolDetails;
 use aj_models::types::{Message, ToolResultMessage, UserContent};
 use aj_session::{
     ConversationEntry, ConversationEntryKind, ConversationLog, EntryId, ThreadFilter, replay,
+    resolve_tool_details,
 };
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use serde::ser::SerializeMap;
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Serialize, Serializer};
 
 /// The HTML shell with `{{KEY}}` placeholders, filled by
 /// [`fill_template`].
@@ -50,8 +51,9 @@ const MARKED_JS: &str = include_str!("../assets/export/vendor/marked.min.js");
 /// travel with a redistribution.
 const MARKED_LICENSE: &str = include_str!("../assets/export/vendor/marked.LICENSE");
 
-/// The embedded session envelope. Valid diff details are canonicalized during
-/// serialization. All other entry data keeps its on-disk shape.
+/// The embedded session envelope. Valid diff details are canonicalized and
+/// valid text body references are expanded during serialization. All other
+/// entry data keeps its on-disk shape.
 #[derive(Serialize)]
 struct ExportData<'a> {
     session_id: &'a str,
@@ -90,10 +92,13 @@ impl Serialize for ExportEntry<'_> {
         let Some(raw_details) = result.details.as_ref() else {
             return entry.serialize(serializer);
         };
-        if raw_details.get("kind").and_then(|kind| kind.as_str()) != Some("diff") {
+        let kind = raw_details.get("kind").and_then(|kind| kind.as_str());
+        let project_details =
+            kind == Some("diff") || (kind == Some("text") && raw_details.get("body_ref").is_some());
+        if !project_details {
             return entry.serialize(serializer);
         }
-        let Ok(details) = ToolDetails::deserialize(raw_details) else {
+        let Some(details) = resolve_tool_details(raw_details, &result.content) else {
             return entry.serialize(serializer);
         };
 
@@ -454,6 +459,51 @@ mod tests {
         let original = result.details.as_ref().expect("original details");
         assert!(original.get("before").is_some());
         assert!(original.get("after").is_some());
+    }
+
+    #[test]
+    fn export_expands_compact_text_details_without_mutating_log() {
+        let compact_text = r#"{"id":"t0000001","parent_id":"a0000001","thread":"user","type":"message","message":{"role":"tool_result","tool_call_id":"call-1","tool_name":"read_file","content":[{"type":"text","text":"first block"},{"type":"text","text":"second block"}],"details":{"kind":"text","summary":"read_file x.rs","body_ref":{"source":"content_text","append_newline":true}},"is_error":false,"timestamp":0}}"#;
+        let (_dir, log) = log_from_jsonl(&[SYSTEM, USER, ASSISTANT, compact_text]);
+
+        let html = render_session_html(&log);
+        let data: serde_json::Value =
+            serde_json::from_str(&decoded_island(&html)).expect("export data parses");
+        assert_eq!(
+            data["entries"][3]["message"]["details"],
+            serde_json::json!({
+                "kind": "text",
+                "summary": "read_file x.rs",
+                "body": "first blocksecond block\n",
+            })
+        );
+
+        let entries = log.entries_in_order();
+        let ConversationEntryKind::Message { message } = &entries[3].entry else {
+            panic!("expected message entry");
+        };
+        let Some(Message::ToolResult(result)) = message.as_wire() else {
+            panic!("expected tool result");
+        };
+        let original = result.details.as_ref().expect("original details");
+        assert_eq!(original["body_ref"]["source"], "content_text");
+        assert!(original.get("body").is_none());
+    }
+
+    #[test]
+    fn export_preserves_malformed_text_references() {
+        let malformed = r#"{"id":"t0000001","parent_id":"a0000001","thread":"user","type":"message","message":{"role":"tool_result","tool_call_id":"call-1","tool_name":"read_file","content":[{"type":"text","text":"model result"}],"details":{"kind":"text","summary":"read_file x.rs","body_ref":{"source":"content_text","append_newline":"yes"}},"is_error":false,"timestamp":0}}"#;
+        let (_dir, log) = log_from_jsonl(&[SYSTEM, USER, ASSISTANT, malformed]);
+
+        let source: serde_json::Value = serde_json::from_str(malformed).expect("source entry");
+        let html = render_session_html(&log);
+        let exported: serde_json::Value =
+            serde_json::from_str(&decoded_island(&html)).expect("export data parses");
+
+        assert_eq!(
+            exported["entries"][3]["message"]["details"],
+            source["message"]["details"]
+        );
     }
 
     #[test]

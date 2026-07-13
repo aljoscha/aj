@@ -19,6 +19,9 @@ const here = dirname(fileURLToPath(import.meta.url));
 const read = (p) => readFileSync(join(here, p), 'utf8');
 
 // ---- Fixture: exercises every renderer path, including both diff formats. ----
+// `projectedTextBody` is the full shape the Rust exporter emits after resolving
+// a compact Text body reference.
+const projectedTextBody = Array.from({ length: 20 }, (_, i) => 'line ' + (i + 1)).join('\n');
 const entries = [
   { id: 'root', thread: 'meta', type: 'system_prompt', text: 'You are aj.', timestamp: '2024-01-01T00:00:00Z' },
   { id: 'u1', parent_id: 'root', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:01Z',
@@ -34,14 +37,15 @@ const entries = [
         { type: 'tool_call', id: 'c6', name: 'edit_file', arguments: { path: '/home/me/y.rs' } },
         { type: 'tool_call', id: 'c7', name: 'edit_file', arguments: { path: '/home/me/z.rs' } },
         { type: 'tool_call', id: 'c8', name: 'edit_file', arguments: { path: '/home/me/multiline.rs' } },
+        { type: 'tool_call', id: 'c9', name: 'read_file', arguments: { path: '/home/me/future.rs' } },
         { type: 'tool_call', id: 'c4', name: 'agent', arguments: { task: 'investigate' } },
       ],
       usage: { input: 100, output: 50, cache_read: 0, cache_write: 0, total_tokens: 150, cost: { total: 0.01 } },
       stop_reason: 'ToolUse', timestamp: 0 } },
   { id: 'r1', parent_id: 'a1', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:03Z',
     message: { role: 'tool_result', tool_call_id: 'c1', tool_name: 'read_file',
-      content: [{ type: 'text', text: 'body' }],
-      details: { kind: 'text', summary: 'read_file /home/me/x.rs', body: Array.from({ length: 20 }, (_, i) => 'line ' + (i + 1)).join('\n') },
+      content: [{ type: 'text', text: projectedTextBody }],
+      details: { kind: 'text', summary: 'read_file /home/me/x.rs', body: projectedTextBody + '\n' },
       is_error: false, timestamp: 0 } },
   { id: 'r2', parent_id: 'r1', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:04Z',
     message: { role: 'tool_result', tool_call_id: 'c2', tool_name: 'bash',
@@ -72,6 +76,12 @@ const entries = [
       details: { kind: 'diff', format: 'display-v1', path: '/home/me/multiline.rs',
         lines: ['--- a//home/me/multiline.rs', '+++ b//home/me/multiline.rs', '+ first\n+ must not split'] },
       is_error: false, timestamp: 0 } },
+  { id: 'r3f', parent_id: 'r3n', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:05Z',
+    message: { role: 'tool_result', tool_call_id: 'c9', tool_name: 'read_file',
+      content: [{ type: 'text', text: 'future marker model-facing content' }],
+      details: { kind: 'text', summary: 'future marker summary',
+        body_ref: { source: 'future_content', append_newline: false } },
+      is_error: false, timestamp: 0 } },
   // sub-agent run spawned by a1
   { id: 'sp', parent_id: 'a1', thread: 'subagent', agent_id: 1, type: 'sub_agent_spawn', task: 'investigate the bug',
     settings: { provider: 'anthropic', model_id: 'claude-test', thinking: 'off', speed: 'standard', verbosity: '' }, timestamp: '2024-01-01T00:00:06Z' },
@@ -79,7 +89,7 @@ const entries = [
     message: { role: 'assistant', model: 'claude-test', content: [{ type: 'text', text: 'sub-agent finding' }],
       usage: { input: 0, output: 0, cache_read: 0, cache_write: 0, total_tokens: 0, cost: { total: 0 } }, stop_reason: 'Stop', timestamp: 0 } },
   // the agent tool_result (successful report) on the user thread
-  { id: 'r4', parent_id: 'r3n', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:08Z',
+  { id: 'r4', parent_id: 'r3f', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:08Z',
     message: { role: 'tool_result', tool_call_id: 'c4', tool_name: 'agent',
       content: [{ type: 'text', text: 'sub-agent finding' }],
       details: { kind: 'sub_agent_report', agent_id: 1, task: 'investigate the bug', report: 'sub-agent finding' },
@@ -274,6 +284,8 @@ has('malformed compact uses model-facing fallback', 'malformed compact fallback'
 hasnt('arbitrary compact line not rendered', 'bogus must not render');
 has('multiline compact uses model-facing fallback', 'multiline compact fallback');
 hasnt('multiline compact line not rendered', 'must not split');
+has('future text marker keeps summary', 'future marker summary');
+has('future text marker uses model-facing fallback', 'future marker model-facing content');
 has('compact edit diff added', '<div class="diff-added">+ fresh compact</div>');
 has('compact edit diff removed', '<div class="diff-removed">- stale compact</div>');
 hasnt('stored diff old header suppressed', '--- a/');

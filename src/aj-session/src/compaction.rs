@@ -14,6 +14,7 @@ use aj_agent::message::AgentMessage;
 use aj_models::types::{AssistantContent, Message, UserContent, UserMessage};
 
 use crate::log::{Conversation, ConversationEntry, ConversationEntryKind, EntryId};
+use crate::tool_details::expand_message;
 
 /// Files touched in a summarized range, surfaced so the model knows
 /// what was read or modified without parsing the summary prose. The
@@ -636,7 +637,9 @@ pub fn prepare_compaction(
     let messages_to_summarize: Vec<Message> = entries[boundary_start..history_end]
         .iter()
         .filter_map(|e| match &e.entry {
-            ConversationEntryKind::Message { message } => message.as_wire().cloned(),
+            ConversationEntryKind::Message { message } => {
+                expand_message(message.clone()).as_wire().cloned()
+            }
             _ => None,
         })
         .collect();
@@ -651,7 +654,9 @@ pub fn prepare_compaction(
         Some(turn_start) => entries[turn_start..cut.first_kept_index]
             .iter()
             .filter_map(|e| match &e.entry {
-                ConversationEntryKind::Message { message } => message.as_wire().cloned(),
+                ConversationEntryKind::Message { message } => {
+                    expand_message(message.clone()).as_wire().cloned()
+                }
                 _ => None,
             })
             .collect(),
