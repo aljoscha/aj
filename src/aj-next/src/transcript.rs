@@ -88,9 +88,11 @@ pub(crate) struct TranscriptStyles {
     /// Border glyph color for the focused user message's marker in
     /// transcript-focus mode, the theme's `borderAccent` (Spec E section 2).
     pub(crate) border_accent: Color,
-    /// Background tint for a transcript selection's highlight, the app's
-    /// selection color (see Spec E section 2). Only the background is
-    /// restyled over the composed frame, so the selected text stays readable.
+    /// Background tint for a transcript selection's highlight, the theme's
+    /// `TextSelectionBg` token (see Spec E section 2): a macOS-style blue on
+    /// light themes and a darker blue on dark themes, distinct from the
+    /// menu-cursor band. Only the background is restyled over the composed
+    /// frame, so the selected text stays readable.
     pub(crate) selection_bg: Color,
     /// Foreground mapper for markdown span roles, consumed by
     /// [`MarkdownView`]. Rebuilt from the theme here so a runtime swap
@@ -148,7 +150,7 @@ impl TranscriptStyles {
             tool_error_bg: bg(ThemeBg::ToolErrorBg),
             user_message_bg: bg(ThemeBg::UserMessageBg),
             border_accent: vaxis_color(theme.fg_color(ThemeColor::BorderAccent), mode),
-            selection_bg: bg(ThemeBg::SelectedBg),
+            selection_bg: bg(ThemeBg::TextSelectionBg),
             markdown: MarkdownStyles::from_theme(theme),
             hyperlinks: TERMINAL_HYPERLINKS,
         }
@@ -2356,6 +2358,37 @@ mod tests {
         TranscriptStyles::from_theme(&Theme::bundled_dark_with_mode(
             aj_app::theme::ColorMode::Truecolor,
         ))
+    }
+
+    /// The mouse-selection highlight reads the theme's `TextSelectionBg`
+    /// token: the macOS selection blue on light themes, a darker blue on
+    /// dark themes, and distinct from the menu-cursor band (`SelectedBg`).
+    #[test]
+    fn selection_bg_uses_the_theme_text_selection_token() {
+        use aj_app::theme::ColorMode;
+        let light =
+            TranscriptStyles::from_theme(&Theme::bundled_light_with_mode(ColorMode::Truecolor));
+        assert_eq!(
+            light.selection_bg,
+            Color::Rgb([183, 211, 248]),
+            "light theme uses the macOS selection blue"
+        );
+        let dark_theme = Theme::bundled_dark_with_mode(ColorMode::Truecolor);
+        let dark = TranscriptStyles::from_theme(&dark_theme);
+        assert_eq!(
+            dark.selection_bg,
+            Color::Rgb([48, 84, 128]),
+            "dark theme uses the darker selection blue"
+        );
+        assert_ne!(light.selection_bg, dark.selection_bg);
+        assert_ne!(
+            dark.selection_bg,
+            vaxis_color(
+                dark_theme.bg_color(ThemeBg::SelectedBg),
+                ColorMode::Truecolor
+            ),
+            "the selection color is distinct from the pick-list band"
+        );
     }
 
     fn draw_ctx(width: u16, height: u16) -> DrawContext {

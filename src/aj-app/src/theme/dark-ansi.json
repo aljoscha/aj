@@ -19,6 +19,7 @@
     "thinkingText": "brightBlack",
 
     "selectedBg": "brightBlack",
+    "textSelectionBg": "brightBlack",
     "userMessageBg": "",
     "userMessageText": "",
     "customMessageBg": "",

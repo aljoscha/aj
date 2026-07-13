@@ -324,6 +324,11 @@ pub fn thinking_color_token(level: Option<&ThinkingConfig>) -> ThemeColor {
 pub enum ThemeBg {
     /// Selected-row background in select-list overlays.
     SelectedBg,
+    /// Free-form text-selection highlight background, drag-to-select in
+    /// the transcript. Distinct from `SelectedBg` (the menu-cursor band):
+    /// a macOS-style selection blue on light themes and a darker blue on
+    /// dark themes.
+    TextSelectionBg,
     /// User message body background.
     UserMessageBg,
     /// Custom message body background.
@@ -342,6 +347,7 @@ impl ThemeBg {
     pub fn json_key(self) -> &'static str {
         match self {
             ThemeBg::SelectedBg => "selectedBg",
+            ThemeBg::TextSelectionBg => "textSelectionBg",
             ThemeBg::UserMessageBg => "userMessageBg",
             ThemeBg::CustomMessageBg => "customMessageBg",
             ThemeBg::ToolPendingBg => "toolPendingBg",
@@ -355,6 +361,7 @@ impl ThemeBg {
     fn all() -> &'static [ThemeBg] {
         &[
             ThemeBg::SelectedBg,
+            ThemeBg::TextSelectionBg,
             ThemeBg::UserMessageBg,
             ThemeBg::CustomMessageBg,
             ThemeBg::ToolPendingBg,
@@ -1118,7 +1125,7 @@ mod tests {
                 "border": "", "borderAccent": "", "borderMuted": "",
                 "success": "", "error": "", "warning": "", "muted": "",
                 "text": "", "thinkingText": "",
-                "selectedBg": "", "userMessageBg": "", "userMessageText": "",
+                "selectedBg": "", "textSelectionBg": "", "userMessageBg": "", "userMessageText": "",
                 "customMessageBg": "", "customMessageText": "",
                 "customMessageLabel": "", "toolPendingBg": "",
                 "toolSuccessBg": "", "toolErrorBg": "", "toolTitle": "",
@@ -1160,7 +1167,7 @@ mod tests {
                 "border": "", "borderAccent": "", "borderMuted": "",
                 "success": "", "error": "", "warning": "", "muted": "",
                 "text": "", "thinkingText": "",
-                "selectedBg": "", "userMessageBg": "", "userMessageText": "",
+                "selectedBg": "", "textSelectionBg": "", "userMessageBg": "", "userMessageText": "",
                 "customMessageBg": "", "customMessageText": "",
                 "customMessageLabel": "", "toolPendingBg": "",
                 "toolSuccessBg": "", "toolErrorBg": "", "toolTitle": "",
@@ -1308,7 +1315,7 @@ mod tests {
                     "border": "", "borderAccent": "", "borderMuted": "",
                     "success": "", "error": "", "warning": "", "muted": "",
                     "text": "", "thinkingText": "",
-                    "selectedBg": "", "userMessageBg": "", "userMessageText": "",
+                    "selectedBg": "", "textSelectionBg": "", "userMessageBg": "", "userMessageText": "",
                     "customMessageBg": "", "customMessageText": "",
                     "customMessageLabel": "", "toolPendingBg": "",
                     "toolSuccessBg": "", "toolErrorBg": "", "toolTitle": "",

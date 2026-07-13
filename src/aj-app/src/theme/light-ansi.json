@@ -19,6 +19,7 @@
     "thinkingText": "white",
 
     "selectedBg": "white",
+    "textSelectionBg": "white",
     "userMessageBg": "",
     "userMessageText": "",
     "customMessageBg": "",
