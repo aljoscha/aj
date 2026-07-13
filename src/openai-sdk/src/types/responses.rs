@@ -190,6 +190,12 @@ pub enum ResponseInputItem {
     /// A function tool call from a previous response (for multi-turn replay).
     #[serde(rename = "function_call")]
     FunctionCall {
+        // Omit when absent rather than emitting `"id": null`. The Responses
+        // item id is optional on replay (dropped on cross-model replay so the
+        // server does not pair the call with reasoning it never produced), and
+        // stricter gateways reject an explicit null where they accept an
+        // omitted field.
+        #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
         call_id: String,
         name: String,
@@ -1105,6 +1111,55 @@ impl ResponseTool {
             description,
             parameters: Some(parameters),
             strict: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A replayed `function_call` with no item id must omit the field rather
+    // than emit `"id": null`. OpenAI tolerates the null, but stricter Responses
+    // gateways (e.g. OpenRouter) reject it, which broke cross-model replay.
+    #[test]
+    fn function_call_omits_id_when_none() {
+        let item = ResponseInputItem::FunctionCall {
+            id: None,
+            call_id: "call_abc".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+            status: None,
+        };
+        let value = serde_json::to_value(&item).unwrap();
+        assert!(
+            value.get("id").is_none(),
+            "id must be omitted when None, got {value}"
+        );
+    }
+
+    #[test]
+    fn function_call_keeps_id_when_present() {
+        let item = ResponseInputItem::FunctionCall {
+            id: Some("fc_123".into()),
+            call_id: "call_abc".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+            status: None,
+        };
+        let value = serde_json::to_value(&item).unwrap();
+        assert_eq!(value.get("id").and_then(|v| v.as_str()), Some("fc_123"));
+    }
+
+    // Deserialization of an id-less function_call round-trips to `None`.
+    #[test]
+    fn function_call_missing_id_deserializes_to_none() {
+        let json =
+            r#"{"type":"function_call","call_id":"call_abc","name":"bash","arguments":"{}"}"#;
+        let item: ResponseInputItem = serde_json::from_str(json).unwrap();
+        match item {
+            ResponseInputItem::FunctionCall { id, .. } => assert_eq!(id, None),
+            other => panic!("expected function_call, got {other:?}"),
         }
     }
 }

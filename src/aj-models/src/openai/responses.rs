@@ -1804,6 +1804,14 @@ mod tests {
             }
             other => panic!("unexpected item: {other:?}"),
         }
+        // The wire shape must OMIT `id`, not emit `"id": null`: stricter
+        // Responses gateways reject an explicit null where they accept an
+        // absent field.
+        let wire = serde_json::to_value(&items[0]).unwrap();
+        assert!(
+            wire.get("id").is_none(),
+            "cross-model function_call must omit id on the wire, got {wire}"
+        );
     }
 
     #[test]
