@@ -6420,9 +6420,13 @@ mod tests {
     #[test]
     fn insert_pasted_image_path_inserts_bare_path() {
         let editor = TextArea::new();
+        // Seed an in-progress draft so the assertion proves the path lands at
+        // the cursor without clobbering existing text. A whole-buffer set_text
+        // would drop the draft and fail here.
+        editor.borrow_mut().set_text("draft ");
         let path = PathBuf::from("/tmp/aj-clipboard-test.png");
         assert!(insert_pasted_image_path(&editor, &path));
-        assert_eq!(editor.borrow().text(), "/tmp/aj-clipboard-test.png");
+        assert_eq!(editor.borrow().text(), "draft /tmp/aj-clipboard-test.png");
     }
 
     // ---- Overlay substrate ----
