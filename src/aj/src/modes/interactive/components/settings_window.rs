@@ -25,6 +25,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
+use aj_app::settings::option_description;
 use aj_conf::{Config, ConfigOption, ValueKind};
 use aj_models::registry::ModelInfo;
 use aj_tui::component::Component;
@@ -400,11 +401,7 @@ fn build_items(
                     format!("{}/{}", current.model_key.0, current.model_key.1),
                     model_submenu_factory(select_theme.clone(), model_catalog.clone()),
                 );
-                item.description = Some(
-                    "Model the main agent uses, applied from the next turn. Persisted as \
-                     model_api + model_name."
-                        .to_string(),
-                );
+                item.description = Some(option_description(option));
                 items.push(item);
             }
             // Folded into the model row above.
@@ -418,10 +415,7 @@ fn build_items(
                 );
                 // Empty means "use the provider's default endpoint".
                 item.empty_placeholder = Some("(default)".to_string());
-                item.description = Some(describe(
-                    option,
-                    "Takes effect on restart. Submit an empty value to unset.",
-                ));
+                item.description = Some(option_description(option));
                 items.push(item);
             }
             "thinking" => {
@@ -431,7 +425,7 @@ fn build_items(
                     current.thinking.clone(),
                     thinking_submenu_factory(select_theme.clone()),
                 );
-                item.description = Some(option.description.to_string());
+                item.description = Some(option_description(option));
                 items.push(item);
             }
             "thinking_display" => {
@@ -446,10 +440,7 @@ fn build_items(
                         .unwrap_or_else(|| UNSET_VALUE.to_string()),
                     values,
                 );
-                item.description = Some(describe(
-                    option,
-                    "\"default\" keeps the provider's stock behavior. Takes effect next turn.",
-                ));
+                item.description = Some(option_description(option));
                 items.push(item);
             }
             "speed" => {
@@ -459,7 +450,7 @@ fn build_items(
                     current.speed.clone(),
                     enum_values(option),
                 );
-                item.description = Some(describe(option, "Takes effect next turn."));
+                item.description = Some(option_description(option));
                 items.push(item);
             }
             "verbosity" => {
@@ -474,10 +465,7 @@ fn build_items(
                         .unwrap_or_else(|| UNSET_VALUE.to_string()),
                     values,
                 );
-                item.description = Some(describe(
-                    option,
-                    "\"default\" leaves the server default. Takes effect next turn.",
-                ));
+                item.description = Some(option_description(option));
                 items.push(item);
             }
             "theme" => {
@@ -487,7 +475,7 @@ fn build_items(
                     current.theme.clone(),
                     theme_submenu_factory(select_theme.clone(), theme_names.clone()),
                 );
-                item.description = Some(option.description.to_string());
+                item.description = Some(option_description(option));
                 items.push(item);
             }
             "disabled_tools" => {
@@ -498,10 +486,7 @@ fn build_items(
                     join_names(&initial),
                     name_toggle_submenu_factory(settings_theme.clone(), tool_names.clone()),
                 );
-                item.description = Some(describe(
-                    option,
-                    "Toggles apply when the picker closes; takes effect for new sessions.",
-                ));
+                item.description = Some(option_description(option));
                 items.push(item);
             }
             "disabled_skills" => {
@@ -512,51 +497,39 @@ fn build_items(
                     join_names(&initial),
                     name_toggle_submenu_factory(settings_theme.clone(), skill_names.clone()),
                 );
-                item.description = Some(describe(
-                    option,
-                    "Toggles apply when the picker closes; takes effect for new sessions.",
-                ));
+                item.description = Some(option_description(option));
                 items.push(item);
             }
             "hide_thinking_block" => {
-                items.push(bool_item(option, current.hide_thinking_block, None));
+                items.push(bool_item(option, current.hide_thinking_block));
             }
             "show_frame_stats" => {
-                items.push(bool_item(
-                    option,
-                    current.show_frame_stats,
-                    Some("Only affects the aj-next interactive TUI."),
+                let mut item = bool_item(option, current.show_frame_stats);
+                // This note is aj-classic-specific, so it stays out of the
+                // shared helper and is appended here.
+                item.description = Some(format!(
+                    "{} Only affects the aj-next interactive TUI.",
+                    option_description(option)
                 ));
+                items.push(item);
             }
             "image_auto_resize" => {
-                items.push(bool_item(
-                    option,
-                    current.image_auto_resize,
-                    Some("Takes effect for new sessions."),
-                ));
+                items.push(bool_item(option, current.image_auto_resize));
             }
             "image_show_in_terminal" => {
-                items.push(bool_item(option, current.image_show_in_terminal, None));
+                items.push(bool_item(option, current.image_show_in_terminal));
             }
             "image_block" => {
-                items.push(bool_item(
-                    option,
-                    current.image_block,
-                    Some("Takes effect for new sessions."),
-                ));
+                items.push(bool_item(option, current.image_block));
             }
             "syntax_highlighting" => {
-                items.push(bool_item(
-                    option,
-                    current.syntax_highlighting,
-                    Some("Takes effect for new sessions."),
-                ));
+                items.push(bool_item(option, current.syntax_highlighting));
             }
             "auto_compact" => {
-                items.push(bool_item(option, current.auto_compact, None));
+                items.push(bool_item(option, current.auto_compact));
             }
             "bash_rtk" => {
-                items.push(bool_item(option, current.bash_rtk, None));
+                items.push(bool_item(option, current.bash_rtk));
             }
             "compact_threshold" => {
                 let mut item = SettingItem::with_submenu(
@@ -565,7 +538,7 @@ fn build_items(
                     current.compact_threshold.clone(),
                     text_submenu_factory(),
                 );
-                item.description = Some(describe(option, "A fraction between 0.0 and 1.0."));
+                item.description = Some(option_description(option));
                 items.push(item);
             }
             "compact_keep_recent" => {
@@ -575,7 +548,7 @@ fn build_items(
                     current.compact_keep_recent.clone(),
                     text_submenu_factory(),
                 );
-                item.description = Some(describe(option, "A positive number of tokens."));
+                item.description = Some(option_description(option));
                 items.push(item);
             }
             other => {
@@ -587,23 +560,15 @@ fn build_items(
 }
 
 /// Cycleable true/false row for a [`ValueKind::Bool`] option.
-fn bool_item(option: &ConfigOption, value: bool, note: Option<&str>) -> SettingItem {
+fn bool_item(option: &ConfigOption, value: bool) -> SettingItem {
     let mut item = SettingItem::cycleable(
         option.name,
         option.name,
         value.to_string(),
         vec!["true".to_string(), "false".to_string()],
     );
-    item.description = Some(match note {
-        Some(n) => describe(option, n),
-        None => option.description.to_string(),
-    });
+    item.description = Some(option_description(option));
     item
-}
-
-/// Schema description plus a settings-window-specific note.
-fn describe(option: &ConfigOption, note: &str) -> String {
-    format!("{} {}", option.description, note)
 }
 
 /// Variant list of a [`ValueKind::Enum`] option, in schema order.

@@ -743,3 +743,98 @@ pub async fn confirm_speed_for_main(
         },
     }
 }
+
+/// Fully composed settings-window description for `option`: the schema
+/// one-liner plus the settings-window note the interactive windows show
+/// below the highlighted row.
+///
+/// This is the single source of the description copy both frontends
+/// render. It is frontend-neutral: an addendum that only applies to one
+/// frontend (e.g. the aj-classic note that `show_frame_stats` only
+/// affects the aj-next TUI) is appended by that frontend, not here.
+pub fn option_description(option: &aj_conf::ConfigOption) -> String {
+    match option.name {
+        // The model row folds `model_api` + `model_name`, so its text names
+        // both keys rather than describing `model_api` alone.
+        "model_api" => "Model the main agent uses, applied from the next turn. \
+             Persisted as model_api + model_name."
+            .to_string(),
+        "model_url" => describe(
+            option,
+            "Takes effect on restart. Submit an empty value to unset.",
+        ),
+        "thinking_display" => describe(
+            option,
+            "\"default\" keeps the provider's stock behavior. Takes effect next turn.",
+        ),
+        "speed" => describe(option, "Takes effect next turn."),
+        "verbosity" => describe(
+            option,
+            "\"default\" leaves the server default. Takes effect next turn.",
+        ),
+        "disabled_tools" | "disabled_skills" => describe(
+            option,
+            "Toggles apply when the picker closes; takes effect for new sessions.",
+        ),
+        "image_auto_resize" | "image_block" | "syntax_highlighting" => {
+            describe(option, "Takes effect for new sessions.")
+        }
+        "compact_threshold" => describe(option, "A fraction between 0.0 and 1.0."),
+        "compact_keep_recent" => describe(option, "A positive number of tokens."),
+        // Plain schema string: thinking, theme, hide_thinking_block,
+        // image_show_in_terminal, auto_compact, bash_rtk, show_frame_stats,
+        // and model_name (folded into the model row, never shown alone).
+        _ => option.description.to_string(),
+    }
+}
+
+/// Schema description plus a settings-window note.
+fn describe(option: &aj_conf::ConfigOption, note: &str) -> String {
+    format!("{} {}", option.description, note)
+}
+
+#[cfg(test)]
+mod tests {
+    use aj_conf::Config;
+
+    use crate::settings::option_description;
+
+    fn option(name: &str) -> &'static aj_conf::ConfigOption {
+        Config::OPTIONS
+            .iter()
+            .find(|o| o.name == name)
+            .expect("option exists")
+    }
+
+    #[test]
+    fn model_api_uses_the_custom_folded_text() {
+        assert_eq!(
+            option_description(option("model_api")),
+            "Model the main agent uses, applied from the next turn. \
+             Persisted as model_api + model_name."
+        );
+    }
+
+    #[test]
+    fn noted_option_appends_the_settings_note() {
+        let speed = option("speed");
+        assert_eq!(
+            option_description(speed),
+            format!("{} Takes effect next turn.", speed.description)
+        );
+    }
+
+    #[test]
+    fn plain_option_returns_the_schema_string() {
+        let thinking = option("thinking");
+        assert_eq!(option_description(thinking), thinking.description);
+    }
+
+    #[test]
+    fn show_frame_stats_is_frontend_neutral() {
+        let opt = option("show_frame_stats");
+        // No aj-classic addendum here: the frontend appends it.
+        assert_eq!(option_description(opt), opt.description);
+        assert!(!option_description(opt).contains("aj-next"));
+    }
+}
