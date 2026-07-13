@@ -51,7 +51,7 @@ use chrono::Utc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use vaxis::cell::Style;
+use vaxis::cell::{Color, Style};
 use vaxis::tty::PosixTty;
 use vaxis::vaxis::{Options as VaxisOptions, Vaxis};
 use vaxis::vxfw::{
@@ -1509,6 +1509,9 @@ fn apply_picker_outcome(
             // render cache, which the draw's active-view clear would do
             // anyway, so the two don't fight.
             shell.borrow().transcript.borrow_mut().reset_to_tail();
+            // The new view may run a different thinking level, so re-tint the
+            // editor border to match the agent now under view.
+            shell.borrow().apply_editor_border(world);
             ActionEffect::Redraw
         }
         AgentPickerOutcome::OpenTask(id) => {
@@ -1737,6 +1740,12 @@ async fn apply_selector_activity(
                 fold_notice(world, &notice);
             }
         }
+    }
+    // A thinking or theme edit in this batch may have changed the active view's
+    // border tint. The thinking selector, the settings-window thinking row, and
+    // a theme switch all land here, so re-tint once after applying the batch.
+    if changed {
+        shell.borrow().apply_editor_border(world);
     }
     changed
 }
@@ -2500,17 +2509,29 @@ const FOOTER_ROWS: u16 = 1;
 /// least this many rows on screen above itself so the title stays visible.
 const HEADER_ROWS: u16 = 1;
 
+/// Resolve the editor-border [`Color`] for a thinking `level` against the
+/// current palette.
+///
+/// Mirrors `aj`'s thinking-level border tint: the level selects a
+/// [`ThemeColor`] token (via [`aj_app::theme::thinking_color_token`]) that the
+/// palette resolves and [`vaxis_color`] bakes into a concrete color for the
+/// active color mode.
+fn editor_border_color(theme: &Theme, level: Option<&ThinkingConfig>) -> Color {
+    vaxis_color(
+        theme.fg_color(aj_app::theme::thinking_color_token(level)),
+        theme.color_mode(),
+    )
+}
+
 /// Build the editor's border theme from the shared palette (Spec D structured
 /// colors), the same way the other chrome resolves its styles.
 ///
-/// `aj` tints the editor border by the agent's thinking level (and a bash
-/// mode), resolving through a live theme closure. We render the border with
-/// the thinking-off token statically, which matches `aj`'s un-tinted default
-/// (`thinkingOff` and `borderMuted` share a value in the bundled themes).
-///
-/// TODO(aljoscha): tint the border by thinking level via
-/// [`TextArea::set_border_color`], recomputed on thinking changes and session
-/// installs, to reach full parity with `aj`'s editor border.
+/// The `border_color` seeded here is only a resting default (the `ThinkingOff`
+/// token, which shares a value with `borderMuted` in the bundled themes). The
+/// host overrides it per active view through [`Shell::apply_editor_border`],
+/// which tints the border by the viewed agent's thinking level to match `aj`.
+/// That override runs in the same event that changes the theme, the active
+/// view, or its level, before the next draw, so this default never flashes.
 fn editor_theme_from_theme(theme: &Theme) -> EditorTheme {
     let mode = theme.color_mode();
     // The autocomplete popup paints its selected row as a compact band over
@@ -3160,6 +3181,21 @@ impl Shell {
         *self.chrome.borrow_mut() = chrome;
     }
 
+    /// Tint the editor border with the viewed agent's thinking level.
+    ///
+    /// Overrides the resting `border_color` that [`editor_theme_from_theme`]
+    /// seeds. We resolve the active view's level through [`viewed_thinking`]
+    /// and bake it against the live theme, so the border always shows the
+    /// reasoning budget of the agent under view. Callers invoke this whenever
+    /// the theme, the active view, or that view's level changes, before the
+    /// next draw.
+    fn apply_editor_border(&self, world: &World) {
+        let active = world.chat.borrow().active_view();
+        let level = viewed_thinking(world, active);
+        let color = editor_border_color(&self.theme.read(), level.as_ref());
+        self.editor.borrow_mut().set_border_color(color);
+    }
+
     /// Recompute the editor's visible-row cap for a `terminal_rows`-tall frame
     /// and apply it. The layout owns the height budget (see [`editor_row_cap`]):
     /// called once at startup and again on every resize so the editor's growth
@@ -3198,6 +3234,9 @@ impl Shell {
             &world.core.env.working_directory,
         );
         self.transcript.borrow_mut().reset_to_tail();
+        // A session install lands on the main view, whose thinking level may
+        // differ from the outgoing session's, so re-tint the border here.
+        self.apply_editor_border(world);
     }
 }
 
@@ -3527,6 +3566,11 @@ pub async fn run(args: Args) -> Result<()> {
         shell.borrow().restyle();
         app.request_redraw();
     }
+
+    // Seed the editor border from the initial view's thinking level. The
+    // shell's build and the color-mode reconcile above both leave the border
+    // at the resting default, so apply the real tint before the first frame.
+    shell.borrow().apply_editor_border(&world);
 
     // Hot-reload watcher for a user theme (bundled names have no on-disk
     // source, so this is inert for `dark` / `light` with no override).
@@ -3868,6 +3912,10 @@ async fn drive(
                             let shell = shell.borrow();
                             shell.theme.replace(new_theme);
                             shell.restyle();
+                            // `set_border_color` bakes a concrete color, so a
+                            // theme swap needs an explicit re-tint (unlike the
+                            // live palette closures the rest of the chrome uses).
+                            shell.apply_editor_border(world);
                         }
                         fold_notice(world, &format!("Theme '{name}' reloaded."));
                         app.request_redraw();
@@ -5180,6 +5228,105 @@ mod tests {
             "unselected rows keep the default background"
         );
         assert_ne!(editor_theme.popup.selected, editor_theme.popup.item);
+    }
+
+    /// `editor_border_color` routes each thinking level to its palette token.
+    /// Spot-checks the ends of the range and the shared top tint so a mis-wired
+    /// mapping surfaces here rather than as a wrong border color on screen.
+    #[test]
+    fn editor_border_color_resolves_each_thinking_token() {
+        let theme = Theme::bundled_dark_with_mode(ColorMode::Truecolor);
+        let mode = theme.color_mode();
+        assert_eq!(
+            editor_border_color(&theme, None),
+            vaxis_color(theme.fg_color(ThemeColor::ThinkingOff), mode),
+            "None routes to the ThinkingOff tint"
+        );
+        assert_eq!(
+            editor_border_color(&theme, Some(&ThinkingConfig::XHigh)),
+            vaxis_color(theme.fg_color(ThemeColor::ThinkingXhigh), mode),
+            "XHigh routes to the ThinkingXhigh tint"
+        );
+        // `Max` shares the top `Xhigh` tint (the schema tops out there).
+        assert_eq!(
+            editor_border_color(&theme, Some(&ThinkingConfig::Max)),
+            editor_border_color(&theme, Some(&ThinkingConfig::XHigh)),
+            "Max shares the XHigh tint"
+        );
+        // The off tint and the strongest tint differ, so the border visibly
+        // moves across the range.
+        assert_ne!(
+            editor_border_color(&theme, None),
+            editor_border_color(&theme, Some(&ThinkingConfig::XHigh)),
+        );
+    }
+
+    /// Reads the editor's top-border foreground color from a fresh draw. The
+    /// top rule is row 0 and `draw_rule` paints every cell with the border
+    /// style, so the corner cell carries the current border color.
+    fn editor_border_fg(shell: &Rc<RefCell<Shell>>) -> Color {
+        let surf = shell.borrow().editor.borrow_mut().draw(&draw_ctx(100, 30));
+        surf.read_cell(0, 0).style.fg
+    }
+
+    /// The editor border tints to the active view's thinking level, and a
+    /// thinking change for that view re-tints it. This is the aj color-bar
+    /// parity: the border tracks the reasoning budget of the agent under view.
+    #[tokio::test]
+    async fn editor_border_tracks_the_active_view_thinking_level() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, _app, _writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        let theme = Theme::bundled_dark_with_mode(ColorMode::Truecolor);
+
+        // Seed the border the way the startup path does, then check it matches
+        // the active view's current level.
+        let initial = viewed_thinking(&world, AgentId::Main);
+        shell.borrow().apply_editor_border(&world);
+        assert_eq!(
+            editor_border_fg(&shell),
+            editor_border_color(&theme, initial.as_ref()),
+            "startup seeds the border to the active view's thinking tint"
+        );
+
+        // Confirm `minimal` through the real apply path; the batch re-tints the
+        // border for the active view.
+        let mut watch = inert_theme_watch();
+        apply_selector_activity(
+            &mut world,
+            &shell,
+            &mut watch,
+            vec![SelectorActivity::ThinkingConfirmed {
+                target: AgentId::Main,
+                level: Some(ThinkingConfig::Minimal),
+            }],
+        )
+        .await;
+        let minimal = editor_border_fg(&shell);
+        assert_eq!(
+            minimal,
+            editor_border_color(&theme, Some(&ThinkingConfig::Minimal)),
+            "confirming minimal tints the border to the minimal token"
+        );
+
+        // Confirm `xhigh`: the border moves to the stronger tint.
+        apply_selector_activity(
+            &mut world,
+            &shell,
+            &mut watch,
+            vec![SelectorActivity::ThinkingConfirmed {
+                target: AgentId::Main,
+                level: Some(ThinkingConfig::XHigh),
+            }],
+        )
+        .await;
+        let xhigh = editor_border_fg(&shell);
+        assert_eq!(
+            xhigh,
+            editor_border_color(&theme, Some(&ThinkingConfig::XHigh)),
+            "a thinking change re-tints the editor border"
+        );
+        assert_ne!(minimal, xhigh, "the tint changed with the level");
     }
 
     /// The tools-expand chord (alt+o) flips the chat model's flag through
