@@ -2,9 +2,9 @@
 //!
 //! Implements [`aj_agent::tool::ToolDefinition`]. Returns a
 //! [`ToolOutcome`] whose
-//! `details` is [`ToolDetails::Diff`] on success: `before` is the
-//! file's prior content, `after` is the post-replacement content. The
-//! wire `content` is the short success summary so the model still sees
+//! `details` is [`ToolDetails::Diff`] on success. It contains the
+//! canonical compact display diff for the replacement. The wire `content` is
+//! the short success summary so the model still sees
 //! a deterministic `"Successfully replaced ..."` line.
 //!
 //! Recoverable errors (path-not-absolute, file-not-found, read /
@@ -17,12 +17,15 @@
 //!
 //! [`execution_mode`]: ToolDefinition::execution_mode
 
-use aj_agent::tool::{ExecutionMode, ToolContext, ToolDefinition, ToolDetails, ToolOutcome};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use aj_agent::tool::{
+    DiffDetails, ExecutionMode, ToolContext, ToolDefinition, ToolDetails, ToolOutcome,
+};
 use aj_models::types::UserContent;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::{Path, PathBuf};
 
 const DESCRIPTION: &str = r#"
 Edit files by doing exact string replacement.
@@ -129,6 +132,13 @@ impl ToolDefinition for EditFileTool {
         let new_content = original_content.replace(&input.old_string, &input.new_string);
 
         let display_path = display_relative(path, &ctx.working_directory());
+        // Complete rendering work before mutation so a diff timeout fallback or
+        // unexpected panic cannot leave a successful write without an outcome.
+        let details = ToolDetails::Diff(DiffDetails::new(
+            display_path,
+            &original_content,
+            &new_content,
+        ));
 
         if let Err(e) = fs::write(path, &new_content) {
             return Ok(error_outcome(
@@ -144,11 +154,7 @@ impl ToolDefinition for EditFileTool {
 
         Ok(ToolOutcome {
             content: vec![UserContent::text(return_value)],
-            details: ToolDetails::Diff {
-                path: display_path,
-                before: original_content,
-                after: new_content,
-            },
+            details,
             is_error: false,
         })
     }
@@ -195,10 +201,7 @@ mod tests {
             .join("")
     }
 
-    /// Single-occurrence replacement is the common case. The wire
-    /// content reports the success summary; the structured `Diff`
-    /// payload carries the file's prior content as `before` and the
-    /// post-replacement content as `after`.
+    /// Replaces one occurrence and returns its compact display diff.
     #[tokio::test]
     async fn single_occurrence_replacement_returns_diff_outcome() {
         let mut file = NamedTempFile::new().expect("temp file");
@@ -226,13 +229,17 @@ mod tests {
         assert!(wire.contains("BETA"), "wire: {wire:?}");
 
         match &outcome.details {
-            ToolDetails::Diff {
-                path: _,
-                before,
-                after,
-            } => {
-                assert_eq!(before, "alpha beta gamma\n");
-                assert_eq!(after, "alpha BETA gamma\n");
+            ToolDetails::Diff(diff) => {
+                assert!(
+                    diff.lines()
+                        .iter()
+                        .any(|line| line.text() == "- alpha beta gamma")
+                );
+                assert!(
+                    diff.lines()
+                        .iter()
+                        .any(|line| line.text() == "+ alpha BETA gamma")
+                );
             }
             other => panic!("expected Diff details, got {other:?}"),
         }
@@ -265,9 +272,17 @@ mod tests {
 
         assert!(!outcome.is_error);
         match &outcome.details {
-            ToolDetails::Diff { before, after, .. } => {
-                assert_eq!(before, "foo foo foo\n");
-                assert_eq!(after, "bar bar bar\n");
+            ToolDetails::Diff(diff) => {
+                assert!(
+                    diff.lines()
+                        .iter()
+                        .any(|line| line.text() == "- foo foo foo")
+                );
+                assert!(
+                    diff.lines()
+                        .iter()
+                        .any(|line| line.text() == "+ bar bar bar")
+                );
             }
             other => panic!("expected Diff details, got {other:?}"),
         }

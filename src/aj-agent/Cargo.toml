@@ -10,6 +10,7 @@ futures = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+similar = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-retry2 = { workspace = true }

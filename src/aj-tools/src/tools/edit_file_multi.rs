@@ -3,9 +3,9 @@
 //!
 //! Implements [`aj_agent::tool::ToolDefinition`]. Returns a
 //! [`ToolOutcome`] whose
-//! `details` is [`ToolDetails::Diff`] on success: `before` is the
-//! file's prior content, `after` is the content after every edit
-//! has been applied. The wire `content` keeps the
+//! `details` is [`ToolDetails::Diff`] on success. It contains the
+//! canonical compact display diff after every edit has been applied. The
+//! wire `content` keeps the
 //! `"Successfully applied N edits ..."` summary so the model still
 //! reads a deterministic confirmation.
 //!
@@ -29,12 +29,15 @@
 //!
 //! [`execution_mode`]: ToolDefinition::execution_mode
 
-use aj_agent::tool::{ExecutionMode, ToolContext, ToolDefinition, ToolDetails, ToolOutcome};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use aj_agent::tool::{
+    DiffDetails, ExecutionMode, ToolContext, ToolDefinition, ToolDetails, ToolOutcome,
+};
 use aj_models::types::UserContent;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::{Path, PathBuf};
 
 const DESCRIPTION: &str = r#"
 Edit files by doing multiple exact string replacements sequentially.
@@ -168,6 +171,10 @@ impl ToolDefinition for EditFileMultiTool {
         }
 
         let display_path = display_relative(path, &ctx.working_directory());
+        // Complete rendering work before the all-or-nothing disk mutation. An
+        // unexpected diff failure must leave the original file intact.
+        let details =
+            ToolDetails::Diff(DiffDetails::new(display_path, &original_content, &content));
 
         if let Err(e) = fs::write(path, &content) {
             return Ok(error_outcome(
@@ -185,11 +192,7 @@ impl ToolDefinition for EditFileMultiTool {
 
         Ok(ToolOutcome {
             content: vec![UserContent::text(return_value)],
-            details: ToolDetails::Diff {
-                path: display_path,
-                before: original_content,
-                after: content,
-            },
+            details,
             is_error: false,
         })
     }
@@ -237,10 +240,7 @@ mod tests {
             .join("")
     }
 
-    /// Multiple independent edits applied in order. Confirms the wire
-    /// content carries the per-edit summary lines and the structured
-    /// `Diff` carries the original content as `before` and the
-    /// post-batch content as `after`.
+    /// Applies independent edits in order and returns one compact display diff.
     #[tokio::test]
     async fn multiple_edits_apply_sequentially() {
         let mut file = NamedTempFile::new().expect("temp file");
@@ -280,9 +280,17 @@ mod tests {
         assert!(wire.contains("Edit #2"), "wire: {wire:?}");
 
         match &outcome.details {
-            ToolDetails::Diff { before, after, .. } => {
-                assert_eq!(before, "alpha beta gamma\n");
-                assert_eq!(after, "ALPHA beta GAMMA\n");
+            ToolDetails::Diff(diff) => {
+                assert!(
+                    diff.lines()
+                        .iter()
+                        .any(|line| line.text() == "- alpha beta gamma")
+                );
+                assert!(
+                    diff.lines()
+                        .iter()
+                        .any(|line| line.text() == "+ ALPHA beta GAMMA")
+                );
             }
             other => panic!("expected Diff details, got {other:?}"),
         }
@@ -326,9 +334,9 @@ mod tests {
 
         assert!(!outcome.is_error);
         match &outcome.details {
-            ToolDetails::Diff { before, after, .. } => {
-                assert_eq!(before, "foo\n");
-                assert_eq!(after, "final\n");
+            ToolDetails::Diff(diff) => {
+                assert!(diff.lines().iter().any(|line| line.text() == "- foo"));
+                assert!(diff.lines().iter().any(|line| line.text() == "+ final"));
             }
             other => panic!("expected Diff details, got {other:?}"),
         }
@@ -360,9 +368,9 @@ mod tests {
 
         assert!(!outcome.is_error);
         match &outcome.details {
-            ToolDetails::Diff { before, after, .. } => {
-                assert_eq!(before, "x x y y\n");
-                assert_eq!(after, "X X y y\n");
+            ToolDetails::Diff(diff) => {
+                assert!(diff.lines().iter().any(|line| line.text() == "- x x y y"));
+                assert!(diff.lines().iter().any(|line| line.text() == "+ X X y y"));
             }
             other => panic!("expected Diff details, got {other:?}"),
         }

@@ -8,8 +8,8 @@
   // The session is embedded in a <script> island as gzip-compressed,
   // base64-encoded JSON:
   //   { session_id, leaf_id, entries: [ConversationEntry, ...] }
-  // Entries are the verbatim on-disk records (snake_case fields, the
-  // `type`/`role`/`kind` tags exactly as serialized by aj-session).
+  // Entries keep their on-disk shape except that valid diff details are
+  // canonicalized by the Rust exporter before embedding.
   //
   // The load is async (inflate is stream-based) and fails on a browser
   // without DecompressionStream, so we bail with a visible message
@@ -276,6 +276,17 @@
     return out;
   }
 
+  function renderStoredDiff(lines) {
+    let html = '<div class="tool-diff">';
+    for (const line of lines) {
+      if (line.startsWith('--- a/') || line.startsWith('+++ b/')) continue;
+      const cls = line.startsWith('- ') ? 'diff-removed' :
+        line.startsWith('+ ') ? 'diff-added' : 'diff-context';
+      html += '<div class="' + cls + '">' + escapeHtml(replaceTabs(line)) + '</div>';
+    }
+    return html + '</div>';
+  }
+
   function renderDiff(before, after) {
     const ops = lcsDiff(before.split('\n'), after.split('\n'));
     const CONTEXT = 3;
@@ -302,13 +313,15 @@
   // MESSAGE RENDERING
   // ============================================================
 
+  function renderToolResultFallback(result) {
+    const text = result ? textOf(result.content) : '';
+    return text ? outputBlock(text, 'head', TEXT_LINES) : '';
+  }
+
   function renderToolDetails(name, result) {
     const details = result && result.details;
     if (!details || !details.kind) {
-      // No structured details (older logs): fall back to the result's
-      // model-facing text.
-      const text = result ? textOf(result.content) : '';
-      return text ? outputBlock(text, 'head', TEXT_LINES) : '';
+      return renderToolResultFallback(result);
     }
     switch (details.kind) {
       case 'text': {
@@ -317,9 +330,28 @@
         if (details.body) html += outputBlock(details.body, 'head', TEXT_LINES);
         return html;
       }
-      case 'diff':
-        return '<div class="summary">' + escapeHtml(details.path) + '</div>' +
-          renderDiff(details.before || '', details.after || '');
+      case 'diff': {
+        const canonical = details.format === 'display-v1' &&
+          typeof details.path === 'string' && Array.isArray(details.lines) &&
+          details.lines.every((line) => typeof line === 'string' &&
+            !line.includes('\r') && !line.includes('\n') &&
+            (line === '--- a/' + details.path ||
+              line === '+++ b/' + details.path ||
+              line === '\u2026' || line.startsWith('+ ') ||
+              line.startsWith('- ') || line.startsWith('  ')));
+        if (canonical) {
+          return '<div class="summary">' + escapeHtml(details.path) + '</div>' +
+            renderStoredDiff(details.lines);
+        }
+        // Valid legacy details are normalized by the exporter. Keep this path
+        // for malformed or unrecognized records that still have usable snapshots.
+        if (typeof details.before === 'string' && typeof details.after === 'string') {
+          const path = typeof details.path === 'string' ? details.path : name;
+          return '<div class="summary">' + escapeHtml(path) + '</div>' +
+            renderDiff(details.before, details.after);
+        }
+        return renderToolResultFallback(result);
+      }
       case 'bash': {
         let html = '<div class="tool-command">$ ' + escapeHtml(details.command || '') + '</div>';
         if (details.stdout) html += outputBlock(details.stdout, 'tail', BASH_LINES);

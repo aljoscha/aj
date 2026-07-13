@@ -58,7 +58,7 @@ pub fn format_todo_list(todos: &[TodoItem]) -> String {
         // math or the model's own context the next time it reads the
         // list back. The strikethrough SGR added below survives
         // because it's emitted *after* sanitisation.
-        let content = crate::sanitize::sanitize_terminal_output(&todo.content);
+        let content = crate::sanitize_terminal_output(&todo.content);
 
         // Strike through completed items via the SGR strikethrough
         // attribute (`ESC[9m` on, `ESC[29m` off). Renderers that

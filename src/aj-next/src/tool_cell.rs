@@ -14,9 +14,8 @@
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
-use aj_agent::tool::{TaskId, TaskKind, TaskStatus, ToolDetails};
+use aj_agent::tool::{DiffLineKind, TaskId, TaskKind, TaskStatus, ToolDetails};
 use aj_app::chat::{TaskInfo, ToolEntry, ToolStatus};
-use aj_app::diff::{DiffLineKind, unified_diff_lines};
 use aj_tools::sanitize_terminal_output;
 use aj_tools::tools::bash::stream_marker;
 use aj_tools::tools::todo::format_todo_list;
@@ -232,12 +231,8 @@ fn line(text: impl Into<String>, style: Style) -> Line {
 
 /// Render the body lines for a [`ToolDetails`] variant.
 ///
-/// Every raw text field that originated outside this crate (tool
-/// summaries, command strings, sub-agent reports, the diff payload)
-/// passes through [`sanitize_terminal_output`] before any styling is
-/// applied, so stray ANSI escapes, carriage returns, and terminal
-/// control bytes can't disagree with the renderer's width math or
-/// leak into adjacent cells.
+/// Raw text fields pass through [`sanitize_terminal_output`] before styling.
+/// Canonical diff lines were sanitized at construction or deserialization.
 fn details_body(details: &ToolDetails, expanded: bool, styles: &TranscriptStyles) -> Vec<Line> {
     match details {
         ToolDetails::Text { summary, body } => {
@@ -264,31 +259,20 @@ fn details_body(details: &ToolDetails, expanded: bool, styles: &TranscriptStyles
             }
             lines
         }
-        ToolDetails::Diff {
-            path,
-            before,
-            after,
-        } => unified_diff_lines(
-            &sanitize_terminal_output(path),
-            &sanitize_terminal_output(before),
-            &sanitize_terminal_output(after),
-        )
-        .into_iter()
-        .map(|(kind, text)| {
-            let style = match kind {
-                // Context lines, like headers and separators, use the faint
-                // attribute rather than a color, so they track the terminal's
-                // own foreground the way `aj` does. Only add/remove carry a
-                // color.
-                DiffLineKind::Header | DiffLineKind::Separator | DiffLineKind::Context => {
-                    styles.dim
-                }
-                DiffLineKind::Add => styles.diff_add,
-                DiffLineKind::Remove => styles.diff_remove,
-            };
-            line(text, style)
-        })
-        .collect(),
+        ToolDetails::Diff(diff) => diff
+            .lines()
+            .iter()
+            .map(|diff_line| {
+                let style = match diff_line.kind() {
+                    DiffLineKind::Header | DiffLineKind::Separator | DiffLineKind::Context => {
+                        styles.dim
+                    }
+                    DiffLineKind::Add => styles.diff_add,
+                    DiffLineKind::Remove => styles.diff_remove,
+                };
+                line(diff_line.text(), style)
+            })
+            .collect(),
         ToolDetails::Bash {
             command,
             stdout,
@@ -560,7 +544,7 @@ mod tests {
     use std::time::Instant;
 
     use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
-    use aj_agent::tool::{TodoItem, TodoPriority, TodoStatus};
+    use aj_agent::tool::{DiffDetails, TodoItem, TodoPriority, TodoStatus};
     use aj_app::chat::{ChatState, reduce};
     use aj_app::theme::{ColorMode, Theme};
     use vaxis::cell::Color;
@@ -994,11 +978,7 @@ mod tests {
     fn diff_body_renders_headers_signs_context_and_separator() {
         let before = "one\na\nb\nc\nd\ne\nf\ng\ntwo\n";
         let after = "ONE\na\nb\nc\nd\ne\nf\ng\nTWO\n";
-        let details = ToolDetails::Diff {
-            path: "src/lib.rs".into(),
-            before: before.into(),
-            after: after.into(),
-        };
+        let details = ToolDetails::Diff(DiffDetails::new("src/lib.rs", before, after));
         let s = styles();
         let lines = details_body(&details, false, &s);
         let texts: Vec<String> = lines

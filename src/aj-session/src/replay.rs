@@ -93,7 +93,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use aj_agent::events::{AgentEvent, AgentId, AgentSettings, CompactionReason};
-use aj_agent::message::AgentMessage;
+use aj_agent::message::{AgentMessage, AgentMessageKind};
 use aj_agent::tool::ToolDetails;
 use aj_agent::types::TokenUsage;
 use aj_models::types::{AssistantContent, Message, Usage, UserContent};
@@ -578,6 +578,14 @@ impl ReplayState {
                 .unwrap_or_else(|_| text_fallback(&tool_name, &tr.content)),
             None => text_fallback(&tool_name, &tr.content),
         };
+        let mut normalized_message = agent_msg.clone();
+        let AgentMessageKind::Wire(Message::ToolResult(normalized_result)) =
+            &mut normalized_message.kind
+        else {
+            unreachable!("project_tool_result requires a tool-result message");
+        };
+        normalized_result.details =
+            Some(serde_json::to_value(&result).expect("resolved ToolDetails always serialize"));
 
         out.push_back(AgentEvent::ToolExecutionStart {
             agent_id,
@@ -589,11 +597,11 @@ impl ReplayState {
         // pump sees the same shape a live agent emits.
         out.push_back(AgentEvent::MessageStart {
             agent_id,
-            message: agent_msg.clone(),
+            message: normalized_message.clone(),
         });
         out.push_back(AgentEvent::MessageEnd {
             agent_id,
-            message: agent_msg.clone(),
+            message: normalized_message,
         });
         out.push_back(AgentEvent::ToolExecutionEnd {
             agent_id,
@@ -674,6 +682,7 @@ mod tests {
     use super::*;
     use crate::log::{ConversationLog, ConversationView};
     use crate::persistence::ConversationPersistence;
+    use aj_agent::tool::DiffDetails;
     use aj_models::types::{
         AssistantContent, AssistantMessage, TextContent, ThinkingContent, ToolCall,
         ToolResultMessage, UserMessage,
@@ -715,6 +724,43 @@ mod tests {
         let mut tr = ToolResultMessage::text(id, name, body, false);
         tr.details = details.and_then(|d| serde_json::to_value(d).ok());
         AgentMessage::wire(Message::ToolResult(tr))
+    }
+
+    fn replay_events_with_raw_tool_details(details: Value) -> Vec<AgentEvent> {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("system prompt");
+
+        let mut result = ToolResultMessage::text("tu-edit", "edit_file", "edited", false);
+        result.timestamp = 42;
+        result.details = Some(details);
+        {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_message(user_msg("edit it")).expect("user message");
+            view.add_message(assistant_msg(vec![AssistantContent::ToolCall(ToolCall {
+                id: "tu-edit".into(),
+                name: "edit_file".into(),
+                arguments: json!({"path": "/tmp/x"}),
+            })]))
+            .expect("assistant message");
+            view.add_message(AgentMessage::wire(Message::ToolResult(result)))
+                .expect("tool result");
+        }
+
+        replay(&log).collect()
+    }
+
+    fn replay_raw_tool_details(details: Value) -> ToolDetails {
+        replay_events_with_raw_tool_details(details)
+            .into_iter()
+            .find_map(|event| match event {
+                AgentEvent::ToolExecutionEnd {
+                    call_id, result, ..
+                } if call_id == "tu-edit" => Some(result),
+                _ => None,
+            })
+            .expect("tool execution end")
     }
 
     /// Build a seeded log exercising assistant text, thinking, tool
@@ -887,11 +933,7 @@ mod tests {
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
-        let diff_details = ToolDetails::Diff {
-            path: "/tmp/x".into(),
-            before: "a".into(),
-            after: "b".into(),
-        };
+        let diff_details = ToolDetails::Diff(DiffDetails::new("/tmp/x", "a", "b"));
 
         {
             let mut view = ConversationView::user(&mut log, None);
@@ -920,18 +962,91 @@ mod tests {
             .expect("ToolExecutionEnd for tu-edit");
         match end {
             AgentEvent::ToolExecutionEnd { result, .. } => match result {
-                ToolDetails::Diff {
-                    path,
-                    before,
-                    after,
-                } => {
-                    assert_eq!(path, "/tmp/x");
-                    assert_eq!(before, "a");
-                    assert_eq!(after, "b");
+                ToolDetails::Diff(diff) => {
+                    assert_eq!(diff.path(), "/tmp/x");
+                    assert!(diff.lines().iter().any(|line| line.text() == "- a"));
+                    assert!(diff.lines().iter().any(|line| line.text() == "+ b"));
                 }
                 other => panic!("expected Diff details, got {other:?}"),
             },
             _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn replay_deserializes_literal_legacy_diff_details() {
+        let details = replay_raw_tool_details(json!({
+            "kind": "diff",
+            "path": "/tmp/x",
+            "before": "same\nold\n",
+            "after": "same\nnew\n",
+        }));
+
+        let ToolDetails::Diff(diff) = details else {
+            panic!("expected legacy details to normalize to Diff");
+        };
+        assert_eq!(diff.path(), "/tmp/x");
+        assert!(diff.lines().iter().any(|line| line.text() == "- old"));
+        assert!(diff.lines().iter().any(|line| line.text() == "+ new"));
+    }
+
+    #[test]
+    fn replay_normalizes_legacy_details_in_both_message_events() {
+        let events = replay_events_with_raw_tool_details(json!({
+            "kind": "diff",
+            "path": "/tmp/x",
+            "before": "same\nold\n",
+            "after": "same\nnew\n",
+        }));
+        let projected: Vec<&ToolResultMessage> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::MessageStart { message, .. }
+                | AgentEvent::MessageEnd { message, .. } => match message.as_wire() {
+                    Some(Message::ToolResult(result)) => Some(result),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(projected.len(), 2);
+        for result in projected {
+            assert_eq!(result.tool_call_id, "tu-edit");
+            assert_eq!(result.tool_name, "edit_file");
+            assert!(!result.is_error);
+            assert_eq!(result.timestamp, 42);
+            assert!(matches!(
+                result.content.as_slice(),
+                [UserContent::Text(text)] if text.text == "edited"
+            ));
+            let details = result.details.as_ref().expect("normalized details");
+            assert_eq!(details["format"], "display-v1");
+            assert!(details.get("before").is_none());
+            assert!(details.get("after").is_none());
+            assert!(
+                details["lines"]
+                    .as_array()
+                    .is_some_and(|lines| lines.iter().all(Value::is_string))
+            );
+        }
+    }
+
+    #[test]
+    fn replay_keeps_text_fallback_for_malformed_compact_diff() {
+        let details = replay_raw_tool_details(json!({
+            "kind": "diff",
+            "format": "display-v1",
+            "path": "/tmp/x",
+            "lines": ["not a canonical line"],
+        }));
+
+        match details {
+            ToolDetails::Text { summary, body } => {
+                assert_eq!(summary, "edit_file");
+                assert_eq!(body, "edited");
+            }
+            other => panic!("expected text fallback, got {other:?}"),
         }
     }
 

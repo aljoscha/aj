@@ -6,17 +6,21 @@
 //! [`ToolOutcome`] into both the wire transcript and the typed event
 //! stream.
 
+use std::collections::hash_map::DefaultHasher;
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use aj_models::types::UserContent;
 use schemars::JsonSchema;
 use schemars::generate::SchemaSettings;
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, Error as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use similar::{ChangeTag, TextDiff};
 use tokio_util::sync::CancellationToken;
 
 use crate::TaskRegistry;
@@ -73,7 +77,7 @@ impl Default for ExecutionMode {
 /// New tools whose rendering doesn't fit any variant fall back to
 /// [`ToolDetails::Json`]; new dedicated variants are added when a
 /// rendering pattern repeats.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolDetails {
     /// Default rendering: a one-line summary plus optional body.
@@ -85,17 +89,8 @@ pub enum ToolDetails {
         /// Full body shown when expanded. May be empty.
         body: String,
     },
-    /// File-edit rendering: shows a unified diff between `before`
-    /// and `after`. Used by `write_file`, `edit_file`,
-    /// `edit_file_multi`.
-    Diff {
-        /// Display path of the edited file.
-        path: String,
-        /// File content prior to the edit.
-        before: String,
-        /// File content after the edit.
-        after: String,
-    },
+    /// File-edit rendering with canonical display lines.
+    Diff(DiffDetails),
     /// Command-output rendering for `bash`.
     ///
     /// Cross-field invariant: `stdout`/`stderr` carry a bounded rolling
@@ -184,6 +179,407 @@ pub enum ToolDetails {
     /// New tools start here and graduate to a dedicated variant once
     /// a rendering pattern repeats.
     Json(Value),
+}
+
+const DIFF_CONTEXT: usize = 3;
+
+// Myers can take quadratic time for broad rewrites. The synchronous file tools
+// build details before writing, so this bounds their diff work. On expiry,
+// `similar` returns a coarse delete-and-insert approximation.
+const DIFF_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Canonical compact display diff stored in [`ToolDetails::Diff`].
+///
+/// The payload stores only display lines, not either source snapshot. A complete
+/// rewrite of very short lines can therefore exceed the snapshots' combined
+/// size due to the display prefixes. Small edits in large files remain bounded
+/// by their context windows.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+pub struct DiffDetails {
+    format: DiffFormat,
+    path: String,
+    lines: Vec<DiffLine>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    missing_newline: Vec<u32>,
+    #[serde(skip)]
+    content_fingerprint: u64,
+}
+
+impl DiffDetails {
+    /// Builds the canonical display diff and discards the input snapshots.
+    pub fn new(path: impl AsRef<str>, before: impl AsRef<str>, after: impl AsRef<str>) -> Self {
+        Self::new_with_config(path, before, after, |config| {
+            config.timeout(DIFF_TIMEOUT);
+        })
+    }
+
+    fn new_with_config(
+        path: impl AsRef<str>,
+        before: impl AsRef<str>,
+        after: impl AsRef<str>,
+        configure: impl FnOnce(&mut similar::TextDiffConfig),
+    ) -> Self {
+        let path = sanitize_diff_path(path.as_ref());
+        let before = crate::sanitize_terminal_output(before.as_ref());
+        let after = crate::sanitize_terminal_output(after.as_ref());
+        let mut lines = Vec::new();
+        let mut missing_newline = Vec::new();
+
+        if !before.is_empty() {
+            lines.push(DiffLine::new(DiffLineKind::Header, format!("--- a/{path}")));
+        }
+        if !after.is_empty() {
+            lines.push(DiffLine::new(DiffLineKind::Header, format!("+++ b/{path}")));
+        }
+
+        let mut config = TextDiff::configure();
+        configure(&mut config);
+        let diff = config.diff_lines(&before, &after);
+        let tags: Vec<ChangeTag> = diff.iter_all_changes().map(|change| change.tag()).collect();
+        let mut last_emitted_idx = None;
+
+        for (idx, change) in diff.iter_all_changes().enumerate() {
+            if matches!(change.tag(), ChangeTag::Equal)
+                && !is_diff_context(&tags, idx, DIFF_CONTEXT)
+            {
+                continue;
+            }
+
+            if last_emitted_idx.is_some_and(|last| idx > last + 1) {
+                lines.push(DiffLine::new(DiffLineKind::Separator, "…".to_string()));
+            }
+            last_emitted_idx = Some(idx);
+
+            let value = change.value().trim_end_matches('\n');
+            let (kind, text) = match change.tag() {
+                ChangeTag::Delete => (DiffLineKind::Remove, format!("- {value}")),
+                ChangeTag::Insert => (DiffLineKind::Add, format!("+ {value}")),
+                ChangeTag::Equal => (DiffLineKind::Context, format!("  {value}")),
+            };
+            if change.missing_newline() {
+                let line_index = u32::try_from(lines.len())
+                    .expect("a display diff cannot contain more than u32::MAX lines");
+                missing_newline.push(line_index);
+            }
+            lines.push(DiffLine::new(kind, text));
+        }
+
+        let content_fingerprint = diff_content_fingerprint(&path, &lines, &missing_newline);
+        Self {
+            format: DiffFormat::DisplayV1,
+            path,
+            lines,
+            missing_newline,
+            content_fingerprint,
+        }
+    }
+
+    /// Returns the sanitized display path.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Returns the canonical semantic display lines.
+    pub fn lines(&self) -> &[DiffLine] {
+        &self.lines
+    }
+
+    /// Returns indexes of display lines whose source lacked a final newline.
+    pub fn missing_newline_indexes(&self) -> &[u32] {
+        &self.missing_newline
+    }
+
+    /// Returns the precomputed fingerprint of immutable display content.
+    pub fn content_fingerprint(&self) -> u64 {
+        self.content_fingerprint
+    }
+
+    fn from_compact(raw: CompactDiffDetails) -> Result<Self, String> {
+        let path = sanitize_diff_path(&raw.path);
+        let lines = raw
+            .lines
+            .into_iter()
+            .map(|text| {
+                if text.contains('\r') || text.contains('\n') {
+                    return Err("canonical diff lines must contain exactly one line".to_string());
+                }
+                let text = crate::sanitize_terminal_output(&text);
+                let kind = diff_line_kind(&path, &text)
+                    .ok_or_else(|| format!("invalid canonical diff line: {text:?}"))?;
+                Ok(DiffLine::new(kind, text))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        let mut previous = None;
+        for &index in &raw.missing_newline {
+            let line_index = usize::try_from(index)
+                .map_err(|_| format!("missing-newline index {index} is out of bounds"))?;
+            let Some(line) = lines.get(line_index) else {
+                return Err(format!("missing-newline index {index} is out of bounds"));
+            };
+            if previous.is_some_and(|previous| index <= previous) {
+                return Err("missing-newline indexes must be strictly increasing".to_string());
+            }
+            if matches!(line.kind, DiffLineKind::Header | DiffLineKind::Separator) {
+                return Err(format!(
+                    "missing-newline index {index} does not refer to a content line"
+                ));
+            }
+            previous = Some(index);
+        }
+
+        let content_fingerprint = diff_content_fingerprint(&path, &lines, &raw.missing_newline);
+        Ok(Self {
+            format: raw.format,
+            path,
+            lines,
+            missing_newline: raw.missing_newline,
+            content_fingerprint,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for DiffDetails {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::from_compact(CompactDiffDetails::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
+/// Semantic role of one canonical diff line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DiffLineKind {
+    /// A file header.
+    Header,
+    /// An inserted line.
+    Add,
+    /// A removed line.
+    Remove,
+    /// An unchanged context line.
+    Context,
+    /// A separator between non-adjacent context windows.
+    Separator,
+}
+
+/// One prefixed display line and its semantic role.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DiffLine {
+    kind: DiffLineKind,
+    text: String,
+}
+
+impl DiffLine {
+    fn new(kind: DiffLineKind, text: String) -> Self {
+        Self { kind, text }
+    }
+
+    /// Returns the line's semantic role.
+    pub fn kind(&self) -> DiffLineKind {
+        self.kind
+    }
+
+    /// Returns the canonical prefixed line text.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+impl Serialize for DiffLine {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.text)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+enum DiffFormat {
+    #[serde(rename = "display-v1")]
+    DisplayV1,
+}
+
+#[derive(Deserialize)]
+struct CompactDiffDetails {
+    format: DiffFormat,
+    path: String,
+    lines: Vec<String>,
+    #[serde(default)]
+    missing_newline: Vec<u32>,
+}
+
+#[derive(Deserialize)]
+struct LegacyDiffDetails {
+    path: String,
+    before: String,
+    after: String,
+}
+
+enum DiffDetailsWire {
+    Compact(DiffDetails),
+    Legacy(LegacyDiffDetails),
+}
+
+impl<'de> Deserialize<'de> for DiffDetailsWire {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = Value::deserialize(deserializer)?;
+        if raw.get("format").is_some() || raw.get("lines").is_some() {
+            serde_json::from_value(raw)
+                .map(Self::Compact)
+                .map_err(D::Error::custom)
+        } else {
+            serde_json::from_value(raw)
+                .map(Self::Legacy)
+                .map_err(D::Error::custom)
+        }
+    }
+}
+
+fn sanitize_diff_path(path: &str) -> String {
+    crate::sanitize_terminal_output(path).replace('\n', "\\n")
+}
+
+fn diff_content_fingerprint(path: &str, lines: &[DiffLine], missing_newline: &[u32]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    lines.hash(&mut hasher);
+    missing_newline.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn diff_line_kind(path: &str, text: &str) -> Option<DiffLineKind> {
+    if text == format!("--- a/{path}") || text == format!("+++ b/{path}") {
+        Some(DiffLineKind::Header)
+    } else if text == "…" {
+        Some(DiffLineKind::Separator)
+    } else if text.starts_with("+ ") {
+        Some(DiffLineKind::Add)
+    } else if text.starts_with("- ") {
+        Some(DiffLineKind::Remove)
+    } else if text.starts_with("  ") {
+        Some(DiffLineKind::Context)
+    } else {
+        None
+    }
+}
+
+fn is_diff_context(tags: &[ChangeTag], idx: usize, context: usize) -> bool {
+    let lo = idx.saturating_sub(context);
+    let hi = idx
+        .saturating_add(context)
+        .min(tags.len().saturating_sub(1));
+    (lo..=hi).any(|index| !matches!(tags[index], ChangeTag::Equal))
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ToolDetailsWire {
+    Text {
+        summary: String,
+        body: String,
+    },
+    Diff(DiffDetailsWire),
+    Bash {
+        command: String,
+        stdout: String,
+        stderr: String,
+        #[serde(default)]
+        exit_code: Option<i32>,
+        #[serde(default)]
+        truncated: bool,
+        #[serde(default)]
+        full_output_path: Option<PathBuf>,
+        #[serde(default)]
+        stdout_truncation: Option<BashStreamTruncation>,
+        #[serde(default)]
+        stderr_truncation: Option<BashStreamTruncation>,
+        #[serde(default)]
+        task_id: Option<TaskId>,
+    },
+    SubAgentReport {
+        agent_id: usize,
+        task: String,
+        report: String,
+    },
+    Todos {
+        items: Vec<TodoItem>,
+    },
+    Image {
+        summary: String,
+        mime_type: String,
+        original_dimensions: (u32, u32),
+        displayed_dimensions: (u32, u32),
+    },
+    Json(Value),
+}
+
+impl From<ToolDetailsWire> for ToolDetails {
+    fn from(wire: ToolDetailsWire) -> Self {
+        match wire {
+            ToolDetailsWire::Text { summary, body } => Self::Text { summary, body },
+            ToolDetailsWire::Diff(DiffDetailsWire::Compact(diff)) => Self::Diff(diff),
+            ToolDetailsWire::Diff(DiffDetailsWire::Legacy(legacy)) => {
+                Self::Diff(DiffDetails::new(legacy.path, legacy.before, legacy.after))
+            }
+            ToolDetailsWire::Bash {
+                command,
+                stdout,
+                stderr,
+                exit_code,
+                truncated,
+                full_output_path,
+                stdout_truncation,
+                stderr_truncation,
+                task_id,
+            } => Self::Bash {
+                command,
+                stdout,
+                stderr,
+                exit_code,
+                truncated,
+                full_output_path,
+                stdout_truncation,
+                stderr_truncation,
+                task_id,
+            },
+            ToolDetailsWire::SubAgentReport {
+                agent_id,
+                task,
+                report,
+            } => Self::SubAgentReport {
+                agent_id,
+                task,
+                report,
+            },
+            ToolDetailsWire::Todos { items } => Self::Todos { items },
+            ToolDetailsWire::Image {
+                summary,
+                mime_type,
+                original_dimensions,
+                displayed_dimensions,
+            } => Self::Image {
+                summary,
+                mime_type,
+                original_dimensions,
+                displayed_dimensions,
+            },
+            ToolDetailsWire::Json(value) => Self::Json(value),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolDetails {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        ToolDetailsWire::deserialize(deserializer).map(Into::into)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -809,11 +1205,7 @@ mod tests {
                 summary: "hi".into(),
                 body: "body".into(),
             },
-            ToolDetails::Diff {
-                path: "a.txt".into(),
-                before: "old".into(),
-                after: "new".into(),
-            },
+            ToolDetails::Diff(DiffDetails::new("a.txt", "old", "new")),
             ToolDetails::Bash {
                 command: "ls".into(),
                 stdout: "out".into(),
@@ -844,6 +1236,224 @@ mod tests {
             assert!(json.get("kind").is_some(), "missing kind tag: {json}");
             let _back: ToolDetails = serde_json::from_value(json).expect("deserialize round trip");
         }
+    }
+
+    #[test]
+    fn compact_diff_uses_canonical_wire_shape() {
+        let details = ToolDetails::Diff(DiffDetails::new("src/lib.rs", "old", "new"));
+        let value = serde_json::to_value(&details).expect("serialize compact diff");
+
+        assert_eq!(value["kind"], "diff");
+        assert_eq!(value["format"], "display-v1");
+        assert_eq!(value["path"], "src/lib.rs");
+        assert_eq!(
+            value["lines"],
+            json!(["--- a/src/lib.rs", "+++ b/src/lib.rs", "- old", "+ new"])
+        );
+        assert_eq!(value["missing_newline"], json!([2, 3]));
+        assert!(value.get("content_fingerprint").is_none());
+        assert!(value.get("before").is_none());
+        assert!(value.get("after").is_none());
+    }
+
+    #[test]
+    fn legacy_diff_deserializes_and_reserializes_compactly() {
+        let legacy = json!({
+            "kind": "diff",
+            "path": "src/lib.rs",
+            "before": "same\nold\n",
+            "after": "same\nnew\n",
+        });
+
+        let details: ToolDetails = serde_json::from_value(legacy).expect("legacy diff parses");
+        let ToolDetails::Diff(diff) = &details else {
+            panic!("expected diff details");
+        };
+        assert_eq!(diff.path(), "src/lib.rs");
+        assert!(diff.lines().iter().any(|line| line.text() == "- old"));
+        assert!(diff.lines().iter().any(|line| line.text() == "+ new"));
+
+        let compact = serde_json::to_value(details).expect("serialize normalized diff");
+        assert_eq!(compact["format"], "display-v1");
+        assert!(compact.get("before").is_none());
+        assert!(compact.get("after").is_none());
+    }
+
+    #[test]
+    fn diff_preserves_headers_context_separators_and_identical_behavior() {
+        let creation = DiffDetails::new("f.txt", "", "hello\nworld\n");
+        assert_eq!(creation.lines()[0].text(), "+++ b/f.txt");
+        assert!(
+            creation
+                .lines()
+                .iter()
+                .all(|line| line.text() != "--- a/f.txt")
+        );
+
+        let deletion = DiffDetails::new("f.txt", "hello\n", "");
+        assert_eq!(deletion.lines()[0].text(), "--- a/f.txt");
+        assert!(
+            deletion
+                .lines()
+                .iter()
+                .all(|line| line.text() != "+++ b/f.txt")
+        );
+
+        let before = "one\na\nb\nc\nd\ne\nf\ng\ntwo\n";
+        let after = "ONE\na\nb\nc\nd\ne\nf\ng\nTWO\n";
+        let diff = DiffDetails::new("f.txt", before, after);
+        assert_eq!(
+            diff.lines()
+                .iter()
+                .filter(|line| line.kind() == DiffLineKind::Separator)
+                .count(),
+            1
+        );
+        assert!(diff.lines().iter().any(|line| line.text() == "  a"));
+
+        let identical = DiffDetails::new("f.txt", "same\n", "same\n");
+        assert!(
+            identical
+                .lines()
+                .iter()
+                .all(|line| line.kind() == DiffLineKind::Header)
+        );
+    }
+
+    #[test]
+    fn diff_sanitizes_inputs_and_preserves_unicode_and_tabs() {
+        let diff = DiffDetails::new(
+            "src/odd\nname\r\n\x1b[31mlib.rs",
+            "α\told\x1b[0m\n",
+            "α\tnew\n",
+        );
+
+        assert_eq!(diff.path(), "src/odd\\nname\\nlib.rs");
+        assert!(diff.lines().iter().any(|line| line.text() == "- α\told"));
+        assert!(diff.lines().iter().any(|line| line.text() == "+ α\tnew"));
+        assert!(diff.lines().iter().all(|line| {
+            !line.text().contains('\x1b')
+                && !line.text().contains('\r')
+                && !line.text().contains('\n')
+        }));
+    }
+
+    #[test]
+    fn compact_diff_rejects_embedded_line_breaks() {
+        for line in ["+ first\n+ second", "- first\r- second"] {
+            let value = json!({
+                "kind": "diff",
+                "format": "display-v1",
+                "path": "src/lib.rs",
+                "lines": ["--- a/src/lib.rs", "+++ b/src/lib.rs", line],
+                "before": "old\n",
+                "after": "new\n",
+            });
+
+            serde_json::from_value::<ToolDetails>(value)
+                .expect_err("embedded line break must be rejected");
+        }
+    }
+
+    #[test]
+    fn compact_diff_rejects_unknown_format_even_with_legacy_snapshots() {
+        let value = json!({
+            "kind": "diff",
+            "format": "display-v2",
+            "path": "src/lib.rs",
+            "lines": ["--- a/src/lib.rs", "+++ b/src/lib.rs", "- old", "+ new"],
+            "before": "old\n",
+            "after": "new\n",
+        });
+
+        serde_json::from_value::<ToolDetails>(value)
+            .expect_err("unknown compact format must not fall through to legacy");
+    }
+
+    #[test]
+    fn diff_retains_missing_final_newline_indexes() {
+        let diff = DiffDetails::new("f.txt", "same\nold", "same\nnew");
+        let missing: Vec<&str> = diff
+            .missing_newline_indexes()
+            .iter()
+            .map(|&index| {
+                let index = usize::try_from(index).expect("u32 index fits usize");
+                diff.lines()[index].text()
+            })
+            .collect();
+
+        assert_eq!(missing, vec!["- old", "+ new"]);
+        let fingerprint = diff.content_fingerprint();
+        let round_trip: ToolDetails = serde_json::from_value(
+            serde_json::to_value(ToolDetails::Diff(diff)).expect("serialize"),
+        )
+        .expect("deserialize");
+        let ToolDetails::Diff(round_trip) = round_trip else {
+            panic!("expected diff details");
+        };
+        assert_eq!(round_trip.missing_newline_indexes().len(), 2);
+        assert_eq!(round_trip.content_fingerprint(), fingerprint);
+    }
+
+    #[test]
+    fn broad_rewrite_with_expired_deadline_has_coarse_bounded_shape() {
+        let before: String = (0..4_096).map(|index| format!("old-{index}\n")).collect();
+        let after: String = (0..4_096).map(|index| format!("new-{index}\n")).collect();
+        let expired = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("one second fits before now");
+
+        let diff = DiffDetails::new_with_config("large.txt", before, after, |config| {
+            config.deadline(expired);
+        });
+
+        assert_eq!(
+            diff.lines()
+                .iter()
+                .filter(|line| line.kind() == DiffLineKind::Remove)
+                .count(),
+            4_096
+        );
+        assert_eq!(
+            diff.lines()
+                .iter()
+                .filter(|line| line.kind() == DiffLineKind::Add)
+                .count(),
+            4_096
+        );
+        assert!(
+            diff.lines()
+                .iter()
+                .all(|line| line.kind() != DiffLineKind::Context)
+        );
+    }
+
+    #[test]
+    fn compact_diff_size_does_not_scale_with_unchanged_file_size() {
+        let payload = "x".repeat(80);
+        let before: String = (0..15_000)
+            .map(|index| format!("{index:05} {payload}\n"))
+            .collect();
+        let old = format!("07500 {payload}\n");
+        let new = format!("07500 {}\n", "y".repeat(80));
+        let after = before.replacen(&old, &new, 1);
+
+        assert!(before.len() > 1_000_000);
+        let value = serde_json::to_value(ToolDetails::Diff(DiffDetails::new(
+            "large.txt",
+            &before,
+            &after,
+        )))
+        .expect("serialize large-file edit");
+        let encoded = serde_json::to_vec(&value).expect("encode compact diff");
+
+        assert!(value.get("before").is_none());
+        assert!(value.get("after").is_none());
+        assert!(
+            encoded.len() < 2_000,
+            "compact diff was {} bytes",
+            encoded.len()
+        );
     }
 
     #[test]

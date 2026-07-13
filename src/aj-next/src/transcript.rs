@@ -631,10 +631,9 @@ fn tool_fingerprint(t: &ToolEntry, chat: &ChatState, hasher: &mut DefaultHasher)
     }
 }
 
-/// The details variant discriminant plus a cheap, layout-free size proxy. For
-/// the streaming variants (bash streams, text/report bodies) the payload only
-/// ever grows, so a length proxy reliably changes as content arrives. `Json`
-/// hashes its structure since it is the escape hatch and not append-only.
+/// The details variant discriminant plus enough payload content to invalidate
+/// every rendered change. Streaming text uses length proxies because it only
+/// grows. Immutable canonical diffs use their precomputed content fingerprint.
 fn details_fingerprint(details: &ToolDetails, hasher: &mut DefaultHasher) {
     match details {
         ToolDetails::Text { summary, body } => {
@@ -642,15 +641,9 @@ fn details_fingerprint(details: &ToolDetails, hasher: &mut DefaultHasher) {
             summary.len().hash(hasher);
             body.len().hash(hasher);
         }
-        ToolDetails::Diff {
-            path,
-            before,
-            after,
-        } => {
+        ToolDetails::Diff(diff) => {
             1u8.hash(hasher);
-            path.len().hash(hasher);
-            before.len().hash(hasher);
-            after.len().hash(hasher);
+            diff.content_fingerprint().hash(hasher);
         }
         ToolDetails::Bash {
             command,
@@ -2340,7 +2333,7 @@ mod tests {
 
     use aj_agent::events::AgentEvent;
     use aj_agent::message::AgentMessage;
-    use aj_agent::tool::TaskKind;
+    use aj_agent::tool::{DiffDetails, TaskKind};
     use aj_app::chat::{
         AssistantEntry, CompactionEntry, EntryId, NoticeEntry, Transcript, UserEntry, reduce,
     };
@@ -3925,6 +3918,20 @@ mod tests {
     }
 
     // ---- Render cache: per-kind no-stale ---------------------------------
+
+    #[test]
+    fn same_length_diff_content_changes_the_fingerprint() {
+        fn fingerprint(details: &ToolDetails) -> u64 {
+            let mut hasher = DefaultHasher::new();
+            details_fingerprint(details, &mut hasher);
+            hasher.finish()
+        }
+
+        let first = ToolDetails::Diff(DiffDetails::new("x.txt", "old\n", "new\n"));
+        let second = ToolDetails::Diff(DiffDetails::new("x.txt", "bad\n", "yay\n"));
+
+        assert_ne!(fingerprint(&first), fingerprint(&second));
+    }
 
     /// Assistant text growth changes the fingerprint, so the second render
     /// misses and matches a fresh uncached draw of the grown message.

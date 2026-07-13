@@ -40,8 +40,9 @@
     <div id="image-modal" class="image-modal"><img id="modal-image" src="" alt=""></div>
   </div>
 
-  <!-- The complete session, embedded losslessly as gzip-compressed,
-       base64-encoded JSON. The base64 alphabet has no `<`, so the payload
+  <!-- The complete session export, with valid diff details canonicalized,
+       embedded as gzip-compressed, base64-encoded JSON. The base64
+       alphabet has no `<`, so the payload
        cannot break out of this script element. The renderer inflates it
        with the browser's DecompressionStream, then JSON.parse. -->
   <script type="application/octet-stream" id="session-data">{{SESSION_DATA}}</script>

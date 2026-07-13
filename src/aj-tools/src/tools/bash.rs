@@ -1217,7 +1217,7 @@ fn spawn_error_outcome(command: &str, error: String) -> ToolOutcome {
 /// the exact transform.
 fn decode_stream_output(bytes: Vec<u8>) -> String {
     let lossy = String::from_utf8_lossy(&bytes);
-    crate::sanitize::sanitize_terminal_output(&lossy)
+    crate::sanitize_terminal_output(&lossy)
 }
 
 /// Terminate the child's whole process group and reap the child.

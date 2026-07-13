@@ -2,11 +2,9 @@
 //!
 //! Implements [`aj_agent::tool::ToolDefinition`]. Returns a
 //! [`ToolOutcome`] whose
-//! `details` is [`ToolDetails::Diff`] on success: `before` is the
-//! file's prior content (empty when the file didn't exist, which the
-//! renderer naturally surfaces as a creation diff with all `+` lines),
-//! `after` is the freshly-written content. The wire `content` is the
-//! short success summary so the model still sees a deterministic
+//! `details` is [`ToolDetails::Diff`] on success. It contains the
+//! canonical compact display diff for the file edit. The wire `content` is
+//! the short success summary so the model still sees a deterministic
 //! `"Successfully {action} ..."` line.
 //!
 //! Recoverable errors (path-not-absolute, IO write failure) come back
@@ -18,12 +16,15 @@
 //!
 //! [`execution_mode`]: ToolDefinition::execution_mode
 
-use aj_agent::tool::{ExecutionMode, ToolContext, ToolDefinition, ToolDetails, ToolOutcome};
+use std::path::{Path, PathBuf};
+use std::{fs, io};
+
+use aj_agent::tool::{
+    DiffDetails, ExecutionMode, ToolContext, ToolDefinition, ToolDetails, ToolOutcome,
+};
 use aj_models::types::UserContent;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
-use std::{fs, io};
 
 const DESCRIPTION: &str = r#"
 Write a file to the local file system.
@@ -78,12 +79,8 @@ impl ToolDefinition for WriteFileTool {
             ));
         }
 
-        // Snapshot the previous content so the structured `Diff`
-        // payload can show a unified diff against the new bytes.
-        // Missing files surface as an empty `before`; any other read
-        // error is treated as "no prior content" rather than failing
-        // the call — the write below will surface a real failure if
-        // the path is genuinely unusable.
+        // Read the previous content before writing so the display diff can be
+        // constructed before the filesystem mutation.
         let original_content = match fs::read_to_string(path) {
             Ok(content) => Some(content),
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
@@ -92,6 +89,15 @@ impl ToolDefinition for WriteFileTool {
         let file_existed = original_content.is_some();
 
         let display_path = display_relative(path, &ctx.working_directory());
+
+        // Build the display outcome before touching disk. Myers diffing is
+        // bounded, but keeping all rendering work ahead of the write also
+        // prevents an unexpected panic from leaving an unreported mutation.
+        let details = ToolDetails::Diff(DiffDetails::new(
+            display_path,
+            original_content.as_deref().unwrap_or_default(),
+            &input.content,
+        ));
 
         if let Err(e) = fs::write(path, &input.content) {
             return Ok(error_outcome(
@@ -105,11 +111,7 @@ impl ToolDefinition for WriteFileTool {
 
         Ok(ToolOutcome {
             content: vec![UserContent::text(return_value)],
-            details: ToolDetails::Diff {
-                path: display_path,
-                before: original_content.unwrap_or_default(),
-                after: input.content,
-            },
+            details,
             is_error: false,
         })
     }
@@ -157,10 +159,7 @@ mod tests {
             .join("")
     }
 
-    /// Writes a brand-new file. The wire content reports a "created"
-    /// action; the structured `Diff` payload carries an empty `before`
-    /// (so the renderer surfaces an all-`+` creation diff) and the
-    /// freshly-written bytes as `after`.
+    /// Writes a brand-new file and returns an all-addition display diff.
     #[tokio::test]
     async fn create_new_file_returns_diff_outcome() {
         let dir = TempDir::new().expect("temp dir");
@@ -187,14 +186,16 @@ mod tests {
         );
 
         match &outcome.details {
-            ToolDetails::Diff {
-                path,
-                before,
-                after,
-            } => {
-                assert!(path.ends_with("new.txt"), "path: {path:?}");
-                assert!(before.is_empty(), "before should be empty: {before:?}");
-                assert_eq!(after, "hello\nworld\n");
+            ToolDetails::Diff(diff) => {
+                assert!(diff.path().ends_with("new.txt"), "path: {:?}", diff.path());
+                assert!(
+                    diff.lines()
+                        .iter()
+                        .all(|line| !line.text().starts_with("--- a/")),
+                    "creation should omit the old header"
+                );
+                assert!(diff.lines().iter().any(|line| line.text() == "+ hello"));
+                assert!(diff.lines().iter().any(|line| line.text() == "+ world"));
             }
             other => panic!("expected Diff details, got {other:?}"),
         }
@@ -204,10 +205,7 @@ mod tests {
         assert_eq!(on_disk, "hello\nworld\n");
     }
 
-    /// Overwrites an existing file. The wire content reports an
-    /// "overwrote" action; the structured `Diff` carries the prior
-    /// bytes as `before` and the new bytes as `after` so the renderer
-    /// can show a real diff.
+    /// Overwrites an existing file and returns its compact display diff.
     #[tokio::test]
     async fn overwrite_existing_file_returns_diff_outcome() {
         let mut file = NamedTempFile::new().expect("temp file");
@@ -232,14 +230,22 @@ mod tests {
         assert!(wire.starts_with("Successfully overwrote"), "wire: {wire:?}");
 
         match &outcome.details {
-            ToolDetails::Diff {
-                path: _,
-                before,
-                after,
-            } => {
-                assert!(before.contains("old line one"), "before: {before:?}");
-                assert!(before.contains("old line two"), "before: {before:?}");
-                assert_eq!(after, "new content\n");
+            ToolDetails::Diff(diff) => {
+                assert!(
+                    diff.lines()
+                        .iter()
+                        .any(|line| line.text() == "- old line one")
+                );
+                assert!(
+                    diff.lines()
+                        .iter()
+                        .any(|line| line.text() == "- old line two")
+                );
+                assert!(
+                    diff.lines()
+                        .iter()
+                        .any(|line| line.text() == "+ new content")
+                );
             }
             other => panic!("expected Diff details, got {other:?}"),
         }

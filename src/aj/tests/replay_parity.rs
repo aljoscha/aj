@@ -392,8 +392,8 @@ async fn replay_renders_edit_file_tool_identically_to_live() {
     // `edit_file` needs a real file with the `old_string` substring
     // in place, so we materialise one inside the working tempdir
     // and feed its absolute path to the model. The resulting
-    // `ToolDetails::Diff { before, after, path }` payload exercises
-    // the unified-diff rendering path.
+    // The resulting compact `ToolDetails::Diff` payload exercises the
+    // canonical display-line rendering path.
     let sessions_dir = TempDir::new().expect("sessions tempdir");
     let working_dir = TempDir::new().expect("working tempdir");
     let sample_path = working_dir.path().join("sample.txt");

@@ -59,7 +59,7 @@ use serde_json::Value;
 
 use crate::config::theme::ChatTheme;
 use crate::modes::interactive::components::bash_execution::render_bash_body;
-use crate::modes::interactive::components::diff::render_unified_diff;
+use crate::modes::interactive::components::diff::render_diff_details;
 use crate::modes::interactive::render_settings::RenderSettings;
 
 /// Horizontal padding inside the bubble (one column on each side
@@ -782,19 +782,9 @@ fn derive_image_payload(details: &ToolDetails, content: &[UserContent]) -> Optio
 /// here keeps each variant's specialised rendering close to the
 /// component while letting [`Self::render`] stay variant-agnostic.
 ///
-/// Every raw text field that originated outside this crate -- tool
-/// summaries, command strings, sub-agent reports, the diff payload
-/// -- passes through [`sanitize_terminal_output`] before any styling
-/// is applied. Today the bash tool already sanitises its own stdout
-/// / stderr at the source, so applying the transform a second time
-/// here is a no-op for that path; the call covers every other variant
-/// and guards against future tools that emit raw subprocess output
-/// without going through the bash tool's helper. The transform
-/// strips ANSI escapes, drops carriage returns, and removes other
-/// terminal-control bytes that would otherwise disagree with the
-/// renderer's width math (and produce a ragged right edge on the
-/// surrounding bubble) or clobber adjacent cells via cursor moves
-/// or erase-in-line side effects.
+/// Raw text variants pass through [`sanitize_terminal_output`] before styling.
+/// Diff lines are sanitized when their canonical representation is built or
+/// deserialized, so this function only applies their semantic styles.
 fn render_details_body(details: &ToolDetails, expanded: bool) -> Vec<String> {
     match details {
         ToolDetails::Text { summary, body } => {
@@ -821,15 +811,7 @@ fn render_details_body(details: &ToolDetails, expanded: bool) -> Vec<String> {
             }
             lines
         }
-        ToolDetails::Diff {
-            path,
-            before,
-            after,
-        } => render_unified_diff(
-            &sanitize_terminal_output(path),
-            &sanitize_terminal_output(before),
-            &sanitize_terminal_output(after),
-        ),
+        ToolDetails::Diff(diff) => render_diff_details(diff),
         ToolDetails::Bash {
             command,
             stdout,

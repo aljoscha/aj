@@ -18,7 +18,7 @@ import zlib from 'node:zlib';
 const here = dirname(fileURLToPath(import.meta.url));
 const read = (p) => readFileSync(join(here, p), 'utf8');
 
-// ---- Fixture: exercises every renderer path. ----
+// ---- Fixture: exercises every renderer path, including both diff formats. ----
 const entries = [
   { id: 'root', thread: 'meta', type: 'system_prompt', text: 'You are aj.', timestamp: '2024-01-01T00:00:00Z' },
   { id: 'u1', parent_id: 'root', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:01Z',
@@ -31,6 +31,9 @@ const entries = [
         { type: 'tool_call', id: 'c1', name: 'read_file', arguments: { path: '/home/me/x.rs' } },
         { type: 'tool_call', id: 'c2', name: 'bash', arguments: { command: 'cargo test' } },
         { type: 'tool_call', id: 'c3', name: 'edit', arguments: { path: '/home/me/x.rs' } },
+        { type: 'tool_call', id: 'c6', name: 'edit_file', arguments: { path: '/home/me/y.rs' } },
+        { type: 'tool_call', id: 'c7', name: 'edit_file', arguments: { path: '/home/me/z.rs' } },
+        { type: 'tool_call', id: 'c8', name: 'edit_file', arguments: { path: '/home/me/multiline.rs' } },
         { type: 'tool_call', id: 'c4', name: 'agent', arguments: { task: 'investigate' } },
       ],
       usage: { input: 100, output: 50, cache_read: 0, cache_write: 0, total_tokens: 150, cost: { total: 0.01 } },
@@ -48,7 +51,26 @@ const entries = [
   { id: 'r3', parent_id: 'r2', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:05Z',
     message: { role: 'tool_result', tool_call_id: 'c3', tool_name: 'edit',
       content: [{ type: 'text', text: 'ok' }],
-      details: { kind: 'diff', path: '/home/me/x.rs', before: 'fn main(){}\nold\n', after: 'fn main(){}\nnew\n' },
+      details: { kind: 'diff', format: 'future-v2', path: '/home/me/x.rs',
+        lines: ['+ unknown stored line'], before: 'fn main(){}\nold\n', after: 'fn main(){}\nnew\n' },
+      is_error: false, timestamp: 0 } },
+  { id: 'r3c', parent_id: 'r3', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:05Z',
+    message: { role: 'tool_result', tool_call_id: 'c6', tool_name: 'edit_file',
+      content: [{ type: 'text', text: 'ok' }],
+      details: { kind: 'diff', format: 'display-v1', path: '/home/me/y.rs',
+        lines: ['--- a//home/me/y.rs', '+++ b//home/me/y.rs', '  keep', '- stale compact', '+ fresh compact'] },
+      is_error: false, timestamp: 0 } },
+  { id: 'r3m', parent_id: 'r3c', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:05Z',
+    message: { role: 'tool_result', tool_call_id: 'c7', tool_name: 'edit_file',
+      content: [{ type: 'text', text: 'malformed compact fallback' }],
+      details: { kind: 'diff', format: 'display-v1', path: '/home/me/z.rs',
+        lines: ['--- a//home/me/z.rs', '+++ b//home/me/z.rs', 'bogus must not render'] },
+      is_error: false, timestamp: 0 } },
+  { id: 'r3n', parent_id: 'r3m', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:05Z',
+    message: { role: 'tool_result', tool_call_id: 'c8', tool_name: 'edit_file',
+      content: [{ type: 'text', text: 'multiline compact fallback' }],
+      details: { kind: 'diff', format: 'display-v1', path: '/home/me/multiline.rs',
+        lines: ['--- a//home/me/multiline.rs', '+++ b//home/me/multiline.rs', '+ first\n+ must not split'] },
       is_error: false, timestamp: 0 } },
   // sub-agent run spawned by a1
   { id: 'sp', parent_id: 'a1', thread: 'subagent', agent_id: 1, type: 'sub_agent_spawn', task: 'investigate the bug',
@@ -57,7 +79,7 @@ const entries = [
     message: { role: 'assistant', model: 'claude-test', content: [{ type: 'text', text: 'sub-agent finding' }],
       usage: { input: 0, output: 0, cache_read: 0, cache_write: 0, total_tokens: 0, cost: { total: 0 } }, stop_reason: 'Stop', timestamp: 0 } },
   // the agent tool_result (successful report) on the user thread
-  { id: 'r4', parent_id: 'r3', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:08Z',
+  { id: 'r4', parent_id: 'r3n', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:08Z',
     message: { role: 'tool_result', tool_call_id: 'c4', tool_name: 'agent',
       content: [{ type: 'text', text: 'sub-agent finding' }],
       details: { kind: 'sub_agent_report', agent_id: 1, task: 'investigate the bug', report: 'sub-agent finding' },
@@ -245,8 +267,18 @@ has('bash tail truncation', 'earlier lines');
 has('bash error styling', 'tool-execution error');
 has('bash exit code', 'exit code 1');
 has('stderr class', 'tool-output expandable stderr');
-has('edit diff added', 'diff-added');
-has('edit diff removed', 'diff-removed');
+has('legacy fallback diff added', '<div class="diff-added">+ new</div>');
+has('legacy fallback diff removed', '<div class="diff-removed">- old</div>');
+hasnt('unknown compact lines rejected', 'unknown stored line');
+has('malformed compact uses model-facing fallback', 'malformed compact fallback');
+hasnt('arbitrary compact line not rendered', 'bogus must not render');
+has('multiline compact uses model-facing fallback', 'multiline compact fallback');
+hasnt('multiline compact line not rendered', 'must not split');
+has('compact edit diff added', '<div class="diff-added">+ fresh compact</div>');
+has('compact edit diff removed', '<div class="diff-removed">- stale compact</div>');
+hasnt('stored diff old header suppressed', '--- a/');
+hasnt('stored diff new header suppressed', '+++ b/');
+check('compact diff path renders once', rendered.split('/home/me/y.rs').length - 1 === 1);
 // Tool executions are siblings of the assistant bubble, not nested inside
 // it (matching the TUI). The bubble for a1 must close before its tools.
 const a1box = divRegion(elements['messages'].innerHTML, 'id="entry-a1"');

@@ -12,10 +12,12 @@ pub mod hooks;
 pub mod message;
 pub mod projection;
 pub mod queue;
+pub mod sanitize;
 pub mod tool;
 pub mod types;
 
 pub use error::BoxError;
+pub use sanitize::sanitize_terminal_output;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;

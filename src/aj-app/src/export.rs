@@ -6,11 +6,11 @@
 //! the transcript server-side. The browser parses the embedded entries
 //! and builds the view (messages, tool results, sub-agent runs,
 //! markdown, syntax highlighting), so the same file is both a readable
-//! transcript and the lossless source data.
+//! transcript and the source data used by the page.
 //!
 //! What gets embedded:
-//! - the verbatim on-disk entries (`ConversationEntry`), under a small
-//!   envelope carrying the session id and the active user-thread leaf,
+//! - the on-disk entries (`ConversationEntry`), with valid diff details
+//!   normalized to their canonical wire representation one entry at a time,
 //! - the page renderer (`template.js`),
 //! - `marked` (markdown), vendored under `assets/export/vendor` (see its
 //!   `PROVENANCE.md`).
@@ -18,24 +18,25 @@
 //! Security: the session rides in a `<script type="application/octet-stream">`
 //! block as gzip-compressed, base64-encoded bytes. The base64 alphabet
 //! has no `<`, so the payload cannot open or close a tag and needs no
-//! further escaping. The browser inflates it (via the native
-//! `DecompressionStream`) and `JSON.parse`s the result. Compression
-//! matters because the on-disk session stores full file contents for
-//! every edit, so a transcript with large or repeatedly edited files is
-//! many megabytes of highly redundant JSON. The renderer treats raw HTML
-//! in prose as inert text and restricts link/image URLs to a scheme
+//! further escaping. The browser inflates it with the native
+//! `DecompressionStream` and `JSON.parse`s the result. The renderer treats raw
+//! HTML in prose as inert text and restricts link/image URLs to a scheme
 //! allow-list, so a shared transcript cannot inject markup or scripts.
 
 use std::io::Write;
 
 use aj_agent::events::AgentEvent;
-use aj_models::types::{Message, UserContent};
-use aj_session::{ConversationEntry, ConversationLog, EntryId, ThreadFilter, replay};
+use aj_agent::tool::ToolDetails;
+use aj_models::types::{Message, ToolResultMessage, UserContent};
+use aj_session::{
+    ConversationEntry, ConversationEntryKind, ConversationLog, EntryId, ThreadFilter, replay,
+};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use serde::Serialize;
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Serialize, Serializer};
 
 /// The HTML shell with `{{KEY}}` placeholders, filled by
 /// [`fill_template`].
@@ -49,9 +50,8 @@ const MARKED_JS: &str = include_str!("../assets/export/vendor/marked.min.js");
 /// travel with a redistribution.
 const MARKED_LICENSE: &str = include_str!("../assets/export/vendor/marked.LICENSE");
 
-/// The embedded session envelope. Entries serialize verbatim (snake_case
-/// fields, `type`/`role`/`kind` tags as on disk); the renderer reads
-/// them directly.
+/// The embedded session envelope. Valid diff details are canonicalized during
+/// serialization. All other entry data keeps its on-disk shape.
 #[derive(Serialize)]
 struct ExportData<'a> {
     session_id: &'a str,
@@ -59,7 +59,112 @@ struct ExportData<'a> {
     /// a resumed session would. `None` for a session with no user
     /// messages yet.
     leaf_id: Option<EntryId>,
-    entries: Vec<&'a ConversationEntry>,
+    entries: Vec<ExportEntry<'a>>,
+}
+
+struct ExportEntry<'a>(&'a ConversationEntry);
+
+#[derive(Serialize)]
+struct ExportToolResultMessage<'a> {
+    role: &'static str,
+    tool_call_id: &'a str,
+    tool_name: &'a str,
+    content: &'a [UserContent],
+    details: &'a ToolDetails,
+    is_error: bool,
+    timestamp: i64,
+}
+
+impl Serialize for ExportEntry<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let entry = self.0;
+        let ConversationEntryKind::Message { message } = &entry.entry else {
+            return entry.serialize(serializer);
+        };
+        let Some(Message::ToolResult(result)) = message.as_wire() else {
+            return entry.serialize(serializer);
+        };
+        let Some(raw_details) = result.details.as_ref() else {
+            return entry.serialize(serializer);
+        };
+        if raw_details.get("kind").and_then(|kind| kind.as_str()) != Some("diff") {
+            return entry.serialize(serializer);
+        }
+        let Ok(details) = ToolDetails::deserialize(raw_details) else {
+            return entry.serialize(serializer);
+        };
+
+        serialize_normalized_tool_result(entry, result, &details, serializer)
+    }
+}
+
+fn serialize_normalized_tool_result<S>(
+    entry: &ConversationEntry,
+    result: &ToolResultMessage,
+    details: &ToolDetails,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    // Keep these patterns exhaustive so new persisted fields cannot disappear
+    // from normalized exports without a compile error.
+    let ConversationEntry {
+        id,
+        parent_id,
+        timestamp,
+        thread,
+        agent_id,
+        entry: _,
+    } = entry;
+    let ToolResultMessage {
+        tool_call_id,
+        tool_name,
+        content,
+        details: _,
+        is_error,
+        timestamp: message_timestamp,
+    } = result;
+
+    let mut map = serializer.serialize_map(None)?;
+    map.serialize_entry("id", id)?;
+    if let Some(parent_id) = parent_id {
+        map.serialize_entry("parent_id", parent_id)?;
+    }
+    map.serialize_entry("timestamp", timestamp)?;
+    map.serialize_entry("thread", thread)?;
+    if let Some(agent_id) = agent_id {
+        map.serialize_entry("agent_id", agent_id)?;
+    }
+    map.serialize_entry("type", "message")?;
+    map.serialize_entry(
+        "message",
+        &ExportToolResultMessage {
+            role: "tool_result",
+            tool_call_id,
+            tool_name,
+            content,
+            details,
+            is_error: *is_error,
+            timestamp: *message_timestamp,
+        },
+    )?;
+    map.end()
+}
+
+fn export_data(log: &ConversationLog) -> ExportData<'_> {
+    ExportData {
+        session_id: log.session_id(),
+        leaf_id: log.latest_leaf(ThreadFilter::USER),
+        entries: log
+            .entries_in_order()
+            .into_iter()
+            .map(ExportEntry)
+            .collect(),
+    }
 }
 
 /// Render a whole session to a self-contained HTML document.
@@ -71,11 +176,7 @@ pub fn render_session_html(log: &ConversationLog) -> String {
         .map(|t| truncate_title(&t))
         .unwrap_or_else(|| "aj session".to_string());
 
-    let data = ExportData {
-        session_id: log.session_id(),
-        leaf_id: log.latest_leaf(ThreadFilter::USER),
-        entries: log.entries_in_order(),
-    };
+    let data = export_data(log);
     let session_data = embed_session(&data);
     let licenses = format!("marked (MIT) https://github.com/markedjs/marked\n\n{MARKED_LICENSE}");
 
@@ -134,11 +235,10 @@ fn fill_template(template: &str, vars: &[(&str, &str)]) -> String {
 /// Serialize the export envelope, gzip-compress it, and base64-encode
 /// the result for embedding in a `<script>` element.
 ///
-/// Compression is the point: the session JSON is large and highly
-/// redundant (full file contents per edit), and gzip shrinks it several
-/// fold. The base64 alphabet contains no `<`, so the payload is inert
-/// inside its surrounding element without any further escaping. The
-/// browser reverses both steps (`DecompressionStream` then `JSON.parse`).
+/// Compression keeps large text tool results and long sessions compact. The
+/// base64 alphabet contains no `<`, so the payload is inert inside its
+/// surrounding element without any further escaping. The browser reverses
+/// both steps with `DecompressionStream` and `JSON.parse`.
 fn embed_session(data: &ExportData) -> String {
     let json = serde_json::to_vec(data).expect("ExportData always serializes");
     let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
@@ -317,6 +417,61 @@ mod tests {
     }
 
     #[test]
+    fn export_normalizes_valid_diff_details_without_mutating_log() {
+        let legacy = r#"{"id":"t0000001","parent_id":"a0000001","thread":"user","type":"message","message":{"role":"tool_result","tool_call_id":"call-1","tool_name":"edit_file","content":[{"type":"text","text":"legacy model result"}],"details":{"kind":"diff","path":"legacy.rs","before":"same\nold\n","after":"same\nnew\n"},"is_error":false,"timestamp":0}}"#;
+        let compact = r#"{"id":"t0000002","parent_id":"t0000001","thread":"user","type":"message","message":{"role":"tool_result","tool_call_id":"call-2","tool_name":"edit_file","content":[{"type":"text","text":"compact model result"}],"details":{"kind":"diff","format":"display-v1","path":"src/\u001b[31mlib.rs","lines":["--- a/src/\u001b[31mlib.rs","+++ b/src/\u001b[31mlib.rs","- old","+ new"]},"is_error":false,"timestamp":0}}"#;
+        let (_dir, log) = log_from_jsonl(&[SYSTEM, USER, ASSISTANT, legacy, compact]);
+
+        let html = render_session_html(&log);
+        let data: serde_json::Value =
+            serde_json::from_str(&decoded_island(&html)).expect("export data parses");
+        let legacy = &data["entries"][3]["message"]["details"];
+        assert_eq!(legacy["format"], "display-v1");
+        assert_eq!(legacy["path"], "legacy.rs");
+        assert!(legacy.get("before").is_none());
+        assert!(legacy.get("after").is_none());
+        assert_eq!(legacy["lines"][2], "  same");
+        assert_eq!(legacy["lines"][3], "- old");
+        assert_eq!(legacy["lines"][4], "+ new");
+
+        let compact = &data["entries"][4]["message"]["details"];
+        assert_eq!(compact["format"], "display-v1");
+        assert_eq!(compact["path"], "src/lib.rs");
+        assert_eq!(compact["lines"][0], "--- a/src/lib.rs");
+        assert!(
+            compact["lines"]
+                .as_array()
+                .is_some_and(|lines| { lines.iter().all(serde_json::Value::is_string) })
+        );
+
+        let entries = log.entries_in_order();
+        let ConversationEntryKind::Message { message } = &entries[3].entry else {
+            panic!("expected message entry");
+        };
+        let Some(Message::ToolResult(result)) = message.as_wire() else {
+            panic!("expected tool result");
+        };
+        let original = result.details.as_ref().expect("original details");
+        assert!(original.get("before").is_some());
+        assert!(original.get("after").is_some());
+    }
+
+    #[test]
+    fn export_preserves_non_diff_detail_extensions() {
+        let text = r#"{"id":"t0000001","parent_id":"a0000001","thread":"user","type":"message","message":{"role":"tool_result","tool_call_id":"call-1","tool_name":"read_file","content":[{"type":"text","text":"model result"}],"details":{"kind":"text","summary":"read_file x.rs","body":"body","extension":{"version":2,"enabled":true}},"is_error":false,"timestamp":0}}"#;
+        let (_dir, log) = log_from_jsonl(&[SYSTEM, USER, ASSISTANT, text]);
+
+        let source: serde_json::Value = serde_json::from_str(text).expect("source entry parses");
+        let html = render_session_html(&log);
+        let exported: serde_json::Value =
+            serde_json::from_str(&decoded_island(&html)).expect("export data parses");
+        assert_eq!(
+            exported["entries"][3]["message"]["details"],
+            source["message"]["details"]
+        );
+    }
+
+    #[test]
     fn data_island_is_inert_base64() {
         // The base64 payload contains no `<`, so it cannot open or close a
         // tag inside its surrounding script element, no matter what a
@@ -378,17 +533,12 @@ mod tests {
     }
 
     #[test]
-    fn island_round_trips_losslessly() {
+    fn island_round_trips_export_envelope() {
         let (_dir, log) = log_from_jsonl(&[SYSTEM, USER, ASSISTANT, TOOL_RESULT]);
         let html = render_session_html(&log);
-        // Decoding the island yields exactly the JSON the exporter
-        // serialized, so the gzip+base64 step is lossless and the
-        // download-JSONL feature reconstructs the session faithfully.
-        let data = ExportData {
-            session_id: log.session_id(),
-            leaf_id: log.latest_leaf(ThreadFilter::USER),
-            entries: log.entries_in_order(),
-        };
+        // Decoding the island yields exactly the canonical export data before
+        // the gzip and base64 transport steps.
+        let data = export_data(&log);
         let expected = serde_json::to_string(&data).expect("serialize envelope");
         assert_eq!(decoded_island(html.as_str()), expected);
     }

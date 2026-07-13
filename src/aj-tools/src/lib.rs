@@ -11,7 +11,6 @@
 //! carries the structured result); `aj-tools` is wire-only.
 
 pub mod image;
-pub mod sanitize;
 /// Test-only [`aj_agent::tool::ToolContext`] doubles for exercising tools
 /// without a live agent runtime. Gated behind `cfg(test)` plus the `testing`
 /// feature so it never ships in the production public API. Other crates'
@@ -20,6 +19,11 @@ pub mod sanitize;
 pub mod testing;
 pub mod tools;
 pub mod truncate;
+
+/// Compatibility path for terminal-output sanitization.
+pub mod sanitize {
+    pub use aj_agent::sanitize_terminal_output;
+}
 
 pub use sanitize::sanitize_terminal_output;
 
@@ -100,6 +104,14 @@ pub fn builtin_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_compatibility_path_matches_root_export() {
+        assert_eq!(
+            sanitize::sanitize_terminal_output("\x1b[31mtext\x1b[0m"),
+            sanitize_terminal_output("\x1b[31mtext\x1b[0m")
+        );
+    }
 
     #[test]
     fn builtin_tools_empty_disabled_is_full_catalog() {
