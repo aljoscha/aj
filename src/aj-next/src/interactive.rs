@@ -1744,6 +1744,10 @@ async fn apply_selector_activity(
     // A thinking or theme edit in this batch may have changed the active view's
     // border tint. The thinking selector, the settings-window thinking row, and
     // a theme switch all land here, so re-tint once after applying the batch.
+    // `changed` only means the batch applied something, not that a
+    // border-relevant setting moved. So for a border-irrelevant activity like a
+    // skill toggle the re-tint recomputes the same color and is an idempotent
+    // no-op.
     if changed {
         shell.borrow().apply_editor_border(world);
     }
@@ -8135,6 +8139,73 @@ mod tests {
         );
         assert!(matches!(effect, ActionEffect::Redraw));
         assert_eq!(world.chat.borrow().active_view(), AgentId::Sub(2));
+    }
+
+    /// Observing an agent whose thinking level differs from the current view
+    /// re-tints the editor border to the newly viewed agent's level. This pins
+    /// the Observe-site re-tint: drop that call and the border keeps the
+    /// previous view's tint after the switch.
+    #[tokio::test]
+    async fn agent_picker_observe_retints_the_editor_border() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let theme = Theme::bundled_dark_with_mode(ColorMode::Truecolor);
+
+        // Pin the main view to a low level, then seed an observable sub-agent
+        // at a high level, so the two views resolve to distinct border tints.
+        let mut watch = inert_theme_watch();
+        apply_selector_activity(
+            &mut world,
+            &shell,
+            &mut watch,
+            vec![SelectorActivity::ThinkingConfirmed {
+                target: AgentId::Main,
+                level: Some(ThinkingConfig::Minimal),
+            }],
+        )
+        .await;
+        let _ = reduce(
+            &mut world.chat.borrow_mut(),
+            &mut world.core.lifecycle,
+            AgentEvent::SubAgentStart {
+                parent: AgentId::Main,
+                child: AgentId::Sub(1),
+                task: "reason harder".into(),
+                background: false,
+                settings: aj_agent::events::AgentSettings {
+                    provider: "scripted".into(),
+                    model_id: "scripted".into(),
+                    thinking: "xhigh".into(),
+                    speed: "standard".into(),
+                    verbosity: "default".into(),
+                },
+            },
+        );
+
+        // The border rests on the main view's minimal tint before the switch.
+        let before = editor_border_fg(&shell);
+        assert_eq!(
+            before,
+            editor_border_color(&theme, Some(&ThinkingConfig::Minimal)),
+            "border seeded to the main view's minimal tint"
+        );
+
+        let effect = apply_picker_outcome(
+            &mut world,
+            &shell,
+            AgentPickerOutcome::Observe(AgentId::Sub(1)),
+        );
+        assert!(matches!(effect, ActionEffect::Redraw));
+        assert_eq!(world.chat.borrow().active_view(), AgentId::Sub(1));
+
+        // The view switch must recompute the border to the sub-agent's tint.
+        let after = editor_border_fg(&shell);
+        assert_eq!(
+            after,
+            editor_border_color(&theme, Some(&ThinkingConfig::XHigh)),
+            "the view switch re-tints the border to the sub-agent's xhigh tint"
+        );
+        assert_ne!(before, after, "the border moved with the active view");
     }
 
     /// A confirmed task pick opens and refocuses its viewer before another
