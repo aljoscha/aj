@@ -59,6 +59,10 @@ pub(crate) struct TaskOutputView {
     follow: bool,
     text_style: Style,
     dim_style: Style,
+    /// Scrollbar thumb color, the shared `Dim` token so the thumb matches
+    /// every other scrollbar. Distinct from `dim_style` (the header's faint
+    /// attribute), which reads dim but is not the `Dim` color.
+    thumb_style: Style,
     on_close: Option<Box<dyn FnMut(&mut EventContext)>>,
 }
 
@@ -69,6 +73,7 @@ impl TaskOutputView {
         command: String,
         text_style: Style,
         dim_style: Style,
+        thumb_style: Style,
     ) -> TaskOutputView {
         let mut list = ListView::new(Source::Slice(Vec::new()));
         list.draw_cursor = false;
@@ -86,6 +91,7 @@ impl TaskOutputView {
             follow: true,
             text_style,
             dim_style,
+            thumb_style,
             on_close: None,
         };
         view.refresh();
@@ -207,9 +213,10 @@ impl Widget for TaskOutputView {
                     height: Some(body_height),
                 },
             );
-            // NOTE: tint the thumb Dim per-draw, via the shared helper, so it
-            // matches every other scrollbar.
-            crate::scroll::apply_thumb_style(&mut self.bars, self.dim_style);
+            // NOTE: tint the thumb from the shared Dim color token per-draw,
+            // via the shared helper, so it matches every other scrollbar. This
+            // is the `Dim` color, not the header's faint `dim_style`.
+            crate::scroll::apply_thumb_style(&mut self.bars, self.thumb_style);
             surface.children.push(SubSurface {
                 origin: RelativePoint {
                     row: i32::from(HEADER_ROWS),
@@ -390,6 +397,7 @@ pub(crate) fn open_task_output(
         command,
         chrome.select.label,
         faint(),
+        chrome.select.scrollbar_thumb,
     )));
     {
         let stack_c = Rc::clone(stack);
@@ -495,6 +503,7 @@ mod tests {
             "echo hi".to_string(),
             Style::default(),
             Style::default(),
+            Style::default(),
         );
         let rendered = flatten(&view.draw(&draw_ctx(40, 12)));
         assert!(rendered.contains("echo hi"), "command header: {rendered}");
@@ -511,6 +520,7 @@ mod tests {
             "echo hi".to_string(),
             Style::default(),
             Style::default(),
+            Style::default(),
         );
         let rendered = flatten(&view.draw(&draw_ctx(40, 10)));
         assert!(rendered.contains("exited 0"), "{rendered}");
@@ -524,6 +534,7 @@ mod tests {
             registry.clone(),
             id,
             "echo hi".to_string(),
+            Style::default(),
             Style::default(),
             Style::default(),
         );
@@ -551,6 +562,7 @@ mod tests {
             registry,
             id,
             "echo hi".to_string(),
+            Style::default(),
             Style::default(),
             Style::default(),
         );
@@ -601,21 +613,27 @@ mod tests {
     }
 
     /// The tailing body's scrollbar thumb is tinted with the view's
-    /// `dim_style`, via the shared helper, whenever the output overflows its
-    /// slot. Dropping the per-draw `apply_thumb_style` in `draw` leaves the
-    /// thumb at the default fg and fails here.
+    /// `thumb_style` (the shared `Dim` color), via the shared helper, whenever
+    /// the output overflows its slot. Dropping the per-draw `apply_thumb_style`
+    /// in `draw` leaves the thumb at the default fg and fails here.
     #[test]
     fn scrollbar_thumb_carries_the_dim_tint() {
         let contents: String = (1..=40).map(|n| format!("line{n}\n")).collect();
         let (registry, id, _f) = task(&contents, TaskStatus::Running);
-        // A distinct dim fg so the tinted thumb can't be confused with a
-        // default-styled cell.
-        let dim = Style {
+        // A distinct thumb fg so the tinted thumb can't be confused with a
+        // default-styled cell or the header's faint dim_style.
+        let thumb = Style {
             fg: vaxis::cell::Color::Index(1),
             ..Style::default()
         };
-        let mut view =
-            TaskOutputView::new(registry, id, "echo hi".to_string(), Style::default(), dim);
+        let mut view = TaskOutputView::new(
+            registry,
+            id,
+            "echo hi".to_string(),
+            Style::default(),
+            Style::default(),
+            thumb,
+        );
         let surface = view.draw(&draw_ctx(20, 8));
         // The thumb sits on the body's right edge, in a child surface, so
         // composite the tree before reading the cell's style.
@@ -628,8 +646,8 @@ mod tests {
             })
             .expect("a thumb cell is drawn on the body's right edge");
         assert_eq!(
-            fg, dim.fg,
-            "the task-output body thumb carries the dim_style tint"
+            fg, thumb.fg,
+            "the task-output body thumb carries the thumb_style tint"
         );
     }
 }
