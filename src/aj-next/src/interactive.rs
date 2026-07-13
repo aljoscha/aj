@@ -1233,11 +1233,11 @@ async fn apply_command_action(
             ActionEffect::OpenedOverlay
         }
         CommandAction::OpenSettings => {
-            // The global window shows the PERSISTED user-layer config, the
-            // config a fresh session loads as its user layer. That can differ
-            // from an unpersisted runtime toggle, which is intended: this
-            // window edits `~/.aj/config.toml`, it is not a view of the live
-            // session.
+            // NOTE: the global window shows the PERSISTED user-layer config,
+            // the config a fresh session loads as its user layer. That can
+            // differ from an unpersisted runtime toggle, which is intended:
+            // this window edits `~/.aj/config.toml`, it is not a view of the
+            // live session.
             let user = world
                 .config_layers
                 .lock()

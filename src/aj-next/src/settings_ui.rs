@@ -2000,9 +2000,13 @@ mod tests {
     fn project_and_global_rows_share_indentation_without_a_glyph() {
         use crate::test_support::{draw_ctx, rows};
 
+        // Cover both override and inherited rows: a glyph or an
+        // inherited-only indent shift would move one of them off col 0.
         let mut override_row = cycle_row("auto_compact", "true");
         override_row.inherited = false;
-        let mut project = SettingList::new(vec![override_row], styles(), true);
+        let mut inherited_row = cycle_row("bash_rtk", "true");
+        inherited_row.inherited = true;
+        let mut project = SettingList::new(vec![override_row, inherited_row], styles(), true);
         let mut global = SettingList::new(vec![cycle_row("auto_compact", "true")], styles(), false);
         let ctx = draw_ctx(60, Some(20));
 
@@ -2013,17 +2017,21 @@ mod tests {
             project_text.iter().all(|l| !l.contains('\u{25cf}')),
             "no override glyph is drawn in project mode: {project_text:?}"
         );
-        let project_col = project_text
-            .iter()
-            .find_map(|l| l.find("auto_compact"))
-            .expect("project row present");
-        let global_col = global_text
-            .iter()
-            .find_map(|l| l.find("auto_compact"))
-            .expect("global row present");
-        assert_eq!(project_col, 0, "the label starts at col 0 in project mode");
+        let col = |text: &[String], label: &str| text.iter().find_map(|l| l.find(label));
+        let project_override_col =
+            col(&project_text, "auto_compact").expect("override row present");
+        let project_inherited_col = col(&project_text, "bash_rtk").expect("inherited row present");
+        let global_col = col(&global_text, "auto_compact").expect("global row present");
         assert_eq!(
-            project_col, global_col,
+            project_override_col, 0,
+            "the override label starts at col 0 in project mode"
+        );
+        assert_eq!(
+            project_inherited_col, 0,
+            "the inherited label starts at col 0 in project mode"
+        );
+        assert_eq!(
+            project_override_col, global_col,
             "both windows lay the label out at the same column"
         );
     }
