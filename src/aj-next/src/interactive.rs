@@ -1545,6 +1545,8 @@ fn apply_picker_outcome(
             // The new view may run a different thinking level, so re-tint the
             // editor border to match the agent now under view.
             shell.borrow().apply_editor_border(world);
+            // Mark which agent the editor is observing (or clear it on Main).
+            shell.borrow().apply_editor_agent_marker(world);
             ActionEffect::Redraw
         }
         AgentPickerOutcome::OpenTask(id) => {
@@ -3200,6 +3202,17 @@ impl Shell {
         self.editor.borrow_mut().set_border_color(color);
     }
 
+    /// Reflect the observed agent in the editor's top-bar label: an
+    /// `agent N` marker for a sub-agent, cleared for the main agent.
+    /// Mirrors `aj`'s editor agent marker.
+    fn apply_editor_agent_marker(&self, world: &World) {
+        let label = match world.chat.borrow().active_view() {
+            AgentId::Main => None,
+            AgentId::Sub(n) => Some(format!("agent {n}")),
+        };
+        self.editor.borrow_mut().set_top_bar_label(label);
+    }
+
     /// Recompute the editor's visible-row cap for a `terminal_rows`-tall frame
     /// and apply it. The layout owns the height budget (see [`editor_row_cap`]):
     /// called once at startup and again on every resize so the editor's growth
@@ -3241,6 +3254,9 @@ impl Shell {
         // A session install lands on the main view, whose thinking level may
         // differ from the outgoing session's, so re-tint the border here.
         self.apply_editor_border(world);
+        // A fresh session lands on the main view, so clear any stale sub-agent
+        // marker left in the editor's top bar.
+        self.apply_editor_agent_marker(world);
     }
 }
 
@@ -8240,6 +8256,118 @@ mod tests {
             "the view switch re-tints the border to the sub-agent's xhigh tint"
         );
         assert_ne!(before, after, "the border moved with the active view");
+    }
+
+    /// Reads the editor's top-border row as a single string. The top rule is
+    /// row 0, so the inlaid agent marker (if any) lands there.
+    fn editor_top_bar_text(shell: &Rc<RefCell<Shell>>) -> String {
+        let surf = shell.borrow().editor.borrow_mut().draw(&draw_ctx(100, 30));
+        (0..surf.size.width)
+            .map(|c| surf.read_cell(c, 0).char.grapheme().to_string())
+            .collect()
+    }
+
+    /// Observing a sub-agent inlays an `agent N` marker into the editor's top
+    /// bar, and observing the main agent clears it. This pins both halves of
+    /// the marker through the real Observe apply path.
+    #[tokio::test]
+    async fn agent_picker_observe_marks_the_editor_top_bar() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+
+        // Seed an observable sub-agent to switch the view onto.
+        let _ = reduce(
+            &mut world.chat.borrow_mut(),
+            &mut world.core.lifecycle,
+            AgentEvent::SubAgentStart {
+                parent: AgentId::Main,
+                child: AgentId::Sub(1),
+                task: "reason harder".into(),
+                background: false,
+                settings: aj_agent::events::AgentSettings {
+                    provider: "scripted".into(),
+                    model_id: "scripted".into(),
+                    thinking: "standard".into(),
+                    speed: "standard".into(),
+                    verbosity: "default".into(),
+                },
+            },
+        );
+
+        // Observing the sub-agent inlays its `agent N` marker.
+        let effect = apply_picker_outcome(
+            &mut world,
+            &shell,
+            AgentPickerOutcome::Observe(AgentId::Sub(1)),
+        );
+        assert!(matches!(effect, ActionEffect::Redraw));
+        // Pin the exact marker text, not just a substring: `sub-agent 1` also
+        // contains `agent 1`, so the `!contains("sub-agent")` guard is what
+        // rejects a wrong `sub-agent {n}` label.
+        let top = editor_top_bar_text(&shell);
+        assert!(
+            top.contains("agent 1") && !top.contains("sub-agent"),
+            "observing a sub-agent inlays the `agent N` marker"
+        );
+
+        // Observing the main agent clears the marker again.
+        let effect = apply_picker_outcome(
+            &mut world,
+            &shell,
+            AgentPickerOutcome::Observe(AgentId::Main),
+        );
+        assert!(matches!(effect, ActionEffect::Redraw));
+        assert!(
+            !editor_top_bar_text(&shell).contains("agent"),
+            "observing the main agent clears the marker"
+        );
+    }
+
+    /// A session install lands on the main view, so `rebind` clears an
+    /// `agent N` marker left over from observing a sub-agent in the previous
+    /// session. This is the second marker trigger. The picker path above
+    /// covers the first.
+    #[tokio::test]
+    async fn rebind_clears_a_stale_editor_agent_marker() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+
+        // Observe a sub-agent so the editor carries an `agent 1` marker.
+        let _ = reduce(
+            &mut world.chat.borrow_mut(),
+            &mut world.core.lifecycle,
+            AgentEvent::SubAgentStart {
+                parent: AgentId::Main,
+                child: AgentId::Sub(1),
+                task: "reason harder".into(),
+                background: false,
+                settings: aj_agent::events::AgentSettings {
+                    provider: "scripted".into(),
+                    model_id: "scripted".into(),
+                    thinking: "standard".into(),
+                    speed: "standard".into(),
+                    verbosity: "default".into(),
+                },
+            },
+        );
+        let _ = apply_picker_outcome(
+            &mut world,
+            &shell,
+            AgentPickerOutcome::Observe(AgentId::Sub(1)),
+        );
+        assert!(
+            editor_top_bar_text(&shell).contains("agent 1"),
+            "sub-agent observed, marker set"
+        );
+
+        // A fresh session lands on the main view; rebind reflects that and
+        // clears the stale marker.
+        world.chat.borrow_mut().set_active_view(AgentId::Main);
+        shell.borrow_mut().rebind(&world);
+        assert!(
+            !editor_top_bar_text(&shell).contains("agent"),
+            "rebind clears the stale sub-agent marker on a fresh session"
+        );
     }
 
     /// A confirmed task pick opens and refocuses its viewer before another
