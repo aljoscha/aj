@@ -8,7 +8,7 @@
 //! model, and the [`TranscriptView`] renders it with follow-tail.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,7 +43,10 @@ use aj_models::registry::ModelInfo;
 use aj_models::types::{Speed, UserContent};
 use aj_models::usage::default_reset_sources;
 use aj_models::{ThinkingConfig, speed_from_name, speed_name, thinking_config_from_name};
-use aj_session::{ConversationPersistence, PromptEntry, SessionPreview, ThreadFilter, replay};
+use aj_session::{
+    ConversationPersistence, PromptEntry, SessionPreview, ThreadFilter, project_thread,
+    replay_deferring_subs,
+};
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -112,6 +115,12 @@ struct World {
     /// loop mutates it (via [`reduce`] and the arm helpers). The view
     /// reads it at draw time. Never borrowed across an await.
     chat: Rc<RefCell<ChatState>>,
+    /// The resumed sub-agent indices whose transcript is not yet
+    /// materialized. A sub-agent enters the set in the resume drain and
+    /// leaves it the first time it is observed. Live-spawned sub-agents
+    /// are never in it, since they build their transcript from the live
+    /// event stream.
+    deferred_subs: HashSet<usize>,
     /// Mirror of the lifecycle bits the status chrome (loader,
     /// footer) reads at draw time, shared with those widgets and
     /// refreshed by [`sync_status`] once per loop iteration. The
@@ -216,10 +225,24 @@ async fn build_world(
     // Replay a resumed session's history through the same reducer the
     // live events go through. Replay never hits the bus, so nothing is
     // double-persisted. A fresh log replays nothing.
+    //
+    // Deferred replay withholds each sub-agent's content events but still
+    // emits its `SubAgentStart`/`SubAgentEnd`, so every sub-agent box is
+    // built (and `Done` with its report) while its transcript stays empty
+    // until observed. We record which indices were deferred so Observe
+    // can materialize them on demand.
+    let mut deferred_subs = HashSet::new();
     {
         let log = Arc::clone(&core.log);
         let log = log.lock().await;
-        for event in replay(&log) {
+        for event in replay_deferring_subs(&log) {
+            if let AgentEvent::SubAgentStart {
+                child: AgentId::Sub(n),
+                ..
+            } = &event
+            {
+                deferred_subs.insert(*n);
+            }
             let _ = reduce(&mut chat, &mut core.lifecycle, event);
         }
     }
@@ -312,6 +335,7 @@ async fn build_world(
     Ok(World {
         core,
         chat: Rc::new(RefCell::new(chat)),
+        deferred_subs,
         status: Rc::new(RefCell::new(StatusState::default())),
         config: Arc::new(StdMutex::new(config)),
         config_layers: Arc::new(StdMutex::new(layers)),
@@ -332,6 +356,10 @@ async fn build_world(
 struct NextSession {
     core: SessionCore,
     chat: ChatState,
+    /// The resumed sub-agent indices whose transcript is deferred, seeded
+    /// by this build's drain and swapped onto the world in
+    /// [`install_next_session`]. See [`World::deferred_subs`].
+    deferred_subs: HashSet<usize>,
     notices: Vec<String>,
 }
 
@@ -398,10 +426,21 @@ async fn build_next_session(
     chat.hide_thinking_block = config.hide_thinking_block;
     chat.show_image_in_terminal = config.image_show_in_terminal;
     chat.syntax_highlight = config.syntax_highlighting;
+    // Deferred replay withholds sub-agent content but still builds every
+    // sub-agent box, so the seeded set records which indices Observe must
+    // materialize (see `build_world`).
+    let mut deferred_subs = HashSet::new();
     {
         let log = Arc::clone(&core.log);
         let log = log.lock().await;
-        for event in replay(&log) {
+        for event in replay_deferring_subs(&log) {
+            if let AgentEvent::SubAgentStart {
+                child: AgentId::Sub(n),
+                ..
+            } = &event
+            {
+                deferred_subs.insert(*n);
+            }
             let _ = reduce(&mut chat, &mut core.lifecycle, event);
         }
     }
@@ -422,6 +461,7 @@ async fn build_next_session(
     Ok(NextSession {
         core,
         chat,
+        deferred_subs,
         notices,
     })
 }
@@ -457,6 +497,9 @@ fn switch_failure_notice(spec: &SessionSpec, err: &anyhow::Error) -> String {
 /// header id.
 fn install_next_session(world: &mut World, shell: &Rc<RefCell<Shell>>, next: NextSession) {
     *world.chat.borrow_mut() = next.chat;
+    // Swap the deferred-sub set together with the chat, so a prior
+    // session's indices can't leak into the new session's Observe path.
+    world.deferred_subs = next.deferred_subs;
     // Status is resynced from the new core once per iteration; reset it so
     // the frame between install and the next sync shows idle chrome.
     *world.status.borrow_mut() = StatusState::default();
@@ -1535,13 +1578,40 @@ fn fill_skills_window(list: &SkillsFill, skills: Vec<Skill>) {
 /// swaps the viewed transcript; opening a task drills into the read-only
 /// task viewer (which opens a child overlay, hence [`ActionEffect::OpenedOverlay`]);
 /// killing a task cancels it through the registry and folds a notice.
-fn apply_picker_outcome(
+///
+/// Async because Observe may materialize a still-deferred resumed
+/// sub-agent, which locks the log for the read.
+async fn apply_picker_outcome(
     world: &mut World,
     shell: &Rc<RefCell<Shell>>,
     outcome: AgentPickerOutcome,
 ) -> ActionEffect {
     match outcome {
         AgentPickerOutcome::Observe(id) => {
+            // A resumed sub-agent's transcript is deferred (see
+            // `replay_deferring_subs`), so materialize it before switching
+            // the view. Doing it first lets `set_active_view` reconcile
+            // `header_only` against the now-present tool cells.
+            if let AgentId::Sub(n) = id
+                && world.deferred_subs.contains(&n)
+            {
+                // Lock only for the read. `linearize` returns an owned
+                // `Conversation`, so we drop the lock before the projection
+                // and reduce, which would otherwise stall a concurrent live
+                // turn's inline persistence on a large sub-agent.
+                let conv = {
+                    let log = world.core.log.lock().await;
+                    log.latest_leaf(ThreadFilter::subagent(n))
+                        .map(|head| log.linearize(&head, ThreadFilter::subagent(n)))
+                };
+                if let Some(conv) = conv {
+                    let mut chat = world.chat.borrow_mut();
+                    for event in project_thread(&conv, AgentId::Sub(n)) {
+                        let _ = reduce(&mut chat, &mut world.core.lifecycle, event);
+                    }
+                }
+                world.deferred_subs.remove(&n);
+            }
             // The transcript view reads `active_view` at draw, and the
             // per-iteration status/keymap sync picks up the new view, so
             // switching plus a redraw is all it takes.
@@ -1613,11 +1683,15 @@ fn apply_picker_outcome(
 }
 
 /// Drains and applies the picker outcome parked during input dispatch.
-fn apply_pending_picker_outcome(world: &mut World, shell: &Rc<RefCell<Shell>>, app: &mut AsyncApp) {
+async fn apply_pending_picker_outcome(
+    world: &mut World,
+    shell: &Rc<RefCell<Shell>>,
+    app: &mut AsyncApp,
+) {
     // Drop the Shell borrow before a refocus event dispatches through it.
     let outcome = shell.borrow().take_picker_outcome();
     if let Some(outcome) = outcome {
-        match apply_picker_outcome(world, shell, outcome) {
+        match apply_picker_outcome(world, shell, outcome).await {
             ActionEffect::None => {}
             ActionEffect::Redraw => app.request_redraw(),
             ActionEffect::OpenedOverlay => {
@@ -4106,7 +4180,7 @@ async fn drive(
                         // task / kill). Opening the task viewer pushes a
                         // child overlay, so it takes the same refocus path
                         // as a host-opened selector.
-                        apply_pending_picker_outcome(world, shell, app);
+                        apply_pending_picker_outcome(world, shell, app).await;
                         // A prompt-history recall: drop the chosen text
                         // into the editor (it does not submit).
                         if let Some(text) = shell.borrow().take_recall() {
@@ -4471,7 +4545,7 @@ mod tests {
     use std::io::{PipeWriter, Write};
     use std::sync::Arc;
 
-    use aj_app::chat::{EntryKind, NoticeLevel};
+    use aj_app::chat::{EntryKind, NoticeLevel, SubAgentStatus, ToolStatus};
     use clap::Parser;
     use tempfile::TempDir;
     use vaxis::gwidth;
@@ -4870,6 +4944,667 @@ mod tests {
         build_world(&args, default_layers(), &[], &auth, &persistence)
             .await
             .expect("build resumed world")
+    }
+
+    /// Submit a prompt and drive a scripted demo, including its sub-agent
+    /// turns, to full completion so the persisted log holds complete
+    /// sub-agent runs.
+    ///
+    /// Loops join + drain, spawning any earned post-turn wakes, until no
+    /// turn is in flight. A single join + drain (as in [`persist_session`])
+    /// is enough for a one-turn demo, but a multi-agent demo can leave
+    /// wake turns behind, so we settle the whole join set.
+    async fn drive_demo_to_completion(world: &mut World) {
+        handle_submit(world, "run the demo".to_string());
+        loop {
+            if !world.turns.is_empty() {
+                let joined = join_next_or_pending(&mut world.turns).await;
+                handle_turn_join(world, joined).expect("turn settles cleanly");
+            }
+            let mut wakes = Vec::new();
+            if let Ok(first) = world.core.event_rx.try_recv() {
+                let (_, targets) = drain_events(world, first);
+                wakes = targets;
+            }
+            spawn_wakes(world, wakes);
+            if world.turns.is_empty() {
+                break;
+            }
+        }
+    }
+
+    /// A shell wrapping `world`'s chat and queues, for the resume/observe
+    /// tests that need one but build the world by resuming rather than via
+    /// [`world_and_shell`].
+    fn shell_for(world: &World) -> Rc<RefCell<Shell>> {
+        Rc::new(RefCell::new(Shell::new(
+            Rc::clone(&world.chat),
+            Rc::clone(&world.status),
+            world.core.message_queues.clone(),
+            ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor)),
+            "aj-next".to_string(),
+            "",
+            PathBuf::from("/tmp"),
+        )))
+    }
+
+    /// The sub-agent boxes in the Main transcript, as `(child, status,
+    /// report, task)` tuples in append order.
+    fn sub_boxes(chat: &ChatState) -> Vec<(usize, SubAgentStatus, Option<String>, String)> {
+        chat.transcript(AgentId::Main)
+            .expect("main transcript")
+            .entries()
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntryKind::SubAgent(s) => {
+                    Some((s.child, s.status, s.report.clone(), s.task.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A richer projection of a transcript entry than its kind alone, for
+    /// parity comparisons between the eager and lazily materialized paths. It
+    /// captures the payload fields those paths could diverge on: assistant
+    /// text and its `finalized` flag, tool name / args / status / `header_only`.
+    /// Comparing shapes (not just kinds) catches a bug in tool args, message
+    /// text, or `header_only` that a kind-only comparison would pass.
+    #[derive(Debug, PartialEq)]
+    enum EntryShape {
+        User {
+            text: String,
+            collapsible: bool,
+        },
+        Assistant {
+            text: String,
+            finalized: bool,
+        },
+        Tool {
+            tool: String,
+            args: serde_json::Value,
+            status: ToolStatus,
+            header_only: bool,
+        },
+        SubAgent {
+            child: usize,
+            status: SubAgentStatus,
+            report: Option<String>,
+        },
+        Compaction {
+            summary: String,
+        },
+        Notice {
+            level: NoticeLevel,
+            text: String,
+        },
+        TurnUsage {
+            line: String,
+        },
+    }
+
+    /// The concatenated text blocks of an assistant message, matching how the
+    /// box report and `capture_sub_report` fold assistant content.
+    fn assistant_text(msg: &aj_models::types::AssistantMessage) -> String {
+        msg.content
+            .iter()
+            .filter_map(|b| match b {
+                aj_models::types::AssistantContent::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn entry_shape(kind: &EntryKind) -> EntryShape {
+        match kind {
+            EntryKind::User(u) => EntryShape::User {
+                text: u.joined_text(),
+                collapsible: u.collapsible,
+            },
+            EntryKind::Assistant(a) => EntryShape::Assistant {
+                text: assistant_text(&a.message),
+                finalized: a.finalized,
+            },
+            EntryKind::Tool(t) => EntryShape::Tool {
+                tool: t.tool.clone(),
+                args: t.args.clone(),
+                status: t.status,
+                header_only: t.header_only,
+            },
+            EntryKind::SubAgent(s) => EntryShape::SubAgent {
+                child: s.child,
+                status: s.status,
+                report: s.report.clone(),
+            },
+            EntryKind::Compaction(c) => EntryShape::Compaction {
+                summary: c.summary.clone(),
+            },
+            EntryKind::Notice(n) => EntryShape::Notice {
+                level: n.level,
+                text: n.text.clone(),
+            },
+            EntryKind::TurnUsage(u) => EntryShape::TurnUsage { line: u.line() },
+        }
+    }
+
+    /// The transcript for `id` as a sequence of [`EntryShape`]s.
+    fn transcript_shape(chat: &ChatState, id: AgentId) -> Vec<EntryShape> {
+        chat.transcript(id)
+            .map(|t| t.entries().iter().map(|e| entry_shape(&e.kind)).collect())
+            .unwrap_or_default()
+    }
+
+    /// The `header_only` flag of each tool cell in `id`'s transcript, in
+    /// append order. Used to check the view-switch reconcile.
+    fn tool_header_only(chat: &ChatState, id: AgentId) -> Vec<bool> {
+        chat.transcript(id)
+            .map(|t| {
+                t.entries()
+                    .iter()
+                    .filter_map(|e| match &e.kind {
+                        EntryKind::Tool(tool) => Some(tool.header_only),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The chat state the eager (full-replay) path builds for `world`'s log,
+    /// with `view` set active so `header_only` reconciles exactly as a
+    /// lazily materialized world viewing `view` does. Settings only drive
+    /// footer chrome, not transcript entries, so a dummy chat suffices for
+    /// the entry-shape, report, and `header_only` comparisons these tests
+    /// make.
+    async fn eager_chat(world: &World, view: AgentId) -> ChatState {
+        let mut eager = ChatState::new(
+            aj_agent::events::AgentSettings {
+                provider: "scripted".into(),
+                model_id: "scripted".into(),
+                thinking: "off".into(),
+                speed: "standard".into(),
+                verbosity: "default".into(),
+            },
+            0,
+            Arc::new(Vec::new()),
+        );
+        let mut life = aj_app::session::AgentLifecycle::default();
+        {
+            let log = world.core.log.lock().await;
+            for event in aj_session::replay(&log) {
+                let _ = reduce(&mut eager, &mut life, event);
+            }
+        }
+        eager.set_active_view(view);
+        eager
+    }
+
+    /// Resume a session and confirm every sub-agent box is present, `Done`,
+    /// and reporting, while its transcript stays empty until observed: the
+    /// deferred-replay contract.
+    #[tokio::test]
+    async fn resume_defers_subagent_transcripts() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut world = scripted_world(&dir, "parallel-agents").await;
+        drive_demo_to_completion(&mut world).await;
+        let session_id = world.core.session_id.clone();
+
+        let resumed = resumed_world(&dir, "parallel-agents", &session_id).await;
+        let boxes = sub_boxes(&resumed.chat.borrow());
+
+        assert!(
+            !resumed.deferred_subs.is_empty(),
+            "the demo spawns sub-agents, so the resume defers them"
+        );
+        let box_indices: HashSet<usize> = boxes.iter().map(|(n, _, _, _)| *n).collect();
+        assert_eq!(
+            resumed.deferred_subs, box_indices,
+            "deferred set is exactly the resumed sub-agent boxes"
+        );
+
+        for (n, status, report, task) in &boxes {
+            assert_eq!(
+                *status,
+                SubAgentStatus::Done,
+                "resumed box Sub({n}) is Done (replay closes the bracket)"
+            );
+            assert!(
+                report.as_deref().is_some_and(|r| !r.is_empty()),
+                "resumed box Sub({n}) carries a non-empty report: {report:?}"
+            );
+            assert!(
+                !task.is_empty(),
+                "resumed box Sub({n}) carries its spawn task: {task:?}"
+            );
+            let chat = resumed.chat.borrow();
+            let transcript = chat
+                .transcript(AgentId::Sub(*n))
+                .unwrap_or_else(|| panic!("Sub({n}) transcript slot present"));
+            assert!(
+                transcript.entries().is_empty(),
+                "Sub({n}) transcript is deferred, so empty until observed"
+            );
+        }
+    }
+
+    /// Observing a deferred sub-agent materializes its transcript on demand,
+    /// switches the view to it, and produces the same entry shape the eager
+    /// replay path builds.
+    #[tokio::test]
+    async fn observe_materializes_a_deferred_subagent() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut world = scripted_world(&dir, "parallel-agents").await;
+        drive_demo_to_completion(&mut world).await;
+        let session_id = world.core.session_id.clone();
+
+        let mut resumed = resumed_world(&dir, "parallel-agents", &session_id).await;
+        let shell = shell_for(&resumed);
+        let n = *resumed
+            .deferred_subs
+            .iter()
+            .min()
+            .expect("a deferred sub-agent to observe");
+
+        // What the eager path produces for Sub(n): full `replay` reduced into
+        // a throwaway chat over the same log, with Sub(n) set active so its
+        // tool cells reconcile to `header_only == false` exactly as the
+        // materialized world will once observe makes Sub(n) active. Comparing
+        // the richer shape (not just the kind) catches a divergence in tool
+        // args, message text, `finalized`, or `header_only`.
+        let (eager_shape, eager_report) = {
+            let eager = eager_chat(&resumed, AgentId::Sub(n)).await;
+            let report = sub_boxes(&eager)
+                .into_iter()
+                .find(|(m, _, _, _)| *m == n)
+                .map(|(_, _, report, _)| report)
+                .expect("eager box for Sub(n)");
+            (transcript_shape(&eager, AgentId::Sub(n)), report)
+        };
+
+        // The box report the resume produced, captured before observe so we can
+        // prove observe does not touch it.
+        let resume_report = sub_boxes(&resumed.chat.borrow())
+            .into_iter()
+            .find(|(m, _, _, _)| *m == n)
+            .map(|(_, _, report, _)| report)
+            .expect("resumed box for Sub(n)");
+        assert_eq!(
+            resume_report, eager_report,
+            "the resumed box report matches the eager resume's"
+        );
+
+        let effect = apply_picker_outcome(
+            &mut resumed,
+            &shell,
+            AgentPickerOutcome::Observe(AgentId::Sub(n)),
+        )
+        .await;
+        assert!(matches!(effect, ActionEffect::Redraw));
+
+        assert!(
+            !resumed.deferred_subs.contains(&n),
+            "Sub({n}) left the deferred set on observe"
+        );
+        assert_eq!(
+            resumed.chat.borrow().active_view(),
+            AgentId::Sub(n),
+            "observe switches the active view to the sub-agent"
+        );
+
+        let chat = resumed.chat.borrow();
+        let transcript = chat
+            .transcript(AgentId::Sub(n))
+            .expect("Sub(n) transcript materialized");
+        assert!(
+            !transcript.entries().is_empty(),
+            "materialized transcript has entries"
+        );
+        assert!(
+            transcript
+                .entries()
+                .iter()
+                .any(|e| matches!(e.kind, EntryKind::Tool(_))),
+            "the sub-agent's bash call materialized as a tool cell"
+        );
+        assert!(
+            transcript
+                .entries()
+                .iter()
+                .any(|e| matches!(e.kind, EntryKind::Assistant(_))),
+            "the sub-agent's assistant messages materialized"
+        );
+        // Parity with the eager path: same entries and payloads, with
+        // `header_only` reconciled the same way now that both views point at
+        // Sub(n). So the materialized transcript equals what a full resume
+        // would build.
+        assert_eq!(
+            transcript_shape(&chat, AgentId::Sub(n)),
+            eager_shape,
+            "materialized transcript matches the eager replay on kind, \
+             header_only, finalized, and payload"
+        );
+        // Observe is a pure read of box metadata: the report is unchanged by
+        // materializing the transcript, so it still equals both its resume-time
+        // value and the eager resume's.
+        let post_observe_report = sub_boxes(&chat)
+            .into_iter()
+            .find(|(m, _, _, _)| *m == n)
+            .map(|(_, _, report, _)| report)
+            .expect("observed box for Sub(n)");
+        assert_eq!(
+            post_observe_report, resume_report,
+            "observe leaves the box report unchanged from resume"
+        );
+        assert_eq!(
+            post_observe_report, eager_report,
+            "the observed box report matches the eager resume's"
+        );
+    }
+
+    /// Re-observing a materialized sub-agent is a no-op: its transcript is
+    /// unchanged and it stays out of the deferred set.
+    #[tokio::test]
+    async fn re_observe_is_idempotent() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut world = scripted_world(&dir, "parallel-agents").await;
+        drive_demo_to_completion(&mut world).await;
+        let session_id = world.core.session_id.clone();
+
+        let mut resumed = resumed_world(&dir, "parallel-agents", &session_id).await;
+        let shell = shell_for(&resumed);
+        let n = *resumed
+            .deferred_subs
+            .iter()
+            .min()
+            .expect("a deferred sub-agent to observe");
+
+        apply_picker_outcome(
+            &mut resumed,
+            &shell,
+            AgentPickerOutcome::Observe(AgentId::Sub(n)),
+        )
+        .await;
+        let count_after_first = resumed
+            .chat
+            .borrow()
+            .transcript(AgentId::Sub(n))
+            .expect("materialized")
+            .entries()
+            .len();
+
+        // Switch to Main, then observe the same sub again.
+        apply_picker_outcome(
+            &mut resumed,
+            &shell,
+            AgentPickerOutcome::Observe(AgentId::Main),
+        )
+        .await;
+        apply_picker_outcome(
+            &mut resumed,
+            &shell,
+            AgentPickerOutcome::Observe(AgentId::Sub(n)),
+        )
+        .await;
+
+        assert!(
+            !resumed.deferred_subs.contains(&n),
+            "re-observe leaves Sub({n}) out of the deferred set"
+        );
+        let count_after_second = resumed
+            .chat
+            .borrow()
+            .transcript(AgentId::Sub(n))
+            .expect("still materialized")
+            .entries()
+            .len();
+        assert_eq!(
+            count_after_first, count_after_second,
+            "re-observe does no materialize work, so the transcript is intact"
+        );
+    }
+
+    /// After materializing a sub-agent, switching the active view away and
+    /// back flips its tool cells' `header_only` flags exactly as the eager
+    /// path leaves them with the sub active. This pins the reconcile in
+    /// `set_active_view` for a resumed, lazily materialized transcript.
+    #[tokio::test]
+    async fn header_only_reconciles_across_view_switches() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut world = scripted_world(&dir, "parallel-agents").await;
+        drive_demo_to_completion(&mut world).await;
+        let session_id = world.core.session_id.clone();
+
+        let mut resumed = resumed_world(&dir, "parallel-agents", &session_id).await;
+        let shell = shell_for(&resumed);
+        let n = *resumed
+            .deferred_subs
+            .iter()
+            .min()
+            .expect("a deferred sub-agent to observe");
+
+        // Eager reference: Sub(n) active, so its tool cells are expanded.
+        let eager_header_only = {
+            let eager = eager_chat(&resumed, AgentId::Sub(n)).await;
+            tool_header_only(&eager, AgentId::Sub(n))
+        };
+        assert!(
+            !eager_header_only.is_empty(),
+            "the sub-agent has tool cells to reconcile"
+        );
+
+        // Observe makes Sub(n) active and materializes it, expanding its
+        // tool cells.
+        apply_picker_outcome(
+            &mut resumed,
+            &shell,
+            AgentPickerOutcome::Observe(AgentId::Sub(n)),
+        )
+        .await;
+        assert!(
+            tool_header_only(&resumed.chat.borrow(), AgentId::Sub(n))
+                .iter()
+                .all(|h| !h),
+            "observing the sub expands its tool cells"
+        );
+
+        // Switch to Main: the sub's tool cells collapse.
+        resumed.chat.borrow_mut().set_active_view(AgentId::Main);
+        assert!(
+            tool_header_only(&resumed.chat.borrow(), AgentId::Sub(n))
+                .iter()
+                .all(|h| *h),
+            "viewing Main collapses the sub's tool cells"
+        );
+
+        // Switch back to Sub(n): the flags must land exactly where the eager
+        // path leaves them.
+        resumed.chat.borrow_mut().set_active_view(AgentId::Sub(n));
+        assert_eq!(
+            tool_header_only(&resumed.chat.borrow(), AgentId::Sub(n)),
+            eager_header_only,
+            "returning to the sub reconciles header_only to the eager result"
+        );
+    }
+
+    /// Switching from a session with deferred sub-agents to a fresh session
+    /// replaces the deferred set, so the old indices cannot leak.
+    #[tokio::test]
+    async fn session_switch_replaces_deferred_subs() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut world = scripted_world(&dir, "parallel-agents").await;
+        drive_demo_to_completion(&mut world).await;
+        let previous_id = world.core.session_id.clone();
+
+        // Resume the sub-agent session so the world carries a non-empty
+        // deferred set, then switch onto a fresh session over it.
+        let mut resumed = resumed_world(&dir, "parallel-agents", &previous_id).await;
+        assert!(
+            !resumed.deferred_subs.is_empty(),
+            "the resumed session has deferred sub-agents"
+        );
+        let shell = shell_for(&resumed);
+
+        let fresh = build_next_session(
+            &resumed,
+            SessionSpec::Create {
+                entry: SessionEntry::Switch,
+            },
+            &previous_id,
+        )
+        .await
+        .expect("build fresh next session");
+        install_next_session(&mut resumed, &shell, fresh);
+
+        assert!(
+            resumed.deferred_subs.is_empty(),
+            "a fresh session has no deferred subs, and the old set did not leak"
+        );
+    }
+
+    /// A session aborted mid sub-agent run (a torn final line and a log cut
+    /// short) still resumes: the repair drops the torn record, every box is
+    /// `Done`, and observing one materializes its flushed history without
+    /// panicking.
+    #[tokio::test]
+    async fn aborted_session_resume_loads_and_observes() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut world = scripted_world(&dir, "parallel-agents").await;
+        drive_demo_to_completion(&mut world).await;
+        let session_id = world.core.session_id.clone();
+        let log_path = {
+            let log = world.core.log.lock().await;
+            log.path().to_path_buf()
+        };
+        // Drop the world so no open handle races the on-disk rewrite.
+        drop(world);
+
+        // Truncate mid sub-agent run: keep every complete line up to the last
+        // sub-agent line, then tear that line in half. `ConversationLog::resume`
+        // repairs the log by dropping the torn final line, so that sub-agent's
+        // run is cut short with only its earlier messages flushed. This is the
+        // aborted shape the spec wants (no terminal record, torn final line).
+        let bytes = std::fs::read(&log_path).expect("read persisted log");
+        let (keep, torn_sub) = {
+            let text = std::str::from_utf8(&bytes).expect("log is utf8");
+            let mut off = 0usize;
+            let mut last_sub: Option<(usize, usize, usize)> = None;
+            for line in text.lines() {
+                let start = off;
+                let end = off + line.len();
+                off = end + 1; // one '\n' terminator per line
+                let v: serde_json::Value =
+                    serde_json::from_str(line).expect("each log line is JSON");
+                if v.get("thread").and_then(|t| t.as_str()) == Some("subagent") {
+                    let agent = v
+                        .get("agent_id")
+                        .and_then(|a| a.as_u64())
+                        .and_then(|a| usize::try_from(a).ok())
+                        .expect("a subagent line carries its agent id");
+                    last_sub = Some((start, end, agent));
+                }
+            }
+            let (start, end, agent) = last_sub.expect("the demo persisted sub-agent lines");
+            (start + (end - start) / 2, agent)
+        };
+        std::fs::write(&log_path, &bytes[..keep]).expect("truncate persisted log");
+
+        let mut resumed = resumed_world(&dir, "parallel-agents", &session_id).await;
+
+        // The main transcript loads (at least the seeded user turn).
+        assert!(
+            resumed
+                .chat
+                .borrow()
+                .transcript(AgentId::Main)
+                .is_some_and(|t| !t.entries().is_empty()),
+            "the main transcript resumes from the truncated log"
+        );
+        for (n, status, _, _) in sub_boxes(&resumed.chat.borrow()) {
+            assert_eq!(
+                status,
+                SubAgentStatus::Done,
+                "an aborted sub-agent box Sub({n}) still resumes Done"
+            );
+        }
+
+        // The truncation cuts sub `torn_sub` mid run, so its box is deferred.
+        // Fail loudly rather than silently skip the materialize check if the
+        // truncation ever stops covering a sub-agent.
+        assert!(
+            !resumed.deferred_subs.is_empty(),
+            "the truncated log still holds deferred sub-agents"
+        );
+        assert!(
+            resumed.deferred_subs.contains(&torn_sub),
+            "the torn sub-agent Sub({torn_sub}) is deferred"
+        );
+        let n = torn_sub;
+
+        // The eager (full-replay) resume over the SAME truncated, repaired log,
+        // with Sub(n) set active. This is the reference a non-lazy resume would
+        // build.
+        let eager = eager_chat(&resumed, AgentId::Sub(n)).await;
+        let eager_shape = transcript_shape(&eager, AgentId::Sub(n));
+        let eager_report = sub_boxes(&eager)
+            .into_iter()
+            .find(|(m, _, _, _)| *m == n)
+            .map(|(_, _, report, _)| report)
+            .expect("eager box for Sub(n)");
+
+        // Resume-time report parity: the lazy resume and the eager resume agree
+        // on the box report. Sub(n) is tool-concluding here (its last flushed
+        // entry is a tool result, its concluding assistant text was torn off),
+        // so per spec both show an empty report (a thin box). This is the "the
+        // report matches, per spec" guarantee.
+        let resumed_report = sub_boxes(&resumed.chat.borrow())
+            .into_iter()
+            .find(|(m, _, _, _)| *m == n)
+            .map(|(_, _, report, _)| report)
+            .expect("resumed box for Sub(n)");
+        assert_eq!(
+            resumed_report, eager_report,
+            "the aborted box report matches the eager resume"
+        );
+
+        let shell = shell_for(&resumed);
+        apply_picker_outcome(
+            &mut resumed,
+            &shell,
+            AgentPickerOutcome::Observe(AgentId::Sub(n)),
+        )
+        .await;
+        assert!(
+            !resumed.deferred_subs.contains(&n),
+            "observe materialized Sub({n})"
+        );
+
+        // Observing reads the actual flushed history from the repaired log:
+        // the materialized transcript equals the eager resume's, entry for
+        // entry, including tool args and `header_only`.
+        assert_eq!(
+            transcript_shape(&resumed.chat.borrow(), AgentId::Sub(n)),
+            eager_shape,
+            "the materialized transcript equals the eager resume's flushed history"
+        );
+
+        // Observe is a pure read of box metadata: materializing Sub(n)'s
+        // transcript does not rewrite its box report. `parallel-agents` runs
+        // its two subs concurrently, so their entries interleave in the log's
+        // append order and replay opens/closes each bracket several times. For
+        // such an interleaved sub the report set by `SubAgentEnd` (bracket
+        // order) differs from the thread-order last assistant text that
+        // materializing replays through `reduce_assistant_end`. The reducer
+        // refreshes the report only while the box is `Running`, so a Done box
+        // keeps its authoritative resume-time report through observe.
+        let post_observe_report = sub_boxes(&resumed.chat.borrow())
+            .into_iter()
+            .find(|(m, _, _, _)| *m == n)
+            .map(|(_, _, report, _)| report)
+            .expect("observed box for Sub(n)");
+        assert_eq!(
+            post_observe_report, eager_report,
+            "observe leaves the box report equal to the eager resume's"
+        );
     }
 
     /// A fresh session folds the context listing as the leading Info notice,
@@ -8209,7 +8944,8 @@ mod tests {
             &mut world,
             &shell,
             AgentPickerOutcome::Observe(AgentId::Sub(2)),
-        );
+        )
+        .await;
         assert!(matches!(effect, ActionEffect::Redraw));
         assert_eq!(world.chat.borrow().active_view(), AgentId::Sub(2));
     }
@@ -8270,7 +9006,8 @@ mod tests {
             &mut world,
             &shell,
             AgentPickerOutcome::Observe(AgentId::Sub(1)),
-        );
+        )
+        .await;
         assert!(matches!(effect, ActionEffect::Redraw));
         assert_eq!(world.chat.borrow().active_view(), AgentId::Sub(1));
 
@@ -8351,7 +9088,8 @@ mod tests {
             &mut world,
             &shell,
             AgentPickerOutcome::Observe(AgentId::Sub(1)),
-        );
+        )
+        .await;
         sync_editor_chrome(&world, &shell);
 
         let border = editor_border_fg(&shell);
@@ -8408,7 +9146,8 @@ mod tests {
             &mut world,
             &shell,
             AgentPickerOutcome::Observe(AgentId::Sub(1)),
-        );
+        )
+        .await;
         assert!(matches!(effect, ActionEffect::Redraw));
         // The picker switches the view; the reconcile writes the marker.
         sync_editor_chrome(&world, &shell);
@@ -8426,7 +9165,8 @@ mod tests {
             &mut world,
             &shell,
             AgentPickerOutcome::Observe(AgentId::Main),
-        );
+        )
+        .await;
         assert!(matches!(effect, ActionEffect::Redraw));
         sync_editor_chrome(&world, &shell);
         assert!(
@@ -8466,7 +9206,8 @@ mod tests {
             &mut world,
             &shell,
             AgentPickerOutcome::Observe(AgentId::Sub(1)),
-        );
+        )
+        .await;
         sync_editor_chrome(&world, &shell);
         assert!(
             editor_top_bar_text(&shell).contains("agent 1"),
@@ -8521,7 +9262,8 @@ mod tests {
             &mut world,
             &shell,
             AgentPickerOutcome::Observe(AgentId::Sub(1)),
-        );
+        )
+        .await;
         sync_editor_chrome(&world, &shell);
         let sub_tint = editor_border_fg(&shell);
         assert!(
@@ -8667,7 +9409,7 @@ mod tests {
             "confirm closed picker"
         );
 
-        apply_pending_picker_outcome(&mut world, &shell, &mut app);
+        apply_pending_picker_outcome(&mut world, &shell, &mut app).await;
         assert!(shell.borrow().overlays.borrow().is_open(), "viewer open");
 
         writer.write_all(&[0x0b]).expect("write ctrl+k");
@@ -8700,11 +9442,13 @@ mod tests {
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         let id = register_bash_task(&world, "cargo test");
 
-        let effect = apply_picker_outcome(&mut world, &shell, AgentPickerOutcome::OpenTask(id));
+        let effect =
+            apply_picker_outcome(&mut world, &shell, AgentPickerOutcome::OpenTask(id)).await;
         assert!(matches!(effect, ActionEffect::OpenedOverlay));
         assert!(shell.borrow().overlays.borrow().is_open(), "viewer open");
 
-        let effect = apply_picker_outcome(&mut world, &shell, AgentPickerOutcome::OpenTask(9_999));
+        let effect =
+            apply_picker_outcome(&mut world, &shell, AgentPickerOutcome::OpenTask(9_999)).await;
         assert!(matches!(effect, ActionEffect::Redraw));
         assert!(
             main_notices(&world)
@@ -8722,13 +9466,13 @@ mod tests {
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         let id = register_bash_task(&world, "sleep 100");
 
-        apply_picker_outcome(&mut world, &shell, AgentPickerOutcome::Kill(id));
+        apply_picker_outcome(&mut world, &shell, AgentPickerOutcome::Kill(id)).await;
         world
             .core
             .task_registry
             .set_status(id, aj_agent::tool::TaskStatus::Killed);
-        apply_picker_outcome(&mut world, &shell, AgentPickerOutcome::Kill(id));
-        apply_picker_outcome(&mut world, &shell, AgentPickerOutcome::Kill(9_999));
+        apply_picker_outcome(&mut world, &shell, AgentPickerOutcome::Kill(id)).await;
+        apply_picker_outcome(&mut world, &shell, AgentPickerOutcome::Kill(9_999)).await;
 
         let notices = main_notices(&world);
         assert!(
@@ -8755,7 +9499,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         let id = register_bash_task(&world, "echo hello");
-        apply_picker_outcome(&mut world, &shell, AgentPickerOutcome::OpenTask(id));
+        apply_picker_outcome(&mut world, &shell, AgentPickerOutcome::OpenTask(id)).await;
         // The viewer shows the command header and a running status.
         let rendered = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
         assert!(rendered.contains("echo hello"), "command: {rendered}");

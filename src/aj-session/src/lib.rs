@@ -44,6 +44,6 @@ pub use prompt_history::{
     workspace_history, workspace_history_streaming,
 };
 pub use repair::repair_interrupted_tool_uses;
-pub use replay::replay;
+pub use replay::{project_thread, replay, replay_deferring_subs};
 pub use stats::SessionStats;
 pub use tool_details::resolve_tool_details;
