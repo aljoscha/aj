@@ -1,74 +1,75 @@
 //! The sub-agent box: the parent-transcript widget for one sub-agent
-//! run, rendering the child's transcript inline.
+//! run.
 //!
-//! This is `aj`'s compact mode: a gray box with a one-line
-//! `{glyph} agent {N} · {task}` title, the child transcript laid out
-//! below it through the same per-entry builders the top-level list
-//! uses (tool entries compose header-only via their `header_only`
-//! flag), tail-windowed to [`COMPACT_ROWS`] rows with an
-//! `… (N earlier lines)` hint so a long-running sub-agent never
-//! floods the scrollback.
+//! A gray box with a one-line `{glyph} agent {N} · {task}` title and a
+//! metadata body. Once the sub-agent is done the body is its report,
+//! soft-wrapped. While it runs the glyph is an event-driven spinner
+//! frame (advanced by the box's activity counter) and the body is a
+//! single latest-activity line that clips with an ellipsis.
 //!
-//! `aj`'s full ("observing") mode has no counterpart here: switching
-//! the observed agent swaps the [`TranscriptView`]'s whole list over
-//! to that agent's transcript (`ChatState::set_active_view`), so the
-//! box itself never renders full-size.
+//! The box renders from box metadata alone: it never composites the
+//! child transcript or tail-windows it, so it needs no access to the
+//! sub's transcript. That is what lets a resumed sub-agent's transcript
+//! stay unmaterialized until observed. The full conversation is one
+//! Observe away, which swaps the whole list over to that agent's
+//! transcript ([`set_active_view`](aj_app::chat::ChatState::set_active_view)).
 //!
 //! Like the other transcript widgets, the box is built fresh per draw
-//! from data extracted out of [`ChatState`] at build time. Drawing
-//! needs no model access, so the `ListView` builder's shared borrow
-//! never nests or escapes.
-//!
-//! [`TranscriptView`]: crate::transcript::TranscriptView
+//! from data extracted out of [`ChatState`](aj_app::chat::ChatState) at
+//! build time. Drawing needs no model access, so the `ListView`
+//! builder's shared borrow never nests or escapes.
 
-use aj_agent::events::AgentId;
-use aj_app::chat::{ChatState, SubAgentEntry, SubAgentStatus};
+use aj_app::chat::{SubAgentEntry, SubAgentStatus};
 use vaxis::cell::{Cell, Color, Style};
 use vaxis::vxfw::{
     DrawContext, MaxSize, Overflow, RichText, Size, SubSurface, Surface, TextSpan, Widget,
 };
 
 use crate::bubble::{MIN_BUBBLE_WIDTH, PADDING_X, PADDING_Y};
-use crate::transcript::{TranscriptStyles, build_entry_widget};
+use crate::transcript::TranscriptStyles;
 
-/// Inner transcript rows shown in the compact box before the tail
-/// window kicks in (hint row included), the single knob to tune.
-const COMPACT_ROWS: usize = 18;
+/// Spinner frames for a `Running` box's glyph. A local copy of the
+/// status-loader frame set: the modules stay decoupled, so the box
+/// does not reach into `status.rs`'s private const.
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// On-screen representation of one sub-agent run, boxed inside the
 /// parent's transcript.
 pub(crate) struct SubAgentBox {
     /// The `{glyph} agent {N} · {task}` title spans, one logical line
-    /// (the task text is whitespace-normalized at build time).
+    /// (the task text is whitespace-normalized at build time). The
+    /// glyph is a check when done or a spinner frame while running.
     title: Vec<TextSpan>,
-    /// The child transcript's entry widgets, in append order. Built
-    /// at construction so drawing needs no `ChatState` access.
-    children: Vec<Box<dyn Widget>>,
+    /// The body spans: the report when done, the latest-activity line
+    /// while running. Empty when there is nothing to show (a done
+    /// sub-agent with no report, a running sub with no activity yet).
+    body: Vec<TextSpan>,
+    /// Whether the body soft-wraps. A done report wraps across rows; a
+    /// running activity line stays on one row and clips with an ellipsis.
+    body_softwrap: bool,
     /// The box tint (the shared pending-tool gray, matching `aj`).
     bg: Color,
-    /// Style of the `… (N earlier lines)` window hint.
-    dim: Style,
 }
 
-/// Build the box for `entry`, snapshotting the child transcript's
-/// entries into per-entry widgets.
-///
-/// Sub-agents never spawn sub-agents (the `agent` tool is excluded
-/// from a child's inherited tool list), so the inner entries are
-/// built non-recursively: an impossible nested `SubAgent` entry
-/// degrades to the builder's dim stub line.
-pub(crate) fn build_subagent_box(
-    entry: &SubAgentEntry,
-    chat: &ChatState,
-    styles: &TranscriptStyles,
-) -> SubAgentBox {
+/// Build the box for `entry` from its metadata: the report (done) or a
+/// spinner glyph plus latest-activity line (running). Reads no
+/// transcript.
+pub(crate) fn build_subagent_box(entry: &SubAgentEntry, styles: &TranscriptStyles) -> SubAgentBox {
     let span = |text: String, style: Style| TextSpan {
         text,
         style,
         ..TextSpan::default()
     };
     let glyph = match entry.status {
-        SubAgentStatus::Running => span("▸".into(), styles.dim),
+        // The running glyph advances on activity, not a wall-clock: the
+        // frame is picked by the box's activity counter, so it steps on
+        // each sub-agent event without a redraw timer.
+        SubAgentStatus::Running => {
+            // Modulo the frame count so the index is bounded and fits usize.
+            let n = u64::try_from(SPINNER_FRAMES.len()).unwrap_or(u64::MAX);
+            let idx = usize::try_from(entry.activity_ticks % n).unwrap_or(0);
+            span(SPINNER_FRAMES[idx].into(), styles.dim)
+        }
         SubAgentStatus::Done => span("✓".into(), styles.success),
     };
     // Collapse the task text to one line so the title never wraps.
@@ -82,20 +83,27 @@ pub(crate) fn build_subagent_box(
         span(" · ".into(), styles.text),
         span(task, styles.dim),
     ];
-    let children = chat
-        .transcript(AgentId::Sub(entry.child))
-        .map(|t| {
-            t.entries()
-                .iter()
-                .map(|e| build_entry_widget(e, chat, styles, true, None).into_boxed())
-                .collect()
-        })
-        .unwrap_or_default();
+    // The body is metadata only. A done box shows its report; a running
+    // box shows the latest-activity line. An empty report is a real,
+    // accepted case (a sub-agent that concluded on a tool call), and
+    // renders a thin title-only box.
+    let (body, body_softwrap) = match entry.status {
+        SubAgentStatus::Done => match entry.report.as_deref() {
+            Some(report) if !report.is_empty() => (vec![span(report.into(), styles.text)], true),
+            _ => (Vec::new(), true),
+        },
+        SubAgentStatus::Running => match entry.latest_activity.as_deref() {
+            Some(activity) if !activity.is_empty() => {
+                (vec![span(activity.into(), styles.dim)], false)
+            }
+            _ => (Vec::new(), false),
+        },
+    };
     SubAgentBox {
         title,
-        children,
+        body,
+        body_softwrap,
         bg: styles.tool_pending_bg,
-        dim: styles.dim,
     }
 }
 
@@ -137,49 +145,18 @@ pub(crate) fn surface_rows(surface: &Surface) -> Vec<Vec<Cell>> {
     grid
 }
 
-/// Whether a composited row is visually empty: no text and no
-/// background tint. Bg-painted pad rows of an inner bubble count as
-/// content, so trimming can't eat a bubble's frame.
-fn row_is_blank(row: &[Cell]) -> bool {
-    row.iter()
-        .all(|c| c.char.grapheme().trim().is_empty() && c.style.bg == Color::Default)
-}
-
 impl SubAgentBox {
-    /// Lay the child widgets out at `inner_ctx`'s width and composite
-    /// them into one row list, in entry order. Trailing blank rows
-    /// (the last entry's spacer) are trimmed so the box's own bottom
-    /// padding provides the closing rhythm.
-    fn body_rows(&mut self, inner_ctx: &DrawContext) -> Vec<Vec<Cell>> {
-        let mut rows = Vec::new();
-        for child in &mut self.children {
-            rows.extend(surface_rows(&child.draw(inner_ctx)));
+    /// Draw the body spans at `inner_ctx`'s width. The report wraps
+    /// across rows; a running activity line stays on one row and clips
+    /// with an ellipsis. Empty body draws no rows.
+    fn body_rows(&self, inner_ctx: &DrawContext) -> Vec<Vec<Cell>> {
+        if self.body.is_empty() {
+            return Vec::new();
         }
-        while rows.last().is_some_and(|r| row_is_blank(r)) {
-            rows.pop();
-        }
-        rows
-    }
-
-    /// Tail-window `rows` to [`COMPACT_ROWS`], reserving one row for
-    /// the dropped-lines hint so the total body never exceeds the
-    /// window.
-    fn window_tail(&self, mut rows: Vec<Vec<Cell>>, inner_ctx: &DrawContext) -> Vec<Vec<Cell>> {
-        if rows.len() <= COMPACT_ROWS {
-            return rows;
-        }
-        let keep = COMPACT_ROWS - 1;
-        let earlier = rows.len() - keep;
-        let tail = rows.split_off(rows.len() - keep);
-        let mut hint = RichText::new(vec![TextSpan {
-            text: format!("… ({earlier} earlier lines)"),
-            style: self.dim,
-            ..TextSpan::default()
-        }]);
-        hint.softwrap = false;
-        let mut windowed = surface_rows(&hint.draw(inner_ctx));
-        windowed.extend(tail);
-        windowed
+        let mut text = RichText::new(self.body.clone());
+        text.softwrap = self.body_softwrap;
+        text.overflow = Overflow::Ellipsis;
+        surface_rows(&text.draw(inner_ctx))
     }
 
     /// Draw the title spans as a single ellipsis-truncated row at the
@@ -232,8 +209,7 @@ impl Widget for SubAgentBox {
         );
 
         let mut content = self.title_rows(&inner_ctx);
-        let body = self.body_rows(&inner_ctx);
-        content.extend(self.window_tail(body, &inner_ctx));
+        content.extend(self.body_rows(&inner_ctx));
 
         if !bubble {
             return Self::draw_plain(content, width);
@@ -241,10 +217,10 @@ impl Widget for SubAgentBox {
 
         // The bubble frame: bg-filled padding around the content rows
         // plus one untinted spacer row, the same rhythm as `Bubble`.
-        // Content is written directly into the buffer (not as child
-        // surfaces) because the tail window slices rows out of the
-        // middle of the children's output.
-        let content_height = u16::try_from(content.len()).expect("windowed box rows fit u16");
+        // Content (title rows followed by body rows) is written directly
+        // into the buffer rather than as child surfaces so we can paint
+        // the box tint under each composited row.
+        let content_height = u16::try_from(content.len()).expect("box rows fit u16");
         let bubble_height = content_height + 2 * PADDING_Y;
         let mut surface = Surface::with_size(Size {
             width,
@@ -297,10 +273,10 @@ impl Widget for SubAgentBox {
 mod tests {
     use std::sync::Arc;
 
-    use aj_agent::events::{AgentEvent, AgentSettings};
+    use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
     use aj_agent::message::AgentMessage;
     use aj_agent::tool::ToolDetails;
-    use aj_app::chat::{EntryKind, reduce};
+    use aj_app::chat::{ChatState, EntryKind, reduce};
     use aj_app::session::AgentLifecycle;
     use aj_app::theme::{ColorMode, Theme};
     use aj_models::types::{
@@ -348,9 +324,10 @@ mod tests {
     }
 
     /// Reduce a lifelike sub-agent event sequence into `chat`: spawn,
-    /// task prompt, an assistant line, and one bash tool call. The
-    /// active view stays `Main`, so the tool entry is flagged
-    /// `header_only` by the reducer.
+    /// task prompt, an assistant line, and one bash tool call. The box
+    /// stays `Running`, with `bash` as its latest activity (the tool
+    /// start is the last live event). The child transcript is built too,
+    /// which the metadata box ignores.
     fn reduce_sub_run(chat: &mut ChatState, life: &mut AgentLifecycle) {
         let sub = AgentId::Sub(0);
         let events = vec![
@@ -442,15 +419,22 @@ mod tests {
 
     fn draw_box(chat: &ChatState, width: u16) -> Surface {
         let s = styles();
-        let mut b = build_subagent_box(box_entry(chat), chat, &s);
+        let mut b = build_subagent_box(box_entry(chat), &s);
         b.draw(&draw_ctx(width, None))
     }
 
+    /// The spinner frame a `Running` box shows for the given activity count.
+    fn frame_for(ticks: u64) -> &'static str {
+        let n = u64::try_from(SPINNER_FRAMES.len()).unwrap_or(u64::MAX);
+        SPINNER_FRAMES[usize::try_from(ticks % n).unwrap_or(0)]
+    }
+
     #[test]
-    fn compact_box_renders_title_content_and_tint() {
+    fn compact_box_renders_title_report_and_tint() {
         let mut chat = chat();
         let mut life = AgentLifecycle::default();
         reduce_sub_run(&mut chat, &mut life);
+        reduce_sub_end(&mut chat, &mut life);
         let s = styles();
         let surface = draw_box(&chat, 60);
         let r = rows(&surface);
@@ -458,30 +442,18 @@ mod tests {
         // Frame: bg-painted blank pads around the content, untinted
         // spacer at the bottom.
         assert_eq!(r[0], "", "top pad row is blank");
-        assert_eq!(r[1], " ▸ agent 0 · check the build setup");
+        assert_eq!(r[1], " ✓ agent 0 · check the build setup");
+        assert_eq!(r[2], " all good", "the report is the body");
         assert_eq!(r.last().unwrap(), "", "spacer row is blank");
-        // Inner entries composite in order: task bubble, assistant
-        // text, header-only tool line.
-        let body = r.join("\n");
-        assert!(body.contains("check the build setup"), "{r:?}");
-        assert!(body.contains("On it."), "{r:?}");
-        assert!(
-            body.contains("✓ bash(command=\"echo hi\")"),
-            "header-only tool line inside: {r:?}",
-        );
-        assert!(
-            !body.contains("$ echo hi"),
-            "header-only tools show no body: {r:?}",
-        );
 
-        // Tint: every bubble row is painted (the inner user bubble
-        // keeps its own tint), the trailing spacer row is not.
+        // Tint: every bubble row is the tool-pending gray, the trailing
+        // spacer row is untinted.
         let grid = flatten(&surface);
         let h = grid.len();
         for (row_idx, row) in grid.iter().enumerate().take(h - 1) {
             for (col_idx, cell) in row.iter().enumerate() {
-                assert!(
-                    cell.style.bg == s.tool_pending_bg || cell.style.bg == s.user_message_bg,
+                assert_eq!(
+                    cell.style.bg, s.tool_pending_bg,
                     "cell ({row_idx},{col_idx}) untinted",
                 );
             }
@@ -490,31 +462,16 @@ mod tests {
     }
 
     #[test]
-    fn inner_user_bubble_keeps_its_own_tint() {
-        let mut chat = chat();
-        let mut life = AgentLifecycle::default();
-        reduce_sub_run(&mut chat, &mut life);
-        let s = styles();
-        let grid = flatten(&draw_box(&chat, 60));
-        assert!(
-            grid.iter()
-                .flatten()
-                .any(|c| c.style.bg == s.user_message_bg),
-            "the task prompt's user bubble tint survives the box paint",
-        );
-    }
-
-    #[test]
     fn box_never_tints_a_default_cell() {
         // A tinted cell must not stay flagged `default`. The render diff's
         // default fast-path treats two `default` cells as equal regardless of
         // background, so a `default` cell carrying the box tint reads as blank
         // and is never repainted, stranding stale gray when the box moves or
-        // shrinks. The inner user bubble's blank spacer row is the cell that
-        // used to slip through the box paint.
+        // shrinks.
         let mut chat = chat();
         let mut life = AgentLifecycle::default();
         reduce_sub_run(&mut chat, &mut life);
+        reduce_sub_end(&mut chat, &mut life);
         let grid = flatten(&draw_box(&chat, 60));
         for (r, row) in grid.iter().enumerate() {
             for (c, cell) in row.iter().enumerate() {
@@ -528,44 +485,73 @@ mod tests {
     }
 
     #[test]
-    fn done_status_flips_glyph_to_check() {
+    fn running_box_shows_spinner_and_latest_activity() {
+        let mut chat = chat();
+        let mut life = AgentLifecycle::default();
+        reduce_sub_run(&mut chat, &mut life);
+        let entry = box_entry(&chat);
+        assert_eq!(entry.status, SubAgentStatus::Running);
+        // The bash tool start is the sub's last live activity.
+        assert_eq!(entry.latest_activity.as_deref(), Some("bash"));
+        let frame = frame_for(entry.activity_ticks);
+
+        let r = rows(&draw_box(&chat, 60));
+        assert_eq!(r[1], format!(" {frame} agent 0 · check the build setup"));
+        assert_eq!(r[2], " bash", "the body is the latest-activity line");
+    }
+
+    #[test]
+    fn done_box_shows_check_and_report() {
         let mut chat = chat();
         let mut life = AgentLifecycle::default();
         reduce_sub_run(&mut chat, &mut life);
         reduce_sub_end(&mut chat, &mut life);
         assert_eq!(box_entry(&chat).status, SubAgentStatus::Done);
         let r = rows(&draw_box(&chat, 60));
+        let body = r.join("\n");
         assert_eq!(r[1], " ✓ agent 0 · check the build setup");
+        assert!(body.contains("all good"), "the report is shown: {r:?}");
+        // The box renders the report only, never the child transcript.
+        assert!(!body.contains("On it."), "no child assistant text: {r:?}");
+        assert!(!body.contains("echo hi"), "no child tool body: {r:?}");
     }
 
     #[test]
-    fn long_inner_transcript_windows_to_the_tail_with_hint() {
+    fn long_report_renders_in_full_softwrapped() {
         let mut chat = chat();
         let mut life = AgentLifecycle::default();
         reduce_sub_run(&mut chat, &mut life);
-        for i in 0..40 {
-            let _ = reduce(
-                &mut chat,
-                &mut life,
-                AgentEvent::Notice {
-                    agent_id: AgentId::Sub(0),
-                    text: format!("inner-{i}-marker"),
-                },
-            );
-        }
-        let surface = draw_box(&chat, 60);
-        let r = rows(&surface);
-        let body = r.join("\n");
-        assert!(body.contains("inner-39-marker"), "{r:?}");
-        assert!(!body.contains("inner-0-marker"), "{r:?}");
-        // The hint carries no expand-key suffix: the box windows
-        // unconditionally, there is nothing to expand.
-        assert!(body.contains("earlier lines)"), "{r:?}");
-        assert!(!body.contains("to expand"), "{r:?}");
-        // Total height: title + windowed body + pads + spacer.
-        assert_eq!(
-            usize::from(surface.size.height),
-            1 + COMPACT_ROWS + 2 * usize::from(PADDING_Y) + 1,
+        // A long report with distinctive markers at start, middle, and end.
+        // The box wraps it in full: no tail-window hint, and the markers land
+        // on different rows, so the whole report renders across rows.
+        let report = "ALPHA lorem ipsum dolor sit amet consectetur adipiscing elit \
+            sed do BETA eiusmod tempor incididunt ut labore et dolore magna aliqua \
+            ut enim ad minim OMEGA";
+        let _ = reduce(
+            &mut chat,
+            &mut life,
+            AgentEvent::SubAgentEnd {
+                parent: AgentId::Main,
+                child: AgentId::Sub(0),
+                report: report.into(),
+            },
+        );
+        let _ = reduce(
+            &mut chat,
+            &mut life,
+            AgentEvent::AgentEnd {
+                agent_id: AgentId::Sub(0),
+                messages: Vec::new(),
+            },
+        );
+        let r = rows(&draw_box(&chat, 40));
+        let alpha = r.iter().position(|l| l.contains("ALPHA")).expect("ALPHA");
+        let omega = r.iter().position(|l| l.contains("OMEGA")).expect("OMEGA");
+        assert!(r.iter().any(|l| l.contains("BETA")), "middle shown: {r:?}");
+        assert!(omega > alpha, "the report wraps across rows: {r:?}");
+        assert!(
+            !r.join("\n").contains("earlier lines"),
+            "no window hint remains: {r:?}",
         );
     }
 
@@ -595,9 +581,13 @@ mod tests {
             },
         );
         let width = 40;
+        let frame = frame_for(box_entry(&chat).activity_ticks);
         let surface = draw_box(&chat, width);
         let r = rows(&surface);
-        assert!(r[1].starts_with(" ▸ agent 0 · Search"), "{r:?}");
+        assert!(
+            r[1].starts_with(&format!(" {frame} agent 0 · Search")),
+            "{r:?}",
+        );
         assert!(r[1].ends_with('…'), "truncated with ellipsis: {r:?}");
         assert!(
             !r[2].contains("transcript entry"),
@@ -618,7 +608,7 @@ mod tests {
             flatten(&surface)
                 .iter()
                 .flatten()
-                .all(|c| c.style.bg == Color::Default || c.style.bg == styles().user_message_bg)
+                .all(|c| c.style.bg == Color::Default)
         );
     }
 
@@ -652,5 +642,6 @@ mod tests {
         let surface = view.draw(&ctx);
         let body = rows(&surface).join("\n");
         assert!(body.contains("✓ agent 0 · check the build setup"), "{body}");
+        assert!(body.contains("all good"), "the report shows: {body}");
     }
 }

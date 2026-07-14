@@ -539,7 +539,7 @@ fn fingerprint_into(entry: &Entry, chat: &ChatState, hasher: &mut DefaultHasher)
         }
         EntryKind::SubAgent(s) => {
             3u8.hash(hasher);
-            subagent_fingerprint(s, chat, hasher);
+            subagent_fingerprint(s, hasher);
         }
         EntryKind::Compaction(c) => {
             4u8.hash(hasher);
@@ -766,30 +766,26 @@ fn json_fingerprint(value: &Value, hasher: &mut DefaultHasher) {
     }
 }
 
-/// Sub-agent box fields: its run status, the child transcript's entry count,
-/// and the fold of every child entry's fingerprint. Folding ALL children (not
-/// just the tail) is required: a background task can update a non-tail child
-/// cell. This is O(child entries) but layout-free, far cheaper than building
-/// and drawing them.
+/// Sub-agent box fields, hashed by full value. The box now renders from
+/// this metadata, not the child transcript, so the fingerprint keys on the
+/// exact inputs the box reads: the status tag, the task, the report, the
+/// latest-activity line, the activity counter, and the background flag.
 ///
-/// The box title also renders `s.child` and `s.task`, neither folded in: both
-/// are fixed at `SubAgentStart` and never mutate, so the first miss captures
-/// them. `s.report` is not rendered by the box (the parent's tool cell carries
-/// it), so it needs no coverage here.
-fn subagent_fingerprint(s: &SubAgentEntry, chat: &ChatState, hasher: &mut DefaultHasher) {
+/// The report and activity strings are hashed by full value, not a length
+/// proxy, because a same-length activity transition (for example `bash` to
+/// `grep`) must still invalidate the cache, otherwise a stale line survives.
+/// The activity counter changes on every live sub-agent event, so a
+/// `Running` box re-renders (and its glyph advances) as work happens.
+fn subagent_fingerprint(s: &SubAgentEntry, hasher: &mut DefaultHasher) {
     match s.status {
         SubAgentStatus::Running => 0u8.hash(hasher),
         SubAgentStatus::Done => 1u8.hash(hasher),
     }
-    match chat.transcript(AgentId::Sub(s.child)) {
-        Some(t) => {
-            t.entries().len().hash(hasher);
-            for child in t.entries() {
-                fingerprint_into(child, chat, hasher);
-            }
-        }
-        None => 0usize.hash(hasher),
-    }
+    s.task.hash(hasher);
+    s.report.hash(hasher);
+    s.latest_activity.hash(hasher);
+    s.activity_ticks.hash(hasher);
+    s.background.hash(hasher);
 }
 
 fn notice_level_tag(level: NoticeLevel) -> u8 {
@@ -880,9 +876,7 @@ pub(crate) fn build_entry_widget(
         EntryKind::User(user) => {
             EntryWidget::Bubble(build_user_bubble(user, chat.tools_expanded, styles, focus))
         }
-        EntryKind::SubAgent(s) if !nested => {
-            EntryWidget::SubAgent(build_subagent_box(s, chat, styles))
-        }
+        EntryKind::SubAgent(s) if !nested => EntryWidget::SubAgent(build_subagent_box(s, styles)),
         // Assistant prose and the expanded compaction summary render as
         // markdown through the width-aware `MarkdownView`. A nested assistant
         // entry (inside a sub-agent box) takes this path too, so a child's
@@ -4242,45 +4236,46 @@ mod tests {
         );
     }
 
-    /// Appending a new child entry to the sub transcript changes the box's
-    /// fingerprint (child count + fold), so the box render is not stale.
+    /// A live sub-agent event that bumps the box's activity counter (here a
+    /// tool start, which also sets the latest-activity line) changes the box
+    /// fingerprint, so the running box rebuilds and re-renders with the new
+    /// activity. The box now keys on its own metadata, not a child fold.
     #[test]
-    fn subagent_child_append_is_not_stale() {
-        let chat = empty_chat();
-        let mut life = AgentLifecycle::default();
-        spawn_sub(&chat, &mut life);
-        let builder = caching_builder(&chat);
-        draw_and_assert_fresh(&builder, AgentId::Main, 0, 70);
-
-        apply(
-            &chat,
-            &mut life,
-            AgentEvent::Notice {
-                agent_id: AgentId::Sub(0),
-                text: "sub-child-marker".into(),
-            },
-        );
-        let after = draw_and_assert_fresh(&builder, AgentId::Main, 0, 70);
-        assert_eq!(misses(&builder), 2, "child append rebuilt the box");
-        assert!(
-            crate::test_support::rows(&after)
-                .join("\n")
-                .contains("sub-child-marker"),
-            "appended child rendered inside the box",
-        );
-    }
-
-    /// Growth of the sub's tail child (a streaming assistant line) changes the
-    /// box fingerprint through the child fold.
-    #[test]
-    fn subagent_last_child_streaming_is_not_stale() {
+    fn subagent_activity_bump_rebuilds_the_box() {
         let chat = empty_chat();
         let mut life = AgentLifecycle::default();
         spawn_sub(&chat, &mut life);
         let builder = caching_builder(&chat);
         let first = draw_and_assert_fresh(&builder, AgentId::Main, 0, 70);
 
-        // Replace the sub's single assistant line with a longer one.
+        apply(&chat, &mut life, tool_start(AgentId::Sub(0), "c1", "grep"));
+        let after = draw_and_assert_fresh(&builder, AgentId::Main, 0, 70);
+        assert_eq!(misses(&builder), 2, "activity bump rebuilt the box");
+        assert_ne!(
+            crate::test_support::flatten(&first),
+            crate::test_support::flatten(&after),
+            "the running body changed",
+        );
+        assert!(
+            crate::test_support::rows(&after)
+                .join("\n")
+                .contains("grep"),
+            "the box shows the new latest activity: {:?}",
+            crate::test_support::rows(&after),
+        );
+    }
+
+    /// Updating the sub's conclusion (a fresh assistant `MessageEnd`) refreshes
+    /// the box's report and latest-activity, so the box fingerprint changes and
+    /// it re-renders.
+    #[test]
+    fn subagent_conclusion_update_rebuilds_the_box() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        spawn_sub(&chat, &mut life);
+        let builder = caching_builder(&chat);
+        let first = draw_and_assert_fresh(&builder, AgentId::Main, 0, 70);
+
         apply(
             &chat,
             &mut life,
@@ -4292,7 +4287,7 @@ mod tests {
             },
         );
         let grown = draw_and_assert_fresh(&builder, AgentId::Main, 0, 70);
-        assert_eq!(misses(&builder), 2, "tail-child growth rebuilt the box");
+        assert_eq!(misses(&builder), 2, "conclusion change rebuilt the box");
         assert_ne!(
             crate::test_support::flatten(&first),
             crate::test_support::flatten(&grown),
@@ -4300,11 +4295,13 @@ mod tests {
         );
     }
 
-    /// A background task updating a NON-tail child (its badge flips on
-    /// `TaskEnd`) changes the box fingerprint. This only holds because the
-    /// fold covers every child, not just the tail.
+    /// A child-transcript-only change does NOT rebuild the box: the metadata
+    /// box reads no child transcript, so a notice appended to the child and a
+    /// background task's terminal badge flip both leave the box fingerprint
+    /// untouched and hit the cache. This decoupling is what lets a resumed
+    /// sub-agent's transcript stay unmaterialized behind a `Done` box.
     #[test]
-    fn subagent_non_tail_child_update_is_not_stale() {
+    fn subagent_child_only_change_hits_the_cache() {
         let chat = empty_chat();
         let mut life = AgentLifecycle::default();
         apply(
@@ -4318,8 +4315,8 @@ mod tests {
                 settings: cache_settings(),
             },
         );
-        // A bash tool cell with a background task, then a trailing notice, so
-        // the tool cell is a NON-tail child.
+        // A bash tool cell backed by a background task, so a later `TaskEnd`
+        // is a pure child-transcript change (a badge flip).
         apply(&chat, &mut life, tool_start(AgentId::Sub(0), "c1", "bash"));
         apply(
             &chat,
@@ -4344,25 +4341,21 @@ mod tests {
                 bash("sleep 1", "", None, Some(1)),
             ),
         );
+        let builder = caching_builder(&chat);
+        draw_and_assert_fresh(&builder, AgentId::Main, 0, 70);
+        let misses_before = misses(&builder);
+
+        // A notice appended to the child transcript touches no box metadata.
         apply(
             &chat,
             &mut life,
             AgentEvent::Notice {
                 agent_id: AgentId::Sub(0),
-                text: "tail notice".into(),
+                text: "sub-child-marker".into(),
             },
         );
-        let builder = caching_builder(&chat);
-        let running = draw_and_assert_fresh(&builder, AgentId::Main, 0, 70);
-        assert!(
-            crate::test_support::rows(&running)
-                .join("\n")
-                .contains("[task #1]"),
-            "running badge on the non-tail child: {:?}",
-            crate::test_support::rows(&running),
-        );
-
-        // Terminal status flips the non-tail child's badge.
+        let _ = draw_cached(&builder, 0, 70);
+        // A background task's terminal badge flip is likewise child-only.
         apply(
             &chat,
             &mut life,
@@ -4374,14 +4367,21 @@ mod tests {
                 label: "sleep 1".into(),
             },
         );
-        let done = draw_and_assert_fresh(&builder, AgentId::Main, 0, 70);
-        assert_eq!(misses(&builder), 2, "non-tail child change rebuilt the box");
+        let after = draw_cached(&builder, 0, 70);
+
+        assert_eq!(
+            misses(&builder),
+            misses_before,
+            "child-only changes did not rebuild the box",
+        );
+        let body = crate::test_support::rows(&after).join("\n");
         assert!(
-            crate::test_support::rows(&done)
-                .join("\n")
-                .contains("exited 0"),
-            "non-tail child badge updated: {:?}",
-            crate::test_support::rows(&done),
+            !body.contains("sub-child-marker"),
+            "the child notice is not shown in the box: {body}",
+        );
+        assert!(
+            !body.contains("[task #1]"),
+            "the child tool cell is not shown in the box: {body}",
         );
     }
 

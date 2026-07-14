@@ -138,6 +138,16 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
             if tool == "agent" {
                 return Redraw(false);
             }
+            // A sub-agent's tool start is its latest live activity. Main's
+            // own tool calls are not sub-agent activity, and gating on
+            // `Sub(n)` excludes them (the parent's `agent` tool is already
+            // skipped above).
+            if let AgentId::Sub(n) = agent_id
+                && let Some(b) = state.sub_box_mut(n)
+            {
+                b.latest_activity = Some(tool.clone());
+                b.activity_ticks += 1;
+            }
             append_tool_entry(state, agent_id, call_id, tool, args);
             Redraw(true)
         }
@@ -342,6 +352,8 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
                                 started_at: Instant::now(),
                                 finished_at: None,
                                 background,
+                                latest_activity: None,
+                                activity_ticks: 0,
                             }));
                     state.sub_boxes.insert(n, (parent, id));
                 }
@@ -592,6 +604,21 @@ fn reduce_assistant_end(
         .content
         .iter()
         .any(|b| matches!(b, AssistantContent::Text(_) | AssistantContent::Thinking(_)));
+    // The sub-agent box renders its report, sourced from the sub's latest
+    // assistant conclusion, so capture that text before `assistant` moves
+    // into the transcript entry below. Only sub-agents need it, so skip the
+    // allocation on the Main path. Concatenating the Text blocks mirrors
+    // replay's report capture (latest assistant text wins).
+    let conclusion: Option<String> = matches!(agent_id, AgentId::Sub(_)).then(|| {
+        assistant
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                AssistantContent::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    });
     let current = state
         .render
         .get_mut(&agent_id)
@@ -622,6 +649,37 @@ fn reduce_assistant_end(
             changed = true;
         }
         None => {}
+    }
+    // A sub-agent's box renders its report, not the sub's transcript, so keep
+    // the report fresh from the sub's latest conclusion while it runs. A
+    // continuation or steering re-run completes through `AgentEnd(Sub n)`,
+    // which carries no report, so without this a re-run box would keep
+    // showing the first run's conclusion.
+    //
+    // We refresh only while the box is `Running`. A resumed box is already
+    // `Done` with its report set by `SubAgentEnd`, and observing it replays
+    // the sub's `MessageEnd`s through here to materialize its transcript.
+    // Gating on `Running` keeps that materialize a pure read, so a
+    // materialized box renders identically to a freshly resumed one. This
+    // matters for a tool-concluding or interleaved sub whose thread-order
+    // last assistant differs from replay's bracket-order report. A live
+    // re-run flips the box back to `Running` via `AgentStart(Sub n)` before
+    // its `MessageEnd`s, so the live path still refreshes.
+    //
+    // The report tracks the last assistant text even when empty, mirroring
+    // replay's `capture_sub_report`, so a tool-concluding sub shows a thin
+    // box. We keep the last non-empty `latest_activity` line though.
+    if let AgentId::Sub(n) = agent_id
+        && let Some(conclusion) = conclusion
+        && let Some(b) = state.sub_box_mut(n)
+        && b.status == SubAgentStatus::Running
+    {
+        if !conclusion.is_empty() {
+            b.latest_activity = Some(one_line(&conclusion));
+        }
+        b.report = Some(conclusion);
+        b.activity_ticks += 1;
+        changed = true;
     }
     if let Some(line) = error_line {
         append_notice(state, agent_id, NoticeLevel::Error, line);
@@ -672,6 +730,12 @@ fn append_notice(state: &mut ChatState, agent_id: AgentId, level: NoticeLevel, t
         .entry(agent_id)
         .or_default()
         .append(EntryKind::Notice(NoticeEntry { level, text }));
+}
+
+/// Collapse `s`'s runs of whitespace into single spaces, yielding one line.
+/// Used for the sub-agent box's single-line latest-activity string.
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
@@ -831,6 +895,31 @@ mod tests {
             task: format!("task {n}"),
             background: false,
             settings: sub_settings(provider, model_id),
+        }
+    }
+
+    /// A sub-agent assistant `MessageEnd` carrying a single text block, the
+    /// shape a sub-agent's concluding report takes on the live path.
+    fn sub_assistant_end(n: usize, text: &str) -> AgentEvent {
+        AgentEvent::MessageEnd {
+            agent_id: AgentId::Sub(n),
+            message: AgentMessage::wire(Message::Assistant(text_partial(text))),
+        }
+    }
+
+    /// A sub-agent assistant `MessageEnd` whose only content is a tool call,
+    /// the shape a tool-concluding sub-agent's final turn takes: no Text
+    /// blocks, so its concluding report is empty.
+    fn sub_tool_only_end(n: usize, call_id: &str, tool: &str) -> AgentEvent {
+        AgentEvent::MessageEnd {
+            agent_id: AgentId::Sub(n),
+            message: AgentMessage::wire(Message::Assistant(partial_with(vec![
+                AssistantContent::ToolCall(ToolCall {
+                    id: call_id.into(),
+                    name: tool.into(),
+                    arguments: serde_json::json!({}),
+                }),
+            ]))),
         }
     }
 
@@ -1443,6 +1532,245 @@ mod tests {
             );
             assert_eq!(box_status(&mut s), SubAgentStatus::Done);
         }
+    }
+
+    #[test]
+    fn continuation_refreshes_the_box_report_from_the_latest_conclusion() {
+        // The box renders `report`. A continuation re-run completes through
+        // `AgentEnd(Sub n)`, which carries no report, so the report is kept
+        // fresh from the sub's latest assistant conclusion. Without that the
+        // box would keep showing the first run's report.
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        apply(
+            &mut s,
+            &mut life,
+            sub_agent_start(1, "scripted", "scripted"),
+        );
+
+        // First run: concludes and ends via `SubAgentEnd`.
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::AgentStart {
+                agent_id: AgentId::Sub(1),
+            },
+        );
+        apply(&mut s, &mut life, sub_assistant_end(1, "first result"));
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::SubAgentEnd {
+                parent: AgentId::Main,
+                child: AgentId::Sub(1),
+                report: "first result".into(),
+            },
+        );
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::AgentEnd {
+                agent_id: AgentId::Sub(1),
+                messages: Vec::new(),
+            },
+        );
+        assert_eq!(
+            s.sub_box_mut(1).expect("box").report.as_deref(),
+            Some("first result"),
+        );
+
+        // Continuation re-run: a fresh conclusion, then `AgentEnd` with NO
+        // `SubAgentEnd`.
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::AgentStart {
+                agent_id: AgentId::Sub(1),
+            },
+        );
+        apply(&mut s, &mut life, sub_assistant_end(1, "second result"));
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::AgentEnd {
+                agent_id: AgentId::Sub(1),
+                messages: Vec::new(),
+            },
+        );
+
+        let b = s.sub_box_mut(1).expect("box");
+        assert_eq!(b.status, SubAgentStatus::Done);
+        assert_eq!(
+            b.report.as_deref(),
+            Some("second result"),
+            "the box report tracks the latest run's conclusion",
+        );
+    }
+
+    #[test]
+    fn continuation_with_a_tool_concluding_run_blanks_the_box_report() {
+        // A tool-concluding (or aborted) final turn carries no Text blocks, so
+        // its concluding report is empty. The box report must track that empty
+        // text rather than keep the previous run's conclusion, because replay's
+        // `capture_sub_report` overwrites unconditionally and would show an
+        // empty report on a later resume. Diverging here would break parity.
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        apply(
+            &mut s,
+            &mut life,
+            sub_agent_start(1, "scripted", "scripted"),
+        );
+
+        // First run: a prose conclusion, ends via `SubAgentEnd`.
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::AgentStart {
+                agent_id: AgentId::Sub(1),
+            },
+        );
+        apply(&mut s, &mut life, sub_assistant_end(1, "first result"));
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::SubAgentEnd {
+                parent: AgentId::Main,
+                child: AgentId::Sub(1),
+                report: "first result".into(),
+            },
+        );
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::AgentEnd {
+                agent_id: AgentId::Sub(1),
+                messages: Vec::new(),
+            },
+        );
+        assert_eq!(
+            s.sub_box_mut(1).expect("box").report.as_deref(),
+            Some("first result"),
+        );
+
+        // Continuation re-run whose final assistant turn is tool-only, then
+        // `AgentEnd` with no `SubAgentEnd`.
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::AgentStart {
+                agent_id: AgentId::Sub(1),
+            },
+        );
+        apply(&mut s, &mut life, sub_tool_only_end(1, "c1", "read_file"));
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::AgentEnd {
+                agent_id: AgentId::Sub(1),
+                messages: Vec::new(),
+            },
+        );
+
+        let b = s.sub_box_mut(1).expect("box");
+        assert_eq!(b.status, SubAgentStatus::Done);
+        assert_eq!(
+            b.report.as_deref(),
+            Some(""),
+            "the box report tracks the empty conclusion, not the prior run",
+        );
+        // The empty turn does not blank the last meaningful activity line.
+        assert_eq!(b.latest_activity.as_deref(), Some("first result"));
+    }
+
+    #[test]
+    fn materialize_does_not_change_a_done_box_report() {
+        // Observing a resumed sub materializes its transcript by replaying the
+        // sub's `MessageEnd`s through the reducer. Those bare `MessageEnd`s
+        // arrive with no preceding `AgentStart(Sub n)`, so the box stays
+        // `Done`. The report was set authoritatively by `SubAgentEnd` on the
+        // deferred drain and must survive the replay untouched, otherwise a
+        // tool-concluding or interleaved sub's box would flip to the
+        // thread-order last assistant text and break eager/lazy parity.
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        apply(
+            &mut s,
+            &mut life,
+            sub_agent_start(1, "scripted", "scripted"),
+        );
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::AgentStart {
+                agent_id: AgentId::Sub(1),
+            },
+        );
+        apply(&mut s, &mut life, sub_assistant_end(1, "resume value"));
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::SubAgentEnd {
+                parent: AgentId::Main,
+                child: AgentId::Sub(1),
+                report: "resume value".into(),
+            },
+        );
+        {
+            let b = s.sub_box_mut(1).expect("box");
+            assert_eq!(b.status, SubAgentStatus::Done);
+            assert_eq!(b.report.as_deref(), Some("resume value"));
+        }
+
+        // Materialize: a bare sub `MessageEnd` with no `AgentStart` before it.
+        apply(&mut s, &mut life, sub_assistant_end(1, "materialized text"));
+
+        let b = s.sub_box_mut(1).expect("box");
+        assert_eq!(
+            b.status,
+            SubAgentStatus::Done,
+            "materialize leaves the box Done",
+        );
+        assert_eq!(
+            b.report.as_deref(),
+            Some("resume value"),
+            "materialize is a pure read: the Done box report is not rewritten",
+        );
+    }
+
+    #[test]
+    fn sub_activity_updates_latest_activity_and_ticks() {
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        apply(
+            &mut s,
+            &mut life,
+            sub_agent_start(1, "scripted", "scripted"),
+        );
+        {
+            let b = s.sub_box_mut(1).expect("box");
+            assert_eq!(b.activity_ticks, 0);
+            assert_eq!(b.latest_activity, None);
+        }
+
+        // A sub assistant conclusion sets the collapsed one-line activity and
+        // bumps the counter.
+        apply(
+            &mut s,
+            &mut life,
+            sub_assistant_end(1, "line one\n  line two"),
+        );
+        {
+            let b = s.sub_box_mut(1).expect("box");
+            assert_eq!(b.latest_activity.as_deref(), Some("line one line two"));
+            assert_eq!(b.activity_ticks, 1);
+        }
+
+        // A sub tool start sets the tool name and bumps the counter again.
+        apply(&mut s, &mut life, tool_start(AgentId::Sub(1), "c1", "grep"));
+        let b = s.sub_box_mut(1).expect("box");
+        assert_eq!(b.latest_activity.as_deref(), Some("grep"));
+        assert_eq!(b.activity_ticks, 2);
     }
 
     fn agent_row(s: &ChatState, id: AgentId) -> AgentEntry {
