@@ -876,7 +876,9 @@ pub(crate) fn build_entry_widget(
         EntryKind::User(user) => {
             EntryWidget::Bubble(build_user_bubble(user, chat.tools_expanded, styles, focus))
         }
-        EntryKind::SubAgent(s) if !nested => EntryWidget::SubAgent(build_subagent_box(s, styles)),
+        EntryKind::SubAgent(s) if !nested => {
+            EntryWidget::SubAgent(build_subagent_box(s, chat.tools_expanded, styles))
+        }
         // Assistant prose and the expanded compaction summary render as
         // markdown through the width-aware `MarkdownView`. A nested assistant
         // entry (inside a sub-agent box) takes this path too, so a child's

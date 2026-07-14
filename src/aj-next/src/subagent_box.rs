@@ -3,9 +3,11 @@
 //!
 //! A gray box with a one-line `{glyph} agent {N} · {task}` title and a
 //! metadata body. Once the sub-agent is done the body is its report,
-//! soft-wrapped. While it runs the glyph is an event-driven spinner
-//! frame (advanced by the box's activity counter) and the body is a
-//! single latest-activity line that clips with an ellipsis.
+//! soft-wrapped, and folded to a head preview when collapsed the same
+//! way tool cells fold long output (the shared tools-expand toggle
+//! shows the whole report). While it runs the glyph is an event-driven
+//! spinner frame (advanced by the box's activity counter) and the body
+//! is a single latest-activity line that clips with an ellipsis.
 //!
 //! The box renders from box metadata alone: it never composites the
 //! child transcript or tail-windows it, so it needs no access to the
@@ -20,12 +22,14 @@
 //! builder's shared borrow never nests or escapes.
 
 use aj_app::chat::{SubAgentEntry, SubAgentStatus};
+use aj_tools::sanitize_terminal_output;
 use vaxis::cell::{Cell, Color, Style};
 use vaxis::vxfw::{
     DrawContext, MaxSize, Overflow, RichText, Size, SubSurface, Surface, TextSpan, Widget,
 };
 
 use crate::bubble::{MIN_BUBBLE_WIDTH, PADDING_X, PADDING_Y};
+use crate::tool_cell::{HintKind, REPORT_COLLAPSED_LINES, expand_hint};
 use crate::transcript::TranscriptStyles;
 
 /// Spinner frames for a `Running` box's glyph. A local copy of the
@@ -40,9 +44,10 @@ pub(crate) struct SubAgentBox {
     /// (the task text is whitespace-normalized at build time). The
     /// glyph is a check when done or a spinner frame while running.
     title: Vec<TextSpan>,
-    /// The body spans: the report when done, the latest-activity line
-    /// while running. Empty when there is nothing to show (a done
-    /// sub-agent with no report, a running sub with no activity yet).
+    /// The body spans: the report when done (folded to a preview when
+    /// collapsed), the latest-activity line while running. Empty when
+    /// there is nothing to show (a done sub-agent with no report, a
+    /// running sub with no activity yet).
     body: Vec<TextSpan>,
     /// Whether the body soft-wraps. A done report wraps across rows; a
     /// running activity line stays on one row and clips with an ellipsis.
@@ -54,7 +59,14 @@ pub(crate) struct SubAgentBox {
 /// Build the box for `entry` from its metadata: the report (done) or a
 /// spinner glyph plus latest-activity line (running). Reads no
 /// transcript.
-pub(crate) fn build_subagent_box(entry: &SubAgentEntry, styles: &TranscriptStyles) -> SubAgentBox {
+///
+/// `expanded` is the session-wide tools-expand flag: when set, a long
+/// done-report renders in full, otherwise it folds to a head preview.
+pub(crate) fn build_subagent_box(
+    entry: &SubAgentEntry,
+    expanded: bool,
+    styles: &TranscriptStyles,
+) -> SubAgentBox {
     let span = |text: String, style: Style| TextSpan {
         text,
         style,
@@ -89,7 +101,7 @@ pub(crate) fn build_subagent_box(entry: &SubAgentEntry, styles: &TranscriptStyle
     // renders a thin title-only box.
     let (body, body_softwrap) = match entry.status {
         SubAgentStatus::Done => match entry.report.as_deref() {
-            Some(report) if !report.is_empty() => (vec![span(report.into(), styles.text)], true),
+            Some(report) if !report.is_empty() => (report_body(report, expanded, styles), true),
             _ => (Vec::new(), true),
         },
         SubAgentStatus::Running => match entry.latest_activity.as_deref() {
@@ -105,6 +117,46 @@ pub(crate) fn build_subagent_box(entry: &SubAgentEntry, styles: &TranscriptStyle
         body_softwrap,
         bg: styles.tool_pending_bg,
     }
+}
+
+/// Build the done-report body spans. Collapsed, the report folds to its
+/// first [`REPORT_COLLAPSED_LINES`] source lines plus a `… (N more
+/// lines, <key> to expand)` hint, matching how tool cells fold long
+/// output. Expanded shows the whole report. Newlines are hard breaks;
+/// the retained lines still soft-wrap at draw.
+fn report_body(report: &str, expanded: bool, styles: &TranscriptStyles) -> Vec<TextSpan> {
+    let span = |text: String, style: Style| TextSpan {
+        text,
+        style,
+        ..TextSpan::default()
+    };
+    // Sanitize before splitting so control bytes and escapes leave both the
+    // rendered content and the source-line count, matching how tool cells
+    // process their bodies. A bare carriage return would otherwise underflow
+    // the wrap engine at draw time.
+    let report = sanitize_terminal_output(report);
+    let mut lines: Vec<&str> = report.split('\n').collect();
+    // Drop a trailing empty line from a report that ended in `\n`: the
+    // box's bottom pad already separates it from the next entry.
+    if lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    let hidden = if expanded {
+        0
+    } else {
+        lines.len().saturating_sub(REPORT_COLLAPSED_LINES)
+    };
+    if hidden > 0 {
+        lines.truncate(REPORT_COLLAPSED_LINES);
+    }
+    // The retained lines are one text span (embedded `\n` are hard
+    // breaks); the hint is its own dim line below them.
+    let mut spans = vec![span(lines.join("\n"), styles.text)];
+    if hidden > 0 {
+        spans.push(span("\n".into(), styles.text));
+        spans.push(span(expand_hint(hidden, HintKind::More), styles.dim));
+    }
+    spans
 }
 
 /// Composite a surface tree (buffer plus children by z-order) into a
@@ -404,6 +456,25 @@ mod tests {
         }
     }
 
+    /// Run the sub to completion with `report` as its final report, leaving a
+    /// `Done` box in Main's transcript.
+    fn finish_with_report(chat: &mut ChatState, life: &mut AgentLifecycle, report: &str) {
+        reduce_sub_run(chat, life);
+        for event in [
+            AgentEvent::SubAgentEnd {
+                parent: AgentId::Main,
+                child: AgentId::Sub(0),
+                report: report.into(),
+            },
+            AgentEvent::AgentEnd {
+                agent_id: AgentId::Sub(0),
+                messages: Vec::new(),
+            },
+        ] {
+            let _ = reduce(chat, life, event);
+        }
+    }
+
     /// The `SubAgentEntry` of the box in Main's transcript.
     fn box_entry(chat: &ChatState) -> &SubAgentEntry {
         chat.transcript(AgentId::Main)
@@ -417,10 +488,14 @@ mod tests {
             .expect("sub-agent box entry")
     }
 
-    fn draw_box(chat: &ChatState, width: u16) -> Surface {
+    fn draw_box_with(chat: &ChatState, width: u16, expanded: bool) -> Surface {
         let s = styles();
-        let mut b = build_subagent_box(box_entry(chat), &s);
+        let mut b = build_subagent_box(box_entry(chat), expanded, &s);
         b.draw(&draw_ctx(width, None))
+    }
+
+    fn draw_box(chat: &ChatState, width: u16) -> Surface {
+        draw_box_with(chat, width, false)
     }
 
     /// The spinner frame a `Running` box shows for the given activity count.
@@ -552,6 +627,186 @@ mod tests {
         assert!(
             !r.join("\n").contains("earlier lines"),
             "no window hint remains: {r:?}",
+        );
+    }
+
+    #[test]
+    fn long_report_folds_when_collapsed_and_expands_with_the_toggle() {
+        let mut chat = chat();
+        let mut life = AgentLifecycle::default();
+        reduce_sub_run(&mut chat, &mut life);
+        // A report with more source lines than the collapsed cap, each short
+        // enough not to wrap at this width, so the fold is by source line.
+        let report = (1..=15)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = reduce(
+            &mut chat,
+            &mut life,
+            AgentEvent::SubAgentEnd {
+                parent: AgentId::Main,
+                child: AgentId::Sub(0),
+                report,
+            },
+        );
+        let _ = reduce(
+            &mut chat,
+            &mut life,
+            AgentEvent::AgentEnd {
+                agent_id: AgentId::Sub(0),
+                messages: Vec::new(),
+            },
+        );
+
+        // Collapsed: the first REPORT_COLLAPSED_LINES lines plus a fold hint,
+        // the rest hidden.
+        let collapsed = rows(&draw_box(&chat, 60)).join("\n");
+        assert!(
+            collapsed.contains("line 10"),
+            "head line shown: {collapsed}"
+        );
+        assert!(
+            !collapsed.contains("line 11"),
+            "folded line hidden: {collapsed}",
+        );
+        assert!(
+            collapsed.contains("5 more lines") && collapsed.contains("expand"),
+            "fold hint shown: {collapsed}",
+        );
+
+        // Expanded: the whole report, no fold hint.
+        let expanded = rows(&draw_box_with(&chat, 60, true)).join("\n");
+        assert!(expanded.contains("line 15"), "tail line shown: {expanded}");
+        assert!(!expanded.contains("more lines"), "no fold hint: {expanded}");
+    }
+
+    #[test]
+    fn a_report_at_the_collapse_cap_does_not_fold() {
+        let mut chat = chat();
+        let mut life = AgentLifecycle::default();
+        let report = (1..=REPORT_COLLAPSED_LINES)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        finish_with_report(&mut chat, &mut life, &report);
+        let collapsed = rows(&draw_box(&chat, 60)).join("\n");
+        assert!(
+            collapsed.contains(&format!("line {REPORT_COLLAPSED_LINES}")),
+            "the cap-th line shows: {collapsed}",
+        );
+        assert!(
+            !collapsed.contains("more lines"),
+            "a report at the cap does not fold: {collapsed}",
+        );
+    }
+
+    #[test]
+    fn a_trailing_newline_is_popped_before_counting() {
+        // Eleven content lines plus a trailing newline: the pop drops the
+        // empty twelfth line, so the fold hides one line, not two.
+        let mut chat = chat();
+        let mut life = AgentLifecycle::default();
+        let mut report = (1..=11)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        report.push('\n');
+        finish_with_report(&mut chat, &mut life, &report);
+        let collapsed = rows(&draw_box(&chat, 60)).join("\n");
+        assert!(
+            collapsed.contains("1 more lines"),
+            "the trailing empty line is not counted: {collapsed}",
+        );
+    }
+
+    #[test]
+    fn folding_counts_source_lines_not_wrapped_rows() {
+        // Six source lines, each wide enough to soft-wrap to several rows at
+        // this width. Six is under the cap, so nothing folds even though the
+        // rendered height runs well past it.
+        let mut chat = chat();
+        let mut life = AgentLifecycle::default();
+        let wide = "word ".repeat(20);
+        let report = vec![wide; 6].join("\n");
+        finish_with_report(&mut chat, &mut life, &report);
+        let rendered = rows(&draw_box(&chat, 30));
+        assert!(
+            rendered.len() > REPORT_COLLAPSED_LINES,
+            "the report wraps past the cap in rows: {}",
+            rendered.len(),
+        );
+        assert!(
+            !rendered.join("\n").contains("more lines"),
+            "the fold counts source lines, so it does not trigger: {rendered:?}",
+        );
+    }
+
+    #[test]
+    fn a_report_with_control_bytes_draws_without_panicking() {
+        // A bare carriage return underflows the wrap engine unless the report
+        // is sanitized first, the way tool cells sanitize their bodies.
+        let mut chat = chat();
+        let mut life = AgentLifecycle::default();
+        finish_with_report(&mut chat, &mut life, "done\rok\x1b[0m tail");
+        let out = rows(&draw_box(&chat, 60)).join("\n");
+        assert!(!out.contains('\u{1b}'), "the escape is stripped: {out:?}");
+        assert!(out.contains("done"), "the content shows: {out:?}");
+    }
+
+    #[test]
+    fn transcript_view_folds_the_box_and_expands_on_toggle() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        use crate::transcript::TranscriptView;
+
+        let mut chat = chat();
+        let mut life = AgentLifecycle::default();
+        let report = (1..=15)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        finish_with_report(&mut chat, &mut life, &report);
+        let chat = Rc::new(RefCell::new(chat));
+        let theme = Theme::bundled_dark_with_mode(ColorMode::Truecolor);
+        let mut view = TranscriptView::new(
+            Rc::clone(&chat),
+            &theme,
+            Rc::new(std::cell::Cell::new(false)),
+        );
+        let ctx = DrawContext {
+            max: MaxSize {
+                width: Some(60),
+                height: Some(24),
+            },
+            ..draw_ctx(60, Some(24))
+        };
+
+        // Collapsed: the fold hint shows and the tail line is hidden. This is
+        // the real draw path (`build_entry_widget` passes `tools_expanded`),
+        // not the unit `draw_box` helper.
+        let collapsed = rows(&view.draw(&ctx)).join("\n");
+        assert!(
+            collapsed.contains("more lines"),
+            "folded through the view: {collapsed}",
+        );
+        assert!(
+            !collapsed.contains("line 15"),
+            "the tail is hidden when collapsed: {collapsed}",
+        );
+
+        // Toggling the shared flag clears the render cache, so the next draw
+        // rebuilds the box in full.
+        chat.borrow_mut().tools_expanded = true;
+        let expanded = rows(&view.draw(&ctx)).join("\n");
+        assert!(
+            expanded.contains("line 15"),
+            "the tail shows when expanded: {expanded}",
+        );
+        assert!(
+            !expanded.contains("more lines"),
+            "no hint when expanded: {expanded}",
         );
     }
 

@@ -34,8 +34,9 @@ const TEXT_COLLAPSED_LINES: usize = 10;
 /// Maximum body lines rendered for a head-truncated `SubAgentReport`
 /// body when collapsed. Aliased to [`TEXT_COLLAPSED_LINES`] for
 /// parallelism but kept as its own constant so a divergence is a
-/// one-line change.
-const REPORT_COLLAPSED_LINES: usize = TEXT_COLLAPSED_LINES;
+/// one-line change. Shared with the sub-agent box, which folds its
+/// done-report body the same way.
+pub(crate) const REPORT_COLLAPSED_LINES: usize = TEXT_COLLAPSED_LINES;
 
 /// Number of trailing lines kept per bash stream when collapsed.
 const BASH_COLLAPSED_LINES: usize = 5;
