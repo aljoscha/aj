@@ -3182,9 +3182,9 @@ impl Shell {
     }
 
     /// Recompute the editor's visible-row cap for a `terminal_rows`-tall frame
-    /// and apply it. The layout owns the height budget (see [`editor_row_cap`]):
-    /// called once at startup and again on every resize so the editor's growth
-    /// ceiling tracks the terminal height.
+    /// and apply it. The layout owns the height budget (see [`editor_row_cap`]).
+    /// Called from [`Shell::draw`] each frame so the editor's growth ceiling
+    /// tracks the live terminal height.
     fn set_editor_row_cap(&self, terminal_rows: usize) {
         self.editor
             .borrow_mut()
@@ -3231,6 +3231,13 @@ impl Widget for Shell {
         // controller must be an ancestor of an open overlay so its
         // capture chords (close-all) run before the overlay's widgets
         // see the key.
+
+        // The editor's visible-row cap is a pure function of terminal height, so
+        // resolve it from the frame here. Applying it before the layout draws
+        // means the editor grows against the current frame, and the first
+        // painted frame is already correct.
+        self.set_editor_row_cap(usize::from(ctx.max.size().height));
+
         let mut inner = draw_widget(&to_widget_ref(Rc::clone(&self.keymap)), ctx);
 
         // Autocomplete popup overlay. We float the editor's popup as a
@@ -3580,13 +3587,6 @@ pub async fn run(args: Args) -> Result<()> {
     // Hot-reload watcher for a user theme (bundled names have no on-disk
     // source, so this is inert for `dark` / `light` with no override).
     let mut theme_watch = ThemeWatch::install(&theme_name);
-
-    // Seed the editor's visible-row cap from the startup frame height. The
-    // layout owns the editor's height budget; resizes recompute it inside
-    // `drive`.
-    shell
-        .borrow()
-        .set_editor_row_cap(usize::from(app.vaxis().window().height));
 
     // Bootstrap the editor's prompt-history ring from the workspace's session
     // logs. The scan runs off the loop (blocking IO) and `drive`'s seed arm
@@ -4009,13 +4009,6 @@ async fn drive(
             event = app.next_input() => {
                 match event {
                     Some(event) => {
-                        // The layout owns the editor's height budget, so a
-                        // terminal resize recomputes the visible-row cap. We
-                        // read it off the event before `handle_input` consumes
-                        // it and applies the internal resize.
-                        if let Event::Winsize(ws) = &event {
-                            shell.borrow().set_editor_row_cap(usize::from(ws.rows));
-                        }
                         // Every global chord (the ctrl+c ladder, the
                         // toggles, the overlay openers) is matched by
                         // the keymap controller inside this dispatch.
@@ -5202,6 +5195,48 @@ mod tests {
             surface.size.height,
             u16::try_from(cap + 2).unwrap(),
             "the cap plus the two border rows bound the editor height"
+        );
+    }
+
+    /// `Shell::draw` resolves the editor's visible-row cap from the frame
+    /// height, so a taller frame reveals more editor rows before scrolling. The
+    /// editor holds more content lines than either cap, so its drawn height is
+    /// cap-limited at both heights. The difference between the two drawn heights
+    /// isolates the cap because the editor's border chrome is constant, so it
+    /// must equal the difference of the two caps.
+    #[tokio::test]
+    async fn draw_caps_the_editor_from_the_frame_height() {
+        let shell = test_shell_with_chat(empty_chat());
+        // Forty lines exceed both caps under test (7 at height 24, 15 at height
+        // 50), so the editor is cap-limited, not content-limited, at both.
+        shell.borrow().editor.borrow_mut().insert_at_cursor(
+            &(1..=40)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+
+        let short = draw_ctx(80, 24);
+        shell.borrow_mut().draw(&short);
+        let drawn_short = shell.borrow().editor.borrow().drawn_height();
+
+        let tall = draw_ctx(80, 50);
+        shell.borrow_mut().draw(&tall);
+        let drawn_tall = shell.borrow().editor.borrow().drawn_height();
+
+        let expected = u16::try_from(editor_row_cap(50) - editor_row_cap(24)).unwrap();
+        assert_eq!(
+            drawn_tall - drawn_short,
+            expected,
+            "the editor's drawn rows must track the cap resolved from the frame height",
+        );
+        // Pin one absolute height too: the border chrome adds a constant two
+        // rows, so the short frame is exactly its cap plus chrome. This catches
+        // a chrome or formula drift that the difference alone would cancel.
+        assert_eq!(
+            drawn_short,
+            u16::try_from(editor_row_cap(24) + 2).unwrap(),
+            "short frame caps the editor at its row cap plus border chrome",
         );
     }
 
