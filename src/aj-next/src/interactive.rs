@@ -469,6 +469,15 @@ fn install_next_session(world: &mut World, shell: &Rc<RefCell<Shell>>, next: Nex
     // wheel scroll must not carry over.
     shell.borrow().splash.borrow_mut().reset_scroll();
     shell.borrow_mut().rebind(world);
+    // Reconcile the editor chrome onto the freshly installed session. The
+    // per-iteration reconcile runs at the bottom of `drive`, but `drive`
+    // re-enters here with no prior render and paints its first frame at the top
+    // of the loop, one iteration before that reconcile. The editor widget
+    // persists across the chat swap, so without this the first frame would show
+    // the outgoing session's baked border tint and stale `agent N` marker. This
+    // mirrors the `world.status` reset above, which resets chrome for the same
+    // install-to-first-draw window.
+    sync_editor_chrome(world, shell);
     // Folded after the install so they land in the new session's chat, on
     // top of any replayed history.
     for notice in next.notices {
@@ -1542,11 +1551,6 @@ fn apply_picker_outcome(
             // render cache, which the draw's active-view clear would do
             // anyway, so the two don't fight.
             shell.borrow().transcript.borrow_mut().reset_to_tail();
-            // The new view may run a different thinking level, so re-tint the
-            // editor border to match the agent now under view.
-            shell.borrow().apply_editor_border(world);
-            // Mark which agent the editor is observing (or clear it on Main).
-            shell.borrow().apply_editor_agent_marker(world);
             ActionEffect::Redraw
         }
         AgentPickerOutcome::OpenTask(id) => {
@@ -1742,16 +1746,6 @@ async fn apply_selector_activity(
                 fold_notice(world, &notice);
             }
         }
-    }
-    // A thinking or theme edit in this batch may have changed the active view's
-    // border tint. The thinking selector, the settings-window thinking row, and
-    // a theme switch all land here, so re-tint once after applying the batch.
-    // `changed` only means the batch applied something, not that a
-    // border-relevant setting moved. So for a border-irrelevant activity like a
-    // skill toggle the re-tint recomputes the same color and is an idempotent
-    // no-op.
-    if changed {
-        shell.borrow().apply_editor_border(world);
     }
     changed
 }
@@ -2534,10 +2528,10 @@ fn editor_border_color(theme: &Theme, level: Option<&ThinkingConfig>) -> Color {
 ///
 /// The `border_color` seeded here is only a resting default (the `ThinkingOff`
 /// token, which shares a value with `borderMuted` in the bundled themes). The
-/// host overrides it per active view through [`Shell::apply_editor_border`],
-/// which tints the border by the viewed agent's thinking level to match `aj`.
-/// That override runs in the same event that changes the theme, the active
-/// view, or its level, before the next draw, so this default never flashes.
+/// host overrides it per active view through [`sync_editor_chrome`], which
+/// tints the border by the viewed agent's thinking level to match `aj`. That
+/// reconcile runs once per drive-loop iteration and once before the first
+/// paint, so this default never flashes.
 fn editor_theme_from_theme(theme: &Theme) -> EditorTheme {
     let mode = theme.color_mode();
     // The autocomplete popup paints its selected row as a compact band over
@@ -3187,32 +3181,6 @@ impl Shell {
         *self.chrome.borrow_mut() = chrome;
     }
 
-    /// Tint the editor border with the viewed agent's thinking level.
-    ///
-    /// Overrides the resting `border_color` that [`editor_theme_from_theme`]
-    /// seeds. We resolve the active view's level through [`viewed_thinking`]
-    /// and bake it against the live theme, so the border always shows the
-    /// reasoning budget of the agent under view. Callers invoke this whenever
-    /// the theme, the active view, or that view's level changes, before the
-    /// next draw.
-    fn apply_editor_border(&self, world: &World) {
-        let active = world.chat.borrow().active_view();
-        let level = viewed_thinking(world, active);
-        let color = editor_border_color(&self.theme.read(), level.as_ref());
-        self.editor.borrow_mut().set_border_color(color);
-    }
-
-    /// Reflect the observed agent in the editor's top-bar label: an
-    /// `agent N` marker for a sub-agent, cleared for the main agent.
-    /// Mirrors `aj`'s editor agent marker.
-    fn apply_editor_agent_marker(&self, world: &World) {
-        let label = match world.chat.borrow().active_view() {
-            AgentId::Main => None,
-            AgentId::Sub(n) => Some(format!("agent {n}")),
-        };
-        self.editor.borrow_mut().set_top_bar_label(label);
-    }
-
     /// Recompute the editor's visible-row cap for a `terminal_rows`-tall frame
     /// and apply it. The layout owns the height budget (see [`editor_row_cap`]):
     /// called once at startup and again on every resize so the editor's growth
@@ -3251,12 +3219,6 @@ impl Shell {
             &world.core.env.working_directory,
         );
         self.transcript.borrow_mut().reset_to_tail();
-        // A session install lands on the main view, whose thinking level may
-        // differ from the outgoing session's, so re-tint the border here.
-        self.apply_editor_border(world);
-        // A fresh session lands on the main view, so clear any stale sub-agent
-        // marker left in the editor's top bar.
-        self.apply_editor_agent_marker(world);
     }
 }
 
@@ -3489,6 +3451,26 @@ fn sync_keymap_ctx(world: &World, shell: &Rc<RefCell<Shell>>) {
     ctx.active_view = active;
 }
 
+/// Reconcile the editor's border tint and agent marker from the active view.
+/// The border follows the viewed agent's thinking level (aj's color-bar
+/// parity) and the top-bar label reads `agent N` for a sub-agent, cleared for
+/// the main agent. This is the single writer: the drive loop calls it once per
+/// iteration and once before the first paint, so no view-switch or
+/// thinking-change path has to remember to retint.
+fn sync_editor_chrome(world: &World, shell: &Rc<RefCell<Shell>>) {
+    let active = world.chat.borrow().active_view();
+    let level = viewed_thinking(world, active);
+    let shell = shell.borrow();
+    let color = editor_border_color(&shell.theme.read(), level.as_ref());
+    let label = match active {
+        AgentId::Main => None,
+        AgentId::Sub(n) => Some(format!("agent {n}")),
+    };
+    let mut editor = shell.editor.borrow_mut();
+    editor.set_border_color(color);
+    editor.set_top_bar_label(label);
+}
+
 /// Runs the interactive shell until the user quits.
 ///
 /// Restores the terminal via [`AsyncApp::shutdown`] on the way out,
@@ -3587,10 +3569,13 @@ pub async fn run(args: Args) -> Result<()> {
         app.request_redraw();
     }
 
-    // Seed the editor border from the initial view's thinking level. The
-    // shell's build and the color-mode reconcile above both leave the border
-    // at the resting default, so apply the real tint before the first frame.
-    shell.borrow().apply_editor_border(&world);
+    // Seed the editor's border and agent marker from the initial view before
+    // the first drive-loop frame. `app.init` already painted one frame, and the
+    // drive loop draws at the top of its iteration but reconciles the chrome at
+    // the bottom, so without this seed the first drive-loop paint would show the
+    // resting default. The shell's build and the color-mode reconcile above both
+    // leave the chrome at that default.
+    sync_editor_chrome(&world, &shell);
 
     // Hot-reload watcher for a user theme (bundled names have no on-disk
     // source, so this is inert for `dark` / `light` with no override).
@@ -3932,10 +3917,10 @@ async fn drive(
                             let shell = shell.borrow();
                             shell.theme.replace(new_theme);
                             shell.restyle();
-                            // `set_border_color` bakes a concrete color, so a
-                            // theme swap needs an explicit re-tint (unlike the
-                            // live palette closures the rest of the chrome uses).
-                            shell.apply_editor_border(world);
+                            // The per-iteration `sync_editor_chrome` runs after
+                            // this arm and recomputes the border from the freshly
+                            // swapped `shell.theme`, so the chrome reconciles
+                            // through the loop sync, not here.
                         }
                         fold_notice(world, &format!("Theme '{name}' reloaded."));
                         app.request_redraw();
@@ -4383,6 +4368,7 @@ async fn drive(
         // the host just drives the tick from its own loop.
         shell.borrow().editor.borrow_mut().pump_autocomplete();
         sync_keymap_ctx(world, shell);
+        sync_editor_chrome(world, shell);
         // The close-all chord must not pre-empt the login dialog's own
         // Esc/Ctrl+C teardown, so mirror the login liveness into the
         // keymap context. This loop is the field's single writer.
@@ -5302,15 +5288,15 @@ mod tests {
         // Seed the border the way the startup path does, then check it matches
         // the active view's current level.
         let initial = viewed_thinking(&world, AgentId::Main);
-        shell.borrow().apply_editor_border(&world);
+        sync_editor_chrome(&world, &shell);
         assert_eq!(
             editor_border_fg(&shell),
             editor_border_color(&theme, initial.as_ref()),
             "startup seeds the border to the active view's thinking tint"
         );
 
-        // Confirm `minimal` through the real apply path; the batch re-tints the
-        // border for the active view.
+        // Confirm `minimal` through the real apply path, then reconcile the
+        // chrome the way the drive loop does.
         let mut watch = inert_theme_watch();
         apply_selector_activity(
             &mut world,
@@ -5322,6 +5308,7 @@ mod tests {
             }],
         )
         .await;
+        sync_editor_chrome(&world, &shell);
         let minimal = editor_border_fg(&shell);
         assert_eq!(
             minimal,
@@ -5340,6 +5327,7 @@ mod tests {
             }],
         )
         .await;
+        sync_editor_chrome(&world, &shell);
         let xhigh = editor_border_fg(&shell);
         assert_eq!(
             xhigh,
@@ -8192,9 +8180,10 @@ mod tests {
     }
 
     /// Observing an agent whose thinking level differs from the current view
-    /// re-tints the editor border to the newly viewed agent's level. This pins
-    /// the Observe-site re-tint: drop that call and the border keeps the
-    /// previous view's tint after the switch.
+    /// re-tints the editor border to the newly viewed agent's level. The picker
+    /// only switches the view. The reconcile the test runs after it is what
+    /// recomputes the border, so this pins that the reconcile follows the active
+    /// view's thinking tint across an Observe switch.
     #[tokio::test]
     async fn agent_picker_observe_retints_the_editor_border() {
         let dir = TempDir::new().expect("tempdir");
@@ -8233,6 +8222,8 @@ mod tests {
         );
 
         // The border rests on the main view's minimal tint before the switch.
+        // The reconcile is the single writer, so seed through it here.
+        sync_editor_chrome(&world, &shell);
         let before = editor_border_fg(&shell);
         assert_eq!(
             before,
@@ -8248,7 +8239,9 @@ mod tests {
         assert!(matches!(effect, ActionEffect::Redraw));
         assert_eq!(world.chat.borrow().active_view(), AgentId::Sub(1));
 
-        // The view switch must recompute the border to the sub-agent's tint.
+        // The picker only switches the view; the per-iteration reconcile is what
+        // recomputes the border to the newly viewed sub-agent's tint.
+        sync_editor_chrome(&world, &shell);
         let after = editor_border_fg(&shell);
         assert_eq!(
             after,
@@ -8256,6 +8249,87 @@ mod tests {
             "the view switch re-tints the border to the sub-agent's xhigh tint"
         );
         assert_ne!(before, after, "the border moved with the active view");
+    }
+
+    /// The border of a FINISHED sub-agent still follows the sub's thinking
+    /// level, not main's. Footer settings are retained past `AgentEnd`, so the
+    /// reconcile must resolve the viewed sub's level even after it completes.
+    #[tokio::test]
+    async fn border_tracks_a_finished_sub_agents_thinking_level() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let theme = Theme::bundled_dark_with_mode(ColorMode::Truecolor);
+
+        // Pin the main view to a low level so it resolves to a distinct tint.
+        let mut watch = inert_theme_watch();
+        apply_selector_activity(
+            &mut world,
+            &shell,
+            &mut watch,
+            vec![SelectorActivity::ThinkingConfirmed {
+                target: AgentId::Main,
+                level: Some(ThinkingConfig::Minimal),
+            }],
+        )
+        .await;
+
+        // Seed a sub-agent at a distinct high level, then finish it. The
+        // reducer's `SubAgentEnd`/`AgentEnd` arms mark the box done but leave
+        // the footer settings in place, so the sub's level must survive.
+        let _ = reduce(
+            &mut world.chat.borrow_mut(),
+            &mut world.core.lifecycle,
+            AgentEvent::SubAgentStart {
+                parent: AgentId::Main,
+                child: AgentId::Sub(1),
+                task: "reason harder".into(),
+                background: false,
+                settings: aj_agent::events::AgentSettings {
+                    provider: "scripted".into(),
+                    model_id: "scripted".into(),
+                    thinking: "xhigh".into(),
+                    speed: "standard".into(),
+                    verbosity: "default".into(),
+                },
+            },
+        );
+        let _ = reduce(
+            &mut world.chat.borrow_mut(),
+            &mut world.core.lifecycle,
+            AgentEvent::SubAgentEnd {
+                parent: AgentId::Main,
+                child: AgentId::Sub(1),
+                report: "done".into(),
+            },
+        );
+        let _ = reduce(
+            &mut world.chat.borrow_mut(),
+            &mut world.core.lifecycle,
+            AgentEvent::AgentEnd {
+                agent_id: AgentId::Sub(1),
+                messages: Vec::new(),
+            },
+        );
+
+        // Observe the finished sub-agent and reconcile the chrome.
+        let _ = apply_picker_outcome(
+            &mut world,
+            &shell,
+            AgentPickerOutcome::Observe(AgentId::Sub(1)),
+        );
+        sync_editor_chrome(&world, &shell);
+
+        let border = editor_border_fg(&shell);
+        assert_eq!(
+            border,
+            editor_border_color(&theme, Some(&ThinkingConfig::XHigh)),
+            "a finished sub-agent's border still follows its own thinking level"
+        );
+        assert_ne!(
+            border,
+            editor_border_color(&theme, Some(&ThinkingConfig::Minimal)),
+            "the border did not fall back to the main view's tint"
+        );
     }
 
     /// Reads the editor's top-border row as a single string. The top rule is
@@ -8301,6 +8375,8 @@ mod tests {
             AgentPickerOutcome::Observe(AgentId::Sub(1)),
         );
         assert!(matches!(effect, ActionEffect::Redraw));
+        // The picker switches the view; the reconcile writes the marker.
+        sync_editor_chrome(&world, &shell);
         // Pin the exact marker text, not just a substring: `sub-agent 1` also
         // contains `agent 1`, so the `!contains("sub-agent")` guard is what
         // rejects a wrong `sub-agent {n}` label.
@@ -8317,18 +8393,19 @@ mod tests {
             AgentPickerOutcome::Observe(AgentId::Main),
         );
         assert!(matches!(effect, ActionEffect::Redraw));
+        sync_editor_chrome(&world, &shell);
         assert!(
             !editor_top_bar_text(&shell).contains("agent"),
             "observing the main agent clears the marker"
         );
     }
 
-    /// A session install lands on the main view, so `rebind` clears an
-    /// `agent N` marker left over from observing a sub-agent in the previous
-    /// session. This is the second marker trigger. The picker path above
-    /// covers the first.
+    /// The reconcile clears a stale `agent N` marker once the active view
+    /// returns to the main agent, which is the view a fresh-session install
+    /// lands on. Covers both halves: setting the marker for an observed
+    /// sub-agent and clearing it back on the main view.
     #[tokio::test]
-    async fn rebind_clears_a_stale_editor_agent_marker() {
+    async fn sync_editor_chrome_clears_the_marker_on_the_main_view() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
 
@@ -8355,18 +8432,176 @@ mod tests {
             &shell,
             AgentPickerOutcome::Observe(AgentId::Sub(1)),
         );
+        sync_editor_chrome(&world, &shell);
         assert!(
             editor_top_bar_text(&shell).contains("agent 1"),
             "sub-agent observed, marker set"
         );
 
-        // A fresh session lands on the main view; rebind reflects that and
-        // clears the stale marker.
+        // A fresh session lands on the main view; the reconcile clears the
+        // stale marker once the active view is back on Main.
         world.chat.borrow_mut().set_active_view(AgentId::Main);
-        shell.borrow_mut().rebind(&world);
+        sync_editor_chrome(&world, &shell);
         assert!(
             !editor_top_bar_text(&shell).contains("agent"),
-            "rebind clears the stale sub-agent marker on a fresh session"
+            "the reconcile clears the stale sub-agent marker on the main view"
+        );
+    }
+
+    /// A session install reconciles the editor chrome onto the new session, so
+    /// its first paint is correct without waiting for the drive loop's
+    /// bottom-of-iteration reconcile. Observing a sub-agent bakes an `agent N`
+    /// marker and the sub's tint into the editor, and the editor persists across
+    /// the chat swap, so after the install the marker must be gone and the
+    /// border must match the fresh main view's tint. Asserted without a manual
+    /// reconcile: the install is the single writer for this window.
+    #[tokio::test]
+    async fn install_reconciles_the_editor_chrome_onto_the_new_session() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let theme = Theme::bundled_dark_with_mode(ColorMode::Truecolor);
+
+        // Observe a sub-agent at a level distinct from the default (a fresh
+        // main view falls back to the run config's level), so the editor
+        // carries both an `agent 1` marker and a border tint that visibly moves
+        // across the switch.
+        let _ = reduce(
+            &mut world.chat.borrow_mut(),
+            &mut world.core.lifecycle,
+            AgentEvent::SubAgentStart {
+                parent: AgentId::Main,
+                child: AgentId::Sub(1),
+                task: "reason harder".into(),
+                background: false,
+                settings: aj_agent::events::AgentSettings {
+                    provider: "scripted".into(),
+                    model_id: "scripted".into(),
+                    thinking: "minimal".into(),
+                    speed: "standard".into(),
+                    verbosity: "default".into(),
+                },
+            },
+        );
+        let _ = apply_picker_outcome(
+            &mut world,
+            &shell,
+            AgentPickerOutcome::Observe(AgentId::Sub(1)),
+        );
+        sync_editor_chrome(&world, &shell);
+        let sub_tint = editor_border_fg(&shell);
+        assert!(
+            editor_top_bar_text(&shell).contains("agent 1"),
+            "sub-agent observed, marker set before the switch"
+        );
+        assert_eq!(
+            sub_tint,
+            editor_border_color(&theme, Some(&ThinkingConfig::Minimal)),
+            "border carries the observed sub-agent's tint before the switch"
+        );
+
+        // Build and install a fresh session. Installing lands on the main view.
+        let previous_id = world.core.session_id.clone();
+        let next = build_next_session(
+            &world,
+            SessionSpec::Create {
+                entry: SessionEntry::Switch,
+            },
+            &previous_id,
+        )
+        .await
+        .expect("build fresh next session");
+        install_next_session(&mut world, &shell, next);
+
+        // No manual `sync_editor_chrome`: the install already reconciled the
+        // chrome, so the first post-install paint shows the fresh main view.
+        let fresh_main_tint =
+            editor_border_color(&theme, viewed_thinking(&world, AgentId::Main).as_ref());
+        assert_ne!(
+            fresh_main_tint, sub_tint,
+            "the fresh main tint must differ from the sub's tint for this test to bite"
+        );
+        assert!(
+            !editor_top_bar_text(&shell).contains("agent"),
+            "the install cleared the stale `agent N` marker"
+        );
+        assert_eq!(
+            editor_border_fg(&shell),
+            fresh_main_tint,
+            "the install re-tinted the border to the fresh main view"
+        );
+    }
+
+    /// The drive loop reconciles the editor chrome once per iteration, so a
+    /// view change that lands outside an explicit reconcile still shows up. We
+    /// point the active view at a sub-agent without touching the chrome, drive
+    /// one benign key through the real loop to an EOF quit, and confirm the
+    /// loop's bottom-of-iteration `sync_editor_chrome` baked the `agent 1`
+    /// marker and the sub's tint. This pins the per-iteration call: delete it
+    /// and the chrome stays at the resting default.
+    #[tokio::test]
+    async fn drive_loop_reconciles_the_editor_chrome_each_iteration() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        let theme = Theme::bundled_dark_with_mode(ColorMode::Truecolor);
+
+        // Seed a sub-agent and point the active view at it, leaving the editor
+        // chrome at its resting default. Only the loop's reconcile should move
+        // it.
+        let _ = reduce(
+            &mut world.chat.borrow_mut(),
+            &mut world.core.lifecycle,
+            AgentEvent::SubAgentStart {
+                parent: AgentId::Main,
+                child: AgentId::Sub(1),
+                task: "reason harder".into(),
+                background: false,
+                settings: aj_agent::events::AgentSettings {
+                    provider: "scripted".into(),
+                    model_id: "scripted".into(),
+                    thinking: "xhigh".into(),
+                    speed: "standard".into(),
+                    verbosity: "default".into(),
+                },
+            },
+        );
+        world.chat.borrow_mut().set_active_view(AgentId::Sub(1));
+
+        let mut theme_watch = inert_theme_watch();
+        let mut prompt_history_rx: Option<UnboundedReceiver<Vec<String>>> = None;
+        let mut autocomplete_rx = shell
+            .borrow()
+            .editor
+            .borrow_mut()
+            .take_autocomplete_rx()
+            .expect("editor hands out its autocomplete receiver once");
+
+        // One benign key forces a full loop iteration, whose
+        // bottom-of-iteration reconcile runs, then EOF (the dropped writer)
+        // quits on the next iteration before it reaches that reconcile.
+        writer.write_all(b"x").expect("benign key");
+        drop(writer);
+        let exit = drive(
+            &mut app,
+            &root,
+            &shell,
+            &mut world,
+            &mut theme_watch,
+            &mut prompt_history_rx,
+            &mut autocomplete_rx,
+        )
+        .await
+        .expect("drive exits without a fatal error");
+        assert!(matches!(exit, SessionExit::Quit), "EOF quit the loop");
+
+        assert!(
+            editor_top_bar_text(&shell).contains("agent 1"),
+            "the loop's reconcile inlaid the observed sub-agent's marker"
+        );
+        assert_eq!(
+            editor_border_fg(&shell),
+            editor_border_color(&theme, Some(&ThinkingConfig::XHigh)),
+            "the loop's reconcile tinted the border to the sub-agent's level"
         );
     }
 
