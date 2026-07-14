@@ -102,7 +102,8 @@ use serde_json::Value;
 
 use crate::compaction::estimate_conversation_context;
 use crate::log::{
-    ConversationEntry, ConversationEntryKind, ConversationLog, ThreadFilter, ThreadKind,
+    Conversation, ConversationEntry, ConversationEntryKind, ConversationLog, ThreadFilter,
+    ThreadKind,
 };
 use crate::tool_details::resolve_tool_details;
 
@@ -115,22 +116,103 @@ pub fn replay(log: &ConversationLog) -> impl Iterator<Item = AgentEvent> + '_ {
     Replay::new(log)
 }
 
+/// Like [`replay`], but withholds every sub-agent's projected content
+/// events.
+///
+/// This is the full replay state machine with sub-agent content
+/// projection gated off. It runs the same bracketing as [`replay`], so
+/// it emits the identical sequence of [`AgentEvent::SubAgentStart`] /
+/// [`AgentEvent::SubAgentEnd`] events, with identical reports. The only
+/// difference: for an entry whose agent is a sub-agent it does not push
+/// the projected `MessageStart`/`End`, `ToolExecution*`, `UsageUpdate`,
+/// or `Notice` events. Main-agent entries project exactly as in full
+/// replay. A caller reconstructs a sub-agent's withheld content on
+/// demand with [`project_thread`].
+///
+/// This makes resuming a large session cheap. The projection clones
+/// every sub-agent message and tool payload into an event, and
+/// sub-agent threads dominate a big log, so deferring that work builds
+/// the main transcript and the sub-agent boxes without paying for
+/// transcripts the user is usually not looking at.
+pub fn replay_deferring_subs(log: &ConversationLog) -> impl Iterator<Item = AgentEvent> + '_ {
+    Replay::deferring_subs(log)
+}
+
+/// Project one already-linearized sub-agent thread into that
+/// sub-agent's content events, with a fresh projection state.
+///
+/// `conv` must be the linearization of a single sub-agent thread
+/// (`log.linearize(head, ThreadFilter::subagent(n))`) and `agent` the
+/// matching [`AgentId::Sub`]. It emits that sub-agent's
+/// `MessageStart`/`End`, `ToolExecution*`, `UsageUpdate`, and `Notice`
+/// events, equal in order and payload to what full [`replay`] emits for
+/// the same thread. It does not emit [`AgentEvent::SubAgentStart`] /
+/// [`AgentEvent::SubAgentEnd`] and does not bracket, because the box
+/// these events fill already exists.
+///
+/// Takes an owned [`Conversation`], not a `&ConversationLog`, so the
+/// caller can drop the log lock before projecting. This is sound
+/// because a sub-agent thread never carries a
+/// [`ConversationEntryKind::Compaction`] entry (compaction runs on the
+/// user thread only), which is the only projection step that needs the
+/// full log.
+pub fn project_thread(conv: &Conversation, agent: AgentId) -> Vec<AgentEvent> {
+    // A fresh state scoped to this thread reproduces full replay's
+    // per-agent projection: the usage accumulator and the
+    // settings-notice gate are keyed per `AgentId`, and every entry on
+    // this thread is `agent`, so the `UsageUpdate` sequence and `Notice`
+    // gating match what full replay produces for this sub-agent.
+    debug_assert!(
+        matches!(agent, AgentId::Sub(_)),
+        "project_thread projects a sub-agent thread"
+    );
+    let mut state = ReplayState::default();
+    let mut out = VecDeque::new();
+    for entry in conv.entries() {
+        // No bracketing and no log handle: the box exists already, and
+        // a sub-agent thread carries no `Compaction` entry.
+        //
+        // Guard against a misrouted conversation: every entry that carries an
+        // agent id must be `agent`. Meta entries (settings, system prompt)
+        // carry none and are fine on any thread.
+        debug_assert!(
+            agent_id_for(entry).is_none_or(|id| id == agent),
+            "project_thread received an entry for a different agent"
+        );
+        state.project_entry(entry, None, &mut out);
+    }
+    out.into()
+}
+
 struct Replay<'a> {
     log: &'a ConversationLog,
     next_entry: usize,
     state: ReplayState,
     pending: VecDeque<AgentEvent>,
     finished: bool,
+    /// When set, sub-agent content events are withheld (see
+    /// [`replay_deferring_subs`]). Bracketing and report capture are
+    /// unaffected.
+    defer_subs: bool,
 }
 
 impl<'a> Replay<'a> {
     fn new(log: &'a ConversationLog) -> Self {
+        Self::with_mode(log, false)
+    }
+
+    fn deferring_subs(log: &'a ConversationLog) -> Self {
+        Self::with_mode(log, true)
+    }
+
+    fn with_mode(log: &'a ConversationLog, defer_subs: bool) -> Self {
         Self {
             log,
             next_entry: 0,
             state: ReplayState::default(),
             pending: VecDeque::new(),
             finished: false,
+            defer_subs,
         }
     }
 }
@@ -149,7 +231,16 @@ impl Iterator for Replay<'_> {
                 self.next_entry += 1;
                 if let Some(entry) = self.log.entry_in_append_order(index) {
                     self.state.bracket_subagent(entry, &mut self.pending);
-                    self.state.project_entry(entry, self.log, &mut self.pending);
+                    if self.defer_subs && matches!(agent_id_for(entry), Some(AgentId::Sub(_))) {
+                        // Deferred mode withholds a sub-agent's content
+                        // events but still advances the report that
+                        // `close_open_sub` reads, so the `SubAgentEnd`
+                        // matches full replay byte for byte.
+                        self.state.capture_sub_report_from_entry(entry);
+                    } else {
+                        self.state
+                            .project_entry(entry, Some(self.log), &mut self.pending);
+                    }
                 }
                 continue;
             }
@@ -343,11 +434,12 @@ impl ReplayState {
     /// Translate one entry into zero or more events, appending them
     /// to `out`. `log` is consulted only for a `Compaction` entry, to
     /// estimate the post-compaction occupancy of the reduced
-    /// projection.
+    /// projection. Single-thread projection ([`project_thread`]) passes
+    /// `None`: a sub-agent thread never carries a `Compaction` entry.
     fn project_entry(
         &mut self,
         entry: &ConversationEntry,
-        log: &ConversationLog,
+        log: Option<&ConversationLog>,
         out: &mut VecDeque<AgentEvent>,
     ) {
         let agent_id = match agent_id_for(entry) {
@@ -401,6 +493,16 @@ impl ReplayState {
                 // durable on-disk record, so we carry it through here
                 // to paint the same collapsible compaction-summary row
                 // a live run shows.
+                let Some(log) = log else {
+                    // Only single-thread projection passes `None`, and a
+                    // sub-agent thread never carries a `Compaction`
+                    // entry, so this arm is unreachable there.
+                    debug_assert!(
+                        false,
+                        "compaction entry on a thread projected without a log"
+                    );
+                    return;
+                };
                 let tokens_after =
                     estimate_conversation_context(&log.linearize(&entry.id, ThreadFilter::USER))
                         .tokens;
@@ -453,6 +555,50 @@ impl ReplayState {
         }
     }
 
+    /// Fold `assistant`'s text into the open sub-agent run's report.
+    ///
+    /// Overwrites rather than accumulates: the report is the most
+    /// recent sub-agent assistant message's text. `bracket_subagent`
+    /// clears it on open, so after the run's last assistant message it
+    /// holds the final report `close_open_sub` reads onto the
+    /// `SubAgentEnd`. A no-op unless `agent_id` is the open sub.
+    ///
+    /// Split out from projection so deferred replay can advance the
+    /// report without cloning the sub-agent's messages into events. The
+    /// naive alternative, skipping sub-agent projection wholesale, would
+    /// also skip this and leave every resumed box with an empty report.
+    fn capture_sub_report(
+        &mut self,
+        agent_id: AgentId,
+        assistant: &aj_models::types::AssistantMessage,
+    ) {
+        if matches!((self.open_sub, agent_id), (Some(n), AgentId::Sub(m)) if n == m) {
+            let mut report = String::new();
+            for c in &assistant.content {
+                if let AssistantContent::Text(t) = c {
+                    report.push_str(&t.text);
+                }
+            }
+            self.open_sub_report = report;
+        }
+    }
+
+    /// Advance the open sub-agent run's report from `entry` without
+    /// projecting its content events. Deferred replay calls this for
+    /// sub-agent entries: only an assistant message carries report
+    /// text, every other kind is a no-op here.
+    fn capture_sub_report_from_entry(&mut self, entry: &ConversationEntry) {
+        let Some(agent_id) = agent_id_for(entry) else {
+            return;
+        };
+        let ConversationEntryKind::Message { message } = &entry.entry else {
+            return;
+        };
+        if let Some(Message::Assistant(a)) = message.as_wire() {
+            self.capture_sub_report(agent_id, a);
+        }
+    }
+
     /// Project an assistant-role message into a `MessageStart`
     /// (with an empty placeholder so renderers can open the slot)
     /// followed by a `MessageEnd` carrying the finalized message.
@@ -495,15 +641,7 @@ impl ReplayState {
         // While a sub-agent run is open, record this assistant
         // message's text as the running report; after the run's last
         // assistant message it holds the final report.
-        if matches!((self.open_sub, agent_id), (Some(n), AgentId::Sub(m)) if n == m) {
-            let mut report = String::new();
-            for c in &assistant.content {
-                if let AssistantContent::Text(t) = c {
-                    report.push_str(&t.text);
-                }
-            }
-            self.open_sub_report = report;
-        }
+        self.capture_sub_report(agent_id, assistant);
 
         // Synthesize the matching `UsageUpdate`. Live runs emit one
         // per assistant turn on the bus; without this resumed
@@ -1976,5 +2114,343 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    /// Build a log with a main thread and one foreground sub-agent run
+    /// that produces assistant text, a tool call, a tool result, and a
+    /// concluding report, then main resumes. The sub content is rich so
+    /// the deferred/`project_thread` parity checks exercise
+    /// `MessageStart`/`End`, `ToolExecution*`, and `UsageUpdate`.
+    fn log_with_foreground_sub() -> (PathBuf, ConversationLog) {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.clone());
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("sp");
+
+        let user_head = {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_message(user_msg("hi")).expect("u");
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "delegating".into(),
+                text_signature: None,
+            })]))
+            .expect("a");
+            view.head().cloned().expect("head")
+        };
+
+        let settings = AgentSettings {
+            provider: "anthropic".into(),
+            model_id: "claude-x".into(),
+            thinking: "high".into(),
+            speed: "fast".into(),
+            verbosity: "default".into(),
+        };
+        log.append_subagent_spawn(1, user_head, "subtask", false, &settings)
+            .expect("spawn");
+        let sub_head = {
+            let sub_leaf = log
+                .latest_leaf(ThreadFilter::subagent(1))
+                .expect("sub leaf");
+            let mut view = ConversationView::subagent(&mut log, sub_leaf, 1);
+            view.add_message(user_msg("subtask")).expect("u");
+            view.add_message(assistant_msg(vec![AssistantContent::ToolCall(ToolCall {
+                id: "sub-call-1".into(),
+                name: "read_file".into(),
+                arguments: json!({"path": "/tmp/s"}),
+            })]))
+            .expect("a tool call");
+            view.add_message(tool_result_msg("sub-call-1", "read_file", "sub body", None))
+                .expect("tr");
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "final sub report".into(),
+                text_signature: None,
+            })]))
+            .expect("a report");
+            view.head().cloned().expect("sub head")
+        };
+
+        // Main resumes after the sub run, anchored past the sub's tail.
+        {
+            let mut view = ConversationView::user(&mut log, Some(sub_head));
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "back on main".into(),
+                text_signature: None,
+            })]))
+            .expect("a");
+        }
+
+        (dir, log)
+    }
+
+    /// Build a log whose sub-agent run interleaves with the parent's in
+    /// append order: a background sub takes a turn, main takes a turn
+    /// while it is still open, then the sub concludes and main
+    /// concludes. In append order the sub's entries straddle a main
+    /// entry, so full replay opens and closes the sub bracket twice.
+    fn log_with_background_sub() -> (PathBuf, ConversationLog) {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.clone());
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("sp");
+
+        let mut user_head = {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_message(user_msg("hi")).expect("u");
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "delegating".into(),
+                text_signature: None,
+            })]))
+            .expect("a");
+            view.head().cloned().expect("head")
+        };
+
+        let settings = super::fallback_settings();
+        let mut sub_head = log
+            .append_subagent_spawn(1, user_head.clone(), "bg subtask", true, &settings)
+            .expect("spawn");
+
+        // First sub turn.
+        sub_head = {
+            let mut view = ConversationView::subagent(&mut log, sub_head, 1);
+            view.add_message(user_msg("bg subtask")).expect("u");
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "sub step one".into(),
+                text_signature: None,
+            })]))
+            .expect("a");
+            view.head().cloned().expect("sub head")
+        };
+
+        // Main takes a turn while the background sub is still open, so
+        // the sub's remaining entry lands after this one in append order.
+        user_head = {
+            let mut view = ConversationView::user(&mut log, Some(user_head));
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "main while bg runs".into(),
+                text_signature: None,
+            })]))
+            .expect("a");
+            view.head().cloned().expect("head")
+        };
+
+        // Sub resumes and concludes.
+        {
+            let mut view = ConversationView::subagent(&mut log, sub_head, 1);
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "bg final report".into(),
+                text_signature: None,
+            })]))
+            .expect("a");
+        }
+
+        // Main concludes.
+        {
+            let mut view = ConversationView::user(&mut log, Some(user_head));
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "main done".into(),
+                text_signature: None,
+            })]))
+            .expect("a");
+        }
+
+        (dir, log)
+    }
+
+    fn event_values<'a>(events: impl IntoIterator<Item = &'a AgentEvent>) -> Vec<Value> {
+        events
+            .into_iter()
+            .map(|e| serde_json::to_value(e).expect("event serializes"))
+            .collect()
+    }
+
+    fn bracket_events(events: &[AgentEvent]) -> Vec<Value> {
+        event_values(events.iter().filter(|e| {
+            matches!(
+                e,
+                AgentEvent::SubAgentStart { .. } | AgentEvent::SubAgentEnd { .. }
+            )
+        }))
+    }
+
+    /// Every event whose `agent_id()` is `Main`. Bracket events report
+    /// the parent, so this subsequence includes them.
+    fn main_subsequence(events: &[AgentEvent]) -> Vec<Value> {
+        event_values(
+            events
+                .iter()
+                .filter(|e| matches!(e.agent_id(), AgentId::Main)),
+        )
+    }
+
+    fn sub_reports(events: &[AgentEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::SubAgentEnd { report, .. } => Some(report.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Count of sub-agent-tagged events. Bracket events report the
+    /// parent, so every `Sub(_)`-tagged event is projected content.
+    fn sub_content_count(events: &[AgentEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e.agent_id(), AgentId::Sub(_)))
+            .count()
+    }
+
+    /// Deferred replay is the full state machine with sub-agent content
+    /// gated off: identical bracket sequence, identical non-empty
+    /// reports, identical main subsequence, and zero sub-agent content
+    /// events (full replay emits some).
+    fn assert_deferred_matches_full(log: &ConversationLog) {
+        let full: Vec<AgentEvent> = replay(log).collect();
+        let deferred: Vec<AgentEvent> = replay_deferring_subs(log).collect();
+
+        assert_eq!(
+            bracket_events(&full),
+            bracket_events(&deferred),
+            "bracket sequence must be identical"
+        );
+
+        let reports = sub_reports(&full);
+        assert_eq!(reports, sub_reports(&deferred), "reports must be identical");
+        assert!(!reports.is_empty(), "the log has at least one sub run");
+        assert!(
+            reports.iter().all(|r| !r.is_empty()),
+            "reports must be non-empty, got {reports:?}"
+        );
+
+        assert_eq!(
+            sub_content_count(&deferred),
+            0,
+            "deferred mode withholds all sub content, got {deferred:#?}"
+        );
+        assert!(
+            sub_content_count(&full) > 0,
+            "full replay projects sub content"
+        );
+
+        assert_eq!(
+            main_subsequence(&full),
+            main_subsequence(&deferred),
+            "main-agent subsequence must be identical"
+        );
+    }
+
+    /// `project_thread` for `Sub(n)` reproduces exactly the
+    /// `Sub(n)`-tagged content events full replay emits for that thread
+    /// (bracket events report the parent, so they're already excluded).
+    fn assert_project_thread_matches_full(log: &ConversationLog, n: usize) {
+        let full: Vec<AgentEvent> = replay(log).collect();
+        let expected = event_values(
+            full.iter()
+                .filter(|e| matches!(e.agent_id(), AgentId::Sub(m) if m == n)),
+        );
+        assert!(
+            !expected.is_empty(),
+            "full replay produced Sub({n}) content"
+        );
+
+        let head = log
+            .latest_leaf(ThreadFilter::subagent(n))
+            .expect("sub leaf");
+        let conv = log.linearize(&head, ThreadFilter::subagent(n));
+        let projected = event_values(project_thread(&conv, AgentId::Sub(n)).iter());
+
+        assert_eq!(projected, expected, "project_thread parity for Sub({n})");
+    }
+
+    /// Deferred replay of a clean foreground sub run matches full replay
+    /// on brackets and reports and withholds all sub content. The
+    /// concrete report value pins the report-capture refactor, whose
+    /// naive form (skipping sub projection wholesale) yields an empty
+    /// report here.
+    #[test]
+    fn replay_deferring_subs_matches_full_for_foreground_sub() {
+        let (_dir, log) = log_with_foreground_sub();
+        assert_deferred_matches_full(&log);
+        let full: Vec<AgentEvent> = replay(&log).collect();
+        assert_eq!(sub_reports(&full), vec!["final sub report".to_string()]);
+    }
+
+    /// Same parity contract for a background sub whose entries interleave
+    /// with the parent's, so the bracket opens and closes twice.
+    #[test]
+    fn replay_deferring_subs_matches_full_for_background_sub() {
+        let (_dir, log) = log_with_background_sub();
+        assert_deferred_matches_full(&log);
+        let full: Vec<AgentEvent> = replay(&log).collect();
+        assert_eq!(
+            sub_reports(&full),
+            vec!["sub step one".to_string(), "bg final report".to_string()],
+        );
+    }
+
+    #[test]
+    fn project_thread_matches_full_replay_for_foreground_sub() {
+        let (_dir, log) = log_with_foreground_sub();
+        assert_project_thread_matches_full(&log, 1);
+    }
+
+    /// Parity relies on the sub's append order matching its `parent_id`
+    /// chain, which interleaving would break if `linearize` and replay
+    /// disagreed. This pins the interleaved case.
+    #[test]
+    fn project_thread_matches_full_replay_for_background_sub() {
+        let (_dir, log) = log_with_background_sub();
+        assert_project_thread_matches_full(&log, 1);
+    }
+
+    /// A legacy log with no `SubAgentSpawn` entry still yields a
+    /// `SubAgentStart` under `replay_deferring_subs`, synthesized by the
+    /// `bracket_subagent` fallback at the sub's first message. The aj-next
+    /// resume drain seeds `deferred_subs` from that event, so without the
+    /// synthesized start a legacy sub-agent would never be marked deferred
+    /// and never materialize on observe.
+    #[test]
+    fn replay_deferring_subs_emits_start_for_legacy_log() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("sp");
+
+        let user_head = {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_message(user_msg("hi")).expect("u");
+            view.head().cloned().expect("head present")
+        };
+        // No `append_subagent_spawn`: the sub thread leads straight with its
+        // task message, the legacy shape the fallback exists for.
+        {
+            let mut view = ConversationView::subagent(&mut log, user_head, 1);
+            view.add_message(user_msg("subtask")).expect("u");
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "reply".into(),
+                text_signature: None,
+            })]))
+            .expect("a");
+        }
+
+        let deferred: Vec<AgentEvent> = replay_deferring_subs(&log).collect();
+        match deferred
+            .iter()
+            .find(|e| matches!(e, AgentEvent::SubAgentStart { .. }))
+            .expect("deferred replay synthesizes a SubAgentStart for the legacy sub")
+        {
+            AgentEvent::SubAgentStart { child, task, .. } => {
+                assert_eq!(*child, AgentId::Sub(1));
+                assert_eq!(task, "subtask");
+            }
+            _ => unreachable!(),
+        }
+        // Deferred mode still withholds the sub's content events.
+        assert_eq!(
+            sub_content_count(&deferred),
+            0,
+            "deferred mode withholds the legacy sub's content, got {deferred:#?}"
+        );
     }
 }
