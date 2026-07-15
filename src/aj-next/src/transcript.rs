@@ -34,11 +34,12 @@ use vaxis::gwidth;
 use vaxis::key::{Key, Modifiers};
 use vaxis::mouse;
 use vaxis::vxfw::{
-    Builder, DrawContext, Event, EventContext, ListView, MaxSize, RelativePoint, RichText,
-    ScrollBars, Size, Source, SubSurface, Surface, TextSpan, Widget, WidgetRef,
+    Builder, DrawContext, Event, EventContext, ListView, MaxSize, PadValues, Padding,
+    RelativePoint, RichText, ScrollBars, Size, Source, SubSurface, Surface, TextSpan, Widget,
+    WidgetRef,
 };
 
-use crate::bubble::{Bubble, BubbleBorder};
+use crate::bubble::{Bubble, BubbleBorder, PADDING_X};
 use crate::markdown_view::{MarkdownSegment, MarkdownStyles, MarkdownView};
 use crate::subagent_box::{SubAgentBox, build_subagent_box, surface_rows};
 use crate::terminal::TERMINAL_HYPERLINKS;
@@ -491,7 +492,7 @@ impl Widget for CachingEntry {
             // user message. Every other entry builds unbordered.
             let focus = self.focused.then(|| self.copy_label.as_slice());
             let mut widget =
-                build_entry_widget(entry, &chat, &self.styles, false, focus).into_boxed();
+                build_entry_widget(entry, &chat, &self.styles, false, focus).into_indented_boxed();
             widget.draw(ctx)
         };
         self.cache
@@ -839,14 +840,34 @@ pub(crate) enum EntryWidget {
 }
 
 impl EntryWidget {
-    /// Erase to a boxed widget, for the sub-agent box's child list.
-    pub(crate) fn into_boxed(self) -> Box<dyn Widget> {
+    /// Erase to a boxed widget, applying the shared one-column left indent
+    /// every transcript entry carries.
+    ///
+    /// Bubbles and the sub-agent box already inset their content by
+    /// `PADDING_X` over a full-width background, so they are boxed as-is. The
+    /// plain rich and markdown entries paint from column zero, so we wrap them
+    /// in a `Padding` that shifts their content right by `PADDING_X`. That
+    /// leaves a true blank first column (no background) which semantic
+    /// selection skips.
+    pub(crate) fn into_indented_boxed(self) -> Box<dyn Widget> {
         match self {
             EntryWidget::Bubble(b) => Box::new(b),
-            EntryWidget::Rich(r) => Box::new(r),
-            EntryWidget::Markdown(m) => Box::new(m),
             EntryWidget::SubAgent(b) => Box::new(b),
+            EntryWidget::Rich(r) => Box::new(indent_entry(r)),
+            EntryWidget::Markdown(m) => Box::new(indent_entry(m)),
         }
+    }
+}
+
+/// Wrap a background-less entry widget in the shared left indent, matching the
+/// column-one text start of the bubble entries.
+fn indent_entry<W: Widget + 'static>(widget: W) -> Padding {
+    Padding {
+        child: Rc::new(RefCell::new(widget)),
+        padding: PadValues {
+            left: PADDING_X,
+            ..PadValues::default()
+        },
     }
 }
 
@@ -1010,10 +1031,10 @@ fn entry_spans(entry: &Entry, styles: &TranscriptStyles) -> Vec<TextSpan> {
         // fallback, which can't occur live (sub-agents don't spawn
         // sub-agents), so a dim stub is enough.
         EntryKind::SubAgent(s) => vec![span(format!("[sub-agent {}]", s.child), styles.dim)],
-        // Notice and usage rows carry the same one-column left inset
-        // the tool bubbles have, so the transcript's left edge lines
-        // up. Wrapped continuation lines start at column zero, which
-        // is acceptable for these short rows.
+        // Notice and usage rows render as plain rich text. The shared
+        // one-column left indent is applied when the entry is boxed (see
+        // `into_indented_boxed`), so it covers wrapped continuation lines too
+        // and we add no leading space here.
         EntryKind::Notice(n) => {
             let style = match n.level {
                 NoticeLevel::Info => styles.dim,
@@ -1023,11 +1044,9 @@ fn entry_spans(entry: &Entry, styles: &TranscriptStyles) -> Vec<TextSpan> {
             // Parse any SGR strikethrough markers (the context notice strikes a
             // disabled skill's row) into struck spans. Text with no markers
             // yields a single span, so this is safe for every notice.
-            let mut spans = vec![span(" ".to_string(), style)];
-            spans.extend(strikethrough_spans(&n.text, style));
-            spans
+            strikethrough_spans(&n.text, style)
         }
-        EntryKind::TurnUsage(u) => vec![span(format!(" {}", u.line()), styles.dim)],
+        EntryKind::TurnUsage(u) => vec![span(u.line(), styles.dim)],
     };
     // Normalize away trailing newlines so the spacer below yields
     // exactly one blank row regardless of how the content ends.
@@ -1124,19 +1143,20 @@ fn build_assistant_markdown(
 /// Build the [`MarkdownView`] for a compaction entry: a dim plain header above
 /// the markdown-rendered summary.
 ///
-/// The header stays a plain (non-markdown) leading row so its one-column inset
-/// and token glyphs survive verbatim, carrying the `(<key> to expand)` hint
-/// while collapsed. Folding rides the session-wide `tools_expanded` flag, the
-/// same one tool bodies honor, so a summary expands and collapses together with
-/// tool results under one keystroke. The summary renders as a markdown segment
-/// only once expanded and non-empty.
+/// The header stays a plain (non-markdown) leading row so its token glyphs
+/// survive verbatim, carrying the `(<key> to expand)` hint while collapsed.
+/// Folding rides the session-wide `tools_expanded` flag, the same one tool
+/// bodies honor, so a summary expands and collapses together with tool results
+/// under one keystroke. The summary renders as a markdown segment only once
+/// expanded and non-empty. The shared one-column left indent is applied when
+/// the entry is boxed (see `into_indented_boxed`).
 fn build_compaction_markdown(
     c: &CompactionEntry,
     tools_expanded: bool,
     syntax_highlight: bool,
     styles: &TranscriptStyles,
 ) -> MarkdownView {
-    let mut header = format!(" {}", compaction_header(c.tokens_before, c.tokens_after));
+    let mut header = compaction_header(c.tokens_before, c.tokens_after);
     if !tools_expanded && !c.summary.is_empty() {
         let key = EXPAND_KEY_LABEL.as_str();
         header.push_str(&format!(" ({key} to expand)"));
@@ -1760,7 +1780,7 @@ impl TranscriptView {
                 return Rc::new(Vec::new());
             };
             let mut widget =
-                build_entry_widget(entry, &chat, &self.styles, false, None).into_boxed();
+                build_entry_widget(entry, &chat, &self.styles, false, None).into_indented_boxed();
             let surface = widget.draw(&ctx);
             let mut rows = surface_rows(&surface);
             for row in &mut rows {
@@ -2443,8 +2463,11 @@ mod tests {
         let EntryKind::Compaction(c) = &t.entries()[0].kind else {
             panic!("expected a compaction entry");
         };
-        let mut view = build_compaction_markdown(c, expanded, false, &styles());
-        let surface = view.draw(&crate::test_support::draw_ctx(width, None));
+        let view = build_compaction_markdown(c, expanded, false, &styles());
+        // Render through the indented boxed path so the rows carry the shared
+        // one-column left indent the transcript applies to every entry.
+        let mut widget = EntryWidget::Markdown(view).into_indented_boxed();
+        let surface = widget.draw(&crate::test_support::draw_ctx(width, None));
         let rows = crate::test_support::rows(&surface);
         let grid = crate::test_support::flatten(&surface);
         let header_style = grid[0]
@@ -2760,16 +2783,23 @@ mod tests {
         }
     }
 
-    /// Notice and usage rows carry the one-column left inset that
-    /// lines them up with the tool bubbles' content column.
+    /// Notice and usage rows get the shared one-column left indent when boxed,
+    /// lining them up with the tool bubbles' content column. The spans
+    /// themselves carry no leading space, the indent is a blank first column
+    /// from the entry's `Padding` wrapper.
     #[test]
     fn notice_and_usage_rows_are_inset_one_column() {
+        let s = styles();
         let t = transcript_with(EntryKind::Notice(NoticeEntry {
             level: NoticeLevel::Info,
             text: "note".into(),
         }));
-        let spans = entry_spans(&t.entries()[0], &styles());
-        assert_eq!(joined(&spans), " note\n\n");
+        // The raw spans carry no inset.
+        let spans = entry_spans(&t.entries()[0], &s);
+        assert_eq!(joined(&spans), "note\n\n");
+        // Boxed, the text starts at column one over a blank first column.
+        let rows = indented_rich_rows(&t.entries()[0], &s, 40);
+        assert_eq!(rows[0], " note", "text at column one: {rows:?}");
 
         let t = transcript_with(EntryKind::TurnUsage(aj_app::chat::TurnUsageEntry {
             agent_id: aj_agent::events::AgentId::Main,
@@ -2784,8 +2814,20 @@ mod tests {
                 turn_cache_read: 0,
             },
         }));
-        let spans = entry_spans(&t.entries()[0], &styles());
-        assert!(joined(&spans).starts_with(" Token Usage"), "{spans:?}");
+        let spans = entry_spans(&t.entries()[0], &s);
+        assert!(joined(&spans).starts_with("Token Usage"), "{spans:?}");
+        let rows = indented_rich_rows(&t.entries()[0], &s, 40);
+        assert!(rows[0].starts_with(" Token Usage"), "{rows:?}");
+    }
+
+    /// Render an entry that goes through the `Rich` arm of the builder
+    /// (notice, usage, sub-agent stub) via the indented boxed path, returning
+    /// its rows.
+    fn indented_rich_rows(entry: &Entry, styles: &TranscriptStyles, width: u16) -> Vec<String> {
+        let mut widget =
+            EntryWidget::Rich(RichText::new(entry_spans(entry, styles))).into_indented_boxed();
+        let surface = widget.draw(&crate::test_support::draw_ctx(width, None));
+        crate::test_support::rows(&surface)
     }
 
     /// A notice's SGR strikethrough markers are parsed into struck spans: the
@@ -3759,7 +3801,7 @@ mod tests {
         let chat = builder.chat.borrow();
         let entry = &chat.transcript(agent).expect("transcript").entries()[idx];
         let mut widget =
-            build_entry_widget(entry, &chat, &builder.styles, false, None).into_boxed();
+            build_entry_widget(entry, &chat, &builder.styles, false, None).into_indented_boxed();
         widget.draw(&crate::test_support::draw_ctx(width, None))
     }
 
