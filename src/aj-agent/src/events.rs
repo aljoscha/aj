@@ -65,6 +65,27 @@ pub struct AgentSettings {
     pub verbosity: String,
 }
 
+/// How a sub-agent run concluded, delivered to the parent alongside its
+/// report and used to set the parent box's status. Not persisted on its
+/// own. On resume it is reconstructed from the sub's final message stop
+/// reason (see `aj-session`'s replay), so no on-disk format change is
+/// needed to tell a failed or truncated run from a clean one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubAgentConclusion {
+    /// Normal stop. The report is the sub-agent's complete final answer.
+    #[default]
+    Completed,
+    /// The final message hit the model's token cap, so the report is the
+    /// partial answer. The parent still delivers it but flags the tool
+    /// result as incomplete.
+    Truncated,
+    /// The run failed (error or abort). On the live path the report holds
+    /// the failure text. On resume it holds the failing turn's terminal
+    /// message text, which is usually empty for a pre-stream error.
+    Failed,
+}
+
 /// Identifier for the agent emitting an event.
 ///
 /// `Main` is the top-level agent in a session; `Sub(n)` is the n-th
@@ -274,6 +295,9 @@ pub enum AgentEvent {
         parent: AgentId,
         child: AgentId,
         report: String,
+        /// How the run concluded. Drives the parent box's status and the
+        /// `agent` tool result's error flag.
+        conclusion: SubAgentConclusion,
     },
 
     // --- Background tasks ----------------------------------------------------

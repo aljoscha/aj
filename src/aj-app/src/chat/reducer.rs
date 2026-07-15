@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use aj_agent::events::{AgentEvent, AgentId};
+use aj_agent::events::{AgentEvent, AgentId, SubAgentConclusion};
 use aj_agent::message::AgentMessageKind;
 use aj_agent::tool::{TASK_NOTIFICATION_OPEN_TAG, TaskStatus};
 use aj_models::streaming::AssistantMessageEvent;
@@ -77,7 +77,15 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
             if let AgentId::Sub(n) = agent_id
                 && let Some(b) = state.sub_box_mut(n)
             {
-                b.status = SubAgentStatus::Done;
+                // Conclude a still-running box only. On the live path the
+                // trailing `SubAgentEnd` carries the real conclusion and
+                // sets the final `Truncated`/`Failed`/`Done` status. This
+                // guard is defensive: were the two events ever delivered in
+                // the other order, an unconditional `Done` here would
+                // clobber that conclusion.
+                if b.status == SubAgentStatus::Running {
+                    b.status = SubAgentStatus::Done;
+                }
                 b.finished_at = Some(Instant::now());
             }
             Redraw(true)
@@ -365,11 +373,20 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
             }
             Redraw(true)
         }
-        AgentEvent::SubAgentEnd { child, report, .. } => {
+        AgentEvent::SubAgentEnd {
+            child,
+            report,
+            conclusion,
+            ..
+        } => {
             if let AgentId::Sub(n) = child
                 && let Some(b) = state.sub_box_mut(n)
             {
-                b.status = SubAgentStatus::Done;
+                b.status = match conclusion {
+                    SubAgentConclusion::Completed => SubAgentStatus::Done,
+                    SubAgentConclusion::Truncated => SubAgentStatus::Truncated,
+                    SubAgentConclusion::Failed => SubAgentStatus::Failed,
+                };
                 b.report = Some(report);
                 b.finished_at = Some(Instant::now());
             }
@@ -1429,6 +1446,7 @@ mod tests {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 report: "done".into(),
+                conclusion: aj_agent::events::SubAgentConclusion::Completed,
             },
         );
 
@@ -1535,6 +1553,93 @@ mod tests {
     }
 
     #[test]
+    fn sub_agent_end_conclusion_drives_the_box_status() {
+        // Each conclusion maps to a distinct box status. On the live path
+        // `AgentEnd(Sub n)` fires first and marks the still-running box
+        // `Done`; the trailing `SubAgentEnd` carries the conclusion and
+        // must set the final `Truncated`/`Failed` without being clobbered.
+        for (conclusion, expected) in [
+            (SubAgentConclusion::Completed, SubAgentStatus::Done),
+            (SubAgentConclusion::Truncated, SubAgentStatus::Truncated),
+            (SubAgentConclusion::Failed, SubAgentStatus::Failed),
+        ] {
+            let mut s = state();
+            let mut life = AgentLifecycle::default();
+            apply(
+                &mut s,
+                &mut life,
+                sub_agent_start(1, "scripted", "scripted"),
+            );
+            apply(
+                &mut s,
+                &mut life,
+                AgentEvent::AgentStart {
+                    agent_id: AgentId::Sub(1),
+                },
+            );
+            apply(
+                &mut s,
+                &mut life,
+                AgentEvent::AgentEnd {
+                    agent_id: AgentId::Sub(1),
+                    messages: Vec::new(),
+                },
+            );
+            apply(
+                &mut s,
+                &mut life,
+                AgentEvent::SubAgentEnd {
+                    parent: AgentId::Main,
+                    child: AgentId::Sub(1),
+                    report: "r".into(),
+                    conclusion,
+                },
+            );
+            assert_eq!(
+                s.sub_box_mut(1).expect("box").status,
+                expected,
+                "conclusion {conclusion:?} maps to {expected:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn agent_end_does_not_clobber_a_concluded_box() {
+        // The `AgentEnd` guard matters only if the events reorder so that
+        // `SubAgentEnd` (carrying the conclusion) lands before `AgentEnd`.
+        // Deliver them that way and assert the conclusion survives.
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        apply(
+            &mut s,
+            &mut life,
+            sub_agent_start(1, "scripted", "scripted"),
+        );
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::SubAgentEnd {
+                parent: AgentId::Main,
+                child: AgentId::Sub(1),
+                report: "r".into(),
+                conclusion: SubAgentConclusion::Failed,
+            },
+        );
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::AgentEnd {
+                agent_id: AgentId::Sub(1),
+                messages: Vec::new(),
+            },
+        );
+        assert_eq!(
+            s.sub_box_mut(1).expect("box").status,
+            SubAgentStatus::Failed,
+        );
+    }
+
+    #[test]
     fn continuation_refreshes_the_box_report_from_the_latest_conclusion() {
         // The box renders `report`. A continuation re-run completes through
         // `AgentEnd(Sub n)`, which carries no report, so the report is kept
@@ -1564,6 +1669,7 @@ mod tests {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 report: "first result".into(),
+                conclusion: aj_agent::events::SubAgentConclusion::Completed,
             },
         );
         apply(
@@ -1638,6 +1744,7 @@ mod tests {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 report: "first result".into(),
+                conclusion: aj_agent::events::SubAgentConclusion::Completed,
             },
         );
         apply(
@@ -1714,6 +1821,7 @@ mod tests {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 report: "resume value".into(),
+                conclusion: aj_agent::events::SubAgentConclusion::Completed,
             },
         );
         {
@@ -1804,6 +1912,7 @@ mod tests {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 report: "done".into(),
+                conclusion: aj_agent::events::SubAgentConclusion::Completed,
             },
         );
         // Ended: the end is stamped and the reported runtime no longer moves.
@@ -1883,6 +1992,7 @@ mod tests {
                 parent: AgentId::Main,
                 child: AgentId::Sub(2),
                 report: "done".into(),
+                conclusion: aj_agent::events::SubAgentConclusion::Completed,
             },
         );
         assert!(

@@ -780,6 +780,8 @@ fn subagent_fingerprint(s: &SubAgentEntry, hasher: &mut DefaultHasher) {
     match s.status {
         SubAgentStatus::Running => 0u8.hash(hasher),
         SubAgentStatus::Done => 1u8.hash(hasher),
+        SubAgentStatus::Truncated => 2u8.hash(hasher),
+        SubAgentStatus::Failed => 3u8.hash(hasher),
     }
     s.task.hash(hasher);
     s.report.hash(hasher);

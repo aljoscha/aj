@@ -30,6 +30,7 @@
 //!
 //! [`Parallel`]: aj_agent::tool::ExecutionMode::Parallel
 
+use aj_agent::events::SubAgentConclusion;
 use aj_agent::tool::{
     SpawnMode, SpawnResult, ToolContext, ToolDefinition, ToolDetails, ToolOutcome,
 };
@@ -130,15 +131,25 @@ impl ToolDefinition for AgentTool {
             // payload is the structured triple the renderer /
             // persistence listener uses to group nested transcripts
             // under this tool call.
-            SpawnResult::Completed(spawned) => Ok(ToolOutcome {
-                content: vec![UserContent::text(spawned.report.clone())],
-                details: ToolDetails::SubAgentReport {
-                    agent_id: spawned.agent_id,
-                    task,
-                    report: spawned.report,
-                },
-                is_error: false,
-            }),
+            SpawnResult::Completed(spawned) => {
+                // A truncated report is partial (the sub hit the token cap):
+                // deliver the text so the parent can still use it, but flag
+                // the result and annotate the wire content so the model
+                // doesn't take a cut-off answer as final. Any non-`Completed`
+                // conclusion is flagged; `Failed` cannot reach this arm (it
+                // arrives as an `Err` from `spawn_agent`), but flagging it
+                // keeps the invariant safe if that ever changes.
+                let content = aj_agent::delivered_report(spawned.conclusion, &spawned.report);
+                Ok(ToolOutcome {
+                    content: vec![UserContent::text(content)],
+                    details: ToolDetails::SubAgentReport {
+                        agent_id: spawned.agent_id,
+                        task,
+                        report: spawned.report,
+                    },
+                    is_error: spawned.conclusion != SubAgentConclusion::Completed,
+                })
+            }
             // A background spawn needs no rich details variant: the
             // `SubAgentStart` event already created the transcript
             // box, and the report reaches the transcript through the
@@ -307,6 +318,7 @@ mod tests {
             response: SpawnResult::Completed(SpawnedAgent {
                 agent_id: 7,
                 report: "investigation complete".to_string(),
+                conclusion: aj_agent::events::SubAgentConclusion::Completed,
             }),
         };
 
@@ -357,6 +369,94 @@ mod tests {
         }
     }
 
+    /// A truncated sub-agent (final message hit the token cap) still
+    /// delivers its partial report, but the tool result is flagged
+    /// `is_error` and the wire content carries an explicit truncation
+    /// note so the parent model doesn't take the cut-off text as final.
+    #[tokio::test]
+    async fn truncated_sub_agent_is_flagged_and_annotated() {
+        let mut ctx = StubSpawnContext {
+            last_task: None,
+            last_mode: None,
+            tasks: Default::default(),
+            response: SpawnResult::Completed(SpawnedAgent {
+                agent_id: 3,
+                report: "partial findings".to_string(),
+                conclusion: aj_agent::events::SubAgentConclusion::Truncated,
+            }),
+        };
+
+        let outcome = AgentTool
+            .execute(
+                &mut ctx,
+                AgentInput {
+                    task: "scan".to_string(),
+                    description: None,
+                    run_in_background: false,
+                },
+            )
+            .await
+            .expect("execute");
+
+        assert!(outcome.is_error, "a truncated report is flagged");
+        let wire = outcome
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                UserContent::Text(t) => Some(t.text.as_str()),
+                UserContent::Image(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            wire.contains("partial findings"),
+            "the text is delivered: {wire}"
+        );
+        assert!(wire.contains("truncated"), "with a truncation note: {wire}");
+
+        // The structured details keep the raw report (the box renders it
+        // under its own truncated glyph); only the model-facing wire
+        // content carries the note.
+        match outcome.details {
+            ToolDetails::SubAgentReport { report, .. } => {
+                assert_eq!(report, "partial findings");
+            }
+            other => panic!("expected SubAgentReport, got {other:?}"),
+        }
+    }
+
+    /// Defensive: a `Failed` conclusion cannot reach the `Completed` spawn
+    /// arm today (a failure arrives as an `Err` from `spawn_agent`), but if
+    /// it ever did, the tool result must still be flagged `is_error` so the
+    /// model never reads a failure as a clean success.
+    #[tokio::test]
+    async fn a_failed_completed_spawn_is_still_flagged() {
+        let mut ctx = StubSpawnContext {
+            last_task: None,
+            last_mode: None,
+            tasks: Default::default(),
+            response: SpawnResult::Completed(SpawnedAgent {
+                agent_id: 4,
+                report: "sub-agent failed: boom".to_string(),
+                conclusion: aj_agent::events::SubAgentConclusion::Failed,
+            }),
+        };
+
+        let outcome = AgentTool
+            .execute(
+                &mut ctx,
+                AgentInput {
+                    task: "scan".to_string(),
+                    description: None,
+                    run_in_background: false,
+                },
+            )
+            .await
+            .expect("execute");
+
+        assert!(outcome.is_error, "a failed report must be flagged");
+    }
+
     /// The optional `description` field is part of the model-facing
     /// schema but doesn't change the structured outcome — we keep it
     /// for backwards compatibility with the existing tool contract
@@ -370,6 +470,7 @@ mod tests {
             response: SpawnResult::Completed(SpawnedAgent {
                 agent_id: 1,
                 report: "ok".to_string(),
+                conclusion: aj_agent::events::SubAgentConclusion::Completed,
             }),
         };
 

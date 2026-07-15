@@ -93,11 +93,11 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use aj_agent::events::{AgentEvent, AgentId, AgentSettings, CompactionReason};
+use aj_agent::events::{AgentEvent, AgentId, AgentSettings, CompactionReason, SubAgentConclusion};
 use aj_agent::message::{AgentMessage, AgentMessageKind};
 use aj_agent::tool::ToolDetails;
 use aj_agent::types::TokenUsage;
-use aj_models::types::{AssistantContent, Message, Usage, UserContent};
+use aj_models::types::{AssistantContent, Message, StopReason, Usage, UserContent};
 use serde_json::Value;
 
 use crate::compaction::estimate_conversation_context;
@@ -293,6 +293,15 @@ struct ReplayState {
     /// message this holds the final report carried on the closing
     /// [`AgentEvent::SubAgentEnd`].
     open_sub_report: String,
+    /// How the open sub run concluded, carried on the closing
+    /// [`AgentEvent::SubAgentEnd`]. Derived from the run's last assistant
+    /// message stop reason: `Length` -> `Truncated`, `Error`/`Aborted` and
+    /// an interrupted `ToolUse` terminal -> `Failed`, otherwise
+    /// `Completed`. This reconstructs the conclusion on resume without any
+    /// dedicated on-disk entry, because a failed, aborted, or interrupted
+    /// run's terminal message is itself persisted with the matching stop
+    /// reason.
+    open_sub_conclusion: SubAgentConclusion,
     /// Agents for which at least one `Message` entry has been
     /// projected. Settings entries emit a [`AgentEvent::Notice`]
     /// only for agents present here; seed entries (before any
@@ -311,6 +320,25 @@ fn fallback_settings() -> AgentSettings {
         thinking: "off".to_string(),
         speed: "standard".to_string(),
         verbosity: "default".to_string(),
+    }
+}
+
+/// Reconstruct a sub-agent run's conclusion from its terminal message's
+/// stop reason. `Length` is a token-cap truncation. A failure is `Error`,
+/// `Aborted`, or a `ToolUse` terminal: a run only ends on `ToolUse` when it
+/// was interrupted mid tool-loop before producing a final answer (a clean
+/// run's last assistant message is always `Stop`), which matches the live
+/// path mapping such an interruption to `Failed`. `Stop` is a clean
+/// completion.
+///
+/// This is how a resumed session tells a failed, truncated, or interrupted
+/// run from a clean one without a dedicated on-disk marker: the terminal
+/// message is persisted carrying the matching stop reason.
+fn conclusion_from_stop_reason(stop_reason: &StopReason) -> SubAgentConclusion {
+    match stop_reason {
+        StopReason::Length => SubAgentConclusion::Truncated,
+        StopReason::Error | StopReason::Aborted | StopReason::ToolUse => SubAgentConclusion::Failed,
+        StopReason::Stop => SubAgentConclusion::Completed,
     }
 }
 
@@ -364,6 +392,7 @@ impl ReplayState {
             self.open_sub = Some(n);
             self.open_sub_started = false;
             self.open_sub_report.clear();
+            self.open_sub_conclusion = SubAgentConclusion::Completed;
         }
         if self.open_sub_started {
             return;
@@ -427,6 +456,7 @@ impl ReplayState {
                 parent: AgentId::Main,
                 child: AgentId::Sub(k),
                 report: std::mem::take(&mut self.open_sub_report),
+                conclusion: std::mem::take(&mut self.open_sub_conclusion),
             });
         }
     }
@@ -555,12 +585,14 @@ impl ReplayState {
         }
     }
 
-    /// Fold `assistant`'s text into the open sub-agent run's report.
+    /// Fold `assistant`'s text into the open sub-agent run's report, and
+    /// capture the run's conclusion from `assistant`'s stop reason.
     ///
-    /// Overwrites rather than accumulates: the report is the most
-    /// recent sub-agent assistant message's text. `bracket_subagent`
-    /// clears it on open, so after the run's last assistant message it
-    /// holds the final report `close_open_sub` reads onto the
+    /// Both overwrite rather than accumulate: the report is the most
+    /// recent sub-agent assistant message's text, and the conclusion its
+    /// stop reason (see [`conclusion_from_stop_reason`]). `bracket_subagent`
+    /// resets them on open, so after the run's last assistant message they
+    /// hold the final report and conclusion `close_open_sub` reads onto the
     /// `SubAgentEnd`. A no-op unless `agent_id` is the open sub.
     ///
     /// Split out from projection so deferred replay can advance the
@@ -580,6 +612,7 @@ impl ReplayState {
                 }
             }
             self.open_sub_report = report;
+            self.open_sub_conclusion = conclusion_from_stop_reason(&assistant.stop_reason);
         }
     }
 
@@ -591,11 +624,13 @@ impl ReplayState {
         let Some(agent_id) = agent_id_for(entry) else {
             return;
         };
-        let ConversationEntryKind::Message { message } = &entry.entry else {
-            return;
-        };
-        if let Some(Message::Assistant(a)) = message.as_wire() {
-            self.capture_sub_report(agent_id, a);
+        match &entry.entry {
+            ConversationEntryKind::Message { message } => {
+                if let Some(Message::Assistant(a)) = message.as_wire() {
+                    self.capture_sub_report(agent_id, a);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1383,10 +1418,12 @@ mod tests {
                 parent,
                 child,
                 report,
+                conclusion,
             } => {
                 assert_eq!(*parent, AgentId::Main);
                 assert_eq!(*child, AgentId::Sub(1));
                 assert_eq!(report, "reply");
+                assert_eq!(*conclusion, SubAgentConclusion::Completed);
             }
             other => panic!("expected SubAgentEnd, got {other:?}"),
         }
@@ -1408,6 +1445,153 @@ mod tests {
             end_idx > last_sub,
             "SubAgentEnd must follow the last Sub(1) event"
         );
+    }
+
+    /// Build a log with one blocking sub-agent run whose final assistant
+    /// message carries `stop_reason`.
+    fn subagent_log_with_stop_reason(stop_reason: StopReason) -> ConversationLog {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("sp");
+
+        let user_head = {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_message(user_msg("hi")).expect("u");
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "delegating".into(),
+                text_signature: None,
+            })]))
+            .expect("a");
+            view.head().cloned().expect("head present")
+        };
+
+        {
+            let mut view = ConversationView::subagent(&mut log, user_head, 1);
+            view.add_message(user_msg("subtask")).expect("u");
+            view.add_message(AgentMessage::wire(Message::Assistant(AssistantMessage {
+                content: vec![AssistantContent::Text(TextContent {
+                    text: "reply".into(),
+                    text_signature: None,
+                })],
+                stop_reason,
+                ..AssistantMessage::empty()
+            })))
+            .expect("a");
+        }
+
+        log
+    }
+
+    fn replayed_conclusion(events: &[AgentEvent]) -> SubAgentConclusion {
+        events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::SubAgentEnd { conclusion, .. } => Some(*conclusion),
+                _ => None,
+            })
+            .expect("SubAgentEnd present")
+    }
+
+    /// Replay reads the run's outcome off its final message stop reason, so
+    /// a token-cap `Length` terminal reads as `Truncated`.
+    #[test]
+    fn replay_infers_truncated_conclusion_from_the_final_stop_reason() {
+        let log = subagent_log_with_stop_reason(StopReason::Length);
+        let events: Vec<_> = replay(&log).collect();
+        assert_eq!(replayed_conclusion(&events), SubAgentConclusion::Truncated);
+    }
+
+    /// A failed run's terminal message is persisted with `stop_reason ==
+    /// Error`, so replay reconstructs `Failed` without any dedicated
+    /// on-disk marker.
+    #[test]
+    fn replay_infers_failed_conclusion_from_an_error_terminal() {
+        let log = subagent_log_with_stop_reason(StopReason::Error);
+        let events: Vec<_> = replay(&log).collect();
+        assert_eq!(replayed_conclusion(&events), SubAgentConclusion::Failed);
+    }
+
+    /// A run interrupted mid tool-loop leaves a `ToolUse` assistant message
+    /// as its last persisted terminal (it never reached a final answer).
+    /// Replay reconstructs `Failed`, matching the live path, which maps such
+    /// an interruption (an aborted turn) to `Failed`.
+    #[test]
+    fn replay_infers_failed_conclusion_from_an_interrupted_tool_use_terminal() {
+        let log = subagent_log_with_stop_reason(StopReason::ToolUse);
+        let events: Vec<_> = replay(&log).collect();
+        assert_eq!(replayed_conclusion(&events), SubAgentConclusion::Failed);
+    }
+
+    /// Deferred replay withholds the sub's content but must still report
+    /// the same conclusion as full replay, since resume uses the deferred
+    /// path. Cover the two outcomes that differ from the default.
+    #[test]
+    fn deferred_replay_reconstructs_the_same_conclusion_as_full_replay() {
+        for stop_reason in [StopReason::Length, StopReason::Error] {
+            let label = format!("{stop_reason:?}");
+            let log = subagent_log_with_stop_reason(stop_reason);
+            let full: Vec<_> = replay(&log).collect();
+            let deferred: Vec<_> = replay_deferring_subs(&log).collect();
+            assert_eq!(
+                replayed_conclusion(&deferred),
+                replayed_conclusion(&full),
+                "deferred and full disagree for stop reason {label}",
+            );
+        }
+    }
+
+    /// A normal multi-turn sub-agent run has intermediate `ToolUse`
+    /// assistant messages but ends on `Stop`. The conclusion tracks the
+    /// last assistant message, so the trailing `Stop` wins and the run
+    /// reconstructs `Completed`, not `Failed`. This pins the overwrite
+    /// semantics the `ToolUse -> Failed` mapping relies on.
+    #[test]
+    fn replay_reconstructs_completed_for_a_tool_using_run_ending_in_stop() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("sp");
+
+        let user_head = {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_message(user_msg("hi")).expect("u");
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "delegating".into(),
+                text_signature: None,
+            })]))
+            .expect("a");
+            view.head().cloned().expect("head present")
+        };
+
+        {
+            let mut view = ConversationView::subagent(&mut log, user_head, 1);
+            view.add_message(user_msg("subtask")).expect("u");
+            // Intermediate tool-use inference (would map to Failed if it
+            // were the terminal).
+            view.add_message(AgentMessage::wire(Message::Assistant(AssistantMessage {
+                content: vec![AssistantContent::Text(TextContent {
+                    text: "let me check".into(),
+                    text_signature: None,
+                })],
+                stop_reason: StopReason::ToolUse,
+                ..AssistantMessage::empty()
+            })))
+            .expect("tool-use turn");
+            // Final answer.
+            view.add_message(AgentMessage::wire(Message::Assistant(AssistantMessage {
+                content: vec![AssistantContent::Text(TextContent {
+                    text: "done".into(),
+                    text_signature: None,
+                })],
+                stop_reason: StopReason::Stop,
+                ..AssistantMessage::empty()
+            })))
+            .expect("final turn");
+        }
+
+        let events: Vec<_> = replay(&log).collect();
+        assert_eq!(replayed_conclusion(&events), SubAgentConclusion::Completed);
     }
 
     #[test]

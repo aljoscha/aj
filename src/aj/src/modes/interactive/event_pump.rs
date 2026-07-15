@@ -3640,6 +3640,7 @@ mod tests {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 report: "done".into(),
+                conclusion: aj_agent::events::SubAgentConclusion::Completed,
             },
         );
 

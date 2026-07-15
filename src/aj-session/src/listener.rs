@@ -151,7 +151,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use aj_agent::bus::{EventBus, listener_from_sync};
-    use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
+    use aj_agent::events::{AgentEvent, AgentId, AgentSettings, SubAgentConclusion};
     use aj_agent::message::AgentMessage;
     use aj_agent::tool::ToolDetails;
     use aj_models::types::{
@@ -455,6 +455,66 @@ mod tests {
             ConversationEntryKind::Message { .. }
         ));
         assert_eq!(entries[2].parent_id.as_ref(), Some(&entries[1].id));
+    }
+
+    #[tokio::test]
+    async fn sub_agent_end_appends_no_entry() {
+        // Conclusions are not persisted. On resume the outcome is
+        // reconstructed from the sub's final message stop reason, so the
+        // listener must leave the sub thread's last entry as that message
+        // and add nothing for `SubAgentEnd`.
+        let (_dir, log) = fresh_log();
+        {
+            let mut log_guard = log.lock().await;
+            let mut view = ConversationView::user(&mut log_guard, None);
+            view.add_message(user_msg("hi")).expect("u");
+            view.add_message(assistant_text("ack")).expect("a");
+        }
+
+        let bus = EventBus::new();
+        let _h = bus.subscribe(persistence_listener(Arc::clone(&log)));
+
+        bus.emit(sub_start(1, "do thing"))
+            .await
+            .expect("emit start");
+        bus.emit(AgentEvent::MessageEnd {
+            agent_id: AgentId::Sub(1),
+            message: assistant_text("partial"),
+        })
+        .await
+        .expect("emit assistant");
+
+        let count_before = log.lock().await.entries_in_order().len();
+
+        bus.emit(AgentEvent::SubAgentEnd {
+            parent: AgentId::Main,
+            child: AgentId::Sub(1),
+            report: "sub-agent failed: boom".into(),
+            conclusion: SubAgentConclusion::Failed,
+        })
+        .await
+        .expect("emit end");
+
+        let log_guard = log.lock().await;
+        // `SubAgentEnd` adds no entry anywhere in the log.
+        assert_eq!(
+            log_guard.entries_in_order().len(),
+            count_before,
+            "SubAgentEnd must not append any entry"
+        );
+        let sub_head = log_guard
+            .latest_leaf(ThreadFilter::subagent(1))
+            .expect("sub-agent thread head exists");
+        let convo = log_guard.linearize(&sub_head, ThreadFilter::subagent(1));
+        let entries = convo.entries();
+        // The sub thread's last entry is the sub's final assistant message,
+        // not a conclusion marker.
+        match &entries.last().expect("at least one entry").entry {
+            ConversationEntryKind::Message { message } => {
+                assert!(matches!(message.as_wire(), Some(Message::Assistant(_))));
+            }
+            other => panic!("expected the sub's final message, got {other:?}"),
+        }
     }
 
     #[tokio::test]

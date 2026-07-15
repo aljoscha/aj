@@ -444,10 +444,9 @@ impl Conversation {
                     }
                 }
                 ConversationEntryKind::SystemPrompt { .. } => {}
-                // Compaction does not change settings; the retained tail
-                // still carries the last assistant model, and any
-                // settings entries before the boundary remain on the
-                // path.
+                // Compaction does not change settings: it keeps the
+                // retained tail's last assistant model plus any
+                // pre-boundary settings entries.
                 ConversationEntryKind::Compaction { .. } => {}
             }
         }

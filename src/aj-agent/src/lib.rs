@@ -35,7 +35,7 @@ use aj_models::types::{
 };
 
 use crate::bus::{EventBus, Listener, SubscriptionHandle};
-use crate::events::{AgentEvent, AgentId, AgentSettings};
+use crate::events::{AgentEvent, AgentId, AgentSettings, SubAgentConclusion};
 use crate::message::AgentMessage;
 use crate::projection::transcript_to_messages;
 use crate::queue::{MessageQueues, PendingKind};
@@ -90,6 +90,41 @@ pub struct AgentSeed {
     /// sub-agents never collide with subtrees already persisted in
     /// the log. `0` for a fresh session.
     pub sub_agent_counter: usize,
+}
+
+/// A sub-agent's single-turn result, returned by [`Agent::run_single_turn`]
+/// and delivered to the parent.
+///
+/// A hard failure is an `Err` from `run_single_turn`, not a variant here, so
+/// `conclusion` is only ever `Completed` or `Truncated`. The spawn paths map
+/// the `Err` to [`SubAgentConclusion::Failed`] when they build the parent's
+/// `SubAgentEnd`.
+#[derive(Clone, Debug)]
+pub struct SubAgentOutcome {
+    /// The child's final assistant text.
+    pub text: String,
+    /// Whether the report is complete or a token-cap `Truncated` partial.
+    pub conclusion: SubAgentConclusion,
+}
+
+/// Note appended to a truncated sub-agent's report before it is delivered
+/// to the parent, so the model treats the token-capped text as incomplete
+/// rather than as the final answer.
+pub const SUBAGENT_TRUNCATION_NOTE: &str = "[note: the sub-agent's report was \
+    truncated at the model's token limit and may be incomplete.]";
+
+/// The report text delivered to the parent model for a concluded run. A
+/// `Truncated` report is annotated with [`SUBAGENT_TRUNCATION_NOTE`] so the
+/// model treats the token-capped text as incomplete rather than final.
+/// Every other conclusion is delivered verbatim. Shared by the blocking
+/// `agent` tool result and the background completion notice so the two stay
+/// in sync. The box's own report is always the raw text. This only shapes
+/// the model-facing copy.
+pub fn delivered_report(conclusion: SubAgentConclusion, report: &str) -> String {
+    match conclusion {
+        SubAgentConclusion::Truncated => format!("{report}\n\n{SUBAGENT_TRUNCATION_NOTE}"),
+        SubAgentConclusion::Completed | SubAgentConclusion::Failed => report.to_string(),
+    }
 }
 
 pub struct Agent {
@@ -889,7 +924,7 @@ impl Agent {
     /// Appends `prompt` as a user message on the sub-agent's own
     /// transcript, runs the assistant turn loop, and returns the
     /// final assistant text the sub-agent produced.
-    pub async fn run_single_turn(&mut self, prompt: String) -> Result<String, BoxError> {
+    pub async fn run_single_turn(&mut self, prompt: String) -> Result<SubAgentOutcome, BoxError> {
         // Sub-agent runs share the same lifecycle framing as the
         // top-level agent — `AgentStart` / `AgentEnd` events
         // bracket the entire run so listeners that group by
@@ -912,7 +947,7 @@ impl Agent {
         outcome
     }
 
-    async fn run_single_turn_inner(&mut self, prompt: String) -> Result<String, BoxError> {
+    async fn run_single_turn_inner(&mut self, prompt: String) -> Result<SubAgentOutcome, BoxError> {
         // Same prompt-top drain point as the top-level path: a
         // sub-agent that backgrounded a command hears about it on its
         // next continuation even when the task finished between runs.
@@ -961,7 +996,28 @@ impl Agent {
             })
             .collect();
 
-        Ok(last_assistant_text)
+        // Classify the terminal from the final message's stop reason rather
+        // than assuming a returned `Ok` is a clean success. `Error`/`Aborted`
+        // never reach here (they short-circuit through `execute_turn`'s `?`),
+        // so the only degraded terminal that lands on this path is a
+        // token-cap `Length`, which we flag as truncated. The partial text is
+        // still delivered so the parent can use it.
+        //
+        // NOTE: a returned `Ok` always carries a `Stop` or `Length` terminal.
+        // `ToolUse` would only surface as an `Ok` terminal via the
+        // `should_stop_after_turn` hook, which no sub-agent installs. If one
+        // ever did, this `_ => Completed` and replay's `ToolUse -> Failed`
+        // (which reads a `ToolUse` terminal as an interrupted run) would
+        // disagree, so a sub-agent must not install that hook.
+        let conclusion = match last_assistant.stop_reason {
+            StopReason::Length => SubAgentConclusion::Truncated,
+            _ => SubAgentConclusion::Completed,
+        };
+
+        Ok(SubAgentOutcome {
+            text: last_assistant_text,
+            conclusion,
+        })
     }
 
     /// Execute one assistant-message turn against the in-memory
@@ -2885,25 +2941,37 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
             // need to clean up nested-transcript framing on errors
             // too. The report carries the child's final assistant
             // text (or the error string) so the parent's listener
-            // sees a single complete summary.
-            let report = match &result {
-                Ok(text) => text.clone(),
-                Err(err) => format!("sub-agent failed: {err:#}"),
+            // sees a single complete summary, and `conclusion` tells
+            // it apart from a clean run: a token-cap `Truncated` from
+            // the child, or `Failed` for an error/abort.
+            let (report, conclusion) = match &result {
+                Ok(r) => (r.text.clone(), r.conclusion),
+                Err(err) => (
+                    format!("sub-agent failed: {err:#}"),
+                    SubAgentConclusion::Failed,
+                ),
             };
             self.parent_bus
                 .emit(AgentEvent::SubAgentEnd {
                     parent: self.parent_agent_id,
                     child: child_id,
-                    report: report.clone(),
+                    report,
+                    conclusion,
                 })
                 .await?;
 
             // Surface the freshly-allocated sub-agent id alongside
-            // the child's final assistant text. Errors still
-            // propagate via `?` so the agent runtime keeps
+            // the child's final assistant text and how it concluded.
+            // Errors still propagate via `?` so the agent runtime keeps
             // synthesizing a generic tool-error result for failed
             // spawns.
-            result.map(|report| SpawnResult::Completed(SpawnedAgent { agent_id, report }))
+            result.map(|r| {
+                SpawnResult::Completed(SpawnedAgent {
+                    agent_id,
+                    report: r.text,
+                    conclusion: r.conclusion,
+                })
+            })
         })
     }
 
@@ -3052,15 +3120,19 @@ async fn drive_background_agent(run: BackgroundAgentRun) {
     // `AgentStart(Sub)` → `SubAgentEnd`. Benign: the pump's running
     // set keys off the `Agent*` pair, and persistence tolerates
     // post-`SubAgentEnd` continuations.
-    let report = match &result {
-        Ok(text) => text.clone(),
-        Err(err) => format!("sub-agent failed: {err:#}"),
+    let (report, conclusion) = match &result {
+        Ok(r) => (r.text.clone(), r.conclusion),
+        Err(err) => (
+            format!("sub-agent failed: {err:#}"),
+            SubAgentConclusion::Failed,
+        ),
     };
     let emit_result = parent_bus
         .emit(AgentEvent::SubAgentEnd {
             parent,
             child: AgentId::Sub(agent_id),
             report: report.clone(),
+            conclusion,
         })
         .await;
     if let Err(err) = emit_result {
@@ -3078,7 +3150,14 @@ async fn drive_background_agent(run: BackgroundAgentRun) {
     // loses its error text, which is acceptable: the kill was
     // requested and the run is gone either way.
     let (status, report_text) = match &result {
-        Ok(text) => (TaskStatus::Exited(Some(0)), Some(text.clone())),
+        // A truncated background run still delivers its partial text, but
+        // the completion notice flags it so the parent model does not take
+        // the token-capped text as final. This mirrors the blocking `agent`
+        // tool result. The box's own report (emitted above) stays raw.
+        Ok(r) => {
+            let text = delivered_report(r.conclusion, &r.text);
+            (TaskStatus::Exited(Some(0)), Some(text))
+        }
         Err(_) if cancel.is_cancelled() => (TaskStatus::Killed, None),
         Err(_) => (TaskStatus::Exited(Some(1)), Some(report)),
     };
@@ -3297,7 +3376,7 @@ mod event_protocol_tests {
     use tokio_util::sync::CancellationToken;
 
     use crate::bus::listener_from_sync;
-    use crate::events::{AgentEvent, AgentId};
+    use crate::events::{AgentEvent, AgentId, SubAgentConclusion};
     use crate::message::AgentMessage;
     use crate::queue::MessageQueues;
     use crate::tool::{
@@ -4706,7 +4785,7 @@ mod event_protocol_tests {
             .run_single_turn("hello".to_string())
             .await
             .expect("transient truncation should be retried into a successful turn");
-        assert_eq!(final_text, "recovered");
+        assert_eq!(final_text.text, "recovered");
 
         // Exactly one StreamRetry was emitted for the truncated attempt.
         let retries: Vec<u32> = recorded
@@ -4760,7 +4839,7 @@ mod event_protocol_tests {
             .run_single_turn("hi".to_string())
             .await
             .expect("scripted success turn");
-        assert_eq!(text, "hello world");
+        assert_eq!(text.text, "hello world");
 
         let last = agent.last_assistant().expect("terminal message retained");
         assert_eq!(last.stop_reason, StopReason::Stop);
@@ -4773,6 +4852,24 @@ mod event_protocol_tests {
             })
             .collect();
         assert!(body.contains("hello world"));
+    }
+
+    /// A token-cap (`Length`) terminal is not a failure: `run_single_turn`
+    /// still returns `Ok` with the partial text, but flags the conclusion
+    /// `Truncated` so the parent can deliver it while marking it incomplete.
+    #[tokio::test]
+    async fn run_single_turn_flags_a_length_terminal_as_truncated() {
+        let mut msg = finalize_text("partial answer");
+        msg.stop_reason = StopReason::Length;
+        let scripts = vec![finalize_script(msg)];
+        let mut agent = build_agent(scripts, Vec::new());
+
+        let report = agent
+            .run_single_turn("go".to_string())
+            .await
+            .expect("a length terminal still returns Ok with the partial text");
+        assert_eq!(report.text, "partial answer");
+        assert_eq!(report.conclusion, SubAgentConclusion::Truncated);
     }
 
     /// `last_assistant` retains a non-retryable error terminal even
@@ -4790,6 +4887,55 @@ mod event_protocol_tests {
         assert_eq!(
             last.error.as_ref().expect("error retained").category,
             aj_models::types::ErrorCategory::ContextOverflow
+        );
+    }
+
+    /// The load-bearing premise of resume fidelity: a failing sub-agent turn
+    /// still emits a `MessageEnd` for its error terminal, carrying
+    /// `stop_reason == Error`, even though that message is kept out of the
+    /// in-memory transcript. The persistence listener writes every
+    /// `MessageEnd` to disk, so replay reconstructs `Failed` from this
+    /// terminal. If this stopped holding, resume would silently report a
+    /// failed sub as `Completed`.
+    #[tokio::test]
+    async fn a_failed_turn_emits_an_error_stop_reason_terminal() {
+        let mut agent = build_agent(vec![overflow_error_script()], Vec::new());
+
+        let stop_reasons: Arc<Mutex<Vec<StopReason>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&stop_reasons);
+        let _handle = agent.subscribe(listener_from_sync(move |event| {
+            if let AgentEvent::MessageEnd { message, .. } = event
+                && let Some(Message::Assistant(a)) = message.as_wire()
+            {
+                seen.lock().unwrap().push(a.stop_reason.clone());
+            }
+        }));
+
+        let result = agent.run_single_turn("hi".to_string()).await;
+        assert!(result.is_err(), "non-retryable overflow surfaces as error");
+
+        assert!(
+            stop_reasons.lock().unwrap().contains(&StopReason::Error),
+            "the error terminal must be emitted so persistence records it and \
+             replay can reconstruct Failed"
+        );
+    }
+
+    /// `delivered_report` annotates only a `Truncated` report (so the model
+    /// treats it as incomplete) and passes everything else through verbatim.
+    #[test]
+    fn delivered_report_annotates_only_truncated() {
+        let truncated = crate::delivered_report(SubAgentConclusion::Truncated, "partial");
+        assert!(truncated.starts_with("partial"));
+        assert!(truncated.contains(crate::SUBAGENT_TRUNCATION_NOTE));
+
+        assert_eq!(
+            crate::delivered_report(SubAgentConclusion::Completed, "done"),
+            "done"
+        );
+        assert_eq!(
+            crate::delivered_report(SubAgentConclusion::Failed, "boom"),
+            "boom"
         );
     }
 
@@ -5345,6 +5491,7 @@ mod event_protocol_tests {
                 parent,
                 child,
                 report,
+                ..
             } => {
                 sub_agent_ends_clone
                     .lock()

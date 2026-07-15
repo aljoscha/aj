@@ -394,8 +394,10 @@ fn task_status_label(status: TaskStatus) -> String {
 /// sub-agent box so the two views read the same.
 fn sub_status_glyph(status: SubAgentStatus) -> &'static str {
     match status {
-        SubAgentStatus::Running => "\u{25b8}", // ▸
-        SubAgentStatus::Done => "\u{2713}",    // ✓
+        SubAgentStatus::Running => "\u{25b8}",   // ▸
+        SubAgentStatus::Done => "\u{2713}",      // ✓
+        SubAgentStatus::Truncated => "\u{26a0}", // ⚠
+        SubAgentStatus::Failed => "\u{2717}",    // ✗
     }
 }
 
@@ -690,6 +692,39 @@ mod tests {
         // decodes back to its agent id.
         assert!(!item.filter_key.contains('\n'), "{:?}", item.filter_key);
         assert_eq!(decode_agent(&item.filter_key), Some(AgentId::Sub(1)));
+    }
+
+    /// A truncated or failed sub-agent row carries its own distinct glyph,
+    /// so the picker tells the three concluded outcomes apart at a glance.
+    #[test]
+    fn agent_row_glyph_reflects_the_conclusion() {
+        let truncated = AgentEntry {
+            id: AgentId::Sub(1),
+            task: Some("scan".to_string()),
+            status: Some(SubAgentStatus::Truncated),
+            runtime: Some(Duration::from_secs(5)),
+            background: false,
+        };
+        assert!(
+            agent_item(&truncated, AgentId::Main)
+                .label
+                .starts_with('\u{26a0}'),
+            "truncated row shows the warning glyph"
+        );
+
+        let failed = AgentEntry {
+            id: AgentId::Sub(2),
+            task: Some("scan".to_string()),
+            status: Some(SubAgentStatus::Failed),
+            runtime: Some(Duration::from_secs(5)),
+            background: false,
+        };
+        assert!(
+            agent_item(&failed, AgentId::Main)
+                .label
+                .starts_with('\u{2717}'),
+            "failed row shows the cross glyph"
+        );
     }
 
     /// The row description pins the `task tail \u{b7} mode \u{b7} runtime` layout for a

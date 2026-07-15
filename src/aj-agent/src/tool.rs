@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use crate::TaskRegistry;
 use crate::bus::EventBus;
 use crate::error::BoxError;
-use crate::events::{AgentEvent, AgentId};
+use crate::events::{AgentEvent, AgentId, SubAgentConclusion};
 
 // ---------------------------------------------------------------------------
 // Execution mode
@@ -707,6 +707,12 @@ pub struct SpawnedAgent {
     pub agent_id: usize,
     /// Final assistant text returned by the sub-agent.
     pub report: String,
+    /// How the run concluded. `Completed` for a clean stop, `Truncated`
+    /// when the final message hit the token cap (the parent still
+    /// delivers `report` but flags the tool result). A hard failure is
+    /// surfaced as an `Err` from `spawn_agent`, not a `Completed`, so this
+    /// is never `Failed`.
+    pub conclusion: SubAgentConclusion,
 }
 
 /// How [`ToolContext::spawn_agent`] runs the child's initial turn.

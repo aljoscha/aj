@@ -83,6 +83,11 @@ pub(crate) fn build_subagent_box(
             span(SPINNER_FRAMES[idx].into(), styles.dim)
         }
         SubAgentStatus::Done => span("✓".into(), styles.success),
+        // A truncated run finished but its report is partial, and a failed
+        // run errored: distinct glyphs and tints so the box reads its
+        // outcome at a glance.
+        SubAgentStatus::Truncated => span("⚠".into(), styles.warning),
+        SubAgentStatus::Failed => span("✗".into(), styles.error),
     };
     // Collapse the task text to one line so the title never wraps.
     // Over-wide titles are truncated at draw time (the draw disables
@@ -95,21 +100,24 @@ pub(crate) fn build_subagent_box(
         span(" · ".into(), styles.text),
         span(task, styles.dim),
     ];
-    // The body is metadata only. A done box shows its report; a running
-    // box shows the latest-activity line. An empty report is a real,
-    // accepted case (a sub-agent that concluded on a tool call), and
-    // renders a thin title-only box.
+    // The body is metadata only. A running box shows its latest-activity
+    // line; a concluded box (done, truncated, or failed) shows its
+    // report, folded. An empty report is a real, accepted case (a
+    // sub-agent that concluded on a tool call), and renders a thin
+    // title-only box.
     let (body, body_softwrap) = match entry.status {
-        SubAgentStatus::Done => match entry.report.as_deref() {
-            Some(report) if !report.is_empty() => (report_body(report, expanded, styles), true),
-            _ => (Vec::new(), true),
-        },
         SubAgentStatus::Running => match entry.latest_activity.as_deref() {
             Some(activity) if !activity.is_empty() => {
                 (vec![span(activity.into(), styles.dim)], false)
             }
             _ => (Vec::new(), false),
         },
+        SubAgentStatus::Done | SubAgentStatus::Truncated | SubAgentStatus::Failed => {
+            match entry.report.as_deref() {
+                Some(report) if !report.is_empty() => (report_body(report, expanded, styles), true),
+                _ => (Vec::new(), true),
+            }
+        }
     };
     SubAgentBox {
         title,
@@ -325,7 +333,7 @@ impl Widget for SubAgentBox {
 mod tests {
     use std::sync::Arc;
 
-    use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
+    use aj_agent::events::{AgentEvent, AgentId, AgentSettings, SubAgentConclusion};
     use aj_agent::message::AgentMessage;
     use aj_agent::tool::ToolDetails;
     use aj_app::chat::{ChatState, EntryKind, reduce};
@@ -445,6 +453,7 @@ mod tests {
                 parent: AgentId::Main,
                 child: sub,
                 report: "all good".into(),
+                conclusion: aj_agent::events::SubAgentConclusion::Completed,
             },
             AgentEvent::AgentEnd {
                 agent_id: sub,
@@ -465,6 +474,7 @@ mod tests {
                 parent: AgentId::Main,
                 child: AgentId::Sub(0),
                 report: report.into(),
+                conclusion: aj_agent::events::SubAgentConclusion::Completed,
             },
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(0),
@@ -609,6 +619,7 @@ mod tests {
                 parent: AgentId::Main,
                 child: AgentId::Sub(0),
                 report: report.into(),
+                conclusion: aj_agent::events::SubAgentConclusion::Completed,
             },
         );
         let _ = reduce(
@@ -648,6 +659,7 @@ mod tests {
                 parent: AgentId::Main,
                 child: AgentId::Sub(0),
                 report,
+                conclusion: aj_agent::events::SubAgentConclusion::Completed,
             },
         );
         let _ = reduce(
@@ -808,6 +820,40 @@ mod tests {
             !expanded.contains("more lines"),
             "no hint when expanded: {expanded}",
         );
+    }
+
+    #[test]
+    fn truncated_and_failed_boxes_show_distinct_glyphs() {
+        // A truncated run shows a warning glyph, a failed one an error
+        // glyph, both distinct from the clean-`Done` check. Each still
+        // renders its report body.
+        for (conclusion, glyph) in [
+            (SubAgentConclusion::Truncated, "⚠"),
+            (SubAgentConclusion::Failed, "✗"),
+        ] {
+            let mut chat = chat();
+            let mut life = AgentLifecycle::default();
+            reduce_sub_run(&mut chat, &mut life);
+            let _ = reduce(
+                &mut chat,
+                &mut life,
+                AgentEvent::SubAgentEnd {
+                    parent: AgentId::Main,
+                    child: AgentId::Sub(0),
+                    report: "outcome text".into(),
+                    conclusion,
+                },
+            );
+            let r = rows(&draw_box(&chat, 60));
+            assert!(
+                r[1].starts_with(&format!(" {glyph} agent 0")),
+                "{conclusion:?} shows its glyph: {r:?}",
+            );
+            assert!(
+                r.join("\n").contains("outcome text"),
+                "{conclusion:?} still renders its report: {r:?}",
+            );
+        }
     }
 
     #[test]

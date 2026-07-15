@@ -136,7 +136,16 @@ pub struct ToolEntry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubAgentStatus {
     Running,
+    /// Finished cleanly.
     Done,
+    /// Finished, but the final report hit the model's token cap and is
+    /// partial (`SubAgentConclusion::Truncated`).
+    Truncated,
+    /// The run failed (error or abort). For a live run `report` holds the
+    /// failure text. A resumed run shows whatever the failing turn's
+    /// terminal message carried, usually empty for a pre-stream error, and
+    /// the status is reconstructed from that message's stop reason.
+    Failed,
 }
 
 /// The parent-transcript box representing a sub-agent run. The sub's
