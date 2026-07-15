@@ -3,9 +3,9 @@
 //!
 //! It reads a host-shared [`Copied`] record the transcript writes when a
 //! select-to-copy lands, and shows for [`COPIED_TOAST_DURATION`] after that.
-//! Like the frame-stats box it is non-interactive, built straight from
-//! `OverlayWindow`/`RichText` whose surfaces carry no widget identity, so it
-//! never joins the focus path and leaves hit-testing outside it untouched.
+//! It builds its body from that record and frames it with the shared
+//! [`corner_box`](crate::corner_box::corner_box), so it is non-interactive and
+//! never joins the focus path.
 //!
 //! The box has no self-timer. The drive loop wakes at the record's deadline
 //! and requests a repaint, and this `draw` returns `None` once the record has
@@ -16,12 +16,9 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use vaxis::cell::Style;
-use vaxis::vxfw::{
-    DrawContext, MaxSize, OVERLAY_WINDOW_CHROME_COLS, OVERLAY_WINDOW_CHROME_ROWS, Overflow,
-    OverlayWindow, RichText, Size, Surface, TextAlign, TextSpan, Widget, WidgetRef, WidthBasis,
-};
+use vaxis::vxfw::{DrawContext, Size, Surface};
 
+use crate::corner_box::{CornerBoxBody, corner_box, span};
 use crate::overlay::OverlayChrome;
 use crate::transcript::TranscriptStyles;
 
@@ -93,52 +90,23 @@ impl CopiedToast {
             "characters"
         };
         let tail = format!(" {noun} copied to clipboard");
-        let span = |text: String, style: Style| TextSpan {
-            text,
-            style,
-            ..TextSpan::default()
-        };
+        let content_width = ctx.string_width(&count) + ctx.string_width(&tail);
         let spans = vec![
-            span(count.clone(), self.styles.keybinding_hint),
-            span(tail.clone(), self.styles.dim),
+            span(count, self.styles.keybinding_hint),
+            span(tail, self.styles.dim),
         ];
 
-        let content_width = ctx.string_width(&count) + ctx.string_width(&tail);
-        let chrome_cols = usize::from(OVERLAY_WINDOW_CHROME_COLS);
-        let box_width = content_width + chrome_cols;
-        let box_height = 1 + usize::from(OVERLAY_WINDOW_CHROME_ROWS);
-
-        let size = Size {
-            width: u16::try_from(box_width).ok()?,
-            height: u16::try_from(box_height).ok()?,
-        };
-        if size.width > avail.width || size.height > avail.height {
-            return None;
-        }
-
-        let child: WidgetRef = Rc::new(RefCell::new(RichText {
-            text: spans,
-            text_align: TextAlign::Left,
-            base_style: Style::default(),
-            // No soft wrap: the interior is sized to the content, so the line
-            // never wraps, and the ellipsis overflow is a belt-and-braces guard
-            // for a pathological width clamp.
-            softwrap: false,
-            overflow: Overflow::Ellipsis,
-            width_basis: WidthBasis::LongestLine,
-        }));
-        let chrome = self.chrome.borrow();
-        let mut win = OverlayWindow::new(String::new(), child);
-        win.border_style = chrome.border;
-        win.title_style = chrome.title;
-        let win_ctx = ctx.with_constraints(
-            Size {
-                width: 0,
-                height: 0,
+        corner_box(
+            ctx,
+            &self.chrome.borrow(),
+            avail,
+            CornerBoxBody {
+                title: String::new(),
+                spans,
+                content_width,
+                content_rows: 1,
             },
-            MaxSize::from_size(size),
-        );
-        Some(win.draw(&win_ctx))
+        )
     }
 }
 

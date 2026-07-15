@@ -4,22 +4,18 @@
 //!
 //! It reads a host-refreshed [`FrameStats`] snapshot the drive loop writes
 //! just before each paint, so the box shows the previous frame's numbers and
-//! freezes when the UI is idle (no new frame is produced). It is
-//! non-interactive: built straight from `OverlayWindow`/`RichText` whose
-//! surfaces carry no widget identity, so it never joins the focus path and,
-//! occupying only its own cells, leaves hit-testing outside it untouched.
+//! freezes when the UI is idle (no new frame is produced). It builds its body
+//! from that snapshot and frames it with the shared
+//! [`corner_box`](crate::corner_box::corner_box), so it is non-interactive and
+//! never joins the focus path.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
-use vaxis::cell::Style;
-use vaxis::vxfw::{
-    DrawContext, FrameStats, MaxSize, OVERLAY_WINDOW_CHROME_COLS, OVERLAY_WINDOW_CHROME_ROWS,
-    Overflow, OverlayWindow, RichText, Size, Surface, TextAlign, TextSpan, Widget, WidgetRef,
-    WidthBasis,
-};
+use vaxis::vxfw::{DrawContext, FrameStats, Size, Surface};
 
+use crate::corner_box::{CornerBoxBody, corner_box, span};
 use crate::overlay::OverlayChrome;
 use crate::transcript::TranscriptStyles;
 
@@ -82,11 +78,6 @@ impl FrameStatsBox {
             .max()
             .unwrap_or(0);
 
-        let span = |text: String, style: Style| TextSpan {
-            text,
-            style,
-            ..TextSpan::default()
-        };
         let mut spans = Vec::new();
         for (i, (label, value)) in rows.iter().enumerate() {
             let newline = if i + 1 < rows.len() { "\n" } else { "" };
@@ -119,45 +110,17 @@ impl FrameStatsBox {
             .unwrap_or(0);
         let content_rows = rows.len();
 
-        // The frame adds chrome on every side, and the top edge must be wide
-        // enough to inline the title (`OverlayWindow` insets it two columns and
-        // pads it with a space on each side).
-        let chrome_cols = usize::from(OVERLAY_WINDOW_CHROME_COLS);
-        let title_min_width = ctx.string_width(TITLE) + chrome_cols + 2;
-        let box_width = (content_width + chrome_cols).max(title_min_width);
-        let box_height = content_rows + usize::from(OVERLAY_WINDOW_CHROME_ROWS);
-
-        let size = Size {
-            width: u16::try_from(box_width).ok()?,
-            height: u16::try_from(box_height).ok()?,
-        };
-        if size.width > avail.width || size.height > avail.height {
-            return None;
-        }
-
-        let child: WidgetRef = Rc::new(RefCell::new(RichText {
-            text: spans,
-            text_align: TextAlign::Left,
-            base_style: Style::default(),
-            // No soft wrap: the interior is sized to the content, so lines
-            // never wrap, and the ellipsis overflow is a belt-and-braces guard
-            // for a pathological width clamp.
-            softwrap: false,
-            overflow: Overflow::Ellipsis,
-            width_basis: WidthBasis::LongestLine,
-        }));
-        let chrome = self.chrome.borrow();
-        let mut win = OverlayWindow::new(TITLE.to_string(), child);
-        win.border_style = chrome.border;
-        win.title_style = chrome.title;
-        let win_ctx = ctx.with_constraints(
-            Size {
-                width: 0,
-                height: 0,
+        corner_box(
+            ctx,
+            &self.chrome.borrow(),
+            avail,
+            CornerBoxBody {
+                title: TITLE.to_string(),
+                spans,
+                content_width,
+                content_rows,
             },
-            MaxSize::from_size(size),
-        );
-        Some(win.draw(&win_ctx))
+        )
     }
 }
 

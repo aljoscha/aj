@@ -16,6 +16,7 @@ mod autocomplete;
 mod bubble;
 mod content_overlay;
 mod copied_toast;
+mod corner_box;
 mod footer;
 mod frame_stats_box;
 mod interactive;

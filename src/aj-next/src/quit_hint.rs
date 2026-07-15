@@ -11,18 +11,17 @@
 //! The box is drawn straight from the live keymap state by the Shell, so it
 //! appears and clears with the armed state. Only the running-work warning is
 //! host-provided (the widgets can't reach the task registry), refreshed by
-//! the drive loop on the arming edge.
+//! the drive loop on the arming edge. It frames its body with the shared
+//! [`corner_box`](crate::corner_box::corner_box), like the frame-stats and
+//! toast boxes.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use aj_app::keybindings::fixed_keys;
-use vaxis::cell::Style;
-use vaxis::vxfw::{
-    DrawContext, MaxSize, OVERLAY_WINDOW_CHROME_COLS, OVERLAY_WINDOW_CHROME_ROWS, Overflow,
-    OverlayWindow, RichText, Size, Surface, TextAlign, TextSpan, Widget, WidgetRef, WidthBasis,
-};
+use vaxis::vxfw::{DrawContext, Size, Surface};
 
+use crate::corner_box::{CornerBoxBody, corner_box, span};
 use crate::overlay::{OverlayChrome, close_key_label};
 use crate::transcript::TranscriptStyles;
 
@@ -84,11 +83,6 @@ impl QuitHint {
             .max(ctx.string_width(&cancel_key));
         let pad = |key: &str| " ".repeat(key_col.saturating_sub(ctx.string_width(key)));
 
-        let span = |text: String, style: Style| TextSpan {
-            text,
-            style,
-            ..TextSpan::default()
-        };
         let mut spans = Vec::new();
         if let Some(w) = &warning {
             spans.push(span(format!("{w}\n"), self.styles.dim));
@@ -111,45 +105,17 @@ impl QuitHint {
             .max(warning.as_ref().map_or(0, |w| ctx.string_width(w)));
         let content_rows = 2 + usize::from(warning.is_some());
 
-        // The frame adds chrome on every side, and the top edge must be wide
-        // enough to inline the title (`OverlayWindow` insets it two columns and
-        // pads it with a space on each side).
-        let chrome_cols = usize::from(OVERLAY_WINDOW_CHROME_COLS);
-        let title_min_width = ctx.string_width(&title) + chrome_cols + 2;
-        let box_width = (content_width + chrome_cols).max(title_min_width);
-        let box_height = content_rows + usize::from(OVERLAY_WINDOW_CHROME_ROWS);
-
-        let size = Size {
-            width: u16::try_from(box_width).ok()?,
-            height: u16::try_from(box_height).ok()?,
-        };
-        if size.width > avail.width || size.height > avail.height {
-            return None;
-        }
-
-        let child: WidgetRef = Rc::new(RefCell::new(RichText {
-            text: spans,
-            text_align: TextAlign::Left,
-            base_style: Style::default(),
-            // No soft wrap: the interior is sized to the content, so lines
-            // never wrap, and the ellipsis overflow is a belt-and-braces guard
-            // for a pathological width clamp.
-            softwrap: false,
-            overflow: Overflow::Ellipsis,
-            width_basis: WidthBasis::LongestLine,
-        }));
-        let chrome = self.chrome.borrow();
-        let mut win = OverlayWindow::new(title, child);
-        win.border_style = chrome.border;
-        win.title_style = chrome.title;
-        let win_ctx = ctx.with_constraints(
-            Size {
-                width: 0,
-                height: 0,
+        corner_box(
+            ctx,
+            &self.chrome.borrow(),
+            avail,
+            CornerBoxBody {
+                title,
+                spans,
+                content_width,
+                content_rows,
             },
-            MaxSize::from_size(size),
-        );
-        Some(win.draw(&win_ctx))
+        )
     }
 }
 
