@@ -1336,6 +1336,23 @@ fn row_text(row: &[Cell]) -> String {
     row[..end].iter().map(|cell| cell.char.grapheme()).collect()
 }
 
+/// The first content column of a rendered entry row, past the shared chrome
+/// indent every entry carries.
+///
+/// Selection is semantic: it never grabs the blank left margin the transcript
+/// insets each entry by (`PADDING_X` columns). We skip at most that many
+/// leading blank columns, so content-level leading whitespace past the margin
+/// (a code block's indentation, say) is preserved, and a degenerate entry with
+/// no margin keeps its first column. The blank test matches the tinted padding
+/// a bubble paints as well as the default blank a plain entry leaves.
+fn content_start(row: &[Cell]) -> usize {
+    let blanks = row
+        .iter()
+        .take_while(|cell| cell.char.grapheme().trim().is_empty())
+        .count();
+    blanks.min(usize::from(PADDING_X))
+}
+
 /// Read the graphemes of the cell range `a..=b` out of `lines`, joining rows
 /// with `\n`. Backs [`TranscriptView::extract_selection`], see it for the
 /// contract.
@@ -1360,6 +1377,9 @@ fn extract_from_lines(lines: &[Vec<Cell>], a: (usize, usize), b: (usize, usize))
         // row so an out-of-range column reads nothing rather than panicking.
         let from = if row == start_row { start_col } else { 0 };
         let to = if row == end_row { end_col } else { cells.len() };
+        // Semantic selection: never read the chrome indent margin, so start at
+        // the content column even when the range reaches into it.
+        let from = from.max(content_start(cells));
         let from = from.min(cells.len());
         let to = to.min(cells.len()).max(from);
         if row != start_row {
@@ -2155,6 +2175,9 @@ impl TranscriptView {
                 None => (0, 0),
             };
             let (from, to) = (from.min(width), to.min(width));
+            // Semantic selection: don't highlight the chrome indent margin, so
+            // the painted span matches the copied text.
+            let from = from.max(content_start(row));
             for (c, cell) in row.iter().enumerate() {
                 let mut cell = cell.clone();
                 if to > from {
@@ -4773,7 +4796,7 @@ mod tests {
             col: 6,
         };
         view.selection = Some(Selection { anchor, caret });
-        assert_eq!(view.extract_selection(w, anchor, caret), "row 0\n\n row 1");
+        assert_eq!(view.extract_selection(w, anchor, caret), "row 0\n\nrow 1");
     }
 
     /// One row of single-width cells from `s`, for the row-range reader test.
@@ -4788,29 +4811,48 @@ mod tests {
 
     /// The per-row range reader that both extraction and (indirectly) the
     /// highlight rest on: it normalizes reversed endpoints, clamps out-of-range
-    /// rows and columns, trims trailing pad per line, and joins rows with `\n`.
-    /// This is the panic-safety net when a stale selection outlives a width or
-    /// content change, so it is exercised directly.
+    /// rows and columns, skips the leading chrome margin, trims trailing pad
+    /// per line, and joins rows with `\n`. This is the panic-safety net when a
+    /// stale selection outlives a width or content change, so it is exercised
+    /// directly.
     #[test]
     fn extract_from_lines_reads_normalized_ranges() {
         let lines = vec![cells(" row 0"), cells(""), cells(" row 1")];
         // Forward substring within a line, and the same range reversed.
         assert_eq!(extract_from_lines(&lines, (0, 1), (0, 4)), "row");
         assert_eq!(extract_from_lines(&lines, (0, 4), (0, 1)), "row");
-        // A column past the content trims the trailing pad.
-        assert_eq!(extract_from_lines(&lines, (0, 0), (0, 40)), " row 0");
+        // A range that starts in the margin skips it and trims the trailing pad.
+        assert_eq!(extract_from_lines(&lines, (0, 0), (0, 40)), "row 0");
         // Multi-line join keeps the blank middle row.
-        assert_eq!(
-            extract_from_lines(&lines, (0, 1), (2, 6)),
-            "row 0\n\n row 1"
-        );
+        assert_eq!(extract_from_lines(&lines, (0, 1), (2, 6)), "row 0\n\nrow 1");
         // An out-of-range end row clamps to the last line.
         assert_eq!(
             extract_from_lines(&lines, (0, 1), (99, 3)),
-            "row 0\n\n row 1"
+            "row 0\n\nrow 1"
         );
         // A degenerate range is empty.
         assert_eq!(extract_from_lines(&lines, (1, 0), (1, 0)), "");
+    }
+
+    /// `content_start` skips at most the one-column chrome margin: a plain
+    /// row's text column is found, while content-level leading whitespace past
+    /// the margin (a code block's indentation) is preserved, and a row with no
+    /// margin keeps its first column.
+    #[test]
+    fn content_start_skips_only_the_chrome_margin() {
+        assert_eq!(content_start(&cells("code")), 0, "no margin");
+        assert_eq!(content_start(&cells(" text")), 1, "one blank margin column");
+        assert_eq!(
+            content_start(&cells("   deep")),
+            1,
+            "margin skipped, content indentation kept",
+        );
+        assert_eq!(
+            content_start(&cells("    ")),
+            1,
+            "fully blank row caps at margin"
+        );
+        assert_eq!(content_start(&cells("")), 0, "empty row has no margin");
     }
 
     /// A selection spanning two entries highlights the tail of the start row
@@ -4848,8 +4890,10 @@ mod tests {
         // Start row: highlighted from min.col, not before it.
         assert_ne!(grid[0][2].style.bg, bg, "before min.col is untouched");
         assert_eq!(grid[0][3].style.bg, bg, "min.col starts the highlight");
-        // Interior row (entry 0's blank spacer): highlighted end to end.
-        assert_eq!(grid[1][0].style.bg, bg, "interior row painted at col 0");
+        // Interior row (entry 0's blank spacer): highlighted from the content
+        // column to the edge, skipping the chrome margin (semantic selection).
+        assert_ne!(grid[1][0].style.bg, bg, "chrome margin is not highlighted");
+        assert_eq!(grid[1][1].style.bg, bg, "interior row painted from col 1");
         assert_eq!(grid[1][38].style.bg, bg, "interior row painted to the edge");
         // End row: highlighted up to max.col, not past it.
         assert_eq!(grid[2][1].style.bg, bg, "before max.col is highlighted");
@@ -4891,8 +4935,13 @@ mod tests {
         let covered: String = grid[2][0..6].iter().map(|c| c.char.grapheme()).collect();
         assert_eq!(covered, " row 1", "text under the highlight is preserved");
 
-        // The covered cells carry the selection background.
-        for c in 0..6 {
+        // The covered cells carry the selection background, except the chrome
+        // margin (col 0), which semantic selection never highlights.
+        assert_ne!(
+            grid[2][0].style.bg, bg,
+            "chrome margin (2,0) is not highlighted"
+        );
+        for c in 1..6 {
             assert_eq!(grid[2][c].style.bg, bg, "cell (2,{c}) is highlighted");
         }
         // Cells past the caret on that row are untouched.
@@ -5010,7 +5059,7 @@ mod tests {
             vaxis::vxfw::Command::CopyToClipboard(text) => Some(text.clone()),
             _ => None,
         });
-        assert_eq!(copied.as_deref(), Some(" row 1"), "copied the selection");
+        assert_eq!(copied.as_deref(), Some("row 1"), "copied the selection");
         assert!(
             view.selection.is_some(),
             "a real range stays highlighted after copy",
