@@ -786,6 +786,7 @@ mod tests {
             Rc::clone(&chat),
             &theme,
             Rc::new(std::cell::Cell::new(false)),
+            Rc::new(std::cell::Cell::new(None)),
         );
         let ctx = DrawContext {
             max: MaxSize {
@@ -932,6 +933,7 @@ mod tests {
             Rc::clone(&chat),
             &theme,
             std::rc::Rc::new(std::cell::Cell::new(false)),
+            std::rc::Rc::new(std::cell::Cell::new(None)),
         );
         let ctx = DrawContext {
             max: MaxSize {

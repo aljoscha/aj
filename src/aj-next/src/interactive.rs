@@ -64,6 +64,7 @@ use vaxis::vxfw::{
 
 use crate::agent_picker::{AgentPickerOutcome, PickerSnapshot, open_agent_picker};
 use crate::content_overlay::{ContentStyles, Row, auth_rows, session_info_rows, set_rows};
+use crate::copied_toast::{COPIED_TOAST_DURATION, Copied, CopiedToast};
 use crate::footer::FooterLine;
 use crate::frame_stats_box::FrameStatsBox;
 use crate::keymap::{HostCtx, build_keymap};
@@ -2723,6 +2724,14 @@ struct Shell {
     /// The frame-statistics debug overlay, floated in the top-right corner
     /// when `show_frame_stats` is on. Reads the `frame_stats` snapshot below.
     frame_stats_box: Rc<RefCell<FrameStatsBox>>,
+    /// The "copied to clipboard" toast, stacked above the quit hint for a
+    /// couple of seconds after a mouse text selection copies. Reads the
+    /// `copied` record below, written by the transcript.
+    copied_toast: Rc<RefCell<CopiedToast>>,
+    /// The last select-to-copy record, shared with the transcript that writes
+    /// it and the `copied_toast` that reports it. The drive loop reads it to
+    /// wake at the toast's deadline. Copy payload, so a `Cell` not a `RefCell`.
+    copied: Rc<Cell<Option<Copied>>>,
     /// Whether the frame-stats overlay is shown. Seeded from
     /// `config.show_frame_stats` at build time and flipped live by the
     /// settings window through `apply_setting_change`, which shares this cell.
@@ -2861,6 +2870,11 @@ impl Shell {
         // writer, via focus in/out) and the keymap host context (which reads it
         // to gate the copy chord). Created here so both get the same cell.
         let focus_mode = Rc::new(std::cell::Cell::new(false));
+        // The select-to-copy record, shared between the transcript (its single
+        // writer, on a copy) and the `CopiedToast` that reports it, and read by
+        // the drive loop to schedule the toast's dismissal. Created here so
+        // all three see the same cell.
+        let copied: Rc<Cell<Option<Copied>>> = Rc::new(Cell::new(None));
         // Resolve the initial styles and chrome from a single snapshot of
         // the theme, then keep the handle for the runtime re-style path.
         let (styles, transcript, chrome) = {
@@ -2870,6 +2884,7 @@ impl Shell {
                 Rc::clone(&chat),
                 &t,
                 Rc::clone(&focus_mode),
+                Rc::clone(&copied),
             )));
             editor.borrow_mut().set_theme(editor_theme_from_theme(&t));
             (styles, transcript, OverlayChrome::from_theme(&t))
@@ -2890,6 +2905,11 @@ impl Shell {
             Rc::clone(&styles),
             Rc::clone(&chrome),
             Rc::clone(&frame_stats),
+        )));
+        let copied_toast = Rc::new(RefCell::new(CopiedToast::new(
+            Rc::clone(&styles),
+            Rc::clone(&chrome),
+            Rc::clone(&copied),
         )));
         let pending = Rc::new(RefCell::new(PendingBox::new(
             Rc::clone(&chat),
@@ -3110,6 +3130,8 @@ impl Shell {
             quit_hint,
             quit_hint_warning,
             frame_stats_box,
+            copied_toast,
+            copied,
             show_frame_stats,
             frame_stats,
             submitted,
@@ -3240,6 +3262,9 @@ impl Shell {
         self.frame_stats_box
             .borrow_mut()
             .set_styles(Rc::clone(&styles));
+        self.copied_toast
+            .borrow_mut()
+            .set_styles(Rc::clone(&styles));
         self.splash
             .borrow_mut()
             .set_styles(Rc::clone(&styles), t.color_mode());
@@ -3354,40 +3379,44 @@ impl Widget for Shell {
             }
         }
 
-        // Ctrl+C quit-arm hint. While the quit sequence is armed (the first
-        // Ctrl+C landed, the second is pending), float a small box above the
-        // editor, flush to the right edge, spelling out the ladder. Read live
-        // from the keymap so the box appears and clears with the armed state,
-        // no mirror. Suppressed under a modal, where a quit never arms anyway.
+        // Corner boxes stacked above the editor, flush to the right edge and
+        // built bottom-up: the Ctrl+C quit-arm hint at the bottom, the "copied
+        // to clipboard" toast on top of it. Both are suppressed under a modal
+        // (a quit never arms there, and the transcript can't be selected).
         //
-        // The keymap's only sequence is the ctrl+c/ctrl+c quit chord, so a
-        // pending sequence is exactly this armed state. Safe to borrow the
-        // keymap here: `draw_widget` above already released its mutable borrow.
-        let quit_armed = self.keymap.borrow().pending_sequence().is_some();
-        if quit_armed && self.overlays.borrow().top().is_none() {
+        // The quit hint is drawn straight from the live keymap state, so it
+        // appears and clears with the armed state, no mirror. The keymap's
+        // only sequence is the ctrl+c/ctrl+c quit chord, so a pending sequence
+        // is exactly this armed state. Safe to borrow the keymap here:
+        // `draw_widget` above already released its mutable borrow.
+        if self.overlays.borrow().top().is_none() {
             let term = ctx.max.size();
             let editor_top = term
                 .height
                 .saturating_sub(FOOTER_ROWS)
                 .saturating_sub(self.editor.borrow().drawn_height());
-            // Bound the box to the room above the editor, keeping the header
-            // row on screen. `QuitHint::draw` returns `None` when it can't fit.
+            // The next box's bottom row, moved up as boxes stack. Each box is
+            // bounded by the room left above it, keeping the header on screen,
+            // and its `draw` returns `None` when it can't fit.
+            let mut stack_bottom = editor_top;
+
+            let quit_armed = self.keymap.borrow().pending_sequence().is_some();
+            if quit_armed {
+                let avail = Size {
+                    width: term.width,
+                    height: stack_bottom.saturating_sub(HEADER_ROWS),
+                };
+                if let Some(hint) = self.quit_hint.borrow().draw(ctx, avail) {
+                    stack_bottom = push_corner_box(&mut inner, term.width, stack_bottom, hint);
+                }
+            }
+
             let avail = Size {
                 width: term.width,
-                height: editor_top.saturating_sub(HEADER_ROWS),
+                height: stack_bottom.saturating_sub(HEADER_ROWS),
             };
-            if let Some(hint) = self.quit_hint.borrow().draw(ctx, avail) {
-                let anchor_row = editor_top.saturating_sub(hint.size.height);
-                let anchor_col = term.width.saturating_sub(hint.size.width);
-                inner.children.push(SubSurface {
-                    origin: RelativePoint {
-                        row: i32::from(anchor_row),
-                        col: i32::from(anchor_col),
-                    },
-                    surface: hint,
-                    // z 1 draws over the base `FlexColumn` (z 0), like the popup.
-                    z_index: 1,
-                });
+            if let Some(toast) = self.copied_toast.borrow().draw(ctx, avail) {
+                push_corner_box(&mut inner, term.width, stack_bottom, toast);
             }
         }
 
@@ -3859,6 +3888,24 @@ fn earliest_deadline(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> 
     }
 }
 
+/// Anchor a corner box flush to the right edge with its bottom at `bottom`,
+/// pushing it onto `inner` over the base layout (z 1, like the autocomplete
+/// popup). Returns the box's top row, the bottom edge for the next box stacked
+/// above it.
+fn push_corner_box(inner: &mut Surface, term_width: u16, bottom: u16, surface: Surface) -> u16 {
+    let anchor_row = bottom.saturating_sub(surface.size.height);
+    let anchor_col = term_width.saturating_sub(surface.size.width);
+    inner.children.push(SubSurface {
+        origin: RelativePoint {
+            row: i32::from(anchor_row),
+            col: i32::from(anchor_col),
+        },
+        surface,
+        z_index: 1,
+    });
+    anchor_row
+}
+
 async fn drive(
     app: &mut AsyncApp,
     root: &WidgetRef,
@@ -3876,6 +3923,10 @@ async fn drive(
     // quit is armed. We refresh the hint's running-work warning on each edge
     // (set it on arm, clear it on disarm).
     let mut quit_was_armed = false;
+    // Rising/falling-edge tracker for the copied-to-clipboard toast, so on the
+    // frame the toast expires we ask for one repaint to clear it (its deadline
+    // is also folded into the wake below, so that repaint happens on time).
+    let mut toast_was_live = false;
     // Async read-only overlay fills. The list handle is `!Send`, so it
     // stays here (paired with its `FetchKind`) while the detached fetch
     // sends only the rendered rows back over the channel.
@@ -3968,7 +4019,19 @@ async fn drive(
         let frame_deadline = app
             .needs_redraw()
             .then(|| last_render.map_or_else(Instant::now, |t| t + frame_interval));
-        let deadline = earliest_deadline(tick_deadline, frame_deadline);
+        // The copied-to-clipboard toast has no self-timer, so wake at its
+        // deadline: the box's `draw` drops it once the record has expired, and
+        // the edge check below asks for that clearing repaint.
+        let toast_deadline = shell
+            .borrow()
+            .copied
+            .get()
+            .filter(Copied::is_live)
+            .map(|c| c.at + COPIED_TOAST_DURATION);
+        let deadline = earliest_deadline(
+            earliest_deadline(tick_deadline, frame_deadline),
+            toast_deadline,
+        );
         tokio::select! {
             biased;
 
@@ -4461,6 +4524,15 @@ async fn drive(
             app.request_redraw();
         }
         quit_was_armed = quit_armed;
+        // Clear the copied toast on the frame it expires. A new copy sets the
+        // record (from the transcript's release handler, which also requests a
+        // redraw), so the rising edge needs no work here, but when it falls we
+        // ask for the repaint that drops the now-stale box.
+        let toast_live = shell.borrow().copied.get().is_some_and(|c| c.is_live());
+        if toast_was_live && !toast_live {
+            app.request_redraw();
+        }
+        toast_was_live = toast_live;
     };
 
     exit
@@ -6634,6 +6706,7 @@ mod tests {
             Rc::clone(&world.chat),
             &Theme::bundled_dark_with_mode(aj_app::theme::ColorMode::Truecolor),
             Rc::new(std::cell::Cell::new(false)),
+            Rc::new(std::cell::Cell::new(None)),
         );
         let ctx = DrawContext {
             min: Size {

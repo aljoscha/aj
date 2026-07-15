@@ -13,6 +13,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::LazyLock;
+use std::time::Instant;
 
 use aj_agent::events::AgentId;
 use aj_agent::tool::{
@@ -29,6 +30,7 @@ use aj_app::theme::{ColorMode, Theme, ThemeBg, ThemeColor, ThemeRgb, rgb_to_256}
 use aj_models::types::AssistantContent;
 use aj_tools::sanitize_terminal_output;
 use serde_json::Value;
+use unicode_segmentation::UnicodeSegmentation;
 use vaxis::cell::{Cell, Character, Color, Style};
 use vaxis::gwidth;
 use vaxis::key::{Key, Modifiers};
@@ -40,6 +42,7 @@ use vaxis::vxfw::{
 };
 
 use crate::bubble::{Bubble, BubbleBorder, PADDING_X};
+use crate::copied_toast::Copied;
 use crate::markdown_view::{MarkdownSegment, MarkdownStyles, MarkdownView};
 use crate::subagent_box::{SubAgentBox, build_subagent_box, surface_rows};
 use crate::terminal::TERMINAL_HYPERLINKS;
@@ -1295,6 +1298,10 @@ pub struct TranscriptView {
     /// left-button press-drag over the content and kept highlighted after the
     /// release copies it, until the next plain click or Esc clears it.
     selection: Option<Selection>,
+    /// The last select-to-copy record, shared with the `CopiedToast` that
+    /// reports it and the drive loop that schedules its dismissal. Written on
+    /// the release that copies a real range.
+    copied: Rc<std::cell::Cell<Option<Copied>>>,
     /// Viewport size the last completed [`draw`](Widget::draw) laid out
     /// against. The mouse handlers run between draws with no `DrawContext`, so
     /// they read the geometry back from here to map widget-local coordinates
@@ -1398,6 +1405,7 @@ impl TranscriptView {
         chat: Rc<RefCell<ChatState>>,
         theme: &Theme,
         focused: Rc<std::cell::Cell<bool>>,
+        copied: Rc<std::cell::Cell<Option<Copied>>>,
     ) -> TranscriptView {
         let styles = Rc::new(TranscriptStyles::from_theme(theme));
         let cache = Rc::new(RefCell::new(EntryRenderCache::new()));
@@ -1442,6 +1450,7 @@ impl TranscriptView {
             focused,
             on_exit_focus: None,
             selection: None,
+            copied,
             last_view: Size {
                 width: 0,
                 height: 0,
@@ -2042,10 +2051,21 @@ impl TranscriptView {
                     } else {
                         // Select-to-copy: a real range copies to the clipboard
                         // via OSC 52 and stays highlighted until the next click
-                        // or Esc.
+                        // or Esc. A range that covers only blank margin extracts
+                        // nothing, so we neither copy nor toast (the clipboard
+                        // is left untouched).
                         let width = self.content_width();
                         let text = self.extract_selection(width, sel.anchor, sel.caret);
-                        ctx.copy_to_clipboard(text);
+                        if !text.is_empty() {
+                            // Report the copy to the toast. Count graphemes, so
+                            // a multi-byte character (or an emoji) reads as one.
+                            let chars = text.graphemes(true).count();
+                            self.copied.set(Some(Copied {
+                                chars,
+                                at: Instant::now(),
+                            }));
+                            ctx.copy_to_clipboard(text);
+                        }
                     }
                     ctx.redraw = true;
                 }
@@ -3050,6 +3070,7 @@ mod tests {
             Rc::clone(chat),
             &theme,
             Rc::new(std::cell::Cell::new(false)),
+            Rc::new(std::cell::Cell::new(None)),
         )
     }
 
@@ -5064,6 +5085,44 @@ mod tests {
             view.selection.is_some(),
             "a real range stays highlighted after copy",
         );
+    }
+
+    /// A select-to-copy release records the copied character count in the
+    /// shared cell the toast reads, while a plain click records nothing.
+    #[test]
+    fn release_records_the_copied_character_count() {
+        let chat = chat_with_notices(20);
+        let theme = Theme::bundled_dark_with_mode(aj_app::theme::ColorMode::Truecolor);
+        let copied = Rc::new(std::cell::Cell::new(None));
+        let mut view = TranscriptView::new(
+            Rc::clone(&chat),
+            &theme,
+            Rc::new(std::cell::Cell::new(false)),
+            Rc::clone(&copied),
+        );
+        let ctx = draw_ctx(40, 10);
+        view.follow_tail = false;
+        view.list.borrow_mut().scroll_lines(-1000);
+        let _ = view.draw(&ctx);
+
+        // A plain click (no drag) records nothing.
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &mouse(2, 2, mouse::Type::Press));
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &mouse(2, 2, mouse::Type::Release));
+        assert!(copied.get().is_none(), "a plain click records no copy");
+
+        // Select " row 1" (entry 1, screen row 2): press at col 0, drag to
+        // col 6, release. The chrome margin is skipped, so "row 1" is copied.
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &mouse(0, 2, mouse::Type::Press));
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &mouse(6, 2, mouse::Type::Drag));
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &mouse(6, 2, mouse::Type::Release));
+
+        let rec = copied.get().expect("release records a copy");
+        assert_eq!(rec.chars, 5, "five characters copied (\"row 1\")");
     }
 
     /// Select-to-copy on a transcript shorter than the viewport. Bottom-anchoring

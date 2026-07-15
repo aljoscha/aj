@@ -27,6 +27,7 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+unicode-segmentation = { workspace = true }
 vaxis = { path = "../vaxis/" }
 
 [dev-dependencies]
