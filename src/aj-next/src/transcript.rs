@@ -846,12 +846,17 @@ impl EntryWidget {
     /// Erase to a boxed widget, applying the shared one-column left indent
     /// every transcript entry carries.
     ///
-    /// Bubbles and the sub-agent box already inset their content by
-    /// `PADDING_X` over a full-width background, so they are boxed as-is. The
-    /// plain rich and markdown entries paint from column zero, so we wrap them
-    /// in a `Padding` that shifts their content right by `PADDING_X`. That
-    /// leaves a true blank first column (no background) which semantic
-    /// selection skips.
+    /// The tinted bubble and sub-agent box entries already inset their content
+    /// by `PADDING_X` over a full-width background, so they are boxed as-is.
+    /// The background-less rich and markdown entries paint from column zero, so
+    /// we wrap them in a `Padding` that shifts their content right by
+    /// `PADDING_X`, leaving a true blank first column (no background) which
+    /// semantic selection skips.
+    ///
+    /// NOTE: an untinted or too-narrow bubble falls back to a flush plain
+    /// render at column zero, so it is not indented here. That path is not a
+    /// live top-level entry (a top-level tool bubble is always tinted and
+    /// rendered wide), so it does not break the transcript's alignment today.
     pub(crate) fn into_indented_boxed(self) -> Box<dyn Widget> {
         match self {
             EntryWidget::Bubble(b) => Box::new(b),
@@ -2725,6 +2730,29 @@ mod tests {
         // Segments stack in order with one blank row between them and the
         // trailing spacer, the tool call contributing nothing.
         assert_eq!(rows, vec!["Thinking: pondering", "", "answer", ""]);
+    }
+
+    /// An assistant entry gets the shared one-column indent when boxed, like
+    /// the notice and compaction entries. The raw markdown starts flush at
+    /// column zero (see the test above); the indent is added by
+    /// `into_indented_boxed`.
+    #[test]
+    fn assistant_entry_is_indented_one_column_when_boxed() {
+        let t = transcript_with(EntryKind::Assistant(AssistantEntry {
+            message: assistant_message(vec![AssistantContent::Text(TextContent {
+                text: "answer".into(),
+                text_signature: None,
+            })]),
+            finalized: true,
+        }));
+        let EntryKind::Assistant(a) = &t.entries()[0].kind else {
+            panic!("expected an assistant entry");
+        };
+        let view = build_assistant_markdown(a, false, false, &styles());
+        let mut widget = EntryWidget::Markdown(view).into_indented_boxed();
+        let surface = widget.draw(&crate::test_support::draw_ctx(40, None));
+        let rows = crate::test_support::rows(&surface);
+        assert_eq!(rows[0], " answer", "assistant text at column one: {rows:?}");
     }
 
     #[test]

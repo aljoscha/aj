@@ -6554,6 +6554,73 @@ mod tests {
         assert_eq!(last_col_glyph, "╮", "box hugs the right edge: {body}");
     }
 
+    /// `push_corner_box` stacks boxes upward, flush to the right edge: the
+    /// second box sits strictly above the first, which is how the copied toast
+    /// lands on top of the Ctrl+C quit hint when both are up.
+    #[test]
+    fn corner_boxes_stack_upward_flush_right() {
+        let mut inner = Surface::with_size(Size {
+            width: 80,
+            height: 24,
+        });
+        let editor_top = 20u16;
+
+        // Bottom box (quit hint): its bottom edge is the editor top.
+        let hint = Surface::with_size(Size {
+            width: 10,
+            height: 3,
+        });
+        let hint_top = push_corner_box(&mut inner, 80, editor_top, hint);
+        assert_eq!(hint_top, editor_top - 3);
+
+        // Top box (toast): anchored with its bottom at the hint's top edge.
+        let toast = Surface::with_size(Size {
+            width: 14,
+            height: 4,
+        });
+        let toast_top = push_corner_box(&mut inner, 80, hint_top, toast);
+        assert_eq!(toast_top, hint_top - 4);
+
+        assert_eq!(inner.children.len(), 2);
+        for (child, width) in inner.children.iter().zip([10u16, 14]) {
+            assert_eq!(child.z_index, 1, "drawn over the base layout");
+            assert_eq!(
+                child.origin.col,
+                i32::from(80 - width),
+                "flush to the right edge",
+            );
+        }
+        // The toast (second) sits strictly above the quit hint (first).
+        assert!(
+            inner.children[1].origin.row < inner.children[0].origin.row,
+            "toast stacks above the quit hint",
+        );
+    }
+
+    /// A live copied record pops the toast in `Shell::draw`; without one there
+    /// is no box.
+    #[test]
+    fn copied_toast_shows_when_a_copy_is_recorded() {
+        let shell = test_shell_with_chat(empty_chat());
+        let ctx = draw_ctx(100, 30);
+
+        let before = shell.borrow_mut().draw(&ctx);
+        assert!(
+            !crate::test_support::rows(&before)
+                .join("\n")
+                .contains("copied to clipboard"),
+            "no toast without a copy",
+        );
+
+        shell.borrow().copied.set(Some(Copied {
+            chars: 7,
+            at: Instant::now(),
+        }));
+        let after = shell.borrow_mut().draw(&ctx);
+        let body = crate::test_support::rows(&after).join("\n");
+        assert!(body.contains("7 characters copied to clipboard"), "{body}");
+    }
+
     /// machinery: after the tick fires, the next ctrl+c re-arms instead
     /// of quitting.
     #[tokio::test]
