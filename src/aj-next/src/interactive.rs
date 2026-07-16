@@ -3311,7 +3311,7 @@ impl Shell {
         self.pending
             .borrow_mut()
             .set_queues(world.core.message_queues.clone());
-        self.header.borrow_mut().text = format!("aj-next — {}", world.core.session_id);
+        self.header.borrow_mut().text = format!("aj-next - session {}", world.core.session_id);
         self.window_title = aj_app::session::window_title(
             APP_TITLE,
             &world.core.session_id,
@@ -3632,7 +3632,7 @@ pub async fn run(args: Args) -> Result<()> {
     let theme_name = resolve_theme_name(world_config_theme(&world).as_deref()).to_string();
     let env_mode = ColorMode::detect();
     let theme = ThemeHandle::new(Theme::load_with_mode(&theme_name, env_mode));
-    let header = format!("aj-next — {}", world.core.session_id);
+    let header = format!("aj-next - session {}", world.core.session_id);
     let cwd = world.core.env.working_directory.clone();
     let shell = Rc::new(RefCell::new(Shell::new(
         Rc::clone(&world.chat),
@@ -4674,7 +4674,7 @@ mod tests {
             ThemeHandle::new(Theme::bundled_dark_with_mode(
                 aj_app::theme::ColorMode::Truecolor,
             )),
-            format!("aj-next — {session_id}"),
+            format!("aj-next - session {session_id}"),
             session_id,
             PathBuf::from(cwd),
         )
@@ -9982,7 +9982,7 @@ mod tests {
         // The header id followed the swap.
         assert_eq!(
             shell.borrow().header.borrow().text,
-            format!("aj-next — {beta}")
+            format!("aj-next - session {beta}")
         );
         // The pending box reads the new agent's queues (rebound on the
         // swap), so a message queued on the new core previews.
