@@ -50,6 +50,10 @@ pub enum EntryKind {
 /// A user message appended from `MessageEnd { User }`.
 #[derive(Debug)]
 pub struct UserEntry {
+    /// Id of the originating user `AgentMessage` / log entry, used to
+    /// anchor branch operations. Non-empty within the TUI: live messages
+    /// mint it, replayed messages are backfilled on resume.
+    pub message_id: String,
     /// The authoritative wire content blocks.
     pub content: Vec<UserContent>,
     /// True for harness task-completion notices (text starts with the
@@ -713,6 +717,7 @@ mod tests {
             .get_mut(&AgentId::Main)
             .expect("main transcript")
             .append(EntryKind::User(UserEntry {
+                message_id: String::new(),
                 content: Vec::new(),
                 collapsible: false,
             }));

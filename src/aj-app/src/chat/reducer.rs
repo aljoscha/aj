@@ -118,19 +118,25 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
         AgentEvent::MessageUpdate {
             agent_id, event, ..
         } => reduce_message_update(state, agent_id, event),
-        AgentEvent::MessageEnd { agent_id, message } => match message.kind {
-            AgentMessageKind::Wire(Message::User(user)) => reduce_user_end(state, agent_id, user),
-            AgentMessageKind::Wire(Message::Assistant(assistant)) => {
-                reduce_assistant_end(state, agent_id, assistant)
+        AgentEvent::MessageEnd { agent_id, message } => {
+            // Capture the id before matching, which moves `message.kind`.
+            let message_id = message.id().to_string();
+            match message.kind {
+                AgentMessageKind::Wire(Message::User(user)) => {
+                    reduce_user_end(state, agent_id, user, message_id)
+                }
+                AgentMessageKind::Wire(Message::Assistant(assistant)) => {
+                    reduce_assistant_end(state, agent_id, assistant)
+                }
+                AgentMessageKind::Wire(Message::ToolResult(_)) => {
+                    // Tool results render through the dedicated
+                    // `ToolExecutionEnd` event (which carries the
+                    // structured `ToolDetails`). The unified
+                    // `MessageEnd { ToolResult }` is structural framing.
+                    Redraw(false)
+                }
             }
-            AgentMessageKind::Wire(Message::ToolResult(_)) => {
-                // Tool results render through the dedicated
-                // `ToolExecutionEnd` event (which carries the
-                // structured `ToolDetails`). The unified
-                // `MessageEnd { ToolResult }` is structural framing.
-                Redraw(false)
-            }
-        },
+        }
 
         // ---- Tool execution -------------------------------------------------
         //
@@ -548,7 +554,12 @@ fn reduce_message_update(
 /// Handle `MessageEnd { User }`: append the authoritative payload.
 /// The rendering path for both live user prompts and replayed user
 /// threads.
-fn reduce_user_end(state: &mut ChatState, agent_id: AgentId, user: UserMessage) -> Redraw {
+fn reduce_user_end(
+    state: &mut ChatState,
+    agent_id: AgentId,
+    user: UserMessage,
+    message_id: String,
+) -> Redraw {
     let text = joined_user_text(&user.content);
     if text.is_empty() {
         return Redraw(false);
@@ -565,6 +576,7 @@ fn reduce_user_end(state: &mut ChatState, agent_id: AgentId, user: UserMessage) 
         .entry(agent_id)
         .or_default()
         .append(EntryKind::User(UserEntry {
+            message_id,
             content: user.content,
             collapsible,
         }));

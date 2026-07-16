@@ -36,16 +36,47 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct AgentMessage {
+    /// In-memory unique id, minted at construction. Never serialized:
+    /// `#[serde(skip)]` keeps the wire-JSON shape (a bare [`Message`])
+    /// intact, which is a locked on-disk contract, and `#[serde(transparent)]`
+    /// still sees exactly one serialized field (`kind`). A deserialized
+    /// `AgentMessage` therefore has an empty id until a consumer backfills
+    /// it. The log adopts this id as the entry id for message entries and
+    /// backfills it from the entry id on resume.
+    ///
+    /// NOTE: `MessageStart` and `MessageEnd` of one assistant turn are
+    /// separate `wire()` constructions, so they carry different ids. Only
+    /// `MessageEnd` ids are consumed.
+    #[serde(skip)]
+    id: String,
     /// Categorized payload. See [`AgentMessageKind`].
     pub kind: AgentMessageKind,
 }
 
 impl AgentMessage {
-    /// Wrap a wire [`Message`] as an [`AgentMessage`].
+    /// Wrap a wire [`Message`] as an [`AgentMessage`], minting a fresh id.
+    ///
+    /// This is the single choke point where message ids are minted: every
+    /// other constructor routes through here. The id is a 128-bit random
+    /// hex token, wide enough that collisions are negligible without a
+    /// central registry to check against.
     pub fn wire(message: Message) -> Self {
         Self {
+            id: format!("{:032x}", rand::random::<u128>()),
             kind: AgentMessageKind::Wire(message),
         }
+    }
+
+    /// The message's unique id. Empty for a message deserialized outside
+    /// the log's backfill path (see [`AgentMessage::set_id`]).
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Set the message's id. Used by the log to backfill the id from the
+    /// on-disk entry id when resuming a session.
+    pub fn set_id(&mut self, id: String) {
+        self.id = id;
     }
 
     /// Borrow the inner wire [`Message`] if this entry carries one.
@@ -147,5 +178,36 @@ mod tests {
             }
             other => panic!("expected Wire(User), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn wire_mints_unique_nonempty_ids() {
+        let make = || {
+            AgentMessage::from(Message::User(UserMessage {
+                content: vec![UserContent::Text(TextContent {
+                    text: "hi".to_string(),
+                    text_signature: None,
+                })],
+                timestamp: 0,
+            }))
+        };
+        let a = make();
+        let b = make();
+        assert_eq!(a.id().len(), 32, "id is a 32-hex token");
+        assert!(!a.id().is_empty());
+        assert_ne!(a.id(), b.id(), "each construction mints a fresh id");
+    }
+
+    #[test]
+    fn deserialized_message_has_empty_id_until_set() {
+        let json = serde_json::json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "hi"}],
+            "timestamp": 0,
+        });
+        let mut msg: AgentMessage = serde_json::from_value(json).unwrap();
+        assert!(msg.id().is_empty(), "id is skipped on the wire, so empty");
+        msg.set_id("deadbeef".to_string());
+        assert_eq!(msg.id(), "deadbeef");
     }
 }

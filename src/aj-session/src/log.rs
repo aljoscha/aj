@@ -662,6 +662,17 @@ impl ConversationLog {
         drop(reader);
         let file = OpenOptions::new().append(true).open(&path)?;
 
+        // Backfill each message entry's in-memory id from its on-disk entry
+        // id, so replay, reseeding, and the reducer see ids for free. We do
+        // this over the `entries` map (the one handed to `linearize` and the
+        // projections), covering both the loop-inserted and trailing entries.
+        // Old 8-hex files simply adopt their entry id as the message id.
+        for (entry_id, entry) in entries.iter_mut() {
+            if let ConversationEntryKind::Message { message } = &mut entry.entry {
+                message.set_id(entry_id.clone());
+            }
+        }
+
         Ok(Self {
             path,
             session_id: session_id.to_string(),
@@ -767,7 +778,25 @@ impl ConversationLog {
             compact_message(message);
         }
 
-        let id = self.mint_id();
+        // Adopt the message's own id as the entry id for `Message` entries.
+        // This lives in `append` rather than the persistence listener so
+        // every writer, repair included, stays consistent. Non-message
+        // entries and message entries with no id (deserialized outside the
+        // backfill path) get a log-minted id.
+        let id = match &entry {
+            ConversationEntryKind::Message { message } if !message.id().is_empty() => {
+                message.id().to_string()
+            }
+            _ => self.mint_id(),
+        };
+        // A duplicate id would silently diverge the parent chain. It is a
+        // ~2^-64 event for adopted 128-bit ids, so we error loudly rather
+        // than paper over it. `mint_id` already excludes existing ids.
+        if self.entries.contains_key(&id) {
+            return Err(ConversationError::InvalidAppend(format!(
+                "duplicate entry id {id}: already present in log"
+            )));
+        }
         let record = ConversationEntry {
             id: id.clone(),
             parent_id: parent_id.clone(),
@@ -827,7 +856,7 @@ impl ConversationLog {
         Ok(self.file.as_mut().expect("file just opened above"))
     }
 
-    /// Mint a fresh entry id: a random 32-bit value as 8 hex digits,
+    /// Mint a fresh entry id: a random 128-bit value as 32 hex digits,
     /// re-drawn until it doesn't collide with an id already in this log.
     ///
     /// Ids are random rather than a per-process counter so two processes
@@ -837,10 +866,14 @@ impl ConversationLog {
     /// ids this process already holds, so it fully guards the
     /// within-process draw. Two concurrent processes don't see each
     /// other's fresh ids, so a cross-process collision is possible at
-    /// ~1/2^32 per overlapping mint, which we accept over taking a lock.
+    /// ~1/2^128 per overlapping mint, which we accept over taking a lock.
+    ///
+    /// The 32-hex format matches the ids `AgentMessage` mints for itself,
+    /// so all ids written by current code are uniform. Old 8-hex ids
+    /// coexist in the same file: parent links copy strings verbatim.
     fn mint_id(&self) -> EntryId {
         loop {
-            let id = format!("{:08x}", rand::random::<u32>());
+            let id = format!("{:032x}", rand::random::<u128>());
             if !self.entries.contains_key(&id) {
                 return id;
             }

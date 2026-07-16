@@ -56,6 +56,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
+ "rand 0.9.4",
  "schemars",
  "serde",
  "serde_json",
