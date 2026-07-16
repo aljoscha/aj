@@ -73,6 +73,7 @@ use crate::login::{
     AuthPickerRequest, AuthRow, DialogCallbacks, LoginDialogState, open_login_dialog,
     open_login_picker, open_logout_picker,
 };
+use crate::notice_toast::{Notice, NoticeToast, raise_toast};
 use crate::overlay::{MouseBlocker, OverlayChrome, OverlayStack, Scrim};
 use crate::palette::{FetchKind, PendingFetch, open_palette};
 use crate::pending::PendingBox;
@@ -897,25 +898,18 @@ struct BranchAnchor {
     /// The focused user message's stable id, resolved against the log on
     /// submit to find the branch point (the message's parent).
     message_id: String,
-    /// Whether a background-task-shutdown confirm is pending. The first armed
-    /// submit with live background work warns and sets this; a repeat submit
-    /// proceeds. Reset whenever the anchor is disarmed or re-armed.
-    confirm_pending: bool,
 }
 
-/// Arm a branch anchor: store the message id and the footer indicator preview,
-/// starting with no confirm pending. The two slots move in lockstep, so a set
-/// indicator is exactly "an anchor is armed".
+/// Arm a branch anchor: store the message id and the footer indicator preview.
+/// The two slots move in lockstep, so a set indicator is exactly "an anchor is
+/// armed".
 fn arm_branch(
     anchor: &Rc<RefCell<Option<BranchAnchor>>>,
     indicator: &Rc<RefCell<Option<String>>>,
     message_id: String,
     preview: String,
 ) {
-    *anchor.borrow_mut() = Some(BranchAnchor {
-        message_id,
-        confirm_pending: false,
-    });
+    *anchor.borrow_mut() = Some(BranchAnchor { message_id });
     *indicator.borrow_mut() = Some(preview);
 }
 
@@ -1154,29 +1148,47 @@ fn quit_arm_running_work(world: &World) -> Option<String> {
 /// site: the [`SessionExit`] to break the loop with, or `None` to stay in the
 /// session.
 ///
-/// A tree-view branch switch (`SessionRequest::Branch`) rebuilds the session,
-/// which shuts its turns and background work down. We refuse it (fold a notice,
-/// return `None`) while any turn or background task/sub-agent is live, rather
-/// than tear live work down silently. The overlay opens gated only on
-/// `world.turns`, so two things can still be running when the request is
-/// consumed: a background sub-agent finishing while the overlay is open spawns
-/// a parent wake turn (so `world.turns` is non-empty), and detached bash tasks
-/// or background sub-agents were never in `world.turns` to begin with. This is
-/// a v1 refuse, deliberately simpler than the `b`-submit flow's two-step
-/// background-task confirm.
+/// Both a tree-view branch switch (`SessionRequest::Branch`) and a
+/// selector resume (`SessionRequest::Resume`) rebuild the session, which shuts
+/// its turns and background work down. We refuse either while any turn or
+/// background task/sub-agent is live rather than tear live work down silently.
+/// The overlays open read-only and refuse the switch at confirm time, but a
+/// request can still slip through with work live: a background sub-agent
+/// finishing between the confirm and this consumption spawns a parent wake
+/// turn (so `world.turns` is non-empty), and the confirm-time `busy` snapshot
+/// is one drive-loop iteration stale. This is the authoritative recheck.
 ///
-/// `New`/`Resume` are only ever parked with no turn in flight, so they keep the
+/// `New` is only ever parked with no turn in flight (the `NewSession` command
+/// guards on `world.turns`, not via an overlay), so it keeps the
 /// debug-assert-and-consume path.
-fn consume_session_request(world: &mut World, request: SessionRequest) -> Option<SessionExit> {
-    if let SessionRequest::Branch { .. } = request {
-        let (agents, bash) =
-            running_work_counts(world.turns.len(), &world.core.task_registry.snapshot());
-        if agents + bash > 0 {
-            fold_notice(world, "Can't switch branches while work is running.");
-            return None;
+fn consume_session_request(
+    world: &mut World,
+    shell: &Rc<RefCell<Shell>>,
+    request: SessionRequest,
+) -> Option<SessionExit> {
+    match &request {
+        SessionRequest::Branch { .. } => {
+            let (agents, bash) =
+                running_work_counts(world.turns.len(), &world.core.task_registry.snapshot());
+            if agents + bash > 0 {
+                fold_notice(world, "Can't switch branches while work is running.");
+                return None;
+            }
         }
-    } else {
-        debug_assert!(world.turns.is_empty(), "session change requested mid-turn");
+        SessionRequest::Resume(_) => {
+            let (agents, bash) =
+                running_work_counts(world.turns.len(), &world.core.task_registry.snapshot());
+            if agents + bash > 0 {
+                // A toast, matching the selector's confirm-time refuse.
+                shell
+                    .borrow()
+                    .show_toast("Can't switch sessions while work is running.");
+                return None;
+            }
+        }
+        SessionRequest::New => {
+            debug_assert!(world.turns.is_empty(), "new session requested mid-turn");
+        }
     }
     Some(request.into_exit())
 }
@@ -1371,10 +1383,9 @@ async fn resolve_branch_head(world: &World, message_id: &str) -> BranchTarget {
 
 /// The outcome of a submit made while a branch anchor is armed.
 enum ArmedSubmit {
-    /// Stay in the current session: the submit was refused (empty, mid-turn,
-    /// or a pending background-task confirm) or the resolution failed (missing
-    /// / root). The anchor and any needed notice are handled inside; the
-    /// caller only redraws.
+    /// Stay in the current session: the submit was refused (empty, or busy)
+    /// or the resolution failed (missing / root). The anchor and any needed
+    /// notice/toast are handled inside; the caller only redraws.
     Stay,
     /// Resolved: break the drive loop and rebuild the session onto `head`,
     /// running `prompt` as the branch's first turn.
@@ -1399,39 +1410,20 @@ async fn submit_with_armed_anchor(
         fold_notice(world, "Type a message to branch, or press Esc to cancel.");
         return ArmedSubmit::Stay;
     }
-    // Mid-turn: refuse and keep the anchor and text (the same global busy
-    // check the session-changing commands use). Restore the text the submit
-    // cleared so the user keeps it.
-    if !world.turns.is_empty() {
-        shell.borrow().editor.borrow_mut().set_text(&text);
-        fold_notice(world, &session_busy_notice("branch from a message"));
-        return ArmedSubmit::Stay;
-    }
-    // Background tasks: two-step confirm. The rebuild's shutdown would kill
-    // detached bash tasks and background sub-agents silently, surprising for a
-    // gesture the user reads as "edit and resend", so warn once and require a
-    // repeat submit to confirm.
-    let (agents, tasks) =
+    // Busy: refuse and keep the anchor and text. A branch rebuilds the
+    // session, which tears down any in-flight turn AND background work
+    // (background sub-agents, detached bash tasks). We refuse while busy
+    // rather than kill live work, matching the session-changing overlays.
+    // Raise the toast and restore the text the submit cleared so the user
+    // keeps it.
+    let (agents, bash) =
         running_work_counts(world.turns.len(), &world.core.task_registry.snapshot());
-    if agents + tasks > 0 {
-        let confirm_pending = shell
+    if agents + bash > 0 {
+        shell.borrow().editor.borrow_mut().set_text(&text);
+        shell
             .borrow()
-            .branch_anchor
-            .borrow()
-            .as_ref()
-            .is_some_and(|a| a.confirm_pending);
-        if !confirm_pending {
-            if let Some(anchor) = shell.borrow().branch_anchor.borrow_mut().as_mut() {
-                anchor.confirm_pending = true;
-            }
-            shell.borrow().editor.borrow_mut().set_text(&text);
-            let work = running_work_summary(agents, tasks).unwrap_or_else(|| "work".to_string());
-            fold_warning(
-                world,
-                &format!("Branching will stop background {work}. Submit again to confirm."),
-            );
-            return ArmedSubmit::Stay;
-        }
+            .show_toast("Can't branch while work is running.");
+        return ArmedSubmit::Stay;
     }
     // Resolve the anchor against the log.
     let message_id = shell
@@ -1755,40 +1747,32 @@ async fn apply_command_action(
             );
             ActionEffect::OpenedOverlay
         }
-        // Session-changing commands tear down the current world and rebuild
-        // it, which must never abort in-flight work, so refuse them mid-turn
-        // (matching aj). The user can cancel the turn and retry.
+        // The session-selector and session-tree overlays open READ-ONLY at any
+        // time, even mid-work. Switching (Enter) is refused at confirm time
+        // with a toast (see their `on_confirm` closures), so there is no
+        // open-time busy guard here. `NewSession` below keeps its own guard.
         CommandAction::OpenSessionSelector => {
-            // Any host-driven turn in flight (Main, a wake turn, or a
-            // user-driven sub turn) blocks the switch, matching aj's
-            // `!turns.is_empty()` guard and the `world.turns.is_empty()`
-            // debug-assert the drive loop honors the request under.
-            if !world.turns.is_empty() {
-                fold_notice(world, &session_busy_notice("switch sessions"));
-                return ActionEffect::Redraw;
-            }
-            let handles = shell.borrow().overlay_handles();
+            let (handles, busy, notice) = {
+                let sh = shell.borrow();
+                (
+                    sh.overlay_handles(),
+                    Rc::clone(&sh.busy),
+                    Rc::clone(&sh.notice),
+                )
+            };
             open_session_selector(
                 &handles.stack,
                 &handles.editor,
                 &handles.chrome,
                 &handles.session_scan,
                 &handles.session_request,
+                &busy,
+                &notice,
                 world.core.session_id.clone(),
             );
             ActionEffect::OpenedOverlay
         }
         CommandAction::OpenSessionTree => {
-            // Selecting a branch tears the world down and rebuilds it, so it
-            // rides the same mid-turn guard as the other session-changing
-            // commands. Refusing to OPEN (not just to select) is a v1
-            // simplification: it reuses the established guard and guarantees no
-            // branch request reaches the drive loop while a turn is in flight
-            // (whose take_session_request path assumes `world.turns` is empty).
-            if !world.turns.is_empty() {
-                fold_notice(world, &session_busy_notice("open the session tree"));
-                return ActionEffect::Redraw;
-            }
             // Building the tree is cheap and in-memory, so lock the log, snapshot
             // the rows and the current head, and drop the lock before opening.
             let (rows, current_head) = {
@@ -1798,12 +1782,21 @@ async fn apply_command_action(
                     log.head().cloned(),
                 )
             };
-            let handles = shell.borrow().overlay_handles();
+            let (handles, busy, notice) = {
+                let sh = shell.borrow();
+                (
+                    sh.overlay_handles(),
+                    Rc::clone(&sh.busy),
+                    Rc::clone(&sh.notice),
+                )
+            };
             open_session_tree(
                 &handles.stack,
                 &handles.editor,
                 &handles.chrome,
                 &handles.session_request,
+                &busy,
+                &notice,
                 rows,
                 current_head,
             );
@@ -3137,6 +3130,20 @@ struct Shell {
     /// it and the `copied_toast` that reports it. The drive loop reads it to
     /// wake at the toast's deadline. Copy payload, so a `Cell` not a `RefCell`.
     copied: Rc<Cell<Option<Copied>>>,
+    /// The transient notice toast, stacked with the copy toast above the
+    /// editor. Reads the `notice` record below, raised by the host through
+    /// [`Shell::show_toast`] (and the overlay confirm closures directly).
+    notice_toast: Rc<RefCell<NoticeToast>>,
+    /// The latest raised notice, shared with the overlay confirm closures that
+    /// write it and the `notice_toast` that reports it. The drive loop reads it
+    /// to wake at the toast's deadline. A `String` payload, so a `RefCell`.
+    notice: Rc<RefCell<Option<Notice>>>,
+    /// Whether any work is in flight (an in-flight turn OR background
+    /// sub-agents / bash tasks). Refreshed every drive-loop iteration by
+    /// [`sync_keymap_ctx`] from `running_work_counts`. The session-overlay
+    /// confirm closures read it at Enter time to refuse a switch mid-work
+    /// while still opening read-only.
+    busy: Rc<Cell<bool>>,
     /// Whether the frame-stats overlay is shown. Seeded from
     /// `config.show_frame_stats` at build time and flipped live by the
     /// settings window through `apply_setting_change`, which shares this cell.
@@ -3293,6 +3300,14 @@ impl Shell {
         // the drive loop to schedule the toast's dismissal. Created here so
         // all three see the same cell.
         let copied: Rc<Cell<Option<Copied>>> = Rc::new(Cell::new(None));
+        // The raised-notice record, shared between the host (its writers: the
+        // overlay confirm closures and `Shell::show_toast`) and the
+        // `NoticeToast` that reports it, and read by the drive loop to schedule
+        // the toast's dismissal. A `String` payload, so a `RefCell`.
+        let notice: Rc<RefCell<Option<Notice>>> = Rc::new(RefCell::new(None));
+        // The global busy flag, refreshed each drive-loop iteration. Read by
+        // the session-overlay confirm closures to refuse a switch mid-work.
+        let busy: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         // Branch-anchor slots, following the parked-slot pattern: `on_action`
         // arms them on `b`, the drive loop resolves them on submit, the footer
         // reads the indicator at draw, and the Esc handler flips
@@ -3341,6 +3356,11 @@ impl Shell {
             Rc::clone(&styles),
             Rc::clone(&chrome),
             Rc::clone(&copied),
+        )));
+        let notice_toast = Rc::new(RefCell::new(NoticeToast::new(
+            Rc::clone(&styles),
+            Rc::clone(&chrome),
+            Rc::clone(&notice),
         )));
         let pending = Rc::new(RefCell::new(PendingBox::new(
             Rc::clone(&chat),
@@ -3605,6 +3625,9 @@ impl Shell {
             frame_stats_box,
             copied_toast,
             copied,
+            notice_toast,
+            notice,
+            busy,
             show_frame_stats,
             frame_stats,
             submitted,
@@ -3644,6 +3667,13 @@ impl Shell {
     /// Clear the armed branch anchor and its footer indicator.
     fn disarm_branch(&self) {
         clear_branch(&self.branch_anchor, &self.branch_indicator);
+    }
+
+    /// Raise a transient bottom-right toast with `message`, replacing any live
+    /// one and resetting its timer. The caller still owns the repaint (the
+    /// drive loop schedules the clearing repaint at the toast's deadline).
+    fn show_toast(&self, message: impl Into<String>) {
+        raise_toast(&self.notice, message);
     }
 
     /// Take the "an Esc cancelled the armed anchor" flag, so the drive loop
@@ -3750,6 +3780,9 @@ impl Shell {
             .borrow_mut()
             .set_styles(Rc::clone(&styles));
         self.copied_toast
+            .borrow_mut()
+            .set_styles(Rc::clone(&styles));
+        self.notice_toast
             .borrow_mut()
             .set_styles(Rc::clone(&styles));
         self.splash
@@ -3868,9 +3901,10 @@ impl Widget for Shell {
         }
 
         // Corner boxes stacked above the editor, flush to the right edge and
-        // built bottom-up: the Ctrl+C quit-arm hint at the bottom, the "copied
-        // to clipboard" toast on top of it. Both are suppressed under a modal
-        // (a quit never arms there, and the transcript can't be selected).
+        // built bottom-up: the Ctrl+C quit-arm hint at the bottom, then the
+        // "copied to clipboard" toast, then the transient notice toast on top.
+        // All are suppressed under a modal (a quit never arms there, and the
+        // transcript can't be selected).
         //
         // The quit hint is drawn straight from the live keymap state, so it
         // appears and clears with the armed state, no mirror. The keymap's
@@ -3905,6 +3939,15 @@ impl Widget for Shell {
                 height: stack_bottom.saturating_sub(HEADER_ROWS),
             };
             if let Some(toast) = self.copied_toast.borrow().draw(ctx, avail) {
+                let toast = block_mouse(toast, &self.transcript);
+                stack_bottom = push_corner_box(&mut inner, term.width, stack_bottom, toast);
+            }
+
+            let avail = Size {
+                width: term.width,
+                height: stack_bottom.saturating_sub(HEADER_ROWS),
+            };
+            if let Some(toast) = self.notice_toast.borrow().draw(ctx, avail) {
                 let toast = block_mouse(toast, &self.transcript);
                 push_corner_box(&mut inner, term.width, stack_bottom, toast);
             }
@@ -3968,6 +4011,32 @@ impl Widget for Shell {
                 surface: draw_widget(&top.widget, &overlay_ctx),
                 z_index: 2,
             });
+            // The transient notice toast floats above an open overlay too: a
+            // session-overlay confirm that refuses a switch mid-work raises it
+            // and keeps the overlay open, so it must sit above the scrim and
+            // the overlay (z 3). Anchored bottom-right above the editor. When
+            // no overlay is open it is instead stacked with the other corner
+            // boxes above; the two cases are mutually exclusive per frame.
+            let editor_top = term
+                .height
+                .saturating_sub(FOOTER_ROWS)
+                .saturating_sub(self.editor.borrow().drawn_height());
+            let avail = Size {
+                width: term.width,
+                height: editor_top.saturating_sub(HEADER_ROWS),
+            };
+            if let Some(toast) = self.notice_toast.borrow().draw(ctx, avail) {
+                let anchor_row = editor_top.saturating_sub(toast.size.height);
+                let anchor_col = term.width.saturating_sub(toast.size.width);
+                inner.children.push(SubSurface {
+                    origin: RelativePoint {
+                        row: i32::from(anchor_row),
+                        col: i32::from(anchor_col),
+                    },
+                    surface: toast,
+                    z_index: 3,
+                });
+            }
         }
         // Wrap the controller's surface instead of returning it: the
         // caller's draw_widget re-stamps whatever we return with the
@@ -4064,7 +4133,14 @@ impl Widget for Shell {
 fn sync_keymap_ctx(world: &World, shell: &Rc<RefCell<Shell>>) {
     let active = world.chat.borrow().active_view();
     let busy = world.turn_cancels.contains_key(&active) || world.core.is_running(active);
+    // The global busy flag the session-overlay confirm closures read: any
+    // in-flight turn OR background work (background sub-agents + bash tasks),
+    // not just the viewed agent. Distinct from `turn_running` above, which is
+    // per-view and gates the keymap's steer/dequeue chords.
+    let (agents, bash) =
+        running_work_counts(world.turns.len(), &world.core.task_registry.snapshot());
     let shell = shell.borrow();
+    shell.busy.set(agents + bash > 0);
     let mut ctx = shell.keymap_ctx.borrow_mut();
     ctx.turn_running = busy;
     // The queue handle is swapped on session change (`world.core` is replaced),
@@ -4499,9 +4575,10 @@ async fn drive(
     // quit is armed. We refresh the hint's running-work warning on each edge
     // (set it on arm, clear it on disarm).
     let mut quit_was_armed = false;
-    // Rising/falling-edge tracker for the copied-to-clipboard toast, so on the
-    // frame the toast expires we ask for one repaint to clear it (its deadline
-    // is also folded into the wake below, so that repaint happens on time).
+    // Rising/falling-edge tracker for the transient toasts (copied-to-clipboard
+    // and the notice toast), so on the frame either expires we ask for one
+    // repaint to clear it (its deadline is also folded into the wake below, so
+    // that repaint happens on time).
     let mut toast_was_live = false;
     // Async read-only overlay fills. The list handle is `!Send`, so it
     // stays here (paired with its `FetchKind`) while the detached fetch
@@ -4597,13 +4674,24 @@ async fn drive(
             .then(|| last_render.map_or_else(Instant::now, |t| t + frame_interval));
         // The copied-to-clipboard toast has no self-timer, so wake at its
         // deadline: the box's `draw` drops it once the record has expired, and
-        // the edge check below asks for that clearing repaint.
-        let toast_deadline = shell
-            .borrow()
-            .copied
-            .get()
-            .filter(Copied::is_live)
-            .map(|c| c.at + COPIED_TOAST_DURATION);
+        // the edge check below asks for that clearing repaint. The transient
+        // notice toast rides the same scheme, so fold in the earliest of the
+        // two live deadlines.
+        let toast_deadline = {
+            let shell = shell.borrow();
+            let copied_deadline = shell
+                .copied
+                .get()
+                .filter(Copied::is_live)
+                .map(|c| c.at + COPIED_TOAST_DURATION);
+            let notice_deadline = shell
+                .notice
+                .borrow()
+                .as_ref()
+                .filter(|n| n.is_live())
+                .map(|n| n.at + COPIED_TOAST_DURATION);
+            earliest_deadline(copied_deadline, notice_deadline)
+        };
         let deadline = earliest_deadline(
             earliest_deadline(tick_deadline, frame_deadline),
             toast_deadline,
@@ -4912,14 +5000,16 @@ async fn drive(
                         // task.
                         cancel_login(world, shell, app, &mut login_session);
                         // A parked session change (the `NewSession` command
-                        // or a confirmed resume pick). A change is only ever
-                        // requested with no turn in flight, so tearing the
-                        // world down can't strand a running turn. A tree-view
-                        // branch switch is the exception: it can be parked with
-                        // background work live, so it is refused there rather
-                        // than consumed (see `consume_session_request`).
-                        if let Some(request) = shell.borrow().take_session_request() {
-                            match consume_session_request(world, request) {
+                        // or a confirmed resume pick). Bind the take out of the
+                        // borrow first, so no RefCell ref is held across
+                        // `consume_session_request` (which borrows the shell to
+                        // raise its refuse toast). A tree-view branch switch or
+                        // a resume can be parked with background work live, so
+                        // both are rechecked and refused there rather than
+                        // consumed (see `consume_session_request`).
+                        let session_request = shell.borrow().take_session_request();
+                        if let Some(request) = session_request {
+                            match consume_session_request(world, shell, request) {
                                 Some(exit) => break Ok(exit),
                                 None => app.request_redraw(),
                             }
@@ -5133,11 +5223,15 @@ async fn drive(
             app.request_redraw();
         }
         quit_was_armed = quit_armed;
-        // Clear the copied toast on the frame it expires. A new copy sets the
-        // record (from the transcript's release handler, which also requests a
-        // redraw), so the rising edge needs no work here, but when it falls we
-        // ask for the repaint that drops the now-stale box.
-        let toast_live = shell.borrow().copied.get().is_some_and(|c| c.is_live());
+        // Clear the copied and notice toasts on the frame they expire. A new
+        // copy or a raised notice sets its record (and requests a redraw), so
+        // the rising edge needs no work here, but when either falls we ask for
+        // the repaint that drops the now-stale box.
+        let toast_live = {
+            let shell = shell.borrow();
+            shell.copied.get().is_some_and(|c| c.is_live())
+                || shell.notice.borrow().as_ref().is_some_and(Notice::is_live)
+        };
         if toast_was_live && !toast_live {
             app.request_redraw();
         }
@@ -7351,6 +7445,29 @@ mod tests {
         let after = shell.borrow_mut().draw(&ctx);
         let body = crate::test_support::rows(&after).join("\n");
         assert!(body.contains("7 characters copied to clipboard"), "{body}");
+    }
+
+    /// A raised notice pops the notice toast in `Shell::draw`; without one
+    /// there is no box.
+    #[test]
+    fn notice_toast_shows_when_raised() {
+        let shell = test_shell_with_chat(empty_chat());
+        let ctx = draw_ctx(100, 30);
+
+        let before = shell.borrow_mut().draw(&ctx);
+        assert!(
+            !crate::test_support::rows(&before)
+                .join("\n")
+                .contains("work is running"),
+            "no toast without a raised notice",
+        );
+
+        shell
+            .borrow()
+            .show_toast("Can't switch sessions while work is running.");
+        let after = shell.borrow_mut().draw(&ctx);
+        let body = crate::test_support::rows(&after).join("\n");
+        assert!(body.contains("work is running"), "{body}");
     }
 
     /// machinery: after the tick fires, the next ctrl+c re-arms instead
@@ -10687,41 +10804,50 @@ mod tests {
         ));
     }
 
-    /// Both session-changing commands are refused while a turn runs (aj's
-    /// spirit: rebuilding the world under a live turn would strand it). The
-    /// refusal folds a notice and parks nothing.
+    /// The session selector opens read-only even mid-turn (the switch is
+    /// refused at confirm time, not by refusing to open). `NewSession` still
+    /// refuses mid-turn (it starts a fresh session with no overlay to gate
+    /// the switch), folding a notice and parking nothing.
     #[tokio::test]
-    async fn session_commands_refused_mid_turn() {
+    async fn new_session_refused_mid_turn_selector_opens() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         handle_submit(&mut world, "go".to_string());
         assert!(world.turn_cancels.contains_key(&AgentId::Main), "busy");
 
+        // The selector opens read-only mid-turn.
         assert!(matches!(
             apply_command(&mut world, &shell, CommandAction::OpenSessionSelector).await,
-            ActionEffect::Redraw
+            ActionEffect::OpenedOverlay
         ));
         assert!(
-            !shell.borrow().overlays.borrow().is_open(),
-            "no selector opened mid-turn"
+            shell.borrow().overlays.borrow().is_open(),
+            "the selector opens read-only mid-turn"
         );
+        assert!(
+            !main_notices(&world)
+                .iter()
+                .any(|n| n.contains("switch sessions")),
+            "no open-time refusal notice: {:?}",
+            main_notices(&world)
+        );
+        shell.borrow().overlays.borrow_mut().close_all();
+
+        // NewSession is still refused mid-turn.
         assert!(matches!(
             apply_command(&mut world, &shell, CommandAction::NewSession).await,
             ActionEffect::Redraw
         ));
         assert!(
             shell.borrow().take_session_request().is_none(),
-            "no switch parked mid-turn"
-        );
-
-        let notices = main_notices(&world);
-        assert!(
-            notices.iter().any(|n| n.contains("switch sessions")),
-            "{notices:?}"
+            "no new-session parked mid-turn"
         );
         assert!(
-            notices.iter().any(|n| n.contains("start a new session")),
-            "{notices:?}"
+            main_notices(&world)
+                .iter()
+                .any(|n| n.contains("start a new session")),
+            "{:?}",
+            main_notices(&world)
         );
 
         // Settle the turn so teardown is clean.
@@ -10730,11 +10856,10 @@ mod tests {
         handle_turn_join(&mut world, joined).expect("abort is non-fatal");
     }
 
-    /// Opening the session tree while a turn runs is refused (the branch
-    /// switch it leads to would tear the world down under a live turn), and
-    /// folds the busy notice rather than opening the overlay.
+    /// The session tree opens read-only even mid-turn (the branch switch it
+    /// leads to is refused at confirm time, not by refusing to open).
     #[tokio::test]
-    async fn session_tree_refused_mid_turn() {
+    async fn session_tree_opens_mid_turn() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         handle_submit(&mut world, "go".to_string());
@@ -10742,16 +10867,18 @@ mod tests {
 
         assert!(matches!(
             apply_command(&mut world, &shell, CommandAction::OpenSessionTree).await,
-            ActionEffect::Redraw
+            ActionEffect::OpenedOverlay
         ));
         assert!(
-            !shell.borrow().overlays.borrow().is_open(),
-            "no tree opened mid-turn"
+            shell.borrow().overlays.borrow().is_open(),
+            "the tree opens read-only mid-turn"
         );
-        let notices = main_notices(&world);
         assert!(
-            notices.iter().any(|n| n.contains("open the session tree")),
-            "{notices:?}"
+            !main_notices(&world)
+                .iter()
+                .any(|n| n.contains("open the session tree")),
+            "no open-time refusal notice: {:?}",
+            main_notices(&world)
         );
 
         // Settle the turn so teardown is clean.
@@ -10775,6 +10902,33 @@ mod tests {
         assert!(
             shell.borrow().overlays.borrow().is_open(),
             "the tree overlay opened"
+        );
+    }
+
+    /// The notice toast renders ABOVE an open session overlay: the busy-refuse
+    /// keeps the overlay open, so the toast must float over it (z above the
+    /// scrim/overlay) rather than being suppressed like the copy toast / quit
+    /// hint.
+    #[tokio::test]
+    async fn notice_toast_renders_over_an_open_overlay() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        apply_command(&mut world, &shell, CommandAction::OpenSessionTree).await;
+        assert!(
+            shell.borrow().overlays.borrow().is_open(),
+            "the overlay is open"
+        );
+        shell
+            .borrow()
+            .show_toast("Can't switch branches while work is running.");
+        let body = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+        assert!(
+            body.contains("Session tree"),
+            "the overlay is drawn: {body}"
+        );
+        assert!(
+            body.contains("work is running"),
+            "the toast floats over the overlay: {body}"
         );
     }
 
@@ -11222,15 +11376,17 @@ mod tests {
         );
     }
 
-    /// A mid-turn submit while armed is refused, keeping the anchor and
-    /// restoring the editor text the submit cleared.
+    /// A submit while busy (here a live turn) is refused with a toast, keeping
+    /// the anchor and restoring the editor text the submit cleared, and spawns
+    /// no rebuild or new turn.
     #[tokio::test]
-    async fn mid_turn_submit_refused_keeps_anchor_and_restores_text() {
+    async fn busy_submit_refused_toasts_keeps_anchor_and_restores_text() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         // Start a turn so the world is busy.
         handle_submit(&mut world, "first".to_string());
         assert!(!world.turns.is_empty(), "a turn is in flight");
+        let turns_before = world.turns.len();
         {
             let sh = shell.borrow();
             arm_branch(
@@ -11244,18 +11400,80 @@ mod tests {
         assert!(matches!(outcome, ArmedSubmit::Stay));
         assert!(
             shell.borrow().branch_anchor.borrow().is_some(),
-            "the anchor is kept on a mid-turn submit"
+            "the anchor is kept on a busy submit"
         );
         assert_eq!(
             shell.borrow().editor.borrow().text(),
             "edited",
             "the text is restored into the editor"
         );
+        assert!(
+            shell
+                .borrow()
+                .notice
+                .borrow()
+                .as_ref()
+                .is_some_and(|n| n.message.contains("Can't branch while work is running")),
+            "the refusal raises the branch toast: {:?}",
+            shell
+                .borrow()
+                .notice
+                .borrow()
+                .as_ref()
+                .map(|n| n.message.clone()),
+        );
+        assert_eq!(
+            world.turns.len(),
+            turns_before,
+            "no new turn spawned by the refused submit"
+        );
 
         // Settle the turn so world teardown is clean.
         cancel_viewed_turn(&world);
         let joined = join_next_or_pending(&mut world.turns).await;
         handle_turn_join(&mut world, joined).expect("abort is non-fatal");
+    }
+
+    /// A submit while a background bash task runs (no turn in flight) is
+    /// refused the same way: a toast, the anchor kept, the text restored, and
+    /// no branch resolved. This is the case the removed two-step
+    /// background-task confirm used to cover.
+    #[tokio::test]
+    async fn background_task_submit_refused_toasts_keeps_anchor() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        run_prompt(&mut world, "seed").await;
+        assert!(world.turns.is_empty(), "no turn in flight");
+        let task = register_bash_task(&world, "sleep 100");
+        {
+            let sh = shell.borrow();
+            arm_branch(
+                &sh.branch_anchor,
+                &sh.branch_indicator,
+                "m1".to_string(),
+                branch_indicator_text("edited"),
+            );
+        }
+        let outcome = submit_with_armed_anchor(&mut world, &shell, "edited".to_string()).await;
+        assert!(matches!(outcome, ArmedSubmit::Stay));
+        assert!(
+            shell.borrow().branch_anchor.borrow().is_some(),
+            "the anchor is kept on a background-task submit"
+        );
+        assert_eq!(shell.borrow().editor.borrow().text(), "edited");
+        assert!(
+            shell
+                .borrow()
+                .notice
+                .borrow()
+                .as_ref()
+                .is_some_and(|n| n.message.contains("Can't branch while work is running")),
+            "the refusal raises the branch toast"
+        );
+        world
+            .core
+            .task_registry
+            .set_status(task, aj_agent::tool::TaskStatus::Killed);
     }
 
     /// Submitting with an anchor armed on a persisted user message resolves to
@@ -11321,7 +11539,7 @@ mod tests {
     #[tokio::test]
     async fn parked_branch_switch_refused_while_busy_and_proceeds_when_idle() {
         let dir = TempDir::new().expect("tempdir");
-        let (mut world, _shell) = world_and_shell(&dir, "streaming-text").await;
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         run_prompt(&mut world, "seed").await;
         let head = world
             .core
@@ -11336,8 +11554,12 @@ mod tests {
         handle_submit(&mut world, "busy".to_string());
         assert!(!world.turns.is_empty(), "a turn is in flight");
         assert!(
-            consume_session_request(&mut world, SessionRequest::Branch { head: head.clone() })
-                .is_none(),
+            consume_session_request(
+                &mut world,
+                &shell,
+                SessionRequest::Branch { head: head.clone() }
+            )
+            .is_none(),
             "a live turn refuses the branch switch"
         );
         assert!(
@@ -11354,8 +11576,12 @@ mod tests {
         // A running background task refuses the switch too, even with no turn.
         let task = register_bash_task(&world, "cargo build");
         assert!(
-            consume_session_request(&mut world, SessionRequest::Branch { head: head.clone() })
-                .is_none(),
+            consume_session_request(
+                &mut world,
+                &shell,
+                SessionRequest::Branch { head: head.clone() }
+            )
+            .is_none(),
             "a running background task refuses the branch switch"
         );
 
@@ -11367,10 +11593,61 @@ mod tests {
             .set_status(task, aj_agent::tool::TaskStatus::Killed);
         assert!(
             matches!(
-                consume_session_request(&mut world, SessionRequest::Branch { head: head.clone() }),
+                consume_session_request(
+                    &mut world,
+                    &shell,
+                    SessionRequest::Branch { head: head.clone() }
+                ),
                 Some(SessionExit::Branch { head: h, prompt: None }) if h == head
             ),
             "an idle branch request maps to a prompt-less branch exit"
+        );
+    }
+
+    /// The safety-net recheck for a resume: a `SessionRequest::Resume` that
+    /// slipped through with background work live (a wake turn spawned between
+    /// the selector's confirm and this consumption) is refused with a toast and
+    /// no exit, then proceeds once idle. `consume_session_request` is the
+    /// authoritative recheck since the confirm-time `busy` snapshot is stale.
+    #[tokio::test]
+    async fn parked_resume_refused_while_busy_and_proceeds_when_idle() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        run_prompt(&mut world, "seed").await;
+
+        // A running background task refuses the resume with a toast, no exit.
+        let task = register_bash_task(&world, "cargo build");
+        assert!(
+            consume_session_request(
+                &mut world,
+                &shell,
+                SessionRequest::Resume("other-session".to_string())
+            )
+            .is_none(),
+            "a running background task refuses the resume"
+        );
+        assert!(
+            shell.borrow().notice.borrow().as_ref().is_some_and(|n| n
+                .message
+                .contains("Can't switch sessions while work is running")),
+            "the refusal raises the switch toast"
+        );
+
+        // Idle (task terminal): the resume proceeds to a switch exit.
+        world
+            .core
+            .task_registry
+            .set_status(task, aj_agent::tool::TaskStatus::Killed);
+        assert!(
+            matches!(
+                consume_session_request(
+                    &mut world,
+                    &shell,
+                    SessionRequest::Resume("other-session".to_string())
+                ),
+                Some(SessionExit::Switch(id)) if id == "other-session"
+            ),
+            "an idle resume request maps to a switch exit"
         );
     }
 

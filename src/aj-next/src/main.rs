@@ -23,6 +23,7 @@ mod interactive;
 mod keymap;
 mod login;
 mod markdown_view;
+mod notice_toast;
 mod overlay;
 mod palette;
 mod pending;
