@@ -114,14 +114,14 @@ const BOX_CHROME: u16 = 4;
 const MIN_BOX_INNER: u16 = 20;
 /// Cap on the box's inner width, so it stays a centered block rather than
 /// stretching across a very wide terminal.
-const MAX_BOX_INNER: u16 = 48;
+const MAX_BOX_INNER: u16 = 72;
 /// Minimum available height below the hint to show a box at all. The rendered
 /// box is content-sized within that.
 const MIN_BOX_HEIGHT: u16 = 5;
 /// Cap on the visible content rows in the box. The box sizes to its content
 /// up to this many rows and scrolls beyond it, keeping the splash short by
 /// default. Tunable: a larger cap trades a taller box for less scrolling.
-const MAX_NOTICE_ROWS: u16 = 8;
+const MAX_NOTICE_ROWS: u16 = 16;
 /// Blank rows kept below the box so it does not touch the slot's bottom edge.
 const BOX_BOTTOM_MARGIN: u16 = 1;
 /// Vertical margin bounding where the centered logo+hint block sits: it caps
