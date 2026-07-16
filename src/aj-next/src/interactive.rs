@@ -4102,20 +4102,21 @@ impl Widget for Shell {
             ctx.redraw = true;
             return;
         }
-        // Esc cancels an armed branch anchor and resumes transcript following.
-        // This runs in the bubble phase at the root, so a focused transcript,
-        // autocomplete popup, or overlay gets first refusal. Transcript-focus
-        // mode resumes following in its own Esc handler before returning focus
-        // to the editor.
+        // Higher-priority owners consume Esc before it reaches this bubble
+        // handler. Keep the explicit guards so a leaked overlay or transcript
+        // focus event cannot alter editor-mode state.
         if let Event::KeyPress(key) = event
             && key.matches(Key::ESCAPE, Modifiers::empty())
+            && !self.overlays.borrow().is_open()
+            && !self.transcript.borrow().in_focus_mode()
         {
             if self.branch_anchor.borrow().is_some() {
                 self.disarm_branch();
                 self.branch_cancelled.set(true);
+                ctx.consume_and_redraw();
+                return;
             }
-            if !self.overlays.borrow().is_open() && !self.transcript.borrow().in_focus_mode() {
-                self.transcript.borrow_mut().resume_follow_tail();
+            if self.transcript.borrow_mut().handle_unfocused_escape() {
                 ctx.consume_and_redraw();
             }
         }
@@ -8401,6 +8402,18 @@ mod tests {
         }
     }
 
+    fn left_mouse_at(row: i16, col: i16, kind: vaxis::mouse::Type) -> Event {
+        Event::Mouse(vaxis::mouse::Mouse {
+            col,
+            row,
+            xoffset: 0,
+            yoffset: 0,
+            button: vaxis::mouse::Button::Left,
+            mods: vaxis::mouse::Modifiers::empty(),
+            kind,
+        })
+    }
+
     fn wheel_up_at(row: i16, col: i16) -> Event {
         Event::Mouse(vaxis::mouse::Mouse {
             col,
@@ -9493,15 +9506,137 @@ mod tests {
             !transcript.borrow().is_at_bottom(),
             "wheel-up leaves the transcript in history"
         );
+        assert!(
+            !transcript.borrow().is_following_tail(),
+            "wheel-up disengages follow-tail"
+        );
 
         writer.write_all(b"\x1b").expect("write esc");
         let event = app.next_input().await.expect("input event");
         app.handle_input(event);
+        assert!(
+            transcript.borrow().is_following_tail(),
+            "Esc re-engages follow-tail"
+        );
         let _ = shell.borrow_mut().draw(&full_draw_ctx());
         assert!(
             transcript.borrow().is_at_bottom(),
             "Esc returns the transcript to its live tail"
         );
+    }
+
+    /// Branch cancellation owns the first Esc and leaves a detached viewport
+    /// untouched. A later Esc can resume following.
+    #[tokio::test]
+    async fn armed_branch_escape_cancels_before_resuming_follow_tail() {
+        let chat = empty_chat();
+        fold_lines(&chat, 80);
+        let (mut app, mut writer, shell, _root) = init_app_with_chat(chat).await;
+        let transcript = Rc::clone(&shell.borrow().transcript);
+
+        for _ in 0..2 {
+            app.handle_input(wheel_up_at(3, 3));
+        }
+        let _ = shell.borrow_mut().draw(&full_draw_ctx());
+        {
+            let shell = shell.borrow();
+            arm_branch(
+                &shell.branch_anchor,
+                &shell.branch_indicator,
+                "m1".to_string(),
+                branch_indicator_text("branch draft"),
+            );
+        }
+
+        writer.write_all(b"\x1b").expect("write first esc");
+        let event = app.next_input().await.expect("first input event");
+        app.handle_input(event);
+        let _ = shell.borrow_mut().draw(&full_draw_ctx());
+        assert!(shell.borrow().branch_anchor.borrow().is_none());
+        assert!(shell.borrow().take_branch_cancelled());
+        assert!(
+            !transcript.borrow().is_following_tail(),
+            "branch cancellation preserves detached follow state"
+        );
+        assert!(
+            !transcript.borrow().is_at_bottom(),
+            "branch cancellation preserves the historical viewport"
+        );
+
+        writer.write_all(b"\x1b").expect("write second esc");
+        let event = app.next_input().await.expect("second input event");
+        app.handle_input(event);
+        assert!(
+            transcript.borrow().is_following_tail(),
+            "a later Esc resumes following"
+        );
+    }
+
+    /// Mouse selection keeps editor focus. Its first Esc clears the selection
+    /// without moving the historical viewport, and the next resumes following.
+    #[tokio::test]
+    async fn editor_focused_selection_clears_before_following_resumes() {
+        let chat = empty_chat();
+        fold_lines(&chat, 80);
+        let (mut app, mut writer, shell, _root) = init_app_with_chat(chat).await;
+        let transcript = Rc::clone(&shell.borrow().transcript);
+
+        for _ in 0..2 {
+            app.handle_input(wheel_up_at(3, 3));
+        }
+        let _ = shell.borrow_mut().draw(&full_draw_ctx());
+        app.handle_input(left_mouse_at(3, 3, vaxis::mouse::Type::Press));
+        app.handle_input(left_mouse_at(3, 9, vaxis::mouse::Type::Drag));
+        app.handle_input(left_mouse_at(3, 9, vaxis::mouse::Type::Release));
+        assert!(transcript.borrow().has_selection(), "selection is live");
+        assert!(
+            !transcript.borrow().in_focus_mode(),
+            "mouse selection leaves the editor focused"
+        );
+
+        writer.write_all(b"\x1b").expect("write first esc");
+        let event = app.next_input().await.expect("first input event");
+        app.handle_input(event);
+        let _ = shell.borrow_mut().draw(&full_draw_ctx());
+        assert!(
+            !transcript.borrow().has_selection(),
+            "first Esc clears the selection"
+        );
+        assert!(
+            !transcript.borrow().is_following_tail(),
+            "clearing the selection does not resume following"
+        );
+        assert!(
+            !transcript.borrow().is_at_bottom(),
+            "clearing the selection preserves the historical viewport"
+        );
+
+        writer.write_all(b"\x1b").expect("write second esc");
+        let event = app.next_input().await.expect("second input event");
+        app.handle_input(event);
+        assert!(
+            transcript.borrow().is_following_tail(),
+            "second Esc resumes following"
+        );
+    }
+
+    /// Shell leaves an otherwise unclaimed Esc alone when follow-tail is
+    /// already engaged.
+    #[test]
+    fn already_following_escape_is_not_consumed_or_redrawn() {
+        let shell = test_shell_with_chat(empty_chat());
+        assert!(shell.borrow().transcript.borrow().is_following_tail());
+        let mut ctx = EventContext::new();
+        shell.borrow_mut().handle_event(
+            &mut ctx,
+            &Event::KeyPress(Key {
+                codepoint: Key::ESCAPE,
+                mods: Modifiers::empty(),
+                ..Key::default()
+            }),
+        );
+        assert!(!ctx.consume_event, "idempotent Esc remains unclaimed");
+        assert!(!ctx.redraw, "idempotent Esc does not redraw");
     }
 
     /// With the palette open, the same wheel-up at transcript coordinates

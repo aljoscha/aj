@@ -1711,6 +1711,16 @@ impl TranscriptView {
         self.list.borrow().is_at_bottom()
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_following_tail(&self) -> bool {
+        self.follow_tail
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_selection(&self) -> bool {
+        self.selection.is_some()
+    }
+
     /// The entry indices of the active view's user messages, ascending
     /// (document order). Transcript-focus navigation steps between these,
     /// skipping assistant, tool, and other entries (Spec E section 1).
@@ -2173,6 +2183,24 @@ impl TranscriptView {
         // the tail (see [`draw`](Widget::draw)). Cancel any in-flight glide so
         // it does not fight the re-pin.
         self.resume_follow_tail();
+    }
+
+    /// Handles Escape after focused widgets and overlays decline it.
+    ///
+    /// A live selection owns the first key. Otherwise, Escape resumes a
+    /// detached viewport and leaves an already-following transcript unclaimed.
+    pub(crate) fn handle_unfocused_escape(&mut self) -> bool {
+        if self.in_focus_mode() {
+            return false;
+        }
+        if self.selection.take().is_some() {
+            return true;
+        }
+        if self.follow_tail {
+            return false;
+        }
+        self.resume_follow_tail();
+        true
     }
 
     /// Re-engages follow-tail so the next draw pins the transcript to the bottom.
