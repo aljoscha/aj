@@ -54,10 +54,11 @@ pub enum ConversationError {
 ///
 /// Ids are only unique within one log file and are not meaningful outside
 /// of it. They are random, collision-resistant tokens (minted by
-/// `ConversationLog::mint_id`), not a counter. Within one process the mint
-/// check rules out duplicates; across two processes appending to the same
-/// file a collision is possible but vanishingly unlikely (a 32-bit draw),
-/// rather than the certainty a shared counter would produce.
+/// `ConversationLog::mint_id`, or adopted from a message's own id), not a
+/// counter. Within one process the mint check rules out duplicates; across
+/// two processes appending to the same file a collision is possible but
+/// vanishingly unlikely (a 128-bit draw), rather than the certainty a
+/// shared counter would produce.
 pub type EntryId = String;
 
 /// Which thread within a conversation log an entry belongs to.
