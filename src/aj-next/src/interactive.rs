@@ -4033,19 +4033,22 @@ impl Widget for Shell {
             ctx.redraw = true;
             return;
         }
-        // Esc cancels an armed branch anchor. This runs in the bubble phase at
-        // the root, so an open autocomplete popup (which consumes Esc at the
-        // editor target) is handled first, matching the established Esc
-        // priority: popup close before anchor cancel. The editor text stays
-        // (the user's to keep or clear); we only clear the anchor and flag the
-        // drive loop to fold the cancel notice.
+        // Esc cancels an armed branch anchor and resumes transcript following.
+        // This runs in the bubble phase at the root, so a focused transcript,
+        // autocomplete popup, or overlay gets first refusal. Transcript-focus
+        // mode resumes following in its own Esc handler before returning focus
+        // to the editor.
         if let Event::KeyPress(key) = event
             && key.matches(Key::ESCAPE, Modifiers::empty())
-            && self.branch_anchor.borrow().is_some()
         {
-            self.disarm_branch();
-            self.branch_cancelled.set(true);
-            ctx.consume_and_redraw();
+            if self.branch_anchor.borrow().is_some() {
+                self.disarm_branch();
+                self.branch_cancelled.set(true);
+            }
+            if !self.overlays.borrow().is_open() && !self.transcript.borrow().in_focus_mode() {
+                self.transcript.borrow_mut().resume_follow_tail();
+                ctx.consume_and_redraw();
+            }
         }
     }
 
@@ -9352,6 +9355,35 @@ mod tests {
         assert!(
             !rows.iter().any(|row| row.contains("line-079")),
             "tail scrolled out of view: {rows:?}"
+        );
+    }
+
+    /// With the editor focused, Esc resumes follow-tail after a manual scroll.
+    /// The same gesture in transcript-focus mode is handled by the transcript
+    /// itself before the event can bubble here.
+    #[tokio::test]
+    async fn esc_resumes_follow_tail_after_wheel_scroll() {
+        let chat = empty_chat();
+        fold_lines(&chat, 80);
+        let (mut app, mut writer, shell, _root) = init_app_with_chat(chat).await;
+        let transcript = Rc::clone(&shell.borrow().transcript);
+
+        for _ in 0..2 {
+            app.handle_input(wheel_up_at(3, 3));
+        }
+        let _ = shell.borrow_mut().draw(&full_draw_ctx());
+        assert!(
+            !transcript.borrow().is_at_bottom(),
+            "wheel-up leaves the transcript in history"
+        );
+
+        writer.write_all(b"\x1b").expect("write esc");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        let _ = shell.borrow_mut().draw(&full_draw_ctx());
+        assert!(
+            transcript.borrow().is_at_bottom(),
+            "Esc returns the transcript to its live tail"
         );
     }
 
