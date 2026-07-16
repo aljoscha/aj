@@ -95,7 +95,13 @@ fn render_segment(
     } else {
         "  "
     };
-    let label = truncate_chars(&seg.label, LABEL_MAX_CHARS);
+    // Collapse the label to its first line before truncating. A branch's
+    // first user message can contain newlines, and a multi-line row would
+    // spill across visual rows, misaligning the connectors and breaking the
+    // selector's single-line overflow math. Mirrors the session selector's
+    // primary-column handling.
+    let one_line = seg.label.lines().next().unwrap_or(&seg.label);
+    let label = truncate_chars(one_line, LABEL_MAX_CHARS);
     let description = if seg.is_leaf {
         leaf_suffix(seg.message_count, seg.last_timestamp, now)
     } else {
@@ -377,6 +383,33 @@ mod tests {
         };
         let rows = build_tree_rows(&tree, Utc::now());
         assert!(rows[0].display.ends_with('\u{2026}'), "{}", rows[0].display);
+    }
+
+    /// A multi-line label renders as a single line: only its first line, then
+    /// truncated. A newline in the label would otherwise spill the row across
+    /// visual rows and misalign the tree.
+    #[test]
+    fn multiline_label_collapses_to_one_line() {
+        let tree = SessionTree {
+            segments: vec![segment("h", "line one\nline two", None, vec![], true)],
+        };
+        let rows = build_tree_rows(&tree, Utc::now());
+        assert_eq!(rows.len(), 1);
+        assert!(
+            !rows[0].display.contains('\n'),
+            "row body is one line: {:?}",
+            rows[0].display
+        );
+        assert!(
+            rows[0].display.contains("line one"),
+            "first line kept: {:?}",
+            rows[0].display
+        );
+        assert!(
+            !rows[0].display.contains("line two"),
+            "second line dropped: {:?}",
+            rows[0].display
+        );
     }
 
     /// Leaf suffix drops the age when there is no timestamp, and pluralizes.

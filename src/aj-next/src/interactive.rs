@@ -401,7 +401,7 @@ async fn build_next_session(
         world.restore.as_ref(),
     ) {
         Ok((core, seed)) => {
-            let notice = switch_notice(&spec, &core.session_id, branch);
+            let notice = switch_notice(&spec, &core.session_id);
             (
                 core,
                 seed,
@@ -463,12 +463,21 @@ async fn build_next_session(
         }
     }
 
-    // The switch/create confirmation first, then (for a fresh switch) the
-    // context listing folded as an Info notice right after it, then any
-    // resume-restore notices. The confirmation is the switch acknowledgment, so
-    // context follows it rather than leading. The caller folds these after
-    // install so they sit on top of the replayed history.
-    let mut notices = vec![notice];
+    // Order: the switch/create confirmation, then (for a fresh switch) the
+    // context listing folded as an Info notice, then any resume-restore
+    // notices. The confirmation is the switch acknowledgment, so context
+    // follows it rather than leading. The caller folds these after install so
+    // they sit on top of the replayed history.
+    //
+    // A successful branch build leads with no confirmation: its wording
+    // depends on the prompt handoff and the head-apply outcome, which only the
+    // run loop knows, so the run loop inserts it after this build returns (see
+    // `apply_branch_switch_notice`). A build fallback still leads with its
+    // failure notice.
+    let mut notices = Vec::new();
+    if !(branch && !fell_back) {
+        notices.push(notice);
+    }
     if is_fresh {
         notices.push(aj_app::notices::build_context_notice(
             &core.env,
@@ -486,13 +495,10 @@ async fn build_next_session(
     })
 }
 
-/// Confirmation notice for a successful session change, matching aj. A branch
-/// rebuild is a same-session resume, so it gets its own wording rather than
-/// "Switched to session {same id}".
-fn switch_notice(spec: &SessionSpec, session_id: &str, branch: bool) -> String {
-    if branch {
-        return "Branched the conversation from an earlier message.".to_string();
-    }
+/// Confirmation notice for a successful New/Switch session change, matching
+/// aj. A branch rebuild's confirmation is decided by the run loop instead (see
+/// [`apply_branch_switch_notice`]), so it never flows through here.
+fn switch_notice(spec: &SessionSpec, session_id: &str) -> String {
     match spec {
         SessionSpec::Create { .. } => format!("Started a fresh session ({session_id})."),
         SessionSpec::Resume { session_id, .. } => format!("Switched to session {session_id}."),
@@ -1136,6 +1142,37 @@ fn quit_arm_running_work(world: &World) -> Option<String> {
     running_work_summary(agents, tasks)
 }
 
+/// Decide what a parked session request does at the drive-loop consumption
+/// site: the [`SessionExit`] to break the loop with, or `None` to stay in the
+/// session.
+///
+/// A tree-view branch switch (`SessionRequest::Branch`) rebuilds the session,
+/// which shuts its turns and background work down. We refuse it (fold a notice,
+/// return `None`) while any turn or background task/sub-agent is live, rather
+/// than tear live work down silently. The overlay opens gated only on
+/// `world.turns`, so two things can still be running when the request is
+/// consumed: a background sub-agent finishing while the overlay is open spawns
+/// a parent wake turn (so `world.turns` is non-empty), and detached bash tasks
+/// or background sub-agents were never in `world.turns` to begin with. This is
+/// a v1 refuse, deliberately simpler than the `b`-submit flow's two-step
+/// background-task confirm.
+///
+/// `New`/`Resume` are only ever parked with no turn in flight, so they keep the
+/// debug-assert-and-consume path.
+fn consume_session_request(world: &mut World, request: SessionRequest) -> Option<SessionExit> {
+    if let SessionRequest::Branch { .. } = request {
+        let (agents, bash) =
+            running_work_counts(world.turns.len(), &world.core.task_registry.snapshot());
+        if agents + bash > 0 {
+            fold_notice(world, "Can't switch branches while work is running.");
+            return None;
+        }
+    } else {
+        debug_assert!(world.turns.is_empty(), "session change requested mid-turn");
+    }
+    Some(request.into_exit())
+}
+
 /// Pull the viewed agent's queued message back into the editor,
 /// prepending it to whatever is currently typed (blank-line joined).
 /// Returns whether anything was yanked. Ported from `aj`: used by the
@@ -1434,6 +1471,40 @@ async fn submit_with_armed_anchor(
 /// instead, never submitting it against the wrong head.
 fn branch_prompt_should_submit(fell_back: bool, head_override_applied: Option<bool>) -> bool {
     !fell_back && head_override_applied == Some(true)
+}
+
+/// The confirmation for a branch rebuild on a successful build, chosen from
+/// whether a prompt is handed off and whether the head installed cleanly.
+/// `None` means the run loop folds nothing here, because the prompt handoff
+/// folds its own restore notice.
+///
+/// - prompt + clean apply: the `b`-submit flow succeeded, the prompt
+///   auto-submits as the branch's first turn.
+/// - no prompt + clean apply: a tree-view switch that only moved the head.
+/// - prompt + stale head: the `b` flow restores the prompt and folds "Branch
+///   failed ...", so we add nothing.
+/// - no prompt + stale head: a tree-view switch that could not move the head;
+///   nothing else reports it, so we do.
+fn branch_switch_notice(prompt_present: bool, head_applied_cleanly: bool) -> Option<&'static str> {
+    match (prompt_present, head_applied_cleanly) {
+        (true, true) => Some("Branched the conversation from an earlier message."),
+        (false, true) => Some("Switched to the selected branch."),
+        (true, false) => None,
+        (false, false) => Some("Couldn't switch to that branch."),
+    }
+}
+
+/// Prepend the branch rebuild's confirmation to `next.notices`, so it lands
+/// ahead of any restore notices when the run loop folds them after install. A
+/// no-op for a non-branch build and for a build fallback (which keeps its own
+/// failure notice). See [`branch_switch_notice`] for the wording.
+fn apply_branch_switch_notice(next: &mut NextSession, is_branch: bool, prompt_present: bool) {
+    if is_branch && !next.fell_back {
+        let clean = branch_prompt_should_submit(next.fell_back, next.head_override_applied);
+        if let Some(notice) = branch_switch_notice(prompt_present, clean) {
+            next.notices.insert(0, notice.to_string());
+        }
+    }
 }
 
 /// Hand the branch prompt to the freshly rebuilt session, under the
@@ -4219,22 +4290,13 @@ pub async fn run(args: Args) -> Result<()> {
                 // Read the prompt-safety inputs before `install` consumes `next`.
                 let fell_back = next.fell_back;
                 let head_applied = next.head_override_applied;
-                // A branch rebuild's confirmation notice ("Branched the
-                // conversation ...") is the build's leading notice, accurate
-                // only on a clean apply. On the stale-head path the build still
-                // succeeds (fell_back == false) but the head override didn't
-                // install, so folding the confirmation would contradict the
-                // "Branch failed" restore notice below. Drop it there, gated on
-                // the same clean-apply condition as the auto-submit, leaving the
-                // restore notice as the only branch feedback. A build fallback
-                // (fell_back == true) keeps its own failure notice.
-                if is_branch
-                    && !fell_back
-                    && !branch_prompt_should_submit(fell_back, head_applied)
-                    && !next.notices.is_empty()
-                {
-                    next.notices.remove(0);
-                }
+                // A successful branch build leads with no confirmation; insert
+                // the accurate one here. It depends on whether a prompt is
+                // handed off (the `b`-submit flow) or only the head moved (a
+                // tree-view switch), and on whether the head installed cleanly.
+                // A `b`-flow failure inserts nothing: its prompt handoff below
+                // folds the restore notice instead.
+                apply_branch_switch_notice(&mut next, is_branch, branch_prompt.is_some());
                 install_next_session(&mut world, &shell, next);
                 // Retitle the terminal for the switched-to session. The switch
                 // ran off the loop with no event context, so we ride an app
@@ -4810,13 +4872,15 @@ async fn drive(
                         // A parked session change (the `NewSession` command
                         // or a confirmed resume pick). A change is only ever
                         // requested with no turn in flight, so tearing the
-                        // world down can't strand a running turn.
+                        // world down can't strand a running turn. A tree-view
+                        // branch switch is the exception: it can be parked with
+                        // background work live, so it is refused there rather
+                        // than consumed (see `consume_session_request`).
                         if let Some(request) = shell.borrow().take_session_request() {
-                            debug_assert!(
-                                world.turns.is_empty(),
-                                "session change requested mid-turn"
-                            );
-                            break Ok(request.into_exit());
+                            match consume_session_request(world, request) {
+                                Some(exit) => break Ok(exit),
+                                None => app.request_redraw(),
+                            }
                         }
                     }
                     // The reader ended (EOF or a read error), so no
@@ -10632,6 +10696,31 @@ mod tests {
         );
     }
 
+    /// The branch confirmation distinguishes the `b`-submit flow (a prompt is
+    /// handed off) from a tree-view switch (a bare head move), and reports a
+    /// stale-head tree switch that the prompt handoff would otherwise leave
+    /// silent.
+    #[test]
+    fn branch_switch_notice_distinguishes_b_flow_from_tree_switch() {
+        // `b`-flow success and tree-switch success get distinct wording.
+        assert_eq!(
+            branch_switch_notice(true, true),
+            Some("Branched the conversation from an earlier message.")
+        );
+        assert_eq!(
+            branch_switch_notice(false, true),
+            Some("Switched to the selected branch.")
+        );
+        // A `b`-flow stale head folds nothing here: its prompt handoff folds
+        // the restore notice instead.
+        assert_eq!(branch_switch_notice(true, false), None);
+        // A tree-view stale head has no prompt handoff, so it reports here.
+        assert_eq!(
+            branch_switch_notice(false, false),
+            Some("Couldn't switch to that branch.")
+        );
+    }
+
     /// Arming sets the anchor and the footer indicator; re-arming replaces
     /// both; disarming clears them.
     #[tokio::test]
@@ -10889,6 +10978,215 @@ mod tests {
             shell.borrow().branch_anchor.borrow().is_none(),
             "the anchor is disarmed on resolution"
         );
+    }
+
+    /// A parked tree-view branch switch is refused (a notice folded, no exit)
+    /// while a turn or a background task is live, and proceeds to a branch exit
+    /// once idle. This drives the drive loop's request-consumption decision
+    /// (`consume_session_request`) directly, at the layer the harness exposes.
+    #[tokio::test]
+    async fn parked_branch_switch_refused_while_busy_and_proceeds_when_idle() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, _shell) = world_and_shell(&dir, "streaming-text").await;
+        run_prompt(&mut world, "seed").await;
+        let head = world
+            .core
+            .log
+            .lock()
+            .await
+            .head()
+            .cloned()
+            .expect("a persisted head");
+
+        // A live turn refuses the switch and folds a notice.
+        handle_submit(&mut world, "busy".to_string());
+        assert!(!world.turns.is_empty(), "a turn is in flight");
+        assert!(
+            consume_session_request(&mut world, SessionRequest::Branch { head: head.clone() })
+                .is_none(),
+            "a live turn refuses the branch switch"
+        );
+        assert!(
+            main_notices(&world)
+                .iter()
+                .any(|n| n.contains("Can't switch branches while work is running")),
+            "the refusal folds a notice: {:?}",
+            main_notices(&world)
+        );
+        cancel_viewed_turn(&world);
+        let joined = join_next_or_pending(&mut world.turns).await;
+        handle_turn_join(&mut world, joined).expect("abort is non-fatal");
+
+        // A running background task refuses the switch too, even with no turn.
+        let task = register_bash_task(&world, "cargo build");
+        assert!(
+            consume_session_request(&mut world, SessionRequest::Branch { head: head.clone() })
+                .is_none(),
+            "a running background task refuses the branch switch"
+        );
+
+        // Idle (turn settled, task terminal): the switch proceeds to a
+        // prompt-less branch exit for the selected head.
+        world
+            .core
+            .task_registry
+            .set_status(task, aj_agent::tool::TaskStatus::Killed);
+        assert!(
+            matches!(
+                consume_session_request(&mut world, SessionRequest::Branch { head: head.clone() }),
+                Some(SessionExit::Branch { head: h, prompt: None }) if h == head
+            ),
+            "an idle branch request maps to a prompt-less branch exit"
+        );
+    }
+
+    /// End-to-end tree switch (the prompt-`None` run-loop path): a two-branch
+    /// session on disk, a selector confirm parks `SessionRequest::Branch`, its
+    /// `into_exit` yields a prompt-less `SessionExit::Branch`, and the rebuild
+    /// lands on the chosen head without auto-submitting. Switching back onto
+    /// the other head shows that branch instead, the spec's round-trip check.
+    ///
+    /// Driving the whole `run()` loop is impractical in the harness, so we
+    /// assert the chain up to `into_exit()` plus the rebuild-onto-head using
+    /// `build_next_session` / `install_next_session`, folding the run loop's
+    /// tree-switch notice via `apply_branch_switch_notice` exactly as `run()`
+    /// does.
+    #[tokio::test]
+    async fn tree_switch_rebuilds_onto_the_selected_head_without_submitting() {
+        use aj_agent::message::AgentMessage;
+        use aj_models::types::{
+            AssistantContent, AssistantMessage, Message, TextContent, UserMessage,
+        };
+        use aj_session::{ConversationEntryKind, ConversationLog, ThreadKind};
+
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+
+        let user = |t: &str| ConversationEntryKind::Message {
+            message: AgentMessage::wire(Message::User(UserMessage::text(t))),
+        };
+        let assistant = |t: &str| ConversationEntryKind::Message {
+            message: AgentMessage::wire(Message::Assistant(AssistantMessage {
+                content: vec![AssistantContent::Text(TextContent {
+                    text: t.to_string(),
+                    text_signature: None,
+                })],
+                ..AssistantMessage::empty()
+            })),
+        };
+
+        // A fork on disk: shared prefix, then branch A and branch B off it.
+        let (session_id, branch_a, branch_b) = {
+            let mut log = ConversationLog::create(&persistence).expect("create log");
+            log.set_system_prompt("prompt".to_string())
+                .expect("system prompt");
+            let sp = log.system_prompt_id().cloned().expect("system prompt id");
+            let shared = log
+                .append(Some(sp), ThreadKind::User, None, user("shared question"))
+                .expect("shared");
+            let fork = log
+                .append(
+                    Some(shared),
+                    ThreadKind::User,
+                    None,
+                    assistant("shared answer"),
+                )
+                .expect("fork");
+            let branch_a = log
+                .append(
+                    Some(fork.clone()),
+                    ThreadKind::User,
+                    None,
+                    user("branch A prompt"),
+                )
+                .expect("branch A");
+            let branch_b = log
+                .append(Some(fork), ThreadKind::User, None, user("branch B prompt"))
+                .expect("branch B");
+            (log.session_id().to_string(), branch_a, branch_b)
+        };
+
+        let mut world = resumed_world(&dir, "streaming-text", &session_id).await;
+        let shell = shell_for(&world);
+        let previous_id = world.core.session_id.clone();
+
+        // A tree-selector confirm parks a branch switch for branch A's head;
+        // the drive loop maps it to a prompt-less branch exit.
+        match (SessionRequest::Branch {
+            head: branch_a.clone(),
+        })
+        .into_exit()
+        {
+            SessionExit::Branch { head, prompt } => {
+                assert_eq!(head, branch_a, "the switch targets the selected head");
+                assert!(prompt.is_none(), "a tree switch carries no prompt");
+            }
+            _ => panic!("a branch request maps to a branch exit"),
+        }
+
+        // Rebuild onto branch A (the run loop's branch path with no prompt).
+        let mut next = build_next_session(
+            &world,
+            SessionSpec::Resume {
+                session_id: session_id.clone(),
+                entry: SessionEntry::Switch,
+                head: Some(branch_a.clone()),
+            },
+            &previous_id,
+            true,
+        )
+        .await
+        .expect("build onto branch A");
+        apply_branch_switch_notice(&mut next, true, false);
+        install_next_session(&mut world, &shell, next);
+
+        let rows = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+        assert!(
+            rows.contains("branch A prompt"),
+            "branch A content shown: {rows}"
+        );
+        assert!(
+            !rows.contains("branch B prompt"),
+            "branch B content absent after switching to A: {rows}"
+        );
+        assert!(
+            main_notices(&world)
+                .iter()
+                .any(|n| n == "Switched to the selected branch."),
+            "the tree-switch notice is folded: {:?}",
+            main_notices(&world)
+        );
+        assert!(
+            world.turns.is_empty(),
+            "a prompt-less tree switch spawns no turn"
+        );
+
+        // Switch back via the tree onto branch B: the transcript matches that
+        // branch instead, proving each head rebuilds faithfully.
+        let current_id = world.core.session_id.clone();
+        let next = build_next_session(
+            &world,
+            SessionSpec::Resume {
+                session_id: session_id.clone(),
+                entry: SessionEntry::Switch,
+                head: Some(branch_b.clone()),
+            },
+            &current_id,
+            true,
+        )
+        .await
+        .expect("build onto branch B");
+        install_next_session(&mut world, &shell, next);
+        let rows = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+        assert!(
+            rows.contains("branch B prompt"),
+            "branch B content shown after switching back: {rows}"
+        );
+        assert!(
+            !rows.contains("branch A prompt"),
+            "branch A content absent after switching to B: {rows}"
+        );
+        assert!(world.turns.is_empty(), "still no turn spawned");
     }
 
     /// Submitting with an anchor armed on the file root (a user message with no

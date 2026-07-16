@@ -492,4 +492,159 @@ mod tests {
             "head sits at the active branch's tip",
         );
     }
+
+    /// A session with a spawned sub-agent stays a single linear segment: the
+    /// spawn root and the sub-agent's messages live on the sub thread, so the
+    /// spawning assistant message never reads as a fork, and `message_count`
+    /// counts only user-thread `Message` entries.
+    #[test]
+    fn sub_agent_thread_does_not_fork_the_segment() {
+        use aj_agent::events::AgentSettings;
+
+        let mut log = new_log();
+        add(&mut log, user_text("first question"));
+        let spawner = add(&mut log, assistant_text("spawning a sub-agent"));
+
+        // A real sub-agent: a spawn root anchored at the spawning assistant
+        // message, then one message on the sub thread. Neither advances the
+        // user-thread head.
+        let settings = AgentSettings {
+            provider: "anthropic".into(),
+            model_id: "claude".into(),
+            thinking: "off".into(),
+            speed: "standard".into(),
+            verbosity: "default".into(),
+        };
+        let spawn = log
+            .append_subagent_spawn(1, spawner.clone(), "do the thing", false, &settings)
+            .expect("spawn root");
+        {
+            let mut view = ConversationView::subagent(&mut log, spawn, 1);
+            view.add_message(user_text("subtask")).expect("sub message");
+        }
+
+        // The user thread continues after the spawn, chaining onto the
+        // spawning assistant message (still the head).
+        let last = add(&mut log, user_text("second question"));
+
+        let tree = log.session_tree();
+        assert_eq!(
+            tree.segments.len(),
+            1,
+            "the sub-agent spawn does not split the segment"
+        );
+        let seg = &tree.segments[0];
+        assert_eq!(seg.head, last, "head is the last user-thread entry");
+        assert_eq!(
+            seg.message_count, 3,
+            "only user-thread Message entries counted (spawn root and sub message excluded)"
+        );
+        assert!(seg.is_leaf);
+    }
+
+    /// A nested fork from a real log: a fork whose active child branch itself
+    /// forks. The segment tree's parent/children indices, heads, labels, and
+    /// active-path marks are correct at every level (exercises `build_segment`
+    /// recursion and parent-index threading through `session_tree`).
+    #[test]
+    fn nested_fork_threads_parents_children_and_active_path() {
+        let mut log = new_log();
+        add(&mut log, user_text("shared"));
+        let fork1 = add(&mut log, assistant_text("shared answer"));
+
+        // First-level fork: branch A (a leaf) and branch B (which forks again).
+        log.set_head(fork1.clone()).expect("head to fork1");
+        let branch_a = add(&mut log, user_text("branch A"));
+
+        log.set_head(fork1.clone()).expect("head to fork1");
+        add(&mut log, user_text("branch B"));
+        let fork2 = add(&mut log, assistant_text("branch B answer"));
+
+        // Second-level fork under branch B: B1 (leaf) and B2 (leaf, active).
+        log.set_head(fork2.clone()).expect("head to fork2");
+        let branch_b1 = add(&mut log, user_text("branch B1"));
+
+        log.set_head(fork2.clone()).expect("head to fork2");
+        let branch_b2 = add(&mut log, user_text("branch B2"));
+
+        let tree = log.session_tree();
+        assert_eq!(tree.segments.len(), 5);
+
+        let idx = |head: &str| {
+            tree.segments
+                .iter()
+                .position(|s| s.head == head)
+                .unwrap_or_else(|| panic!("no segment with head {head}"))
+        };
+        let prefix = idx(&fork1);
+        let seg_a = idx(&branch_a);
+        // Branch B's segment runs [branch B, fork2], so its head is fork2.
+        let seg_b = idx(&fork2);
+        let seg_b1 = idx(&branch_b1);
+        let seg_b2 = idx(&branch_b2);
+
+        // The shared prefix is a root, forking to A and B in append order.
+        assert_eq!(tree.segments[prefix].parent, None);
+        assert_eq!(tree.segments[prefix].children, vec![seg_a, seg_b]);
+        assert!(!tree.segments[prefix].is_leaf);
+
+        // Branch A is a leaf under the prefix.
+        assert_eq!(tree.segments[seg_a].parent, Some(prefix));
+        assert!(tree.segments[seg_a].is_leaf);
+        assert_eq!(tree.segments[seg_a].label, "branch A");
+
+        // Branch B is itself a fork under the prefix, splitting to B1 and B2.
+        assert_eq!(tree.segments[seg_b].parent, Some(prefix));
+        assert_eq!(tree.segments[seg_b].children, vec![seg_b1, seg_b2]);
+        assert_eq!(tree.segments[seg_b].label, "branch B");
+        assert!(!tree.segments[seg_b].is_leaf);
+
+        // The second-level leaves point back at branch B's segment.
+        assert_eq!(tree.segments[seg_b1].parent, Some(seg_b));
+        assert!(tree.segments[seg_b1].is_leaf);
+        assert_eq!(tree.segments[seg_b2].parent, Some(seg_b));
+        assert!(tree.segments[seg_b2].is_leaf);
+
+        // The head sits at B2 (the last append), so its whole ancestry is
+        // active and every abandoned sibling is not.
+        assert!(tree.segments[prefix].on_active_path);
+        assert!(tree.segments[seg_b].on_active_path);
+        assert!(tree.segments[seg_b2].on_active_path);
+        assert!(!tree.segments[seg_a].on_active_path);
+        assert!(!tree.segments[seg_b1].on_active_path);
+    }
+
+    /// A head parked on an interior entry of a segment (not its tip) still
+    /// marks that segment via the any-entry-in-chain rule, and nothing below
+    /// the head (the branches under the segment's terminating fork) is marked.
+    #[test]
+    fn interior_head_marks_its_segment_but_nothing_below() {
+        let mut log = new_log();
+        add(&mut log, user_text("shared"));
+        let mid = add(&mut log, assistant_text("interior"));
+        add(&mut log, user_text("more shared"));
+        let fork = add(&mut log, assistant_text("fork answer"));
+
+        // Two branches off the fork, so the prefix segment ends at a fork with
+        // children below it.
+        log.set_head(fork.clone()).expect("head to fork");
+        let branch_a = add(&mut log, user_text("branch A"));
+        log.set_head(fork.clone()).expect("head to fork");
+        let branch_b = add(&mut log, user_text("branch B"));
+
+        // Park the head on an interior entry of the prefix segment, above the
+        // fork and its branches.
+        log.set_head(mid.clone()).expect("head to interior");
+
+        let tree = log.session_tree();
+        // The prefix segment [shared, mid, more shared, fork] holds the head.
+        assert!(
+            segment_with_head(&tree, &fork).on_active_path,
+            "the segment holding the interior head is marked"
+        );
+        // Nothing below the head (the branches under the fork) is marked.
+        assert!(!segment_with_head(&tree, &branch_a).on_active_path);
+        assert!(!segment_with_head(&tree, &branch_b).on_active_path);
+        assert_eq!(log.head(), Some(&mid), "head is the interior entry");
+    }
 }
