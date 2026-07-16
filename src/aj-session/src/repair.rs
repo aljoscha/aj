@@ -227,4 +227,44 @@ mod tests {
         let repaired = repair_interrupted_tool_uses(&mut log, &convo).expect("repair");
         assert!(!repaired, "resolved tool_call ids must not trigger repair",);
     }
+
+    #[test]
+    fn repair_adopts_synthesized_message_ids_as_entry_ids() {
+        let (_dir, mut log) = fresh_log();
+        {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_message(user("hi")).expect("u");
+            view.add_message(assistant_tool_call("tu-1", "ping"))
+                .expect("a");
+        }
+
+        let head = log
+            .latest_leaf(ThreadFilter::USER)
+            .expect("user head exists");
+        let convo = log.linearize(&head, ThreadFilter::USER);
+        let count_before = log.entries_in_order().len();
+
+        let repaired = repair_interrupted_tool_uses(&mut log, &convo).expect("repair");
+        assert!(repaired, "a dangling tool call must be repaired");
+
+        // The repair appends through the same `append` path as any writer,
+        // so its synthesized messages get their minted id adopted as the
+        // entry id, just like the persistence listener's writes.
+        let after = log.entries_in_order();
+        let synthesized = &after[count_before..];
+        assert!(
+            !synthesized.is_empty(),
+            "repair appended at least one entry"
+        );
+        for entry in synthesized {
+            let ConversationEntryKind::Message { message } = &entry.entry else {
+                panic!("repair only appends message entries");
+            };
+            assert!(
+                !message.id().is_empty(),
+                "synthesized message carries an id"
+            );
+            assert_eq!(message.id(), entry.id, "adopted as the entry id");
+        }
+    }
 }

@@ -119,8 +119,14 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
             agent_id, event, ..
         } => reduce_message_update(state, agent_id, event),
         AgentEvent::MessageEnd { agent_id, message } => {
-            // Capture the id before matching, which moves `message.kind`.
-            let message_id = message.id().to_string();
+            // Only the user arm consumes the id, so read it under a borrow
+            // here and skip the copy for the other arms. We cannot hoist the
+            // read into the arm itself: the by-value match below moves
+            // `message.kind`, and `id()` borrows the whole message.
+            let message_id = match &message.kind {
+                AgentMessageKind::Wire(Message::User(_)) => message.id().to_string(),
+                _ => String::new(),
+            };
             match message.kind {
                 AgentMessageKind::Wire(Message::User(user)) => {
                     reduce_user_end(state, agent_id, user, message_id)
@@ -1317,6 +1323,32 @@ mod tests {
         }
         match &rows[1].kind {
             EntryKind::User(u) => assert!(u.collapsible),
+            other => panic!("unexpected kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_message_end_stores_message_id() {
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+
+        // Read the minted id off the event before reducing consumes it.
+        let event = user_message_end("hello");
+        let AgentEvent::MessageEnd { message, .. } = &event else {
+            panic!("user_message_end builds a MessageEnd event");
+        };
+        let expected_id = message.id().to_string();
+        assert!(
+            !expected_id.is_empty(),
+            "a live message mints a non-empty id"
+        );
+
+        apply(&mut s, &mut life, event);
+
+        let rows = entries(&s, AgentId::Main);
+        assert_eq!(rows.len(), 1);
+        match &rows[0].kind {
+            EntryKind::User(u) => assert_eq!(u.message_id, expected_id),
             other => panic!("unexpected kind: {other:?}"),
         }
     }

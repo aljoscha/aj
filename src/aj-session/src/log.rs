@@ -789,9 +789,11 @@ impl ConversationLog {
             }
             _ => self.mint_id(),
         };
-        // A duplicate id would silently diverge the parent chain. It is a
-        // ~2^-64 event for adopted 128-bit ids, so we error loudly rather
-        // than paper over it. `mint_id` already excludes existing ids.
+        // A duplicate id would silently diverge the parent chain, so we
+        // error loudly rather than paper over it. For an adopted 128-bit
+        // id, this append collides with probability ~M/2^128 (M = entries
+        // already in the log): negligible, not impossible. `mint_id`
+        // already excludes existing ids.
         if self.entries.contains_key(&id) {
             return Err(ConversationError::InvalidAppend(format!(
                 "duplicate entry id {id}: already present in log"
@@ -1851,6 +1853,134 @@ mod tests {
             }
             other => panic!("expected ToolResult, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn message_id_is_adopted_as_entry_id_and_survives_resume() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("sys".into()).expect("set sp");
+
+        // A live message mints its own id; capture it before the append
+        // takes ownership.
+        let message = user_text("hi");
+        let message_id = message.id().to_string();
+        assert!(!message_id.is_empty(), "live messages mint an id");
+
+        let entry_id = {
+            let mut view = ConversationView::user(&mut log, None);
+            view.add_message(message).expect("user msg")
+        };
+        assert_eq!(entry_id, message_id, "append adopts the message id");
+
+        let session_id = log.session_id().to_string();
+        drop(log);
+        let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume");
+
+        let entry = resumed
+            .entries_in_order()
+            .into_iter()
+            .find(|entry| matches!(entry.entry, ConversationEntryKind::Message { .. }))
+            .expect("reloaded message entry");
+        assert_eq!(entry.id, message_id, "entry id is stable across resume");
+        let ConversationEntryKind::Message { message } = &entry.entry else {
+            unreachable!("matched a message entry");
+        };
+        assert_eq!(
+            message.id(),
+            entry.id,
+            "resume backfills the message id from the entry id"
+        );
+    }
+
+    #[test]
+    fn resume_backfills_message_ids_on_legacy_8hex_file() {
+        // Materialize a session so a file path exists, then overwrite it
+        // with a hand-built legacy fixture: 8-hex entry ids and bare wire
+        // messages with no `id` field, the real shape of old files.
+        let persistence = ConversationPersistence::new(fresh_sessions_dir());
+        let session_id = {
+            let mut log = ConversationLog::create(&persistence).expect("create log");
+            log.set_system_prompt("sys".into()).expect("set sp");
+            {
+                let mut view = ConversationView::user(&mut log, None);
+                view.add_message(user_text("materialize")).expect("u");
+            }
+            log.session_id().to_string()
+        };
+
+        let root = ConversationEntry {
+            id: "0000aaaa".to_string(),
+            parent_id: None,
+            timestamp: None,
+            thread: ThreadKind::User,
+            agent_id: None,
+            entry: ConversationEntryKind::Message {
+                message: user_text("hi"),
+            },
+        };
+        let child = ConversationEntry {
+            id: "1111bbbb".to_string(),
+            parent_id: Some("0000aaaa".to_string()),
+            timestamp: None,
+            thread: ThreadKind::User,
+            agent_id: None,
+            entry: ConversationEntryKind::Message {
+                message: assistant_text("hello"),
+            },
+        };
+        let root_line = serde_json::to_string(&root).expect("serialize root");
+        let child_line = serde_json::to_string(&child).expect("serialize child");
+
+        // The wire message is `#[serde(skip)]` on its id, so the nested
+        // `message` object carries none: this is what old files look like.
+        let root_json: serde_json::Value = serde_json::from_str(&root_line).unwrap();
+        assert!(
+            root_json["message"].get("id").is_none(),
+            "legacy fixture must not carry an id inside the wire message"
+        );
+
+        std::fs::write(
+            persistence.session_path(&session_id),
+            format!("{root_line}\n{child_line}\n"),
+        )
+        .expect("write legacy fixture");
+
+        let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume");
+        let mut message_entries = 0;
+        for entry in resumed.entries_in_order() {
+            if let ConversationEntryKind::Message { message } = &entry.entry {
+                message_entries += 1;
+                assert!(!message.id().is_empty(), "backfilled id is non-empty");
+                assert_eq!(
+                    message.id(),
+                    entry.id,
+                    "legacy entry id becomes the message id"
+                );
+            }
+        }
+        assert_eq!(message_entries, 2, "both message entries were backfilled");
+    }
+
+    #[test]
+    fn duplicate_message_id_append_errors() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("sys".into()).expect("set sp");
+
+        let m1 = user_text("first");
+        let mut m2 = user_text("second");
+        m2.set_id(m1.id().to_string());
+
+        let mut view = ConversationView::user(&mut log, None);
+        view.add_message(m1).expect("append m1");
+        let err = view.add_message(m2).expect_err("duplicate id must error");
+        assert!(
+            matches!(err, ConversationError::InvalidAppend(_)),
+            "expected InvalidAppend on a duplicate adopted id, got {err}"
+        );
     }
 
     fn assistant_from(provider: &str, model: &str) -> AgentMessage {
