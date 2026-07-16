@@ -2910,6 +2910,7 @@ mod tests {
         let t = transcript_with(EntryKind::User(UserEntry {
             content: vec![UserContent::text("hello")],
             collapsible: false,
+            message_id: String::new(),
         }));
         let spans = entry_spans(&t.entries()[0], &styles());
         assert_eq!(joined(&spans), "\n\n");
@@ -2930,6 +2931,7 @@ mod tests {
         UserEntry {
             content: vec![UserContent::text(lines.join("\n"))],
             collapsible: true,
+            message_id: String::new(),
         }
     }
 
@@ -2944,6 +2946,7 @@ mod tests {
         let user = UserEntry {
             content: vec![UserContent::text("hello world")],
             collapsible: false,
+            message_id: String::new(),
         };
         let s = styles();
         let mut bubble = build_user_bubble(&user, false, &s, None);
@@ -3012,6 +3015,7 @@ mod tests {
         let user = UserEntry {
             content: vec![UserContent::text("ciao?")],
             collapsible: false,
+            message_id: String::new(),
         };
         let s = styles();
         let label = copy_label_spans(&s);
@@ -3059,6 +3063,7 @@ mod tests {
         let user = UserEntry {
             content: vec![UserContent::text(lines.join("\n"))],
             collapsible: false,
+            message_id: String::new(),
         };
         let r = bubble_rows(&user, false, 80);
         let body = r.join("\n");
@@ -3073,6 +3078,7 @@ mod tests {
                 "<task-notification>\ntask #1 done\n</task-notification>",
             )],
             collapsible: true,
+            message_id: String::new(),
         };
         let r = bubble_rows(&user, false, 80);
         let body = r.join("\n");
@@ -5069,14 +5075,17 @@ mod tests {
         let hello = transcript_with(EntryKind::User(UserEntry {
             content: vec![UserContent::text("hello")],
             collapsible: false,
+            message_id: String::new(),
         }));
         let longer = transcript_with(EntryKind::User(UserEntry {
             content: vec![UserContent::text("hello, world")],
             collapsible: false,
+            message_id: String::new(),
         }));
         let collapsible = transcript_with(EntryKind::User(UserEntry {
             content: vec![UserContent::text("hello")],
             collapsible: true,
+            message_id: String::new(),
         }));
         let chat = empty_chat();
         let fp = |t: &Transcript| entry_fingerprint(&t.entries()[0], &chat.borrow());
