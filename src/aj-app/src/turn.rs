@@ -404,17 +404,19 @@ fn wrap_overflow_giveup(err: TurnError) -> TurnError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
 
     use aj_agent::TurnError;
     use aj_agent::bus::listener_from_sync;
-    use aj_agent::events::AgentEvent;
+    use aj_agent::events::{AgentEvent, CompactionReason};
     use aj_models::types::{AssistantContent, AssistantMessage};
-    use aj_session::ConversationPersistence;
+    use aj_session::{ConversationEntryKind, ConversationPersistence, ThreadFilter};
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
     use super::{OVERFLOW_GIVEUP, TurnPolicy, TurnStart, drive_turn};
+    use crate::compaction::{CompactionOutcome, run_compaction};
     use crate::test_support::{
         build_test_agent, finalized_text_message, finalized_text_message_with_usage,
         scripted_run_config, scripted_run_config_with_window,
@@ -674,6 +676,144 @@ mod tests {
             format!("{:?}", agent.messages()).contains("SUMMARY of earlier work"),
             "reseeded transcript carries the compaction summary: {:?}",
             agent.messages()
+        );
+    }
+
+    /// Compaction planned after a branch switch summarizes the ACTIVE
+    /// branch's path, not the abandoned one. This pins `run_compaction`'s
+    /// planning read onto `head()`: the head is on branch A, but the most
+    /// recently appended entries are on branch B, so a `latest_leaf`-based
+    /// read would summarize and reseed the wrong branch.
+    #[tokio::test]
+    async fn compaction_after_branch_switch_summarizes_active_path() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let run_config = scripted_run_config(vec![
+            finalized_text_message("shared answer"),
+            finalized_text_message("active answer"),
+            finalized_text_message("abandoned answer"),
+            finalized_text_message("SUMMARY of shared work"),
+        ]);
+        let (mut agent, log, _persistence) = build_test_agent(&persistence, &run_config);
+
+        // Turn 1 builds the common prefix; its tail is the divergence
+        // point both branches chain from.
+        agent
+            .prompt("shared question".to_string(), CancellationToken::new())
+            .await
+            .expect("common turn completes");
+        let common = {
+            let guard = log.lock().await;
+            guard.head().cloned().expect("common head")
+        };
+
+        // Branch A (active): a large user prompt so the keep-recent cut
+        // lands on it, leaving the shared prefix as the summarized range.
+        agent
+            .prompt(
+                format!("ACTIVE {}", "X".repeat(2000)),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("active turn completes");
+        let active_head = {
+            let guard = log.lock().await;
+            guard.head().cloned().expect("active head")
+        };
+
+        // Rewind to the divergence point and grow branch B (abandoned).
+        // It is the most recently appended branch, so `latest_leaf`
+        // points here while `head` still needs to be moved back.
+        {
+            let mut guard = log.lock().await;
+            guard.set_head(common.clone()).expect("rewind to common");
+        }
+        agent
+            .prompt("abandoned question".to_string(), CancellationToken::new())
+            .await
+            .expect("abandoned turn completes");
+        let abandoned_head = {
+            let guard = log.lock().await;
+            guard.head().cloned().expect("abandoned head")
+        };
+        assert_ne!(active_head, abandoned_head, "branches must diverge");
+
+        // Head back on branch A: `head` is the active branch, but
+        // `latest_leaf` is still the abandoned branch. Capture each
+        // branch's linearized entry ids to check the plan's scope.
+        let (active_ids, abandoned_ids) = {
+            let mut guard = log.lock().await;
+            guard
+                .set_head(active_head.clone())
+                .expect("head to branch A");
+            let active_ids: HashSet<String> = guard
+                .linearize(&active_head, ThreadFilter::USER)
+                .entries()
+                .iter()
+                .map(|e| e.id.clone())
+                .collect();
+            let abandoned_ids: HashSet<String> = guard
+                .linearize(&abandoned_head, ThreadFilter::USER)
+                .entries()
+                .iter()
+                .map(|e| e.id.clone())
+                .collect();
+            (active_ids, abandoned_ids)
+        };
+
+        let outcome = run_compaction(
+            &mut agent,
+            &log,
+            CompactionReason::Manual,
+            None,
+            100,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            matches!(outcome, CompactionOutcome::Compacted { .. }),
+            "expected a compaction, got {outcome:?}"
+        );
+
+        // The compaction's `first_kept_entry_id` is an entry on the
+        // active path and not on the abandoned branch.
+        let first_kept = {
+            let guard = log.lock().await;
+            guard
+                .entries_in_order()
+                .iter()
+                .find_map(|e| match &e.entry {
+                    ConversationEntryKind::Compaction {
+                        first_kept_entry_id,
+                        ..
+                    } => Some(first_kept_entry_id.clone()),
+                    _ => None,
+                })
+                .expect("compaction entry written")
+        };
+        assert!(
+            active_ids.contains(&first_kept),
+            "first_kept must be on the active path"
+        );
+        assert!(
+            !abandoned_ids.contains(&first_kept),
+            "first_kept must not be on the abandoned branch"
+        );
+
+        // The reseeded transcript carries the summary and the active
+        // branch's kept tail, and nothing from the abandoned branch.
+        let transcript = format!("{:?}", agent.messages());
+        assert!(
+            transcript.contains("SUMMARY of shared work"),
+            "reseeded transcript carries the summary: {transcript}"
+        );
+        assert!(
+            transcript.contains("ACTIVE"),
+            "reseeded transcript keeps the active branch tail: {transcript}"
+        );
+        assert!(
+            !transcript.contains("abandoned"),
+            "reseeded transcript must not include the abandoned branch: {transcript}"
         );
     }
 

@@ -225,27 +225,42 @@ impl<'a> Replay<'a> {
     }
 }
 
-/// Compute the set of entry ids replay should project: the active path
-/// walked back from [`ConversationLog::head`], plus every sub-agent
-/// thread whose first entry (in append order) anchors on that path.
+/// Compute the set of entry ids replay should project: the head's
+/// ancestor chain on the main thread, plus every sub-agent entry that
+/// chains onto that path.
 ///
 /// Returns `None` when the log has no user-thread head, which disables
 /// filtering so a headless log replays in full as before.
 ///
-/// Sub-agent threads are included whole or not at all. A thread anchors
-/// on the path when its first entry's `parent_id` is on the main path.
-/// We key on the first entry rather than a [`ConversationEntryKind::SubAgentSpawn`]
-/// root because legacy logs have sub threads without a spawn root that
-/// lead directly with the task user message; both shapes anchor their
-/// first entry at the spawning assistant on the user thread. No
-/// transitive closure is needed: a spawned agent has the `agent` tool
-/// removed, so sub threads always anchor on the user thread.
+/// Invariant: only sub-agent entries expand forward. Main-thread
+/// inclusion is exactly the head's ancestor chain, so sibling branches
+/// are excluded. A main-thread entry off the head's chain is never
+/// added, which is what keeps an abandoned branch out of the replay.
+///
+/// Anchoring on parent chains rather than on `agent_id` is what makes
+/// this correct under concurrent writers. Two writers that both resume
+/// before spawning can mint the same `Sub(n)` id on different branches
+/// (the counter is seeded from `max_agent_id` at resume), so the id
+/// alone cannot tell an on-path run from an abandoned one. The parent
+/// chain can: append order guarantees a sub entry's anchor (its
+/// main-thread parent, or an earlier entry of the same run) precedes
+/// it, so a single forward pass includes each on-path run completely
+/// and never touches a run anchored on an excluded main entry.
+///
+/// Keying on the parent rather than a [`ConversationEntryKind::SubAgentSpawn`]
+/// root also handles legacy logs whose sub threads lead with the task
+/// user message: both shapes anchor their first entry on the user
+/// thread and chain forward the same way. No transitive closure across
+/// sub threads is needed, since a spawned agent has the `agent` tool
+/// removed and its thread always anchors on the user thread.
 fn included_entries(log: &ConversationLog) -> Option<HashSet<String>> {
     let head = log.head()?;
 
     // Main path: walk parent pointers from the head, collecting the
     // head's user and meta ancestors (settings and system-prompt
-    // entries chain here too, so they stay included).
+    // entries chain here too, so they stay included). This is the only
+    // source of main-thread inclusion, so sibling branches never enter
+    // the set.
     let mut included: HashSet<String> = HashSet::new();
     let mut cursor = Some(head.clone());
     while let Some(id) = cursor {
@@ -254,35 +269,24 @@ fn included_entries(log: &ConversationLog) -> Option<HashSet<String>> {
         cursor = entry.parent_id.clone();
     }
 
-    // For each sub-agent thread, record its first entry's parent and
-    // collect all of its entry ids, both in append order.
-    let mut first_parent: HashMap<usize, Option<String>> = HashMap::new();
-    let mut sub_threads: HashMap<usize, Vec<String>> = HashMap::new();
-    for entry in log.entries_in_order() {
-        if entry.thread != ThreadKind::Subagent {
-            continue;
-        }
-        let Some(agent_id) = entry.agent_id else {
+    // Single forward pass in append order: a sub-agent entry joins the
+    // set when its parent is already included. A run's first entry
+    // anchors on the main path, later entries chain onto earlier ones of
+    // the same run, so one pass includes each on-path run whole. Only
+    // `Subagent` entries expand here. Expanding user entries too would
+    // pull in a sibling branch's first entry, whose parent is a common
+    // ancestor on the main path, and leak the abandoned branch.
+    for index in 0..log.len() {
+        let Some(entry) = log.entry_in_append_order(index) else {
             continue;
         };
-        first_parent
-            .entry(agent_id)
-            .or_insert_with(|| entry.parent_id.clone());
-        sub_threads
-            .entry(agent_id)
-            .or_default()
-            .push(entry.id.clone());
-    }
-
-    // A sub thread is included exactly when its first entry anchors on
-    // the main path.
-    for (agent_id, ids) in sub_threads {
-        let anchored = matches!(
-            first_parent.get(&agent_id),
-            Some(Some(parent)) if included.contains(parent)
-        );
-        if anchored {
-            included.extend(ids);
+        let anchored_on_path = entry.thread == ThreadKind::Subagent
+            && entry
+                .parent_id
+                .as_ref()
+                .is_some_and(|parent| included.contains(parent));
+        if anchored_on_path {
+            included.insert(entry.id.clone());
         }
     }
 
@@ -2717,6 +2721,39 @@ mod tests {
         );
     }
 
+    /// The concatenated text of every `MessageEnd` for `agent` (user
+    /// and assistant), in order.
+    fn agent_texts(events: &[AgentEvent], agent: AgentId) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::MessageEnd { agent_id, message } if *agent_id == agent => {
+                    let text = match message.as_wire()? {
+                        Message::User(u) => u
+                            .content
+                            .iter()
+                            .filter_map(|c| match c {
+                                UserContent::Text(t) => Some(t.text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<String>(),
+                        Message::Assistant(a) => a
+                            .content
+                            .iter()
+                            .filter_map(|c| match c {
+                                AssistantContent::Text(t) => Some(t.text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<String>(),
+                        Message::ToolResult(_) => return None,
+                    };
+                    Some(text)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The concatenated text of every user `MessageEnd`, in order.
     fn user_texts(events: &[AgentEvent]) -> Vec<String> {
         events
@@ -2865,6 +2902,103 @@ mod tests {
         assert!(
             !events.iter().any(|e| e.agent_id() == AgentId::Sub(2)),
             "no Sub(2) content events leak in"
+        );
+    }
+
+    #[test]
+    fn path_aware_replay_disambiguates_colliding_sub_agent_ids() {
+        // Two concurrent writers that both resume before spawning can
+        // mint the SAME `Sub(1)` id on different branches (the counter is
+        // seeded from `max_agent_id` at resume). Inclusion must key on
+        // the sub's parent chain, not its id: only the run anchored on
+        // the active branch may replay, even though the abandoned run
+        // carries the same id.
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("sp");
+
+        let common = {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(user_msg("common")).expect("common")
+        };
+
+        // Branch A: an assistant turn spawns sub-agent 1.
+        let a_a = {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "branch A".into(),
+                text_signature: None,
+            })]))
+            .expect("a")
+        };
+        let spawn_a = log
+            .append_subagent_spawn(1, a_a.clone(), "sub A task", false, &fallback_settings())
+            .expect("spawn A");
+        {
+            let mut view = ConversationView::subagent(&mut log, spawn_a, 1);
+            view.add_message(user_msg("sub A prompt")).expect("sub a u");
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "sub A report".into(),
+                text_signature: None,
+            })]))
+            .expect("sub a a");
+        }
+
+        // Branch B off the common parent: another assistant turn spawns a
+        // sub-agent reusing the SAME id 1, the collision this test pins.
+        log.set_head(common).expect("rewind to common");
+        let a_b = {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "branch B".into(),
+                text_signature: None,
+            })]))
+            .expect("b")
+        };
+        let spawn_b = log
+            .append_subagent_spawn(1, a_b, "sub B task", false, &fallback_settings())
+            .expect("spawn B");
+        {
+            let mut view = ConversationView::subagent(&mut log, spawn_b, 1);
+            view.add_message(user_msg("sub B prompt")).expect("sub b u");
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "sub B report".into(),
+                text_signature: None,
+            })]))
+            .expect("sub b a");
+        }
+
+        // Head on branch A: only branch A's sub run replays, even though
+        // the abandoned branch B run shares the id `Sub(1)`.
+        log.set_head(a_a).expect("head to branch A");
+        let events: Vec<AgentEvent> = replay(&log).collect();
+
+        // Exactly one SubAgentStart, carrying branch A's task.
+        let starts: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::SubAgentStart { child, task, .. } if *child == AgentId::Sub(1) => {
+                    Some(task.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts, vec!["sub A task"], "only branch A's sub starts");
+
+        // Every Sub(1) message comes from branch A, none from branch B.
+        let sub_text = agent_texts(&events, AgentId::Sub(1));
+        assert!(
+            sub_text.iter().any(|t| t == "sub A prompt"),
+            "branch A sub prompt replays: {sub_text:?}"
+        );
+        assert!(
+            sub_text.iter().any(|t| t == "sub A report"),
+            "branch A sub report replays: {sub_text:?}"
+        );
+        assert!(
+            !sub_text.iter().any(|t| t.contains("sub B")),
+            "colliding-id sub on the abandoned branch must not leak: {sub_text:?}"
         );
     }
 

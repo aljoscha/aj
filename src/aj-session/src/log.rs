@@ -1229,7 +1229,17 @@ impl ConversationLog {
     fn parent_for_thread_append(&self, filter: ThreadFilter) -> Option<EntryId> {
         let leaf = match filter.thread {
             ThreadKind::User => self.head.clone(),
-            _ => self.latest_leaf(filter),
+            // Sub threads are linear per `agent_id`, so they anchor at
+            // their own leaf. Branching does not apply to them.
+            ThreadKind::Subagent => self.latest_leaf(filter),
+            // Settings and compaction appends only ever target the user
+            // or a sub-agent thread. A `Meta` filter is a misuse: a
+            // `ThreadFilter` is never constructed with `thread: Meta`
+            // (see `ThreadFilter::matches`), so reaching here means a
+            // caller built an invalid filter.
+            ThreadKind::Meta => {
+                unreachable!("settings/compaction appends never target the meta thread")
+            }
         };
         leaf.or_else(|| self.system_prompt_id().cloned())
     }
