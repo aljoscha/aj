@@ -188,21 +188,7 @@ impl MarkdownView {
         if self.cache.as_ref().is_some_and(|c| c.width == width) {
             return;
         }
-        let mut rows: Vec<Vec<TextSpan>> = Vec::new();
-        for seg in &self.segments {
-            let seg_rows = render_markdown(&seg.text, usize::from(width), &seg.opts);
-            if seg_rows.is_empty() {
-                continue;
-            }
-            // One blank row between consecutive segments, matching the block
-            // separation the plain-text renderer used before.
-            if !rows.is_empty() {
-                rows.push(Vec::new());
-            }
-            for md_row in &seg_rows {
-                rows.push(to_vaxis_row(md_row, seg, &self.styles));
-            }
-        }
+        let rows = segment_rows(&self.segments, &self.styles, width);
         self.cache = Some(RowCache { width, rows });
     }
 
@@ -269,6 +255,57 @@ impl Widget for MarkdownView {
         }
         surface
     }
+}
+
+/// Lay `segments` out to pre-wrapped vaxis span rows at `width`, one row per
+/// visual line, with a single blank row between consecutive non-empty
+/// segments. The shared renderer pre-wraps to `width`, so callers paint these
+/// rows with wrapping disabled.
+fn segment_rows(
+    segments: &[MarkdownSegment],
+    styles: &MarkdownStyles,
+    width: u16,
+) -> Vec<Vec<TextSpan>> {
+    let mut rows: Vec<Vec<TextSpan>> = Vec::new();
+    for seg in segments {
+        let seg_rows = render_markdown(&seg.text, usize::from(width), &seg.opts);
+        if seg_rows.is_empty() {
+            continue;
+        }
+        // One blank row between consecutive segments, matching the block
+        // separation the plain-text renderer used before.
+        if !rows.is_empty() {
+            rows.push(Vec::new());
+        }
+        for md_row in &seg_rows {
+            rows.push(to_vaxis_row(md_row, seg, styles));
+        }
+    }
+    rows
+}
+
+/// Render `segments` to a surface at `width`, one markdown row per surface
+/// row. Unlike [`MarkdownView`] this adds no leading chrome and no trailing
+/// spacer, so a caller can composite the rows into its own layout (the
+/// sub-agent box paints them under its box tint). Rows are pre-wrapped by the
+/// shared renderer, so painting disables further wrapping.
+///
+/// Expects `width >= 1`. A zero width yields a zero-width surface (the shared
+/// renderer clamps its wrap width to at least one, but the painted cells then
+/// clip away), which is not a useful render.
+pub(crate) fn draw_markdown_segments(
+    ctx: &DrawContext,
+    segments: &[MarkdownSegment],
+    styles: &MarkdownStyles,
+    width: u16,
+) -> Surface {
+    let rows = segment_rows(segments, styles, width);
+    let height = u16::try_from(rows.len()).unwrap_or(u16::MAX);
+    let mut surface = Surface::with_size(Size { width, height });
+    for (i, row) in rows.iter().enumerate() {
+        paint_row(&mut surface, u16::try_from(i).unwrap_or(0), row, ctx);
+    }
+    surface
 }
 
 /// Convert one shared [`MarkdownRow`](aj_app::markdown::MarkdownRow) into a

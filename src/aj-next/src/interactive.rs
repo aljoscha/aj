@@ -826,10 +826,10 @@ fn spawn_wakes(world: &mut World, targets: Vec<AgentId>) {
 }
 
 /// Mirror the lifecycle bits the status chrome reads into the shared
-/// [`StatusState`] cell, returning whether the viewed agent is busy.
-/// Called once per loop iteration right before rendering, so every
-/// mutation path (event batch, turn join, submits) shares one sync
-/// point and the mirror can't silently drift.
+/// [`StatusState`] cell, returning whether the animation tick should run
+/// (see [`StatusState::animating`]). Called once per loop iteration right
+/// before rendering, so every mutation path (event batch, turn join,
+/// submits) shares one sync point and the mirror can't silently drift.
 fn sync_status(world: &World) -> bool {
     let active = world.chat.borrow().active_view();
     let life = &world.core.lifecycle;
@@ -843,7 +843,7 @@ fn sync_status(world: &World) -> bool {
             .count(),
     };
     *world.status.borrow_mut() = next;
-    next.busy()
+    next.animating()
 }
 
 /// Handle an editor submit: spawn a prompt turn on the viewed agent
@@ -3917,7 +3917,7 @@ async fn drive(
 ) -> Result<SessionExit> {
     // Rising-edge tracker for the loader's animation: the tick chain
     // is armed once per idle-to-busy transition, not per iteration.
-    let mut was_busy = false;
+    let mut was_animating = false;
     // Edge tracker for the quit-arm hint's warning: the keymap's only
     // sequence is the ctrl+c/ctrl+c quit chord, so a pending sequence means the
     // quit is armed. We refresh the hint's running-work warning on each edge
@@ -4484,11 +4484,13 @@ async fn drive(
             }
         }
         // One status sync per iteration, whatever the arm did. On the
-        // idle-to-busy edge, post the loader wake: widgets can only
+        // idle-to-animating edge, post the loader wake: widgets can only
         // schedule ticks from an event handler, so the host hands the
         // loader an app event to arm its animation chain (the Shell
-        // forwards it, see `Shell::capture_event`).
-        let busy = sync_status(world);
+        // forwards it, see `Shell::capture_event`). The edge tracks
+        // animating, not just busy, so a background sub-agent starting while
+        // the viewed agent is idle still arms the box-spinner redraw pump.
+        let animating = sync_status(world);
         // Advance the editor's autocomplete once per iteration. The delivery
         // arm above wakes the loop as streaming matches and one-shot results
         // land, but a narrowing keystroke re-scores an already-walked tree in
@@ -4503,13 +4505,13 @@ async fn drive(
         // Esc/Ctrl+C teardown, so mirror the login liveness into the
         // keymap context. This loop is the field's single writer.
         shell.borrow().keymap_ctx.borrow_mut().login_active = login_session.is_some();
-        if busy && !was_busy {
+        if animating && !was_animating {
             let _ = app.post_app_event(UserEvent {
                 name: STATUS_WAKE_EVENT.to_string(),
                 data: None,
             });
         }
-        was_busy = busy;
+        was_animating = animating;
         // Surface the quit arming: the sequence-start is consumed silently by
         // the keymap engine, so on the arming edge the host refreshes the
         // hint's running-work warning (the background work a quit would tear

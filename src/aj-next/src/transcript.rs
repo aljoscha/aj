@@ -430,6 +430,13 @@ impl Builder for EntryBuilder {
         fingerprint_into(entry, &chat, &mut hasher);
         focused.hash(&mut hasher);
         let fingerprint = hasher.finish();
+        // A Running sub-agent box animates its glyph off the wall-clock, so it
+        // must rebuild on every redraw, not just when its fingerprint changes.
+        // We bypass the cache for it rather than fold the clock into the
+        // fingerprint. The rebuild is cheap (a title and one activity line, no
+        // markdown), and the redraw pump ticks while any sub-agent runs.
+        let bypass_cache =
+            matches!(&entry.kind, EntryKind::SubAgent(s) if s.status == SubAgentStatus::Running);
         Some(Rc::new(RefCell::new(CachingEntry {
             cache: Rc::clone(&self.cache),
             chat: Rc::clone(&self.chat),
@@ -438,6 +445,7 @@ impl Builder for EntryBuilder {
             entry_id: entry.id,
             fingerprint,
             focused,
+            bypass_cache,
             copy_label: Rc::clone(&self.copy_label),
         })))
     }
@@ -460,6 +468,10 @@ struct CachingEntry {
     /// Whether this entry is the focused user message, so its bubble gets the
     /// focus border on the miss-path build. Already folded into `fingerprint`.
     focused: bool,
+    /// Whether to skip the render cache and rebuild on every draw. Set for a
+    /// `Running` sub-agent box, whose spinner glyph advances on the wall-clock
+    /// and so cannot be served from a fingerprint-keyed surface.
+    bypass_cache: bool,
     /// The copy-key hint shown on the border's bottom edge, used only when
     /// `focused`.
     copy_label: Rc<Vec<TextSpan>>,
@@ -472,10 +484,13 @@ impl Widget for CachingEntry {
 
         // HIT: the stored surface was drawn for this fingerprint and width, so
         // replay it verbatim. Bind the lookup to a `let` so the cache's
-        // `RefMut` is released before the miss path re-borrows it.
-        let cached = self.cache.borrow_mut().get(key, self.fingerprint, width);
-        if let Some(surface) = cached {
-            return surface;
+        // `RefMut` is released before the miss path re-borrows it. A
+        // bypass entry (an animated Running box) always rebuilds.
+        if !self.bypass_cache {
+            let cached = self.cache.borrow_mut().get(key, self.fingerprint, width);
+            if let Some(surface) = cached {
+                return surface;
+            }
         }
 
         // MISS: rebuild the real widget and draw it. The `item_at_idx` chat
@@ -498,9 +513,13 @@ impl Widget for CachingEntry {
                 build_entry_widget(entry, &chat, &self.styles, false, focus).into_indented_boxed();
             widget.draw(ctx)
         };
-        self.cache
-            .borrow_mut()
-            .insert(key, self.fingerprint, width, surface.clone());
+        // A bypass entry is never stored, so it can't strand a stale slot when
+        // its glyph advances or when it later concludes and becomes cacheable.
+        if !self.bypass_cache {
+            self.cache
+                .borrow_mut()
+                .insert(key, self.fingerprint, width, surface.clone());
+        }
         surface
     }
 }
@@ -770,16 +789,18 @@ fn json_fingerprint(value: &Value, hasher: &mut DefaultHasher) {
     }
 }
 
-/// Sub-agent box fields, hashed by full value. The box now renders from
-/// this metadata, not the child transcript, so the fingerprint keys on the
-/// exact inputs the box reads: the status tag, the task, the report, the
-/// latest-activity line, the activity counter, and the background flag.
+/// Sub-agent box fields, hashed by full value. The box renders from this
+/// metadata, not the child transcript, so the fingerprint keys on the exact
+/// inputs a concluded box reads: the status tag, the task, the report, the
+/// latest-activity line, and the background flag.
 ///
 /// The report and activity strings are hashed by full value, not a length
 /// proxy, because a same-length activity transition (for example `bash` to
 /// `grep`) must still invalidate the cache, otherwise a stale line survives.
-/// The activity counter changes on every live sub-agent event, so a
-/// `Running` box re-renders (and its glyph advances) as work happens.
+///
+/// A `Running` box bypasses the render cache entirely (its glyph animates on
+/// the wall-clock, see `CachingEntry`), so this fingerprint only actually
+/// gates a concluded box's cached surface.
 fn subagent_fingerprint(s: &SubAgentEntry, hasher: &mut DefaultHasher) {
     match s.status {
         SubAgentStatus::Running => 0u8.hash(hasher),
@@ -790,7 +811,6 @@ fn subagent_fingerprint(s: &SubAgentEntry, hasher: &mut DefaultHasher) {
     s.task.hash(hasher);
     s.report.hash(hasher);
     s.latest_activity.hash(hasher);
-    s.activity_ticks.hash(hasher);
     s.background.hash(hasher);
 }
 
@@ -907,9 +927,12 @@ pub(crate) fn build_entry_widget(
         EntryKind::User(user) => {
             EntryWidget::Bubble(build_user_bubble(user, chat.tools_expanded, styles, focus))
         }
-        EntryKind::SubAgent(s) if !nested => {
-            EntryWidget::SubAgent(build_subagent_box(s, chat.tools_expanded, styles))
-        }
+        EntryKind::SubAgent(s) if !nested => EntryWidget::SubAgent(build_subagent_box(
+            s,
+            chat.tools_expanded,
+            chat.syntax_highlight,
+            styles,
+        )),
         // Assistant prose and the expanded compaction summary render as
         // markdown through the width-aware `MarkdownView`. A nested assistant
         // entry (inside a sub-agent box) takes this path too, so a child's
@@ -4354,21 +4377,28 @@ mod tests {
         );
     }
 
-    /// A live sub-agent event that bumps the box's activity counter (here a
-    /// tool start, which also sets the latest-activity line) changes the box
-    /// fingerprint, so the running box rebuilds and re-renders with the new
-    /// activity. The box now keys on its own metadata, not a child fold.
+    /// A `Running` box bypasses the render cache: it rebuilds on every draw
+    /// (its glyph animates on the wall-clock), so it never records a hit and
+    /// always reflects the latest live activity. The box keys on its own
+    /// metadata, not a child fold.
     #[test]
-    fn subagent_activity_bump_rebuilds_the_box() {
+    fn running_box_bypasses_cache_and_reflects_activity() {
         let chat = empty_chat();
         let mut life = AgentLifecycle::default();
         spawn_sub(&chat, &mut life);
         let builder = caching_builder(&chat);
-        let first = draw_and_assert_fresh(&builder, AgentId::Main, 0, 70);
+        // Two unchanged draws: a cached entry would hit the second time, but a
+        // Running box bypasses the cache and never populates it. We draw
+        // through the cache path directly rather than compare against a fresh
+        // render, because a bypass box has no cached surface to go stale (and
+        // its wall-clock glyph would differ between two builds anyway).
+        let first = draw_cached(&builder, 0, 70);
+        let _ = draw_cached(&builder, 0, 70);
+        assert_eq!(hits(&builder), 0, "a running box never hits the cache");
+        assert_eq!(misses(&builder), 0, "and never populates it");
 
         apply(&chat, &mut life, tool_start(AgentId::Sub(0), "c1", "grep"));
-        let after = draw_and_assert_fresh(&builder, AgentId::Main, 0, 70);
-        assert_eq!(misses(&builder), 2, "activity bump rebuilt the box");
+        let after = draw_cached(&builder, 0, 70);
         assert_ne!(
             crate::test_support::flatten(&first),
             crate::test_support::flatten(&after),
@@ -4383,16 +4413,16 @@ mod tests {
         );
     }
 
-    /// Updating the sub's conclusion (a fresh assistant `MessageEnd`) refreshes
-    /// the box's report and latest-activity, so the box fingerprint changes and
-    /// it re-renders.
+    /// A live conclusion update (a fresh assistant `MessageEnd` on the still
+    /// running sub) refreshes the box's latest-activity line, and because the
+    /// box bypasses the cache the next draw reflects it.
     #[test]
-    fn subagent_conclusion_update_rebuilds_the_box() {
+    fn running_box_reflects_a_conclusion_update() {
         let chat = empty_chat();
         let mut life = AgentLifecycle::default();
         spawn_sub(&chat, &mut life);
         let builder = caching_builder(&chat);
-        let first = draw_and_assert_fresh(&builder, AgentId::Main, 0, 70);
+        let first = draw_cached(&builder, 0, 70);
 
         apply(
             &chat,
@@ -4404,8 +4434,7 @@ mod tests {
                 ))),
             },
         );
-        let grown = draw_and_assert_fresh(&builder, AgentId::Main, 0, 70);
-        assert_eq!(misses(&builder), 2, "conclusion change rebuilt the box");
+        let grown = draw_cached(&builder, 0, 70);
         assert_ne!(
             crate::test_support::flatten(&first),
             crate::test_support::flatten(&grown),
@@ -4413,13 +4442,46 @@ mod tests {
         );
     }
 
-    /// A child-transcript-only change does NOT rebuild the box: the metadata
-    /// box reads no child transcript, so a notice appended to the child and a
-    /// background task's terminal badge flip both leave the box fingerprint
-    /// untouched and hit the cache. This decoupling is what lets a resumed
-    /// sub-agent's transcript stay unmaterialized behind a `Done` box.
+    /// A concluded (`Done`) box is cacheable, unlike a `Running` one: it reads
+    /// no wall-clock, so a redraw with no metadata change hits the cache. This
+    /// guards the `status == Running` guard on the bypass predicate: widening
+    /// it would rebuild every concluded box each frame.
     #[test]
-    fn subagent_child_only_change_hits_the_cache() {
+    fn done_box_is_cached() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        spawn_sub(&chat, &mut life);
+        apply(
+            &chat,
+            &mut life,
+            AgentEvent::SubAgentEnd {
+                parent: AgentId::Main,
+                child: AgentId::Sub(0),
+                report: "all done".into(),
+                conclusion: aj_agent::events::SubAgentConclusion::Completed,
+            },
+        );
+        apply(
+            &chat,
+            &mut life,
+            AgentEvent::AgentEnd {
+                agent_id: AgentId::Sub(0),
+                messages: Vec::new(),
+            },
+        );
+        let builder = caching_builder(&chat);
+        let _ = draw_cached(&builder, 0, 60);
+        let _ = draw_cached(&builder, 0, 60);
+        assert!(hits(&builder) > 0, "a Done box hits the cache on redraw");
+    }
+
+    /// A `Running` box reads no child transcript, so child-only changes (a
+    /// notice appended to the child, a background task's terminal badge flip)
+    /// never appear in the box. This is the metadata decoupling that lets a
+    /// resumed sub-agent's transcript stay unmaterialized behind the box. The
+    /// running box also bypasses the render cache, so it records no hits.
+    #[test]
+    fn running_box_ignores_child_only_changes() {
         let chat = empty_chat();
         let mut life = AgentLifecycle::default();
         apply(
@@ -4460,8 +4522,7 @@ mod tests {
             ),
         );
         let builder = caching_builder(&chat);
-        draw_and_assert_fresh(&builder, AgentId::Main, 0, 70);
-        let misses_before = misses(&builder);
+        draw_cached(&builder, 0, 70);
 
         // A notice appended to the child transcript touches no box metadata.
         apply(
@@ -4487,10 +4548,13 @@ mod tests {
         );
         let after = draw_cached(&builder, 0, 70);
 
+        // A running box bypasses the cache, so it never serves a cached
+        // surface: three draws record no hits. If it were cached, the
+        // child-only changes (which touch no box metadata) would hit.
         assert_eq!(
-            misses(&builder),
-            misses_before,
-            "child-only changes did not rebuild the box",
+            hits(&builder),
+            0,
+            "a running box bypasses the render cache entirely",
         );
         let body = crate::test_support::rows(&after).join("\n");
         assert!(
@@ -4654,6 +4718,9 @@ mod tests {
         let chat = empty_chat();
         let mut life = AgentLifecycle::default();
         spawn_sub(&chat, &mut life);
+        // A cacheable Main entry: the running sub box bypasses the cache, so
+        // without another entry the Main view would record no hits to clear.
+        apply(&chat, &mut life, user_end("hi"));
         let mut view = transcript_view(&chat);
         let ctx = draw_ctx(60, 24);
         let _ = view.draw(&ctx);

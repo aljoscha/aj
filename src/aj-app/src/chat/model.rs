@@ -178,10 +178,6 @@ pub struct SubAgentEntry {
     /// sub-agent content and shows its report instead, and a `Done` box
     /// ignores it. Never read from the sub's transcript.
     pub latest_activity: Option<String>,
-    /// Count of live sub-agent events that updated this box. Drives the
-    /// `Running` box's spinner frame, so the glyph advances on activity
-    /// with no redraw timer.
-    pub activity_ticks: u64,
 }
 
 /// A completed compaction's summary row.

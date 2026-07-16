@@ -53,6 +53,14 @@ impl StatusState {
     pub(crate) fn busy(&self) -> bool {
         self.running || self.compacting
     }
+
+    /// Whether the animation tick should run. Broader than [`busy`](Self::busy):
+    /// it also covers a background sub-agent running while the viewed agent is
+    /// idle, so the sub-agent boxes keep their spinners animating even though
+    /// the loader line itself stays hidden.
+    pub(crate) fn animating(&self) -> bool {
+        self.busy() || self.sub_agents_running > 0
+    }
 }
 
 /// The loader line widget: zero height while idle, one leading blank
@@ -132,10 +140,10 @@ impl StatusLine {
         FRAMES[idx]
     }
 
-    /// Schedule the next animation tick if the loader is visible and
-    /// none is pending, and latch a redraw so the new frame paints.
+    /// Schedule the next animation tick if the animation should run and none
+    /// is pending, and latch a redraw so the new frame paints.
     fn arm_tick(&mut self, ctx: &mut EventContext) {
-        if !self.status.borrow().busy() {
+        if !self.status.borrow().animating() {
             return;
         }
         ctx.redraw = true;
@@ -189,7 +197,7 @@ impl Widget for StatusLine {
             Event::Tick => {
                 self.tick_armed = false;
                 // Repaint even when the agent just went idle so the
-                // final frame clears, then re-arm only while busy.
+                // final frame clears, then re-arm only while animating.
                 ctx.redraw = true;
                 self.arm_tick(ctx);
             }
@@ -379,5 +387,57 @@ mod tests {
         line.borrow_mut().handle_event(&mut ctx, &Event::Tick);
         assert!(ctx.redraw, "final clearing repaint");
         assert!(ctx.cmds.is_empty(), "chain ends when idle");
+    }
+
+    /// `animating` is broader than `busy`: a running sub-agent arms the pump
+    /// even when the viewed agent is idle, though the loader line stays hidden.
+    #[test]
+    fn animating_covers_a_background_sub_while_the_viewed_agent_is_idle() {
+        assert!(!StatusState::default().animating(), "nothing running");
+        let sub_only = StatusState {
+            sub_agents_running: 1,
+            ..StatusState::default()
+        };
+        assert!(sub_only.animating(), "a running sub arms the pump");
+        assert!(!sub_only.busy(), "but the loader line stays hidden");
+    }
+
+    /// A background sub while the viewed agent is idle: the loader draws no
+    /// row, but a wake still arms the tick chain (gated on `animating`, not
+    /// `busy`), and the chain stops once the sub finishes. This fails if
+    /// `arm_tick` gates on `busy` instead of `animating`.
+    #[test]
+    fn background_sub_arms_the_pump_with_the_loader_hidden() {
+        let (line, status) = loader(StatusState {
+            sub_agents_running: 1,
+            ..StatusState::default()
+        });
+        let surface = line
+            .borrow_mut()
+            .draw(&crate::test_support::draw_ctx(80, None));
+        assert_eq!(
+            surface.size.height, 0,
+            "no loader line for a background sub"
+        );
+
+        let wake = Event::App(vaxis::vxfw::UserEvent {
+            name: STATUS_WAKE_EVENT.to_string(),
+            data: None,
+        });
+        let mut ctx = EventContext::new();
+        line.borrow_mut().handle_event(&mut ctx, &wake);
+        assert!(ctx.redraw);
+        assert_eq!(
+            ctx.cmds.len(),
+            1,
+            "the wake armed a tick with the viewed agent idle"
+        );
+
+        // The sub finishes: the next tick repaints once more but does not
+        // re-arm, so the pump winds down.
+        status.borrow_mut().sub_agents_running = 0;
+        let mut ctx = EventContext::new();
+        line.borrow_mut().handle_event(&mut ctx, &Event::Tick);
+        assert!(ctx.cmds.is_empty(), "chain ends when no sub is running");
     }
 }

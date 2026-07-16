@@ -1,13 +1,22 @@
 //! The sub-agent box: the parent-transcript widget for one sub-agent
 //! run.
 //!
-//! A gray box with a one-line `{glyph} agent {N} · {task}` title and a
-//! metadata body. Once the sub-agent is done the body is its report,
-//! soft-wrapped, and folded to a head preview when collapsed the same
-//! way tool cells fold long output (the shared tools-expand toggle
-//! shows the whole report). While it runs the glyph is an event-driven
-//! spinner frame (advanced by the box's activity counter) and the body
-//! is a single latest-activity line that clips with an ellipsis.
+//! A gray box with a one-line `{glyph} agent {N} · {task}` title and a body,
+//! separated by a blank row. Once the sub-agent is done the body is its
+//! report, rendered as markdown the same way assistant prose renders in the
+//! transcript, and folded to a head preview when collapsed the same way tool
+//! cells fold long output (the shared tools-expand toggle shows the whole
+//! report). While it runs the glyph is a wall-clock spinner frame and the
+//! body is a single latest-activity line that clips with an ellipsis.
+//!
+//! The running glyph animates on a wall-clock, matching the status loader's
+//! cadence, so it keeps spinning between sub-agent events rather than
+//! freezing (a frozen glyph reads as stalled). Two pieces outside this module
+//! drive that: the status loader arms its redraw tick while any sub-agent
+//! runs, not only while the viewed agent is busy (see
+//! [`StatusState::animating`](crate::status::StatusState::animating)), and a
+//! `Running` box bypasses the transcript render cache so each redraw rebuilds
+//! it with a fresh frame.
 //!
 //! The box renders from box metadata alone: it never composites the
 //! child transcript or tail-windows it, so it needs no access to the
@@ -21,7 +30,10 @@
 //! build time. Drawing needs no model access, so the `ListView`
 //! builder's shared borrow never nests or escapes.
 
+use std::time::Duration;
+
 use aj_app::chat::{SubAgentEntry, SubAgentStatus};
+use aj_app::markdown::{Emphasis, RenderOpts};
 use aj_tools::sanitize_terminal_output;
 use vaxis::cell::{Cell, Color, Style};
 use vaxis::vxfw::{
@@ -29,6 +41,7 @@ use vaxis::vxfw::{
 };
 
 use crate::bubble::{MIN_BUBBLE_WIDTH, PADDING_X, PADDING_Y};
+use crate::markdown_view::{MarkdownSegment, MarkdownStyles, draw_markdown_segments};
 use crate::tool_cell::{HintKind, REPORT_COLLAPSED_LINES, expand_hint};
 use crate::transcript::TranscriptStyles;
 
@@ -37,6 +50,21 @@ use crate::transcript::TranscriptStyles;
 /// does not reach into `status.rs`'s private const.
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Milliseconds each spinner frame shows for. Matches the status loader's
+/// cadence so the box glyph and the main loader advance at the same rate. A
+/// local const keeps the box decoupled from `status.rs`.
+const SPINNER_INTERVAL_MS: u128 = 80;
+
+/// The spinner glyph for a `Running` box `elapsed` into its current run.
+/// Derived from the wall-clock, like the status loader, so the animation runs
+/// at a steady cadence independent of when the box happens to be rebuilt.
+fn spinner_frame(elapsed: Duration) -> &'static str {
+    // Modulo the frame count so the index is bounded and fits usize.
+    let n = u128::try_from(SPINNER_FRAMES.len()).unwrap_or(u128::MAX);
+    let idx = usize::try_from((elapsed.as_millis() / SPINNER_INTERVAL_MS) % n).unwrap_or(0);
+    SPINNER_FRAMES[idx]
+}
+
 /// On-screen representation of one sub-agent run, boxed inside the
 /// parent's transcript.
 pub(crate) struct SubAgentBox {
@@ -44,16 +72,28 @@ pub(crate) struct SubAgentBox {
     /// (the task text is whitespace-normalized at build time). The
     /// glyph is a check when done or a spinner frame while running.
     title: Vec<TextSpan>,
-    /// The body spans: the report when done (folded to a preview when
-    /// collapsed), the latest-activity line while running. Empty when
-    /// there is nothing to show (a done sub-agent with no report, a
-    /// running sub with no activity yet).
-    body: Vec<TextSpan>,
-    /// Whether the body soft-wraps. A done report wraps across rows; a
-    /// running activity line stays on one row and clips with an ellipsis.
-    body_softwrap: bool,
+    /// The content below the title, separated from it by a blank row.
+    body: BoxBody,
     /// The box tint (the shared pending-tool gray, matching `aj`).
     bg: Color,
+}
+
+/// The box body below the title.
+enum BoxBody {
+    /// Nothing below the header: a title-only box (a running sub with no
+    /// activity yet, or a concluded sub with an empty report).
+    Empty,
+    /// A running box's latest-activity line. Clips to one row with an
+    /// ellipsis, no soft wrap.
+    Activity(Vec<TextSpan>),
+    /// A concluded box's report, rendered as markdown (folded to a head
+    /// preview when collapsed), with an optional dim fold hint below it. The
+    /// markdown is laid out at draw time because it needs the box width.
+    Report {
+        segments: Vec<MarkdownSegment>,
+        markdown: MarkdownStyles,
+        hint: Option<TextSpan>,
+    },
 }
 
 /// Build the box for `entry` from its metadata: the report (done) or a
@@ -62,9 +102,12 @@ pub(crate) struct SubAgentBox {
 ///
 /// `expanded` is the session-wide tools-expand flag: when set, a long
 /// done-report renders in full, otherwise it folds to a head preview.
+/// `syntax_highlight` is the session-wide flag threaded into the report's
+/// markdown segments, the same one assistant prose uses.
 pub(crate) fn build_subagent_box(
     entry: &SubAgentEntry,
     expanded: bool,
+    syntax_highlight: bool,
     styles: &TranscriptStyles,
 ) -> SubAgentBox {
     let span = |text: String, style: Style| TextSpan {
@@ -73,14 +116,11 @@ pub(crate) fn build_subagent_box(
         ..TextSpan::default()
     };
     let glyph = match entry.status {
-        // The running glyph advances on activity, not a wall-clock: the
-        // frame is picked by the box's activity counter, so it steps on
-        // each sub-agent event without a redraw timer.
+        // The running glyph is a wall-clock spinner frame, kept dim (the muted
+        // gray the box uses for its metadata). See the module docs for the
+        // redraw pump and cache bypass that keep it animating.
         SubAgentStatus::Running => {
-            // Modulo the frame count so the index is bounded and fits usize.
-            let n = u64::try_from(SPINNER_FRAMES.len()).unwrap_or(u64::MAX);
-            let idx = usize::try_from(entry.activity_ticks % n).unwrap_or(0);
-            span(SPINNER_FRAMES[idx].into(), styles.dim)
+            span(spinner_frame(entry.started_at.elapsed()).into(), styles.dim)
         }
         SubAgentStatus::Done => span("✓".into(), styles.success),
         // A truncated run finished but its report is partial, and a failed
@@ -105,39 +145,40 @@ pub(crate) fn build_subagent_box(
     // report, folded. An empty report is a real, accepted case (a
     // sub-agent that concluded on a tool call), and renders a thin
     // title-only box.
-    let (body, body_softwrap) = match entry.status {
+    let body = match entry.status {
         SubAgentStatus::Running => match entry.latest_activity.as_deref() {
             Some(activity) if !activity.is_empty() => {
-                (vec![span(activity.into(), styles.dim)], false)
+                BoxBody::Activity(vec![span(activity.into(), styles.dim)])
             }
-            _ => (Vec::new(), false),
+            _ => BoxBody::Empty,
         },
         SubAgentStatus::Done | SubAgentStatus::Truncated | SubAgentStatus::Failed => {
             match entry.report.as_deref() {
-                Some(report) if !report.is_empty() => (report_body(report, expanded, styles), true),
-                _ => (Vec::new(), true),
+                Some(report) if !report.is_empty() => {
+                    report_body(report, expanded, syntax_highlight, styles)
+                }
+                _ => BoxBody::Empty,
             }
         }
     };
     SubAgentBox {
         title,
         body,
-        body_softwrap,
         bg: styles.tool_pending_bg,
     }
 }
 
-/// Build the done-report body spans. Collapsed, the report folds to its
-/// first [`REPORT_COLLAPSED_LINES`] source lines plus a `… (N more
-/// lines, <key> to expand)` hint, matching how tool cells fold long
-/// output. Expanded shows the whole report. Newlines are hard breaks;
-/// the retained lines still soft-wrap at draw.
-fn report_body(report: &str, expanded: bool, styles: &TranscriptStyles) -> Vec<TextSpan> {
-    let span = |text: String, style: Style| TextSpan {
-        text,
-        style,
-        ..TextSpan::default()
-    };
+/// Build the concluded-report body. Collapsed, the report folds to its first
+/// [`REPORT_COLLAPSED_LINES`] source lines plus a `… (N more lines, <key> to
+/// expand)` hint, matching how tool cells fold long output. Expanded shows the
+/// whole report. The retained source renders as markdown, so the report reads
+/// like assistant prose in the transcript.
+fn report_body(
+    report: &str,
+    expanded: bool,
+    syntax_highlight: bool,
+    styles: &TranscriptStyles,
+) -> BoxBody {
     // Sanitize before splitting so control bytes and escapes leave both the
     // rendered content and the source-line count, matching how tool cells
     // process their bodies. A bare carriage return would otherwise underflow
@@ -149,6 +190,9 @@ fn report_body(report: &str, expanded: bool, styles: &TranscriptStyles) -> Vec<T
     if lines.last().is_some_and(|l| l.is_empty()) {
         lines.pop();
     }
+    // Fold by source line, before markdown rendering, so the hidden count and
+    // the fold match how tool output folds. Markdown then reflows the retained
+    // lines at draw width.
     let hidden = if expanded {
         0
     } else {
@@ -157,14 +201,25 @@ fn report_body(report: &str, expanded: bool, styles: &TranscriptStyles) -> Vec<T
     if hidden > 0 {
         lines.truncate(REPORT_COLLAPSED_LINES);
     }
-    // The retained lines are one text span (embedded `\n` are hard
-    // breaks); the hint is its own dim line below them.
-    let mut spans = vec![span(lines.join("\n"), styles.text)];
-    if hidden > 0 {
-        spans.push(span("\n".into(), styles.text));
-        spans.push(span(expand_hint(hidden, HintKind::More), styles.dim));
+    let segment = MarkdownSegment {
+        text: lines.join("\n"),
+        opts: RenderOpts {
+            hyperlinks: styles.hyperlinks,
+            default_emphasis: Emphasis::default(),
+            syntax_highlight,
+        },
+        base_style: styles.text,
+    };
+    let hint = (hidden > 0).then(|| TextSpan {
+        text: expand_hint(hidden, HintKind::More),
+        style: styles.dim,
+        ..TextSpan::default()
+    });
+    BoxBody::Report {
+        segments: vec![segment],
+        markdown: styles.markdown,
+        hint,
     }
-    spans
 }
 
 /// Composite a surface tree (buffer plus children by z-order) into a
@@ -206,17 +261,39 @@ pub(crate) fn surface_rows(surface: &Surface) -> Vec<Vec<Cell>> {
 }
 
 impl SubAgentBox {
-    /// Draw the body spans at `inner_ctx`'s width. The report wraps
-    /// across rows; a running activity line stays on one row and clips
-    /// with an ellipsis. Empty body draws no rows.
+    /// Draw the body at `inner_ctx`'s width. A running activity line stays on
+    /// one row and clips with an ellipsis; a concluded report renders as
+    /// pre-wrapped markdown rows plus its optional fold hint. Empty body draws
+    /// no rows.
     fn body_rows(&self, inner_ctx: &DrawContext) -> Vec<Vec<Cell>> {
-        if self.body.is_empty() {
-            return Vec::new();
+        match &self.body {
+            BoxBody::Empty => Vec::new(),
+            BoxBody::Activity(spans) => {
+                let mut text = RichText::new(spans.clone());
+                text.softwrap = false;
+                text.overflow = Overflow::Ellipsis;
+                surface_rows(&text.draw(inner_ctx))
+            }
+            BoxBody::Report {
+                segments,
+                markdown,
+                hint,
+            } => {
+                let width = inner_ctx.max.width.unwrap_or(inner_ctx.min.width);
+                let mut rows = surface_rows(&draw_markdown_segments(
+                    inner_ctx, segments, markdown, width,
+                ));
+                // The fold hint is a plain dim line below the report, clipped
+                // to one row like the activity line.
+                if let Some(hint) = hint {
+                    let mut text = RichText::new(vec![hint.clone()]);
+                    text.softwrap = false;
+                    text.overflow = Overflow::Ellipsis;
+                    rows.extend(surface_rows(&text.draw(inner_ctx)));
+                }
+                rows
+            }
         }
-        let mut text = RichText::new(self.body.clone());
-        text.softwrap = self.body_softwrap;
-        text.overflow = Overflow::Ellipsis;
-        surface_rows(&text.draw(inner_ctx))
     }
 
     /// Draw the title spans as a single ellipsis-truncated row at the
@@ -269,7 +346,15 @@ impl Widget for SubAgentBox {
         );
 
         let mut content = self.title_rows(&inner_ctx);
-        content.extend(self.body_rows(&inner_ctx));
+        let body = self.body_rows(&inner_ctx);
+        if !body.is_empty() {
+            // A blank row separates the header from the body, so the activity
+            // line or report doesn't sit flush under the title. An empty
+            // `Vec<Cell>` row renders as a tinted blank line (the bubble tint
+            // is pre-painted and untouched `default` cells are skipped below).
+            content.push(Vec::new());
+            content.extend(body);
+        }
 
         if !bubble {
             return Self::draw_plain(content, width);
@@ -500,7 +585,7 @@ mod tests {
 
     fn draw_box_with(chat: &ChatState, width: u16, expanded: bool) -> Surface {
         let s = styles();
-        let mut b = build_subagent_box(box_entry(chat), expanded, &s);
+        let mut b = build_subagent_box(box_entry(chat), expanded, false, &s);
         b.draw(&draw_ctx(width, None))
     }
 
@@ -508,10 +593,26 @@ mod tests {
         draw_box_with(chat, width, false)
     }
 
-    /// The spinner frame a `Running` box shows for the given activity count.
-    fn frame_for(ticks: u64) -> &'static str {
-        let n = u64::try_from(SPINNER_FRAMES.len()).unwrap_or(u64::MAX);
-        SPINNER_FRAMES[usize::try_from(ticks % n).unwrap_or(0)]
+    #[test]
+    fn spinner_frame_advances_with_elapsed_time() {
+        // Frame index is `elapsed / interval % frames`, like the status loader.
+        let ms = |n: u64| Duration::from_millis(n);
+        assert_eq!(spinner_frame(Duration::ZERO), SPINNER_FRAMES[0]);
+        assert_eq!(spinner_frame(ms(80)), SPINNER_FRAMES[1]);
+        assert_eq!(spinner_frame(ms(80 * 3 + 10)), SPINNER_FRAMES[3]);
+        // Wraps around the frame set.
+        assert_eq!(spinner_frame(ms(80 * 10)), SPINNER_FRAMES[0]);
+    }
+
+    /// The box spinner shares the status loader's cadence (the spec wants them
+    /// to advance at the same rate). The frame sets are deliberate local
+    /// copies, but the interval must not silently diverge.
+    #[test]
+    fn spinner_cadence_matches_the_status_loader() {
+        assert_eq!(
+            SPINNER_INTERVAL_MS,
+            u128::from(crate::status::FRAME_INTERVAL_MS),
+        );
     }
 
     #[test]
@@ -525,10 +626,11 @@ mod tests {
         let r = rows(&surface);
 
         // Frame: bg-painted blank pads around the content, untinted
-        // spacer at the bottom.
+        // spacer at the bottom. A blank row separates the header from the body.
         assert_eq!(r[0], "", "top pad row is blank");
         assert_eq!(r[1], " ✓ agent 0 · check the build setup");
-        assert_eq!(r[2], " all good", "the report is the body");
+        assert_eq!(r[2], "", "blank row separates header and body");
+        assert_eq!(r[3], " all good", "the report is the body");
         assert_eq!(r.last().unwrap(), "", "spacer row is blank");
 
         // Tint: every bubble row is the tool-pending gray, the trailing
@@ -578,11 +680,18 @@ mod tests {
         assert_eq!(entry.status, SubAgentStatus::Running);
         // The bash tool start is the sub's last live activity.
         assert_eq!(entry.latest_activity.as_deref(), Some("bash"));
-        let frame = frame_for(entry.activity_ticks);
 
         let r = rows(&draw_box(&chat, 60));
-        assert_eq!(r[1], format!(" {frame} agent 0 · check the build setup"));
-        assert_eq!(r[2], " bash", "the body is the latest-activity line");
+        // The title is `{spinner} agent {N} · {task}`; the glyph is a
+        // wall-clock frame, so we only assert it is one of the frame set.
+        assert!(r[1].ends_with("agent 0 · check the build setup"), "{r:?}");
+        let glyph = r[1].trim_start().chars().next().expect("glyph").to_string();
+        assert!(
+            SPINNER_FRAMES.contains(&glyph.as_str()),
+            "title glyph is a spinner frame: {r:?}",
+        );
+        assert_eq!(r[2], "", "blank row separates header and body");
+        assert_eq!(r[3], " bash", "the body is the latest-activity line");
     }
 
     #[test]
@@ -646,10 +755,10 @@ mod tests {
         let mut chat = chat();
         let mut life = AgentLifecycle::default();
         reduce_sub_run(&mut chat, &mut life);
-        // A report with more source lines than the collapsed cap, each short
-        // enough not to wrap at this width, so the fold is by source line.
+        // One short token per source line, so the fold counts source lines
+        // and each token stays intact after markdown reflows the paragraph.
         let report = (1..=15)
-            .map(|i| format!("line {i}"))
+            .map(|i| format!("row{i:02}"))
             .collect::<Vec<_>>()
             .join("\n");
         let _ = reduce(
@@ -674,12 +783,9 @@ mod tests {
         // Collapsed: the first REPORT_COLLAPSED_LINES lines plus a fold hint,
         // the rest hidden.
         let collapsed = rows(&draw_box(&chat, 60)).join("\n");
+        assert!(collapsed.contains("row10"), "head line shown: {collapsed}");
         assert!(
-            collapsed.contains("line 10"),
-            "head line shown: {collapsed}"
-        );
-        assert!(
-            !collapsed.contains("line 11"),
+            !collapsed.contains("row11"),
             "folded line hidden: {collapsed}",
         );
         assert!(
@@ -689,7 +795,7 @@ mod tests {
 
         // Expanded: the whole report, no fold hint.
         let expanded = rows(&draw_box_with(&chat, 60, true)).join("\n");
-        assert!(expanded.contains("line 15"), "tail line shown: {expanded}");
+        assert!(expanded.contains("row15"), "tail line shown: {expanded}");
         assert!(!expanded.contains("more lines"), "no fold hint: {expanded}");
     }
 
@@ -698,13 +804,13 @@ mod tests {
         let mut chat = chat();
         let mut life = AgentLifecycle::default();
         let report = (1..=REPORT_COLLAPSED_LINES)
-            .map(|i| format!("line {i}"))
+            .map(|i| format!("row{i:02}"))
             .collect::<Vec<_>>()
             .join("\n");
         finish_with_report(&mut chat, &mut life, &report);
         let collapsed = rows(&draw_box(&chat, 60)).join("\n");
         assert!(
-            collapsed.contains(&format!("line {REPORT_COLLAPSED_LINES}")),
+            collapsed.contains(&format!("row{REPORT_COLLAPSED_LINES:02}")),
             "the cap-th line shows: {collapsed}",
         );
         assert!(
@@ -767,6 +873,38 @@ mod tests {
     }
 
     #[test]
+    fn report_renders_as_markdown_not_plain_text() {
+        // The report goes through the shared markdown renderer, so inline
+        // markup is parsed (its markers consumed and the text styled) rather
+        // than shown literally. A plain-text render would keep the `**` and
+        // backticks and never set the bold bit.
+        let mut chat = chat();
+        let mut life = AgentLifecycle::default();
+        finish_with_report(&mut chat, &mut life, "**ZZZ** and `qqq`");
+        let surface = draw_box(&chat, 60);
+        let out = rows(&surface).join("\n");
+        assert!(!out.contains("**"), "bold markers consumed: {out:?}");
+        assert!(!out.contains('`'), "code markers consumed: {out:?}");
+        assert!(
+            out.contains("ZZZ") && out.contains("qqq"),
+            "the text itself is kept: {out:?}",
+        );
+        // The `ZZZ` span carries the bold emphasis bit, proving the markdown
+        // mapper ran (a plain-text render would leave it unset). Bold is a
+        // style flag, so this is theme-independent. `Z` and `q` don't appear
+        // in the title, so the first such cell is the body span.
+        let bold_cell = flatten(&surface)
+            .into_iter()
+            .flatten()
+            .find(|c| c.char.grapheme() == "Z")
+            .expect("a cell rendering the bold span");
+        assert!(
+            bold_cell.style.bold,
+            "the bold span is styled bold: {out:?}"
+        );
+    }
+
+    #[test]
     fn transcript_view_folds_the_box_and_expands_on_toggle() {
         use std::cell::RefCell;
         use std::rc::Rc;
@@ -776,7 +914,7 @@ mod tests {
         let mut chat = chat();
         let mut life = AgentLifecycle::default();
         let report = (1..=15)
-            .map(|i| format!("line {i}"))
+            .map(|i| format!("row{i:02}"))
             .collect::<Vec<_>>()
             .join("\n");
         finish_with_report(&mut chat, &mut life, &report);
@@ -805,7 +943,7 @@ mod tests {
             "folded through the view: {collapsed}",
         );
         assert!(
-            !collapsed.contains("line 15"),
+            !collapsed.contains("row15"),
             "the tail is hidden when collapsed: {collapsed}",
         );
 
@@ -814,7 +952,7 @@ mod tests {
         chat.borrow_mut().tools_expanded = true;
         let expanded = rows(&view.draw(&ctx)).join("\n");
         assert!(
-            expanded.contains("line 15"),
+            expanded.contains("row15"),
             "the tail shows when expanded: {expanded}",
         );
         assert!(
@@ -883,13 +1021,9 @@ mod tests {
             },
         );
         let width = 40;
-        let frame = frame_for(box_entry(&chat).activity_ticks);
         let surface = draw_box(&chat, width);
         let r = rows(&surface);
-        assert!(
-            r[1].starts_with(&format!(" {frame} agent 0 · Search")),
-            "{r:?}",
-        );
+        assert!(r[1].contains("agent 0 · Search"), "{r:?}");
         assert!(r[1].ends_with('…'), "truncated with ellipsis: {r:?}");
         assert!(
             !r[2].contains("transcript entry"),

@@ -154,7 +154,6 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
                 && let Some(b) = state.sub_box_mut(n)
             {
                 b.latest_activity = Some(tool.clone());
-                b.activity_ticks += 1;
             }
             append_tool_entry(state, agent_id, call_id, tool, args);
             Redraw(true)
@@ -361,7 +360,6 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
                                 finished_at: None,
                                 background,
                                 latest_activity: None,
-                                activity_ticks: 0,
                             }));
                     state.sub_boxes.insert(n, (parent, id));
                 }
@@ -695,7 +693,6 @@ fn reduce_assistant_end(
             b.latest_activity = Some(one_line(&conclusion));
         }
         b.report = Some(conclusion);
-        b.activity_ticks += 1;
         changed = true;
     }
     if let Some(line) = error_line {
@@ -1847,7 +1844,7 @@ mod tests {
     }
 
     #[test]
-    fn sub_activity_updates_latest_activity_and_ticks() {
+    fn sub_activity_updates_latest_activity() {
         let mut s = state();
         let mut life = AgentLifecycle::default();
         apply(
@@ -1857,12 +1854,10 @@ mod tests {
         );
         {
             let b = s.sub_box_mut(1).expect("box");
-            assert_eq!(b.activity_ticks, 0);
             assert_eq!(b.latest_activity, None);
         }
 
-        // A sub assistant conclusion sets the collapsed one-line activity and
-        // bumps the counter.
+        // A sub assistant conclusion sets the collapsed one-line activity.
         apply(
             &mut s,
             &mut life,
@@ -1871,14 +1866,12 @@ mod tests {
         {
             let b = s.sub_box_mut(1).expect("box");
             assert_eq!(b.latest_activity.as_deref(), Some("line one line two"));
-            assert_eq!(b.activity_ticks, 1);
         }
 
-        // A sub tool start sets the tool name and bumps the counter again.
+        // A sub tool start sets the tool name.
         apply(&mut s, &mut life, tool_start(AgentId::Sub(1), "c1", "grep"));
         let b = s.sub_box_mut(1).expect("box");
         assert_eq!(b.latest_activity.as_deref(), Some("grep"));
-        assert_eq!(b.activity_ticks, 2);
     }
 
     fn agent_row(s: &ChatState, id: AgentId) -> AgentEntry {

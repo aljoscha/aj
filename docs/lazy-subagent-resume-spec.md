@@ -87,20 +87,17 @@ introduces no transcript dependency and no lazy-load concern. It stays
 `None` on a resumed box, which is always `Done` and so shows its report
 instead.
 
-The running indicator advances on each sub-agent event, not on a
-wall-clock timer. A small per-box activity counter (a `u64` on
-`SubAgentEntry`) is bumped by the reducer on every live sub-agent event
-that updates the box, and the running glyph is chosen from a fixed
-frame set by `counter % frames`. This matters because when the user is
-viewing Main while a background sub-agent runs, there is no periodic
-redraw tick in the frontend today (the status loader's tick is armed
-only for the viewed agent). An event-driven counter needs no such tick:
-every sub-agent event already drives a redraw, and the glyph and
-latest-activity advance with it. A wall-clock animated spinner would
-additionally require arming a periodic tick while any sub-agent runs,
-which is extra machinery we deliberately avoid. Between events the glyph
-sits still, which is acceptable and mirrors the fact that nothing
-changed.
+The running indicator is a wall-clock spinner, matching the status
+loader's cadence, so it keeps animating between sub-agent events rather
+than freezing (a frozen glyph reads as stalled). Three pieces drive it.
+The glyph is picked from a fixed frame set by
+`started_at.elapsed() / interval % frames`. The status loader arms its
+redraw tick while any sub-agent runs, not only while the viewed agent is
+busy, so a background sub-agent viewed from Main still gets a periodic
+redraw. And a `Running` box bypasses the transcript render cache, so each
+redraw rebuilds it with a fresh frame. The reducer still updates the
+box's `latest_activity` line on live events, which the bypassing box
+picks up on its next rebuild.
 
 The box always shows the latest run's conclusion. Report is written by
 `SubAgentEnd` (initial run and replay), but a continuation or steering
@@ -264,19 +261,17 @@ hook sidesteps this, and keeps `drain_events` synchronous.
 the child transcript so the box re-renders when the child changes. With
 the box rendering from metadata, the fingerprint changes to hash the box
 entry's state: status, the report, the latest-activity string, and the
-activity counter that drives the running glyph. The report and activity
-strings are short, so the fingerprint hashes their full value rather
-than a length proxy, otherwise a same-length activity transition (for
-example `bash` to `grep`) would leave a stale line. The activity counter
-changes on every live sub-agent event, so a `Running` box re-renders
-(and its glyph advances) as work happens. Changing both
-transcript readers together is load-bearing: `build_subagent_box` and
-`subagent_fingerprint` are the only two readers of a sub-agent's
-transcript in the render path, and the box currently renders the child
-transcript, so a box left unchanged would render blank for a deferred
-`Done` sub-agent. A `Done` box no longer depends on the transcript at
-all. A `Running` box updates as its status, report, latest-activity, or
-activity counter change, which is what drives live redraws.
+background flag. The report and activity strings are short, so the
+fingerprint hashes their full value rather than a length proxy, otherwise
+a same-length activity transition (for example `bash` to `grep`) would
+leave a stale line. Changing both transcript readers together is
+load-bearing: `build_subagent_box` and `subagent_fingerprint` are the
+only two readers of a sub-agent's transcript in the render path, and the
+box currently renders the child transcript, so a box left unchanged would
+render blank for a deferred `Done` sub-agent. A `Done` box no longer
+depends on the transcript at all. A `Running` box bypasses this
+fingerprint cache entirely (its glyph animates on the wall-clock), so it
+rebuilds on every redraw and always reflects its latest metadata.
 
 ## Non-goals
 
@@ -292,10 +287,9 @@ activity counter change, which is what drives live redraws.
 - The old `aj` interactive TUI is out of scope and keeps its current
   eager behavior. It has its own event pump and sub-agent box and does
   not consume `aj-app`'s `reduce` / `ChatState`, so the shared `aj-app`
-  changes here (the `latest_activity` string and activity counter on
-  `SubAgentEntry`, the continuation-report refresh, and the new
-  `replay_deferring_subs` constructor) are additive for it and render
-  only in `aj-next`.
+  changes here (the `latest_activity` string on `SubAgentEntry`, the
+  continuation-report refresh, and the new `replay_deferring_subs`
+  constructor) are additive for it and render only in `aj-next`.
 - Print mode and HTML export are unaffected. Print uses full `replay`,
   export's body reads `ConversationLog::entries_in_order` directly and
   its title uses full `replay` (`derive_title`), so both still render
@@ -362,9 +356,9 @@ Observes it, which materializes its flushed history.
 - `src/aj-next/src/transcript.rs`: `subagent_fingerprint` keys on box
   metadata by full value.
 - `src/aj-app/src/chat/model.rs` and `reducer.rs`: the `latest_activity`
-  string and the activity counter on `SubAgentEntry`, their live update,
-  and the continuation `AgentEnd(Sub n)` report refresh. No change to
-  how transcripts are stored. These are consumed only by `aj-next`.
+  string on `SubAgentEntry`, its live update, and the continuation
+  `AgentEnd(Sub n)` report refresh. No change to how transcripts are
+  stored. These are consumed only by `aj-next`.
 
 ## Testing
 
@@ -452,13 +446,10 @@ sub-agent's size, then caches.
   final assistant text. If it turns out common, the report capture can
   be widened to a last-activity string (last tool label when no trailing
   prose), at the cost of a small change to what the report means.
-- The running indicator does not animate on a wall-clock while a
-  background sub-agent runs and Main is viewed, because there is no
-  periodic redraw tick in that state. It advances on each sub-agent
-  event instead. A wall-clock spinner is possible but needs a periodic
-  tick armed while any sub-agent runs plus a fingerprint phase, which is
-  more machinery than the win warrants. Flagged in case the static
-  between-events indicator reads as stalled.
+- The running indicator animates on a wall-clock even while a background
+  sub-agent runs and Main is viewed: the status loader arms its redraw
+  tick whenever any sub-agent runs, and a `Running` box bypasses the
+  render cache so each redraw rebuilds it with a fresh frame.
 - Resumed sub-agent runtime shows as roughly zero, because
   `started_at`/`finished_at` are stamped at reduce time and
   `SubAgentStart`/`SubAgentEnd` fire back to back on resume. This is
