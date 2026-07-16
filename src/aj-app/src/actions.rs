@@ -16,10 +16,11 @@
 //! widget's data, not part of the global action vocabulary.
 
 use crate::keybindings::{
-    ACTION_AGENT_PICKER, ACTION_CHAT_PAGE_DOWN, ACTION_CHAT_PAGE_UP, ACTION_CHAT_SCROLL_BOTTOM,
-    ACTION_CHAT_SCROLL_TOP, ACTION_CLIPBOARD_PASTE_IMAGE, ACTION_COPY_MESSAGE, ACTION_DEQUEUE,
-    ACTION_HISTORY_OPEN, ACTION_OVERLAY_CLOSE_ALL, ACTION_PALETTE_OPEN, ACTION_SUBMIT_STEERING,
-    ACTION_THINKING_TOGGLE, ACTION_TOOLS_EXPAND, ACTION_TRANSCRIPT_FOCUS, default_chord,
+    ACTION_AGENT_PICKER, ACTION_BRANCH_MESSAGE, ACTION_CHAT_PAGE_DOWN, ACTION_CHAT_PAGE_UP,
+    ACTION_CHAT_SCROLL_BOTTOM, ACTION_CHAT_SCROLL_TOP, ACTION_CLIPBOARD_PASTE_IMAGE,
+    ACTION_COPY_MESSAGE, ACTION_DEQUEUE, ACTION_HISTORY_OPEN, ACTION_OVERLAY_CLOSE_ALL,
+    ACTION_PALETTE_OPEN, ACTION_SUBMIT_STEERING, ACTION_THINKING_TOGGLE, ACTION_TOOLS_EXPAND,
+    ACTION_TRANSCRIPT_FOCUS, default_chord,
 };
 
 /// A global keymap action, the typed counterpart of the `aj.*` action-ID
@@ -69,6 +70,9 @@ pub enum AjAction {
     /// Copy the focused user message to the clipboard, live only in
     /// transcript-focus mode (`aj.transcript.copy_message`).
     CopyMessage,
+    /// Branch the conversation from the focused user message, live only in
+    /// transcript-focus mode (`aj.transcript.branch_message`).
+    BranchMessage,
     /// Cancel the viewed agent's running turn (the Ctrl+C ladder's first
     /// rung).
     CancelTurn,
@@ -272,6 +276,7 @@ pub fn default_global_bindings() -> Vec<GlobalBinding> {
         ),
         compiled(AjAction::TranscriptFocus, ACTION_TRANSCRIPT_FOCUS, Capture),
         compiled(AjAction::CopyMessage, ACTION_COPY_MESSAGE, Capture),
+        compiled(AjAction::BranchMessage, ACTION_BRANCH_MESSAGE, Capture),
     ]
 }
 

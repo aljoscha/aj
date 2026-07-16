@@ -994,6 +994,32 @@ impl ConversationLog {
         Ok(())
     }
 
+    /// Drain the buffered non-punctuation writes to disk, in append order.
+    ///
+    /// Non-punctuation entries (settings records, spawn roots) normally
+    /// buffer in memory until the next punctuation append flushes them
+    /// (see [`ConversationEntryKind::is_punctuation`]). Branch rebuilds
+    /// re-resume the log from disk, so any still-buffered entries would be
+    /// lost unless flushed first. This forces that flush.
+    ///
+    /// No-op when the log has never materialized a file (`file` is `None`):
+    /// forcing a file open here would defeat the abandoned-empty-session
+    /// property (a session that only ever buffered a system prompt leaves
+    /// nothing on disk). The buffered lines stay in memory in that case.
+    pub fn flush_pending(&mut self) -> Result<(), ConversationError> {
+        if self.file.is_none() || self.pending_writes.is_empty() {
+            return Ok(());
+        }
+        let queued: Vec<String> = self.pending_writes.drain(..).collect();
+        // The file is present (checked above), so write directly rather than
+        // through `ensure_open`, which would otherwise create one.
+        let file = self.file.as_mut().expect("file present, checked above");
+        for line in &queued {
+            file.write_all(format!("{line}\n").as_bytes())?;
+        }
+        Ok(())
+    }
+
     /// Total number of entries in the log (across all threads and branches).
     pub fn len(&self) -> usize {
         self.order.len()
@@ -1445,6 +1471,49 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(records.len(), 2);
         (persistence, session_id, records)
+    }
+
+    /// `flush_pending` drains buffered non-punctuation entries to disk so a
+    /// re-resume sees them, and is a no-op on an unmaterialized log (it must
+    /// not create a file, preserving the abandoned-empty-session property).
+    #[test]
+    fn flush_pending_persists_buffered_entries_and_noops_when_unmaterialized() {
+        let persistence = ConversationPersistence::new(fresh_sessions_dir());
+
+        // Unmaterialized log: only a buffered (non-punctuation) system prompt.
+        // Flushing must not create a file on disk.
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("prompt".to_string())
+            .expect("set system prompt");
+        let path = log.path().to_path_buf();
+        log.flush_pending()
+            .expect("flush is a no-op on an unmaterialized log");
+        assert!(
+            !path.exists(),
+            "flush must not materialize an abandoned session"
+        );
+
+        // Materialize with a punctuation entry, then buffer a settings entry
+        // and flush it explicitly.
+        {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(user_text("hi")).expect("add user message");
+        }
+        log.append_model_change(ThreadFilter::USER, "prov", "model")
+            .expect("buffer a model change");
+        let session_id = log.session_id().to_string();
+        log.flush_pending().expect("flush drains the buffer");
+        drop(log);
+
+        // The flushed settings entry is on disk after resume.
+        let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume log");
+        assert!(
+            resumed
+                .entries_in_order()
+                .iter()
+                .any(|e| matches!(e.entry, ConversationEntryKind::ModelChange { .. })),
+            "the flushed model change is on disk after resume"
+        );
     }
 
     #[test]

@@ -167,6 +167,15 @@ pub const ACTION_TRANSCRIPT_FOCUS: &str = "aj.transcript.focus";
 /// select-to-copy uses.
 pub const ACTION_COPY_MESSAGE: &str = "aj.transcript.copy_message";
 
+/// Action ID for the "branch from the focused message" chord.
+///
+/// Bound by default to `b`. Live only in transcript-focus mode, like
+/// [`ACTION_COPY_MESSAGE`]: the frontend gates it on the transcript being
+/// focused, so with the editor focused `b` types normally. Pressing it
+/// prefills the editor with the focused user message and arms a branch
+/// anchor; submitting rebuilds the session at that message's parent.
+pub const ACTION_BRANCH_MESSAGE: &str = "aj.transcript.branch_message";
+
 /// Action ID for the "clear the selected project override" chord in
 /// the project settings window.
 ///
@@ -270,6 +279,11 @@ pub const AJ_KEYBINDINGS: &[(&str, &str, &str)] = &[
         "Focus the transcript to step through past messages",
     ),
     (ACTION_COPY_MESSAGE, "y", "Copy the focused message"),
+    (
+        ACTION_BRANCH_MESSAGE,
+        "b",
+        "Branch from the focused message",
+    ),
     (
         ACTION_SETTINGS_CLEAR,
         "ctrl+x",

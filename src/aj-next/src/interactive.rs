@@ -53,6 +53,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use vaxis::cell::{Color, Style};
+use vaxis::key::{Key, Modifiers};
 use vaxis::tty::PosixTty;
 use vaxis::vaxis::{Options as VaxisOptions, Vaxis};
 use vaxis::vxfw::{
@@ -193,6 +194,7 @@ async fn build_world(
         }) => SessionSpec::Resume {
             session_id: id.clone(),
             entry: SessionEntry::Startup,
+            head: None,
         },
         Some(Command::Continue {
             session_id: None,
@@ -201,6 +203,7 @@ async fn build_world(
             Some(latest) => SessionSpec::Resume {
                 session_id: latest,
                 entry: SessionEntry::Startup,
+                head: None,
             },
             None => {
                 eprintln!("No latest conversation to resume; starting a fresh session.");
@@ -362,6 +365,15 @@ struct NextSession {
     /// [`install_next_session`]. See [`World::deferred_subs`].
     deferred_subs: HashSet<usize>,
     notices: Vec<String>,
+    /// Whether the requested build failed and this session is the
+    /// previous-session fallback. The branch flow reads it (with
+    /// `head_override_applied`) to decide whether auto-submitting the branch
+    /// prompt is safe.
+    fell_back: bool,
+    /// The build's head-override outcome, forwarded from
+    /// [`aj_app::session::MainAgentSeed`]. `None` when none was requested,
+    /// `Some(true)` when installed, `Some(false)` when stale.
+    head_override_applied: Option<bool>,
 }
 
 /// Build the session a new-session or resume request asks for, reusing the
@@ -377,9 +389,10 @@ async fn build_next_session(
     world: &World,
     spec: SessionSpec,
     previous_id: &str,
+    branch: bool,
 ) -> Result<NextSession> {
     let config = world.config.lock().expect("config mutex poisoned").clone();
-    let (mut core, seed, notice, is_fresh) = match SessionCore::build(
+    let (mut core, seed, notice, is_fresh, fell_back) = match SessionCore::build(
         &config,
         &world.run_config,
         &world.persistence,
@@ -387,21 +400,23 @@ async fn build_next_session(
         world.restore.as_ref(),
     ) {
         Ok((core, seed)) => {
-            let notice = switch_notice(&spec, &core.session_id);
+            let notice = switch_notice(&spec, &core.session_id, branch);
             (
                 core,
                 seed,
                 notice,
                 matches!(spec, SessionSpec::Create { .. }),
+                false,
             )
         }
         Err(err) => {
             // The requested build failed. Fall back to the session that
             // just ended so the user keeps a live world, and report why.
-            let failure = switch_failure_notice(&spec, &err);
+            let failure = switch_failure_notice(&spec, &err, branch);
             let fallback = SessionSpec::Resume {
                 session_id: previous_id.to_string(),
                 entry: SessionEntry::Switch,
+                head: None,
             };
             let (core, seed) = SessionCore::build(
                 &config,
@@ -411,9 +426,10 @@ async fn build_next_session(
                 world.restore.as_ref(),
             )?;
             // The fallback resumes an existing session, so it is never fresh.
-            (core, seed, failure, false)
+            (core, seed, failure, false, true)
         }
     };
+    let head_override_applied = seed.head_override_applied;
 
     // Seed a fresh chat from the built core, replaying a resumed session's
     // history through the same reducer the live events use. Replay never
@@ -464,11 +480,18 @@ async fn build_next_session(
         chat,
         deferred_subs,
         notices,
+        fell_back,
+        head_override_applied,
     })
 }
 
-/// Confirmation notice for a successful session change, matching aj.
-fn switch_notice(spec: &SessionSpec, session_id: &str) -> String {
+/// Confirmation notice for a successful session change, matching aj. A branch
+/// rebuild is a same-session resume, so it gets its own wording rather than
+/// "Switched to session {same id}".
+fn switch_notice(spec: &SessionSpec, session_id: &str, branch: bool) -> String {
+    if branch {
+        return "Branched the conversation from an earlier message.".to_string();
+    }
     match spec {
         SessionSpec::Create { .. } => format!("Started a fresh session ({session_id})."),
         SessionSpec::Resume { session_id, .. } => format!("Switched to session {session_id}."),
@@ -477,7 +500,10 @@ fn switch_notice(spec: &SessionSpec, session_id: &str) -> String {
 
 /// Failure notice when a requested session change couldn't be built (the
 /// host falls back to resuming the previous session), matching aj.
-fn switch_failure_notice(spec: &SessionSpec, err: &anyhow::Error) -> String {
+fn switch_failure_notice(spec: &SessionSpec, err: &anyhow::Error, branch: bool) -> String {
+    if branch {
+        return format!("Failed to branch the conversation: {err}");
+    }
     match spec {
         SessionSpec::Create { .. } => format!("Failed to start a fresh session: {err}"),
         SessionSpec::Resume { session_id, .. } => {
@@ -505,6 +531,11 @@ fn install_next_session(world: &mut World, shell: &Rc<RefCell<Shell>>, next: Nex
     // the frame between install and the next sync shows idle chrome.
     *world.status.borrow_mut() = StatusState::default();
     world.core = next.core;
+    // Clear any armed branch anchor: the shell and its slots survive session
+    // rebuilds, so without this a stale anchor could resolve against the new
+    // session's log (and with legacy 8-hex ids even hit a wrong entry). Covers
+    // every install path (New, Switch, and the branch rebuild itself).
+    shell.borrow().disarm_branch();
     // A session change is only requested with no turn in flight (the outer
     // loop shut the outgoing turns down, and the guard refuses mid-turn
     // requests), so this is already empty; clear defensively.
@@ -846,6 +877,78 @@ fn sync_status(world: &World) -> bool {
     next.animating()
 }
 
+/// Character budget for the branch-anchor footer preview, past which the
+/// prefilled message is truncated with an ellipsis.
+const BRANCH_PREVIEW_CHARS: usize = 40;
+
+/// An armed branch anchor: the user pressed `b` on a focused user message, the
+/// editor now holds that message, and a submit will rebuild the session at the
+/// message's parent. Lives in a shell slot (the parked-slot pattern) so the
+/// footer indicator reads it while the drive loop resolves it on submit.
+#[derive(Clone)]
+struct BranchAnchor {
+    /// The focused user message's stable id, resolved against the log on
+    /// submit to find the branch point (the message's parent).
+    message_id: String,
+    /// Whether a background-task-shutdown confirm is pending. The first armed
+    /// submit with live background work warns and sets this; a repeat submit
+    /// proceeds. Reset whenever the anchor is disarmed or re-armed.
+    confirm_pending: bool,
+}
+
+/// Arm a branch anchor: store the message id and the footer indicator preview,
+/// starting with no confirm pending. The two slots move in lockstep, so a set
+/// indicator is exactly "an anchor is armed".
+fn arm_branch(
+    anchor: &Rc<RefCell<Option<BranchAnchor>>>,
+    indicator: &Rc<RefCell<Option<String>>>,
+    message_id: String,
+    preview: String,
+) {
+    *anchor.borrow_mut() = Some(BranchAnchor {
+        message_id,
+        confirm_pending: false,
+    });
+    *indicator.borrow_mut() = Some(preview);
+}
+
+/// Clear both the branch-anchor resolution state and the footer indicator.
+fn clear_branch(
+    anchor: &Rc<RefCell<Option<BranchAnchor>>>,
+    indicator: &Rc<RefCell<Option<String>>>,
+) {
+    *anchor.borrow_mut() = None;
+    *indicator.borrow_mut() = None;
+}
+
+/// The footer indicator for an armed anchor: a label plus a one-line,
+/// truncated preview of the prefilled message, so the pending branch behavior
+/// is never a surprise.
+fn branch_indicator_text(message: &str) -> String {
+    let first_line = message
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    let chars: Vec<char> = first_line.chars().collect();
+    let preview = if chars.len() > BRANCH_PREVIEW_CHARS {
+        let mut s: String = chars[..BRANCH_PREVIEW_CHARS.saturating_sub(1)]
+            .iter()
+            .collect();
+        s.push('\u{2026}');
+        s
+    } else {
+        first_line.to_string()
+    };
+    format!("branching from message: {preview}")
+}
+
+/// The notice folded when a gesture incoherent with an armed branch anchor
+/// (steer, dequeue) is attempted: it points the user at Esc to cancel.
+fn branch_armed_notice(what: &str) -> String {
+    format!("Can't {what} while branching \u{2014} press Esc to cancel the branch first.")
+}
+
 /// Handle an editor submit: spawn a prompt turn on the viewed agent
 /// if it is idle, or queue the text as a follow-up while it is busy.
 ///
@@ -1128,10 +1231,26 @@ fn handle_host_action(world: &mut World, shell: &Rc<RefCell<Shell>>, action: AjA
             false
         }
         AjAction::Steer => {
+            // Steering is incoherent with an armed branch anchor: it would
+            // consume the branch prompt as steering for the branch being
+            // abandoned. Refuse and keep the anchor and editor text intact.
+            if shell.borrow().branch_anchor.borrow().is_some() {
+                fold_notice(world, &branch_armed_notice("steer"));
+                return true;
+            }
             handle_steer(world, shell);
             true
         }
-        AjAction::Dequeue => yank_pending_into_editor(world, shell),
+        AjAction::Dequeue => {
+            // Dequeueing is incoherent with an armed branch anchor: it would
+            // splice queued text into the prefilled branch prompt. Refuse and
+            // keep the anchor and editor text intact.
+            if shell.borrow().branch_anchor.borrow().is_some() {
+                fold_notice(world, &branch_armed_notice("dequeue a message"));
+                return true;
+            }
+            yank_pending_into_editor(world, shell)
+        }
         // Read the clipboard image to a tempfile and insert its path at the
         // editor cursor. Silent when there is no image, matching `aj`.
         AjAction::PasteImage => paste_clipboard_image(shell),
@@ -1160,6 +1279,7 @@ fn handle_host_action(world: &mut World, shell: &Rc<RefCell<Shell>>, action: AjA
         | AjAction::ChatScrollToBottom
         | AjAction::TranscriptFocus
         | AjAction::CopyMessage
+        | AjAction::BranchMessage
         | AjAction::Quit => false,
     }
 }
@@ -1171,6 +1291,142 @@ fn session_busy_notice(what: &str) -> String {
         "Can't {what} while a turn is running \u{2014} press {} to cancel it first.",
         fixed_keys::CTRL_C
     )
+}
+
+/// Where an armed branch anchor resolves against the log.
+enum BranchTarget {
+    /// The message resolved: rebuild on this head (the message's parent).
+    Head(String),
+    /// The message id is not in the log (a stale anchor, or a wrong-session
+    /// resolve that the install-time clear should have prevented).
+    Missing,
+    /// The message is the file root: there is nothing to branch from.
+    Root,
+}
+
+/// Resolve a branch anchor's message id to the new head by scanning the log's
+/// entries for it and taking its `parent_id`. Locks the log, so call with no
+/// turn in flight.
+async fn resolve_branch_head(world: &World, message_id: &str) -> BranchTarget {
+    let log = world.core.log.lock().await;
+    match log
+        .entries_in_order()
+        .into_iter()
+        .find(|e| e.id == message_id)
+    {
+        None => BranchTarget::Missing,
+        Some(entry) => match &entry.parent_id {
+            None => BranchTarget::Root,
+            Some(parent) => BranchTarget::Head(parent.clone()),
+        },
+    }
+}
+
+/// The outcome of a submit made while a branch anchor is armed.
+enum ArmedSubmit {
+    /// Stay in the current session: the submit was refused (empty, mid-turn,
+    /// or a pending background-task confirm) or the resolution failed (missing
+    /// / root). The anchor and any needed notice are handled inside; the
+    /// caller only redraws.
+    Stay,
+    /// Resolved: break the drive loop and rebuild the session onto `head`,
+    /// running `prompt` as the branch's first turn.
+    Branch { head: String, prompt: String },
+}
+
+/// Decide what an armed-anchor submit does. Called at the drive-loop submit
+/// site only when an anchor is armed (the prompt has already been recorded to
+/// history by the caller, so it survives a failed branch).
+///
+/// Refusals keep the anchor and restore the editor text (submit clears the
+/// editor). Arming is always allowed; only the submit is gated here.
+async fn submit_with_armed_anchor(
+    world: &mut World,
+    shell: &Rc<RefCell<Shell>>,
+    text: String,
+) -> ArmedSubmit {
+    // Empty (post-trim): refuse and keep the anchor. The head must not move
+    // for a prompt that would be dropped. The editor is already empty, so
+    // there is nothing to restore.
+    if text.trim().is_empty() {
+        fold_notice(world, "Type a message to branch, or press Esc to cancel.");
+        return ArmedSubmit::Stay;
+    }
+    // Mid-turn: refuse and keep the anchor and text (the same global busy
+    // check the session-changing commands use). Restore the text the submit
+    // cleared so the user keeps it.
+    if !world.turns.is_empty() {
+        shell.borrow().editor.borrow_mut().set_text(&text);
+        fold_notice(world, &session_busy_notice("branch from a message"));
+        return ArmedSubmit::Stay;
+    }
+    // Background tasks: two-step confirm. The rebuild's shutdown would kill
+    // detached bash tasks and background sub-agents silently, surprising for a
+    // gesture the user reads as "edit and resend", so warn once and require a
+    // repeat submit to confirm.
+    let (agents, tasks) =
+        running_work_counts(world.turns.len(), &world.core.task_registry.snapshot());
+    if agents + tasks > 0 {
+        let confirm_pending = shell
+            .borrow()
+            .branch_anchor
+            .borrow()
+            .as_ref()
+            .is_some_and(|a| a.confirm_pending);
+        if !confirm_pending {
+            if let Some(anchor) = shell.borrow().branch_anchor.borrow_mut().as_mut() {
+                anchor.confirm_pending = true;
+            }
+            shell.borrow().editor.borrow_mut().set_text(&text);
+            let work = running_work_summary(agents, tasks).unwrap_or_else(|| "work".to_string());
+            fold_warning(
+                world,
+                &format!("Branching will stop background {work}. Submit again to confirm."),
+            );
+            return ArmedSubmit::Stay;
+        }
+    }
+    // Resolve the anchor against the log.
+    let message_id = shell
+        .borrow()
+        .branch_anchor
+        .borrow()
+        .as_ref()
+        .map(|a| a.message_id.clone());
+    let Some(message_id) = message_id else {
+        // No anchor: the caller gates on `is_some`, so this is unreachable in
+        // practice. Treat it as a plain submit rather than panicking.
+        handle_submit(world, text);
+        return ArmedSubmit::Stay;
+    };
+    match resolve_branch_head(world, &message_id).await {
+        BranchTarget::Missing => {
+            shell.borrow().disarm_branch();
+            fold_notice(
+                world,
+                "Can't branch: that message is no longer in this session.",
+            );
+            ArmedSubmit::Stay
+        }
+        BranchTarget::Root => {
+            shell.borrow().disarm_branch();
+            fold_notice(world, "Can't branch at the first message.");
+            ArmedSubmit::Stay
+        }
+        BranchTarget::Head(head) => {
+            shell.borrow().disarm_branch();
+            ArmedSubmit::Branch { head, prompt: text }
+        }
+    }
+}
+
+/// The prompt-safety invariant for the branch flow: auto-submit the branch
+/// prompt only when the rebuild landed on the intended head, i.e. the build
+/// did not fall back to the previous session AND the head override resolved
+/// and was installed. Any other outcome restores the prompt into the editor
+/// instead, never submitting it against the wrong head.
+fn branch_prompt_should_submit(fell_back: bool, head_override_applied: Option<bool>) -> bool {
+    !fell_back && head_override_applied == Some(true)
 }
 
 /// Write rendered session HTML to `~/.aj/exports/aj-session-<id>.html`,
@@ -2820,6 +3076,19 @@ struct Shell {
     /// drained by the drive loop (which owns the credential store and the
     /// login task machinery).
     auth_request: Rc<RefCell<Option<AuthPickerRequest>>>,
+    /// The armed branch anchor, `Some` while the user is composing a branch
+    /// (after `b`). The `on_action` handler arms it, the drive loop resolves
+    /// it on submit, and any session install clears it so a stale anchor can't
+    /// resolve against a different session's log.
+    branch_anchor: Rc<RefCell<Option<BranchAnchor>>>,
+    /// The footer's branch indicator, in lockstep with `branch_anchor`: the
+    /// short "branching from message" preview shown while armed, `None`
+    /// otherwise. Shared with the [`FooterLine`], which reads it at draw.
+    branch_indicator: Rc<RefCell<Option<String>>>,
+    /// Set by the Esc handler when it cancels an armed anchor, so the drive
+    /// loop folds the cancel notice (the Shell can't reach the chat model's
+    /// lifecycle). A plain flag, drained once per input event.
+    branch_cancelled: Rc<Cell<bool>>,
 }
 
 impl Shell {
@@ -2875,6 +3144,14 @@ impl Shell {
         // the drive loop to schedule the toast's dismissal. Created here so
         // all three see the same cell.
         let copied: Rc<Cell<Option<Copied>>> = Rc::new(Cell::new(None));
+        // Branch-anchor slots, following the parked-slot pattern: `on_action`
+        // arms them on `b`, the drive loop resolves them on submit, the footer
+        // reads the indicator at draw, and the Esc handler flips
+        // `branch_cancelled` so the drive loop folds the cancel notice. Created
+        // here so the closures and the footer all share the same cells.
+        let branch_anchor: Rc<RefCell<Option<BranchAnchor>>> = Rc::new(RefCell::new(None));
+        let branch_indicator: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let branch_cancelled: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         // Resolve the initial styles and chrome from a single snapshot of
         // the theme, then keep the handle for the runtime re-style path.
         let (styles, transcript, chrome) = {
@@ -2926,6 +3203,7 @@ impl Shell {
             status,
             Rc::clone(&styles),
             cwd_display,
+            Rc::clone(&branch_indicator),
         )));
         // The empty-state splash and the transcript share the chat slot. The
         // `ChatSlot` wrapper draws whichever fits the current state, so the
@@ -2991,6 +3269,9 @@ impl Shell {
             let settings_ui_for_actions = Rc::clone(&settings_ui);
             let transcript_for_actions = Rc::clone(&transcript);
             let transcript_widget: WidgetRef = to_widget_ref(Rc::clone(&transcript));
+            let editor_for_actions = Rc::clone(&editor);
+            let branch_anchor_for_actions = Rc::clone(&branch_anchor);
+            let branch_indicator_for_actions = Rc::clone(&branch_indicator);
             let action_slot = Rc::clone(&host_action);
             let theme_for_actions = theme.clone();
             Box::new(move |ctx, action| match action {
@@ -3074,6 +3355,33 @@ impl Shell {
                     // the mouse select-to-copy uses.
                     if let Some(text) = transcript_for_actions.borrow().focused_message_text() {
                         ctx.copy_to_clipboard(text);
+                    }
+                }
+                AjAction::BranchMessage => {
+                    // `focused_message_id` already gates on focus mode, the
+                    // cursor sitting on a user message, and the active view
+                    // being Main (a sub-agent user message is not a branch
+                    // point), so a `Some` here means the gesture is valid.
+                    // Inert otherwise.
+                    let transcript = transcript_for_actions.borrow();
+                    let anchor = transcript
+                        .focused_message_id()
+                        .zip(transcript.focused_message_text());
+                    drop(transcript);
+                    if let Some((message_id, text)) = anchor {
+                        // Prefill the editor with the message, arm the anchor,
+                        // and move focus to the editor. The focus move's
+                        // `FocusOut` exits transcript focus, matching the copy
+                        // shortcut's contract of overwriting the editor.
+                        editor_for_actions.borrow_mut().set_text(&text);
+                        arm_branch(
+                            &branch_anchor_for_actions,
+                            &branch_indicator_for_actions,
+                            message_id,
+                            branch_indicator_text(&text),
+                        );
+                        ctx.request_focus(Rc::clone(&editor_widget));
+                        ctx.redraw = true;
                     }
                 }
                 AjAction::CancelTurn
@@ -3162,12 +3470,26 @@ impl Shell {
             session_scan,
             session_request,
             auth_request,
+            branch_anchor,
+            branch_indicator,
+            branch_cancelled,
         }
     }
 
     /// Collect a submit parked by the editor callback, if any.
     fn take_submitted(&self) -> Option<String> {
         self.submitted.borrow_mut().take()
+    }
+
+    /// Clear the armed branch anchor and its footer indicator.
+    fn disarm_branch(&self) {
+        clear_branch(&self.branch_anchor, &self.branch_indicator);
+    }
+
+    /// Take the "an Esc cancelled the armed anchor" flag, so the drive loop
+    /// folds the cancel notice exactly once.
+    fn take_branch_cancelled(&self) -> bool {
+        self.branch_cancelled.replace(false)
     }
 
     /// Collect a keymap action parked for the host loop, if any.
@@ -3542,6 +3864,21 @@ impl Widget for Shell {
             // frame, so the title applies ahead of the initial paint.
             ctx.set_title(self.window_title.clone());
             ctx.redraw = true;
+            return;
+        }
+        // Esc cancels an armed branch anchor. This runs in the bubble phase at
+        // the root, so an open autocomplete popup (which consumes Esc at the
+        // editor target) is handled first, matching the established Esc
+        // priority: popup close before anchor cancel. The editor text stays
+        // (the user's to keep or clear); we only clear the anchor and flag the
+        // drive loop to fold the cancel notice.
+        if let Event::KeyPress(key) = event
+            && key.matches(Key::ESCAPE, Modifiers::empty())
+            && self.branch_anchor.borrow().is_some()
+        {
+            self.disarm_branch();
+            self.branch_cancelled.set(true);
+            ctx.consume_and_redraw();
         }
     }
 
@@ -3756,6 +4093,13 @@ pub async fn run(args: Args) -> Result<()> {
         aj_app::shutdown_background_tasks(&world.core.task_registry).await;
         world.turns.shutdown().await;
 
+        // A branch rebuild reuses the switch machinery but is a same-session
+        // resume with a head override plus an optional prompt to hand off. We
+        // track both across the match so the build and the post-install prompt
+        // handoff below can act on them.
+        let mut is_branch = false;
+        let mut branch_prompt: Option<String> = None;
+
         let spec = match exit {
             Ok(SessionExit::Quit) => break Ok(()),
             Err(fatal) => break Err(fatal),
@@ -3765,19 +4109,47 @@ pub async fn run(args: Args) -> Result<()> {
             Ok(SessionExit::Switch(session_id)) => SessionSpec::Resume {
                 session_id,
                 entry: SessionEntry::Switch,
+                head: None,
             },
+            Ok(SessionExit::Branch { head, prompt }) => {
+                // Flush the abandoned branch's buffered non-punctuation entries
+                // to disk before the re-resume: they belong to that branch and
+                // must survive the resume-from-disk (but must not follow the
+                // user to the new branch). Runs here, after turn and
+                // background-task shutdown, so a racing sub-agent shutdown
+                // append is included and not stranded (spec Part 4).
+                if let Err(err) = world.core.log.lock().await.flush_pending() {
+                    tracing::warn!(
+                        "failed to flush buffered log entries before branch rebuild: {err}"
+                    );
+                }
+                is_branch = true;
+                branch_prompt = prompt;
+                SessionSpec::Resume {
+                    session_id: world.core.session_id.clone(),
+                    entry: SessionEntry::Switch,
+                    head: Some(head),
+                }
+            }
         };
 
         // Snapshot the outgoing session's usage for the banner before we
         // rebuild over it. The replacement session's usage starts at zero,
         // so nothing is double-counted (including on the fallback path,
-        // which resumes the same session in a fresh world).
+        // which resumes the same session in a fresh world). A same-session
+        // branch rebuild must not push a duplicate banner entry for the id
+        // it is rebuilding onto, so we guard the push.
         let usage = world.core.usage_summary().await;
-        completed_sessions.push((world.core.session_id.clone(), usage));
+        if !is_branch {
+            completed_sessions.push((world.core.session_id.clone(), usage));
+        }
         let previous_id = world.core.session_id.clone();
 
-        match build_next_session(&world, spec, &previous_id).await {
+        match build_next_session(&world, spec, &previous_id, is_branch).await {
             Ok(next) => {
+                // Read the prompt-safety inputs before `install` consumes `next`.
+                let fell_back = next.fell_back;
+                let head_applied = next.head_override_applied;
                 install_next_session(&mut world, &shell, next);
                 // Retitle the terminal for the switched-to session. The switch
                 // ran off the loop with no event context, so we ride an app
@@ -3787,6 +4159,26 @@ pub async fn run(args: Args) -> Result<()> {
                     data: None,
                 });
                 app.request_redraw();
+                // Branch prompt handoff, under the prompt-safety invariant:
+                // auto-submit the branch prompt if and only if the rebuild
+                // landed on the intended session id AND applied the intended
+                // head (the build did not fall back and the override
+                // resolved). Otherwise restore the prompt verbatim into the
+                // editor with a notice, never submitting it. The prompt is
+                // already in prompt-history (recorded at the submit site), so
+                // it is never lost.
+                if let Some(prompt) = branch_prompt {
+                    if branch_prompt_should_submit(fell_back, head_applied) {
+                        auto_submit_launch(&mut world, vec![UserContent::text(prompt)]);
+                    } else {
+                        shell.borrow().editor.borrow_mut().set_text(&prompt);
+                        fold_notice(
+                            &mut world,
+                            "Branch failed; your message was restored to the editor.",
+                        );
+                    }
+                    app.request_redraw();
+                }
             }
             // Both the requested build and the fallback failed: no session
             // survived, so there is nothing to install. Break with the error
@@ -4159,7 +4551,10 @@ async fn drive(
                         if app.handle_input(event).quit {
                             break Ok(SessionExit::Quit);
                         }
-                        if let Some(text) = shell.borrow().take_submitted() {
+                        // Bind the submitted text out of the borrow first so
+                        // no `RefCell` ref is held across the await below.
+                        let submitted = shell.borrow().take_submitted();
+                        if let Some(text) = submitted {
                             // Record the submitted prompt into the editor's
                             // history ring, idle or busy (matching aj). The
                             // text is already trimmed by the editor's submit;
@@ -4167,9 +4562,35 @@ async fn drive(
                             // duplicate entry. In-session submissions stay the
                             // most-recent entries an Up press reaches, with the
                             // disk seed spliced in beneath (see
-                            // `spawn_prompt_history_bootstrap`).
+                            // `spawn_prompt_history_bootstrap`). Recording it
+                            // before the branch resolution below means the
+                            // prompt survives a failed branch.
                             shell.borrow().editor.borrow_mut().add_to_history(&text);
-                            handle_submit(world, text);
+                            // With a branch anchor armed, submit resolves the
+                            // branch instead of starting a turn: a refusal
+                            // stays in the session, a resolution breaks out
+                            // with `SessionExit::Branch`.
+                            let armed = shell.borrow().branch_anchor.borrow().is_some();
+                            if armed {
+                                match submit_with_armed_anchor(world, shell, text).await {
+                                    ArmedSubmit::Stay => app.request_redraw(),
+                                    ArmedSubmit::Branch { head, prompt } => {
+                                        break Ok(SessionExit::Branch {
+                                            head,
+                                            prompt: Some(prompt),
+                                        });
+                                    }
+                                }
+                            } else {
+                                handle_submit(world, text);
+                            }
+                        }
+                        // An Esc that cancelled an armed branch anchor: fold
+                        // the cancel notice (the Shell can't reach the chat
+                        // lifecycle) and redraw so the indicator clears.
+                        if shell.borrow().take_branch_cancelled() {
+                            fold_notice(world, "Branch cancelled.");
+                            app.request_redraw();
                         }
                         if let Some(action) = shell.borrow().take_host_action()
                             && handle_host_action(world, shell, action)
@@ -5529,6 +5950,7 @@ mod tests {
                 entry: SessionEntry::Switch,
             },
             &previous_id,
+            false,
         )
         .await
         .expect("build fresh next session");
@@ -5778,6 +6200,7 @@ mod tests {
                 entry: SessionEntry::Switch,
             },
             &previous_id,
+            false,
         )
         .await
         .expect("build fresh next session");
@@ -5796,8 +6219,10 @@ mod tests {
             SessionSpec::Resume {
                 session_id: resumable.clone(),
                 entry: SessionEntry::Switch,
+                head: None,
             },
             &previous_id,
+            false,
         )
         .await
         .expect("build resumed next session");
@@ -5815,8 +6240,10 @@ mod tests {
             SessionSpec::Resume {
                 session_id: "no-such-session".to_string(),
                 entry: SessionEntry::Switch,
+                head: None,
             },
             &resumable,
+            false,
         )
         .await
         .expect("the fallback resumes the previous session");
@@ -5834,6 +6261,7 @@ mod tests {
                 entry: SessionEntry::Switch,
             },
             &previous_id,
+            false,
         )
         .await
         .expect("build fresh next session");
@@ -9432,6 +9860,7 @@ mod tests {
                 entry: SessionEntry::Switch,
             },
             &previous_id,
+            false,
         )
         .await
         .expect("build fresh next session");
@@ -9965,8 +10394,10 @@ mod tests {
             SessionSpec::Resume {
                 session_id: beta.clone(),
                 entry: SessionEntry::Switch,
+                head: None,
             },
             &alpha_id,
+            false,
         )
         .await
         .expect("build beta");
@@ -10020,6 +10451,7 @@ mod tests {
                 entry: SessionEntry::Switch,
             },
             &prev,
+            false,
         )
         .await
         .expect("build fresh");
@@ -10039,5 +10471,348 @@ mod tests {
         assert_eq!(completed[1].0, beta);
         // Formatting the banner over the accumulated list must not panic.
         print_exit_banner(&world, &completed, true).await;
+    }
+
+    // --- Branch flow (Phase 3) ---
+
+    /// The footer branch indicator labels and truncates the prefilled message
+    /// to one line.
+    #[test]
+    fn branch_indicator_text_labels_and_truncates() {
+        let short = branch_indicator_text("hello world");
+        assert_eq!(short, "branching from message: hello world");
+        // A multi-line message collapses to its first non-empty line.
+        let multi = branch_indicator_text("\n  first line  \nsecond line");
+        assert_eq!(multi, "branching from message: first line");
+        // A long line is truncated with an ellipsis.
+        let long = branch_indicator_text(&"x".repeat(100));
+        assert!(long.ends_with('\u{2026}'), "truncated: {long}");
+        assert!(long.chars().count() < 100);
+    }
+
+    /// The prompt-safety invariant: auto-submit only on a clean rebuild (no
+    /// fallback and the head override installed); every other outcome restores.
+    #[test]
+    fn branch_prompt_submits_only_on_clean_head_apply() {
+        assert!(branch_prompt_should_submit(false, Some(true)));
+        assert!(
+            !branch_prompt_should_submit(true, Some(true)),
+            "a build fallback must not submit against the wrong head"
+        );
+        assert!(
+            !branch_prompt_should_submit(false, Some(false)),
+            "a stale head override must not submit"
+        );
+        assert!(
+            !branch_prompt_should_submit(false, None),
+            "no override requested is never a branch submit"
+        );
+    }
+
+    /// Arming sets the anchor and the footer indicator; re-arming replaces
+    /// both; disarming clears them.
+    #[tokio::test]
+    async fn arming_sets_indicator_and_rearm_replaces_and_disarm_clears() {
+        let dir = TempDir::new().expect("tempdir");
+        let (_world, shell) = world_and_shell(&dir, "streaming-text").await;
+        {
+            let sh = shell.borrow();
+            arm_branch(
+                &sh.branch_anchor,
+                &sh.branch_indicator,
+                "m1".to_string(),
+                branch_indicator_text("first message"),
+            );
+        }
+        assert_eq!(
+            shell
+                .borrow()
+                .branch_anchor
+                .borrow()
+                .as_ref()
+                .map(|a| a.message_id.clone()),
+            Some("m1".to_string())
+        );
+        // The footer renders the indicator.
+        let row = {
+            let sh = shell.borrow();
+            let surface = sh
+                .footer
+                .borrow_mut()
+                .draw(&crate::test_support::draw_ctx(120, None));
+            crate::test_support::rows(&surface).join("\n")
+        };
+        assert!(
+            row.contains("branching from message: first message"),
+            "footer shows the indicator: {row:?}"
+        );
+
+        // Re-arming replaces the anchor and indicator.
+        {
+            let sh = shell.borrow();
+            arm_branch(
+                &sh.branch_anchor,
+                &sh.branch_indicator,
+                "m2".to_string(),
+                branch_indicator_text("second message"),
+            );
+        }
+        assert_eq!(
+            shell
+                .borrow()
+                .branch_anchor
+                .borrow()
+                .as_ref()
+                .map(|a| a.message_id.clone()),
+            Some("m2".to_string())
+        );
+        assert_eq!(
+            shell.borrow().branch_indicator.borrow().clone(),
+            Some("branching from message: second message".to_string())
+        );
+
+        // Disarming clears both slots.
+        shell.borrow().disarm_branch();
+        assert!(shell.borrow().branch_anchor.borrow().is_none());
+        assert!(shell.borrow().branch_indicator.borrow().is_none());
+    }
+
+    /// Esc cancels an armed anchor: it clears the anchor and indicator, flags
+    /// the drive loop to fold the cancel notice, and consumes the key. The
+    /// editor text is left untouched (the user's to keep). The popup-first
+    /// priority is structural: the editor consumes Esc at the target phase
+    /// when its autocomplete popup is open, so this bubble-phase handler only
+    /// runs with the popup closed.
+    #[tokio::test]
+    async fn esc_cancels_the_armed_anchor() {
+        let dir = TempDir::new().expect("tempdir");
+        let (_world, shell) = world_and_shell(&dir, "streaming-text").await;
+        shell.borrow().editor.borrow_mut().set_text("kept draft");
+        {
+            let sh = shell.borrow();
+            arm_branch(
+                &sh.branch_anchor,
+                &sh.branch_indicator,
+                "m1".to_string(),
+                branch_indicator_text("kept draft"),
+            );
+        }
+        let mut ctx = EventContext::new();
+        shell.borrow_mut().handle_event(
+            &mut ctx,
+            &Event::KeyPress(Key {
+                codepoint: Key::ESCAPE,
+                mods: Modifiers::empty(),
+                ..Key::default()
+            }),
+        );
+        assert!(ctx.consume_event, "Esc is consumed");
+        assert!(
+            shell.borrow().branch_anchor.borrow().is_none(),
+            "anchor cleared"
+        );
+        assert!(
+            shell.borrow().branch_indicator.borrow().is_none(),
+            "indicator cleared"
+        );
+        assert!(
+            shell.borrow().take_branch_cancelled(),
+            "cancel flag set for the drive loop's notice"
+        );
+        assert_eq!(
+            shell.borrow().editor.borrow().text(),
+            "kept draft",
+            "the editor text stays after cancel"
+        );
+    }
+
+    /// Steer and dequeue are refused while a branch anchor is armed, keeping
+    /// the anchor and the editor draft intact (both are incoherent with a
+    /// pending branch).
+    #[tokio::test]
+    async fn steer_and_dequeue_refused_while_branch_armed() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        shell.borrow().editor.borrow_mut().set_text("branch draft");
+        {
+            let sh = shell.borrow();
+            arm_branch(
+                &sh.branch_anchor,
+                &sh.branch_indicator,
+                "m1".to_string(),
+                branch_indicator_text("branch draft"),
+            );
+        }
+        // Steer is refused: the editor keeps its draft and the anchor stays.
+        assert!(handle_host_action(&mut world, &shell, AjAction::Steer));
+        assert_eq!(shell.borrow().editor.borrow().text(), "branch draft");
+        assert!(shell.borrow().branch_anchor.borrow().is_some());
+        // Dequeue is refused the same way.
+        assert!(handle_host_action(&mut world, &shell, AjAction::Dequeue));
+        assert_eq!(shell.borrow().editor.borrow().text(), "branch draft");
+        assert!(shell.borrow().branch_anchor.borrow().is_some());
+    }
+
+    /// An empty (post-trim) submit while armed is refused and keeps the
+    /// anchor: the head must not move for a prompt that would be dropped.
+    #[tokio::test]
+    async fn empty_submit_refused_keeps_anchor() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        {
+            let sh = shell.borrow();
+            arm_branch(
+                &sh.branch_anchor,
+                &sh.branch_indicator,
+                "m1".to_string(),
+                branch_indicator_text("x"),
+            );
+        }
+        let outcome = submit_with_armed_anchor(&mut world, &shell, "   ".to_string()).await;
+        assert!(matches!(outcome, ArmedSubmit::Stay));
+        assert!(
+            shell.borrow().branch_anchor.borrow().is_some(),
+            "the anchor is kept on an empty submit"
+        );
+    }
+
+    /// A mid-turn submit while armed is refused, keeping the anchor and
+    /// restoring the editor text the submit cleared.
+    #[tokio::test]
+    async fn mid_turn_submit_refused_keeps_anchor_and_restores_text() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        // Start a turn so the world is busy.
+        handle_submit(&mut world, "first".to_string());
+        assert!(!world.turns.is_empty(), "a turn is in flight");
+        {
+            let sh = shell.borrow();
+            arm_branch(
+                &sh.branch_anchor,
+                &sh.branch_indicator,
+                "m1".to_string(),
+                branch_indicator_text("edited"),
+            );
+        }
+        let outcome = submit_with_armed_anchor(&mut world, &shell, "edited".to_string()).await;
+        assert!(matches!(outcome, ArmedSubmit::Stay));
+        assert!(
+            shell.borrow().branch_anchor.borrow().is_some(),
+            "the anchor is kept on a mid-turn submit"
+        );
+        assert_eq!(
+            shell.borrow().editor.borrow().text(),
+            "edited",
+            "the text is restored into the editor"
+        );
+
+        // Settle the turn so world teardown is clean.
+        cancel_viewed_turn(&world);
+        let joined = join_next_or_pending(&mut world.turns).await;
+        handle_turn_join(&mut world, joined).expect("abort is non-fatal");
+    }
+
+    /// Submitting with an anchor armed on a persisted user message resolves to
+    /// a branch exit whose head is that message's parent, carrying the edited
+    /// prompt. The anchor is disarmed on resolution.
+    #[tokio::test]
+    async fn armed_submit_branches_at_the_messages_parent() {
+        use aj_models::types::Message;
+        use aj_session::ConversationEntryKind;
+
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        persist_session(&mut world).await;
+
+        // The first user message on disk, plus its parent (a settings entry).
+        let (message_id, expected_head) = {
+            let log = world.core.log.lock().await;
+            let entry = log
+                .entries_in_order()
+                .into_iter()
+                .find(|e| {
+                    matches!(
+                        &e.entry,
+                        ConversationEntryKind::Message { message }
+                            if matches!(message.as_wire(), Some(Message::User(_)))
+                    )
+                })
+                .expect("a persisted user message");
+            (
+                entry.id.clone(),
+                entry
+                    .parent_id
+                    .clone()
+                    .expect("the user message has a parent"),
+            )
+        };
+        {
+            let sh = shell.borrow();
+            arm_branch(
+                &sh.branch_anchor,
+                &sh.branch_indicator,
+                message_id,
+                branch_indicator_text("persist me"),
+            );
+        }
+        match submit_with_armed_anchor(&mut world, &shell, "edited prompt".to_string()).await {
+            ArmedSubmit::Branch { head, prompt } => {
+                assert_eq!(head, expected_head, "branches at the message's parent");
+                assert_eq!(prompt, "edited prompt");
+            }
+            ArmedSubmit::Stay => panic!("expected a branch exit"),
+        }
+        assert!(
+            shell.borrow().branch_anchor.borrow().is_none(),
+            "the anchor is disarmed on resolution"
+        );
+    }
+
+    /// Submitting with an anchor armed on the file root (a user message with no
+    /// parent, as in an ancient file) is refused, and the anchor is disarmed.
+    #[tokio::test]
+    async fn armed_submit_refused_at_root_message() {
+        use aj_agent::message::AgentMessage;
+        use aj_models::types::{Message, UserMessage};
+        use aj_session::{ConversationEntryKind, ConversationLog, ThreadKind};
+
+        let dir = TempDir::new().expect("tempdir");
+        // Hand-build an ancient-file fixture: a single root user message with
+        // no system prompt and no seeded settings, so its `parent_id` is None.
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let (session_id, root_id) = {
+            let mut log = ConversationLog::create(&persistence).expect("create log");
+            let root_id = log
+                .append(
+                    None,
+                    ThreadKind::User,
+                    None,
+                    ConversationEntryKind::Message {
+                        message: AgentMessage::wire(Message::User(UserMessage::text("root"))),
+                    },
+                )
+                .expect("append the root user message");
+            (log.session_id().to_string(), root_id)
+        };
+        let mut world = resumed_world(&dir, "streaming-text", &session_id).await;
+        let shell = shell_for(&world);
+        {
+            let sh = shell.borrow();
+            arm_branch(
+                &sh.branch_anchor,
+                &sh.branch_indicator,
+                root_id,
+                branch_indicator_text("root"),
+            );
+        }
+        let outcome = submit_with_armed_anchor(&mut world, &shell, "edited".to_string()).await;
+        assert!(
+            matches!(outcome, ArmedSubmit::Stay),
+            "root branch is refused"
+        );
+        assert!(
+            shell.borrow().branch_anchor.borrow().is_none(),
+            "the anchor is disarmed on a root refusal"
+        );
     }
 }

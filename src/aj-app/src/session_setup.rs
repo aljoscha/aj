@@ -25,7 +25,7 @@ use aj_models::{
     verbosity_from_name, verbosity_name,
 };
 use aj_session::{
-    ConversationLog, ConversationPersistence, ThreadFilter, repair_interrupted_tool_uses,
+    ConversationLog, ConversationPersistence, EntryId, ThreadFilter, repair_interrupted_tool_uses,
 };
 use aj_tools::{BuiltinToolOptions, builtin_tools};
 use anyhow::{Context, Result};
@@ -387,7 +387,13 @@ pub fn build_agent(
 /// additionally carries the header-notice wording.
 pub enum SessionSource {
     Create,
-    Resume { session_id: String },
+    Resume {
+        session_id: String,
+        /// Optional user-thread head override, applied after resume and
+        /// before repair (see [`prepare_log`]). `None` keeps the log's
+        /// default head (`latest_leaf`).
+        head: Option<EntryId>,
+    },
 }
 
 impl SessionSource {
@@ -411,6 +417,12 @@ pub struct PreparedLog {
     /// restored, or why a recorded value was kept out). Empty unless
     /// resuming with a [`RestoreContext`].
     pub restore_notices: Vec<String>,
+    /// Outcome of a requested head override: `None` when none was
+    /// requested, `Some(true)` when the override was installed, and
+    /// `Some(false)` when it was stale and we fell back to the default
+    /// head. Lets the caller decide whether a branch prompt is safe to
+    /// auto-submit.
+    pub head_override_applied: Option<bool>,
 }
 
 /// Resolve the log for `source`, repair any interrupted tool uses, and
@@ -431,8 +443,30 @@ pub fn prepare_log(
     let mut log = match source {
         SessionSource::Create => ConversationLog::create(persistence)
             .context("failed to create a fresh conversation log")?,
-        SessionSource::Resume { session_id } => ConversationLog::resume(persistence, session_id)
-            .with_context(|| format!("failed to resume session {session_id}"))?,
+        SessionSource::Resume { session_id, .. } => {
+            ConversationLog::resume(persistence, session_id)
+                .with_context(|| format!("failed to resume session {session_id}"))?
+        }
+    };
+
+    // Install a requested head override before repair runs, so repair
+    // anchors its synthesized tool results at the branch path's tip, not at
+    // the abandoned tail's. A stale id (truncated file, hand-edited log)
+    // can't resolve, so we warn, keep the resume-initialized default head,
+    // and record that the override was not applied. The empty-log case
+    // (head `None`) never carries an override.
+    let head_override_applied = match source {
+        SessionSource::Resume { head: Some(h), .. } => match log.set_head(h.clone()) {
+            Ok(()) => Some(true),
+            Err(err) => {
+                tracing::warn!(
+                    "branch head override {h} could not be applied: {err}; \
+                     falling back to the default head"
+                );
+                Some(false)
+            }
+        },
+        _ => None,
     };
 
     let mut restore_notices = Vec::new();
@@ -474,6 +508,7 @@ pub fn prepare_log(
         log,
         transcript,
         restore_notices,
+        head_override_applied,
     })
 }
 
@@ -595,6 +630,102 @@ mod tests {
         assert_eq!(
             cfg.stream_options.session_id.as_deref(),
             Some(session_id.as_str())
+        );
+    }
+
+    /// Build a two-user-message session on `persistence` and return its id
+    /// plus the two message ids, in append order. The user thread is
+    /// `system_prompt -> m1 -> m2`.
+    fn two_message_session(
+        persistence: &ConversationPersistence,
+    ) -> (String, aj_session::EntryId, aj_session::EntryId) {
+        use aj_agent::message::AgentMessage;
+        use aj_models::types::{Message, UserMessage};
+        use aj_session::{ConversationEntryKind, ConversationLog, ThreadKind};
+
+        let mut log = ConversationLog::create(persistence).expect("create log");
+        let sp = log
+            .set_system_prompt("prompt".to_string())
+            .expect("system prompt");
+        let user = |text: &str| ConversationEntryKind::Message {
+            message: AgentMessage::wire(Message::User(UserMessage::text(text))),
+        };
+        let m1 = log
+            .append(Some(sp), ThreadKind::User, None, user("one"))
+            .expect("first user message");
+        let m2 = log
+            .append(Some(m1.clone()), ThreadKind::User, None, user("two"))
+            .expect("second user message");
+        (log.session_id().to_string(), m1, m2)
+    }
+
+    /// A valid head override rebuilds and repairs from the override point:
+    /// resuming at the first message linearizes only that message, and the
+    /// override is reported as applied.
+    #[test]
+    fn prepare_log_applies_a_valid_head_override() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let (session_id, m1, _m2) = two_message_session(&persistence);
+
+        let config = Config::default();
+        let args = Args::parse_from(["aj", "--scripted", "streaming-text"]);
+        let (run_config, _restore) =
+            build_initial_run_config(&args, &config, &empty_auth(&dir), None).expect("run config");
+        let run_config = Arc::new(StdMutex::new(run_config));
+
+        let prepared = prepare_log(
+            &persistence,
+            &SessionSource::Resume {
+                session_id,
+                head: Some(m1),
+            },
+            &config,
+            &run_config,
+            None,
+        )
+        .expect("prepare log");
+
+        assert_eq!(prepared.head_override_applied, Some(true));
+        assert_eq!(
+            prepared.transcript.len(),
+            1,
+            "the override linearizes only the branch path (the first message)"
+        );
+    }
+
+    /// A stale head override (an id not in the log) falls back to the default
+    /// head with a warning, reported via `head_override_applied == Some(false)`,
+    /// and the transcript then spans the full default path.
+    #[test]
+    fn prepare_log_falls_back_on_a_stale_head_override() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let (session_id, _m1, _m2) = two_message_session(&persistence);
+
+        let config = Config::default();
+        let args = Args::parse_from(["aj", "--scripted", "streaming-text"]);
+        let (run_config, _restore) =
+            build_initial_run_config(&args, &config, &empty_auth(&dir), None).expect("run config");
+        let run_config = Arc::new(StdMutex::new(run_config));
+
+        let prepared = prepare_log(
+            &persistence,
+            &SessionSource::Resume {
+                session_id,
+                head: Some("does-not-exist".to_string()),
+            },
+            &config,
+            &run_config,
+            None,
+        )
+        .expect("prepare log");
+
+        assert_eq!(prepared.head_override_applied, Some(false));
+        assert_eq!(
+            prepared.transcript.len(),
+            2,
+            "the fallback keeps the default head, spanning both messages"
         );
     }
 }

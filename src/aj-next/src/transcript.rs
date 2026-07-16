@@ -24,7 +24,9 @@ use aj_app::chat::{
     SubAgentEntry, SubAgentStatus, ToolEntry, ToolStatus, UserEntry,
 };
 use aj_app::footer::format_tokens;
-use aj_app::keybindings::{ACTION_COPY_MESSAGE, ACTION_THINKING_TOGGLE, default_action_shortcut};
+use aj_app::keybindings::{
+    ACTION_BRANCH_MESSAGE, ACTION_COPY_MESSAGE, ACTION_THINKING_TOGGLE, default_action_shortcut,
+};
 use aj_app::markdown::{Emphasis, RenderOpts};
 use aj_app::theme::{ColorMode, Theme, ThemeBg, ThemeColor, ThemeRgb, rgb_to_256};
 use aj_models::types::AssistantContent;
@@ -1016,23 +1018,30 @@ fn build_user_bubble(
     }
 }
 
-/// The pre-styled copy-key hint shown on the focused-message border's bottom
-/// edge, resolved through the keybinding data so the key is never a literal
-/// (Spec E section 2). The key renders in the accent color and the rest muted,
-/// the way an overlay styles the key hints in its chrome.
+/// The pre-styled shortcut hint shown on the focused-message border's bottom
+/// edge, resolved through the keybinding data so the keys are never literals
+/// (Spec E section 2). Each key renders in the accent color and the rest
+/// muted, the way an overlay styles the key hints in its chrome. Both the copy
+/// and branch shortcuts share the one line (`y to copy · b to branch`).
 fn copy_label_spans(styles: &TranscriptStyles) -> Vec<TextSpan> {
-    let key = default_action_shortcut(ACTION_COPY_MESSAGE).unwrap_or_default();
+    let copy_key = default_action_shortcut(ACTION_COPY_MESSAGE).unwrap_or_default();
+    let branch_key = default_action_shortcut(ACTION_BRANCH_MESSAGE).unwrap_or_default();
+    let key_span = |text: String| TextSpan {
+        text,
+        style: styles.accent,
+        ..TextSpan::default()
+    };
+    let dim_span = |text: &str| TextSpan {
+        text: text.into(),
+        style: styles.dim,
+        ..TextSpan::default()
+    };
     vec![
-        TextSpan {
-            text: key,
-            style: styles.accent,
-            ..TextSpan::default()
-        },
-        TextSpan {
-            text: " to copy".into(),
-            style: styles.dim,
-            ..TextSpan::default()
-        },
+        key_span(copy_key),
+        dim_span(" to copy"),
+        dim_span(" \u{b7} "),
+        key_span(branch_key),
+        dim_span(" to branch"),
     ]
 }
 
@@ -1966,6 +1975,31 @@ impl TranscriptView {
         let entry = chat.transcript(chat.active_view())?.entries().get(idx)?;
         match &entry.kind {
             EntryKind::User(user) => Some(user.joined_text()),
+            _ => None,
+        }
+    }
+
+    /// The stable message id of the focused user message, the branch anchor
+    /// for the `b` shortcut. Sibling of [`focused_message_text`].
+    ///
+    /// `Some` only when in focus mode, the cursor sits on an `EntryKind::User`
+    /// entry, and the active view is Main. A sub-agent user message is not a
+    /// branch point: its parent chain lives on a sub thread, so anchoring the
+    /// user-thread head there would splice the main conversation onto a
+    /// sub-agent thread. We gate the Main-view check here (rather than in the
+    /// caller) because `chat.active_view()` is already in hand.
+    pub(crate) fn focused_message_id(&self) -> Option<String> {
+        if !self.in_focus_mode() {
+            return None;
+        }
+        let chat = self.chat.borrow();
+        if chat.active_view() != AgentId::Main {
+            return None;
+        }
+        let idx = usize::try_from(self.list.borrow().cursor).ok()?;
+        let entry = chat.transcript(chat.active_view())?.entries().get(idx)?;
+        match &entry.kind {
+            EntryKind::User(user) => Some(user.message_id.clone()),
             _ => None,
         }
     }
@@ -3054,6 +3088,36 @@ mod tests {
                 .flatten()
                 .all(|c| c.char.grapheme() != "\u{250f}"),
             "the unfocused bubble draws no border",
+        );
+    }
+
+    /// The focus hint renders BOTH the copy and branch shortcuts, each resolved
+    /// from the shared keybinding data rather than a hardcoded letter.
+    #[test]
+    fn focus_hint_renders_both_copy_and_branch_shortcuts_from_binding_data() {
+        let user = UserEntry {
+            content: vec![UserContent::text("ciao?")],
+            collapsible: false,
+            message_id: String::new(),
+        };
+        let s = styles();
+        let label = copy_label_spans(&s);
+        // Wide enough that the whole hint fits on the border's bottom edge.
+        let ctx = crate::test_support::draw_ctx(60, None);
+        let bordered = build_user_bubble(&user, false, &s, Some(&label)).draw(&ctx);
+        let last_row = usize::from(bordered.size.height) - 2;
+        let row = crate::test_support::rows(&bordered)[last_row].clone();
+
+        let copy_key = default_action_shortcut(ACTION_COPY_MESSAGE).expect("copy chord bound");
+        let branch_key =
+            default_action_shortcut(ACTION_BRANCH_MESSAGE).expect("branch chord bound");
+        assert!(
+            row.contains(&format!("{copy_key} to copy")),
+            "copy shortcut on the hint line: {row:?}",
+        );
+        assert!(
+            row.contains(&format!("{branch_key} to branch")),
+            "branch shortcut on the hint line: {row:?}",
         );
     }
 

@@ -24,7 +24,7 @@ use aj_models::provider::Provider;
 use aj_models::registry::ModelInfo;
 use aj_models::types::{Speed, StreamOptions};
 use aj_models::{ThinkingConfig, speed_name, thinking_config_name, verbosity_name};
-use aj_session::{ConversationLog, ConversationPersistence, persistence_listener};
+use aj_session::{ConversationLog, ConversationPersistence, EntryId, persistence_listener};
 use anyhow::Result;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -59,6 +59,12 @@ pub enum SessionSpec {
     Resume {
         session_id: String,
         entry: SessionEntry,
+        /// Optional user-thread head to rebuild on, for branching and
+        /// tree-view switching. `None` means "use the log's default head"
+        /// (its `latest_leaf`), the plain-resume behavior. `None` never
+        /// means "branch to the file root": root branching is refused up
+        /// front, so every branch target here is a real entry id.
+        head: Option<EntryId>,
     },
 }
 
@@ -78,6 +84,14 @@ pub enum SessionExit {
     Switch(String),
     /// New session: rebuild onto a freshly minted session.
     New,
+    /// Branch the current session at an earlier user message: rebuild the
+    /// same session onto `head` (the branched-from message's parent) and,
+    /// when set, auto-submit `prompt` as the branch's first turn. `prompt`
+    /// is `None` for a tree-view switch, which only moves the head.
+    Branch {
+        head: EntryId,
+        prompt: Option<String>,
+    },
 }
 
 /// A session change requested by a command or selector. The session's
@@ -190,6 +204,13 @@ impl AgentLifecycle {
 pub struct MainAgentSeed {
     pub settings: AgentSettings,
     pub context_window: u64,
+    /// Outcome of a requested head override (branching / tree-view switch):
+    /// `None` when the build requested none (fresh session or plain resume),
+    /// `Some(true)` when the override resolved and was installed, `Some(false)`
+    /// when it was stale and the build fell back to the default head. The
+    /// branch flow reads this to decide whether auto-submitting the branch
+    /// prompt is safe (see the prompt-safety invariant in the run loop).
+    pub head_override_applied: Option<bool>,
 }
 
 /// Everything with session lifetime that a rendering backend does not
@@ -282,8 +303,11 @@ impl SessionCore {
     ) -> Result<(SessionCore, MainAgentSeed)> {
         let source = match spec {
             SessionSpec::Create { .. } => SessionSource::Create,
-            SessionSpec::Resume { session_id, .. } => SessionSource::Resume {
+            SessionSpec::Resume {
+                session_id, head, ..
+            } => SessionSource::Resume {
                 session_id: session_id.clone(),
+                head: head.clone(),
             },
         };
 
@@ -294,6 +318,7 @@ impl SessionCore {
             mut log,
             transcript,
             restore_notices,
+            head_override_applied,
         } = prepare_log(persistence, &source, config, run_config, restore)?;
 
         // Build a fresh agent off the run-config snapshot, which at this
@@ -376,6 +401,7 @@ impl SessionCore {
                 verbosity: verbosity_name(verbosity).to_string(),
             },
             context_window: agent.model_info().context_window,
+            head_override_applied,
         };
 
         let log = Arc::new(TokioMutex::new(log));

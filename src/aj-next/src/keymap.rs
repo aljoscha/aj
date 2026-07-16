@@ -238,8 +238,9 @@ pub(crate) fn build_keymap() -> Keymap<AjAction, HostCtx> {
             // editor's accept key with it up (see `focus_enabled`).
             AjAction::TranscriptFocus => focus_enabled,
             // The copy chord is live only while the transcript is focused (see
-            // `in_transcript_focus`), so `y` types normally in the editor.
-            AjAction::CopyMessage => in_transcript_focus,
+            // `in_transcript_focus`), so `y` types normally in the editor. The
+            // branch chord (`b`) rides the same gate for the same reason.
+            AjAction::CopyMessage | AjAction::BranchMessage => in_transcript_focus,
             _ => |_| true,
         };
         entries.push(
@@ -581,6 +582,30 @@ mod tests {
             keymap.match_single(&y, BindingPhase::Capture, &transcript_focused),
             Some(&AjAction::CopyMessage),
             "focus mode: y copies the focused message",
+        );
+    }
+
+    /// The branch chord (`b`) matches in the capture phase only while the
+    /// transcript-focus flag is set, mirroring the copy chord: with the editor
+    /// focused it declines, so `b` descends to the editor and types normally.
+    #[test]
+    fn branch_message_matches_on_b_only_in_transcript_focus() {
+        let keymap = build_keymap();
+        let b = key(u32::from('b'), Modifiers::empty());
+
+        let editor_focused = ctx(false);
+        assert_eq!(
+            keymap.match_single(&b, BindingPhase::Capture, &editor_focused),
+            None,
+            "not in focus mode: b is not captured and types in the editor",
+        );
+
+        let transcript_focused = ctx(false);
+        transcript_focused.focus_mode.set(true);
+        assert_eq!(
+            keymap.match_single(&b, BindingPhase::Capture, &transcript_focused),
+            Some(&AjAction::BranchMessage),
+            "focus mode: b branches from the focused message",
         );
     }
 

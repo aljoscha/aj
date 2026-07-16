@@ -250,14 +250,16 @@ mod tests {
         assert_eq!(
             header_notice(&SessionSpec::Resume {
                 session_id: "s".to_string(),
-                entry: SessionEntry::Startup
+                entry: SessionEntry::Startup,
+                head: None,
             }),
             "Resuming conversation"
         );
         assert_eq!(
             header_notice(&SessionSpec::Resume {
                 session_id: "s".to_string(),
-                entry: SessionEntry::Switch
+                entry: SessionEntry::Switch,
+                head: None,
             }),
             "Resumed conversation"
         );
@@ -530,6 +532,7 @@ mod tests {
                 SessionSpec::Resume {
                     session_id: session_id.clone(),
                     entry: SessionEntry::Startup,
+                    head: None,
                 },
                 "Resuming conversation",
             ),

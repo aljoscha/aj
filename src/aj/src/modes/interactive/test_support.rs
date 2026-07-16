@@ -92,6 +92,7 @@ pub(crate) fn resume_spec(session_id: &str) -> SessionSpec {
     SessionSpec::Resume {
         session_id: session_id.to_string(),
         entry: SessionEntry::Switch,
+        head: None,
     }
 }
 

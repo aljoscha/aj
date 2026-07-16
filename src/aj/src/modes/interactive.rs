@@ -322,6 +322,7 @@ impl InteractiveMode {
             }) => SessionSpec::Resume {
                 session_id: id,
                 entry: SessionEntry::Startup,
+                head: None,
             },
             Some(Command::Continue {
                 session_id: None,
@@ -330,6 +331,7 @@ impl InteractiveMode {
                 Some(latest) => SessionSpec::Resume {
                     session_id: latest,
                     entry: SessionEntry::Startup,
+                    head: None,
                 },
                 None => {
                     eprintln!("No latest conversation to resume; starting a fresh session.");
@@ -612,7 +614,15 @@ impl InteractiveMode {
                 Ok(SessionExit::Switch(session_id)) => SessionSpec::Resume {
                     session_id,
                     entry: SessionEntry::Switch,
+                    head: None,
                 },
+                // The `aj` frontend does not implement branching (it is an
+                // `aj-next`-only gesture), so its session loop never emits
+                // `Branch`. The variant is shared through `aj_app`, hence this
+                // arm exists only to keep the match total.
+                Ok(SessionExit::Branch { .. }) => {
+                    unreachable!("aj never emits SessionExit::Branch")
+                }
             };
 
             // Snapshot the outgoing world's usage for the shutdown
@@ -859,6 +869,7 @@ fn build_next_world(
             let fallback = SessionSpec::Resume {
                 session_id: previous_session_id.to_string(),
                 entry: SessionEntry::Switch,
+                head: None,
             };
             let mut world = SessionWorld::build(
                 config,
@@ -4907,7 +4918,8 @@ mod tests {
                 &next.spec,
                 SessionSpec::Resume {
                     session_id,
-                    entry: SessionEntry::Switch
+                    entry: SessionEntry::Switch,
+                    ..
                 } if *session_id == first_id
             ),
             "requested spec carried through for install"
@@ -4936,7 +4948,8 @@ mod tests {
                 &next.spec,
                 SessionSpec::Resume {
                     session_id,
-                    entry: SessionEntry::Switch
+                    entry: SessionEntry::Switch,
+                    ..
                 } if *session_id == previous_id
             ),
             "fallback spec carried through for install"
