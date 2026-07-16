@@ -2029,6 +2029,19 @@ impl TranscriptView {
             self.focus_last_user_message(ctx);
             ctx.consume_and_redraw();
         } else if key.matches(Key::ESCAPE, empty) {
+            // Leave focus at the live bottom: a clean resting position to hand
+            // back to the editor. Re-engage follow-tail so the next draw (out
+            // of focus mode by then, via the `FocusOut` the exit callback
+            // triggers) pins the viewport there, and drop any in-flight glide
+            // so it cannot fight the re-pin. Gated on having an exit callback:
+            // without one there is no `FocusOut` to leave the mode, so we must
+            // not strand `follow_tail` on inside focus mode. This lands the
+            // exit at the bottom only for Esc: an overlay stealing focus exits
+            // through `exit_focus_mode` alone and leaves the scroll where it was.
+            if self.on_exit_focus.is_some() {
+                self.cancel_scroll_anim();
+                self.follow_tail = true;
+            }
             if let Some(on_exit) = self.on_exit_focus.as_mut() {
                 on_exit(ctx);
             }
@@ -3967,6 +3980,93 @@ mod tests {
         view.handle_event(&mut ec, &key_press(Key::ESCAPE, Modifiers::empty()));
         assert_eq!(fired.get(), 1, "focused Esc fires the exit callback");
         assert!(ec.consume_event, "Esc is consumed");
+    }
+
+    /// Esc out of focus mode lands the viewport at the live bottom: it
+    /// re-engages follow-tail, and the exit's `FocusOut` then lets the next
+    /// draw pin the viewport there.
+    #[test]
+    fn esc_exit_lands_at_the_bottom() {
+        let chat = chat_with_user_messages(6);
+        let mut view = transcript_view(&chat);
+        view.set_on_exit_focus(Box::new(|_ctx| {}));
+        let ctx = draw_ctx(40, 8);
+        let _ = view.draw(&ctx);
+
+        // Enter focus and scroll up to the first user message.
+        view.handle_event(&mut EventContext::new(), &Event::FocusIn);
+        let _ = view.draw(&ctx);
+        view.scroll_to_top(&mut EventContext::new());
+        let _ = view.draw(&ctx);
+        assert!(!view.follow_tail, "focus mode keeps follow-tail off");
+        assert!(
+            !view.list.borrow().is_at_bottom(),
+            "scrolled up off the bottom"
+        );
+
+        // A glide is in flight (simulated: this non-Rc view can't arm one
+        // itself), so Esc must cancel it as well as re-engaging follow-tail.
+        view.scroll_anim = Some(ScrollAnim {
+            total: -20.0,
+            applied: 0.0,
+            completion: ScrollCompletion::Page,
+            start: Instant::now(),
+            duration: Duration::from_millis(100),
+        });
+
+        // Esc re-engages follow-tail and exits. The exit's FocusOut clears
+        // focus mode, and the next draw pins the viewport to the bottom.
+        view.handle_event(
+            &mut EventContext::new(),
+            &key_press(Key::ESCAPE, Modifiers::empty()),
+        );
+        assert!(view.follow_tail, "Esc re-engages follow-tail");
+        assert!(
+            view.scroll_anim.is_none(),
+            "Esc cancelled the in-flight glide"
+        );
+        view.handle_event(&mut EventContext::new(), &Event::FocusOut);
+        assert!(!view.in_focus_mode(), "exited focus mode");
+        let _ = view.draw(&ctx);
+        assert!(
+            view.list.borrow().is_at_bottom(),
+            "rests at the live bottom"
+        );
+    }
+
+    /// Losing focus without Esc (an overlay steals it, firing a bare
+    /// `FocusOut`) must NOT jump to the bottom: only Esc re-engages follow-tail,
+    /// so a scrolled-up transcript keeps its position under an overlay.
+    #[test]
+    fn overlay_steal_preserves_the_scroll_position() {
+        let chat = chat_with_user_messages(6);
+        let mut view = transcript_view(&chat);
+        view.set_on_exit_focus(Box::new(|_ctx| {}));
+        let ctx = draw_ctx(40, 8);
+        let _ = view.draw(&ctx);
+
+        view.handle_event(&mut EventContext::new(), &Event::FocusIn);
+        let _ = view.draw(&ctx);
+        view.scroll_to_top(&mut EventContext::new());
+        let _ = view.draw(&ctx);
+        assert!(
+            !view.list.borrow().is_at_bottom(),
+            "scrolled up off the bottom"
+        );
+
+        // A bare FocusOut (not the Esc chord) exits the mode but leaves
+        // follow-tail off, so the next draw keeps the scrolled-up position.
+        view.handle_event(&mut EventContext::new(), &Event::FocusOut);
+        assert!(!view.in_focus_mode(), "exited focus mode");
+        assert!(
+            !view.follow_tail,
+            "an overlay steal does not re-engage the tail"
+        );
+        let _ = view.draw(&ctx);
+        assert!(
+            !view.list.borrow().is_at_bottom(),
+            "scroll position preserved under the overlay"
+        );
     }
 
     /// Entering focus mode and navigating an empty transcript must not
