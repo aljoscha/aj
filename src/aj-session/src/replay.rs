@@ -194,6 +194,13 @@ struct Replay<'a> {
     /// [`replay_deferring_subs`]). Bracketing and report capture are
     /// unaffected.
     defer_subs: bool,
+    /// The entry ids to project: the active path from [`ConversationLog::head`]
+    /// plus the sub-agent threads anchored on it. Append-order entries
+    /// outside this set are skipped, so sibling branches on disk don't
+    /// interleave into the replayed stream. `None` disables filtering
+    /// (a log with no user-thread head), preserving the whole-file
+    /// behaviour.
+    included: Option<HashSet<String>>,
 }
 
 impl<'a> Replay<'a> {
@@ -213,8 +220,73 @@ impl<'a> Replay<'a> {
             pending: VecDeque::new(),
             finished: false,
             defer_subs,
+            included: included_entries(log),
         }
     }
+}
+
+/// Compute the set of entry ids replay should project: the active path
+/// walked back from [`ConversationLog::head`], plus every sub-agent
+/// thread whose first entry (in append order) anchors on that path.
+///
+/// Returns `None` when the log has no user-thread head, which disables
+/// filtering so a headless log replays in full as before.
+///
+/// Sub-agent threads are included whole or not at all. A thread anchors
+/// on the path when its first entry's `parent_id` is on the main path.
+/// We key on the first entry rather than a [`ConversationEntryKind::SubAgentSpawn`]
+/// root because legacy logs have sub threads without a spawn root that
+/// lead directly with the task user message; both shapes anchor their
+/// first entry at the spawning assistant on the user thread. No
+/// transitive closure is needed: a spawned agent has the `agent` tool
+/// removed, so sub threads always anchor on the user thread.
+fn included_entries(log: &ConversationLog) -> Option<HashSet<String>> {
+    let head = log.head()?;
+
+    // Main path: walk parent pointers from the head, collecting the
+    // head's user and meta ancestors (settings and system-prompt
+    // entries chain here too, so they stay included).
+    let mut included: HashSet<String> = HashSet::new();
+    let mut cursor = Some(head.clone());
+    while let Some(id) = cursor {
+        let Some(entry) = log.get(&id) else { break };
+        included.insert(id.clone());
+        cursor = entry.parent_id.clone();
+    }
+
+    // For each sub-agent thread, record its first entry's parent and
+    // collect all of its entry ids, both in append order.
+    let mut first_parent: HashMap<usize, Option<String>> = HashMap::new();
+    let mut sub_threads: HashMap<usize, Vec<String>> = HashMap::new();
+    for entry in log.entries_in_order() {
+        if entry.thread != ThreadKind::Subagent {
+            continue;
+        }
+        let Some(agent_id) = entry.agent_id else {
+            continue;
+        };
+        first_parent
+            .entry(agent_id)
+            .or_insert_with(|| entry.parent_id.clone());
+        sub_threads
+            .entry(agent_id)
+            .or_default()
+            .push(entry.id.clone());
+    }
+
+    // A sub thread is included exactly when its first entry anchors on
+    // the main path.
+    for (agent_id, ids) in sub_threads {
+        let anchored = matches!(
+            first_parent.get(&agent_id),
+            Some(Some(parent)) if included.contains(parent)
+        );
+        if anchored {
+            included.extend(ids);
+        }
+    }
+
+    Some(included)
 }
 
 impl Iterator for Replay<'_> {
@@ -230,16 +302,27 @@ impl Iterator for Replay<'_> {
                 let index = self.next_entry;
                 self.next_entry += 1;
                 if let Some(entry) = self.log.entry_in_append_order(index) {
-                    self.state.bracket_subagent(entry, &mut self.pending);
-                    if self.defer_subs && matches!(agent_id_for(entry), Some(AgentId::Sub(_))) {
-                        // Deferred mode withholds a sub-agent's content
-                        // events but still advances the report that
-                        // `close_open_sub` reads, so the `SubAgentEnd`
-                        // matches full replay byte for byte.
-                        self.state.capture_sub_report_from_entry(entry);
-                    } else {
-                        self.state
-                            .project_entry(entry, Some(self.log), &mut self.pending);
+                    // Skip entries off the active path (sibling branches,
+                    // sub threads anchored on an abandoned branch).
+                    // Sub threads are excluded whole, never partially,
+                    // so an excluded run is simply never opened and the
+                    // bracketing stays balanced.
+                    let skip = self
+                        .included
+                        .as_ref()
+                        .is_some_and(|set| !set.contains(&entry.id));
+                    if !skip {
+                        self.state.bracket_subagent(entry, &mut self.pending);
+                        if self.defer_subs && matches!(agent_id_for(entry), Some(AgentId::Sub(_))) {
+                            // Deferred mode withholds a sub-agent's content
+                            // events but still advances the report that
+                            // `close_open_sub` reads, so the `SubAgentEnd`
+                            // matches full replay byte for byte.
+                            self.state.capture_sub_report_from_entry(entry);
+                        } else {
+                            self.state
+                                .project_entry(entry, Some(self.log), &mut self.pending);
+                        }
                     }
                 }
                 continue;
@@ -908,7 +991,7 @@ mod tests {
         result.timestamp = 42;
         result.details = Some(details);
         {
-            let mut view = ConversationView::user(&mut log, None);
+            let mut view = ConversationView::user(&mut log);
             view.add_message(user_msg("edit it")).expect("user message");
             view.add_message(assistant_msg(vec![AssistantContent::ToolCall(ToolCall {
                 id: "tu-edit".into(),
@@ -943,7 +1026,7 @@ mod tests {
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("sys".into()).expect("system prompt");
         {
-            let mut view = ConversationView::user(&mut log, None);
+            let mut view = ConversationView::user(&mut log);
             view.add_message(user_msg("hi")).expect("user msg");
             view.add_message(assistant_msg(vec![
                 AssistantContent::Thinking(ThinkingContent {
@@ -1108,7 +1191,7 @@ mod tests {
         let diff_details = ToolDetails::Diff(DiffDetails::new("/tmp/x", "a", "b"));
 
         {
-            let mut view = ConversationView::user(&mut log, None);
+            let mut view = ConversationView::user(&mut log);
             view.add_message(user_msg("edit it")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::ToolCall(ToolCall {
                 id: "tu-edit".into(),
@@ -1332,7 +1415,7 @@ mod tests {
         log.set_system_prompt("p".into()).expect("sp");
 
         let user_head = {
-            let mut view = ConversationView::user(&mut log, None);
+            let mut view = ConversationView::user(&mut log);
             view.add_message(user_msg("hi")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "delegating".into(),
@@ -1369,7 +1452,7 @@ mod tests {
         log.set_system_prompt("p".into()).expect("sp");
 
         let user_head = {
-            let mut view = ConversationView::user(&mut log, None);
+            let mut view = ConversationView::user(&mut log);
             view.add_message(user_msg("hi")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "delegating".into(),
@@ -1456,7 +1539,7 @@ mod tests {
         log.set_system_prompt("p".into()).expect("sp");
 
         let user_head = {
-            let mut view = ConversationView::user(&mut log, None);
+            let mut view = ConversationView::user(&mut log);
             view.add_message(user_msg("hi")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "delegating".into(),
@@ -1554,7 +1637,7 @@ mod tests {
         log.set_system_prompt("p".into()).expect("sp");
 
         let user_head = {
-            let mut view = ConversationView::user(&mut log, None);
+            let mut view = ConversationView::user(&mut log);
             view.add_message(user_msg("hi")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "delegating".into(),
@@ -1606,7 +1689,7 @@ mod tests {
         log.set_system_prompt("p".into()).expect("sp");
 
         let user_head = {
-            let mut view = ConversationView::user(&mut log, None);
+            let mut view = ConversationView::user(&mut log);
             view.add_message(user_msg("hi")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "delegating".into(),
@@ -1616,7 +1699,7 @@ mod tests {
             view.head().cloned().expect("head present")
         };
 
-        let sub_head = {
+        {
             let mut view = ConversationView::subagent(&mut log, user_head.clone(), 1);
             view.add_message(user_msg("subtask")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
@@ -1624,12 +1707,11 @@ mod tests {
                 text_signature: None,
             })]))
             .expect("a");
-            view.head().cloned().expect("sub head present")
-        };
+        }
 
         // Resume main activity after the sub run.
         {
-            let mut view = ConversationView::user(&mut log, Some(sub_head));
+            let mut view = ConversationView::user(&mut log);
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "back on main".into(),
                 text_signature: None,
@@ -1681,7 +1763,7 @@ mod tests {
         let persistence = ConversationPersistence::new(dir);
         let mut log = ConversationLog::create(&persistence).expect("create log");
         {
-            let mut view = ConversationView::user(&mut log, None);
+            let mut view = ConversationView::user(&mut log);
             // Insert the tool_result with no preceding tool_call.
             view.add_message(tool_result_msg("orphan", "", "body", None))
                 .expect("orphan tr");
@@ -1741,7 +1823,7 @@ mod tests {
         let persistence = ConversationPersistence::new(dir);
         let mut log = ConversationLog::create(&persistence).expect("create log");
         {
-            let mut view = ConversationView::user(&mut log, None);
+            let mut view = ConversationView::user(&mut log);
             view.add_message(assistant_msg_with_usage(
                 vec![AssistantContent::Text(TextContent {
                     text: "first".into(),
@@ -1819,7 +1901,7 @@ mod tests {
         let mut log = ConversationLog::create(&persistence).expect("create log");
 
         let first_kept = {
-            let mut view = ConversationView::user(&mut log, None);
+            let mut view = ConversationView::user(&mut log);
             view.add_message(user_msg("old request")).expect("u0");
             // The retained assistant reports a large (pre-compaction)
             // prompt; after compaction this usage is stale.
@@ -1902,7 +1984,7 @@ mod tests {
         let mut log = ConversationLog::create(&persistence).expect("create log");
 
         let user_head = {
-            let mut view = ConversationView::user(&mut log, None);
+            let mut view = ConversationView::user(&mut log);
             view.add_message(user_msg("hi")).expect("u");
             view.add_message(assistant_msg_with_usage(
                 vec![AssistantContent::Text(TextContent {
@@ -1979,8 +2061,7 @@ mod tests {
         log.append_speed_change(crate::log::ThreadFilter::USER, "fast")
             .expect("sc");
         {
-            let head = log.latest_leaf(crate::log::ThreadFilter::USER);
-            let mut view = ConversationView::user(&mut log, head);
+            let mut view = ConversationView::user(&mut log);
             view.add_message(user_msg("hi")).expect("u");
         }
 
@@ -2002,7 +2083,7 @@ mod tests {
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
         {
-            let mut view = ConversationView::user(&mut log, None);
+            let mut view = ConversationView::user(&mut log);
             view.add_message(user_msg("hi")).expect("u");
         }
         log.append_model_change(crate::log::ThreadFilter::USER, "openai", "gpt-x")
@@ -2045,7 +2126,7 @@ mod tests {
         log.set_system_prompt("p".into()).expect("sp");
 
         let user_head = {
-            let mut view = ConversationView::user(&mut log, None);
+            let mut view = ConversationView::user(&mut log);
             view.add_message(user_msg("hi")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "delegating".into(),
@@ -2131,7 +2212,7 @@ mod tests {
         log.set_system_prompt("p".into()).expect("sp");
 
         let user_head = {
-            let mut view = ConversationView::user(&mut log, None);
+            let mut view = ConversationView::user(&mut log);
             view.add_message(user_msg("hi")).expect("u");
             view.head().cloned().expect("head present")
         };
@@ -2181,7 +2262,7 @@ mod tests {
         log.set_system_prompt("p".into()).expect("sp");
 
         let user_head = {
-            let mut view = ConversationView::user(&mut log, None);
+            let mut view = ConversationView::user(&mut log);
             view.add_message(user_msg("hi")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "delegating".into(),
@@ -2271,7 +2352,7 @@ mod tests {
         log.set_system_prompt("p".into()).expect("sp");
 
         let user_head = {
-            let mut view = ConversationView::user(&mut log, None);
+            let mut view = ConversationView::user(&mut log);
             view.add_message(user_msg("hi")).expect("u");
             view.head().cloned().expect("head present")
         };
@@ -2312,7 +2393,7 @@ mod tests {
         log.set_system_prompt("p".into()).expect("sp");
 
         let user_head = {
-            let mut view = ConversationView::user(&mut log, None);
+            let mut view = ConversationView::user(&mut log);
             view.add_message(user_msg("hi")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "delegating".into(),
@@ -2331,7 +2412,7 @@ mod tests {
         };
         log.append_subagent_spawn(1, user_head, "subtask", false, &settings)
             .expect("spawn");
-        let sub_head = {
+        {
             let sub_leaf = log
                 .latest_leaf(ThreadFilter::subagent(1))
                 .expect("sub leaf");
@@ -2350,12 +2431,11 @@ mod tests {
                 text_signature: None,
             })]))
             .expect("a report");
-            view.head().cloned().expect("sub head")
-        };
+        }
 
-        // Main resumes after the sub run, anchored past the sub's tail.
+        // Main resumes after the sub run.
         {
-            let mut view = ConversationView::user(&mut log, Some(sub_head));
+            let mut view = ConversationView::user(&mut log);
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "back on main".into(),
                 text_signature: None,
@@ -2377,8 +2457,8 @@ mod tests {
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
-        let mut user_head = {
-            let mut view = ConversationView::user(&mut log, None);
+        let user_head = {
+            let mut view = ConversationView::user(&mut log);
             view.add_message(user_msg("hi")).expect("u");
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "delegating".into(),
@@ -2407,15 +2487,14 @@ mod tests {
 
         // Main takes a turn while the background sub is still open, so
         // the sub's remaining entry lands after this one in append order.
-        user_head = {
-            let mut view = ConversationView::user(&mut log, Some(user_head));
+        {
+            let mut view = ConversationView::user(&mut log);
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "main while bg runs".into(),
                 text_signature: None,
             })]))
             .expect("a");
-            view.head().cloned().expect("head")
-        };
+        }
 
         // Sub resumes and concludes.
         {
@@ -2429,7 +2508,7 @@ mod tests {
 
         // Main concludes.
         {
-            let mut view = ConversationView::user(&mut log, Some(user_head));
+            let mut view = ConversationView::user(&mut log);
             view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
                 text: "main done".into(),
                 text_signature: None,
@@ -2602,7 +2681,7 @@ mod tests {
         log.set_system_prompt("p".into()).expect("sp");
 
         let user_head = {
-            let mut view = ConversationView::user(&mut log, None);
+            let mut view = ConversationView::user(&mut log);
             view.add_message(user_msg("hi")).expect("u");
             view.head().cloned().expect("head present")
         };
@@ -2635,6 +2714,211 @@ mod tests {
             sub_content_count(&deferred),
             0,
             "deferred mode withholds the legacy sub's content, got {deferred:#?}"
+        );
+    }
+
+    /// The concatenated text of every user `MessageEnd`, in order.
+    fn user_texts(events: &[AgentEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::MessageEnd { message, .. } => match message.as_wire() {
+                    Some(Message::User(u)) => {
+                        let text = u
+                            .content
+                            .iter()
+                            .filter_map(|c| match c {
+                                UserContent::Text(t) => Some(t.text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<String>();
+                        Some(text)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn path_aware_replay_excludes_sibling_branch() {
+        // Two user-thread branches off a common parent. Replay must
+        // project only the branch the head is on, not the sibling. This
+        // pins the concurrent-writer interleaving fix.
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("sp");
+
+        let common = {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(user_msg("common")).expect("common")
+        };
+
+        // Branch A off the common parent.
+        {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(user_msg("alpha")).expect("alpha");
+        }
+        let alpha = log.head().cloned().expect("alpha head");
+
+        // Rewind and grow branch B off the same parent (a sibling on disk).
+        log.set_head(common).expect("rewind to common");
+        {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(user_msg("beta")).expect("beta");
+        }
+        let beta = log.head().cloned().expect("beta head");
+
+        // Head on branch A: only A's user messages replay.
+        log.set_head(alpha).expect("head to alpha");
+        let events: Vec<AgentEvent> = replay(&log).collect();
+        assert_eq!(
+            user_texts(&events),
+            vec!["common".to_string(), "alpha".to_string()]
+        );
+
+        // Head on branch B: only B's user messages replay.
+        log.set_head(beta).expect("head to beta");
+        let events: Vec<AgentEvent> = replay(&log).collect();
+        assert_eq!(
+            user_texts(&events),
+            vec!["common".to_string(), "beta".to_string()]
+        );
+    }
+
+    #[test]
+    fn path_aware_replay_includes_sub_on_path_excludes_sub_on_abandoned_branch() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("sp");
+
+        let common = {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(user_msg("common")).expect("common")
+        };
+
+        // Branch A: an assistant turn that spawns sub-agent 1.
+        let a_a = {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "branch A".into(),
+                text_signature: None,
+            })]))
+            .expect("a")
+        };
+        let spawn_a = log
+            .append_subagent_spawn(1, a_a.clone(), "sub A task", false, &fallback_settings())
+            .expect("spawn 1");
+        {
+            let mut view = ConversationView::subagent(&mut log, spawn_a, 1);
+            view.add_message(user_msg("sub A prompt")).expect("sub a u");
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "sub A report".into(),
+                text_signature: None,
+            })]))
+            .expect("sub a a");
+        }
+
+        // Branch B off the common parent: another assistant turn spawns sub 2.
+        log.set_head(common).expect("rewind to common");
+        let a_b = {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "branch B".into(),
+                text_signature: None,
+            })]))
+            .expect("b")
+        };
+        let spawn_b = log
+            .append_subagent_spawn(2, a_b, "sub B task", false, &fallback_settings())
+            .expect("spawn 2");
+        {
+            let mut view = ConversationView::subagent(&mut log, spawn_b, 2);
+            view.add_message(user_msg("sub B prompt")).expect("sub b u");
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "sub B report".into(),
+                text_signature: None,
+            })]))
+            .expect("sub b a");
+        }
+
+        // Active path is branch A: sub 1 replays, sub 2 does not.
+        log.set_head(a_a).expect("head to branch A");
+        let events: Vec<AgentEvent> = replay(&log).collect();
+
+        let started = |n: usize| {
+            events.iter().any(|e| {
+                matches!(
+                    e,
+                    AgentEvent::SubAgentStart { child, .. } if *child == AgentId::Sub(n)
+                )
+            })
+        };
+        assert!(started(1), "sub anchored on the active path is included");
+        assert!(
+            !started(2),
+            "sub anchored on an abandoned branch is excluded"
+        );
+        assert!(
+            !events.iter().any(|e| e.agent_id() == AgentId::Sub(2)),
+            "no Sub(2) content events leak in"
+        );
+    }
+
+    #[test]
+    fn path_aware_replay_includes_legacy_sub_without_spawn_root() {
+        // A legacy sub thread leads with the task user message (no
+        // SubAgentSpawn root). Anchored on the active path, it must
+        // still be included.
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("sp");
+
+        {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(user_msg("common")).expect("common");
+        }
+        let a1 = {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "delegating".into(),
+                text_signature: None,
+            })]))
+            .expect("a")
+        };
+        // Legacy sub thread: first entry is the task user message,
+        // anchored at the active-path assistant message.
+        {
+            let mut view = ConversationView::subagent(&mut log, a1, 1);
+            view.add_message(user_msg("legacy sub task"))
+                .expect("sub u");
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "legacy sub report".into(),
+                text_signature: None,
+            })]))
+            .expect("sub a");
+        }
+
+        let events: Vec<AgentEvent> = replay(&log).collect();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::SubAgentStart { child, .. } if *child == AgentId::Sub(1)
+            )),
+            "legacy sub anchored on the path is included"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::MessageEnd { agent_id, message }
+                    if *agent_id == AgentId::Sub(1)
+                        && matches!(message.as_wire(), Some(Message::User(_)))
+            )),
+            "the legacy sub's task message replays"
         );
     }
 }

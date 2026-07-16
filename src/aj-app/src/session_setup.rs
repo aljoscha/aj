@@ -436,11 +436,12 @@ pub fn prepare_log(
     };
 
     let mut restore_notices = Vec::new();
-    let transcript = if let Some(head) = log.latest_leaf(ThreadFilter::USER) {
+    let transcript = if let Some(head) = log.head().cloned() {
         let conversation = log.linearize(&head, ThreadFilter::USER);
         repair_interrupted_tool_uses(&mut log, &conversation)?;
         let head = log
-            .latest_leaf(ThreadFilter::USER)
+            .head()
+            .cloned()
             .expect("post-repair head exists when pre-repair head did");
         let conversation = log.linearize(&head, ThreadFilter::USER);
         if source.is_resume()

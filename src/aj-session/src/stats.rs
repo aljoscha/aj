@@ -75,7 +75,8 @@ impl ConversationLog {
     ///
     /// One pass over every entry in every thread, so message and
     /// tool-call totals include sub-agent activity. `settings` is read
-    /// from the user thread's latest leaf via [`Conversation::settings`].
+    /// from the user thread's current head via [`Conversation::settings`],
+    /// so it reflects the active branch.
     ///
     /// [`Conversation::settings`]: crate::log::Conversation::settings
     pub fn stats(&self) -> SessionStats {
@@ -123,8 +124,8 @@ impl ConversationLog {
         tool_call_counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
         let settings = self
-            .latest_leaf(ThreadFilter::USER)
-            .map(|head| self.linearize(&head, ThreadFilter::USER).settings())
+            .head()
+            .map(|head| self.linearize(head, ThreadFilter::USER).settings())
             .unwrap_or_default();
 
         SessionStats {
@@ -214,7 +215,7 @@ mod tests {
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).unwrap();
 
-        let mut head = ConversationView::user(&mut log, None);
+        let mut head = ConversationView::user(&mut log);
         head.add_message(AgentMessage::wire(user("hi"))).unwrap();
         head.add_message(AgentMessage::wire(assistant_with_calls(&[
             "read_file",
@@ -292,7 +293,7 @@ mod tests {
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).unwrap();
 
-        let mut head = ConversationView::user(&mut log, None);
+        let mut head = ConversationView::user(&mut log);
         head.add_message(AgentMessage::wire(user("hi"))).unwrap();
         head.add_message(AgentMessage::wire(assistant_with_usage(100, 50, 0.10)))
             .unwrap();

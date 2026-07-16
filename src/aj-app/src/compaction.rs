@@ -60,7 +60,7 @@ pub async fn run_compaction(
     // `None` plan both collapse to "nothing to do".
     let plan = {
         let log_guard = log.lock().await;
-        match log_guard.latest_leaf(ThreadFilter::USER) {
+        match log_guard.head().cloned() {
             Some(head) => {
                 let conversation = log_guard.linearize(&head, ThreadFilter::USER);
                 planning::prepare_compaction(&conversation, keep_recent_tokens)
@@ -158,9 +158,7 @@ pub async fn run_compaction(
             drop(log_guard);
             return finish_failed(agent, reason, plan.tokens_before, err.to_string()).await;
         }
-        let head = log_guard
-            .latest_leaf(ThreadFilter::USER)
-            .expect("head exists after append");
+        let head = log_guard.head().cloned().expect("head exists after append");
         let conversation = log_guard.linearize(&head, ThreadFilter::USER);
         let mut messages = conversation.agent_messages();
         // Drop a trailing failed-assistant message. The log records the

@@ -31,7 +31,6 @@ use aj_models::types::{AssistantContent, Message, ToolResultMessage};
 
 use crate::log::{
     Conversation, ConversationEntryKind, ConversationError, ConversationLog, ConversationView,
-    ThreadFilter,
 };
 
 /// Scan the linearized user thread for `tool_call` blocks that never
@@ -87,10 +86,9 @@ pub fn repair_interrupted_tool_uses(
         dangling.len()
     );
 
-    let head = log
-        .latest_leaf(ThreadFilter::USER)
-        .expect("repair called with a non-empty user thread");
-    let mut view = ConversationView::user(log, Some(head));
+    // Anchor the synthesized results at the user-thread head, the same
+    // point the next real turn would append at.
+    let mut view = ConversationView::user(log);
     for (id, name) in dangling {
         let tr = ToolResultMessage::text(
             id,
@@ -157,7 +155,7 @@ mod tests {
     fn repair_synthesizes_tool_results_for_dangling_uses() {
         let (_dir, mut log) = fresh_log();
         {
-            let mut view = ConversationView::user(&mut log, None);
+            let mut view = ConversationView::user(&mut log);
             view.add_message(user("hi")).expect("u");
             view.add_message(assistant_tool_call("tu-1", "ping"))
                 .expect("a");
@@ -188,7 +186,7 @@ mod tests {
     fn repair_is_a_noop_when_consistent() {
         let (_dir, mut log) = fresh_log();
         {
-            let mut view = ConversationView::user(&mut log, None);
+            let mut view = ConversationView::user(&mut log);
             view.add_message(user("hi")).expect("u");
             view.add_message(assistant_text("hello")).expect("a");
         }
@@ -212,7 +210,7 @@ mod tests {
     fn repair_recognises_resolved_tool_call_ids() {
         let (_dir, mut log) = fresh_log();
         {
-            let mut view = ConversationView::user(&mut log, None);
+            let mut view = ConversationView::user(&mut log);
             view.add_message(user("hi")).expect("u");
             view.add_message(assistant_tool_call("tu-1", "ping"))
                 .expect("a");
@@ -232,7 +230,7 @@ mod tests {
     fn repair_adopts_synthesized_message_ids_as_entry_ids() {
         let (_dir, mut log) = fresh_log();
         {
-            let mut view = ConversationView::user(&mut log, None);
+            let mut view = ConversationView::user(&mut log);
             view.add_message(user("hi")).expect("u");
             view.add_message(assistant_tool_call("tu-1", "ping"))
                 .expect("a");

@@ -502,7 +502,7 @@ mod tests {
     /// Append one user-text message and one assistant-text message
     /// via the high-level [`ConversationView::add_message`] path.
     fn append_user_then_assistant(log: &mut ConversationLog, u: &str, a: &str) {
-        let mut view = ConversationView::user(log, None);
+        let mut view = ConversationView::user(log);
         view.add_message(user_msg(u)).expect("append user");
         view.add_message(assistant_text(a))
             .expect("append assistant");
@@ -525,10 +525,7 @@ mod tests {
         append_user_then_assistant(&mut log, "hello world", "hi there");
 
         // A second message on the user thread so the count crosses 2.
-        let head = log
-            .latest_leaf(crate::ThreadFilter::USER)
-            .expect("head exists");
-        let mut view = ConversationView::user(&mut log, Some(head));
+        let mut view = ConversationView::user(&mut log);
         view.add_message(user_msg("follow-up"))
             .expect("append second user");
 
@@ -608,7 +605,7 @@ mod tests {
         let mut log = ConversationLog::create(&persistence).expect("create");
         // First message is a tool_result (not a user prompt). The
         // preview should leave `first_user_message` at `None`.
-        let mut view = ConversationView::user(&mut log, None);
+        let mut view = ConversationView::user(&mut log);
         view.add_message(AgentMessage::wire(Message::ToolResult(
             ToolResultMessage::text("x", "ping", "ok", false),
         )))
@@ -732,7 +729,7 @@ mod tests {
         let (_dir, persistence) = fixture();
         let mut log = ConversationLog::create(&persistence).expect("create");
         {
-            let mut view = ConversationView::user(&mut log, None);
+            let mut view = ConversationView::user(&mut log);
             view.add_message(user_msg("hi")).expect("u");
             view.add_message(AgentMessage::wire(Message::Assistant(AssistantMessage {
                 content: vec![AssistantContent::ToolCall(ToolCall {
@@ -793,10 +790,7 @@ mod tests {
         let mut log = ConversationLog::create(&persistence).expect("create");
         append_user_then_assistant(&mut log, "hello", "world");
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let head = log
-            .latest_leaf(crate::ThreadFilter::USER)
-            .expect("head exists");
-        let mut view = ConversationView::user(&mut log, Some(head));
+        let mut view = ConversationView::user(&mut log);
         view.add_message(user_msg("follow-up"))
             .expect("append user2");
 

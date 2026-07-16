@@ -29,7 +29,7 @@ use aj_agent::events::AgentEvent;
 use aj_agent::tool::ToolDetails;
 use aj_models::types::{Message, ToolResultMessage, UserContent};
 use aj_session::{
-    ConversationEntry, ConversationEntryKind, ConversationLog, EntryId, ThreadFilter, replay,
+    ConversationEntry, ConversationEntryKind, ConversationLog, EntryId, replay,
     resolve_tool_details,
 };
 use base64::Engine;
@@ -163,7 +163,7 @@ where
 fn export_data(log: &ConversationLog) -> ExportData<'_> {
     ExportData {
         session_id: log.session_id(),
-        leaf_id: log.latest_leaf(ThreadFilter::USER),
+        leaf_id: log.head().cloned(),
         entries: log
             .entries_in_order()
             .into_iter()

@@ -71,9 +71,12 @@ pub fn persistence_listener(log: Arc<TokioMutex<ConversationLog>>) -> Listener {
                     let AgentId::Sub(child_n) = child else {
                         return Err(format!("SubAgentStart with non-Sub child {child:?}").into());
                     };
-                    let parent_filter = filter_for(parent);
                     let mut log_guard = log.lock().await;
-                    let parent_head = log_guard.latest_leaf(parent_filter).ok_or_else(|| {
+                    // Anchor the spawn root at the main thread's current
+                    // head. A sub-agent cannot spawn a sub-agent (the
+                    // `agent` tool is removed from its toolset), so the
+                    // parent is always the main thread.
+                    let parent_head = log_guard.head().cloned().ok_or_else(|| {
                         BoxError::from(format!(
                             "SubAgentStart: parent {parent:?} thread has no head entry to anchor child {child:?} at"
                         ))
@@ -99,28 +102,22 @@ pub fn persistence_listener(log: Arc<TokioMutex<ConversationLog>>) -> Listener {
 
 /// Append one finalized message to the log on behalf of `agent_id`.
 ///
-/// For [`AgentId::Main`] the parent for the new entry is the user
-/// thread's current `latest_leaf` (or `None`, anchoring at the
-/// system-prompt root for fresh threads). For [`AgentId::Sub(n)`]
-/// it's the sub-agent thread's own `latest_leaf`; the thread is
-/// never empty for a legitimately spawned sub-agent because
-/// [`AgentEvent::SubAgentStart`] seeds it with a `SubAgentSpawn`
-/// entry.
+/// For [`AgentId::Main`] the new entry anchors at the user thread's
+/// explicit `head` (or the system-prompt root for a fresh thread). For
+/// [`AgentId::Sub(n)`] it's the sub-agent thread's own `latest_leaf`;
+/// the thread is never empty for a legitimately spawned sub-agent
+/// because [`AgentEvent::SubAgentStart`] seeds it with a
+/// `SubAgentSpawn` entry.
 fn persist(
     log: &mut ConversationLog,
     agent_id: AgentId,
     message: AgentMessage,
 ) -> Result<(), BoxError> {
     let mut view = match agent_id {
-        AgentId::Main => {
-            // `latest_leaf` returning `None` is fine here: the user
-            // thread can be empty on a fresh log (only the
-            // system-prompt root entry exists yet).
-            // [`ConversationView::user`] anchors at that root
-            // automatically.
-            let head = log.latest_leaf(ThreadFilter::USER);
-            ConversationView::user(log, head)
-        }
+        // A `None` head is fine here: the user thread can be empty on a
+        // fresh log (only the system-prompt root exists yet), and
+        // `ConversationView::user` anchors at that root automatically.
+        AgentId::Main => ConversationView::user(log),
         AgentId::Sub(n) => {
             let head = log
                 .latest_leaf(ThreadFilter::subagent(n))
@@ -135,15 +132,6 @@ fn persist(
 
     view.add_message(message)?;
     Ok(())
-}
-
-/// Translate an [`AgentId`] into the [`ThreadFilter`] selecting that
-/// agent's own thread.
-fn filter_for(agent_id: AgentId) -> ThreadFilter {
-    match agent_id {
-        AgentId::Main => ThreadFilter::USER,
-        AgentId::Sub(n) => ThreadFilter::subagent(n),
-    }
 }
 
 #[cfg(test)]
@@ -258,7 +246,7 @@ mod tests {
         let (_dir, log) = fresh_log();
         {
             let mut log_guard = log.lock().await;
-            let mut view = ConversationView::user(&mut log_guard, None);
+            let mut view = ConversationView::user(&mut log_guard);
             view.add_message(user_msg("hi")).expect("user msg");
         }
 
@@ -286,7 +274,7 @@ mod tests {
         let (_dir, log) = fresh_log();
         {
             let mut log_guard = log.lock().await;
-            let mut view = ConversationView::user(&mut log_guard, None);
+            let mut view = ConversationView::user(&mut log_guard);
             view.add_message(user_msg("hi")).expect("u");
             // Assistant turn carrying a tool call.
             let assistant = AgentMessage::wire(Message::Assistant(AssistantMessage {
@@ -400,7 +388,7 @@ mod tests {
         let (_dir, log) = fresh_log();
         let parent_anchor = {
             let mut log_guard = log.lock().await;
-            let mut view = ConversationView::user(&mut log_guard, None);
+            let mut view = ConversationView::user(&mut log_guard);
             view.add_message(user_msg("hi")).expect("u");
             view.add_message(assistant_text("ack")).expect("a");
             log_guard
@@ -466,7 +454,7 @@ mod tests {
         let (_dir, log) = fresh_log();
         {
             let mut log_guard = log.lock().await;
-            let mut view = ConversationView::user(&mut log_guard, None);
+            let mut view = ConversationView::user(&mut log_guard);
             view.add_message(user_msg("hi")).expect("u");
             view.add_message(assistant_text("ack")).expect("a");
         }
@@ -525,7 +513,7 @@ mod tests {
         let (_dir, log) = fresh_log();
         {
             let mut log_guard = log.lock().await;
-            let mut view = ConversationView::user(&mut log_guard, None);
+            let mut view = ConversationView::user(&mut log_guard);
             view.add_message(user_msg("hi")).expect("u");
             view.add_message(assistant_text("ack")).expect("a");
         }
