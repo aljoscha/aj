@@ -609,6 +609,21 @@ impl ListView {
         self.scroll.offset
     }
 
+    /// Absolute line offset of the top of item `idx`, from the geometry
+    /// read-model: the sum of measured heights below `idx` plus the mean-height
+    /// estimate for any item not yet measured. `idx` is clamped to the item
+    /// count.
+    ///
+    /// This is the same read-model that sizes the scrollbar thumb, so it is
+    /// approximate for items never drawn (and stale after a resize until they
+    /// are re-measured on scroll). Callers animating the viewport toward a
+    /// target item use it to estimate the travel distance, then land on the
+    /// exact position with [`ensure_scroll`](Self::ensure_scroll) or
+    /// [`jump_to_item`](Self::jump_to_item).
+    pub fn item_top_line(&self, idx: usize) -> u64 {
+        self.geometry.offset_for_index(idx)
+    }
+
     /// Blank rows above the first visible child as of the last completed draw.
     ///
     /// Zero in the normal top-anchored and overflow cases. Non-zero only when

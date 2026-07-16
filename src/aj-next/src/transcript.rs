@@ -11,9 +11,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::LazyLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aj_agent::events::AgentId;
 use aj_agent::tool::{
@@ -1262,6 +1262,76 @@ struct RowPos {
     line: usize,
 }
 
+/// Where the viewport should come to rest relative to the focused message
+/// once a focus-navigation scroll finishes. Recorded when the scroll starts
+/// so the final frame can land on the exact position `ensure_scroll` would
+/// have snapped to, correcting any drift the estimate-based travel accrued.
+#[derive(Clone, Copy)]
+enum FocusAnchor {
+    /// The message sits at the top of the viewport (stepping to an older
+    /// message, or one taller than the viewport). Landed with `jump_to_item`.
+    Top,
+    /// The message's bottom sits at the viewport bottom (stepping to a newer
+    /// message below the fold), or it is already in view. Landed with
+    /// `ensure_scroll`, whose deferred `wants_cursor` the next draw resolves.
+    Bottom,
+}
+
+/// An in-flight smooth scroll toward a focused message.
+///
+/// Focus navigation moves the item cursor instantly (so the focus border jumps
+/// to the target at once) while the viewport glides to follow. The glide is
+/// time-based: [`total`](Self::total) lines over [`duration`](Self::duration),
+/// eased, driven by a self-scheduled tick chain. The travel distance comes
+/// from the list's estimate-based geometry, so the last frame snaps to
+/// [`anchor`](Self::anchor) rather than trusting the accumulated deltas.
+struct ScrollAnim {
+    /// Signed line distance to travel: negative scrolls toward the top.
+    total: f64,
+    /// Lines already fed to the list this animation, so each tick applies only
+    /// the incremental delta and per-frame rounding cannot drift.
+    applied: f64,
+    anchor: FocusAnchor,
+    start: Instant,
+    duration: Duration,
+}
+
+/// Interval between smooth-scroll frames, matching the drive loop's 60 fps cap.
+const SCROLL_ANIM_FRAME_MS: u32 = 16;
+/// Below this travel distance a focus step just snaps: a move of a line or two
+/// is not worth animating and would only add latency.
+const SCROLL_ANIM_MIN_LINES: f64 = 2.0;
+/// Per-line pacing for the glide, clamped to
+/// [`SCROLL_ANIM_MIN_MS`]`..=`[`SCROLL_ANIM_MAX_MS`]. Roughly constant speed
+/// for short and medium jumps, capped so a long jump stays snappy (the
+/// ease-out then front-loads the distance and decelerates into the target).
+const SCROLL_ANIM_MS_PER_LINE: f64 = 7.0;
+const SCROLL_ANIM_MIN_MS: f64 = 60.0;
+const SCROLL_ANIM_MAX_MS: f64 = 160.0;
+
+/// Duration for a glide of `distance` lines (absolute).
+#[allow(clippy::as_conversions)]
+fn scroll_anim_duration(distance: f64) -> Duration {
+    // `distance` is a line count and the product is clamped to a small
+    // millisecond range, so the cast to `u64` never overflows or loses signal.
+    let ms = (distance * SCROLL_ANIM_MS_PER_LINE).clamp(SCROLL_ANIM_MIN_MS, SCROLL_ANIM_MAX_MS);
+    Duration::from_millis(ms as u64)
+}
+
+/// A line offset as `f64` for the smooth-scroll math. Transcript line counts
+/// are far below the f64 integer-precision limit, so the cast is exact.
+#[allow(clippy::as_conversions)]
+fn line_as_f64(line: u64) -> f64 {
+    line as f64
+}
+
+/// Round a signed line delta to `i32` for `ListView::scroll_lines`. The delta
+/// is one frame's share of a bounded travel, so it never overflows.
+#[allow(clippy::as_conversions)]
+fn round_lines(v: f64) -> i32 {
+    v.round() as i32
+}
+
 /// The chat area: a follow-tail `ListView` over the active transcript,
 /// wrapped in [`ScrollBars`] for the vertical scrollbar thumb (Spec E
 /// section 1). The bar reserves the rightmost column and hides its
@@ -1335,6 +1405,15 @@ pub struct TranscriptView {
     /// they read the geometry back from here to map widget-local coordinates
     /// into entry-relative selection positions. Zero before the first draw.
     last_view: Size,
+    /// Weak self-reference, so focus navigation can schedule ticks targeting
+    /// this widget to drive the smooth scroll (see [`ScrollAnim`]). Set by the
+    /// host via [`set_widget_ref`](Self::set_widget_ref) once the view is
+    /// behind an `Rc`. Empty in unit tests, where ticks are never delivered, so
+    /// a focus step there snaps rather than animating.
+    me: Weak<RefCell<TranscriptView>>,
+    /// The in-flight focus-scroll animation, if any. `None` when the viewport
+    /// is at rest.
+    scroll_anim: Option<ScrollAnim>,
 }
 
 /// The session-wide render inputs the transcript cache does not fingerprint
@@ -1486,6 +1565,8 @@ impl TranscriptView {
                 width: 0,
                 height: 0,
             },
+            me: Weak::new(),
+            scroll_anim: None,
         }
     }
 
@@ -1528,6 +1609,10 @@ impl TranscriptView {
         // A fresh session's entries are unrelated to the old selection's anchor
         // entry, so drop it rather than highlight stale content.
         self.selection = None;
+        // An in-flight focus glide targets an entry index in the outgoing
+        // content, which the swap invalidates. Cancel it so its remaining
+        // scroll deltas do not land on the new session's transcript.
+        self.scroll_anim = None;
     }
 
     /// Install the callback invoked when Esc leaves transcript-focus mode.
@@ -1535,6 +1620,20 @@ impl TranscriptView {
     /// whose `FocusOut` then clears the item cursor and exits the mode.
     pub(crate) fn set_on_exit_focus(&mut self, on_exit: Box<dyn FnMut(&mut EventContext)>) {
         self.on_exit_focus = Some(on_exit);
+    }
+
+    /// Record the view's own `WidgetRef` (as a `Weak`), so focus navigation can
+    /// schedule ticks targeting this widget to drive the smooth scroll. The
+    /// host calls this once the view is behind an `Rc`. Without it a focus step
+    /// snaps rather than animating.
+    pub(crate) fn set_widget_ref(&mut self, me: Weak<RefCell<TranscriptView>>) {
+        self.me = me;
+    }
+
+    /// This view's `WidgetRef`, for self-scheduled ticks. `None` when the weak
+    /// self-reference is unset (unit tests) or has been dropped.
+    fn widget(&self) -> Option<WidgetRef> {
+        self.me.upgrade().map(|rc| -> WidgetRef { rc })
     }
 
     /// Entry count of the active view's transcript, or 0 when it has none.
@@ -1574,33 +1673,141 @@ impl TranscriptView {
         !self.user_message_indices().is_empty()
     }
 
-    /// Move the item cursor onto entry `idx` and bring it into view with a
-    /// minimal scroll (`ensure_scroll`), so a step to a nearby user message
-    /// keeps the surrounding replies on screen rather than jumping the
-    /// viewport. `idx` must be a valid entry index. `item_count` is refreshed
-    /// first so the move sees the current length even before the focused
-    /// view's first draw.
-    fn focus_item(&self, idx: usize) {
+    /// Move the item cursor onto entry `idx` and bring it into view, gliding
+    /// the viewport there rather than snapping (see [`ScrollAnim`]). The
+    /// destination matches the minimal scroll `ensure_scroll` would pick, so a
+    /// step to a nearby user message keeps the surrounding replies on screen.
+    /// `idx` must be a valid entry index. `item_count` is refreshed first so
+    /// the move sees the current length even before the focused view's first
+    /// draw.
+    fn focus_item(&mut self, ctx: &mut EventContext, idx: usize) {
         let count = self.entry_count();
+        {
+            let mut list = self.list.borrow_mut();
+            list.item_count = Some(u32::try_from(count).expect("entry count fits u32"));
+            // Move the cursor at once so the focus border lands on the target
+            // immediately; only the viewport lags behind and animates.
+            list.cursor = u32::try_from(idx).expect("index fits u32");
+        }
+        self.start_focus_scroll(ctx, idx);
+    }
+
+    /// Plan and begin the glide toward the (already-cursored) entry `idx`.
+    ///
+    /// Reads the current viewport top and the target's extent from the list's
+    /// geometry to decide where the viewport should rest ([`FocusAnchor`]) and
+    /// how far it must travel. A travel below [`SCROLL_ANIM_MIN_LINES`], a
+    /// viewport not yet measured, or a missing self-reference (unit tests) all
+    /// land immediately instead of animating.
+    fn start_focus_scroll(&mut self, ctx: &mut EventContext, idx: usize) {
+        let (anchor, total) = {
+            let list = self.list.borrow();
+            let vh = f64::from(list.viewport_height().unwrap_or(0));
+            let top0 = usize::try_from(list.scroll_top()).expect("top fits usize");
+            let off0 = f64::from(list.scroll_offset());
+            // Absolute line of the current viewport top and the target's top /
+            // bottom, all from the same estimate-based read-model.
+            let l0 = line_as_f64(list.item_top_line(top0)) + off0;
+            let target_top = line_as_f64(list.item_top_line(idx));
+            let target_bottom = line_as_f64(list.item_top_line(idx + 1));
+            let item_h = target_bottom - target_top;
+
+            // Replicate `ensure_scroll` + the draw's `wants_cursor` handling:
+            // an older target (or one taller than the viewport) rests at the
+            // top; a newer one below the fold rests with its bottom at the
+            // viewport bottom; an already-visible one does not move.
+            let (anchor, ldest) = if idx <= top0 || item_h >= vh {
+                (FocusAnchor::Top, target_top)
+            } else if target_bottom > l0 + vh {
+                (FocusAnchor::Bottom, target_bottom - vh)
+            } else {
+                (FocusAnchor::Bottom, l0)
+            };
+            (anchor, ldest - l0)
+        };
+
+        let viewport_unmeasured = self.list.borrow().viewport_height().is_none();
+        let widget = self.widget();
+        if viewport_unmeasured || widget.is_none() || total.abs() < SCROLL_ANIM_MIN_LINES {
+            self.snap_focus(anchor);
+            return;
+        }
+        let already_animating = self.scroll_anim.is_some();
+        self.scroll_anim = Some(ScrollAnim {
+            total,
+            applied: 0.0,
+            anchor,
+            start: Instant::now(),
+            duration: scroll_anim_duration(total.abs()),
+        });
+        // Arm the tick chain only on the rising edge: a retarget mid-glide
+        // reuses the in-flight tick, which reads the fresh `scroll_anim`.
+        if !already_animating {
+            ctx.tick(SCROLL_ANIM_FRAME_MS, widget.expect("checked above"));
+        }
+        ctx.redraw = true;
+    }
+
+    /// Land the viewport on the focused message at once, at the position the
+    /// glide targets. `Top` pins the cursor to the viewport top; `Bottom`
+    /// defers to the draw via `ensure_scroll`, which brings the cursor fully
+    /// into view (anchored to the bottom, or as the sole item when it overflows
+    /// the viewport).
+    fn snap_focus(&self, anchor: FocusAnchor) {
         let mut list = self.list.borrow_mut();
-        list.item_count = Some(u32::try_from(count).expect("entry count fits u32"));
-        list.cursor = u32::try_from(idx).expect("index fits u32");
-        list.ensure_scroll();
+        match anchor {
+            FocusAnchor::Top => {
+                let cursor = list.cursor;
+                list.jump_to_item(cursor);
+            }
+            FocusAnchor::Bottom => list.ensure_scroll(),
+        }
+    }
+
+    /// Advance the in-flight focus glide one frame, re-arming until the
+    /// duration elapses. Driven by `Event::Tick`. A no-op with no animation.
+    ///
+    /// Each frame applies only the incremental eased delta so per-frame
+    /// rounding cannot drift, and the final frame snaps to the recorded anchor
+    /// (the geometry-estimated deltas need not have landed exactly).
+    fn advance_scroll_anim(&mut self, ctx: &mut EventContext) {
+        let Some(mut anim) = self.scroll_anim.take() else {
+            return;
+        };
+        let t = (anim.start.elapsed().as_secs_f64() / anim.duration.as_secs_f64()).clamp(0.0, 1.0);
+        if t >= 1.0 {
+            self.snap_focus(anim.anchor);
+            ctx.redraw = true;
+            return;
+        }
+        // Ease-out cubic: fast to start, decelerating into the target.
+        let eased = 1.0 - (1.0 - t).powi(3);
+        let want = (anim.total * eased).round();
+        let delta = want - anim.applied;
+        if delta != 0.0 {
+            self.list.borrow_mut().scroll_lines(round_lines(delta));
+        }
+        anim.applied = want;
+        self.scroll_anim = Some(anim);
+        if let Some(widget) = self.widget() {
+            ctx.tick(SCROLL_ANIM_FRAME_MS, widget);
+        }
+        ctx.redraw = true;
     }
 
     /// Move the cursor onto the newest (last) user message. Used on entering
     /// focus mode and for the End / G jump. A no-op with no user message.
-    fn focus_last_user_message(&self) {
+    fn focus_last_user_message(&mut self, ctx: &mut EventContext) {
         if let Some(&idx) = self.user_message_indices().last() {
-            self.focus_item(idx);
+            self.focus_item(ctx, idx);
         }
     }
 
     /// Move the cursor onto the oldest (first) user message. Home / g jump.
     /// A no-op with no user message.
-    fn focus_first_user_message(&self) {
+    fn focus_first_user_message(&mut self, ctx: &mut EventContext) {
         if let Some(&idx) = self.user_message_indices().first() {
-            self.focus_item(idx);
+            self.focus_item(ctx, idx);
         }
     }
 
@@ -1608,7 +1815,7 @@ impl TranscriptView {
     /// cursor). Clamps at the first, so a no-op once there is none older. It
     /// finds the nearest user message strictly above the cursor, which is
     /// defensive against a cursor that ever sits on a non-user entry.
-    pub(crate) fn focus_prev_user_message(&self) {
+    pub(crate) fn focus_prev_user_message(&mut self, ctx: &mut EventContext) {
         let cursor = usize::try_from(self.list.borrow().cursor).expect("cursor fits usize");
         if let Some(&idx) = self
             .user_message_indices()
@@ -1616,7 +1823,7 @@ impl TranscriptView {
             .rev()
             .find(|&&i| i < cursor)
         {
-            self.focus_item(idx);
+            self.focus_item(ctx, idx);
         }
     }
 
@@ -1624,10 +1831,10 @@ impl TranscriptView {
     /// last, so a no-op once there is none newer. It finds the nearest user
     /// message strictly below the cursor, defensive the same way
     /// [`focus_prev_user_message`](Self::focus_prev_user_message) is.
-    fn focus_next_user_message(&self) {
+    fn focus_next_user_message(&mut self, ctx: &mut EventContext) {
         let cursor = usize::try_from(self.list.borrow().cursor).expect("cursor fits usize");
         if let Some(&idx) = self.user_message_indices().iter().find(|&&i| i > cursor) {
-            self.focus_item(idx);
+            self.focus_item(ctx, idx);
         }
     }
 
@@ -1662,7 +1869,7 @@ impl TranscriptView {
         // stays off (Spec E section 2).
         self.focused.set(true);
         self.follow_tail = false;
-        self.focus_last_user_message();
+        self.focus_last_user_message(ctx);
         ctx.redraw = true;
     }
 
@@ -1694,20 +1901,20 @@ impl TranscriptView {
             || key.matches(u32::from('k'), empty)
             || key.matches(u32::from('p'), ctrl)
         {
-            self.focus_prev_user_message();
+            self.focus_prev_user_message(ctx);
             ctx.consume_and_redraw();
         } else if key.matches(Key::DOWN, empty)
             || key.matches(u32::from('j'), empty)
             || key.matches(u32::from('n'), ctrl)
             || key.matches(Key::TAB, Modifiers::SHIFT)
         {
-            self.focus_next_user_message();
+            self.focus_next_user_message(ctx);
             ctx.consume_and_redraw();
         } else if key.matches(u32::from('g'), empty) {
-            self.focus_first_user_message();
+            self.focus_first_user_message(ctx);
             ctx.consume_and_redraw();
         } else if key.matches(u32::from('g'), Modifiers::SHIFT) {
-            self.focus_last_user_message();
+            self.focus_last_user_message(ctx);
             ctx.consume_and_redraw();
         } else if key.matches(Key::ESCAPE, empty) {
             if let Some(on_exit) = self.on_exit_focus.as_mut() {
@@ -1743,11 +1950,11 @@ impl TranscriptView {
     }
 
     /// Scroll the transcript to the top (Spec E section 1, Home), mode-aware.
-    pub(crate) fn scroll_to_top(&mut self) {
+    pub(crate) fn scroll_to_top(&mut self, ctx: &mut EventContext) {
         if self.in_focus_mode() {
             // Focus mode: move the item cursor onto the first user message,
             // matching the `g` jump.
-            self.focus_first_user_message();
+            self.focus_first_user_message(ctx);
             return;
         }
         // Reaching the top means the reader left the tail, so follow-tail
@@ -1759,11 +1966,11 @@ impl TranscriptView {
     }
 
     /// Scroll the transcript to the bottom (Spec E section 1, End), mode-aware.
-    pub(crate) fn scroll_to_bottom(&mut self) {
+    pub(crate) fn scroll_to_bottom(&mut self, ctx: &mut EventContext) {
         if self.in_focus_mode() {
             // Focus mode: move the item cursor onto the last user message,
             // matching the `G` jump.
-            self.focus_last_user_message();
+            self.focus_last_user_message(ctx);
             return;
         }
         // Re-engaging follow-tail is the whole gesture: the next draw runs the
@@ -2398,6 +2605,9 @@ impl Widget for TranscriptView {
             // focus, which cleanly exits the mode.
             Event::FocusIn => self.enter_focus_mode(ctx),
             Event::FocusOut => self.exit_focus_mode(ctx),
+            // Drives the smooth focus-scroll glide (see `ScrollAnim`), a no-op
+            // once the animation is done and the tick chain has stopped.
+            Event::Tick => self.advance_scroll_anim(ctx),
             Event::KeyPress(key) => {
                 // Esc clears a live selection first (Spec E section 2), before
                 // the focus-mode Esc would leave the mode, so one Esc drops the
@@ -3319,7 +3529,7 @@ mod tests {
 
         // Home jumps to the absolute top: the first row is item 0's first line
         // and follow-tail is off.
-        view.scroll_to_top();
+        view.scroll_to_top(&mut EventContext::new());
         assert!(!view.follow_tail, "Home disengages follow-tail");
         let rows = crate::test_support::rows(&view.draw(&ctx));
         assert!(rows[0].contains("row 0"), "top of the transcript: {rows:?}");
@@ -3336,7 +3546,7 @@ mod tests {
 
         // End re-engages follow-tail and the next draw lands back at the
         // bottom's last row.
-        view.scroll_to_bottom();
+        view.scroll_to_bottom(&mut EventContext::new());
         assert!(view.follow_tail, "End re-engages follow-tail");
         let rows = crate::test_support::rows(&view.draw(&ctx));
         assert!(view.list.borrow().is_at_bottom(), "back at the bottom");
@@ -3371,7 +3581,7 @@ mod tests {
 
         // Home moves the cursor to the first user message; follow-tail stays
         // off (the cursor owns the viewport in focus mode).
-        view.scroll_to_top();
+        view.scroll_to_top(&mut EventContext::new());
         assert_eq!(
             view.list.borrow().cursor,
             0,
@@ -3380,7 +3590,7 @@ mod tests {
         assert!(!view.follow_tail, "focus mode keeps follow-tail disengaged");
 
         // End moves the cursor back to the last user message.
-        view.scroll_to_bottom();
+        view.scroll_to_bottom(&mut EventContext::new());
         assert_eq!(
             view.list.borrow().cursor,
             8,
@@ -3668,9 +3878,9 @@ mod tests {
             view.handle_event(&mut ec, &k);
             assert_eq!(view.list.borrow().cursor, 0, "cursor stays at 0 when empty");
         }
-        view.scroll_to_top();
+        view.scroll_to_top(&mut EventContext::new());
         assert_eq!(view.list.borrow().cursor, 0, "scroll_to_top stays at 0");
-        view.scroll_to_bottom();
+        view.scroll_to_bottom(&mut EventContext::new());
         assert_eq!(view.list.borrow().cursor, 0, "scroll_to_bottom stays at 0");
         let _ = view.draw(&ctx);
     }
@@ -3720,10 +3930,96 @@ mod tests {
             "lands on the only user message"
         );
 
-        view.focus_prev_user_message();
+        view.focus_prev_user_message(&mut EventContext::new());
         assert_eq!(view.list.borrow().cursor, 0, "nothing older to step to");
-        view.focus_next_user_message();
+        view.focus_next_user_message(&mut EventContext::new());
         assert_eq!(view.list.borrow().cursor, 0, "nothing newer to step to");
+    }
+
+    /// A focus step that must move the viewport more than a line glides there
+    /// over several frames instead of snapping: the cursor lands on the target
+    /// at once, the viewport lags, and driving the tick chain to completion
+    /// leaves it exactly where the instant snap would have (a self-ref-less
+    /// reference view that snaps is the oracle).
+    #[test]
+    fn focus_scroll_glides_to_the_snap_destination() {
+        let chat = chat_with_user_messages(6);
+        let ctx = draw_ctx(40, 6);
+
+        // Oracle: a view with no self-reference, so its focus steps snap.
+        let mut oracle = transcript_view(&chat);
+        let _ = oracle.draw(&ctx);
+        oracle.handle_event(&mut EventContext::new(), &Event::FocusIn);
+        let _ = oracle.draw(&ctx);
+        oracle.scroll_to_top(&mut EventContext::new());
+        let oracle_rows = crate::test_support::rows(&oracle.draw(&ctx));
+        let oracle_top = oracle.list.borrow().scroll_top();
+        let oracle_off = oracle.list.borrow().scroll_offset();
+        assert_eq!(
+            oracle.list.borrow().cursor,
+            0,
+            "snapped onto the first message"
+        );
+
+        // Subject: identical steps, but behind an `Rc` with a self-reference,
+        // so the jump to the top animates.
+        let view = Rc::new(RefCell::new(transcript_view(&chat)));
+        view.borrow_mut().set_widget_ref(Rc::downgrade(&view));
+        let _ = view.borrow_mut().draw(&ctx);
+        view.borrow_mut()
+            .handle_event(&mut EventContext::new(), &Event::FocusIn);
+        let _ = view.borrow_mut().draw(&ctx);
+        settle_scroll_anim(&view, &ctx); // drain any enter-focus glide first
+        let before_top = view.borrow().list.borrow().scroll_top();
+
+        view.borrow_mut().scroll_to_top(&mut EventContext::new());
+        assert!(
+            view.borrow().scroll_anim.is_some(),
+            "a multi-message jump up animates rather than snapping"
+        );
+        assert_eq!(
+            view.borrow().list.borrow().cursor,
+            0,
+            "the cursor lands on the target immediately"
+        );
+        assert_eq!(
+            view.borrow().list.borrow().scroll_top(),
+            before_top,
+            "the viewport has not jumped yet"
+        );
+
+        settle_scroll_anim(&view, &ctx);
+        let rows = crate::test_support::rows(&view.borrow_mut().draw(&ctx));
+        assert_eq!(
+            view.borrow().list.borrow().scroll_top(),
+            oracle_top,
+            "the glide lands on the snap's top item"
+        );
+        assert_eq!(
+            view.borrow().list.borrow().scroll_offset(),
+            oracle_off,
+            "the glide lands on the snap's line offset"
+        );
+        assert_eq!(
+            rows, oracle_rows,
+            "the glide's final frame matches the snap"
+        );
+    }
+
+    /// Deliver ticks (with a real sleep, since the glide is wall-clock timed)
+    /// and redraw until the focus-scroll animation finishes. Bounded so a stuck
+    /// animation fails the test rather than hanging.
+    fn settle_scroll_anim(view: &Rc<RefCell<TranscriptView>>, ctx: &DrawContext) {
+        for _ in 0..200 {
+            if view.borrow().scroll_anim.is_none() {
+                return;
+            }
+            view.borrow_mut()
+                .handle_event(&mut EventContext::new(), &Event::Tick);
+            let _ = view.borrow_mut().draw(ctx);
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        panic!("scroll animation did not finish");
     }
 
     /// The number of top-left corner glyphs in a drawn view: one per bordered

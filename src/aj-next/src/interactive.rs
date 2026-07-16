@@ -2890,6 +2890,11 @@ impl Shell {
             (styles, transcript, OverlayChrome::from_theme(&t))
         };
         let chrome = Rc::new(RefCell::new(chrome));
+        // Give the transcript its own `WidgetRef` (weak) so focus navigation
+        // can schedule ticks targeting it to drive the smooth focus scroll.
+        transcript
+            .borrow_mut()
+            .set_widget_ref(Rc::downgrade(&transcript));
         let status_line = StatusLine::new(Rc::clone(&chat), Rc::clone(&status), Rc::clone(&styles));
         let quit_hint_warning: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let quit_hint = Rc::new(RefCell::new(QuitHint::new(
@@ -3037,11 +3042,11 @@ impl Shell {
                     ctx.redraw = true;
                 }
                 AjAction::ChatScrollToTop => {
-                    transcript_for_actions.borrow_mut().scroll_to_top();
+                    transcript_for_actions.borrow_mut().scroll_to_top(ctx);
                     ctx.redraw = true;
                 }
                 AjAction::ChatScrollToBottom => {
-                    transcript_for_actions.borrow_mut().scroll_to_bottom();
+                    transcript_for_actions.borrow_mut().scroll_to_bottom(ctx);
                     ctx.redraw = true;
                 }
                 AjAction::TranscriptFocus => {
@@ -3052,9 +3057,9 @@ impl Shell {
                     // focus mode, but only if there is a user message to land
                     // on: its `FocusIn` lands on the newest one. No user
                     // messages means Tab is a no-op and stays in the editor.
-                    let transcript = transcript_for_actions.borrow_mut();
+                    let mut transcript = transcript_for_actions.borrow_mut();
                     if transcript.in_focus_mode() {
-                        transcript.focus_prev_user_message();
+                        transcript.focus_prev_user_message(ctx);
                         ctx.redraw = true;
                     } else if transcript.has_user_message() {
                         drop(transcript);
