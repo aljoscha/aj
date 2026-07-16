@@ -34,6 +34,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::error::Error;
 use crate::event_loop::{AsyncInput, async_input};
+use crate::image::{Image, Source};
 use crate::tty::Tty;
 use crate::vaxis::Vaxis;
 use crate::vxfw::app_core::{
@@ -394,6 +395,27 @@ impl AsyncApp {
         f(self.core.tty.writer())
     }
 
+    /// Transmit an image into the terminal's graphics store, returning a handle
+    /// whose id can be placed into a surface cell. Requires the kitty graphics
+    /// capability, returning [`Error::NoGraphicsCapability`] otherwise.
+    //
+    // NOTE: This lives here rather than being composed from `vaxis()` and
+    // `with_writer()` because transmission borrows the `Vaxis` and the tty
+    // writer at once, and those are disjoint `pub(crate)` fields of `AppCore`
+    // that no external caller can borrow together.
+    pub fn load_image(&mut self, source: Source) -> Result<Image, Error> {
+        let mut writer = self.core.tty.writer();
+        self.core.vx.load_image(&mut writer, source)
+    }
+
+    /// Delete a transmitted image from the terminal's graphics store, freeing
+    /// its id. Best-effort: write and flush errors are swallowed, matching
+    /// [`Vaxis::free_image`].
+    pub fn free_image(&mut self, id: u32) {
+        let mut writer = self.core.tty.writer();
+        self.core.vx.free_image(&mut writer, id);
+    }
+
     /// Restores the terminal: stops the reader, leaves the alt screen,
     /// disables mouse and paste, shows the cursor, and flushes. Best-effort.
     pub async fn shutdown(mut self) {
@@ -742,5 +764,58 @@ mod tests {
             stats.last_cells, 0,
             "an unchanged frame reports zero changed cells"
         );
+    }
+
+    /// A 2x2 RGBA image encoded as PNG bytes for `Source::Mem`.
+    fn tiny_png() -> Vec<u8> {
+        let img = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([10, 20, 30, 255]),
+        ));
+        let mut png = Vec::new();
+        img.write_with_encoder(image::codecs::png::PngEncoder::new(&mut png))
+            .expect("encode png");
+        png
+    }
+
+    /// Builds and initializes an `AsyncApp` over a `TestTty` and a pipe, with
+    /// the kitty graphics capability set to `kitty_graphics`. Returns the write
+    /// end so the caller keeps the reader from seeing EOF.
+    async fn init_graphics_app(kitty_graphics: bool) -> (AsyncApp, OwnedFd) {
+        let (read_fd, write_fd) = nix::unistd::pipe().expect("pipe");
+        write_all(&write_fd, b"\x1b[?c");
+
+        let root: WidgetRef = to_widget_ref(Rc::new(RefCell::new(Recorder::default())));
+        // Seeding `caps` before `init` survives detection: `query_terminal_send`
+        // seeds the shared detected state from the current caps, and the DA1
+        // reply folds nothing that turns kitty graphics back off.
+        let mut vx = Vaxis::new(VaxisOptions::default());
+        vx.caps.kitty_graphics = kitty_graphics;
+        let mut app = AsyncApp::new(vx, Box::new(TestTty::new()), read_fd);
+        app.init(root, Options::default()).await.expect("init");
+        (app, write_fd)
+    }
+
+    #[tokio::test]
+    async fn load_image_transmits_when_graphics_capable() {
+        let (mut app, _write_fd) = init_graphics_app(true).await;
+
+        let img = app.load_image(Source::Mem(tiny_png())).expect("load image");
+
+        // The capability gate passed, the first id was allocated, and the
+        // delegation ran without a write error against the tty.
+        assert_eq!(img.id(), 1);
+        assert_eq!((img.width(), img.height()), (2, 2));
+    }
+
+    #[tokio::test]
+    async fn load_image_errors_without_graphics_capability() {
+        let (mut app, _write_fd) = init_graphics_app(false).await;
+
+        assert!(matches!(
+            app.load_image(Source::Mem(tiny_png())),
+            Err(Error::NoGraphicsCapability)
+        ));
     }
 }
