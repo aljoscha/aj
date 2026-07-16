@@ -2578,7 +2578,7 @@ fn apply_editor_agent_marker(tui: &mut Tui, id: AgentId) {
 /// stay at least `COMMANDS.len() + 3`. The content-heavy overlays
 /// (session switcher, prompt history) size their rows dynamically
 /// instead. See [`large_overlay_inner_rows`].
-const PALETTE_OVERLAY_INNER_ROWS: usize = 22;
+const PALETTE_OVERLAY_INNER_ROWS: usize = 23;
 
 /// Sizing/anchor used by the command palette and the compact pickers
 /// (model / thinking / help). Centered, fills ~75% of the terminal
@@ -3304,6 +3304,13 @@ async fn handle_command(
                 notice: None,
             }
         }
+        // The session-tree overlay is an aj-next surface; this frontend has no
+        // renderer for it, so the palette entry folds a notice rather than
+        // opening anything.
+        CommandAction::OpenSessionTree => CommandOutcome::Continue {
+            selector: None,
+            notice: Some("The session tree is available in aj-next.".to_string()),
+        },
         CommandAction::OpenPromptHistory => {
             // Both scans run on a blocking thread so the overlay opens
             // immediately and fills in incrementally. The

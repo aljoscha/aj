@@ -18,6 +18,8 @@
 //! - [`compaction`] is the pure planning library for context
 //!   compaction: token estimation, cut-point selection, summary
 //!   prompt templates, and file-op extraction over log entries.
+//! - [`tree`] projects the log's branch structure onto a
+//!   segment-collapsed [`SessionTree`] for the tree-view overlay.
 
 pub mod compaction;
 pub mod listener;
@@ -28,6 +30,7 @@ pub mod repair;
 pub mod replay;
 pub mod stats;
 mod tool_details;
+pub mod tree;
 
 pub use compaction::{
     CompactionDetails, CompactionPlan, ContextEstimate, estimate_context_tokens,
@@ -47,3 +50,4 @@ pub use repair::repair_interrupted_tool_uses;
 pub use replay::{project_thread, replay, replay_deferring_subs};
 pub use stats::SessionStats;
 pub use tool_details::resolve_tool_details;
+pub use tree::{SessionTree, TreeSegment};

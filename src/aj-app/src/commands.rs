@@ -111,6 +111,14 @@ pub const COMMANDS: &[Command] = &[
         action: CommandAction::OpenSessionSelector,
     },
     Command {
+        name: "tree",
+        title: "tree",
+        category: "session",
+        description: "Navigate this session's branches and switch between them.",
+        action_id: None,
+        action: CommandAction::OpenSessionTree,
+    },
+    Command {
         name: "new",
         title: "new",
         category: "session",
@@ -270,6 +278,11 @@ pub enum CommandAction {
     /// session is pre-selected; `Enter` swaps the agent over to the
     /// chosen session, `Esc` cancels.
     OpenSessionSelector,
+    /// Open the session-tree overlay: the current session's branch
+    /// structure, one row per segment. `Enter` switches the active
+    /// branch to the chosen segment's tip (a no-op on the current
+    /// tip); `Esc` cancels. Opening is read-only.
+    OpenSessionTree,
     /// Open the prompt-history search overlay. `Enter` recalls the
     /// chosen prompt into the editor; `Esc` cancels.
     OpenPromptHistory,

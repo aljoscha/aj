@@ -30,6 +30,7 @@ mod prompt_history;
 mod quit_hint;
 mod scroll;
 mod session_selector;
+mod session_tree;
 mod settings_ui;
 mod splash;
 mod status;

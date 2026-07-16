@@ -79,6 +79,7 @@ use crate::pending::PendingBox;
 use crate::prompt_history::{HistoryFetch, HistoryScope, MAX_ENTRIES, open_prompt_history};
 use crate::quit_hint::QuitHint;
 use crate::session_selector::{SessionScan, extend_session_scan, open_session_selector};
+use crate::session_tree::{build_tree_rows, open_session_tree};
 use crate::settings_ui::{
     MODEL_SETTING_ID, SelectorActivity, SettingsCatalogs, SettingsUi, SettingsValues, SkillRow,
     SkillsFill, UNSET_VALUE, build_skill_rows, open_model, open_settings, open_skills,
@@ -1694,6 +1695,37 @@ async fn apply_command_action(
                 &handles.session_scan,
                 &handles.session_request,
                 world.core.session_id.clone(),
+            );
+            ActionEffect::OpenedOverlay
+        }
+        CommandAction::OpenSessionTree => {
+            // Selecting a branch tears the world down and rebuilds it, so it
+            // rides the same mid-turn guard as the other session-changing
+            // commands. Refusing to OPEN (not just to select) is a v1
+            // simplification: it reuses the established guard and guarantees no
+            // branch request reaches the drive loop while a turn is in flight
+            // (whose take_session_request path assumes `world.turns` is empty).
+            if !world.turns.is_empty() {
+                fold_notice(world, &session_busy_notice("open the session tree"));
+                return ActionEffect::Redraw;
+            }
+            // Building the tree is cheap and in-memory, so lock the log, snapshot
+            // the rows and the current head, and drop the lock before opening.
+            let (rows, current_head) = {
+                let log = world.core.log.lock().await;
+                (
+                    build_tree_rows(&log.session_tree(), Utc::now()),
+                    log.head().cloned(),
+                )
+            };
+            let handles = shell.borrow().overlay_handles();
+            open_session_tree(
+                &handles.stack,
+                &handles.editor,
+                &handles.chrome,
+                &handles.session_request,
+                rows,
+                current_head,
             );
             ActionEffect::OpenedOverlay
         }
@@ -10298,6 +10330,54 @@ mod tests {
         cancel_viewed_turn(&world);
         let joined = join_next_or_pending(&mut world.turns).await;
         handle_turn_join(&mut world, joined).expect("abort is non-fatal");
+    }
+
+    /// Opening the session tree while a turn runs is refused (the branch
+    /// switch it leads to would tear the world down under a live turn), and
+    /// folds the busy notice rather than opening the overlay.
+    #[tokio::test]
+    async fn session_tree_refused_mid_turn() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        handle_submit(&mut world, "go".to_string());
+        assert!(world.turn_cancels.contains_key(&AgentId::Main), "busy");
+
+        assert!(matches!(
+            apply_command(&mut world, &shell, CommandAction::OpenSessionTree).await,
+            ActionEffect::Redraw
+        ));
+        assert!(
+            !shell.borrow().overlays.borrow().is_open(),
+            "no tree opened mid-turn"
+        );
+        let notices = main_notices(&world);
+        assert!(
+            notices.iter().any(|n| n.contains("open the session tree")),
+            "{notices:?}"
+        );
+
+        // Settle the turn so teardown is clean.
+        cancel_viewed_turn(&world);
+        let joined = join_next_or_pending(&mut world.turns).await;
+        handle_turn_join(&mut world, joined).expect("abort is non-fatal");
+    }
+
+    /// While idle the session tree opens read-only, listing the current
+    /// session's single branch (its first user message).
+    #[tokio::test]
+    async fn session_tree_opens_and_lists_the_branch_when_idle() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        run_prompt(&mut world, "tree branch prompt").await;
+
+        assert!(matches!(
+            apply_command(&mut world, &shell, CommandAction::OpenSessionTree).await,
+            ActionEffect::OpenedOverlay
+        ));
+        assert!(
+            shell.borrow().overlays.borrow().is_open(),
+            "the tree overlay opened"
+        );
     }
 
     /// The selector opens showing a loading placeholder, fills from a real

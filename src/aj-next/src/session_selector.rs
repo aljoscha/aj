@@ -237,7 +237,7 @@ fn format_secondary(preview: &SessionPreview, now: DateTime<Utc>) -> String {
 
 /// Render `then` as a coarse age relative to `now`: `now / 5m / 3h / 2d /
 /// 4w / 6mo / 2y`. The bucket boundaries are deliberately fuzzy.
-fn format_age(now: DateTime<Utc>, then: DateTime<Utc>) -> String {
+pub(crate) fn format_age(now: DateTime<Utc>, then: DateTime<Utc>) -> String {
     let secs = now.signed_duration_since(then).num_seconds().max(0);
     let mins = secs / 60;
     let hours = mins / 60;
@@ -278,7 +278,7 @@ fn format_created(now: DateTime<Utc>, created: DateTime<Utc>) -> String {
 
 /// Truncate to `max` characters (not bytes), appending an ellipsis when
 /// cut.
-fn truncate_chars(text: &str, max: usize) -> String {
+pub(crate) fn truncate_chars(text: &str, max: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= max {
         return text.to_string();

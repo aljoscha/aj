@@ -101,6 +101,12 @@ pub enum SessionExit {
 pub enum SessionRequest {
     New,
     Resume(String),
+    /// Switch the active branch of the current session: rebuild it onto
+    /// `head` with no prompt. Parked by the session-tree overlay's confirm,
+    /// this reuses the branch rebuild path (see [`SessionExit::Branch`]).
+    Branch {
+        head: EntryId,
+    },
 }
 
 impl SessionRequest {
@@ -108,6 +114,7 @@ impl SessionRequest {
         match self {
             SessionRequest::New => SessionExit::New,
             SessionRequest::Resume(id) => SessionExit::Switch(id),
+            SessionRequest::Branch { head } => SessionExit::Branch { head, prompt: None },
         }
     }
 }
