@@ -20,6 +20,7 @@ use aj_app::keybindings::{
 };
 use aj_app::theme::{Theme, ThemeBg, ThemeColor};
 use vaxis::cell::Style;
+use vaxis::mouse;
 use vaxis::vxfw::{
     DrawContext, Event, EventContext, RelativePoint, SelectStyles, Size, Surface, Widget, WidgetRef,
 };
@@ -193,6 +194,43 @@ impl Widget for Scrim {
         // Clicks and wheel scrolls stop here instead of bubbling into the
         // base layout. Nothing changed visually, so no redraw.
         if let Event::Mouse(_) = event {
+            ctx.consume_event();
+        }
+    }
+
+    fn wants_events(&self) -> bool {
+        true
+    }
+}
+
+/// An event target for transient surfaces painted above base content.
+pub(crate) struct MouseBlocker {
+    on_mouse: Box<dyn FnMut()>,
+}
+
+impl MouseBlocker {
+    pub(crate) fn new(on_mouse: Box<dyn FnMut()>) -> MouseBlocker {
+        MouseBlocker { on_mouse }
+    }
+}
+
+impl Widget for MouseBlocker {
+    fn draw(&mut self, ctx: &DrawContext) -> Surface {
+        Surface::with_size(ctx.max.size())
+    }
+
+    fn handle_event(&mut self, ctx: &mut EventContext, event: &Event) {
+        let Event::Mouse(m) = event else {
+            return;
+        };
+        (self.on_mouse)();
+        if !matches!(
+            m.button,
+            mouse::Button::WheelUp
+                | mouse::Button::WheelDown
+                | mouse::Button::WheelLeft
+                | mouse::Button::WheelRight
+        ) {
             ctx.consume_event();
         }
     }
@@ -505,6 +543,36 @@ mod tests {
             }),
         );
         assert!(!ctx.consume_event, "keys route by focus, not by the scrim");
+    }
+
+    #[test]
+    fn transient_blocker_consumes_buttons_but_leaves_wheel_scrolling_available() {
+        let seen = Rc::new(std::cell::Cell::new(0));
+        let seen_c = Rc::clone(&seen);
+        let mut blocker = MouseBlocker::new(Box::new(move || seen_c.set(seen_c.get() + 1)));
+        let event = |button| {
+            Event::Mouse(mouse::Mouse {
+                col: 0,
+                row: 0,
+                xoffset: 0,
+                yoffset: 0,
+                button,
+                mods: mouse::Modifiers::empty(),
+                kind: mouse::Type::Press,
+            })
+        };
+
+        let mut ctx = EventContext::new();
+        blocker.handle_event(&mut ctx, &event(mouse::Button::Left));
+        assert!(
+            ctx.consume_event,
+            "button input cannot reach obscured content"
+        );
+
+        let mut ctx = EventContext::new();
+        blocker.handle_event(&mut ctx, &event(mouse::Button::WheelUp));
+        assert!(!ctx.consume_event, "wheel input keeps its existing routing");
+        assert_eq!(seen.get(), 2, "both events interrupt pending clicks");
     }
 
     /// The subtitle builders resolve their labels through the keybinding

@@ -73,7 +73,7 @@ use crate::login::{
     AuthPickerRequest, AuthRow, DialogCallbacks, LoginDialogState, open_login_dialog,
     open_login_picker, open_logout_picker,
 };
-use crate::overlay::{OverlayChrome, OverlayStack, Scrim};
+use crate::overlay::{MouseBlocker, OverlayChrome, OverlayStack, Scrim};
 use crate::palette::{FetchKind, PendingFetch, open_palette};
 use crate::pending::PendingBox;
 use crate::prompt_history::{HistoryFetch, HistoryScope, MAX_ENTRIES, open_prompt_history};
@@ -3156,7 +3156,7 @@ struct Shell {
     /// The modal stack. Shared: overlay callbacks (confirm/cancel) mutate
     /// it from inside dispatch while the Shell reads it at draw time.
     overlays: Rc<RefCell<OverlayStack>>,
-    /// The scrim widget, kept across frames so its identity is stable for
+    /// The modal scrim, kept across frames so its identity is stable for
     /// hit-testing.
     scrim: Rc<RefCell<Scrim>>,
     /// A host-applied command parked by the palette's confirm (compact,
@@ -3581,6 +3581,17 @@ impl Shell {
                     ctx.redraw = true;
                 }));
         }
+        // Route transcript box clicks through the picker outcome slot. The
+        // drive loop then applies the normal observe behavior, including
+        // materializing deferred transcripts from resumed sessions.
+        {
+            let picker_outcome = Rc::clone(&picker_outcome);
+            transcript
+                .borrow_mut()
+                .set_on_observe_agent(Box::new(move |id| {
+                    *picker_outcome.borrow_mut() = Some(AgentPickerOutcome::Observe(id));
+                }));
+        }
         let keymap =
             KeymapController::new(build_keymap(), Rc::clone(&keymap_ctx), layout, on_action);
 
@@ -3841,6 +3852,7 @@ impl Widget for Shell {
             // Rows available above the editor, keeping the header on screen.
             let max_rows = usize::from(editor_top.saturating_sub(HEADER_ROWS));
             if let Some(popup) = editor.draw_autocomplete_popup_surface(term.width, max_rows) {
+                let popup = block_mouse(popup, &self.transcript);
                 // Anchor so the popup's bottom edge abuts the editor's top.
                 let anchor = editor_top.saturating_sub(popup.size.height);
                 inner.children.push(SubSurface {
@@ -3883,6 +3895,7 @@ impl Widget for Shell {
                     height: stack_bottom.saturating_sub(HEADER_ROWS),
                 };
                 if let Some(hint) = self.quit_hint.borrow().draw(ctx, avail) {
+                    let hint = block_mouse(hint, &self.transcript);
                     stack_bottom = push_corner_box(&mut inner, term.width, stack_bottom, hint);
                 }
             }
@@ -3892,18 +3905,17 @@ impl Widget for Shell {
                 height: stack_bottom.saturating_sub(HEADER_ROWS),
             };
             if let Some(toast) = self.copied_toast.borrow().draw(ctx, avail) {
+                let toast = block_mouse(toast, &self.transcript);
                 push_corner_box(&mut inner, term.width, stack_bottom, toast);
             }
         }
 
         // Frame-statistics debug overlay. Opt-in (off by default), floated in
         // the top-right corner above the base content (z 1, like the popup and
-        // quit hint) so it stays visible during interaction. It is
-        // non-interactive: the box surface carries no widget identity, so it
-        // never joins the focus path, and, occupying only its own cells, it
-        // leaves hit-testing elsewhere untouched. It shows the previous frame's
-        // numbers (the drive loop refreshes the snapshot before each paint) and
-        // freezes when idle. When off we append nothing.
+        // quit hint) so it stays visible during interaction. The box never
+        // joins the focus path. A transparent blocker over its exact bounds
+        // stops pointer-button input from reaching obscured content. It shows the
+        // previous frame's numbers and freezes when idle.
         if self.show_frame_stats.get() {
             let term = ctx.max.size();
             // Room below the fixed header row, where the box is anchored.
@@ -3912,6 +3924,7 @@ impl Widget for Shell {
                 height: term.height.saturating_sub(HEADER_ROWS),
             };
             if let Some(surf) = self.frame_stats_box.borrow().draw(ctx, avail) {
+                let surf = block_mouse(surf, &self.transcript);
                 let anchor_col = term.width.saturating_sub(surf.size.width);
                 inner.children.push(SubSurface {
                     origin: RelativePoint {
@@ -3974,6 +3987,11 @@ impl Widget for Shell {
     }
 
     fn capture_event(&mut self, ctx: &mut EventContext, event: &Event) {
+        if matches!(event, Event::KeyPress(_))
+            || matches!(event, Event::Mouse(_)) && self.overlays.borrow().top().is_some()
+        {
+            self.transcript.borrow_mut().cancel_agent_click();
+        }
         // Host-posted app events target the focused widget, but they're
         // meant for the Shell chrome. The Shell is the root of every focus
         // path, so it forwards them from the capturing phase without
@@ -4429,6 +4447,18 @@ fn earliest_deadline(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> 
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
     }
+}
+
+/// Adds a transparent event target over `surface` without changing its paint.
+fn block_mouse(mut surface: Surface, transcript: &Rc<RefCell<TranscriptView>>) -> Surface {
+    let transcript = Rc::downgrade(transcript);
+    let blocker = MouseBlocker::new(Box::new(move || {
+        if let Some(transcript) = transcript.upgrade() {
+            transcript.borrow_mut().cancel_agent_click();
+        }
+    }));
+    surface.widget = Some(Rc::new(RefCell::new(blocker)));
+    surface
 }
 
 /// Anchor a corner box flush to the right edge with its bottom at `bottom`,
@@ -5481,6 +5511,36 @@ mod tests {
         let popup = popup_overlay(&composed).expect("a popup overlay floats above the base layout");
         assert_eq!(popup.origin.col, 0);
         assert!(popup.surface.size.height >= 1, "the popup has rows");
+        let mut hits = Vec::new();
+        composed.hit_test(
+            vaxis::vxfw::Point {
+                row: u16::try_from(popup.origin.row).expect("popup row is non-negative"),
+                col: 1,
+            },
+            &mut hits,
+        );
+        let blocker_name = std::any::type_name::<MouseBlocker>();
+        assert_eq!(
+            hits.last()
+                .expect("popup point has a target")
+                .widget
+                .borrow()
+                .debug_label(),
+            blocker_name,
+        );
+        let mut hits = Vec::new();
+        composed.hit_test(
+            vaxis::vxfw::Point {
+                row: u16::try_from(popup.origin.row - 1).expect("row above popup is visible"),
+                col: 1,
+            },
+            &mut hits,
+        );
+        assert!(
+            hits.iter()
+                .all(|hit| hit.widget.borrow().debug_label() != blocker_name),
+            "the blocker is limited to the popup bounds",
+        );
         // The editor sits directly above the footer, so its top row is the
         // popup's bottom edge.
         let editor_top = 30 - FOOTER_ROWS - editor_h_open;
@@ -5510,6 +5570,90 @@ mod tests {
         assert!(
             popup.surface.size.height < 15,
             "the popup shrank below the item count to fit the short terminal",
+        );
+    }
+
+    #[test]
+    fn transcript_box_click_parks_shell_picker_outcome() {
+        let chat = empty_chat();
+        let mut lifecycle = aj_app::session::AgentLifecycle::default();
+        let _ = reduce(
+            &mut chat.borrow_mut(),
+            &mut lifecycle,
+            AgentEvent::SubAgentStart {
+                parent: AgentId::Main,
+                child: AgentId::Sub(7),
+                task: "inspect the picker wiring".into(),
+                background: false,
+                settings: aj_agent::events::AgentSettings {
+                    provider: "scripted".into(),
+                    model_id: "scripted".into(),
+                    thinking: "off".into(),
+                    speed: "standard".into(),
+                    verbosity: "default".into(),
+                },
+            },
+        );
+        let shell = test_shell_with_chat(chat);
+        let surface = shell
+            .borrow()
+            .transcript
+            .borrow_mut()
+            .draw(&draw_ctx(40, 20));
+        let row = crate::test_support::rows(&surface)
+            .iter()
+            .position(|row| row.contains("agent 7"))
+            .expect("the sub-agent box is visible");
+        let mouse = |kind| {
+            Event::Mouse(vaxis::mouse::Mouse {
+                col: 5,
+                row: i16::try_from(row).expect("row fits"),
+                xoffset: 0,
+                yoffset: 0,
+                button: vaxis::mouse::Button::Left,
+                mods: vaxis::mouse::Modifiers::empty(),
+                kind,
+            })
+        };
+
+        let mut ctx = EventContext::new();
+        shell
+            .borrow()
+            .transcript
+            .borrow_mut()
+            .handle_event(&mut ctx, &mouse(vaxis::mouse::Type::Press));
+        shell
+            .borrow()
+            .transcript
+            .borrow_mut()
+            .handle_event(&mut ctx, &mouse(vaxis::mouse::Type::Release));
+
+        assert_eq!(
+            shell.borrow().take_picker_outcome(),
+            Some(AgentPickerOutcome::Observe(AgentId::Sub(7))),
+        );
+
+        shell
+            .borrow()
+            .transcript
+            .borrow_mut()
+            .handle_event(&mut ctx, &mouse(vaxis::mouse::Type::Press));
+        shell.borrow_mut().capture_event(
+            &mut ctx,
+            &Event::KeyPress(Key {
+                codepoint: u32::from('x'),
+                ..Key::default()
+            }),
+        );
+        shell
+            .borrow()
+            .transcript
+            .borrow_mut()
+            .handle_event(&mut ctx, &mouse(vaxis::mouse::Type::Release));
+        assert_eq!(
+            shell.borrow().take_picker_outcome(),
+            None,
+            "keyboard input interrupts a pending mouse click",
         );
     }
 
@@ -7055,8 +7199,8 @@ mod tests {
 
     /// The frame-stats overlay is gated on the `show_frame_stats` cell: off
     /// (the default) the box never appears; on, with a snapshot set, a
-    /// top-right "frame stats" box shows the numbers. The box surface carries
-    /// no widget identity, so it never joins the focus path.
+    /// top-right "frame stats" box shows the numbers. A mouse blocker owns the
+    /// box bounds so input cannot pass through to content behind it.
     #[test]
     fn frame_stats_overlay_gates_on_the_flag() {
         let shell = test_shell_with_chat(empty_chat());
@@ -7114,10 +7258,12 @@ mod tests {
         );
         assert!(body.contains("cells 1234"), "{body}");
         assert!(body.contains("size  100x30"), "{body}");
-        assert!(
-            box_surf.widget.is_none(),
-            "the box must be non-interactive (no widget identity)"
+        let blocker = box_surf.widget.as_ref().expect("box has a mouse blocker");
+        assert_eq!(
+            blocker.borrow().debug_label(),
+            std::any::type_name::<MouseBlocker>()
         );
+        assert!(blocker.borrow().wants_events());
 
         // The box is flush to the right edge (top-right corner).
         let composited = crate::test_support::flatten(&on);

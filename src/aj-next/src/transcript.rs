@@ -1411,6 +1411,17 @@ pub struct TranscriptView {
     /// back to the editor. `None` until the host wires it in `Shell::new`.
     /// The resulting `FocusOut` clears the focus flag, exiting the mode.
     on_exit_focus: Option<Box<dyn FnMut(&mut EventContext)>>,
+    /// Called after a plain click on a sub-agent box. The host routes the ID
+    /// through the same observe path as the agent picker.
+    on_observe_agent: Option<Box<dyn FnMut(AgentId)>>,
+    /// A sub-agent box hit on the current left-button press. Cleared by any
+    /// drag, so select-to-copy never switches views on release.
+    agent_click: Option<AgentId>,
+    /// Sub-agent boxes under each row of the last completed bounded draw.
+    /// Mouse dispatch uses the previous frame, so hit testing must use its
+    /// geometry rather than re-laying live entries between frames.
+    agent_hit_rows: Vec<Option<AgentId>>,
+    agent_hit_width: u16,
     /// The active free-form selection, if any (Spec E section 2). Set on a
     /// left-button press-drag over the content and kept highlighted after the
     /// release copies it, until the next plain click or Esc clears it.
@@ -1585,6 +1596,10 @@ impl TranscriptView {
             follow_tail: true,
             focused,
             on_exit_focus: None,
+            on_observe_agent: None,
+            agent_click: None,
+            agent_hit_rows: Vec::new(),
+            agent_hit_width: 0,
             selection: None,
             copied,
             last_view: Size {
@@ -1628,6 +1643,9 @@ impl TranscriptView {
         // re-lays the new transcript's entries rather than reading the previous
         // session's rows.
         self.entry_text.clear();
+        self.agent_click = None;
+        self.agent_hit_rows.clear();
+        self.agent_hit_width = 0;
         // The reused list holds a different session whose entries reuse indices,
         // so a geometry carried over from the previous session would missize the
         // new session's thumb. Drop it so the next draw rebuilds it.
@@ -1648,6 +1666,16 @@ impl TranscriptView {
     /// whose `FocusOut` then clears the item cursor and exits the mode.
     pub(crate) fn set_on_exit_focus(&mut self, on_exit: Box<dyn FnMut(&mut EventContext)>) {
         self.on_exit_focus = Some(on_exit);
+    }
+
+    /// Install the callback invoked after a plain click on a sub-agent box.
+    pub(crate) fn set_on_observe_agent(&mut self, on_observe: Box<dyn FnMut(AgentId)>) {
+        self.on_observe_agent = Some(on_observe);
+    }
+
+    /// Cancel any in-flight sub-agent box click.
+    pub(crate) fn cancel_agent_click(&mut self) {
+        self.agent_click = None;
     }
 
     /// Record the view's own `WidgetRef` (as a `Weak`), so focus navigation can
@@ -2415,12 +2443,54 @@ impl TranscriptView {
         })
     }
 
+    /// Return the sub-agent whose box contains this point in the last frame.
+    fn subagent_at_point(&self, row: i16, col: i16) -> Option<AgentId> {
+        let row = usize::try_from(row).ok()?;
+        let col = u16::try_from(col).ok()?;
+        if col >= self.agent_hit_width {
+            return None;
+        }
+        self.agent_hit_rows.get(row).copied().flatten()
+    }
+
+    /// Snapshot the visible sub-agent boxes from the geometry just drawn.
+    fn record_agent_hit_map(&mut self) {
+        let height = usize::from(self.last_view.height);
+        let width = self.content_width();
+        let positions = self.drawn_row_positions(height);
+        let mut rows = Vec::with_capacity(height);
+
+        for pos in positions {
+            let Some(pos) = pos else {
+                rows.push(None);
+                continue;
+            };
+            let chat = self.chat.borrow();
+            let agent = chat
+                .transcript(chat.active_view())
+                .and_then(|transcript| transcript.get(pos.entry))
+                .and_then(|entry| match &entry.kind {
+                    EntryKind::SubAgent(sub) => Some(AgentId::Sub(sub.child)),
+                    _ => None,
+                });
+            rows.push(agent);
+        }
+
+        self.agent_hit_rows = rows;
+        self.agent_hit_width = width;
+    }
+
     /// Drive the free-form selection from a left-button mouse event (Spec E
     /// section 2). Called only after the bars declined the event, so a
     /// scrollbar-thumb drag scrolls rather than selects.
     fn handle_selection_mouse(&mut self, ctx: &mut EventContext, m: &mouse::Mouse) {
         match m.kind {
             mouse::Type::Press => {
+                self.agent_click = if m.mods.is_empty() {
+                    self.subagent_at_point(m.row, m.col)
+                } else {
+                    None
+                };
                 // A press anchors a fresh (zero-width) selection and stops the
                 // viewport chasing the tail so the anchor stays put.
                 let Some(pos) = self.point_to_sel(m.row, m.col) else {
@@ -2434,6 +2504,7 @@ impl TranscriptView {
                 ctx.redraw = true;
             }
             mouse::Type::Drag => {
+                self.agent_click = None;
                 // Dragging past the top or bottom edge auto-scrolls by the
                 // overshoot so a selection can span more than one screen. The
                 // revealed rows extend the selection on subsequent frames. A
@@ -2466,6 +2537,15 @@ impl TranscriptView {
                 ctx.redraw = true;
             }
             mouse::Type::Release => {
+                let released_agent = if m.mods.is_empty() {
+                    self.subagent_at_point(m.row, m.col)
+                } else {
+                    None
+                };
+                let observe = self
+                    .agent_click
+                    .take()
+                    .filter(|id| Some(*id) == released_agent);
                 if let Some(sel) = self.selection {
                     if sel.anchor == sel.caret {
                         // A plain click (no drag) clears the selection.
@@ -2491,9 +2571,56 @@ impl TranscriptView {
                     }
                     ctx.redraw = true;
                 }
+                if let Some(id) = observe
+                    && let Some(on_observe) = self.on_observe_agent.as_mut()
+                {
+                    on_observe(id);
+                }
             }
             mouse::Type::Motion => {}
         }
+    }
+
+    /// Clickable row positions from the list's last completed layout geometry.
+    /// The trailing spacer of each entry is left unmapped.
+    fn drawn_row_positions(&self, height: usize) -> Vec<Option<RowPos>> {
+        let list = self.list.borrow();
+        let mut idx = usize::try_from(list.scroll_top()).unwrap_or(0);
+        let mut line = usize::try_from(list.scroll_offset()).unwrap_or(0);
+        let pad = usize::from(list.top_pad()).min(height);
+        let mut rows = vec![None; pad];
+
+        let item_height = |idx: usize| {
+            usize::try_from(
+                list.item_top_line(idx + 1)
+                    .saturating_sub(list.item_top_line(idx)),
+            )
+            .unwrap_or(usize::MAX)
+            .max(1)
+        };
+        let mut current = self.entry_id_at(idx).map(|id| (id, item_height(idx)));
+        for _ in pad..height {
+            while let Some((_, current_height)) = current {
+                if line < current_height {
+                    break;
+                }
+                idx += 1;
+                line = 0;
+                current = self.entry_id_at(idx).map(|id| (id, item_height(idx)));
+            }
+            match current {
+                Some((entry, current_height)) if line + 1 < current_height => {
+                    rows.push(Some(RowPos { entry, line }));
+                    line += 1;
+                }
+                Some(_) => {
+                    rows.push(None);
+                    line += 1;
+                }
+                None => rows.push(None),
+            }
+        }
+        rows
     }
 
     /// For each of the `height` visible screen rows, the `(entry, line)` it
@@ -2732,10 +2859,11 @@ impl Widget for TranscriptView {
             surface: bars_surface,
             z_index: 0,
         });
-        // Record the viewport this draw laid out against, so the between-draw
-        // mouse handlers can map screen coordinates into entry-relative
-        // selection positions.
+        // Record the viewport and clickable rows from this completed layout.
+        // Mouse events dispatch against this frame until another draw replaces
+        // it, even if live entry geometry changes in the meantime.
         self.last_view = ctx.max.size();
+        self.record_agent_hit_map();
         // Paint the selection highlight over the composed frame (Spec E
         // section 2). A zero-width selection (a plain click) shows nothing.
         if let Some(sel) = self.selection {
@@ -2750,6 +2878,9 @@ impl Widget for TranscriptView {
         // Content-area mouse events target the inner list, so they
         // pass through here on the way down.
         if let Event::Mouse(m) = event {
+            if m.kind == mouse::Type::Drag {
+                self.agent_click = None;
+            }
             self.observe_mouse(ctx, event, m);
         }
     }
@@ -2757,6 +2888,9 @@ impl Widget for TranscriptView {
     fn handle_event(&mut self, ctx: &mut EventContext, event: &Event) {
         match event {
             Event::Mouse(m) => {
+                if !matches!(m.button, mouse::Button::Left | mouse::Button::None) {
+                    self.agent_click = None;
+                }
                 self.observe_mouse(ctx, event, m);
                 if ctx.consume_event {
                     return;
@@ -2781,8 +2915,10 @@ impl Widget for TranscriptView {
                 }
                 self.list.borrow_mut().handle_event(ctx, event);
             }
-            // The bars cancel an in-flight drag when the mouse leaves.
-            Event::MouseLeave => self.bars.handle_event(ctx, event),
+            Event::MouseLeave => {
+                self.agent_click = None;
+                self.bars.handle_event(ctx, event);
+            }
             // Focus in/out drive transcript-focus mode: the transcript is "in
             // focus mode" exactly when it is the focused widget (Spec E
             // section 1). FocusOut also fires when an opening overlay steals
@@ -3578,13 +3714,17 @@ mod tests {
     }
 
     fn mouse(col: i16, row: i16, kind: mouse::Type) -> Event {
+        mouse_with_mods(col, row, kind, mouse::Modifiers::empty())
+    }
+
+    fn mouse_with_mods(col: i16, row: i16, kind: mouse::Type, mods: mouse::Modifiers) -> Event {
         Event::Mouse(mouse::Mouse {
             col,
             row,
             xoffset: 0,
             yoffset: 0,
             button: mouse::Button::Left,
-            mods: mouse::Modifiers::empty(),
+            mods,
             kind,
         })
     }
@@ -5333,13 +5473,21 @@ mod tests {
     /// Spawn a sub-agent with one assistant line in its child transcript, and
     /// return the (Main) index of the box entry (always 0 here).
     fn spawn_sub(chat: &Rc<RefCell<ChatState>>, life: &mut AgentLifecycle) {
+        spawn_sub_id(chat, life, 0);
+    }
+
+    fn spawn_sub_id(chat: &Rc<RefCell<ChatState>>, life: &mut AgentLifecycle, child: usize) {
         apply(
             chat,
             life,
             AgentEvent::SubAgentStart {
                 parent: AgentId::Main,
-                child: AgentId::Sub(0),
-                task: "scout the code".into(),
+                child: AgentId::Sub(child),
+                task: if child == 0 {
+                    "scout the code".into()
+                } else {
+                    format!("scout the code as agent {child}")
+                },
                 background: false,
                 settings: cache_settings(),
             },
@@ -5348,7 +5496,7 @@ mod tests {
             chat,
             life,
             AgentEvent::MessageEnd {
-                agent_id: AgentId::Sub(0),
+                agent_id: AgentId::Sub(child),
                 message: AgentMessage::wire(Message::Assistant(text_message("starting"))),
             },
         );
@@ -6114,6 +6262,193 @@ mod tests {
         let grid = crate::test_support::flatten(&surface);
         assert_eq!(rows[4], " row 16", "the same content moved down two rows");
         assert_eq!(highlighted_rows(&grid, bg), vec![4]);
+    }
+
+    #[test]
+    fn plain_click_on_subagent_box_observes_agent_but_edges_and_drags_do_not() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        spawn_sub(&chat, &mut life);
+        let mut view = transcript_view(&chat);
+        let observed = Rc::new(std::cell::Cell::new(None));
+        let observed_c = Rc::clone(&observed);
+        view.set_on_observe_agent(Box::new(move |id| observed_c.set(Some(id))));
+        let ctx = draw_ctx(40, 20);
+        let _ = view.draw(&ctx);
+
+        let id = entry_id(&chat, 0);
+        let positions = view.visible_row_positions(20);
+        let box_height = view.entry_height(id, view.content_width());
+        let box_row = positions
+            .iter()
+            .position(|pos| matches!(pos, Some(pos) if pos.entry == id && pos.line == 0))
+            .expect("first box row is visible");
+        let spacer_row = positions
+            .iter()
+            .position(
+                |pos| matches!(pos, Some(pos) if pos.entry == id && pos.line + 1 == box_height),
+            )
+            .expect("box spacer is visible");
+        let blank_row = positions
+            .iter()
+            .position(Option::is_none)
+            .expect("short transcript leaves a blank top band");
+        let box_row = i16::try_from(box_row).expect("row fits");
+        let spacer_row = i16::try_from(spacer_row).expect("row fits");
+        let blank_row = i16::try_from(blank_row).expect("row fits");
+
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &mouse(5, box_row, mouse::Type::Press));
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &mouse(5, box_row, mouse::Type::Release));
+        assert_eq!(observed.take(), Some(AgentId::Sub(0)));
+
+        for row in [spacer_row, blank_row] {
+            let mut ec = EventContext::new();
+            view.handle_event(&mut ec, &mouse(5, row, mouse::Type::Press));
+            let mut ec = EventContext::new();
+            view.handle_event(&mut ec, &mouse(5, row, mouse::Type::Release));
+            assert_eq!(observed.get(), None, "row {row} is not clickable");
+        }
+
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &mouse(5, box_row, mouse::Type::Press));
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &mouse(6, box_row, mouse::Type::Drag));
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &mouse(6, box_row, mouse::Type::Release));
+        assert_eq!(observed.get(), None, "a selection drag does not navigate");
+
+        let mut ec = EventContext::new();
+        view.handle_event(
+            &mut ec,
+            &mouse_with_mods(5, box_row, mouse::Type::Press, mouse::Modifiers::SHIFT),
+        );
+        let mut ec = EventContext::new();
+        view.handle_event(
+            &mut ec,
+            &mouse_with_mods(5, box_row, mouse::Type::Release, mouse::Modifiers::SHIFT),
+        );
+        assert_eq!(observed.get(), None, "a modified click does not navigate");
+    }
+
+    #[test]
+    fn agent_hit_testing_uses_the_last_drawn_geometry() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        spawn_sub_id(&chat, &mut life, 0);
+        spawn_sub_id(&chat, &mut life, 1);
+        let mut view = transcript_view(&chat);
+        let observed = Rc::new(std::cell::Cell::new(None));
+        let observed_c = Rc::clone(&observed);
+        view.set_on_observe_agent(Box::new(move |id| observed_c.set(Some(id))));
+        view.follow_tail = false;
+        view.list.borrow_mut().scroll_lines(-1000);
+        let ctx = draw_ctx(40, 10);
+        let _ = view.draw(&ctx);
+        let old_agent_1_row = view
+            .agent_hit_rows
+            .iter()
+            .position(|agent| *agent == Some(AgentId::Sub(1)))
+            .expect("agent 1 is visible in the rendered frame");
+
+        let report = (0..20)
+            .map(|line| format!("report line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        apply(
+            &chat,
+            &mut life,
+            AgentEvent::SubAgentEnd {
+                parent: AgentId::Main,
+                child: AgentId::Sub(0),
+                report,
+                conclusion: aj_agent::events::SubAgentConclusion::Completed,
+            },
+        );
+        apply(
+            &chat,
+            &mut life,
+            AgentEvent::AgentEnd {
+                agent_id: AgentId::Sub(0),
+                messages: Vec::new(),
+            },
+        );
+
+        let row = i16::try_from(old_agent_1_row).expect("row fits");
+        assert_eq!(
+            view.subagent_at_point(row, 5),
+            Some(AgentId::Sub(1)),
+            "live geometry changes do not alter the displayed frame's hit map",
+        );
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &mouse(5, row, mouse::Type::Press));
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &mouse(5, row, mouse::Type::Release));
+        assert_eq!(observed.get(), Some(AgentId::Sub(1)));
+
+        let _ = view.draw(&ctx);
+        assert_eq!(
+            view.subagent_at_point(row, 5),
+            Some(AgentId::Sub(0)),
+            "a redraw installs the expanded box's geometry",
+        );
+    }
+
+    #[test]
+    fn mouse_leave_reset_and_capture_drag_cancel_agent_clicks() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        spawn_sub(&chat, &mut life);
+        let mut view = transcript_view(&chat);
+        let observed = Rc::new(std::cell::Cell::new(None));
+        let observed_c = Rc::clone(&observed);
+        view.set_on_observe_agent(Box::new(move |id| observed_c.set(Some(id))));
+        let ctx = draw_ctx(40, 20);
+        let _ = view.draw(&ctx);
+        let row = i16::try_from(
+            view.agent_hit_rows
+                .iter()
+                .position(Option::is_some)
+                .expect("box row is visible"),
+        )
+        .expect("row fits");
+
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &mouse(5, row, mouse::Type::Press));
+        view.handle_event(&mut ec, &Event::MouseLeave);
+        view.handle_event(&mut ec, &mouse(5, row, mouse::Type::Release));
+        assert_eq!(observed.get(), None, "MouseLeave cancels the click");
+
+        view.handle_event(&mut ec, &mouse(5, row, mouse::Type::Press));
+        view.reset_to_tail();
+        assert_eq!(
+            view.subagent_at_point(row, 5),
+            None,
+            "reset drops stale rendered geometry",
+        );
+        view.handle_event(&mut ec, &mouse(5, row, mouse::Type::Release));
+        assert_eq!(observed.get(), None, "reset cancels the click");
+
+        let _ = view.draw(&ctx);
+        view.handle_event(&mut ec, &mouse(5, row, mouse::Type::Press));
+        view.capture_event(&mut ec, &mouse(6, row, mouse::Type::Drag));
+        assert_eq!(
+            view.agent_click, None,
+            "capture-phase drag cancels the click"
+        );
+        view.handle_event(&mut ec, &mouse(6, row, mouse::Type::Release));
+        assert_eq!(observed.get(), None, "drag does not navigate");
+
+        view.handle_event(&mut ec, &mouse(5, row, mouse::Type::Press));
+        let mut wheel = match mouse(5, row, mouse::Type::Press) {
+            Event::Mouse(mouse) => mouse,
+            _ => unreachable!(),
+        };
+        wheel.button = mouse::Button::WheelUp;
+        view.handle_event(&mut ec, &Event::Mouse(wheel));
+        view.handle_event(&mut ec, &mouse(5, row, mouse::Type::Release));
+        assert_eq!(observed.get(), None, "wheel input cancels the click");
     }
 
     /// A left press-drag-release over a real range copies the extracted text to
