@@ -3924,7 +3924,59 @@ mod tests {
         assert!(!view.in_focus_mode(), "FocusOut leaves focus mode");
     }
 
-    /// While focused, the step keys (arrows, j/k, Ctrl+P/N, Shift+Tab) move
+    /// `b` is inert in a sub-agent view: `focused_message_id` returns `None`
+    /// even with the cursor on a sub-agent user row, so no branch anchor can be
+    /// armed there. Anchoring the user-thread head at a sub-agent user message
+    /// would splice the main conversation onto a sub thread, the data-
+    /// corruption path the Main-view gate guards. `focused_message_text` still
+    /// resolves, proving the `None` comes from the view gate and not from an
+    /// empty or non-user cursor.
+    #[test]
+    fn focused_message_id_is_none_in_a_sub_agent_view() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        // A real Main branch point, so the None below is the sub-view gate, not
+        // an empty session.
+        apply(&chat, &mut life, user_end("main message"));
+        apply(
+            &chat,
+            &mut life,
+            assistant_message_end(text_message("main reply")),
+        );
+        // A sub-agent whose task prompt lands as a user row.
+        spawn_sub(&chat, &mut life);
+        apply(
+            &chat,
+            &mut life,
+            AgentEvent::MessageEnd {
+                agent_id: AgentId::Sub(0),
+                message: AgentMessage::wire(Message::User(aj_models::types::UserMessage::text(
+                    "sub task prompt",
+                ))),
+            },
+        );
+
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(40, 10);
+        let _ = view.draw(&ctx);
+        // Switch to the sub view and focus its last user row, as the host does.
+        chat.borrow_mut().set_active_view(AgentId::Sub(0));
+        view.reset_to_tail();
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &Event::FocusIn);
+        let _ = view.draw(&ctx);
+
+        assert!(view.in_focus_mode(), "the sub view is in focus mode");
+        assert_eq!(
+            view.focused_message_text().as_deref(),
+            Some("sub task prompt"),
+            "the cursor sits on the sub-agent user row"
+        );
+        assert!(
+            view.focused_message_id().is_none(),
+            "the branch anchor is inert in a sub-agent view"
+        );
+    }
     /// the cursor between user messages, skipping the assistant entries, and
     /// `g` / `G` jump to the first / last user message. The step keys clamp at
     /// the ends and are ignored while the transcript is not focused. (Tab and

@@ -194,8 +194,10 @@ impl AgentLifecycle {
     }
 }
 
-/// The Main agent's footer seed, computed on the freshly-built agent
-/// before it is shared behind a lock.
+/// Post-build facts about the Main agent that the frontend needs after a
+/// rebuild, read off the freshly-built agent before it is shared behind a
+/// lock. It carries the footer seed (settings and context window) plus the
+/// head-override outcome.
 ///
 /// The context window is read off the agent's `model_info`, which a
 /// synchronous caller can no longer do once the agent lives behind an
@@ -205,11 +207,12 @@ pub struct MainAgentSeed {
     pub settings: AgentSettings,
     pub context_window: u64,
     /// Outcome of a requested head override (branching / tree-view switch):
-    /// `None` when the build requested none (fresh session or plain resume),
-    /// `Some(true)` when the override resolved and was installed, `Some(false)`
-    /// when it was stale and the build fell back to the default head. The
-    /// branch flow reads this to decide whether auto-submitting the branch
-    /// prompt is safe (see the prompt-safety invariant in the run loop).
+    /// `None` when no override was requested (fresh session or plain resume),
+    /// `Some(true)` when the requested head was installed, and `Some(false)`
+    /// when the requested head was stale or invalid and the build fell back to
+    /// the default head. The branch flow reads this to decide whether
+    /// auto-submitting the branch prompt is safe (see the prompt-safety
+    /// invariant in the run loop).
     pub head_override_applied: Option<bool>,
 }
 

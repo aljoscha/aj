@@ -1493,26 +1493,42 @@ mod tests {
             "flush must not materialize an abandoned session"
         );
 
-        // Materialize with a punctuation entry, then buffer a settings entry
-        // and flush it explicitly.
+        // Materialize with a punctuation entry, then buffer multiple settings
+        // entries and flush them explicitly. Buffering more than one exercises
+        // the drain's append ordering, not just a single write.
         {
             let mut view = ConversationView::user(&mut log);
             view.add_message(user_text("hi")).expect("add user message");
         }
-        log.append_model_change(ThreadFilter::USER, "prov", "model")
+        let model_id = log
+            .append_model_change(ThreadFilter::USER, "prov", "model")
             .expect("buffer a model change");
+        let thinking_id = log
+            .append_thinking_change(ThreadFilter::USER, "high")
+            .expect("buffer a thinking change");
         let session_id = log.session_id().to_string();
         log.flush_pending().expect("flush drains the buffer");
         drop(log);
 
-        // The flushed settings entry is on disk after resume.
+        // Both flushed settings entries are on disk after resume, in the order
+        // they were buffered.
         let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume log");
-        assert!(
-            resumed
-                .entries_in_order()
-                .iter()
-                .any(|e| matches!(e.entry, ConversationEntryKind::ModelChange { .. })),
-            "the flushed model change is on disk after resume"
+        let flushed: Vec<EntryId> = resumed
+            .entries_in_order()
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.entry,
+                    ConversationEntryKind::ModelChange { .. }
+                        | ConversationEntryKind::ThinkingChange { .. }
+                )
+            })
+            .map(|e| e.id.clone())
+            .collect();
+        assert_eq!(
+            flushed,
+            vec![model_id, thinking_id],
+            "both flushed settings entries are on disk in append order after resume"
         );
     }
 

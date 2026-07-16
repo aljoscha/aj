@@ -728,4 +728,131 @@ mod tests {
             "the fallback keeps the default head, spanning both messages"
         );
     }
+
+    /// Repair runs after the head override is installed, so a branch whose tip
+    /// ends in a dangling tool_call is healed on the OVERRIDE path, not on the
+    /// abandoned tail. This pins the ordering in `prepare_log`: install the
+    /// override, then linearize and repair from it.
+    #[test]
+    fn prepare_log_repairs_the_override_path_not_the_abandoned_tail() {
+        use aj_agent::message::AgentMessage;
+        use aj_models::types::{
+            AssistantContent, AssistantMessage, Message, ToolCall, UserMessage,
+        };
+        use aj_session::{ConversationEntryKind, ConversationLog, ThreadKind};
+        use serde_json::json;
+
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+
+        // Two sibling branches off the system prompt, each ending in its own
+        // dangling tool_call: the branch we override to (tip `a_branch`) and
+        // the abandoned tail (tip `a_tail`, appended last so it is the default
+        // `latest_leaf` head).
+        let (session_id, a_branch) = {
+            let mut log = ConversationLog::create(&persistence).expect("create log");
+            let sp = log
+                .set_system_prompt("prompt".to_string())
+                .expect("system prompt");
+            let user = |text: &str| ConversationEntryKind::Message {
+                message: AgentMessage::wire(Message::User(UserMessage::text(text))),
+            };
+            let tool_call = |id: &str| ConversationEntryKind::Message {
+                message: AgentMessage::wire(Message::Assistant(AssistantMessage {
+                    content: vec![AssistantContent::ToolCall(ToolCall {
+                        id: id.to_string(),
+                        name: "ping".to_string(),
+                        arguments: json!({}),
+                    })],
+                    ..AssistantMessage::empty()
+                })),
+            };
+            let m_branch = log
+                .append(Some(sp.clone()), ThreadKind::User, None, user("branch"))
+                .expect("branch user message");
+            let a_branch = log
+                .append(
+                    Some(m_branch),
+                    ThreadKind::User,
+                    None,
+                    tool_call("tu-branch"),
+                )
+                .expect("branch dangling tool_call");
+            let m_tail = log
+                .append(Some(sp), ThreadKind::User, None, user("tail"))
+                .expect("tail user message");
+            log.append(Some(m_tail), ThreadKind::User, None, tool_call("tu-tail"))
+                .expect("tail dangling tool_call");
+            (log.session_id().to_string(), a_branch)
+        };
+
+        let config = Config::default();
+        let args = Args::parse_from(["aj", "--scripted", "streaming-text"]);
+        let (run_config, _restore) =
+            build_initial_run_config(&args, &config, &empty_auth(&dir), None).expect("run config");
+        let run_config = Arc::new(StdMutex::new(run_config));
+
+        let prepared = prepare_log(
+            &persistence,
+            &SessionSource::Resume {
+                session_id,
+                head: Some(a_branch.clone()),
+            },
+            &config,
+            &run_config,
+            None,
+        )
+        .expect("prepare log");
+
+        assert_eq!(prepared.head_override_applied, Some(true));
+
+        // The seeded transcript is the branch path with the synthesized result
+        // at its tip; it never touches the abandoned tail's dangling call.
+        match prepared
+            .transcript
+            .last()
+            .expect("a seeded message")
+            .as_wire()
+        {
+            Some(Message::ToolResult(tr)) => {
+                assert_eq!(
+                    tr.tool_call_id, "tu-branch",
+                    "repaired the branch's dangling call"
+                );
+                assert!(tr.is_error, "the synthesized result is error-flagged");
+            }
+            other => panic!("expected a synthesized ToolResult at the branch tip, got {other:?}"),
+        }
+        assert!(
+            !prepared.transcript.iter().any(|m| matches!(
+                m.as_wire(),
+                Some(Message::ToolResult(tr)) if tr.tool_call_id == "tu-tail"
+            )),
+            "the abandoned tail's dangling call is not repaired onto the branch path"
+        );
+
+        // The synthesized result anchors at the branch tip, proving the
+        // override was installed before repair ran (otherwise it would chain
+        // off the abandoned tail's `a_tail`).
+        let synthesized = prepared
+            .log
+            .entries_in_order()
+            .into_iter()
+            .find(|e| {
+                matches!(
+                    &e.entry,
+                    ConversationEntryKind::Message { message }
+                        if matches!(
+                            message.as_wire(),
+                            Some(Message::ToolResult(tr)) if tr.tool_call_id == "tu-branch"
+                        )
+                )
+            })
+            .expect("the synthesized tool_result is in the log");
+        assert_eq!(
+            synthesized.parent_id.as_deref(),
+            Some(a_branch.as_str()),
+            "the synthesized result anchors at the branch tip, not the abandoned tail"
+        );
+    }
 }
