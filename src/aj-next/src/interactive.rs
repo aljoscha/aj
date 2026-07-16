@@ -964,16 +964,16 @@ fn branch_armed_notice(what: &str) -> String {
 /// `handle_turn_join` and the `AgentEnd` trigger in [`drain_events`]
 /// both spawn a wake when `message_queues.has_pending`. History is
 /// recorded by the callers (the drive loop and [`handle_steer`]), which
-/// own the editor.
-fn handle_submit(world: &mut World, text: String) {
+/// own the editor. Returns whether the message was accepted for delivery.
+fn handle_submit(world: &mut World, text: String) -> bool {
     let trimmed = text.trim().to_string();
     if trimmed.is_empty() {
-        return;
+        return false;
     }
     let target = world.chat.borrow().active_view();
     if world.turn_cancels.contains_key(&target) || world.core.is_running(target) {
         world.core.message_queues.append_follow_up(target, &trimmed);
-        return;
+        return true;
     }
     let policy = turn_policy(target, &world.config);
     // The user's message row arrives back over the bus as
@@ -989,6 +989,14 @@ fn handle_submit(world: &mut World, text: String) {
     );
     if !spawned {
         fold_notice(world, "This agent can't be prompted.");
+    }
+    spawned
+}
+
+/// Submit editor text and return the transcript to its live tail when accepted.
+fn handle_editor_submit(world: &mut World, shell: &Rc<RefCell<Shell>>, text: String) {
+    if handle_submit(world, text) {
+        shell.borrow().transcript.borrow_mut().resume_follow_tail();
     }
 }
 
@@ -1245,10 +1253,11 @@ fn handle_steer(world: &mut World, shell: &Rc<RefCell<Shell>>) {
         } else {
             world.core.message_queues.append_steering(target, &text);
             shell.borrow().editor.borrow_mut().add_to_history(&text);
+            shell.borrow().transcript.borrow_mut().resume_follow_tail();
         }
     } else if !text.is_empty() {
         shell.borrow().editor.borrow_mut().add_to_history(&text);
-        handle_submit(world, text);
+        handle_editor_submit(world, shell, text);
     }
 }
 
@@ -4719,7 +4728,7 @@ async fn drive(
                                     }
                                 }
                             } else {
-                                handle_submit(world, text);
+                                handle_editor_submit(world, shell, text);
                             }
                         }
                         // An Esc that cancelled an armed branch anchor: fold
@@ -7727,7 +7736,7 @@ mod tests {
             .editor
             .borrow_mut()
             .insert_at_cursor("steer this");
-        handle_host_action(&mut world, &shell, AjAction::Steer);
+        assert!(handle_host_action(&mut world, &shell, AjAction::Steer));
         let snapshot = world.core.message_queues.snapshot(AgentId::Main);
         assert_eq!(snapshot.kind, Some(aj_agent::queue::PendingKind::Steering));
         assert_eq!(snapshot.text, "steer this");
@@ -7743,7 +7752,7 @@ mod tests {
             .core
             .message_queues
             .append_follow_up(AgentId::Main, "follow-up");
-        handle_host_action(&mut world, &shell, AjAction::Steer);
+        assert!(handle_host_action(&mut world, &shell, AjAction::Steer));
         let snapshot = world.core.message_queues.snapshot(AgentId::Main);
         assert_eq!(
             snapshot.kind,
@@ -7772,7 +7781,7 @@ mod tests {
             .editor
             .borrow_mut()
             .insert_at_cursor("hi there");
-        handle_host_action(&mut world, &shell, AjAction::Steer);
+        assert!(handle_host_action(&mut world, &shell, AjAction::Steer));
         assert!(
             world.turn_cancels.contains_key(&AgentId::Main),
             "idle steer spawned a prompt turn"
@@ -7800,6 +7809,153 @@ mod tests {
             &e.kind,
             EntryKind::User(u) if u.joined_text() == "hi there"
         )));
+    }
+
+    /// Editor-focused busy Alt+Enter returns a scrolled transcript to the live
+    /// tail after the host accepts the steering text.
+    #[tokio::test]
+    async fn editor_focused_busy_alt_enter_follows_the_transcript_tail() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut app, mut writer, mut world, shell, root) =
+            init_app_with_world(&dir, "streaming-text").await;
+
+        handle_submit(&mut world, "earlier prompt".to_string());
+        let joined = join_next_or_pending(&mut world.turns).await;
+        handle_turn_join(&mut world, joined).expect("turn settles");
+        let first = world.core.event_rx.try_recv().expect("events buffered");
+        drain_events(&mut world, first);
+        for i in 0..40 {
+            fold_notice(&mut world, &format!("historical notice {i}"));
+        }
+        app.request_redraw();
+        app.render(&root).expect("render populated transcript");
+        handle_submit(&mut world, "running prompt".to_string());
+
+        let transcript = Rc::clone(&shell.borrow().transcript);
+        let transcript_ctx = draw_ctx(40, 8);
+        transcript
+            .borrow_mut()
+            .scroll_to_top(&mut EventContext::new());
+        let _ = transcript.borrow_mut().draw(&transcript_ctx);
+        assert!(!transcript.borrow().is_at_bottom(), "starts in history");
+        assert!(!transcript.borrow().in_focus_mode(), "editor owns focus");
+        shell.borrow().editor.borrow_mut().set_text("steer draft");
+
+        writer.write_all(b"\x1b\r").expect("write Alt+Enter");
+        let event = app.next_input().await.expect("Alt+Enter event");
+        app.handle_input(event);
+        let action = shell
+            .borrow()
+            .take_host_action()
+            .expect("editor Alt+Enter parks a host action");
+        assert_eq!(action, AjAction::Steer);
+        assert!(handle_host_action(&mut world, &shell, action));
+
+        let snapshot = world.core.message_queues.snapshot(AgentId::Main);
+        assert_eq!(snapshot.kind, Some(aj_agent::queue::PendingKind::Steering));
+        assert_eq!(snapshot.text, "steer draft");
+        let _ = transcript.borrow_mut().draw(&transcript_ctx);
+        assert!(
+            transcript.borrow().is_at_bottom(),
+            "accepted text follows tail"
+        );
+
+        world.core.message_queues.clear(AgentId::Main);
+        cancel_viewed_turn(&world);
+        let joined = join_next_or_pending(&mut world.turns).await;
+        handle_turn_join(&mut world, joined).expect("abort is non-fatal");
+    }
+
+    /// Alt+Enter is editor-local: with transcript focus, an idle draft is
+    /// preserved and no host action or turn is produced.
+    #[tokio::test]
+    async fn focused_idle_alt_enter_does_not_submit() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut app, mut writer, mut world, shell, root) =
+            init_app_with_world(&dir, "streaming-text").await;
+
+        handle_submit(&mut world, "earlier prompt".to_string());
+        let joined = join_next_or_pending(&mut world.turns).await;
+        handle_turn_join(&mut world, joined).expect("turn settles");
+        let first = world.core.event_rx.try_recv().expect("events buffered");
+        drain_events(&mut world, first);
+        for i in 0..40 {
+            fold_notice(&mut world, &format!("historical notice {i}"));
+        }
+        app.request_redraw();
+        app.render(&root).expect("render populated transcript");
+
+        let transcript = Rc::clone(&shell.borrow().transcript);
+        let transcript_ctx = draw_ctx(40, 8);
+        transcript
+            .borrow_mut()
+            .scroll_to_top(&mut EventContext::new());
+        let _ = transcript.borrow_mut().draw(&transcript_ctx);
+        assert!(!transcript.borrow().is_at_bottom(), "starts in history");
+        shell.borrow().editor.borrow_mut().set_text("new prompt");
+
+        writer.write_all(b"\t").expect("write Tab");
+        let event = app.next_input().await.expect("Tab event");
+        app.handle_input(event);
+        assert!(transcript.borrow().in_focus_mode());
+
+        writer.write_all(b"\x1b\r").expect("write Alt+Enter");
+        let event = app.next_input().await.expect("Alt+Enter event");
+        app.handle_input(event);
+
+        assert_eq!(shell.borrow().take_host_action(), None);
+        assert_eq!(shell.borrow().editor.borrow().text(), "new prompt");
+        assert!(world.turns.is_empty(), "no turn was spawned");
+        assert!(transcript.borrow().in_focus_mode(), "focus is preserved");
+        let _ = transcript.borrow_mut().draw(&transcript_ctx);
+        assert!(!transcript.borrow().is_at_bottom(), "scroll is preserved");
+    }
+
+    /// Alt+Enter is also inert outside the editor while a turn is busy, so it
+    /// cannot consume the draft or mutate the steering queue.
+    #[tokio::test]
+    async fn focused_busy_alt_enter_does_not_steer() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut app, mut writer, mut world, shell, root) =
+            init_app_with_world(&dir, "streaming-text").await;
+
+        handle_submit(&mut world, "earlier prompt".to_string());
+        let joined = join_next_or_pending(&mut world.turns).await;
+        handle_turn_join(&mut world, joined).expect("turn settles");
+        let first = world.core.event_rx.try_recv().expect("events buffered");
+        drain_events(&mut world, first);
+        for i in 0..40 {
+            fold_notice(&mut world, &format!("historical notice {i}"));
+        }
+        app.request_redraw();
+        app.render(&root).expect("render populated transcript");
+        handle_submit(&mut world, "running prompt".to_string());
+
+        let transcript = Rc::clone(&shell.borrow().transcript);
+        let transcript_ctx = draw_ctx(40, 8);
+        transcript
+            .borrow_mut()
+            .scroll_to_top(&mut EventContext::new());
+        let _ = transcript.borrow_mut().draw(&transcript_ctx);
+        shell.borrow().editor.borrow_mut().set_text("steer draft");
+
+        writer.write_all(b"\t").expect("write Tab");
+        let event = app.next_input().await.expect("Tab event");
+        app.handle_input(event);
+        writer.write_all(b"\x1b\r").expect("write Alt+Enter");
+        let event = app.next_input().await.expect("Alt+Enter event");
+        app.handle_input(event);
+
+        assert_eq!(shell.borrow().take_host_action(), None);
+        assert_eq!(shell.borrow().editor.borrow().text(), "steer draft");
+        assert!(!world.core.message_queues.has_pending(AgentId::Main));
+        assert!(transcript.borrow().in_focus_mode(), "focus is preserved");
+        let _ = transcript.borrow_mut().draw(&transcript_ctx);
+        assert!(!transcript.borrow().is_at_bottom(), "scroll is preserved");
+
+        cancel_viewed_turn(&world);
+        let joined = join_next_or_pending(&mut world.turns).await;
+        handle_turn_join(&mut world, joined).expect("abort is non-fatal");
     }
 
     /// Alt+Up's dequeue action pulls the queued message back into the

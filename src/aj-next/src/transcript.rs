@@ -1678,6 +1678,11 @@ impl TranscriptView {
         self.focused.get()
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_at_bottom(&self) -> bool {
+        self.list.borrow().is_at_bottom()
+    }
+
     /// The entry indices of the active view's user messages, ascending
     /// (document order). Transcript-focus navigation steps between these,
     /// skipping assistant, tool, and other entries (Spec E section 1).
@@ -2073,8 +2078,7 @@ impl TranscriptView {
             // exit at the bottom only for Esc: an overlay stealing focus exits
             // through `exit_focus_mode` alone and leaves the scroll where it was.
             if self.on_exit_focus.is_some() {
-                self.cancel_scroll_anim();
-                self.follow_tail = true;
+                self.resume_follow_tail();
             }
             if let Some(on_exit) = self.on_exit_focus.as_mut() {
                 on_exit(ctx);
@@ -2140,6 +2144,11 @@ impl TranscriptView {
         // inner list's `scroll_to_bottom` and the transcript resumes following
         // the tail (see [`draw`](Widget::draw)). Cancel any in-flight glide so
         // it does not fight the re-pin.
+        self.resume_follow_tail();
+    }
+
+    /// Re-engages follow-tail so the next draw pins the transcript to the bottom.
+    pub(crate) fn resume_follow_tail(&mut self) {
         self.cancel_scroll_anim();
         self.follow_tail = true;
     }
@@ -3765,6 +3774,36 @@ mod tests {
             rows.join("\n").contains("row 49"),
             "shows the last row: {rows:?}"
         );
+    }
+
+    /// Resuming follow-tail is the host-facing counterpart to editor-mode End:
+    /// it cancels stale motion and pins the next draw to the live bottom.
+    #[test]
+    fn resume_follow_tail_cancels_motion_and_lands_at_the_bottom() {
+        let chat = chat_with_notices(50);
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(40, 10);
+        let _ = view.draw(&ctx);
+        view.scroll_to_top(&mut EventContext::new());
+        let _ = view.draw(&ctx);
+        assert!(
+            !view.list.borrow().is_at_bottom(),
+            "starts away from the tail"
+        );
+
+        view.scroll_anim = Some(ScrollAnim {
+            total: 20.0,
+            applied: 0.0,
+            completion: ScrollCompletion::Page,
+            start: Instant::now(),
+            duration: Duration::from_millis(100),
+        });
+        view.resume_follow_tail();
+        assert!(view.follow_tail, "follow-tail re-engaged");
+        assert!(view.scroll_anim.is_none(), "stale glide cancelled");
+
+        let _ = view.draw(&ctx);
+        assert!(view.list.borrow().is_at_bottom(), "next draw pins the tail");
     }
 
     /// In focus mode the Home/End chords move the item cursor to the first /

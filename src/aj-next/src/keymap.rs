@@ -87,6 +87,11 @@ fn in_transcript_focus(cx: &HostCtx) -> bool {
     cx.focus_mode.get()
 }
 
+/// The editor owns base-layout focus when no overlay or transcript has it.
+fn in_editor_focus(cx: &HostCtx) -> bool {
+    no_overlay(cx) && !in_transcript_focus(cx)
+}
+
 fn can_cancel(cx: &HostCtx) -> bool {
     no_overlay(cx) && cx.turn_running
 }
@@ -109,8 +114,7 @@ fn can_arm_quit(cx: &HostCtx) -> bool {
 /// bubble-phase, so without this gate the capture-phase recall would pre-empt
 /// it. Declining here lets the key descend to the transcript's focus stepping.
 fn can_recall_pending(cx: &HostCtx) -> bool {
-    no_overlay(cx)
-        && !in_transcript_focus(cx)
+    in_editor_focus(cx)
         && cx.editor.borrow().text().is_empty()
         && cx.message_queues.has_pending(cx.active_view)
 }
@@ -227,12 +231,14 @@ pub(crate) fn build_keymap() -> Keymap<AjAction, HostCtx> {
             AjAction::PaletteOpen
             | AjAction::HistoryOpen
             | AjAction::AgentPickerOpen
-            | AjAction::Steer
             | AjAction::Dequeue
             | AjAction::ChatPageUp
             | AjAction::ChatPageDown
             | AjAction::ChatScrollToTop
             | AjAction::ChatScrollToBottom => no_overlay,
+            // Alt+Enter submits editor text, so it is inert when the transcript
+            // or an overlay owns focus.
+            AjAction::Steer => in_editor_focus,
             // Transcript focus is gated to the autocomplete popup being closed,
             // so Tab focuses the transcript with the popup down and stays the
             // editor's accept key with it up (see `focus_enabled`).
@@ -438,6 +444,20 @@ mod tests {
         assert_eq!(
             keymap.match_single(&alt_enter, BindingPhase::Capture, &idle),
             Some(&AjAction::Steer)
+        );
+
+        let mut focused = ctx(false);
+        focused.focus_mode.set(true);
+        assert_eq!(
+            keymap.match_single(&alt_enter, BindingPhase::Capture, &focused),
+            None,
+            "steer is inert while the transcript owns focus"
+        );
+        focused.turn_running = true;
+        assert_eq!(
+            keymap.match_single(&alt_enter, BindingPhase::Capture, &focused),
+            None,
+            "busy steering is also inert outside the editor"
         );
     }
 
