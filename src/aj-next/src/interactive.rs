@@ -3034,11 +3034,11 @@ impl Shell {
                     // Chat scroll is reachable from widget land (the transcript
                     // owns its scroll state), so it runs here in dispatch rather
                     // than parking for the host loop.
-                    transcript_for_actions.borrow_mut().page_up();
+                    transcript_for_actions.borrow_mut().page_up(ctx);
                     ctx.redraw = true;
                 }
                 AjAction::ChatPageDown => {
-                    transcript_for_actions.borrow_mut().page_down();
+                    transcript_for_actions.borrow_mut().page_down(ctx);
                     ctx.redraw = true;
                 }
                 AjAction::ChatScrollToTop => {

@@ -1277,21 +1277,31 @@ enum FocusAnchor {
     Bottom,
 }
 
-/// An in-flight smooth scroll toward a focused message.
+/// How a [`ScrollAnim`] lands on its final frame.
+#[derive(Clone, Copy)]
+enum ScrollCompletion {
+    /// Snap onto the focused message at the recorded anchor. Focus travel is
+    /// estimate-based, so the snap corrects any residual drift.
+    Focus(FocusAnchor),
+    /// Apply the exact remaining line delta and stop. Page travel is an exact
+    /// line count, and the glide also stops early once the viewport reaches the
+    /// end it is heading for (see [`at_scroll_end`](TranscriptView::at_scroll_end)).
+    Page,
+}
+
+/// An in-flight smooth scroll of the transcript viewport.
 ///
-/// Focus navigation moves the item cursor instantly (so the focus border jumps
-/// to the target at once) while the viewport glides to follow. The glide is
-/// time-based: [`total`](Self::total) lines over [`duration`](Self::duration),
-/// eased, driven by a self-scheduled tick chain. The travel distance comes
-/// from the list's estimate-based geometry, so the last frame snaps to
-/// [`anchor`](Self::anchor) rather than trusting the accumulated deltas.
+/// Both focus navigation and page scrolling move the viewport by a time-based
+/// eased glide: [`total`](Self::total) lines over [`duration`](Self::duration),
+/// driven by a self-scheduled tick chain. How the final frame lands depends on
+/// [`completion`](Self::completion).
 struct ScrollAnim {
     /// Signed line distance to travel: negative scrolls toward the top.
     total: f64,
     /// Lines already fed to the list this animation, so each tick applies only
     /// the incremental delta and per-frame rounding cannot drift.
     applied: f64,
-    anchor: FocusAnchor,
+    completion: ScrollCompletion,
     start: Instant,
     duration: Duration,
 }
@@ -1405,15 +1415,22 @@ pub struct TranscriptView {
     /// they read the geometry back from here to map widget-local coordinates
     /// into entry-relative selection positions. Zero before the first draw.
     last_view: Size,
-    /// Weak self-reference, so focus navigation can schedule ticks targeting
-    /// this widget to drive the smooth scroll (see [`ScrollAnim`]). Set by the
-    /// host via [`set_widget_ref`](Self::set_widget_ref) once the view is
-    /// behind an `Rc`. Empty in unit tests, where ticks are never delivered, so
-    /// a focus step there snaps rather than animating.
+    /// Weak self-reference, so scroll animations can schedule ticks targeting
+    /// this widget to drive the smooth focus and page glides (see
+    /// [`ScrollAnim`]). Set by the host via
+    /// [`set_widget_ref`](Self::set_widget_ref) once the view is behind an
+    /// `Rc`. Empty in unit tests, where ticks are never delivered, so a scroll
+    /// there snaps rather than animating.
     me: Weak<RefCell<TranscriptView>>,
-    /// The in-flight focus-scroll animation, if any. `None` when the viewport
-    /// is at rest.
+    /// The in-flight focus or page glide, if any. `None` when the viewport is
+    /// at rest. Cleared to cancel a glide (e.g. when a snapping gesture
+    /// supersedes it); see [`scroll_tick_scheduled`](Self::scroll_tick_scheduled).
     scroll_anim: Option<ScrollAnim>,
+    /// Whether a scroll-animation tick is already pending. Keeps exactly one
+    /// tick chain alive: cancelling [`scroll_anim`](Self::scroll_anim) leaves a
+    /// pending tick to fire once and stop, and a glide started before that
+    /// orphan fires reuses it rather than arming a second (double-speed) chain.
+    scroll_tick_scheduled: bool,
 }
 
 /// The session-wide render inputs the transcript cache does not fingerprint
@@ -1567,6 +1584,7 @@ impl TranscriptView {
             },
             me: Weak::new(),
             scroll_anim: None,
+            scroll_tick_scheduled: false,
         }
     }
 
@@ -1609,9 +1627,10 @@ impl TranscriptView {
         // A fresh session's entries are unrelated to the old selection's anchor
         // entry, so drop it rather than highlight stale content.
         self.selection = None;
-        // An in-flight focus glide targets an entry index in the outgoing
-        // content, which the swap invalidates. Cancel it so its remaining
-        // scroll deltas do not land on the new session's transcript.
+        // An in-flight glide targets a position in the outgoing content, which
+        // the swap invalidates (a focus glide by entry index, a page glide by
+        // line delta). Cancel it so its remaining scroll does not land on the
+        // new session's transcript.
         self.scroll_anim = None;
     }
 
@@ -1727,25 +1746,101 @@ impl TranscriptView {
         };
 
         let viewport_unmeasured = self.list.borrow().viewport_height().is_none();
-        let widget = self.widget();
-        if viewport_unmeasured || widget.is_none() || total.abs() < SCROLL_ANIM_MIN_LINES {
+        if viewport_unmeasured || self.widget().is_none() || total.abs() < SCROLL_ANIM_MIN_LINES {
+            // Nothing to animate: land now and drop any in-flight glide so it
+            // cannot keep driving the viewport past this destination.
+            self.scroll_anim = None;
             self.snap_focus(anchor);
             return;
         }
-        let already_animating = self.scroll_anim.is_some();
         self.scroll_anim = Some(ScrollAnim {
             total,
             applied: 0.0,
-            anchor,
+            completion: ScrollCompletion::Focus(anchor),
             start: Instant::now(),
             duration: scroll_anim_duration(total.abs()),
         });
-        // Arm the tick chain only on the rising edge: a retarget mid-glide
-        // reuses the in-flight tick, which reads the fresh `scroll_anim`.
-        if !already_animating {
-            ctx.tick(SCROLL_ANIM_FRAME_MS, widget.expect("checked above"));
-        }
+        self.schedule_scroll_tick(ctx);
         ctx.redraw = true;
+    }
+
+    /// Begin a page glide of `delta` lines (negative scrolls up), the smooth
+    /// counterpart to [`ListView::scroll_lines`]. A missing self-reference
+    /// (unit tests) or an unmeasured viewport applies the delta at once, and a
+    /// glide already at the edge it heads for is a no-op.
+    ///
+    /// A press during an in-flight page glide carries that glide's unfinished
+    /// travel into the new one, so rapid presses reach the same cumulative
+    /// position repeated instant scrolls would rather than restarting from
+    /// mid-glide and under-scrolling.
+    fn start_line_scroll(&mut self, ctx: &mut EventContext, delta: i32) {
+        if self.widget().is_none() || self.list.borrow().viewport_height().is_none() {
+            self.scroll_anim = None;
+            self.list.borrow_mut().scroll_lines(delta);
+            return;
+        }
+        // Carry an in-flight page glide's remaining travel. A focus glide's
+        // travel is measured against a cursor, not the viewport top, so it is
+        // discarded (the new page glide replaces it outright).
+        let carried = match &self.scroll_anim {
+            Some(a) if matches!(a.completion, ScrollCompletion::Page) => a.total - a.applied,
+            _ => 0.0,
+        };
+        let total = f64::from(delta) + carried;
+        if self.at_scroll_end(total < 0.0) {
+            self.scroll_anim = None;
+            return;
+        }
+        if total.abs() < SCROLL_ANIM_MIN_LINES {
+            // A net move too small to bother animating (e.g. a reversal that
+            // nearly cancels the carry): apply it at once and drop the glide.
+            self.scroll_anim = None;
+            self.list.borrow_mut().scroll_lines(round_lines(total));
+            return;
+        }
+        self.scroll_anim = Some(ScrollAnim {
+            total,
+            applied: 0.0,
+            completion: ScrollCompletion::Page,
+            start: Instant::now(),
+            duration: scroll_anim_duration(total.abs()),
+        });
+        self.schedule_scroll_tick(ctx);
+        ctx.redraw = true;
+    }
+
+    /// Schedule the next scroll-animation frame unless one is already pending.
+    /// The [`scroll_tick_scheduled`](Self::scroll_tick_scheduled) guard keeps
+    /// exactly one tick chain alive across cancellation and retarget.
+    fn schedule_scroll_tick(&mut self, ctx: &mut EventContext) {
+        if self.scroll_tick_scheduled {
+            return;
+        }
+        if let Some(widget) = self.widget() {
+            ctx.tick(SCROLL_ANIM_FRAME_MS, widget);
+            self.scroll_tick_scheduled = true;
+        }
+    }
+
+    /// Cancel any in-flight glide so a manual or instant scroll owns the
+    /// viewport. Any already-scheduled tick fires once, finds no animation, and
+    /// stops (see [`scroll_tick_scheduled`](Self::scroll_tick_scheduled)), so
+    /// this need not touch the tick flag.
+    fn cancel_scroll_anim(&mut self) {
+        self.scroll_anim = None;
+    }
+
+    /// Whether the viewport, as of the last draw, has reached the edge it would
+    /// head for scrolling `toward_top` (or downward when false). A page glide
+    /// stops here rather than spending its duration re-applying deltas the draw
+    /// clamps away at the edge.
+    fn at_scroll_end(&self, toward_top: bool) -> bool {
+        let list = self.list.borrow();
+        if toward_top {
+            list.scroll_top() == 0 && list.scroll_offset() == 0
+        } else {
+            list.is_at_bottom()
+        }
     }
 
     /// Land the viewport on the focused message at once, at the position the
@@ -1764,19 +1859,38 @@ impl TranscriptView {
         }
     }
 
-    /// Advance the in-flight focus glide one frame, re-arming until the
-    /// duration elapses. Driven by `Event::Tick`. A no-op with no animation.
+    /// Advance the in-flight glide one frame, re-arming until it finishes.
+    /// Driven by `Event::Tick`. A no-op with no animation.
     ///
     /// Each frame applies only the incremental eased delta so per-frame
-    /// rounding cannot drift, and the final frame snaps to the recorded anchor
-    /// (the geometry-estimated deltas need not have landed exactly).
+    /// rounding cannot drift. A focus glide finishes by snapping to its anchor
+    /// (its estimate-based deltas need not have landed exactly); a page glide
+    /// applies the exact remainder, and also stops early the moment the
+    /// viewport reaches the edge it heads for.
     fn advance_scroll_anim(&mut self, ctx: &mut EventContext) {
+        // This delivery consumes the pending tick; a continuing glide re-arms
+        // below via `schedule_scroll_tick`.
+        self.scroll_tick_scheduled = false;
         let Some(mut anim) = self.scroll_anim.take() else {
             return;
         };
+        // A page glide that has reached its edge cannot move further, so drop
+        // it rather than tick out the rest of its duration.
+        if matches!(anim.completion, ScrollCompletion::Page) && self.at_scroll_end(anim.total < 0.0)
+        {
+            return;
+        }
         let t = (anim.start.elapsed().as_secs_f64() / anim.duration.as_secs_f64()).clamp(0.0, 1.0);
         if t >= 1.0 {
-            self.snap_focus(anim.anchor);
+            match anim.completion {
+                ScrollCompletion::Focus(anchor) => self.snap_focus(anchor),
+                ScrollCompletion::Page => {
+                    let delta = anim.total - anim.applied;
+                    if delta.abs() >= 1.0 {
+                        self.list.borrow_mut().scroll_lines(round_lines(delta));
+                    }
+                }
+            }
             ctx.redraw = true;
             return;
         }
@@ -1789,9 +1903,7 @@ impl TranscriptView {
         }
         anim.applied = want;
         self.scroll_anim = Some(anim);
-        if let Some(widget) = self.widget() {
-            ctx.tick(SCROLL_ANIM_FRAME_MS, widget);
-        }
+        self.schedule_scroll_tick(ctx);
         ctx.redraw = true;
     }
 
@@ -1930,23 +2042,23 @@ impl TranscriptView {
     /// disengages and new content stops yanking the viewport to the bottom.
     /// (Paging up on a transcript that fits the viewport can't move it, so
     /// the draw re-engages follow-tail right away, leaving it pinned.)
-    pub(crate) fn page_up(&mut self) {
+    pub(crate) fn page_up(&mut self, ctx: &mut EventContext) {
         self.follow_tail = false;
         // Read the viewport under a short immutable borrow that drops at the
-        // end of the statement, before the `borrow_mut` for `scroll_lines`.
+        // end of the statement, before `start_line_scroll` borrows again.
         let lines = crate::scroll::page_scroll_lines(self.list.borrow().viewport_height());
-        self.list.borrow_mut().scroll_lines(-lines);
+        self.start_line_scroll(ctx, -lines);
     }
 
     /// Scroll the transcript down by one viewport page (Spec E section 1).
     ///
-    /// Unlike [`page_up`](Self::page_up) this takes `&self`: it never touches
-    /// `follow_tail` directly. If the scroll lands back at the bottom the next
-    /// draw re-engages follow-tail (see [`draw`](Widget::draw)), so paging
-    /// down to the end resumes following streamed content.
-    pub(crate) fn page_down(&self) {
+    /// This never touches `follow_tail` directly. If the glide lands back at
+    /// the bottom the next draw re-engages follow-tail (see
+    /// [`draw`](Widget::draw)), so paging down to the end resumes following
+    /// streamed content.
+    pub(crate) fn page_down(&mut self, ctx: &mut EventContext) {
         let lines = crate::scroll::page_scroll_lines(self.list.borrow().viewport_height());
-        self.list.borrow_mut().scroll_lines(lines);
+        self.start_line_scroll(ctx, lines);
     }
 
     /// Scroll the transcript to the top (Spec E section 1, Home), mode-aware.
@@ -1960,7 +2072,9 @@ impl TranscriptView {
         // Reaching the top means the reader left the tail, so follow-tail
         // disengages. `jump_to_item(0)` pins the scroll window to item 0 at
         // offset 0, the very first line, rather than only moving the hidden
-        // cursor.
+        // cursor. Cancel any in-flight glide so it cannot drive the viewport
+        // back off the top afterward.
+        self.cancel_scroll_anim();
         self.follow_tail = false;
         self.list.borrow_mut().jump_to_item(0);
     }
@@ -1975,7 +2089,9 @@ impl TranscriptView {
         }
         // Re-engaging follow-tail is the whole gesture: the next draw runs the
         // inner list's `scroll_to_bottom` and the transcript resumes following
-        // the tail (see [`draw`](Widget::draw)).
+        // the tail (see [`draw`](Widget::draw)). Cancel any in-flight glide so
+        // it does not fight the re-pin.
+        self.cancel_scroll_anim();
         self.follow_tail = true;
     }
 
@@ -2149,9 +2265,16 @@ impl TranscriptView {
         self.bars.capture_event(ctx, event);
         if ctx.consume_event {
             if m.kind == mouse::Type::Drag {
+                // A thumb drag moves the viewport, so it takes over from any
+                // in-flight glide and leaves the tail.
+                self.cancel_scroll_anim();
                 self.follow_tail = false;
             }
             return;
+        }
+        if matches!(m.button, mouse::Button::WheelUp | mouse::Button::WheelDown) {
+            // A wheel tick is a manual scroll, so it supersedes any glide.
+            self.cancel_scroll_anim();
         }
         if m.button == mouse::Button::WheelUp {
             self.follow_tail = false;
@@ -2255,11 +2378,14 @@ impl TranscriptView {
             mouse::Type::Drag => {
                 // Dragging past the top or bottom edge auto-scrolls by the
                 // overshoot so a selection can span more than one screen. The
-                // revealed rows extend the selection on subsequent frames.
+                // revealed rows extend the selection on subsequent frames. A
+                // manual drag-scroll supersedes any in-flight glide.
                 let height = i16::try_from(self.last_view.height).unwrap_or(i16::MAX);
                 if m.row < 0 {
+                    self.cancel_scroll_anim();
                     self.list.borrow_mut().scroll_lines(i32::from(m.row));
                 } else if m.row >= height {
+                    self.cancel_scroll_anim();
                     self.list
                         .borrow_mut()
                         .scroll_lines(i32::from(m.row - height + 1));
@@ -2605,8 +2731,8 @@ impl Widget for TranscriptView {
             // focus, which cleanly exits the mode.
             Event::FocusIn => self.enter_focus_mode(ctx),
             Event::FocusOut => self.exit_focus_mode(ctx),
-            // Drives the smooth focus-scroll glide (see `ScrollAnim`), a no-op
-            // once the animation is done and the tick chain has stopped.
+            // Drives the smooth focus and page glides (see `ScrollAnim`), a
+            // no-op once the animation is done and the tick chain has stopped.
             Event::Tick => self.advance_scroll_anim(ctx),
             Event::KeyPress(key) => {
                 // Esc clears a live selection first (Spec E section 2), before
@@ -3486,7 +3612,7 @@ mod tests {
         let bottom = crate::test_support::rows(&view.draw(&ctx));
 
         // Page up: follow-tail disengages and the viewport moves.
-        view.page_up();
+        view.page_up(&mut EventContext::new());
         assert!(!view.follow_tail, "paging up disengages follow-tail");
         let scrolled = crate::test_support::rows(&view.draw(&ctx));
         assert_ne!(scrolled, bottom, "the viewport moved up off the bottom");
@@ -3501,7 +3627,7 @@ mod tests {
         // only once a scroll overshoots the end, matching the wheel), so page
         // down until it re-engages, the way a user holding PageDown does.
         for _ in 0..4 {
-            view.page_down();
+            view.page_down(&mut EventContext::new());
             let _ = view.draw(&ctx);
             if view.follow_tail {
                 break;
@@ -3639,7 +3765,7 @@ mod tests {
 
         // Scroll the main view up so follow-tail is off; a plain redraw does
         // not re-engage it, so only an explicit reset can.
-        view.page_up();
+        view.page_up(&mut EventContext::new());
         let _ = view.draw(&ctx);
         assert!(!view.follow_tail, "paged up on the main view");
         let _ = view.draw(&ctx);
@@ -4020,6 +4146,292 @@ mod tests {
             std::thread::sleep(Duration::from_millis(3));
         }
         panic!("scroll animation did not finish");
+    }
+
+    /// Editor-mode page scrolling glides the viewport instead of snapping, and
+    /// the glide lands where the instant page scroll would (a self-ref-less
+    /// reference view that snaps is the oracle).
+    #[test]
+    fn page_scroll_glides_to_the_snap_destination() {
+        let chat = chat_with_notices(50);
+        let ctx = draw_ctx(40, 10);
+
+        // Oracle: no self-reference, so page_up snaps.
+        let mut oracle = transcript_view(&chat);
+        let _ = oracle.draw(&ctx);
+        oracle.page_up(&mut EventContext::new());
+        let oracle_rows = crate::test_support::rows(&oracle.draw(&ctx));
+        let oracle_top = oracle.list.borrow().scroll_top();
+        let oracle_off = oracle.list.borrow().scroll_offset();
+
+        // Subject: identical page_up, but with a self-reference so it glides.
+        let view = Rc::new(RefCell::new(transcript_view(&chat)));
+        view.borrow_mut().set_widget_ref(Rc::downgrade(&view));
+        let _ = view.borrow_mut().draw(&ctx);
+        let before_top = view.borrow().list.borrow().scroll_top();
+
+        view.borrow_mut().page_up(&mut EventContext::new());
+        assert!(
+            view.borrow().scroll_anim.is_some(),
+            "page up off the bottom animates"
+        );
+        assert!(!view.borrow().follow_tail, "page up disengages follow-tail");
+        assert_eq!(
+            view.borrow().list.borrow().scroll_top(),
+            before_top,
+            "the viewport has not jumped yet"
+        );
+
+        settle_scroll_anim(&view, &ctx);
+        let rows = crate::test_support::rows(&view.borrow_mut().draw(&ctx));
+        assert_eq!(view.borrow().list.borrow().scroll_top(), oracle_top);
+        assert_eq!(view.borrow().list.borrow().scroll_offset(), oracle_off);
+        assert_eq!(
+            rows, oracle_rows,
+            "the glide's final frame matches the snap"
+        );
+    }
+
+    /// A page glide is inert at the edge it heads for: paging down at the
+    /// bottom and up at the top start no animation.
+    #[test]
+    fn page_scroll_is_inert_at_the_edge() {
+        let chat = chat_with_notices(50);
+        let ctx = draw_ctx(40, 10);
+        let view = Rc::new(RefCell::new(transcript_view(&chat)));
+        view.borrow_mut().set_widget_ref(Rc::downgrade(&view));
+        let _ = view.borrow_mut().draw(&ctx);
+
+        // Opens at the bottom, so page down cannot move.
+        assert!(view.borrow().list.borrow().is_at_bottom());
+        view.borrow_mut().page_down(&mut EventContext::new());
+        assert!(
+            view.borrow().scroll_anim.is_none(),
+            "page down at the bottom is inert"
+        );
+
+        // Jump to the top (editor-mode Home snaps), then page up cannot move.
+        view.borrow_mut().scroll_to_top(&mut EventContext::new());
+        let _ = view.borrow_mut().draw(&ctx);
+        assert_eq!(view.borrow().list.borrow().scroll_top(), 0);
+        view.borrow_mut().page_up(&mut EventContext::new());
+        assert!(
+            view.borrow().scroll_anim.is_none(),
+            "page up at the top is inert"
+        );
+    }
+
+    /// A page glide moves the viewport gradually: one frame in, the top line
+    /// sits strictly between the start and the settled destination, so the
+    /// glide is not a disguised instant jump.
+    #[test]
+    fn page_glide_moves_gradually() {
+        let chat = chat_with_notices(50);
+        let ctx = draw_ctx(40, 10);
+        let view = Rc::new(RefCell::new(transcript_view(&chat)));
+        view.borrow_mut().set_widget_ref(Rc::downgrade(&view));
+        let _ = view.borrow_mut().draw(&ctx);
+
+        let before = top_line(&view);
+        view.borrow_mut().page_up(&mut EventContext::new());
+
+        // One frame: the viewport has moved up, but not all the way.
+        std::thread::sleep(Duration::from_millis(3));
+        view.borrow_mut()
+            .handle_event(&mut EventContext::new(), &Event::Tick);
+        let _ = view.borrow_mut().draw(&ctx);
+        let mid = top_line(&view);
+
+        settle_scroll_anim(&view, &ctx);
+        let _ = view.borrow_mut().draw(&ctx);
+        let end = top_line(&view);
+
+        assert!(end < before, "page up moved the viewport toward the top");
+        assert!(
+            end < mid && mid < before,
+            "one frame lands strictly between start ({before}) and end ({end}): mid={mid}"
+        );
+    }
+
+    /// A second page press while a page glide is in flight carries the
+    /// unfinished travel, so two rapid presses reach the same cumulative
+    /// position two instant page scrolls would (an oracle proves the target).
+    #[test]
+    fn page_glide_retarget_reaches_the_cumulative_destination() {
+        let chat = chat_with_notices(50);
+        let ctx = draw_ctx(40, 10);
+
+        // Oracle: two instant page scrolls up from the bottom. `page_up`
+        // (not raw `scroll_lines`) disengages follow-tail, else the draw
+        // re-pins the viewport to the bottom.
+        let mut oracle = transcript_view(&chat);
+        let _ = oracle.draw(&ctx);
+        oracle.page_up(&mut EventContext::new());
+        oracle.page_up(&mut EventContext::new());
+        let _ = oracle.draw(&ctx);
+        let oracle_line = top_line_view(&oracle);
+
+        // Subject: two page_up presses with no tick between them, so the second
+        // carries the first glide's full (un-applied) travel.
+        let view = Rc::new(RefCell::new(transcript_view(&chat)));
+        view.borrow_mut().set_widget_ref(Rc::downgrade(&view));
+        let _ = view.borrow_mut().draw(&ctx);
+        view.borrow_mut().page_up(&mut EventContext::new());
+        view.borrow_mut().page_up(&mut EventContext::new());
+        settle_scroll_anim(&view, &ctx);
+        let _ = view.borrow_mut().draw(&ctx);
+
+        assert_eq!(
+            top_line(&view),
+            oracle_line,
+            "two rapid page ups land where two instant page ups would"
+        );
+    }
+
+    /// Paging back down with the glide re-engages follow-tail once the viewport
+    /// reaches the bottom, so streaming resumes (the instant-path counterpart is
+    /// `page_up_disengages_and_page_down_reengages_follow_tail`).
+    #[test]
+    fn page_glide_down_reengages_follow_tail() {
+        let chat = chat_with_notices(50);
+        let ctx = draw_ctx(40, 10);
+        let view = Rc::new(RefCell::new(transcript_view(&chat)));
+        view.borrow_mut().set_widget_ref(Rc::downgrade(&view));
+        let _ = view.borrow_mut().draw(&ctx);
+
+        view.borrow_mut().page_up(&mut EventContext::new());
+        settle_scroll_anim(&view, &ctx);
+        assert!(!view.borrow().follow_tail, "paged up, follow-tail off");
+
+        // Page down (gliding) until follow-tail re-engages at the bottom.
+        for _ in 0..8 {
+            view.borrow_mut().page_down(&mut EventContext::new());
+            settle_scroll_anim(&view, &ctx);
+            let _ = view.borrow_mut().draw(&ctx);
+            if view.borrow().follow_tail {
+                break;
+            }
+        }
+        assert!(
+            view.borrow().follow_tail,
+            "gliding down to the bottom re-engages follow-tail"
+        );
+        assert!(view.borrow().list.borrow().is_at_bottom());
+    }
+
+    /// `at_scroll_end` reports the edge for the direction it is asked about,
+    /// not the other one (guards the direction sign the early-stop relies on).
+    #[test]
+    fn at_scroll_end_reports_the_edge_for_each_direction() {
+        let chat = chat_with_notices(50);
+        let ctx = draw_ctx(40, 10);
+        let mut view = transcript_view(&chat);
+        let _ = view.draw(&ctx);
+
+        // At the bottom: heading down is at the end, heading up is not.
+        assert!(view.at_scroll_end(false), "at the bottom heading down");
+        assert!(!view.at_scroll_end(true), "at the bottom, not the top");
+
+        // At the top: the reverse.
+        view.scroll_to_top(&mut EventContext::new());
+        let _ = view.draw(&ctx);
+        assert!(view.at_scroll_end(true), "at the top heading up");
+        assert!(!view.at_scroll_end(false), "at the top, not the bottom");
+    }
+
+    /// A focus step that resolves to a snap cancels an in-flight page glide, so
+    /// the glide cannot keep driving the viewport away from the focused
+    /// message (regression: the snap path used to leave the glide running).
+    #[test]
+    fn focus_snap_cancels_an_in_flight_page_glide() {
+        let chat = chat_with_user_messages(6);
+        let ctx = draw_ctx(40, 8);
+        let view = Rc::new(RefCell::new(transcript_view(&chat)));
+        view.borrow_mut().set_widget_ref(Rc::downgrade(&view));
+        let _ = view.borrow_mut().draw(&ctx);
+
+        // Enter focus and settle onto the last user message.
+        view.borrow_mut()
+            .handle_event(&mut EventContext::new(), &Event::FocusIn);
+        let _ = view.borrow_mut().draw(&ctx);
+        settle_scroll_anim(&view, &ctx);
+        assert!(
+            view.borrow().scroll_anim.is_none(),
+            "settled after entering"
+        );
+        let cursor = view.borrow().list.borrow().cursor;
+
+        // Page up starts a glide but the viewport has not moved yet (no tick).
+        view.borrow_mut().page_up(&mut EventContext::new());
+        assert!(view.borrow().scroll_anim.is_some(), "page up armed a glide");
+
+        // End re-focuses the last message, still at rest, so it snaps. The snap
+        // must cancel the page glide rather than let it scroll on.
+        view.borrow_mut().scroll_to_bottom(&mut EventContext::new());
+        assert!(
+            view.borrow().scroll_anim.is_none(),
+            "the focus snap cancelled the in-flight page glide"
+        );
+        assert_eq!(
+            view.borrow().list.borrow().cursor,
+            cursor,
+            "still on the last user message"
+        );
+    }
+
+    /// An instant editor-mode scroll (Home) cancels an in-flight page glide, so
+    /// the glide cannot drive the viewport back off the jumped-to position
+    /// (regression: a page-down glide plus Home used to drift down from the
+    /// top).
+    #[test]
+    fn instant_scroll_cancels_an_in_flight_page_glide() {
+        let chat = chat_with_notices(50);
+        let ctx = draw_ctx(40, 10);
+        let view = Rc::new(RefCell::new(transcript_view(&chat)));
+        view.borrow_mut().set_widget_ref(Rc::downgrade(&view));
+        let _ = view.borrow_mut().draw(&ctx);
+
+        // Get off the bottom so a page-down glide has somewhere to go.
+        view.borrow_mut().page_up(&mut EventContext::new());
+        settle_scroll_anim(&view, &ctx);
+
+        // Arm a page-down glide (viewport not moved yet), then jump to the top.
+        view.borrow_mut().page_down(&mut EventContext::new());
+        assert!(
+            view.borrow().scroll_anim.is_some(),
+            "page down armed a glide"
+        );
+        view.borrow_mut().scroll_to_top(&mut EventContext::new());
+        assert!(
+            view.borrow().scroll_anim.is_none(),
+            "Home cancelled the in-flight page glide"
+        );
+
+        // Any orphaned tick must not drift the viewport back off the top.
+        for _ in 0..4 {
+            view.borrow_mut()
+                .handle_event(&mut EventContext::new(), &Event::Tick);
+            let _ = view.borrow_mut().draw(&ctx);
+        }
+        assert_eq!(
+            view.borrow().list.borrow().scroll_top(),
+            0,
+            "stays pinned at the top"
+        );
+        assert_eq!(view.borrow().list.borrow().scroll_offset(), 0);
+    }
+
+    /// Absolute top line of a `ListView` (top item's start line plus the
+    /// in-item offset), the linear measure the glide tests compare.
+    fn top_line(view: &Rc<RefCell<TranscriptView>>) -> i64 {
+        top_line_view(&view.borrow())
+    }
+
+    fn top_line_view(view: &TranscriptView) -> i64 {
+        let list = view.list.borrow();
+        let top = usize::try_from(list.scroll_top()).expect("top fits usize");
+        i64::try_from(list.item_top_line(top)).expect("line fits i64")
+            + i64::from(list.scroll_offset())
     }
 
     /// The number of top-left corner glyphs in a drawn view: one per bordered
