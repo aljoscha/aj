@@ -2036,7 +2036,8 @@ impl TranscriptView {
         }
     }
 
-    /// Scroll the transcript up by one viewport page (Spec E section 1).
+    /// Scroll the transcript up by half a viewport (Spec E section 1, the
+    /// PageUp chord).
     ///
     /// A manual scroll up means the reader wants history, so follow-tail
     /// disengages and new content stops yanking the viewport to the bottom.
@@ -2046,18 +2047,19 @@ impl TranscriptView {
         self.follow_tail = false;
         // Read the viewport under a short immutable borrow that drops at the
         // end of the statement, before `start_line_scroll` borrows again.
-        let lines = crate::scroll::page_scroll_lines(self.list.borrow().viewport_height());
+        let lines = crate::scroll::half_page_scroll_lines(self.list.borrow().viewport_height());
         self.start_line_scroll(ctx, -lines);
     }
 
-    /// Scroll the transcript down by one viewport page (Spec E section 1).
+    /// Scroll the transcript down by half a viewport (Spec E section 1, the
+    /// PageDown chord).
     ///
     /// This never touches `follow_tail` directly. If the glide lands back at
     /// the bottom the next draw re-engages follow-tail (see
     /// [`draw`](Widget::draw)), so paging down to the end resumes following
     /// streamed content.
     pub(crate) fn page_down(&mut self, ctx: &mut EventContext) {
-        let lines = crate::scroll::page_scroll_lines(self.list.borrow().viewport_height());
+        let lines = crate::scroll::half_page_scroll_lines(self.list.borrow().viewport_height());
         self.start_line_scroll(ctx, lines);
     }
 

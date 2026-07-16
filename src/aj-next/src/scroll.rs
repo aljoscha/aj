@@ -1,9 +1,10 @@
 //! Shared scroll policy for the vaxis frontend's line-scrolling widgets.
 //!
-//! The page-turn overlap and the pre-first-draw fallback are UX policy, so
-//! they live here rather than in vaxis's `ListView`, which only supplies the
-//! raw `viewport_height()` mechanism. Both the transcript and the read-only
-//! content overlay page by the same rule, so they share this one function.
+//! The page-turn overlap, the half-page step, and the pre-first-draw fallback
+//! are UX policy, so they live here rather than in vaxis's `ListView`, which
+//! only supplies the raw `viewport_height()` mechanism. The read-only content
+//! overlay turns a full page ([`page_scroll_lines`]); the transcript takes a
+//! gentler half-page step ([`half_page_scroll_lines`]).
 
 use vaxis::cell::{Cell, Character, Style};
 use vaxis::vxfw::{ListView, ScrollBars};
@@ -30,6 +31,20 @@ pub(crate) fn page_scroll_lines(viewport_height: Option<u16>) -> i32 {
         Some(h) if h > PAGE_OVERLAP => i32::from(h - PAGE_OVERLAP),
         Some(h) if h > 0 => i32::from(h),
         _ => DEFAULT_PAGE_LINES,
+    }
+}
+
+/// Line delta for a half-viewport scroll, the transcript's page-key step.
+///
+/// Half the viewport height keeps the jump gentle enough to stay oriented
+/// without a page-turn overlap (half the screen is retained anyway). Never
+/// zero: a viewport too short to halve still steps by one row. Falls back to
+/// half [`DEFAULT_PAGE_LINES`] before the first draw and for a degenerate
+/// zero-height viewport, matching [`page_scroll_lines`].
+pub(crate) fn half_page_scroll_lines(viewport_height: Option<u16>) -> i32 {
+    match viewport_height {
+        Some(h) if h > 0 => i32::from(h / 2).max(1),
+        _ => DEFAULT_PAGE_LINES / 2,
     }
 }
 
@@ -79,5 +94,22 @@ mod tests {
         // A degenerate zero-height viewport can't page by its own height, so it
         // takes the same fallback as an unmeasured one rather than a zero delta.
         assert_eq!(page_scroll_lines(Some(0)), DEFAULT_PAGE_LINES);
+    }
+
+    #[test]
+    fn half_page_is_half_the_viewport() {
+        assert_eq!(half_page_scroll_lines(Some(10)), 5);
+        assert_eq!(half_page_scroll_lines(Some(11)), 5);
+    }
+
+    #[test]
+    fn half_page_short_viewport_steps_by_at_least_one_row() {
+        assert_eq!(half_page_scroll_lines(Some(1)), 1);
+    }
+
+    #[test]
+    fn half_page_falls_back_before_the_first_draw() {
+        assert_eq!(half_page_scroll_lines(None), DEFAULT_PAGE_LINES / 2);
+        assert_eq!(half_page_scroll_lines(Some(0)), DEFAULT_PAGE_LINES / 2);
     }
 }
