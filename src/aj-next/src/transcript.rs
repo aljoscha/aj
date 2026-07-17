@@ -44,7 +44,7 @@ use vaxis::vxfw::{
 };
 
 use crate::bubble::{Bubble, BubbleBorder, PADDING_X};
-use crate::copied_toast::Copied;
+use crate::copied::Copied;
 use crate::markdown_view::{MarkdownSegment, MarkdownStyles, MarkdownView};
 use crate::subagent_box::{SubAgentBox, build_subagent_box, surface_rows};
 use crate::terminal::TERMINAL_HYPERLINKS;
@@ -1426,9 +1426,9 @@ pub struct TranscriptView {
     /// left-button press-drag over the content and kept highlighted after the
     /// release copies it, until the next plain click or Esc clears it.
     selection: Option<Selection>,
-    /// The last select-to-copy record, shared with the `CopiedToast` that
-    /// reports it and the drive loop that schedules its dismissal. Written on
-    /// the release that copies a real range.
+    /// The last select-to-copy record. Written on the release that copies a
+    /// real range. The drive loop edge-detects fresh records and raises the
+    /// copy toast.
     copied: Rc<std::cell::Cell<Option<Copied>>>,
     /// Viewport size the last completed [`draw`](Widget::draw) laid out
     /// against. The mouse handlers run between draws with no `DrawContext`, so

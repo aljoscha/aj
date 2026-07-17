@@ -15,7 +15,7 @@ mod agent_picker;
 mod autocomplete;
 mod bubble;
 mod content_overlay;
-mod copied_toast;
+mod copied;
 mod corner_box;
 mod footer;
 mod frame_stats_box;

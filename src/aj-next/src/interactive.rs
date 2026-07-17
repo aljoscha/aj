@@ -65,7 +65,7 @@ use vaxis::vxfw::{
 
 use crate::agent_picker::{AgentPickerOutcome, PickerSnapshot, open_agent_picker};
 use crate::content_overlay::{ContentStyles, Row, auth_rows, session_info_rows, set_rows};
-use crate::copied_toast::Copied;
+use crate::copied::Copied;
 use crate::footer::FooterLine;
 use crate::frame_stats_box::FrameStatsBox;
 use crate::keymap::{HostCtx, build_keymap};
