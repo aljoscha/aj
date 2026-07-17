@@ -44,8 +44,8 @@ use vaxis::vxfw::{
 };
 
 use crate::bubble::{Bubble, BubbleBorder, PADDING_X};
-use crate::copied::Copied;
 use crate::markdown_view::{MarkdownSegment, MarkdownStyles, MarkdownView};
+use crate::selection_copied::SelectionCopied;
 use crate::subagent_box::{SubAgentBox, build_subagent_box, surface_rows};
 use crate::terminal::TERMINAL_HYPERLINKS;
 use crate::tool_cell::{
@@ -1429,7 +1429,7 @@ pub struct TranscriptView {
     /// The last select-to-copy record. Written on the release that copies a
     /// real range. The drive loop edge-detects fresh records and raises the
     /// copy toast.
-    copied: Rc<std::cell::Cell<Option<Copied>>>,
+    selection_copied: Rc<std::cell::Cell<Option<SelectionCopied>>>,
     /// Viewport size the last completed [`draw`](Widget::draw) laid out
     /// against. The mouse handlers run between draws with no `DrawContext`, so
     /// they read the geometry back from here to map widget-local coordinates
@@ -1549,7 +1549,7 @@ impl TranscriptView {
         chat: Rc<RefCell<ChatState>>,
         theme: &Theme,
         focused: Rc<std::cell::Cell<bool>>,
-        copied: Rc<std::cell::Cell<Option<Copied>>>,
+        selection_copied: Rc<std::cell::Cell<Option<SelectionCopied>>>,
     ) -> TranscriptView {
         let styles = Rc::new(TranscriptStyles::from_theme(theme));
         let cache = Rc::new(RefCell::new(EntryRenderCache::new()));
@@ -1601,7 +1601,7 @@ impl TranscriptView {
             agent_hit_rows: Vec::new(),
             agent_hit_width: 0,
             selection: None,
-            copied,
+            selection_copied,
             last_view: Size {
                 width: 0,
                 height: 0,
@@ -2590,7 +2590,7 @@ impl TranscriptView {
                             // Report the copy to the toast. Count graphemes, so
                             // a multi-byte character (or an emoji) reads as one.
                             let chars = text.graphemes(true).count();
-                            self.copied.set(Some(Copied {
+                            self.selection_copied.set(Some(SelectionCopied {
                                 chars,
                                 at: Instant::now(),
                             }));
@@ -6528,12 +6528,12 @@ mod tests {
     fn release_records_the_copied_character_count() {
         let chat = chat_with_notices(20);
         let theme = Theme::bundled_dark_with_mode(aj_app::theme::ColorMode::Truecolor);
-        let copied = Rc::new(std::cell::Cell::new(None));
+        let selection_copied = Rc::new(std::cell::Cell::new(None));
         let mut view = TranscriptView::new(
             Rc::clone(&chat),
             &theme,
             Rc::new(std::cell::Cell::new(false)),
-            Rc::clone(&copied),
+            Rc::clone(&selection_copied),
         );
         let ctx = draw_ctx(40, 10);
         view.follow_tail = false;
@@ -6545,7 +6545,10 @@ mod tests {
         view.handle_event(&mut ec, &mouse(2, 2, mouse::Type::Press));
         let mut ec = EventContext::new();
         view.handle_event(&mut ec, &mouse(2, 2, mouse::Type::Release));
-        assert!(copied.get().is_none(), "a plain click records no copy");
+        assert!(
+            selection_copied.get().is_none(),
+            "a plain click records no copy"
+        );
 
         // Select " row 1" (entry 1, screen row 2): press at col 0, drag to
         // col 6, release. The chrome margin is skipped, so "row 1" is copied.
@@ -6556,7 +6559,7 @@ mod tests {
         let mut ec = EventContext::new();
         view.handle_event(&mut ec, &mouse(6, 2, mouse::Type::Release));
 
-        let rec = copied.get().expect("release records a copy");
+        let rec = selection_copied.get().expect("release records a copy");
         assert_eq!(rec.chars, 5, "five characters copied (\"row 1\")");
     }
 

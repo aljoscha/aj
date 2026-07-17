@@ -66,7 +66,6 @@ use vaxis::vxfw::{
 use crate::agent_picker::{AgentPickerOutcome, PickerSnapshot, open_agent_picker};
 use crate::branch_banner::BranchBanner;
 use crate::content_overlay::{ContentStyles, Row, auth_rows, session_info_rows, set_rows};
-use crate::copied::Copied;
 use crate::footer::FooterLine;
 use crate::frame_stats_box::FrameStatsBox;
 use crate::keymap::{HostCtx, build_keymap};
@@ -79,6 +78,7 @@ use crate::palette::{FetchKind, PendingFetch, open_palette};
 use crate::pending::PendingBox;
 use crate::prompt_history::{HistoryFetch, HistoryScope, MAX_ENTRIES, open_prompt_history};
 use crate::quit_hint::QuitHint;
+use crate::selection_copied::SelectionCopied;
 use crate::session_selector::{SessionScan, extend_session_scan, open_session_selector};
 use crate::session_tree::{build_tree_rows, open_session_tree};
 use crate::settings_ui::{
@@ -3103,7 +3103,7 @@ struct Shell {
     /// unified toast stack deliberately leaves untouched). The drive loop
     /// edge-detects fresh records by their timestamp and folds each into
     /// `toasts`. Copy payload, so a `Cell` not a `RefCell`.
-    copied: Rc<Cell<Option<Copied>>>,
+    selection_copied: Rc<Cell<Option<SelectionCopied>>>,
     /// Whether any work is in flight (an in-flight turn OR background
     /// sub-agents / bash tasks). Refreshed every drive-loop iteration by
     /// [`sync_keymap_ctx`] from `running_work_counts`. The session-overlay
@@ -3268,7 +3268,7 @@ impl Shell {
         // writer, on a copy) and the drive loop, which edge-detects fresh
         // records and folds each into the toast stack. Created here so both
         // see the same cell.
-        let copied: Rc<Cell<Option<Copied>>> = Rc::new(Cell::new(None));
+        let selection_copied: Rc<Cell<Option<SelectionCopied>>> = Rc::new(Cell::new(None));
         // The toast stack, shared between its writers (the drive loop's copy
         // fold, the overlay confirm closures, `Shell::show_toast`) and the
         // `Toasts` box that draws it. The drive loop prunes it and wakes at
@@ -3294,7 +3294,7 @@ impl Shell {
                 Rc::clone(&chat),
                 &t,
                 Rc::clone(&focus_mode),
-                Rc::clone(&copied),
+                Rc::clone(&selection_copied),
             )));
             editor.borrow_mut().set_theme(editor_theme_from_theme(&t));
             (styles, transcript, OverlayChrome::from_theme(&t))
@@ -3594,7 +3594,7 @@ impl Shell {
             frame_stats_box,
             toast_box,
             toasts,
-            copied,
+            selection_copied,
             busy,
             show_frame_stats,
             frame_stats,
@@ -4495,13 +4495,13 @@ fn block_mouse(mut surface: Surface, transcript: &Rc<RefCell<TranscriptView>>) -
 
 /// Fold a fresh select-to-copy record into the toast stack.
 ///
-/// The transcript writes the shared `copied` cell (the unified toast stack
-/// deliberately leaves it in place), so the drive loop edge-detects fresh
+/// The transcript writes the shared `selection_copied` cell (the unified toast
+/// stack deliberately leaves it in place), so the drive loop edge-detects fresh
 /// records here by their timestamp: each new copy pushes exactly one toast
 /// with the copy-toast look and its own timer. Returns whether a toast was
 /// pushed, so the caller requests the showing repaint.
-fn fold_copied_record(shell: &Shell, seen: &mut Option<Instant>) -> bool {
-    let Some(copied) = shell.copied.get() else {
+fn fold_selection_copied_record(shell: &Shell, seen: &mut Option<Instant>) -> bool {
+    let Some(copied) = shell.selection_copied.get() else {
         return false;
     };
     if *seen == Some(copied.at) {
@@ -4558,7 +4558,8 @@ async fn drive(
     // per-iteration fold below pushes each fresh record onto the toast stack.
     // Seeded from the current record so a copy already reported by a previous
     // session's drive loop isn't re-toasted.
-    let mut copied_seen: Option<Instant> = shell.borrow().copied.get().map(|c| c.at);
+    let mut selection_copied_seen: Option<Instant> =
+        shell.borrow().selection_copied.get().map(|c| c.at);
     // Async read-only overlay fills. The list handle is `!Send`, so it
     // stays here (paired with its `FetchKind`) while the detached fetch
     // sends only the rendered rows back over the channel.
@@ -5195,7 +5196,7 @@ async fn drive(
         // redraws.
         {
             let shell = shell.borrow();
-            if fold_copied_record(&shell, &mut copied_seen) {
+            if fold_selection_copied_record(&shell, &mut selection_copied_seen) {
                 app.request_redraw();
             }
             if crate::toasts::prune_expired(&shell.toasts) {
@@ -7390,8 +7391,8 @@ mod tests {
     }
 
     /// A fresh select-to-copy record folds into the toast stack (the drive
-    /// loop's `fold_copied_record`) and shows in `Shell::draw`; the same
-    /// record folds only once.
+    /// loop's `fold_selection_copied_record`) and shows in `Shell::draw`; the
+    /// same record folds only once.
     #[test]
     fn copy_toast_shows_when_a_copy_is_folded() {
         let shell = test_shell_with_chat(empty_chat());
@@ -7405,17 +7406,17 @@ mod tests {
             "no toast without a copy",
         );
 
-        shell.borrow().copied.set(Some(Copied {
+        shell.borrow().selection_copied.set(Some(SelectionCopied {
             chars: 7,
             at: Instant::now(),
         }));
         let mut seen = None;
         assert!(
-            fold_copied_record(&shell.borrow(), &mut seen),
+            fold_selection_copied_record(&shell.borrow(), &mut seen),
             "a fresh record pushes a toast"
         );
         assert!(
-            !fold_copied_record(&shell.borrow(), &mut seen),
+            !fold_selection_copied_record(&shell.borrow(), &mut seen),
             "the same record folds only once"
         );
         let after = shell.borrow_mut().draw(&ctx);
@@ -7428,19 +7429,23 @@ mod tests {
         );
     }
 
-    /// The drive loop seeds `copied_seen` from the restored record's `at`
-    /// before its first iteration, so a record carried over from a previous
-    /// session folds NO toast. A fresh record (a new `at`) still toasts once.
+    /// The drive loop seeds `selection_copied_seen` from the restored record's
+    /// `at` before its first iteration, so a record carried over from a
+    /// previous session folds NO toast. A fresh record (a new `at`) still
+    /// toasts once.
     #[test]
     fn preseeded_copy_record_does_not_retoast() {
         let shell = test_shell_with_chat(empty_chat());
         let at = Instant::now();
-        shell.borrow().copied.set(Some(Copied { chars: 7, at }));
+        shell
+            .borrow()
+            .selection_copied
+            .set(Some(SelectionCopied { chars: 7, at }));
 
         // The loop-start seed: `seen` already holds the record's timestamp.
         let mut seen = Some(at);
         assert!(
-            !fold_copied_record(&shell.borrow(), &mut seen),
+            !fold_selection_copied_record(&shell.borrow(), &mut seen),
             "the seeded record folds no toast"
         );
         assert!(
@@ -7448,12 +7453,12 @@ mod tests {
             "no toast for a previous session's copy"
         );
 
-        shell.borrow().copied.set(Some(Copied {
+        shell.borrow().selection_copied.set(Some(SelectionCopied {
             chars: 9,
             at: at + std::time::Duration::from_millis(1),
         }));
         assert!(
-            fold_copied_record(&shell.borrow(), &mut seen),
+            fold_selection_copied_record(&shell.borrow(), &mut seen),
             "a fresh record still toasts"
         );
         assert_eq!(

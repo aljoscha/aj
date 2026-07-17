@@ -11,7 +11,7 @@ use std::time::Instant;
 /// when. The `at` timestamp doubles as the edge the drive loop detects fresh
 /// records by.
 #[derive(Clone, Copy)]
-pub(crate) struct Copied {
+pub(crate) struct SelectionCopied {
     pub(crate) chars: usize,
     pub(crate) at: Instant,
 }
