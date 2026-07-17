@@ -64,6 +64,7 @@ use vaxis::vxfw::{
 };
 
 use crate::agent_picker::{AgentPickerOutcome, PickerSnapshot, open_agent_picker};
+use crate::branch_banner::BranchBanner;
 use crate::content_overlay::{ContentStyles, Row, auth_rows, session_info_rows, set_rows};
 use crate::copied::Copied;
 use crate::footer::FooterLine;
@@ -887,7 +888,7 @@ const BRANCH_PREVIEW_CHARS: usize = 40;
 /// An armed branch anchor: the user pressed `b` on a focused user message, the
 /// editor now holds that message, and a submit will rebuild the session at the
 /// message's parent. Lives in a shell slot (the parked-slot pattern) so the
-/// footer indicator reads it while the drive loop resolves it on submit.
+/// branch banner reads it while the drive loop resolves it on submit.
 #[derive(Clone)]
 struct BranchAnchor {
     /// The focused user message's stable id, resolved against the log on
@@ -895,7 +896,7 @@ struct BranchAnchor {
     message_id: String,
 }
 
-/// Arm a branch anchor: store the message id and the footer indicator preview.
+/// Arm a branch anchor: store the message id and the banner indicator preview.
 /// The two slots move in lockstep, so a set indicator is exactly "an anchor is
 /// armed".
 fn arm_branch(
@@ -908,7 +909,7 @@ fn arm_branch(
     *indicator.borrow_mut() = Some(preview);
 }
 
-/// Clear both the branch-anchor resolution state and the footer indicator.
+/// Clear both the branch-anchor resolution state and the banner indicator.
 fn clear_branch(
     anchor: &Rc<RefCell<Option<BranchAnchor>>>,
     indicator: &Rc<RefCell<Option<String>>>,
@@ -917,7 +918,7 @@ fn clear_branch(
     *indicator.borrow_mut() = None;
 }
 
-/// The footer indicator for an armed anchor: a label plus a one-line,
+/// The banner indicator for an armed anchor: a label plus a one-line,
 /// truncated preview of the prefilled message, so the pending branch behavior
 /// is never a surprise.
 fn branch_indicator_text(message: &str) -> String {
@@ -3155,6 +3156,9 @@ struct Shell {
     splash: Rc<RefCell<Splash>>,
     pending: Rc<RefCell<PendingBox>>,
     footer: Rc<RefCell<FooterLine>>,
+    /// The branch banner above the editor, kept so [`Shell::restyle`] can
+    /// re-tint it. Reads the shared `branch_indicator` at draw.
+    branch_banner: Rc<RefCell<BranchBanner>>,
     /// Confirmed config edits parked by the selector and settings overlays
     /// for the drive loop to apply through the shared settings core (the
     /// overlays can't reach the async cores or the session world). Drained
@@ -3202,9 +3206,9 @@ struct Shell {
     /// it on submit, and any session install clears it so a stale anchor can't
     /// resolve against a different session's log.
     branch_anchor: Rc<RefCell<Option<BranchAnchor>>>,
-    /// The footer's branch indicator, in lockstep with `branch_anchor`: the
+    /// The branch banner's indicator, in lockstep with `branch_anchor`: the
     /// short "branching from message" preview shown while armed, `None`
-    /// otherwise. Shared with the [`FooterLine`], which reads it at draw.
+    /// otherwise. Shared with the [`BranchBanner`], which reads it at draw.
     branch_indicator: Rc<RefCell<Option<String>>>,
     /// Set by the Esc handler when it cancels an armed anchor, so the drive
     /// loop folds the cancel notice (the Shell can't reach the chat model's
@@ -3274,10 +3278,10 @@ impl Shell {
         // the session-overlay confirm closures to refuse a switch mid-work.
         let busy: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         // Branch-anchor slots, following the parked-slot pattern: `on_action`
-        // arms them on `b`, the drive loop resolves them on submit, the footer
-        // reads the indicator at draw, and the Esc handler flips
+        // arms them on `b`, the drive loop resolves them on submit, the branch
+        // banner reads the indicator at draw, and the Esc handler flips
         // `branch_cancelled` so the drive loop folds the cancel notice. Created
-        // here so the closures and the footer all share the same cells.
+        // here so the closures and the banner all share the same cells.
         let branch_anchor: Rc<RefCell<Option<BranchAnchor>>> = Rc::new(RefCell::new(None));
         let branch_indicator: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let branch_cancelled: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -3332,7 +3336,10 @@ impl Shell {
             status,
             Rc::clone(&styles),
             cwd_display,
+        )));
+        let branch_banner = Rc::new(RefCell::new(BranchBanner::new(
             Rc::clone(&branch_indicator),
+            Rc::clone(&styles),
         )));
         // The empty-state splash and the transcript share the chat slot. The
         // `ChatSlot` wrapper draws whichever fits the current state, so the
@@ -3344,9 +3351,10 @@ impl Shell {
             transcript: Rc::clone(&transcript),
         }));
         // Slot order mirrors `aj`'s layout: header, chat (flex),
-        // status, pending, editor, footer. The status and pending
-        // slots collapse to zero height while idle/empty, so the
-        // editor sits flush under the chat between turns.
+        // status, pending, branch banner, editor, footer. The status,
+        // pending, and branch-banner slots collapse to zero height while
+        // idle/empty/disarmed, so the editor sits flush under the chat
+        // between turns.
         let header_line = Rc::new(RefCell::new(Text::new(&header)));
         let layout: WidgetRef = Rc::new(RefCell::new(FlexColumn {
             children: vec![
@@ -3354,6 +3362,7 @@ impl Shell {
                 FlexItem::init(to_widget_ref(Rc::clone(&chat_slot)), 1),
                 FlexItem::init(to_widget_ref(Rc::clone(&status_line)), 0),
                 FlexItem::init(to_widget_ref(Rc::clone(&pending)), 0),
+                FlexItem::init(to_widget_ref(Rc::clone(&branch_banner)), 0),
                 FlexItem::init(to_widget_ref(Rc::clone(&editor)), 0),
                 FlexItem::init(to_widget_ref(Rc::clone(&footer)), 0),
             ],
@@ -3601,6 +3610,7 @@ impl Shell {
             splash,
             pending,
             footer,
+            branch_banner,
             selector_activity,
             settings_ui,
             picker_outcome,
@@ -3623,7 +3633,7 @@ impl Shell {
         self.submitted.borrow_mut().take()
     }
 
-    /// Clear the armed branch anchor and its footer indicator.
+    /// Clear the armed branch anchor and its banner indicator.
     fn disarm_branch(&self) {
         clear_branch(&self.branch_anchor, &self.branch_indicator);
     }
@@ -3745,6 +3755,9 @@ impl Shell {
             .borrow_mut()
             .set_styles(Rc::clone(&styles), t.color_mode());
         self.pending.borrow_mut().set_styles(Rc::clone(&styles));
+        self.branch_banner
+            .borrow_mut()
+            .set_styles(Rc::clone(&styles));
         self.footer.borrow_mut().set_styles(styles);
         self.editor
             .borrow_mut()
@@ -11368,7 +11381,7 @@ mod tests {
         );
     }
 
-    /// Arming sets the anchor and the footer indicator; re-arming replaces
+    /// Arming sets the anchor and the banner indicator; re-arming replaces
     /// both; disarming clears them.
     #[tokio::test]
     async fn arming_sets_indicator_and_rearm_replaces_and_disarm_clears() {
@@ -11392,18 +11405,18 @@ mod tests {
                 .map(|a| a.message_id.clone()),
             Some("m1".to_string())
         );
-        // The footer renders the indicator.
+        // The banner above the editor renders the indicator.
         let row = {
             let sh = shell.borrow();
             let surface = sh
-                .footer
+                .branch_banner
                 .borrow_mut()
                 .draw(&crate::test_support::draw_ctx(120, None));
             crate::test_support::rows(&surface).join("\n")
         };
         assert!(
             row.contains("branching from message: first message"),
-            "footer shows the indicator: {row:?}"
+            "banner shows the indicator: {row:?}"
         );
 
         // Re-arming replaces the anchor and indicator.
@@ -12091,7 +12104,7 @@ mod tests {
         );
         assert!(
             shell.borrow().branch_indicator.borrow().is_none(),
-            "and its footer indicator"
+            "and its banner indicator"
         );
     }
 

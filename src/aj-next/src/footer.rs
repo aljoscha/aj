@@ -32,10 +32,6 @@ pub(crate) struct FooterLine {
     styles: Rc<TranscriptStyles>,
     /// Working-directory display string, fixed for the session.
     cwd: String,
-    /// The branch-anchor indicator, shared with the shell (its single
-    /// writer). `Some` while a branch anchor is armed, holding the
-    /// "branching from message" preview shown as the leading footer part.
-    branch_indicator: Rc<RefCell<Option<String>>>,
 }
 
 impl FooterLine {
@@ -44,14 +40,12 @@ impl FooterLine {
         status: Rc<RefCell<StatusState>>,
         styles: Rc<TranscriptStyles>,
         cwd: String,
-        branch_indicator: Rc<RefCell<Option<String>>>,
     ) -> FooterLine {
         FooterLine {
             chat,
             status,
             styles,
             cwd,
-            branch_indicator,
         }
     }
 
@@ -75,12 +69,6 @@ impl Widget for FooterLine {
         // Each part is a short span list so the context-usage part
         // can color its percentage while everything else stays dim.
         let mut parts: Vec<Vec<TextSpan>> = Vec::new();
-        // While a branch anchor is armed, lead with the indicator in the
-        // accent style so the pending branch behavior is visible but
-        // unobtrusive. It clears the moment the anchor is disarmed.
-        if let Some(indicator) = self.branch_indicator.borrow().clone() {
-            parts.push(vec![span(indicator, self.styles.accent)]);
-        }
         if let Some(model) = chat.footers().model_line(active) {
             parts.push(vec![span(model, dim)]);
         }
@@ -174,7 +162,6 @@ mod tests {
             Rc::new(RefCell::new(status)),
             styles(),
             "/home/user/proj".into(),
-            Rc::new(RefCell::new(None)),
         )
     }
 
