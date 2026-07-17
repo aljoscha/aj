@@ -2161,6 +2161,19 @@ impl TaskRegistry {
         inner.entries.get(&id).map(|entry| entry.status)
     }
 
+    /// Whether sub-agent `n` has a background run still `Running`.
+    ///
+    /// Lets a host tell a detached background sub-agent, which
+    /// legitimately outlives the turn that spawned it, from a leaked
+    /// foreground spawn whose `AgentEnd` never arrived.
+    pub fn agent_task_running(&self, n: usize) -> bool {
+        let inner = self.inner.lock().expect("task registry mutex poisoned");
+        inner.entries.values().any(|entry| {
+            entry.status == TaskStatus::Running
+                && matches!(entry.kind, TaskKind::Agent { agent_id, .. } if agent_id == n)
+        })
+    }
+
     /// Record the usage accumulated by task `id`'s agent run. No-op
     /// for unknown ids.
     pub fn record_usage(&self, id: TaskId, usage: Usage) {
@@ -2517,6 +2530,29 @@ mod task_registry_tests {
         let (b, _) = register(&registry, AgentId::Sub(1), "b");
         let (c, _) = register(&registry, AgentId::Main, "c");
         assert_eq!((a, b, c), (1, 2, 3));
+    }
+
+    #[test]
+    fn agent_task_running_tracks_background_runs() {
+        let registry = TaskRegistry::default();
+        // A bash task never counts, whatever the sub id.
+        register(&registry, AgentId::Main, "sleep 5");
+        assert!(!registry.agent_task_running(7));
+
+        let (id, _) = registry.register(
+            AgentId::Main,
+            TaskKind::Agent {
+                agent_id: 7,
+                task: "research".to_string(),
+            },
+            "research".to_string(),
+            Arc::new(StubOutput),
+        );
+        assert!(registry.agent_task_running(7));
+        assert!(!registry.agent_task_running(8));
+
+        registry.set_status(id, TaskStatus::Exited(None));
+        assert!(!registry.agent_task_running(7));
     }
 
     #[test]

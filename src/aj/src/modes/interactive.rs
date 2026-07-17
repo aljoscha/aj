@@ -971,11 +971,14 @@ async fn run_session(
                         // independently driving (∉ turn_cancels) so a
                         // leaked sub-agent can't pin the
                         // footer/spinner. Independent continuations
-                        // are in turn_cancels and survive.
+                        // are in turn_cancels, and detached background
+                        // runs have a Running registry entry; both
+                        // survive.
                         if id == AgentId::Main {
                             for sub in world.core.running_agents() {
-                                if matches!(sub, AgentId::Sub(_))
-                                    && !turn_cancels.contains_key(&sub)
+                                let AgentId::Sub(n) = sub else { continue };
+                                if !turn_cancels.contains_key(&sub)
+                                    && !world.core.task_registry.agent_task_running(n)
                                 {
                                     world.pump.mark_idle(&mut world.core.lifecycle, &mut shell.tui, sub);
                                 }

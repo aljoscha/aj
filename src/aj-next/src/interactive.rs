@@ -1026,10 +1026,15 @@ fn handle_turn_join(
     // Main-turn completion bounds every nested initial spawn it
     // started. Drain any sub still marked running that this host is
     // not independently driving, so a leaked sub-agent can't pin the
-    // running set forever.
+    // running set forever. Independent continuations are in
+    // `turn_cancels`, and detached background runs have a Running
+    // registry entry; both survive.
     if id == AgentId::Main {
         for sub in world.core.running_agents() {
-            if matches!(sub, AgentId::Sub(_)) && !world.turn_cancels.contains_key(&sub) {
+            let AgentId::Sub(n) = sub else { continue };
+            if !world.turn_cancels.contains_key(&sub)
+                && !world.core.task_registry.agent_task_running(n)
+            {
                 world.core.mark_idle(sub);
             }
         }
