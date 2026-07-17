@@ -368,14 +368,11 @@ struct NextSession {
     deferred_subs: HashSet<usize>,
     notices: Vec<String>,
     /// Whether the requested build failed and this session is the
-    /// previous-session fallback. The branch flow reads it (with
-    /// `head_override_applied`) to decide whether auto-submitting the branch
-    /// prompt is safe.
+    /// previous-session fallback. The branch flow gates the prompt handoff
+    /// on it: a successful build with a requested head override guarantees
+    /// the head applied (a stale head fails the build), so `!fell_back`
+    /// alone is the clean-rebuild signal.
     fell_back: bool,
-    /// The build's head-override outcome, forwarded from
-    /// [`aj_app::session::MainAgentSeed`]. `None` when none was requested,
-    /// `Some(true)` when installed, `Some(false)` when stale.
-    head_override_applied: Option<bool>,
 }
 
 /// Build the session a new-session or resume request asks for, reusing the
@@ -431,7 +428,6 @@ async fn build_next_session(
             (core, seed, failure, false, true)
         }
     };
-    let head_override_applied = seed.head_override_applied;
 
     // Seed a fresh chat from the built core, replaying a resumed session's
     // history through the same reducer the live events use. Replay never
@@ -471,8 +467,8 @@ async fn build_next_session(
     // they sit on top of the replayed history.
     //
     // A successful branch build leads with no confirmation: its wording
-    // depends on the prompt handoff and the head-apply outcome, which only the
-    // run loop knows, so the run loop inserts it after this build returns (see
+    // depends on whether a prompt is handed off, which only the run loop
+    // knows, so the run loop inserts it after this build returns (see
     // `apply_branch_switch_notice`). A build fallback still leads with its
     // failure notice.
     let mut notices = Vec::new();
@@ -492,7 +488,6 @@ async fn build_next_session(
         deferred_subs,
         notices,
         fell_back,
-        head_override_applied,
     })
 }
 
@@ -1159,7 +1154,7 @@ fn quit_arm_running_work(world: &World) -> Option<String> {
 /// non-empty), and the earlier `busy` snapshot is one drive-loop iteration
 /// stale. This is the authoritative recheck.
 fn consume_session_request(
-    world: &mut World,
+    world: &World,
     shell: &Rc<RefCell<Shell>>,
     request: SessionRequest,
 ) -> Option<SessionExit> {
@@ -1448,57 +1443,39 @@ async fn submit_with_armed_anchor(
     }
 }
 
-/// The prompt-safety invariant for the branch flow: auto-submit the branch
-/// prompt only when the rebuild landed on the intended head, i.e. the build
-/// did not fall back to the previous session AND the head override resolved
-/// and was installed. Any other outcome restores the prompt into the editor
-/// instead, never submitting it against the wrong head.
-fn branch_prompt_should_submit(fell_back: bool, head_override_applied: Option<bool>) -> bool {
-    !fell_back && head_override_applied == Some(true)
-}
-
-/// The confirmation for a branch rebuild on a successful build, chosen from
-/// whether a prompt is handed off and whether the head installed cleanly.
-/// `None` means the run loop folds nothing here, because the prompt handoff
-/// folds its own restore notice.
-///
-/// - prompt + clean apply: the `b`-submit flow succeeded, the prompt
-///   auto-submits as the branch's first turn.
-/// - no prompt + clean apply: a tree-view switch that only moved the head.
-/// - prompt + stale head: the `b` flow restores the prompt and folds "Branch
-///   failed ...", so we add nothing.
-/// - no prompt + stale head: a tree-view switch that could not move the head;
-///   nothing else reports it, so we do.
-fn branch_switch_notice(prompt_present: bool, head_applied_cleanly: bool) -> Option<&'static str> {
-    match (prompt_present, head_applied_cleanly) {
-        (true, true) => Some("Branched the conversation from an earlier message."),
-        (false, true) => Some("Switched to the selected branch."),
-        (true, false) => None,
-        (false, false) => Some("Couldn't switch to that branch."),
+/// The confirmation for a clean (non-fallback) branch rebuild, chosen from
+/// whether a prompt is handed off: the `b`-submit flow (the prompt
+/// auto-submits as the branch's first turn) vs a tree-view switch that only
+/// moved the head. A successful build guarantees the requested head applied,
+/// so there is no stale-head case to report.
+fn branch_switch_notice(prompt_present: bool) -> &'static str {
+    if prompt_present {
+        "Branched the conversation from an earlier message."
+    } else {
+        "Switched to the selected branch."
     }
 }
 
 /// Prepend the branch rebuild's confirmation to `next.notices`, so it lands
 /// ahead of any restore notices when the run loop folds them after install. A
-/// no-op for a non-branch build and for a build fallback (which keeps its own
-/// failure notice). See [`branch_switch_notice`] for the wording.
+/// no-op for a non-branch build and for a build fallback, which leads with
+/// its own failure notice instead (and, when a prompt was pending, the
+/// handoff folds the restore notice on top). See [`branch_switch_notice`]
+/// for the wording.
 fn apply_branch_switch_notice(next: &mut NextSession, is_branch: bool, prompt_present: bool) {
     if is_branch && !next.fell_back {
-        let clean = branch_prompt_should_submit(next.fell_back, next.head_override_applied);
-        if let Some(notice) = branch_switch_notice(prompt_present, clean) {
-            next.notices.insert(0, notice.to_string());
-        }
+        next.notices
+            .insert(0, branch_switch_notice(prompt_present).to_string());
     }
 }
 
 /// Hand the branch prompt to the freshly rebuilt session, under the
-/// prompt-safety invariant. On a clean rebuild (see
-/// [`branch_prompt_should_submit`]) the prompt is auto-submitted as the
-/// branch's first turn. On any other outcome (stale head, or a build
-/// fallback) it is restored verbatim into the editor with a notice and
-/// never submitted, so it can't run against the wrong head. The prompt is
-/// already in prompt-history (recorded at the submit site), so it is never
-/// lost either way.
+/// prompt-safety invariant: auto-submit it as the branch's first turn only
+/// on a clean rebuild (`!fell_back`, and a successful build guarantees the
+/// requested head applied). On a build fallback the prompt is restored
+/// verbatim into the editor with a notice and never submitted, so it can't
+/// run against the wrong head. The prompt is already in prompt-history
+/// (recorded at the submit site), so it is never lost either way.
 ///
 /// Returns whether the prompt was submitted, so callers (and tests) can
 /// distinguish the submit path from the restore path.
@@ -1507,9 +1484,8 @@ fn hand_off_branch_prompt(
     shell: &Rc<RefCell<Shell>>,
     prompt: String,
     fell_back: bool,
-    head_override_applied: Option<bool>,
 ) -> bool {
-    if branch_prompt_should_submit(fell_back, head_override_applied) {
+    if !fell_back {
         auto_submit_launch(world, vec![UserContent::text(prompt)]);
         true
     } else {
@@ -4358,15 +4334,14 @@ pub async fn run(args: Args) -> Result<()> {
 
         match build_next_session(&world, spec, &previous_id, is_branch).await {
             Ok(mut next) => {
-                // Read the prompt-safety inputs before `install` consumes `next`.
+                // Read the prompt-safety input before `install` consumes `next`.
                 let fell_back = next.fell_back;
-                let head_applied = next.head_override_applied;
                 // A successful branch build leads with no confirmation; insert
                 // the accurate one here. It depends on whether a prompt is
                 // handed off (the `b`-submit flow) or only the head moved (a
-                // tree-view switch), and on whether the head installed cleanly.
-                // A `b`-flow failure inserts nothing: its prompt handoff below
-                // folds the restore notice instead.
+                // tree-view switch). A build fallback inserts nothing: it leads
+                // with its own failure notice, and the prompt handoff below
+                // folds the restore notice.
                 apply_branch_switch_notice(&mut next, is_branch, branch_prompt.is_some());
                 install_next_session(&mut world, &shell, next);
                 // Retitle the terminal for the switched-to session. The switch
@@ -4384,7 +4359,7 @@ pub async fn run(args: Args) -> Result<()> {
                 // in prompt-history (recorded at the submit site), so it is
                 // never lost.
                 if let Some(prompt) = branch_prompt {
-                    hand_off_branch_prompt(&mut world, &shell, prompt, fell_back, head_applied);
+                    hand_off_branch_prompt(&mut world, &shell, prompt, fell_back);
                     app.request_redraw();
                 }
             }
@@ -11019,7 +10994,7 @@ mod tests {
 
         // The consumption site rechecks a request that slipped through.
         assert!(
-            consume_session_request(&mut world, &shell, SessionRequest::New).is_none(),
+            consume_session_request(&world, &shell, SessionRequest::New).is_none(),
             "a running background task refuses the parked new-session request"
         );
 
@@ -11029,7 +11004,7 @@ mod tests {
             .task_registry
             .set_status(task, aj_agent::tool::TaskStatus::Killed);
         assert!(matches!(
-            consume_session_request(&mut world, &shell, SessionRequest::New),
+            consume_session_request(&world, &shell, SessionRequest::New),
             Some(SessionExit::New)
         ));
     }
@@ -11342,47 +11317,18 @@ mod tests {
         assert!(long.chars().count() < 100);
     }
 
-    /// The prompt-safety invariant: auto-submit only on a clean rebuild (no
-    /// fallback and the head override installed); every other outcome restores.
-    #[test]
-    fn branch_prompt_submits_only_on_clean_head_apply() {
-        assert!(branch_prompt_should_submit(false, Some(true)));
-        assert!(
-            !branch_prompt_should_submit(true, Some(true)),
-            "a build fallback must not submit against the wrong head"
-        );
-        assert!(
-            !branch_prompt_should_submit(false, Some(false)),
-            "a stale head override must not submit"
-        );
-        assert!(
-            !branch_prompt_should_submit(false, None),
-            "no override requested is never a branch submit"
-        );
-    }
-
-    /// The branch confirmation distinguishes the `b`-submit flow (a prompt is
-    /// handed off) from a tree-view switch (a bare head move), and reports a
-    /// stale-head tree switch that the prompt handoff would otherwise leave
-    /// silent.
+    /// The clean-rebuild branch confirmation distinguishes the `b`-submit
+    /// flow (a prompt is handed off) from a tree-view switch (a bare head
+    /// move).
     #[test]
     fn branch_switch_notice_distinguishes_b_flow_from_tree_switch() {
-        // `b`-flow success and tree-switch success get distinct wording.
         assert_eq!(
-            branch_switch_notice(true, true),
-            Some("Branched the conversation from an earlier message.")
+            branch_switch_notice(true),
+            "Branched the conversation from an earlier message."
         );
         assert_eq!(
-            branch_switch_notice(false, true),
-            Some("Switched to the selected branch.")
-        );
-        // A `b`-flow stale head folds nothing here: its prompt handoff folds
-        // the restore notice instead.
-        assert_eq!(branch_switch_notice(true, false), None);
-        // A tree-view stale head has no prompt handoff, so it reports here.
-        assert_eq!(
-            branch_switch_notice(false, false),
-            Some("Couldn't switch to that branch.")
+            branch_switch_notice(false),
+            "Switched to the selected branch."
         );
     }
 
@@ -11721,7 +11667,7 @@ mod tests {
         assert!(!world.turns.is_empty(), "a turn is in flight");
         assert!(
             consume_session_request(
-                &mut world,
+                &world,
                 &shell,
                 SessionRequest::Branch { head: head.clone() }
             )
@@ -11743,7 +11689,7 @@ mod tests {
         let task = register_bash_task(&world, "cargo build");
         assert!(
             consume_session_request(
-                &mut world,
+                &world,
                 &shell,
                 SessionRequest::Branch { head: head.clone() }
             )
@@ -11760,7 +11706,7 @@ mod tests {
         assert!(
             matches!(
                 consume_session_request(
-                    &mut world,
+                    &world,
                     &shell,
                     SessionRequest::Branch { head: head.clone() }
                 ),
@@ -11785,7 +11731,7 @@ mod tests {
         let task = register_bash_task(&world, "cargo build");
         assert!(
             consume_session_request(
-                &mut world,
+                &world,
                 &shell,
                 SessionRequest::Resume("other-session".to_string())
             )
@@ -11807,7 +11753,7 @@ mod tests {
         assert!(
             matches!(
                 consume_session_request(
-                    &mut world,
+                    &world,
                     &shell,
                     SessionRequest::Resume("other-session".to_string())
                 ),
@@ -11966,6 +11912,51 @@ mod tests {
         assert!(world.turns.is_empty(), "still no turn spawned");
     }
 
+    /// The transactional head override end to end: a branch rebuild onto a
+    /// stale head FAILS the build (`prepare_log` propagates the `set_head`
+    /// error), so `build_next_session` falls back to a default-head resume of
+    /// the previous session, leading with the branch-failure notice, and the
+    /// prompt handoff restores instead of submitting.
+    #[tokio::test]
+    async fn stale_head_branch_build_falls_back_with_a_failure_notice() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        run_prompt(&mut world, "seed").await;
+        let previous_id = world.core.session_id.clone();
+
+        let next = build_next_session(
+            &world,
+            SessionSpec::Resume {
+                session_id: previous_id.clone(),
+                entry: SessionEntry::Switch,
+                head: Some("does-not-exist".to_string()),
+            },
+            &previous_id,
+            true,
+        )
+        .await
+        .expect("the fallback build succeeds");
+        assert!(next.fell_back, "a stale head fails the requested build");
+        assert!(
+            next.notices
+                .first()
+                .is_some_and(|n| n.contains("Failed to branch the conversation")
+                    && n.contains("does-not-exist")),
+            "the fallback leads with the branch-failure notice: {:?}",
+            next.notices
+        );
+
+        // The run loop's handoff gates on `fell_back` alone now: the pending
+        // prompt is restored, never submitted against the fallback head.
+        let fell_back = next.fell_back;
+        install_next_session(&mut world, &shell, next);
+        let submitted =
+            hand_off_branch_prompt(&mut world, &shell, "edited prompt".to_string(), fell_back);
+        assert!(!submitted, "the fallback restores instead of submitting");
+        assert_eq!(shell.borrow().editor.borrow().text(), "edited prompt");
+        assert!(world.turns.is_empty(), "no turn spawned");
+    }
+
     /// Submitting with an anchor armed on the file root (a user message with no
     /// parent, as in an ancient file) is refused, and the anchor is disarmed.
     /// Like the other refusals, it restores the edited text the submit cleared
@@ -12067,26 +12058,20 @@ mod tests {
         );
     }
 
-    /// The post-rebuild branch handoff restores the prompt into the editor on a
-    /// non-clean rebuild (stale head, or a build fallback), folds the failure
-    /// notice, and spawns no turn. The prompt is recorded to prompt-history at
-    /// the drive-loop submit site (before the branch breaks out), so the
-    /// handoff itself only decides submit-vs-restore.
+    /// The post-rebuild branch handoff restores the prompt into the editor on
+    /// a build fallback, folds the failure notice, and spawns no turn. The
+    /// prompt is recorded to prompt-history at the drive-loop submit site
+    /// (before the branch breaks out), so the handoff itself only decides
+    /// submit-vs-restore. A stale requested head fails the build, so it IS
+    /// the fallback case, there is no separate stale-head path.
     #[tokio::test]
-    async fn branch_handoff_restores_the_prompt_on_a_non_clean_rebuild() {
+    async fn branch_handoff_restores_the_prompt_on_a_build_fallback() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
 
-        // Stale head: the build succeeded (fell_back == false) but the override
-        // did not install (Some(false)). Restore, do not submit.
-        let submitted = hand_off_branch_prompt(
-            &mut world,
-            &shell,
-            "edited branch prompt".to_string(),
-            false,
-            Some(false),
-        );
-        assert!(!submitted, "a stale-head rebuild must not submit");
+        let submitted =
+            hand_off_branch_prompt(&mut world, &shell, "edited branch prompt".to_string(), true);
+        assert!(!submitted, "a build fallback must not submit");
         assert_eq!(
             shell.borrow().editor.borrow().text(),
             "edited branch prompt",
@@ -12105,29 +12090,18 @@ mod tests {
             .iter()
             .any(|e| matches!(&e.kind, EntryKind::Notice(n) if n.text.contains("Branch failed")));
         assert!(restored_notice, "the failure/restore notice is folded");
-
-        // A build fallback (fell_back == true) also restores and never submits.
-        let submitted =
-            hand_off_branch_prompt(&mut world, &shell, "another prompt".to_string(), true, None);
-        assert!(!submitted, "a build fallback must not submit");
-        assert!(world.turns.is_empty(), "still no turn spawned");
     }
 
-    /// The clean-apply handoff auto-submits the branch prompt as the branch's
-    /// first turn (the positive counterpart to the restore path).
+    /// The clean-rebuild handoff auto-submits the branch prompt as the
+    /// branch's first turn (the positive counterpart to the restore path).
     #[tokio::test]
-    async fn branch_handoff_submits_on_a_clean_apply() {
+    async fn branch_handoff_submits_on_a_clean_rebuild() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
 
-        let submitted = hand_off_branch_prompt(
-            &mut world,
-            &shell,
-            "branch turn".to_string(),
-            false,
-            Some(true),
-        );
-        assert!(submitted, "a clean apply submits the prompt");
+        let submitted =
+            hand_off_branch_prompt(&mut world, &shell, "branch turn".to_string(), false);
+        assert!(submitted, "a clean rebuild submits the prompt");
         assert!(!world.turns.is_empty(), "a turn was spawned");
 
         // Settle the spawned turn so world teardown is clean.

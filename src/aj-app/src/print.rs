@@ -251,7 +251,6 @@ async fn run_inner<W: Write + Send + 'static>(
         mut log,
         transcript,
         restore_notices,
-        head_override_applied: _,
     } = prepare_log(
         &conversation_persistence,
         &source,

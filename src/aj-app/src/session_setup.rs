@@ -417,12 +417,6 @@ pub struct PreparedLog {
     /// restored, or why a recorded value was kept out). Empty unless
     /// resuming with a [`RestoreContext`].
     pub restore_notices: Vec<String>,
-    /// Outcome of a requested head override: `None` when none was
-    /// requested, `Some(true)` when the override was installed, and
-    /// `Some(false)` when it was stale and we fell back to the default
-    /// head. Lets the caller decide whether a branch prompt is safe to
-    /// auto-submit.
-    pub head_override_applied: Option<bool>,
 }
 
 /// Resolve the log for `source`, repair any interrupted tool uses, and
@@ -451,23 +445,15 @@ pub fn prepare_log(
 
     // Install a requested head override before repair runs, so repair
     // anchors its synthesized tool results at the branch path's tip, not at
-    // the abandoned tail's. A stale id (truncated file, hand-edited log)
-    // can't resolve, so we warn, keep the resume-initialized default head,
-    // and record that the override was not applied. The empty-log case
+    // the abandoned tail's. The override is apply-or-fail: a stale or
+    // invalid id (truncated file, hand-edited log) fails the whole build
+    // rather than silently resuming the default head, so a successful
+    // return guarantees the requested head is installed. The empty-log case
     // (head `None`) never carries an override.
-    let head_override_applied = match source {
-        SessionSource::Resume { head: Some(h), .. } => match log.set_head(h.clone()) {
-            Ok(()) => Some(true),
-            Err(err) => {
-                tracing::warn!(
-                    "branch head override {h} could not be applied: {err}; \
-                     falling back to the default head"
-                );
-                Some(false)
-            }
-        },
-        _ => None,
-    };
+    if let SessionSource::Resume { head: Some(h), .. } = source {
+        log.set_head(h.clone())
+            .with_context(|| format!("failed to apply branch head {h}"))?;
+    }
 
     let mut restore_notices = Vec::new();
     let transcript = if let Some(head) = log.head().cloned() {
@@ -508,7 +494,6 @@ pub fn prepare_log(
         log,
         transcript,
         restore_notices,
-        head_override_applied,
     })
 }
 
@@ -660,8 +645,9 @@ mod tests {
     }
 
     /// A valid head override rebuilds and repairs from the override point:
-    /// resuming at the first message linearizes only that message, and the
-    /// override is reported as applied.
+    /// resuming at the first message linearizes only that message. A
+    /// successful return guarantees the override applied (a stale one errors,
+    /// see below).
     #[test]
     fn prepare_log_applies_a_valid_head_override() {
         let dir = TempDir::new().expect("tempdir");
@@ -686,7 +672,6 @@ mod tests {
         )
         .expect("prepare log");
 
-        assert_eq!(prepared.head_override_applied, Some(true));
         assert_eq!(
             prepared.transcript.len(),
             1,
@@ -694,11 +679,12 @@ mod tests {
         );
     }
 
-    /// A stale head override (an id not in the log) falls back to the default
-    /// head with a warning, reported via `head_override_applied == Some(false)`,
-    /// and the transcript then spans the full default path.
+    /// A stale head override (an id not in the log) fails the build: the
+    /// override is apply-or-fail, so the caller's fallback machinery (not a
+    /// silent default-head resume) handles it. The error names the requested
+    /// head and carries the log's InvalidHead cause.
     #[test]
-    fn prepare_log_falls_back_on_a_stale_head_override() {
+    fn prepare_log_errors_on_a_stale_head_override() {
         let dir = TempDir::new().expect("tempdir");
         let persistence = ConversationPersistence::new(dir.path().join("sessions"));
         let (session_id, _m1, _m2) = two_message_session(&persistence);
@@ -709,7 +695,9 @@ mod tests {
             build_initial_run_config(&args, &config, &empty_auth(&dir), None).expect("run config");
         let run_config = Arc::new(StdMutex::new(run_config));
 
-        let prepared = prepare_log(
+        // `expect_err` needs `Debug` on the Ok type, which `PreparedLog`
+        // doesn't carry, so unpack manually.
+        let Err(err) = prepare_log(
             &persistence,
             &SessionSource::Resume {
                 session_id,
@@ -718,14 +706,18 @@ mod tests {
             &config,
             &run_config,
             None,
-        )
-        .expect("prepare log");
+        ) else {
+            panic!("a stale head override fails the build");
+        };
 
-        assert_eq!(prepared.head_override_applied, Some(false));
-        assert_eq!(
-            prepared.transcript.len(),
-            2,
-            "the fallback keeps the default head, spanning both messages"
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("failed to apply branch head does-not-exist"),
+            "the context names the requested head: {chain}"
+        );
+        assert!(
+            chain.contains("invalid conversation head"),
+            "the InvalidHead cause is in the chain: {chain}"
         );
     }
 
@@ -803,8 +795,6 @@ mod tests {
             None,
         )
         .expect("prepare log");
-
-        assert_eq!(prepared.head_override_applied, Some(true));
 
         // The seeded transcript is the branch path with the synthesized result
         // at its tip; it never touches the abandoned tail's dangling call.

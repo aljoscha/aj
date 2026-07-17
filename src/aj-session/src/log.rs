@@ -47,6 +47,8 @@ pub enum ConversationError {
     Corrupt(String),
     #[error("invalid append to conversation log: {0}")]
     InvalidAppend(String),
+    #[error("invalid conversation head: {0}")]
+    InvalidHead(String),
 }
 
 /// A unique identifier for a [ConversationEntry] within a single
@@ -975,10 +977,12 @@ impl ConversationLog {
     /// checks would not catch (they validate the new entry's thread,
     /// not the parent's). A non-system-prompt meta entry and a missing
     /// id are rejected for the same "the head must be a real branch
-    /// point" reason.
+    /// point" reason. Rejections return
+    /// [`ConversationError::InvalidHead`], whose message is fit to
+    /// surface to the user.
     pub fn set_head(&mut self, id: EntryId) -> Result<(), ConversationError> {
         let entry = self.entries.get(&id).ok_or_else(|| {
-            ConversationError::InvalidAppend(format!("set_head: entry {id} not found in log"))
+            ConversationError::InvalidHead(format!("entry {id} is not in this session's log"))
         })?;
         let valid = match entry.thread {
             ThreadKind::User => true,
@@ -986,8 +990,8 @@ impl ConversationLog {
             ThreadKind::Subagent => false,
         };
         if !valid {
-            return Err(ConversationError::InvalidAppend(format!(
-                "set_head: entry {id} is not a user-thread or system-prompt entry"
+            return Err(ConversationError::InvalidHead(format!(
+                "entry {id} is not a user-thread or system-prompt entry"
             )));
         }
         self.head = Some(id);
@@ -3015,15 +3019,15 @@ mod tests {
         // leaving the head unchanged.
         assert!(matches!(
             log.set_head(sub_msg),
-            Err(ConversationError::InvalidAppend(_))
+            Err(ConversationError::InvalidHead(_))
         ));
         assert!(matches!(
             log.set_head(spawn),
-            Err(ConversationError::InvalidAppend(_))
+            Err(ConversationError::InvalidHead(_))
         ));
         assert!(matches!(
             log.set_head("does-not-exist".to_string()),
-            Err(ConversationError::InvalidAppend(_))
+            Err(ConversationError::InvalidHead(_))
         ));
         assert_eq!(log.head(), Some(&sp), "rejected set_head leaves the head");
     }

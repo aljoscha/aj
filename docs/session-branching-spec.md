@@ -243,7 +243,10 @@ rebuilds core, agent seed, and `ChatState` from a log correctly.
   then linearizes and repairs as today. Ordering matters: repair must anchor
   its synthesized tool results at the branch path's tip, not at the abandoned
   branch's, otherwise a branch created below a dangling tool_call is seeded
-  with the dangle intact.
+  with the dangle intact. The override is apply-or-fail: a stale or invalid
+  requested head (truncated file, hand-edited log) fails the whole build
+  instead of silently resuming the default head, so a successful build
+  guarantees the requested head is installed.
 - The `aj-next` session loop gains an exit variant carrying the same session
   id, the target head, and an optional pending prompt
   (`SessionExit::Branch { head, prompt }` or equivalent). The outer loop in
@@ -306,13 +309,14 @@ boundary sees full pre-compaction history through the normal projection.
   repeating the action confirms and shuts them down.
 - **The prompt is never lost and never missubmitted.** The armed submit
   records the prompt to prompt history before breaking out of `drive()` (the
-  normal drive-loop submit site is bypassed). If `prepare_log`'s head
-  override fails to resolve (stale id: truncated file, hand-edited log), or
-  `build_next_session` falls back to a default-head resume after a build
-  failure, the pending prompt is *not* fed into the fallback world. It is
-  restored into the editor with a notice explaining the branch failed. A
-  head-override fallback without a pending prompt (plain resume) keeps the
-  warn-and-continue behavior.
+  normal drive-loop submit site is bypassed). A requested head override is
+  apply-or-fail: if it cannot be installed (stale id: truncated file,
+  hand-edited log), `prepare_log` fails the build, and `build_next_session`'s
+  existing fallback machinery resumes the previous session on its default
+  head with a failure notice. The same happens when the build fails for any
+  other reason. Either way the pending prompt is *not* fed into the fallback
+  world. It is restored into the editor with a notice explaining the branch
+  failed, and it is never submitted against the wrong head.
 
 ## Part 5: the `b` shortcut
 
@@ -502,7 +506,8 @@ Each phase lands independently and keeps all tests green.
 - `aj-session`: appends anchor at `head` and advance it. `set_head` +
   subsequent append creates a sibling on disk. `set_head` rejects sub-agent
   entries and missing ids. Resume with a head override linearizes the right
-  path, stale override falls back with a warning. Repair with a head override
+  path, a stale override fails the build with an error. Repair with a head
+  override
   anchors its synthesized results at the override (pin the ordering).
   Path-aware replay excludes sibling branches, includes sub-agent threads
   anchored on the path, and includes legacy sub threads without spawn roots
