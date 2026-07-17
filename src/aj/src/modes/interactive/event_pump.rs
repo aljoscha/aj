@@ -127,21 +127,17 @@ pub struct EventPump {
     /// resumed session starts with an empty map.
     tasks: BTreeMap<TaskId, TaskInfo>,
     /// Launch cells recorded at `ToolExecutionEnd` for bash results
-    /// carrying a `task_id`, keyed by that id. Replayed results seed
-    /// entries too, with task ids from the previous session world.
-    /// The detached driver's `TaskStart` is unordered relative to the
+    /// carrying a `task_id`, keyed by the launching `call_id`. The
+    /// detached driver's `TaskStart` is unordered relative to the
     /// tool result and may even trail the owner's `AgentEnd`, which
-    /// wipes `tool_index`. This map is what still links the task to
-    /// its cell then. Only a bash-kind `TaskStart` consumes an entry,
-    /// removing it even when the live `tool_index` lookup wins. Stale
-    /// entries linger (a replayed launch whose `TaskStart` never
-    /// comes, or a live one whose `TaskStart` beat its
-    /// `ToolExecutionEnd`), which is safe: live task ids are unique,
-    /// agent-kind events never consume, and a replayed entry
-    /// colliding with a live bash id is overwritten by the live
-    /// launch's own `ToolExecutionEnd` before a post-`AgentEnd`
-    /// `TaskStart` could need the fallback.
-    pending_task_cells: HashMap<TaskId, usize>,
+    /// wipes `tool_index`. This map is the surviving sibling of
+    /// `tool_index` that still links the task to its cell then.
+    /// Entries are consumed at `TaskStart`, removed even when the
+    /// live `tool_index` lookup wins. Residue (a replayed launch
+    /// whose `TaskStart` never comes, or a live one whose
+    /// `TaskStart` beat its `ToolExecutionEnd`) is inert: call ids
+    /// are provider-generated and never collide.
+    pending_task_cells: HashMap<String, usize>,
     /// Shared session-wide render settings (tool expansion,
     /// thinking-block fold, inline-image rendering). Cloned into
     /// every assistant / tool component the pump creates so they
@@ -777,16 +773,11 @@ impl EventPump {
                 // the linkage recorded at `ToolExecutionEnd`.
                 // `TaskStart` is unordered relative to that result
                 // and may even trail the owner's `AgentEnd`, which
-                // wipes `tool_index`. Only bash-kind events may touch
-                // the fallback: replayed launch cells seed it with a
-                // previous world's task ids, and an agent-kind task
-                // (whose `agent` tool has no cell, it renders as a
-                // sub-agent box) colliding with such an id must not
-                // claim a stale bash cell.
-                let pending = match kind {
-                    TaskKind::Bash { .. } => self.pending_task_cells.remove(task_id),
-                    TaskKind::Agent { .. } => None,
-                };
+                // wipes `tool_index`. Both lookups key on the
+                // launching `call_id`, so an agent-kind task (whose
+                // `agent` tool has no cell, it renders as a sub-agent
+                // box) misses both and keeps `cell = None`.
+                let pending = self.pending_task_cells.remove(call_id);
                 let cell = self
                     .agents
                     .get(agent_id)
@@ -1293,11 +1284,10 @@ impl EventPump {
         // Record the cell so a `TaskStart` arriving after the owner's
         // `AgentEnd` can still find it.
         if let aj_agent::tool::ToolDetails::Bash {
-            task_id: Some(task_id),
-            ..
+            task_id: Some(_), ..
         } = result
         {
-            self.pending_task_cells.insert(*task_id, idx);
+            self.pending_task_cells.insert(call_id.to_string(), idx);
         }
     }
 
@@ -3501,9 +3491,9 @@ mod tests {
         // session's first background task can collide with a task id
         // in a replayed launch cell. The `agent` tool has no cell (it
         // renders as a sub-agent box), so a background agent task's
-        // `TaskStart` always misses the live `tool_index` and would
-        // grab the stale fallback entry if consumption were not
-        // bash-gated.
+        // `TaskStart` misses the live `tool_index`, and the fallback,
+        // keyed by the launching `call_id`, must not hand it the
+        // stale bash cell either.
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
         let mut life = AgentLifecycle::default();
         // Replay: the persisted launch result arrives without a

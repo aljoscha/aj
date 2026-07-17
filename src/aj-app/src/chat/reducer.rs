@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use aj_agent::events::{AgentEvent, AgentId, SubAgentConclusion};
 use aj_agent::message::AgentMessageKind;
-use aj_agent::tool::{TASK_NOTIFICATION_OPEN_TAG, TaskKind, TaskStatus, ToolDetails};
+use aj_agent::tool::{TASK_NOTIFICATION_OPEN_TAG, TaskStatus, ToolDetails};
 use aj_models::streaming::AssistantMessageEvent;
 use aj_models::types::{
     AssistantContent, AssistantMessage, ErrorCategory, Message, StopReason, UserContent,
@@ -218,7 +218,7 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
                 None => append_tool_entry(
                     state,
                     agent_id,
-                    call_id,
+                    call_id.clone(),
                     tool,
                     Value::Object(Default::default()),
                 ),
@@ -235,7 +235,7 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
                 ..
             } = &result
             {
-                state.pending_task_cells.insert(*task_id, id);
+                state.pending_task_cells.insert(call_id.clone(), id);
                 frozen = state
                     .tasks
                     .get(task_id)
@@ -436,16 +436,11 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
             // the owner's turn is still running, else from the linkage
             // recorded at `ToolExecutionEnd`. `TaskStart` is unordered
             // relative to that result and may even trail the owner's
-            // `AgentEnd`, which wipes `tool_index`. Only bash-kind
-            // events may touch the fallback: replayed launch cells
-            // seed it with a previous world's task ids, and an
-            // agent-kind task (whose `agent` tool has no cell, it
-            // renders as a sub-agent box) colliding with such an id
-            // must not claim a stale bash cell.
-            let pending = match &kind {
-                TaskKind::Bash { .. } => state.pending_task_cells.remove(&task_id),
-                TaskKind::Agent { .. } => None,
-            };
+            // `AgentEnd`, which wipes `tool_index`. Both lookups key
+            // on the launching `call_id`, so an agent-kind task (whose
+            // `agent` tool has no cell, it renders as a sub-agent box)
+            // misses both and keeps `cell = None`.
+            let pending = state.pending_task_cells.remove(&call_id);
             let cell = state
                 .render
                 .get(&agent_id)
@@ -2273,9 +2268,9 @@ mod tests {
         // session's first background task can collide with a task id
         // in a replayed launch cell. The `agent` tool has no cell (it
         // renders as a sub-agent box), so a background agent task's
-        // `TaskStart` always misses the live `tool_index` and would
-        // grab the stale fallback entry if consumption were not
-        // bash-gated.
+        // `TaskStart` misses the live `tool_index`, and the fallback,
+        // keyed by the launching `call_id`, must not hand it the
+        // stale bash cell either.
         let mut s = state();
         let mut life = AgentLifecycle::default();
         // Replay: the persisted launch result arrives without a

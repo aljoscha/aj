@@ -371,21 +371,17 @@ pub struct ChatState {
     /// resumed session starts with an empty map.
     pub(crate) tasks: BTreeMap<TaskId, TaskInfo>,
     /// Launch cells recorded at `ToolExecutionEnd` for bash results
-    /// carrying a `task_id`, keyed by that id. Replayed results seed
-    /// entries too, with task ids from the previous session world.
-    /// The detached driver's `TaskStart` is unordered relative to the
+    /// carrying a `task_id`, keyed by the launching `call_id`. The
+    /// detached driver's `TaskStart` is unordered relative to the
     /// tool result and may even trail the owner's `AgentEnd`, which
-    /// wipes `tool_index`. This map is what still links the task to
-    /// its cell then. Only a bash-kind `TaskStart` consumes an entry,
-    /// removing it even when the live `tool_index` lookup wins. Stale
-    /// entries linger (a replayed launch whose `TaskStart` never
-    /// comes, or a live one whose `TaskStart` beat its
-    /// `ToolExecutionEnd`), which is safe: live task ids are unique,
-    /// agent-kind events never consume, and a replayed entry
-    /// colliding with a live bash id is overwritten by the live
-    /// launch's own `ToolExecutionEnd` before a post-`AgentEnd`
-    /// `TaskStart` could need the fallback.
-    pub(crate) pending_task_cells: HashMap<TaskId, EntryId>,
+    /// wipes `tool_index`. This map is the surviving sibling of
+    /// `tool_index` that still links the task to its cell then.
+    /// Entries are consumed at `TaskStart`, removed even when the
+    /// live `tool_index` lookup wins. Residue (a replayed launch
+    /// whose `TaskStart` never comes, or a live one whose
+    /// `TaskStart` beat its `ToolExecutionEnd`) is inert: call ids
+    /// are provider-generated and never collide.
+    pub(crate) pending_task_cells: HashMap<String, EntryId>,
     /// Per-agent footer store (model line + context occupancy).
     pub(crate) footers: AgentFooters,
     /// Model catalog, for resolving a settings identity's context
