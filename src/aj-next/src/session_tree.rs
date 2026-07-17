@@ -16,22 +16,20 @@
 //! through a filter-key -> head map, the same indirection the session selector
 //! uses.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use aj_app::session::SessionRequest;
 use aj_session::{EntryId, SessionTree};
 use chrono::{DateTime, Utc};
-use vaxis::vxfw::{FilterableSelect, SelectItem, WidgetRef, to_widget_ref};
+use vaxis::vxfw::{FilterableSelect, SelectItem, to_widget_ref};
 
-use crate::notice_toast::{Notice, raise_toast};
-use crate::overlay::{
-    OverlayChrome, OverlayPlacement, OverlayStack, close_all, close_key_label, close_top,
-    confirm_key_label,
-};
+use crate::interactive::OverlayHandles;
+use crate::overlay::{OverlayPlacement, close_all, close_key_label, close_top, confirm_key_label};
 use crate::session_selector::{format_age, truncate_chars};
 use crate::settings_ui::push_window;
+use crate::toasts::{busy_refusal, show_toast};
 
 /// How much of a segment's label a row shows before truncating.
 const LABEL_MAX_CHARS: usize = 60;
@@ -156,29 +154,24 @@ fn leaf_suffix(count: usize, last: Option<DateTime<Utc>>, now: DateTime<Utc>) ->
 }
 
 /// Open the session-tree overlay over `rows`. A confirmed row parks a
-/// [`SessionRequest::Branch`] in `request_slot` unless it is already the
-/// current tip (`current_head`); Esc closes with no change. An empty `rows`
-/// (an unpersisted session) shows an inert placeholder. Does not move focus:
-/// the caller posts the refocus event.
+/// [`SessionRequest::Branch`] in `handles.session_request` unless it is
+/// already the current tip (`current_head`); Esc closes with no change. An
+/// empty `rows` (an unpersisted session) shows an inert placeholder. Does not
+/// move focus: the caller posts the refocus event.
 ///
 /// The overlay opens read-only at any time. A real branch switch is refused
-/// at confirm time while `busy` (an in-flight turn or background work): it
-/// raises a toast into `notice` and keeps the overlay open rather than parking
-/// a request that would tear live work down.
+/// at confirm time while `handles.busy` (an in-flight turn or background
+/// work): it raises a toast into `handles.toasts` and keeps the overlay open
+/// rather than parking a request that would tear live work down.
 pub(crate) fn open_session_tree(
-    stack: &Rc<RefCell<OverlayStack>>,
-    editor: &WidgetRef,
-    chrome: &OverlayChrome,
-    request_slot: &Rc<RefCell<Option<SessionRequest>>>,
-    busy: &Rc<Cell<bool>>,
-    notice: &Rc<RefCell<Option<Notice>>>,
+    handles: &OverlayHandles,
     rows: Vec<TreeRow>,
     current_head: Option<EntryId>,
 ) -> Rc<RefCell<FilterableSelect>> {
     let heads = heads_map(&rows);
     let select = Rc::new(RefCell::new(FilterableSelect::new(
         tree_items(&rows),
-        chrome.select.clone(),
+        handles.chrome.select.clone(),
     )));
     let focus = select.borrow().focus_target();
     {
@@ -187,11 +180,11 @@ pub(crate) fn open_session_tree(
         sel.set_show_scrollbar(true);
         let heads_c = heads.clone();
         let current_c = current_head.clone();
-        let request_c = Rc::clone(request_slot);
-        let busy_c = Rc::clone(busy);
-        let notice_c = Rc::clone(notice);
-        let stack_c = Rc::clone(stack);
-        let editor_c = Rc::clone(editor);
+        let request_c = Rc::clone(&handles.session_request);
+        let busy_c = Rc::clone(&handles.busy);
+        let toasts_c = Rc::clone(&handles.toasts);
+        let stack_c = Rc::clone(&handles.stack);
+        let editor_c = Rc::clone(&handles.editor);
         sel.on_confirm = Some(Box::new(move |ctx, item| {
             if let Some(request) = confirm_request(&heads_c, current_c.as_deref(), &item.filter_key)
             {
@@ -199,7 +192,7 @@ pub(crate) fn open_session_tree(
                 // background work down, so refuse it: raise the toast and keep
                 // the overlay open (the user can Esc or wait).
                 if busy_c.get() {
-                    raise_toast(&notice_c, "Can't switch branches while work is running.");
+                    show_toast(&toasts_c, busy_refusal("switch branches"));
                     ctx.redraw = true;
                     return;
                 }
@@ -209,8 +202,8 @@ pub(crate) fn open_session_tree(
             // included) back to the transcript, matching the session selector.
             close_all(&stack_c, ctx, &editor_c);
         }));
-        let stack_cancel = Rc::clone(stack);
-        let editor_cancel = Rc::clone(editor);
+        let stack_cancel = Rc::clone(&handles.stack);
+        let editor_cancel = Rc::clone(&handles.editor);
         sel.on_cancel = Some(Box::new(move |ctx| {
             close_top(&stack_cancel, ctx, &editor_cancel)
         }));
@@ -223,8 +216,8 @@ pub(crate) fn open_session_tree(
             .select_matching(|item| heads.get(&item.filter_key).map(String::as_str) == Some(head));
     }
     push_window(
-        stack,
-        chrome,
+        &handles.stack,
+        &handles.chrome,
         "Session tree",
         subtitle(),
         to_widget_ref(Rc::clone(&select)),
@@ -480,18 +473,15 @@ mod tests {
     /// Drive the REAL confirm closure `open_session_tree` builds, over a live
     /// overlay stack, selecting the abandoned branch A (a real switch off the
     /// current tip "b"). Returns the parked request, the stack (to check
-    /// open/closed), and the raised notice cell.
+    /// open/closed), and the toast stack.
     #[expect(clippy::type_complexity)]
     fn confirm_switch_over(
         busy: bool,
     ) -> (
         Rc<RefCell<Option<SessionRequest>>>,
-        Rc<RefCell<OverlayStack>>,
-        Rc<RefCell<Option<Notice>>>,
+        Rc<RefCell<crate::overlay::OverlayStack>>,
+        crate::toasts::ToastStack,
     ) {
-        use aj_app::theme::{ColorMode, Theme};
-        use vaxis::vxfw::Text;
-
         let tree = SessionTree {
             segments: vec![
                 segment("p", "shared", None, vec![1, 2], true),
@@ -506,24 +496,10 @@ mod tests {
             .map(row_key)
             .expect("a row for branch A");
 
-        let t = Theme::bundled_dark_with_mode(ColorMode::Truecolor);
-        let chrome = OverlayChrome::from_theme(&t);
-        let stack = Rc::new(RefCell::new(OverlayStack::default()));
-        let editor: WidgetRef = to_widget_ref(Rc::new(RefCell::new(Text::new(""))));
-        let request_slot: Rc<RefCell<Option<SessionRequest>>> = Rc::new(RefCell::new(None));
-        let busy_cell = Rc::new(Cell::new(busy));
-        let notice: Rc<RefCell<Option<Notice>>> = Rc::new(RefCell::new(None));
+        let handles = OverlayHandles::for_tests();
+        handles.busy.set(busy);
 
-        let select = open_session_tree(
-            &stack,
-            &editor,
-            &chrome,
-            &request_slot,
-            &busy_cell,
-            &notice,
-            rows,
-            Some("b".to_string()),
-        );
+        let select = open_session_tree(&handles, rows, Some("b".to_string()));
         select
             .borrow()
             .select_matching(|item| item.filter_key == key_for_a);
@@ -532,23 +508,27 @@ mod tests {
             let mut ctx = vaxis::vxfw::EventContext::new();
             cb(&mut ctx, &picked);
         }
-        (request_slot, stack, notice)
+        (
+            Rc::clone(&handles.session_request),
+            Rc::clone(&handles.stack),
+            Rc::clone(&handles.toasts),
+        )
     }
 
     /// While busy, confirming a real branch switch raises the toast and parks
     /// NO request, leaving the overlay open so the user can Esc or wait.
     #[test]
     fn confirm_switch_while_busy_toasts_and_stays_open() {
-        let (request, stack, notice) = confirm_switch_over(true);
+        let (request, stack, toasts) = confirm_switch_over(true);
         assert!(request.borrow().is_none(), "no request parked while busy");
         assert!(
             stack.borrow().is_open(),
             "the overlay stays open while busy"
         );
         assert!(
-            notice.borrow().as_ref().is_some_and(|n| n
-                .message
-                .contains("Can't switch branches while work is running")),
+            crate::toasts::toast_texts(&toasts)
+                .iter()
+                .any(|m| m.contains("Can't switch branches while work is running")),
             "the refusal raises the branch toast"
         );
     }
@@ -556,13 +536,16 @@ mod tests {
     /// While idle, confirming a real branch switch parks it and closes.
     #[test]
     fn confirm_switch_while_idle_parks_and_closes() {
-        let (request, stack, notice) = confirm_switch_over(false);
+        let (request, stack, toasts) = confirm_switch_over(false);
         assert!(
             matches!(request.borrow().as_ref(), Some(SessionRequest::Branch { head }) if head == "a"),
             "an idle switch parks a branch for the picked head",
         );
         assert!(!stack.borrow().is_open(), "the confirm closed the overlay");
-        assert!(notice.borrow().is_none(), "no toast raised while idle");
+        assert!(
+            crate::toasts::toast_texts(&toasts).is_empty(),
+            "no toast raised while idle"
+        );
     }
 
     /// A mid-segment head (not equal to any segment's last entry) is not the

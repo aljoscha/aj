@@ -65,7 +65,7 @@ use vaxis::vxfw::{
 
 use crate::agent_picker::{AgentPickerOutcome, PickerSnapshot, open_agent_picker};
 use crate::content_overlay::{ContentStyles, Row, auth_rows, session_info_rows, set_rows};
-use crate::copied_toast::{COPIED_TOAST_DURATION, Copied, CopiedToast};
+use crate::copied_toast::Copied;
 use crate::footer::FooterLine;
 use crate::frame_stats_box::FrameStatsBox;
 use crate::keymap::{HostCtx, build_keymap};
@@ -73,7 +73,6 @@ use crate::login::{
     AuthPickerRequest, AuthRow, DialogCallbacks, LoginDialogState, open_login_dialog,
     open_login_picker, open_logout_picker,
 };
-use crate::notice_toast::{Notice, NoticeToast, raise_toast};
 use crate::overlay::{MouseBlocker, OverlayChrome, OverlayStack, Scrim};
 use crate::palette::{FetchKind, PendingFetch, open_palette};
 use crate::pending::PendingBox;
@@ -89,6 +88,7 @@ use crate::settings_ui::{
 use crate::splash::{SPLASH_WAKE_EVENT, Splash};
 use crate::status::{STATUS_WAKE_EVENT, StatusLine, StatusState};
 use crate::task_output::open_task_output;
+use crate::toasts::{ToastStack, Toasts, busy_refusal};
 use crate::transcript::{TranscriptStyles, TranscriptView, vaxis_color};
 use crate::usage_overlay::open_usage_overlay;
 
@@ -1148,47 +1148,32 @@ fn quit_arm_running_work(world: &World) -> Option<String> {
 /// site: the [`SessionExit`] to break the loop with, or `None` to stay in the
 /// session.
 ///
-/// Both a tree-view branch switch (`SessionRequest::Branch`) and a
-/// selector resume (`SessionRequest::Resume`) rebuild the session, which shuts
-/// its turns and background work down. We refuse either while any turn or
-/// background task/sub-agent is live rather than tear live work down silently.
-/// The overlays open read-only and refuse the switch at confirm time, but a
-/// request can still slip through with work live: a background sub-agent
-/// finishing between the confirm and this consumption spawns a parent wake
-/// turn (so `world.turns` is non-empty), and the confirm-time `busy` snapshot
-/// is one drive-loop iteration stale. This is the authoritative recheck.
-///
-/// `New` is only ever parked with no turn in flight (the `NewSession` command
-/// guards on `world.turns`, not via an overlay), so it keeps the
-/// debug-assert-and-consume path.
+/// Every request (a new session, a selector resume, a tree-view branch
+/// switch) rebuilds the session, which shuts its turns and background work
+/// down. We refuse any of them while a turn or background task/sub-agent is
+/// live rather than tear live work down silently. The request sites refuse
+/// while busy up front (the overlays at confirm time, the `NewSession`
+/// command in `apply_command_action`), but a request can still slip through
+/// with work live: a background sub-agent finishing between that check and
+/// this consumption spawns a parent wake turn (so `world.turns` is
+/// non-empty), and the earlier `busy` snapshot is one drive-loop iteration
+/// stale. This is the authoritative recheck.
 fn consume_session_request(
     world: &mut World,
     shell: &Rc<RefCell<Shell>>,
     request: SessionRequest,
 ) -> Option<SessionExit> {
-    match &request {
-        SessionRequest::Branch { .. } => {
-            let (agents, bash) =
-                running_work_counts(world.turns.len(), &world.core.task_registry.snapshot());
-            if agents + bash > 0 {
-                fold_notice(world, "Can't switch branches while work is running.");
-                return None;
-            }
-        }
-        SessionRequest::Resume(_) => {
-            let (agents, bash) =
-                running_work_counts(world.turns.len(), &world.core.task_registry.snapshot());
-            if agents + bash > 0 {
-                // A toast, matching the selector's confirm-time refuse.
-                shell
-                    .borrow()
-                    .show_toast("Can't switch sessions while work is running.");
-                return None;
-            }
-        }
-        SessionRequest::New => {
-            debug_assert!(world.turns.is_empty(), "new session requested mid-turn");
-        }
+    let (agents, bash) =
+        running_work_counts(world.turns.len(), &world.core.task_registry.snapshot());
+    if agents + bash > 0 {
+        // A toast, matching the request sites' up-front refuse.
+        let what = match &request {
+            SessionRequest::Branch { .. } => "switch branches",
+            SessionRequest::Resume(_) => "switch sessions",
+            SessionRequest::New => "start a new session",
+        };
+        shell.borrow().show_toast(busy_refusal(what));
+        return None;
     }
     Some(request.into_exit())
 }
@@ -1420,9 +1405,7 @@ async fn submit_with_armed_anchor(
         running_work_counts(world.turns.len(), &world.core.task_registry.snapshot());
     if agents + bash > 0 {
         shell.borrow().editor.borrow_mut().set_text(&text);
-        shell
-            .borrow()
-            .show_toast("Can't branch while work is running.");
+        shell.borrow().show_toast(busy_refusal("branch"));
         return ArmedSubmit::Stay;
     }
     // Resolve the anchor against the log.
@@ -1750,26 +1733,11 @@ async fn apply_command_action(
         // The session-selector and session-tree overlays open READ-ONLY at any
         // time, even mid-work. Switching (Enter) is refused at confirm time
         // with a toast (see their `on_confirm` closures), so there is no
-        // open-time busy guard here. `NewSession` below keeps its own guard.
+        // open-time busy guard here. `NewSession` below refuses while busy up
+        // front instead, since it opens no overlay.
         CommandAction::OpenSessionSelector => {
-            let (handles, busy, notice) = {
-                let sh = shell.borrow();
-                (
-                    sh.overlay_handles(),
-                    Rc::clone(&sh.busy),
-                    Rc::clone(&sh.notice),
-                )
-            };
-            open_session_selector(
-                &handles.stack,
-                &handles.editor,
-                &handles.chrome,
-                &handles.session_scan,
-                &handles.session_request,
-                &busy,
-                &notice,
-                world.core.session_id.clone(),
-            );
+            let handles = shell.borrow().overlay_handles();
+            open_session_selector(&handles, world.core.session_id.clone());
             ActionEffect::OpenedOverlay
         }
         CommandAction::OpenSessionTree => {
@@ -1782,29 +1750,21 @@ async fn apply_command_action(
                     log.head().cloned(),
                 )
             };
-            let (handles, busy, notice) = {
-                let sh = shell.borrow();
-                (
-                    sh.overlay_handles(),
-                    Rc::clone(&sh.busy),
-                    Rc::clone(&sh.notice),
-                )
-            };
-            open_session_tree(
-                &handles.stack,
-                &handles.editor,
-                &handles.chrome,
-                &handles.session_request,
-                &busy,
-                &notice,
-                rows,
-                current_head,
-            );
+            let handles = shell.borrow().overlay_handles();
+            open_session_tree(&handles, rows, current_head);
             ActionEffect::OpenedOverlay
         }
         CommandAction::NewSession => {
-            if !world.turns.is_empty() {
-                fold_notice(world, &session_busy_notice("start a new session"));
+            // A new session rebuilds the world, which tears down any turn AND
+            // background work, so it joins the refuse-while-busy rule of the
+            // other session-changing requests. `consume_session_request`
+            // rechecks at consumption.
+            let (agents, bash) =
+                running_work_counts(world.turns.len(), &world.core.task_registry.snapshot());
+            if agents + bash > 0 {
+                shell
+                    .borrow()
+                    .show_toast(busy_refusal("start a new session"));
             } else {
                 // No overlay: park the request straight away. The drive
                 // loop's post-input check turns it into `SessionExit::New`.
@@ -3032,30 +2992,61 @@ fn editor_theme_from_theme(theme: &Theme) -> EditorTheme {
     }
 }
 
-/// The shared handles the drive loop hands to a config-editing overlay's open
-/// function. Gathered from the shell in one borrow so the open call site never
-/// holds a shell borrow across it.
-struct OverlayHandles {
-    stack: Rc<RefCell<OverlayStack>>,
-    editor: WidgetRef,
-    chrome: OverlayChrome,
-    activity: Rc<RefCell<Vec<SelectorActivity>>>,
-    settings_ui: Rc<RefCell<Option<SettingsUi>>>,
+/// The shared handles the drive loop hands to an overlay's open function.
+/// Gathered from the shell in one borrow so the open call site never holds a
+/// shell borrow across it.
+pub(crate) struct OverlayHandles {
+    pub(crate) stack: Rc<RefCell<OverlayStack>>,
+    pub(crate) editor: WidgetRef,
+    pub(crate) chrome: OverlayChrome,
+    pub(crate) activity: Rc<RefCell<Vec<SelectorActivity>>>,
+    pub(crate) settings_ui: Rc<RefCell<Option<SettingsUi>>>,
     /// Where the agent picker parks its confirmed pick / kill.
-    picker_outcome: Rc<RefCell<Option<AgentPickerOutcome>>>,
+    pub(crate) picker_outcome: Rc<RefCell<Option<AgentPickerOutcome>>>,
     /// Where the prompt-history overlay parks a scan request.
-    history_fetch: Rc<RefCell<Option<HistoryFetch>>>,
+    pub(crate) history_fetch: Rc<RefCell<Option<HistoryFetch>>>,
     /// Where the skills window parks its fill handle on open, for the drive
     /// loop to stream discovered rows into.
-    skills_fill: Rc<RefCell<Option<SkillsFill>>>,
+    pub(crate) skills_fill: Rc<RefCell<Option<SkillsFill>>>,
     /// Where the prompt-history overlay parks a recalled prompt.
-    recall_slot: Rc<RefCell<Option<String>>>,
+    pub(crate) recall_slot: Rc<RefCell<Option<String>>>,
     /// Where the session selector parks its preview-scan request.
-    session_scan: Rc<RefCell<Option<SessionScan>>>,
+    pub(crate) session_scan: Rc<RefCell<Option<SessionScan>>>,
     /// Where the session selector parks a confirmed resume request.
-    session_request: Rc<RefCell<Option<SessionRequest>>>,
+    pub(crate) session_request: Rc<RefCell<Option<SessionRequest>>>,
     /// Where the login/logout picker parks a confirmed provider action.
-    auth_request: Rc<RefCell<Option<AuthPickerRequest>>>,
+    pub(crate) auth_request: Rc<RefCell<Option<AuthPickerRequest>>>,
+    /// The shared work-in-flight flag the session-changing overlays read at
+    /// confirm time to refuse a switch mid-work.
+    pub(crate) busy: Rc<Cell<bool>>,
+    /// The shared toast stack those refusals raise into.
+    pub(crate) toasts: ToastStack,
+}
+
+#[cfg(test)]
+impl OverlayHandles {
+    /// A free-standing handle bundle for widget tests that drive an open
+    /// function without a Shell: fresh slots, an inert editor, and the
+    /// bundled dark chrome.
+    pub(crate) fn for_tests() -> OverlayHandles {
+        let t = Theme::bundled_dark_with_mode(ColorMode::Truecolor);
+        OverlayHandles {
+            stack: Rc::new(RefCell::new(OverlayStack::default())),
+            editor: to_widget_ref(Rc::new(RefCell::new(Text::new("")))),
+            chrome: OverlayChrome::from_theme(&t),
+            activity: Rc::new(RefCell::new(Vec::new())),
+            settings_ui: Rc::new(RefCell::new(None)),
+            picker_outcome: Rc::new(RefCell::new(None)),
+            history_fetch: Rc::new(RefCell::new(None)),
+            skills_fill: Rc::new(RefCell::new(None)),
+            recall_slot: Rc::new(RefCell::new(None)),
+            session_scan: Rc::new(RefCell::new(None)),
+            session_request: Rc::new(RefCell::new(None)),
+            auth_request: Rc::new(RefCell::new(None)),
+            busy: Rc::new(Cell::new(false)),
+            toasts: Rc::new(RefCell::new(Vec::new())),
+        }
+    }
 }
 
 /// The chat slot: draws the empty-state [`Splash`] until the active view has a
@@ -3122,22 +3113,20 @@ struct Shell {
     /// The frame-statistics debug overlay, floated in the top-right corner
     /// when `show_frame_stats` is on. Reads the `frame_stats` snapshot below.
     frame_stats_box: Rc<RefCell<FrameStatsBox>>,
-    /// The "copied to clipboard" toast, stacked above the quit hint for a
-    /// couple of seconds after a mouse text selection copies. Reads the
-    /// `copied` record below, written by the transcript.
-    copied_toast: Rc<RefCell<CopiedToast>>,
-    /// The last select-to-copy record, shared with the transcript that writes
-    /// it and the `copied_toast` that reports it. The drive loop reads it to
-    /// wake at the toast's deadline. Copy payload, so a `Cell` not a `RefCell`.
+    /// The toast-stack widget, drawn bottom-right every frame: stacked above
+    /// the quit hint when no modal is open, floated over the scrim/overlay
+    /// (z 3) otherwise. Reads the `toasts` stack below.
+    toast_box: Rc<RefCell<Toasts>>,
+    /// The live toast records, shared with the writers (the drive loop's
+    /// select-to-copy fold, the overlay confirm closures, [`Shell::show_toast`])
+    /// and the `toast_box` that draws them. The drive loop prunes it and
+    /// wakes at the earliest live deadline.
+    toasts: ToastStack,
+    /// The last select-to-copy record, written by the transcript (which the
+    /// unified toast stack deliberately leaves untouched). The drive loop
+    /// edge-detects fresh records by their timestamp and folds each into
+    /// `toasts`. Copy payload, so a `Cell` not a `RefCell`.
     copied: Rc<Cell<Option<Copied>>>,
-    /// The transient notice toast, stacked with the copy toast above the
-    /// editor. Reads the `notice` record below, raised by the host through
-    /// [`Shell::show_toast`] (and the overlay confirm closures directly).
-    notice_toast: Rc<RefCell<NoticeToast>>,
-    /// The latest raised notice, shared with the overlay confirm closures that
-    /// write it and the `notice_toast` that reports it. The drive loop reads it
-    /// to wake at the toast's deadline. A `String` payload, so a `RefCell`.
-    notice: Rc<RefCell<Option<Notice>>>,
     /// Whether any work is in flight (an in-flight turn OR background
     /// sub-agents / bash tasks). Refreshed every drive-loop iteration by
     /// [`sync_keymap_ctx`] from `running_work_counts`. The session-overlay
@@ -3296,15 +3285,15 @@ impl Shell {
         // to gate the copy chord). Created here so both get the same cell.
         let focus_mode = Rc::new(std::cell::Cell::new(false));
         // The select-to-copy record, shared between the transcript (its single
-        // writer, on a copy) and the `CopiedToast` that reports it, and read by
-        // the drive loop to schedule the toast's dismissal. Created here so
-        // all three see the same cell.
+        // writer, on a copy) and the drive loop, which edge-detects fresh
+        // records and folds each into the toast stack. Created here so both
+        // see the same cell.
         let copied: Rc<Cell<Option<Copied>>> = Rc::new(Cell::new(None));
-        // The raised-notice record, shared between the host (its writers: the
-        // overlay confirm closures and `Shell::show_toast`) and the
-        // `NoticeToast` that reports it, and read by the drive loop to schedule
-        // the toast's dismissal. A `String` payload, so a `RefCell`.
-        let notice: Rc<RefCell<Option<Notice>>> = Rc::new(RefCell::new(None));
+        // The toast stack, shared between its writers (the drive loop's copy
+        // fold, the overlay confirm closures, `Shell::show_toast`) and the
+        // `Toasts` box that draws it. The drive loop prunes it and wakes at
+        // the earliest live deadline.
+        let toasts: ToastStack = Rc::new(RefCell::new(Vec::new()));
         // The global busy flag, refreshed each drive-loop iteration. Read by
         // the session-overlay confirm closures to refuse a switch mid-work.
         let busy: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -3352,15 +3341,10 @@ impl Shell {
             Rc::clone(&chrome),
             Rc::clone(&frame_stats),
         )));
-        let copied_toast = Rc::new(RefCell::new(CopiedToast::new(
+        let toast_box = Rc::new(RefCell::new(Toasts::new(
             Rc::clone(&styles),
             Rc::clone(&chrome),
-            Rc::clone(&copied),
-        )));
-        let notice_toast = Rc::new(RefCell::new(NoticeToast::new(
-            Rc::clone(&styles),
-            Rc::clone(&chrome),
-            Rc::clone(&notice),
+            Rc::clone(&toasts),
         )));
         let pending = Rc::new(RefCell::new(PendingBox::new(
             Rc::clone(&chat),
@@ -3623,10 +3607,9 @@ impl Shell {
             quit_hint,
             quit_hint_warning,
             frame_stats_box,
-            copied_toast,
+            toast_box,
+            toasts,
             copied,
-            notice_toast,
-            notice,
             busy,
             show_frame_stats,
             frame_stats,
@@ -3669,11 +3652,11 @@ impl Shell {
         clear_branch(&self.branch_anchor, &self.branch_indicator);
     }
 
-    /// Raise a transient bottom-right toast with `message`, replacing any live
-    /// one and resetting its timer. The caller still owns the repaint (the
+    /// Raise a transient bottom-right toast with `message`. Live toasts
+    /// stack, each with its own timer. The caller still owns the repaint (the
     /// drive loop schedules the clearing repaint at the toast's deadline).
     fn show_toast(&self, message: impl Into<String>) {
-        raise_toast(&self.notice, message);
+        crate::toasts::show_toast(&self.toasts, message);
     }
 
     /// Take the "an Esc cancelled the armed anchor" flag, so the drive loop
@@ -3743,10 +3726,10 @@ impl Shell {
         self.auth_request.borrow_mut().take()
     }
 
-    /// The shared handles the drive loop needs to open a config-editing
-    /// overlay: the stack it pushes onto, the editor (focus fallback), a live
-    /// chrome snapshot, and the activity / settings-window / picker /
-    /// history / recall slots.
+    /// The shared handles the drive loop needs to open an overlay: the stack
+    /// it pushes onto, the editor (focus fallback), a live chrome snapshot,
+    /// the parked-request slots, and the busy flag plus toast stack the
+    /// session-changing confirms read and raise into.
     fn overlay_handles(&self) -> OverlayHandles {
         OverlayHandles {
             stack: Rc::clone(&self.overlays),
@@ -3761,6 +3744,8 @@ impl Shell {
             session_scan: Rc::clone(&self.session_scan),
             session_request: Rc::clone(&self.session_request),
             auth_request: Rc::clone(&self.auth_request),
+            busy: Rc::clone(&self.busy),
+            toasts: Rc::clone(&self.toasts),
         }
     }
 
@@ -3779,12 +3764,7 @@ impl Shell {
         self.frame_stats_box
             .borrow_mut()
             .set_styles(Rc::clone(&styles));
-        self.copied_toast
-            .borrow_mut()
-            .set_styles(Rc::clone(&styles));
-        self.notice_toast
-            .borrow_mut()
-            .set_styles(Rc::clone(&styles));
+        self.toast_box.borrow_mut().set_styles(Rc::clone(&styles));
         self.splash
             .borrow_mut()
             .set_styles(Rc::clone(&styles), t.color_mode());
@@ -3902,9 +3882,9 @@ impl Widget for Shell {
 
         // Corner boxes stacked above the editor, flush to the right edge and
         // built bottom-up: the Ctrl+C quit-arm hint at the bottom, then the
-        // "copied to clipboard" toast, then the transient notice toast on top.
-        // All are suppressed under a modal (a quit never arms there, and the
-        // transcript can't be selected).
+        // live toasts (oldest closest to the bottom). The quit hint is
+        // suppressed under a modal (a quit never arms there); the toast stack
+        // is drawn in the modal branch below instead, same spot, higher z.
         //
         // The quit hint is drawn straight from the live keymap state, so it
         // appears and clears with the armed state, no mirror. The keymap's
@@ -3930,7 +3910,7 @@ impl Widget for Shell {
                 };
                 if let Some(hint) = self.quit_hint.borrow().draw(ctx, avail) {
                     let hint = block_mouse(hint, &self.transcript);
-                    stack_bottom = push_corner_box(&mut inner, term.width, stack_bottom, hint);
+                    stack_bottom = push_corner_box(&mut inner, term.width, stack_bottom, hint, 1);
                 }
             }
 
@@ -3938,18 +3918,9 @@ impl Widget for Shell {
                 width: term.width,
                 height: stack_bottom.saturating_sub(HEADER_ROWS),
             };
-            if let Some(toast) = self.copied_toast.borrow().draw(ctx, avail) {
+            for toast in self.toast_box.borrow().draw_stack(ctx, avail) {
                 let toast = block_mouse(toast, &self.transcript);
-                stack_bottom = push_corner_box(&mut inner, term.width, stack_bottom, toast);
-            }
-
-            let avail = Size {
-                width: term.width,
-                height: stack_bottom.saturating_sub(HEADER_ROWS),
-            };
-            if let Some(toast) = self.notice_toast.borrow().draw(ctx, avail) {
-                let toast = block_mouse(toast, &self.transcript);
-                push_corner_box(&mut inner, term.width, stack_bottom, toast);
+                stack_bottom = push_corner_box(&mut inner, term.width, stack_bottom, toast, 1);
             }
         }
 
@@ -4011,31 +3982,24 @@ impl Widget for Shell {
                 surface: draw_widget(&top.widget, &overlay_ctx),
                 z_index: 2,
             });
-            // The transient notice toast floats above an open overlay too: a
-            // session-overlay confirm that refuses a switch mid-work raises it
-            // and keeps the overlay open, so it must sit above the scrim and
-            // the overlay (z 3). Anchored bottom-right above the editor. When
-            // no overlay is open it is instead stacked with the other corner
-            // boxes above; the two cases are mutually exclusive per frame.
+            // The toast stack floats above an open overlay too: a
+            // session-overlay confirm that refuses a switch mid-work raises a
+            // toast and keeps the overlay open, so toasts must sit above the
+            // scrim and the overlay (z 3). Same bottom-right spot and stacking
+            // as the no-modal branch above; only the quit hint stays
+            // suppressed under modals.
             let editor_top = term
                 .height
                 .saturating_sub(FOOTER_ROWS)
                 .saturating_sub(self.editor.borrow().drawn_height());
+            let mut stack_bottom = editor_top;
             let avail = Size {
                 width: term.width,
                 height: editor_top.saturating_sub(HEADER_ROWS),
             };
-            if let Some(toast) = self.notice_toast.borrow().draw(ctx, avail) {
-                let anchor_row = editor_top.saturating_sub(toast.size.height);
-                let anchor_col = term.width.saturating_sub(toast.size.width);
-                inner.children.push(SubSurface {
-                    origin: RelativePoint {
-                        row: i32::from(anchor_row),
-                        col: i32::from(anchor_col),
-                    },
-                    surface: toast,
-                    z_index: 3,
-                });
+            for toast in self.toast_box.borrow().draw_stack(ctx, avail) {
+                let toast = block_mouse(toast, &self.transcript);
+                stack_bottom = push_corner_box(&mut inner, term.width, stack_bottom, toast, 3);
             }
         }
         // Wrap the controller's surface instead of returning it: the
@@ -4541,11 +4505,36 @@ fn block_mouse(mut surface: Surface, transcript: &Rc<RefCell<TranscriptView>>) -
     surface
 }
 
+/// Fold a fresh select-to-copy record into the toast stack.
+///
+/// The transcript writes the shared `copied` cell (the unified toast stack
+/// deliberately leaves it in place), so the drive loop edge-detects fresh
+/// records here by their timestamp: each new copy pushes exactly one toast
+/// with the copy-toast look and its own timer. Returns whether a toast was
+/// pushed, so the caller requests the showing repaint.
+fn fold_copied_record(shell: &Shell, seen: &mut Option<Instant>) -> bool {
+    let Some(copied) = shell.copied.get() else {
+        return false;
+    };
+    if *seen == Some(copied.at) {
+        return false;
+    }
+    *seen = Some(copied.at);
+    crate::toasts::push_copy_toast(&shell.toasts, copied.chars);
+    true
+}
+
 /// Anchor a corner box flush to the right edge with its bottom at `bottom`,
-/// pushing it onto `inner` over the base layout (z 1, like the autocomplete
-/// popup). Returns the box's top row, the bottom edge for the next box stacked
-/// above it.
-fn push_corner_box(inner: &mut Surface, term_width: u16, bottom: u16, surface: Surface) -> u16 {
+/// pushing it onto `inner` at `z` (1 over the base layout like the
+/// autocomplete popup, 3 over an open modal for the toast stack). Returns the
+/// box's top row, the bottom edge for the next box stacked above it.
+fn push_corner_box(
+    inner: &mut Surface,
+    term_width: u16,
+    bottom: u16,
+    surface: Surface,
+    z: u8,
+) -> u16 {
     let anchor_row = bottom.saturating_sub(surface.size.height);
     let anchor_col = term_width.saturating_sub(surface.size.width);
     inner.children.push(SubSurface {
@@ -4554,7 +4543,7 @@ fn push_corner_box(inner: &mut Surface, term_width: u16, bottom: u16, surface: S
             col: i32::from(anchor_col),
         },
         surface,
-        z_index: 1,
+        z_index: z,
     });
     anchor_row
 }
@@ -4576,11 +4565,12 @@ async fn drive(
     // quit is armed. We refresh the hint's running-work warning on each edge
     // (set it on arm, clear it on disarm).
     let mut quit_was_armed = false;
-    // Rising/falling-edge tracker for the transient toasts (copied-to-clipboard
-    // and the notice toast), so on the frame either expires we ask for one
-    // repaint to clear it (its deadline is also folded into the wake below, so
-    // that repaint happens on time).
-    let mut toast_was_live = false;
+    // Edge tracker for the transcript's select-to-copy record: the transcript
+    // writes the shared cell (it stays the cell's single writer), and the
+    // per-iteration fold below pushes each fresh record onto the toast stack.
+    // Seeded from the current record so a copy already reported by a previous
+    // session's drive loop isn't re-toasted.
+    let mut copied_seen: Option<Instant> = shell.borrow().copied.get().map(|c| c.at);
     // Async read-only overlay fills. The list handle is `!Send`, so it
     // stays here (paired with its `FetchKind`) while the detached fetch
     // sends only the rendered rows back over the channel.
@@ -4673,26 +4663,11 @@ async fn drive(
         let frame_deadline = app
             .needs_redraw()
             .then(|| last_render.map_or_else(Instant::now, |t| t + frame_interval));
-        // The copied-to-clipboard toast has no self-timer, so wake at its
-        // deadline: the box's `draw` drops it once the record has expired, and
-        // the edge check below asks for that clearing repaint. The transient
-        // notice toast rides the same scheme, so fold in the earliest of the
-        // two live deadlines.
-        let toast_deadline = {
-            let shell = shell.borrow();
-            let copied_deadline = shell
-                .copied
-                .get()
-                .filter(Copied::is_live)
-                .map(|c| c.at + COPIED_TOAST_DURATION);
-            let notice_deadline = shell
-                .notice
-                .borrow()
-                .as_ref()
-                .filter(|n| n.is_live())
-                .map(|n| n.at + COPIED_TOAST_DURATION);
-            earliest_deadline(copied_deadline, notice_deadline)
-        };
+        // Toasts have no self-timer, so wake at the earliest live toast's
+        // deadline: the per-iteration prune below drops what expired then and
+        // requests the clearing repaint, so each toast vanishes exactly on
+        // time even while others stay live.
+        let toast_deadline = crate::toasts::earliest_toast_deadline(&shell.borrow().toasts);
         let deadline = earliest_deadline(
             earliest_deadline(tick_deadline, frame_deadline),
             toast_deadline,
@@ -5004,10 +4979,10 @@ async fn drive(
                         // or a confirmed resume pick). Bind the take out of the
                         // borrow first, so no RefCell ref is held across
                         // `consume_session_request` (which borrows the shell to
-                        // raise its refuse toast). A tree-view branch switch or
-                        // a resume can be parked with background work live, so
-                        // both are rechecked and refused there rather than
-                        // consumed (see `consume_session_request`).
+                        // raise its refuse toast). Any request can be parked
+                        // with background work live, so all are rechecked and
+                        // refused there rather than consumed (see
+                        // `consume_session_request`).
                         let session_request = shell.borrow().take_session_request();
                         if let Some(request) = session_request {
                             match consume_session_request(world, shell, request) {
@@ -5224,19 +5199,20 @@ async fn drive(
             app.request_redraw();
         }
         quit_was_armed = quit_armed;
-        // Clear the copied and notice toasts on the frame they expire. A new
-        // copy or a raised notice sets its record (and requests a redraw), so
-        // the rising edge needs no work here, but when either falls we ask for
-        // the repaint that drops the now-stale box.
-        let toast_live = {
+        // Fold a fresh select-to-copy into the toast stack (the transcript
+        // wrote the shared record during dispatch), then prune expired toasts
+        // so the repaint the earliest-deadline wake scheduled clears exactly
+        // the boxes whose time is up. Other raise sites request their own
+        // redraws.
+        {
             let shell = shell.borrow();
-            shell.copied.get().is_some_and(|c| c.is_live())
-                || shell.notice.borrow().as_ref().is_some_and(Notice::is_live)
-        };
-        if toast_was_live && !toast_live {
-            app.request_redraw();
+            if fold_copied_record(&shell, &mut copied_seen) {
+                app.request_redraw();
+            }
+            if crate::toasts::prune_expired(&shell.toasts) {
+                app.request_redraw();
+            }
         }
-        toast_was_live = toast_live;
     };
 
     exit
@@ -7382,8 +7358,8 @@ mod tests {
     }
 
     /// `push_corner_box` stacks boxes upward, flush to the right edge: the
-    /// second box sits strictly above the first, which is how the copied toast
-    /// lands on top of the Ctrl+C quit hint when both are up.
+    /// second box sits strictly above the first, which is how a toast lands
+    /// on top of the Ctrl+C quit hint when both are up.
     #[test]
     fn corner_boxes_stack_upward_flush_right() {
         let mut inner = Surface::with_size(Size {
@@ -7397,7 +7373,7 @@ mod tests {
             width: 10,
             height: 3,
         });
-        let hint_top = push_corner_box(&mut inner, 80, editor_top, hint);
+        let hint_top = push_corner_box(&mut inner, 80, editor_top, hint, 1);
         assert_eq!(hint_top, editor_top - 3);
 
         // Top box (toast): anchored with its bottom at the hint's top edge.
@@ -7405,7 +7381,7 @@ mod tests {
             width: 14,
             height: 4,
         });
-        let toast_top = push_corner_box(&mut inner, 80, hint_top, toast);
+        let toast_top = push_corner_box(&mut inner, 80, hint_top, toast, 1);
         assert_eq!(toast_top, hint_top - 4);
 
         assert_eq!(inner.children.len(), 2);
@@ -7424,10 +7400,11 @@ mod tests {
         );
     }
 
-    /// A live copied record pops the toast in `Shell::draw`; without one there
-    /// is no box.
+    /// A fresh select-to-copy record folds into the toast stack (the drive
+    /// loop's `fold_copied_record`) and shows in `Shell::draw`; the same
+    /// record folds only once.
     #[test]
-    fn copied_toast_shows_when_a_copy_is_recorded() {
+    fn copy_toast_shows_when_a_copy_is_folded() {
         let shell = test_shell_with_chat(empty_chat());
         let ctx = draw_ctx(100, 30);
 
@@ -7443,15 +7420,29 @@ mod tests {
             chars: 7,
             at: Instant::now(),
         }));
+        let mut seen = None;
+        assert!(
+            fold_copied_record(&shell.borrow(), &mut seen),
+            "a fresh record pushes a toast"
+        );
+        assert!(
+            !fold_copied_record(&shell.borrow(), &mut seen),
+            "the same record folds only once"
+        );
         let after = shell.borrow_mut().draw(&ctx);
         let body = crate::test_support::rows(&after).join("\n");
         assert!(body.contains("7 characters copied to clipboard"), "{body}");
+        assert_eq!(
+            crate::toasts::toast_texts(&shell.borrow().toasts).len(),
+            1,
+            "exactly one toast on the stack"
+        );
     }
 
-    /// A raised notice pops the notice toast in `Shell::draw`; without one
-    /// there is no box.
+    /// A raised toast shows in `Shell::draw`; without one there is no box.
+    /// Several live toasts stack, oldest closest to the bottom.
     #[test]
-    fn notice_toast_shows_when_raised() {
+    fn toasts_show_when_raised_and_stack_oldest_at_the_bottom() {
         let shell = test_shell_with_chat(empty_chat());
         let ctx = draw_ctx(100, 30);
 
@@ -7460,15 +7451,22 @@ mod tests {
             !crate::test_support::rows(&before)
                 .join("\n")
                 .contains("work is running"),
-            "no toast without a raised notice",
+            "no toast without a raise",
         );
 
-        shell
-            .borrow()
-            .show_toast("Can't switch sessions while work is running.");
+        shell.borrow().show_toast("older toast message");
+        shell.borrow().show_toast("newer toast message");
         let after = shell.borrow_mut().draw(&ctx);
-        let body = crate::test_support::rows(&after).join("\n");
-        assert!(body.contains("work is running"), "{body}");
+        let rows = crate::test_support::rows(&after);
+        let row_of = |needle: &str| {
+            rows.iter()
+                .position(|r| r.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} not drawn: {rows:?}"))
+        };
+        assert!(
+            row_of("older toast message") > row_of("newer toast message"),
+            "the oldest toast sits closest to the bottom: {rows:?}"
+        );
     }
 
     /// machinery: after the tick fires, the next ctrl+c re-arms instead
@@ -10942,7 +10940,7 @@ mod tests {
     /// The session selector opens read-only even mid-turn (the switch is
     /// refused at confirm time, not by refusing to open). `NewSession` still
     /// refuses mid-turn (it starts a fresh session with no overlay to gate
-    /// the switch), folding a notice and parking nothing.
+    /// the switch), raising a toast and parking nothing.
     #[tokio::test]
     async fn new_session_refused_mid_turn_selector_opens() {
         let dir = TempDir::new().expect("tempdir");
@@ -10978,17 +10976,62 @@ mod tests {
             "no new-session parked mid-turn"
         );
         assert!(
-            main_notices(&world)
+            crate::toasts::toast_texts(&shell.borrow().toasts)
                 .iter()
-                .any(|n| n.contains("start a new session")),
+                .any(|m| m.contains("Can't start a new session while work is running")),
             "{:?}",
-            main_notices(&world)
+            crate::toasts::toast_texts(&shell.borrow().toasts)
         );
 
         // Settle the turn so teardown is clean.
         cancel_viewed_turn(&world);
         let joined = join_next_or_pending(&mut world.turns).await;
         handle_turn_join(&mut world, joined).expect("abort is non-fatal");
+    }
+
+    /// `NewSession` joins the refuse-while-busy rule for BACKGROUND work too
+    /// (no turn in flight): the command refuses with a toast and parks
+    /// nothing, and the consumption-site recheck refuses a `New` request that
+    /// slipped through, then proceeds once idle.
+    #[tokio::test]
+    async fn new_session_refused_while_background_work_runs() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        run_prompt(&mut world, "seed").await;
+        assert!(world.turns.is_empty(), "no turn in flight");
+        let task = register_bash_task(&world, "sleep 100");
+
+        // The command refuses up front.
+        assert!(matches!(
+            apply_command(&mut world, &shell, CommandAction::NewSession).await,
+            ActionEffect::Redraw
+        ));
+        assert!(
+            shell.borrow().take_session_request().is_none(),
+            "no new-session parked while background work runs"
+        );
+        assert!(
+            crate::toasts::toast_texts(&shell.borrow().toasts)
+                .iter()
+                .any(|m| m.contains("Can't start a new session while work is running")),
+            "the refusal raises the toast"
+        );
+
+        // The consumption site rechecks a request that slipped through.
+        assert!(
+            consume_session_request(&mut world, &shell, SessionRequest::New).is_none(),
+            "a running background task refuses the parked new-session request"
+        );
+
+        // Idle (task terminal): the request proceeds to a new-session exit.
+        world
+            .core
+            .task_registry
+            .set_status(task, aj_agent::tool::TaskStatus::Killed);
+        assert!(matches!(
+            consume_session_request(&mut world, &shell, SessionRequest::New),
+            Some(SessionExit::New)
+        ));
     }
 
     /// The session tree opens read-only even mid-turn (the branch switch it
@@ -11040,12 +11083,11 @@ mod tests {
         );
     }
 
-    /// The notice toast renders ABOVE an open session overlay: the busy-refuse
+    /// The toast stack renders ABOVE an open session overlay: the busy-refuse
     /// keeps the overlay open, so the toast must float over it (z above the
-    /// scrim/overlay) rather than being suppressed like the copy toast / quit
-    /// hint.
+    /// scrim/overlay) rather than being suppressed like the quit hint.
     #[tokio::test]
-    async fn notice_toast_renders_over_an_open_overlay() {
+    async fn toast_stack_renders_over_an_open_overlay() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         apply_command(&mut world, &shell, CommandAction::OpenSessionTree).await;
@@ -11543,19 +11585,11 @@ mod tests {
             "the text is restored into the editor"
         );
         assert!(
-            shell
-                .borrow()
-                .notice
-                .borrow()
-                .as_ref()
-                .is_some_and(|n| n.message.contains("Can't branch while work is running")),
+            crate::toasts::toast_texts(&shell.borrow().toasts)
+                .iter()
+                .any(|m| m.contains("Can't branch while work is running")),
             "the refusal raises the branch toast: {:?}",
-            shell
-                .borrow()
-                .notice
-                .borrow()
-                .as_ref()
-                .map(|n| n.message.clone()),
+            crate::toasts::toast_texts(&shell.borrow().toasts),
         );
         assert_eq!(
             world.turns.len(),
@@ -11597,12 +11631,9 @@ mod tests {
         );
         assert_eq!(shell.borrow().editor.borrow().text(), "edited");
         assert!(
-            shell
-                .borrow()
-                .notice
-                .borrow()
-                .as_ref()
-                .is_some_and(|n| n.message.contains("Can't branch while work is running")),
+            crate::toasts::toast_texts(&shell.borrow().toasts)
+                .iter()
+                .any(|m| m.contains("Can't branch while work is running")),
             "the refusal raises the branch toast"
         );
         world
@@ -11667,7 +11698,7 @@ mod tests {
         );
     }
 
-    /// A parked tree-view branch switch is refused (a notice folded, no exit)
+    /// A parked tree-view branch switch is refused (a toast raised, no exit)
     /// while a turn or a background task is live, and proceeds to a branch exit
     /// once idle. This drives the drive loop's request-consumption decision
     /// (`consume_session_request`) directly, at the layer the harness exposes.
@@ -11698,11 +11729,11 @@ mod tests {
             "a live turn refuses the branch switch"
         );
         assert!(
-            main_notices(&world)
+            crate::toasts::toast_texts(&shell.borrow().toasts)
                 .iter()
-                .any(|n| n.contains("Can't switch branches while work is running")),
-            "the refusal folds a notice: {:?}",
-            main_notices(&world)
+                .any(|m| m.contains("Can't switch branches while work is running")),
+            "the refusal raises the branch toast: {:?}",
+            crate::toasts::toast_texts(&shell.borrow().toasts)
         );
         cancel_viewed_turn(&world);
         let joined = join_next_or_pending(&mut world.turns).await;
@@ -11762,9 +11793,9 @@ mod tests {
             "a running background task refuses the resume"
         );
         assert!(
-            shell.borrow().notice.borrow().as_ref().is_some_and(|n| n
-                .message
-                .contains("Can't switch sessions while work is running")),
+            crate::toasts::toast_texts(&shell.borrow().toasts)
+                .iter()
+                .any(|m| m.contains("Can't switch sessions while work is running")),
             "the refusal raises the switch toast"
         );
 

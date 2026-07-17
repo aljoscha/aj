@@ -23,7 +23,6 @@ mod interactive;
 mod keymap;
 mod login;
 mod markdown_view;
-mod notice_toast;
 mod overlay;
 mod palette;
 mod pending;
@@ -40,6 +39,7 @@ mod task_output;
 mod terminal;
 #[cfg(test)]
 mod test_support;
+mod toasts;
 mod tool_cell;
 mod transcript;
 mod usage_overlay;

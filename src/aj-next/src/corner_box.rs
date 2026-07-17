@@ -1,6 +1,6 @@
 //! Shared construction for the small bordered "corner boxes" the Shell floats
 //! above the editor: the frame-stats overlay, the quit-arm hint, and the
-//! copied-to-clipboard toast.
+//! toast stack.
 //!
 //! Each box supplies its own title and a measured body (the styled spans plus
 //! the interior extent). This module frames that body in a bordered,

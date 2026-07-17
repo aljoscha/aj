@@ -19,21 +19,19 @@
 //! its actions), since the widget hands the confirm callback only the row's
 //! filter key.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use aj_app::session::SessionRequest;
 use aj_session::SessionPreview;
 use chrono::{DateTime, Datelike, Utc};
-use vaxis::vxfw::{FilterableSelect, SelectItem, WidgetRef, to_widget_ref};
+use vaxis::vxfw::{FilterableSelect, SelectItem, to_widget_ref};
 
-use crate::notice_toast::{Notice, raise_toast};
-use crate::overlay::{
-    OverlayChrome, OverlayPlacement, OverlayStack, close_all, close_key_label, close_top,
-    confirm_key_label,
-};
+use crate::interactive::OverlayHandles;
+use crate::overlay::{OverlayPlacement, close_all, close_key_label, close_top, confirm_key_label};
 use crate::settings_ui::push_window;
+use crate::toasts::{busy_refusal, show_toast};
 
 /// How much of the first user message a row's primary column shows before
 /// truncating with an ellipsis.
@@ -70,27 +68,20 @@ fn loading_items() -> Vec<SelectItem> {
 }
 
 /// Open the session selector, showing a loading placeholder and parking a
-/// scan for the host in `scan_slot`. A confirmed non-current row lands a
-/// [`SessionRequest::Resume`] in `request_slot`; the current row (or Esc)
-/// just closes. Does not move focus: the caller posts the refocus event.
+/// scan for the host in `handles.session_scan`. A confirmed non-current row
+/// lands a [`SessionRequest::Resume`] in `handles.session_request`; the
+/// current row (or Esc) just closes. Does not move focus: the caller posts
+/// the refocus event.
 ///
 /// The overlay opens read-only at any time. A real switch (a different
-/// session) is refused at confirm time while `busy` (an in-flight turn or
-/// background work): it raises a toast into `notice` and keeps the overlay
-/// open rather than parking a request that would tear live work down.
-pub(crate) fn open_session_selector(
-    stack: &Rc<RefCell<OverlayStack>>,
-    editor: &WidgetRef,
-    chrome: &OverlayChrome,
-    scan_slot: &Rc<RefCell<Option<SessionScan>>>,
-    request_slot: &Rc<RefCell<Option<SessionRequest>>>,
-    busy: &Rc<Cell<bool>>,
-    notice: &Rc<RefCell<Option<Notice>>>,
-    current: String,
-) {
+/// session) is refused at confirm time while `handles.busy` (an in-flight
+/// turn or background work): it raises a toast into `handles.toasts` and
+/// keeps the overlay open rather than parking a request that would tear live
+/// work down.
+pub(crate) fn open_session_selector(handles: &OverlayHandles, current: String) {
     let select = Rc::new(RefCell::new(FilterableSelect::new(
         loading_items(),
-        chrome.select.clone(),
+        handles.chrome.select.clone(),
     )));
     let focus = select.borrow().focus_target();
     let ids: Rc<RefCell<HashMap<String, String>>> = Rc::new(RefCell::new(HashMap::new()));
@@ -100,11 +91,11 @@ pub(crate) fn open_session_selector(
         sel.set_show_scrollbar(true);
         let ids_c = Rc::clone(&ids);
         let current_c = current.clone();
-        let request_c = Rc::clone(request_slot);
-        let busy_c = Rc::clone(busy);
-        let notice_c = Rc::clone(notice);
-        let stack_c = Rc::clone(stack);
-        let editor_c = Rc::clone(editor);
+        let request_c = Rc::clone(&handles.session_request);
+        let busy_c = Rc::clone(&handles.busy);
+        let toasts_c = Rc::clone(&handles.toasts);
+        let stack_c = Rc::clone(&handles.stack);
+        let editor_c = Rc::clone(&handles.editor);
         sel.on_confirm = Some(Box::new(move |ctx, item| {
             // The loading placeholder (and any row not yet in the map) has
             // no session to resume, so leave the overlay open.
@@ -120,7 +111,7 @@ pub(crate) fn open_session_selector(
             // down, so refuse it: raise the toast and keep the overlay open
             // (the user can Esc or wait for the work to finish).
             if busy_c.get() {
-                raise_toast(&notice_c, "Can't switch sessions while work is running.");
+                show_toast(&toasts_c, busy_refusal("switch sessions"));
                 ctx.redraw = true;
                 return;
             }
@@ -130,22 +121,22 @@ pub(crate) fn open_session_selector(
             // `close_top`, which returns to the palette underneath.
             close_all(&stack_c, ctx, &editor_c);
         }));
-        let stack_cancel = Rc::clone(stack);
-        let editor_cancel = Rc::clone(editor);
+        let stack_cancel = Rc::clone(&handles.stack);
+        let editor_cancel = Rc::clone(&handles.editor);
         sel.on_cancel = Some(Box::new(move |ctx| {
             close_top(&stack_cancel, ctx, &editor_cancel)
         }));
     }
     push_window(
-        stack,
-        chrome,
+        &handles.stack,
+        &handles.chrome,
         "Resume session",
         subtitle(),
         to_widget_ref(Rc::clone(&select)),
         focus,
         OverlayPlacement::Large,
     );
-    *scan_slot.borrow_mut() = Some(SessionScan {
+    *handles.session_scan.borrow_mut() = Some(SessionScan {
         select,
         current,
         ids,
@@ -426,38 +417,24 @@ mod tests {
     /// Drive the REAL confirm closure `open_session_selector` builds, over a
     /// live overlay stack, having filled the list and selected a non-current
     /// row. Returns the parked request, the stack (to check open/closed), and
-    /// the raised notice cell.
+    /// the toast stack.
     #[expect(clippy::type_complexity)]
     fn confirm_switch_over(
         busy: bool,
     ) -> (
         Rc<RefCell<Option<SessionRequest>>>,
-        Rc<RefCell<OverlayStack>>,
-        Rc<RefCell<Option<Notice>>>,
+        Rc<RefCell<crate::overlay::OverlayStack>>,
+        crate::toasts::ToastStack,
     ) {
-        use aj_app::theme::{ColorMode, Theme};
-        use vaxis::vxfw::Text;
+        let handles = OverlayHandles::for_tests();
+        handles.busy.set(busy);
 
-        let t = Theme::bundled_dark_with_mode(ColorMode::Truecolor);
-        let chrome = OverlayChrome::from_theme(&t);
-        let stack = Rc::new(RefCell::new(OverlayStack::default()));
-        let editor: WidgetRef = to_widget_ref(Rc::new(RefCell::new(Text::new(""))));
-        let scan_slot = Rc::new(RefCell::new(None));
-        let request_slot: Rc<RefCell<Option<SessionRequest>>> = Rc::new(RefCell::new(None));
-        let busy_cell = Rc::new(Cell::new(busy));
-        let notice: Rc<RefCell<Option<Notice>>> = Rc::new(RefCell::new(None));
-
-        open_session_selector(
-            &stack,
-            &editor,
-            &chrome,
-            &scan_slot,
-            &request_slot,
-            &busy_cell,
-            &notice,
-            "current".to_string(),
-        );
-        let scan = scan_slot.borrow_mut().take().expect("open parked a scan");
+        open_session_selector(&handles, "current".to_string());
+        let scan = handles
+            .session_scan
+            .borrow_mut()
+            .take()
+            .expect("open parked a scan");
         let previews = vec![preview(
             "other",
             Some("other prompt"),
@@ -473,23 +450,27 @@ mod tests {
             let mut ctx = vaxis::vxfw::EventContext::new();
             cb(&mut ctx, &picked);
         }
-        (request_slot, stack, notice)
+        (
+            Rc::clone(&handles.session_request),
+            Rc::clone(&handles.stack),
+            Rc::clone(&handles.toasts),
+        )
     }
 
     /// While busy, confirming a non-current row raises the toast and parks NO
     /// request, leaving the overlay open so the user can Esc or wait.
     #[test]
     fn confirm_switch_while_busy_toasts_and_stays_open() {
-        let (request, stack, notice) = confirm_switch_over(true);
+        let (request, stack, toasts) = confirm_switch_over(true);
         assert!(request.borrow().is_none(), "no request parked while busy");
         assert!(
             stack.borrow().is_open(),
             "the overlay stays open while busy"
         );
         assert!(
-            notice.borrow().as_ref().is_some_and(|n| n
-                .message
-                .contains("Can't switch sessions while work is running")),
+            crate::toasts::toast_texts(&toasts)
+                .iter()
+                .any(|m| m.contains("Can't switch sessions while work is running")),
             "the refusal raises the switch toast"
         );
     }
@@ -497,13 +478,16 @@ mod tests {
     /// While idle, confirming a non-current row parks the resume and closes.
     #[test]
     fn confirm_switch_while_idle_parks_and_closes() {
-        let (request, stack, notice) = confirm_switch_over(false);
+        let (request, stack, toasts) = confirm_switch_over(false);
         assert!(
             matches!(request.borrow().as_ref(), Some(SessionRequest::Resume(id)) if id == "other"),
             "an idle switch parks a resume for the picked id",
         );
         assert!(!stack.borrow().is_open(), "the confirm closed the overlay");
-        assert!(notice.borrow().is_none(), "no toast raised while idle");
+        assert!(
+            crate::toasts::toast_texts(&toasts).is_empty(),
+            "no toast raised while idle"
+        );
     }
 
     /// Batches accumulate across a streamed fill: the first replaces the
