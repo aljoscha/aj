@@ -4638,8 +4638,9 @@ async fn drive(
         let frame_deadline = app
             .needs_redraw()
             .then(|| last_render.map_or_else(Instant::now, |t| t + frame_interval));
-        // Toasts have no self-timer, so wake at the earliest live toast's
-        // deadline: the per-iteration prune below drops what expired then and
+        // Toasts have no self-timer, so wake at the earliest toast deadline
+        // (past deadlines included, so an expired-but-unpruned toast still
+        // wakes us): the per-iteration prune below drops what expired and
         // requests the clearing repaint, so each toast vanishes exactly on
         // time even while others stay live.
         let toast_deadline = crate::toasts::earliest_toast_deadline(&shell.borrow().toasts);
