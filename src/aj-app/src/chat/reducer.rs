@@ -74,19 +74,13 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
                 render.current_assistant = None;
                 render.tool_index.clear();
             }
-            if let AgentId::Sub(n) = agent_id
-                && let Some(b) = state.sub_box_mut(n)
-            {
-                // Conclude a still-running box only. On the live path the
-                // trailing `SubAgentEnd` carries the real conclusion and
-                // sets the final `Truncated`/`Failed`/`Done` status. This
-                // guard is defensive: were the two events ever delivered in
-                // the other order, an unconditional `Done` here would
-                // clobber that conclusion.
-                if b.status == SubAgentStatus::Running {
-                    b.status = SubAgentStatus::Done;
-                }
-                b.finished_at = Some(Instant::now());
+            // On the live path the trailing `SubAgentEnd` carries the
+            // real conclusion and sets the final
+            // `Truncated`/`Failed`/`Done` status. `conclude_sub_box`
+            // touches a still-running box only, so an `AgentEnd`
+            // delivered after it can't clobber that conclusion.
+            if let AgentId::Sub(n) = agent_id {
+                state.conclude_sub_box(n);
             }
             Redraw(true)
         }

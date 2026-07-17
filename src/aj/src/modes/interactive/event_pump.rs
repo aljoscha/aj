@@ -452,13 +452,13 @@ impl EventPump {
         tui.request_render();
     }
 
-    /// Force `id` out of the running set, reconciling everything
-    /// derived from it (per-view spinner, footer count, box
-    /// status). Idempotent w.r.t. an `AgentEnd` the pump already
-    /// processed. The binary calls this on main-turn completion to
-    /// drain a leaked sub-agent whose `AgentEnd` never arrived.
-    pub fn mark_idle(&mut self, life: &mut AgentLifecycle, tui: &mut Tui, id: AgentId) {
-        life.mark_idle(id);
+    /// Reconcile the UI after the caller marked `id` idle in the
+    /// lifecycle: flip a sub-agent's box to Done and re-sync the
+    /// spinner, footer count, and OS progress indicator. Idempotent
+    /// w.r.t. an `AgentEnd` the pump already processed. The binary
+    /// calls this per agent reaped on turn completion, so a leaked
+    /// sub-agent's chrome can't stay stuck on running.
+    pub fn note_idle(&mut self, life: &AgentLifecycle, tui: &mut Tui, id: AgentId) {
         if let AgentId::Sub(n) = id
             && let Some(chat) = tui.get_mut_as::<ChatView>(SlotIndex::Chat.idx())
             && let Some(b) = chat.sub_box_mut(n)
@@ -2813,9 +2813,9 @@ mod tests {
         // The pump keeps `running_agents` as literal truth: the
         // leaked `Sub(1)` is *still* in the set after Main's end.
         // Reconciling it is the binary's job on main-turn completion
-        // (it drains running subs it isn't independently driving via
-        // `mark_idle`), not the pump's — so the spinner-off here is
-        // purely the per-view scoping, not a drain.
+        // (`Turns::reap` sweeps running subs the host is not
+        // independently driving), not the pump's — so the spinner-off
+        // here is purely the per-view scoping, not a drain.
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
         let mut life = AgentLifecycle::default();
 
@@ -3460,11 +3460,11 @@ mod tests {
     }
 
     #[test]
-    fn mark_idle_removes_agent_and_stops_spinner_when_viewed() {
-        // `mark_idle` is the binary's reconciliation hook: it forces
-        // an agent out of the running set and reconciles everything
-        // derived from it. While viewing that agent the spinner must
-        // stop, and `is_running` must report `false`.
+    fn note_idle_reconciles_ui_when_viewed() {
+        // `note_idle` is the binary's reconciliation hook after the
+        // reap marked an agent idle: it reconciles everything derived
+        // from the running set. While viewing that agent the spinner
+        // must stop.
         let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
         let mut life = AgentLifecycle::default();
 
@@ -3478,14 +3478,17 @@ mod tests {
         pump.set_active_view(&life, &mut tui, AgentId::Sub(1));
         assert!(loader_active(&mut tui), "viewing the running sub: on");
 
-        pump.mark_idle(&mut life, &mut tui, AgentId::Sub(1));
+        // The lifecycle mutation happens in the reap; the pump only
+        // reconciles the chrome from the already-updated set.
+        life.mark_idle(AgentId::Sub(1));
+        pump.note_idle(&life, &mut tui, AgentId::Sub(1));
         assert!(
             !loader_active(&mut tui),
-            "mark_idle stops the spinner of the viewed agent",
+            "note_idle stops the spinner of the viewed agent",
         );
         assert!(
             !life.is_running(AgentId::Sub(1)),
-            "mark_idle removes the agent from the running set",
+            "the agent is out of the running set",
         );
     }
 

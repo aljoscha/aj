@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use aj_agent::events::{AgentEvent, AgentId, CompactionReason};
-use aj_agent::{Agent, TurnError, sub_agent_session_id};
+use aj_agent::{Agent, TaskRegistry, TaskSummary, TurnError, sub_agent_session_id};
 use aj_conf::Config;
 use aj_models::errors::is_context_overflow;
 use aj_models::types::UserContent;
@@ -29,7 +29,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::compaction::run_compaction;
-use crate::session::{SessionCore, SubAgentOverrides};
+use crate::session::{AgentLifecycle, SessionCore, SubAgentOverrides};
 use crate::session_setup::RunConfigSnapshot;
 
 /// How a turn sequence begins.
@@ -160,91 +160,204 @@ pub fn apply_turn_config(
 const OVERFLOW_GIVEUP: &str =
     "context overflow recovery failed; reduce context or switch to a larger-context model";
 
-/// Spawn a turn sequence for `target` onto `turns`: resolve the agent
-/// handle, mint the per-sequence cancel token (into `turn_cancels`,
-/// which the host's Ctrl+C fires), and drive `start` plus its automatic
-/// continuations via [`drive_turn`]. The spawned task re-stamps the
-/// staged run config before each inference. Returns `false` without
-/// spawning when `target` has no live handle (e.g. a resumed
-/// sub-agent).
-pub fn spawn_turn(
-    core: &SessionCore,
-    run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
-    target: AgentId,
-    start: TurnStart,
-    policy: TurnPolicy,
-    turns: &mut JoinSet<(AgentId, Result<(), TurnError>)>,
-    turn_cancels: &mut HashMap<AgentId, CancellationToken>,
-) -> bool {
-    let Some(handle) = core.resolve_agent(target) else {
-        return false;
-    };
-    let run_config_for_turn = Arc::clone(run_config);
-    let sub_overrides_for_turn = Arc::clone(&core.sub_overrides);
-    let log = Arc::clone(&core.log);
-    let turn_cancel = CancellationToken::new();
-    turn_cancels.insert(target, turn_cancel.clone());
-    turns.spawn(async move {
-        let mut a = handle.lock().await;
-        let result = drive_turn(
-            &mut a,
-            &log,
-            &policy,
-            start,
-            |agent: &mut Agent| {
-                apply_turn_config(target, agent, &run_config_for_turn, &sub_overrides_for_turn);
-            },
-            turn_cancel,
-        )
-        .await;
-        (target, result)
-    });
-    true
+/// The turns a host is driving: the JoinSet of spawned turn
+/// sequences plus the per-agent cancel tokens. The cancel map's key
+/// set is exactly the agents the host is currently driving.
+#[derive(Default)]
+pub struct Turns {
+    set: JoinSet<(AgentId, Result<(), TurnError>)>,
+    cancels: HashMap<AgentId, CancellationToken>,
 }
 
-/// Spawn a wake turn on `owner` if it is idle, delivering queued
-/// notices / messages. This is the single post-turn wake path: the
-/// driver itself does not deliver queued work, so the host starts a
-/// wake here whenever an agent has work pending and no turn in flight.
-/// A busy owner is left alone (its running turn drains steering
-/// mid-flight). Both wake triggers may fire for the same notice;
-/// `Agent::wake` returns `Empty` (emitting nothing) once the queue is
-/// drained, so the loser is a cheap no-op.
-pub fn spawn_wake_turn(
-    owner: AgentId,
-    core: &SessionCore,
-    run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
-    policy: TurnPolicy,
-    turns: &mut JoinSet<(AgentId, Result<(), TurnError>)>,
-    turn_cancels: &mut HashMap<AgentId, CancellationToken>,
-) {
-    if turn_cancels.contains_key(&owner) || core.is_running(owner) {
-        return;
+impl Turns {
+    /// An empty set of driven turns.
+    pub fn new() -> Self {
+        Self::default()
     }
-    spawn_turn(
-        core,
-        run_config,
-        owner,
-        TurnStart::Wake,
-        policy,
-        turns,
-        turn_cancels,
-    );
+
+    /// Whether no driven turn is in flight.
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+
+    /// The number of driven turns in flight, for quit-guard work
+    /// counts.
+    pub fn driven(&self) -> usize {
+        self.set.len()
+    }
+
+    /// Whether the host is driving a turn for `id`.
+    pub fn is_driving(&self, id: AgentId) -> bool {
+        self.cancels.contains_key(&id)
+    }
+
+    /// Fire `id`'s cancel token if the host is driving it. Returns
+    /// whether a token was fired.
+    pub fn cancel(&self, id: AgentId) -> bool {
+        match self.cancels.get(&id) {
+            Some(token) => {
+                token.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether `id` is busy from the host's perspective: a driven turn
+    /// or a running turn observed on the bus. `is_running` alone
+    /// misses the gap between spawning a turn and its `AgentStart`
+    /// landing, and `is_driving` alone misses foreground sub-agent
+    /// spawns nested inside a main turn, so both are checked.
+    pub fn is_busy(&self, lifecycle: &AgentLifecycle, id: AgentId) -> bool {
+        self.is_driving(id) || lifecycle.is_running(id)
+    }
+
+    /// Spawn a turn sequence for `target`: resolve the agent handle,
+    /// mint the per-sequence cancel token (kept in the cancel map,
+    /// which the host's Ctrl+C fires), and drive `start` plus its
+    /// automatic continuations via [`drive_turn`]. The spawned task
+    /// re-stamps the staged run config before each inference. Returns
+    /// `false` without spawning when `target` has no live handle
+    /// (e.g. a resumed sub-agent).
+    ///
+    /// Callers must not spawn for a target already being driven (they
+    /// gate via [`Turns::is_busy`] / [`Turns::spawn_wake`]): a second
+    /// spawn would overwrite the first turn's cancel token, leaving
+    /// that turn uncancellable.
+    pub fn spawn(
+        &mut self,
+        core: &SessionCore,
+        run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
+        target: AgentId,
+        start: TurnStart,
+        policy: TurnPolicy,
+    ) -> bool {
+        debug_assert!(
+            !self.is_driving(target),
+            "spawn for the already-driven target {target:?}"
+        );
+        let Some(handle) = core.resolve_agent(target) else {
+            return false;
+        };
+        let run_config_for_turn = Arc::clone(run_config);
+        let sub_overrides_for_turn = Arc::clone(&core.sub_overrides);
+        let log = Arc::clone(&core.log);
+        let turn_cancel = CancellationToken::new();
+        self.cancels.insert(target, turn_cancel.clone());
+        self.set.spawn(async move {
+            let mut a = handle.lock().await;
+            let result = drive_turn(
+                &mut a,
+                &log,
+                &policy,
+                start,
+                |agent: &mut Agent| {
+                    apply_turn_config(target, agent, &run_config_for_turn, &sub_overrides_for_turn);
+                },
+                turn_cancel,
+            )
+            .await;
+            (target, result)
+        });
+        true
+    }
+
+    /// Spawn a wake turn on `owner` if it is idle, delivering queued
+    /// notices / messages. This is the single post-turn wake path: the
+    /// driver itself does not deliver queued work, so the host starts a
+    /// wake here whenever an agent has work pending and no turn in
+    /// flight. A busy owner is left alone (its running turn drains
+    /// steering mid-flight). Both wake triggers may fire for the same
+    /// notice; `Agent::wake` returns `Empty` (emitting nothing) once
+    /// the queue is drained, so the loser is a cheap no-op.
+    pub fn spawn_wake(
+        &mut self,
+        owner: AgentId,
+        core: &SessionCore,
+        run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
+        policy: TurnPolicy,
+    ) {
+        if self.is_busy(&core.lifecycle, owner) {
+            return;
+        }
+        self.spawn(core, run_config, owner, TurnStart::Wake, policy);
+    }
+
+    /// Await the next completed turn, or pend forever when no turn is
+    /// in flight, so a host's `select!` arm stays simple.
+    pub async fn join_next(
+        &mut self,
+    ) -> Result<(AgentId, Result<(), TurnError>), tokio::task::JoinError> {
+        if self.set.is_empty() {
+            std::future::pending().await
+        } else {
+            self.set
+                .join_next()
+                .await
+                .expect("non-empty JoinSet yields Some")
+        }
+    }
+
+    /// Join-time bookkeeping for the just-completed turn of `id`: drop
+    /// its cancel token and mark it idle. On a Main completion, also
+    /// sweep leaked sub-agents: a main-turn completion bounds every
+    /// nested initial spawn it started, so any sub still marked running
+    /// that the host is not independently driving and that has no
+    /// running agent-backed registry task is marked idle too.
+    /// Independent continuations are in the cancel map, and detached
+    /// background runs have a Running registry entry. Both survive.
+    ///
+    /// Returns the joined agent plus every sub the sweep marked idle
+    /// (order unspecified) so the host can run its per-agent UI sync.
+    pub fn reap(
+        &mut self,
+        lifecycle: &mut AgentLifecycle,
+        registry: &TaskRegistry,
+        id: AgentId,
+    ) -> Vec<AgentId> {
+        self.cancels.remove(&id);
+        lifecycle.mark_idle(id);
+        let mut idled = vec![id];
+        if id == AgentId::Main {
+            for sub in lifecycle.running_agents() {
+                let AgentId::Sub(n) = sub else { continue };
+                if !self.is_driving(sub) && !registry.agent_task_running(n) {
+                    lifecycle.mark_idle(sub);
+                    idled.push(sub);
+                }
+            }
+        }
+        idled
+    }
+
+    /// Abort every in-flight turn and await them. Clears the cancel
+    /// map, since nothing is driven afterwards.
+    pub async fn shutdown(&mut self) {
+        self.set.shutdown().await;
+        self.cancels.clear();
+    }
 }
 
-/// Await the next completed turn, or pend forever when no turn is in
-/// flight, so a host's `select!` arm stays simple.
-pub async fn join_next_or_pending(
-    turns: &mut JoinSet<(AgentId, Result<(), TurnError>)>,
-) -> Result<(AgentId, Result<(), TurnError>), tokio::task::JoinError> {
-    if turns.is_empty() {
-        std::future::pending().await
-    } else {
-        turns
-            .join_next()
-            .await
-            .expect("non-empty JoinSet yields Some")
+/// Counts of running work a quit would tear down, for the Ctrl+C
+/// quit-arming guard: (agents, bash tasks).
+///
+/// Driven turns plus running agent-backed tasks (background sub-agent
+/// runs, which the driven set doesn't track) make up the agent count,
+/// running bash tasks the task count. An agent-backed task counts as
+/// an agent, never as a task, matching the footer's classification.
+pub fn running_work_counts(driven_turns: usize, tasks: &[TaskSummary]) -> (usize, usize) {
+    let mut agents = driven_turns;
+    let mut bash = 0;
+    for task in tasks {
+        if task.status != aj_agent::tool::TaskStatus::Running {
+            continue;
+        }
+        match task.kind {
+            aj_agent::tool::TaskKind::Agent { .. } => agents += 1,
+            aj_agent::tool::TaskKind::Bash { .. } => bash += 1,
+        }
     }
+    (agents, bash)
 }
 
 /// Drive one turn and its automatic continuations to quiescence.
@@ -853,6 +966,177 @@ mod tests {
             !format!("{:?}", agent.messages()).contains("compacted into the following summary"),
             "no compaction summary should be present: {:?}",
             agent.messages()
+        );
+    }
+}
+
+#[cfg(test)]
+mod turns_tests {
+    use std::sync::Arc;
+
+    use aj_agent::TaskRegistry;
+    use aj_agent::events::AgentId;
+    use aj_agent::tool::{TaskKind, TaskOutputSource, TaskRead, TaskStatus};
+    use tokio_util::sync::CancellationToken;
+
+    use super::Turns;
+    use crate::session::AgentLifecycle;
+
+    struct StubOutput;
+
+    impl TaskOutputSource for StubOutput {
+        fn snapshot(&self) -> TaskRead {
+            TaskRead::default()
+        }
+    }
+
+    /// Register a background agent-backed task for `Sub(n)`, returning
+    /// the task id so a test can drive its status.
+    fn register_agent_task(registry: &TaskRegistry, n: usize) -> usize {
+        let (id, _cancel) = registry.register(
+            AgentId::Main,
+            TaskKind::Agent {
+                agent_id: n,
+                task: "explore".to_string(),
+            },
+            "explore".to_string(),
+            Arc::new(StubOutput),
+        );
+        id
+    }
+
+    /// Reaping a joined id drops its cancel entry and marks it idle.
+    #[test]
+    fn reap_removes_cancel_and_marks_idle() {
+        let mut turns = Turns::new();
+        let mut lifecycle = AgentLifecycle::default();
+        let registry = TaskRegistry::default();
+        turns
+            .cancels
+            .insert(AgentId::Sub(1), CancellationToken::new());
+        lifecycle.mark_running(AgentId::Sub(1));
+
+        let idled = turns.reap(&mut lifecycle, &registry, AgentId::Sub(1));
+
+        assert_eq!(idled, vec![AgentId::Sub(1)]);
+        assert!(!turns.is_driving(AgentId::Sub(1)));
+        assert!(!lifecycle.is_running(AgentId::Sub(1)));
+    }
+
+    /// A Main join sweeps a running sub that is neither driven nor
+    /// backed by a running registry task.
+    #[test]
+    fn main_reap_sweeps_leaked_sub() {
+        let mut turns = Turns::new();
+        let mut lifecycle = AgentLifecycle::default();
+        let registry = TaskRegistry::default();
+        turns
+            .cancels
+            .insert(AgentId::Main, CancellationToken::new());
+        lifecycle.mark_running(AgentId::Main);
+        lifecycle.mark_running(AgentId::Sub(1));
+
+        let idled = turns.reap(&mut lifecycle, &registry, AgentId::Main);
+
+        assert!(idled.contains(&AgentId::Main));
+        assert!(idled.contains(&AgentId::Sub(1)), "leaked sub swept");
+        assert!(!lifecycle.is_running(AgentId::Sub(1)));
+    }
+
+    /// A Main join spares a sub the host is independently driving.
+    #[test]
+    fn main_reap_spares_driven_sub() {
+        let mut turns = Turns::new();
+        let mut lifecycle = AgentLifecycle::default();
+        let registry = TaskRegistry::default();
+        turns
+            .cancels
+            .insert(AgentId::Main, CancellationToken::new());
+        turns
+            .cancels
+            .insert(AgentId::Sub(1), CancellationToken::new());
+        lifecycle.mark_running(AgentId::Main);
+        lifecycle.mark_running(AgentId::Sub(1));
+
+        let idled = turns.reap(&mut lifecycle, &registry, AgentId::Main);
+
+        assert_eq!(idled, vec![AgentId::Main]);
+        assert!(lifecycle.is_running(AgentId::Sub(1)), "driven sub spared");
+        assert!(turns.is_driving(AgentId::Sub(1)));
+    }
+
+    /// A Main join spares a sub with a Running agent-backed registry
+    /// task, and sweeps it once that task turns terminal.
+    #[test]
+    fn main_reap_spares_background_sub_until_terminal() {
+        let mut turns = Turns::new();
+        let mut lifecycle = AgentLifecycle::default();
+        let registry = TaskRegistry::default();
+        let task_id = register_agent_task(&registry, 1);
+        lifecycle.mark_running(AgentId::Sub(1));
+
+        lifecycle.mark_running(AgentId::Main);
+        let idled = turns.reap(&mut lifecycle, &registry, AgentId::Main);
+        assert_eq!(idled, vec![AgentId::Main]);
+        assert!(
+            lifecycle.is_running(AgentId::Sub(1)),
+            "background sub spared while its task runs"
+        );
+
+        registry.set_status(task_id, TaskStatus::Exited(None));
+        lifecycle.mark_running(AgentId::Main);
+        let idled = turns.reap(&mut lifecycle, &registry, AgentId::Main);
+        assert!(idled.contains(&AgentId::Sub(1)), "swept once terminal");
+        assert!(!lifecycle.is_running(AgentId::Sub(1)));
+    }
+
+    /// `cancel` fires the driven turn's token and reports a miss for an
+    /// agent the host is not driving.
+    #[test]
+    fn cancel_fires_token_and_reports_misses() {
+        let mut turns = Turns::new();
+        let token = CancellationToken::new();
+        turns.cancels.insert(AgentId::Main, token.clone());
+
+        assert!(turns.cancel(AgentId::Main));
+        assert!(token.is_cancelled());
+        assert!(!turns.cancel(AgentId::Sub(1)), "unknown id is a miss");
+    }
+
+    /// `shutdown` leaves nothing driven: the join set and the cancel
+    /// map both end empty.
+    #[tokio::test]
+    async fn shutdown_clears_the_cancel_map() {
+        let mut turns = Turns::new();
+        turns
+            .cancels
+            .insert(AgentId::Main, CancellationToken::new());
+
+        turns.shutdown().await;
+
+        assert!(!turns.is_driving(AgentId::Main));
+        assert!(turns.is_empty());
+    }
+
+    /// Only a Main join sweeps: a sub's own completion never touches
+    /// another agent's running state.
+    #[test]
+    fn non_main_reap_never_sweeps() {
+        let mut turns = Turns::new();
+        let mut lifecycle = AgentLifecycle::default();
+        let registry = TaskRegistry::default();
+        turns
+            .cancels
+            .insert(AgentId::Sub(2), CancellationToken::new());
+        lifecycle.mark_running(AgentId::Sub(2));
+        lifecycle.mark_running(AgentId::Sub(1));
+
+        let idled = turns.reap(&mut lifecycle, &registry, AgentId::Sub(2));
+
+        assert_eq!(idled, vec![AgentId::Sub(2)]);
+        assert!(
+            lifecycle.is_running(AgentId::Sub(1)),
+            "no sweep on a sub join"
         );
     }
 }

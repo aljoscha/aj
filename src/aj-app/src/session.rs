@@ -146,9 +146,12 @@ pub struct SubAgentOverrides {
 /// `AgentStart`/`AgentEnd` and compaction events.
 ///
 /// `running_agents` is the single source of truth for what is running:
-/// `AgentStart` inserts, `AgentEnd` removes, and no agent's lifecycle
-/// touches another's entry. The per-view spinner, the footer's
-/// running-agent count, and per-box status all derive from it.
+/// `AgentStart` inserts and `AgentEnd` removes. The host's join-time
+/// reap ([`crate::turn::Turns::reap`]) is the second writer: it marks
+/// the joined agent idle without an `AgentEnd`, and on a Main
+/// completion also clears other agents' leaked entries. The per-view
+/// spinner, the footer's running-agent count, and per-box status all
+/// derive from it.
 ///
 /// `compacting` is kept separately because compaction is
 /// host-orchestrated and does not bracket itself with

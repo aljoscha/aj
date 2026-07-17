@@ -570,6 +570,20 @@ impl ChatState {
         matches!(agent_id, AgentId::Sub(_)) && self.active_view != agent_id
     }
 
+    /// Conclude the `Sub(n)` box after its run ended without a final
+    /// conclusion event: a still-running box flips to `Done` and
+    /// freezes its runtime clock. A box already carrying a
+    /// `SubAgentEnd` conclusion (`Done`/`Truncated`/`Failed`) and a
+    /// missing box are left untouched.
+    pub fn conclude_sub_box(&mut self, n: usize) {
+        if let Some(b) = self.sub_box_mut(n)
+            && b.status == SubAgentStatus::Running
+        {
+            b.status = SubAgentStatus::Done;
+            b.finished_at = Some(Instant::now());
+        }
+    }
+
     /// Mutable access to the `Sub(n)` box entry, if one exists.
     pub(crate) fn sub_box_mut(&mut self, n: usize) -> Option<&mut SubAgentEntry> {
         let &(parent, id) = self.sub_boxes.get(&n)?;

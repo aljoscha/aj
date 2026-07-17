@@ -25,7 +25,6 @@ pub mod shutdown;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,8 +54,6 @@ use aj_tui::terminal::ProcessTerminal;
 use aj_tui::tui::{OverlayAnchor, OverlayHandle, OverlayOptions, SizeValue, Tui, TuiEvent};
 use anyhow::{Context, Result};
 use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::task::JoinSet;
-use tokio_util::sync::CancellationToken;
 
 use crate::auth::LoginLine;
 use crate::cli::args::{Args, Command};
@@ -121,7 +118,7 @@ use crate::modes::interactive::shutdown::{
     print_resume_hint, print_session_usage, print_usage_summary,
 };
 use crate::session_setup::{RestoreContext, RunConfigSnapshot, build_initial_run_config};
-use crate::turn::{TurnPolicy, TurnStart, join_next_or_pending, spawn_turn, spawn_wake_turn};
+use crate::turn::{TurnPolicy, TurnStart, Turns, running_work_counts};
 
 /// User-facing notice shown when a session-changing command
 /// (resume, new) is invoked while a turn is in flight.
@@ -133,31 +130,6 @@ use crate::turn::{TurnPolicy, TurnStart, join_next_or_pending, spawn_turn, spawn
 fn session_busy_notice(what: &str) -> String {
     let cancel = crate::config::keybindings::fixed_keys::CTRL_C;
     format!("Can't {what} while a turn is running — press {cancel} to cancel it first.")
-}
-
-/// Counts of running work a quit would tear down, for the Ctrl+C
-/// quit-arming guard: (agents, bash tasks).
-///
-/// Binary-driven turns plus running agent-backed tasks (background
-/// sub-agent runs, which the `turns` JoinSet doesn't track) make up
-/// the agent count; running bash tasks the task count. The
-/// classification mirrors the footer's — an agent-backed task counts
-/// as an agent, never as a task — though the agent counts can differ
-/// (the footer counts running agents from pump events; this counts
-/// the work a quit tears down).
-fn running_work_counts(driven_turns: usize, tasks: &[aj_agent::TaskSummary]) -> (usize, usize) {
-    let mut agents = driven_turns;
-    let mut bash = 0;
-    for task in tasks {
-        if task.status != aj_agent::tool::TaskStatus::Running {
-            continue;
-        }
-        match task.kind {
-            aj_agent::tool::TaskKind::Agent { .. } => agents += 1,
-            aj_agent::tool::TaskKind::Bash { .. } => bash += 1,
-        }
-    }
-    (agents, bash)
 }
 
 /// Quit-arming notice for a Ctrl+C on an idle view while other work
@@ -909,13 +881,12 @@ async fn run_session(
     launch_content: Vec<UserContent>,
 ) -> Result<SessionExit> {
     // ---- Main event loop ------------------------------------------
-    // In-flight turns keyed by the agent running them. `JoinSet`
-    // gives completion-as-they-finish and preserves panic detection
-    // (`join_next` yields `Err(JoinError)`); `turn_cancels` holds the
-    // binary's clone of each turn's cancel token, and its key set is
-    // exactly "agents the binary is currently driving".
-    let mut turns: JoinSet<(AgentId, Result<(), TurnError>)> = JoinSet::new();
-    let mut turn_cancels: HashMap<AgentId, CancellationToken> = HashMap::new();
+    // In-flight turns keyed by the agent running them. The `Turns`
+    // JoinSet gives completion-as-they-finish and preserves panic
+    // detection (`join_next` yields `Err(JoinError)`); its cancel map
+    // holds the binary's clone of each turn's cancel token, and its
+    // key set is exactly "agents the binary is currently driving".
+    let mut turns = Turns::new();
     // Implements the "press Ctrl+C again to quit" guard when the
     // viewed agent is idle but other agents or background tasks are
     // still running.
@@ -943,14 +914,12 @@ async fn run_session(
     // Auto-submit the launch prompt (`aj <msg>` / `aj @file ...`) as the
     // first turn. Empty for any in-process session switch after the first.
     if !launch_content.is_empty() {
-        spawn_turn(
+        turns.spawn(
             &world.core,
             &shell.run_config,
             AgentId::Main,
             TurnStart::Content(launch_content),
             crate::turn::turn_policy(AgentId::Main, &shell.config),
-            &mut turns,
-            &mut turn_cancels,
         );
         sync_editor_enabled(&mut shell.tui);
     }
@@ -960,29 +929,11 @@ async fn run_session(
             biased;
 
             // --- Agent run finished ---
-            joined = join_next_or_pending(&mut turns) => {
+            joined = turns.join_next() => {
                 match joined {
                     Ok((id, result)) => {
-                        turn_cancels.remove(&id);
-                        world.pump.mark_idle(&mut world.core.lifecycle, &mut shell.tui, id);
-                        // Main-turn completion bounds every nested
-                        // initial spawn it started. Drain any sub
-                        // still marked running that the binary is NOT
-                        // independently driving (∉ turn_cancels) so a
-                        // leaked sub-agent can't pin the
-                        // footer/spinner. Independent continuations
-                        // are in turn_cancels, and detached background
-                        // runs have a Running registry entry; both
-                        // survive.
-                        if id == AgentId::Main {
-                            for sub in world.core.running_agents() {
-                                let AgentId::Sub(n) = sub else { continue };
-                                if !turn_cancels.contains_key(&sub)
-                                    && !world.core.task_registry.agent_task_running(n)
-                                {
-                                    world.pump.mark_idle(&mut world.core.lifecycle, &mut shell.tui, sub);
-                                }
-                            }
+                        for idle in turns.reap(&mut world.core.lifecycle, &world.core.task_registry, id) {
+                            world.pump.note_idle(&world.core.lifecycle, &mut shell.tui, idle);
                         }
                         sync_editor_enabled(&mut shell.tui);
                         // Post-turn wake: deliver queued task notices
@@ -997,13 +948,11 @@ async fn run_session(
                         if world.core.task_registry.has_notices(id)
                             || world.core.message_queues.has_pending(id)
                         {
-                            spawn_wake_turn(
+                            turns.spawn_wake(
                                 id,
                                 &world.core,
                                 &shell.run_config,
                                 crate::turn::turn_policy(id, &shell.config),
-                                &mut turns,
-                                &mut turn_cancels,
                             );
                             sync_editor_enabled(&mut shell.tui);
                         }
@@ -1116,7 +1065,7 @@ async fn run_session(
                         // 3. Otherwise act on the agent you are
                         //    *viewing*:
                         //    - Viewed agent has a binary-driven
-                        //      turn (`turn_cancels`): cancel just
+                        //      turn (in the cancel map): cancel just
                         //      it. The cancel handle is the
                         //      binary's clone of the per-turn
                         //      `CancellationToken` passed to
@@ -1128,7 +1077,7 @@ async fn run_session(
                         //      group.
                         //    - Viewed agent is a sub running its
                         //      initial spawn (running but not in
-                        //      `turn_cancels`): cancel the main
+                        //      the cancel map): cancel the main
                         //      turn that owns it; the child token
                         //      cascades.
                         //    - Viewed agent idle but other agents
@@ -1157,9 +1106,8 @@ async fn run_session(
                             } else {
                                 // Per-view Ctrl+C: act on the agent you're viewing.
                                 let active = world.pump.active_view(&mut shell.tui);
-                                if let Some(token) = turn_cancels.get(&active) {
+                                if turns.cancel(active) {
                                     // Viewed agent has a binary-driven turn: cancel just it.
-                                    token.cancel();
                                     // Don't discard what the user lined
                                     // up: pull any queued message back
                                     // into the editor.
@@ -1175,9 +1123,7 @@ async fn run_session(
                                     // Viewed agent is a sub running its initial spawn, owned by
                                     // the main turn: cancel the main turn (the child token
                                     // cascades to the sub).
-                                    if let Some(token) = turn_cancels.get(&AgentId::Main) {
-                                        token.cancel();
-                                    }
+                                    turns.cancel(AgentId::Main);
                                     yank_pending_into_editor(
                                         &mut shell.tui,
                                         &world.pump,
@@ -1195,7 +1141,7 @@ async fn run_session(
                                 // cancelled; a bare exit only when
                                 // nothing runs anywhere.
                                 let (agents, tasks) = running_work_counts(
-                                    turns.len(),
+                                    turns.driven(),
                                     &world.core.task_registry.snapshot(),
                                 );
                                 if agents + tasks > 0 {
@@ -1307,8 +1253,7 @@ async fn run_session(
                                     .get_mut_as::<Editor>(SlotIndex::Editor.idx())
                                     .map(|e| e.get_expanded_text().trim().to_string())
                                     .unwrap_or_default();
-                                let busy = turn_cancels.contains_key(&target)
-                                    || world.core.is_running(target);
+                                let busy = turns.is_busy(&world.core.lifecycle, target);
                                 if busy {
                                     if text.is_empty() {
                                         world.core.message_queues.promote(target);
@@ -1332,7 +1277,6 @@ async fn run_session(
                                         text,
                                         crate::turn::turn_policy(target, &shell.config),
                                         &mut turns,
-                                        &mut turn_cancels,
                                     ) {
                                         sync_editor_enabled(&mut shell.tui);
                                     } else {
@@ -1712,20 +1656,19 @@ async fn run_session(
                                     }
                                     // `/compact` runs as a tracked task
                                     // (like a turn), so the loop (which
-                                    // owns `turns` and `turn_cancels`)
-                                    // drives it rather than `handle_command`,
-                                    // which can't spawn. It opens no child,
+                                    // owns `turns`) drives it rather
+                                    // than `handle_command`, which
+                                    // can't spawn. It opens no child,
                                     // so any kept palette closes back to chat.
                                     if matches!(action, CommandAction::Compact) {
-                                        if turn_cancels.contains_key(&AgentId::Main)
-                                            || world.core.is_running(AgentId::Main)
+                                        if turns.is_busy(&world.core.lifecycle, AgentId::Main)
                                         {
                                             world.pump.handle(&mut world.core.lifecycle,
                                                 &mut shell.tui,
                                                 &notice_event(&session_busy_notice("compact")),
                                             );
                                         } else {
-                                            spawn_turn(
+                                            turns.spawn(
                                                 &world.core,
                                                 &shell.run_config,
                                                 AgentId::Main,
@@ -1735,8 +1678,6 @@ async fn run_session(
                                                     instructions: None,
                                                 },
                                                 crate::turn::turn_policy(AgentId::Main, &shell.config),
-                                                &mut turns,
-                                                &mut turn_cancels,
                                             );
                                         }
                                         selectors.close_all(&mut shell.tui);
@@ -1813,7 +1754,7 @@ async fn run_session(
                             // when the turn ends. The editor already
                             // cleared itself on submit, so we only
                             // record the history entry.
-                            if turn_cancels.contains_key(&target) || world.core.is_running(target) {
+                            if turns.is_busy(&world.core.lifecycle, target) {
                                 if let Some(editor) =
                                     shell.tui.get_mut_as::<Editor>(SlotIndex::Editor.idx())
                                 {
@@ -1826,8 +1767,8 @@ async fn run_session(
 
                             // Idle: start a turn. `spawn_prompt_turn`
                             // clears the editor, records history, mints
-                            // the per-turn cancel token (kept in
-                            // `turn_cancels` so the Ctrl+C arm can fire
+                            // the per-turn cancel token (kept in the
+                            // cancel map so the Ctrl+C arm can fire
                             // it without locking the agent), and spawns
                             // onto `turns`. A non-promptable target
                             // (resumed sub with no handle) returns false
@@ -1840,7 +1781,6 @@ async fn run_session(
                                 trimmed,
                                 crate::turn::turn_policy(target, &shell.config),
                                 &mut turns,
-                                &mut turn_cancels,
                             ) {
                                 sync_editor_enabled(&mut shell.tui);
                             } else {
@@ -1863,13 +1803,11 @@ async fn run_session(
                 // reaches the model; a busy owner picks the notice up
                 // at its next drain point instead.
                 if let AgentEvent::TaskEnd { agent_id, .. } = &event {
-                    spawn_wake_turn(
+                    turns.spawn_wake(
                         *agent_id,
                         &world.core,
                         &shell.run_config,
                         crate::turn::turn_policy(*agent_id, &shell.config),
-                        &mut turns,
-                        &mut turn_cancels,
                     );
                 }
                 // A sub-agent's initial run is nested inside the
@@ -1879,18 +1817,16 @@ async fn run_session(
                 // point it would rot until the next prompt — catch it
                 // here on the run's AgentEnd. The pump has already
                 // processed the event, so the owner reads as idle and
-                // the gate inside spawn_wake_turn is open.
+                // the gate inside spawn_wake is open.
                 if let AgentEvent::AgentEnd { agent_id, .. } = &event
                     && (world.core.task_registry.has_notices(*agent_id)
                         || world.core.message_queues.has_pending(*agent_id))
                 {
-                    spawn_wake_turn(
+                    turns.spawn_wake(
                         *agent_id,
                         &world.core,
                         &shell.run_config,
                         crate::turn::turn_policy(*agent_id, &shell.config),
-                        &mut turns,
-                        &mut turn_cancels,
                     );
                 }
                 sync_editor_enabled(&mut shell.tui);
@@ -1978,8 +1914,7 @@ fn spawn_prompt_turn(
     target: AgentId,
     text: String,
     policy: TurnPolicy,
-    turns: &mut JoinSet<(AgentId, Result<(), TurnError>)>,
-    turn_cancels: &mut HashMap<AgentId, CancellationToken>,
+    turns: &mut Turns,
 ) -> bool {
     if core.resolve_agent(target).is_none() {
         return false;
@@ -1988,15 +1923,7 @@ fn spawn_prompt_turn(
         editor.set_text("");
         editor.add_to_history(&text);
     }
-    spawn_turn(
-        core,
-        run_config,
-        target,
-        TurnStart::Prompt(text),
-        policy,
-        turns,
-        turn_cancels,
-    )
+    turns.spawn(core, run_config, target, TurnStart::Prompt(text), policy)
 }
 
 /// prepending it to whatever is currently typed (blank-line joined),
@@ -4626,6 +4553,7 @@ async fn handle_selector_outcome(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     use aj_conf::{AgentEnv, ContextFile, SystemPrompt, SystemPromptSource};
@@ -5924,11 +5852,11 @@ mod tests {
     }
 
     /// An idle owner with a queued notice gets a wake turn through
-    /// the normal per-agent machinery: gated via `turn_cancels`,
-    /// spawned on the `turns` JoinSet, and the wake drains the notice
+    /// the normal per-agent machinery: gated on the busy check,
+    /// spawned onto the driven set, and the wake drains the notice
     /// into the transcript before the scripted reply.
     #[tokio::test]
-    async fn spawn_wake_turn_wakes_idle_owner() {
+    async fn spawn_wake_wakes_idle_owner() {
         let dir = TempDir::new().expect("tempdir");
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let run_config = scripted_run_config(vec![finalized_text_message("woke and reacted")]);
@@ -5939,26 +5867,14 @@ mod tests {
             .task_registry
             .push_notice(bash_notice(AgentId::Main, 1, "task #1 done"));
 
-        let mut turns: JoinSet<(AgentId, Result<(), TurnError>)> = JoinSet::new();
-        let mut turn_cancels: HashMap<AgentId, CancellationToken> = HashMap::new();
-        spawn_wake_turn(
-            AgentId::Main,
-            &world.core,
-            &run_config,
-            test_policy(),
-            &mut turns,
-            &mut turn_cancels,
-        );
+        let mut turns = Turns::new();
+        turns.spawn_wake(AgentId::Main, &world.core, &run_config, test_policy());
 
         assert!(
-            turn_cancels.contains_key(&AgentId::Main),
-            "wake turn registered in turn_cancels"
+            turns.is_driving(AgentId::Main),
+            "wake turn registered in the cancel map"
         );
-        let (id, result) = turns
-            .join_next()
-            .await
-            .expect("one wake turn spawned")
-            .expect("wake turn did not panic");
+        let (id, result) = turns.join_next().await.expect("wake turn did not panic");
         assert_eq!(id, AgentId::Main);
         result.expect("wake turn succeeds");
 
@@ -5975,14 +5891,17 @@ mod tests {
         assert!(!world.core.task_registry.has_notices(AgentId::Main));
     }
 
-    /// A busy owner (already in `turn_cancels`) is left alone — the
-    /// in-flight turn's drain points or the turn-completion trigger
-    /// deliver the notice instead.
+    /// Dual wake triggers may fire for the same notice (the mid-select
+    /// `TaskEnd` trigger and the turn-join trigger). Right after the
+    /// first spawn the wake task has not been polled, so `is_running`
+    /// is still false and dedup rests entirely on the `is_driving`
+    /// half of the busy gate. A double spawn would overwrite the first
+    /// turn's cancel token, leaving it uncancellable.
     #[tokio::test]
-    async fn spawn_wake_turn_skips_busy_owner() {
+    async fn spawn_wake_dedups_racing_triggers_via_is_driving() {
         let dir = TempDir::new().expect("tempdir");
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let run_config = scripted_run_config(Vec::new());
+        let run_config = scripted_run_config(vec![finalized_text_message("woke once")]);
         let world =
             build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
         world
@@ -5990,18 +5909,37 @@ mod tests {
             .task_registry
             .push_notice(bash_notice(AgentId::Main, 1, "task #1 done"));
 
-        let mut turns: JoinSet<(AgentId, Result<(), TurnError>)> = JoinSet::new();
-        let mut turn_cancels: HashMap<AgentId, CancellationToken> = HashMap::new();
-        turn_cancels.insert(AgentId::Main, CancellationToken::new());
+        let mut turns = Turns::new();
+        turns.spawn_wake(AgentId::Main, &world.core, &run_config, test_policy());
+        turns.spawn_wake(AgentId::Main, &world.core, &run_config, test_policy());
 
-        spawn_wake_turn(
-            AgentId::Main,
-            &world.core,
-            &run_config,
-            test_policy(),
-            &mut turns,
-            &mut turn_cancels,
-        );
+        assert!(turns.is_driving(AgentId::Main));
+        assert_eq!(turns.driven(), 1, "second trigger deduped on is_driving");
+
+        let (id, result) = turns.join_next().await.expect("wake turn did not panic");
+        assert_eq!(id, AgentId::Main);
+        result.expect("wake turn succeeds");
+    }
+
+    /// A busy owner (marked running) is left alone — the
+    /// in-flight turn's drain points or the turn-completion trigger
+    /// deliver the notice instead.
+    #[tokio::test]
+    async fn spawn_wake_skips_busy_owner() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let run_config = scripted_run_config(Vec::new());
+        let mut world =
+            build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
+        world
+            .core
+            .task_registry
+            .push_notice(bash_notice(AgentId::Main, 1, "task #1 done"));
+
+        let mut turns = Turns::new();
+        world.core.lifecycle.mark_running(AgentId::Main);
+
+        turns.spawn_wake(AgentId::Main, &world.core, &run_config, test_policy());
         assert!(turns.is_empty(), "busy owner must not get a wake turn");
         assert!(
             world.core.task_registry.has_notices(AgentId::Main),
@@ -6014,29 +5952,17 @@ mod tests {
     /// inference, no transcript change (the strict-mode provider
     /// would panic on an unscripted inference).
     #[tokio::test]
-    async fn spawn_wake_turn_with_empty_queue_is_a_noop() {
+    async fn spawn_wake_with_empty_queue_is_a_noop() {
         let dir = TempDir::new().expect("tempdir");
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let run_config = scripted_run_config(Vec::new());
         let world =
             build_test_world(&persistence, &run_config, &create_spec()).expect("create world");
 
-        let mut turns: JoinSet<(AgentId, Result<(), TurnError>)> = JoinSet::new();
-        let mut turn_cancels: HashMap<AgentId, CancellationToken> = HashMap::new();
-        spawn_wake_turn(
-            AgentId::Main,
-            &world.core,
-            &run_config,
-            test_policy(),
-            &mut turns,
-            &mut turn_cancels,
-        );
+        let mut turns = Turns::new();
+        turns.spawn_wake(AgentId::Main, &world.core, &run_config, test_policy());
 
-        let (id, result) = turns
-            .join_next()
-            .await
-            .expect("wake turn spawned")
-            .expect("wake turn did not panic");
+        let (id, result) = turns.join_next().await.expect("wake turn did not panic");
         assert_eq!(id, AgentId::Main);
         result.expect("empty wake succeeds");
         let agent = world.core.agent.lock().await;
@@ -6046,7 +5972,7 @@ mod tests {
     // ---- message queues: submit routing, yank, wake delivery -------------
 
     /// `spawn_prompt_turn` for an idle, promptable target clears the
-    /// editor, registers the turn in `turn_cancels`, and runs the
+    /// editor, registers the turn in the cancel map, and runs the
     /// prompt against the agent.
     #[tokio::test]
     async fn spawn_prompt_turn_starts_a_turn_and_clears_editor() {
@@ -6061,8 +5987,7 @@ mod tests {
             e.set_text("draft text");
         }
 
-        let mut turns: JoinSet<(AgentId, Result<(), TurnError>)> = JoinSet::new();
-        let mut turn_cancels: HashMap<AgentId, CancellationToken> = HashMap::new();
+        let mut turns = Turns::new();
         let spawned = spawn_prompt_turn(
             &mut tui,
             &world.core,
@@ -6071,21 +5996,16 @@ mod tests {
             "do the thing".to_string(),
             test_policy(),
             &mut turns,
-            &mut turn_cancels,
         );
         assert!(spawned);
-        assert!(turn_cancels.contains_key(&AgentId::Main));
+        assert!(turns.is_driving(AgentId::Main));
         let editor_text = tui
             .get_mut_as::<Editor>(SlotIndex::Editor.idx())
             .map(|e| e.get_text())
             .unwrap();
         assert!(editor_text.is_empty(), "editor cleared on spawn");
 
-        let (id, result) = turns
-            .join_next()
-            .await
-            .expect("one turn spawned")
-            .expect("turn did not panic");
+        let (id, result) = turns.join_next().await.expect("turn did not panic");
         assert_eq!(id, AgentId::Main);
         result.expect("turn succeeds");
         let agent = world.core.agent.lock().await;
@@ -6109,8 +6029,7 @@ mod tests {
             e.set_text("keep me");
         }
 
-        let mut turns: JoinSet<(AgentId, Result<(), TurnError>)> = JoinSet::new();
-        let mut turn_cancels: HashMap<AgentId, CancellationToken> = HashMap::new();
+        let mut turns = Turns::new();
         let spawned = spawn_prompt_turn(
             &mut tui,
             &world.core,
@@ -6119,11 +6038,10 @@ mod tests {
             "x".to_string(),
             test_policy(),
             &mut turns,
-            &mut turn_cancels,
         );
         assert!(!spawned);
         assert!(turns.is_empty());
-        assert!(turn_cancels.is_empty());
+        assert!(!turns.is_driving(AgentId::Sub(99)));
         let editor_text = tui
             .get_mut_as::<Editor>(SlotIndex::Editor.idx())
             .map(|e| e.get_text())
@@ -6174,11 +6092,11 @@ mod tests {
     }
 
     /// A finished turn with a pending follow-up is delivered by the
-    /// wake path: `spawn_wake_turn` runs it as a fresh turn whose user
+    /// wake path: `Turns::spawn_wake` runs it as a fresh turn whose user
     /// message is the queued text, and the queue ends empty. (No task
     /// notice is queued — the follow-up alone opens the wake gate.)
     #[tokio::test]
-    async fn spawn_wake_turn_delivers_queued_follow_up() {
+    async fn spawn_wake_delivers_queued_follow_up() {
         let dir = TempDir::new().expect("tempdir");
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let run_config = scripted_run_config(vec![finalized_text_message("on it")]);
@@ -6189,25 +6107,13 @@ mod tests {
             .message_queues
             .append_follow_up(AgentId::Main, "then tidy up");
 
-        let mut turns: JoinSet<(AgentId, Result<(), TurnError>)> = JoinSet::new();
-        let mut turn_cancels: HashMap<AgentId, CancellationToken> = HashMap::new();
-        spawn_wake_turn(
-            AgentId::Main,
-            &world.core,
-            &run_config,
-            test_policy(),
-            &mut turns,
-            &mut turn_cancels,
-        );
+        let mut turns = Turns::new();
+        turns.spawn_wake(AgentId::Main, &world.core, &run_config, test_policy());
         assert!(
-            turn_cancels.contains_key(&AgentId::Main),
+            turns.is_driving(AgentId::Main),
             "follow-up alone opens the wake gate"
         );
-        let (id, result) = turns
-            .join_next()
-            .await
-            .expect("one wake turn spawned")
-            .expect("wake turn did not panic");
+        let (id, result) = turns.join_next().await.expect("wake turn did not panic");
         assert_eq!(id, AgentId::Main);
         result.expect("wake turn succeeds");
 

@@ -8,7 +8,7 @@
 //! model, and the [`TranscriptView`] renders it with follow-tail.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,7 +33,7 @@ use aj_app::shutdown::{format_resume_hint, format_session_usage_header, format_u
 use aj_app::theme::{
     ColorMode, Theme, ThemeBg, ThemeColor, ThemeHandle, ThemeWatcherGuard, watch_user_theme,
 };
-use aj_app::turn::{TurnStart, join_next_or_pending, spawn_turn, spawn_wake_turn, turn_policy};
+use aj_app::turn::{TurnStart, Turns, running_work_counts, turn_policy};
 use aj_conf::skills::Skill;
 use aj_conf::{
     Config, ConfigDiagnostic, ConfigSpeed, ConfigThinkingDisplay, ConfigVerbosity, Severity,
@@ -50,8 +50,6 @@ use aj_session::{
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tokio::task::JoinSet;
-use tokio_util::sync::CancellationToken;
 use vaxis::cell::{Color, Style};
 use vaxis::key::{Key, Modifiers};
 use vaxis::tty::PosixTty;
@@ -143,10 +141,8 @@ struct World {
     catalog: Arc<Vec<ModelInfo>>,
     run_config: Arc<StdMutex<RunConfigSnapshot>>,
     /// In-flight turns keyed by the agent running them, plus the
-    /// host's clone of each turn's cancel token. The token map's key
-    /// set is exactly "agents this host is currently driving".
-    turns: JoinSet<(AgentId, Result<(), TurnError>)>,
-    turn_cancels: HashMap<AgentId, CancellationToken>,
+    /// host's clone of each turn's cancel token.
+    turns: Turns,
     /// Credential store, shared with the async read-only overlays (auth
     /// status, usage) whose fetches run detached off the drive loop.
     auth: AuthStorage,
@@ -348,8 +344,7 @@ async fn build_world(
         config_layers: Arc::new(StdMutex::new(layers)),
         catalog,
         run_config,
-        turns: JoinSet::new(),
-        turn_cancels: HashMap::new(),
+        turns: Turns::new(),
         auth: auth.clone(),
         persistence: persistence.clone(),
         restore,
@@ -542,8 +537,10 @@ fn install_next_session(world: &mut World, shell: &Rc<RefCell<Shell>>, next: Nex
     shell.borrow().disarm_branch();
     // A session change is only requested with no turn in flight (the outer
     // loop shut the outgoing turns down, and the guard refuses mid-turn
-    // requests), so this is already empty; clear defensively.
-    world.turn_cancels.clear();
+    // requests), so this replace is normally a no-op. Dropping the old value
+    // is still the safer defensive move: it aborts any turn that slipped
+    // through rather than leaving it running against the outgoing session.
+    world.turns = Turns::default();
     // Start the switched-to session's splash box at the top: a prior session's
     // wheel scroll must not carry over.
     shell.borrow().splash.borrow_mut().reset_scroll();
@@ -807,7 +804,7 @@ fn finish_login(
 ///
 /// - `TaskEnd`: the owner is woken unconditionally so the completion
 ///   notice reaches the model the moment the task finishes. The gate
-///   inside `spawn_wake_turn` skips busy owners, which pick the
+///   inside `Turns::spawn_wake` skips busy owners, which pick the
 ///   notice up at their next drain point instead.
 /// - `AgentEnd` with queued notices or pending messages: a sub's
 ///   initial run is nested inside the parent's turn (not driven
@@ -815,7 +812,7 @@ fn finish_login(
 ///   it end. Without this, a notice arriving after that run's last
 ///   drain point would rot until the next prompt. The condition is
 ///   checked after the event reduced, so the owner reads as idle and
-///   the gate inside `spawn_wake_turn` is open.
+///   the gate inside `Turns::spawn_wake` is open.
 fn drain_events(world: &mut World, first: AgentEvent) -> (bool, Vec<AgentId>) {
     let mut redraw = false;
     let mut wake_targets = Vec::new();
@@ -844,19 +841,14 @@ fn drain_events(world: &mut World, first: AgentEvent) -> (bool, Vec<AgentId>) {
 }
 
 /// Spawn the post-turn wakes earned while draining a batch of events.
-/// `spawn_wake_turn` gates on busy owners, so duplicate targets in
+/// `Turns::spawn_wake` gates on busy owners, so duplicate targets in
 /// one batch are harmless.
 fn spawn_wakes(world: &mut World, targets: Vec<AgentId>) {
     for id in targets {
         let policy = turn_policy(id, &world.config);
-        spawn_wake_turn(
-            id,
-            &world.core,
-            &world.run_config,
-            policy,
-            &mut world.turns,
-            &mut world.turn_cancels,
-        );
+        world
+            .turns
+            .spawn_wake(id, &world.core, &world.run_config, policy);
     }
 }
 
@@ -961,21 +953,19 @@ fn handle_submit(world: &mut World, text: String) -> bool {
         return false;
     }
     let target = world.chat.borrow().active_view();
-    if world.turn_cancels.contains_key(&target) || world.core.is_running(target) {
+    if world.turns.is_busy(&world.core.lifecycle, target) {
         world.core.message_queues.append_follow_up(target, &trimmed);
         return true;
     }
     let policy = turn_policy(target, &world.config);
     // The user's message row arrives back over the bus as
     // `MessageEnd { User }`, so nothing is inserted into the model here.
-    let spawned = spawn_turn(
+    let spawned = world.turns.spawn(
         &world.core,
         &world.run_config,
         target,
         TurnStart::Prompt(trimmed),
         policy,
-        &mut world.turns,
-        &mut world.turn_cancels,
     );
     if !spawned {
         fold_notice(world, "This agent can't be prompted.");
@@ -1002,14 +992,12 @@ fn auto_submit_launch(world: &mut World, content: Vec<UserContent>) {
         return;
     }
     let policy = turn_policy(AgentId::Main, &world.config);
-    spawn_turn(
+    world.turns.spawn(
         &world.core,
         &world.run_config,
         AgentId::Main,
         TurnStart::Content(content),
         policy,
-        &mut world.turns,
-        &mut world.turn_cancels,
     );
 }
 
@@ -1021,22 +1009,18 @@ fn handle_turn_join(
     joined: Result<(AgentId, Result<(), TurnError>), tokio::task::JoinError>,
 ) -> Result<()> {
     let (id, result) = joined.map_err(|join_err| anyhow!("agent task panicked: {join_err}"))?;
-    world.turn_cancels.remove(&id);
-    world.core.mark_idle(id);
-    // Main-turn completion bounds every nested initial spawn it
-    // started. Drain any sub still marked running that this host is
-    // not independently driving, so a leaked sub-agent can't pin the
-    // running set forever. Independent continuations are in
-    // `turn_cancels`, and detached background runs have a Running
-    // registry entry; both survive.
-    if id == AgentId::Main {
-        for sub in world.core.running_agents() {
-            let AgentId::Sub(n) = sub else { continue };
-            if !world.turn_cancels.contains_key(&sub)
-                && !world.core.task_registry.agent_task_running(n)
-            {
-                world.core.mark_idle(sub);
-            }
+    // The spinner and footer resync from the lifecycle each frame, but a
+    // sub-agent box's status chip and runtime clock are reducer state
+    // flipped by `AgentEnd`/`SubAgentEnd`. A sub the reap sweeps emitted
+    // neither, so conclude its box directly. For the joined agent itself
+    // (and any driven sub) the buffered events carry the real conclusion
+    // and `conclude_sub_box` leaves a concluded box untouched.
+    for idled in world
+        .turns
+        .reap(&mut world.core.lifecycle, &world.core.task_registry, id)
+    {
+        if let AgentId::Sub(n) = idled {
+            world.chat.borrow_mut().conclude_sub_box(n);
         }
     }
     // Post-turn wake: deliver queued task notices the moment the agent
@@ -1045,14 +1029,9 @@ fn handle_turn_join(
     // (see `drain_events`), covering tasks that finish between turns.
     if world.core.task_registry.has_notices(id) || world.core.message_queues.has_pending(id) {
         let policy = turn_policy(id, &world.config);
-        spawn_wake_turn(
-            id,
-            &world.core,
-            &world.run_config,
-            policy,
-            &mut world.turns,
-            &mut world.turn_cancels,
-        );
+        world
+            .turns
+            .spawn_wake(id, &world.core, &world.run_config, policy);
     }
     match result {
         Ok(()) => Ok(()),
@@ -1080,40 +1059,16 @@ fn handle_turn_join(
 /// predicate keeps it off the dispatch path while nothing runs.
 fn cancel_viewed_turn(world: &World) -> bool {
     let active = world.chat.borrow().active_view();
-    if let Some(token) = world.turn_cancels.get(&active) {
-        token.cancel();
+    if world.turns.cancel(active) {
         return true;
     }
     if world.core.is_running(active) {
         // A sub running its initial spawn is owned by the main turn.
         // Cancelling that token cascades to the child.
-        if let Some(token) = world.turn_cancels.get(&AgentId::Main) {
-            token.cancel();
-        }
+        world.turns.cancel(AgentId::Main);
         return true;
     }
     false
-}
-
-/// Counts of running work a quit would tear down, for the Ctrl+C
-/// quit-arming notice: (agents, bash tasks). Ported from `aj`.
-///
-/// Binary-driven turns plus running agent-backed tasks (background
-/// sub-agent runs, which the `turns` JoinSet doesn't track) make up
-/// the agent count, running bash tasks the task count.
-fn running_work_counts(driven_turns: usize, tasks: &[aj_agent::TaskSummary]) -> (usize, usize) {
-    let mut agents = driven_turns;
-    let mut bash = 0;
-    for task in tasks {
-        if task.status != aj_agent::tool::TaskStatus::Running {
-            continue;
-        }
-        match task.kind {
-            aj_agent::tool::TaskKind::Agent { .. } => agents += 1,
-            aj_agent::tool::TaskKind::Bash { .. } => bash += 1,
-        }
-    }
-    (agents, bash)
 }
 
 /// Summarize the background work a quit would tear down, for the quit-arm
@@ -1141,7 +1096,7 @@ fn running_work_summary(agents: usize, tasks: usize) -> Option<String> {
 /// nothing runs.
 fn quit_arm_running_work(world: &World) -> Option<String> {
     let (agents, tasks) =
-        running_work_counts(world.turns.len(), &world.core.task_registry.snapshot());
+        running_work_counts(world.turns.driven(), &world.core.task_registry.snapshot());
     running_work_summary(agents, tasks)
 }
 
@@ -1165,7 +1120,7 @@ fn consume_session_request(
     request: SessionRequest,
 ) -> Option<SessionExit> {
     let (agents, bash) =
-        running_work_counts(world.turns.len(), &world.core.task_registry.snapshot());
+        running_work_counts(world.turns.driven(), &world.core.task_registry.snapshot());
     if agents + bash > 0 {
         // A toast, matching the request sites' up-front refuse.
         let what = match &request {
@@ -1244,7 +1199,7 @@ fn handle_steer(world: &mut World, shell: &Rc<RefCell<Shell>>) {
         editor.clear();
         text
     };
-    let busy = world.turn_cancels.contains_key(&target) || world.core.is_running(target);
+    let busy = world.turns.is_busy(&world.core.lifecycle, target);
     if busy {
         if text.is_empty() {
             world.core.message_queues.promote(target);
@@ -1403,7 +1358,7 @@ async fn submit_with_armed_anchor(
     // Raise the toast and restore the text the submit cleared so the user
     // keeps it.
     let (agents, bash) =
-        running_work_counts(world.turns.len(), &world.core.task_registry.snapshot());
+        running_work_counts(world.turns.driven(), &world.core.task_registry.snapshot());
     if agents + bash > 0 {
         shell.borrow().editor.borrow_mut().set_text(&text);
         shell.borrow().show_toast(busy_refusal("branch"));
@@ -1557,13 +1512,11 @@ async fn apply_command_action(
             // `/compact` runs as a tracked turn (it owns the turn
             // machinery the palette confirm can't reach). Busy agents get
             // the same notice `aj` folds rather than a silent no-op.
-            if world.turn_cancels.contains_key(&AgentId::Main)
-                || world.core.is_running(AgentId::Main)
-            {
+            if world.turns.is_busy(&world.core.lifecycle, AgentId::Main) {
                 fold_notice(world, &session_busy_notice("compact"));
             } else {
                 let policy = turn_policy(AgentId::Main, &world.config);
-                spawn_turn(
+                world.turns.spawn(
                     &world.core,
                     &world.run_config,
                     AgentId::Main,
@@ -1572,8 +1525,6 @@ async fn apply_command_action(
                         instructions: None,
                     },
                     policy,
-                    &mut world.turns,
-                    &mut world.turn_cancels,
                 );
             }
             ActionEffect::Redraw
@@ -1742,7 +1693,7 @@ async fn apply_command_action(
             // other session-changing requests. `consume_session_request`
             // rechecks at consumption.
             let (agents, bash) =
-                running_work_counts(world.turns.len(), &world.core.task_registry.snapshot());
+                running_work_counts(world.turns.driven(), &world.core.task_registry.snapshot());
             if agents + bash > 0 {
                 shell
                     .borrow()
@@ -4086,18 +4037,18 @@ impl Widget for Shell {
 }
 
 /// Whether the viewed agent is busy from the host's perspective (a
-/// binary-driven turn in `turn_cancels`, or a running initial
+/// binary-driven turn in the cancel map, or a running initial
 /// sub-agent spawn), mirrored into the keymap context. Called from the
 /// drive loop's per-iteration sync point, its single writer.
 fn sync_keymap_ctx(world: &World, shell: &Rc<RefCell<Shell>>) {
     let active = world.chat.borrow().active_view();
-    let busy = world.turn_cancels.contains_key(&active) || world.core.is_running(active);
+    let busy = world.turns.is_busy(&world.core.lifecycle, active);
     // The global busy flag the session-overlay confirm closures read: any
     // in-flight turn OR background work (background sub-agents + bash tasks),
     // not just the viewed agent. Distinct from `turn_running` above, which is
     // per-view and gates the keymap's steer/dequeue chords.
     let (agents, bash) =
-        running_work_counts(world.turns.len(), &world.core.task_registry.snapshot());
+        running_work_counts(world.turns.driven(), &world.core.task_registry.snapshot());
     let shell = shell.borrow();
     shell.busy.set(agents + bash > 0);
     let mut ctx = shell.keymap_ctx.borrow_mut();
@@ -4671,7 +4622,7 @@ async fn drive(
             biased;
 
             // --- Agent turn finished ---
-            joined = join_next_or_pending(&mut world.turns) => {
+            joined = world.turns.join_next() => {
                 handle_turn_join(world, joined)?;
                 app.request_redraw();
             }
@@ -5789,7 +5740,7 @@ mod tests {
     /// and can be resumed by the session-switch paths.
     async fn persist_session(world: &mut World) {
         handle_submit(world, "persist me".to_string());
-        let joined = join_next_or_pending(&mut world.turns).await;
+        let joined = world.turns.join_next().await;
         handle_turn_join(world, joined).expect("turn settles cleanly");
         if let Ok(first) = world.core.event_rx.try_recv() {
             let _ = drain_events(world, first);
@@ -5819,7 +5770,7 @@ mod tests {
         handle_submit(world, "run the demo".to_string());
         loop {
             if !world.turns.is_empty() {
-                let joined = join_next_or_pending(&mut world.turns).await;
+                let joined = world.turns.join_next().await;
                 handle_turn_join(world, joined).expect("turn settles cleanly");
             }
             let mut wakes = Vec::new();
@@ -6756,7 +6707,7 @@ mod tests {
 
         // Settle the turn so world teardown is clean.
         cancel_viewed_turn(&world);
-        let joined = join_next_or_pending(&mut world.turns).await;
+        let joined = world.turns.join_next().await;
         handle_turn_join(&mut world, joined).expect("abort is non-fatal");
     }
 
@@ -7603,7 +7554,7 @@ mod tests {
 
         // Settle the turn so world teardown is clean.
         cancel_viewed_turn(&world);
-        let joined = join_next_or_pending(&mut world.turns).await;
+        let joined = world.turns.join_next().await;
         handle_turn_join(&mut world, joined).expect("abort is non-fatal");
     }
 
@@ -7617,12 +7568,13 @@ mod tests {
         let mut world = scripted_world(&dir, "streaming-text").await;
 
         handle_submit(&mut world, "hi there".to_string());
-        assert!(world.turn_cancels.contains_key(&AgentId::Main));
+        assert!(world.turns.is_driving(AgentId::Main));
 
         // Turn-join arm.
-        let joined = join_next_or_pending(&mut world.turns).await;
+        let joined = world.turns.join_next().await;
         handle_turn_join(&mut world, joined).expect("turn settles cleanly");
-        assert!(world.turn_cancels.is_empty());
+        assert!(!world.turns.is_driving(AgentId::Main));
+        assert!(world.turns.is_empty(), "no turn left in flight");
 
         // Event arm: everything the turn emitted is buffered now.
         let first = world.core.event_rx.try_recv().expect("events buffered");
@@ -7689,11 +7641,11 @@ mod tests {
         let mut world = scripted_world(&dir, "streaming-text").await;
 
         auto_submit_launch(&mut world, vec![UserContent::text("launch me")]);
-        assert!(world.turn_cancels.contains_key(&AgentId::Main));
+        assert!(world.turns.is_driving(AgentId::Main));
 
         // Settle the turn so world teardown is clean.
         cancel_viewed_turn(&world);
-        let joined = join_next_or_pending(&mut world.turns).await;
+        let joined = world.turns.join_next().await;
         handle_turn_join(&mut world, joined).expect("abort is non-fatal");
     }
 
@@ -7705,7 +7657,7 @@ mod tests {
         let mut world = scripted_world(&dir, "streaming-text").await;
 
         auto_submit_launch(&mut world, Vec::new());
-        assert!(world.turn_cancels.is_empty());
+        assert!(!world.turns.is_driving(AgentId::Main));
         assert!(world.turns.is_empty());
     }
 
@@ -7742,6 +7694,65 @@ mod tests {
         assert_eq!(wake, vec![AgentId::Main], "AgentEnd with pending work");
     }
 
+    /// A Main turn's join sweeps a leaked sub: one still marked running
+    /// whose `AgentEnd` never arrived and that has no backing
+    /// background run.
+    #[tokio::test]
+    async fn main_turn_join_sweeps_leaked_sub() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut world = scripted_world(&dir, "streaming-text").await;
+
+        handle_submit(&mut world, "go".to_string());
+        world.core.lifecycle.mark_running(AgentId::Sub(1));
+
+        let joined = world.turns.join_next().await;
+        handle_turn_join(&mut world, joined).expect("turn settles cleanly");
+        assert!(
+            !world.core.is_running(AgentId::Sub(1)),
+            "leaked sub swept on the Main join"
+        );
+    }
+
+    /// A background sub-agent run (a Running `TaskKind::Agent` registry
+    /// entry) survives a Main join, and is swept once its task turns
+    /// terminal.
+    #[tokio::test]
+    async fn main_turn_join_spares_background_sub_until_terminal() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut world = scripted_world(&dir, "streaming-text").await;
+
+        let (task_id, _cancel) = world.core.task_registry.register(
+            AgentId::Main,
+            aj_agent::tool::TaskKind::Agent {
+                agent_id: 1,
+                task: "explore".to_string(),
+            },
+            "explore".to_string(),
+            Arc::new(NoOutput),
+        );
+        world.core.lifecycle.mark_running(AgentId::Sub(1));
+
+        handle_submit(&mut world, "go".to_string());
+        let joined = world.turns.join_next().await;
+        handle_turn_join(&mut world, joined).expect("turn settles cleanly");
+        assert!(
+            world.core.is_running(AgentId::Sub(1)),
+            "background sub spared while its task runs"
+        );
+
+        world
+            .core
+            .task_registry
+            .set_status(task_id, aj_agent::tool::TaskStatus::Exited(None));
+        handle_submit(&mut world, "again".to_string());
+        let joined = world.turns.join_next().await;
+        handle_turn_join(&mut world, joined).expect("turn settles cleanly");
+        assert!(
+            !world.core.is_running(AgentId::Sub(1)),
+            "swept once the background run turned terminal"
+        );
+    }
+
     /// End-to-end over the `background-task` demo: the launch turn
     /// spawns a real background bash task, its completion triggers a
     /// wake turn, and the wake delivers the collapsible
@@ -7752,14 +7763,14 @@ mod tests {
         let mut world = scripted_world(&dir, "background-task").await;
 
         handle_submit(&mut world, "run it".to_string());
-        let joined = join_next_or_pending(&mut world.turns).await;
+        let joined = world.turns.join_next().await;
         handle_turn_join(&mut world, joined).expect("prompt turn settles");
 
         // The wake turn is spawned either by the turn join above (the
         // task finished while the turn still streamed, so its notice
         // was already queued) or by the TaskEnd trigger while draining
         // here. Loop until one of the two paths armed a turn.
-        while world.turn_cancels.is_empty() {
+        while !world.turns.is_driving(AgentId::Main) {
             let event = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
                 world.core.event_rx.recv(),
@@ -7771,7 +7782,7 @@ mod tests {
             spawn_wakes(&mut world, wake_targets);
         }
 
-        let joined = join_next_or_pending(&mut world.turns).await;
+        let joined = world.turns.join_next().await;
         handle_turn_join(&mut world, joined).expect("wake turn settles");
         // Fold the buffered tail. Wake targets are ignored on purpose:
         // the TaskEnd may sit in this tail, and re-waking the idle
@@ -7853,7 +7864,7 @@ mod tests {
         let mut world = scripted_world(&dir, "streaming-text").await;
 
         handle_submit(&mut world, "first".to_string());
-        assert!(world.turn_cancels.contains_key(&AgentId::Main));
+        assert!(world.turns.is_driving(AgentId::Main));
 
         // Wait until the prompt's own user message landed before
         // queueing: the turn drains the follow-up queue right at its
@@ -7890,15 +7901,15 @@ mod tests {
 
         // First turn settles; the join handler sees the pending
         // follow-up and spawns the wake turn.
-        let joined = join_next_or_pending(&mut world.turns).await;
+        let joined = world.turns.join_next().await;
         handle_turn_join(&mut world, joined).expect("prompt turn settles");
         assert!(
-            world.turn_cancels.contains_key(&AgentId::Main),
+            world.turns.is_driving(AgentId::Main),
             "post-turn wake spawned for the pending message",
         );
 
         // The wake consumes the queue and delivers the message.
-        let joined = join_next_or_pending(&mut world.turns).await;
+        let joined = world.turns.join_next().await;
         handle_turn_join(&mut world, joined).expect("wake turn settles");
         assert!(
             world
@@ -7938,7 +7949,7 @@ mod tests {
         handle_submit(&mut world, "go".to_string());
         assert!(cancel_viewed_turn(&world), "running turn is cancelled");
 
-        let joined = join_next_or_pending(&mut world.turns).await;
+        let joined = world.turns.join_next().await;
         // The cancelled turn surfaces Aborted, which folds a notice
         // and keeps the session alive.
         handle_turn_join(&mut world, joined).expect("abort is non-fatal");
@@ -8027,7 +8038,7 @@ mod tests {
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
 
         handle_submit(&mut world, "first".to_string());
-        assert!(world.turn_cancels.contains_key(&AgentId::Main), "busy");
+        assert!(world.turns.is_driving(AgentId::Main), "busy");
 
         // Busy + editor text: queue as steering, clear the editor.
         shell
@@ -8064,7 +8075,7 @@ mod tests {
         // first so the join's wake gate has nothing to deliver.
         world.core.message_queues.clear(AgentId::Main);
         cancel_viewed_turn(&world);
-        let joined = join_next_or_pending(&mut world.turns).await;
+        let joined = world.turns.join_next().await;
         handle_turn_join(&mut world, joined).expect("abort is non-fatal");
     }
 
@@ -8082,7 +8093,7 @@ mod tests {
             .insert_at_cursor("hi there");
         assert!(handle_host_action(&mut world, &shell, AjAction::Steer));
         assert!(
-            world.turn_cancels.contains_key(&AgentId::Main),
+            world.turns.is_driving(AgentId::Main),
             "idle steer spawned a prompt turn"
         );
         assert!(
@@ -8095,7 +8106,7 @@ mod tests {
             "nothing queued"
         );
 
-        let joined = join_next_or_pending(&mut world.turns).await;
+        let joined = world.turns.join_next().await;
         handle_turn_join(&mut world, joined).expect("turn settles");
         let first = world.core.event_rx.try_recv().expect("events buffered");
         drain_events(&mut world, first);
@@ -8119,7 +8130,7 @@ mod tests {
             init_app_with_world(&dir, "streaming-text").await;
 
         handle_submit(&mut world, "earlier prompt".to_string());
-        let joined = join_next_or_pending(&mut world.turns).await;
+        let joined = world.turns.join_next().await;
         handle_turn_join(&mut world, joined).expect("turn settles");
         let first = world.core.event_rx.try_recv().expect("events buffered");
         drain_events(&mut world, first);
@@ -8161,7 +8172,7 @@ mod tests {
 
         world.core.message_queues.clear(AgentId::Main);
         cancel_viewed_turn(&world);
-        let joined = join_next_or_pending(&mut world.turns).await;
+        let joined = world.turns.join_next().await;
         handle_turn_join(&mut world, joined).expect("abort is non-fatal");
     }
 
@@ -8174,7 +8185,7 @@ mod tests {
             init_app_with_world(&dir, "streaming-text").await;
 
         handle_submit(&mut world, "earlier prompt".to_string());
-        let joined = join_next_or_pending(&mut world.turns).await;
+        let joined = world.turns.join_next().await;
         handle_turn_join(&mut world, joined).expect("turn settles");
         let first = world.core.event_rx.try_recv().expect("events buffered");
         drain_events(&mut world, first);
@@ -8219,7 +8230,7 @@ mod tests {
             init_app_with_world(&dir, "streaming-text").await;
 
         handle_submit(&mut world, "earlier prompt".to_string());
-        let joined = join_next_or_pending(&mut world.turns).await;
+        let joined = world.turns.join_next().await;
         handle_turn_join(&mut world, joined).expect("turn settles");
         let first = world.core.event_rx.try_recv().expect("events buffered");
         drain_events(&mut world, first);
@@ -8253,7 +8264,7 @@ mod tests {
         assert!(!transcript.borrow().is_at_bottom(), "scroll is preserved");
 
         cancel_viewed_turn(&world);
-        let joined = join_next_or_pending(&mut world.turns).await;
+        let joined = world.turns.join_next().await;
         handle_turn_join(&mut world, joined).expect("abort is non-fatal");
     }
 
@@ -8284,7 +8295,7 @@ mod tests {
         assert!(!handle_host_action(&mut world, &shell, AjAction::Dequeue));
 
         cancel_viewed_turn(&world);
-        let joined = join_next_or_pending(&mut world.turns).await;
+        let joined = world.turns.join_next().await;
         handle_turn_join(&mut world, joined).expect("abort is non-fatal");
     }
 
@@ -8306,12 +8317,13 @@ mod tests {
         );
         assert!(!world.core.message_queues.has_pending(AgentId::Main));
 
-        let joined = join_next_or_pending(&mut world.turns).await;
+        let joined = world.turns.join_next().await;
         handle_turn_join(&mut world, joined).expect("abort is non-fatal");
         assert!(
-            world.turn_cancels.is_empty(),
+            !world.turns.is_driving(AgentId::Main),
             "no wake spawned, the queue was empty"
         );
+        assert!(world.turns.is_empty(), "nothing else left in flight");
     }
 
     /// The two overlay openers park their command for the host to open the
@@ -10948,7 +10960,7 @@ mod tests {
     /// into the chat model (and, via the persistence listener, to disk).
     async fn run_prompt(world: &mut World, prompt: &str) {
         handle_submit(world, prompt.to_string());
-        let joined = join_next_or_pending(&mut world.turns).await;
+        let joined = world.turns.join_next().await;
         handle_turn_join(world, joined).expect("turn settles");
         while let Ok(event) = world.core.event_rx.try_recv() {
             let _ = drain_events(world, event);
@@ -10980,7 +10992,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         handle_submit(&mut world, "go".to_string());
-        assert!(world.turn_cancels.contains_key(&AgentId::Main), "busy");
+        assert!(world.turns.is_driving(AgentId::Main), "busy");
 
         // The selector opens read-only mid-turn.
         assert!(matches!(
@@ -11019,7 +11031,7 @@ mod tests {
 
         // Settle the turn so teardown is clean.
         cancel_viewed_turn(&world);
-        let joined = join_next_or_pending(&mut world.turns).await;
+        let joined = world.turns.join_next().await;
         handle_turn_join(&mut world, joined).expect("abort is non-fatal");
     }
 
@@ -11075,7 +11087,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         handle_submit(&mut world, "go".to_string());
-        assert!(world.turn_cancels.contains_key(&AgentId::Main), "busy");
+        assert!(world.turns.is_driving(AgentId::Main), "busy");
 
         assert!(matches!(
             apply_command(&mut world, &shell, CommandAction::OpenSessionTree).await,
@@ -11095,7 +11107,7 @@ mod tests {
 
         // Settle the turn so teardown is clean.
         cancel_viewed_turn(&world);
-        let joined = join_next_or_pending(&mut world.turns).await;
+        let joined = world.turns.join_next().await;
         handle_turn_join(&mut world, joined).expect("abort is non-fatal");
     }
 
@@ -11568,7 +11580,7 @@ mod tests {
         // Start a turn so the world is busy.
         handle_submit(&mut world, "first".to_string());
         assert!(!world.turns.is_empty(), "a turn is in flight");
-        let turns_before = world.turns.len();
+        let turns_before = world.turns.driven();
         {
             let sh = shell.borrow();
             arm_branch(
@@ -11597,14 +11609,14 @@ mod tests {
             crate::toasts::toast_texts(&shell.borrow().toasts),
         );
         assert_eq!(
-            world.turns.len(),
+            world.turns.driven(),
             turns_before,
             "no new turn spawned by the refused submit"
         );
 
         // Settle the turn so world teardown is clean.
         cancel_viewed_turn(&world);
-        let joined = join_next_or_pending(&mut world.turns).await;
+        let joined = world.turns.join_next().await;
         handle_turn_join(&mut world, joined).expect("abort is non-fatal");
     }
 
@@ -11741,7 +11753,7 @@ mod tests {
             crate::toasts::toast_texts(&shell.borrow().toasts)
         );
         cancel_viewed_turn(&world);
-        let joined = join_next_or_pending(&mut world.turns).await;
+        let joined = world.turns.join_next().await;
         handle_turn_join(&mut world, joined).expect("abort is non-fatal");
 
         // A running background task refuses the switch too, even with no turn.
@@ -12165,7 +12177,7 @@ mod tests {
         assert!(!world.turns.is_empty(), "a turn was spawned");
 
         // Settle the spawned turn so world teardown is clean.
-        let joined = join_next_or_pending(&mut world.turns).await;
+        let joined = world.turns.join_next().await;
         handle_turn_join(&mut world, joined).expect("turn settles");
     }
 }
