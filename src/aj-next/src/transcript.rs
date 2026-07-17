@@ -5338,6 +5338,16 @@ mod tests {
         apply(
             &chat,
             &mut life,
+            tool_end(
+                AgentId::Main,
+                "c1",
+                "bash",
+                bash("sleep 1", "", None, Some(1)),
+            ),
+        );
+        apply(
+            &chat,
+            &mut life,
             AgentEvent::TaskStart {
                 agent_id: AgentId::Main,
                 task_id: 1,
@@ -5347,16 +5357,6 @@ mod tests {
                 },
                 label: "sleep 1".into(),
             },
-        );
-        apply(
-            &chat,
-            &mut life,
-            tool_end(
-                AgentId::Main,
-                "c1",
-                "bash",
-                bash("sleep 1", "", None, Some(1)),
-            ),
         );
         let builder = caching_builder(&chat);
         let running = draw_and_assert_fresh(&builder, AgentId::Main, 0, 60);
@@ -5654,6 +5654,16 @@ mod tests {
         apply(
             &chat,
             &mut life,
+            tool_end(
+                AgentId::Sub(0),
+                "c1",
+                "bash",
+                bash("sleep 1", "", None, Some(1)),
+            ),
+        );
+        apply(
+            &chat,
+            &mut life,
             AgentEvent::TaskStart {
                 agent_id: AgentId::Sub(0),
                 task_id: 1,
@@ -5663,16 +5673,6 @@ mod tests {
                 },
                 label: "sleep 1".into(),
             },
-        );
-        apply(
-            &chat,
-            &mut life,
-            tool_end(
-                AgentId::Sub(0),
-                "c1",
-                "bash",
-                bash("sleep 1", "", None, Some(1)),
-            ),
         );
         let builder = caching_builder(&chat);
         draw_cached(&builder, 0, 70);

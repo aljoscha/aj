@@ -1151,6 +1151,13 @@ pub trait ToolContext: Send {
     /// driver needs: the task id, a cancel token (child of the
     /// registry root, NOT of the per-turn token), and an event sink.
     ///
+    /// Caller contract: registration is synchronous, and the caller
+    /// must spawn the driver with no await point in between. Tool
+    /// futures are cancelled by drop, and a drop in that window would
+    /// leave a phantom `Running` registry entry with no driver to
+    /// ever flip it. The driver must emit [`TaskEventSink::started`]
+    /// before any other task event.
+    ///
     /// NOTE: ids are allocated by the registry, not by session state,
     /// so detached drivers never need the `&mut SessionState` borrow
     /// that makes foreground tools block.

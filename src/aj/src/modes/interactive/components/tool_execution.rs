@@ -396,6 +396,13 @@ impl ToolExecutionComponent {
         content: &[UserContent],
         is_error: bool,
     ) {
+        // Frozen: a fast background task can reach `TaskEnd` before
+        // the launch's `ToolExecutionEnd` is processed, and the empty
+        // launch snapshot must not clobber the final output the task
+        // events already rendered.
+        if self.task_status.is_some() {
+            return;
+        }
         self.reconcile_settings();
         self.body = render_details_body(details, self.expanded);
         self.image_payload = derive_image_payload(details, content);

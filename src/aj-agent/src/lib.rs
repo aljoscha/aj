@@ -2936,9 +2936,18 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
             self.sub_agent_registry
                 .insert(agent_id, Arc::clone(&shared));
 
+            // NOTE: no await point between the registry registration
+            // in the background arm above and the driver spawn below
+            // (the `sub_agent_registry.insert` in between is sync and
+            // must stay that way). Tool futures are cancelled by drop,
+            // and a drop in that window would leave a phantom `Running`
+            // entry with no driver to ever flip it. The driver owns all
+            // task lifecycle emissions: `TaskStart` first, then
+            // `TaskOutput` / `TaskEnd`. That first emit races this
+            // future's own return, so `TaskStart` may land before or
+            // after the spawn's `ToolExecutionEnd`.
             if let Some((started, kind, output)) = background {
                 let StartedTask { id, cancel, events } = started;
-                events.started(kind.clone()).await;
                 tokio::spawn(drive_background_agent(BackgroundAgentRun {
                     shared,
                     task,
@@ -3114,10 +3123,10 @@ struct BackgroundAgentRun {
     output: Arc<AgentTaskOutput>,
 }
 
-/// Drive a background agent spawn to completion: run the child's
-/// initial turn, park its usage on the registry entry, emit
-/// `SubAgentEnd`, and finish the task with the report as the notice
-/// body.
+/// Drive a background agent spawn to completion: announce it with
+/// `TaskStart`, run the child's initial turn, park its usage on the
+/// registry entry, emit `SubAgentEnd`, and finish the task with the
+/// report as the notice body.
 async fn drive_background_agent(run: BackgroundAgentRun) {
     let BackgroundAgentRun {
         shared,
@@ -3132,6 +3141,8 @@ async fn drive_background_agent(run: BackgroundAgentRun) {
         events,
         output,
     } = run;
+
+    events.started(kind.clone()).await;
 
     let (result, usage) = {
         let mut guard = shared.lock().await;
@@ -3416,8 +3427,8 @@ mod event_protocol_tests {
     use crate::message::AgentMessage;
     use crate::queue::MessageQueues;
     use crate::tool::{
-        ErasedToolDefinition, TaskKind, TaskNotice, TaskStatus, ToolContext, ToolDefinition,
-        ToolDetails, ToolOutcome,
+        ErasedToolDefinition, TaskId, TaskKind, TaskNotice, TaskStatus, ToolContext,
+        ToolDefinition, ToolDetails, ToolOutcome,
     };
     use crate::{Agent, AgentSeed, TaskRegistry};
 
@@ -5522,6 +5533,11 @@ mod event_protocol_tests {
         // that contract for background initial runs.
         let sub_lifecycle: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
         let sub_lifecycle_clone = Arc::clone(&sub_lifecycle);
+        // The detached driver owns the task lifecycle emissions.
+        // Record them so the test catches a driver that stops
+        // announcing the task before finishing it.
+        let task_events: Arc<Mutex<Vec<(&'static str, TaskId)>>> = Arc::new(Mutex::new(Vec::new()));
+        let task_events_clone = Arc::clone(&task_events);
         let _handle = agent.subscribe(listener_from_sync(move |event| match event {
             AgentEvent::SubAgentEnd {
                 parent,
@@ -5540,6 +5556,12 @@ mod event_protocol_tests {
             AgentEvent::AgentEnd { agent_id, .. } if *agent_id == AgentId::Sub(1) => {
                 sub_lifecycle_clone.lock().unwrap().push("end");
             }
+            AgentEvent::TaskStart { task_id, .. } => {
+                task_events_clone.lock().unwrap().push(("start", *task_id));
+            }
+            AgentEvent::TaskEnd { task_id, .. } => {
+                task_events_clone.lock().unwrap().push(("end", *task_id));
+            }
             _ => {}
         }));
 
@@ -5557,6 +5579,19 @@ mod event_protocol_tests {
         // the completion notice it queues.
         wait_until(|| tasks.has_notices(AgentId::Main), "completion notice").await;
         assert_eq!(tasks.status(1), Some(TaskStatus::Exited(Some(0))));
+        // The driver announced the task on the bus as its first act
+        // and closed it with `TaskEnd`. The notice is queued before
+        // the `TaskEnd` emit, so wait for the emit itself.
+        wait_until(
+            || task_events.lock().unwrap().contains(&("end", 1)),
+            "TaskEnd on the bus",
+        )
+        .await;
+        assert_eq!(
+            *task_events.lock().unwrap(),
+            vec![("start", 1), ("end", 1)],
+            "TaskStart precedes TaskEnd"
+        );
         assert_eq!(
             *sub_agent_ends.lock().unwrap(),
             vec![(AgentId::Main, AgentId::Sub(1), "sub report".to_string())]

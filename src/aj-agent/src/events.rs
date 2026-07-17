@@ -304,6 +304,12 @@ pub enum AgentEvent {
     /// A background task has been registered and its detached driver
     /// started. Transient — not persisted. `call_id` correlates the
     /// task with the originating tool call's transcript cell.
+    ///
+    /// Ordering: the driver emits this as its first act, so it always
+    /// precedes the same task's `TaskOutput` / `TaskEnd`. It is
+    /// unordered relative to the originating `ToolExecutionEnd` (the
+    /// driver races the tool future's return) and may even trail the
+    /// owner's `AgentEnd`.
     TaskStart {
         agent_id: AgentId,
         task_id: TaskId,

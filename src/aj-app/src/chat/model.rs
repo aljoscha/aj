@@ -370,6 +370,22 @@ pub struct ChatState {
     /// scope can list finished tasks. Task events are transient, so a
     /// resumed session starts with an empty map.
     pub(crate) tasks: BTreeMap<TaskId, TaskInfo>,
+    /// Launch cells recorded at `ToolExecutionEnd` for bash results
+    /// carrying a `task_id`, keyed by that id. Replayed results seed
+    /// entries too, with task ids from the previous session world.
+    /// The detached driver's `TaskStart` is unordered relative to the
+    /// tool result and may even trail the owner's `AgentEnd`, which
+    /// wipes `tool_index`. This map is what still links the task to
+    /// its cell then. Only a bash-kind `TaskStart` consumes an entry,
+    /// removing it even when the live `tool_index` lookup wins. Stale
+    /// entries linger (a replayed launch whose `TaskStart` never
+    /// comes, or a live one whose `TaskStart` beat its
+    /// `ToolExecutionEnd`), which is safe: live task ids are unique,
+    /// agent-kind events never consume, and a replayed entry
+    /// colliding with a live bash id is overwritten by the live
+    /// launch's own `ToolExecutionEnd` before a post-`AgentEnd`
+    /// `TaskStart` could need the fallback.
+    pub(crate) pending_task_cells: HashMap<TaskId, EntryId>,
     /// Per-agent footer store (model line + context occupancy).
     pub(crate) footers: AgentFooters,
     /// Model catalog, for resolving a settings identity's context
@@ -411,6 +427,7 @@ impl ChatState {
             active_view: AgentId::Main,
             render: HashMap::new(),
             tasks: BTreeMap::new(),
+            pending_task_cells: HashMap::new(),
             footers: AgentFooters::new(main_settings, main_context_window),
             catalog,
             sub_boxes: HashMap::new(),

@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use aj_agent::events::{AgentEvent, AgentId, SubAgentConclusion};
 use aj_agent::message::AgentMessageKind;
-use aj_agent::tool::{TASK_NOTIFICATION_OPEN_TAG, TaskStatus};
+use aj_agent::tool::{TASK_NOTIFICATION_OPEN_TAG, TaskKind, TaskStatus, ToolDetails};
 use aj_models::streaming::AssistantMessageEvent;
 use aj_models::types::{
     AssistantContent, AssistantMessage, ErrorCategory, Message, StopReason, UserContent,
@@ -223,10 +223,30 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
                     Value::Object(Default::default()),
                 ),
             };
+            // A bash result carrying a task id is a background launch.
+            // Record the cell so a `TaskStart` arriving after the
+            // owner's `AgentEnd` can still find it. A fast task can
+            // already have reached `TaskEnd`, which froze the cell
+            // around the final `TaskOutput` snapshot. The launch
+            // result's empty snapshot must not clobber that.
+            let mut frozen = false;
+            if let ToolDetails::Bash {
+                task_id: Some(task_id),
+                ..
+            } = &result
+            {
+                state.pending_task_cells.insert(*task_id, id);
+                frozen = state
+                    .tasks
+                    .get(task_id)
+                    .is_some_and(|info| info.status.is_terminal());
+            }
             if let Some(entry) = state.tool_entry_mut(agent_id, id) {
                 entry.status = ToolStatus::Done { is_error };
-                entry.details = Some(result);
-                entry.content = content;
+                if !frozen {
+                    entry.details = Some(result);
+                    entry.content = content;
+                }
             }
             Redraw(true)
         }
@@ -412,14 +432,26 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
             kind,
             label,
         } => {
-            // Snapshot the launch cell's id now: the owner's
-            // `tool_index` is wiped on its `AgentEnd`, and task events
-            // keep arriving after the turn.
+            // Resolve the launch cell: from the live `tool_index` when
+            // the owner's turn is still running, else from the linkage
+            // recorded at `ToolExecutionEnd`. `TaskStart` is unordered
+            // relative to that result and may even trail the owner's
+            // `AgentEnd`, which wipes `tool_index`. Only bash-kind
+            // events may touch the fallback: replayed launch cells
+            // seed it with a previous world's task ids, and an
+            // agent-kind task (whose `agent` tool has no cell, it
+            // renders as a sub-agent box) colliding with such an id
+            // must not claim a stale bash cell.
+            let pending = match &kind {
+                TaskKind::Bash { .. } => state.pending_task_cells.remove(&task_id),
+                TaskKind::Agent { .. } => None,
+            };
             let cell = state
                 .render
                 .get(&agent_id)
                 .and_then(|r| r.tool_index.get(&call_id))
-                .copied();
+                .copied()
+                .or(pending);
             if let Some(cell_id) = cell
                 && let Some(entry) = state.tool_entry_mut(agent_id, cell_id)
             {
@@ -2061,6 +2093,14 @@ mod tests {
         apply(
             &mut s,
             &mut life,
+            tool_end(AgentId::Main, "c1", "bash", bash_task_details("", Some(1))),
+        );
+        // The detached driver races the tool future's return, so
+        // `TaskStart` can land on either side of `ToolExecutionEnd`.
+        // This test feeds the post-result order.
+        apply(
+            &mut s,
+            &mut life,
             AgentEvent::TaskStart {
                 agent_id: AgentId::Main,
                 task_id: 1,
@@ -2070,11 +2110,6 @@ mod tests {
                 },
                 label: "sleep 5".into(),
             },
-        );
-        apply(
-            &mut s,
-            &mut life,
-            tool_end(AgentId::Main, "c1", "bash", bash_task_details("", Some(1))),
         );
 
         let cell_details = |s: &ChatState| -> String {
@@ -2141,6 +2176,146 @@ mod tests {
             },
         );
         assert_eq!(cell_details(&s), "LIVETAIL", "frozen cell keeps its tail");
+    }
+
+    #[test]
+    fn task_start_after_owner_agent_end_still_finds_the_launch_cell() {
+        // The detached driver emits `TaskStart` and in the extreme it
+        // lands only after the owner's `AgentEnd` already wiped the
+        // `tool_index`. The linkage recorded at `ToolExecutionEnd` is
+        // what keeps the badge and the live tail working then.
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::AgentStart {
+                agent_id: AgentId::Main,
+            },
+        );
+        apply(&mut s, &mut life, tool_start(AgentId::Main, "c1", "bash"));
+        apply(
+            &mut s,
+            &mut life,
+            tool_end(AgentId::Main, "c1", "bash", bash_task_details("", Some(1))),
+        );
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::AgentEnd {
+                agent_id: AgentId::Main,
+                messages: Vec::new(),
+            },
+        );
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::TaskStart {
+                agent_id: AgentId::Main,
+                task_id: 1,
+                call_id: "c1".into(),
+                kind: TaskKind::Bash {
+                    command: "sleep 5".into(),
+                },
+                label: "sleep 5".into(),
+            },
+        );
+
+        // The cell got its task linkage despite the wiped index.
+        match &entries(&s, AgentId::Main)[0].kind {
+            EntryKind::Tool(t) => assert_eq!(t.task, Some(1), "cell carries the task badge"),
+            other => panic!("unexpected kind: {other:?}"),
+        }
+        // Remove-on-consume: the fallback entry is claimed exactly
+        // once.
+        assert!(
+            s.pending_task_cells.is_empty(),
+            "consumed linkage is removed"
+        );
+
+        // Live tail still lands in the launch cell.
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::TaskOutput {
+                agent_id: AgentId::Main,
+                task_id: 1,
+                call_id: "c1".into(),
+                partial: bash_task_details("LIVETAIL", Some(1)),
+            },
+        );
+        match &entries(&s, AgentId::Main)[0].kind {
+            EntryKind::Tool(t) => match t.details.as_ref().expect("details") {
+                ToolDetails::Bash { stdout, .. } => assert_eq!(stdout, "LIVETAIL"),
+                other => panic!("expected bash details, got {other:?}"),
+            },
+            other => panic!("unexpected kind: {other:?}"),
+        }
+
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::TaskEnd {
+                agent_id: AgentId::Main,
+                task_id: 1,
+                call_id: "c1".into(),
+                status: TaskStatus::Exited(Some(0)),
+                label: "sleep 5".into(),
+            },
+        );
+        let info = s.tasks().get(&1).expect("tracked task");
+        assert_eq!(info.status, TaskStatus::Exited(Some(0)));
+    }
+
+    #[test]
+    fn agent_task_start_does_not_claim_a_replayed_bash_cell() {
+        // Task ids restart at 1 per session world, so a resumed
+        // session's first background task can collide with a task id
+        // in a replayed launch cell. The `agent` tool has no cell (it
+        // renders as a sub-agent box), so a background agent task's
+        // `TaskStart` always misses the live `tool_index` and would
+        // grab the stale fallback entry if consumption were not
+        // bash-gated.
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        // Replay: the persisted launch result arrives without a
+        // preceding Start and seeds the fallback map with the old
+        // session's task id.
+        apply(
+            &mut s,
+            &mut life,
+            tool_end(
+                AgentId::Main,
+                "c-resumed",
+                "bash",
+                bash_task_details("", Some(1)),
+            ),
+        );
+        // Live: a background agent spawn mints task id 1 in the
+        // fresh registry.
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::TaskStart {
+                agent_id: AgentId::Main,
+                task_id: 1,
+                call_id: "c-agent".into(),
+                kind: TaskKind::Agent {
+                    agent_id: 1,
+                    task: "explore".into(),
+                },
+                label: "agent 1".into(),
+            },
+        );
+
+        // The agent task tracks no cell, and the replayed bash cell
+        // stays unclaimed.
+        let info = s.tasks().get(&1).expect("tracked task");
+        assert_eq!(info.cell, None, "agent tasks have no launch cell");
+        match &entries(&s, AgentId::Main)[0].kind {
+            EntryKind::Tool(t) => assert_eq!(t.task, None, "replayed cell stays unclaimed"),
+            other => panic!("unexpected kind: {other:?}"),
+        }
     }
 
     #[test]

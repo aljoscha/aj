@@ -126,6 +126,22 @@ pub struct EventPump {
     /// [`TaskKind::Bash`] entries. Task events are transient, so a
     /// resumed session starts with an empty map.
     tasks: BTreeMap<TaskId, TaskInfo>,
+    /// Launch cells recorded at `ToolExecutionEnd` for bash results
+    /// carrying a `task_id`, keyed by that id. Replayed results seed
+    /// entries too, with task ids from the previous session world.
+    /// The detached driver's `TaskStart` is unordered relative to the
+    /// tool result and may even trail the owner's `AgentEnd`, which
+    /// wipes `tool_index`. This map is what still links the task to
+    /// its cell then. Only a bash-kind `TaskStart` consumes an entry,
+    /// removing it even when the live `tool_index` lookup wins. Stale
+    /// entries linger (a replayed launch whose `TaskStart` never
+    /// comes, or a live one whose `TaskStart` beat its
+    /// `ToolExecutionEnd`), which is safe: live task ids are unique,
+    /// agent-kind events never consume, and a replayed entry
+    /// colliding with a live bash id is overwritten by the live
+    /// launch's own `ToolExecutionEnd` before a post-`AgentEnd`
+    /// `TaskStart` could need the fallback.
+    pending_task_cells: HashMap<TaskId, usize>,
     /// Shared session-wide render settings (tool expansion,
     /// thinking-block fold, inline-image rendering). Cloned into
     /// every assistant / tool component the pump creates so they
@@ -185,6 +201,7 @@ impl EventPump {
             theme,
             agents: HashMap::new(),
             tasks: BTreeMap::new(),
+            pending_task_cells: HashMap::new(),
             render_settings,
             footer_data: AgentFooters::new(main_settings, main_context_window),
             catalog,
@@ -755,14 +772,27 @@ impl EventPump {
                 kind,
                 label,
             } => {
-                // Snapshot the launch cell's index now: the owner's
-                // `tool_index` is wiped on its `AgentEnd`, and task
-                // events keep arriving after the turn.
+                // Resolve the launch cell: from the live `tool_index`
+                // when the owner's turn is still running, else from
+                // the linkage recorded at `ToolExecutionEnd`.
+                // `TaskStart` is unordered relative to that result
+                // and may even trail the owner's `AgentEnd`, which
+                // wipes `tool_index`. Only bash-kind events may touch
+                // the fallback: replayed launch cells seed it with a
+                // previous world's task ids, and an agent-kind task
+                // (whose `agent` tool has no cell, it renders as a
+                // sub-agent box) colliding with such an id must not
+                // claim a stale bash cell.
+                let pending = match kind {
+                    TaskKind::Bash { .. } => self.pending_task_cells.remove(task_id),
+                    TaskKind::Agent { .. } => None,
+                };
                 let cell = self
                     .agents
                     .get(agent_id)
                     .and_then(|a| a.tool_index.get(call_id))
-                    .copied();
+                    .copied()
+                    .or(pending);
                 self.tasks.insert(
                     *task_id,
                     TaskInfo {
@@ -1259,6 +1289,16 @@ impl EventPump {
             return;
         };
         c.update_result(result, content, is_error);
+        // A bash result carrying a task id is a background launch.
+        // Record the cell so a `TaskStart` arriving after the owner's
+        // `AgentEnd` can still find it.
+        if let aj_agent::tool::ToolDetails::Bash {
+            task_id: Some(task_id),
+            ..
+        } = result
+        {
+            self.pending_task_cells.insert(*task_id, idx);
+        }
     }
 
     /// Resolve task `id`'s launch cell: the owner plus the cell's
@@ -3139,8 +3179,10 @@ mod tests {
     }
 
     /// Drive a background-bash launch into the pump: the tool call's
-    /// cell, the task registration, and the immediately-returning
-    /// started result (carrying the task id).
+    /// cell, the immediately-returning started result (carrying the
+    /// task id), then the detached driver's `TaskStart`. The driver
+    /// races the tool future's return, so live delivery can go either
+    /// way. This helper feeds the post-result order.
     fn launch_bash_task(
         tui: &mut Tui,
         pump: &mut EventPump,
@@ -3161,18 +3203,6 @@ mod tests {
         pump.handle(
             life,
             tui,
-            &task_start(
-                AgentId::Main,
-                task_id,
-                call_id,
-                TaskKind::Bash {
-                    command: "sleep 5".into(),
-                },
-            ),
-        );
-        pump.handle(
-            life,
-            tui,
             &AgentEvent::ToolExecutionEnd {
                 agent_id: AgentId::Main,
                 call_id: call_id.into(),
@@ -3181,6 +3211,18 @@ mod tests {
                 content: std::sync::Arc::from(Vec::<aj_models::types::UserContent>::new()),
                 is_error: false,
             },
+        );
+        pump.handle(
+            life,
+            tui,
+            &task_start(
+                AgentId::Main,
+                task_id,
+                call_id,
+                TaskKind::Bash {
+                    command: "sleep 5".into(),
+                },
+            ),
         );
     }
 
@@ -3362,6 +3404,153 @@ mod tests {
         let body = rendered_cell(&mut tui, cell);
         assert!(!body.contains("AFTERFREEZE"), "got:\n{body}");
         assert!(body.contains("LIVETAIL"), "got:\n{body}");
+    }
+
+    #[test]
+    fn task_start_after_owner_agent_end_still_finds_the_launch_cell() {
+        // The detached driver emits `TaskStart` and in the extreme it
+        // lands only after the owner's `AgentEnd` already wiped the
+        // `tool_index`. The linkage recorded at `ToolExecutionEnd` is
+        // what keeps the cell live-tailing and freezable then.
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let mut life = AgentLifecycle::default();
+        pump.handle(
+            &mut life,
+            &mut tui,
+            &AgentEvent::AgentStart {
+                agent_id: AgentId::Main,
+            },
+        );
+        pump.handle(
+            &mut life,
+            &mut tui,
+            &AgentEvent::ToolExecutionStart {
+                agent_id: AgentId::Main,
+                call_id: "c1".into(),
+                tool: "bash".into(),
+                args: serde_json::json!({"command": "sleep 5"}),
+            },
+        );
+        pump.handle(
+            &mut life,
+            &mut tui,
+            &AgentEvent::ToolExecutionEnd {
+                agent_id: AgentId::Main,
+                call_id: "c1".into(),
+                tool: "bash".into(),
+                result: bash_task_details("", Some(1)),
+                content: std::sync::Arc::from(Vec::<aj_models::types::UserContent>::new()),
+                is_error: false,
+            },
+        );
+        pump.handle(
+            &mut life,
+            &mut tui,
+            &AgentEvent::AgentEnd {
+                agent_id: AgentId::Main,
+                messages: Vec::new(),
+            },
+        );
+        pump.handle(
+            &mut life,
+            &mut tui,
+            &task_start(
+                AgentId::Main,
+                1,
+                "c1",
+                TaskKind::Bash {
+                    command: "sleep 5".into(),
+                },
+            ),
+        );
+        // Remove-on-consume: the fallback entry is claimed exactly
+        // once.
+        assert!(
+            pump.pending_task_cells.is_empty(),
+            "consumed linkage is removed"
+        );
+
+        // Live tail still lands in the launch cell.
+        let cell = main_tool_cell(&mut tui);
+        pump.handle(
+            &mut life,
+            &mut tui,
+            &AgentEvent::TaskOutput {
+                agent_id: AgentId::Main,
+                task_id: 1,
+                call_id: "c1".into(),
+                partial: bash_task_details("LIVETAIL", Some(1)),
+            },
+        );
+        let body = rendered_cell(&mut tui, cell);
+        assert!(body.contains("LIVETAIL"), "got:\n{body}");
+
+        // TaskEnd freezes the cell with the terminal-status badge.
+        pump.handle(
+            &mut life,
+            &mut tui,
+            &task_end(AgentId::Main, 1, "c1", TaskStatus::Exited(Some(0))),
+        );
+        let body = rendered_cell(&mut tui, cell);
+        assert!(body.contains("[task #1 · exited 0]"), "got:\n{body}");
+    }
+
+    #[test]
+    fn agent_task_start_does_not_claim_a_replayed_bash_cell() {
+        // Task ids restart at 1 per session world, so a resumed
+        // session's first background task can collide with a task id
+        // in a replayed launch cell. The `agent` tool has no cell (it
+        // renders as a sub-agent box), so a background agent task's
+        // `TaskStart` always misses the live `tool_index` and would
+        // grab the stale fallback entry if consumption were not
+        // bash-gated.
+        let (mut tui, mut pump, _theme) = fresh_tui_with_layout();
+        let mut life = AgentLifecycle::default();
+        // Replay: the persisted launch result arrives without a
+        // preceding Start and seeds the fallback map with the old
+        // session's task id.
+        pump.handle(
+            &mut life,
+            &mut tui,
+            &AgentEvent::ToolExecutionEnd {
+                agent_id: AgentId::Main,
+                call_id: "c-resumed".into(),
+                tool: "bash".into(),
+                result: bash_task_details("", Some(1)),
+                content: std::sync::Arc::from(Vec::<aj_models::types::UserContent>::new()),
+                is_error: false,
+            },
+        );
+        let cell = main_tool_cell(&mut tui);
+        // Live: a background agent spawn mints task id 1 in the
+        // fresh registry.
+        pump.handle(
+            &mut life,
+            &mut tui,
+            &AgentEvent::TaskStart {
+                agent_id: AgentId::Main,
+                task_id: 1,
+                call_id: "c-agent".into(),
+                kind: TaskKind::Agent {
+                    agent_id: 1,
+                    task: "explore".into(),
+                },
+                label: "agent 1".into(),
+            },
+        );
+        // The agent task tracks no cell, so its TaskEnd must not
+        // poke the replayed bash cell.
+        pump.handle(
+            &mut life,
+            &mut tui,
+            &task_end(AgentId::Main, 1, "c-agent", TaskStatus::Exited(Some(0))),
+        );
+        let body = rendered_cell(&mut tui, cell);
+        assert!(body.contains("[task #1]"), "untracked badge stays: {body}");
+        assert!(
+            !body.contains("exited"),
+            "agent TaskEnd must not freeze the replayed cell: {body}"
+        );
     }
 
     #[test]

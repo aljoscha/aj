@@ -397,8 +397,16 @@ impl ToolDefinition for BashTool {
                 command: command.clone(),
             };
             let StartedTask { id, cancel, events } =
-                ctx.start_background_task(kind.clone(), command.clone(), output);
-            events.started(kind).await;
+                ctx.start_background_task(kind, command.clone(), output);
+            // NOTE: no await point between the registry registration
+            // above and the driver spawn below. Tool futures are
+            // cancelled by drop, and a drop in that window would leave
+            // a phantom `Running` entry with no driver to ever flip it
+            // (and an orphaned child process nobody watches). The
+            // driver owns all task lifecycle emissions: `TaskStart`
+            // first, then `TaskOutput` / `TaskEnd`. That first emit
+            // races this future's own return, so `TaskStart` may land
+            // before or after the launch's `ToolExecutionEnd`.
             tokio::spawn(drive_background_bash(BackgroundBash {
                 child,
                 child_pid,
@@ -815,9 +823,10 @@ struct BackgroundBash {
     events: TaskEventSink,
 }
 
-/// Drive a background bash task to completion: emit throttled
-/// `TaskOutput` snapshots, kill the process group on cancellation,
-/// and finish with the registry status flip + completion notice.
+/// Drive a background bash task to completion: announce it with
+/// `TaskStart`, emit throttled `TaskOutput` snapshots, kill the
+/// process group on cancellation, and finish with the registry status
+/// flip + completion notice.
 async fn drive_background_bash(task: BackgroundBash) {
     let BackgroundBash {
         mut child,
@@ -832,6 +841,12 @@ async fn drive_background_bash(task: BackgroundBash) {
         cancel,
         events,
     } = task;
+
+    events
+        .started(TaskKind::Bash {
+            command: command.clone(),
+        })
+        .await;
 
     let mut last_update = Instant::now() - UPDATE_DEBOUNCE;
     // `None` forces the leading-edge emit so the TUI cell shows the
@@ -2079,6 +2094,45 @@ mod tests {
         assert!(
             body.contains(&format!("Full output: {}", spill_path.display())),
             "notice body: {body:?}"
+        );
+
+        std::fs::remove_file(&spill_path).ok();
+    }
+
+    /// The detached driver announces the task on the bus as its
+    /// first act: `TaskStart` is emitted and precedes the same
+    /// task's `TaskEnd`. Deleting the driver's `started` emit must
+    /// fail here.
+    #[tokio::test]
+    async fn background_driver_emits_task_start_before_task_end() {
+        let mut ctx = DummyToolContext::default();
+        let events: Arc<StdMutex<Vec<(&'static str, aj_agent::tool::TaskId)>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let events_clone = Arc::clone(&events);
+        let _sub = ctx.bus.subscribe(aj_agent::bus::listener_from_sync(
+            move |event| match event {
+                aj_agent::events::AgentEvent::TaskStart { task_id, .. } => {
+                    events_clone.lock().unwrap().push(("start", *task_id));
+                }
+                aj_agent::events::AgentEvent::TaskEnd { task_id, .. } => {
+                    events_clone.lock().unwrap().push(("end", *task_id));
+                }
+                _ => {}
+            },
+        ));
+
+        let (id, spill_path) = start_background(&mut ctx, "true", 30).await;
+        // The registry flips terminal before the `TaskEnd` emit, so
+        // wait for the emit itself.
+        wait_for(
+            || events.lock().unwrap().contains(&("end", id)),
+            "TaskEnd on the bus",
+        )
+        .await;
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![("start", id), ("end", id)],
+            "TaskStart precedes TaskEnd"
         );
 
         std::fs::remove_file(&spill_path).ok();
