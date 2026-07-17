@@ -449,10 +449,11 @@ pub fn prepare_log(
     // invalid id (truncated file, hand-edited log) fails the whole build
     // rather than silently resuming the default head, so a successful
     // return guarantees the requested head is installed. The empty-log case
-    // (head `None`) never carries an override.
+    // (head `None`) never carries an override. No context wrapper here:
+    // `set_head`'s `InvalidHead` message names the offending entry and is
+    // fit to surface to the user verbatim, a wrapper would bury it.
     if let SessionSource::Resume { head: Some(h), .. } = source {
-        log.set_head(h.clone())
-            .with_context(|| format!("failed to apply branch head {h}"))?;
+        log.set_head(h.clone())?;
     }
 
     let mut restore_notices = Vec::new();
@@ -681,8 +682,9 @@ mod tests {
 
     /// A stale head override (an id not in the log) fails the build: the
     /// override is apply-or-fail, so the caller's fallback machinery (not a
-    /// silent default-head resume) handles it. The error names the requested
-    /// head and carries the log's InvalidHead cause.
+    /// silent default-head resume) handles it. The error IS the log's
+    /// `InvalidHead`, naming the requested head, so the caller's notice
+    /// surfaces the reason directly.
     #[test]
     fn prepare_log_errors_on_a_stale_head_override() {
         let dir = TempDir::new().expect("tempdir");
@@ -712,12 +714,10 @@ mod tests {
 
         let chain = format!("{err:#}");
         assert!(
-            chain.contains("failed to apply branch head does-not-exist"),
-            "the context names the requested head: {chain}"
-        );
-        assert!(
-            chain.contains("invalid conversation head"),
-            "the InvalidHead cause is in the chain: {chain}"
+            chain.contains(
+                "invalid conversation head: entry does-not-exist is not in this session's log"
+            ),
+            "the InvalidHead message names the requested head: {chain}"
         );
     }
 

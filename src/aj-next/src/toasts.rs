@@ -6,7 +6,7 @@
 //! stacked vertically in the same bottom-right spot whether or not a modal
 //! overlay is open (the Shell picks the z, this module only builds surfaces).
 //! Each toast carries its own timer. A toast has no self-timer widget-side:
-//! the drive loop wakes at the earliest live deadline, prunes what expired
+//! the drive loop wakes at the earliest deadline, prunes what expired
 //! ([`prune_expired`]), and requests the clearing repaint, so every toast
 //! vanishes exactly on time even while others stay live.
 
@@ -23,15 +23,16 @@ use crate::transcript::TranscriptStyles;
 
 /// How long the copy toast stays up: a couple of seconds, matching the
 /// quit-arm hint's timeout so the two boxes feel of a piece.
-pub(crate) const COPY_TOAST_DURATION: Duration = Duration::from_millis(2000);
+const COPY_TOAST_DURATION: Duration = Duration::from_millis(2000);
 
 /// How long a notice toast stays up. Longer than the copy toast because a
-/// busy refusal carries a remedy tail the user should get to read.
-pub(crate) const NOTICE_TOAST_DURATION: Duration = Duration::from_millis(4000);
+/// busy refusal carries a remedy row the user should get to read.
+const NOTICE_TOAST_DURATION: Duration = Duration::from_millis(4000);
 
 /// A styled toast fragment. Semantic kinds rather than resolved `Style`s so a
 /// runtime theme swap re-tints a live toast through the widget's current
 /// styles.
+#[derive(PartialEq, Eq)]
 pub(crate) enum ToastSpan {
     /// The accent (key-hint) style, for the value part of a value/label pair.
     Accent(String),
@@ -39,10 +40,31 @@ pub(crate) enum ToastSpan {
     Dim(String),
 }
 
-/// One raised toast: its styled message, when it was raised, and how long it
-/// stays up.
+/// A toast's body: one or more rows of styled spans. Most toasts are a
+/// single row; the busy refusal splits its message and remedy across two so
+/// the box stays narrow enough for an 80-column terminal.
+pub(crate) struct ToastBody {
+    rows: Vec<Vec<ToastSpan>>,
+}
+
+impl From<String> for ToastBody {
+    fn from(message: String) -> ToastBody {
+        ToastBody {
+            rows: vec![vec![ToastSpan::Dim(message)]],
+        }
+    }
+}
+
+impl From<&str> for ToastBody {
+    fn from(message: &str) -> ToastBody {
+        ToastBody::from(message.to_string())
+    }
+}
+
+/// One raised toast: its styled body rows, when it was raised, and how long
+/// it stays up.
 pub(crate) struct Toast {
-    spans: Vec<ToastSpan>,
+    rows: Vec<Vec<ToastSpan>>,
     raised_at: Instant,
     duration: Duration,
 }
@@ -58,15 +80,14 @@ impl Toast {
         self.raised_at + self.duration
     }
 
-    /// The unstyled message text, for test assertions.
+    /// The unstyled message text, rows newline-joined, for test assertions.
     #[cfg(test)]
     pub(crate) fn text(&self) -> String {
-        self.spans
+        self.rows
             .iter()
-            .map(|s| match s {
-                ToastSpan::Accent(t) | ToastSpan::Dim(t) => t.as_str(),
-            })
-            .collect()
+            .map(|row| row_text(row))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
@@ -74,16 +95,12 @@ impl Toast {
 /// the [`Toasts`] widget draws, and the drive loop prunes and schedules wakes.
 pub(crate) type ToastStack = Rc<RefCell<Vec<Toast>>>;
 
-/// Raise a transient notice toast with `message`. Live toasts stack, each
+/// Raise a transient notice toast with `body`. Live toasts stack, each
 /// with its own timer. The caller still owns the repaint: raise this, then
 /// request a redraw so the box appears immediately (the drive loop schedules
 /// the clearing repaint at the toast's deadline).
-pub(crate) fn show_toast(stack: &ToastStack, message: impl Into<String>) {
-    stack.borrow_mut().push(Toast {
-        spans: vec![ToastSpan::Dim(message.into())],
-        raised_at: Instant::now(),
-        duration: NOTICE_TOAST_DURATION,
-    });
+pub(crate) fn show_toast(stack: &ToastStack, body: impl Into<ToastBody>) {
+    push_or_refresh(stack, body.into().rows, NOTICE_TOAST_DURATION);
 }
 
 /// Raise the "copied to clipboard" toast for a select-to-copy of `chars`
@@ -95,13 +112,30 @@ pub(crate) fn push_copy_toast(stack: &ToastStack, chars: usize) {
     } else {
         "characters"
     };
-    stack.borrow_mut().push(Toast {
-        spans: vec![
+    push_or_refresh(
+        stack,
+        vec![vec![
             ToastSpan::Accent(chars.to_string()),
             ToastSpan::Dim(format!(" {noun} copied to clipboard")),
-        ],
+        ]],
+        COPY_TOAST_DURATION,
+    );
+}
+
+/// Push a toast, or, when a live toast with identical content is already on
+/// the stack, refresh that one's timer instead. Without the dedup a held
+/// chord (key repeat on a refused gesture) would stack a column of identical
+/// boxes, one per repeat.
+fn push_or_refresh(stack: &ToastStack, rows: Vec<Vec<ToastSpan>>, duration: Duration) {
+    let mut toasts = stack.borrow_mut();
+    if let Some(same) = toasts.iter_mut().find(|t| t.is_live() && t.rows == rows) {
+        same.raised_at = Instant::now();
+        return;
+    }
+    toasts.push(Toast {
+        rows,
         raised_at: Instant::now(),
-        duration: COPY_TOAST_DURATION,
+        duration,
     });
 }
 
@@ -114,15 +148,26 @@ pub(crate) fn prune_expired(stack: &ToastStack) -> bool {
     toasts.len() != before
 }
 
-/// The earliest live toast's expiry, for the drive loop's wake deadline.
-/// `None` when nothing is live.
+/// The earliest toast's expiry, for the drive loop's wake deadline. `None`
+/// only when the stack is empty.
+///
+/// Deliberately over every toast still on the stack, expired or not: a toast
+/// that expires between the loop's prune and this computation yields a past
+/// deadline, so the wake fires immediately and the next prune drops it and
+/// requests the clearing repaint. Filtering to live toasts would leave that
+/// toast painted, with no wake scheduled, until an unrelated event.
 pub(crate) fn earliest_toast_deadline(stack: &ToastStack) -> Option<Instant> {
-    stack
-        .borrow()
-        .iter()
-        .filter(|t| t.is_live())
-        .map(Toast::deadline)
-        .min()
+    stack.borrow().iter().map(Toast::deadline).min()
+}
+
+/// The unstyled text of one toast row, for test assertions.
+#[cfg(test)]
+fn row_text(row: &[ToastSpan]) -> String {
+    row.iter()
+        .map(|s| match s {
+            ToastSpan::Accent(t) | ToastSpan::Dim(t) => t.as_str(),
+        })
+        .collect()
 }
 
 /// The unstyled messages of the live toasts, in stack order, for tests.
@@ -136,25 +181,33 @@ pub(crate) fn toast_texts(stack: &ToastStack) -> Vec<String> {
         .collect()
 }
 
-/// The refusal toast for a session-changing gesture while work is running:
-/// `"Can't <what> while work is running · <remedies>"`. One builder so the
-/// wording (and the remedy tail) can't drift across the refuse sites.
-pub(crate) fn busy_refusal(what: &str) -> String {
-    format!(
-        "Can't {what} while work is running \u{00b7} {}",
-        remedy_tail()
-    )
+/// The refusal toast for a session-changing gesture while work is running.
+/// Two rows: the message (`"Can't <what> while work is running"`) and the
+/// remedy row, split so the box fits an 80-column terminal. One builder so
+/// the wording (and the remedy) can't drift across the refuse sites.
+pub(crate) fn busy_refusal(what: &str) -> ToastBody {
+    ToastBody {
+        rows: vec![
+            vec![ToastSpan::Dim(format!(
+                "Can't {what} while work is running"
+            ))],
+            vec![ToastSpan::Dim(remedy_row())],
+        ],
+    }
 }
 
-/// The remedy tail shared by every busy refusal: how to cancel the running
+/// The remedy row shared by every busy refusal: how to cancel the running
 /// turn and where to stop background tasks. The cancel chord is a fixed
 /// terminal convention (no keybinding entry), so it reads from `fixed_keys`;
 /// the picker chord resolves through the keybinding data, falling back to the
 /// literal if the entry ever disappears.
-fn remedy_tail() -> String {
+fn remedy_row() -> String {
     let picker =
         default_action_shortcut(ACTION_AGENT_PICKER).unwrap_or_else(|| "Alt+A".to_string());
-    format!("{} cancels, {picker} stops tasks", fixed_keys::CTRL_C)
+    format!(
+        "{} cancels \u{00b7} {picker} stops tasks",
+        fixed_keys::CTRL_C
+    )
 }
 
 /// The toast-stack widget.
@@ -200,15 +253,23 @@ impl Toasts {
         let mut remaining = avail.height;
         let mut out = Vec::new();
         for toast in self.toasts.borrow().iter().filter(|t| t.is_live()) {
-            let spans: Vec<_> = toast
-                .spans
-                .iter()
-                .map(|s| match s {
-                    ToastSpan::Accent(t) => span(t.clone(), self.styles.keybinding_hint),
-                    ToastSpan::Dim(t) => span(t.clone(), self.styles.dim),
-                })
-                .collect();
-            let content_width = spans.iter().map(|s| ctx.string_width(&s.text)).sum();
+            let mut spans = Vec::new();
+            let mut content_width = 0;
+            for (i, row) in toast.rows.iter().enumerate() {
+                if i > 0 {
+                    spans.push(span("\n".to_string(), self.styles.dim));
+                }
+                let mut row_width = 0;
+                for s in row {
+                    let (text, style) = match s {
+                        ToastSpan::Accent(t) => (t, self.styles.keybinding_hint),
+                        ToastSpan::Dim(t) => (t, self.styles.dim),
+                    };
+                    row_width += ctx.string_width(text);
+                    spans.push(span(text.clone(), style));
+                }
+                content_width = content_width.max(row_width);
+            }
             let Some(surf) = corner_box(
                 ctx,
                 &chrome,
@@ -220,7 +281,7 @@ impl Toasts {
                     title: String::new(),
                     spans,
                     content_width,
-                    content_rows: 1,
+                    content_rows: toast.rows.len(),
                 },
             ) else {
                 continue;
@@ -393,10 +454,12 @@ mod tests {
         assert!(rows(&surfs[1]).join("\n").contains("newer toast"));
     }
 
-    /// Per-toast expiry: with two toasts raised apart, the earlier one's
-    /// deadline drives the wake, and the prune at that wake drops only the
-    /// expired toast (returning `true` so the drive loop repaints) while the
-    /// later stays live with its own later deadline.
+    /// Per-toast expiry: with two toasts raised apart, the wake deadline
+    /// tracks the earliest toast on the stack (here the already-expired copy
+    /// toast, whose past deadline fires the wake immediately), and the prune
+    /// at that wake drops only the expired toast (returning `true` so the
+    /// drive loop repaints) while the later stays live with its own later
+    /// deadline, which then drives the next wake.
     #[test]
     fn earlier_toast_expires_and_prunes_while_later_stays_live() {
         let stack = empty_stack();
@@ -406,32 +469,111 @@ mod tests {
         backdate_last(&stack, COPY_TOAST_DURATION + Duration::from_millis(1));
         show_toast(&stack, "still live");
 
-        // The wake deadline tracks the earliest LIVE toast, i.e. the notice.
-        let notice_deadline = stack.borrow()[1].deadline();
-        assert_eq!(earliest_toast_deadline(&stack), Some(notice_deadline));
+        // The wake deadline is the expired copy toast's, already in the past.
+        let copy_deadline = stack.borrow()[0].deadline();
+        assert_eq!(earliest_toast_deadline(&stack), Some(copy_deadline));
+        assert!(copy_deadline <= Instant::now(), "an immediate wake");
 
         // The prune drops exactly the expired copy toast and reports it, so
         // the drive loop requests the clearing repaint while the notice stays.
         assert!(prune_expired(&stack), "the expired toast was pruned");
         assert_eq!(toast_texts(&stack), vec!["still live".to_string()]);
         assert!(!prune_expired(&stack), "nothing left to prune");
+
+        // The next wake tracks the surviving notice's deadline.
+        let notice_deadline = stack.borrow()[0].deadline();
+        assert_eq!(earliest_toast_deadline(&stack), Some(notice_deadline));
     }
 
-    /// Every busy refusal shares the same shape and remedy tail, resolved
-    /// from the keybinding data.
+    /// A toast that expires between the loop's prune and its deadline
+    /// computation still yields a wake deadline (a past one), so the next
+    /// wake fires immediately and prunes it. `None` would disable the sleep
+    /// arm and strand the painted toast until an unrelated event.
     #[test]
-    fn busy_refusal_carries_the_remedy_tail() {
+    fn expired_unpruned_toast_still_yields_a_deadline() {
+        let stack = empty_stack();
+        show_toast(&stack, "just expired");
+        backdate_last(&stack, NOTICE_TOAST_DURATION + Duration::from_millis(1));
+        let deadline = earliest_toast_deadline(&stack)
+            .expect("an expired-but-unpruned toast still schedules a wake");
+        assert!(deadline <= Instant::now(), "the deadline is in the past");
+    }
+
+    /// Raising a toast identical to a live one refreshes that toast's timer
+    /// instead of stacking a duplicate (key repeat on a refused chord).
+    /// Different content still stacks.
+    #[test]
+    fn identical_toasts_refresh_instead_of_stacking() {
+        let stack = empty_stack();
+        show_toast(&stack, "same message");
+        backdate_last(&stack, Duration::from_millis(500));
+        let first_deadline = stack.borrow()[0].deadline();
+
+        show_toast(&stack, "same message");
+        assert_eq!(stack.borrow().len(), 1, "the duplicate did not stack");
+        assert!(
+            stack.borrow()[0].deadline() > first_deadline,
+            "the duplicate refreshed the live toast's timer"
+        );
+
+        show_toast(&stack, "different message");
+        assert_eq!(stack.borrow().len(), 2, "different content stacks");
+    }
+
+    /// Every busy refusal shares the same two-row shape: the message row and
+    /// the remedy row, resolved from the keybinding data.
+    #[test]
+    fn busy_refusal_carries_the_remedy_row() {
+        let body = busy_refusal("switch sessions");
         assert_eq!(
-            busy_refusal("switch sessions"),
-            "Can't switch sessions while work is running \u{00b7} \
-             Ctrl+C cancels, Alt+A stops tasks"
+            body.rows.iter().map(|r| row_text(r)).collect::<Vec<_>>(),
+            vec![
+                "Can't switch sessions while work is running".to_string(),
+                "Ctrl+C cancels \u{00b7} Alt+A stops tasks".to_string(),
+            ]
         );
         let picker = default_action_shortcut(ACTION_AGENT_PICKER).expect("picker chord bound");
         for what in ["switch branches", "branch", "start a new session"] {
-            let msg = busy_refusal(what);
-            assert!(msg.contains(&format!("Can't {what} while work is running")));
-            assert!(msg.contains(fixed_keys::CTRL_C), "{msg}");
-            assert!(msg.contains(&picker), "{msg}");
+            let body = busy_refusal(what);
+            assert_eq!(body.rows.len(), 2, "two rows for {what}");
+            assert_eq!(
+                row_text(&body.rows[0]),
+                format!("Can't {what} while work is running")
+            );
+            let remedy = row_text(&body.rows[1]);
+            assert!(remedy.contains(fixed_keys::CTRL_C), "{remedy}");
+            assert!(remedy.contains(&picker), "{remedy}");
+        }
+    }
+
+    /// Every busy refusal draws on a classic 80-column terminal: the two-row
+    /// split keeps each row narrow enough for the frame to fit.
+    #[test]
+    fn busy_refusals_fit_an_80_column_terminal() {
+        for what in [
+            "switch sessions",
+            "switch branches",
+            "branch",
+            "start a new session",
+        ] {
+            let stack = empty_stack();
+            show_toast(&stack, busy_refusal(what));
+            let toasts = widget_over(&stack);
+            let ctx = draw_ctx(80, Some(24));
+            let surfs = toasts.draw_stack(
+                &ctx,
+                Size {
+                    width: 80,
+                    height: 24,
+                },
+            );
+            assert_eq!(surfs.len(), 1, "the {what} refusal fits 80 columns");
+            let body = rows(&surfs[0]).join("\n");
+            assert!(
+                body.contains(&format!("Can't {what} while work is running")),
+                "{body:?}"
+            );
+            assert!(body.contains("stops tasks"), "{body:?}");
         }
     }
 }

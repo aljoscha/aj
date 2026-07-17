@@ -88,7 +88,7 @@ use crate::settings_ui::{
 use crate::splash::{SPLASH_WAKE_EVENT, Splash};
 use crate::status::{STATUS_WAKE_EVENT, StatusLine, StatusState};
 use crate::task_output::open_task_output;
-use crate::toasts::{ToastStack, Toasts, busy_refusal};
+use crate::toasts::{ToastBody, ToastStack, Toasts, busy_refusal};
 use crate::transcript::{TranscriptStyles, TranscriptView, vaxis_color};
 use crate::usage_overlay::open_usage_overlay;
 
@@ -1327,7 +1327,7 @@ fn handle_host_action(world: &mut World, shell: &Rc<RefCell<Shell>>, action: AjA
 /// chosen mid-turn.
 fn session_busy_notice(what: &str) -> String {
     format!(
-        "Can't {what} while a turn is running \u{2014} press {} to cancel it first.",
+        "Can't {what} while a turn is running. Press {} to cancel it first.",
         fixed_keys::CTRL_C
     )
 }
@@ -1492,7 +1492,7 @@ fn hand_off_branch_prompt(
         shell.borrow().editor.borrow_mut().set_text(&prompt);
         fold_notice(
             world,
-            "Branch failed; your message was restored to the editor.",
+            "Branch failed. Your message was restored to the editor.",
         );
         false
     }
@@ -3628,11 +3628,11 @@ impl Shell {
         clear_branch(&self.branch_anchor, &self.branch_indicator);
     }
 
-    /// Raise a transient bottom-right toast with `message`. Live toasts
+    /// Raise a transient bottom-right toast with `body`. Live toasts
     /// stack, each with its own timer. The caller still owns the repaint (the
     /// drive loop schedules the clearing repaint at the toast's deadline).
-    fn show_toast(&self, message: impl Into<String>) {
-        crate::toasts::show_toast(&self.toasts, message);
+    fn show_toast(&self, body: impl Into<ToastBody>) {
+        crate::toasts::show_toast(&self.toasts, body);
     }
 
     /// Take the "an Esc cancelled the armed anchor" flag, so the drive loop
@@ -7411,6 +7411,41 @@ mod tests {
             crate::toasts::toast_texts(&shell.borrow().toasts).len(),
             1,
             "exactly one toast on the stack"
+        );
+    }
+
+    /// The drive loop seeds `copied_seen` from the restored record's `at`
+    /// before its first iteration, so a record carried over from a previous
+    /// session folds NO toast. A fresh record (a new `at`) still toasts once.
+    #[test]
+    fn preseeded_copy_record_does_not_retoast() {
+        let shell = test_shell_with_chat(empty_chat());
+        let at = Instant::now();
+        shell.borrow().copied.set(Some(Copied { chars: 7, at }));
+
+        // The loop-start seed: `seen` already holds the record's timestamp.
+        let mut seen = Some(at);
+        assert!(
+            !fold_copied_record(&shell.borrow(), &mut seen),
+            "the seeded record folds no toast"
+        );
+        assert!(
+            crate::toasts::toast_texts(&shell.borrow().toasts).is_empty(),
+            "no toast for a previous session's copy"
+        );
+
+        shell.borrow().copied.set(Some(Copied {
+            chars: 9,
+            at: at + std::time::Duration::from_millis(1),
+        }));
+        assert!(
+            fold_copied_record(&shell.borrow(), &mut seen),
+            "a fresh record still toasts"
+        );
+        assert_eq!(
+            crate::toasts::toast_texts(&shell.borrow().toasts).len(),
+            1,
+            "exactly one toast for the fresh record"
         );
     }
 
@@ -11941,8 +11976,9 @@ mod tests {
             next.notices
                 .first()
                 .is_some_and(|n| n.contains("Failed to branch the conversation")
+                    && n.contains("invalid conversation head")
                     && n.contains("does-not-exist")),
-            "the fallback leads with the branch-failure notice: {:?}",
+            "the fallback leads with the branch-failure notice naming the reason: {:?}",
             next.notices
         );
 

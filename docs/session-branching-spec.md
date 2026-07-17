@@ -304,9 +304,11 @@ boundary sees full pre-compaction history through the normal projection.
 - **Background tasks:** the `turns` check does not cover detached bash tasks
   and background sub-agents, and the rebuild's shutdown would kill them
   silently, which is surprising for a gesture the user reads as "edit and
-  resend". Branch operations therefore use the quit-hint pattern: the first
-  attempt with live background tasks shows a warning with the task count, and
-  repeating the action confirms and shuts them down.
+  resend". Branch submit, tree-view switching, session switching, and
+  starting a new session therefore all refuse outright while background work
+  runs. The refusal is a toast that names the blocked action and carries a
+  short remedy: cancel the running turn with Ctrl+C, or stop background
+  tasks from the agent picker.
 - **The prompt is never lost and never missubmitted.** The armed submit
   records the prompt to prompt history before breaking out of `drive()` (the
   normal drive-loop submit site is bypassed). A requested head override is
@@ -507,8 +509,8 @@ Each phase lands independently and keeps all tests green.
   subsequent append creates a sibling on disk. `set_head` rejects sub-agent
   entries and missing ids. Resume with a head override linearizes the right
   path, a stale override fails the build with an error. Repair with a head
-  override
-  anchors its synthesized results at the override (pin the ordering).
+  override anchors its synthesized results at the override (pin the
+  ordering).
   Path-aware replay excludes sibling branches, includes sub-agent threads
   anchored on the path, and includes legacy sub threads without spawn roots
   (pin the concurrent-writer interleave fix). Message-id backfill on
