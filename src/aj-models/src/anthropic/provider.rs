@@ -774,9 +774,10 @@ fn build_thinking(
     }
     let level = reasoning;
     if !model.reasoning {
-        // The caller asked for reasoning on a non-reasoning model.
-        // The spec maps this to "disabled" — silently ignoring the
-        // ThinkingLevel rather than rejecting the request.
+        // Defensive: `validate_thinking_level` rejects any non-off level
+        // on a non-reasoning model before a request is built, so this is
+        // only reached if that gate is bypassed. Disable thinking either
+        // way to keep the request valid.
         return (Some(AThinking::Disabled), None);
     }
     let display = display.map(to_anthropic_display);

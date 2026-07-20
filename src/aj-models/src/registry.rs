@@ -531,10 +531,10 @@ const ALL_THINKING_LEVELS: [ThinkingLevel; 7] = [
 /// - Anthropic extended thinking is opt-in, so every reasoning Anthropic
 ///   model can also run with thinking `off`, regardless of its effort
 ///   enum (which names only the levels used while thinking is on).
-/// - A budget-only model (a token budget, no effort enum) and an
-///   under-described reasoning model (no controls at all) both fall back
-///   to the full ladder: we discretize the budget onto it, or lack the
-///   data to be exact, and let the provider surface any 400.
+/// - A reasoning model with no `Effort` control (budget-only,
+///   toggle-only, or no controls at all) has no effort vocabulary to be
+///   exact about, so it falls back to the full ladder and lets the
+///   provider surface any level it can't honour.
 pub fn supported_thinking_levels(model: &ModelInfo) -> Vec<ThinkingLevel> {
     if !model.reasoning {
         return vec![ThinkingLevel::Off];
@@ -542,7 +542,6 @@ pub fn supported_thinking_levels(model: &ModelInfo) -> Vec<ThinkingLevel> {
 
     let mut offered: Vec<ThinkingLevel> = Vec::new();
     let mut has_effort = false;
-    let mut has_budget = false;
     for option in &model.reasoning_options {
         match option {
             ReasoningOption::Effort { values } => {
@@ -550,7 +549,9 @@ pub fn supported_thinking_levels(model: &ModelInfo) -> Vec<ThinkingLevel> {
                 offered.extend(values.iter().copied());
             }
             ReasoningOption::Toggle => offered.push(ThinkingLevel::Off),
-            ReasoningOption::BudgetTokens { .. } => has_budget = true,
+            // A token budget accepts any effort; the no-effort fallback
+            // below turns that into the full ladder.
+            ReasoningOption::BudgetTokens { .. } => {}
         }
     }
 
@@ -558,15 +559,25 @@ pub fn supported_thinking_levels(model: &ModelInfo) -> Vec<ThinkingLevel> {
         offered.push(ThinkingLevel::Off);
     }
 
-    if (has_budget && !has_effort) || model.reasoning_options.is_empty() {
+    // No effort vocabulary to be exact about (budget-only, toggle-only,
+    // or no controls at all): offer the full ladder.
+    if !has_effort {
         return ALL_THINKING_LEVELS.to_vec();
     }
 
-    ALL_THINKING_LEVELS
+    let levels: Vec<ThinkingLevel> = ALL_THINKING_LEVELS
         .iter()
         .copied()
         .filter(|level| offered.contains(level))
-        .collect()
+        .collect();
+    // An effort control normally maps at least one level, but an empty
+    // or all-unknown effort enum (only reachable via a hand-edited
+    // override) would leave nothing. Fall back to the full ladder so the
+    // returned set is never empty and reasoning stays reachable.
+    if levels.is_empty() {
+        return ALL_THINKING_LEVELS.to_vec();
+    }
+    levels
 }
 
 // ============================================================================
@@ -1243,6 +1254,18 @@ mod tests {
         unknown.reasoning = true;
         assert_eq!(
             supported_thinking_levels(&unknown),
+            ALL_THINKING_LEVELS.to_vec()
+        );
+
+        // A non-Anthropic reasoning model whose only control is a toggle
+        // has no effort vocabulary, so it also gets the full ladder
+        // (never just `[off]`, which would make reasoning unreachable).
+        let mut toggle = sample_model("openai", "toggle-only");
+        toggle.api = "openai-responses".into();
+        toggle.reasoning = true;
+        toggle.reasoning_options = vec![ReasoningOption::Toggle];
+        assert_eq!(
+            supported_thinking_levels(&toggle),
             ALL_THINKING_LEVELS.to_vec()
         );
     }

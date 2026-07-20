@@ -382,6 +382,51 @@ mod tests {
     }
 
     #[test]
+    fn thinking_levels_for_filters_to_supported_levels() {
+        use aj_models::registry::ReasoningOption;
+        use aj_models::types::ThinkingLevel;
+
+        // An effort enum without off or the top rungs surfaces only those
+        // rungs, matched by name against the catalog rows.
+        let mut restricted = sample_model("openai", "gpt-x", "openai-responses");
+        restricted.reasoning = true;
+        restricted.reasoning_options = vec![ReasoningOption::Effort {
+            values: vec![
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High,
+            ],
+        }];
+        let names: Vec<&str> = crate::commands::thinking_levels_for(&restricted)
+            .iter()
+            .map(|row| row.name)
+            .collect();
+        assert_eq!(names, vec!["low", "medium", "high"]);
+
+        // A non-reasoning model offers only off.
+        let plain = sample_model("openai", "gpt-4o", "openai-responses");
+        let names: Vec<&str> = crate::commands::thinking_levels_for(&plain)
+            .iter()
+            .map(|row| row.name)
+            .collect();
+        assert_eq!(names, vec!["off"]);
+
+        // An under-described reasoning model gets the full ladder, which
+        // exercises the name bridge across all seven levels (incl. off,
+        // xhigh).
+        let mut full = sample_model("openai", "gpt-y", "openai-responses");
+        full.reasoning = true;
+        let names: Vec<&str> = crate::commands::thinking_levels_for(&full)
+            .iter()
+            .map(|row| row.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+        );
+    }
+
+    #[test]
     fn pick_model_returns_explicit_match() {
         let reg = registry(vec![
             sample_model("anthropic", "claude-x", "anthropic-messages"),

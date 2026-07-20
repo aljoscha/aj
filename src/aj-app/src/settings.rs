@@ -358,29 +358,31 @@ pub async fn confirm_thinking_for_sub(
         };
     }
     let name = thinking_level_name(&level);
-    // Validate against the target's model: the staged bundle override's
-    // info if present, else the model the frontend tracks, else skip
-    // (same lenient posture as scripted mode).
-    if let Some(tc) = level.as_ref() {
-        let target_info: Option<Arc<ModelInfo>> = {
-            let overrides = core
-                .sub_overrides
-                .lock()
-                .expect("sub overrides mutex poisoned");
-            overrides
-                .get(&n)
-                .and_then(|o| o.bundle.as_ref())
-                .map(|(_, info, _, _)| Arc::clone(info))
-        }
-        .or(tracked_model);
-        if let Some(info) = target_info
-            && let Err(msg) = validate_thinking_level(&info, &thinking_level_for(tc))
-        {
-            return SubConfirm {
-                notice: format!("Can't set thinking level {name:?} for agent {n}: {msg}"),
-                applied: false,
-            };
-        }
+    // Validate the chosen level (including off) against the target's
+    // model: the staged bundle override's info if present, else the model
+    // the frontend tracks, else skip (no model in scope, e.g. scripted).
+    let wire = level
+        .as_ref()
+        .map(thinking_level_for)
+        .unwrap_or(aj_models::types::ThinkingLevel::Off);
+    let target_info: Option<Arc<ModelInfo>> = {
+        let overrides = core
+            .sub_overrides
+            .lock()
+            .expect("sub overrides mutex poisoned");
+        overrides
+            .get(&n)
+            .and_then(|o| o.bundle.as_ref())
+            .map(|(_, info, _, _)| Arc::clone(info))
+    }
+    .or(tracked_model);
+    if let Some(info) = target_info
+        && let Err(msg) = validate_thinking_level(&info, &wire)
+    {
+        return SubConfirm {
+            notice: format!("Can't set thinking level {name:?} for agent {n}: {msg}"),
+            applied: false,
+        };
     }
     // Stage the standing choice; the sub's next turn applies it.
     core.sub_overrides

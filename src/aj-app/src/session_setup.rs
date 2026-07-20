@@ -18,7 +18,7 @@ use aj_agent::{Agent, AgentSeed};
 use aj_conf::{AgentEnv, Config, ConfigSpeed};
 use aj_models::auth::AuthStorage;
 use aj_models::provider::Provider;
-use aj_models::registry::{ModelInfo, ModelRegistry, validate_thinking_level};
+use aj_models::registry::{ModelInfo, ModelRegistry};
 use aj_models::types::{Speed, StreamOptions, ThinkingLevel, Verbosity};
 use aj_models::{
     ThinkingConfig, speed_name, thinking_config_from_name, thinking_config_name,
@@ -295,27 +295,18 @@ pub(crate) fn restore_session_settings(
         }
     }
 
-    // Thinking, validated against the (possibly just-restored) model.
-    // Clamping rules are provider-specific, so a rejected level keeps
-    // the current one rather than guessing a substitute.
+    // Thinking: apply the recorded level verbatim. It was recorded
+    // alongside its model, so it is normally valid for the restored
+    // model. A mismatch (e.g. the recorded model is gone and a different
+    // one was picked) surfaces at the next turn's validation rather than
+    // being silently substituted here.
     if let Some(level_str) = settings.thinking.as_deref() {
         let current = thinking_config_name(cfg.thinking.as_ref());
         match thinking_config_from_name(level_str) {
             None => notices.push(format!(
                 "Session recorded unknown thinking level {level_str:?}; keeping {current}."
             )),
-            Some(level) => {
-                let validation = match &level {
-                    None => Ok(()),
-                    Some(tc) => validate_thinking_level(&cfg.model_info, &thinking_level_for(tc)),
-                };
-                match validation {
-                    Ok(()) => cfg.thinking = level,
-                    Err(msg) => notices.push(format!(
-                        "Can't restore thinking level {level_str:?} ({msg}); keeping {current}."
-                    )),
-                }
-            }
+            Some(level) => cfg.thinking = level,
         }
     }
 
