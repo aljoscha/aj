@@ -1175,10 +1175,6 @@ impl TextArea {
         &self.lines[self.cursor_line]
     }
 
-    fn is_empty_doc(&self) -> bool {
-        self.lines.len() == 1 && self.lines[0].is_empty()
-    }
-
     /// Grapheme-cluster byte boundaries for the current line, including `0` and
     /// the line length.
     fn grapheme_boundaries(&self) -> Vec<usize> {
@@ -2313,8 +2309,11 @@ impl TextArea {
 
     // -- Vertical dispatch helpers --
 
-    /// Handles an Up press: history at an empty or already-browsing top line,
-    /// jump-to-start on an otherwise top line, else move up one visual line.
+    /// Handles an Up press. On the top visual row a first Up snaps the cursor
+    /// to column 0, and a second Up (already at the start) steps back through
+    /// history, parking the current draft so Down restores it. While browsing,
+    /// Up keeps stepping back regardless of column. Off the top row it moves up
+    /// one visual line.
     fn on_cursor_up(&mut self) {
         // Prime the cache, then read the one value we need off a shared borrow so
         // the borrow is dropped before we delegate to a `&mut self` mover below.
@@ -2323,15 +2322,18 @@ impl TextArea {
             let vls = self.cached_visual_line_map();
             self.find_current_visual_line(vls)
         };
-        if self.is_empty_doc() {
+        if current_vl != 0 {
+            self.move_up();
+        } else if self.history_index.is_some() || self.cursor_col == 0 {
+            // Top row, and either already browsing or sitting at the start:
+            // step back in history. `history_up` parks a live draft at the
+            // tail and no-ops when there's nothing to recall.
             self.history_up();
-        } else if self.history_index.is_some() && current_vl == 0 {
-            self.history_up();
-        } else if current_vl == 0 {
+        } else {
+            // First Up from a non-empty top row snaps to the start; the next
+            // Up (now at column 0) enters history.
             self.cursor_col = 0;
             self.reset_sticky_state();
-        } else {
-            self.move_up();
         }
         self.last_action = LastAction::None;
     }
@@ -4313,6 +4315,47 @@ mod tests {
         send(&mut ed, &key(Key::UP, Modifiers::empty()));
         assert_eq!(ed.text(), "typed");
         assert_eq!(ed.cursor(), (0, 0));
+    }
+
+    #[test]
+    fn up_from_start_of_nonempty_top_line_recalls_and_restores_draft() {
+        // A first Up snaps to column 0 (covered above); a second Up, now at the
+        // start, steps into history and parks the draft. Down restores it.
+        let mut ed = editor();
+        ed.add_to_history("prev");
+        type_str(&mut ed, "typed");
+
+        // Snap to start, then recall the newest entry, parking "typed".
+        send(&mut ed, &key(Key::UP, Modifiers::empty()));
+        assert_eq!(ed.cursor(), (0, 0));
+        send(&mut ed, &key(Key::UP, Modifiers::empty()));
+        assert_eq!(ed.text(), "prev");
+
+        // Down walks back to the parked draft.
+        send(&mut ed, &key(Key::DOWN, Modifiers::empty()));
+        assert_eq!(ed.text(), "typed");
+    }
+
+    #[test]
+    fn up_at_top_left_of_multiline_draft_recalls_history() {
+        // From the very top-left of a multi-line draft, Up steps into history
+        // (parking the whole draft) rather than doing nothing. The path is
+        // move-up to the top row, snap-to-start, then recall.
+        let mut ed = editor();
+        ed.add_to_history("prev");
+        type_str(&mut ed, "line one");
+        send(&mut ed, &shift_enter());
+        type_str(&mut ed, "line two");
+
+        send(&mut ed, &key(Key::UP, Modifiers::empty())); // row 1 -> row 0
+        send(&mut ed, &key(Key::UP, Modifiers::empty())); // snap to column 0
+        assert_eq!(ed.cursor(), (0, 0));
+        assert_eq!(ed.text(), "line one\nline two");
+
+        send(&mut ed, &key(Key::UP, Modifiers::empty())); // recall
+        assert_eq!(ed.text(), "prev");
+        send(&mut ed, &key(Key::DOWN, Modifiers::empty())); // restore draft
+        assert_eq!(ed.text(), "line one\nline two");
     }
 
     // -- Submit / newline / backslash --
