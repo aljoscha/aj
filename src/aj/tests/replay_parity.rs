@@ -318,12 +318,14 @@ fn persisted_tool_result(
     log.entries_in_order()
         .into_iter()
         .find_map(|entry| match &entry.entry {
-            aj_session::ConversationEntryKind::Message { message } => match message.as_wire() {
-                Some(Message::ToolResult(result)) if result.tool_call_id == call_id => {
-                    Some(result.clone())
+            aj_session::ConversationEntryKind::Message { message } => {
+                match message.as_stored_wire() {
+                    Some(Message::ToolResult(result)) if result.tool_call_id == call_id => {
+                        Some(result.clone())
+                    }
+                    _ => None,
                 }
-                _ => None,
-            },
+            }
             _ => None,
         })
         .expect("persisted tool result")

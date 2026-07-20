@@ -491,10 +491,13 @@ fn json_event_listener<W: Write + Send + 'static>(out: Arc<Mutex<W>>) -> Listene
 /// round-trip through `Agent::prompt`.
 fn print_final_assistant_text<W: Write>(agent: &Agent, out: &Arc<Mutex<W>>) -> Result<()> {
     let messages = agent.messages();
-    let last_assistant = messages.iter().rev().find_map(|m| match m.as_wire() {
-        Some(aj_models::types::Message::Assistant(a)) => Some(a),
-        _ => None,
-    });
+    let last_assistant = messages
+        .iter()
+        .rev()
+        .find_map(|m| match m.as_stored_wire() {
+            Some(aj_models::types::Message::Assistant(a)) => Some(a),
+            _ => None,
+        });
 
     let Some(message) = last_assistant else {
         return Err(anyhow!(

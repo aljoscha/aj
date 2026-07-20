@@ -802,7 +802,7 @@ mod tests {
             .transcript
             .last()
             .expect("a seeded message")
-            .as_wire()
+            .as_stored_wire()
         {
             Some(Message::ToolResult(tr)) => {
                 assert_eq!(
@@ -815,7 +815,7 @@ mod tests {
         }
         assert!(
             !prepared.transcript.iter().any(|m| matches!(
-                m.as_wire(),
+                m.as_stored_wire(),
                 Some(Message::ToolResult(tr)) if tr.tool_call_id == "tu-tail"
             )),
             "the abandoned tail's dangling call is not repaired onto the branch path"
@@ -833,7 +833,7 @@ mod tests {
                     &e.entry,
                     ConversationEntryKind::Message { message }
                         if matches!(
-                            message.as_wire(),
+                            message.as_stored_wire(),
                             Some(Message::ToolResult(tr)) if tr.tool_call_id == "tu-branch"
                         )
                 )

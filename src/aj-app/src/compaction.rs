@@ -207,7 +207,7 @@ pub async fn run_compaction(
 fn trim_trailing_failed_assistant(messages: &mut Vec<AgentMessage>) {
     while let Some(last) = messages.last() {
         let trim = matches!(
-            last.as_wire(),
+            last.as_stored_wire(),
             Some(Message::Assistant(a))
                 if matches!(a.stop_reason, StopReason::Error | StopReason::Aborted)
                     && !a
@@ -375,7 +375,7 @@ mod tests {
         let mut msgs = vec![user("hi"), assistant(StopReason::Error, vec![])];
         trim_trailing_failed_assistant(&mut msgs);
         assert_eq!(msgs.len(), 1);
-        assert!(matches!(msgs[0].as_wire(), Some(Message::User(_))));
+        assert!(matches!(msgs[0].as_stored_wire(), Some(Message::User(_))));
     }
 
     #[test]

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aj_agent::events::{AgentId, AgentSettings, CompactionPhase};
+use aj_agent::message::{TaskNotificationKind, TaskOutcome};
 use aj_agent::tool::{TaskId, TaskKind, TaskStatus, ToolDetails};
 use aj_agent::types::TokenUsage;
 use aj_models::registry::ModelInfo;
@@ -45,6 +46,10 @@ pub enum EntryKind {
     Compaction(CompactionEntry),
     Notice(NoticeEntry),
     TurnUsage(TurnUsageEntry),
+    /// A background task's completion notice (see
+    /// [`TaskNotificationEntry`]). Distinct from [`EntryKind::Notice`],
+    /// which is an unrelated transient UI notice (level + text).
+    TaskNotification(TaskNotificationEntry),
 }
 
 /// A user message appended from `MessageEnd { User }`.
@@ -56,11 +61,6 @@ pub struct UserEntry {
     pub message_id: String,
     /// The authoritative wire content blocks.
     pub content: Vec<UserContent>,
-    /// True for harness task-completion notices (text starts with the
-    /// task-notification tag). The view renders these collapsible
-    /// under the tools-expand flag instead of dumping the whole
-    /// notice.
-    pub collapsible: bool,
 }
 
 impl UserEntry {
@@ -69,6 +69,27 @@ impl UserEntry {
     pub fn joined_text(&self) -> String {
         joined_user_text(&self.content)
     }
+}
+
+/// A background task's completion notice, appended from
+/// `MessageEnd { TaskNotification }`.
+///
+/// Carries the structured fields for rich rendering (an outcome-tinted
+/// bubble). The [`Self::body`] is the pre-rendered notice text, the
+/// same text projected to the model.
+#[derive(Debug)]
+pub struct TaskNotificationEntry {
+    /// Id of the originating notice `AgentMessage` / log entry.
+    pub message_id: String,
+    /// Command line (bash) or task description (agent).
+    pub label: String,
+    /// What kind of work ran.
+    pub kind: TaskNotificationKind,
+    /// Terminal outcome, which drives the bubble tint.
+    pub outcome: TaskOutcome,
+    /// Pre-rendered notice body (exit status + output tail, or the
+    /// agent report).
+    pub body: String,
 }
 
 /// Join a user message's text blocks with `\n`, skipping images.
@@ -746,7 +767,6 @@ mod tests {
             .append(EntryKind::User(UserEntry {
                 message_id: String::new(),
                 content: Vec::new(),
-                collapsible: false,
             }));
         assert!(
             chat.has_conversation(),

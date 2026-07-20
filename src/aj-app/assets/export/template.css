@@ -230,6 +230,19 @@ pre code { background: none; padding: 0; }
 .tool-command { color: var(--tool); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }
 .summary { color: var(--muted); font-size: 13px; margin: 4px 0; }
 
+/* Task notifications (background task completion). Styled like tool
+   output, tinted by outcome: green for success, red for failure/kill. */
+.task-notification {
+  position: relative; margin: 10px 0 0; padding: 8px 12px; border-left: 3px solid var(--add);
+  background: var(--panel2); border-radius: 0 6px 6px 0;
+}
+.task-notification.err { border-left-color: var(--err); }
+.task-notification-head { font-weight: 600; font-size: 12px; color: var(--add);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; margin-bottom: 6px; }
+.task-notification.err .task-notification-head { color: var(--err); }
+.task-notification-body { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px; margin: 4px 0; white-space: pre-wrap; }
+
 /* Expandable tool output: preview collapsed, full text on expand. */
 .tool-output { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; margin: 4px 0; }
 .tool-output pre { margin: 4px 0; }

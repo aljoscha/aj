@@ -1,11 +1,12 @@
 //! The generic transcript bubble: a full-width tinted rectangle
 //! around wrapped rich text.
 //!
-//! Tool cells and user-message bubbles share the exact same surface
-//! mechanics (one-column inset, one bg-painted blank row above and
-//! below, an untinted trailing spacer row), so the widget is generic
-//! over the flattened span content and the tint. The builders in
-//! `tool_cell` and `transcript` decide what goes inside.
+//! Tool cells, user-message bubbles, and task-notification bubbles
+//! share the exact same surface mechanics (one-column inset, one
+//! bg-painted blank row above and below, an untinted trailing spacer
+//! row), so the widget is generic over the flattened span content and
+//! the tint. The builders in `tool_cell` and `transcript` decide what
+//! goes inside.
 
 use vaxis::cell::{Cell, Character, Color, Style};
 use vaxis::vxfw::{

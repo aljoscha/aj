@@ -23,7 +23,6 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use aj_agent::message::{AgentMessage, AgentMessageKind};
-use aj_agent::tool::TASK_NOTIFICATION_OPEN_TAG;
 use aj_models::types::{Message, UserContent};
 
 use crate::log::{ConversationEntry, ConversationEntryKind, ThreadKind};
@@ -248,14 +247,12 @@ pub fn scan_file_user_prompts(path: &Path) -> Vec<String> {
             continue;
         }
         // Confirmed a top-level user message. The full parse is what
-        // actually pulls the text content out.
+        // actually pulls the text content out. Task-completion notices
+        // are stored with `role:"task_notification"`, so `is_user_prompt`
+        // already excluded them above and they never reach here.
         if let Ok(entry) = serde_json::from_str::<ConversationEntry>(&line)
             && let ConversationEntryKind::Message { message: msg } = entry.entry
             && let Some(text) = extract_user_prompt_text(&msg)
-            // Task-completion notices are persisted as user-role messages so
-            // the model sees them, but they're harness-injected, not typed by
-            // the user. They must not surface in prompt history.
-            && !text.trim_start().starts_with(TASK_NOTIFICATION_OPEN_TAG)
         {
             prompts.push(text);
         }
@@ -345,6 +342,24 @@ mod tests {
                 "role": "user",
                 "content": [{"type": "text", "text": text}],
                 "timestamp": 0,
+            },
+        }))
+        .unwrap()
+    }
+
+    /// A persisted task-completion notice line: `role:"task_notification"`,
+    /// the on-disk shape the drain writes.
+    fn notification_line(body: &str, id: &str) -> String {
+        serde_json::to_string(&serde_json::json!({
+            "id": id,
+            "thread": "user",
+            "type": "message",
+            "message": {
+                "role": "task_notification",
+                "label": "cargo build",
+                "kind": "bash",
+                "outcome": {"status": "succeeded"},
+                "body": body,
             },
         }))
         .unwrap()
@@ -465,11 +480,13 @@ mod tests {
     #[test]
     fn task_notifications_are_excluded() {
         let dir = scratch_dir("notices");
-        let notice = format!("{TASK_NOTIFICATION_OPEN_TAG}background task done");
         write_jsonl(
             &dir,
             "2024-01-01-00-00-00",
-            &[user_line("real prompt", "1"), user_line(&notice, "2")],
+            &[
+                user_line("real prompt", "1"),
+                notification_line("background task done", "2"),
+            ],
         );
         let persistence = ConversationPersistence::new(dir);
         let entries = workspace_history(&persistence, 2000);

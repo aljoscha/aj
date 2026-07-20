@@ -376,7 +376,7 @@ fn read_session_preview_file(
         if let ConversationEntryKind::Message { message: msg } = &entry.entry {
             message_count += 1;
             if first_user_message.is_none() {
-                if let Some(Message::User(u)) = msg.as_wire() {
+                if let Some(Message::User(u)) = msg.as_stored_wire() {
                     if let Some(text) = first_user_text(&u.content) {
                         first_user_message = Some(text);
                     }

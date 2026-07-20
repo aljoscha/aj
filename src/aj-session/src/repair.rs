@@ -58,7 +58,7 @@ pub fn repair_interrupted_tool_uses(
         let ConversationEntryKind::Message { message: msg } = &entry.entry else {
             continue;
         };
-        match msg.as_wire() {
+        match msg.as_stored_wire() {
             Some(Message::Assistant(a)) => {
                 for c in &a.content {
                     if let AssistantContent::ToolCall(tc) = c {

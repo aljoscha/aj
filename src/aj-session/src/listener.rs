@@ -302,7 +302,7 @@ mod tests {
         let entries: Vec<_> = log_guard.entries_in_order().into_iter().cloned().collect();
         let last = entries.last().expect("log has entries");
         match &last.entry {
-            ConversationEntryKind::Message { message: m } => match m.as_wire() {
+            ConversationEntryKind::Message { message: m } => match m.as_stored_wire() {
                 Some(Message::ToolResult(tr)) => {
                     assert_eq!(tr.tool_call_id, "tu-1");
                     assert!(!tr.is_error);
@@ -364,7 +364,7 @@ mod tests {
 
         let captured = captured.lock().expect("capture mutex");
         let live_details = captured.iter().find_map(|event| match event {
-            AgentEvent::MessageEnd { message, .. } => match message.as_wire() {
+            AgentEvent::MessageEnd { message, .. } => match message.as_stored_wire() {
                 Some(Message::ToolResult(result)) => result.details.as_ref(),
                 _ => None,
             },
@@ -499,7 +499,10 @@ mod tests {
         // not a conclusion marker.
         match &entries.last().expect("at least one entry").entry {
             ConversationEntryKind::Message { message } => {
-                assert!(matches!(message.as_wire(), Some(Message::Assistant(_))));
+                assert!(matches!(
+                    message.as_stored_wire(),
+                    Some(Message::Assistant(_))
+                ));
             }
             other => panic!("expected the sub's final message, got {other:?}"),
         }
@@ -589,7 +592,7 @@ mod tests {
             ConversationEntryKind::Message { message } => message,
             other => panic!("expected Message entry, got {other:?}"),
         };
-        match message.as_wire() {
+        match message.as_stored_wire() {
             Some(Message::User(u)) => u
                 .content
                 .iter()

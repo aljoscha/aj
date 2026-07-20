@@ -86,7 +86,7 @@ impl Serialize for ExportEntry<'_> {
         let ConversationEntryKind::Message { message } = &entry.entry else {
             return entry.serialize(serializer);
         };
-        let Some(Message::ToolResult(result)) = message.as_wire() else {
+        let Some(Message::ToolResult(result)) = message.as_stored_wire() else {
             return entry.serialize(serializer);
         };
         let Some(raw_details) = result.details.as_ref() else {
@@ -263,7 +263,7 @@ fn embed_session(data: &ExportData) -> String {
 fn derive_title(log: &ConversationLog) -> Option<String> {
     for event in replay(log) {
         if let AgentEvent::MessageEnd { message, .. } = event
-            && let Some(Message::User(u)) = message.as_wire()
+            && let Some(Message::User(u)) = message.as_stored_wire()
             && let Some(text) = first_text(&u.content)
         {
             return Some(text);
@@ -354,6 +354,11 @@ mod tests {
     const USER: &str = r#"{"id":"u0000001","parent_id":"root0001","timestamp":"2024-01-01T00:00:01Z","thread":"user","type":"message","message":{"role":"user","content":[{"type":"text","text":"Hello **world**"}],"timestamp":1704067201000}}"#;
     const ASSISTANT: &str = r#"{"id":"a0000001","parent_id":"u0000001","timestamp":"2024-01-01T00:00:02Z","thread":"user","type":"message","message":{"role":"assistant","content":[{"type":"text","text":"Reading the file."},{"type":"tool_call","id":"call-1","name":"read_file","arguments":{"path":"/tmp/x"}}],"api":"anthropic-messages","provider":"anthropic","model":"claude-test","usage":{"input":10,"output":5,"cache_read":0,"cache_write":0,"total_tokens":15,"cost":{"input":0.0,"output":0.0,"cache_read":0.0,"cache_write":0.0,"total":0.0}},"stop_reason":"ToolUse","timestamp":1704067202000}}"#;
     const TOOL_RESULT: &str = r#"{"id":"t0000001","parent_id":"a0000001","timestamp":"2024-01-01T00:00:03Z","thread":"user","type":"message","message":{"role":"tool_result","tool_call_id":"call-1","tool_name":"read_file","content":[{"type":"text","text":"the file body"}],"details":{"kind":"text","summary":"read_file /tmp/x","body":"the file body"},"is_error":false,"timestamp":1704067203000}}"#;
+    // A task-completion notice on the user thread, in the new on-disk
+    // shape (`role:"task_notification"` with structured fields).
+    const NOTIFICATION_ROOT: &str = r#"{"id":"n0000001","parent_id":"root0001","timestamp":"2024-01-01T00:00:01Z","thread":"user","type":"message","message":{"role":"task_notification","label":"cargo build","kind":"bash","outcome":{"status":"succeeded"},"body":"exit code 0"}}"#;
+    const USER_AFTER_NOTICE: &str = r#"{"id":"u0000009","parent_id":"n0000001","timestamp":"2024-01-01T00:00:02Z","thread":"user","type":"message","message":{"role":"user","content":[{"type":"text","text":"typed after notice"}],"timestamp":1704067202000}}"#;
+    const NOTIFICATION_TAIL: &str = r#"{"id":"n0000002","parent_id":"t0000001","timestamp":"2024-01-01T00:00:04Z","thread":"user","type":"message","message":{"role":"task_notification","label":"cargo build","kind":"bash","outcome":{"status":"succeeded"},"body":"exit code 0"}}"#;
 
     #[test]
     fn escapes_html_special_chars() {
@@ -397,6 +402,33 @@ mod tests {
         let (_dir, log) = log_from_jsonl(&[SYSTEM]);
         let html = render_session_html(&log);
         assert!(html.contains("<title>aj session</title>"));
+    }
+
+    #[test]
+    fn derive_title_skips_task_notifications() {
+        // A notice precedes the first typed prompt. `derive_title` keys
+        // on the stored-wire accessor, which yields `None` for a notice,
+        // so the title comes from the real prompt after it.
+        let (_dir, log) = log_from_jsonl(&[SYSTEM, NOTIFICATION_ROOT, USER_AFTER_NOTICE]);
+        assert_eq!(derive_title(&log).as_deref(), Some("typed after notice"));
+    }
+
+    #[test]
+    fn task_notification_serializes_with_its_role_and_fields() {
+        // The raw entry serializer falls through to the on-disk shape,
+        // so a notice rides the island as `role:"task_notification"`
+        // with its structured fields (not a user bubble).
+        let (_dir, log) =
+            log_from_jsonl(&[SYSTEM, USER, ASSISTANT, TOOL_RESULT, NOTIFICATION_TAIL]);
+        let html = render_session_html(&log);
+        let data = decoded_island(html.as_str());
+        assert!(
+            data.contains("\"role\":\"task_notification\""),
+            "notice role not embedded: {data}"
+        );
+        assert!(data.contains("\"label\":\"cargo build\""), "label missing");
+        assert!(data.contains("\"status\":\"succeeded\""), "outcome missing");
+        assert!(data.contains("\"body\":\"exit code 0\""), "body missing");
     }
 
     #[test]
@@ -453,7 +485,7 @@ mod tests {
         let ConversationEntryKind::Message { message } = &entries[3].entry else {
             panic!("expected message entry");
         };
-        let Some(Message::ToolResult(result)) = message.as_wire() else {
+        let Some(Message::ToolResult(result)) = message.as_stored_wire() else {
             panic!("expected tool result");
         };
         let original = result.details.as_ref().expect("original details");
@@ -482,7 +514,7 @@ mod tests {
         let ConversationEntryKind::Message { message } = &entries[3].entry else {
             panic!("expected message entry");
         };
-        let Some(Message::ToolResult(result)) = message.as_wire() else {
+        let Some(Message::ToolResult(result)) = message.as_stored_wire() else {
             panic!("expected tool result");
         };
         let original = result.details.as_ref().expect("original details");

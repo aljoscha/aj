@@ -218,7 +218,7 @@ fn user_message_text(entry: &ConversationEntry) -> Option<String> {
     let ConversationEntryKind::Message { message } = &entry.entry else {
         return None;
     };
-    match message.as_wire()? {
+    match message.as_stored_wire()? {
         Message::User(u) => first_text(&u.content),
         _ => None,
     }
@@ -229,7 +229,7 @@ fn any_message_text(entry: &ConversationEntry) -> Option<String> {
     let ConversationEntryKind::Message { message } = &entry.entry else {
         return None;
     };
-    match message.as_wire()? {
+    match message.as_stored_wire()? {
         Message::User(u) => first_text(&u.content),
         Message::ToolResult(r) => first_text(&r.content),
         Message::Assistant(a) => a.content.iter().find_map(|c| match c {

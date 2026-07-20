@@ -5826,7 +5826,6 @@ mod tests {
     enum EntryShape {
         User {
             text: String,
-            collapsible: bool,
         },
         Assistant {
             text: String,
@@ -5853,6 +5852,11 @@ mod tests {
         TurnUsage {
             line: String,
         },
+        TaskNotification {
+            label: String,
+            outcome: aj_agent::message::TaskOutcome,
+            body: String,
+        },
     }
 
     /// The concatenated text blocks of an assistant message, matching how the
@@ -5871,7 +5875,6 @@ mod tests {
         match kind {
             EntryKind::User(u) => EntryShape::User {
                 text: u.joined_text(),
-                collapsible: u.collapsible,
             },
             EntryKind::Assistant(a) => EntryShape::Assistant {
                 text: assistant_text(&a.message),
@@ -5896,6 +5899,11 @@ mod tests {
                 text: n.text.clone(),
             },
             EntryKind::TurnUsage(u) => EntryShape::TurnUsage { line: u.line() },
+            EntryKind::TaskNotification(n) => EntryShape::TaskNotification {
+                label: n.label.clone(),
+                outcome: n.outcome,
+                body: n.body.clone(),
+            },
         }
     }
 
@@ -7824,12 +7832,14 @@ mod tests {
             "task tracked to exited 0: {:?}",
             chat.tasks(),
         );
-        // The completion notice arrived as a collapsible user bubble.
+        // The completion notice arrived as a typed task-notification
+        // entry (not a user prompt), so navigation and export branch on
+        // it.
         assert!(
             entries
                 .iter()
-                .any(|e| matches!(&e.kind, EntryKind::User(u) if u.collapsible)),
-            "collapsible task-notification entry present",
+                .any(|e| matches!(&e.kind, EntryKind::TaskNotification(_))),
+            "task-notification entry present",
         );
         // The wrap-up response followed the notification.
         let wrap = entries
@@ -11681,7 +11691,7 @@ mod tests {
                     matches!(
                         &e.entry,
                         ConversationEntryKind::Message { message }
-                            if matches!(message.as_wire(), Some(Message::User(_)))
+                            if matches!(message.as_stored_wire(), Some(Message::User(_)))
                     )
                 })
                 .expect("a persisted user message");

@@ -634,13 +634,15 @@ impl ReplayState {
             }
             ConversationEntryKind::Message { message: agent_msg } => {
                 self.seen_message.insert(agent_id);
-                let Some(wire) = agent_msg.as_wire() else {
-                    return;
-                };
-                match wire {
-                    Message::User(_) => {
-                        // User messages: just a MessageStart/End pair
-                        // around the wire message.
+                match &agent_msg.kind {
+                    AgentMessageKind::Wire(Message::User(_))
+                    | AgentMessageKind::TaskNotification(_) => {
+                        // User prompts and task notices both replay as a
+                        // MessageStart/End pair around the entry, carrying the
+                        // typed `AgentMessage` so the frontend rebuilds them on
+                        // resume exactly as they rendered live. (The notice has
+                        // no stored wire message; it acquires its framing only
+                        // when it projects onto the provider.)
                         out.push_back(AgentEvent::MessageStart {
                             agent_id,
                             message: agent_msg.clone(),
@@ -650,10 +652,10 @@ impl ReplayState {
                             message: agent_msg.clone(),
                         });
                     }
-                    Message::Assistant(a) => {
+                    AgentMessageKind::Wire(Message::Assistant(a)) => {
                         self.project_assistant(agent_id, agent_msg, a, out);
                     }
-                    Message::ToolResult(tr) => {
+                    AgentMessageKind::Wire(Message::ToolResult(tr)) => {
                         self.project_tool_result(agent_id, agent_msg, tr, out);
                     }
                 }
@@ -713,7 +715,7 @@ impl ReplayState {
         };
         match &entry.entry {
             ConversationEntryKind::Message { message } => {
-                if let Some(Message::Assistant(a)) = message.as_wire() {
+                if let Some(Message::Assistant(a)) = message.as_stored_wire() {
                     self.capture_sub_report(agent_id, a);
                 }
             }
@@ -913,7 +915,7 @@ fn subagent_task(entry: &ConversationEntry) -> String {
     let ConversationEntryKind::Message { message } = &entry.entry else {
         return String::new();
     };
-    let Some(Message::User(u)) = message.as_wire() else {
+    let Some(Message::User(u)) = message.as_stored_wire() else {
         return String::new();
     };
     let mut task = String::new();
@@ -1022,6 +1024,66 @@ mod tests {
             .expect("tool execution end")
     }
 
+    #[test]
+    fn task_notification_replays_as_typed_kind() {
+        use aj_agent::message::{TaskNotification, TaskNotificationKind, TaskOutcome};
+
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("system prompt");
+        {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(user_msg("hi")).expect("user message");
+            view.add_message(AgentMessage::task_notification(TaskNotification::new(
+                "cargo build".into(),
+                TaskNotificationKind::Bash,
+                TaskOutcome::Succeeded,
+                "exit code 0".into(),
+            )))
+            .expect("task notification");
+        }
+
+        let events: Vec<AgentEvent> = replay(&log).collect();
+        // The notice replays as a MessageEnd carrying the typed kind, so
+        // the frontend rebuilds it on resume as a notification, not a
+        // user prompt.
+        let notice = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::MessageEnd { message, .. } => match &message.kind {
+                    AgentMessageKind::TaskNotification(n) => Some(n.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("notice replayed as the typed kind");
+        assert_eq!(notice.label, "cargo build");
+        assert_eq!(notice.body, "exit code 0");
+
+        // The only user-role MessageEnd is the real prompt; the notice is
+        // never replayed as a user message.
+        let user_ends: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::MessageEnd { message, .. } => match message.as_stored_wire() {
+                    Some(Message::User(u)) => Some(
+                        u.content
+                            .iter()
+                            .filter_map(|c| match c {
+                                UserContent::Text(t) => Some(t.text.clone()),
+                                _ => None,
+                            })
+                            .collect::<String>(),
+                    ),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(user_ends, vec!["hi".to_string()]);
+    }
+
     /// Build a seeded log exercising assistant text, thinking, tool
     /// use, and tool result with structured details.
     fn seeded_log() -> (PathBuf, ConversationLog) {
@@ -1097,7 +1159,7 @@ mod tests {
         assert_eq!(events.len(), 9, "got events: {events:#?}");
 
         match &events[0] {
-            AgentEvent::MessageStart { message, .. } => match message.as_wire() {
+            AgentEvent::MessageStart { message, .. } => match message.as_stored_wire() {
                 Some(Message::User(u)) => match &u.content[0] {
                     UserContent::Text(t) => assert_eq!(t.text, "hi"),
                     other => panic!("expected text, got {other:?}"),
@@ -1109,7 +1171,7 @@ mod tests {
 
         // Assistant MessageEnd carries the finalized content.
         match &events[3] {
-            AgentEvent::MessageEnd { message, .. } => match message.as_wire() {
+            AgentEvent::MessageEnd { message, .. } => match message.as_stored_wire() {
                 Some(Message::Assistant(a)) => {
                     assert_eq!(a.content.len(), 3);
                 }
@@ -1261,7 +1323,7 @@ mod tests {
             .iter()
             .filter_map(|event| match event {
                 AgentEvent::MessageStart { message, .. }
-                | AgentEvent::MessageEnd { message, .. } => match message.as_wire() {
+                | AgentEvent::MessageEnd { message, .. } => match message.as_stored_wire() {
                     Some(Message::ToolResult(result)) => Some(result),
                     _ => None,
                 },
@@ -1303,7 +1365,7 @@ mod tests {
             .iter()
             .filter_map(|event| match event {
                 AgentEvent::MessageStart { message, .. }
-                | AgentEvent::MessageEnd { message, .. } => match message.as_wire() {
+                | AgentEvent::MessageEnd { message, .. } => match message.as_stored_wire() {
                     Some(Message::ToolResult(result)) => Some(result),
                     _ => None,
                 },
@@ -1374,7 +1436,7 @@ mod tests {
         for event in events {
             let details = match event {
                 AgentEvent::MessageStart { message, .. }
-                | AgentEvent::MessageEnd { message, .. } => match message.as_wire() {
+                | AgentEvent::MessageEnd { message, .. } => match message.as_stored_wire() {
                     Some(Message::ToolResult(result)) => result.details.clone(),
                     _ => continue,
                 },
@@ -2728,7 +2790,7 @@ mod tests {
             .iter()
             .filter_map(|e| match e {
                 AgentEvent::MessageEnd { agent_id, message } if *agent_id == agent => {
-                    let text = match message.as_wire()? {
+                    let text = match message.as_stored_wire()? {
                         Message::User(u) => u
                             .content
                             .iter()
@@ -2759,7 +2821,7 @@ mod tests {
         events
             .iter()
             .filter_map(|e| match e {
-                AgentEvent::MessageEnd { message, .. } => match message.as_wire() {
+                AgentEvent::MessageEnd { message, .. } => match message.as_stored_wire() {
                     Some(Message::User(u)) => {
                         let text = u
                             .content
@@ -3050,7 +3112,7 @@ mod tests {
                 e,
                 AgentEvent::MessageEnd { agent_id, message }
                     if *agent_id == AgentId::Sub(1)
-                        && matches!(message.as_wire(), Some(Message::User(_)))
+                        && matches!(message.as_stored_wire(), Some(Message::User(_)))
             )),
             "the legacy sub's task message replays"
         );

@@ -98,7 +98,7 @@ impl ConversationLog {
                     if let Some(ts) = entry.timestamp {
                         last_activity = Some(last_activity.map_or(ts, |cur| cur.max(ts)));
                     }
-                    match message.as_wire() {
+                    match message.as_stored_wire() {
                         Some(Message::User(_)) => user_messages += 1,
                         Some(Message::Assistant(a)) => {
                             assistant_messages += 1;

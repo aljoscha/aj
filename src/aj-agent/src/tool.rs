@@ -838,20 +838,27 @@ pub struct StartedTask {
     pub events: TaskEventSink,
 }
 
-/// Opening tag wrapping a harness-injected task-completion notice in
-/// the transcript. `Agent::drain_task_notices` emits each notice body
-/// between this tag and [`TASK_NOTIFICATION_CLOSE_TAG`] as a user
-/// message, marking it as harness-injected rather than a user reply.
-/// Frontends key their rendering off the open tag, so the format lives
-/// here as the single source of truth.
-pub const TASK_NOTIFICATION_OPEN_TAG: &str = "<task-notification>";
+/// Opening tag wrapping a harness-injected task-completion notice when
+/// it is projected onto the wire. [`AgentMessage::to_projected_wire`]
+/// frames the notice body between this tag and
+/// [`TASK_NOTIFICATION_CLOSE_TAG`] as a user message, marking it to the
+/// model as harness-injected rather than a user reply. The framing is
+/// projection-only: locally a notice is a typed
+/// [`AgentMessageKind::TaskNotification`], so the format lives here as
+/// the single source of truth for what the model sees.
+///
+/// [`AgentMessage::to_projected_wire`]: crate::message::AgentMessage::to_projected_wire
+/// [`AgentMessageKind::TaskNotification`]: crate::message::AgentMessageKind::TaskNotification
+pub(crate) const TASK_NOTIFICATION_OPEN_TAG: &str = "<task-notification>";
 
 /// Closing tag paired with [`TASK_NOTIFICATION_OPEN_TAG`].
-pub const TASK_NOTIFICATION_CLOSE_TAG: &str = "</task-notification>";
+pub(crate) const TASK_NOTIFICATION_CLOSE_TAG: &str = "</task-notification>";
 
 /// Completion notice queued when a background task reaches a terminal
-/// status, drained into the owner's transcript at the next drain
-/// point as a user message wrapped in [`TASK_NOTIFICATION_OPEN_TAG`].
+/// status, drained into the owner's transcript at the next drain point
+/// as a typed [`AgentMessageKind::TaskNotification`].
+///
+/// [`AgentMessageKind::TaskNotification`]: crate::message::AgentMessageKind::TaskNotification
 #[derive(Clone, Debug)]
 pub struct TaskNotice {
     /// The agent that started the task and receives the notice.

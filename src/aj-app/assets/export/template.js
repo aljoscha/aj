@@ -494,12 +494,32 @@
     return html + '</div>';
   }
 
+  function renderTaskNotification(entry) {
+    const m = entry.message;
+    const outcome = m.outcome || {};
+    const status = outcome.status || 'succeeded';
+    const succeeded = status === 'succeeded';
+    const cls = succeeded ? 'task-notification' : 'task-notification err';
+    let verb = succeeded ? 'succeeded' : (status === 'killed' ? 'was killed' : 'failed');
+    if (status === 'failed' && outcome.code != null) {
+      verb += ' (exit ' + escapeHtml(String(outcome.code)) + ')';
+    }
+    let html = '<div class="' + cls + '" id="entry-' + escapeHtml(entry.id) + '">' +
+      copyLinkButton(entry.id) +
+      '<div class="task-notification-head">task ' + escapeHtml(normalize(m.label || '')) + ' ' + verb + '</div>';
+    if (m.body && m.body.trim()) {
+      html += '<pre class="task-notification-body">' + escapeHtml(m.body) + '</pre>';
+    }
+    return html + '</div>';
+  }
+
   function renderEntry(entry) {
     if (entry.type === 'message') {
       const msg = entry.message;
       if (!msg) return '';
       if (msg.role === 'user') return renderUser(entry);
       if (msg.role === 'assistant') return renderAssistant(entry);
+      if (msg.role === 'task_notification') return renderTaskNotification(entry);
       // Tool results are shown inline under their call.
       return '';
     }
@@ -547,6 +567,8 @@
       if (e.type === 'compaction') s.compactions++;
       if (e.type !== 'message' || !e.message) continue;
       const m = e.message;
+      // A task notification carries `role:"task_notification"`, so it is
+      // naturally excluded from the user counter and every other stat.
       if (m.role === 'user') s.user++;
       else if (m.role === 'tool_result') s.toolResults++;
       else if (m.role === 'assistant') {

@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use aj_agent::events::{AgentEvent, AgentId, SubAgentConclusion};
-use aj_agent::message::AgentMessageKind;
-use aj_agent::tool::{TASK_NOTIFICATION_OPEN_TAG, TaskStatus, ToolDetails};
+use aj_agent::message::{AgentMessageKind, TaskNotification};
+use aj_agent::tool::{TaskStatus, ToolDetails};
 use aj_models::streaming::AssistantMessageEvent;
 use aj_models::types::{
     AssistantContent, AssistantMessage, ErrorCategory, Message, StopReason, UserContent,
@@ -22,8 +22,8 @@ use serde_json::Value;
 
 use crate::chat::model::{
     AssistantEntry, ChatState, CompactionEntry, EntryId, EntryKind, NoticeEntry, NoticeLevel,
-    SubAgentEntry, SubAgentStatus, TaskInfo, ToolEntry, ToolStatus, TurnUsageEntry, UserEntry,
-    joined_user_text,
+    SubAgentEntry, SubAgentStatus, TaskInfo, TaskNotificationEntry, ToolEntry, ToolStatus,
+    TurnUsageEntry, UserEntry, joined_user_text,
 };
 use crate::session::AgentLifecycle;
 
@@ -113,12 +113,14 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
             agent_id, event, ..
         } => reduce_message_update(state, agent_id, event),
         AgentEvent::MessageEnd { agent_id, message } => {
-            // Only the user arm consumes the id, so read it under a borrow
-            // here and skip the copy for the other arms. We cannot hoist the
-            // read into the arm itself: the by-value match below moves
-            // `message.kind`, and `id()` borrows the whole message.
+            // The user and task-notification arms consume the id, so
+            // read it under a borrow here and skip the copy for the
+            // other arms. We cannot hoist the read into the arm itself:
+            // the by-value match below moves `message.kind`, and `id()`
+            // borrows the whole message.
             let message_id = match &message.kind {
-                AgentMessageKind::Wire(Message::User(_)) => message.id().to_string(),
+                AgentMessageKind::Wire(Message::User(_))
+                | AgentMessageKind::TaskNotification(_) => message.id().to_string(),
                 _ => String::new(),
             };
             match message.kind {
@@ -134,6 +136,9 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
                     // structured `ToolDetails`). The unified
                     // `MessageEnd { ToolResult }` is structural framing.
                     Redraw(false)
+                }
+                AgentMessageKind::TaskNotification(notification) => {
+                    reduce_task_notification_end(state, agent_id, notification, message_id)
                 }
             }
         }
@@ -591,13 +596,6 @@ fn reduce_user_end(
     if text.is_empty() {
         return Redraw(false);
     }
-    // Harness-injected task-completion notices arrive as user messages
-    // wrapped in the task-notification tag (see
-    // `Agent::drain_task_notices`). They can be long, so the view
-    // renders them foldable under the tools-expand flag instead of
-    // dumping the whole notice into scrollback. Typed prompts never
-    // start with the tag.
-    let collapsible = text.trim_start().starts_with(TASK_NOTIFICATION_OPEN_TAG);
     state
         .transcripts
         .entry(agent_id)
@@ -605,7 +603,29 @@ fn reduce_user_end(
         .append(EntryKind::User(UserEntry {
             message_id,
             content: user.content,
-            collapsible,
+        }));
+    Redraw(true)
+}
+
+/// Handle `MessageEnd { TaskNotification }`: append the typed
+/// task-completion notice entry, which the view renders as an
+/// outcome-tinted bubble rather than a user prompt.
+fn reduce_task_notification_end(
+    state: &mut ChatState,
+    agent_id: AgentId,
+    notification: TaskNotification,
+    message_id: String,
+) -> Redraw {
+    state
+        .transcripts
+        .entry(agent_id)
+        .or_default()
+        .append(EntryKind::TaskNotification(TaskNotificationEntry {
+            message_id,
+            label: notification.label,
+            kind: notification.kind,
+            outcome: notification.outcome,
+            body: notification.body,
         }));
     Redraw(true)
 }
@@ -801,7 +821,7 @@ mod tests {
 
     use aj_agent::bus::listener_from_sync;
     use aj_agent::events::{AgentSettings, CompactionPhase, CompactionReason};
-    use aj_agent::message::AgentMessage;
+    use aj_agent::message::{AgentMessage, TaskNotification, TaskNotificationKind, TaskOutcome};
     use aj_agent::tool::{TaskKind, ToolDetails};
     use aj_agent::types::TokenUsage;
     use aj_models::registry::ModelInfo;
@@ -903,6 +923,26 @@ mod tests {
         AgentEvent::MessageEnd {
             agent_id: AgentId::Main,
             message: AgentMessage::wire(Message::User(UserMessage::text(text))),
+        }
+    }
+
+    /// A `MessageEnd { TaskNotification }` for a bash task with `label`
+    /// and `outcome`, the shape `Agent::drain_task_notices` emits.
+    fn task_notification_end(label: &str, outcome: TaskOutcome) -> AgentEvent {
+        let body = match outcome {
+            TaskOutcome::Succeeded => "exit code 0".to_string(),
+            TaskOutcome::Failed { code: Some(c) } => format!("exit code {c}"),
+            TaskOutcome::Failed { code: None } => "killed by signal".to_string(),
+            TaskOutcome::Killed => "killed".to_string(),
+        };
+        AgentEvent::MessageEnd {
+            agent_id: AgentId::Main,
+            message: AgentMessage::task_notification(TaskNotification::new(
+                label.to_string(),
+                TaskNotificationKind::Bash,
+                outcome,
+                body,
+            )),
         }
     }
 
@@ -1322,7 +1362,7 @@ mod tests {
     }
 
     #[test]
-    fn user_message_end_skips_empty_and_marks_task_notifications_collapsible() {
+    fn user_message_end_skips_empty_and_notification_appends_typed_entry() {
         let mut s = state();
         let mut life = AgentLifecycle::default();
 
@@ -1330,21 +1370,28 @@ mod tests {
         assert!(entries(&s, AgentId::Main).is_empty(), "empty text skipped");
 
         apply(&mut s, &mut life, user_message_end("hello"));
-        let notice = format!("{TASK_NOTIFICATION_OPEN_TAG}task #1 finished");
-        apply(&mut s, &mut life, user_message_end(&notice));
+        apply(
+            &mut s,
+            &mut life,
+            task_notification_end("cargo build", TaskOutcome::Failed { code: Some(1) }),
+        );
 
         let rows = entries(&s, AgentId::Main);
         assert_eq!(rows.len(), 2);
         match &rows[0].kind {
-            EntryKind::User(u) => {
-                assert_eq!(u.joined_text(), "hello");
-                assert!(!u.collapsible);
-            }
+            EntryKind::User(u) => assert_eq!(u.joined_text(), "hello"),
             other => panic!("unexpected kind: {other:?}"),
         }
+        // The notice lands as a typed `TaskNotification` entry, not a
+        // user prompt, so navigation and export can branch on it.
         match &rows[1].kind {
-            EntryKind::User(u) => assert!(u.collapsible),
-            other => panic!("unexpected kind: {other:?}"),
+            EntryKind::TaskNotification(n) => {
+                assert_eq!(n.label, "cargo build");
+                assert_eq!(n.kind, TaskNotificationKind::Bash);
+                assert_eq!(n.outcome, TaskOutcome::Failed { code: Some(1) });
+                assert_eq!(n.body, "exit code 1");
+            }
+            other => panic!("expected TaskNotification, got {other:?}"),
         }
     }
 

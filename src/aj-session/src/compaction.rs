@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use aj_agent::message::AgentMessage;
+use aj_agent::message::{AgentMessage, AgentMessageKind};
 use aj_models::types::{AssistantContent, Message, UserContent, UserMessage};
 
 use crate::log::{Conversation, ConversationEntry, ConversationEntryKind, EntryId};
@@ -266,7 +266,7 @@ fn usage_anchor_is_stale(entries: &[ConversationEntry]) -> bool {
         match &entry.entry {
             ConversationEntryKind::Compaction { .. } => return true,
             ConversationEntryKind::Message { message }
-                if matches!(message.as_wire(), Some(Message::Assistant(_))) =>
+                if matches!(message.as_stored_wire(), Some(Message::Assistant(_))) =>
             {
                 return false;
             }
@@ -310,11 +310,23 @@ pub fn should_compact(context_tokens: u64, context_window: u64, threshold: f64) 
     context_window > 0 && (context_tokens as f64) > (context_window as f64) * threshold
 }
 
-/// Borrow the wire [`Message`] an entry carries, if it is a `Message`
-/// entry. Settings / compaction / system-prompt entries yield `None`.
+/// Borrow the wire [`Message`] an entry literally stores, if it is a
+/// `Message` entry with a stored wire form. Settings / compaction /
+/// system-prompt entries and task notifications yield `None`.
 fn entry_wire(entry: &ConversationEntry) -> Option<&Message> {
     match &entry.entry {
-        ConversationEntryKind::Message { message } => message.as_wire(),
+        ConversationEntryKind::Message { message } => message.as_stored_wire(),
+        _ => None,
+    }
+}
+
+/// The wire [`Message`] an entry projects onto the provider, if it is
+/// a `Message` entry. A task notification projects to its framed user
+/// message here, so it counts toward token budgets and feeds summaries;
+/// non-message entries yield `None`.
+fn entry_projected_wire(entry: &ConversationEntry) -> Option<Message> {
+    match &entry.entry {
+        ConversationEntryKind::Message { message } => message.to_projected_wire(),
         _ => None,
     }
 }
@@ -327,9 +339,29 @@ fn is_assistant_message(entry: &ConversationEntry) -> bool {
     matches!(entry_wire(entry), Some(Message::Assistant(_)))
 }
 
+/// Whether the entry is a task-completion notice (a typed
+/// [`AgentMessageKind::TaskNotification`]).
+fn is_task_notification(entry: &ConversationEntry) -> bool {
+    matches!(
+        &entry.entry,
+        ConversationEntryKind::Message { message }
+            if matches!(message.kind, AgentMessageKind::TaskNotification(_))
+    )
+}
+
+/// Whether the entry starts a turn: a user prompt or a task notice.
+///
+/// A notice is followed by the assistant wake response, a coherent
+/// unit we do not want to split at a cut. `is_assistant_message` stays
+/// separate: an assistant message is a valid cut point but never a
+/// turn start.
+fn is_turn_start(entry: &ConversationEntry) -> bool {
+    is_user_message(entry) || is_task_notification(entry)
+}
+
 /// Walk backward from `cut_index` (exclusive) down to `boundary_start`
-/// (inclusive) for the nearest user message — the turn that the cut
-/// lands inside.
+/// (inclusive) for the nearest turn start (user prompt or task notice),
+/// the turn that the cut lands inside.
 fn find_turn_start(
     entries: &[ConversationEntry],
     cut_index: usize,
@@ -338,7 +370,7 @@ fn find_turn_start(
     let mut i = cut_index;
     while i > boundary_start {
         i -= 1;
-        if is_user_message(&entries[i]) {
+        if is_turn_start(&entries[i]) {
             return Some(i);
         }
     }
@@ -347,22 +379,22 @@ fn find_turn_start(
 
 /// Choose the first retained entry given a `keep_recent_tokens` budget.
 ///
-/// Valid cut points are user- or assistant-message starts in
-/// `boundary_start..entries.len()`; a `tool_result` is never a cut
-/// point, because keeping a result whose call was summarized away would
-/// orphan it on the wire. The walk accumulates estimated tokens from
-/// the head backward until the budget is reached, then snaps the cut to
-/// the nearest valid cut point at or after that position. When the cut
-/// lands on an assistant message mid-turn, `turn_start_index` carries
-/// the turn's user start so the host can summarize the prefix
-/// separately.
+/// Valid cut points are turn starts (user prompts or task notices) and
+/// assistant-message starts in `boundary_start..entries.len()`; a
+/// `tool_result` is never a cut point, because keeping a result whose
+/// call was summarized away would orphan it on the wire. The walk
+/// accumulates estimated tokens from the head backward until the budget
+/// is reached, then snaps the cut to the nearest valid cut point at or
+/// after that position. When the cut lands on an assistant message
+/// mid-turn, `turn_start_index` carries the turn's start (its user
+/// prompt or notice) so the host can summarize the prefix separately.
 pub fn find_cut_point(
     entries: &[ConversationEntry],
     boundary_start: usize,
     keep_recent_tokens: u64,
 ) -> Option<CutPoint> {
     let valid: Vec<usize> = (boundary_start..entries.len())
-        .filter(|&i| is_user_message(&entries[i]) || is_assistant_message(&entries[i]))
+        .filter(|&i| is_turn_start(&entries[i]) || is_assistant_message(&entries[i]))
         .collect();
     if valid.is_empty() {
         return None;
@@ -371,14 +403,15 @@ pub fn find_cut_point(
     // Accumulate tokens from the head backward; once the keep-recent
     // budget is reached, snap to the first valid cut point at or after
     // the position we stopped at (a `tool_result` there is skipped
-    // forward to the next user/assistant message).
+    // forward to the next valid cut point). A notice counts through its
+    // owned projection so it contributes to the keep-recent budget.
     let mut acc: u64 = 0;
     let mut cut_index: Option<usize> = None;
     let mut i = entries.len();
     while i > boundary_start {
         i -= 1;
-        if let Some(m) = entry_wire(&entries[i]) {
-            acc += estimate_message_tokens(m);
+        if let Some(m) = entry_projected_wire(&entries[i]) {
+            acc += estimate_message_tokens(&m);
             if acc >= keep_recent_tokens {
                 let snapped = valid
                     .iter()
@@ -395,7 +428,7 @@ pub fn find_cut_point(
     // range and declines to compact).
     let cut_index = cut_index.unwrap_or(valid[0]);
 
-    let turn_start_index = if is_user_message(&entries[cut_index]) {
+    let turn_start_index = if is_turn_start(&entries[cut_index]) {
         None
     } else {
         find_turn_start(entries, cut_index, boundary_start)
@@ -638,7 +671,7 @@ pub fn prepare_compaction(
         .iter()
         .filter_map(|e| match &e.entry {
             ConversationEntryKind::Message { message } => {
-                expand_message(message.clone()).as_wire().cloned()
+                expand_message(message.clone()).to_projected_wire()
             }
             _ => None,
         })
@@ -655,7 +688,7 @@ pub fn prepare_compaction(
             .iter()
             .filter_map(|e| match &e.entry {
                 ConversationEntryKind::Message { message } => {
-                    expand_message(message.clone()).as_wire().cloned()
+                    expand_message(message.clone()).to_projected_wire()
                 }
                 _ => None,
             })
@@ -728,6 +761,25 @@ mod tests {
             },
             ..AssistantMessage::empty()
         })
+    }
+
+    fn notification_entry(id: &str, body: &str) -> ConversationEntry {
+        use aj_agent::message::{TaskNotification, TaskNotificationKind, TaskOutcome};
+        ConversationEntry {
+            id: id.to_string(),
+            parent_id: None,
+            timestamp: None,
+            thread: ThreadKind::User,
+            agent_id: None,
+            entry: ConversationEntryKind::Message {
+                message: AgentMessage::task_notification(TaskNotification::new(
+                    "cargo build".to_string(),
+                    TaskNotificationKind::Bash,
+                    TaskOutcome::Succeeded,
+                    body.to_string(),
+                )),
+            },
+        }
     }
 
     fn compaction_entry(id: &str, first_kept: &str, summary: &str) -> ConversationEntry {
@@ -882,6 +934,69 @@ mod tests {
         let cut = find_cut_point(&entries, 0, 10).expect("cut point");
         assert_eq!(cut.first_kept_index, 2);
         assert_eq!(cut.turn_start_index, None);
+    }
+
+    #[test]
+    fn find_cut_point_treats_notice_as_turn_start() {
+        // A task notice followed by its wake response. The notice is a
+        // valid cut point and a turn start, so a cut landing on it keeps
+        // the notice-plus-wake unit intact and sets no split turn.
+        let entries = vec![
+            msg_entry("0", user(&"x".repeat(400))),           // 100 tokens
+            msg_entry("1", assistant_text(&"y".repeat(400))), // 100 tokens
+            notification_entry("2", &"z".repeat(400)),        // framed ~111 tokens
+            msg_entry("3", assistant_text("wake")),           // ~1 token
+        ];
+        // Budget 100: the backward walk is only ~1 token at the wake
+        // reply, then the notice's projected ~111 tokens push it over
+        // the budget, so the cut snaps onto the notice.
+        let cut = find_cut_point(&entries, 0, 100).expect("cut point");
+        assert_eq!(cut.first_kept_index, 2, "cut lands on the notice");
+        assert_eq!(cut.first_kept_entry_id, "2");
+        assert_eq!(
+            cut.turn_start_index, None,
+            "a notice is itself a turn start, so the cut does not split a turn"
+        );
+    }
+
+    #[test]
+    fn compaction_summarizes_a_notice_in_range() {
+        // A notice inside the summarized range must feed the summary via
+        // its projected framing, not vanish because it has no stored
+        // wire message.
+        let entries = vec![
+            msg_entry("0", user("start")),
+            notification_entry("1", "TASK_MARKER done"),
+            msg_entry("2", assistant_text("wake")),
+            msg_entry("3", user(&"r".repeat(400))), // 100 tokens (recent)
+            msg_entry("4", assistant_text(&"s".repeat(400))), // 100 tokens
+        ];
+        let conv = Conversation::from_entries("t".to_string(), entries);
+        let plan = prepare_compaction(&conv, 10).expect("plan");
+        let joined = serialize_conversation(&plan.messages_to_summarize);
+        assert!(
+            joined.contains("<task-notification>") && joined.contains("TASK_MARKER"),
+            "notice text must feed the summary, got {joined:?}"
+        );
+    }
+
+    #[test]
+    fn occupancy_counts_a_notice() {
+        // `messages()` projects the notice, so occupancy estimation sees
+        // its tokens rather than dropping it.
+        let with_notice = Conversation::from_entries(
+            "t".to_string(),
+            vec![
+                msg_entry("0", user("hi")),
+                notification_entry("1", &"z".repeat(400)),
+            ],
+        );
+        let without = Conversation::from_entries("t".to_string(), vec![msg_entry("0", user("hi"))]);
+        assert!(
+            estimate_conversation_context(&with_notice).tokens
+                > estimate_conversation_context(&without).tokens,
+            "the notice must contribute to occupancy"
+        );
     }
 
     #[test]

@@ -16,12 +16,13 @@ use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use aj_agent::events::AgentId;
+use aj_agent::message::TaskOutcome;
 use aj_agent::tool::{
     BashStreamTruncation, TaskStatus, TodoPriority, TodoStatus, ToolDetails, TruncationCause,
 };
 use aj_app::chat::{
     AssistantEntry, ChatState, CompactionEntry, Entry, EntryId, EntryKind, NoticeLevel,
-    SubAgentEntry, SubAgentStatus, ToolEntry, ToolStatus, UserEntry,
+    SubAgentEntry, SubAgentStatus, TaskNotificationEntry, ToolEntry, ToolStatus, UserEntry,
 };
 use aj_app::footer::format_tokens;
 use aj_app::keybindings::{
@@ -182,11 +183,11 @@ pub(crate) fn vaxis_color(rgb: ThemeRgb, mode: ColorMode) -> Color {
     }
 }
 
-/// Source-line count shown for a collapsible user message (a harness
-/// task notification) while collapsed. A short preview keeps a long
-/// notification from flooding the scrollback while still surfacing
-/// its first (and most informative) line.
-const USER_COLLAPSED_LINES: usize = 10;
+/// Source-line count shown for a collapsed task notification while
+/// folded. A short preview keeps a long notification from flooding the
+/// scrollback while still surfacing its first (and most informative)
+/// line.
+const NOTIFICATION_COLLAPSED_LINES: usize = 10;
 
 /// Upper bound on cached slots. The live working set is the viewport (a
 /// screen's worth of entries), so this sits comfortably above it. Overflow
@@ -560,7 +561,6 @@ fn fingerprint_into(entry: &Entry, chat: &ChatState, hasher: &mut DefaultHasher)
         EntryKind::User(u) => {
             2u8.hash(hasher);
             u.joined_text().len().hash(hasher);
-            u.collapsible.hash(hasher);
         }
         EntryKind::SubAgent(s) => {
             3u8.hash(hasher);
@@ -582,6 +582,13 @@ fn fingerprint_into(entry: &Entry, chat: &ChatState, hasher: &mut DefaultHasher)
         }
         EntryKind::TurnUsage(_) => {
             6u8.hash(hasher);
+        }
+        EntryKind::TaskNotification(n) => {
+            7u8.hash(hasher);
+            n.body.len().hash(hasher);
+            // The outcome drives the bubble tint, so fold in a
+            // per-outcome discriminant.
+            task_outcome_tag(&n.outcome).hash(hasher);
         }
     }
 }
@@ -926,8 +933,9 @@ pub(crate) fn build_entry_widget(
             chat.tools_expanded,
             styles,
         )),
-        EntryKind::User(user) => {
-            EntryWidget::Bubble(build_user_bubble(user, chat.tools_expanded, styles, focus))
+        EntryKind::User(user) => EntryWidget::Bubble(build_user_bubble(user, styles, focus)),
+        EntryKind::TaskNotification(n) => {
+            EntryWidget::Bubble(build_task_notification(n, chat.tools_expanded, styles))
         }
         EntryKind::SubAgent(s) if !nested => EntryWidget::SubAgent(build_subagent_box(
             s,
@@ -959,17 +967,11 @@ pub(crate) fn build_entry_widget(
 /// user-message tint, with no `> ` prefix (the tint is the entire
 /// visual cue, which also keeps the text cleanly copy-pasteable).
 ///
-/// Harness-injected task notifications (`collapsible`) fold to their
-/// first [`USER_COLLAPSED_LINES`] source lines plus an italic expand
-/// hint, and expand together with tool output under the session-wide
-/// `tools_expanded` flag. Typed prompts always render in full.
-///
 /// When `focus` is `Some`, the bubble carries the focus border in the
 /// `borderAccent` color, with the supplied copy-key hint on its bottom edge
 /// (Spec E section 2).
 fn build_user_bubble(
     user: &UserEntry,
-    expanded: bool,
     styles: &TranscriptStyles,
     focus: Option<&[TextSpan]>,
 ) -> Bubble {
@@ -978,35 +980,13 @@ fn build_user_bubble(
         style,
         ..TextSpan::default()
     };
-    // Task notifications embed captured task output, so the text is
-    // not guaranteed to be terminal-safe the way a typed prompt is.
-    let text = sanitize_terminal_output(&user.joined_text());
-    let mut lines: Vec<&str> = text.lines().collect();
-    let fold = user.collapsible && !expanded && lines.len() > USER_COLLAPSED_LINES;
-    let hint = fold.then(|| {
-        let more = lines.len() - USER_COLLAPSED_LINES;
-        lines.truncate(USER_COLLAPSED_LINES);
-        expand_hint(more, HintKind::More)
-    });
+    let text = user.joined_text();
     let mut spans = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
+    for (i, line) in text.lines().enumerate() {
         if i > 0 {
             spans.push(span("\n".into(), styles.user));
         }
-        spans.push(span((*line).to_string(), styles.user));
-    }
-    if let Some(hint) = hint {
-        // Italic rather than dim: the hint sits on the bubble tint,
-        // where the muted-but-legible cue is the slant (mirroring
-        // `aj`'s markdown-emphasis hint).
-        spans.push(span("\n".into(), styles.user));
-        spans.push(span(
-            hint,
-            Style {
-                italic: true,
-                ..styles.text
-            },
-        ));
+        spans.push(span(line.to_string(), styles.user));
     }
     let bubble = Bubble::entry(spans, Some(styles.user_message_bg), styles.text);
     match focus {
@@ -1015,6 +995,69 @@ fn build_user_bubble(
             label: label.to_vec(),
         }),
         None => bubble,
+    }
+}
+
+/// Build a task-notification bubble: the notice body under an
+/// outcome-tinted surface, styled like a tool cell rather than a user
+/// prompt.
+///
+/// The tint reflects the outcome (success vs did-not-succeed), matching
+/// how a tool cell tints by status. A long notice folds to its first
+/// [`NOTIFICATION_COLLAPSED_LINES`] source lines plus a dim expand hint,
+/// expanding together with tool output under the session-wide
+/// `tools_expanded` flag. The body embeds captured task output, so it
+/// runs through [`sanitize_terminal_output`].
+fn build_task_notification(
+    notification: &TaskNotificationEntry,
+    expanded: bool,
+    styles: &TranscriptStyles,
+) -> Bubble {
+    let span = |text: String, style: Style| TextSpan {
+        text,
+        style,
+        ..TextSpan::default()
+    };
+    let text = sanitize_terminal_output(&notification.body);
+    let mut lines: Vec<&str> = text.lines().collect();
+    let fold = !expanded && lines.len() > NOTIFICATION_COLLAPSED_LINES;
+    let hint = fold.then(|| {
+        let more = lines.len() - NOTIFICATION_COLLAPSED_LINES;
+        lines.truncate(NOTIFICATION_COLLAPSED_LINES);
+        expand_hint(more, HintKind::More)
+    });
+    let mut spans = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            spans.push(span("\n".into(), styles.text));
+        }
+        spans.push(span((*line).to_string(), styles.text));
+    }
+    if let Some(hint) = hint {
+        spans.push(span("\n".into(), styles.text));
+        spans.push(span(hint, styles.dim));
+    }
+    let bg = task_notification_bg(&notification.outcome, styles);
+    Bubble::entry(spans, Some(bg), styles.text)
+}
+
+/// The bubble tint for a task notification's outcome: success reads as
+/// a done tool cell, and every did-not-succeed outcome (failed or
+/// killed) reads as an errored one.
+fn task_notification_bg(outcome: &TaskOutcome, styles: &TranscriptStyles) -> Color {
+    match outcome {
+        TaskOutcome::Succeeded => styles.tool_success_bg,
+        TaskOutcome::Failed { .. } | TaskOutcome::Killed => styles.tool_error_bg,
+    }
+}
+
+/// Stable per-outcome discriminant folded into an entry's fingerprint,
+/// since the outcome drives the bubble tint.
+fn task_outcome_tag(outcome: &TaskOutcome) -> u8 {
+    match outcome {
+        TaskOutcome::Succeeded => 0,
+        TaskOutcome::Failed { .. } => 1,
+        TaskOutcome::Killed => 2,
     }
 }
 
@@ -1066,6 +1109,7 @@ fn entry_spans(entry: &Entry, styles: &TranscriptStyles) -> Vec<TextSpan> {
         EntryKind::User(_)
         | EntryKind::Assistant(_)
         | EntryKind::Tool(_)
+        | EntryKind::TaskNotification(_)
         | EntryKind::Compaction(_) => Vec::new(),
         // The `SubAgent` arm is only reachable as the nested-inside-a-box
         // fallback, which can't occur live (sub-agents don't spawn
@@ -3116,7 +3160,6 @@ mod tests {
         // span path only carries the spacer.
         let t = transcript_with(EntryKind::User(UserEntry {
             content: vec![UserContent::text("hello")],
-            collapsible: false,
             message_id: String::new(),
         }));
         let spans = entry_spans(&t.entries()[0], &styles());
@@ -3124,26 +3167,30 @@ mod tests {
     }
 
     /// A long task notification with a recognisable first line and a
-    /// tail marker well past [`USER_COLLAPSED_LINES`].
-    fn notification() -> UserEntry {
-        let mut lines = vec![
-            "<task-notification>".to_string(),
-            "Background task #1 finished: sleep - exit code 0".to_string(),
-        ];
+    /// tail marker well past [`NOTIFICATION_COLLAPSED_LINES`].
+    fn notification() -> TaskNotificationEntry {
+        let mut lines = vec!["Background task #1 finished: sleep - exit code 0".to_string()];
         for i in 1..30 {
             lines.push(format!("tick {i}"));
         }
         lines.push("SECRET_TAIL_MARKER".to_string());
-        lines.push("</task-notification>".to_string());
-        UserEntry {
-            content: vec![UserContent::text(lines.join("\n"))],
-            collapsible: true,
+        TaskNotificationEntry {
             message_id: String::new(),
+            label: "sleep".to_string(),
+            kind: aj_agent::message::TaskNotificationKind::Bash,
+            outcome: TaskOutcome::Succeeded,
+            body: lines.join("\n"),
         }
     }
 
-    fn bubble_rows(user: &UserEntry, expanded: bool, width: u16) -> Vec<String> {
-        let mut bubble = build_user_bubble(user, expanded, &styles(), None);
+    fn notification_rows(n: &TaskNotificationEntry, expanded: bool, width: u16) -> Vec<String> {
+        let mut bubble = build_task_notification(n, expanded, &styles());
+        let surface = bubble.draw(&crate::test_support::draw_ctx(width, None));
+        crate::test_support::rows(&surface)
+    }
+
+    fn user_bubble_rows(user: &UserEntry, width: u16) -> Vec<String> {
+        let mut bubble = build_user_bubble(user, &styles(), None);
         let surface = bubble.draw(&crate::test_support::draw_ctx(width, None));
         crate::test_support::rows(&surface)
     }
@@ -3152,11 +3199,10 @@ mod tests {
     fn user_bubble_paints_the_tint_and_drops_the_prefix() {
         let user = UserEntry {
             content: vec![UserContent::text("hello world")],
-            collapsible: false,
             message_id: String::new(),
         };
         let s = styles();
-        let mut bubble = build_user_bubble(&user, false, &s, None);
+        let mut bubble = build_user_bubble(&user, &s, None);
         let surface = bubble.draw(&crate::test_support::draw_ctx(40, None));
         let r = crate::test_support::rows(&surface);
         // One padding row above and below the content, then the
@@ -3177,9 +3223,9 @@ mod tests {
     }
 
     #[test]
-    fn collapsible_notification_folds_to_ten_lines_with_italic_hint() {
-        let user = notification();
-        let r = bubble_rows(&user, false, 80);
+    fn collapsed_notification_folds_to_ten_lines_with_dim_hint() {
+        let n = notification();
+        let r = notification_rows(&n, false, 80);
         let body = r.join("\n");
         assert!(body.contains("Background task #1 finished"), "{r:?}");
         assert!(!body.contains("SECRET_TAIL_MARKER"), "{r:?}");
@@ -3189,9 +3235,9 @@ mod tests {
             "hint present: {r:?}",
         );
         assert_eq!(r.len(), 10 + 1 + 2 + 1, "{r:?}");
-        // The hint row is italic.
+        // The hint row is dim, styled like a tool cell's expand hint.
         let s = styles();
-        let mut bubble = build_user_bubble(&user, false, &s, None);
+        let mut bubble = build_task_notification(&n, false, &s);
         let surface = bubble.draw(&crate::test_support::draw_ctx(80, None));
         let grid = crate::test_support::flatten(&surface);
         let hint_row = &grid[11];
@@ -3199,15 +3245,38 @@ mod tests {
             hint_row
                 .iter()
                 .filter(|c| !c.char.grapheme().trim().is_empty())
-                .all(|c| c.style.italic),
-            "hint cells are italic",
+                .all(|c| c.style.dim),
+            "hint cells are dim",
         );
     }
 
     #[test]
+    fn notification_bubble_uses_the_outcome_tint() {
+        let s = styles();
+        let ctx = crate::test_support::draw_ctx(40, None);
+        let bg = |outcome: TaskOutcome| {
+            let entry = TaskNotificationEntry {
+                message_id: String::new(),
+                label: "sleep".into(),
+                kind: aj_agent::message::TaskNotificationKind::Bash,
+                outcome,
+                body: "exit".into(),
+            };
+            let surface = build_task_notification(&entry, true, &s).draw(&ctx);
+            crate::test_support::flatten(&surface)[0][0].style.bg
+        };
+        // Success maps to the done-tool token, failure/kill to the errored
+        // one. (The bundled palette may resolve both tokens to the same
+        // color, so we assert the mapping, not that the tints differ.)
+        assert_eq!(bg(TaskOutcome::Succeeded), s.tool_success_bg);
+        assert_eq!(bg(TaskOutcome::Failed { code: Some(1) }), s.tool_error_bg);
+        assert_eq!(bg(TaskOutcome::Killed), s.tool_error_bg);
+    }
+
+    #[test]
     fn expanded_notification_shows_the_full_body() {
-        let user = notification();
-        let r = bubble_rows(&user, true, 80);
+        let n = notification();
+        let r = notification_rows(&n, true, 80);
         let body = r.join("\n");
         assert!(body.contains("SECRET_TAIL_MARKER"), "{r:?}");
         assert!(!body.contains("to expand"), "{r:?}");
@@ -3221,14 +3290,13 @@ mod tests {
     fn focus_border_reuses_the_padding_and_keeps_the_bubble_size() {
         let user = UserEntry {
             content: vec![UserContent::text("ciao?")],
-            collapsible: false,
             message_id: String::new(),
         };
         let s = styles();
         let label = copy_label_spans(&s);
         let ctx = crate::test_support::draw_ctx(40, None);
-        let plain = build_user_bubble(&user, false, &s, None).draw(&ctx);
-        let bordered = build_user_bubble(&user, false, &s, Some(&label)).draw(&ctx);
+        let plain = build_user_bubble(&user, &s, None).draw(&ctx);
+        let bordered = build_user_bubble(&user, &s, Some(&label)).draw(&ctx);
         assert_eq!(
             plain.size, bordered.size,
             "the border reuses reserved padding, so no reflow"
@@ -3270,14 +3338,13 @@ mod tests {
     fn focus_hint_renders_both_copy_and_branch_shortcuts_from_binding_data() {
         let user = UserEntry {
             content: vec![UserContent::text("ciao?")],
-            collapsible: false,
             message_id: String::new(),
         };
         let s = styles();
         let label = copy_label_spans(&s);
         // Wide enough that the whole hint fits on the border's bottom edge.
         let ctx = crate::test_support::draw_ctx(60, None);
-        let bordered = build_user_bubble(&user, false, &s, Some(&label)).draw(&ctx);
+        let bordered = build_user_bubble(&user, &s, Some(&label)).draw(&ctx);
         let last_row = usize::from(bordered.size.height) - 2;
         let row = crate::test_support::rows(&bordered)[last_row].clone();
 
@@ -3295,29 +3362,28 @@ mod tests {
     }
 
     #[test]
-    fn non_collapsible_long_message_is_never_folded() {
+    fn long_user_message_is_never_folded() {
         let lines: Vec<String> = (0..30).map(|i| format!("line {i}")).collect();
         let user = UserEntry {
             content: vec![UserContent::text(lines.join("\n"))],
-            collapsible: false,
             message_id: String::new(),
         };
-        let r = bubble_rows(&user, false, 80);
+        let r = user_bubble_rows(&user, 80);
         let body = r.join("\n");
         assert!(body.contains("line 29"), "{r:?}");
         assert!(!body.contains("to expand"), "{r:?}");
     }
 
     #[test]
-    fn short_collapsible_notification_is_not_truncated() {
-        let user = UserEntry {
-            content: vec![UserContent::text(
-                "<task-notification>\ntask #1 done\n</task-notification>",
-            )],
-            collapsible: true,
+    fn short_notification_is_not_truncated() {
+        let n = TaskNotificationEntry {
             message_id: String::new(),
+            label: "sleep".into(),
+            kind: aj_agent::message::TaskNotificationKind::Bash,
+            outcome: TaskOutcome::Succeeded,
+            body: "task #1 done".into(),
         };
-        let r = bubble_rows(&user, false, 80);
+        let r = notification_rows(&n, false, 80);
         let body = r.join("\n");
         assert!(body.contains("task #1 done"), "{r:?}");
         assert!(!body.contains("to expand"), "{r:?}");
@@ -4467,6 +4533,26 @@ mod tests {
         );
     }
 
+    /// Transcript-focus navigation steps between user prompts only, so a
+    /// task notification is never a focus stop (Spec E section 1). The
+    /// notice sits between two real prompts and must be skipped.
+    #[test]
+    fn transcript_focus_skips_task_notifications() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        apply(&chat, &mut life, user_end("first prompt"));
+        apply(
+            &chat,
+            &mut life,
+            task_notification_end("sleep", TaskOutcome::Succeeded, "done"),
+        );
+        apply(&chat, &mut life, user_end("second prompt"));
+        let view = transcript_view(&chat);
+        // Entries: user(0), notification(1), user(2). Only the two user
+        // prompts are focus stops; the notice at index 1 is skipped.
+        assert_eq!(view.user_message_indices(), vec![0, 2]);
+    }
+
     /// One user message: entering lands on it and prev/next are no-ops that
     /// keep the cursor on it (nothing older or newer to step to).
     #[test]
@@ -5107,6 +5193,18 @@ mod tests {
         }
     }
 
+    fn task_notification_end(label: &str, outcome: TaskOutcome, body: &str) -> AgentEvent {
+        AgentEvent::MessageEnd {
+            agent_id: AgentId::Main,
+            message: AgentMessage::task_notification(aj_agent::message::TaskNotification::new(
+                label.into(),
+                aj_agent::message::TaskNotificationKind::Bash,
+                outcome,
+                body.into(),
+            )),
+        }
+    }
+
     fn tool_start(agent: AgentId, call_id: &str, tool: &str) -> AgentEvent {
         AgentEvent::ToolExecutionStart {
             agent_id: agent,
@@ -5389,31 +5487,44 @@ mod tests {
         );
     }
 
-    /// The fingerprint distinguishes user-entry content and the collapsible
-    /// flag, so a slot could never serve one user render for another. User
-    /// entries are immutable after append, so this fingerprint sensitivity is
-    /// the anti-stale guarantee for them.
+    /// The fingerprint distinguishes user-entry content, so a slot could
+    /// never serve one user render for another. User entries are immutable
+    /// after append, so this fingerprint sensitivity is the anti-stale
+    /// guarantee for them.
     #[test]
-    fn user_entry_fingerprint_tracks_content_and_collapsible() {
+    fn user_entry_fingerprint_tracks_content() {
         let hello = transcript_with(EntryKind::User(UserEntry {
             content: vec![UserContent::text("hello")],
-            collapsible: false,
             message_id: String::new(),
         }));
         let longer = transcript_with(EntryKind::User(UserEntry {
             content: vec![UserContent::text("hello, world")],
-            collapsible: false,
-            message_id: String::new(),
-        }));
-        let collapsible = transcript_with(EntryKind::User(UserEntry {
-            content: vec![UserContent::text("hello")],
-            collapsible: true,
             message_id: String::new(),
         }));
         let chat = empty_chat();
         let fp = |t: &Transcript| entry_fingerprint(&t.entries()[0], &chat.borrow());
         assert_ne!(fp(&hello), fp(&longer), "content length is fingerprinted");
-        assert_ne!(fp(&hello), fp(&collapsible), "collapsible is fingerprinted");
+    }
+
+    /// A notification's outcome is fingerprinted, since it drives the bubble
+    /// tint: two notices identical but for their outcome must not share a
+    /// cached surface.
+    #[test]
+    fn task_notification_fingerprint_tracks_outcome() {
+        let make = |outcome: TaskOutcome| {
+            transcript_with(EntryKind::TaskNotification(TaskNotificationEntry {
+                message_id: String::new(),
+                label: "sleep".into(),
+                kind: aj_agent::message::TaskNotificationKind::Bash,
+                outcome,
+                body: "exit".into(),
+            }))
+        };
+        let ok = make(TaskOutcome::Succeeded);
+        let bad = make(TaskOutcome::Failed { code: Some(1) });
+        let chat = empty_chat();
+        let fp = |t: &Transcript| entry_fingerprint(&t.entries()[0], &chat.borrow());
+        assert_ne!(fp(&ok), fp(&bad), "outcome is fingerprinted");
     }
 
     /// A user entry renders through the cache and hits when unchanged.

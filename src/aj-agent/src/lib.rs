@@ -36,7 +36,7 @@ use aj_models::types::{
 
 use crate::bus::{EventBus, Listener, SubscriptionHandle};
 use crate::events::{AgentEvent, AgentId, AgentSettings, SubAgentConclusion};
-use crate::message::AgentMessage;
+use crate::message::{AgentMessage, TaskNotification, TaskNotificationKind, TaskOutcome};
 use crate::projection::transcript_to_messages;
 use crate::queue::{MessageQueues, PendingKind};
 use crate::tool::{
@@ -65,6 +65,34 @@ use tokio_util::sync::CancellationToken;
 /// stays well under the limit.
 pub fn sub_agent_session_id(base: &str, agent_id: usize) -> String {
     format!("{base}:sub:{agent_id}")
+}
+
+/// Map a terminal [`TaskStatus`] onto a persisted [`TaskOutcome`].
+///
+/// Kind-aware because an agent run has no process exit code: the driver
+/// records a failed run as `Exited(Some(1))` only to reuse the shared
+/// process status rendering, but the persisted outcome must not carry a
+/// fabricated code (export would otherwise render a misleading
+/// "(exit 1)"). So an Agent-kind failure always maps to `Failed { code:
+/// None }`, while Bash keeps the exit-code mapping. Succeeded and Killed
+/// are shared.
+///
+/// Only reached for terminal notices, so `Running` should never occur.
+/// We fold it into `Failed { code: None }` defensively rather than
+/// panic: a stray non-terminal notice is a harmless "did not succeed",
+/// not worth aborting a turn over.
+fn task_outcome(kind: TaskNotificationKind, status: TaskStatus) -> TaskOutcome {
+    match (kind, status) {
+        (_, TaskStatus::Exited(Some(0))) => TaskOutcome::Succeeded,
+        (_, TaskStatus::Killed) => TaskOutcome::Killed,
+        (TaskNotificationKind::Agent, _) => TaskOutcome::Failed { code: None },
+        (TaskNotificationKind::Bash, TaskStatus::Exited(Some(code))) => {
+            TaskOutcome::Failed { code: Some(code) }
+        }
+        (TaskNotificationKind::Bash, TaskStatus::Exited(None) | TaskStatus::Running) => {
+            TaskOutcome::Failed { code: None }
+        }
+    }
 }
 
 /// One-shot session seed applied at construction time: the resumed
@@ -826,8 +854,11 @@ impl Agent {
     /// [`AgentEvent::AgentStart`] / [`AgentEvent::AgentEnd`] events,
     /// and `cancel` is honoured the same way.
     pub async fn continue_run(&mut self, cancel: CancellationToken) -> Result<(), TurnError> {
+        // Check the projected role: a task notification has no stored wire
+        // message but projects to a user message, so a notice-tailed
+        // transcript is a valid provider request and must pass this guard.
         let last_is_user_or_tool_result = matches!(
-            self.transcript.last().and_then(|m| m.as_wire()),
+            self.transcript.last().and_then(|m| m.to_projected_wire()),
             Some(Message::User(_)) | Some(Message::ToolResult(_))
         );
         if !last_is_user_or_tool_result {
@@ -981,7 +1012,7 @@ impl Agent {
             .transcript
             .iter()
             .rev()
-            .find_map(|m| match m.as_wire() {
+            .find_map(|m| match m.as_stored_wire() {
                 Some(Message::Assistant(a)) => Some(a),
                 _ => None,
             })
@@ -1533,11 +1564,15 @@ impl Agent {
     /// Drain this agent's queued task-completion notices into the
     /// transcript.
     ///
-    /// Each notice becomes one user-role message whose body is wrapped
-    /// in a `<task-notification>` tag (marking it as harness-injected,
-    /// not a user reply), emitted with the same `MessageStart` /
-    /// `MessageEnd` pair the prompt path uses so it persists and
-    /// renders like any other message.
+    /// Each notice becomes one typed
+    /// [`AgentMessageKind::TaskNotification`] entry, emitted with the
+    /// same `MessageStart` / `MessageEnd` pair the prompt path uses so
+    /// it persists and renders like any other message. Only when the
+    /// entry projects onto the wire does it acquire the
+    /// `<task-notification>` framing (see
+    /// [`AgentMessage::to_projected_wire`]).
+    ///
+    /// [`AgentMessageKind::TaskNotification`]: crate::message::AgentMessageKind::TaskNotification
     async fn drain_task_notices(&mut self) -> Result<(), TurnError> {
         let notices = self.task_registry.drain_notices(self.agent_id);
         for notice in notices {
@@ -1545,21 +1580,25 @@ impl Agent {
             // child's accumulated usage on the registry entry; fold
             // it into session state here, where we hold `&mut self`,
             // so no shared mutability is needed.
-            if let TaskKind::Agent { agent_id, .. } = &notice.kind {
-                if let Some(usage) = self.task_registry.usage(notice.task_id) {
-                    self.session_state.record_sub_agent_usage(*agent_id, usage);
+            let kind = match &notice.kind {
+                TaskKind::Bash { .. } => TaskNotificationKind::Bash,
+                TaskKind::Agent { agent_id, .. } => {
+                    if let Some(usage) = self.task_registry.usage(notice.task_id) {
+                        self.session_state.record_sub_agent_usage(*agent_id, usage);
+                    }
+                    TaskNotificationKind::Agent
                 }
-            }
-            // The tag delimiters sit on their own lines so the body
-            // renders as regular markdown between them instead of
-            // being glued to the tag text.
-            let text = format!(
-                "{}\n{}\n{}",
-                crate::tool::TASK_NOTIFICATION_OPEN_TAG,
-                notice.body.trim_end(),
-                crate::tool::TASK_NOTIFICATION_CLOSE_TAG,
-            );
-            let message = AgentMessage::wire(Message::User(UserMessage::text(text)));
+            };
+            let outcome = task_outcome(kind, notice.status);
+            let message = AgentMessage::task_notification(TaskNotification::new(
+                notice.label,
+                kind,
+                outcome,
+                // Store the exact model-facing text: trimming the
+                // trailing whitespace here keeps the projected framing
+                // byte-identical to the pre-typed tagged string.
+                notice.body.trim_end().to_string(),
+            ));
             self.transcript.push(message.clone());
             self.bus
                 .emit(AgentEvent::MessageStart {
@@ -3242,7 +3281,7 @@ fn scan_dangling_tool_uses(transcript: &[AgentMessage]) -> std::collections::Has
     let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut resolved: std::collections::HashSet<String> = std::collections::HashSet::new();
     for msg in transcript {
-        match msg.as_wire() {
+        match msg.as_stored_wire() {
             Some(Message::Assistant(a)) => {
                 for c in &a.content {
                     if let AssistantContent::ToolCall(tc) = c {
@@ -3424,7 +3463,7 @@ mod event_protocol_tests {
 
     use crate::bus::listener_from_sync;
     use crate::events::{AgentEvent, AgentId, SubAgentConclusion};
-    use crate::message::AgentMessage;
+    use crate::message::{AgentMessage, TaskNotification, TaskNotificationKind, TaskOutcome};
     use crate::queue::MessageQueues;
     use crate::tool::{
         ErasedToolDefinition, TaskId, TaskKind, TaskNotice, TaskStatus, ToolContext,
@@ -3839,6 +3878,7 @@ mod event_protocol_tests {
             AgentMessageKind::Wire(Message::User(_)) => "User",
             AgentMessageKind::Wire(Message::Assistant(_)) => "Assistant",
             AgentMessageKind::Wire(Message::ToolResult(_)) => "ToolResult",
+            AgentMessageKind::TaskNotification(_) => "TaskNotification",
         }
     }
 
@@ -3943,7 +3983,7 @@ mod event_protocol_tests {
 
         let messages = agent.messages();
         assert_eq!(messages.len(), 2);
-        match messages[0].as_wire().expect("wire message") {
+        match messages[0].as_stored_wire().expect("wire message") {
             Message::User(u) => {
                 assert_eq!(u.content.len(), 1);
                 match &u.content[0] {
@@ -4617,6 +4657,33 @@ mod event_protocol_tests {
     }
 
     #[tokio::test]
+    async fn continue_run_accepts_task_notification_last_message() {
+        // A task notification has no stored wire message but projects to
+        // a user-role message, so a notice-tailed transcript is a valid
+        // provider request. This is the wake+overflow recovery shape: a
+        // task finishes while idle, its notice is drained as the tail,
+        // inference overflows, and compaction reseeds a transcript ending
+        // in the notice. `continue_run` must accept it rather than
+        // fatal-error on the missing stored wire message.
+        let scripts = vec![finalize_script(finalize_text("woke up"))];
+        let mut agent = build_agent_with_transcript(
+            scripts,
+            Vec::new(),
+            vec![AgentMessage::task_notification(TaskNotification::new(
+                "sleep 1".into(),
+                TaskNotificationKind::Bash,
+                TaskOutcome::Succeeded,
+                "Background task #1 finished: sleep 1 — done".into(),
+            ))],
+        );
+
+        agent
+            .continue_run(CancellationToken::new())
+            .await
+            .expect("continue_run must accept a task-notification tail");
+    }
+
+    #[tokio::test]
     async fn prompt_returns_aborted_on_provider_side_cancel() {
         // The provider emits an `Error { reason: Aborted, ... }`
         // terminal (mirroring what the real providers do when their
@@ -4646,7 +4713,7 @@ mod event_protocol_tests {
         // before the next inference.
         let messages = agent.messages();
         assert!(matches!(
-            messages.last().and_then(|m| m.as_wire()),
+            messages.last().and_then(|m| m.as_stored_wire()),
             Some(Message::Assistant(a)) if a.stop_reason == StopReason::Aborted
         ));
     }
@@ -4788,7 +4855,7 @@ mod event_protocol_tests {
             vec!["User", "Assistant"],
             "transcript should be [user, aborted-assistant] after cancel"
         );
-        let last_assistant = match messages.last().and_then(|m| m.as_wire()) {
+        let last_assistant = match messages.last().and_then(|m| m.as_stored_wire()) {
             Some(Message::Assistant(a)) => a,
             _ => panic!("expected trailing assistant message"),
         };
@@ -4868,7 +4935,7 @@ mod event_protocol_tests {
         // Only the recovered turn — not the truncated one — landed on
         // the transcript.
         let messages = agent.messages();
-        let last_assistant = match messages.last().and_then(|m| m.as_wire()) {
+        let last_assistant = match messages.last().and_then(|m| m.as_stored_wire()) {
             Some(Message::Assistant(a)) => a,
             _ => panic!("expected trailing assistant message"),
         };
@@ -4952,7 +5019,7 @@ mod event_protocol_tests {
         let seen = Arc::clone(&stop_reasons);
         let _handle = agent.subscribe(listener_from_sync(move |event| {
             if let AgentEvent::MessageEnd { message, .. } = event
-                && let Some(Message::Assistant(a)) = message.as_wire()
+                && let Some(Message::Assistant(a)) = message.as_stored_wire()
             {
                 seen.lock().unwrap().push(a.stop_reason.clone());
             }
@@ -5451,7 +5518,7 @@ mod event_protocol_tests {
         );
 
         // The transcript ends on the continuation assistant text.
-        let last_text: String = match messages.last().and_then(|m| m.as_wire()) {
+        let last_text: String = match messages.last().and_then(|m| m.as_stored_wire()) {
             Some(Message::Assistant(a)) => a
                 .content
                 .iter()
@@ -5465,7 +5532,7 @@ mod event_protocol_tests {
         assert_eq!(last_text, "continuation");
 
         // The re-prompt's user message appears in the transcript.
-        let has_follow_up = messages.iter().any(|m| match m.as_wire() {
+        let has_follow_up = messages.iter().any(|m| match m.as_stored_wire() {
             Some(Message::User(u)) => u.content.iter().any(|c| match c {
                 aj_models::types::UserContent::Text(t) => t.text == "follow up",
                 _ => false,
@@ -5695,10 +5762,15 @@ mod event_protocol_tests {
 
     // ---- Task-notice drain points ----------------------------------------
 
-    /// Extract the concatenated text of a user-role [`AgentMessage`],
-    /// `None` for other roles.
+    /// The projected user-facing text of an [`AgentMessage`], `None`
+    /// for other roles.
+    ///
+    /// Goes through [`AgentMessage::to_projected_wire`] so a typed task
+    /// notification yields its model-facing framing (a user message),
+    /// letting these tests assert the byte-identical projected text
+    /// alongside real user prompts.
     fn user_text(message: &AgentMessage) -> Option<String> {
-        match message.as_wire() {
+        match message.to_projected_wire() {
             Some(Message::User(u)) => Some(
                 u.content
                     .iter()
@@ -5779,6 +5851,88 @@ mod event_protocol_tests {
         assert!(!registry.has_notices(AgentId::Main));
         let first = user_text(&agent.messages()[0]).expect("first transcript message is user");
         assert!(first.starts_with("<task-notification>"));
+    }
+
+    /// The drained notice is stored as the typed
+    /// `AgentMessageKind::TaskNotification`, carrying the label, kind,
+    /// outcome (mapped from the status), and the trimmed body, rather
+    /// than as a tagged user wire message.
+    #[tokio::test]
+    async fn drain_produces_typed_task_notification() {
+        use crate::message::{AgentMessageKind, TaskNotificationKind, TaskOutcome};
+
+        let scripts = vec![finalize_script(finalize_text("ok"))];
+        let mut agent = build_agent(scripts, Vec::new());
+        let registry = TaskRegistry::default();
+        agent.set_task_registry(registry.clone());
+        registry.push_notice(TaskNotice {
+            owner: AgentId::Main,
+            task_id: 4,
+            kind: TaskKind::Bash {
+                command: "cargo test".to_string(),
+            },
+            label: "cargo test".to_string(),
+            status: TaskStatus::Exited(Some(2)),
+            // Trailing whitespace must be trimmed off the stored body.
+            body: "exit code 2\n\n".to_string(),
+        });
+
+        agent
+            .prompt("hi".to_string(), CancellationToken::new())
+            .await
+            .expect("prompt");
+
+        match &agent.messages()[0].kind {
+            AgentMessageKind::TaskNotification(n) => {
+                assert_eq!(n.label, "cargo test");
+                assert_eq!(n.kind, TaskNotificationKind::Bash);
+                assert_eq!(n.outcome, TaskOutcome::Failed { code: Some(2) });
+                assert_eq!(n.body, "exit code 2");
+            }
+            other => panic!("expected TaskNotification, got {other:?}"),
+        }
+    }
+
+    /// An agent-backed task has no process exit code. Its detached driver
+    /// records a failure as `Exited(Some(1))` only to reuse the shared
+    /// process status rendering, so the persisted outcome must drop that
+    /// fabricated code: `Failed { code: None }`, not `Failed { code:
+    /// Some(1) }`. Otherwise export renders a misleading "(exit 1)". The
+    /// Bash path above keeps its real exit code, so this pins the
+    /// kind-aware split.
+    #[tokio::test]
+    async fn drain_maps_agent_failure_to_codeless_outcome() {
+        use crate::message::AgentMessageKind;
+
+        let scripts = vec![finalize_script(finalize_text("ok"))];
+        let mut agent = build_agent(scripts, Vec::new());
+        let registry = TaskRegistry::default();
+        agent.set_task_registry(registry.clone());
+        registry.push_notice(TaskNotice {
+            owner: AgentId::Main,
+            task_id: 7,
+            kind: TaskKind::Agent {
+                agent_id: 2,
+                task: "investigate".to_string(),
+            },
+            label: "investigate".to_string(),
+            // The driver stamps a failed agent run as Exited(Some(1)).
+            status: TaskStatus::Exited(Some(1)),
+            body: "sub-agent failed: boom".to_string(),
+        });
+
+        agent
+            .prompt("hi".to_string(), CancellationToken::new())
+            .await
+            .expect("prompt");
+
+        match &agent.messages()[0].kind {
+            AgentMessageKind::TaskNotification(n) => {
+                assert_eq!(n.kind, TaskNotificationKind::Agent);
+                assert_eq!(n.outcome, TaskOutcome::Failed { code: None });
+            }
+            other => panic!("expected TaskNotification, got {other:?}"),
+        }
     }
 
     /// Tool that queues a completion notice for `Main` through the
@@ -5869,7 +6023,7 @@ mod event_protocol_tests {
                 matches!(
                     e,
                     AgentEvent::MessageStart { message, .. }
-                        if matches!(message.as_wire(), Some(Message::Assistant(_)))
+                        if matches!(message.as_stored_wire(), Some(Message::Assistant(_)))
                 )
             })
             .map(|(i, _)| i)
@@ -5984,12 +6138,12 @@ mod event_protocol_tests {
                 EventLabel::Message {
                     agent_id: AgentId::Main,
                     phase: "start",
-                    kind: "User",
+                    kind: "TaskNotification",
                 },
                 EventLabel::Message {
                     agent_id: AgentId::Main,
                     phase: "end",
-                    kind: "User",
+                    kind: "TaskNotification",
                 },
                 EventLabel::TurnStart(AgentId::Main),
                 EventLabel::Message {
@@ -6143,7 +6297,7 @@ mod event_protocol_tests {
                 matches!(
                     e,
                     AgentEvent::MessageStart { message, .. }
-                        if matches!(message.as_wire(), Some(Message::Assistant(_)))
+                        if matches!(message.as_stored_wire(), Some(Message::Assistant(_)))
                 )
             })
             .map(|(i, _)| i)
@@ -6273,7 +6427,7 @@ mod event_protocol_tests {
                 matches!(
                     e,
                     AgentEvent::MessageStart { message, .. }
-                        if matches!(message.as_wire(), Some(Message::Assistant(_)))
+                        if matches!(message.as_stored_wire(), Some(Message::Assistant(_)))
                 )
             })
             .map(|(i, _)| i)
@@ -6325,7 +6479,7 @@ mod event_protocol_tests {
         agent
             .messages()
             .iter()
-            .filter_map(|m| match m.as_wire() {
+            .filter_map(|m| match m.as_stored_wire() {
                 Some(Message::ToolResult(r)) => Some(r.tool_call_id.clone()),
                 _ => None,
             })

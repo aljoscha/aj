@@ -335,7 +335,7 @@ impl Conversation {
     pub fn messages(&self) -> Vec<Message> {
         self.projected_agent_messages()
             .iter()
-            .filter_map(|m| m.as_wire().cloned())
+            .filter_map(|m| m.to_projected_wire())
             .collect()
     }
 
@@ -442,7 +442,7 @@ impl Conversation {
                     settings.verbosity = Some(snap.verbosity.clone());
                 }
                 ConversationEntryKind::Message { message } => {
-                    if let Some(Message::Assistant(a)) = message.as_wire() {
+                    if let Some(Message::Assistant(a)) = message.as_stored_wire() {
                         settings.model = Some((a.provider.clone(), a.model.clone()));
                     }
                 }
@@ -457,12 +457,15 @@ impl Conversation {
     }
 
     /// Get the last message in the view, if any.
+    ///
+    /// Returns the provider-facing projection, so a task-notification tail
+    /// yields its projected user message rather than being skipped.
     pub fn last_message(&self) -> Option<Message> {
         self.entries.iter().rev().find_map(|entry| {
             let ConversationEntryKind::Message { message } = &entry.entry else {
                 return None;
             };
-            expand_message(message.clone()).as_wire().cloned()
+            expand_message(message.clone()).to_projected_wire()
         })
     }
 }
@@ -1427,6 +1430,16 @@ mod tests {
         )))
     }
 
+    fn task_notification_msg(body: &str) -> AgentMessage {
+        use aj_agent::message::{TaskNotification, TaskNotificationKind, TaskOutcome};
+        AgentMessage::task_notification(TaskNotification::new(
+            "cargo build".to_string(),
+            TaskNotificationKind::Bash,
+            TaskOutcome::Succeeded,
+            body.to_string(),
+        ))
+    }
+
     fn detailed_text_tool_result(
         id: &str,
         name: &str,
@@ -1444,7 +1457,7 @@ mod tests {
     }
 
     fn agent_tool_result_details(message: &AgentMessage) -> &serde_json::Value {
-        let Some(Message::ToolResult(result)) = message.as_wire() else {
+        let Some(Message::ToolResult(result)) = message.as_stored_wire() else {
             panic!("expected tool-result agent message");
         };
         result.details.as_ref().expect("tool details")
@@ -1855,7 +1868,7 @@ mod tests {
         assert_eq!(convo.entries().len(), 1);
         match &convo.entries()[0].entry {
             ConversationEntryKind::Message { message } => {
-                assert!(matches!(message.as_wire(), Some(Message::User(_))));
+                assert!(matches!(message.as_stored_wire(), Some(Message::User(_))));
             }
             other => panic!("expected user message, got {other:?}"),
         }
@@ -1939,7 +1952,7 @@ mod tests {
                 matches!(
                     &entry.entry,
                     ConversationEntryKind::Message { message }
-                        if matches!(message.as_wire(), Some(Message::ToolResult(_)))
+                        if matches!(message.as_stored_wire(), Some(Message::ToolResult(_)))
                 )
             })
             .expect("stored tool result");
@@ -1962,7 +1975,7 @@ mod tests {
             .iter()
             .find_map(|entry| match &entry.entry {
                 ConversationEntryKind::Message { message }
-                    if matches!(message.as_wire(), Some(Message::ToolResult(_))) =>
+                    if matches!(message.as_stored_wire(), Some(Message::ToolResult(_))) =>
                 {
                     Some(agent_tool_result_details(message))
                 }
@@ -1975,7 +1988,7 @@ mod tests {
         let agent_messages = conversation.agent_messages();
         let projected_agent = agent_messages
             .iter()
-            .find(|message| matches!(message.as_wire(), Some(Message::ToolResult(_))))
+            .find(|message| matches!(message.as_stored_wire(), Some(Message::ToolResult(_))))
             .expect("projected agent tool result");
         let projected_agent_details = agent_tool_result_details(projected_agent);
         assert_eq!(projected_agent_details["summary"], "read_file large.txt");
@@ -1994,6 +2007,53 @@ mod tests {
 
         let last = conversation.last_message().expect("last message");
         assert_eq!(wire_tool_result_details(&last)["body"], body);
+    }
+
+    #[test]
+    fn task_notification_round_trips_as_typed_kind_through_resume() {
+        use aj_agent::message::AgentMessageKind;
+
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("system prompt");
+        {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(user_text("hi")).expect("user message");
+            view.add_message(task_notification_msg("exit code 0"))
+                .expect("task notification");
+        }
+        let session_id = log.session_id().to_string();
+        drop(log);
+
+        // Resume from disk: the notice deserializes back to the typed
+        // kind, not a plain user entry.
+        let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume log");
+        let head = resumed.latest_leaf(ThreadFilter::USER).expect("head");
+        let conversation = resumed.linearize(&head, ThreadFilter::USER);
+
+        let agent_messages = conversation.agent_messages();
+        match &agent_messages.last().expect("a message").kind {
+            AgentMessageKind::TaskNotification(n) => {
+                assert_eq!(n.label, "cargo build");
+                assert_eq!(n.body, "exit code 0");
+            }
+            other => panic!("expected TaskNotification, got {other:?}"),
+        }
+
+        // It still projects onto the wire as the framed user message the
+        // model expects.
+        let messages = conversation.messages();
+        match messages.last().expect("a wire message") {
+            Message::User(u) => match &u.content[0] {
+                UserContent::Text(t) => assert_eq!(
+                    t.text,
+                    "<task-notification>\nexit code 0\n</task-notification>"
+                ),
+                other => panic!("expected text, got {other:?}"),
+            },
+            other => panic!("expected framed user projection, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2802,7 +2862,7 @@ mod tests {
             .iter()
             .find_map(|entry| match &entry.entry {
                 ConversationEntryKind::Message { message }
-                    if matches!(message.as_wire(), Some(Message::ToolResult(_))) =>
+                    if matches!(message.as_stored_wire(), Some(Message::ToolResult(_))) =>
                 {
                     Some(agent_tool_result_details(message))
                 }
@@ -2815,7 +2875,7 @@ mod tests {
         let agent_messages = conversation.agent_messages();
         let projected_agent = agent_messages
             .iter()
-            .find(|message| matches!(message.as_wire(), Some(Message::ToolResult(_))))
+            .find(|message| matches!(message.as_stored_wire(), Some(Message::ToolResult(_))))
             .expect("retained agent tool result");
         let agent_details = agent_tool_result_details(projected_agent);
         assert_eq!(agent_details["summary"], "read_file retained.txt");
@@ -3065,7 +3125,7 @@ mod tests {
         assert_eq!(convo.message_count(), 1);
         match &convo.entries()[0].entry {
             ConversationEntryKind::Message { message } => {
-                assert!(matches!(message.as_wire(), Some(Message::User(_))));
+                assert!(matches!(message.as_stored_wire(), Some(Message::User(_))));
             }
             other => panic!("expected the first user message, got {other:?}"),
         }

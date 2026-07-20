@@ -94,7 +94,12 @@ const entries = [
       content: [{ type: 'text', text: 'sub-agent finding' }],
       details: { kind: 'sub_agent_report', agent_id: 1, task: 'investigate the bug', report: 'sub-agent finding' },
       is_error: false, timestamp: 0 } },
-  { id: 'a2', parent_id: 'r4', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:09Z',
+  // A background-task completion notice on the user thread: the typed
+  // `role:"task_notification"` shape the exporter emits.
+  { id: 'n1', parent_id: 'r4', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:08Z',
+    message: { role: 'task_notification', label: 'cargo build', kind: 'bash',
+      outcome: { status: 'succeeded' }, body: 'exit code 0' } },
+  { id: 'a2', parent_id: 'n1', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:09Z',
     message: { role: 'assistant', model: 'claude-test', content: [{ type: 'text', text: 'Done. <script>alert(1)</script>' },
       { type: 'tool_call', id: 'c5', name: 'agent', arguments: { task: 'double-check' } }],
       usage: { input: 1, output: 1, cache_read: 0, cache_write: 0, total_tokens: 2, cost: { total: 0 } }, stop_reason: 'ToolUse', timestamp: 0 } },
@@ -306,12 +311,18 @@ const a1box = divRegion(elements['messages'].innerHTML, 'id="entry-a1"');
 check('assistant bubble present for a turn with text', a1box.includes('Reading the file'));
 check('tool execution is a sibling, not nested in the assistant bubble', !!a1box && !a1box.includes('tool-execution'));
 
-console.log('sub-agent');
-has('sub-agent box', 'class="subagent"');
+console.log('sub-agent');has('sub-agent box', 'class="subagent"');
 has('sub-agent id and task', 'sub-agent #1');
 has('sub-agent task text', 'investigate the bug');
 has('sub-agent nested message', 'sub-agent finding');
 check('agent report not duplicated', rendered.split('sub-agent finding').length - 1 === 1);
+
+console.log('task notification');
+has('task notification block', 'class="task-notification"');
+has('task notification head', 'task cargo build succeeded');
+has('task notification body', 'exit code 0');
+hasnt('notice not rendered as a user bubble', 'class="msg user" id="entry-n1"');
+has('user stat excludes the notice', '2 user');
 
 console.log('security');
 hasnt('raw script not live', '<script>alert(1)');

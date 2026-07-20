@@ -5881,8 +5881,9 @@ mod tests {
         let agent = world.core.agent.lock().await;
         let transcript = format!("{:?}", agent.messages());
         assert!(
-            transcript.contains("<task-notification>\\ntask #1 done\\n</task-notification>"),
-            "notice drained into the transcript: {transcript}"
+            transcript.contains("TaskNotification")
+                && transcript.contains("body: \"task #1 done\""),
+            "notice drained into the transcript as the typed kind: {transcript}"
         );
         assert!(
             transcript.contains("woke and reacted"),

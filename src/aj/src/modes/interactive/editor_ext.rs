@@ -273,6 +273,24 @@ mod tests {
         serde_json::to_string(&payload).unwrap()
     }
 
+    /// A persisted task-completion notice line: `role:"task_notification"`,
+    /// the on-disk shape `Agent::drain_task_notices` writes.
+    fn task_notification_line(body: &str, id: &str) -> String {
+        let payload = serde_json::json!({
+            "id": id,
+            "thread": "user",
+            "type": "message",
+            "message": {
+                "role": "task_notification",
+                "label": "ls",
+                "kind": "bash",
+                "outcome": {"status": "succeeded"},
+                "body": body,
+            },
+        });
+        serde_json::to_string(&payload).unwrap()
+    }
+
     fn bootstrap_for(dir: &Path, max: usize) -> PromptHistory {
         let p = ConversationPersistence::new(dir.to_path_buf());
         PromptHistory::bootstrap(&p, max)
@@ -475,17 +493,12 @@ mod tests {
     #[test]
     fn bootstrap_ignores_task_notification_messages() {
         let dir = scratch_dir("task-notification");
-        let notice = format!(
-            "{}\nBackground task #1 finished: ls (exit 0)\n{}",
-            aj_agent::tool::TASK_NOTIFICATION_OPEN_TAG,
-            aj_agent::tool::TASK_NOTIFICATION_CLOSE_TAG,
-        );
         write_jsonl(
             &dir,
             "2024-01-01-00-00-00",
             &[
                 &user_message_line("real prompt", "1"),
-                &user_message_line(&notice, "2"),
+                &task_notification_line("Background task #1 finished: ls (exit 0)", "2"),
                 &user_message_line("another real prompt", "3"),
             ],
         );
