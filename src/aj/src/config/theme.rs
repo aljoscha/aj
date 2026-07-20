@@ -554,7 +554,7 @@ mod tests {
                 "border": "", "borderAccent": "", "borderMuted": "",
                 "success": "", "error": "", "warning": "", "muted": "",
                 "text": "", "thinkingText": "",
-                "selectedBg": "", "userMessageBg": "", "userMessageText": "",
+                "selectedBg": "", "textSelectionBg": "", "userMessageBg": "", "userMessageText": "",
                 "customMessageBg": "", "customMessageText": "",
                 "customMessageLabel": "", "toolPendingBg": "",
                 "toolSuccessBg": "", "toolErrorBg": "", "toolTitle": "",
