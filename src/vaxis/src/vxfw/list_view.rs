@@ -393,14 +393,14 @@ pub struct ListView {
 }
 
 impl ListView {
-    /// A list view over `children` with `draw_cursor` on and a wheel step of 3.
+    /// A list view over `children` with `draw_cursor` on and a wheel step of 1.
     pub fn new(children: Source) -> ListView {
         ListView {
             children,
             cursor: 0,
             draw_cursor: true,
             anchor_short_to_bottom: false,
-            wheel_scroll: 3,
+            wheel_scroll: 1,
             item_count: None,
             scroll: Scroll::default(),
             last_viewport_height: None,

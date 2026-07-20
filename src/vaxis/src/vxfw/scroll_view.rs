@@ -130,7 +130,7 @@ pub struct ScrollView {
 
 impl ScrollView {
     /// A scroll view over `children` with `draw_cursor` off and a wheel step of
-    /// 3.
+    /// 1.
     pub fn new(children: Source) -> ScrollView {
         ScrollView {
             children,
@@ -140,7 +140,7 @@ impl ScrollView {
                 char: Character::new("▐", 1),
                 ..Cell::default()
             },
-            wheel_scroll: 3,
+            wheel_scroll: 1,
             item_count: None,
             last_height: 0,
             scroll: Scroll::default(),

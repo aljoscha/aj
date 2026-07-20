@@ -1702,9 +1702,6 @@ impl TranscriptView {
         // shorter than the chat slot it sits at the bottom, so the first message
         // lands right above the editor and later ones grow upward.
         list.anchor_short_to_bottom = true;
-        // Scroll two lines per wheel tick rather than the list default of three,
-        // for a slightly finer, smoother feel when reading history.
-        list.wheel_scroll = 2;
         let mut bars = ScrollBars::new(list);
         bars.draw_horizontal_scrollbar = false;
         apply_scrollbar_thumbs(&mut bars, &styles);
