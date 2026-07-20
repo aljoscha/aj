@@ -59,7 +59,12 @@ impl Provider for AnthropicProvider {
         context: &Context,
         options: &StreamOptions,
     ) -> AssistantMessageEventStream {
-        spawn_stream(model.clone(), context.clone(), options.clone(), None)
+        spawn_stream(
+            model.clone(),
+            context.clone(),
+            options.clone(),
+            ThinkingLevel::Off,
+        )
     }
 
     fn stream_simple(
@@ -88,7 +93,7 @@ fn spawn_stream(
     model: ModelInfo,
     context: Context,
     options: StreamOptions,
-    reasoning: Option<ThinkingLevel>,
+    reasoning: ThinkingLevel,
 ) -> AssistantMessageEventStream {
     let stream = AssistantMessageEventStream::new();
     let producer = stream.clone();
@@ -110,11 +115,9 @@ async fn run_stream(
     model: ModelInfo,
     context: Context,
     options: StreamOptions,
-    reasoning: Option<ThinkingLevel>,
+    reasoning: ThinkingLevel,
 ) {
-    if let Err(err) =
-        run_stream_inner(&producer, &model, &context, &options, reasoning.as_ref()).await
-    {
+    if let Err(err) = run_stream_inner(&producer, &model, &context, &options, &reasoning).await {
         let mut error = AssistantMessage::empty();
         error.api = API_NAME.to_string();
         error.provider = model.provider.clone();
@@ -144,7 +147,7 @@ async fn run_stream_inner(
     model: &ModelInfo,
     context: &Context,
     options: &StreamOptions,
-    reasoning: Option<&ThinkingLevel>,
+    reasoning: &ThinkingLevel,
 ) -> Result<(), AssistantError> {
     // Fast-path: caller already cancelled before we did any work.
     if let Some(token) = options.cancel.as_ref()
@@ -163,9 +166,7 @@ async fn run_stream_inner(
     // Reject a thinking level the model can't honour before building
     // the request: aj sends the chosen effort verbatim, so this is the
     // only client-side guard against an out-of-vocabulary level.
-    if let Some(level) = reasoning
-        && let Err(msg) = validate_thinking_level(model, level)
-    {
+    if let Err(msg) = validate_thinking_level(model, reasoning) {
         return Err(AssistantError::new(ErrorCategory::InvalidRequest, msg));
     }
 
@@ -238,7 +239,7 @@ fn empty_partial(model: &ModelInfo) -> AssistantMessage {
 fn build_client(
     model: &ModelInfo,
     api_key: String,
-    reasoning: Option<&ThinkingLevel>,
+    reasoning: &ThinkingLevel,
     options: &StreamOptions,
 ) -> Client {
     let base_url = if model.base_url.is_empty() {
@@ -251,7 +252,10 @@ fn build_client(
     // reasoning models; adaptive models reject it (Opus 4.7) or treat
     // it as redundant. Send it only when reasoning is on AND the model
     // is not adaptive.
-    if reasoning.is_some() && model.reasoning && !supports_adaptive_thinking(model) {
+    if !matches!(reasoning, ThinkingLevel::Off)
+        && model.reasoning
+        && !supports_adaptive_thinking(model)
+    {
         client = client.with_interleaved_thinking(true);
     }
     for beta in extra_betas_from_headers(options.headers.as_ref()) {
@@ -319,7 +323,7 @@ fn build_request(
     model: &ModelInfo,
     context: &Context,
     options: &StreamOptions,
-    reasoning: Option<&ThinkingLevel>,
+    reasoning: &ThinkingLevel,
 ) -> AMessages {
     // rewrite the history for cross-provider replay (signature
     // strip, tool-call ID normalization, orphan/errored handling, image
@@ -762,12 +766,13 @@ fn to_anthropic_tool_choice(choice: Option<&ToolChoice>, has_tools: bool) -> Opt
 
 fn build_thinking(
     model: &ModelInfo,
-    reasoning: Option<&ThinkingLevel>,
+    reasoning: &ThinkingLevel,
     display: Option<&ThinkingDisplay>,
 ) -> (Option<AThinking>, Option<OutputConfig>) {
-    let Some(level) = reasoning else {
+    if matches!(reasoning, ThinkingLevel::Off) {
         return (Some(AThinking::Disabled), None);
-    };
+    }
+    let level = reasoning;
     if !model.reasoning {
         // The caller asked for reasoning on a non-reasoning model.
         // The spec maps this to "disabled" — silently ignoring the
@@ -812,7 +817,9 @@ fn to_anthropic_display(display: &ThinkingDisplay) -> AThinkingDisplay {
 /// folds onto `Low` to keep the match total.
 fn adaptive_effort_for(level: &ThinkingLevel) -> OutputEffort {
     match level {
-        ThinkingLevel::Minimal | ThinkingLevel::Low => OutputEffort::Low,
+        // Off is handled upstream in build_thinking; folding it onto the
+        // lowest rung here only keeps the match total.
+        ThinkingLevel::Off | ThinkingLevel::Minimal | ThinkingLevel::Low => OutputEffort::Low,
         ThinkingLevel::Medium => OutputEffort::Medium,
         ThinkingLevel::High => OutputEffort::High,
         ThinkingLevel::XHigh => OutputEffort::XHigh,
@@ -822,6 +829,8 @@ fn adaptive_effort_for(level: &ThinkingLevel) -> OutputEffort {
 
 fn budget_for(level: &ThinkingLevel) -> u64 {
     match level {
+        // Off is handled upstream in build_thinking; this arm only keeps the match total.
+        ThinkingLevel::Off => 1024,
         ThinkingLevel::Minimal => 1024,
         ThinkingLevel::Low => 2048,
         ThinkingLevel::Medium => 8192,
@@ -1564,12 +1573,12 @@ mod tests {
 
     #[test]
     fn build_thinking_adaptive_vs_budget() {
-        let (think, oc) = build_thinking(&fake_model(), Some(&ThinkingLevel::High), None);
+        let (think, oc) = build_thinking(&fake_model(), &ThinkingLevel::High, None);
         assert!(matches!(think, Some(AThinking::Adaptive { .. })));
         let oc = oc.unwrap();
         assert!(matches!(oc.effort, Some(OutputEffort::High)));
 
-        let (think, oc) = build_thinking(&budget_model(), Some(&ThinkingLevel::Medium), None);
+        let (think, oc) = build_thinking(&budget_model(), &ThinkingLevel::Medium, None);
         assert!(matches!(
             think,
             Some(AThinking::Enabled {
@@ -1580,7 +1589,7 @@ mod tests {
         assert!(oc.is_none());
 
         // No reasoning + reasoning-capable model → disabled.
-        let (think, oc) = build_thinking(&fake_model(), None, None);
+        let (think, oc) = build_thinking(&fake_model(), &ThinkingLevel::Off, None);
         assert!(matches!(think, Some(AThinking::Disabled)));
         assert!(oc.is_none());
     }
@@ -1737,7 +1746,7 @@ mod tests {
             &budget_model(),
             &Context::new("sys"),
             &options,
-            Some(&ThinkingLevel::High),
+            &ThinkingLevel::High,
         );
         assert_eq!(req.max_tokens, 8192 + 16_384);
         match req.thinking {
@@ -1770,7 +1779,7 @@ mod tests {
             &tiny_model,
             &Context::new("sys"),
             &options,
-            Some(&ThinkingLevel::High),
+            &ThinkingLevel::High,
         );
         assert_eq!(req.max_tokens, 2047);
         match req.thinking {
@@ -1791,7 +1800,7 @@ mod tests {
         // `Adaptive` variant directly.
         let (think, _oc) = build_thinking(
             &fake_model(),
-            Some(&ThinkingLevel::High),
+            &ThinkingLevel::High,
             Some(&ThinkingDisplay::Summarized),
         );
         match think {
@@ -1804,7 +1813,7 @@ mod tests {
         // Budget thinking: same field on the `Enabled` variant.
         let (think, _oc) = build_thinking(
             &budget_model(),
-            Some(&ThinkingLevel::Medium),
+            &ThinkingLevel::Medium,
             Some(&ThinkingDisplay::Omitted),
         );
         match think {
@@ -1816,7 +1825,7 @@ mod tests {
 
         // No display configured → wire field stays None so we
         // don't pin the model into a specific mode.
-        let (think, _oc) = build_thinking(&fake_model(), Some(&ThinkingLevel::High), None);
+        let (think, _oc) = build_thinking(&fake_model(), &ThinkingLevel::High, None);
         match think {
             Some(AThinking::Adaptive { display }) => assert!(display.is_none()),
             other => panic!("expected Adaptive, got {other:?}"),
@@ -1828,13 +1837,13 @@ mod tests {
         // Adaptive models pass each level straight to the wire effort
         // enum — one-to-one, no downgrade.
         let m = fake_model();
-        let (_t, oc) = build_thinking(&m, Some(&ThinkingLevel::XHigh), None);
+        let (_t, oc) = build_thinking(&m, &ThinkingLevel::XHigh, None);
         assert!(matches!(oc.unwrap().effort, Some(OutputEffort::XHigh)));
 
-        let (_t, oc) = build_thinking(&m, Some(&ThinkingLevel::Max), None);
+        let (_t, oc) = build_thinking(&m, &ThinkingLevel::Max, None);
         assert!(matches!(oc.unwrap().effort, Some(OutputEffort::Max)));
 
-        let (_t, oc) = build_thinking(&m, Some(&ThinkingLevel::High), None);
+        let (_t, oc) = build_thinking(&m, &ThinkingLevel::High, None);
         assert!(matches!(oc.unwrap().effort, Some(OutputEffort::High)));
     }
 
@@ -1844,9 +1853,9 @@ mod tests {
         let context = Context::new("sys");
         let mut options = StreamOptions::default();
         options.temperature = Some(0.7);
-        let req = build_request(&model, &context, &options, Some(&ThinkingLevel::High));
+        let req = build_request(&model, &context, &options, &ThinkingLevel::High);
         assert!(req.temperature.is_none());
-        let req = build_request(&model, &context, &options, None);
+        let req = build_request(&model, &context, &options, &ThinkingLevel::Off);
         assert_eq!(req.temperature, Some(0.7));
     }
 
@@ -1857,7 +1866,7 @@ mod tests {
         let model = fake_model();
         let context = Context::new("sys");
         let options = StreamOptions::default();
-        let req = build_request(&model, &context, &options, None);
+        let req = build_request(&model, &context, &options, &ThinkingLevel::Off);
         assert_eq!(req.max_tokens, model.max_tokens);
     }
 
@@ -1867,7 +1876,12 @@ mod tests {
             speed: Some(Speed::Fast),
             ..Default::default()
         };
-        let req = build_request(&fake_model(), &Context::new("sys"), &options, None);
+        let req = build_request(
+            &fake_model(),
+            &Context::new("sys"),
+            &options,
+            &ThinkingLevel::Off,
+        );
         assert_eq!(req.speed, Some(ASpeed::Fast));
     }
 
@@ -1881,7 +1895,12 @@ mod tests {
                 speed,
                 ..Default::default()
             };
-            let req = build_request(&fake_model(), &Context::new("sys"), &options, None);
+            let req = build_request(
+                &fake_model(),
+                &Context::new("sys"),
+                &options,
+                &ThinkingLevel::Off,
+            );
             assert!(req.speed.is_none(), "speed {speed:?} should omit the field");
         }
     }
@@ -1895,7 +1914,12 @@ mod tests {
         context
             .messages
             .push(Message::User(UserMessage::text("u2")));
-        let req = build_request(&fake_model(), &context, &StreamOptions::default(), None);
+        let req = build_request(
+            &fake_model(),
+            &context,
+            &StreamOptions::default(),
+            &ThinkingLevel::Off,
+        );
         // last user is at index 1, last block at index 0.
         let last = req.messages.last().unwrap();
         let cc = last.content.last().unwrap();

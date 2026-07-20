@@ -161,7 +161,7 @@ fn options(key: &str, reasoning: ThinkingLevel) -> SimpleStreamOptions {
             tool_choice: Some(ToolChoice::Auto),
             ..Default::default()
         },
-        reasoning: Some(reasoning),
+        reasoning,
     }
 }
 

@@ -97,7 +97,12 @@ impl Provider for OpenAiCodexResponsesProvider {
         context: &Context,
         options: &StreamOptions,
     ) -> AssistantMessageEventStream {
-        spawn_stream(model.clone(), context.clone(), options.clone(), None)
+        spawn_stream(
+            model.clone(),
+            context.clone(),
+            options.clone(),
+            ThinkingLevel::Off,
+        )
     }
 
     fn stream_simple(
@@ -123,7 +128,7 @@ fn spawn_stream(
     model: ModelInfo,
     context: Context,
     options: StreamOptions,
-    reasoning: Option<ThinkingLevel>,
+    reasoning: ThinkingLevel,
 ) -> AssistantMessageEventStream {
     let stream = AssistantMessageEventStream::new();
     let producer = stream.clone();
@@ -139,11 +144,9 @@ async fn run_stream(
     model: ModelInfo,
     context: Context,
     options: StreamOptions,
-    reasoning: Option<ThinkingLevel>,
+    reasoning: ThinkingLevel,
 ) {
-    if let Err(err) =
-        run_stream_inner(&producer, &model, &context, &options, reasoning.as_ref()).await
-    {
+    if let Err(err) = run_stream_inner(&producer, &model, &context, &options, &reasoning).await {
         let mut error = AssistantMessage::empty();
         error.api = API_NAME.to_string();
         error.provider = model.provider.clone();
@@ -162,7 +165,7 @@ async fn run_stream_inner(
     model: &ModelInfo,
     context: &Context,
     options: &StreamOptions,
-    reasoning: Option<&ThinkingLevel>,
+    reasoning: &ThinkingLevel,
 ) -> Result<(), AssistantError> {
     if let Some(token) = options.cancel.as_ref()
         && token.is_cancelled()
@@ -185,9 +188,7 @@ async fn run_stream_inner(
 
     // Reject a thinking level the model can't honour before building
     // the request: aj sends the chosen effort verbatim.
-    if let Some(level) = reasoning
-        && let Err(msg) = validate_thinking_level(model, level)
-    {
+    if let Err(msg) = validate_thinking_level(model, reasoning) {
         return Err(AssistantError::new(ErrorCategory::InvalidRequest, msg));
     }
 
@@ -683,7 +684,7 @@ fn build_request(
     model: &ModelInfo,
     context: &Context,
     options: &StreamOptions,
-    reasoning: Option<&ThinkingLevel>,
+    reasoning: &ThinkingLevel,
 ) -> CreateResponseRequest {
     // system prompt routed via the top-level `instructions`
     // field, not as a developer/system input item. We seed `input`
@@ -700,7 +701,6 @@ fn build_request(
     // requested level) floors to `minimal`: a reasoning model can't be
     // told not to reason, so we treat off identically to minimal.
     let (reasoning_cfg, include) = if model.reasoning {
-        let level = reasoning.unwrap_or(&ThinkingLevel::Minimal);
         let summary = match options.reasoning_summary.as_ref() {
             Some(UnifiedReasoningSummary::Auto) | None => ReasoningSummaryMode::Auto,
             Some(UnifiedReasoningSummary::Detailed) => ReasoningSummaryMode::Detailed,
@@ -708,7 +708,7 @@ fn build_request(
         };
         (
             Some(Reasoning {
-                effort: Some(map_reasoning_effort(level)),
+                effort: Some(map_reasoning_effort(reasoning)),
                 summary: Some(summary),
             }),
             vec![ResponseIncludable::ReasoningEncryptedContent],
@@ -840,7 +840,7 @@ mod tests {
             &fake_model("gpt-5.1", false),
             &ctx,
             &StreamOptions::default(),
-            None,
+            &ThinkingLevel::Off,
         );
 
         match &req.instructions {
@@ -874,7 +874,7 @@ mod tests {
             &fake_model("gpt-5.1", false),
             &ctx,
             &StreamOptions::default(),
-            None,
+            &ThinkingLevel::Off,
         );
         match &req.instructions {
             Some(ResponseInstructions::String(s)) => assert_eq!(s, "You are a helpful assistant."),
@@ -889,7 +889,7 @@ mod tests {
             &fake_model("gpt-5.1", false),
             &ctx,
             &StreamOptions::default(),
-            None,
+            &ThinkingLevel::Off,
         );
         assert_eq!(req.store, Some(false));
         assert!(matches!(
@@ -911,7 +911,7 @@ mod tests {
                 verbosity: Some(crate::types::Verbosity::High),
                 ..Default::default()
             },
-            None,
+            &ThinkingLevel::Off,
         );
         let text = req
             .text
@@ -932,7 +932,7 @@ mod tests {
                 verbosity: Some(crate::types::Verbosity::High),
                 ..Default::default()
             },
-            None,
+            &ThinkingLevel::Off,
         );
         assert!(
             req.text.is_none(),
@@ -952,7 +952,7 @@ mod tests {
                 session_id: Some("sid".into()),
                 ..Default::default()
             },
-            None,
+            &ThinkingLevel::Off,
         );
         // text omitted: no verbosity requested in these options.
         assert!(req.text.is_none(), "text config must be omitted");
@@ -976,7 +976,7 @@ mod tests {
             &fake_model("gpt-5.1", false),
             &ctx,
             &StreamOptions::default(),
-            None,
+            &ThinkingLevel::Off,
         );
         let serialized = serde_json::to_value(&req).expect("serialize");
         let tools = serialized
@@ -998,7 +998,7 @@ mod tests {
             &fake_model("gpt-5.1", false),
             &ctx,
             &StreamOptions::default(),
-            Some(&ThinkingLevel::Medium),
+            &ThinkingLevel::Medium,
         );
         assert!(req_non.reasoning.is_none());
         assert!(req_non.include.is_empty());
@@ -1007,7 +1007,7 @@ mod tests {
             &fake_model("gpt-5.1", true),
             &ctx,
             &StreamOptions::default(),
-            Some(&ThinkingLevel::Medium),
+            &ThinkingLevel::Medium,
         );
         let r = req_yes.reasoning.expect("reasoning set");
         assert!(matches!(r.effort, Some(ReasoningEffort::Medium)));

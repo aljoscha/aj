@@ -62,7 +62,12 @@ impl Provider for OpenAiCompletionsProvider {
         context: &Context,
         options: &StreamOptions,
     ) -> AssistantMessageEventStream {
-        spawn_stream(model.clone(), context.clone(), options.clone(), None)
+        spawn_stream(
+            model.clone(),
+            context.clone(),
+            options.clone(),
+            ThinkingLevel::Off,
+        )
     }
 
     fn stream_simple(
@@ -91,7 +96,7 @@ fn spawn_stream(
     model: ModelInfo,
     context: Context,
     options: StreamOptions,
-    reasoning: Option<ThinkingLevel>,
+    reasoning: ThinkingLevel,
 ) -> AssistantMessageEventStream {
     let stream = AssistantMessageEventStream::new();
     let producer = stream.clone();
@@ -113,11 +118,9 @@ async fn run_stream(
     model: ModelInfo,
     context: Context,
     options: StreamOptions,
-    reasoning: Option<ThinkingLevel>,
+    reasoning: ThinkingLevel,
 ) {
-    if let Err(err) =
-        run_stream_inner(&producer, &model, &context, &options, reasoning.as_ref()).await
-    {
+    if let Err(err) = run_stream_inner(&producer, &model, &context, &options, &reasoning).await {
         let mut error = AssistantMessage::empty();
         error.api = API_NAME.to_string();
         error.provider = model.provider.clone();
@@ -147,7 +150,7 @@ async fn run_stream_inner(
     model: &ModelInfo,
     context: &Context,
     options: &StreamOptions,
-    reasoning: Option<&ThinkingLevel>,
+    reasoning: &ThinkingLevel,
 ) -> Result<(), AssistantError> {
     if let Some(token) = options.cancel.as_ref()
         && token.is_cancelled()
@@ -165,9 +168,7 @@ async fn run_stream_inner(
 
     // Reject a thinking level the model can't honour before building
     // the request: aj sends the chosen effort verbatim.
-    if let Some(level) = reasoning
-        && let Err(msg) = validate_thinking_level(model, level)
-    {
+    if let Err(msg) = validate_thinking_level(model, reasoning) {
         return Err(AssistantError::new(ErrorCategory::InvalidRequest, msg));
     }
 
@@ -244,7 +245,7 @@ fn build_request(
     model: &ModelInfo,
     context: &Context,
     options: &StreamOptions,
-    reasoning: Option<&ThinkingLevel>,
+    reasoning: &ThinkingLevel,
 ) -> CreateChatCompletionRequest {
     let mut messages = Vec::new();
     if let Some(prompt) = context.system_prompt.as_deref()
@@ -276,8 +277,7 @@ fn build_request(
         // "off" (no requested level) floors to `minimal`: a reasoning
         // model can't be told not to reason — `reasoning_effort: "none"`
         // is rejected by most GPT-5 models — so we treat off as minimal.
-        let level = reasoning.unwrap_or(&ThinkingLevel::Minimal);
-        Some(map_reasoning_effort(level))
+        Some(map_reasoning_effort(reasoning))
     } else {
         // Non-reasoning models reject the field entirely.
         None
@@ -728,6 +728,8 @@ fn to_chat_tool_choice(choice: Option<&ToolChoice>, has_tools: bool) -> Option<C
 /// on the models that expose it.
 fn map_reasoning_effort(level: &ThinkingLevel) -> ReasoningEffort {
     match level {
+        // A reasoning model can't disable reasoning here; off floors to minimal (preserved from the pre-Off behavior).
+        ThinkingLevel::Off => ReasoningEffort::Minimal,
         ThinkingLevel::Minimal => ReasoningEffort::Minimal,
         ThinkingLevel::Low => ReasoningEffort::Low,
         ThinkingLevel::Medium => ReasoningEffort::Medium,
@@ -1335,7 +1337,12 @@ mod tests {
     #[test]
     fn build_request_uses_developer_role_for_reasoning_models() {
         let context = Context::new("you are helpful");
-        let req = build_request(&fake_model(), &context, &StreamOptions::default(), None);
+        let req = build_request(
+            &fake_model(),
+            &context,
+            &StreamOptions::default(),
+            &ThinkingLevel::Off,
+        );
         match &req.messages[0] {
             ChatCompletionRequestMessage::Developer { content, .. } => match content {
                 ChatCompletionTextContent::String(s) => assert_eq!(s, "you are helpful"),
@@ -1352,7 +1359,7 @@ mod tests {
             &non_reasoning_model(),
             &context,
             &StreamOptions::default(),
-            None,
+            &ThinkingLevel::Off,
         );
         match &req.messages[0] {
             ChatCompletionRequestMessage::System { content, .. } => match content {
@@ -1370,7 +1377,7 @@ mod tests {
             &non_reasoning_model(),
             &context,
             &StreamOptions::default(),
-            Some(&ThinkingLevel::High),
+            &ThinkingLevel::High,
         );
         assert!(req.reasoning_effort.is_none());
     }
@@ -1378,7 +1385,12 @@ mod tests {
     #[test]
     fn build_request_sets_store_false_and_include_usage() {
         let context = Context::new("sys");
-        let req = build_request(&fake_model(), &context, &StreamOptions::default(), None);
+        let req = build_request(
+            &fake_model(),
+            &context,
+            &StreamOptions::default(),
+            &ThinkingLevel::Off,
+        );
         assert_eq!(req.store, Some(false));
         assert_eq!(
             req.stream_options

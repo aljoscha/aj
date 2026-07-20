@@ -57,7 +57,7 @@ fn options(key: String) -> SimpleStreamOptions {
             tool_choice: Some(ToolChoice::Auto),
             ..Default::default()
         },
-        reasoning: Some(ThinkingLevel::Low),
+        reasoning: ThinkingLevel::Low,
     }
 }
 

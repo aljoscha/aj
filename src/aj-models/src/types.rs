@@ -340,9 +340,12 @@ pub struct Context {
 /// the target model's wire vocabulary doesn't accept is rejected before
 /// the request is sent (see
 /// [`crate::registry::validate_thinking_level`]).
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingLevel {
+    /// Reasoning disabled; the model runs without extended thinking.
+    #[default]
+    Off,
     Minimal,
     Low,
     Medium,
@@ -664,8 +667,10 @@ pub struct StreamOptions {
 pub struct SimpleStreamOptions {
     #[serde(flatten)]
     pub base: StreamOptions,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning: Option<ThinkingLevel>,
+    /// Reasoning level for this inference. [`ThinkingLevel::Off`] means
+    /// reasoning is disabled.
+    #[serde(default)]
+    pub reasoning: ThinkingLevel,
 }
 
 impl StreamOptions {
@@ -965,7 +970,7 @@ mod tests {
                 temperature: Some(0.7),
                 ..Default::default()
             },
-            reasoning: Some(ThinkingLevel::High),
+            reasoning: ThinkingLevel::High,
         };
         let json = serde_json::to_value(&opts).unwrap();
         // temperature should be at the top level due to #[serde(flatten)]

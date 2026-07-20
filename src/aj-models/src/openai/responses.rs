@@ -67,7 +67,12 @@ impl Provider for OpenAiResponsesProvider {
         context: &Context,
         options: &StreamOptions,
     ) -> AssistantMessageEventStream {
-        spawn_stream(model.clone(), context.clone(), options.clone(), None)
+        spawn_stream(
+            model.clone(),
+            context.clone(),
+            options.clone(),
+            ThinkingLevel::Off,
+        )
     }
 
     fn stream_simple(
@@ -186,7 +191,7 @@ fn spawn_stream(
     model: ModelInfo,
     context: Context,
     options: StreamOptions,
-    reasoning: Option<ThinkingLevel>,
+    reasoning: ThinkingLevel,
 ) -> AssistantMessageEventStream {
     let stream = AssistantMessageEventStream::new();
     let producer = stream.clone();
@@ -202,11 +207,9 @@ async fn run_stream(
     model: ModelInfo,
     context: Context,
     options: StreamOptions,
-    reasoning: Option<ThinkingLevel>,
+    reasoning: ThinkingLevel,
 ) {
-    if let Err(err) =
-        run_stream_inner(&producer, &model, &context, &options, reasoning.as_ref()).await
-    {
+    if let Err(err) = run_stream_inner(&producer, &model, &context, &options, &reasoning).await {
         let mut error = AssistantMessage::empty();
         error.api = API_NAME.to_string();
         error.provider = model.provider.clone();
@@ -225,7 +228,7 @@ async fn run_stream_inner(
     model: &ModelInfo,
     context: &Context,
     options: &StreamOptions,
-    reasoning: Option<&ThinkingLevel>,
+    reasoning: &ThinkingLevel,
 ) -> Result<(), AssistantError> {
     if let Some(token) = options.cancel.as_ref()
         && token.is_cancelled()
@@ -245,9 +248,7 @@ async fn run_stream_inner(
 
     // Reject a thinking level the model can't honour before building
     // the request: aj sends the chosen effort verbatim.
-    if let Some(level) = reasoning
-        && let Err(msg) = validate_thinking_level(model, level)
-    {
+    if let Err(msg) = validate_thinking_level(model, reasoning) {
         return Err(AssistantError::new(ErrorCategory::InvalidRequest, msg));
     }
 
@@ -342,7 +343,7 @@ fn build_request(
     model: &ModelInfo,
     context: &Context,
     options: &StreamOptions,
-    reasoning: Option<&ThinkingLevel>,
+    reasoning: &ThinkingLevel,
 ) -> CreateResponseRequest {
     let mut input: Vec<ResponseInputItem> = Vec::new();
     if let Some(prompt) = context.system_prompt.as_deref()
@@ -368,7 +369,6 @@ fn build_request(
     // told not to reason — `reasoning_effort: "none"` is rejected by
     // most GPT-5 models — so we treat off identically to minimal.
     let (reasoning_cfg, include) = if model.reasoning {
-        let level = reasoning.unwrap_or(&ThinkingLevel::Minimal);
         let summary = match options.reasoning_summary.as_ref() {
             Some(UnifiedReasoningSummary::Auto) | None => ReasoningSummaryMode::Auto,
             Some(UnifiedReasoningSummary::Detailed) => ReasoningSummaryMode::Detailed,
@@ -376,7 +376,7 @@ fn build_request(
         };
         (
             Some(Reasoning {
-                effort: Some(map_reasoning_effort(level)),
+                effort: Some(map_reasoning_effort(reasoning)),
                 summary: Some(summary),
             }),
             vec![ResponseIncludable::ReasoningEncryptedContent],
@@ -470,6 +470,8 @@ fn build_system_item(model: &ModelInfo, prompt: &str) -> ResponseInputItem {
 /// and Codex providers.
 pub(super) fn map_reasoning_effort(level: &ThinkingLevel) -> ReasoningEffort {
     match level {
+        // A reasoning model can't disable reasoning here; off floors to minimal (preserved from the pre-Off behavior).
+        ThinkingLevel::Off => ReasoningEffort::Minimal,
         ThinkingLevel::Minimal => ReasoningEffort::Minimal,
         ThinkingLevel::Low => ReasoningEffort::Low,
         ThinkingLevel::Medium => ReasoningEffort::Medium,
@@ -1678,7 +1680,7 @@ mod tests {
                 verbosity: Some(crate::types::Verbosity::Low),
                 ..Default::default()
             },
-            None,
+            &ThinkingLevel::Off,
         );
         let text = req
             .text
@@ -1696,7 +1698,7 @@ mod tests {
                 verbosity: Some(crate::types::Verbosity::Low),
                 ..Default::default()
             },
-            None,
+            &ThinkingLevel::Off,
         );
         assert!(req.text.is_none());
     }
@@ -1708,7 +1710,7 @@ mod tests {
             &fake_model(false),
             &ctx,
             &StreamOptions::default(),
-            Some(&ThinkingLevel::High),
+            &ThinkingLevel::High,
         );
         assert!(req.reasoning.is_none());
         assert!(req.include.is_empty());
@@ -1721,7 +1723,7 @@ mod tests {
             &fake_model(true),
             &ctx,
             &StreamOptions::default(),
-            Some(&ThinkingLevel::Medium),
+            &ThinkingLevel::Medium,
         );
         let r = req.reasoning.expect("reasoning set");
         assert!(matches!(r.effort, Some(ReasoningEffort::Medium)));
@@ -1736,7 +1738,12 @@ mod tests {
     #[test]
     fn build_request_reasoning_off_floors_to_minimal() {
         let ctx = Context::new("hello");
-        let req = build_request(&fake_model(true), &ctx, &StreamOptions::default(), None);
+        let req = build_request(
+            &fake_model(true),
+            &ctx,
+            &StreamOptions::default(),
+            &ThinkingLevel::Off,
+        );
         let r = req.reasoning.expect("reasoning set");
         // A reasoning model can't disable reasoning; "off" floors to
         // minimal and is treated like any other reasoning level.
@@ -1756,7 +1763,7 @@ mod tests {
             cache_retention: CacheRetention::Long,
             ..Default::default()
         };
-        let req = build_request(&fake_model(false), &ctx, &opts, None);
+        let req = build_request(&fake_model(false), &ctx, &opts, &ThinkingLevel::Off);
         assert_eq!(req.prompt_cache_key.as_deref(), Some("sid"));
         assert!(matches!(
             req.prompt_cache_retention,
@@ -1772,7 +1779,7 @@ mod tests {
             cache_retention: CacheRetention::None,
             ..Default::default()
         };
-        let req = build_request(&fake_model(false), &ctx, &opts, None);
+        let req = build_request(&fake_model(false), &ctx, &opts, &ThinkingLevel::Off);
         assert!(req.prompt_cache_key.is_none());
         assert!(req.prompt_cache_retention.is_none());
     }

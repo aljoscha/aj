@@ -774,6 +774,7 @@ fn split_chunks(text: &str, chunk_size: usize) -> Vec<&str> {
 mod tests {
     use super::*;
     use crate::registry::{InputModality, ModelCost};
+    use crate::types::ThinkingLevel;
     use futures::StreamExt;
 
     fn fake_model() -> ModelInfo {
@@ -1324,7 +1325,7 @@ mod tests {
         }]]);
         let opts = SimpleStreamOptions {
             base: StreamOptions::default(),
-            reasoning: None,
+            reasoning: ThinkingLevel::Off,
         };
         let stream = provider.stream_simple(&fake_model(), &Context::new("system"), &opts);
         let events = collect_events(stream).await;

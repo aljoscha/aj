@@ -654,7 +654,7 @@ impl Agent {
         base.max_tokens = Some(max_tokens);
         let options = SimpleStreamOptions {
             base,
-            reasoning: self.default_thinking.as_ref().map(thinking_config_to_level),
+            reasoning: thinking_config_to_level(self.default_thinking.as_ref()),
         };
 
         let mut stream = self
@@ -1823,7 +1823,7 @@ impl Agent {
 
         let options = SimpleStreamOptions {
             base,
-            reasoning: thinking.as_ref().map(thinking_config_to_level),
+            reasoning: thinking_config_to_level(thinking.as_ref()),
         };
 
         self.provider
@@ -3346,14 +3346,15 @@ impl From<BoxError> for TurnError {
 /// receives. Levels a model can't honour are rejected by the provider
 /// (see [`aj_models::registry::validate_thinking_level`]) rather than
 /// silently downgraded here.
-fn thinking_config_to_level(level: &ThinkingConfig) -> ThinkingLevel {
+fn thinking_config_to_level(level: Option<&ThinkingConfig>) -> ThinkingLevel {
     match level {
-        ThinkingConfig::Minimal => ThinkingLevel::Minimal,
-        ThinkingConfig::Low => ThinkingLevel::Low,
-        ThinkingConfig::Medium => ThinkingLevel::Medium,
-        ThinkingConfig::High => ThinkingLevel::High,
-        ThinkingConfig::XHigh => ThinkingLevel::XHigh,
-        ThinkingConfig::Max => ThinkingLevel::Max,
+        None => ThinkingLevel::Off,
+        Some(ThinkingConfig::Minimal) => ThinkingLevel::Minimal,
+        Some(ThinkingConfig::Low) => ThinkingLevel::Low,
+        Some(ThinkingConfig::Medium) => ThinkingLevel::Medium,
+        Some(ThinkingConfig::High) => ThinkingLevel::High,
+        Some(ThinkingConfig::XHigh) => ThinkingLevel::XHigh,
+        Some(ThinkingConfig::Max) => ThinkingLevel::Max,
     }
 }
 

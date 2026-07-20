@@ -251,7 +251,7 @@ mod tests {
         let ctx = Context::new("system");
         let opts = SimpleStreamOptions {
             base: StreamOptions::default(),
-            reasoning: Some(ThinkingLevel::Low),
+            reasoning: ThinkingLevel::Low,
         };
         let result = complete_simple(&model, &ctx, &opts).await;
         assert_eq!(result.stop_reason, StopReason::Error);
