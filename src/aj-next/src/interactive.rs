@@ -880,6 +880,17 @@ fn arm_branch(anchor: &Rc<RefCell<Option<String>>>, message_id: String) {
     *anchor.borrow_mut() = Some(message_id);
 }
 
+/// Prefill the editor with the branched-from `message`, preserving whatever
+/// the user was typing by first pushing that draft onto the recall history
+/// (up / Ctrl+P) so it is not lost. A blank draft is skipped by
+/// `add_to_history`.
+fn prefill_branch_editor(editor: &Rc<RefCell<TextArea>>, message: &str) {
+    let mut editor = editor.borrow_mut();
+    let draft = editor.text();
+    editor.add_to_history(&draft);
+    editor.set_text(message);
+}
+
 /// The notice folded when a gesture incoherent with an armed branch anchor
 /// (steer, dequeue) is attempted: it points the user at Esc to cancel.
 fn branch_armed_notice(what: &str) -> String {
@@ -3395,13 +3406,14 @@ impl Shell {
                         .zip(transcript.focused_message_text());
                     drop(transcript);
                     if let Some((message_id, text)) = anchor {
-                        // Prefill the editor with the message, arm the anchor,
+                        // Prefill the editor with the message (preserving the
+                        // user's draft on the recall history), arm the anchor,
                         // and move focus to the editor so the user edits the
                         // branch prompt. The focus move's `FocusOut` exits
                         // transcript focus, but the transcript keeps the
                         // highlight box on the branched-from message by reading
                         // the armed anchor.
-                        editor_for_actions.borrow_mut().set_text(&text);
+                        prefill_branch_editor(&editor_for_actions, &text);
                         arm_branch(&branch_anchor_for_actions, message_id);
                         ctx.request_focus(Rc::clone(&editor_widget));
                         ctx.redraw = true;
@@ -3983,20 +3995,27 @@ fn sync_keymap_ctx(world: &World, shell: &Rc<RefCell<Shell>>) {
     ctx.active_view = active;
 }
 
-/// Reconcile the editor's border tint and agent marker from the active view.
-/// The border follows the viewed agent's thinking level (aj's color-bar
-/// parity) and the top-bar label reads `agent N` for a sub-agent, cleared for
-/// the main agent. This is the single writer: the drive loop calls it once per
-/// iteration and once before the first paint, so no view-switch or
+/// Reconcile the editor's border tint and top-bar label from the active view
+/// and branch state. The border follows the viewed agent's thinking level
+/// (aj's color-bar parity). The label reads `branching` while a branch is
+/// armed (the salient mode), else `agent N` for a sub-agent, cleared for the
+/// main agent. This is the single writer: the drive loop calls it once per
+/// iteration and once before the first paint, so no view-switch, arm, or
 /// thinking-change path has to remember to retint.
 fn sync_editor_chrome(world: &World, shell: &Rc<RefCell<Shell>>) {
     let active = world.chat.borrow().active_view();
     let level = viewed_thinking(world, active);
     let shell = shell.borrow();
     let color = editor_border_color(&shell.theme.read(), level.as_ref());
-    let label = match active {
-        AgentId::Main => None,
-        AgentId::Sub(n) => Some(format!("agent {n}")),
+    // A pending branch overrides the agent marker: while composing the branch
+    // prompt the mode matters more than which view is behind it.
+    let label = if shell.branch_anchor.borrow().is_some() {
+        Some("branching".to_string())
+    } else {
+        match active {
+            AgentId::Main => None,
+            AgentId::Sub(n) => Some(format!("agent {n}")),
+        }
     };
     let mut editor = shell.editor.borrow_mut();
     editor.set_border_color(color);
@@ -11342,6 +11361,67 @@ mod tests {
         // Disarming clears it.
         shell.borrow().disarm_branch();
         assert!(shell.borrow().branch_anchor.borrow().is_none());
+    }
+
+    /// While a branch is armed the editor chrome reads `branching`; disarming
+    /// restores the agent marker (empty on the main view).
+    #[tokio::test]
+    async fn editor_chrome_shows_branching_while_armed() {
+        let dir = TempDir::new().expect("tempdir");
+        let (world, shell) = world_and_shell(&dir, "streaming-text").await;
+
+        sync_editor_chrome(&world, &shell);
+        assert!(
+            !editor_top_bar_text(&shell).contains("branching"),
+            "no marker before arming"
+        );
+
+        arm_branch(&shell.borrow().branch_anchor, "m1".to_string());
+        sync_editor_chrome(&world, &shell);
+        assert!(
+            editor_top_bar_text(&shell).contains("branching"),
+            "armed: chrome shows the branching marker: {}",
+            editor_top_bar_text(&shell),
+        );
+
+        shell.borrow().disarm_branch();
+        sync_editor_chrome(&world, &shell);
+        assert!(
+            !editor_top_bar_text(&shell).contains("branching"),
+            "disarming clears the marker"
+        );
+    }
+
+    /// Arming prefills the editor with the branched-from message but preserves
+    /// the user's in-progress draft on the recall history, so clearing the
+    /// prefill and pressing up brings the draft back rather than losing it.
+    #[tokio::test]
+    async fn branch_prefill_preserves_the_draft_for_recall() {
+        let dir = TempDir::new().expect("tempdir");
+        let (_world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let editor = Rc::clone(&shell.borrow().editor);
+        editor.borrow_mut().set_text("my unsent draft");
+
+        // The arm handler's prefill: the draft goes onto history, the message
+        // fills the editor.
+        prefill_branch_editor(&editor, "branched message");
+        assert_eq!(editor.borrow().text(), "branched message");
+
+        // Clearing the prefill and pressing up recalls the preserved draft.
+        editor.borrow_mut().set_text("");
+        editor.borrow_mut().handle_event(
+            &mut EventContext::new(),
+            &Event::KeyPress(Key {
+                codepoint: Key::UP,
+                mods: Modifiers::empty(),
+                ..Key::default()
+            }),
+        );
+        assert_eq!(
+            editor.borrow().text(),
+            "my unsent draft",
+            "up recalls the draft the branch prefill would have discarded"
+        );
     }
 
     /// Esc cancels an armed anchor: it clears the anchor (dropping the
