@@ -115,12 +115,16 @@ pub struct SettingsCurrentValues {
     pub theme: String,
     pub disabled_tools: Vec<String>,
     pub disabled_skills: Vec<String>,
-    pub hide_thinking_block: bool,
+    pub show_thinking_block: bool,
+    /// Only consumed by the aj-next interactive TUI; the classic TUI just
+    /// persists these.
+    pub show_token_usage: bool,
+    pub compact_transcript: bool,
     /// Only consumed by the aj-next interactive TUI; the classic TUI just
     /// persists it.
     pub show_frame_stats: bool,
     pub image_auto_resize: bool,
-    pub image_show_in_terminal: bool,
+    pub show_image_in_terminal: bool,
     pub image_block: bool,
     pub syntax_highlighting: bool,
     pub auto_compact: bool,
@@ -500,8 +504,14 @@ fn build_items(
                 item.description = Some(option_description(option));
                 items.push(item);
             }
-            "hide_thinking_block" => {
-                items.push(bool_item(option, current.hide_thinking_block));
+            "show_thinking_block" => {
+                items.push(bool_item(option, current.show_thinking_block));
+            }
+            "show_token_usage" => {
+                items.push(bool_item(option, current.show_token_usage));
+            }
+            "compact_transcript" => {
+                items.push(bool_item(option, current.compact_transcript));
             }
             "show_frame_stats" => {
                 let mut item = bool_item(option, current.show_frame_stats);
@@ -516,8 +526,8 @@ fn build_items(
             "image_auto_resize" => {
                 items.push(bool_item(option, current.image_auto_resize));
             }
-            "image_show_in_terminal" => {
-                items.push(bool_item(option, current.image_show_in_terminal));
+            "show_image_in_terminal" => {
+                items.push(bool_item(option, current.show_image_in_terminal));
             }
             "image_block" => {
                 items.push(bool_item(option, current.image_block));
@@ -931,10 +941,12 @@ mod tests {
             theme: "dark".to_string(),
             disabled_tools: vec![],
             disabled_skills: vec![],
-            hide_thinking_block: false,
+            show_thinking_block: false,
+            show_token_usage: true,
+            compact_transcript: false,
             show_frame_stats: false,
             image_auto_resize: true,
-            image_show_in_terminal: true,
+            show_image_in_terminal: true,
             image_block: false,
             syntax_highlighting: false,
             auto_compact: true,
@@ -1010,12 +1022,12 @@ mod tests {
     fn cycling_a_bool_row_queues_a_change() {
         let mut component = test_component();
         let changes = component.changes_handle();
-        search_for(&mut component, "hide");
+        search_for(&mut component, "show_thinking");
         component.handle_input(&enter());
         let queued = std::mem::take(&mut *changes.lock().unwrap());
         assert_eq!(
             queued,
-            vec![("hide_thinking_block".to_string(), "true".to_string())]
+            vec![("show_thinking_block".to_string(), "true".to_string())]
         );
     }
 
@@ -1209,7 +1221,7 @@ mod tests {
         // The project sets `theme`, so its row is not inherited.
         assert!(!component.inner.is_inherited("theme"));
         // Everything else falls through to the user layer.
-        assert!(component.inner.is_inherited("hide_thinking_block"));
+        assert!(component.inner.is_inherited("show_thinking_block"));
         assert!(component.inner.is_inherited("auto_compact"));
     }
 

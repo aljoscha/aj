@@ -220,8 +220,10 @@ async fn build_world(
 
     let catalog = load_model_catalog();
     let mut chat = ChatState::new(seed.settings, seed.context_window, Arc::clone(&catalog));
-    chat.hide_thinking_block = config.hide_thinking_block;
-    chat.show_image_in_terminal = config.image_show_in_terminal;
+    chat.show_thinking_block = config.show_thinking_block;
+    chat.show_token_usage = config.show_token_usage;
+    chat.compact_transcript = config.compact_transcript;
+    chat.show_image_in_terminal = config.show_image_in_terminal;
     chat.syntax_highlight = config.syntax_highlighting;
 
     // Replay a resumed session's history through the same reducer the
@@ -433,8 +435,10 @@ async fn build_next_session(
         seed.context_window,
         Arc::clone(&world.catalog),
     );
-    chat.hide_thinking_block = config.hide_thinking_block;
-    chat.show_image_in_terminal = config.image_show_in_terminal;
+    chat.show_thinking_block = config.show_thinking_block;
+    chat.show_token_usage = config.show_token_usage;
+    chat.compact_transcript = config.compact_transcript;
+    chat.show_image_in_terminal = config.show_image_in_terminal;
     chat.syntax_highlight = config.syntax_highlighting;
     // Deferred replay withholds sub-agent content but still builds every
     // sub-agent box, so the seeded set records which indices Observe must
@@ -2440,21 +2444,59 @@ async fn apply_setting_change(
                 }
             }
         }
-        "hide_thinking_block" => {
-            let hide = value == "true";
-            world.chat.borrow_mut().hide_thinking_block = hide;
+        "show_thinking_block" => {
+            let show = value == "true";
+            world.chat.borrow_mut().show_thinking_block = show;
             let save = aj_app::settings::persist_setting(
                 &world.config_layers,
                 &world.config,
                 persist,
-                "hide_thinking_block",
+                "show_thinking_block",
                 Some(value),
-                |c| c.hide_thinking_block = hide,
+                |c| c.show_thinking_block = show,
             );
             Some(join_notice(
                 format!(
                     "Thinking blocks {}.",
-                    if hide { "hidden" } else { "expanded" }
+                    if show { "expanded" } else { "hidden" }
+                ),
+                save,
+            ))
+        }
+        "show_token_usage" => {
+            let show = value == "true";
+            world.chat.borrow_mut().show_token_usage = show;
+            let save = aj_app::settings::persist_setting(
+                &world.config_layers,
+                &world.config,
+                persist,
+                "show_token_usage",
+                Some(value),
+                |c| c.show_token_usage = show,
+            );
+            Some(join_notice(
+                format!(
+                    "Token-usage rows {}.",
+                    if show { "shown" } else { "hidden" }
+                ),
+                save,
+            ))
+        }
+        "compact_transcript" => {
+            let on = value == "true";
+            world.chat.borrow_mut().compact_transcript = on;
+            let save = aj_app::settings::persist_setting(
+                &world.config_layers,
+                &world.config,
+                persist,
+                "compact_transcript",
+                Some(value),
+                |c| c.compact_transcript = on,
+            );
+            Some(join_notice(
+                format!(
+                    "Compact transcript {}.",
+                    if on { "enabled" } else { "disabled" }
                 ),
                 save,
             ))
@@ -2478,19 +2520,19 @@ async fn apply_setting_change(
                 save,
             ))
         }
-        "image_show_in_terminal" => {
+        "show_image_in_terminal" => {
             let show = value == "true";
             world.chat.borrow_mut().show_image_in_terminal = show;
             let save = aj_app::settings::persist_setting(
                 &world.config_layers,
                 &world.config,
                 persist,
-                "image_show_in_terminal",
+                "show_image_in_terminal",
                 Some(value),
-                |c| c.image_show_in_terminal = show,
+                |c| c.show_image_in_terminal = show,
             );
             Some(join_notice(
-                format!("image_show_in_terminal set to {show}."),
+                format!("show_image_in_terminal set to {show}."),
                 save,
             ))
         }
@@ -3314,10 +3356,10 @@ impl Shell {
             Box::new(move |ctx, action| match action {
                 AjAction::ThinkingToggle => {
                     // Matches aj's `aj.thinking.toggle` handler: flip the
-                    // hide flag, no notice (the transcript shows the new
+                    // visibility flag, no notice (the transcript shows the new
                     // state).
                     let mut chat = chat.borrow_mut();
-                    chat.hide_thinking_block = !chat.hide_thinking_block;
+                    chat.show_thinking_block = !chat.show_thinking_block;
                     ctx.redraw = true;
                 }
                 AjAction::ToolsExpand => {
@@ -6910,17 +6952,17 @@ mod tests {
     async fn thinking_toggle_chord_flips_visibility_via_the_keymap() {
         let chat = empty_chat();
         let (mut app, mut writer, _shell, _root) = init_app_with_chat(Rc::clone(&chat)).await;
-        let initial = chat.borrow().hide_thinking_block;
+        let initial = chat.borrow().show_thinking_block;
 
         writer.write_all(b"\x1bt").expect("write alt+t");
         let event = app.next_input().await.expect("input event");
         app.handle_input(event);
-        assert_eq!(chat.borrow().hide_thinking_block, !initial);
+        assert_eq!(chat.borrow().show_thinking_block, !initial);
 
         writer.write_all(b"\x1bt").expect("write alt+t");
         let event = app.next_input().await.expect("input event");
         app.handle_input(event);
-        assert_eq!(chat.borrow().hide_thinking_block, initial);
+        assert_eq!(chat.borrow().show_thinking_block, initial);
     }
 
     /// The world-facing chords park their action for the host loop.

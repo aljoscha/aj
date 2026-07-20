@@ -369,7 +369,7 @@ impl EventPump {
 
     /// Current inline-image render mode. Surface so session-swap /
     /// new-session paths can preserve the user's
-    /// `image_show_in_terminal` choice across pump re-creation.
+    /// `show_image_in_terminal` choice across pump re-creation.
     pub fn show_image_in_terminal(&self) -> bool {
         self.render_settings.show_image_in_terminal()
     }

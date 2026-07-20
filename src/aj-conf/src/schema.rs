@@ -538,7 +538,7 @@ fn toml_value_to_item(value: &toml::Value) -> toml_edit::Item {
 /// theme = "dark"
 /// disabled_tools = ["todo_read", "todo_write"]
 /// disabled_skills = ["tmux-subagents"]
-/// hide_thinking_block = false
+/// show_thinking_block = false
 /// ```
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -579,11 +579,22 @@ pub struct Config {
     /// (so the UI can show them) but excluded from the model-visible skill
     /// listing in the system prompt.
     pub disabled_skills: Vec<String>,
-    /// Replace expanded thinking blocks with a single italic
-    /// "Thinking…" placeholder line in the interactive TUI.
-    /// Defaults to `true` (collapsed). Toggled at runtime with
-    /// `Ctrl+T`.
-    pub hide_thinking_block: bool,
+    /// Show expanded assistant thinking blocks in the interactive
+    /// TUI. Defaults to `false`, which collapses each block to a
+    /// single italic "Thinking…" placeholder line. Toggled at
+    /// runtime with the thinking-toggle chord.
+    pub show_thinking_block: bool,
+    /// Show the inline per-turn "Token Usage - ..." rows in the
+    /// interactive TUI. Defaults to `true`. Usage is always
+    /// recorded, this toggles only its visibility, so it takes
+    /// effect at runtime.
+    pub show_token_usage: bool,
+    /// Render tool cells header-only in the interactive TUI (a bash
+    /// cell keeps its command line). Defaults to `false`. A durable
+    /// view mode, distinct from `auto_compact` and the `compact_*`
+    /// keys, which control context-window compaction. Applied at
+    /// runtime when toggled from the settings window.
+    pub compact_transcript: bool,
     /// Show a frame-statistics debug overlay in the corner of the
     /// interactive TUI. Off by default.
     pub show_frame_stats: bool,
@@ -600,7 +611,7 @@ pub struct Config {
     /// (`[image: mime · WxH]`) is shown regardless of terminal
     /// capability. Independent of `image_block`: this only affects
     /// what the user sees, not what the model receives.
-    pub image_show_in_terminal: bool,
+    pub show_image_in_terminal: bool,
     /// Defense-in-depth: when `true`, strip every
     /// [`aj_models::types::UserContent::Image`] block from outgoing
     /// wire messages (both user messages and tool result messages)
@@ -653,12 +664,14 @@ impl Default for Config {
             theme: None,
             disabled_tools: Vec::new(),
             disabled_skills: Vec::new(),
-            hide_thinking_block: true,
+            show_thinking_block: false,
+            show_token_usage: true,
+            compact_transcript: false,
             show_frame_stats: false,
             // Image features: resize and inline-render by default;
             // blocking is opt-in.
             image_auto_resize: true,
-            image_show_in_terminal: true,
+            show_image_in_terminal: true,
             image_block: false,
             syntax_highlighting: false,
             auto_compact: true,
@@ -860,15 +873,37 @@ impl Config {
             to_toml_fn: |c| string_list_item(&c.disabled_skills),
         },
         ConfigOption {
-            name: "hide_thinking_block",
-            description: "Collapse expanded thinking blocks to a placeholder in the TUI.",
+            name: "show_thinking_block",
+            description: "Show expanded thinking blocks in the TUI (off collapses them to a placeholder).",
             kind: ValueKind::Bool,
             apply_toml_fn: |v, c| {
-                c.hide_thinking_block = v.try_into()?;
+                c.show_thinking_block = v.try_into()?;
                 Ok(())
             },
-            display_fn: |c| c.hide_thinking_block.to_string(),
-            to_toml_fn: |c| bool_item(c.hide_thinking_block, true),
+            display_fn: |c| c.show_thinking_block.to_string(),
+            to_toml_fn: |c| bool_item(c.show_thinking_block, false),
+        },
+        ConfigOption {
+            name: "show_token_usage",
+            description: "Show the inline per-turn token-usage rows in the TUI.",
+            kind: ValueKind::Bool,
+            apply_toml_fn: |v, c| {
+                c.show_token_usage = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| c.show_token_usage.to_string(),
+            to_toml_fn: |c| bool_item(c.show_token_usage, true),
+        },
+        ConfigOption {
+            name: "compact_transcript",
+            description: "Render tool cells header-only in the TUI (bash keeps its command line).",
+            kind: ValueKind::Bool,
+            apply_toml_fn: |v, c| {
+                c.compact_transcript = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| c.compact_transcript.to_string(),
+            to_toml_fn: |c| bool_item(c.compact_transcript, false),
         },
         ConfigOption {
             name: "show_frame_stats",
@@ -893,15 +928,15 @@ impl Config {
             to_toml_fn: |c| bool_item(c.image_auto_resize, true),
         },
         ConfigOption {
-            name: "image_show_in_terminal",
+            name: "show_image_in_terminal",
             description: "Render tool-result images inline in the TUI when the terminal supports it.",
             kind: ValueKind::Bool,
             apply_toml_fn: |v, c| {
-                c.image_show_in_terminal = v.try_into()?;
+                c.show_image_in_terminal = v.try_into()?;
                 Ok(())
             },
-            display_fn: |c| c.image_show_in_terminal.to_string(),
-            to_toml_fn: |c| bool_item(c.image_show_in_terminal, true),
+            display_fn: |c| c.show_image_in_terminal.to_string(),
+            to_toml_fn: |c| bool_item(c.show_image_in_terminal, true),
         },
         ConfigOption {
             name: "image_block",
@@ -1546,7 +1581,8 @@ mod tests {
             config.thinking_display,
             Some(ConfigThinkingDisplay::Summarized)
         );
-        assert!(config.hide_thinking_block);
+        assert!(!config.show_thinking_block);
+        assert!(config.show_token_usage);
     }
 
     #[test]
@@ -1876,7 +1912,8 @@ verbosity = "low"
 theme = "dark"
 disabled_tools = ["bash"]
 disabled_skills = ["scratch"]
-hide_thinking_block = true
+show_thinking_block = true
+show_token_usage = false
 show_frame_stats = true
 bash_rtk = true
 "#;
@@ -1897,7 +1934,8 @@ bash_rtk = true
         assert_eq!(config.theme.as_deref(), Some("dark"));
         assert_eq!(config.disabled_tools, vec!["bash".to_string()]);
         assert_eq!(config.disabled_skills, vec!["scratch".to_string()]);
-        assert!(config.hide_thinking_block);
+        assert!(config.show_thinking_block);
+        assert!(!config.show_token_usage);
         assert!(config.show_frame_stats);
         assert!(config.bash_rtk);
     }
@@ -2009,18 +2047,18 @@ bash_rtk = true
         // Defaults: auto_resize=true, show_in_terminal=true, block=false.
         let cfg = Config::default();
         assert!(cfg.image_auto_resize);
-        assert!(cfg.image_show_in_terminal);
+        assert!(cfg.show_image_in_terminal);
         assert!(!cfg.image_block);
 
         let toml_str = r#"
 image_auto_resize = false
-image_show_in_terminal = false
+show_image_in_terminal = false
 image_block = true
 "#;
         let (cfg, diag) = parse_config(toml_str, Path::new("/tmp/config.toml"));
         assert!(diag.is_empty(), "got: {diag:?}");
         assert!(!cfg.image_auto_resize);
-        assert!(!cfg.image_show_in_terminal);
+        assert!(!cfg.show_image_in_terminal);
         assert!(cfg.image_block);
     }
 
@@ -2059,10 +2097,10 @@ image_block = true
     #[test]
     fn test_config_option_display_bool() {
         let config = Config::default();
-        // Defaults exercise both literals: `hide_thinking_block` is
+        // Defaults exercise both literals: `show_token_usage` is
         // on, `image_block` is off.
-        let hide = Config::option("hide_thinking_block").unwrap();
-        assert_eq!(hide.display(&config), "true");
+        let usage = Config::option("show_token_usage").unwrap();
+        assert_eq!(usage.display(&config), "true");
         let block = Config::option("image_block").unwrap();
         assert_eq!(block.display(&config), "false");
     }
@@ -2229,9 +2267,10 @@ image_block = true
         config.speed = Some(ConfigSpeed::Fast);
         config.theme = Some("light".to_string());
         config.disabled_tools = vec!["bash".to_string(), "todo_read".to_string()];
-        config.hide_thinking_block = false;
+        config.show_thinking_block = true;
+        config.show_token_usage = false;
         config.image_auto_resize = false;
-        config.image_show_in_terminal = false;
+        config.show_image_in_terminal = false;
         config.image_block = true;
 
         let rewritten = rewrite_changed("", &Config::default(), &config);
@@ -2249,9 +2288,10 @@ image_block = true
         assert_eq!(parsed.speed, Some(ConfigSpeed::Fast));
         assert_eq!(parsed.theme.as_deref(), Some("light"));
         assert_eq!(parsed.disabled_tools, vec!["bash", "todo_read"]);
-        assert!(!parsed.hide_thinking_block);
+        assert!(parsed.show_thinking_block);
+        assert!(!parsed.show_token_usage);
         assert!(!parsed.image_auto_resize);
-        assert!(!parsed.image_show_in_terminal);
+        assert!(!parsed.show_image_in_terminal);
         assert!(parsed.image_block);
     }
 

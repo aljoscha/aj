@@ -420,7 +420,14 @@ pub struct ChatState {
 
     /// Display flags the view reads at draw time. Flipping one is a
     /// redraw, not a walk of entries.
-    pub hide_thinking_block: bool,
+    pub show_thinking_block: bool,
+    /// Whether the inline per-turn token-usage rows are visible. Usage
+    /// is always recorded, this only gates its display.
+    pub show_token_usage: bool,
+    /// Compact transcript: tool cells render header-only (bash keeps its
+    /// command line). The `tools_expanded` override still reveals full
+    /// bodies, so it stays a hidden escape hatch under this mode.
+    pub compact_transcript: bool,
     pub tools_expanded: bool,
     pub show_image_in_terminal: bool,
     /// Whether fenced code blocks in rendered markdown are syntax-highlighted.
@@ -449,7 +456,9 @@ impl ChatState {
             catalog,
             sub_boxes: HashMap::new(),
             compaction_phase: HashMap::new(),
-            hide_thinking_block: false,
+            show_thinking_block: true,
+            show_token_usage: true,
+            compact_transcript: false,
             tools_expanded: false,
             show_image_in_terminal: true,
             syntax_highlight: false,

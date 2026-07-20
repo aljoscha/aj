@@ -338,9 +338,11 @@ impl InteractiveMode {
         // each session's pump gets a clone, so `alt+t` / `alt+o`
         // toggles survive a new-session or resume.
         let render_settings = RenderSettings::new(
-            config.hide_thinking_block,
+            // The config key uses show-semantics; `RenderSettings` stores the
+            // inverse hide flag.
+            !config.show_thinking_block,
             false,
-            config.image_show_in_terminal,
+            config.show_image_in_terminal,
         );
         let mut world = SessionWorld::build(
             &config,
@@ -2381,10 +2383,12 @@ fn settings_values_from_config(config: &Config, catalog: &[ModelInfo]) -> Settin
         theme: resolve_theme_name(config.theme.as_deref()).to_string(),
         disabled_tools: config.disabled_tools.clone(),
         disabled_skills: config.disabled_skills.clone(),
-        hide_thinking_block: config.hide_thinking_block,
+        show_thinking_block: config.show_thinking_block,
+        show_token_usage: config.show_token_usage,
+        compact_transcript: config.compact_transcript,
         show_frame_stats: config.show_frame_stats,
         image_auto_resize: config.image_auto_resize,
-        image_show_in_terminal: config.image_show_in_terminal,
+        show_image_in_terminal: config.show_image_in_terminal,
         image_block: config.image_block,
         syntax_highlighting: config.syntax_highlighting,
         auto_compact: config.auto_compact,
@@ -3385,10 +3389,14 @@ async fn handle_command(
                     theme: resolve_theme_name(cfg.theme.as_deref()).to_string(),
                     disabled_tools: cfg.disabled_tools.clone(),
                     disabled_skills: cfg.disabled_skills.clone(),
-                    hide_thinking_block: render_settings.hide_thinking_block(),
+                    // `RenderSettings` stores the hide flag; the settings row
+                    // uses show-semantics, hence the inversion.
+                    show_thinking_block: !render_settings.hide_thinking_block(),
+                    show_token_usage: cfg.show_token_usage,
+                    compact_transcript: cfg.compact_transcript,
                     show_frame_stats: cfg.show_frame_stats,
                     image_auto_resize: cfg.image_auto_resize,
-                    image_show_in_terminal: render_settings.show_image_in_terminal(),
+                    show_image_in_terminal: render_settings.show_image_in_terminal(),
                     image_block: cfg.image_block,
                     syntax_highlighting: cfg.syntax_highlighting,
                     auto_compact: cfg.auto_compact,
@@ -3959,27 +3967,28 @@ async fn apply_setting_change(
                 }
             }
         }
-        "hide_thinking_block" => {
-            let hide = value == "true";
-            render_settings.set_hide_thinking_block(hide);
+        "show_thinking_block" => {
+            let show = value == "true";
+            // `RenderSettings` stores the inverse hide flag.
+            render_settings.set_hide_thinking_block(!show);
             tui.request_render();
             let save_note = persist_setting(
                 layers,
                 config,
                 persist,
-                "hide_thinking_block",
+                "show_thinking_block",
                 Some(value),
-                |c| c.hide_thinking_block = hide,
+                |c| c.show_thinking_block = show,
             );
             Some(join_notice(
                 format!(
                     "Thinking blocks {}.",
-                    if hide { "hidden" } else { "expanded" }
+                    if show { "expanded" } else { "hidden" }
                 ),
                 save_note,
             ))
         }
-        "image_show_in_terminal" => {
+        "show_image_in_terminal" => {
             let show = value == "true";
             render_settings.set_show_image_in_terminal(show);
             tui.request_render();
@@ -3987,12 +3996,12 @@ async fn apply_setting_change(
                 layers,
                 config,
                 persist,
-                "image_show_in_terminal",
+                "show_image_in_terminal",
                 Some(value),
-                |c| c.image_show_in_terminal = show,
+                |c| c.show_image_in_terminal = show,
             );
             Some(join_notice(
-                format!("image_show_in_terminal set to {show}."),
+                format!("show_image_in_terminal set to {show}."),
                 save_note,
             ))
         }

@@ -272,7 +272,7 @@ pub struct ToolExecutionComponent {
     /// `render_details_body` already produces. Kept in step with
     /// `settings.show_image_in_terminal()` by
     /// [`Self::reconcile_settings`]; sourced from the
-    /// `image_show_in_terminal` config key.
+    /// `show_image_in_terminal` config key.
     show_image_in_terminal: bool,
     /// Terminal status of the background task this cell launched,
     /// set by [`Self::finish_task`] when the task's `TaskEnd`
@@ -566,7 +566,7 @@ impl ToolExecutionComponent {
         // result carried a [`UserContent::Image`] block AND the
         // host terminal advertises an image protocol AND the
         // user hasn't suppressed inline rendering via the
-        // `image_show_in_terminal` config key. Kitty + non-PNG
+        // `show_image_in_terminal` config key. Kitty + non-PNG
         // falls back to the textual placeholder that
         // [`render_details_body`] already produces, because
         // Kitty doesn't accept JPEG inline.

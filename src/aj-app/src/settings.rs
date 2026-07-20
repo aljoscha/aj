@@ -781,9 +781,10 @@ pub fn option_description(option: &aj_conf::ConfigOption) -> String {
         }
         "compact_threshold" => describe(option, "A fraction between 0.0 and 1.0."),
         "compact_keep_recent" => describe(option, "A positive number of tokens."),
-        // Plain schema string: thinking, theme, hide_thinking_block,
-        // image_show_in_terminal, auto_compact, bash_rtk, show_frame_stats,
-        // and model_name (folded into the model row, never shown alone).
+        // Plain schema string: thinking, theme, show_thinking_block,
+        // show_token_usage, show_image_in_terminal, auto_compact, bash_rtk,
+        // show_frame_stats, and model_name (folded into the model row, never
+        // shown alone).
         _ => option.description.to_string(),
     }
 }

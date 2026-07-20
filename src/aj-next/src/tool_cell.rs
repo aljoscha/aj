@@ -285,14 +285,12 @@ fn details_body(details: &ToolDetails, expanded: bool, styles: &TranscriptStyles
             stderr_truncation,
             task_id: _,
         } => {
-            let command = sanitize_terminal_output(command);
-            // `stdout` / `stderr` are already sanitized at the bash
-            // tool source. Running the transform again is cheap and
-            // keeps this arm self-contained against future changes to
-            // the payload's provenance.
+            // `stdout` / `stderr` are already sanitized at the bash tool
+            // source. Running the transform again is cheap and keeps this arm
+            // self-contained against future changes to the payload's provenance.
             let stdout = sanitize_terminal_output(stdout);
             let stderr = sanitize_terminal_output(stderr);
-            let mut lines = vec![line(format!("$ {command}"), styles.dim)];
+            let mut lines = vec![bash_command_line(command, styles)];
 
             if !stdout.is_empty() {
                 push_stream_lines(&mut lines, &stdout, expanded, styles);
@@ -506,11 +504,28 @@ fn flatten_lines(lines: Vec<Line>, styles: &TranscriptStyles) -> Vec<TextSpan> {
     spans
 }
 
+/// The `$ {command}` line a bash cell renders as its first body line.
+/// Shared by the full body ([`details_body`]) and the compact render so the
+/// two stay identical. The command is sanitized and keeps any embedded
+/// newlines, which wrap as extra rows.
+fn bash_command_line(command: &str, styles: &TranscriptStyles) -> Line {
+    line(
+        format!("$ {}", sanitize_terminal_output(command)),
+        styles.dim,
+    )
+}
+
 /// Build the widget for `entry` under the current expansion flag.
+///
+/// In `compact` mode a tool cell renders header-only, except a bash cell keeps
+/// its `$ command` line. The `expanded` tools-expand toggle wins over
+/// `compact`: when both are set the full body renders, so tools-expand stays a
+/// reveal-everything escape hatch even under compact mode.
 pub(crate) fn build_tool_cell(
     entry: &ToolEntry,
     tasks: &BTreeMap<TaskId, TaskInfo>,
     expanded: bool,
+    compact: bool,
     styles: &TranscriptStyles,
 ) -> Bubble {
     let status = derive_status(entry, tasks);
@@ -526,7 +541,13 @@ pub(crate) fn build_tool_cell(
     // A freshly started call has no details yet: the bubble shows
     // only the header under the pending tint.
     let mut lines = vec![header];
-    if let Some(details) = &entry.details {
+    if compact && !expanded {
+        // Compact drops the body, but a bash cell keeps its command line so the
+        // one datum worth scanning at a glance survives.
+        if let Some(ToolDetails::Bash { command, .. }) = &entry.details {
+            lines.push(bash_command_line(command, styles));
+        }
+    } else if let Some(details) = &entry.details {
         lines.extend(details_body(details, expanded, styles));
     }
     let bg = match status {
@@ -649,7 +670,7 @@ mod tests {
     fn pending_cell_renders_bubble_with_padding_and_header() {
         let e = entry("read_file", serde_json::json!({"path": "/tmp/foo.txt"}));
         let s = styles_with_distinct_tints();
-        let mut cell = build_tool_cell(&e, &no_tasks(), false, &s);
+        let mut cell = build_tool_cell(&e, &no_tasks(), false, false, &s);
         let surface = draw(&mut cell, 60);
         let rows = rows(&surface);
         // One padding row above, one below the single content row,
@@ -704,7 +725,7 @@ mod tests {
             "bash",
             serde_json::json!({"command": "echo hi", "description": "x".repeat(120)}),
         );
-        let mut cell = build_tool_cell(&e, &no_tasks(), false, &styles());
+        let mut cell = build_tool_cell(&e, &no_tasks(), false, false, &styles());
         let surface = draw(&mut cell, 40);
         let rows = rows(&surface);
         let body: String = rows.join("");
@@ -727,7 +748,7 @@ mod tests {
             false,
         );
         let s = styles_with_distinct_tints();
-        let mut cell = build_tool_cell(&ok, &no_tasks(), false, &s);
+        let mut cell = build_tool_cell(&ok, &no_tasks(), false, false, &s);
         let surface = draw(&mut cell, 60);
         let r = rows(&surface);
         assert_eq!(r[1], " ✓ read_file()");
@@ -744,7 +765,7 @@ mod tests {
             },
             true,
         );
-        let mut cell = build_tool_cell(&err, &no_tasks(), false, &s);
+        let mut cell = build_tool_cell(&err, &no_tasks(), false, false, &s);
         let surface = draw(&mut cell, 60);
         assert_eq!(rows(&surface)[1], " ✗ bash()");
         assert_eq!(flatten(&surface)[0][0].style.bg, s.tool_error_bg);
@@ -760,7 +781,8 @@ mod tests {
             },
             false,
         );
-        let mut cell = build_tool_cell(&e, &no_tasks(), false, &styles_with_distinct_tints());
+        let mut cell =
+            build_tool_cell(&e, &no_tasks(), false, false, &styles_with_distinct_tints());
         let surface = draw(&mut cell, 2);
         // No bubble: no children carrying an inset content surface,
         // and no tinted cells.
@@ -779,7 +801,7 @@ mod tests {
     fn nonzero_bash_exit_paints_failed_even_without_is_error() {
         let e = done_entry("bash", bash_details("", Some(1), None), false);
         let s = styles_with_distinct_tints();
-        let mut cell = build_tool_cell(&e, &no_tasks(), false, &s);
+        let mut cell = build_tool_cell(&e, &no_tasks(), false, false, &s);
         let surface = draw(&mut cell, 40);
         let r = rows(&surface);
         assert!(r[1].starts_with(" ✗"), "{r:?}");
@@ -791,7 +813,7 @@ mod tests {
     fn zero_or_missing_bash_exit_keeps_success() {
         for exit in [Some(0), None] {
             let e = done_entry("bash", bash_details("hi\n", exit, None), false);
-            let mut cell = build_tool_cell(&e, &no_tasks(), false, &styles());
+            let mut cell = build_tool_cell(&e, &no_tasks(), false, false, &styles());
             let surface = draw(&mut cell, 40);
             assert!(rows(&surface)[1].starts_with(" ✓"), "exit {exit:?}");
         }
@@ -838,7 +860,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let e = done_entry("bash", bash_details(&stdout, Some(0), None), false);
-        let mut cell = build_tool_cell(&e, &no_tasks(), false, &styles());
+        let mut cell = build_tool_cell(&e, &no_tasks(), false, false, &styles());
         let r = rows(&draw(&mut cell, 60));
         assert!(
             r.iter()
@@ -860,7 +882,7 @@ mod tests {
             bash_details("a\nb\nc\nd\ne\nf\n", Some(0), None),
             false,
         );
-        let mut cell = build_tool_cell(&e, &no_tasks(), false, &styles());
+        let mut cell = build_tool_cell(&e, &no_tasks(), false, false, &styles());
         let r = rows(&draw(&mut cell, 60));
         assert!(r.iter().any(|l| l.contains("(1 earlier lines")), "{r:?}",);
         assert!(r.iter().any(|l| l == " b"));
@@ -941,7 +963,7 @@ mod tests {
             body,
         };
         let e = done_entry("read_file", details, false);
-        let mut collapsed = build_tool_cell(&e, &no_tasks(), false, &styles());
+        let mut collapsed = build_tool_cell(&e, &no_tasks(), false, false, &styles());
         let r = rows(&draw(&mut collapsed, 60));
         assert!(r.iter().any(|l| l == " line 10"));
         assert!(!r.iter().any(|l| l == " line 11"), "{r:?}");
@@ -951,12 +973,64 @@ mod tests {
             "{r:?}",
         );
 
-        let mut expanded = build_tool_cell(&e, &no_tasks(), true, &styles());
+        let mut expanded = build_tool_cell(&e, &no_tasks(), true, false, &styles());
         let r = rows(&draw(&mut expanded, 60));
         for i in 1..=30 {
             assert!(r.iter().any(|l| l == &format!(" line {i}")), "line {i}");
         }
         assert!(!r.iter().any(|l| l.contains("more lines")), "{r:?}");
+    }
+
+    // ---- Compact transcript mode -----------------------------------------
+
+    /// Compact renders a non-bash tool header-only: the body is dropped.
+    #[test]
+    fn compact_hides_the_body_of_a_non_bash_tool() {
+        let body = (1..=30)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let details = ToolDetails::Text {
+            summary: String::new(),
+            body,
+        };
+        let e = done_entry("read_file", details, false);
+        let mut cell = build_tool_cell(&e, &no_tasks(), false, true, &styles());
+        let r = rows(&draw(&mut cell, 60));
+        assert!(r.iter().any(|l| l.contains("read_file")), "header: {r:?}");
+        assert!(!r.iter().any(|l| l.contains("line 15")), "no body: {r:?}");
+    }
+
+    /// Compact keeps a bash cell's `$ command` line but drops its output.
+    #[test]
+    fn compact_keeps_the_bash_command_line_only() {
+        let e = done_entry("bash", bash_details("out line\n", Some(0), None), false);
+        let mut cell = build_tool_cell(&e, &no_tasks(), false, true, &styles());
+        let r = rows(&draw(&mut cell, 60));
+        assert!(r.iter().any(|l| l.contains("$ cmd")), "command: {r:?}");
+        assert!(
+            !r.iter().any(|l| l.contains("out line")),
+            "no output: {r:?}"
+        );
+        assert!(!r.iter().any(|l| l.contains("[exit 0]")), "no exit: {r:?}");
+    }
+
+    /// The tools-expand override wins over compact: with both set the full
+    /// body renders, so it stays a reveal-everything escape hatch.
+    #[test]
+    fn tools_expand_overrides_compact() {
+        let e = done_entry("bash", bash_details("out line\n", Some(0), None), false);
+        let mut cell = build_tool_cell(&e, &no_tasks(), true, true, &styles());
+        let r = rows(&draw(&mut cell, 60));
+        assert!(r.iter().any(|l| l.contains("$ cmd")), "command: {r:?}");
+        assert!(
+            r.iter().any(|l| l.contains("out line")),
+            "output shown: {r:?}"
+        );
+        assert!(
+            r.iter().any(|l| l.contains("[exit 0]")),
+            "exit shown: {r:?}"
+        );
     }
 
     #[test]
@@ -1133,7 +1207,8 @@ mod tests {
             false,
         );
         e.header_only = true;
-        let mut cell = build_tool_cell(&e, &no_tasks(), false, &styles_with_distinct_tints());
+        let mut cell =
+            build_tool_cell(&e, &no_tasks(), false, false, &styles_with_distinct_tints());
         let surface = draw(&mut cell, 60);
         let r = rows(&surface);
         // First row is the header, not a bg-painted pad, and there
@@ -1157,12 +1232,12 @@ mod tests {
         // `ToolDetails::Bash.task_id` alone (the resume path has no
         // task events), so an empty task map is the whole setup.
         let e = done_entry("bash", bash_details("", None, Some(3)), false);
-        let mut cell = build_tool_cell(&e, &no_tasks(), false, &styles());
+        let mut cell = build_tool_cell(&e, &no_tasks(), false, false, &styles());
         let r = rows(&draw(&mut cell, 60));
         assert!(r[1].contains("[task #3]"), "{r:?}");
 
         let fg = done_entry("bash", bash_details("", Some(0), None), false);
-        let mut cell = build_tool_cell(&fg, &no_tasks(), false, &styles());
+        let mut cell = build_tool_cell(&fg, &no_tasks(), false, false, &styles());
         let r = rows(&draw(&mut cell, 60));
         assert!(!r.iter().any(|l| l.contains("[task #")), "{r:?}");
     }
@@ -1180,7 +1255,7 @@ mod tests {
             agent_id: 1,
             task: "investigate".into(),
         };
-        let mut cell = build_tool_cell(&e, &tasks, false, &s);
+        let mut cell = build_tool_cell(&e, &tasks, false, false, &s);
         let surface = draw(&mut cell, 60);
         let r = rows(&surface);
         assert!(!r.iter().any(|l| l.contains("[task #")), "{r:?}");
@@ -1219,7 +1294,7 @@ mod tests {
         for (status, badge, tint, glyph) in cases {
             let e = done_entry("bash", bash_details("", None, Some(4)), false);
             let tasks = task_map(4, status);
-            let mut cell = build_tool_cell(&e, &tasks, false, &s);
+            let mut cell = build_tool_cell(&e, &tasks, false, false, &s);
             let surface = draw(&mut cell, 60);
             let r = rows(&surface);
             assert!(r[1].contains(badge), "{status:?}: {r:?}");
@@ -1229,7 +1304,7 @@ mod tests {
         // A still-running task keeps the plain badge and base tint.
         let e = done_entry("bash", bash_details("", None, Some(4)), false);
         let tasks = task_map(4, TaskStatus::Running);
-        let mut cell = build_tool_cell(&e, &tasks, false, &s);
+        let mut cell = build_tool_cell(&e, &tasks, false, false, &s);
         let surface = draw(&mut cell, 60);
         assert!(rows(&surface)[1].contains("[task #4]"));
         assert_eq!(flatten(&surface)[0][0].style.bg, s.tool_success_bg);

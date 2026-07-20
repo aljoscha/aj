@@ -213,8 +213,9 @@ struct CachedEntry {
 /// Owned by [`TranscriptView`] and shared into the [`EntryBuilder`] by
 /// `Rc<RefCell<..>>`. One slot per key, so stale `(fingerprint, width)`
 /// variants never accumulate. Session-wide render inputs (the theme,
-/// `tools_expanded`, `hide_thinking_block`, `syntax_highlight`, the active
-/// view) are handled by clearing the whole cache when they change rather than
+/// `tools_expanded`, `show_thinking_block`, `show_token_usage`,
+/// `compact_transcript`, `syntax_highlight`, the active view) are handled by
+/// clearing the whole cache when they change rather than
 /// folding them into every fingerprint (see [`TranscriptView::draw`] and
 /// [`TranscriptView::set_styles`]). Width is a per-slot key.
 ///
@@ -579,7 +580,8 @@ impl Widget for CachingEntry {
 /// Philosophy: over-fingerprint. A field we forget shows stale content (a real
 /// bug); a field we include that doesn't affect rendering only costs a
 /// harmless rebuild. Session-wide render inputs (`tools_expanded`,
-/// `hide_thinking_block`, `syntax_highlight`, the active view, the theme, the
+/// `show_thinking_block`, `show_token_usage`, `compact_transcript`,
+/// `syntax_highlight`, the active view, the theme, the
 /// draw width) are NOT hashed here: the cache clears wholesale when they
 /// change, and width is a per-slot key.
 fn entry_fingerprint(entry: &Entry, chat: &ChatState) -> u64 {
@@ -640,7 +642,7 @@ fn fingerprint_into(entry: &Entry, chat: &ChatState, hasher: &mut DefaultHasher)
 /// Assistant / reasoning fields: the content-block count, a per-block tag (so
 /// a block changing kind is caught), the summed text and thinking byte
 /// lengths, the thinking `redacted` flag (which flips the placeholder text
-/// without changing its length), and `finalized`. `hide_thinking_block` is a
+/// without changing its length), and `finalized`. `show_thinking_block` is a
 /// global clear, so it is not folded in.
 fn assistant_fingerprint(a: &AssistantEntry, hasher: &mut DefaultHasher) {
     a.message.content.len().hash(hasher);
@@ -975,6 +977,7 @@ pub(crate) fn build_entry_widget(
             tool,
             chat.tasks(),
             chat.tools_expanded,
+            chat.compact_transcript,
             styles,
         )),
         EntryKind::User(user) => EntryWidget::Bubble(build_user_bubble(user, styles, focus)),
@@ -993,7 +996,7 @@ pub(crate) fn build_entry_widget(
         // messages render as markdown just like the top-level ones.
         EntryKind::Assistant(a) => EntryWidget::Markdown(build_assistant_markdown(
             a,
-            chat.hide_thinking_block,
+            chat.show_thinking_block,
             chat.syntax_highlight,
             styles,
         )),
@@ -1003,6 +1006,13 @@ pub(crate) fn build_entry_widget(
             chat.syntax_highlight,
             styles,
         )),
+        // Token-usage rows are hidden when the toggle is off. They render as
+        // an empty (zero-height) rich text rather than being dropped from the
+        // list, so the entry index stays aligned with selection and focus,
+        // which key on it.
+        EntryKind::TurnUsage(_) if !chat.show_token_usage => {
+            EntryWidget::Rich(RichText::new(Vec::new()))
+        }
         _ => EntryWidget::Rich(RichText::new(entry_spans(entry, styles))),
     }
 }
@@ -1225,12 +1235,12 @@ static THINKING_EXPAND_KEY_LABEL: LazyLock<String> = LazyLock::new(|| {
 /// Plain text renders under the normal text style; thinking blocks under the
 /// thinking style (its own color plus italic). Tool calls render as their own
 /// `Tool` transcript entries, so the inline block is skipped here to avoid
-/// duplicating them. Redacted and (when `hide_thinking`) hidden thinking
+/// duplicating them. Redacted and (when `show_thinking` is off) hidden thinking
 /// collapse to their placeholders, matching the plain-text renderer they
 /// replace.
 fn build_assistant_markdown(
     a: &AssistantEntry,
-    hide_thinking: bool,
+    show_thinking: bool,
     syntax_highlight: bool,
     styles: &TranscriptStyles,
 ) -> MarkdownView {
@@ -1267,7 +1277,7 @@ fn build_assistant_markdown(
             // thinking, or a provider that omits the transcript) collapses to a
             // bare placeholder so we do not advertise a toggle that reveals
             // nothing.
-            AssistantContent::Thinking(t) if hide_thinking => {
+            AssistantContent::Thinking(t) if !show_thinking => {
                 let text = if t.thinking.is_empty() {
                     "Thinking…".to_string()
                 } else {
@@ -1588,7 +1598,9 @@ pub struct TranscriptView {
 struct GlobalRenderInputs {
     active_view: AgentId,
     tools_expanded: bool,
-    hide_thinking_block: bool,
+    show_thinking_block: bool,
+    show_token_usage: bool,
+    compact_transcript: bool,
     syntax_highlight: bool,
 }
 
@@ -1597,7 +1609,9 @@ impl GlobalRenderInputs {
         GlobalRenderInputs {
             active_view: chat.active_view(),
             tools_expanded: chat.tools_expanded,
-            hide_thinking_block: chat.hide_thinking_block,
+            show_thinking_block: chat.show_thinking_block,
+            show_token_usage: chat.show_token_usage,
+            compact_transcript: chat.compact_transcript,
             syntax_highlight: chat.syntax_highlight,
         }
     }
@@ -2479,13 +2493,14 @@ impl TranscriptView {
         rows
     }
 
-    /// Rendered-row count of entry `id` at `width`, at least 1.
+    /// Rendered-row count of entry `id` at `width`.
     ///
-    /// The floor guards a per-entry walk against a zero-height entry stalling
-    /// it. Entries always render at least a trailing blank row, so it is
-    /// defensive.
+    /// Usually at least 1, but a hidden token-usage row (see
+    /// [`build_entry_widget`]) renders zero rows. The per-entry walks must see
+    /// that true zero, otherwise their row accounting drifts by one against the
+    /// composited list for every entry below a hidden row.
     fn entry_height(&mut self, id: EntryId, width: u16) -> usize {
-        self.entry_rows(id, width).len().max(1)
+        self.entry_rows(id, width).len()
     }
 
     /// The `EntryId` at index `idx` of the active view's transcript, if any.
@@ -2804,12 +2819,13 @@ impl TranscriptView {
         let mut rows = vec![None; pad];
 
         let item_height = |idx: usize| {
+            // A hidden (zero-height) entry reports a true 0 here so the walk
+            // stays aligned with the composited list, which gives it no row.
             usize::try_from(
                 list.item_top_line(idx + 1)
                     .saturating_sub(list.item_top_line(idx)),
             )
             .unwrap_or(usize::MAX)
-            .max(1)
         };
         let mut current = self.entry_id_at(idx).map(|id| (id, item_height(idx)));
         for _ in pad..height {
@@ -2874,8 +2890,9 @@ impl TranscriptView {
         };
         for _ in 0..(height - pad) {
             // Advance past any entries the running line has walked off the end
-            // of. Every entry is at least one row tall, so this consumes at
-            // most one entry per screen row and the walk stays O(viewport).
+            // of. A hidden (zero-height) entry is consumed here too, so a screen
+            // row may cross more than one entry, but the walk stays bounded by
+            // the entry count.
             while let Some((_, h)) = current {
                 if line < h {
                     break;
@@ -3265,11 +3282,11 @@ mod tests {
 
     /// Draw the assistant entry's `MarkdownView` at `width` and return its
     /// composited rows.
-    fn assistant_markdown_rows(t: &Transcript, hide_thinking: bool, width: u16) -> Vec<String> {
+    fn assistant_markdown_rows(t: &Transcript, show_thinking: bool, width: u16) -> Vec<String> {
         let EntryKind::Assistant(a) = &t.entries()[0].kind else {
             panic!("expected an assistant entry");
         };
-        let mut view = build_assistant_markdown(a, hide_thinking, false, &styles());
+        let mut view = build_assistant_markdown(a, show_thinking, false, &styles());
         let surface = view.draw(&crate::test_support::draw_ctx(width, None));
         crate::test_support::rows(&surface)
     }
@@ -3553,7 +3570,7 @@ mod tests {
             ]),
             finalized: true,
         }));
-        let rows = assistant_markdown_rows(&t, false, 80);
+        let rows = assistant_markdown_rows(&t, true, 80);
         // Segments stack in order with one blank row between them and the
         // trailing spacer, the tool call contributing nothing.
         assert_eq!(rows, vec!["Thinking: pondering", "", "answer", ""]);
@@ -3592,7 +3609,7 @@ mod tests {
             })]),
             finalized: true,
         }));
-        let rows = assistant_markdown_rows(&t, true, 80);
+        let rows = assistant_markdown_rows(&t, false, 80);
         // A collapsed block with a body advertises the expand chord, resolved
         // from the shared binding data (the thinking-toggle chord, alt+t by
         // default), not the tools-expand chord (alt+o).
@@ -3621,7 +3638,7 @@ mod tests {
             })]),
             finalized: true,
         }));
-        let rows = assistant_markdown_rows(&t, true, 80);
+        let rows = assistant_markdown_rows(&t, false, 80);
         assert_eq!(rows, vec!["Thinking…", ""]);
     }
 
@@ -3635,7 +3652,7 @@ mod tests {
             })]),
             finalized: true,
         }));
-        let rows = assistant_markdown_rows(&t, false, 80);
+        let rows = assistant_markdown_rows(&t, true, 80);
         assert_eq!(rows, vec!["[Redacted thinking: ]", ""]);
     }
 
@@ -6316,7 +6333,7 @@ mod tests {
         );
     }
 
-    /// Toggling `hide_thinking_block` clears the whole cache.
+    /// Toggling `show_thinking_block` clears the whole cache.
     #[test]
     fn toggling_hide_thinking_clears_the_cache() {
         let chat = empty_chat();
@@ -6345,17 +6362,126 @@ mod tests {
         let misses_before = view.cache.borrow().misses;
         assert!(view.cache.borrow().hits > 0, "second draw hit");
 
-        chat.borrow_mut().hide_thinking_block = true;
+        chat.borrow_mut().show_thinking_block = false;
         let _ = view.draw(&ctx);
         assert!(
             view.cache.borrow().misses > misses_before,
-            "toggling hide_thinking_block forced misses",
+            "toggling show_thinking_block forced misses",
         );
         let rows = crate::test_support::rows(&view.draw(&ctx));
         assert!(
             rows.join("\n").contains("Thinking…"),
             "placeholder shown: {rows:?}"
         );
+    }
+
+    /// Token-usage rows disappear when `show_token_usage` is off, and the
+    /// toggle clears the cache so the change repaints.
+    #[test]
+    fn toggling_show_token_usage_hides_the_rows_and_clears_the_cache() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        apply(
+            &chat,
+            &mut life,
+            AgentEvent::UsageUpdate {
+                agent_id: AgentId::Main,
+                usage: aj_agent::types::TokenUsage {
+                    accumulated_input: 100,
+                    turn_input: 100,
+                    accumulated_output: 50,
+                    turn_output: 50,
+                    accumulated_cache_write: 0,
+                    turn_cache_write: 0,
+                    accumulated_cache_read: 0,
+                    turn_cache_read: 0,
+                },
+            },
+        );
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(60, 24);
+        // Default on: the usage row renders.
+        assert!(
+            crate::test_support::rows(&view.draw(&ctx))
+                .join("\n")
+                .contains("Token Usage"),
+            "usage row shown by default",
+        );
+        let _ = view.draw(&ctx);
+        let misses_before = view.cache.borrow().misses;
+
+        chat.borrow_mut().show_token_usage = false;
+        let rows = crate::test_support::rows(&view.draw(&ctx));
+        assert!(
+            view.cache.borrow().misses > misses_before,
+            "toggling show_token_usage forced misses",
+        );
+        assert!(
+            !rows.join("\n").contains("Token Usage"),
+            "usage row hidden: {rows:?}"
+        );
+    }
+
+    /// A hidden token-usage row occupies zero rows, so the entry below it must
+    /// still map to its own screen row. Regression: the per-entry row-walk once
+    /// floored every entry to one row, which drifted selection and mouse
+    /// hit-testing by one row for everything below a hidden row.
+    #[test]
+    fn hidden_usage_row_keeps_the_row_walk_aligned() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        apply(
+            &chat,
+            &mut life,
+            AgentEvent::Notice {
+                agent_id: AgentId::Main,
+                text: "AAA".into(),
+            },
+        );
+        apply(
+            &chat,
+            &mut life,
+            AgentEvent::UsageUpdate {
+                agent_id: AgentId::Main,
+                usage: aj_agent::types::TokenUsage {
+                    accumulated_input: 1,
+                    turn_input: 1,
+                    accumulated_output: 1,
+                    turn_output: 1,
+                    accumulated_cache_write: 0,
+                    turn_cache_write: 0,
+                    accumulated_cache_read: 0,
+                    turn_cache_read: 0,
+                },
+            },
+        );
+        apply(
+            &chat,
+            &mut life,
+            AgentEvent::Notice {
+                agent_id: AgentId::Main,
+                text: "BBB".into(),
+            },
+        );
+        chat.borrow_mut().show_token_usage = false;
+
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(40, 10);
+        let rows = crate::test_support::rows(&view.draw(&ctx));
+        let bbb_row = rows
+            .iter()
+            .position(|r| r.contains("BBB"))
+            .expect("BBB visible");
+
+        // A click on BBB's screen row resolves to the Notice B entry, not the
+        // hidden usage row sitting (invisibly) between A and B.
+        let usage = entry_id(&chat, 1);
+        let notice_b = entry_id(&chat, 2);
+        let pos = view
+            .point_to_sel(i16::try_from(bbb_row).unwrap(), 1)
+            .expect("resolves to an entry");
+        assert_eq!(pos.entry, notice_b, "click on BBB maps to Notice B");
+        assert_ne!(pos.entry, usage, "never the hidden usage row");
     }
 
     /// Toggling `syntax_highlight` clears the whole cache, so a live change
