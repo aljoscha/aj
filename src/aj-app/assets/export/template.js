@@ -991,57 +991,73 @@
   let showSubAgents = true;
   const SETTINGS_TYPES = ['system_prompt', 'model_change', 'thinking_change', 'speed_change', 'verbosity_change'];
 
+  // Structural suppression that runs in every filter mode: the
+  // sub-agent toggle, the duplicate `agent` tool result, and the empty
+  // assistant wrapper whose tool calls already show as their own
+  // tool-result rows. The current leaf is exempt so the active branch
+  // never vanishes. This set is the widest any mode can show, so it is
+  // the denominator for the "x / y entries" status: under "All" with no
+  // search the numerator equals it and the status reads N / N.
+  function structurallyVisible(entry, leafId) {
+    // Sub-agent rows appear only when the toggle is on. Checked before
+    // the leaf rule so hiding wins even if the leaf is a sub-agent.
+    if (entry.thread === 'subagent' && !showSubAgents) return false;
+    if (entry.id === leafId) return true;
+
+    // A successful `agent` tool result duplicates its sub-agent run:
+    // when sub-agent rows are shown, the run's spawn node already names
+    // the same task (and its report shows in the inline box), so drop
+    // the tool result to avoid listing the task twice. With sub-agent
+    // rows hidden there is no spawn node, so we keep it as the
+    // conversation-thread trace of the call. A failed run is always
+    // kept so the failure is not lost, matching renderToolCall.
+    if (showSubAgents && entry.type === 'message' && entry.message && entry.message.role === 'tool_result') {
+      const tr = entry.message;
+      const call = tr.tool_call_id ? toolCallById.get(tr.tool_call_id) : null;
+      const isAgent = call ? call.name === 'agent' : tr.tool_name === 'agent';
+      if (isAgent && !tr.is_error) return false;
+    }
+
+    // Hide assistant messages that are only tool calls (no text) unless
+    // the turn errored or was aborted. Their calls already appear as the
+    // tool-result rows beneath them.
+    if (entry.type === 'message' && entry.message && entry.message.role === 'assistant') {
+      const hasText = textOf(entry.message.content).trim().length > 0;
+      const sr = entry.message.stop_reason;
+      const errored = sr && sr !== 'Stop' && sr !== 'ToolUse';
+      if (!hasText && !errored) return false;
+    }
+    return true;
+  }
+
+  function passesMode(entry) {
+    const isSettings = SETTINGS_TYPES.includes(entry.type);
+    switch (filterMode) {
+      case 'user-only': return entry.type === 'message' && entry.message && entry.message.role === 'user';
+      case 'no-tools': return !isSettings && !(entry.type === 'message' && entry.message && entry.message.role === 'tool_result');
+      case 'all': return true;
+      default: return !isSettings;
+    }
+  }
+
+  // Returns the laid-out visible nodes plus `total`, the structural
+  // count that is the status denominator. The active mode and search
+  // narrow the structural set; the leaf stays visible regardless,
+  // matching structurallyVisible.
   function filterNodes(flatNodes, leafId, activeIds) {
     const tokens = searchQuery.toLowerCase().split(/\s+/).filter(Boolean);
-    const visible = flatNodes.filter((flat) => {
+    const structural = flatNodes.filter((flat) => structurallyVisible(flat.node.entry, leafId));
+    const visible = structural.filter((flat) => {
       const entry = flat.node.entry;
-      // Sub-agent rows appear only when the toggle is on. Checked before
-      // the leaf rule so hiding wins even if the leaf is a sub-agent.
-      if (entry.thread === 'subagent' && !showSubAgents) return false;
-      // The current leaf is always shown so the active branch never
-      // vanishes, even under a filter or search that would exclude it.
       if (entry.id === leafId) return true;
-
-      // A successful `agent` tool result duplicates its sub-agent run:
-      // when sub-agent rows are shown, the run's spawn node already names
-      // the same task (and its report shows in the inline box), so drop
-      // the tool result to avoid listing the task twice. With sub-agent
-      // rows hidden there is no spawn node, so we keep it as the
-      // conversation-thread trace of the call. A failed run is always
-      // kept so the failure is not lost, matching renderToolCall.
-      if (showSubAgents && entry.type === 'message' && entry.message && entry.message.role === 'tool_result') {
-        const tr = entry.message;
-        const call = tr.tool_call_id ? toolCallById.get(tr.tool_call_id) : null;
-        const isAgent = call ? call.name === 'agent' : tr.tool_name === 'agent';
-        if (isAgent && !tr.is_error) return false;
-      }
-
-      // Hide assistant messages that are only tool calls (no text)
-      // unless the turn errored or was aborted.
-      if (entry.type === 'message' && entry.message && entry.message.role === 'assistant') {
-        const hasText = textOf(entry.message.content).trim().length > 0;
-        const sr = entry.message.stop_reason;
-        const errored = sr && sr !== 'Stop' && sr !== 'ToolUse';
-        if (!hasText && !errored) return false;
-      }
-
-      const isSettings = SETTINGS_TYPES.includes(entry.type);
-      let pass;
-      switch (filterMode) {
-        case 'user-only': pass = entry.type === 'message' && entry.message && entry.message.role === 'user'; break;
-        case 'no-tools': pass = !isSettings && !(entry.type === 'message' && entry.message && entry.message.role === 'tool_result'); break;
-        case 'all': pass = true; break;
-        default: pass = !isSettings; break;
-      }
-      if (!pass) return false;
-
+      if (!passesMode(entry)) return false;
       if (tokens.length > 0) {
         const text = searchableText(entry);
         if (!tokens.every((t) => text.includes(t))) return false;
       }
       return true;
     });
-    return layoutVisible(visible, flatNodes, activeIds);
+    return { visible: layoutVisible(visible, flatNodes, activeIds), total: structural.length };
   }
 
   // ============================================================
@@ -1059,7 +1075,7 @@
     const roots = buildTree();
     const activeIds = activePathIds(currentLeafId);
     const flatNodes = collectNodes(roots);
-    const filtered = filterNodes(flatNodes, currentLeafId, activeIds);
+    const { visible: filtered, total } = filterNodes(flatNodes, currentLeafId, activeIds);
     const container = document.getElementById('tree-container');
 
     container.innerHTML = '';
@@ -1093,7 +1109,7 @@
       container.appendChild(div);
     }
 
-    document.getElementById('tree-status').textContent = filtered.length + ' / ' + flatNodes.length + ' entries';
+    document.getElementById('tree-status').textContent = filtered.length + ' / ' + total + ' entries';
     setTimeout(() => {
       const active = container.querySelector('.tree-node.active');
       if (active) active.scrollIntoView({ block: 'nearest' });

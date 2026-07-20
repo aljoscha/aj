@@ -153,11 +153,20 @@ for (const id of ['session-data', 'header-container', 'messages', 'tree-containe
 // base64-encoded. This exercises the renderer's real inflate path.
 elements['session-data'].textContent = zlib.gzipSync(JSON.stringify(sessionData)).toString('base64');
 
+// Filter radio buttons, queried by class (not id) exactly as the page
+// wires them. `default` starts active, matching template.html.
+const filterButtons = ['default', 'no-tools', 'user-only', 'all'].map((mode) => {
+  const btn = makeEl('button');
+  btn.dataset.filter = mode;
+  if (mode === 'default') btn.classList.add('active');
+  return btn;
+});
+
 const documentShim = {
   getElementById: (id) => elements[id] || null,
   createElement: (tag) => makeEl(tag),
   querySelector: () => null,
-  querySelectorAll: () => [],
+  querySelectorAll: (sel) => (sel === '.filter-btn' ? filterButtons : []),
   addEventListener: () => {},
 };
 
@@ -327,6 +336,23 @@ check('tree draws branch connectors', treeText.includes('\u251c') || treeText.in
 // spawned it and renders before the conversation continues, while the
 // main thread stays on its spine (not indented by the run). sp2 is
 // spawned by a2; a3 is a2's conversation continuation.
+// The status denominator is the structural set (what the widest filter
+// can show given the sub-agent toggle), not the raw entry count. So
+// "All" with no search reads N / N, and narrowing the mode lowers the
+// numerator while the denominator holds.
+console.log('filter denominator');
+{
+  const byMode = (m) => filterButtons.find((b) => b.dataset.filter === m);
+  fire(byMode('all'), 'click');
+  const all = elements['tree-status'].textContent.match(/(\d+) \/ (\d+)/);
+  check('all filter reads N / N', !!all && all[1] === all[2]);
+  fire(byMode('user-only'), 'click');
+  const narrow = elements['tree-status'].textContent.match(/(\d+) \/ (\d+)/);
+  check('narrowing keeps the same denominator', !!narrow && narrow[2] === all[2]);
+  check('narrowing lowers the numerator', !!narrow && Number(narrow[1]) < Number(all[1]));
+  fire(byMode('default'), 'click'); // restore the default view for later checks
+}
+
 console.log('layout');
 {
   const rows = treeRows();
