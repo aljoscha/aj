@@ -27,6 +27,7 @@ use aj_app::chat::{
 use aj_app::footer::format_tokens;
 use aj_app::keybindings::{
     ACTION_BRANCH_MESSAGE, ACTION_COPY_MESSAGE, ACTION_THINKING_TOGGLE, default_action_shortcut,
+    format_keybinding,
 };
 use aj_app::markdown::{Emphasis, RenderOpts};
 use aj_app::theme::{ColorMode, Theme, ThemeBg, ThemeColor, ThemeRgb, rgb_to_256};
@@ -429,7 +430,7 @@ struct EntryBuilder {
     /// armed.
     branch_armed: Rc<RefCell<Option<String>>>,
     /// The pre-styled focus hint (`y to copy \u{b7} b to branch`) and the
-    /// branch hint (`branching \u{b7} esc to cancel`), resolved once through the
+    /// branch hint (`branching \u{b7} Esc to cancel`), resolved once through the
     /// keybinding data. Shared by `Rc` so each `CachingEntry` clones a handle
     /// rather than the spans.
     copy_label: Rc<Vec<TextSpan>>,
@@ -1144,8 +1145,9 @@ fn copy_label_spans(styles: &TranscriptStyles) -> Vec<TextSpan> {
 
 /// The hint shown on an armed-branch bubble's border, mirroring the focus
 /// hint's styling: the status word and the key in accent, the rest muted.
-/// Cancelling a branch is the bare Esc key (no bound action), so it renders as
-/// a literal rather than a resolved shortcut.
+/// Cancelling a branch is the bare Esc key (no bound action), so we spell its
+/// label through `format_keybinding` rather than a raw literal, keeping it
+/// coherent with every other Esc hint.
 fn branch_label_spans(styles: &TranscriptStyles) -> Vec<TextSpan> {
     let accent_span = |text: &str| TextSpan {
         text: text.into(),
@@ -1160,7 +1162,7 @@ fn branch_label_spans(styles: &TranscriptStyles) -> Vec<TextSpan> {
     vec![
         accent_span("branching"),
         dim_span(" \u{b7} "),
-        accent_span("esc"),
+        accent_span(&format_keybinding("escape")),
         dim_span(" to cancel"),
     ]
 }
@@ -5387,7 +5389,7 @@ mod tests {
             "bordered message: {rows:?}"
         );
         assert!(
-            joined.contains("branching") && joined.contains("esc to cancel"),
+            joined.contains("branching") && joined.contains("Esc to cancel"),
             "branch hint on the border edge: {rows:?}",
         );
         assert!(

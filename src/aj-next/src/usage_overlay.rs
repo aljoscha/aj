@@ -47,7 +47,8 @@ use vaxis::vxfw::{
 use crate::content_overlay::{ContentStyles, Row, plain, usage_rows};
 use crate::keymap::action_matches;
 use crate::overlay::{
-    OverlayChrome, OverlayPlacement, OverlayStack, close_top, confirm_key_label, subtitle_close,
+    OverlayChrome, OverlayPlacement, OverlayStack, close_key_label, close_top, confirm_key_label,
+    subtitle_close,
 };
 use crate::settings_ui::push_window;
 
@@ -231,7 +232,11 @@ impl UsageOverlay {
                 }
             }
             Phase::SelectProvider | Phase::Confirm { .. } | Phase::Failed { .. } => {
-                "\u{2191}\u{2193} select \u{00b7} Enter confirm \u{00b7} Esc back".to_string()
+                format!(
+                    "\u{2191}\u{2193} select \u{00b7} {} confirm \u{00b7} {} back",
+                    confirm_key_label(),
+                    close_key_label()
+                )
             }
             Phase::Consuming { .. } => "resetting\u{2026}".to_string(),
             Phase::Done { .. } => {

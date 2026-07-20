@@ -63,8 +63,8 @@ impl StatusState {
     }
 }
 
-/// The loader line widget: zero height while idle, one leading blank
-/// row plus ` {spinner} {message}` while the viewed agent is busy.
+/// The loader line widget: zero height while idle, a single
+/// ` {spinner} {message}` row while the viewed agent is busy.
 pub(crate) struct StatusLine {
     /// Weak self-reference so tick commands can target this widget.
     /// Captured at construction with [`Rc::new_cyclic`], like vxfw's
@@ -179,10 +179,11 @@ impl Widget for StatusLine {
             style,
             ..TextSpan::default()
         };
-        // One leading blank row, then ` {spinner} {message}`, the
-        // exact shape of `aj`'s loader slot.
+        // ` {spinner} {message}` on a single row. No leading blank row, so
+        // the spinner sits flush under the transcript the same way the
+        // collapsed idle slot lets the chat sit flush above the editor.
         let spans = vec![
-            span("\n ".to_string(), self.styles.text),
+            span(" ".to_string(), self.styles.text),
             span(Self::frame(started).to_string(), self.styles.accent),
             span(format!(" {}", self.message()), self.styles.dim),
         ];
@@ -272,8 +273,7 @@ mod tests {
             ..StatusState::default()
         });
         let r = rows(&line);
-        assert_eq!(r[0], "", "leading blank row");
-        assert_eq!(r[1], " ⠋ Working… (Ctrl+C to cancel)", "{r:?}");
+        assert_eq!(r[0], " ⠋ Working… (Ctrl+C to cancel)", "{r:?}");
     }
 
     /// Compaction relabels the loader: the starting phase, then each
@@ -284,7 +284,7 @@ mod tests {
             compacting: true,
             ..StatusState::default()
         });
-        assert!(rows(&line)[1].ends_with("Compacting context…"));
+        assert!(rows(&line)[0].ends_with("Compacting context…"));
 
         let mut life = AgentLifecycle::default();
         for (phase, label) in [
@@ -308,7 +308,7 @@ mod tests {
                 },
             );
             let r = rows(&line);
-            assert!(r[1].ends_with(label), "{phase:?}: {r:?}");
+            assert!(r[0].ends_with(label), "{phase:?}: {r:?}");
         }
 
         // `CompactionEnd` clears the phase (via the reducer) and the
@@ -328,7 +328,7 @@ mod tests {
         );
         line.borrow_mut().status.borrow_mut().compacting = false;
         line.borrow_mut().status.borrow_mut().running = true;
-        assert!(rows(&line)[1].contains("Working…"));
+        assert!(rows(&line)[0].contains("Working…"));
     }
 
     /// The frame index derives from elapsed wall time, so backdating
@@ -344,7 +344,7 @@ mod tests {
         line.borrow_mut().started = Some(Instant::now() - two_frames);
         let r = rows(&line);
         assert!(
-            r[1].starts_with(" ⠹ "),
+            r[0].starts_with(" ⠹ "),
             "third frame after 2 intervals: {r:?}"
         );
     }

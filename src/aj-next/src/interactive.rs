@@ -70,7 +70,7 @@ use crate::login::{
     AuthPickerRequest, AuthRow, DialogCallbacks, LoginDialogState, open_login_dialog,
     open_login_picker, open_logout_picker,
 };
-use crate::overlay::{MouseBlocker, OverlayChrome, OverlayStack, Scrim};
+use crate::overlay::{MouseBlocker, OverlayChrome, OverlayStack, Scrim, close_key_label};
 use crate::palette::{FetchKind, PendingFetch, open_palette};
 use crate::pending::PendingBox;
 use crate::prompt_history::{HistoryFetch, HistoryScope, MAX_ENTRIES, open_prompt_history};
@@ -898,7 +898,10 @@ fn prefill_branch_editor(editor: &Rc<RefCell<TextArea>>, message: &str) {
 /// The notice folded when a gesture incoherent with an armed branch anchor
 /// (steer, dequeue) is attempted: it points the user at Esc to cancel.
 fn branch_armed_notice(what: &str) -> String {
-    format!("Can't {what} while branching \u{2014} press Esc to cancel the branch first.")
+    format!(
+        "Can't {what} while branching \u{2014} press {} to cancel the branch first.",
+        close_key_label()
+    )
 }
 
 /// Handle an editor submit: spawn a prompt turn on the viewed agent
@@ -1311,7 +1314,13 @@ async fn submit_with_armed_anchor(
     // for a prompt that would be dropped. The editor is already empty, so
     // there is nothing to restore.
     if text.trim().is_empty() {
-        fold_notice(world, "Type a message to branch, or press Esc to cancel.");
+        fold_notice(
+            world,
+            &format!(
+                "Type a message to branch, or press {} to cancel.",
+                close_key_label()
+            ),
+        );
         return ArmedSubmit::Stay;
     }
     // Busy: refuse and keep the anchor and text. A branch rebuilds the
