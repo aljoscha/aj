@@ -1317,17 +1317,24 @@ struct RowPos {
 
 /// Where the viewport should come to rest relative to the focused message
 /// once a focus-navigation scroll finishes. Recorded when the scroll starts
-/// so the final frame can land on the exact position `ensure_scroll` would
-/// have snapped to, correcting any drift the estimate-based travel accrued.
+/// so the final frame can land on the exact position the snap computes,
+/// correcting any drift the estimate-based travel accrued.
+///
+/// `Top` and `Bottom` keep [`FOCUS_SCROLL_MARGIN`] rows of context on the side
+/// we scrolled from, so a stepped-to message never sits flush against a
+/// viewport edge.
 #[derive(Clone, Copy)]
 enum FocusAnchor {
-    /// The message sits at the top of the viewport (stepping to an older
-    /// message, or one taller than the viewport). Landed with `jump_to_item`.
-    Top,
-    /// The message's bottom sits at the viewport bottom (stepping to a newer
-    /// message below the fold), or it is already in view. Landed with
-    /// `ensure_scroll`, whose deferred `wants_cursor` the next draw resolves.
-    Bottom,
+    /// The message's top sits `margin` rows below the viewport top (stepping
+    /// to an older message, or hugging the top). `margin` is 0 for a message
+    /// taller than the viewport, which is pinned to the top so its head shows.
+    Top { margin: u16 },
+    /// The message's bottom sits `margin` rows above the viewport bottom
+    /// (stepping to a newer message below the fold, or hugging the bottom).
+    Bottom { margin: u16 },
+    /// The message is already framed with context on both sides. The snap only
+    /// keeps it in view via `ensure_scroll`, it does not reframe.
+    Keep,
 }
 
 /// How a [`ScrollAnim`] lands on its final frame.
@@ -1364,6 +1371,10 @@ const SCROLL_ANIM_FRAME_MS: u32 = 16;
 /// Below this travel distance a focus step just snaps: a move of a line or two
 /// is not worth animating and would only add latency.
 const SCROLL_ANIM_MIN_LINES: f64 = 2.0;
+/// Rows of context kept between a focus-stepped message and the viewport edge
+/// it was scrolled toward, so the message never lands flush against the top or
+/// bottom. Clamped away at the transcript ends, where there is nothing to show.
+const FOCUS_SCROLL_MARGIN: u16 = 3;
 /// Per-line pacing for the glide, clamped to
 /// [`SCROLL_ANIM_MIN_MS`]`..=`[`SCROLL_ANIM_MAX_MS`]. Roughly constant speed
 /// for short and medium jumps, capped so a long jump stays snappy (the
@@ -1790,8 +1801,9 @@ impl TranscriptView {
 
     /// Move the item cursor onto entry `idx` and bring it into view, gliding
     /// the viewport there rather than snapping (see [`ScrollAnim`]). The
-    /// destination matches the minimal scroll `ensure_scroll` would pick, so a
-    /// step to a nearby user message keeps the surrounding replies on screen.
+    /// destination keeps [`FOCUS_SCROLL_MARGIN`] rows of context on the side
+    /// scrolled from (see [`FocusAnchor`]), so the surrounding replies stay on
+    /// screen and the message never sits flush against a viewport edge.
     /// `idx` must be a valid entry index. `item_count` is refreshed first so
     /// the move sees the current length even before the focused view's first
     /// draw.
@@ -1815,6 +1827,8 @@ impl TranscriptView {
     /// viewport not yet measured, or a missing self-reference (unit tests) all
     /// land immediately instead of animating.
     fn start_focus_scroll(&mut self, ctx: &mut EventContext, idx: usize) {
+        let count = self.entry_count();
+        let margin = f64::from(FOCUS_SCROLL_MARGIN);
         let (anchor, total) = {
             let list = self.list.borrow();
             let vh = f64::from(list.viewport_height().unwrap_or(0));
@@ -1827,16 +1841,42 @@ impl TranscriptView {
             let target_bottom = line_as_f64(list.item_top_line(idx + 1));
             let item_h = target_bottom - target_top;
 
-            // Replicate `ensure_scroll` + the draw's `wants_cursor` handling:
-            // an older target (or one taller than the viewport) rests at the
-            // top; a newer one below the fold rests with its bottom at the
-            // viewport bottom; an already-visible one does not move.
-            let (anchor, ldest) = if idx <= top0 || item_h >= vh {
-                (FocusAnchor::Top, target_top)
-            } else if target_bottom > l0 + vh {
-                (FocusAnchor::Bottom, target_bottom - vh)
+            // Cap the margin by the content on that side, so a message at the
+            // transcript's start or end hugs the edge rather than baring a
+            // strip of blank rows nothing can fill.
+            let above = list.item_top_line(idx);
+            let below = list
+                .item_top_line(count)
+                .saturating_sub(list.item_top_line(idx + 1));
+            let cap = |rows: u64| -> u16 {
+                u16::try_from(u64::from(FOCUS_SCROLL_MARGIN).min(rows))
+                    .unwrap_or(FOCUS_SCROLL_MARGIN)
+            };
+            let top_margin = cap(above);
+            let bottom_margin = cap(below);
+
+            // Choose the resting frame, keeping the (capped) margin of context
+            // on the side we scrolled from. A message too tall to frame with a
+            // full margin is pinned to the top so its head shows. An older
+            // target (or one hugging the top) rests below the top; a newer one
+            // below the fold (or hugging the bottom) rests above the bottom; an
+            // already-framed one does not move.
+            let (anchor, ldest) = if item_h + margin >= vh {
+                (FocusAnchor::Top { margin: 0 }, target_top)
+            } else if idx <= top0 || target_top - margin < l0 {
+                (
+                    FocusAnchor::Top { margin: top_margin },
+                    target_top - f64::from(top_margin),
+                )
+            } else if target_bottom + margin > l0 + vh {
+                (
+                    FocusAnchor::Bottom {
+                        margin: bottom_margin,
+                    },
+                    target_bottom + f64::from(bottom_margin) - vh,
+                )
             } else {
-                (FocusAnchor::Bottom, l0)
+                (FocusAnchor::Keep, l0)
             };
             (anchor, ldest - l0)
         };
@@ -1940,18 +1980,42 @@ impl TranscriptView {
     }
 
     /// Land the viewport on the focused message at once, at the position the
-    /// glide targets. `Top` pins the cursor to the viewport top; `Bottom`
-    /// defers to the draw via `ensure_scroll`, which brings the cursor fully
-    /// into view (anchored to the bottom, or as the sole item when it overflows
-    /// the viewport).
+    /// glide targets.
+    ///
+    /// `Top` and `Bottom` both pin the message a fixed number of rows down from
+    /// the viewport top and back-fill the preceding entries above it, so the
+    /// resting frame is exact regardless of the estimate the glide travelled
+    /// on. `Keep` only ensures the message stays in view without reframing.
     fn snap_focus(&self, anchor: FocusAnchor) {
         let mut list = self.list.borrow_mut();
-        match anchor {
-            FocusAnchor::Top => {
-                let cursor = list.cursor;
-                list.jump_to_item(cursor);
-            }
-            FocusAnchor::Bottom => list.ensure_scroll(),
+        let cursor = list.cursor;
+        if let FocusAnchor::Keep = anchor {
+            list.ensure_scroll();
+            return;
+        }
+        // Recompute the message height from the now-measured layout so the
+        // landing is exact regardless of the estimate the glide travelled on.
+        let idx = usize::try_from(cursor).expect("cursor fits usize");
+        let vh = i32::from(list.viewport_height().unwrap_or(0));
+        let item_h = i32::try_from(
+            list.item_top_line(idx + 1)
+                .saturating_sub(list.item_top_line(idx)),
+        )
+        .unwrap_or(vh);
+        // Rows of the preceding entries to reveal above the message. Both
+        // anchors clamp against the measured height so the message never lands
+        // with its bottom past the viewport: a message too tall for the margin
+        // gets less context (or none, pinned to the top), staying fully in view.
+        let rows_above = match anchor {
+            FocusAnchor::Top { margin } => i32::from(margin).min(vh - item_h),
+            FocusAnchor::Bottom { margin } => vh - i32::from(margin) - item_h,
+            FocusAnchor::Keep => unreachable!("handled above"),
+        };
+        list.jump_to_item(cursor);
+        if rows_above > 0 {
+            // The draw clamps at the transcript top when there are fewer rows
+            // above, so a message near the start simply gets less context.
+            list.scroll_lines(-rows_above);
         }
     }
 
@@ -4958,6 +5022,226 @@ mod tests {
             .join("\n")
             .matches('\u{250f}')
             .count()
+    }
+
+    /// Screen rows of the focused bubble's top-left (`┏`) and bottom-left (`┗`)
+    /// border corners, the frame that marks the focused message.
+    fn focus_border_rows(view: &Rc<RefCell<TranscriptView>>, ctx: &DrawContext) -> (usize, usize) {
+        let rows = crate::test_support::rows(&view.borrow_mut().draw(ctx));
+        let top = rows
+            .iter()
+            .position(|r| r.contains('\u{250f}'))
+            .expect("a focused bubble draws a top border");
+        let bottom = rows
+            .iter()
+            .position(|r| r.contains('\u{2517}'))
+            .expect("a focused bubble draws a bottom border");
+        (top, bottom)
+    }
+
+    /// Stepping up to an older message leaves `FOCUS_SCROLL_MARGIN` rows of the
+    /// preceding reply above it, so the focused message never sits flush against
+    /// the top edge.
+    #[test]
+    fn focus_step_up_leaves_context_above_the_message() {
+        // Users at 0, 2, ..., 14 with replies between, over a viewport far
+        // shorter than the transcript so stepping must scroll.
+        let chat = chat_with_user_messages(8);
+        let ctx = draw_ctx(40, 10);
+        let view = Rc::new(RefCell::new(transcript_view(&chat)));
+        view.borrow_mut().set_widget_ref(Rc::downgrade(&view));
+        let _ = view.borrow_mut().draw(&ctx);
+        view.borrow_mut()
+            .handle_event(&mut EventContext::new(), &Event::FocusIn);
+        let _ = view.borrow_mut().draw(&ctx);
+        settle_scroll_anim(&view, &ctx);
+
+        // Step up to a middle message (index 8), with content on both sides.
+        while view.borrow().list.borrow().cursor > 8 {
+            view.borrow_mut()
+                .focus_prev_user_message(&mut EventContext::new());
+            settle_scroll_anim(&view, &ctx);
+        }
+        assert_eq!(view.borrow().list.borrow().cursor, 8);
+
+        let (top, _) = focus_border_rows(&view, &ctx);
+        assert_eq!(
+            top,
+            usize::from(FOCUS_SCROLL_MARGIN),
+            "the message's top border rests FOCUS_SCROLL_MARGIN rows down",
+        );
+        // The rows above the border show the preceding reply, not blank filler.
+        let rows = crate::test_support::rows(&view.borrow_mut().draw(&ctx));
+        assert!(
+            rows[..top].iter().any(|r| r.contains("assistant")),
+            "context above the focused message: {rows:?}",
+        );
+    }
+
+    /// Stepping down to a newer message below the fold leaves
+    /// `FOCUS_SCROLL_MARGIN` rows of the following reply below it, so the
+    /// focused message never sits flush against the bottom edge.
+    #[test]
+    fn focus_step_down_leaves_context_below_the_message() {
+        let chat = chat_with_user_messages(8);
+        let ctx = draw_ctx(40, 10);
+        let view = Rc::new(RefCell::new(transcript_view(&chat)));
+        view.borrow_mut().set_widget_ref(Rc::downgrade(&view));
+        let _ = view.borrow_mut().draw(&ctx);
+        view.borrow_mut()
+            .handle_event(&mut EventContext::new(), &Event::FocusIn);
+        let _ = view.borrow_mut().draw(&ctx);
+        settle_scroll_anim(&view, &ctx);
+
+        // From the top, step down one message: the target sits below the fold,
+        // so it rests near the bottom with context beneath it.
+        view.borrow_mut().scroll_to_top(&mut EventContext::new());
+        settle_scroll_anim(&view, &ctx);
+        view.borrow_mut()
+            .focus_next_user_message(&mut EventContext::new());
+        settle_scroll_anim(&view, &ctx);
+        assert_eq!(view.borrow().list.borrow().cursor, 2);
+
+        let vh = 10usize;
+        let (_, bottom) = focus_border_rows(&view, &ctx);
+        // The bubble is `┏`, body, `┗`, then one trailing spacer row. The
+        // spacer plus FOCUS_SCROLL_MARGIN rows of the following reply sit below
+        // the bottom border.
+        assert_eq!(
+            vh - 1 - bottom,
+            usize::from(FOCUS_SCROLL_MARGIN) + 1,
+            "the message's bottom leaves FOCUS_SCROLL_MARGIN rows below it",
+        );
+        let rows = crate::test_support::rows(&view.borrow_mut().draw(&ctx));
+        assert!(
+            rows[bottom + 1..].iter().any(|r| r.contains("assistant")),
+            "context below the focused message: {rows:?}",
+        );
+    }
+
+    /// A message taller than the viewport-minus-margin still lands fully in
+    /// view when jumped to from afar: the margin is given up rather than
+    /// pushing the message's bottom off-screen. The jump target is off-screen
+    /// and unmeasured at planning time, so its height estimate is small and the
+    /// snap must re-measure it before landing.
+    #[test]
+    fn focus_jump_to_a_tall_message_keeps_it_fully_visible() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        // Two notices precede the first user message, so it is not entry 0 and
+        // has content above it (a top margin is allowed).
+        apply(
+            &chat,
+            &mut life,
+            AgentEvent::Notice {
+                agent_id: AgentId::Main,
+                text: "note A".into(),
+            },
+        );
+        apply(
+            &chat,
+            &mut life,
+            AgentEvent::Notice {
+                agent_id: AgentId::Main,
+                text: "note B".into(),
+            },
+        );
+        // A six-line first user message (entry index 2): taller than
+        // `vh - margin`, still short enough to fit the viewport.
+        let tall = (0..6)
+            .map(|i| format!("tall line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        apply(&chat, &mut life, user_end(&tall));
+        apply(
+            &chat,
+            &mut life,
+            assistant_message_end(text_message("reply 0")),
+        );
+        for i in 1..9 {
+            apply(&chat, &mut life, user_end(&format!("short {i}")));
+            apply(
+                &chat,
+                &mut life,
+                assistant_message_end(text_message(&format!("reply {i}"))),
+            );
+        }
+
+        let ctx = draw_ctx(48, 10);
+        let view = Rc::new(RefCell::new(transcript_view(&chat)));
+        view.borrow_mut().set_widget_ref(Rc::downgrade(&view));
+        let _ = view.borrow_mut().draw(&ctx);
+        view.borrow_mut()
+            .handle_event(&mut EventContext::new(), &Event::FocusIn);
+        let _ = view.borrow_mut().draw(&ctx);
+        settle_scroll_anim(&view, &ctx);
+
+        // Home (focus mode) jumps to the tall first user message, which is
+        // off-screen and unmeasured until the glide brings it into view.
+        view.borrow_mut().scroll_to_top(&mut EventContext::new());
+        settle_scroll_anim(&view, &ctx);
+        assert_eq!(view.borrow().list.borrow().cursor, 2);
+
+        // Both borders are on screen (focus_border_rows panics otherwise) and
+        // the message's last line shows: it is framed whole, not clipped.
+        let (_, bottom) = focus_border_rows(&view, &ctx);
+        assert!(bottom < 10, "the bottom border is on screen: {bottom}");
+        let rows = crate::test_support::rows(&view.borrow_mut().draw(&ctx));
+        assert!(
+            rows.iter().any(|r| r.contains("tall line 5")),
+            "the last content line is visible: {rows:?}",
+        );
+    }
+
+    /// The last user message has no reply of its own beyond the fold, so
+    /// stepping to it hugs the bottom rather than baring blank rows the margin
+    /// would otherwise reserve.
+    #[test]
+    fn focus_last_message_hugs_the_bottom() {
+        // A transcript whose final entry is a user message (no trailing reply),
+        // so there is nothing below it to fill a bottom margin.
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        for i in 0..8 {
+            apply(&chat, &mut life, user_end(&format!("user {i}")));
+            apply(
+                &chat,
+                &mut life,
+                assistant_message_end(text_message(&format!("assistant {i}"))),
+            );
+        }
+        apply(&chat, &mut life, user_end("last prompt"));
+
+        let ctx = draw_ctx(40, 10);
+        let view = Rc::new(RefCell::new(transcript_view(&chat)));
+        view.borrow_mut().set_widget_ref(Rc::downgrade(&view));
+        let _ = view.borrow_mut().draw(&ctx);
+        view.borrow_mut()
+            .handle_event(&mut EventContext::new(), &Event::FocusIn);
+        let _ = view.borrow_mut().draw(&ctx);
+        settle_scroll_anim(&view, &ctx);
+
+        // Scroll up, then step back down to the last message.
+        view.borrow_mut().scroll_to_top(&mut EventContext::new());
+        settle_scroll_anim(&view, &ctx);
+        view.borrow_mut().scroll_to_bottom(&mut EventContext::new());
+        settle_scroll_anim(&view, &ctx);
+
+        // Only the bubble's trailing spacer sits below its bottom border: no
+        // FOCUS_SCROLL_MARGIN rows are reserved, since there is nothing beyond
+        // the last message to show there.
+        let vh = 10usize;
+        let (_, bottom) = focus_border_rows(&view, &ctx);
+        assert_eq!(
+            vh - 1 - bottom,
+            1,
+            "the last message hugs the bottom, no reserved margin below it",
+        );
+        let rows = crate::test_support::rows(&view.borrow_mut().draw(&ctx));
+        assert!(
+            rows.iter().any(|r| r.contains("last prompt")),
+            "the last message is on screen: {rows:?}",
+        );
     }
 
     /// Focusing marks the newest user message with the border (and no other
