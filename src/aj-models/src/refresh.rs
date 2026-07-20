@@ -16,9 +16,11 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::registry::{
-    CODEX_PROVIDER_ID, Catalog, InputModality, ModelCost, ModelCostTier, ModelInfo, apply_override,
-    bundled_codex_seed, bundled_overrides, splice_codex_seed, user_cache_path,
+    CATALOG_SCHEMA_VERSION, CODEX_PROVIDER_ID, Catalog, InputModality, ModelCost, ModelCostTier,
+    ModelInfo, ReasoningOption, apply_override, bundled_codex_seed, bundled_overrides,
+    splice_codex_seed, user_cache_path,
 };
+use crate::types::ThinkingLevel;
 
 /// Failure modes of a catalog refresh.
 ///
@@ -137,6 +139,8 @@ struct RawModel {
     #[serde(default)]
     reasoning: Option<bool>,
     #[serde(default)]
+    reasoning_options: Option<Vec<RawReasoningOption>>,
+    #[serde(default)]
     limit: Option<RawLimit>,
     #[serde(default)]
     cost: Option<RawCost>,
@@ -197,6 +201,27 @@ struct RawModalities {
     input: Option<Vec<String>>,
 }
 
+/// A models.dev `reasoning_options` entry. `type` discriminates the
+/// control; `values`/`min`/`max` carry the payload for the effort and
+/// budget kinds respectively.
+#[derive(Deserialize, Debug, Default)]
+struct RawReasoningOption {
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    // Effort values may include JSON `null` (a model advertising a
+    // null/unspecified effort), so each entry is optional and the
+    // mapper drops the empty ones.
+    #[serde(default)]
+    values: Option<Vec<Option<String>>>,
+    // `budget_tokens` bounds are signed upstream: `-1` marks an
+    // unbounded budget. Parsed as `i64` and normalized (negatives
+    // become `None`) when mapped.
+    #[serde(default)]
+    min: Option<i64>,
+    #[serde(default)]
+    max: Option<i64>,
+}
+
 // ---------------------------------------------------------------------------
 // OpenRouter API shape (only the fields we need).
 // ---------------------------------------------------------------------------
@@ -224,6 +249,21 @@ struct OpenRouterModel {
     /// `"tools"` gates eligibility, `"reasoning"` sets the flag.
     #[serde(default)]
     supported_parameters: Vec<String>,
+    /// Structured reasoning metadata (effort vocabulary, budget
+    /// support). Present for most reasoning models; absent otherwise.
+    #[serde(default)]
+    reasoning: Option<OpenRouterReasoning>,
+}
+
+/// OpenRouter's structured reasoning descriptor. `supported_efforts`
+/// carries the effort vocabulary (may include `"none"`);
+/// `supports_max_tokens` signals a token-budget control.
+#[derive(Deserialize, Debug, Default)]
+struct OpenRouterReasoning {
+    #[serde(default)]
+    supported_efforts: Vec<String>,
+    #[serde(default)]
+    supports_max_tokens: Option<bool>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -480,8 +520,8 @@ fn parse_openrouter(body: &str) -> Result<Vec<ModelInfo>, RefreshError> {
     Ok(models)
 }
 
-/// Splice the hand-curated Codex seed, sort, apply overrides, and stamp
-/// catalog metadata. Shared tail of catalog construction across sources.
+/// Splice the hand-curated Codex seed, then finalize. Shared tail of
+/// catalog construction across the live sources.
 fn assemble_catalog(mut models: Vec<ModelInfo>, source: &str) -> Catalog {
     // re-emit Codex models from the hand-curated seed after
     // upstream filtering. Refresh writes the codex entries into the
@@ -489,7 +529,13 @@ fn assemble_catalog(mut models: Vec<ModelInfo>, source: &str) -> Catalog {
     // codex set showing up as "removed" every run because models.dev
     // doesn't include them).
     splice_codex_seed(&mut models, bundled_codex_seed());
+    finalize_catalog(models, source)
+}
 
+/// Sort by `(provider, id)`, apply the bundled overrides, and stamp the
+/// catalog metadata. Shared by the full refresh and the models.dev-only
+/// seed build; does not splice the Codex seed.
+fn finalize_catalog(mut models: Vec<ModelInfo>, source: &str) -> Catalog {
     // Stable sort: provider then id. Catalog ordering should not depend
     // on HashMap iteration order, otherwise diffs against the seed are
     // noisy.
@@ -508,10 +554,97 @@ fn assemble_catalog(mut models: Vec<ModelInfo>, source: &str) -> Catalog {
     }
 
     Catalog {
+        schema_version: CATALOG_SCHEMA_VERSION,
         updated_at: chrono::Utc::now().timestamp_millis(),
         source: source.to_string(),
         models,
     }
+}
+
+/// Build the bundled-seed catalog from a models.dev `api.json` body: the
+/// models.dev-only baseline (no OpenRouter rows, no Codex splice),
+/// sorted with overrides applied. Used by the seed-regeneration tool
+/// (`examples/regen_seed.rs`); the Codex seed is spliced at load time,
+/// so the bundled seed deliberately omits it.
+pub fn build_seed_from_models_dev(body: &str) -> Result<Catalog, RefreshError> {
+    let models = parse_models_dev(body)?;
+    Ok(finalize_catalog(models, "models.dev"))
+}
+
+/// Map an upstream effort value string onto AJ's [`ThinkingLevel`].
+/// Upstream `"none"` becomes [`ThinkingLevel::Off`] (an explicit
+/// no-reasoning effort). `"default"` and any unrecognized value are
+/// dropped, so an unknown vocabulary entry never becomes a bogus level.
+fn effort_level_from_str(s: &str) -> Option<ThinkingLevel> {
+    match s {
+        "none" => Some(ThinkingLevel::Off),
+        "minimal" => Some(ThinkingLevel::Minimal),
+        "low" => Some(ThinkingLevel::Low),
+        "medium" => Some(ThinkingLevel::Medium),
+        "high" => Some(ThinkingLevel::High),
+        "xhigh" => Some(ThinkingLevel::XHigh),
+        "max" => Some(ThinkingLevel::Max),
+        _ => None,
+    }
+}
+
+/// Normalize models.dev `reasoning_options` into our [`ReasoningOption`]
+/// list. Unknown control kinds are dropped, as is an effort control
+/// whose values all fail to map (which would leave it empty).
+fn reasoning_options_from_models_dev(raw: Option<&[RawReasoningOption]>) -> Vec<ReasoningOption> {
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    raw.iter()
+        .filter_map(|o| match o.kind.as_deref() {
+            Some("toggle") => Some(ReasoningOption::Toggle),
+            Some("effort") => {
+                let values: Vec<_> = o
+                    .values
+                    .iter()
+                    .flatten()
+                    .flatten()
+                    .filter_map(|v| effort_level_from_str(v))
+                    .collect();
+                (!values.is_empty()).then_some(ReasoningOption::Effort { values })
+            }
+            Some("budget_tokens") => Some(ReasoningOption::BudgetTokens {
+                min: o.min.and_then(|v| u64::try_from(v).ok()),
+                max: o.max.and_then(|v| u64::try_from(v).ok()),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Normalize OpenRouter's structured reasoning descriptor into our
+/// [`ReasoningOption`] list. The effort vocabulary becomes an
+/// [`ReasoningOption::Effort`] and a `supports_max_tokens` flag becomes
+/// an unbounded [`ReasoningOption::BudgetTokens`]; a model advertising
+/// both yields both controls (mirroring the models.dev mapper). A model
+/// that publishes neither yields an empty list (an under-described
+/// reasoning model), which the offered-set logic falls back to AJ's own
+/// ladder for.
+fn reasoning_options_from_openrouter(raw: Option<&OpenRouterReasoning>) -> Vec<ReasoningOption> {
+    let Some(r) = raw else {
+        return Vec::new();
+    };
+    let mut options = Vec::new();
+    let values: Vec<_> = r
+        .supported_efforts
+        .iter()
+        .filter_map(|v| effort_level_from_str(v))
+        .collect();
+    if !values.is_empty() {
+        options.push(ReasoningOption::Effort { values });
+    }
+    if r.supports_max_tokens == Some(true) {
+        options.push(ReasoningOption::BudgetTokens {
+            min: None,
+            max: None,
+        });
+    }
+    options
 }
 
 /// Normalize a single models.dev entry into our [`ModelInfo`] shape.
@@ -578,15 +711,7 @@ fn map_model(fixed: &ProviderFixedValues, id: &str, m: &RawModel) -> ModelInfo {
         provider: fixed.provider_id.to_string(),
         base_url: fixed.base_url.to_string(),
         reasoning: m.reasoning.unwrap_or(false),
-        // `supports_adaptive_thinking` is not in models.dev.
-        // Default to `true` for Anthropic reasoning models so a newly
-        // released model uses the modern adaptive API rather than
-        // silently falling back to budget-based thinking; legacy
-        // budget-only Anthropic models are pinned `false` via
-        // overrides. Always `false` for non-Anthropic and non-reasoning
-        // models.
-        supports_adaptive_thinking: fixed.api == "anthropic-messages"
-            && m.reasoning.unwrap_or(false),
+        reasoning_options: reasoning_options_from_models_dev(m.reasoning_options.as_deref()),
         // `supports_verbosity` is not in models.dev. The
         // OpenAI gpt-5 family on the Responses wire honours
         // `text.verbosity`; older OpenAI models and other providers
@@ -632,8 +757,7 @@ fn map_openrouter_model(m: &OpenRouterModel) -> ModelInfo {
         provider: OPENROUTER_PROVIDER_ID.to_string(),
         base_url: OPENROUTER_BASE_URL.to_string(),
         reasoning: m.supported_parameters.iter().any(|p| p == "reasoning"),
-        // Adaptive thinking is an Anthropic-native concept.
-        supports_adaptive_thinking: false,
+        reasoning_options: reasoning_options_from_openrouter(m.reasoning.as_ref()),
         // OpenRouter publishes per-model accepted params; `"verbosity"`
         // there means the model honours OpenAI's `text.verbosity`.
         supports_verbosity: m.supported_parameters.iter().any(|p| p == "verbosity"),
@@ -787,6 +911,7 @@ fn write_catalog_atomically(dest: &Path, catalog: &Catalog) -> Result<(), Refres
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::supports_adaptive_thinking;
 
     /// Minimal models.dev-shaped fixture: two anthropic models (one
     /// tool-capable, one not), one openai model, and one provider we
@@ -799,6 +924,10 @@ mod tests {
                     "name": "Claude Test (Tool)",
                     "tool_call": true,
                     "reasoning": true,
+                    "reasoning_options": [
+                        {"type": "effort", "values": ["none", "low", "medium", "high", "default"]},
+                        {"type": "budget_tokens", "min": 1024}
+                    ],
                     "limit": {"context": 200000, "output": 64000},
                     "cost": {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75},
                     "modalities": {"input": ["text", "image"]}
@@ -891,8 +1020,27 @@ mod tests {
         assert_eq!(claude.api, "anthropic-messages");
         assert_eq!(claude.base_url, "https://api.anthropic.com");
         assert!(claude.reasoning);
-        // Anthropic reasoning model defaults to adaptive thinking.
-        assert!(claude.supports_adaptive_thinking);
+        // An Anthropic model advertising an effort control derives as adaptive.
+        assert!(supports_adaptive_thinking(claude));
+        // `"none"` maps to `Off`; `"default"` and unknowns are dropped;
+        // the budget control is preserved after the effort control.
+        assert_eq!(
+            claude.reasoning_options,
+            vec![
+                ReasoningOption::Effort {
+                    values: vec![
+                        ThinkingLevel::Off,
+                        ThinkingLevel::Low,
+                        ThinkingLevel::Medium,
+                        ThinkingLevel::High,
+                    ],
+                },
+                ReasoningOption::BudgetTokens {
+                    min: Some(1024),
+                    max: None,
+                },
+            ]
+        );
         assert_eq!(
             claude.input,
             vec![InputModality::Text, InputModality::Image]
@@ -1116,7 +1264,8 @@ mod tests {
                     "input_cache_write": "0.000000375"
                 },
                 "top_provider": {"max_completion_tokens": 32768},
-                "supported_parameters": ["tools", "reasoning", "temperature"]
+                "supported_parameters": ["tools", "reasoning", "temperature"],
+                "reasoning": {"supported_efforts": ["none", "low", "high"]}
             },
             {
                 "id": "vendor/chat-1",
@@ -1175,7 +1324,16 @@ mod tests {
         assert_eq!(reasoner.api, "openai-responses");
         assert_eq!(reasoner.base_url, "https://openrouter.ai/api/v1");
         assert!(reasoner.reasoning);
-        assert!(!reasoner.supports_adaptive_thinking);
+        // OpenRouter models are never Anthropic-adaptive, whatever their
+        // effort vocabulary.
+        assert!(!supports_adaptive_thinking(reasoner));
+        // `supported_efforts` maps to an Effort control (`"none"` -> Off).
+        assert_eq!(
+            reasoner.reasoning_options,
+            vec![ReasoningOption::Effort {
+                values: vec![ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::High],
+            }]
+        );
         assert_eq!(
             reasoner.input,
             vec![InputModality::Text, InputModality::Image]
@@ -1243,5 +1401,102 @@ mod tests {
             .count();
         assert_eq!(carried.len(), expected);
         assert!(carried.iter().all(|m| m.provider == "openrouter"));
+    }
+
+    #[test]
+    fn models_dev_reasoning_options_mapping() {
+        let raw = vec![
+            RawReasoningOption {
+                kind: Some("toggle".into()),
+                ..Default::default()
+            },
+            RawReasoningOption {
+                kind: Some("effort".into()),
+                // none -> Off; a JSON null and "default" and "bogus" all drop.
+                values: Some(vec![
+                    Some("none".into()),
+                    Some("low".into()),
+                    None,
+                    Some("default".into()),
+                    Some("bogus".into()),
+                    Some("max".into()),
+                ]),
+                ..Default::default()
+            },
+            RawReasoningOption {
+                kind: Some("budget_tokens".into()),
+                min: Some(-1), // unbounded -> None
+                max: Some(32_000),
+                ..Default::default()
+            },
+            RawReasoningOption {
+                kind: Some("unknown_kind".into()),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            reasoning_options_from_models_dev(Some(&raw)),
+            vec![
+                ReasoningOption::Toggle,
+                ReasoningOption::Effort {
+                    values: vec![ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::Max],
+                },
+                ReasoningOption::BudgetTokens {
+                    min: None,
+                    max: Some(32_000),
+                },
+            ]
+        );
+
+        // An effort control whose values all fail to map yields no control.
+        let all_dropped = vec![RawReasoningOption {
+            kind: Some("effort".into()),
+            values: Some(vec![Some("default".into()), None]),
+            ..Default::default()
+        }];
+        assert!(reasoning_options_from_models_dev(Some(&all_dropped)).is_empty());
+        assert!(reasoning_options_from_models_dev(None).is_empty());
+    }
+
+    #[test]
+    fn openrouter_reasoning_options_mapping() {
+        // Efforts and a token budget together yield both controls.
+        let both = OpenRouterReasoning {
+            supported_efforts: vec!["none".into(), "high".into()],
+            supports_max_tokens: Some(true),
+        };
+        assert_eq!(
+            reasoning_options_from_openrouter(Some(&both)),
+            vec![
+                ReasoningOption::Effort {
+                    values: vec![ThinkingLevel::Off, ThinkingLevel::High],
+                },
+                ReasoningOption::BudgetTokens {
+                    min: None,
+                    max: None,
+                },
+            ]
+        );
+
+        // Budget only.
+        let budget_only = OpenRouterReasoning {
+            supported_efforts: Vec::new(),
+            supports_max_tokens: Some(true),
+        };
+        assert_eq!(
+            reasoning_options_from_openrouter(Some(&budget_only)),
+            vec![ReasoningOption::BudgetTokens {
+                min: None,
+                max: None,
+            }]
+        );
+
+        // Present but empty (no efforts, no budget) and absent both map to nothing.
+        let neither = OpenRouterReasoning {
+            supported_efforts: Vec::new(),
+            supports_max_tokens: None,
+        };
+        assert!(reasoning_options_from_openrouter(Some(&neither)).is_empty());
+        assert!(reasoning_options_from_openrouter(None).is_empty());
     }
 }

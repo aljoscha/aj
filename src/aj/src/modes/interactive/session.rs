@@ -599,7 +599,7 @@ mod tests {
             provider: provider.into(),
             base_url: "https://example.invalid".into(),
             reasoning: false,
-            supports_adaptive_thinking: false,
+            reasoning_options: Vec::new(),
             supports_verbosity: false,
             input: vec![InputModality::Text],
             cost: ModelCost::default(),
@@ -613,6 +613,7 @@ mod tests {
     /// auth store (never touches `~/.aj`).
     fn restore_ctx(dir: &TempDir, models: Vec<ModelInfo>) -> RestoreContext {
         let catalog = Catalog {
+            schema_version: aj_models::registry::CATALOG_SCHEMA_VERSION,
             updated_at: 0,
             source: "test".into(),
             models,

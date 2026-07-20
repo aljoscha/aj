@@ -20,10 +20,10 @@ use serde_json::{Value, json};
 use aj_models::anthropic::provider::{
     assistant_message_to_request_item, parse_assistant_request_item, replay_sse_events,
 };
-use aj_models::registry::{InputModality, ModelCost, ModelInfo};
+use aj_models::registry::{InputModality, ModelCost, ModelInfo, ReasoningOption};
 use aj_models::types::{
     AssistantContent, AssistantMessage, ErrorCategory, StopReason, TextContent, ThinkingContent,
-    ToolCall, Usage,
+    ThinkingLevel, ToolCall, Usage,
 };
 
 use crate::common::{assert_content_eq, parse_sse, read_fixture, read_fixture_json};
@@ -48,7 +48,15 @@ fn fixture_model() -> ModelInfo {
         provider: "anthropic".into(),
         base_url: "https://api.anthropic.com".into(),
         reasoning: true,
-        supports_adaptive_thinking: true,
+        reasoning_options: vec![ReasoningOption::Effort {
+            values: vec![
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High,
+                ThinkingLevel::XHigh,
+                ThinkingLevel::Max,
+            ],
+        }],
         supports_verbosity: false,
         input: vec![InputModality::Text],
         cost: ModelCost {

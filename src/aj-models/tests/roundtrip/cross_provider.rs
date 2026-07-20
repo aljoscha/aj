@@ -58,7 +58,7 @@ fn target_model(provider: &str, api: &str, id: &str) -> ModelInfo {
         provider: provider.into(),
         base_url: "https://example.test".into(),
         reasoning: false,
-        supports_adaptive_thinking: false,
+        reasoning_options: Vec::new(),
         supports_verbosity: false,
         // Vision-on so the image downgrade never fires here —
         // these tests focus on the cross-provider rewrites.

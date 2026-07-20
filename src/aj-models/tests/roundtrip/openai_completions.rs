@@ -60,7 +60,7 @@ fn fixture_model() -> ModelInfo {
         provider: "openai".into(),
         base_url: "https://api.openai.com/v1".into(),
         reasoning: false,
-        supports_adaptive_thinking: false,
+        reasoning_options: Vec::new(),
         supports_verbosity: false,
         input: vec![InputModality::Text],
         cost: ModelCost {

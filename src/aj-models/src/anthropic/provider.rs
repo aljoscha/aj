@@ -1405,7 +1405,7 @@ fn finalize_usage(usage: &mut Usage, cost: &ModelCost) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{InputModality, ModelCost};
+    use crate::registry::{InputModality, ModelCost, ReasoningOption};
     use crate::types::{
         AssistantContent, Message, ThinkingContent, ToolCall, UserContent, UserMessage,
     };
@@ -1419,7 +1419,15 @@ mod tests {
             provider: "anthropic".into(),
             base_url: "https://api.anthropic.com".into(),
             reasoning: true,
-            supports_adaptive_thinking: true,
+            reasoning_options: vec![ReasoningOption::Effort {
+                values: vec![
+                    ThinkingLevel::Low,
+                    ThinkingLevel::Medium,
+                    ThinkingLevel::High,
+                    ThinkingLevel::XHigh,
+                    ThinkingLevel::Max,
+                ],
+            }],
             supports_verbosity: false,
             input: vec![InputModality::Text],
             cost: ModelCost {
@@ -1437,7 +1445,7 @@ mod tests {
 
     fn budget_model() -> ModelInfo {
         ModelInfo {
-            supports_adaptive_thinking: false,
+            reasoning_options: Vec::new(),
             supports_verbosity: false,
             ..fake_model()
         }

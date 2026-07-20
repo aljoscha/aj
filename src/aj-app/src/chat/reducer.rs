@@ -2669,7 +2669,7 @@ mod tests {
             provider: "openai".into(),
             base_url: "https://example.invalid".into(),
             reasoning: false,
-            supports_adaptive_thinking: false,
+            reasoning_options: Vec::new(),
             supports_verbosity: false,
             input: vec![aj_models::registry::InputModality::Text],
             cost: aj_models::registry::ModelCost::default(),

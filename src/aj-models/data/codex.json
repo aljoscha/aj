@@ -7,7 +7,9 @@
       "provider": "openai-codex",
       "base_url": "https://chatgpt.com/backend-api",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        { "type": "effort", "values": ["low", "medium", "high", "xhigh"] }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -29,7 +31,9 @@
       "provider": "openai-codex",
       "base_url": "https://chatgpt.com/backend-api",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        { "type": "effort", "values": ["low", "medium", "high", "xhigh"] }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -51,7 +55,9 @@
       "provider": "openai-codex",
       "base_url": "https://chatgpt.com/backend-api",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        { "type": "effort", "values": ["low", "medium", "high", "xhigh"] }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -73,7 +79,9 @@
       "provider": "openai-codex",
       "base_url": "https://chatgpt.com/backend-api",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        { "type": "effort", "values": ["low", "medium", "high", "xhigh"] }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -95,7 +103,9 @@
       "provider": "openai-codex",
       "base_url": "https://chatgpt.com/backend-api",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        { "type": "effort", "values": ["low", "medium", "high", "xhigh", "max"] }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -126,7 +136,9 @@
       "provider": "openai-codex",
       "base_url": "https://chatgpt.com/backend-api",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        { "type": "effort", "values": ["low", "medium", "high", "xhigh", "max"] }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -157,7 +169,9 @@
       "provider": "openai-codex",
       "base_url": "https://chatgpt.com/backend-api",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        { "type": "effort", "values": ["low", "medium", "high", "xhigh", "max"] }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",

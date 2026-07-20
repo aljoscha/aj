@@ -797,7 +797,7 @@ mod tests {
             provider: "openai-codex".into(),
             base_url: DEFAULT_BASE_URL.into(),
             reasoning,
-            supports_adaptive_thinking: false,
+            reasoning_options: Vec::new(),
             supports_verbosity: false,
             input: vec![InputModality::Text],
             cost: ModelCost {

@@ -296,7 +296,7 @@ mod tests {
             provider: provider.into(),
             base_url: format!("https://api.{provider}.com"),
             reasoning: false,
-            supports_adaptive_thinking: false,
+            reasoning_options: Vec::new(),
             supports_verbosity: false,
             input: vec![],
             cost: ModelCost::default(),

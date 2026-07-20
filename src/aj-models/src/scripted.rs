@@ -785,7 +785,7 @@ mod tests {
             provider: "scripted".into(),
             base_url: "scripted://internal".into(),
             reasoning: false,
-            supports_adaptive_thinking: false,
+            reasoning_options: Vec::new(),
             supports_verbosity: false,
             input: vec![InputModality::Text],
             cost: ModelCost::default(),

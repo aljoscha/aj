@@ -3571,7 +3571,7 @@ mod event_protocol_tests {
             provider: SCRIPT_PROVIDER.to_string(),
             base_url: "scripted://internal".to_string(),
             reasoning: false,
-            supports_adaptive_thinking: false,
+            reasoning_options: Vec::new(),
             supports_verbosity: false,
             input: vec![InputModality::Text],
             cost: ModelCost::default(),

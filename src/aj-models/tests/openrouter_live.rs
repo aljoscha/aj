@@ -29,7 +29,7 @@ fn model() -> ModelInfo {
         provider: "openrouter".into(),
         base_url: "https://openrouter.ai/api/v1".into(),
         reasoning: true,
-        supports_adaptive_thinking: false,
+        reasoning_options: Vec::new(),
         supports_verbosity: false,
         input: vec![InputModality::Text],
         cost: ModelCost::default(),

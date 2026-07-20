@@ -525,7 +525,7 @@ mod tests {
             provider: provider.into(),
             base_url: "https://example.test".into(),
             reasoning: false,
-            supports_adaptive_thinking: false,
+            reasoning_options: Vec::new(),
             supports_verbosity: false,
             input,
             cost: ModelCost::default(),

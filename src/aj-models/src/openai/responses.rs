@@ -465,9 +465,10 @@ fn build_system_item(model: &ModelInfo, prompt: &str) -> ResponseInputItem {
 }
 
 /// Map the unified [`ThinkingLevel`] onto the OpenAI `reasoning_effort`
-/// enum one-to-one. Every rung has a wire equivalent, including `max`
-/// on the models that expose it. Shared by the Responses
-/// and Codex providers.
+/// enum. Each effort rung maps to its wire equivalent (including `max`
+/// on the models that expose it); [`ThinkingLevel::Off`] has no distinct
+/// wire form on a reasoning model, so it floors to `minimal`. Shared by
+/// the Responses and Codex providers.
 pub(super) fn map_reasoning_effort(level: &ThinkingLevel) -> ReasoningEffort {
     match level {
         // A reasoning model can't disable reasoning here; off floors to minimal (preserved from the pre-Off behavior).
@@ -1653,7 +1654,7 @@ mod tests {
             provider: "openai".into(),
             base_url: "https://api.openai.com/v1".into(),
             reasoning,
-            supports_adaptive_thinking: false,
+            reasoning_options: Vec::new(),
             supports_verbosity: false,
             input: vec![InputModality::Text],
             cost: ModelCost {

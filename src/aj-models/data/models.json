@@ -1,5 +1,6 @@
 {
-  "updated_at": 1783662544128,
+  "schema_version": 1,
+  "updated_at": 1784562737707,
   "source": "models.dev",
   "models": [
     {
@@ -9,7 +10,18 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_adaptive_thinking": true,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
       "supports_verbosity": false,
       "input": [
         "text",
@@ -31,7 +43,12 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "budget_tokens",
+          "min": 1024
+        }
+      ],
       "supports_verbosity": false,
       "input": [
         "text",
@@ -53,7 +70,12 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "budget_tokens",
+          "min": 1024
+        }
+      ],
       "supports_verbosity": false,
       "input": [
         "text",
@@ -75,7 +97,12 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "budget_tokens",
+          "min": 1024
+        }
+      ],
       "supports_verbosity": false,
       "input": [
         "text",
@@ -97,7 +124,12 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "budget_tokens",
+          "min": 1024
+        }
+      ],
       "supports_verbosity": false,
       "input": [
         "text",
@@ -119,7 +151,20 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        {
+          "type": "budget_tokens",
+          "min": 1024
+        }
+      ],
       "supports_verbosity": false,
       "input": [
         "text",
@@ -141,7 +186,20 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        {
+          "type": "budget_tokens",
+          "min": 1024
+        }
+      ],
       "supports_verbosity": false,
       "input": [
         "text",
@@ -163,7 +221,21 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_adaptive_thinking": true,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "max"
+          ]
+        },
+        {
+          "type": "budget_tokens",
+          "min": 1024
+        }
+      ],
       "supports_verbosity": false,
       "input": [
         "text",
@@ -185,7 +257,18 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_adaptive_thinking": true,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
       "supports_verbosity": false,
       "input": [
         "text",
@@ -207,7 +290,18 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_adaptive_thinking": true,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
       "supports_verbosity": false,
       "input": [
         "text",
@@ -229,7 +323,12 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "budget_tokens",
+          "min": 1024
+        }
+      ],
       "supports_verbosity": false,
       "input": [
         "text",
@@ -251,7 +350,12 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "budget_tokens",
+          "min": 1024
+        }
+      ],
       "supports_verbosity": false,
       "input": [
         "text",
@@ -273,7 +377,21 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_adaptive_thinking": true,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "max"
+          ]
+        },
+        {
+          "type": "budget_tokens",
+          "min": 1024
+        }
+      ],
       "supports_verbosity": false,
       "input": [
         "text",
@@ -295,7 +413,21 @@
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
       "reasoning": true,
-      "supports_adaptive_thinking": true,
+      "reasoning_options": [
+        {
+          "type": "toggle"
+        },
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
       "supports_verbosity": false,
       "input": [
         "text",
@@ -317,7 +449,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
-      "supports_adaptive_thinking": false,
       "supports_verbosity": false,
       "input": [
         "text"
@@ -338,7 +469,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
-      "supports_adaptive_thinking": false,
       "supports_verbosity": false,
       "input": [
         "text",
@@ -360,7 +490,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
-      "supports_adaptive_thinking": false,
       "supports_verbosity": false,
       "input": [
         "text",
@@ -382,7 +511,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
-      "supports_adaptive_thinking": false,
       "supports_verbosity": false,
       "input": [
         "text",
@@ -404,7 +532,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
-      "supports_adaptive_thinking": false,
       "supports_verbosity": false,
       "input": [
         "text",
@@ -426,7 +553,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
-      "supports_adaptive_thinking": false,
       "supports_verbosity": false,
       "input": [
         "text",
@@ -448,7 +574,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
-      "supports_adaptive_thinking": false,
       "supports_verbosity": false,
       "input": [
         "text",
@@ -470,7 +595,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
-      "supports_adaptive_thinking": false,
       "supports_verbosity": false,
       "input": [
         "text",
@@ -492,7 +616,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
-      "supports_adaptive_thinking": false,
       "supports_verbosity": false,
       "input": [
         "text",
@@ -514,7 +637,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
-      "supports_adaptive_thinking": false,
       "supports_verbosity": false,
       "input": [
         "text",
@@ -536,7 +658,17 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -558,7 +690,16 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -580,7 +721,17 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -602,7 +753,17 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -624,7 +785,14 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "high"
+          ]
+        }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -646,7 +814,17 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "off",
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -668,7 +846,14 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "medium"
+          ]
+        }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -690,7 +875,16 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -712,7 +906,17 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -734,7 +938,16 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -756,7 +969,18 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "off",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -778,7 +1002,14 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "medium"
+          ]
+        }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -800,7 +1031,17 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -822,7 +1063,16 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -844,7 +1094,6 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": false,
-      "supports_adaptive_thinking": false,
       "supports_verbosity": true,
       "input": [
         "text",
@@ -866,7 +1115,18 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "off",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -888,7 +1148,18 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "off",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -910,7 +1181,18 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "off",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -941,7 +1223,18 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "off",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -963,7 +1256,18 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "off",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -985,7 +1289,16 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -1016,7 +1329,18 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "off",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -1047,7 +1371,16 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -1078,7 +1411,19 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "off",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -1109,7 +1454,19 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "off",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -1140,7 +1497,19 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "off",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -1171,7 +1540,19 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "off",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
       "supports_verbosity": true,
       "input": [
         "text",
@@ -1196,13 +1577,55 @@
       "max_tokens": 128000
     },
     {
+      "id": "gpt-realtime-2.1",
+      "name": "GPT-Realtime-2.1",
+      "api": "openai-responses",
+      "provider": "openai",
+      "base_url": "https://api.openai.com/v1",
+      "reasoning": true,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh"
+          ]
+        }
+      ],
+      "supports_verbosity": false,
+      "input": [
+        "text",
+        "image"
+      ],
+      "cost": {
+        "input": 4.0,
+        "output": 24.0,
+        "cache_read": 0.4,
+        "cache_write": 0.0
+      },
+      "context_window": 128000,
+      "max_tokens": 32000
+    },
+    {
       "id": "o1",
       "name": "o1",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
       "supports_verbosity": false,
       "input": [
         "text",
@@ -1224,7 +1647,16 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
       "supports_verbosity": false,
       "input": [
         "text",
@@ -1246,7 +1678,16 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
       "supports_verbosity": false,
       "input": [
         "text",
@@ -1268,7 +1709,14 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "medium"
+          ]
+        }
+      ],
       "supports_verbosity": false,
       "input": [
         "text",
@@ -1290,7 +1738,16 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
       "supports_verbosity": false,
       "input": [
         "text"
@@ -1311,7 +1768,16 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
       "supports_verbosity": false,
       "input": [
         "text",
@@ -1333,7 +1799,16 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      ],
       "supports_verbosity": false,
       "input": [
         "text",
@@ -1355,7 +1830,14 @@
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
       "reasoning": true,
-      "supports_adaptive_thinking": false,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "medium"
+          ]
+        }
+      ],
       "supports_verbosity": false,
       "input": [
         "text",

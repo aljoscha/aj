@@ -22,10 +22,10 @@ use crate::types::{ThinkingLevel, Usage};
 /// committing the resulting JSON.
 const SEED_MODELS_JSON: &str = include_str!("../data/models.json");
 
-/// Bundled overrides. Corrects known upstream inaccuracies and supplies
-/// fields models.dev does not carry
-/// (`supports_adaptive_thinking`). Applied on every load — seed and user
-/// cache alike.
+/// Bundled overrides: shallow patches that correct known upstream
+/// inaccuracies in the catalog, applied on every load (seed and user
+/// cache alike). Currently empty; kept as the seam for authored
+/// corrections when a source ships wrong data.
 const OVERRIDES_JSON: &str = include_str!("../data/overrides.json");
 
 /// Bundled OpenAI Codex seed. The `openai-codex` provider points at
@@ -35,9 +35,11 @@ const OVERRIDES_JSON: &str = include_str!("../data/overrides.json");
 /// authoritative: refresh appends these entries to every fresh cache
 /// (defensively filtering any upstream re-emission first), and load
 /// splices them in so users on a stale cache or an older bundled seed
-/// still see Codex models. `context_window` is set to `272000` (the
-/// observed server cap, not the marketing number) and `max_tokens`
-/// to `128000`; pricing is hand-curated.
+/// still see Codex models. Limits, pricing, and reasoning controls are
+/// hand-curated from the Codex CLI's own model catalog (the ChatGPT
+/// backend advertises no `none`/`minimal` effort, so those rungs are
+/// intentionally absent), not from models.dev whose API entries carry a
+/// different effort vocabulary.
 const CODEX_SEED_JSON: &str = include_str!("../data/codex.json");
 
 /// Provider id used to key Codex catalog entries. Exposed so the
@@ -62,6 +64,29 @@ const STALENESS_THRESHOLD_DAYS: i64 = 90;
 pub enum InputModality {
     Text,
     Image,
+}
+
+/// A reasoning control a model exposes, mirroring the catalog source's
+/// `reasoning_options` shape. Drives the thinking levels AJ offers and
+/// validates, and (for Anthropic) whether the adaptive thinking API is
+/// used. Refresh normalizes each source's vocabulary into this form.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ReasoningOption {
+    /// Reasoning can be turned on or off, with no effort selection.
+    Toggle,
+    /// Reasoning effort is chosen from a fixed vocabulary. A
+    /// [`ThinkingLevel::Off`] value means the model accepts an explicit
+    /// "no reasoning" effort (upstream `"none"`).
+    Effort { values: Vec<ThinkingLevel> },
+    /// Reasoning is controlled by a token budget within `[min, max]`.
+    /// Either bound may be absent when the source doesn't publish it.
+    BudgetTokens {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max: Option<u64>,
+    },
 }
 
 /// Per-million-token cost rates for a model.
@@ -114,22 +139,14 @@ pub struct ModelInfo {
     pub base_url: String,
     /// Whether the model supports extended thinking / reasoning.
     pub reasoning: bool,
-    /// Whether the model uses Anthropic's adaptive thinking API
-    /// (`thinking: {type: "adaptive"}` + `output_config: {effort: ...}`)
-    /// instead of the older budget-based thinking. Also governs whether
-    /// the `interleaved-thinking-2025-05-14` beta header is sent —
-    /// adaptive models have interleaved thinking built in and either
-    /// reject or ignore the header.
-    ///
-    /// Defaults to `true` for Anthropic reasoning models so a new model
-    /// absent from the overrides uses the modern API rather than
-    /// silently falling back to budget-based thinking; legacy
-    /// budget-only models are pinned `false` via overrides. Always
-    /// `false` for non-Anthropic and non-reasoning models. The serde
-    /// default is `false` (belt-and-suspenders for hand-written
-    /// fixtures); the catalog writes the value explicitly.
-    #[serde(default)]
-    pub supports_adaptive_thinking: bool,
+    /// The reasoning controls this model exposes, as published by the
+    /// catalog source. Empty for non-reasoning models, and for
+    /// reasoning models whose source advertises no verified control.
+    /// Drives the thinking levels AJ offers and validates, and (via
+    /// [`supports_adaptive_thinking`]) whether an Anthropic model uses
+    /// the adaptive thinking API.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_options: Vec<ReasoningOption>,
     /// Whether the model honours OpenAI's `text.verbosity` parameter
     /// (the answer-length knob, see [`crate::types::Verbosity`]). The
     /// gpt-5 family on the Responses / Codex wire supports it; older
@@ -161,9 +178,21 @@ pub struct ModelInfo {
 // Catalog file schema
 // ============================================================================
 
+/// Current on-disk catalog schema version. Bump it whenever [`ModelInfo`]'s
+/// shape changes in a way that would make an older cache load with
+/// silently-wrong data. A user cache whose `schema_version` differs is
+/// ignored in favour of the bundled seed (see [`load_active_catalog`]),
+/// so an incompatible cache is a clean miss rather than a subtle bug.
+pub const CATALOG_SCHEMA_VERSION: u32 = 1;
+
 /// On-disk catalog format shared by the bundled seed and the user cache.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Catalog {
+    /// Schema version of this file. Absent in pre-versioned caches, so
+    /// the serde default of `0` never equals [`CATALOG_SCHEMA_VERSION`]
+    /// and those caches are rejected on load.
+    #[serde(default)]
+    pub schema_version: u32,
     /// Unix milliseconds when the catalog was last refreshed. Drives the
     /// staleness warning.
     pub updated_at: i64,
@@ -213,7 +242,7 @@ pub struct OverridePatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub supports_adaptive_thinking: Option<bool>,
+    pub reasoning_options: Option<Vec<ReasoningOption>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_verbosity: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -429,10 +458,21 @@ pub fn models_are_equal(a: &ModelInfo, b: &ModelInfo) -> bool {
     a.provider == b.provider && a.api == b.api && a.id == b.id
 }
 
-/// Whether the model uses Anthropic's adaptive thinking API. Thin
-/// accessor over [`ModelInfo::supports_adaptive_thinking`].
+/// Whether the model uses Anthropic's adaptive thinking API
+/// (`thinking: {type: "adaptive"}` + `output_config: {effort}`) rather
+/// than budget-based thinking.
+///
+/// Derived: an Anthropic model that advertises an [`ReasoningOption::Effort`]
+/// control. A model that only exposes a budget control (legacy
+/// Anthropic) is budget-based. This also gates the
+/// `interleaved-thinking-2025-05-14` beta, which adaptive models reject
+/// or ignore.
 pub fn supports_adaptive_thinking(model: &ModelInfo) -> bool {
-    model.supports_adaptive_thinking
+    model.api == "anthropic-messages"
+        && model
+            .reasoning_options
+            .iter()
+            .any(|o| matches!(o, ReasoningOption::Effort { .. }))
 }
 
 /// Whether the model honours OpenAI's `text.verbosity` parameter.
@@ -470,7 +510,7 @@ pub fn validate_thinking_level(model: &ModelInfo, level: &ThinkingLevel) -> Resu
     }
     match model.api.as_str() {
         "anthropic-messages" => {
-            if model.supports_adaptive_thinking && matches!(level, ThinkingLevel::Minimal) {
+            if supports_adaptive_thinking(model) && matches!(level, ThinkingLevel::Minimal) {
                 return Err(format!(
                     "model '{}' does not support thinking level 'minimal'; \
                      supported: low, medium, high, xhigh, max",
@@ -501,7 +541,16 @@ fn load_active_catalog() -> (Catalog, String) {
     {
         match std::fs::read_to_string(&path) {
             Ok(body) => match serde_json::from_str::<Catalog>(&body) {
-                Ok(cat) => return (cat, format!("user cache {}", path.display())),
+                Ok(cat) if cat.schema_version == CATALOG_SCHEMA_VERSION => {
+                    return (cat, format!("user cache {}", path.display()));
+                }
+                Ok(cat) => tracing::warn!(
+                    "user catalog at {} has schema version {} (expected {}); \
+                     falling back to bundled seed (run `aj update-models` to refresh)",
+                    path.display(),
+                    cat.schema_version,
+                    CATALOG_SCHEMA_VERSION
+                ),
                 Err(err) => tracing::warn!(
                     "failed to parse user catalog at {}: {err}; falling back to bundled seed",
                     path.display()
@@ -647,8 +696,8 @@ pub(crate) fn apply_override(models: &mut [ModelInfo], entry: &OverrideEntry) {
     if let Some(v) = p.reasoning {
         model.reasoning = v;
     }
-    if let Some(v) = p.supports_adaptive_thinking {
-        model.supports_adaptive_thinking = v;
+    if let Some(v) = &p.reasoning_options {
+        model.reasoning_options = v.clone();
     }
     if let Some(v) = p.supports_verbosity {
         model.supports_verbosity = v;
@@ -687,7 +736,7 @@ mod tests {
             provider: provider.into(),
             base_url: "https://example.invalid".into(),
             reasoning: false,
-            supports_adaptive_thinking: false,
+            reasoning_options: Vec::new(),
             supports_verbosity: false,
             input: vec![InputModality::Text],
             cost: ModelCost {
@@ -710,6 +759,7 @@ mod tests {
     #[test]
     fn registry_lookup_and_listing() {
         let cat = Catalog {
+            schema_version: CATALOG_SCHEMA_VERSION,
             // updated_at: 0 suppresses the staleness warning in tests.
             updated_at: 0,
             source: "test".into(),
@@ -756,6 +806,7 @@ mod tests {
     #[test]
     fn overrides_shallow_merge() {
         let cat = Catalog {
+            schema_version: CATALOG_SCHEMA_VERSION,
             updated_at: 0,
             source: "test".into(),
             models: vec![sample_model("anthropic", "claude-opus")],
@@ -767,7 +818,9 @@ mod tests {
                     id: "claude-opus".into(),
                 },
                 patch: OverridePatch {
-                    supports_adaptive_thinking: Some(true),
+                    reasoning_options: Some(vec![ReasoningOption::Effort {
+                        values: vec![ThinkingLevel::Low],
+                    }]),
                     cost: Some(ModelCost {
                         input: 5.0,
                         output: 25.0,
@@ -782,7 +835,9 @@ mod tests {
         };
         let reg = ModelRegistry::from_catalog_with_overrides(cat, overrides, "test");
         let m = reg.get("anthropic", "claude-opus").unwrap();
-        assert!(m.supports_adaptive_thinking);
+        // The Effort control the override installs makes the Anthropic
+        // model derive as adaptive.
+        assert!(supports_adaptive_thinking(m));
         assert_eq!(m.cost.cache_read, 0.5);
         // Untouched fields remain.
         assert_eq!(m.context_window, 200_000);
@@ -792,6 +847,7 @@ mod tests {
     #[test]
     fn overrides_target_unknown_is_silent() {
         let cat = Catalog {
+            schema_version: CATALOG_SCHEMA_VERSION,
             updated_at: 0,
             source: "test".into(),
             models: vec![sample_model("anthropic", "real-model")],
@@ -803,7 +859,7 @@ mod tests {
                     id: "ghost-model".into(),
                 },
                 patch: OverridePatch {
-                    supports_adaptive_thinking: Some(true),
+                    reasoning_options: Some(vec![ReasoningOption::Toggle]),
                     ..Default::default()
                 },
                 reason: "test".into(),
@@ -976,8 +1032,46 @@ mod tests {
     fn capability_probes() {
         let mut m = sample_model("anthropic", "x");
         assert!(!supports_adaptive_thinking(&m));
-        m.supports_adaptive_thinking = true;
+        m.reasoning_options = vec![ReasoningOption::Effort {
+            values: vec![ThinkingLevel::Low, ThinkingLevel::High],
+        }];
         assert!(supports_adaptive_thinking(&m));
+    }
+
+    #[test]
+    fn reasoning_option_serde_round_trips() {
+        // The catalog persists `reasoning_options`, so its on-disk shape
+        // is a contract: `Off` must survive as `"off"` inside effort
+        // values and absent budget bounds must be omitted.
+        let opts = vec![
+            ReasoningOption::Toggle,
+            ReasoningOption::Effort {
+                values: vec![ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::Max],
+            },
+            ReasoningOption::BudgetTokens {
+                min: Some(1024),
+                max: None,
+            },
+        ];
+        let json = serde_json::to_string(&opts).expect("serializes");
+        assert!(json.contains(r#"{"type":"toggle"}"#));
+        assert!(json.contains(r#"{"type":"effort","values":["off","low","max"]}"#));
+        // The absent `max` bound is skipped, not serialized as null.
+        assert!(json.contains(r#"{"type":"budget_tokens","min":1024}"#));
+        let back: Vec<ReasoningOption> = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back, opts);
+    }
+
+    #[test]
+    fn pre_versioned_cache_is_rejected() {
+        // A cache written before schema versioning omits the field, so it
+        // deserializes to `0`, which never equals the current version.
+        // `load_active_catalog` treats that as an incompatible cache and
+        // falls back to the bundled seed.
+        let json = r#"{"updated_at":0,"source":"old","models":[]}"#;
+        let cat: Catalog = serde_json::from_str(json).expect("parses");
+        assert_eq!(cat.schema_version, 0);
+        assert_ne!(cat.schema_version, CATALOG_SCHEMA_VERSION);
     }
 
     #[test]
@@ -985,7 +1079,15 @@ mod tests {
         // Adaptive Anthropic model: no `minimal` rung.
         let mut adaptive = sample_model("anthropic", "claude-opus-4-7");
         adaptive.reasoning = true;
-        adaptive.supports_adaptive_thinking = true;
+        adaptive.reasoning_options = vec![ReasoningOption::Effort {
+            values: vec![
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High,
+                ThinkingLevel::XHigh,
+                ThinkingLevel::Max,
+            ],
+        }];
         assert!(validate_thinking_level(&adaptive, &ThinkingLevel::Minimal).is_err());
         assert!(validate_thinking_level(&adaptive, &ThinkingLevel::Max).is_ok());
         assert!(validate_thinking_level(&adaptive, &ThinkingLevel::XHigh).is_ok());
@@ -994,7 +1096,10 @@ mod tests {
         // (each maps to a token budget).
         let mut budget = sample_model("anthropic", "claude-sonnet-4-5");
         budget.reasoning = true;
-        budget.supports_adaptive_thinking = false;
+        budget.reasoning_options = vec![ReasoningOption::BudgetTokens {
+            min: Some(1024),
+            max: None,
+        }];
         assert!(validate_thinking_level(&budget, &ThinkingLevel::Minimal).is_ok());
         assert!(validate_thinking_level(&budget, &ThinkingLevel::Max).is_ok());
 
@@ -1056,24 +1161,30 @@ mod tests {
         }
     }
 
-    /// Loading the registry from the bundled seed must succeed and the
-    /// overrides must take effect.
+    /// The bundled seed's reasoning controls drive the adaptive
+    /// derivation: opus-4-5 advertises an effort control, so it derives
+    /// adaptive on, while a budget-only model does not. Built from the
+    /// seed directly (not [`ModelRegistry::load`]) so the assertion
+    /// doesn't depend on an ambient `~/.aj/models.json`.
     #[test]
-    fn load_real_registry_applies_overrides() {
-        let reg = ModelRegistry::load();
-        assert!(!reg.providers().is_empty());
-        // Pick a model the overrides file pins: opus-4-5 is a
-        // pre-adaptive reasoning model, so the override forces adaptive
-        // off. The refresh heuristic would otherwise default an
-        // Anthropic reasoning model to adaptive on.
-        if let Some(m) = reg.get("anthropic", "claude-opus-4-5") {
-            assert!(
-                !supports_adaptive_thinking(m),
-                "opus-4-5 override should pin adaptive thinking off"
-            );
-        }
-        // gpt-5.2 is a legacy budget? no — OpenAI model; just assert it
-        // loads. Adaptive thinking is Anthropic-only.
+    fn seed_derives_adaptive_from_effort_controls() {
+        let seed: Catalog = serde_json::from_str(SEED_MODELS_JSON).expect("seed parses");
+        let reg = ModelRegistry::from_catalog_with_overrides(seed, bundled_overrides(), "seed");
+        let opus = reg
+            .get("anthropic", "claude-opus-4-5")
+            .expect("opus-4-5 present in seed");
+        assert!(
+            supports_adaptive_thinking(opus),
+            "opus-4-5 advertises an effort control, so it derives adaptive"
+        );
+        let sonnet = reg
+            .get("anthropic", "claude-sonnet-4-5")
+            .expect("sonnet-4-5 present in seed");
+        assert!(
+            !supports_adaptive_thinking(sonnet),
+            "sonnet-4-5 is budget-only, so it does not derive adaptive"
+        );
+        // Adaptive thinking is Anthropic-only; an OpenAI model never derives it.
         if let Some(m) = reg.get("openai", "gpt-5.2") {
             assert!(!supports_adaptive_thinking(m));
         }
@@ -1169,7 +1280,7 @@ mod tests {
             provider: CODEX_PROVIDER_ID.into(),
             base_url: "https://chatgpt.com/backend-api".into(),
             reasoning: true,
-            supports_adaptive_thinking: false,
+            reasoning_options: Vec::new(),
             supports_verbosity: false,
             input: vec![InputModality::Text, InputModality::Image],
             cost: ModelCost {
@@ -1217,7 +1328,7 @@ mod tests {
             provider: "anthropic".into(),
             base_url: "https://api.anthropic.com".into(),
             reasoning: false,
-            supports_adaptive_thinking: false,
+            reasoning_options: Vec::new(),
             supports_verbosity: false,
             input: vec![InputModality::Text],
             cost: ModelCost::default(),
@@ -1251,6 +1362,19 @@ mod tests {
             .expect("gpt-5.5 present after load");
         assert!(gpt55.reasoning);
         assert!(!supports_adaptive_thinking(gpt55));
+        // Codex carries a hand-curated effort vocabulary (low..xhigh),
+        // with no `off` rung since the backend can't disable reasoning.
+        assert_eq!(
+            gpt55.reasoning_options,
+            vec![ReasoningOption::Effort {
+                values: vec![
+                    ThinkingLevel::Low,
+                    ThinkingLevel::Medium,
+                    ThinkingLevel::High,
+                    ThinkingLevel::XHigh,
+                ],
+            }]
+        );
         assert_eq!(gpt55.api, "openai-codex-responses");
         assert_eq!(gpt55.base_url, "https://chatgpt.com/backend-api");
         assert_eq!(gpt55.context_window, 272_000);
