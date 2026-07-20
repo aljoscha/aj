@@ -2935,7 +2935,24 @@ async fn handle_command(
                         .thinking
                         .clone()
                 });
-            let inner = ThinkingSelectorComponent::new(select_list_theme(theme), current);
+            let (provider, id) = world
+                .pump
+                .agent_settings(target)
+                .map(|s| (s.provider.clone(), s.model_id.clone()))
+                .unwrap_or_else(|| {
+                    run_config
+                        .lock()
+                        .expect("run config mutex poisoned")
+                        .model_key
+                        .clone()
+                });
+            let supported = model_catalog
+                .iter()
+                .find(|m| m.provider == provider && m.id == id)
+                .map(crate::config::commands::thinking_levels_for)
+                .unwrap_or_else(|| crate::config::commands::THINKING_LEVELS.iter().collect());
+            let inner =
+                ThinkingSelectorComponent::new(select_list_theme(theme), current, supported);
             let outcome = inner.outcome_handle();
             let window = aj_tui::components::overlay_window::OverlayWindow::new(
                 "Thinking effort",
@@ -5169,7 +5186,11 @@ mod tests {
         level: Option<ThinkingConfig>,
     ) -> SelectorTransition {
         let theme = ThemeHandle::new(Theme::bundled_dark());
-        let inner = ThinkingSelectorComponent::new(select_list_theme(&theme), None);
+        let inner = ThinkingSelectorComponent::new(
+            select_list_theme(&theme),
+            None,
+            crate::config::commands::THINKING_LEVELS.iter().collect(),
+        );
         let outcome = inner.outcome_handle();
         let handle = tui.show_overlay(Box::new(inner), palette_overlay_options());
         outcome.set(ThinkingSelectorOutcome::Confirmed(level));

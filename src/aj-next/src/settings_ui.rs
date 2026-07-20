@@ -40,7 +40,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use aj_agent::events::AgentId;
-use aj_app::commands::{THINKING_LEVELS, thinking_level_name};
+use aj_app::commands::{THINKING_LEVELS, ThinkingLevel, thinking_level_name, thinking_levels_for};
 use aj_app::footer::format_tokens;
 use aj_app::keybindings::{ACTION_SETTINGS_CLEAR, default_action_shortcut};
 use aj_app::settings::ConfigTarget;
@@ -151,8 +151,8 @@ pub(crate) fn push_window(
 // ============================================================================
 
 /// Pick-list rows for the thinking levels, current one tagged `(current)`.
-fn thinking_items(current_name: &str) -> Vec<SelectItem> {
-    THINKING_LEVELS
+fn thinking_items(current_name: &str, levels: &[&ThinkingLevel]) -> Vec<SelectItem> {
+    levels
         .iter()
         .map(|level| {
             let label = if level.name == current_name {
@@ -173,10 +173,11 @@ pub(crate) fn open_thinking(
     activity: &Rc<RefCell<Vec<SelectorActivity>>>,
     target: AgentId,
     current: Option<ThinkingConfig>,
+    supported: Vec<&'static ThinkingLevel>,
 ) {
     let current_name = thinking_level_name(&current).to_string();
     let select = Rc::new(RefCell::new(FilterableSelect::new(
-        thinking_items(&current_name),
+        thinking_items(&current_name, &supported),
         chrome.select.clone(),
     )));
     select
@@ -1270,6 +1271,16 @@ pub(crate) fn open_settings(
     catalogs: SettingsCatalogs,
 ) {
     let project_mode = target == ConfigTarget::Project;
+    // The thinking submenu is filtered to what the current model offers.
+    // We bind it here at window-build time (the submenu handler only sees
+    // its own row's value, not the model row's), so switching the model
+    // inside this window is reflected on the next open.
+    let thinking_supported: Vec<&'static ThinkingLevel> = catalogs
+        .models
+        .iter()
+        .find(|m| m.provider == values.model_key.0 && m.id == values.model_key.1)
+        .map(thinking_levels_for)
+        .unwrap_or_else(|| THINKING_LEVELS.iter().collect());
     let rows = build_setting_rows(&values, &inherited, project_mode, &set_keys);
     let list = Rc::new(RefCell::new(SettingList::new(
         rows,
@@ -1306,6 +1317,7 @@ pub(crate) fn open_settings(
                 &list_open,
                 target,
                 &catalogs,
+                &thinking_supported,
                 id,
                 value,
             );
@@ -1369,6 +1381,7 @@ fn open_setting_submenu(
     parent: &Rc<RefCell<SettingList>>,
     target: ConfigTarget,
     catalogs: &SettingsCatalogs,
+    thinking_supported: &[&ThinkingLevel],
     id: &str,
     value: &str,
 ) {
@@ -1409,7 +1422,7 @@ fn open_setting_submenu(
             );
         }
         "thinking" => {
-            let items = thinking_items(value);
+            let items = thinking_items(value, thinking_supported);
             open_picker_submenu(
                 ctx,
                 stack,
@@ -2199,7 +2212,8 @@ mod tests {
 
     #[test]
     fn thinking_items_tag_the_current_level() {
-        let items = thinking_items("high");
+        let all: Vec<&ThinkingLevel> = THINKING_LEVELS.iter().collect();
+        let items = thinking_items("high", &all);
         assert!(items.iter().any(|i| i.label == "high (current)"));
         assert!(items.iter().all(|i| i.filter_key != "high (current)"));
     }

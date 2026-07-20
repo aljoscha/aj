@@ -400,6 +400,18 @@ pub fn thinking_level_name(level: &Option<ThinkingConfig>) -> &'static str {
     aj_models::thinking_config_name(level.as_ref())
 }
 
+/// The catalog rows `model` offers, filtered against
+/// [`aj_models::registry::supported_thinking_levels`] and kept in the
+/// canonical display order. Levels are matched by name, the vocabulary
+/// both the catalog rows and the wire enum share.
+pub fn thinking_levels_for(model: &ModelInfo) -> Vec<&'static ThinkingLevel> {
+    let supported = aj_models::registry::supported_thinking_levels(model);
+    THINKING_LEVELS
+        .iter()
+        .filter(|row| supported.iter().any(|level| level.as_str() == row.name))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

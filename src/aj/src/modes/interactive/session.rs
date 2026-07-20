@@ -598,7 +598,9 @@ mod tests {
             api: "anthropic-messages".into(),
             provider: provider.into(),
             base_url: "https://example.invalid".into(),
-            reasoning: false,
+            // A reasoning model with no structured reasoning_options, so
+            // every thinking level (e.g. a restored "high") is valid.
+            reasoning: true,
             reasoning_options: Vec::new(),
             supports_verbosity: false,
             input: vec![InputModality::Text],

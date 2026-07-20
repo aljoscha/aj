@@ -38,7 +38,7 @@ use aj_tui::components::text_input::TextInput;
 use aj_tui::keybindings;
 use aj_tui::keys::InputEvent;
 
-use crate::config::commands::THINKING_LEVELS;
+use crate::config::commands::{THINKING_LEVELS, ThinkingLevel, thinking_levels_for};
 use crate::modes::interactive::components::model_selector::{
     ModelIdentity, ModelIdentityRef, ModelSelectorComponent, ModelSelectorOutcome,
 };
@@ -396,6 +396,15 @@ fn build_items(
     current: &SettingsCurrentValues,
 ) -> Vec<SettingItem> {
     let mut items = Vec::with_capacity(Config::OPTIONS.len());
+    // The thinking row is filtered to what the currently-selected model
+    // offers. This binds at window-build time: a model switch made in
+    // this same window is not reflected until the window is reopened,
+    // because the submenu factory only sees its own row's value.
+    let thinking_supported: Vec<&'static ThinkingLevel> = model_catalog
+        .iter()
+        .find(|m| m.provider == current.model_key.0 && m.id == current.model_key.1)
+        .map(thinking_levels_for)
+        .unwrap_or_else(|| THINKING_LEVELS.iter().collect());
     for option in Config::OPTIONS {
         match option.name {
             "model_api" => {
@@ -427,7 +436,7 @@ fn build_items(
                     option.name,
                     option.name,
                     current.thinking.clone(),
-                    thinking_submenu_factory(select_theme.clone()),
+                    thinking_submenu_factory(select_theme.clone(), thinking_supported.clone()),
                 );
                 item.description = Some(option_description(option));
                 items.push(item);
@@ -637,9 +646,12 @@ fn select_submenu(
 
 /// Submenu factory for the `thinking` row: the level catalog with
 /// descriptions, current level pre-selected.
-fn thinking_submenu_factory(theme: SelectListTheme) -> SubmenuFactory {
+fn thinking_submenu_factory(
+    theme: SelectListTheme,
+    supported: Vec<&'static ThinkingLevel>,
+) -> SubmenuFactory {
     Box::new(move |current: &str, done: SubmenuDoneCallback| {
-        let items: Vec<SelectItem> = THINKING_LEVELS
+        let items: Vec<SelectItem> = supported
             .iter()
             .map(|l| {
                 let label = if l.name == current {
@@ -919,7 +931,9 @@ mod tests {
             api: format!("{provider}-messages"),
             provider: provider.into(),
             base_url: format!("https://api.{provider}.com"),
-            reasoning: false,
+            // A reasoning model with no structured reasoning_options, so
+            // the thinking submenu offers the full ladder.
+            reasoning: true,
             reasoning_options: Vec::new(),
             supports_verbosity: false,
             input: vec![],

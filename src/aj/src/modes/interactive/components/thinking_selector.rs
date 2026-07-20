@@ -10,7 +10,9 @@
 use aj_models::ThinkingConfig;
 use aj_tui::components::select_list::{SelectItem, SelectList, SelectListLayout, SelectListTheme};
 
-use crate::config::commands::{THINKING_LEVELS, parse_thinking_level, thinking_level_name};
+use crate::config::commands::{
+    THINKING_LEVELS, ThinkingLevel, parse_thinking_level, thinking_level_name,
+};
 use crate::modes::interactive::components::outcome::OutcomeSlot;
 
 /// Outcome of a single overlay session.
@@ -41,11 +43,16 @@ pub struct ThinkingSelectorComponent {
 
 impl ThinkingSelectorComponent {
     /// Build a fresh selector. `current` highlights the active
-    /// level on open so `Enter` is a no-op confirm; `theme` styles
-    /// the underlying [`SelectList`].
-    pub fn new(theme: SelectListTheme, current: Option<ThinkingConfig>) -> Self {
+    /// level on open so `Enter` is a no-op confirm; `supported` is the
+    /// set of levels to display, already filtered to the target model;
+    /// `theme` styles the underlying [`SelectList`].
+    pub fn new(
+        theme: SelectListTheme,
+        current: Option<ThinkingConfig>,
+        supported: Vec<&'static ThinkingLevel>,
+    ) -> Self {
         let active_name = thinking_level_name(&current);
-        let items: Vec<SelectItem> = THINKING_LEVELS
+        let items: Vec<SelectItem> = supported
             .iter()
             .map(|l| {
                 let label = if l.name == active_name {
@@ -57,17 +64,12 @@ impl ThinkingSelectorComponent {
             })
             .collect();
 
-        let initial_index = THINKING_LEVELS
+        let initial_index = supported
             .iter()
             .position(|l| l.name == active_name)
             .unwrap_or(0);
 
-        let mut inner = SelectList::new(
-            items,
-            THINKING_LEVELS.len(),
-            theme,
-            SelectListLayout::default(),
-        );
+        let mut inner = SelectList::new(items, supported.len(), theme, SelectListLayout::default());
         inner.set_selected_index(initial_index);
 
         let outcome = OutcomeHandle::new();
@@ -156,8 +158,11 @@ mod tests {
 
     #[test]
     fn highlights_current_level_on_open() {
-        let mut sel =
-            ThinkingSelectorComponent::new(identity_theme(), Some(ThinkingConfig::Medium));
+        let mut sel = ThinkingSelectorComponent::new(
+            identity_theme(),
+            Some(ThinkingConfig::Medium),
+            THINKING_LEVELS.iter().collect(),
+        );
         let lines = sel.render(60);
         // The first list row should be the medium row, marked
         // "(current)" so the user sees what's currently active.
@@ -171,8 +176,11 @@ mod tests {
 
     #[test]
     fn enter_emits_confirmed_outcome_with_selected_level() {
-        let mut sel =
-            ThinkingSelectorComponent::new(identity_theme(), Some(ThinkingConfig::Medium));
+        let mut sel = ThinkingSelectorComponent::new(
+            identity_theme(),
+            Some(ThinkingConfig::Medium),
+            THINKING_LEVELS.iter().collect(),
+        );
         let outcome = sel.outcome_handle();
         // Simulate confirm on the highlighted (medium) row.
         sel.handle_input(&enter_event());
@@ -187,7 +195,11 @@ mod tests {
 
     #[test]
     fn esc_emits_cancelled_outcome() {
-        let mut sel = ThinkingSelectorComponent::new(identity_theme(), Some(ThinkingConfig::Low));
+        let mut sel = ThinkingSelectorComponent::new(
+            identity_theme(),
+            Some(ThinkingConfig::Low),
+            THINKING_LEVELS.iter().collect(),
+        );
         let outcome = sel.outcome_handle();
         sel.handle_input(&escape_event());
         let result = outcome.take();
@@ -196,8 +208,11 @@ mod tests {
 
     #[test]
     fn down_arrow_moves_to_next_level_then_enter_confirms_it() {
-        let mut sel =
-            ThinkingSelectorComponent::new(identity_theme(), Some(ThinkingConfig::Medium));
+        let mut sel = ThinkingSelectorComponent::new(
+            identity_theme(),
+            Some(ThinkingConfig::Medium),
+            THINKING_LEVELS.iter().collect(),
+        );
         let outcome = sel.outcome_handle();
         // medium is index 2; pressing down once lands on high.
         sel.handle_input(&down_event());
@@ -214,7 +229,11 @@ mod tests {
     #[test]
     fn off_is_selectable_and_round_trips() {
         // Build with current=off so off starts highlighted.
-        let mut sel = ThinkingSelectorComponent::new(identity_theme(), None);
+        let mut sel = ThinkingSelectorComponent::new(
+            identity_theme(),
+            None,
+            THINKING_LEVELS.iter().collect(),
+        );
         let outcome = sel.outcome_handle();
         sel.handle_input(&enter_event());
         let result = outcome.take();

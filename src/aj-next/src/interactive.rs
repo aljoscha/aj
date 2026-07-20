@@ -1508,6 +1508,13 @@ async fn apply_command_action(
         CommandAction::OpenThinkingSelector => {
             let target = world.chat.borrow().active_view();
             let current = viewed_thinking(world, target);
+            let (provider, model_id) = viewed_model(world, target);
+            let supported = world
+                .catalog
+                .iter()
+                .find(|m| m.provider == provider && m.id == model_id)
+                .map(aj_app::commands::thinking_levels_for)
+                .unwrap_or_else(|| aj_app::commands::THINKING_LEVELS.iter().collect());
             let handles = shell.borrow().overlay_handles();
             open_thinking(
                 &handles.stack,
@@ -1516,6 +1523,7 @@ async fn apply_command_action(
                 &handles.activity,
                 target,
                 current,
+                supported,
             );
             ActionEffect::OpenedOverlay
         }
