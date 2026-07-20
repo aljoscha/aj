@@ -340,7 +340,7 @@ pub struct Context {
 /// the target model's wire vocabulary doesn't accept is rejected before
 /// the request is sent (see
 /// [`crate::registry::validate_thinking_level`]).
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingLevel {
     /// Reasoning disabled; the model runs without extended thinking.
@@ -356,6 +356,21 @@ pub enum ThinkingLevel {
     /// "max"`. Accepted by adaptive Anthropic models and by the OpenAI
     /// reasoning models that expose a `max` rung.
     Max,
+}
+
+impl ThinkingLevel {
+    /// The wire name of this level, matching its serde encoding.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ThinkingLevel::Off => "off",
+            ThinkingLevel::Minimal => "minimal",
+            ThinkingLevel::Low => "low",
+            ThinkingLevel::Medium => "medium",
+            ThinkingLevel::High => "high",
+            ThinkingLevel::XHigh => "xhigh",
+            ThinkingLevel::Max => "max",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

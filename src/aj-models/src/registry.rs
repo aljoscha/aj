@@ -482,45 +482,91 @@ pub fn supports_verbosity(model: &ModelInfo) -> bool {
 }
 
 /// Validate a requested [`ThinkingLevel`] against a model's wire
-/// vocabulary, returning a human-readable message when the level can't
-/// be honoured.
+/// vocabulary, returning a human-readable message when the level isn't
+/// one the model offers.
 ///
-/// aj sends the chosen effort verbatim — there is no remapping or
-/// silent downgrade — so a level the provider's effort vocabulary
-/// lacks is rejected here before the request is built:
-///
-/// - Anthropic adaptive models take an `effort` enum with no `minimal`
-///   rung, so `Minimal` is rejected. Legacy budget-based Anthropic
-///   models translate every level to a token budget and accept the
-///   rest.
-/// - The OpenAI-family APIs (Responses, Chat Completions, Codex) accept
-///   the full `minimal`..`max` range.
-///
-/// Per-model effort support *within* a provider's vocabulary (e.g.
-/// which adaptive Anthropic model accepts `max` vs `xhigh`, or which
-/// OpenAI model exposes `max`) is deliberately not modelled
-/// here: those requests are sent through and the provider API returns
-/// its own 400.
-///
-/// Non-reasoning models ignore the level entirely (the providers omit
-/// the thinking parameter), so any level is accepted as a no-op.
+/// aj sends the chosen effort verbatim, with no remapping, flooring, or
+/// ceiling, so the level must be a member of
+/// [`supported_thinking_levels`] for this model. A non-reasoning model
+/// offers only `off`, and asking for any effort on it is an error rather
+/// than a silent no-op.
 pub fn validate_thinking_level(model: &ModelInfo, level: &ThinkingLevel) -> Result<(), String> {
-    if !model.reasoning {
+    let supported = supported_thinking_levels(model);
+    if supported.contains(level) {
         return Ok(());
     }
-    match model.api.as_str() {
-        "anthropic-messages" => {
-            if supports_adaptive_thinking(model) && matches!(level, ThinkingLevel::Minimal) {
-                return Err(format!(
-                    "model '{}' does not support thinking level 'minimal'; \
-                     supported: low, medium, high, xhigh, max",
-                    model.id
-                ));
-            }
-            Ok(())
-        }
-        _ => Ok(()),
+    let offered = supported
+        .iter()
+        .map(ThinkingLevel::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "model '{}' does not support thinking level '{}'; supported: {offered}",
+        model.id,
+        level.as_str(),
+    ))
+}
+
+/// Every thinking level in canonical, cheapest-first order. Offered sets
+/// are returned as a subset of this, so callers get a stable order.
+const ALL_THINKING_LEVELS: [ThinkingLevel; 7] = [
+    ThinkingLevel::Off,
+    ThinkingLevel::Minimal,
+    ThinkingLevel::Low,
+    ThinkingLevel::Medium,
+    ThinkingLevel::High,
+    ThinkingLevel::XHigh,
+    ThinkingLevel::Max,
+];
+
+/// The exact thinking levels a model offers, in canonical order. This is
+/// the single source of truth for both the selector UI and
+/// [`validate_thinking_level`].
+///
+/// The rules, in order:
+///
+/// - A non-reasoning model offers only `off`.
+/// - An `Effort` control contributes its advertised levels verbatim, and
+///   a `Toggle` control contributes `off`.
+/// - Anthropic extended thinking is opt-in, so every reasoning Anthropic
+///   model can also run with thinking `off`, regardless of its effort
+///   enum (which names only the levels used while thinking is on).
+/// - A budget-only model (a token budget, no effort enum) and an
+///   under-described reasoning model (no controls at all) both fall back
+///   to the full ladder: we discretize the budget onto it, or lack the
+///   data to be exact, and let the provider surface any 400.
+pub fn supported_thinking_levels(model: &ModelInfo) -> Vec<ThinkingLevel> {
+    if !model.reasoning {
+        return vec![ThinkingLevel::Off];
     }
+
+    let mut offered: Vec<ThinkingLevel> = Vec::new();
+    let mut has_effort = false;
+    let mut has_budget = false;
+    for option in &model.reasoning_options {
+        match option {
+            ReasoningOption::Effort { values } => {
+                has_effort = true;
+                offered.extend(values.iter().copied());
+            }
+            ReasoningOption::Toggle => offered.push(ThinkingLevel::Off),
+            ReasoningOption::BudgetTokens { .. } => has_budget = true,
+        }
+    }
+
+    if model.api == "anthropic-messages" {
+        offered.push(ThinkingLevel::Off);
+    }
+
+    if (has_budget && !has_effort) || model.reasoning_options.is_empty() {
+        return ALL_THINKING_LEVELS.to_vec();
+    }
+
+    ALL_THINKING_LEVELS
+        .iter()
+        .copied()
+        .filter(|level| offered.contains(level))
+        .collect()
 }
 
 // ============================================================================
@@ -1076,7 +1122,8 @@ mod tests {
 
     #[test]
     fn validate_thinking_level_rejects_out_of_vocabulary() {
-        // Adaptive Anthropic model: no `minimal` rung.
+        // Adaptive Anthropic model: the advertised effort enum plus the
+        // always-available off, and nothing else.
         let mut adaptive = sample_model("anthropic", "claude-opus-4-7");
         adaptive.reasoning = true;
         adaptive.reasoning_options = vec![ReasoningOption::Effort {
@@ -1084,16 +1131,17 @@ mod tests {
                 ThinkingLevel::Low,
                 ThinkingLevel::Medium,
                 ThinkingLevel::High,
-                ThinkingLevel::XHigh,
-                ThinkingLevel::Max,
             ],
         }];
+        assert!(validate_thinking_level(&adaptive, &ThinkingLevel::Off).is_ok());
+        assert!(validate_thinking_level(&adaptive, &ThinkingLevel::High).is_ok());
         assert!(validate_thinking_level(&adaptive, &ThinkingLevel::Minimal).is_err());
-        assert!(validate_thinking_level(&adaptive, &ThinkingLevel::Max).is_ok());
-        assert!(validate_thinking_level(&adaptive, &ThinkingLevel::XHigh).is_ok());
+        // Outside the advertised enum, even though `max` is a valid rung
+        // for other models.
+        assert!(validate_thinking_level(&adaptive, &ThinkingLevel::Max).is_err());
 
-        // Legacy budget-based Anthropic model accepts every level
-        // (each maps to a token budget).
+        // Legacy budget-based Anthropic model accepts every level (each
+        // maps to a token budget).
         let mut budget = sample_model("anthropic", "claude-sonnet-4-5");
         budget.reasoning = true;
         budget.reasoning_options = vec![ReasoningOption::BudgetTokens {
@@ -1103,17 +1151,100 @@ mod tests {
         assert!(validate_thinking_level(&budget, &ThinkingLevel::Minimal).is_ok());
         assert!(validate_thinking_level(&budget, &ThinkingLevel::Max).is_ok());
 
-        // OpenAI-family model: accepts the full minimal..max range.
-        let mut openai = sample_model("openai", "gpt-5.6-sol");
+        // OpenAI model whose effort enum excludes off: off is rejected,
+        // and so is any rung the enum doesn't list.
+        let mut openai = sample_model("openai", "gpt-5-pro");
         openai.api = "openai-responses".into();
         openai.reasoning = true;
-        assert!(validate_thinking_level(&openai, &ThinkingLevel::Minimal).is_ok());
-        assert!(validate_thinking_level(&openai, &ThinkingLevel::XHigh).is_ok());
-        assert!(validate_thinking_level(&openai, &ThinkingLevel::Max).is_ok());
+        openai.reasoning_options = vec![ReasoningOption::Effort {
+            values: vec![ThinkingLevel::High],
+        }];
+        assert!(validate_thinking_level(&openai, &ThinkingLevel::High).is_ok());
+        assert!(validate_thinking_level(&openai, &ThinkingLevel::Off).is_err());
+        assert!(validate_thinking_level(&openai, &ThinkingLevel::Medium).is_err());
 
-        // Non-reasoning model ignores the level entirely.
+        // Non-reasoning model offers only off; any effort is an error.
         let plain = sample_model("openai", "gpt-4o");
-        assert!(validate_thinking_level(&plain, &ThinkingLevel::Max).is_ok());
+        assert!(validate_thinking_level(&plain, &ThinkingLevel::Off).is_ok());
+        assert!(validate_thinking_level(&plain, &ThinkingLevel::Max).is_err());
+    }
+
+    #[test]
+    fn supported_thinking_levels_by_category() {
+        // Non-reasoning: off only.
+        let plain = sample_model("openai", "gpt-4o");
+        assert_eq!(supported_thinking_levels(&plain), vec![ThinkingLevel::Off]);
+
+        // OpenAI effort enum with off, returned in canonical order.
+        let mut gpt = sample_model("openai", "gpt-5.5");
+        gpt.api = "openai-responses".into();
+        gpt.reasoning = true;
+        gpt.reasoning_options = vec![ReasoningOption::Effort {
+            values: vec![
+                ThinkingLevel::Off,
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High,
+                ThinkingLevel::XHigh,
+            ],
+        }];
+        assert_eq!(
+            supported_thinking_levels(&gpt),
+            vec![
+                ThinkingLevel::Off,
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High,
+                ThinkingLevel::XHigh,
+            ]
+        );
+
+        // Anthropic adaptive: off is added even though the effort enum
+        // omits it, and the extra budget control is ignored.
+        let mut opus = sample_model("anthropic", "claude-opus-4-5");
+        opus.reasoning = true;
+        opus.reasoning_options = vec![
+            ReasoningOption::Effort {
+                values: vec![
+                    ThinkingLevel::Low,
+                    ThinkingLevel::Medium,
+                    ThinkingLevel::High,
+                ],
+            },
+            ReasoningOption::BudgetTokens {
+                min: Some(1024),
+                max: None,
+            },
+        ];
+        assert_eq!(
+            supported_thinking_levels(&opus),
+            vec![
+                ThinkingLevel::Off,
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High,
+            ]
+        );
+
+        // Budget-only and under-described both fall back to the full ladder.
+        let mut haiku = sample_model("anthropic", "claude-haiku-4-5");
+        haiku.reasoning = true;
+        haiku.reasoning_options = vec![ReasoningOption::BudgetTokens {
+            min: Some(1024),
+            max: None,
+        }];
+        assert_eq!(
+            supported_thinking_levels(&haiku),
+            ALL_THINKING_LEVELS.to_vec()
+        );
+
+        let mut unknown = sample_model("openai", "mystery");
+        unknown.api = "openai-responses".into();
+        unknown.reasoning = true;
+        assert_eq!(
+            supported_thinking_levels(&unknown),
+            ALL_THINKING_LEVELS.to_vec()
+        );
     }
 
     #[test]

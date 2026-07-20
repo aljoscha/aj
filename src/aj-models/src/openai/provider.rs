@@ -274,9 +274,9 @@ fn build_request(
         .map(|t| u32::try_from(t).unwrap_or(u32::MAX));
 
     let reasoning_effort = if model.reasoning {
-        // "off" (no requested level) floors to `minimal`: a reasoning
-        // model can't be told not to reason — `reasoning_effort: "none"`
-        // is rejected by most GPT-5 models — so we treat off as minimal.
+        // We send the requested effort verbatim; `off` reaches here only
+        // for a model whose vocabulary includes it (validated above), so
+        // it maps to an explicit `reasoning_effort: "none"`.
         Some(map_reasoning_effort(reasoning))
     } else {
         // Non-reasoning models reject the field entirely.
@@ -724,13 +724,15 @@ fn to_chat_tool_choice(choice: Option<&ToolChoice>, has_tools: bool) -> Option<C
 // ---------------------------------------------------------------------------
 
 /// Map the unified [`ThinkingLevel`] onto the OpenAI `reasoning_effort`
-/// enum. Each effort rung maps to its wire equivalent (including `max`
-/// on the models that expose it); [`ThinkingLevel::Off`] has no distinct
-/// wire form on a reasoning model, so it floors to `minimal`.
+/// enum, one wire value per rung.
+///
+/// [`ThinkingLevel::Off`] maps to `none`. This is only reached for a
+/// model whose vocabulary advertises off (enforced by
+/// [`validate_thinking_level`]), so we never send `none` to a model that
+/// rejects it.
 fn map_reasoning_effort(level: &ThinkingLevel) -> ReasoningEffort {
     match level {
-        // A reasoning model can't disable reasoning here; off floors to minimal (preserved from the pre-Off behavior).
-        ThinkingLevel::Off => ReasoningEffort::Minimal,
+        ThinkingLevel::Off => ReasoningEffort::None,
         ThinkingLevel::Minimal => ReasoningEffort::Minimal,
         ThinkingLevel::Low => ReasoningEffort::Low,
         ThinkingLevel::Medium => ReasoningEffort::Medium,
@@ -1405,7 +1407,11 @@ mod tests {
     #[test]
     fn reasoning_effort_maps_one_to_one() {
         // Each level passes straight through to the wire enum,
-        // one-to-one.
+        // one-to-one. `off` maps to the explicit `none` rung.
+        assert!(matches!(
+            map_reasoning_effort(&ThinkingLevel::Off),
+            ReasoningEffort::None
+        ));
         assert!(matches!(
             map_reasoning_effort(&ThinkingLevel::XHigh),
             ReasoningEffort::XHigh

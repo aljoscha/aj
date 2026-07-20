@@ -697,9 +697,10 @@ fn build_request(
     let tools: Vec<ResponseTool> = context.tools.iter().map(to_codex_tool).collect();
 
     // reasoning configuration. Non-reasoning models reject the
-    // `reasoning` parameter entirely. For reasoning models, "off" (no
-    // requested level) floors to `minimal`: a reasoning model can't be
-    // told not to reason, so we treat off identically to minimal.
+    // `reasoning` parameter entirely. For reasoning models we send the
+    // requested effort verbatim; `off` reaches here only for a model
+    // whose vocabulary includes it (validated above), so it maps to an
+    // explicit `reasoning_effort: "none"`.
     let (reasoning_cfg, include) = if model.reasoning {
         let summary = match options.reasoning_summary.as_ref() {
             Some(UnifiedReasoningSummary::Auto) | None => ReasoningSummaryMode::Auto,

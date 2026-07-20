@@ -364,10 +364,10 @@ fn build_request(
         .map(|t| u32::try_from(t).unwrap_or(u32::MAX));
 
     // reasoning configuration. Non-reasoning models reject the
-    // `reasoning` parameter entirely. For reasoning models, "off" (no
-    // requested level) floors to `minimal`: a reasoning model can't be
-    // told not to reason — `reasoning_effort: "none"` is rejected by
-    // most GPT-5 models — so we treat off identically to minimal.
+    // `reasoning` parameter entirely. For reasoning models we send the
+    // requested effort verbatim; `off` reaches here only for a model
+    // whose vocabulary includes it (validated above), so it maps to an
+    // explicit `reasoning_effort: "none"`.
     let (reasoning_cfg, include) = if model.reasoning {
         let summary = match options.reasoning_summary.as_ref() {
             Some(UnifiedReasoningSummary::Auto) | None => ReasoningSummaryMode::Auto,
@@ -465,14 +465,16 @@ fn build_system_item(model: &ModelInfo, prompt: &str) -> ResponseInputItem {
 }
 
 /// Map the unified [`ThinkingLevel`] onto the OpenAI `reasoning_effort`
-/// enum. Each effort rung maps to its wire equivalent (including `max`
-/// on the models that expose it); [`ThinkingLevel::Off`] has no distinct
-/// wire form on a reasoning model, so it floors to `minimal`. Shared by
-/// the Responses and Codex providers.
+/// enum, one wire value per rung. Shared by the Responses and Codex
+/// providers.
+///
+/// [`ThinkingLevel::Off`] maps to `none`. This is only reached for a
+/// model whose vocabulary advertises off (enforced by
+/// [`validate_thinking_level`]), so we never send `none` to a model that
+/// rejects it.
 pub(super) fn map_reasoning_effort(level: &ThinkingLevel) -> ReasoningEffort {
     match level {
-        // A reasoning model can't disable reasoning here; off floors to minimal (preserved from the pre-Off behavior).
-        ThinkingLevel::Off => ReasoningEffort::Minimal,
+        ThinkingLevel::Off => ReasoningEffort::None,
         ThinkingLevel::Minimal => ReasoningEffort::Minimal,
         ThinkingLevel::Low => ReasoningEffort::Low,
         ThinkingLevel::Medium => ReasoningEffort::Medium,
@@ -1737,7 +1739,7 @@ mod tests {
     }
 
     #[test]
-    fn build_request_reasoning_off_floors_to_minimal() {
+    fn build_request_reasoning_off_maps_to_none() {
         let ctx = Context::new("hello");
         let req = build_request(
             &fake_model(true),
@@ -1746,9 +1748,9 @@ mod tests {
             &ThinkingLevel::Off,
         );
         let r = req.reasoning.expect("reasoning set");
-        // A reasoning model can't disable reasoning; "off" floors to
-        // minimal and is treated like any other reasoning level.
-        assert!(matches!(r.effort, Some(ReasoningEffort::Minimal)));
+        // `off` is sent verbatim as `reasoning_effort: "none"`; the
+        // model's vocabulary is checked upstream, so we never floor here.
+        assert!(matches!(r.effort, Some(ReasoningEffort::None)));
         assert!(matches!(r.summary, Some(ReasoningSummaryMode::Auto)));
         assert_eq!(
             req.include,
