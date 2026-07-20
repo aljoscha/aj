@@ -1279,6 +1279,7 @@ mod tests {
             Rc::clone(&chat),
             &theme,
             std::rc::Rc::new(std::cell::Cell::new(false)),
+            std::rc::Rc::new(std::cell::RefCell::new(None)),
             std::rc::Rc::new(std::cell::Cell::new(None)),
         );
         let ctx = DrawContext {

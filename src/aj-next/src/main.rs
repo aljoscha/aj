@@ -13,7 +13,6 @@ use tracing_subscriber::EnvFilter;
 
 mod agent_picker;
 mod autocomplete;
-mod branch_banner;
 mod bubble;
 mod content_overlay;
 mod corner_box;

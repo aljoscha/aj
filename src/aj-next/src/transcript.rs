@@ -403,6 +403,17 @@ impl EntryTextCache {
 /// the cheap [`entry_fingerprint`] here (it has the `ChatState` borrow but not
 /// the draw width) and defers the real build+draw to the wrapper's `draw`,
 /// which has the width and only rebuilds on a cache miss.
+/// Which border chrome a user bubble carries, if any. Folded into the
+/// per-entry render fingerprint so the cache re-renders on a border change.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum EntryBorder {
+    None,
+    /// The transcript-focus highlight, with the copy / branch key hint.
+    Focus,
+    /// The armed-branch highlight, with the branching / cancel hint.
+    Branch,
+}
+
 struct EntryBuilder {
     chat: Rc<RefCell<ChatState>>,
     styles: Rc<TranscriptStyles>,
@@ -411,10 +422,35 @@ struct EntryBuilder {
     /// keymap host context. Read live so the focus border tracks the current
     /// mode. The transcript is the single writer.
     focus_mode: Rc<std::cell::Cell<bool>>,
-    /// The pre-styled copy-key hint (`y to copy`) the focused bubble's border
-    /// shows, resolved once through the keybinding data. Shared by `Rc` so
-    /// each `CachingEntry` clones a handle rather than the spans.
+    /// The armed-branch message id, shared with the Shell (its single writer).
+    /// Read live so the branch border stays on the branched-from message while
+    /// the editor, not the transcript, holds focus. `Some` iff a branch is
+    /// armed.
+    branch_armed: Rc<RefCell<Option<String>>>,
+    /// The pre-styled focus hint (`y to copy \u{b7} b to branch`) and the
+    /// branch hint (`branching \u{b7} esc to cancel`), resolved once through the
+    /// keybinding data. Shared by `Rc` so each `CachingEntry` clones a handle
+    /// rather than the spans.
     copy_label: Rc<Vec<TextSpan>>,
+    branch_label: Rc<Vec<TextSpan>>,
+}
+
+impl EntryBuilder {
+    /// The border an entry carries this frame. The armed-branch highlight wins
+    /// over the focus highlight: arming moves focus off the transcript, but the
+    /// box must stay on the branched-from message. Only user bubbles border.
+    fn border_for(&self, entry: &Entry, idx: usize, cursor: usize) -> EntryBorder {
+        let EntryKind::User(user) = &entry.kind else {
+            return EntryBorder::None;
+        };
+        if self.branch_armed.borrow().as_deref() == Some(user.message_id.as_str()) {
+            EntryBorder::Branch
+        } else if self.focus_mode.get() && idx == cursor {
+            EntryBorder::Focus
+        } else {
+            EntryBorder::None
+        }
+    }
 }
 
 impl Builder for EntryBuilder {
@@ -422,16 +458,16 @@ impl Builder for EntryBuilder {
         let chat = self.chat.borrow();
         let agent = chat.active_view();
         let entry = chat.transcript(agent)?.entries().get(idx)?;
-        // The focus border is per-cursor chrome, not entry content, so fold it
-        // into the fingerprint. Without this the cache would replay a stale
-        // bordered or unbordered surface when focus moves. Folding `focused`
-        // in re-renders exactly the entry gaining and the entry losing focus
-        // and leaves the rest cache hits.
-        let focused =
-            self.focus_mode.get() && idx == cursor && matches!(entry.kind, EntryKind::User(_));
+        // The bubble border is per-cursor / per-branch chrome, not entry
+        // content, so fold it into the fingerprint. Without this the cache
+        // would replay a stale bordered or unbordered surface when focus or the
+        // armed branch moves. Folding it in re-renders exactly the entry
+        // gaining and the entry losing the border and leaves the rest cache
+        // hits.
+        let border = self.border_for(entry, idx, cursor);
         let mut hasher = DefaultHasher::new();
         fingerprint_into(entry, &chat, &mut hasher);
-        focused.hash(&mut hasher);
+        border.hash(&mut hasher);
         let fingerprint = hasher.finish();
         // A Running sub-agent box animates its glyph off the wall-clock, so it
         // must rebuild on every redraw, not just when its fingerprint changes.
@@ -447,9 +483,10 @@ impl Builder for EntryBuilder {
             agent,
             entry_id: entry.id,
             fingerprint,
-            focused,
+            border,
             bypass_cache,
             copy_label: Rc::clone(&self.copy_label),
+            branch_label: Rc::clone(&self.branch_label),
         })))
     }
 }
@@ -468,16 +505,18 @@ struct CachingEntry {
     agent: AgentId,
     entry_id: EntryId,
     fingerprint: u64,
-    /// Whether this entry is the focused user message, so its bubble gets the
-    /// focus border on the miss-path build. Already folded into `fingerprint`.
-    focused: bool,
+    /// Which border this entry's bubble gets on the miss-path build. Already
+    /// folded into `fingerprint`.
+    border: EntryBorder,
     /// Whether to skip the render cache and rebuild on every draw. Set for a
     /// `Running` sub-agent box, whose spinner glyph advances on the wall-clock
     /// and so cannot be served from a fingerprint-keyed surface.
     bypass_cache: bool,
-    /// The copy-key hint shown on the border's bottom edge, used only when
-    /// `focused`.
+    /// The hint spans shown on the border's bottom edge: `copy_label` for a
+    /// focus border, `branch_label` for a branch border. Both are held so the
+    /// miss-path build picks by `border` without another lookup.
     copy_label: Rc<Vec<TextSpan>>,
+    branch_label: Rc<Vec<TextSpan>>,
 }
 
 impl Widget for CachingEntry {
@@ -509,11 +548,16 @@ impl Widget for CachingEntry {
                 // an empty surface defensively rather than panic.
                 return Surface::empty();
             };
-            // The focus border is threaded only when this entry is the focused
-            // user message. Every other entry builds unbordered.
-            let focus = self.focused.then(|| self.copy_label.as_slice());
+            // The border is threaded only for a focused or branch-armed user
+            // message, with its matching hint on the bottom edge. Every other
+            // entry builds unbordered.
+            let label = match self.border {
+                EntryBorder::None => None,
+                EntryBorder::Focus => Some(self.copy_label.as_slice()),
+                EntryBorder::Branch => Some(self.branch_label.as_slice()),
+            };
             let mut widget =
-                build_entry_widget(entry, &chat, &self.styles, false, focus).into_indented_boxed();
+                build_entry_widget(entry, &chat, &self.styles, false, label).into_indented_boxed();
             widget.draw(ctx)
         };
         // A bypass entry is never stored, so it can't strand a stale slot when
@@ -1088,6 +1132,29 @@ fn copy_label_spans(styles: &TranscriptStyles) -> Vec<TextSpan> {
     ]
 }
 
+/// The hint shown on an armed-branch bubble's border, mirroring the focus
+/// hint's styling: the status word and the key in accent, the rest muted.
+/// Cancelling a branch is the bare Esc key (no bound action), so it renders as
+/// a literal rather than a resolved shortcut.
+fn branch_label_spans(styles: &TranscriptStyles) -> Vec<TextSpan> {
+    let accent_span = |text: &str| TextSpan {
+        text: text.into(),
+        style: styles.accent,
+        ..TextSpan::default()
+    };
+    let dim_span = |text: &str| TextSpan {
+        text: text.into(),
+        style: styles.dim,
+        ..TextSpan::default()
+    };
+    vec![
+        accent_span("branching"),
+        dim_span(" \u{b7} "),
+        accent_span("esc"),
+        dim_span(" to cancel"),
+    ]
+}
+
 /// Build the styled spans for one entry that renders through [`RichText`]
 /// (notices, usage, the defensive nested sub-agent stub), ending in a blank
 /// spacer row so consecutive entries don't visually collide.
@@ -1462,6 +1529,11 @@ pub struct TranscriptView {
     /// and [`exit_focus_mode`](Self::exit_focus_mode), driven by focus in/out,
     /// set it.
     focused: Rc<std::cell::Cell<bool>>,
+    /// The armed-branch message id, shared by `Rc` with the [`EntryBuilder`]
+    /// (so the branch border tracks the armed message) and the Shell (its
+    /// single writer). Kept so [`set_styles`](Self::set_styles) can rebuild the
+    /// builder on a theme swap without losing the handle.
+    branch_armed: Rc<RefCell<Option<String>>>,
     /// Called from the Esc branch of transcript-focus mode to hand focus
     /// back to the editor. `None` until the host wires it in `Shell::new`.
     /// The resulting `FocusOut` clears the focus flag, exiting the mode.
@@ -1600,10 +1672,13 @@ impl TranscriptView {
     /// Build the view over `chat`. `focused` is the transcript-focus flag,
     /// shared with the keymap host context so the copy chord and the focus
     /// border read the same state (this view is its single writer).
+    /// `branch_armed` is the armed-branch message id, shared with the Shell
+    /// (its single writer) so the branch border tracks the armed message.
     pub fn new(
         chat: Rc<RefCell<ChatState>>,
         theme: &Theme,
         focused: Rc<std::cell::Cell<bool>>,
+        branch_armed: Rc<RefCell<Option<String>>>,
         selection_copied: Rc<std::cell::Cell<Option<SelectionCopied>>>,
     ) -> TranscriptView {
         let styles = Rc::new(TranscriptStyles::from_theme(theme));
@@ -1613,7 +1688,9 @@ impl TranscriptView {
             styles: Rc::clone(&styles),
             cache: Rc::clone(&cache),
             focus_mode: Rc::clone(&focused),
+            branch_armed: Rc::clone(&branch_armed),
             copy_label: Rc::new(copy_label_spans(&styles)),
+            branch_label: Rc::new(branch_label_spans(&styles)),
         };
         let mut list = ListView::new(Source::Builder(Box::new(builder)));
         // `draw_cursor` stays off in every mode: the focused-message marker is
@@ -1650,6 +1727,7 @@ impl TranscriptView {
             last_globals,
             follow_tail: true,
             focused,
+            branch_armed,
             on_exit_focus: None,
             on_observe_agent: None,
             agent_click: None,
@@ -2332,7 +2410,9 @@ impl TranscriptView {
             styles: Rc::clone(&styles),
             cache: Rc::clone(&self.cache),
             focus_mode: Rc::clone(&self.focused),
+            branch_armed: Rc::clone(&self.branch_armed),
             copy_label: Rc::new(copy_label_spans(&styles)),
+            branch_label: Rc::new(branch_label_spans(&styles)),
         };
         self.list.borrow_mut().children = Source::Builder(Box::new(builder));
         apply_scrollbar_thumbs(&mut self.bars, &styles);
@@ -3848,6 +3928,7 @@ mod tests {
             Rc::clone(chat),
             &theme,
             Rc::new(std::cell::Cell::new(false)),
+            Rc::new(RefCell::new(None)),
             Rc::new(std::cell::Cell::new(None)),
         )
     }
@@ -5244,6 +5325,72 @@ mod tests {
         );
     }
 
+    /// While a branch is armed the highlight box stays on the branched-from
+    /// message even though focus mode is off (the editor holds focus), and its
+    /// bottom edge shows the branching hint rather than the copy / branch keys.
+    /// Clearing the anchor drops the box.
+    #[test]
+    fn armed_branch_border_marks_the_message_without_focus_mode() {
+        // Users at 0, 2, 4 ("user 0", "user 1", "user 2"); the middle one is
+        // the branch target.
+        let chat = chat_with_user_messages(3);
+        let armed_id = {
+            let chat = chat.borrow();
+            match &chat.transcript(AgentId::Main).unwrap().entries()[2].kind {
+                EntryKind::User(u) => u.message_id.clone(),
+                _ => panic!("entry 2 is a user message"),
+            }
+        };
+        let branch_armed = Rc::new(RefCell::new(Some(armed_id)));
+        let theme = Theme::bundled_dark_with_mode(aj_app::theme::ColorMode::Truecolor);
+        // Tall viewport so the whole transcript fits and the assertions are
+        // exact.
+        let mut view = TranscriptView::new(
+            Rc::clone(&chat),
+            &theme,
+            Rc::new(std::cell::Cell::new(false)),
+            Rc::clone(&branch_armed),
+            Rc::new(std::cell::Cell::new(None)),
+        );
+        let ctx = draw_ctx(48, 40);
+        let rows = crate::test_support::rows(&view.draw(&ctx));
+        let joined = rows.join("\n");
+
+        assert!(!view.in_focus_mode(), "focus mode is off while branching");
+        assert_eq!(
+            joined.matches('\u{250f}').count(),
+            1,
+            "exactly the armed message is bordered: {rows:?}",
+        );
+        // The bordered bubble is the branch target, and its edge carries the
+        // branch hint, not the focus copy / branch hint.
+        let top = rows
+            .iter()
+            .position(|r| r.contains('\u{250f}'))
+            .expect("a bordered bubble");
+        assert!(
+            rows[top + 1].contains("user 1"),
+            "bordered message: {rows:?}"
+        );
+        assert!(
+            joined.contains("branching") && joined.contains("esc to cancel"),
+            "branch hint on the border edge: {rows:?}",
+        );
+        assert!(
+            !joined.contains("to copy") && !joined.contains("to branch"),
+            "the focus hint is replaced while branching: {rows:?}",
+        );
+
+        // Clearing the anchor drops the box.
+        *branch_armed.borrow_mut() = None;
+        let rows = crate::test_support::rows(&view.draw(&ctx));
+        assert_eq!(
+            rows.join("\n").matches('\u{250f}').count(),
+            0,
+            "the box drops when the branch is disarmed: {rows:?}",
+        );
+    }
+
     /// Focusing marks the newest user message with the border (and no other
     /// entry), stepping moves the border message-to-message, and leaving focus
     /// drops it. The transcript's row count never changes across any of it, so
@@ -5369,12 +5516,15 @@ mod tests {
     fn caching_builder(chat: &Rc<RefCell<ChatState>>) -> EntryBuilder {
         let styles = Rc::new(styles());
         let copy_label = Rc::new(copy_label_spans(&styles));
+        let branch_label = Rc::new(branch_label_spans(&styles));
         EntryBuilder {
             chat: Rc::clone(chat),
             styles,
             cache: Rc::new(RefCell::new(EntryRenderCache::new())),
             focus_mode: Rc::new(std::cell::Cell::new(false)),
+            branch_armed: Rc::new(RefCell::new(None)),
             copy_label,
+            branch_label,
         }
     }
 
@@ -6928,6 +7078,7 @@ mod tests {
             Rc::clone(&chat),
             &theme,
             Rc::new(std::cell::Cell::new(false)),
+            Rc::new(RefCell::new(None)),
             Rc::clone(&selection_copied),
         );
         let ctx = draw_ctx(40, 10);

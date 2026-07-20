@@ -62,7 +62,6 @@ use vaxis::vxfw::{
 };
 
 use crate::agent_picker::{AgentPickerOutcome, PickerSnapshot, open_agent_picker};
-use crate::branch_banner::BranchBanner;
 use crate::content_overlay::{ContentStyles, Row, auth_rows, session_info_rows, set_rows};
 use crate::footer::FooterLine;
 use crate::frame_stats_box::FrameStatsBox;
@@ -873,63 +872,12 @@ fn sync_status(world: &World) -> bool {
     next.animating()
 }
 
-/// Character budget for the branch-anchor footer preview, past which the
-/// prefilled message is truncated with an ellipsis.
-const BRANCH_PREVIEW_CHARS: usize = 40;
-
-/// An armed branch anchor: the user pressed `b` on a focused user message, the
-/// editor now holds that message, and a submit will rebuild the session at the
-/// message's parent. Lives in a shell slot (the parked-slot pattern) so the
-/// branch banner reads it while the drive loop resolves it on submit.
-#[derive(Clone)]
-struct BranchAnchor {
-    /// The focused user message's stable id, resolved against the log on
-    /// submit to find the branch point (the message's parent).
-    message_id: String,
-}
-
-/// Arm a branch anchor: store the message id and the banner indicator preview.
-/// The two slots move in lockstep, so a set indicator is exactly "an anchor is
-/// armed".
-fn arm_branch(
-    anchor: &Rc<RefCell<Option<BranchAnchor>>>,
-    indicator: &Rc<RefCell<Option<String>>>,
-    message_id: String,
-    preview: String,
-) {
-    *anchor.borrow_mut() = Some(BranchAnchor { message_id });
-    *indicator.borrow_mut() = Some(preview);
-}
-
-/// Clear both the branch-anchor resolution state and the banner indicator.
-fn clear_branch(
-    anchor: &Rc<RefCell<Option<BranchAnchor>>>,
-    indicator: &Rc<RefCell<Option<String>>>,
-) {
-    *anchor.borrow_mut() = None;
-    *indicator.borrow_mut() = None;
-}
-
-/// The banner indicator for an armed anchor: a label plus a one-line,
-/// truncated preview of the prefilled message, so the pending branch behavior
-/// is never a surprise.
-fn branch_indicator_text(message: &str) -> String {
-    let first_line = message
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("");
-    let chars: Vec<char> = first_line.chars().collect();
-    let preview = if chars.len() > BRANCH_PREVIEW_CHARS {
-        let mut s: String = chars[..BRANCH_PREVIEW_CHARS.saturating_sub(1)]
-            .iter()
-            .collect();
-        s.push('\u{2026}');
-        s
-    } else {
-        first_line.to_string()
-    };
-    format!("branching from message: {preview}")
+/// Arm a branch anchor: record the branched-from user message's stable id.
+/// A submit resolves it against the log to find the branch point (the
+/// message's parent), and the transcript reads it to keep the highlight box on
+/// that message while the editor holds focus. `Some` iff a branch is armed.
+fn arm_branch(anchor: &Rc<RefCell<Option<String>>>, message_id: String) {
+    *anchor.borrow_mut() = Some(message_id);
 }
 
 /// The notice folded when a gesture incoherent with an armed branch anchor
@@ -1365,12 +1313,7 @@ async fn submit_with_armed_anchor(
         return ArmedSubmit::Stay;
     }
     // Resolve the anchor against the log.
-    let message_id = shell
-        .borrow()
-        .branch_anchor
-        .borrow()
-        .as_ref()
-        .map(|a| a.message_id.clone());
+    let message_id = shell.borrow().branch_anchor.borrow().clone();
     let Some(message_id) = message_id else {
         // No anchor: the caller gates on `is_some`, so this is unreachable in
         // practice. Treat it as a plain submit rather than panicking.
@@ -3112,9 +3055,6 @@ struct Shell {
     splash: Rc<RefCell<Splash>>,
     pending: Rc<RefCell<PendingBox>>,
     footer: Rc<RefCell<FooterLine>>,
-    /// The branch banner above the editor, kept so [`Shell::restyle`] can
-    /// re-tint it. Reads the shared `branch_indicator` at draw.
-    branch_banner: Rc<RefCell<BranchBanner>>,
     /// Confirmed config edits parked by the selector and settings overlays
     /// for the drive loop to apply through the shared settings core (the
     /// overlays can't reach the async cores or the session world). Drained
@@ -3157,15 +3097,13 @@ struct Shell {
     /// drained by the drive loop (which owns the credential store and the
     /// login task machinery).
     auth_request: Rc<RefCell<Option<AuthPickerRequest>>>,
-    /// The armed branch anchor, `Some` while the user is composing a branch
-    /// (after `b`). The `on_action` handler arms it, the drive loop resolves
-    /// it on submit, and any session install clears it so a stale anchor can't
-    /// resolve against a different session's log.
-    branch_anchor: Rc<RefCell<Option<BranchAnchor>>>,
-    /// The branch banner's indicator, in lockstep with `branch_anchor`: the
-    /// short "branching from message" preview shown while armed, `None`
-    /// otherwise. Shared with the [`BranchBanner`], which reads it at draw.
-    branch_indicator: Rc<RefCell<Option<String>>>,
+    /// The armed branch anchor: the branched-from user message's stable id,
+    /// `Some` while the user is composing a branch (after `b`). The
+    /// `on_action` handler arms it, the drive loop resolves it on submit, the
+    /// transcript reads it to keep the highlight box on that message, and any
+    /// session install clears it so a stale anchor can't resolve against a
+    /// different session's log.
+    branch_anchor: Rc<RefCell<Option<String>>>,
     /// Set by the Esc handler when it cancels an armed anchor, so the drive
     /// loop folds the cancel notice (the Shell can't reach the chat model's
     /// lifecycle). A plain flag, drained once per input event.
@@ -3233,13 +3171,13 @@ impl Shell {
         // The global busy flag, refreshed each drive-loop iteration. Read by
         // the session-overlay confirm closures to refuse a switch mid-work.
         let busy: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        // Branch-anchor slots, following the parked-slot pattern: `on_action`
-        // arms them on `b`, the drive loop resolves them on submit, the branch
-        // banner reads the indicator at draw, and the Esc handler flips
-        // `branch_cancelled` so the drive loop folds the cancel notice. Created
-        // here so the closures and the banner all share the same cells.
-        let branch_anchor: Rc<RefCell<Option<BranchAnchor>>> = Rc::new(RefCell::new(None));
-        let branch_indicator: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        // Branch-anchor slot, following the parked-slot pattern: `on_action`
+        // arms it on `b`, the drive loop resolves it on submit, the transcript
+        // reads it to keep the highlight box on the branched-from message, and
+        // the Esc handler flips `branch_cancelled` so the drive loop folds the
+        // cancel notice. Created here so the closures and the transcript all
+        // share the same cell.
+        let branch_anchor: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let branch_cancelled: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         // Resolve the initial styles and chrome from a single snapshot of
         // the theme, then keep the handle for the runtime re-style path.
@@ -3250,6 +3188,7 @@ impl Shell {
                 Rc::clone(&chat),
                 &t,
                 Rc::clone(&focus_mode),
+                Rc::clone(&branch_anchor),
                 Rc::clone(&selection_copied),
             )));
             editor.borrow_mut().set_theme(editor_theme_from_theme(&t));
@@ -3293,10 +3232,6 @@ impl Shell {
             Rc::clone(&styles),
             cwd_display,
         )));
-        let branch_banner = Rc::new(RefCell::new(BranchBanner::new(
-            Rc::clone(&branch_indicator),
-            Rc::clone(&styles),
-        )));
         // The empty-state splash and the transcript share the chat slot. The
         // `ChatSlot` wrapper draws whichever fits the current state, so the
         // transcript's focus and scroll wiring is untouched while it is shown.
@@ -3306,10 +3241,9 @@ impl Shell {
             splash: Rc::clone(&splash),
             transcript: Rc::clone(&transcript),
         }));
-        // Slot order mirrors `aj`'s layout: header, chat (flex),
-        // status, pending, branch banner, editor, footer. The status,
-        // pending, and branch-banner slots collapse to zero height while
-        // idle/empty/disarmed, so the editor sits flush under the chat
+        // Slot order mirrors `aj`'s layout: header, chat (flex), status,
+        // pending, editor, footer. The status and pending slots collapse to
+        // zero height while idle/empty, so the editor sits flush under the chat
         // between turns.
         let header_line = Rc::new(RefCell::new(Text::new(&header)));
         let layout: WidgetRef = Rc::new(RefCell::new(FlexColumn {
@@ -3318,7 +3252,6 @@ impl Shell {
                 FlexItem::init(to_widget_ref(Rc::clone(&chat_slot)), 1),
                 FlexItem::init(to_widget_ref(Rc::clone(&status_line)), 0),
                 FlexItem::init(to_widget_ref(Rc::clone(&pending)), 0),
-                FlexItem::init(to_widget_ref(Rc::clone(&branch_banner)), 0),
                 FlexItem::init(to_widget_ref(Rc::clone(&editor)), 0),
                 FlexItem::init(to_widget_ref(Rc::clone(&footer)), 0),
             ],
@@ -3365,7 +3298,6 @@ impl Shell {
             let transcript_widget: WidgetRef = to_widget_ref(Rc::clone(&transcript));
             let editor_for_actions = Rc::clone(&editor);
             let branch_anchor_for_actions = Rc::clone(&branch_anchor);
-            let branch_indicator_for_actions = Rc::clone(&branch_indicator);
             let action_slot = Rc::clone(&host_action);
             let theme_for_actions = theme.clone();
             Box::new(move |ctx, action| match action {
@@ -3464,16 +3396,13 @@ impl Shell {
                     drop(transcript);
                     if let Some((message_id, text)) = anchor {
                         // Prefill the editor with the message, arm the anchor,
-                        // and move focus to the editor. The focus move's
-                        // `FocusOut` exits transcript focus, matching the copy
-                        // shortcut's contract of overwriting the editor.
+                        // and move focus to the editor so the user edits the
+                        // branch prompt. The focus move's `FocusOut` exits
+                        // transcript focus, but the transcript keeps the
+                        // highlight box on the branched-from message by reading
+                        // the armed anchor.
                         editor_for_actions.borrow_mut().set_text(&text);
-                        arm_branch(
-                            &branch_anchor_for_actions,
-                            &branch_indicator_for_actions,
-                            message_id,
-                            branch_indicator_text(&text),
-                        );
+                        arm_branch(&branch_anchor_for_actions, message_id);
                         ctx.request_focus(Rc::clone(&editor_widget));
                         ctx.redraw = true;
                     }
@@ -3566,7 +3495,6 @@ impl Shell {
             splash,
             pending,
             footer,
-            branch_banner,
             selector_activity,
             settings_ui,
             picker_outcome,
@@ -3579,7 +3507,6 @@ impl Shell {
             session_request,
             auth_request,
             branch_anchor,
-            branch_indicator,
             branch_cancelled,
         }
     }
@@ -3589,9 +3516,9 @@ impl Shell {
         self.submitted.borrow_mut().take()
     }
 
-    /// Clear the armed branch anchor and its banner indicator.
+    /// Clear the armed branch anchor.
     fn disarm_branch(&self) {
-        clear_branch(&self.branch_anchor, &self.branch_indicator);
+        *self.branch_anchor.borrow_mut() = None;
     }
 
     /// Raise a transient bottom-right toast with `body`. Live toasts
@@ -3711,9 +3638,6 @@ impl Shell {
             .borrow_mut()
             .set_styles(Rc::clone(&styles), t.color_mode());
         self.pending.borrow_mut().set_styles(Rc::clone(&styles));
-        self.branch_banner
-            .borrow_mut()
-            .set_styles(Rc::clone(&styles));
         self.footer.borrow_mut().set_styles(styles);
         self.editor
             .borrow_mut()
@@ -4776,7 +4700,7 @@ async fn drive(
                         }
                         // An Esc that cancelled an armed branch anchor: fold
                         // the cancel notice (the Shell can't reach the chat
-                        // lifecycle) and redraw so the indicator clears.
+                        // lifecycle) and redraw so it shows.
                         if shell.borrow().take_branch_cancelled() {
                             fold_notice(world, "Branch cancelled.");
                             app.request_redraw();
@@ -7615,6 +7539,7 @@ mod tests {
             Rc::clone(&world.chat),
             &Theme::bundled_dark_with_mode(aj_app::theme::ColorMode::Truecolor),
             Rc::new(std::cell::Cell::new(false)),
+            Rc::new(std::cell::RefCell::new(None)),
             Rc::new(std::cell::Cell::new(None)),
         );
         let ctx = DrawContext {
@@ -9594,12 +9519,7 @@ mod tests {
         let _ = shell.borrow_mut().draw(&full_draw_ctx());
         {
             let shell = shell.borrow();
-            arm_branch(
-                &shell.branch_anchor,
-                &shell.branch_indicator,
-                "m1".to_string(),
-                branch_indicator_text("branch draft"),
-            );
+            arm_branch(&shell.branch_anchor, "m1".to_string());
         }
 
         writer.write_all(b"\x1b").expect("write first esc");
@@ -11383,21 +11303,6 @@ mod tests {
 
     // --- Branch flow (Phase 3) ---
 
-    /// The footer branch indicator labels and truncates the prefilled message
-    /// to one line.
-    #[test]
-    fn branch_indicator_text_labels_and_truncates() {
-        let short = branch_indicator_text("hello world");
-        assert_eq!(short, "branching from message: hello world");
-        // A multi-line message collapses to its first non-empty line.
-        let multi = branch_indicator_text("\n  first line  \nsecond line");
-        assert_eq!(multi, "branching from message: first line");
-        // A long line is truncated with an ellipsis.
-        let long = branch_indicator_text(&"x".repeat(100));
-        assert!(long.ends_with('\u{2026}'), "truncated: {long}");
-        assert!(long.chars().count() < 100);
-    }
-
     /// The clean-rebuild branch confirmation distinguishes the `b`-submit
     /// flow (a prompt is handed off) from a tree-view switch (a bare head
     /// move).
@@ -11413,75 +11318,34 @@ mod tests {
         );
     }
 
-    /// Arming sets the anchor and the banner indicator; re-arming replaces
-    /// both; disarming clears them.
+    /// Arming records the branched-from message id; re-arming replaces it;
+    /// disarming clears it. The transcript reads this cell to keep the
+    /// highlight box on the branched-from message (that rendering is covered
+    /// in the transcript tests).
     #[tokio::test]
-    async fn arming_sets_indicator_and_rearm_replaces_and_disarm_clears() {
+    async fn arming_sets_anchor_and_rearm_replaces_and_disarm_clears() {
         let dir = TempDir::new().expect("tempdir");
         let (_world, shell) = world_and_shell(&dir, "streaming-text").await;
-        {
-            let sh = shell.borrow();
-            arm_branch(
-                &sh.branch_anchor,
-                &sh.branch_indicator,
-                "m1".to_string(),
-                branch_indicator_text("first message"),
-            );
-        }
+        arm_branch(&shell.borrow().branch_anchor, "m1".to_string());
         assert_eq!(
-            shell
-                .borrow()
-                .branch_anchor
-                .borrow()
-                .as_ref()
-                .map(|a| a.message_id.clone()),
+            shell.borrow().branch_anchor.borrow().clone(),
             Some("m1".to_string())
         );
-        // The banner above the editor renders the indicator.
-        let row = {
-            let sh = shell.borrow();
-            let surface = sh
-                .branch_banner
-                .borrow_mut()
-                .draw(&crate::test_support::draw_ctx(120, None));
-            crate::test_support::rows(&surface).join("\n")
-        };
-        assert!(
-            row.contains("branching from message: first message"),
-            "banner shows the indicator: {row:?}"
-        );
 
-        // Re-arming replaces the anchor and indicator.
-        {
-            let sh = shell.borrow();
-            arm_branch(
-                &sh.branch_anchor,
-                &sh.branch_indicator,
-                "m2".to_string(),
-                branch_indicator_text("second message"),
-            );
-        }
+        // Re-arming replaces the anchor.
+        arm_branch(&shell.borrow().branch_anchor, "m2".to_string());
         assert_eq!(
-            shell
-                .borrow()
-                .branch_anchor
-                .borrow()
-                .as_ref()
-                .map(|a| a.message_id.clone()),
+            shell.borrow().branch_anchor.borrow().clone(),
             Some("m2".to_string())
         );
-        assert_eq!(
-            shell.borrow().branch_indicator.borrow().clone(),
-            Some("branching from message: second message".to_string())
-        );
 
-        // Disarming clears both slots.
+        // Disarming clears it.
         shell.borrow().disarm_branch();
         assert!(shell.borrow().branch_anchor.borrow().is_none());
-        assert!(shell.borrow().branch_indicator.borrow().is_none());
     }
 
-    /// Esc cancels an armed anchor: it clears the anchor and indicator, flags
+    /// Esc cancels an armed anchor: it clears the anchor (dropping the
+    /// transcript's highlight box), flags
     /// the drive loop to fold the cancel notice, and consumes the key. The
     /// editor text is left untouched (the user's to keep). The popup-first
     /// priority is structural: the editor consumes Esc at the target phase
@@ -11494,12 +11358,7 @@ mod tests {
         shell.borrow().editor.borrow_mut().set_text("kept draft");
         {
             let sh = shell.borrow();
-            arm_branch(
-                &sh.branch_anchor,
-                &sh.branch_indicator,
-                "m1".to_string(),
-                branch_indicator_text("kept draft"),
-            );
+            arm_branch(&sh.branch_anchor, "m1".to_string());
         }
         let mut ctx = EventContext::new();
         shell.borrow_mut().handle_event(
@@ -11514,10 +11373,6 @@ mod tests {
         assert!(
             shell.borrow().branch_anchor.borrow().is_none(),
             "anchor cleared"
-        );
-        assert!(
-            shell.borrow().branch_indicator.borrow().is_none(),
-            "indicator cleared"
         );
         assert!(
             shell.borrow().take_branch_cancelled(),
@@ -11540,12 +11395,7 @@ mod tests {
         shell.borrow().editor.borrow_mut().set_text("branch draft");
         {
             let sh = shell.borrow();
-            arm_branch(
-                &sh.branch_anchor,
-                &sh.branch_indicator,
-                "m1".to_string(),
-                branch_indicator_text("branch draft"),
-            );
+            arm_branch(&sh.branch_anchor, "m1".to_string());
         }
         // Steer is refused: the editor keeps its draft and the anchor stays.
         assert!(handle_host_action(&mut world, &shell, AjAction::Steer));
@@ -11565,12 +11415,7 @@ mod tests {
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         {
             let sh = shell.borrow();
-            arm_branch(
-                &sh.branch_anchor,
-                &sh.branch_indicator,
-                "m1".to_string(),
-                branch_indicator_text("x"),
-            );
+            arm_branch(&sh.branch_anchor, "m1".to_string());
         }
         let outcome = submit_with_armed_anchor(&mut world, &shell, "   ".to_string()).await;
         assert!(matches!(outcome, ArmedSubmit::Stay));
@@ -11593,12 +11438,7 @@ mod tests {
         let turns_before = world.turns.driven();
         {
             let sh = shell.borrow();
-            arm_branch(
-                &sh.branch_anchor,
-                &sh.branch_indicator,
-                "m1".to_string(),
-                branch_indicator_text("edited"),
-            );
+            arm_branch(&sh.branch_anchor, "m1".to_string());
         }
         let outcome = submit_with_armed_anchor(&mut world, &shell, "edited".to_string()).await;
         assert!(matches!(outcome, ArmedSubmit::Stay));
@@ -11643,12 +11483,7 @@ mod tests {
         let task = register_bash_task(&world, "sleep 100");
         {
             let sh = shell.borrow();
-            arm_branch(
-                &sh.branch_anchor,
-                &sh.branch_indicator,
-                "m1".to_string(),
-                branch_indicator_text("edited"),
-            );
+            arm_branch(&sh.branch_anchor, "m1".to_string());
         }
         let outcome = submit_with_armed_anchor(&mut world, &shell, "edited".to_string()).await;
         assert!(matches!(outcome, ArmedSubmit::Stay));
@@ -11705,12 +11540,7 @@ mod tests {
         };
         {
             let sh = shell.borrow();
-            arm_branch(
-                &sh.branch_anchor,
-                &sh.branch_indicator,
-                message_id,
-                branch_indicator_text("persist me"),
-            );
+            arm_branch(&sh.branch_anchor, message_id);
         }
         match submit_with_armed_anchor(&mut world, &shell, "edited prompt".to_string()).await {
             ArmedSubmit::Branch { head, prompt } => {
@@ -12071,12 +11901,7 @@ mod tests {
         let shell = shell_for(&world);
         {
             let sh = shell.borrow();
-            arm_branch(
-                &sh.branch_anchor,
-                &sh.branch_indicator,
-                root_id,
-                branch_indicator_text("root"),
-            );
+            arm_branch(&sh.branch_anchor, root_id);
         }
         let outcome =
             submit_with_armed_anchor(&mut world, &shell, "edited root prompt".to_string()).await;
@@ -12106,12 +11931,7 @@ mod tests {
         let previous_id = world.core.session_id.clone();
         {
             let sh = shell.borrow();
-            arm_branch(
-                &sh.branch_anchor,
-                &sh.branch_indicator,
-                "m1".to_string(),
-                branch_indicator_text("armed draft"),
-            );
+            arm_branch(&sh.branch_anchor, "m1".to_string());
         }
         assert!(
             shell.borrow().branch_anchor.borrow().is_some(),
@@ -12133,10 +11953,6 @@ mod tests {
         assert!(
             shell.borrow().branch_anchor.borrow().is_none(),
             "install clears the armed anchor"
-        );
-        assert!(
-            shell.borrow().branch_indicator.borrow().is_none(),
-            "and its banner indicator"
         );
     }
 
