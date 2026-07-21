@@ -21,6 +21,17 @@
 //! - [`tree`] projects the log's branch structure onto a
 //!   segment-collapsed [`SessionTree`] for the tree-view overlay.
 
+/// How many lines a blocking file scan reads between cancellation polls.
+///
+/// The preview and prompt-history scans run on the blocking pool and
+/// can't be aborted by the runtime, so they poll a caller-supplied
+/// `cancel` predicate to bail early when the consumer goes away. We poll
+/// once per this many lines rather than per line: the check is cheap but
+/// not free, and this keeps it off the hot parse path while still
+/// bounding the worst-case stall to a few milliseconds of parsing even
+/// on a single huge session file.
+pub(crate) const SCAN_CANCEL_CHECK_LINES: usize = 1024;
+
 pub mod compaction;
 pub mod listener;
 pub mod log;

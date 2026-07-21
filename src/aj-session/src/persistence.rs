@@ -158,7 +158,7 @@ impl ConversationPersistence {
         let total = candidates.len();
         let mut previews = Vec::with_capacity(total);
         for (i, (session_id, path)) in candidates.into_iter().enumerate() {
-            if let Some(preview) = read_preview(session_id, &path) {
+            if let Some(preview) = read_preview(session_id, &path, &|| false) {
                 previews.push(preview);
             }
             // Tick progress for every file, including the pre-refactor
@@ -178,7 +178,17 @@ impl ConversationPersistence {
     /// Mirrors the failure tolerance of [`Self::list_session_previews`]:
     /// a pre-refactor or unreadable file is skipped (no row emitted),
     /// and a missing or unreadable sessions directory emits nothing.
-    pub fn list_session_previews_streaming(&self, emit: &mut dyn FnMut(Vec<SessionPreview>)) {
+    /// `cancel` is polled between files and periodically within a file so
+    /// the scan, which runs on the blocking pool and can't be aborted,
+    /// bails promptly once the consumer (the selector overlay) goes away.
+    /// It should be sticky: once it returns true the scan stops, and a file
+    /// interrupted mid-read is dropped rather than emitted as a partial row.
+    /// Pass `&|| false` for an uninterruptible scan.
+    pub fn list_session_previews_streaming(
+        &self,
+        cancel: &dyn Fn() -> bool,
+        emit: &mut dyn FnMut(Vec<SessionPreview>),
+    ) {
         let candidates = match self.preview_candidates() {
             Ok(c) => c,
             Err(err) => {
@@ -190,7 +200,17 @@ impl ConversationPersistence {
             }
         };
         for (session_id, path) in candidates {
-            if let Some(preview) = read_preview(session_id, &path) {
+            if cancel() {
+                break;
+            }
+            if let Some(preview) = read_preview(session_id, &path, cancel) {
+                // A mid-file cancel leaves `read_preview` with a partial
+                // count, so re-check before emitting: a sticky `cancel` is
+                // true here and we drop the partial rather than show a row
+                // with a truncated message count.
+                if cancel() {
+                    break;
+                }
                 emit(vec![preview]);
             }
         }
@@ -238,8 +258,12 @@ impl ConversationPersistence {
 /// applies. A read error (the file vanished or became unreadable between
 /// enumeration and the open) also drops it, the same way `list_sessions`
 /// does, so the two listings stay consistent.
-fn read_preview(session_id: String, path: &std::path::Path) -> Option<SessionPreview> {
-    match read_session_preview_file(&session_id, path) {
+fn read_preview(
+    session_id: String,
+    path: &std::path::Path,
+    cancel: &dyn Fn() -> bool,
+) -> Option<SessionPreview> {
+    match read_session_preview_file(&session_id, path, cancel) {
         Ok(Some(preview)) => Some(preview),
         Ok(None) => {
             tracing::info!(
@@ -331,6 +355,7 @@ pub struct SessionPreview {
 fn read_session_preview_file(
     session_id: &str,
     path: &std::path::Path,
+    cancel: &dyn Fn() -> bool,
 ) -> Result<Option<SessionPreview>, ConversationError> {
     let metadata = fs::metadata(path)?;
     let modified = metadata
@@ -351,7 +376,14 @@ fn read_session_preview_file(
     let mut last_message_at: Option<DateTime<Utc>> = None;
     let mut seen_first_entry = false;
 
-    for line_res in reader.lines() {
+    for (lineno, line_res) in reader.lines().enumerate() {
+        // Cooperative cancellation: this runs on the blocking pool, so we
+        // poll `cancel` and stop reading once the consumer is gone. We may
+        // break with a partial count; the streaming caller re-checks
+        // `cancel` before emitting and drops it, so no truncated row shows.
+        if lineno % crate::SCAN_CANCEL_CHECK_LINES == 0 && cancel() {
+            break;
+        }
         // A best-effort `Ok(_)`-only path: an IO error mid-file
         // shouldn't mask the entries we already accumulated. Same
         // policy as the resume tolerance for truncated lines.
@@ -570,7 +602,7 @@ mod tests {
         // Each emit carries exactly one file's preview, in the same
         // newest-first order the batched listing produces.
         let mut batches = Vec::new();
-        persistence.list_session_previews_streaming(&mut |b| batches.push(b));
+        persistence.list_session_previews_streaming(&|| false, &mut |b| batches.push(b));
         assert!(
             batches.iter().all(|b| b.len() == 1),
             "expected one preview per batch, got {:?}",
@@ -591,11 +623,79 @@ mod tests {
     }
 
     #[test]
+    fn list_session_previews_streaming_stops_when_cancelled() {
+        let (_dir, persistence) = fixture();
+        for i in 0..3 {
+            let mut log = ConversationLog::create(&persistence).expect("create");
+            append_user_then_assistant(&mut log, &format!("prompt {i}"), &format!("reply {i}"));
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        // A predicate that trips after the first file leaves the walk: the
+        // between-files check must break before reading the rest.
+        let seen = std::cell::Cell::new(0usize);
+        let mut batches = Vec::new();
+        persistence.list_session_previews_streaming(&|| seen.get() > 0, &mut |b| {
+            seen.set(seen.get() + 1);
+            batches.push(b);
+        });
+        assert_eq!(batches.len(), 1, "cancel should stop after the first file");
+    }
+
+    #[test]
+    fn read_session_preview_file_stops_mid_file() {
+        // A single file larger than the in-file poll interval, so the check
+        // inside the read loop (not the between-files check) is what bails.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("2024-01-01-00-00-00.jsonl");
+        let n = crate::SCAN_CANCEL_CHECK_LINES * 3;
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&path).unwrap();
+            for i in 0..n {
+                let line = serde_json::to_string(&serde_json::json!({
+                    "id": format!("{i:08}"),
+                    "thread": "user",
+                    "type": "message",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": format!("p{i}")}],
+                        "timestamp": 0,
+                    },
+                }))
+                .unwrap();
+                writeln!(file, "{line}").unwrap();
+            }
+        }
+
+        let full = read_session_preview_file("2024-01-01-00-00-00", &path, &|| false)
+            .expect("read")
+            .expect("valid first line");
+        assert_eq!(full.message_count, n);
+
+        // Sticky predicate: false at the line-0 poll, true from line-1024 on.
+        let calls = std::cell::Cell::new(0usize);
+        let cancel = || {
+            let c = calls.get();
+            calls.set(c + 1);
+            c > 0
+        };
+        let partial = read_session_preview_file("2024-01-01-00-00-00", &path, &cancel)
+            .expect("read")
+            .expect("valid first line");
+        assert_eq!(
+            partial.message_count,
+            crate::SCAN_CANCEL_CHECK_LINES,
+            "in-file cancel bails at the 1024-line poll, not after the full read"
+        );
+    }
+
+    #[test]
     fn list_session_previews_streaming_missing_dir_emits_nothing() {
         let dir = TempDir::new().unwrap();
         let persistence = ConversationPersistence::new(dir.path().join("missing"));
         let mut batches = Vec::new();
-        persistence.list_session_previews_streaming(&mut |b| batches.push(b));
+        persistence.list_session_previews_streaming(&|| false, &mut |b| batches.push(b));
         assert!(batches.is_empty());
     }
 
@@ -673,7 +773,7 @@ mod tests {
         lines.insert(1, "}{ this is not json".to_string());
         std::fs::write(&path, format!("{}\n", lines.join("\n"))).expect("rewrite");
 
-        let preview = read_session_preview_file(&session_id, &path)
+        let preview = read_session_preview_file(&session_id, &path, &|| false)
             .expect("read")
             .expect("a valid first line keeps the file");
         // The two messages survive. Only the torn line is skipped.

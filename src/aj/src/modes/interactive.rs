@@ -3224,7 +3224,7 @@ async fn handle_command(
             let scan = {
                 let persistence = conversation_persistence.clone();
                 move |emit: &mut dyn FnMut(Vec<_>)| {
-                    persistence.list_session_previews_streaming(emit)
+                    persistence.list_session_previews_streaming(&|| false, emit)
                 }
             };
 

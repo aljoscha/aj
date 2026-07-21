@@ -2675,17 +2675,27 @@ fn spawn_history_scan(
     let persistence = world.persistence.clone();
     tokio::task::spawn_blocking(move || {
         {
+            // Stop the walk once the receiver is gone (overlay closed or the
+            // app is quitting): the scan runs on the blocking pool and would
+            // otherwise pin process shutdown until it finished reading.
+            let cancel = || tx.is_closed();
             let mut emit = |batch: Vec<PromptEntry>| {
                 let _ = tx.send(ScanMsg::Batch(batch));
             };
             match scope {
-                HistoryScope::Workspace => {
-                    aj_session::workspace_history_streaming(&persistence, MAX_ENTRIES, &mut emit)
-                }
+                HistoryScope::Workspace => aj_session::workspace_history_streaming(
+                    &persistence,
+                    MAX_ENTRIES,
+                    &cancel,
+                    &mut emit,
+                ),
                 HistoryScope::All => match Config::get_sessions_base_dir_path() {
-                    Ok(base) => {
-                        aj_session::all_workspaces_history_streaming(&base, MAX_ENTRIES, &mut emit)
-                    }
+                    Ok(base) => aj_session::all_workspaces_history_streaming(
+                        &base,
+                        MAX_ENTRIES,
+                        &cancel,
+                        &mut emit,
+                    ),
                     // Fall back to the current workspace so the toggle still
                     // shows something when the base dir can't be resolved.
                     Err(err) => {
@@ -2693,6 +2703,7 @@ fn spawn_history_scan(
                         aj_session::workspace_history_streaming(
                             &persistence,
                             MAX_ENTRIES,
+                            &cancel,
                             &mut emit,
                         )
                     }
@@ -2716,9 +2727,19 @@ fn spawn_history_scan(
 fn spawn_session_scan(world: &World, tx: UnboundedSender<ScanMsg<SessionPreview>>) {
     let persistence = world.persistence.clone();
     tokio::task::spawn_blocking(move || {
-        persistence.list_session_previews_streaming(&mut |batch| {
-            let _ = tx.send(ScanMsg::Batch(batch));
-        });
+        {
+            // Stop the walk once the receiver is gone (overlay closed or the
+            // app is quitting): the scan runs on the blocking pool and would
+            // otherwise pin process shutdown until it finished reading. The
+            // current session is the largest and is scanned first, so an
+            // in-file cancellation check (inside the streaming scan) is what
+            // actually bounds the stall.
+            let cancel = || tx.is_closed();
+            let mut emit = |batch: Vec<SessionPreview>| {
+                let _ = tx.send(ScanMsg::Batch(batch));
+            };
+            persistence.list_session_previews_streaming(&cancel, &mut emit);
+        }
         let _ = tx.send(ScanMsg::Done);
     });
 }
@@ -2792,8 +2813,12 @@ fn spawn_prompt_history_bootstrap(
 ) -> UnboundedReceiver<Vec<String>> {
     let (tx, rx) = unbounded_channel();
     tokio::task::spawn_blocking(move || {
+        // Stop the walk once the receiver is gone (the app is quitting before
+        // the ring was seeded): the scan runs on the blocking pool and would
+        // otherwise pin process shutdown.
+        let cancel = || tx.is_closed();
         let mut entries: Vec<String> =
-            aj_session::workspace_history(&persistence, TextArea::HISTORY_LIMIT)
+            aj_session::workspace_history(&persistence, TextArea::HISTORY_LIMIT, &cancel)
                 .into_iter()
                 .map(|e| e.text)
                 .collect();
@@ -11194,7 +11219,7 @@ mod tests {
         let mut previews = Vec::new();
         world
             .persistence
-            .list_session_previews_streaming(&mut |batch| previews.extend(batch));
+            .list_session_previews_streaming(&|| false, &mut |batch| previews.extend(batch));
         assert!(
             previews.len() >= 2,
             "alpha + the current session are on disk: {}",
@@ -11242,7 +11267,7 @@ mod tests {
         let mut previews = Vec::new();
         world
             .persistence
-            .list_session_previews_streaming(&mut |batch| previews.extend(batch));
+            .list_session_previews_streaming(&|| false, &mut |batch| previews.extend(batch));
         extend_session_scan(&scan, &previews, Utc::now(), true, true);
         app.render(&root).expect("render");
         writer.write_all(b"\r").expect("enter on the current row");

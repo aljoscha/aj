@@ -40,9 +40,13 @@ pub struct PromptEntry {
 
 /// Collect the current workspace's submitted prompts, newest-first and
 /// deduplicated, capped at `max`.
-pub fn workspace_history(persistence: &ConversationPersistence, max: usize) -> Vec<PromptEntry> {
+pub fn workspace_history(
+    persistence: &ConversationPersistence,
+    max: usize,
+    cancel: &dyn Fn() -> bool,
+) -> Vec<PromptEntry> {
     let mut out = Vec::new();
-    workspace_history_streaming(persistence, max, &mut |batch| out.extend(batch));
+    workspace_history_streaming(persistence, max, cancel, &mut |batch| out.extend(batch));
     out
 }
 
@@ -57,6 +61,7 @@ pub fn workspace_history(persistence: &ConversationPersistence, max: usize) -> V
 pub fn workspace_history_streaming(
     persistence: &ConversationPersistence,
     max: usize,
+    cancel: &dyn Fn() -> bool,
     emit: &mut dyn FnMut(Vec<PromptEntry>),
 ) {
     let mut seen = HashSet::new();
@@ -66,6 +71,7 @@ pub fn workspace_history_streaming(
         None,
         &mut seen,
         &mut remaining,
+        cancel,
         emit,
     );
 }
@@ -82,7 +88,9 @@ pub fn workspace_history_streaming(
 /// stable but not a "most recent workspace" guarantee.
 pub fn all_workspaces_history(sessions_base: &Path, max: usize) -> Vec<PromptEntry> {
     let mut out = Vec::new();
-    all_workspaces_history_streaming(sessions_base, max, &mut |batch| out.extend(batch));
+    all_workspaces_history_streaming(sessions_base, max, &|| false, &mut |batch| {
+        out.extend(batch)
+    });
     out
 }
 
@@ -93,6 +101,7 @@ pub fn all_workspaces_history(sessions_base: &Path, max: usize) -> Vec<PromptEnt
 pub fn all_workspaces_history_streaming(
     sessions_base: &Path,
     max: usize,
+    cancel: &dyn Fn() -> bool,
     emit: &mut dyn FnMut(Vec<PromptEntry>),
 ) {
     let read_dir = match std::fs::read_dir(sessions_base) {
@@ -120,14 +129,14 @@ pub fn all_workspaces_history_streaming(
     let mut seen = HashSet::new();
     let mut remaining = max;
     for dir in &projects {
-        if remaining == 0 {
+        if remaining == 0 || cancel() {
             break;
         }
         let project = dir
             .file_name()
             .and_then(|n| n.to_str())
             .map(|s| s.to_string());
-        collect_dir(dir, project, &mut seen, &mut remaining, emit);
+        collect_dir(dir, project, &mut seen, &mut remaining, cancel, emit);
     }
 }
 
@@ -142,6 +151,7 @@ fn collect_dir(
     project: Option<String>,
     seen: &mut HashSet<String>,
     remaining: &mut usize,
+    cancel: &dyn Fn() -> bool,
     emit: &mut dyn FnMut(Vec<PromptEntry>),
 ) {
     let read_dir = match std::fs::read_dir(dir) {
@@ -162,12 +172,18 @@ fn collect_dir(
     files.reverse();
 
     for path in &files {
-        if *remaining == 0 {
+        if *remaining == 0 || cancel() {
             return;
         }
         // Within a file prompts are chronological; reverse so the most
         // recent prompt in this file lands first.
-        let mut prompts = load_file_prompts(path);
+        let mut prompts = load_file_prompts(path, cancel);
+        // A mid-file cancel returns a partial (still chronological) read.
+        // Drop it rather than reverse-and-emit an out-of-order partial
+        // batch. A sticky `cancel` is true here after an in-file break.
+        if cancel() {
+            return;
+        }
         prompts.reverse();
         let mut batch = Vec::new();
         for text in prompts {
@@ -191,8 +207,8 @@ fn collect_dir(
 /// Extract the user-submitted prompt texts from a single session file,
 /// in chronological (file) order, each fully trimmed with blanks
 /// dropped.
-fn load_file_prompts(path: &Path) -> Vec<String> {
-    scan_file_user_prompts(path)
+fn load_file_prompts(path: &Path, cancel: &dyn Fn() -> bool) -> Vec<String> {
+    scan_file_user_prompts_cancellable(path, cancel)
         .into_iter()
         .filter_map(|text| {
             let trimmed = text.trim();
@@ -216,6 +232,13 @@ fn load_file_prompts(path: &Path) -> Vec<String> {
 /// non-UTF-8 or unparseable lines are skipped without aborting the rest
 /// of the file.
 pub fn scan_file_user_prompts(path: &Path) -> Vec<String> {
+    scan_file_user_prompts_cancellable(path, &|| false)
+}
+
+/// [`scan_file_user_prompts`] with cooperative cancellation for the
+/// blocking-pool scans. `cancel` is polled periodically while reading so a
+/// large file doesn't pin the scan after the consumer has gone away.
+fn scan_file_user_prompts_cancellable(path: &Path, cancel: &dyn Fn() -> bool) -> Vec<String> {
     let file = match File::open(path) {
         Ok(f) => f,
         Err(e) => {
@@ -226,6 +249,13 @@ pub fn scan_file_user_prompts(path: &Path) -> Vec<String> {
 
     let mut prompts = Vec::new();
     for (lineno, line) in BufReader::new(file).lines().enumerate() {
+        // Cooperative cancellation: this runs on the blocking pool, so we
+        // poll `cancel` and stop reading once the consumer is gone. The
+        // caller (`collect_dir`) re-checks `cancel` and drops the partial
+        // read, so no out-of-order batch is emitted.
+        if lineno % crate::SCAN_CANCEL_CHECK_LINES == 0 && cancel() {
+            break;
+        }
         // A non-UTF-8 (or IO-erroring) line is skipped, not fatal: the
         // failure-isolation property a flat-file format lacks.
         let Ok(line) = line else { continue };
@@ -390,7 +420,7 @@ mod tests {
         );
 
         let persistence = ConversationPersistence::new(dir);
-        let entries = workspace_history(&persistence, 2000);
+        let entries = workspace_history(&persistence, 2000, &|| false);
         let texts: Vec<&str> = entries.iter().map(|e| e.text.as_str()).collect();
         // Newest file first, prompts within a file newest-first, then
         // older files; `second` deduped to its newest position.
@@ -415,12 +445,57 @@ mod tests {
 
         let persistence = ConversationPersistence::new(dir);
         let mut batches: Vec<Vec<String>> = Vec::new();
-        workspace_history_streaming(&persistence, 2000, &mut |batch| {
+        workspace_history_streaming(&persistence, 2000, &|| false, &mut |batch| {
             batches.push(batch.into_iter().map(|e| e.text).collect());
         });
         // One batch per file (newest file first); within a batch newest
         // prompt first; `second` deduped out of the older file's batch.
         assert_eq!(batches, vec![vec!["third", "second"], vec!["first"]]);
+    }
+
+    #[test]
+    fn scan_file_user_prompts_cancellable_stops_mid_file() {
+        // A single file larger than the in-file poll interval: the check
+        // inside the read loop (not just the between-files check) must bail.
+        let dir = scratch_dir("mid-file-cancel");
+        let n = crate::SCAN_CANCEL_CHECK_LINES * 3;
+        let lines: Vec<String> = (0..n)
+            .map(|i| user_line(&format!("p{i}"), &i.to_string()))
+            .collect();
+        write_jsonl(&dir, "2024-01-01-00-00-00", &lines);
+        let path = dir.join("2024-01-01-00-00-00.jsonl");
+
+        // Sticky predicate: false at the line-0 poll, true from the
+        // line-1024 poll onward.
+        let calls = std::cell::Cell::new(0usize);
+        let cancel = || {
+            let c = calls.get();
+            calls.set(c + 1);
+            c > 0
+        };
+
+        let prompts = scan_file_user_prompts_cancellable(&path, &cancel);
+        // Bails at the line-1024 poll, having read lines 0..1023. Without the
+        // in-file check it would read all 3072.
+        assert_eq!(prompts.len(), crate::SCAN_CANCEL_CHECK_LINES);
+    }
+
+    #[test]
+    fn workspace_history_streaming_stops_when_cancelled() {
+        let dir = scratch_dir("workspace-cancel");
+        write_jsonl(&dir, "2024-01-01-00-00-00", &[user_line("first", "1")]);
+        write_jsonl(&dir, "2024-02-01-00-00-00", &[user_line("second", "1")]);
+
+        // Trip the predicate after the first file's batch: the between-files
+        // check must break before reading the older file.
+        let persistence = ConversationPersistence::new(dir);
+        let seen = std::cell::Cell::new(0usize);
+        let mut batches: Vec<Vec<String>> = Vec::new();
+        workspace_history_streaming(&persistence, 2000, &|| seen.get() > 0, &mut |batch| {
+            seen.set(seen.get() + 1);
+            batches.push(batch.into_iter().map(|e| e.text).collect());
+        });
+        assert_eq!(batches, vec![vec!["second"]]);
     }
 
     #[test]
@@ -436,7 +511,7 @@ mod tests {
             ],
         );
         let persistence = ConversationPersistence::new(dir);
-        let entries = workspace_history(&persistence, 2);
+        let entries = workspace_history(&persistence, 2, &|| false);
         assert_eq!(entries.len(), 2, "cap honored: {entries:?}");
     }
 
@@ -489,7 +564,7 @@ mod tests {
             ],
         );
         let persistence = ConversationPersistence::new(dir);
-        let entries = workspace_history(&persistence, 2000);
+        let entries = workspace_history(&persistence, 2000, &|| false);
         let texts: Vec<&str> = entries.iter().map(|e| e.text.as_str()).collect();
         assert_eq!(texts, vec!["real prompt"], "harness notice excluded");
     }
