@@ -174,12 +174,16 @@ pub struct ModelInfo {
 // Catalog file schema
 // ============================================================================
 
-/// Current on-disk catalog schema version. Bump it whenever [`ModelInfo`]'s
-/// shape changes in a way that would make an older cache load with
-/// silently-wrong data. A user cache whose `schema_version` differs is
-/// ignored in favour of the bundled seed (see [`load_active_catalog`]),
-/// so an incompatible cache is a clean miss rather than a subtle bug.
-pub const CATALOG_SCHEMA_VERSION: u32 = 1;
+/// Current on-disk catalog schema version. Bump it whenever the bundled
+/// catalog must supersede an existing user cache: when [`ModelInfo`]'s
+/// shape changes in a way that would load older caches with
+/// silently-wrong data, or when the bundled seed carries corrected data
+/// that the additive load-time Codex splice can't push into a cache that
+/// already holds those entries. A user cache whose `schema_version`
+/// differs is ignored in favour of the bundled seed (see
+/// [`load_active_catalog`]), so an incompatible or stale cache is a clean
+/// miss rather than a subtle bug.
+pub const CATALOG_SCHEMA_VERSION: u32 = 2;
 
 /// On-disk catalog format shared by the bundled seed and the user cache.
 #[derive(Serialize, Deserialize, Clone, Debug)]
