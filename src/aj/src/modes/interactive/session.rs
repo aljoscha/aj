@@ -607,7 +607,6 @@ mod tests {
             cost: ModelCost::default(),
             context_window: 1_000,
             max_tokens: 100,
-            headers: None,
         }
     }
 

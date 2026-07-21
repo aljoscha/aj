@@ -42,7 +42,6 @@ pub fn scripted_model_info() -> ModelInfo {
         cost: aj_models::registry::ModelCost::default(),
         context_window: 0,
         max_tokens: 0,
-        headers: None,
     }
 }
 

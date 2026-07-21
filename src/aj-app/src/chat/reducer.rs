@@ -2675,7 +2675,6 @@ mod tests {
             cost: aj_models::registry::ModelCost::default(),
             context_window: 400_000,
             max_tokens: 100,
-            headers: None,
         };
         let mut s = state_with_catalog(vec![catalog_model]);
         let mut life = AgentLifecycle::default();

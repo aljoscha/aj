@@ -583,8 +583,6 @@ struct ModelInfo {
     context_window: u64,
     /// Maximum output tokens.
     max_tokens: u64,
-    /// Optional extra HTTP headers.
-    headers: Option<HashMap<String, String>>,
 }
 
 struct ModelCost {
@@ -772,8 +770,7 @@ Seed and user cache share one JSON schema:
         "cache_write": 3.75
       },
       "context_window": 200000,
-      "max_tokens": 64000,
-      "headers": null
+      "max_tokens": 64000
     }
   ]
 }
@@ -913,23 +910,22 @@ already contain only filtered entries, so the load path does not
 re-filter.
 
 **Codex models are seeded by hand, not from models.dev.** The
-`openai-codex` provider's model list (`gpt-5.2`, `gpt-5.4`,
-`gpt-5.4-mini`, `gpt-5.5`, and the `gpt-5.6-sol`/`gpt-5.6-terra`/
-`gpt-5.6-luna` family) is not exposed by models.dev. The refresh CLI
-(§3.4.5) preserves the existing Codex entries on every run: it filters
-them out of the upstream diff and re-emits them from a small seed list
-maintained alongside the overrides file. The seed tracks the codex
-backend's own model manifest, so it changes as models are added or
-retired. `context_window` is the observed server cap per model (the
-`gpt-5.6` family reports `372000`, the rest `272000`) and `max_tokens`
-is `128000`; pricing is hand-curated in the seed, mirroring the
-models.dev base rates for the matching `openai` model.
+`openai-codex` provider's model list (`gpt-5.2`, `gpt-5.5`, and the
+`gpt-5.6-sol`/`gpt-5.6-terra`/`gpt-5.6-luna` family) is not exposed by
+models.dev. The refresh CLI (§3.4.5) preserves the existing Codex
+entries on every run: it filters them out of the upstream diff and
+re-emits them from a small seed list maintained alongside the overrides
+file. The seed tracks the codex backend's own model manifest, so it
+changes as models are added or retired. `context_window` is `400000`,
+the real gpt-5 window: the codex client reports a lower `272000`, but
+that is an artificial cost/compaction cap, not the model's capacity.
+`max_tokens` is `128000`; pricing is hand-curated in the seed, mirroring
+the models.dev base rates for the matching `openai` model.
 
-Context pricing tiers (§3.3) are hand-added only to the `gpt-5.6`
-family, whose `372000` window lets a request clear the `272000` tier
-threshold. The `272000`-capped models carry no tier: a request can
-never exceed the threshold there, and the tier requires strictly more,
-so it could never fire. This assumes the codex backend enforces the
+Context pricing tiers (§3.3) are hand-added to the `gpt-5.5` and
+`gpt-5.6` families, whose published rates roughly double above a
+`272000`-token input tier that the `400000` window can clear. `gpt-5.2`
+is flat-rate with no tier. This assumes the codex backend enforces the
 declared `context_window`, `calculate_cost` does not itself clamp usage
 to the window.
 
@@ -2472,7 +2468,7 @@ All work happens across three crates: `anthropic-sdk`, `openai-sdk`, and
     preserve Codex entries (§3.4.7) — bundle a hand-curated seed
     list for `provider: "openai-codex"` covering the §7.4 model set,
     re-emitted on every refresh so models.dev churn never deletes
-    them. `context_window: 272000`, `max_tokens: 128000`, pricing
+    them. `context_window: 400000`, `max_tokens: 128000`, pricing
     per the seed.
 
 ### Phase 4: Cross-Provider & Utilities

@@ -216,8 +216,7 @@ pub fn missing_key_message(provider_id: &str) -> String {
     let vars = find_env_keys(provider_id);
     if vars.is_empty() {
         format!(
-            "no credentials for provider {provider_id:?}; log in from the \
-             command palette (press /), or set a `headers` override in models.json"
+            "no credentials for provider {provider_id:?}; log in from the command palette (press /)"
         )
     } else {
         format!(
@@ -363,7 +362,6 @@ mod tests {
             cost: ModelCost::default(),
             context_window: 1_000,
             max_tokens: 100,
-            headers: None,
         }
     }
 

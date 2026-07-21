@@ -168,10 +168,6 @@ pub struct ModelInfo {
     pub context_window: u64,
     /// Maximum output tokens.
     pub max_tokens: u64,
-    /// Optional extra HTTP headers the client should send (e.g. for
-    /// providers like Copilot/Kimi that require static identity headers).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub headers: Option<HashMap<String, String>>,
 }
 
 // ============================================================================
@@ -253,8 +249,6 @@ pub struct OverridePatch {
     pub context_window: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub headers: Option<HashMap<String, String>>,
 }
 
 // ============================================================================
@@ -771,9 +765,6 @@ pub(crate) fn apply_override(models: &mut [ModelInfo], entry: &OverrideEntry) {
     if let Some(v) = p.max_tokens {
         model.max_tokens = v;
     }
-    if let Some(v) = &p.headers {
-        model.headers = Some(v.clone());
-    }
 }
 
 // ============================================================================
@@ -805,7 +796,6 @@ mod tests {
             },
             context_window: 200_000,
             max_tokens: 64_000,
-            headers: None,
         }
     }
 
@@ -1369,8 +1359,6 @@ mod tests {
         let ids: std::collections::HashSet<&str> = seed.iter().map(|m| m.id.as_str()).collect();
         for expected in [
             "gpt-5.2",
-            "gpt-5.4",
-            "gpt-5.4-mini",
             "gpt-5.5",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
@@ -1378,29 +1366,31 @@ mod tests {
         ] {
             assert!(ids.contains(expected), "codex seed missing {expected}");
         }
+        // gpt-5.4 and gpt-5.4-mini are hidden in the Codex picker, so they
+        // are intentionally absent from the seed.
+        assert!(!ids.contains("gpt-5.4"), "gpt-5.4 must stay dropped");
+        assert!(
+            !ids.contains("gpt-5.4-mini"),
+            "gpt-5.4-mini must stay dropped"
+        );
 
-        // Context windows track the observed server cap per model, not the
-        // marketing number: the gpt-5.6 family reports 372k, the rest sit at
-        // the 272k cap.
+        // Context windows are unified at 400k, the real gpt-5 window. The
+        // Codex client itself reports a lower 272k figure, but that's an
+        // artificial cost/compaction cap, not the model's true capacity.
         for m in &seed {
-            let expected = match m.id.as_str() {
-                "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" => 372_000,
-                _ => 272_000,
-            };
             assert_eq!(
-                m.context_window, expected,
+                m.context_window, 400_000,
                 "unexpected context_window for {}",
                 m.id
             );
         }
 
-        // Only the gpt-5.6 family carries a context tier, and it fires
-        // above 272k. The 272k-capped models must have no tiers: their
-        // context can never strictly exceed the threshold, so a tier would
-        // be dead config.
+        // The gpt-5.5 and gpt-5.6 families carry a context tier that fires
+        // above 272k input tokens, reachable within the 400k window.
+        // gpt-5.2 is flat-rate with no tier.
         for m in &seed {
             match m.id.as_str() {
-                "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" => {
+                "gpt-5.5" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" => {
                     assert_eq!(
                         m.cost.tiers.len(),
                         1,
@@ -1413,11 +1403,7 @@ mod tests {
                         m.id
                     );
                 }
-                _ => assert!(
-                    m.cost.tiers.is_empty(),
-                    "{} must have no tiers (272k cap == threshold)",
-                    m.id
-                ),
+                _ => assert!(m.cost.tiers.is_empty(), "{} must have no tiers", m.id),
             }
         }
     }
@@ -1446,7 +1432,6 @@ mod tests {
             },
             context_window: 272_000,
             max_tokens: 128_000,
-            headers: None,
         }];
 
         let seed = bundled_codex_seed();
@@ -1488,7 +1473,6 @@ mod tests {
             cost: ModelCost::default(),
             context_window: 1,
             max_tokens: 1,
-            headers: None,
         };
         let mut models = Vec::new();
         let appended = splice_codex_seed(&mut models, vec![stray]);
@@ -1531,7 +1515,7 @@ mod tests {
         );
         assert_eq!(gpt55.api, "openai-codex-responses");
         assert_eq!(gpt55.base_url, "https://chatgpt.com/backend-api");
-        assert_eq!(gpt55.context_window, 272_000);
+        assert_eq!(gpt55.context_window, 400_000);
         assert_eq!(gpt55.max_tokens, 128_000);
     }
 }

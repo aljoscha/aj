@@ -66,7 +66,6 @@ fn target_model(provider: &str, api: &str, id: &str) -> ModelInfo {
         cost: ModelCost::default(),
         context_window: 100_000,
         max_tokens: 8_192,
-        headers: None,
     }
 }
 

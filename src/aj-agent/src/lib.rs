@@ -3577,7 +3577,6 @@ mod event_protocol_tests {
             cost: ModelCost::default(),
             context_window: 0,
             max_tokens: 0,
-            headers: None,
         }
     }
 

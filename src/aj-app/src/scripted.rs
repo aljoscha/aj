@@ -96,7 +96,6 @@ fn scripted_model_info(name: &str) -> ModelInfo {
         cost: ModelCost::default(),
         context_window: 0,
         max_tokens: 0,
-        headers: None,
     }
 }
 

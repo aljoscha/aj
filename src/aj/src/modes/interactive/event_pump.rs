@@ -1799,7 +1799,6 @@ mod tests {
             cost: aj_models::registry::ModelCost::default(),
             context_window,
             max_tokens: 100,
-            headers: None,
         }
     }
 

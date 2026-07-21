@@ -35,7 +35,6 @@ fn model() -> ModelInfo {
         cost: ModelCost::default(),
         context_window: 131_072,
         max_tokens: 32_768,
-        headers: None,
     }
 }
 

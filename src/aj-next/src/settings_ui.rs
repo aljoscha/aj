@@ -242,15 +242,36 @@ fn model_items(catalog: &[ModelInfo], current: Option<&(String, String)>) -> Vec
             } else {
                 info.name.clone()
             };
-            let description = format!(
+            let mut description = format!(
                 "{} · {} · {}",
                 info.provider,
                 info.id,
                 format_tokens(info.context_window)
             );
+            if let Some(price) = format_price(info.cost.input, info.cost.output) {
+                description.push_str(" · ");
+                description.push_str(&price);
+            }
             SelectItem::new(label, model_filter_key(info)).with_description(description)
         })
         .collect()
+}
+
+/// Compact per-million-token input/output price for a selector row, e.g.
+/// `$1.75/$14`. Returns `None` when both rates are zero (free or unknown),
+/// so the row omits the segment rather than showing `$0/$0`.
+fn format_price(input: f64, output: f64) -> Option<String> {
+    if input <= 0.0 && output <= 0.0 {
+        return None;
+    }
+    Some(format!("${}/${}", trim_price(input), trim_price(output)))
+}
+
+/// Render a dollar-per-million rate without trailing zeros: `14.0 -> "14"`,
+/// `2.5 -> "2.5"`, `1.75 -> "1.75"`. Rates carry at most two decimals.
+fn trim_price(v: f64) -> String {
+    let s = format!("{v:.2}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 /// Open the model selector for `target`, pre-selecting the current model.
@@ -1869,6 +1890,25 @@ mod tests {
             inherited: false,
             clear_to: String::new(),
         }
+    }
+
+    #[test]
+    fn trim_price_drops_trailing_zeros() {
+        assert_eq!(trim_price(14.0), "14");
+        assert_eq!(trim_price(2.5), "2.5");
+        assert_eq!(trim_price(1.75), "1.75");
+        assert_eq!(trim_price(0.1), "0.1");
+        assert_eq!(trim_price(100.0), "100");
+    }
+
+    #[test]
+    fn format_price_shows_rates_and_omits_when_free() {
+        assert_eq!(format_price(1.75, 14.0).as_deref(), Some("$1.75/$14"));
+        assert_eq!(format_price(5.0, 30.0).as_deref(), Some("$5/$30"));
+        // A zero rate on one side still renders: the model isn't free.
+        assert_eq!(format_price(1.0, 0.0).as_deref(), Some("$1/$0"));
+        // Both zero means unknown or free, so the segment is dropped.
+        assert_eq!(format_price(0.0, 0.0), None);
     }
 
     #[test]

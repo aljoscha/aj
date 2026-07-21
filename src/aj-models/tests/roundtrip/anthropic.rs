@@ -68,7 +68,6 @@ fn fixture_model() -> ModelInfo {
         },
         context_window: 200_000,
         max_tokens: 64_000,
-        headers: None,
     }
 }
 

@@ -1322,7 +1322,6 @@ mod tests {
             },
             context_window: 200_000,
             max_tokens: 16_000,
-            headers: None,
         }
     }
 

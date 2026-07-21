@@ -727,9 +727,6 @@ fn map_model(fixed: &ProviderFixedValues, id: &str, m: &RawModel) -> ModelInfo {
         },
         context_window: limit.and_then(|l| l.context).unwrap_or(4096),
         max_tokens: limit.and_then(|l| l.output).unwrap_or(4096),
-        // models.dev has no per-model headers field; the seed/overrides
-        // own that for providers that need static identity headers.
-        headers: None,
     }
 }
 
@@ -780,7 +777,6 @@ fn map_openrouter_model(m: &OpenRouterModel) -> ModelInfo {
             .as_ref()
             .and_then(|t| t.max_completion_tokens)
             .unwrap_or(4096),
-        headers: None,
     }
 }
 
