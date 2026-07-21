@@ -283,6 +283,81 @@ reference. Rendering the CLI `@file` case graphically would exceed `aj` classic
 and requires recovering pixel dimensions the wire type does not carry (a base64
 decode at the display layer). A possible future extension, not built here.
 
+## Implementation mechanism
+
+Concrete design for the placement, chosen after tracing the widget layer.
+
+### Placement: an image block on `Bubble` (option A)
+
+A tool cell is a `Bubble`, a text-only widget that wraps `Vec<TextSpan>` through
+`RichText`. We give `Bubble` an optional image block rather than adding a
+separate image widget, because the image belongs to the tool cell and the block
+reuses the bubble's background, padding, and header directly.
+
+- `Bubble` gains an optional field carrying the image's pixel dimensions (from
+  `ToolDetails::Image`, known at build time) and an `Option<u32>` transmitted id
+  (from the store, see below).
+- `Bubble::draw` computes the cell footprint at draw time from `ctx.cell_size`
+  (pixels per cell) and the pixel dimensions, capped and aspect-preserving. It
+  reserves that many rows below the text content, inside the tinted area, so the
+  bubble grows by the image's height. When the id is present it writes one
+  `Placement` cell at the image origin carrying an explicit `size` in cells
+  (kitty `r`/`c`), and the terminal renders the image spanning the reserved
+  rows. When the id is absent (pending transmit) it reserves the same rows blank,
+  so the image popping in one frame later does not shift the layout.
+
+The footprint math mirrors `aj` classic's `image_cell_footprint`: scale the 1:1
+pixel grid down to fit `max_cells = (40, 20)` (max cols, max rows) preserving
+aspect, minimum `(1, 1)`. `aj-next` must not depend on `aj-tui`, so this is a
+small pure helper re-implemented in `aj-next` with its own test, not a shared
+call. This duplicates a dozen lines of pure math across the two frontends.
+
+### Terminal capability seam
+
+Introduce `TerminalCaps { images, hyperlinks }`, read once after `app.init(..)`
+next to the existing `caps.rgb` color-mode reconcile. `images` comes from
+`app.vaxis().caps.kitty_graphics`. `hyperlinks` migrates off the compile-time
+`terminal.rs` constant onto this struct and stays optimistically true, since
+vaxis has no OSC 8 probe. This is threaded into `TranscriptStyles::from_theme`,
+which currently bakes `hyperlinks` from the constant. The `Shell` holds the caps
+(set after the probe, so through interior mutability like the theme handle) and
+passes them when it rebuilds styles in `restyle`.
+
+### Image store and the render cache
+
+The host owns an `ImageStore` shared by `Rc<RefCell<..>>` into the transcript's
+`EntryBuilder`:
+
+- A map `(AgentId, EntryId) -> img_id: u32` of transmitted images.
+- A pending set of `(AgentId, EntryId)` keys the builder records for images it
+  wants to draw but that are not transmitted yet.
+
+`EntryBuilder::item_at_idx` (which runs per visible entry each frame) looks the
+entry up in the store. It folds whether the entry is transmitted into the
+`entry_fingerprint`, exactly as it already folds `focused`, so the entry rebuilds
+the frame its id arrives and the cache stops replaying the blank reserve. If
+images are enabled and the entry has an image that is not transmitted, it records
+the key in the pending set. Only visible entries are recorded, which is what
+makes transmission lazy.
+
+### Lazy transmit in the drive loop
+
+Right after `app.render(root)?` in `drive`, the host drains the pending set. The
+set reflects the frame just drawn. For each key it finds the tool entry in the
+chat model, reads the base64 image bytes from its `UserContent::Image` content,
+base64-decodes them (the `base64` workspace crate), and calls
+`app.load_image(Source::Mem(bytes))`. On success it records the returned id in the
+store and requests a redraw, so the next frame places the image. On error it
+leaves the entry on the text fallback.
+
+### Free on session switch
+
+At the production session-switch site (where `install_next_session` is called and
+`app` is in scope), the host frees every transmitted id through
+`app.free_image(id)` and clears the store and pending set. Ids are per session and
+would otherwise leak terminal graphics memory. Within a session, ids are kept
+even after an entry scrolls off, so scrolling back does not re-transmit.
+
 ## Non-goals
 
 - iTerm2 and sixel, unless Decision 1 goes to 1b.
