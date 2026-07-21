@@ -48,6 +48,7 @@ use aj_session::{
     replay_deferring_subs,
 };
 use anyhow::{Context, Result, anyhow};
+use base64::Engine as _;
 use chrono::Utc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use vaxis::cell::{Color, Style};
@@ -65,6 +66,7 @@ use crate::agent_picker::{AgentPickerOutcome, PickerSnapshot, open_agent_picker}
 use crate::content_overlay::{ContentStyles, Row, auth_rows, session_info_rows, set_rows};
 use crate::footer::FooterLine;
 use crate::frame_stats_box::FrameStatsBox;
+use crate::image_store::ImageStore;
 use crate::keymap::{HostCtx, build_keymap};
 use crate::login::{
     AuthPickerRequest, AuthRow, DialogCallbacks, LoginDialogState, open_login_dialog,
@@ -86,6 +88,7 @@ use crate::settings_ui::{
 use crate::splash::{SPLASH_WAKE_EVENT, Splash};
 use crate::status::{STATUS_WAKE_EVENT, StatusLine, StatusState};
 use crate::task_output::open_task_output;
+use crate::terminal::TerminalCaps;
 use crate::toasts::{ToastBody, ToastStack, Toasts, busy_refusal};
 use crate::transcript::{TranscriptStyles, TranscriptView, vaxis_color};
 use crate::usage_overlay::open_usage_overlay;
@@ -561,6 +564,104 @@ fn install_next_session(world: &mut World, shell: &Rc<RefCell<Shell>>, next: Nex
     // top of any replayed history.
     for notice in next.notices {
         fold_notice(world, &notice);
+    }
+}
+
+/// Transmit the images the just-drawn frame recorded as pending, so the next
+/// frame places them. Lazy, draw-driven transmission: only entries drawn this
+/// frame are pending, which bounds terminal graphics memory to images actually
+/// viewed and handles live, replayed, and scrolled-into-view images uniformly.
+///
+/// For each pending key it finds the tool entry, base64-decodes the first
+/// image in its content, transmits the raw image bytes, and records the
+/// returned id. The gate records a pending key only after the kitty-graphics
+/// capability is confirmed, so a `load_image` error here can only be a decode
+/// failure (a corrupt or unsupported payload), never a missing capability. On
+/// that failure, or on undecodable base64, the entry is marked failed so it
+/// falls back to text and is not re-attempted every frame. A redraw is
+/// requested whenever the store changed, so the frame that places the image or
+/// shows the fallback runs.
+fn drain_pending_images(app: &mut AsyncApp, world: &World, shell: &Rc<RefCell<Shell>>) {
+    let pending = shell.borrow().image_store.borrow_mut().take_pending();
+    if pending.is_empty() {
+        return;
+    }
+    let mut dirtied = false;
+    {
+        let chat = world.chat.borrow();
+        for (agent, entry_id) in pending {
+            let entry = chat
+                .transcript(agent)
+                .and_then(|t| t.entries().iter().find(|e| e.id == entry_id));
+            let Some(entry) = entry else {
+                // The entry vanished between recording and draining. Nothing to
+                // transmit and nothing to mark: it is gone from the transcript.
+                continue;
+            };
+            let Some(bytes) = image_entry_bytes(entry) else {
+                // A recorded key is always a tool image, so undecodable bytes
+                // here mean a corrupt base64 payload. Mark it failed so it falls
+                // back to text and is not re-attempted every frame.
+                shell
+                    .borrow()
+                    .image_store
+                    .borrow_mut()
+                    .mark_failed(agent, entry_id);
+                dirtied = true;
+                continue;
+            };
+            // `Source::Mem` takes the raw encoded image bytes; vaxis re-encodes
+            // to PNG on transmit, so we hand it the decoded file bytes, not the
+            // base64 string.
+            match app.load_image(vaxis::image::Source::Mem(bytes)) {
+                Ok(img) => {
+                    shell
+                        .borrow()
+                        .image_store
+                        .borrow_mut()
+                        .insert(agent, entry_id, img.id());
+                    dirtied = true;
+                }
+                Err(_) => {
+                    // The base64 decoded but is not a valid image. Terminal:
+                    // mark it failed so it falls back to text and is not
+                    // re-attempted every frame.
+                    shell
+                        .borrow()
+                        .image_store
+                        .borrow_mut()
+                        .mark_failed(agent, entry_id);
+                    dirtied = true;
+                }
+            }
+        }
+    }
+    if dirtied {
+        app.request_redraw();
+    }
+}
+
+/// The decoded bytes of the first `UserContent::Image` in a tool-result
+/// entry, or `None` when the entry is not a tool cell, carries no image, or
+/// the base64 fails to decode.
+fn image_entry_bytes(entry: &aj_app::chat::Entry) -> Option<Vec<u8>> {
+    let aj_app::chat::EntryKind::Tool(tool) = &entry.kind else {
+        return None;
+    };
+    let data = tool.content.iter().find_map(|c| match c {
+        UserContent::Image(img) => Some(&img.data),
+        UserContent::Text(_) => None,
+    })?;
+    base64::engine::general_purpose::STANDARD.decode(data).ok()
+}
+
+/// Free every transmitted image id and empty the store, on a session switch.
+/// The ids belong to the outgoing session's terminal graphics memory, so
+/// releasing them here bounds it to the live session.
+fn free_session_images(app: &mut AsyncApp, shell: &Rc<RefCell<Shell>>) {
+    let ids = shell.borrow().image_store.borrow_mut().drain_ids();
+    for id in ids {
+        app.free_image(id);
     }
 }
 
@@ -3203,6 +3304,17 @@ struct Shell {
     /// loop folds the cancel notice (the Shell can't reach the chat model's
     /// lifecycle). A plain flag, drained once per input event.
     branch_cancelled: Rc<Cell<bool>>,
+    /// The per-session image store, shared with the [`TranscriptView`]'s entry
+    /// builder (which records pending images and reads transmitted ids) and
+    /// the host loop (which transmits after each frame and frees on a session
+    /// switch).
+    image_store: Rc<RefCell<ImageStore>>,
+    /// The probed terminal capabilities, unknown at construction (the probe
+    /// runs after `app.init`). Set once by [`Shell::set_terminal_caps`] and
+    /// read by [`Shell::restyle`] so a rebuild reflects the probed caps.
+    /// Interior mutability, like the theme handle, so the const-`&self`
+    /// restyle path can read them.
+    terminal_caps: Cell<TerminalCaps>,
 }
 
 impl Shell {
@@ -3274,17 +3386,25 @@ impl Shell {
         // share the same cell.
         let branch_anchor: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let branch_cancelled: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        // The per-session image store, shared between the transcript builder
+        // (which records pending images and reads transmitted ids) and the
+        // host loop (which transmits and frees). Created here so both share
+        // the same handle.
+        let image_store: Rc<RefCell<ImageStore>> = Rc::new(RefCell::new(ImageStore::default()));
         // Resolve the initial styles and chrome from a single snapshot of
         // the theme, then keep the handle for the runtime re-style path.
+        // Caps are unknown here (the probe runs after `app.init`), so styles
+        // start with the default caps and `restyle` refreshes them.
         let (styles, transcript, chrome) = {
             let t = theme.read();
-            let styles = Rc::new(TranscriptStyles::from_theme(&t));
+            let styles = Rc::new(TranscriptStyles::from_theme(&t, TerminalCaps::default()));
             let transcript = Rc::new(RefCell::new(TranscriptView::new(
                 Rc::clone(&chat),
                 &t,
                 Rc::clone(&focus_mode),
                 Rc::clone(&branch_anchor),
                 Rc::clone(&selection_copied),
+                Rc::clone(&image_store),
             )));
             editor.borrow_mut().set_theme(editor_theme_from_theme(&t));
             (styles, transcript, OverlayChrome::from_theme(&t))
@@ -3604,6 +3724,8 @@ impl Shell {
             auth_request,
             branch_anchor,
             branch_cancelled,
+            image_store,
+            terminal_caps: Cell::new(TerminalCaps::default()),
         }
     }
 
@@ -3714,6 +3836,13 @@ impl Shell {
         }
     }
 
+    /// Record the probed terminal capabilities, read once after `app.init`.
+    /// The caller runs [`restyle`](Self::restyle) afterward so the styles pick
+    /// up the probed `images` gate.
+    fn set_terminal_caps(&self, caps: TerminalCaps) {
+        self.terminal_caps.set(caps);
+    }
+
     /// Rebuild every style struct from the current theme, for a runtime
     /// swap (hot-reload, or the settings window's theme row). Every
     /// palette-consuming widget is rebuilt in place, so editor text and
@@ -3722,7 +3851,7 @@ impl Shell {
     /// opened before the swap keep their baked styles until reopened.
     fn restyle(&self) {
         let t = self.theme.read();
-        let styles = Rc::new(TranscriptStyles::from_theme(&t));
+        let styles = Rc::new(TranscriptStyles::from_theme(&t, self.terminal_caps.get()));
         self.transcript.borrow_mut().set_styles(Rc::clone(&styles));
         self.status_line.borrow_mut().set_styles(Rc::clone(&styles));
         self.quit_hint.borrow_mut().set_styles(Rc::clone(&styles));
@@ -4186,13 +4315,21 @@ pub async fn run(args: Args) -> Result<()> {
     let mut app = AsyncApp::new(Vaxis::new(VaxisOptions::default()), Box::new(tty), reader);
     app.init(Rc::clone(&root), Options::default()).await?;
 
+    // Probe the runtime terminal capabilities now that init's detection ran.
+    // `images` comes from the real kitty-graphics probe; `hyperlinks` stays
+    // optimistic (vaxis has no OSC 8 probe). See [`TerminalCaps`].
+    let caps = TerminalCaps {
+        images: app.vaxis().caps.kitty_graphics,
+        ..TerminalCaps::default()
+    };
+    shell.borrow().set_terminal_caps(caps);
+
     // Reconcile the color mode against the terminal's probed capability.
     // A positive `caps.rgb` (the terminal affirmed truecolor during the
     // init probe) upgrades an env guess of Color256, but a negative probe
     // never downgrades the env guess: most terminals don't answer the
     // truecolor query at all, and the env heuristic is the better signal
-    // for them. When the mode actually changes we reload the theme and
-    // re-style every widget through the same path a hot-reload uses.
+    // for them. When the mode actually changes we reload the theme.
     let probed_mode = if app.vaxis().caps.rgb {
         ColorMode::Truecolor
     } else {
@@ -4200,9 +4337,12 @@ pub async fn run(args: Args) -> Result<()> {
     };
     if probed_mode != theme.color_mode() {
         theme.replace(Theme::load_with_mode(&theme_name, probed_mode));
-        shell.borrow().restyle();
-        app.request_redraw();
     }
+    // Restyle unconditionally: the styles must reflect both the reconciled
+    // color mode and the probed caps (`images`), and the caps are only known
+    // now. One all-miss frame is cheap, so we don't gate this on a change.
+    shell.borrow().restyle();
+    app.request_redraw();
 
     // Seed the editor's border and agent marker from the initial view before
     // the first drive-loop frame. `app.init` already painted one frame, and the
@@ -4340,6 +4480,10 @@ pub async fn run(args: Args) -> Result<()> {
                 // folds the restore notice.
                 apply_branch_switch_notice(&mut next, is_branch, branch_prompt.is_some());
                 install_next_session(&mut world, &shell, next);
+                // The outgoing session's transmitted image ids belong to its
+                // terminal graphics memory. Free them and empty the store so
+                // the new session starts clean.
+                free_session_images(&mut app, &shell);
                 // Retitle the terminal for the switched-to session. The switch
                 // ran off the loop with no event context, so we ride an app
                 // event, mirroring the refocus delegation.
@@ -4624,6 +4768,10 @@ async fn drive(
             }
             app.render(root)?;
             last_render = Some(Instant::now());
+            // The frame just drawn recorded any visible-but-untransmitted
+            // images as pending. Transmit them now so the next frame places
+            // them (lazy, draw-driven transmission, see `drain_pending_images`).
+            drain_pending_images(app, world, shell);
         }
         // Compute the wake deadline before the select so no arm holds a borrow
         // of `app` another arm needs. It merges the soonest widget tick with
@@ -7644,6 +7792,9 @@ mod tests {
             Rc::new(std::cell::Cell::new(false)),
             Rc::new(std::cell::RefCell::new(None)),
             Rc::new(std::cell::Cell::new(None)),
+            Rc::new(std::cell::RefCell::new(
+                crate::image_store::ImageStore::default(),
+            )),
         );
         let ctx = DrawContext {
             min: Size {
@@ -9786,6 +9937,323 @@ mod tests {
             .await
             .expect("init");
         (world, shell, app, writer, root)
+    }
+
+    // ---- Inline images (lazy transmit + free) ----
+
+    /// A valid 2x2 RGB PNG, base64-encoded, as a `read_file` tool result would
+    /// carry it. Generated once and pasted in: aj-next has no image encoder.
+    const PNG_2X2_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAADklEQVR4nGOoBwMGCAUAKboF9Rf06ToAAAAASUVORK5CYII=";
+
+    /// Reduce a tool-result image entry (start + end) into `chat` and return
+    /// its `EntryId`. Seeds a user message first so the chat slot shows the
+    /// transcript rather than the empty-state splash.
+    fn seed_image_entry(chat: &Rc<RefCell<ChatState>>) -> aj_app::chat::EntryId {
+        seed_image_entry_with(chat, PNG_2X2_B64)
+    }
+
+    /// Like [`seed_image_entry`] but with an explicit base64 image payload, so a
+    /// test can seed a corrupt image to exercise the transmit-failure path.
+    fn seed_image_entry_with(chat: &Rc<RefCell<ChatState>>, data: &str) -> aj_app::chat::EntryId {
+        use aj_agent::message::AgentMessage;
+        use aj_models::types::{Message, UserMessage};
+
+        let mut life = aj_app::session::AgentLifecycle::default();
+        let _ = reduce(
+            &mut chat.borrow_mut(),
+            &mut life,
+            AgentEvent::MessageEnd {
+                agent_id: AgentId::Main,
+                message: AgentMessage::wire(Message::User(UserMessage::text("show me the png"))),
+            },
+        );
+        let _ = reduce(
+            &mut chat.borrow_mut(),
+            &mut life,
+            AgentEvent::ToolExecutionStart {
+                agent_id: AgentId::Main,
+                call_id: "img-1".into(),
+                tool: "read_file".into(),
+                args: serde_json::json!({"path": "/tmp/pic.png"}),
+            },
+        );
+        let _ = reduce(
+            &mut chat.borrow_mut(),
+            &mut life,
+            AgentEvent::ToolExecutionEnd {
+                agent_id: AgentId::Main,
+                call_id: "img-1".into(),
+                tool: "read_file".into(),
+                result: aj_agent::tool::ToolDetails::Image {
+                    summary: "/tmp/pic.png".into(),
+                    mime_type: "image/png".into(),
+                    original_dimensions: (2, 2),
+                    displayed_dimensions: (2, 2),
+                },
+                content: vec![UserContent::Image(aj_models::types::ImageContent {
+                    data: data.into(),
+                    mime_type: "image/png".into(),
+                })]
+                .into(),
+                is_error: false,
+            },
+        );
+        let chat = chat.borrow();
+        chat.transcript(AgentId::Main)
+            .expect("main transcript")
+            .entries()
+            .iter()
+            .find(|e| matches!(&e.kind, EntryKind::Tool(_)))
+            .expect("tool image entry")
+            .id
+    }
+
+    /// A graphics-capable app + shell over `chat`, with `caps.kitty_graphics`
+    /// set before init so the probe leaves it on, and `images` threaded into
+    /// the styles via `set_terminal_caps` + `restyle`.
+    async fn graphics_shell_app(
+        chat: Rc<RefCell<ChatState>>,
+    ) -> (AsyncApp, PipeWriter, Rc<RefCell<Shell>>, WidgetRef) {
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        writer.write_all(b"\x1b[?c").expect("write DA1 reply");
+        let shell = test_shell_with_chat(chat);
+        let root: WidgetRef = to_widget_ref(Rc::clone(&shell));
+        let mut vx = Vaxis::new(VaxisOptions::default());
+        vx.caps.kitty_graphics = true;
+        let mut app = AsyncApp::new(vx, Box::new(TestTty::new()), reader.into());
+        app.init(Rc::clone(&root), Options::default())
+            .await
+            .expect("init");
+        shell.borrow().set_terminal_caps(TerminalCaps {
+            images: true,
+            ..TerminalCaps::default()
+        });
+        shell.borrow().restyle();
+        (app, writer, shell, root)
+    }
+
+    /// Rendering one frame over a visible image entry and draining the pending
+    /// set transmits it (the store gains an id); a direct `free_session_images`
+    /// then empties the store.
+    ///
+    /// The free path is exercised directly rather than through the production
+    /// session-switch site (`install_next_session` then `free_session_images`),
+    /// which needs a full second session to build. So this pins the store
+    /// lifecycle, not the switch-site call wiring. The `drive`-loop transmit
+    /// call site is pinned separately by [`drive_loop_transmits_visible_image`].
+    #[tokio::test]
+    async fn drive_transmits_visible_image_and_free_drains_the_store() {
+        let dir = TempDir::new().expect("tempdir");
+        let world = scripted_world(&dir, "streaming-text").await;
+        let entry_id = seed_image_entry(&world.chat);
+        let (mut app, _writer, shell, root) = graphics_shell_app(Rc::clone(&world.chat)).await;
+
+        // The frame records the visible image as pending; the drain transmits.
+        app.request_redraw();
+        app.render(&root).expect("render");
+        drain_pending_images(&mut app, &world, &shell);
+
+        assert!(
+            shell
+                .borrow()
+                .image_store
+                .borrow()
+                .get(AgentId::Main, entry_id)
+                .is_some(),
+            "the visible image transmitted and gained an id",
+        );
+
+        // A session switch frees the ids and empties the store. This pins the
+        // store lifecycle only: the boxed `dyn Tty` inside `AppCore` cannot be
+        // downcast, so the emitted kitty delete escape is not observable here.
+        // That byte sequence is asserted at the vaxis layer
+        // (`free_image_emits_delete_by_id`).
+        free_session_images(&mut app, &shell);
+        assert!(
+            shell
+                .borrow()
+                .image_store
+                .borrow()
+                .get(AgentId::Main, entry_id)
+                .is_none(),
+            "free_session_images empties the store",
+        );
+        // Keep `world` alive so its chat outlives the shell's borrows above.
+        world.chat.borrow();
+    }
+
+    /// A visible image whose bytes will not decode is marked failed by the
+    /// drain rather than left pending, so it falls back to text and is not
+    /// re-attempted every frame. Dropping the `mark_failed` call on the
+    /// transmit-error arm leaves the entry unmarked (and re-recorded pending
+    /// next frame), reddening this test.
+    #[tokio::test]
+    async fn drain_marks_undecodable_image_failed() {
+        use base64::Engine;
+
+        let dir = TempDir::new().expect("tempdir");
+        let world = scripted_world(&dir, "streaming-text").await;
+        // Valid base64, but the decoded bytes are not a valid image, so
+        // `load_image` errors and the entry is marked failed.
+        let corrupt = base64::engine::general_purpose::STANDARD.encode(b"not a real image");
+        let entry_id = seed_image_entry_with(&world.chat, &corrupt);
+        let (mut app, _writer, shell, root) = graphics_shell_app(Rc::clone(&world.chat)).await;
+
+        app.request_redraw();
+        app.render(&root).expect("render");
+        drain_pending_images(&mut app, &world, &shell);
+
+        assert!(
+            shell
+                .borrow()
+                .image_store
+                .borrow()
+                .is_failed(AgentId::Main, entry_id),
+            "the drain marked the undecodable image failed",
+        );
+        assert!(
+            shell
+                .borrow()
+                .image_store
+                .borrow()
+                .get(AgentId::Main, entry_id)
+                .is_none(),
+            "an undecodable image is not transmitted",
+        );
+        // Keep `world` alive so its chat outlives the shell's borrows above.
+        world.chat.borrow();
+    }
+
+    /// A graphics-capable app + shell over a scripted `world`, mirroring
+    /// [`init_app_with_world`] but with `caps.kitty_graphics` set before init so
+    /// the probe leaves it on, and `images` threaded into the styles via
+    /// `set_terminal_caps` + `restyle`. Returns the write end so the caller
+    /// keeps the reader from seeing EOF until it drops it.
+    async fn graphics_world_shell_app(
+        dir: &TempDir,
+        demo: &str,
+    ) -> (AsyncApp, PipeWriter, World, Rc<RefCell<Shell>>, WidgetRef) {
+        let world = scripted_world(dir, demo).await;
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        writer.write_all(b"\x1b[?c").expect("write DA1 reply");
+        let shell = Rc::new(RefCell::new(Shell::new(
+            Rc::clone(&world.chat),
+            Rc::clone(&world.status),
+            world.core.message_queues.clone(),
+            ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor)),
+            "aj-next".to_string(),
+            "",
+            PathBuf::from("/tmp"),
+        )));
+        let root: WidgetRef = to_widget_ref(Rc::clone(&shell));
+        let mut vx = Vaxis::new(VaxisOptions::default());
+        vx.caps.kitty_graphics = true;
+        let mut app = AsyncApp::new(vx, Box::new(TestTty::new()), reader.into());
+        app.init(Rc::clone(&root), Options::default())
+            .await
+            .expect("init");
+        shell.borrow().set_terminal_caps(TerminalCaps {
+            images: true,
+            ..TerminalCaps::default()
+        });
+        shell.borrow().restyle();
+        (app, writer, world, shell, root)
+    }
+
+    /// Driving the real `drive` loop one iteration over a visible tool image
+    /// entry transmits it: the top-of-iteration render draws the image (which
+    /// records the pending key) and the loop's post-render
+    /// `drain_pending_images` call transmits it, so the store gains an id.
+    /// Deleting that call site leaves the store empty and reddens this test.
+    #[tokio::test]
+    async fn drive_loop_transmits_visible_image() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut app, mut writer, mut world, shell, root) =
+            graphics_world_shell_app(&dir, "streaming-text").await;
+        let entry_id = seed_image_entry(&world.chat);
+
+        let mut theme_watch = inert_theme_watch();
+        let mut prompt_history_rx: Option<UnboundedReceiver<Vec<String>>> = None;
+        let mut autocomplete_rx = shell
+            .borrow()
+            .editor
+            .borrow_mut()
+            .take_autocomplete_rx()
+            .expect("editor hands out its autocomplete receiver once");
+
+        // One benign key forces a full loop iteration (whose top-of-iteration
+        // render draws the image entry and drains the pending set), then EOF
+        // (the dropped writer) quits.
+        writer.write_all(b"x").expect("benign key");
+        drop(writer);
+        let exit = drive(
+            &mut app,
+            &root,
+            &shell,
+            &mut world,
+            &mut theme_watch,
+            &mut prompt_history_rx,
+            &mut autocomplete_rx,
+        )
+        .await
+        .expect("drive exits without a fatal error");
+        assert!(matches!(exit, SessionExit::Quit), "EOF quit the loop");
+
+        assert!(
+            shell
+                .borrow()
+                .image_store
+                .borrow()
+                .get(AgentId::Main, entry_id)
+                .is_some(),
+            "the loop's drain_pending_images transmitted the visible image",
+        );
+        // Keep `world` alive so its chat outlives the shell's borrows above.
+        world.chat.borrow();
+    }
+
+    /// `image_entry_bytes` decodes the first image in a tool entry, and yields
+    /// `None` for a non-image or a corrupt payload.
+    #[test]
+    fn image_entry_bytes_decodes_tool_image_content() {
+        use aj_app::chat::{ToolEntry, Transcript};
+
+        let image_entry = |content: Vec<UserContent>| {
+            let mut t = Transcript::default();
+            let id = t.append(EntryKind::Tool(ToolEntry {
+                call_id: "c1".into(),
+                tool: "read_file".into(),
+                args: serde_json::json!({}),
+                status: ToolStatus::Done { is_error: false },
+                details: None,
+                content: content.into(),
+                task: None,
+                header_only: false,
+            }));
+            (t, id)
+        };
+
+        let (t, id) = image_entry(vec![UserContent::Image(aj_models::types::ImageContent {
+            data: PNG_2X2_B64.into(),
+            mime_type: "image/png".into(),
+        })]);
+        let bytes = image_entry_bytes(t.get(id).expect("entry")).expect("decoded bytes");
+        assert_eq!(
+            &bytes[..8],
+            b"\x89PNG\r\n\x1a\n",
+            "raw PNG bytes, not base64"
+        );
+
+        // No image content -> None.
+        let (t, id) = image_entry(vec![UserContent::text("hi")]);
+        assert!(image_entry_bytes(t.get(id).expect("entry")).is_none());
+
+        // Corrupt base64 -> None.
+        let (t, id) = image_entry(vec![UserContent::Image(aj_models::types::ImageContent {
+            data: "not valid base64!!!".into(),
+            mime_type: "image/png".into(),
+        })]);
+        assert!(image_entry_bytes(t.get(id).expect("entry")).is_none());
     }
 
     /// Post the refocus app event and render, moving focus onto the overlay

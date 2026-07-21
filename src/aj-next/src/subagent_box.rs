@@ -434,7 +434,10 @@ mod tests {
     use crate::transcript::TranscriptStyles;
 
     fn styles() -> TranscriptStyles {
-        TranscriptStyles::from_theme(&Theme::bundled_dark_with_mode(ColorMode::Truecolor))
+        TranscriptStyles::from_theme(
+            &Theme::bundled_dark_with_mode(ColorMode::Truecolor),
+            crate::terminal::TerminalCaps::default(),
+        )
     }
 
     fn chat() -> ChatState {
@@ -926,6 +929,9 @@ mod tests {
             Rc::new(std::cell::Cell::new(false)),
             Rc::new(std::cell::RefCell::new(None)),
             Rc::new(std::cell::Cell::new(None)),
+            Rc::new(std::cell::RefCell::new(
+                crate::image_store::ImageStore::default(),
+            )),
         );
         let ctx = DrawContext {
             max: MaxSize {
@@ -1070,6 +1076,9 @@ mod tests {
             std::rc::Rc::new(std::cell::Cell::new(false)),
             std::rc::Rc::new(std::cell::RefCell::new(None)),
             std::rc::Rc::new(std::cell::Cell::new(None)),
+            std::rc::Rc::new(std::cell::RefCell::new(
+                crate::image_store::ImageStore::default(),
+            )),
         );
         let ctx = DrawContext {
             max: MaxSize {

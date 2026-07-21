@@ -18,6 +18,7 @@ mod content_overlay;
 mod corner_box;
 mod footer;
 mod frame_stats_box;
+mod image_store;
 mod interactive;
 mod keymap;
 mod login;

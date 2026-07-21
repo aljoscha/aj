@@ -241,6 +241,7 @@ mod tests {
     fn styles() -> Rc<TranscriptStyles> {
         Rc::new(TranscriptStyles::from_theme(
             &Theme::bundled_dark_with_mode(aj_app::theme::ColorMode::Truecolor),
+            crate::terminal::TerminalCaps::default(),
         ))
     }
 

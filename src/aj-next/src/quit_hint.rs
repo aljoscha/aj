@@ -133,7 +133,10 @@ mod tests {
     fn hint(warning: Option<&str>) -> QuitHint {
         let t = theme();
         QuitHint::new(
-            Rc::new(TranscriptStyles::from_theme(&t)),
+            Rc::new(TranscriptStyles::from_theme(
+                &t,
+                crate::terminal::TerminalCaps::default(),
+            )),
             Rc::new(RefCell::new(OverlayChrome::from_theme(&t))),
             Rc::new(RefCell::new(warning.map(str::to_string))),
         )
@@ -190,9 +193,12 @@ mod tests {
     #[test]
     fn keys_use_the_keybinding_hint_style_and_labels_are_dim() {
         let t = theme();
-        let styles = TranscriptStyles::from_theme(&t);
+        let styles = TranscriptStyles::from_theme(&t, crate::terminal::TerminalCaps::default());
         let hint = QuitHint::new(
-            Rc::new(TranscriptStyles::from_theme(&t)),
+            Rc::new(TranscriptStyles::from_theme(
+                &t,
+                crate::terminal::TerminalCaps::default(),
+            )),
             Rc::new(RefCell::new(OverlayChrome::from_theme(&t))),
             Rc::new(RefCell::new(None)),
         );

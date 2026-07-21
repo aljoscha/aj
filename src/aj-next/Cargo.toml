@@ -16,6 +16,7 @@ aj-session = { path = "../aj-session/" }
 aj-tools = { path = "../aj-tools/" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+base64 = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 dotenv = { workspace = true }

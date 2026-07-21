@@ -173,7 +173,10 @@ mod tests {
     fn box_with(stats: Option<FrameStats>) -> FrameStatsBox {
         let t = theme();
         FrameStatsBox::new(
-            Rc::new(TranscriptStyles::from_theme(&t)),
+            Rc::new(TranscriptStyles::from_theme(
+                &t,
+                crate::terminal::TerminalCaps::default(),
+            )),
             Rc::new(RefCell::new(OverlayChrome::from_theme(&t))),
             Rc::new(Cell::new(stats)),
         )

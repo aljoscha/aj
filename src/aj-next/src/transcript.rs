@@ -46,10 +46,11 @@ use vaxis::vxfw::{
 };
 
 use crate::bubble::{Bubble, BubbleBorder, PADDING_X};
+use crate::image_store::{ImageRender, ImageStore};
 use crate::markdown_view::{MarkdownSegment, MarkdownStyles, MarkdownView};
 use crate::selection_copied::SelectionCopied;
 use crate::subagent_box::{SubAgentBox, build_subagent_box, surface_rows};
-use crate::terminal::TERMINAL_HYPERLINKS;
+use crate::terminal::TerminalCaps;
 use crate::tool_cell::{
     EXPAND_KEY_LABEL, HintKind, build_tool_cell, expand_hint, strikethrough_spans,
 };
@@ -106,9 +107,13 @@ pub(crate) struct TranscriptStyles {
     /// [`MarkdownView`]. Rebuilt from the theme here so a runtime swap
     /// re-tints markdown through the same `set_styles` path.
     pub(crate) markdown: MarkdownStyles,
-    /// Whether markdown links emit OSC-8 hyperlinks. See
-    /// [`TERMINAL_HYPERLINKS`](crate::terminal::TERMINAL_HYPERLINKS).
+    /// Whether markdown links emit OSC-8 hyperlinks, from
+    /// [`TerminalCaps`](crate::terminal::TerminalCaps).
     pub(crate) hyperlinks: bool,
+    /// Whether tool-result images render inline via kitty graphics, from
+    /// [`TerminalCaps`](crate::terminal::TerminalCaps). False keeps the text
+    /// placeholder.
+    pub(crate) images: bool,
 }
 
 /// The SGR-2 faint attribute over the default foreground: the exact analogue of
@@ -123,7 +128,7 @@ pub(crate) fn faint() -> Style {
 }
 
 impl TranscriptStyles {
-    pub(crate) fn from_theme(theme: &Theme) -> TranscriptStyles {
+    pub(crate) fn from_theme(theme: &Theme, caps: TerminalCaps) -> TranscriptStyles {
         let mode = theme.color_mode();
         let fg = |token: ThemeColor| Style {
             fg: vaxis_color(theme.fg_color(token), mode),
@@ -160,7 +165,8 @@ impl TranscriptStyles {
             border_accent: vaxis_color(theme.fg_color(ThemeColor::BorderAccent), mode),
             selection_bg: bg(ThemeBg::TextSelectionBg),
             markdown: MarkdownStyles::from_theme(theme),
-            hyperlinks: TERMINAL_HYPERLINKS,
+            hyperlinks: caps.hyperlinks,
+            images: caps.images,
         }
     }
 }
@@ -215,9 +221,9 @@ struct CachedEntry {
 /// `Rc<RefCell<..>>`. One slot per key, so stale `(fingerprint, width)`
 /// variants never accumulate. Session-wide render inputs (the theme,
 /// `tools_expanded`, `show_thinking_block`, `show_token_usage`,
-/// `compact_transcript`, `syntax_highlight`, the active view) are handled by
-/// clearing the whole cache when they change rather than
-/// folding them into every fingerprint (see [`TranscriptView::draw`] and
+/// `compact_transcript`, `syntax_highlight`, `show_image_in_terminal`, the
+/// active view) are handled by clearing the whole cache when they change rather
+/// than folding them into every fingerprint (see [`TranscriptView::draw`] and
 /// [`TranscriptView::set_styles`]). Width is a per-slot key.
 ///
 /// Storing surfaces is safe today: no transcript entry participates in event
@@ -435,6 +441,11 @@ struct EntryBuilder {
     /// rather than the spans.
     copy_label: Rc<Vec<TextSpan>>,
     branch_label: Rc<Vec<TextSpan>>,
+    /// The per-session image store, shared with [`TranscriptView`] and the
+    /// host loop. `item_at_idx` reads it for a tool-result image's transmitted
+    /// id and records visible-but-untransmitted images as pending; the host
+    /// drains that pending set after the frame to transmit them.
+    image_store: Rc<RefCell<ImageStore>>,
 }
 
 impl EntryBuilder {
@@ -453,6 +464,53 @@ impl EntryBuilder {
             EntryBorder::None
         }
     }
+
+    /// How a tool-result image `entry` should render this frame.
+    ///
+    /// `images_enabled` is `styles.images && chat.show_image_in_terminal`,
+    /// computed by the caller (which already holds the `chat` borrow, so we do
+    /// not re-borrow here). Returns [`ImageRender::Disabled`] when images are
+    /// off or `entry` is not a tool-result image, which draws the text
+    /// fallback. Otherwise returns [`ImageRender::Transmitted`] when the store
+    /// has an id, [`ImageRender::Failed`] when a prior transmit gave up (the
+    /// text fallback again, never retried), or records the entry as pending and
+    /// returns [`ImageRender::Pending`] (the blank reserve for one frame).
+    /// Recording
+    /// the key on a visible-but-untransmitted image is what makes transmission
+    /// lazy: only entries drawn this frame get recorded, and the host transmits
+    /// them after the frame.
+    fn resolve_image(&self, agent: AgentId, entry: &Entry, images_enabled: bool) -> ImageRender {
+        if !images_enabled {
+            return ImageRender::Disabled;
+        }
+        let EntryKind::Tool(tool) = &entry.kind else {
+            return ImageRender::Disabled;
+        };
+        if !matches!(tool.details, Some(ToolDetails::Image { .. })) {
+            return ImageRender::Disabled;
+        }
+        // Bind the reads before the mutable borrow: holding the shared
+        // `borrow()` across the `borrow_mut()` below would panic.
+        let resolved = {
+            let store = self.image_store.borrow();
+            if let Some(id) = store.get(agent, entry.id) {
+                Some(ImageRender::Transmitted(id))
+            } else if store.is_failed(agent, entry.id) {
+                Some(ImageRender::Failed)
+            } else {
+                None
+            }
+        };
+        match resolved {
+            Some(render) => render,
+            None => {
+                self.image_store
+                    .borrow_mut()
+                    .record_pending(agent, entry.id);
+                ImageRender::Pending
+            }
+        }
+    }
 }
 
 impl Builder for EntryBuilder {
@@ -467,9 +525,24 @@ impl Builder for EntryBuilder {
         // gaining and the entry losing the border and leaves the rest cache
         // hits.
         let border = self.border_for(entry, idx, cursor);
+        // Resolve how this entry's tool-result image renders. Images are on
+        // only when the terminal supports them (`styles.images`, the caps
+        // probe) and the user has not turned them off
+        // (`show_image_in_terminal`). Reading the config here, under the borrow
+        // the caller already holds, keeps the gate on one seam. Recording a
+        // visible-but-untransmitted image as pending is what makes transmission
+        // lazy: only entries drawn this frame get recorded.
+        let images_enabled = self.styles.images && chat.show_image_in_terminal;
+        let image = self.resolve_image(agent, entry, images_enabled);
         let mut hasher = DefaultHasher::new();
         fingerprint_into(entry, &chat, &mut hasher);
         border.hash(&mut hasher);
+        // Fold the image render state so the entry rebuilds the frame its
+        // transmit resolves: `Pending` -> `Transmitted` places the image and
+        // `Pending` -> `Failed` swaps the blank reserve for text. `Disabled`
+        // and `Pending` fold identically. The config toggle between them rides
+        // the wholesale `GlobalRenderInputs` clear instead.
+        image.render_tag().hash(&mut hasher);
         let fingerprint = hasher.finish();
         // A Running sub-agent box animates its glyph off the wall-clock, so it
         // must rebuild on every redraw, not just when its fingerprint changes.
@@ -489,6 +562,7 @@ impl Builder for EntryBuilder {
             bypass_cache,
             copy_label: Rc::clone(&self.copy_label),
             branch_label: Rc::clone(&self.branch_label),
+            image,
         })))
     }
 }
@@ -519,6 +593,12 @@ struct CachingEntry {
     /// miss-path build picks by `border` without another lookup.
     copy_label: Rc<Vec<TextSpan>>,
     branch_label: Rc<Vec<TextSpan>>,
+    /// How this entry's tool-result image renders this frame. Already folded
+    /// into `fingerprint` via its transmitted id, so the cached surface flips
+    /// when the id arrives. `Disabled` (images off or non-image) and `Pending`
+    /// carry no id, so the config toggle between them relies on the wholesale
+    /// `GlobalRenderInputs` clear, not this fingerprint.
+    image: ImageRender,
 }
 
 impl Widget for CachingEntry {
@@ -559,7 +639,8 @@ impl Widget for CachingEntry {
                 EntryBorder::Branch => Some(self.branch_label.as_slice()),
             };
             let mut widget =
-                build_entry_widget(entry, &chat, &self.styles, false, label).into_indented_boxed();
+                build_entry_widget(entry, &chat, &self.styles, false, label, self.image)
+                    .into_indented_boxed();
             widget.draw(ctx)
         };
         // A bypass entry is never stored, so it can't strand a stale slot when
@@ -582,8 +663,8 @@ impl Widget for CachingEntry {
 /// bug); a field we include that doesn't affect rendering only costs a
 /// harmless rebuild. Session-wide render inputs (`tools_expanded`,
 /// `show_thinking_block`, `show_token_usage`, `compact_transcript`,
-/// `syntax_highlight`, the active view, the theme, the
-/// draw width) are NOT hashed here: the cache clears wholesale when they
+/// `syntax_highlight`, `show_image_in_terminal`, the active view, the theme,
+/// the draw width) are NOT hashed here: the cache clears wholesale when they
 /// change, and width is a per-slot key.
 fn entry_fingerprint(entry: &Entry, chat: &ChatState) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -966,12 +1047,17 @@ fn indent_entry<W: Widget + 'static>(widget: W) -> Padding {
 /// `focus` carries the pre-styled copy-key hint when this entry is the focused
 /// user message, marking its bubble with the focus border (Spec E section 2).
 /// It is `None` for every other entry and every non-`User` kind ignores it.
+///
+/// `image` is how a tool-result image entry renders this frame, resolved from
+/// the capability-and-config gate and the shared image store by the caller.
+/// Only the `Tool` arm reads it.
 pub(crate) fn build_entry_widget(
     entry: &Entry,
     chat: &ChatState,
     styles: &TranscriptStyles,
     nested: bool,
     focus: Option<&[TextSpan]>,
+    image: ImageRender,
 ) -> EntryWidget {
     match &entry.kind {
         EntryKind::Tool(tool) => EntryWidget::Bubble(build_tool_cell(
@@ -980,6 +1066,7 @@ pub(crate) fn build_entry_widget(
             chat.tools_expanded,
             chat.compact_transcript,
             styles,
+            image,
         )),
         EntryKind::User(user) => EntryWidget::Bubble(build_user_bubble(user, styles, focus)),
         EntryKind::TaskNotification(n) => {
@@ -1511,6 +1598,11 @@ pub struct TranscriptView {
     /// entries with the same styles the visible list does. Replaced by
     /// [`set_styles`](Self::set_styles) on a theme swap.
     styles: Rc<TranscriptStyles>,
+    /// The per-session image store, shared with the [`EntryBuilder`] (which
+    /// records pending images and reads transmitted ids) and the host loop
+    /// (which transmits and frees). Held here so [`set_styles`](Self::set_styles)
+    /// can rebuild the builder with the same handle on a theme swap.
+    image_store: Rc<RefCell<ImageStore>>,
     /// Per-entry rendered rows, laid out on demand and cached. Select-to-copy
     /// extracts and highlights text out of these rather than a whole-transcript
     /// grid (Spec E section 2). See [`entry_rows`](Self::entry_rows).
@@ -1596,6 +1688,13 @@ pub struct TranscriptView {
 /// per entry. A change to any of them invalidates every cached surface, so
 /// [`TranscriptView::draw`] clears the cache wholesale on a change. These
 /// toggles are rare, so a full clear costs one all-miss frame.
+///
+/// `show_image_in_terminal` rides here rather than the per-entry fingerprint
+/// because that fingerprint folds only an image's transmitted id, absent for
+/// both the disabled (text) and pending (blank reserve) states. Toggling the
+/// setting flips an entry between those two id-less states, which the per-entry
+/// fingerprint cannot see, so the wholesale clear is what makes images appear
+/// and disappear without a stale replay.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct GlobalRenderInputs {
     active_view: AgentId,
@@ -1604,6 +1703,7 @@ struct GlobalRenderInputs {
     show_token_usage: bool,
     compact_transcript: bool,
     syntax_highlight: bool,
+    show_image_in_terminal: bool,
 }
 
 impl GlobalRenderInputs {
@@ -1615,6 +1715,7 @@ impl GlobalRenderInputs {
             show_token_usage: chat.show_token_usage,
             compact_transcript: chat.compact_transcript,
             syntax_highlight: chat.syntax_highlight,
+            show_image_in_terminal: chat.show_image_in_terminal,
         }
     }
 }
@@ -1690,14 +1791,20 @@ impl TranscriptView {
     /// border read the same state (this view is its single writer).
     /// `branch_armed` is the armed-branch message id, shared with the Shell
     /// (its single writer) so the branch border tracks the armed message.
+    /// `image_store` is the per-session image store, shared with the host loop
+    /// so the builder records pending images the host then transmits.
     pub fn new(
         chat: Rc<RefCell<ChatState>>,
         theme: &Theme,
         focused: Rc<std::cell::Cell<bool>>,
         branch_armed: Rc<RefCell<Option<String>>>,
         selection_copied: Rc<std::cell::Cell<Option<SelectionCopied>>>,
+        image_store: Rc<RefCell<ImageStore>>,
     ) -> TranscriptView {
-        let styles = Rc::new(TranscriptStyles::from_theme(theme));
+        // Caps are unknown at construction (the probe runs after `app.init`),
+        // so build with the default (images off). `Shell::restyle` pushes
+        // caps-aware styles once the probe lands. See [`TerminalCaps`].
+        let styles = Rc::new(TranscriptStyles::from_theme(theme, TerminalCaps::default()));
         let cache = Rc::new(RefCell::new(EntryRenderCache::new()));
         let builder = EntryBuilder {
             chat: Rc::clone(&chat),
@@ -1707,6 +1814,7 @@ impl TranscriptView {
             branch_armed: Rc::clone(&branch_armed),
             copy_label: Rc::new(copy_label_spans(&styles)),
             branch_label: Rc::new(branch_label_spans(&styles)),
+            image_store: Rc::clone(&image_store),
         };
         let mut list = ListView::new(Source::Builder(Box::new(builder)));
         // `draw_cursor` stays off in every mode: the focused-message marker is
@@ -1729,6 +1837,7 @@ impl TranscriptView {
             bars,
             cache,
             styles,
+            image_store,
             entry_text: EntryTextCache::new(),
             // Match the shell's `DrawContext` defaults so a layout built before
             // the first draw wraps the same way the first visible frame will.
@@ -2426,6 +2535,7 @@ impl TranscriptView {
             branch_armed: Rc::clone(&self.branch_armed),
             copy_label: Rc::new(copy_label_spans(&styles)),
             branch_label: Rc::new(branch_label_spans(&styles)),
+            image_store: Rc::clone(&self.image_store),
         };
         self.list.borrow_mut().children = Source::Builder(Box::new(builder));
         apply_scrollbar_thumbs(&mut self.bars, &styles);
@@ -2477,8 +2587,18 @@ impl TranscriptView {
             let Some(entry) = chat.transcript(agent).and_then(|t| t.get(id)) else {
                 return Rc::new(Vec::new());
             };
-            let mut widget =
-                build_entry_widget(entry, &chat, &self.styles, false, None).into_indented_boxed();
+            // `entry_rows` feeds the select-to-copy measurement, so an image
+            // renders as its `[image: ...]` text (copying over an image yields
+            // that text, not a blank reserve). Force `Disabled` here.
+            let mut widget = build_entry_widget(
+                entry,
+                &chat,
+                &self.styles,
+                false,
+                None,
+                ImageRender::Disabled,
+            )
+            .into_indented_boxed();
             let surface = widget.draw(&ctx);
             let mut rows = surface_rows(&surface);
             for row in &mut rows {
@@ -3202,9 +3322,10 @@ mod tests {
     use super::*;
 
     fn styles() -> TranscriptStyles {
-        TranscriptStyles::from_theme(&Theme::bundled_dark_with_mode(
-            aj_app::theme::ColorMode::Truecolor,
-        ))
+        TranscriptStyles::from_theme(
+            &Theme::bundled_dark_with_mode(aj_app::theme::ColorMode::Truecolor),
+            TerminalCaps::default(),
+        )
     }
 
     /// The mouse-selection highlight reads the theme's `TextSelectionBg`
@@ -3213,15 +3334,17 @@ mod tests {
     #[test]
     fn selection_bg_uses_the_theme_text_selection_token() {
         use aj_app::theme::ColorMode;
-        let light =
-            TranscriptStyles::from_theme(&Theme::bundled_light_with_mode(ColorMode::Truecolor));
+        let light = TranscriptStyles::from_theme(
+            &Theme::bundled_light_with_mode(ColorMode::Truecolor),
+            TerminalCaps::default(),
+        );
         assert_eq!(
             light.selection_bg,
             Color::Rgb([183, 211, 248]),
             "light theme uses the macOS selection blue"
         );
         let dark_theme = Theme::bundled_dark_with_mode(ColorMode::Truecolor);
-        let dark = TranscriptStyles::from_theme(&dark_theme);
+        let dark = TranscriptStyles::from_theme(&dark_theme, TerminalCaps::default());
         assert_eq!(
             dark.selection_bg,
             Color::Rgb([48, 84, 128]),
@@ -3236,6 +3359,22 @@ mod tests {
             ),
             "the selection color is distinct from the pick-list band"
         );
+    }
+
+    /// `from_theme` carries the `images` gate straight from `TerminalCaps`.
+    #[test]
+    fn from_theme_carries_images_from_caps() {
+        let theme = Theme::bundled_dark_with_mode(aj_app::theme::ColorMode::Truecolor);
+        let off = TranscriptStyles::from_theme(&theme, TerminalCaps::default());
+        assert!(!off.images, "default caps keep images off");
+        let on = TranscriptStyles::from_theme(
+            &theme,
+            TerminalCaps {
+                images: true,
+                ..TerminalCaps::default()
+            },
+        );
+        assert!(on.images, "caps.images flows into the styles");
     }
 
     fn draw_ctx(width: u16, height: u16) -> DrawContext {
@@ -3946,6 +4085,7 @@ mod tests {
             Rc::new(std::cell::Cell::new(false)),
             Rc::new(RefCell::new(None)),
             Rc::new(std::cell::Cell::new(None)),
+            Rc::new(RefCell::new(ImageStore::default())),
         )
     }
 
@@ -5367,6 +5507,7 @@ mod tests {
             Rc::new(std::cell::Cell::new(false)),
             Rc::clone(&branch_armed),
             Rc::new(std::cell::Cell::new(None)),
+            Rc::new(RefCell::new(ImageStore::default())),
         );
         let ctx = draw_ctx(48, 40);
         let rows = crate::test_support::rows(&view.draw(&ctx));
@@ -5541,7 +5682,235 @@ mod tests {
             branch_armed: Rc::new(RefCell::new(None)),
             copy_label,
             branch_label,
+            image_store: Rc::new(RefCell::new(ImageStore::default())),
         }
+    }
+
+    /// A caching builder with images enabled, sharing `store`, so a test can
+    /// observe the pending recording and the transmit-driven fingerprint flip.
+    fn image_builder(
+        chat: &Rc<RefCell<ChatState>>,
+        store: &Rc<RefCell<ImageStore>>,
+    ) -> EntryBuilder {
+        let styles = Rc::new(TranscriptStyles::from_theme(
+            &Theme::bundled_dark_with_mode(aj_app::theme::ColorMode::Truecolor),
+            TerminalCaps {
+                images: true,
+                ..TerminalCaps::default()
+            },
+        ));
+        let copy_label = Rc::new(copy_label_spans(&styles));
+        let branch_label = Rc::new(branch_label_spans(&styles));
+        EntryBuilder {
+            chat: Rc::clone(chat),
+            styles,
+            cache: Rc::new(RefCell::new(EntryRenderCache::new())),
+            focus_mode: Rc::new(std::cell::Cell::new(false)),
+            branch_armed: Rc::new(RefCell::new(None)),
+            copy_label,
+            branch_label,
+            image_store: Rc::clone(store),
+        }
+    }
+
+    /// A chat with a single tool-result image entry on Main.
+    fn chat_with_image_entry() -> Rc<RefCell<ChatState>> {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        apply(
+            &chat,
+            &mut life,
+            tool_start(AgentId::Main, "c1", "read_file"),
+        );
+        apply(
+            &chat,
+            &mut life,
+            tool_end(
+                AgentId::Main,
+                "c1",
+                "read_file",
+                ToolDetails::Image {
+                    summary: "/tmp/pic.png".into(),
+                    mime_type: "image/png".into(),
+                    original_dimensions: (100, 80),
+                    displayed_dimensions: (100, 80),
+                },
+            ),
+        );
+        chat
+    }
+
+    /// A visible untransmitted image records a pending key and draws the blank
+    /// reserve; once the id lands the fingerprint flips, so the rebuild places
+    /// the image rather than replaying the cached blank.
+    #[test]
+    fn visible_image_records_pending_and_fingerprint_flips_on_transmit() {
+        let chat = chat_with_image_entry();
+        let store = Rc::new(RefCell::new(ImageStore::default()));
+        let builder = image_builder(&chat, &store);
+        let ctx = crate::test_support::draw_ctx(60, None);
+
+        let s1 = builder
+            .item_at_idx(0, 0)
+            .expect("entry")
+            .borrow_mut()
+            .draw(&ctx);
+        assert!(
+            surface_rows(&s1)
+                .iter()
+                .flatten()
+                .all(|c| c.image.is_none()),
+            "no placement before the id lands",
+        );
+        let pending = store.borrow_mut().take_pending();
+        assert_eq!(pending.len(), 1, "the visible image was recorded pending");
+
+        let (agent, entry_id) = pending[0];
+        store.borrow_mut().insert(agent, entry_id, 7);
+        let s2 = builder
+            .item_at_idx(0, 0)
+            .expect("entry")
+            .borrow_mut()
+            .draw(&ctx);
+        let placement = surface_rows(&s2)
+            .into_iter()
+            .flatten()
+            .find_map(|c| c.image);
+        assert!(
+            matches!(placement, Some(p) if p.img_id == 7),
+            "the fingerprint flip rebuilds and places the image: {placement:?}",
+        );
+    }
+
+    /// Caps on but `show_image_in_terminal` off: the tool image cell emits the
+    /// `[image: ...]` text fallback, records no pending key, and writes no
+    /// placement. The config half of the gate is load-bearing (dropping it
+    /// from `resolve_image` records a pending key and draws the blank reserve
+    /// instead).
+    #[test]
+    fn config_off_falls_back_to_text_and_records_no_pending() {
+        let chat = chat_with_image_entry();
+        chat.borrow_mut().show_image_in_terminal = false;
+        let store = Rc::new(RefCell::new(ImageStore::default()));
+        let builder = image_builder(&chat, &store);
+        let ctx = crate::test_support::draw_ctx(60, None);
+
+        let surface = builder
+            .item_at_idx(0, 0)
+            .expect("entry")
+            .borrow_mut()
+            .draw(&ctx);
+
+        let rows = crate::test_support::rows(&surface);
+        assert!(
+            rows.iter().any(|r| r.contains("[image:")),
+            "text fallback shown while the config is off: {rows:?}",
+        );
+        assert!(
+            surface_rows(&surface)
+                .iter()
+                .flatten()
+                .all(|c| c.image.is_none()),
+            "no placement while the config is off",
+        );
+        assert!(
+            store.borrow_mut().take_pending().is_empty(),
+            "no pending key recorded while the config is off",
+        );
+    }
+
+    /// A tool image whose transmit gave up (`Failed`) renders the
+    /// `[image: ...]` text fallback, writes no placement, and records no
+    /// pending key, so the host never re-attempts it. Treating `Failed` as
+    /// `Pending` in the tool cell would draw the blank reserve and redden the
+    /// text assertion; recording it pending would redden the last assertion.
+    #[test]
+    fn failed_image_falls_back_to_text_and_records_no_pending() {
+        let chat = chat_with_image_entry();
+        let entry_id = chat
+            .borrow()
+            .transcript(AgentId::Main)
+            .expect("main transcript")
+            .entries()
+            .iter()
+            .find(|e| matches!(&e.kind, EntryKind::Tool(_)))
+            .expect("tool image entry")
+            .id;
+        let store = Rc::new(RefCell::new(ImageStore::default()));
+        store.borrow_mut().mark_failed(AgentId::Main, entry_id);
+        let builder = image_builder(&chat, &store);
+        let ctx = crate::test_support::draw_ctx(60, None);
+
+        let surface = builder
+            .item_at_idx(0, 0)
+            .expect("entry")
+            .borrow_mut()
+            .draw(&ctx);
+
+        let rows = crate::test_support::rows(&surface);
+        assert!(
+            rows.iter().any(|r| r.contains("[image:")),
+            "text fallback shown for a failed image: {rows:?}",
+        );
+        assert!(
+            surface_rows(&surface)
+                .iter()
+                .flatten()
+                .all(|c| c.image.is_none()),
+            "no placement for a failed image",
+        );
+        assert!(
+            store.borrow_mut().take_pending().is_empty(),
+            "a failed image records no pending key",
+        );
+    }
+
+    /// Toggling `show_image_in_terminal` on while the image is still pending
+    /// clears the render cache wholesale, so the stale text fallback is not
+    /// replayed. The per-entry fingerprint cannot catch this (the id is absent
+    /// in both the disabled and pending states), so `GlobalRenderInputs`
+    /// carries the toggle. Dropping `show_image_in_terminal` from
+    /// `GlobalRenderInputs` replays the cached text and reddens this test.
+    #[test]
+    fn config_toggle_clears_cache_so_no_stale_text() {
+        let chat = chat_with_image_entry();
+        // Start with the config off so the first frame caches the text
+        // fallback under this entry's key.
+        chat.borrow_mut().show_image_in_terminal = false;
+        let theme = Theme::bundled_dark_with_mode(ColorMode::Truecolor);
+        let mut view = TranscriptView::new(
+            Rc::clone(&chat),
+            &theme,
+            Rc::new(std::cell::Cell::new(false)),
+            Rc::new(RefCell::new(None)),
+            Rc::new(std::cell::Cell::new(None)),
+            Rc::new(RefCell::new(ImageStore::default())),
+        );
+        // Caps on, so only the config gate decides.
+        view.set_styles(Rc::new(TranscriptStyles::from_theme(
+            &theme,
+            TerminalCaps {
+                images: true,
+                ..TerminalCaps::default()
+            },
+        )));
+        let ctx = draw_ctx(48, 40);
+
+        let rows0 = crate::test_support::rows(&view.draw(&ctx));
+        assert!(
+            rows0.iter().any(|r| r.contains("[image:")),
+            "text fallback while the config is off: {rows0:?}",
+        );
+
+        // Toggle on: the image is still untransmitted (Pending), so it draws
+        // the blank reserve, not the stale text. Only the wholesale clear can
+        // rebuild it, since the per-entry fingerprint did not change.
+        chat.borrow_mut().show_image_in_terminal = true;
+        let rows1 = crate::test_support::rows(&view.draw(&ctx));
+        assert!(
+            !rows1.iter().any(|r| r.contains("[image:")),
+            "no stale text after toggling images on: {rows1:?}",
+        );
     }
 
     /// Draw entry `idx` of the active view through the caching path, the way
@@ -5573,8 +5942,15 @@ mod tests {
     fn draw_uncached(builder: &EntryBuilder, agent: AgentId, idx: usize, width: u16) -> Surface {
         let chat = builder.chat.borrow();
         let entry = &chat.transcript(agent).expect("transcript").entries()[idx];
-        let mut widget =
-            build_entry_widget(entry, &chat, &builder.styles, false, None).into_indented_boxed();
+        let mut widget = build_entry_widget(
+            entry,
+            &chat,
+            &builder.styles,
+            false,
+            None,
+            ImageRender::Disabled,
+        )
+        .into_indented_boxed();
         widget.draw(&crate::test_support::draw_ctx(width, None))
     }
 
@@ -7205,6 +7581,7 @@ mod tests {
             Rc::new(std::cell::Cell::new(false)),
             Rc::new(RefCell::new(None)),
             Rc::clone(&selection_copied),
+            Rc::new(RefCell::new(ImageStore::default())),
         );
         let ctx = draw_ctx(40, 10);
         view.follow_tail = false;

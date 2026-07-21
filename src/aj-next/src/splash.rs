@@ -786,6 +786,7 @@ mod tests {
     fn styles() -> Rc<TranscriptStyles> {
         Rc::new(TranscriptStyles::from_theme(
             &Theme::bundled_dark_with_mode(ColorMode::Truecolor),
+            crate::terminal::TerminalCaps::default(),
         ))
     }
 

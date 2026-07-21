@@ -23,7 +23,8 @@ use serde_json::Value;
 use vaxis::cell::Style;
 use vaxis::vxfw::TextSpan;
 
-use crate::bubble::Bubble;
+use crate::bubble::{Bubble, BubbleImage};
+use crate::image_store::ImageRender;
 use crate::transcript::TranscriptStyles;
 
 /// Maximum body lines rendered for a head-truncated tool output
@@ -383,9 +384,10 @@ fn details_body(details: &ToolDetails, expanded: bool, styles: &TranscriptStyles
             displayed_dimensions: (disp_w, disp_h),
             ..
         } => {
-            // Textual fallback only, inline terminal images are
-            // deferred. Renders the source dimensions, and the
-            // displayed dimensions when a resize occurred.
+            // The text fallback for an image: shown when inline rendering is
+            // off (no terminal capability or the config gate). Renders the
+            // source dimensions, and the displayed dimensions when a resize
+            // occurred.
             let mime_type = sanitize_terminal_output(mime_type);
             let text = if (orig_w, orig_h) == (disp_w, disp_h) {
                 format!("[image: {mime_type} · {orig_w}x{orig_h}]")
@@ -521,12 +523,20 @@ fn bash_command_line(command: &str, styles: &TranscriptStyles) -> Line {
 /// its `$ command` line. The `expanded` tools-expand toggle wins over
 /// `compact`: when both are set the full body renders, so tools-expand stays a
 /// reveal-everything escape hatch even under compact mode.
+///
+/// `image` is how a tool-result image entry renders this frame, resolved by
+/// the caller from the capability-and-config gate and the shared image store.
+/// It only matters on the image arm: [`ImageRender::Transmitted`] places the
+/// image, [`ImageRender::Pending`] reserves its rows blank while the transmit
+/// is in flight, and [`ImageRender::Disabled`] falls back to the `[image: ...]`
+/// text placeholder.
 pub(crate) fn build_tool_cell(
     entry: &ToolEntry,
     tasks: &BTreeMap<TaskId, TaskInfo>,
     expanded: bool,
     compact: bool,
     styles: &TranscriptStyles,
+    image: ImageRender,
 ) -> Bubble {
     let status = derive_status(entry, tasks);
     let header = header_line(entry, status, tasks, styles);
@@ -536,6 +546,42 @@ pub(crate) fn build_tool_cell(
         // background, or body, so the tool composes inside the
         // sub-agent box's own painted background.
         return Bubble::entry(flatten_lines(vec![header], styles), None, styles.text);
+    }
+
+    let bg = match status {
+        VisualStatus::Pending => styles.tool_pending_bg,
+        VisualStatus::Succeeded => styles.tool_success_bg,
+        VisualStatus::Failed => styles.tool_error_bg,
+    };
+
+    // A tool-result image renders graphically while it is live: the bubble
+    // carries the header alone, with the image reserved below it via the
+    // bubble's image block. `Transmitted` places it; `Pending` reserves the
+    // rows blank. `Disabled` and `Failed` fall through to the `[image: ...]`
+    // text placeholder in `details_body`.
+    if let Some(ToolDetails::Image {
+        displayed_dimensions,
+        ..
+    }) = &entry.details
+    {
+        let img = match image {
+            ImageRender::Transmitted(id) => Some(BubbleImage {
+                px: *displayed_dimensions,
+                img_id: Some(id),
+            }),
+            ImageRender::Pending => Some(BubbleImage {
+                px: *displayed_dimensions,
+                img_id: None,
+            }),
+            // Both fall through to the `[image: ...]` text placeholder in
+            // `details_body`: `Disabled` because images are off, `Failed`
+            // because this image's transmit gave up.
+            ImageRender::Disabled | ImageRender::Failed => None,
+        };
+        if let Some(bubble_image) = img {
+            return Bubble::entry(flatten_lines(vec![header], styles), Some(bg), styles.text)
+                .with_image(bubble_image);
+        }
     }
 
     // A freshly started call has no details yet: the bubble shows
@@ -550,11 +596,6 @@ pub(crate) fn build_tool_cell(
     } else if let Some(details) = &entry.details {
         lines.extend(details_body(details, expanded, styles));
     }
-    let bg = match status {
-        VisualStatus::Pending => styles.tool_pending_bg,
-        VisualStatus::Succeeded => styles.tool_success_bg,
-        VisualStatus::Failed => styles.tool_error_bg,
-    };
     Bubble::entry(flatten_lines(lines, styles), Some(bg), styles.text)
 }
 
@@ -577,7 +618,21 @@ mod tests {
     use crate::transcript::TranscriptView;
 
     fn styles() -> TranscriptStyles {
-        TranscriptStyles::from_theme(&Theme::bundled_dark_with_mode(ColorMode::Truecolor))
+        TranscriptStyles::from_theme(
+            &Theme::bundled_dark_with_mode(ColorMode::Truecolor),
+            crate::terminal::TerminalCaps::default(),
+        )
+    }
+
+    /// Styles with inline images enabled, for the image-placement tests.
+    fn styles_with_images() -> TranscriptStyles {
+        TranscriptStyles::from_theme(
+            &Theme::bundled_dark_with_mode(ColorMode::Truecolor),
+            crate::terminal::TerminalCaps {
+                images: true,
+                ..crate::terminal::TerminalCaps::default()
+            },
+        )
     }
 
     /// Styles with three distinct bubble tints, so tint-selection
@@ -670,7 +725,7 @@ mod tests {
     fn pending_cell_renders_bubble_with_padding_and_header() {
         let e = entry("read_file", serde_json::json!({"path": "/tmp/foo.txt"}));
         let s = styles_with_distinct_tints();
-        let mut cell = build_tool_cell(&e, &no_tasks(), false, false, &s);
+        let mut cell = build_tool_cell(&e, &no_tasks(), false, false, &s, ImageRender::Disabled);
         let surface = draw(&mut cell, 60);
         let rows = rows(&surface);
         // One padding row above, one below the single content row,
@@ -725,7 +780,14 @@ mod tests {
             "bash",
             serde_json::json!({"command": "echo hi", "description": "x".repeat(120)}),
         );
-        let mut cell = build_tool_cell(&e, &no_tasks(), false, false, &styles());
+        let mut cell = build_tool_cell(
+            &e,
+            &no_tasks(),
+            false,
+            false,
+            &styles(),
+            ImageRender::Disabled,
+        );
         let surface = draw(&mut cell, 40);
         let rows = rows(&surface);
         let body: String = rows.join("");
@@ -748,7 +810,7 @@ mod tests {
             false,
         );
         let s = styles_with_distinct_tints();
-        let mut cell = build_tool_cell(&ok, &no_tasks(), false, false, &s);
+        let mut cell = build_tool_cell(&ok, &no_tasks(), false, false, &s, ImageRender::Disabled);
         let surface = draw(&mut cell, 60);
         let r = rows(&surface);
         assert_eq!(r[1], " ✓ read_file()");
@@ -765,7 +827,7 @@ mod tests {
             },
             true,
         );
-        let mut cell = build_tool_cell(&err, &no_tasks(), false, false, &s);
+        let mut cell = build_tool_cell(&err, &no_tasks(), false, false, &s, ImageRender::Disabled);
         let surface = draw(&mut cell, 60);
         assert_eq!(rows(&surface)[1], " ✗ bash()");
         assert_eq!(flatten(&surface)[0][0].style.bg, s.tool_error_bg);
@@ -781,8 +843,14 @@ mod tests {
             },
             false,
         );
-        let mut cell =
-            build_tool_cell(&e, &no_tasks(), false, false, &styles_with_distinct_tints());
+        let mut cell = build_tool_cell(
+            &e,
+            &no_tasks(),
+            false,
+            false,
+            &styles_with_distinct_tints(),
+            ImageRender::Disabled,
+        );
         let surface = draw(&mut cell, 2);
         // No bubble: no children carrying an inset content surface,
         // and no tinted cells.
@@ -801,7 +869,7 @@ mod tests {
     fn nonzero_bash_exit_paints_failed_even_without_is_error() {
         let e = done_entry("bash", bash_details("", Some(1), None), false);
         let s = styles_with_distinct_tints();
-        let mut cell = build_tool_cell(&e, &no_tasks(), false, false, &s);
+        let mut cell = build_tool_cell(&e, &no_tasks(), false, false, &s, ImageRender::Disabled);
         let surface = draw(&mut cell, 40);
         let r = rows(&surface);
         assert!(r[1].starts_with(" ✗"), "{r:?}");
@@ -813,7 +881,14 @@ mod tests {
     fn zero_or_missing_bash_exit_keeps_success() {
         for exit in [Some(0), None] {
             let e = done_entry("bash", bash_details("hi\n", exit, None), false);
-            let mut cell = build_tool_cell(&e, &no_tasks(), false, false, &styles());
+            let mut cell = build_tool_cell(
+                &e,
+                &no_tasks(),
+                false,
+                false,
+                &styles(),
+                ImageRender::Disabled,
+            );
             let surface = draw(&mut cell, 40);
             assert!(rows(&surface)[1].starts_with(" ✓"), "exit {exit:?}");
         }
@@ -860,7 +935,14 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let e = done_entry("bash", bash_details(&stdout, Some(0), None), false);
-        let mut cell = build_tool_cell(&e, &no_tasks(), false, false, &styles());
+        let mut cell = build_tool_cell(
+            &e,
+            &no_tasks(),
+            false,
+            false,
+            &styles(),
+            ImageRender::Disabled,
+        );
         let r = rows(&draw(&mut cell, 60));
         assert!(
             r.iter()
@@ -882,7 +964,14 @@ mod tests {
             bash_details("a\nb\nc\nd\ne\nf\n", Some(0), None),
             false,
         );
-        let mut cell = build_tool_cell(&e, &no_tasks(), false, false, &styles());
+        let mut cell = build_tool_cell(
+            &e,
+            &no_tasks(),
+            false,
+            false,
+            &styles(),
+            ImageRender::Disabled,
+        );
         let r = rows(&draw(&mut cell, 60));
         assert!(r.iter().any(|l| l.contains("(1 earlier lines")), "{r:?}",);
         assert!(r.iter().any(|l| l == " b"));
@@ -963,7 +1052,14 @@ mod tests {
             body,
         };
         let e = done_entry("read_file", details, false);
-        let mut collapsed = build_tool_cell(&e, &no_tasks(), false, false, &styles());
+        let mut collapsed = build_tool_cell(
+            &e,
+            &no_tasks(),
+            false,
+            false,
+            &styles(),
+            ImageRender::Disabled,
+        );
         let r = rows(&draw(&mut collapsed, 60));
         assert!(r.iter().any(|l| l == " line 10"));
         assert!(!r.iter().any(|l| l == " line 11"), "{r:?}");
@@ -973,7 +1069,14 @@ mod tests {
             "{r:?}",
         );
 
-        let mut expanded = build_tool_cell(&e, &no_tasks(), true, false, &styles());
+        let mut expanded = build_tool_cell(
+            &e,
+            &no_tasks(),
+            true,
+            false,
+            &styles(),
+            ImageRender::Disabled,
+        );
         let r = rows(&draw(&mut expanded, 60));
         for i in 1..=30 {
             assert!(r.iter().any(|l| l == &format!(" line {i}")), "line {i}");
@@ -995,7 +1098,14 @@ mod tests {
             body,
         };
         let e = done_entry("read_file", details, false);
-        let mut cell = build_tool_cell(&e, &no_tasks(), false, true, &styles());
+        let mut cell = build_tool_cell(
+            &e,
+            &no_tasks(),
+            false,
+            true,
+            &styles(),
+            ImageRender::Disabled,
+        );
         let r = rows(&draw(&mut cell, 60));
         assert!(r.iter().any(|l| l.contains("read_file")), "header: {r:?}");
         assert!(!r.iter().any(|l| l.contains("line 15")), "no body: {r:?}");
@@ -1005,7 +1115,14 @@ mod tests {
     #[test]
     fn compact_keeps_the_bash_command_line_only() {
         let e = done_entry("bash", bash_details("out line\n", Some(0), None), false);
-        let mut cell = build_tool_cell(&e, &no_tasks(), false, true, &styles());
+        let mut cell = build_tool_cell(
+            &e,
+            &no_tasks(),
+            false,
+            true,
+            &styles(),
+            ImageRender::Disabled,
+        );
         let r = rows(&draw(&mut cell, 60));
         assert!(r.iter().any(|l| l.contains("$ cmd")), "command: {r:?}");
         assert!(
@@ -1020,7 +1137,14 @@ mod tests {
     #[test]
     fn tools_expand_overrides_compact() {
         let e = done_entry("bash", bash_details("out line\n", Some(0), None), false);
-        let mut cell = build_tool_cell(&e, &no_tasks(), true, true, &styles());
+        let mut cell = build_tool_cell(
+            &e,
+            &no_tasks(),
+            true,
+            true,
+            &styles(),
+            ImageRender::Disabled,
+        );
         let r = rows(&draw(&mut cell, 60));
         assert!(r.iter().any(|l| l.contains("$ cmd")), "command: {r:?}");
         assert!(
@@ -1163,6 +1287,73 @@ mod tests {
         assert_eq!(text, "[image: image/jpeg · 2000x1000 → 800x400]");
     }
 
+    fn image_details() -> ToolDetails {
+        ToolDetails::Image {
+            summary: "/tmp/pic.png".into(),
+            mime_type: "image/png".into(),
+            original_dimensions: (100, 80),
+            displayed_dimensions: (100, 80),
+        }
+    }
+
+    /// With images enabled and a transmitted id, the cell drops the `[image:]`
+    /// text and carries a `Placement` for that id.
+    #[test]
+    fn image_cell_places_the_image_when_enabled() {
+        let e = done_entry("read_file", image_details(), false);
+        let mut cell = build_tool_cell(
+            &e,
+            &no_tasks(),
+            false,
+            false,
+            &styles_with_images(),
+            ImageRender::Transmitted(9),
+        );
+        let surface = draw(&mut cell, 60);
+        let placement = flatten(&surface)
+            .into_iter()
+            .flatten()
+            .find_map(|c| c.image);
+        assert!(
+            matches!(placement, Some(p) if p.img_id == 9),
+            "placement carries the id: {placement:?}",
+        );
+        assert!(
+            !rows(&surface).iter().any(|l| l.contains("[image:")),
+            "text fallback dropped when the image renders",
+        );
+    }
+
+    /// With `ImageRender::Disabled` the cell keeps the `[image:]` text
+    /// placeholder and writes no `Placement`. The capability-and-config gate
+    /// lives in the caller (`resolve_image`), so this arm only sees the
+    /// resolved decision.
+    #[test]
+    fn image_cell_falls_back_to_text_when_disabled() {
+        let e = done_entry("read_file", image_details(), false);
+        let mut cell = build_tool_cell(
+            &e,
+            &no_tasks(),
+            false,
+            false,
+            &styles_with_images(),
+            ImageRender::Disabled,
+        );
+        let surface = draw(&mut cell, 60);
+        let r = rows(&surface);
+        assert!(
+            r.iter().any(|l| l.contains("[image: image/png · 100x80]")),
+            "text placeholder shown: {r:?}",
+        );
+        assert!(
+            flatten(&surface)
+                .iter()
+                .flatten()
+                .all(|c| c.image.is_none()),
+            "no placement when images are off",
+        );
+    }
+
     // ---- Sub-agent report -----------------------------------------------------
 
     #[test]
@@ -1207,8 +1398,14 @@ mod tests {
             false,
         );
         e.header_only = true;
-        let mut cell =
-            build_tool_cell(&e, &no_tasks(), false, false, &styles_with_distinct_tints());
+        let mut cell = build_tool_cell(
+            &e,
+            &no_tasks(),
+            false,
+            false,
+            &styles_with_distinct_tints(),
+            ImageRender::Disabled,
+        );
         let surface = draw(&mut cell, 60);
         let r = rows(&surface);
         // First row is the header, not a bg-painted pad, and there
@@ -1232,12 +1429,26 @@ mod tests {
         // `ToolDetails::Bash.task_id` alone (the resume path has no
         // task events), so an empty task map is the whole setup.
         let e = done_entry("bash", bash_details("", None, Some(3)), false);
-        let mut cell = build_tool_cell(&e, &no_tasks(), false, false, &styles());
+        let mut cell = build_tool_cell(
+            &e,
+            &no_tasks(),
+            false,
+            false,
+            &styles(),
+            ImageRender::Disabled,
+        );
         let r = rows(&draw(&mut cell, 60));
         assert!(r[1].contains("[task #3]"), "{r:?}");
 
         let fg = done_entry("bash", bash_details("", Some(0), None), false);
-        let mut cell = build_tool_cell(&fg, &no_tasks(), false, false, &styles());
+        let mut cell = build_tool_cell(
+            &fg,
+            &no_tasks(),
+            false,
+            false,
+            &styles(),
+            ImageRender::Disabled,
+        );
         let r = rows(&draw(&mut cell, 60));
         assert!(!r.iter().any(|l| l.contains("[task #")), "{r:?}");
     }
@@ -1255,7 +1466,7 @@ mod tests {
             agent_id: 1,
             task: "investigate".into(),
         };
-        let mut cell = build_tool_cell(&e, &tasks, false, false, &s);
+        let mut cell = build_tool_cell(&e, &tasks, false, false, &s, ImageRender::Disabled);
         let surface = draw(&mut cell, 60);
         let r = rows(&surface);
         assert!(!r.iter().any(|l| l.contains("[task #")), "{r:?}");
@@ -1294,7 +1505,7 @@ mod tests {
         for (status, badge, tint, glyph) in cases {
             let e = done_entry("bash", bash_details("", None, Some(4)), false);
             let tasks = task_map(4, status);
-            let mut cell = build_tool_cell(&e, &tasks, false, false, &s);
+            let mut cell = build_tool_cell(&e, &tasks, false, false, &s, ImageRender::Disabled);
             let surface = draw(&mut cell, 60);
             let r = rows(&surface);
             assert!(r[1].contains(badge), "{status:?}: {r:?}");
@@ -1304,7 +1515,7 @@ mod tests {
         // A still-running task keeps the plain badge and base tint.
         let e = done_entry("bash", bash_details("", None, Some(4)), false);
         let tasks = task_map(4, TaskStatus::Running);
-        let mut cell = build_tool_cell(&e, &tasks, false, false, &s);
+        let mut cell = build_tool_cell(&e, &tasks, false, false, &s, ImageRender::Disabled);
         let surface = draw(&mut cell, 60);
         assert!(rows(&surface)[1].contains("[task #4]"));
         assert_eq!(flatten(&surface)[0][0].style.bg, s.tool_success_bg);
@@ -1356,6 +1567,9 @@ mod tests {
             std::rc::Rc::new(std::cell::Cell::new(false)),
             std::rc::Rc::new(std::cell::RefCell::new(None)),
             std::rc::Rc::new(std::cell::Cell::new(None)),
+            std::rc::Rc::new(std::cell::RefCell::new(
+                crate::image_store::ImageStore::default(),
+            )),
         );
         let ctx = DrawContext {
             min: Size {

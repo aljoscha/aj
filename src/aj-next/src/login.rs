@@ -55,7 +55,7 @@ use crate::overlay::{
     subtitle_login,
 };
 use crate::settings_ui::push_window;
-use crate::terminal::TERMINAL_HYPERLINKS;
+use crate::terminal::TerminalCaps;
 use crate::transcript::vaxis_color;
 
 /// PgUp/PgDn step, in rows. A fixed jump rather than a viewport-derived
@@ -133,8 +133,11 @@ impl Builder for LineBuilder {
             // The whole wrapped URL then reads as one clickable link and
             // stays fully visible and copyable.
             LoginLine::Url(url) => {
-                let mut widget =
-                    RichText::new(vec![url_segment(url, self.styles.url, TERMINAL_HYPERLINKS)]);
+                let mut widget = RichText::new(vec![url_segment(
+                    url,
+                    self.styles.url,
+                    TerminalCaps::default().hyperlinks,
+                )]);
                 widget.softwrap = true;
                 widget.width_basis = WidthBasis::Parent;
                 to_widget_ref(Rc::new(RefCell::new(widget)))

@@ -311,7 +311,10 @@ mod tests {
     fn widget_over(stack: &ToastStack) -> Toasts {
         let t = theme();
         Toasts::new(
-            Rc::new(TranscriptStyles::from_theme(&t)),
+            Rc::new(TranscriptStyles::from_theme(
+                &t,
+                crate::terminal::TerminalCaps::default(),
+            )),
             Rc::new(RefCell::new(OverlayChrome::from_theme(&t))),
             Rc::clone(stack),
         )
