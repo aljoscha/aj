@@ -62,6 +62,7 @@ mod list_view;
 mod loop_event;
 mod overlay_window;
 mod padding;
+mod prompt_input;
 mod render_debug;
 mod rich_text;
 mod scroll_bars;
@@ -84,7 +85,9 @@ pub use crate::vxfw::autocomplete::{
 pub use crate::vxfw::border::{Border, BorderAlignment, BorderLabel};
 pub use crate::vxfw::button::{Button, ButtonStyle};
 pub use crate::vxfw::center::Center;
-pub use crate::vxfw::filterable_select::{FilterableSelect, SelectItem, SelectStyles};
+pub use crate::vxfw::filterable_select::{
+    FILTER_MARKER, FilterableSelect, SelectItem, SelectStyles,
+};
 pub use crate::vxfw::flex_column::FlexColumn;
 pub use crate::vxfw::flex_row::FlexRow;
 pub use crate::vxfw::keymap::{
@@ -96,6 +99,7 @@ pub use crate::vxfw::overlay_window::{
     OVERLAY_WINDOW_CHROME_COLS, OVERLAY_WINDOW_CHROME_ROWS, OverlayWindow,
 };
 pub use crate::vxfw::padding::{PadValues, Padding};
+pub use crate::vxfw::prompt_input::PromptInput;
 pub use crate::vxfw::rich_text::{RichText, TextSpan};
 pub use crate::vxfw::scroll_bars::{ScrollBars, ScrollableView};
 pub use crate::vxfw::scroll_view::ScrollView;

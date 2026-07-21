@@ -283,6 +283,9 @@ impl OverlayChrome {
 /// for the other overlays. The label is plain here (the shared default); the
 /// palette bolds its own copy on top, so bold labels are palette-only (see
 /// `crate::palette::open_palette`).
+///
+/// The filter marker uses `Muted` too, so the `> ` prompt before the query
+/// input reads as subtle chrome rather than competing with the query text.
 pub(crate) fn select_styles_from_theme(theme: &Theme) -> SelectStyles {
     let mode = theme.color_mode();
     let fg = |token: ThemeColor| Style {
@@ -299,6 +302,7 @@ pub(crate) fn select_styles_from_theme(theme: &Theme) -> SelectStyles {
         },
         secondary: fg(ThemeColor::Muted),
         scrollbar_thumb: fg(ThemeColor::Muted),
+        marker: fg(ThemeColor::Muted),
     }
 }
 

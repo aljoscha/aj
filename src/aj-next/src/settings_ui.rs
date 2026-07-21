@@ -50,9 +50,10 @@ use aj_models::registry::ModelInfo;
 use vaxis::cell::Style;
 use vaxis::key::{Key, Modifiers};
 use vaxis::vxfw::{
-    Builder, DrawContext, Event, EventContext, FilterableSelect, ListView, MaxSize, OverlayWindow,
-    RelativePoint, RichText, ScrollBars, SelectItem, SelectStyles, Size, Source, SubSurface,
-    Surface, TextField, TextSpan, Widget, WidgetRef, WidthBasis, draw_widget, to_widget_ref,
+    Builder, DrawContext, Event, EventContext, FILTER_MARKER, FilterableSelect, ListView, MaxSize,
+    OverlayWindow, PromptInput, RelativePoint, RichText, ScrollBars, SelectItem, SelectStyles,
+    Size, Source, SubSurface, Surface, TextField, TextSpan, Widget, WidgetRef, WidthBasis,
+    draw_widget, to_widget_ref,
 };
 
 use crate::keymap::action_matches;
@@ -520,6 +521,10 @@ struct SelectedRow {
 /// docs for the edit flow.
 pub(crate) struct SettingList {
     filter: Rc<RefCell<TextField>>,
+    /// The filter field wrapped behind the [`FILTER_MARKER`] prompt marker,
+    /// drawn on the top row. Shares the field `Rc` with `filter`, which stays
+    /// the focus target and owns the query and its `on_change`.
+    prompt: Rc<RefCell<PromptInput>>,
     /// The row list, shared with `bars` (which draws it) so event handling and
     /// the value accessors drive the same list the thumb reflects.
     list: Rc<RefCell<ListView>>,
@@ -584,8 +589,17 @@ impl SettingList {
                 ctx.redraw = true;
             }));
         }
+        // Wrap the field behind the shared filter marker so the query reads as
+        // a prompt, matching the other filter overlays. The field stays the
+        // focus target.
+        let prompt = Rc::new(RefCell::new(PromptInput::new(
+            to_widget_ref(Rc::clone(&filter)),
+            FILTER_MARKER,
+            styles.borrow().marker,
+        )));
         SettingList {
             filter,
+            prompt,
             list,
             bars,
             state,
@@ -737,9 +751,12 @@ impl Widget for SettingList {
                 height: Some(1),
             },
         );
+        // Keep the marker tinted with the live styles so a theme swap
+        // re-colors it without rebuilding the prompt.
+        self.prompt.borrow_mut().marker_style = self.styles.borrow().marker;
         surface.children.push(SubSurface {
             origin: RelativePoint { row: 0, col: 0 },
-            surface: draw_widget(&to_widget_ref(Rc::clone(&self.filter)), &filter_ctx),
+            surface: draw_widget(&to_widget_ref(Rc::clone(&self.prompt)), &filter_ctx),
             z_index: 0,
         });
         // Reserve a description panel below the list: a blank separator plus
@@ -2050,6 +2067,34 @@ mod tests {
         assert_eq!(
             after[2][0].style.fg, label,
             "the edited row flips to the regular (override) style"
+        );
+    }
+
+    /// The filter row is drawn behind the shared `> ` prompt marker, matching
+    /// the other filter overlays. The marker sits on row 0 in the marker style.
+    #[test]
+    fn filter_row_carries_the_prompt_marker() {
+        use crate::test_support::{draw_ctx, flatten};
+        use vaxis::vxfw::FILTER_MARKER;
+
+        let marker_fg = Color::Index(99);
+        let sty = SelectStyles {
+            marker: Style {
+                fg: marker_fg,
+                ..Style::default()
+            },
+            ..SelectStyles::default()
+        };
+        let mut list = SettingList::new(vec![cycle_row("auto_compact", "true")], sty, false);
+        let grid = flatten(&list.draw(&draw_ctx(60, Some(20))));
+        let marker: String = grid[0][..FILTER_MARKER.chars().count()]
+            .iter()
+            .map(|c| c.char.grapheme())
+            .collect();
+        assert_eq!(marker, FILTER_MARKER);
+        assert_eq!(
+            grid[0][0].style.fg, marker_fg,
+            "the marker carries the marker style"
         );
     }
 

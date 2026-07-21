@@ -36,10 +36,15 @@ use crate::cell::{Cell, Character, Color, Style};
 use crate::fuzzy::FuzzyMatcher;
 use crate::key::{Key, Modifiers};
 use crate::vxfw::{
-    Builder, DrawContext, Event, EventContext, ListView, MaxSize, RelativePoint, RichText,
-    ScrollBars, Size, Source, SubSurface, Surface, TextField, TextSpan, Widget, WidgetRef,
-    WidthBasis, draw_widget, to_widget_ref,
+    Builder, DrawContext, Event, EventContext, ListView, MaxSize, PromptInput, RelativePoint,
+    RichText, ScrollBars, Size, Source, SubSurface, Surface, TextField, TextSpan, Widget,
+    WidgetRef, WidthBasis, draw_widget, to_widget_ref,
 };
+
+/// The marker drawn before a filter overlay's query input, so the input reads
+/// as a prompt. Shared by [`FilterableSelect`] and the host's settings list so
+/// every text filter marks its input identically.
+pub const FILTER_MARKER: &str = "> ";
 
 /// Theme styles for the pick list's rows, threaded from the host's palette so
 /// the widget carries no theme dependency of its own.
@@ -65,6 +70,8 @@ pub struct SelectStyles {
     /// Foreground of the vertical scroll-bar thumb, for selectors that show
     /// one ([`FilterableSelect::set_show_scrollbar`]). Ignored otherwise.
     pub scrollbar_thumb: Style,
+    /// Style for the [`FILTER_MARKER`] drawn before the filter input.
+    pub marker: Style,
 }
 
 impl Default for SelectStyles {
@@ -78,6 +85,7 @@ impl Default for SelectStyles {
             shortcut: Style::default(),
             secondary: Style::default(),
             scrollbar_thumb: Style::default(),
+            marker: Style::default(),
         }
     }
 }
@@ -459,6 +467,10 @@ fn apply_thumb_style(bars: &mut ScrollBars<ListView>, style: Style) {
 /// separator row, and a [`ListView`] of the matching rows below.
 pub struct FilterableSelect {
     filter: Rc<RefCell<TextField>>,
+    /// The filter field wrapped behind the [`FILTER_MARKER`] prompt marker,
+    /// drawn on the top row. Shares the field `Rc` with `filter`, which stays
+    /// the focus target and owns the query and its `on_change`.
+    prompt: Rc<RefCell<PromptInput>>,
     list: Rc<RefCell<ListView>>,
     /// Scroll bars wrapping the list (sharing its `Rc` via `bars.view`), for
     /// the vertical thumb. `draw` enables the vertical bar per frame only
@@ -539,8 +551,18 @@ impl FilterableSelect {
             }));
         }
 
+        // Wrap the field behind the shared filter marker so the query reads as
+        // a prompt. The field stays the focus target, so its cursor renders
+        // (offset by the marker) and printables reach it.
+        let prompt = Rc::new(RefCell::new(PromptInput::new(
+            to_widget_ref(Rc::clone(&filter)),
+            FILTER_MARKER,
+            styles.borrow().marker,
+        )));
+
         FilterableSelect {
             filter,
+            prompt,
             list,
             bars,
             show_scrollbar: false,
@@ -668,9 +690,12 @@ impl Widget for FilterableSelect {
                 height: Some(1),
             },
         );
+        // Keep the marker tinted with the live styles so a theme swap
+        // re-colors it without rebuilding the prompt.
+        self.prompt.borrow_mut().marker_style = self.styles.borrow().marker;
         surface.children.push(SubSurface {
             origin: RelativePoint { row: 0, col: 0 },
-            surface: draw_widget(&to_widget_ref(Rc::clone(&self.filter)), &filter_ctx),
+            surface: draw_widget(&to_widget_ref(Rc::clone(&self.prompt)), &filter_ctx),
             z_index: 0,
         });
 
@@ -919,6 +944,29 @@ mod tests {
         assert_eq!(surface.children[1].surface.size.height, 8);
     }
 
+    /// The filter row is drawn behind the shared `> ` marker, and the field
+    /// (which owns the query and cursor) is shifted right past it.
+    #[test]
+    fn filter_row_carries_the_prompt_marker() {
+        let mut select = sample();
+        let surface = select.draw(&draw_ctx(30, 10));
+        // children[0] is the prompt wrapper; its own buffer holds the marker
+        // and its child is the field shifted past it.
+        let prompt = &surface.children[0].surface;
+        let marker: String = prompt.buffer[..FILTER_MARKER.chars().count()]
+            .iter()
+            .map(|c| c.char.grapheme())
+            .collect();
+        assert_eq!(marker, FILTER_MARKER);
+        assert_eq!(
+            prompt.children[0].origin,
+            RelativePoint {
+                row: 0,
+                col: i32::try_from(FILTER_MARKER.chars().count()).unwrap(),
+            },
+        );
+    }
+
     /// The E-7 band: the cursored row's cells carry `selected_bg` across the
     /// full inner width, non-selected rows do not, and navigation moves the
     /// band down with the cursor.
@@ -938,6 +986,7 @@ mod tests {
                 shortcut: Style::default(),
                 secondary: Style::default(),
                 scrollbar_thumb: Style::default(),
+                marker: Style::default(),
             },
         );
 
