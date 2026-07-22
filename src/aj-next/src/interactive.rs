@@ -761,11 +761,13 @@ fn start_login(
     {
         let handles = shell.borrow().overlay_handles();
         let theme = shell.borrow().theme.clone();
+        let caps = shell.borrow().terminal_caps();
         let snapshot = theme.read();
         open_login_dialog(
             &handles.stack,
             &handles.chrome,
             &snapshot,
+            caps,
             &provider_name,
             Arc::clone(&state),
             Arc::clone(&pending_input),
@@ -3311,7 +3313,8 @@ struct Shell {
     image_store: Rc<RefCell<ImageStore>>,
     /// The probed terminal capabilities, unknown at construction (the probe
     /// runs after `app.init`). Set once by [`Shell::set_terminal_caps`] and
-    /// read by [`Shell::restyle`] so a rebuild reflects the probed caps.
+    /// read via [`Shell::terminal_caps`] and [`Shell::restyle`] so a rebuild
+    /// reflects the probed caps.
     /// Interior mutability, like the theme handle, so the const-`&self`
     /// restyle path can read them.
     terminal_caps: Cell<TerminalCaps>,
@@ -3843,6 +3846,12 @@ impl Shell {
         self.terminal_caps.set(caps);
     }
 
+    /// The probed terminal capabilities, for components built outside the
+    /// `restyle` path (e.g. the login dialog) that must honor the same caps.
+    fn terminal_caps(&self) -> TerminalCaps {
+        self.terminal_caps.get()
+    }
+
     /// Rebuild every style struct from the current theme, for a runtime
     /// swap (hot-reload, or the settings window's theme row). Every
     /// palette-consuming widget is rebuilt in place, so editor text and
@@ -3851,7 +3860,7 @@ impl Shell {
     /// opened before the swap keep their baked styles until reopened.
     fn restyle(&self) {
         let t = self.theme.read();
-        let styles = Rc::new(TranscriptStyles::from_theme(&t, self.terminal_caps.get()));
+        let styles = Rc::new(TranscriptStyles::from_theme(&t, self.terminal_caps()));
         self.transcript.borrow_mut().set_styles(Rc::clone(&styles));
         self.status_line.borrow_mut().set_styles(Rc::clone(&styles));
         self.quit_hint.borrow_mut().set_styles(Rc::clone(&styles));

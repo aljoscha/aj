@@ -85,7 +85,7 @@ pub(crate) struct LoginDialogState {
 }
 
 /// Resolved line colors for the dialog's line kinds and its input/notice
-/// rows. `Copy` (all fields are `vaxis` [`Style`]s) so the row [`Builder`]
+/// rows. `Copy` (all fields are `Copy`) so the row [`Builder`]
 /// and the widget can each hold one.
 ///
 /// NOTE: `progress`, `prompt`, and `notice` all resolve to `Muted` today.
@@ -97,10 +97,14 @@ struct LoginStyles {
     url: Style,
     prompt: Style,
     notice: Style,
+    /// Whether the authorize-URL segment carries an OSC 8 hyperlink, from the
+    /// probed `TerminalCaps`. Threaded so login honors the same capability as
+    /// the transcript's markdown links.
+    hyperlinks: bool,
 }
 
 impl LoginStyles {
-    fn from_theme(theme: &Theme) -> LoginStyles {
+    fn from_theme(theme: &Theme, caps: TerminalCaps) -> LoginStyles {
         let mode = theme.color_mode();
         let fg = |token: ThemeColor| Style {
             fg: vaxis_color(theme.fg_color(token), mode),
@@ -112,6 +116,7 @@ impl LoginStyles {
             url: fg(ThemeColor::Accent),
             prompt: fg(ThemeColor::Muted),
             notice: fg(ThemeColor::Muted),
+            hyperlinks: caps.hyperlinks,
         }
     }
 }
@@ -136,7 +141,7 @@ impl Builder for LineBuilder {
                 let mut widget = RichText::new(vec![url_segment(
                     url,
                     self.styles.url,
-                    TerminalCaps::default().hyperlinks,
+                    self.styles.hyperlinks,
                 )]);
                 widget.softwrap = true;
                 widget.width_basis = WidthBasis::Parent;
@@ -213,11 +218,12 @@ impl LoginDialog {
     /// [`DialogCallbacks`] and by the host's [`LoginSession`].
     pub(crate) fn new(
         theme: &Theme,
+        caps: TerminalCaps,
         state: Arc<StdMutex<LoginDialogState>>,
         pending_input: PendingInput,
         cancel: Arc<AtomicBool>,
     ) -> LoginDialog {
-        let styles = LoginStyles::from_theme(theme);
+        let styles = LoginStyles::from_theme(theme, caps);
         let mut list = ListView::new(Source::Builder(Box::new(LineBuilder {
             state: Arc::clone(&state),
             styles,
@@ -757,6 +763,7 @@ pub(crate) fn open_login_dialog(
     stack: &Rc<RefCell<OverlayStack>>,
     chrome: &OverlayChrome,
     theme: &Theme,
+    caps: TerminalCaps,
     provider_name: &str,
     state: Arc<StdMutex<LoginDialogState>>,
     pending_input: PendingInput,
@@ -764,6 +771,7 @@ pub(crate) fn open_login_dialog(
 ) {
     let dialog = Rc::new(RefCell::new(LoginDialog::new(
         theme,
+        caps,
         state,
         pending_input,
         cancel,
@@ -803,6 +811,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let dialog = LoginDialog::new(
             &theme(),
+            TerminalCaps::default(),
             Arc::clone(&state),
             Arc::clone(&pending),
             Arc::clone(&cancel),
@@ -1026,7 +1035,7 @@ mod tests {
             .push(LoginLine::Url(url.to_string()));
         let builder = LineBuilder {
             state: Arc::clone(&state),
-            styles: LoginStyles::from_theme(&theme()),
+            styles: LoginStyles::from_theme(&theme(), TerminalCaps::default()),
         };
         let widget = builder.item_at_idx(0, 0).expect("url row widget");
 
@@ -1083,6 +1092,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let dialog = Rc::new(RefCell::new(LoginDialog::new(
             &theme(),
+            TerminalCaps::default(),
             Arc::clone(&state),
             pending,
             cancel,
@@ -1158,6 +1168,71 @@ mod tests {
         assert!(
             clears <= 8,
             "expected a bounded number of link closes, got {clears}"
+        );
+    }
+
+    /// The inverse of the OSC 8 render test: with the probed `hyperlinks`
+    /// capability off, the same dialog renders the URL as plain text and emits
+    /// no OSC 8 hyperlink. This pins the dialog's caps consumption. Were the
+    /// dialog to ignore the caps and assume hyperlinks are always on, the
+    /// `id=aj-oauth` open would appear and redden this test.
+    #[test]
+    fn login_url_omits_osc8_when_hyperlinks_capability_off() {
+        use vaxis::Winsize;
+        use vaxis::vaxis::{Options as VaxisOptions, Vaxis};
+
+        let url =
+            "https://auth.example.com/authorize?client_id=abcdef123456&scope=read+write&state=xyz";
+
+        let state = Arc::new(StdMutex::new(LoginDialogState::default()));
+        state
+            .lock()
+            .unwrap()
+            .lines
+            .push(LoginLine::Url(url.to_string()));
+        let pending: PendingInput = Arc::new(StdMutex::new(None));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let dialog = Rc::new(RefCell::new(LoginDialog::new(
+            &theme(),
+            TerminalCaps {
+                hyperlinks: false,
+                ..TerminalCaps::default()
+            },
+            Arc::clone(&state),
+            pending,
+            cancel,
+        )));
+        let dialog_ref = to_widget_ref(Rc::clone(&dialog));
+
+        let winsize = Winsize {
+            rows: 40,
+            cols: 40,
+            x_pixel: 0,
+            y_pixel: 0,
+        };
+        let mut vx = Vaxis::new(VaxisOptions::default());
+        let mut sink: Vec<u8> = Vec::new();
+        vx.enter_alt_screen(&mut sink).expect("alt");
+        vx.resize(&mut sink, winsize).expect("resize");
+
+        let ctx = crate::test_support::draw_ctx(40, Some(14));
+        let surface = draw_widget(&dialog_ref, &ctx);
+        surface.render(vx.window(), None);
+        let mut out = Vec::new();
+        vx.render(&mut out).expect("render");
+
+        // `id=aj-oauth` appears only in the OSC 8 params, never as printed
+        // text, so its absence proves no hyperlink was emitted.
+        let marker = b"id=aj-oauth";
+        assert!(
+            !out.windows(marker.len()).any(|w| w == marker),
+            "no OSC 8 hyperlink when the capability is off",
+        );
+        // The URL still renders, just as plain styled text.
+        let rows = crate::test_support::rows(&surface);
+        assert!(
+            rows.iter().any(|r| r.contains("auth.example.com")),
+            "the URL still renders as text: {rows:?}",
         );
     }
 
