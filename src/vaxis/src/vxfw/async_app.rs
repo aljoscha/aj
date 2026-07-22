@@ -87,9 +87,9 @@ fn apply_pending_focus(core: &mut AppCore, ctx: &mut EventContext, running: &mut
 /// Lifecycle contract: call [`init`](AsyncApp::init) exactly once before any
 /// other method (the dispatch and render methods panic otherwise), and call
 /// [`shutdown`](AsyncApp::shutdown) on the way out to stop the reader and
-/// restore the terminal. On an unclean drop the reader task aborts and the
-/// posix tty restores termios, but alt screen, mouse, and keyboard state stay
-/// on (the panic hook covers panics).
+/// restore the terminal. On an unclean drop the reader thread is signaled and
+/// detached and the posix tty restores termios, but alt screen, mouse, and
+/// keyboard state stay on (the panic hook covers panics).
 ///
 /// The redraw latch is per-frame, not per-event: it persists across
 /// [`handle_input`](AsyncApp::handle_input) /
@@ -108,11 +108,10 @@ pub struct AsyncApp {
 impl AsyncApp {
     /// Builds a driver over a runtime, a writer-side tty, and a read source.
     ///
-    /// The read source must be a separate open file description of the
-    /// terminal (see
-    /// [`PosixTty::open_reader`](crate::tty::PosixTty::open_reader)), not a
-    /// dup of the writer: the async reader flips its fd non-blocking, and a
-    /// dup would flip the writer with it.
+    /// The read source is a separate read handle on the terminal (see
+    /// [`PosixTty::open_reader`](crate::tty::PosixTty::open_reader)). The reader
+    /// runs on its own thread doing blocking reads, so it needs a fd it can
+    /// block on independently of the writer.
     pub fn new(vx: Vaxis, tty: Box<dyn Tty>, source: OwnedFd) -> AsyncApp {
         AsyncApp {
             core: AppCore::new(vx, tty),
@@ -418,12 +417,16 @@ impl AsyncApp {
 
     /// Restores the terminal: stops the reader, leaves the alt screen,
     /// disables mouse and paste, shows the cursor, and flushes. Best-effort.
+    // Async is part of the teardown API even though the blocking-read reader
+    // needs no await to stop: the host awaits `shutdown` on its exit path.
+    #[allow(clippy::unused_async)]
     pub async fn shutdown(mut self) {
-        // The async reader parks on a shutdown Notify rather than a blocking
-        // read, so no wake byte is needed: signal and join.
+        // The reader is parked in a blocking read on the tty. We cannot
+        // interrupt it without provoking input, so we signal it to stop and
+        // detach: the process is exiting and the OS reaps the parked thread.
         if let Some(running) = self.running.take() {
             running.input.shutdown();
-            let _ = running.input.join().await;
+            running.input.join();
         }
         // Best-effort restore, and flush because the writer is buffered and
         // the reset bytes must reach the terminal before the host prints to

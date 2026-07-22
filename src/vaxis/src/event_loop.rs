@@ -6,10 +6,13 @@
 //! - [`Loop`], the faithful threaded reader over a [`Queue`], ported from
 //!   upstream's `Loop`. A `std::thread` drains a [`ByteSource`] into the core
 //!   and pushes user events onto the queue.
-//! - The async front-end ([`async_input`], unix only), which registers the tty
-//!   fd with the tokio reactor and emits user events on a channel with no reader
-//!   thread. This is the path the async (tokio) `aj` integration uses; it reuses
-//!   the same parser, core, and [`Vaxis`](crate::vaxis::Vaxis) runtime.
+//! - The async front-end ([`async_input`], unix only), a reader thread doing
+//!   blocking reads that emits user events on a [`tokio::sync::mpsc`] channel
+//!   the host can `select!` on. This is the path the async (tokio) `aj`
+//!   integration uses; it reuses the same parser, core, and
+//!   [`Vaxis`](crate::vaxis::Vaxis) runtime. It reads with a blocking `read`
+//!   rather than an OS reactor because macOS rejects a freshly-opened
+//!   `/dev/tty` on kqueue and `poll(2)` (see `async_reader`).
 //!
 //! # The read/write split
 //!

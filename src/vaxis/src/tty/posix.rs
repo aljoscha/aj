@@ -101,17 +101,33 @@ impl PosixTty {
         })
     }
 
-    /// Opens a fresh read-only description of `/dev/tty` for an async reader.
+    /// Returns a read handle on the terminal for the async reader thread.
     ///
-    /// This is a new open, not a dup. The async reader puts its fd into
-    /// non-blocking mode, and a dup'd fd shares file status flags with the
-    /// writer through the common open file description, so a dup'd source
-    /// would silently flip the writer non-blocking too. Raw mode lives in the
-    /// terminal's termios, not the open file description, so the returned fd
-    /// still sees the raw mode this `PosixTty` installed.
+    /// When stdin is a terminal we dup it, otherwise we open a fresh read-only
+    /// `/dev/tty`. We prefer the inherited stdin because a freshly-opened
+    /// `/dev/tty` on macOS is an alias vnode for the controlling terminal that
+    /// the OS readiness paths (kqueue, `poll(2)`) refuse to attach to. The fd
+    /// the shell handed us points straight at the pts and has no such quirk.
+    /// The reader does blocking reads and never sets `O_NONBLOCK`, so sharing
+    /// stdin's open file description with the parent shell is safe: there is no
+    /// file status flag to leak back onto the shell's stdin. Raw mode lives in
+    /// the terminal's termios, so either fd sees the raw mode this `PosixTty`
+    /// installed.
+    ///
+    /// The `/dev/tty` fallback covers a redirected stdin (a pipe or file). A
+    /// blocking read works on that alias vnode even though the readiness paths
+    /// do not, so the fallback is sound on macOS too.
     pub fn open_reader(&self) -> io::Result<OwnedFd> {
-        let file = OpenOptions::new().read(true).open("/dev/tty")?;
-        Ok(OwnedFd::from(file))
+        use std::io::IsTerminal;
+        use std::os::fd::AsFd;
+
+        let stdin = std::io::stdin();
+        if stdin.is_terminal() {
+            stdin.as_fd().try_clone_to_owned()
+        } else {
+            let file = OpenOptions::new().read(true).open("/dev/tty")?;
+            Ok(OwnedFd::from(file))
+        }
     }
 }
 

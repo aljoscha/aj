@@ -1,121 +1,130 @@
-//! The async input front-end: an [`AsyncFd`] over the tty fd driving the shared
-//! [`InputCore`], with no reader thread.
+//! The async input front-end: a dedicated reader thread doing blocking reads
+//! on the tty fd, surfacing decoded events on a channel.
 //!
-//! This is the path the async (tokio) `aj` integration uses. It registers the
-//! terminal fd with the tokio reactor, reads when the fd is readable, feeds the
-//! same parser/core/runtime the threaded [`Loop`](crate::event_loop::Loop)
-//! uses, and emits user events on a [`tokio::sync::mpsc`] channel. The host can
-//! `select!` the returned receiver against its own events.
+//! This is the path the async (tokio) `aj` integration uses. It reads the
+//! terminal on its own thread with a plain blocking `read`, feeds the same
+//! parser/core/runtime the threaded [`Loop`](crate::event_loop::Loop) uses, and
+//! emits user events on a [`tokio::sync::mpsc`] channel. The host can `select!`
+//! the returned receiver against its own events.
+//!
+//! We read with a blocking `read` rather than registering the fd with an OS
+//! reactor, and the reason is a macOS terminal quirk. macOS refuses a
+//! freshly-opened `/dev/tty` on both kqueue (what tokio's `AsyncFd` uses) and
+//! `poll(2)`, failing with `EINVAL` / `POLLNVAL`. That fd is an alias vnode for
+//! the controlling terminal, not the underlying pts, and Darwin's readiness
+//! filters will not attach to it. The fd the shell hands us as stdin points
+//! straight at the pts and a reactor would accept it (it is what mio/crossterm
+//! register), but a reactor also forces the fd non-blocking, and stdin's open
+//! file description is shared with the parent shell, so that would leave the
+//! shell's stdin non-blocking after we exit. A blocking `read` sidesteps both:
+//! it works on any terminal fd and never touches file status flags. It also
+//! matches upstream libvaxis, which reads the same way.
+//!
+//! The fd we read is chosen by
+//! [`PosixTty::open_reader`](crate::tty::PosixTty::open_reader): the inherited
+//! stdin when it is a terminal (the common case, dodging the alias vnode
+//! entirely), and a fresh `/dev/tty` only when stdin is redirected. A blocking
+//! read works on both.
 
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 
-use nix::fcntl::{FcntlArg, OFlag, fcntl};
-use tokio::io::unix::AsyncFd;
-use tokio::sync::Notify;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use tokio::task::JoinHandle;
 
 use crate::event_loop::input::InputCore;
 use crate::event_loop::{FromEvent, READ_CHUNK};
 use crate::vaxis::Shared;
 
-/// A handle to the spawned async input task.
+/// A handle to the spawned reader thread.
 ///
-/// The task ends on source EOF, an unrecoverable read error, a closed receiver,
-/// or an explicit [`shutdown`](AsyncInput::shutdown). Dropping the handle aborts
-/// the task.
+/// The thread ends on source EOF, an unrecoverable read error, or a closed
+/// receiver. [`shutdown`](AsyncInput::shutdown) sets a quit flag the reader
+/// observes after its next read returns.
 pub struct AsyncInput {
-    shutdown: Arc<Notify>,
+    quit: Arc<AtomicBool>,
     // `Option` so `join` can take the handle out without fighting `Drop`.
-    task: Option<JoinHandle<()>>,
+    thread: Option<JoinHandle<()>>,
 }
 
 impl AsyncInput {
-    /// Signals the task to stop after its current iteration.
+    /// Asks the reader thread to stop. It observes the flag after its next read
+    /// returns, so a reader parked in a blocking `read` keeps waiting until a
+    /// byte (or EOF) arrives. Host shutdown does not depend on the thread
+    /// stopping promptly: see [`join`](Self::join).
     pub fn shutdown(&self) {
-        self.shutdown.notify_waiters();
+        self.quit.store(true, Ordering::Relaxed);
     }
 
-    /// Awaits the task's completion (after a [`shutdown`](Self::shutdown) or
-    /// EOF).
-    pub async fn join(mut self) -> Result<(), tokio::task::JoinError> {
-        match self.task.take() {
-            Some(task) => task.await,
-            None => Ok(()),
-        }
+    /// Releases the reader without waiting for it to finish.
+    ///
+    /// A blocking `read` on a live terminal cannot be interrupted without input
+    /// arriving, and the app owns the writer we would need to provoke one. So
+    /// on the host's teardown path we set the quit flag and detach: the process
+    /// is exiting, and the OS reaps the parked thread. The read source (an
+    /// owned fd) is closed when that thread finally unwinds or the process
+    /// exits.
+    pub fn join(mut self) {
+        self.quit.store(true, Ordering::Relaxed);
+        // Detach: dropping the handle does not join, so this returns at once.
+        self.thread.take();
     }
 }
 
 impl Drop for AsyncInput {
     fn drop(&mut self) {
-        if let Some(task) = &self.task {
-            task.abort();
-        }
+        self.quit.store(true, Ordering::Relaxed);
     }
 }
 
-/// Spawns an async reader over `source` (a terminal fd, e.g. a `/dev/tty`
+/// Spawns a reader thread over `source` (a terminal fd, e.g. a `/dev/tty`
 /// `File`) and returns the event receiver plus a handle.
 ///
-/// `source` is put into non-blocking mode and registered with the tokio
-/// reactor. Decoded user events of type `E` are sent on the returned channel;
-/// capability and probe responses fold into `shared` exactly as in the threaded
-/// loop, so a concurrent [`Vaxis::query_terminal`](crate::vaxis::Vaxis::query_terminal)
-/// wakes on DA1.
+/// `source` is left in blocking mode. Decoded user events of type `E` are sent
+/// on the returned channel; capability and probe responses fold into `shared`
+/// exactly as in the threaded loop, so a concurrent
+/// [`Vaxis::query_terminal`](crate::vaxis::Vaxis::query_terminal) wakes on DA1.
 pub fn async_input<E, S>(
     source: S,
     shared: Arc<Shared>,
 ) -> io::Result<(UnboundedReceiver<E>, AsyncInput)>
 where
     E: FromEvent,
-    S: AsRawFd + Send + Sync + 'static,
+    S: AsRawFd + Send + 'static,
 {
-    set_nonblocking(source.as_raw_fd())?;
-    let async_fd = AsyncFd::new(source)?;
-
     let (tx, rx) = mpsc::unbounded_channel::<E>();
-    let shutdown = Arc::new(Notify::new());
-    let task = tokio::spawn(reader(async_fd, shared, tx, Arc::clone(&shutdown)));
+    let quit = Arc::new(AtomicBool::new(false));
+    let thread = {
+        let quit = Arc::clone(&quit);
+        std::thread::Builder::new()
+            .name("vaxis-input".into())
+            .spawn(move || reader(source, shared, tx, quit))?
+    };
 
     Ok((
         rx,
         AsyncInput {
-            shutdown,
-            task: Some(task),
+            quit,
+            thread: Some(thread),
         },
     ))
 }
 
-async fn reader<E, S>(
-    async_fd: AsyncFd<S>,
-    shared: Arc<Shared>,
-    tx: UnboundedSender<E>,
-    shutdown: Arc<Notify>,
-) where
+fn reader<E, S>(source: S, shared: Arc<Shared>, tx: UnboundedSender<E>, quit: Arc<AtomicBool>)
+where
     E: FromEvent,
-    S: AsRawFd + Send + Sync,
+    S: AsRawFd,
 {
     let mut core = InputCore::new(shared);
     let mut tmp = [0u8; READ_CHUNK];
+    let fd = source.as_raw_fd();
 
-    loop {
-        let mut guard = tokio::select! {
-            biased;
-            _ = shutdown.notified() => break,
-            ready = async_fd.readable() => match ready {
-                Ok(guard) => guard,
-                // The reactor dropped the registration; nothing more to read.
-                Err(_) => break,
-            },
-        };
-
-        // `try_io` clears readiness and returns `Err` when the read would block
-        // (a false-positive wakeup), in which case we loop and await again.
-        match guard.try_io(|inner| read_fd(inner.get_ref().as_raw_fd(), &mut tmp)) {
-            Ok(Ok(0)) => break, // EOF
-            Ok(Ok(n)) => {
+    while !quit.load(Ordering::Relaxed) {
+        match read_fd(fd, &mut tmp) {
+            Ok(0) => break, // EOF
+            Ok(n) => {
                 let mut sink = |event: E| {
                     // Ignore send failures: a closed receiver means the host is
                     // gone, handled by the `is_closed` check below.
@@ -125,28 +134,19 @@ async fn reader<E, S>(
                     break;
                 }
             }
-            Ok(Err(_)) => break,    // genuine read error
-            Err(_would_block) => {} // false readiness; await again
+            // Retry an interrupted read, mirroring a syscall EINTR.
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => break, // genuine read error
         }
-
         if tx.is_closed() {
             break;
         }
     }
 }
 
-/// Reads from a raw fd, mapping `EAGAIN` to a `WouldBlock` error so `try_io`
-/// recognizes a would-block read.
+/// Reads from a raw fd, blocking until bytes are available.
 fn read_fd(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     nix::unistd::read(fd, buf).map_err(io::Error::from)
-}
-
-/// Puts `fd` into non-blocking mode, required for [`AsyncFd`].
-fn set_nonblocking(fd: RawFd) -> io::Result<()> {
-    let flags = fcntl(fd, FcntlArg::F_GETFL).map_err(io::Error::from)?;
-    let flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
-    fcntl(fd, FcntlArg::F_SETFL(flags)).map_err(io::Error::from)?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -199,5 +199,16 @@ mod tests {
             Event::KeyPress(key) => assert_eq!(key.codepoint, Key::UP),
             other => panic!("expected cursor up, got {other:?}"),
         }
+    }
+
+    /// EOF on the source (all write ends closed) ends the reader, which closes
+    /// the channel so the host sees `next_input` return `None`.
+    #[tokio::test]
+    async fn source_eof_closes_the_channel() {
+        let (read_fd, write_fd) = nix::unistd::pipe().expect("pipe");
+        let (mut rx, _handle) =
+            async_input::<Event, _>(read_fd, Shared::new()).expect("spawn async reader");
+        drop(write_fd);
+        assert!(rx.recv().await.is_none(), "channel closes on source EOF");
     }
 }
