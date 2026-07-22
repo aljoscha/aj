@@ -20,7 +20,7 @@ use std::rc::Rc;
 
 use aj_agent::TaskRegistry;
 use aj_agent::tool::{TaskId, TaskRead, TaskStatus};
-use aj_app::keybindings::{ACTION_TASK_KILL, default_action_shortcut, format_keybinding};
+use aj_app::keybindings::{ACTION_TASK_KILL, action_shortcut, format_keybinding};
 use vaxis::cell::Style;
 use vaxis::key::{Key, Modifiers};
 use vaxis::vxfw::{
@@ -377,7 +377,7 @@ fn human_bytes(n: u64) -> String {
 /// data (Spec F). Scroll and close are the built-in read-only keys, so
 /// they keep the fixed convention.
 fn subtitle() -> String {
-    let kill = default_action_shortcut(ACTION_TASK_KILL).expect("aj.task.kill has a default chord");
+    let kill = action_shortcut(ACTION_TASK_KILL).expect("aj.task.kill has a default chord");
     let up = format_keybinding("up");
     let down = format_keybinding("down");
     let close = close_key_label();
@@ -610,7 +610,7 @@ mod tests {
         assert!(s.contains(&format_keybinding("up")), "{s}");
         assert!(s.contains(&format_keybinding("down")), "{s}");
         assert!(
-            s.contains(&default_action_shortcut(ACTION_TASK_KILL).unwrap()),
+            s.contains(&action_shortcut(ACTION_TASK_KILL).unwrap()),
             "{s}"
         );
         assert!(s.contains(&close_key_label()), "{s}");

@@ -76,7 +76,7 @@ const ESTIMATED_IMAGE_TOKENS: u64 = 1200; // ~4800 chars / 4
 const READ_TOOLS: &[&str] = &["read_file"];
 
 /// Builtin tool names that modify a file at `arguments["path"]`.
-const EDIT_TOOLS: &[&str] = &["edit_file", "edit_file_multi", "write_file"];
+const EDIT_TOOLS: &[&str] = &["edit_file", "write_file"];
 
 /// Upper bound on the characters of a single tool result embedded in the
 /// summarizer transcript. A large result (a file dump, a long command
@@ -1005,7 +1005,6 @@ mod tests {
             tool_call("c1", "read_file", json!({"path": "/a.rs"})),
             tool_call("c2", "edit_file", json!({"path": "/b.rs"})),
             tool_call("c3", "write_file", json!({"path": "/c.rs"})),
-            tool_call("c4", "edit_file_multi", json!({"path": "/b.rs"})),
         ];
         let previous = CompactionDetails {
             read_files: vec!["/old_read.rs".into()],

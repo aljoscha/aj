@@ -1,6 +1,6 @@
 # Spec A: `AsyncApp` in `vaxis`
 
-## Status: proposal (not started)
+## Status: implemented
 
 Companion to `docs/aj-next-vaxis-plan.md`. This spec adds an async driver for the
 `vxfw` widget framework to the `vaxis` crate, so an async (tokio) host like

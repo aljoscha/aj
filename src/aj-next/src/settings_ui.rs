@@ -42,7 +42,7 @@ use std::sync::Arc;
 use aj_agent::events::AgentId;
 use aj_app::commands::{THINKING_LEVELS, ThinkingLevel, thinking_level_name, thinking_levels_for};
 use aj_app::footer::format_tokens;
-use aj_app::keybindings::{ACTION_SETTINGS_CLEAR, default_action_shortcut};
+use aj_app::keybindings::{ACTION_SETTINGS_CLEAR, action_shortcut};
 use aj_app::settings::ConfigTarget;
 use aj_conf::{Config, ValueKind};
 use aj_models::ThinkingConfig;
@@ -107,8 +107,8 @@ pub(crate) struct SettingsUi {
 }
 
 impl SettingsUi {
-    /// Set a row's displayed value (a host correction after a failed apply).
-    /// No-op for an unknown id.
+    /// Set a row's displayed value (an optimistic edit, or a host correction
+    /// after a failed apply). No-op for an unknown id.
     pub(crate) fn set_value(&self, id: &str, value: &str) {
         self.list.borrow().set_value(id, value);
     }
@@ -659,7 +659,7 @@ impl SettingList {
         apply_setting_filter(&mut state, &mut self.list.borrow_mut());
     }
 
-    /// A row's current displayed value, for host reconciliation and tests.
+    /// A row's current displayed value, for tests.
     #[cfg(test)]
     pub(crate) fn value_of(&self, id: &str) -> Option<String> {
         self.state
@@ -1403,7 +1403,7 @@ pub(crate) fn open_settings(
 /// clear chord, all labels resolved from keybinding data (Spec F).
 fn settings_subtitle(project_mode: bool) -> String {
     let mut hint = subtitle_edit_close("edit");
-    if project_mode && let Some(clear) = default_action_shortcut(ACTION_SETTINGS_CLEAR) {
+    if project_mode && let Some(clear) = action_shortcut(ACTION_SETTINGS_CLEAR) {
         hint.push_str(&format!("  \u{2022}  {clear} to clear"));
     }
     hint

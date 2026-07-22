@@ -6,7 +6,7 @@ emits multiple `tool_use` blocks in one message; today the agent runs
 them serially. This wires up the dormant `ExecutionMode` enum so that
 read-only / side-effect-light tools (`read_file`, `agent`, the `task_*`
 tools, todos) run in parallel, while state-mutating tools (`bash`,
-`write_file`, `edit_file`, `edit_file_multi`) stay serial and act as
+`write_file`, `edit_file`) stay serial and act as
 ordering barriers.
 
 The headline win is **parallel foreground sub-agents**: two `agent`
@@ -47,7 +47,7 @@ emission order.
 `Parallel`) is declared by the tool trait
 (`ToolDefinition::execution_mode`, `tool.rs:607`) and stored on
 `ErasedToolDefinition` (`tool.rs:648`, `660`). Tools override it:
-`bash`, `write_file`, `edit_file`, `edit_file_multi` return
+`bash`, `write_file`, `edit_file` return
 `Sequential`; everything else keeps the `Parallel` default. **No code
 in `aj-agent` reads `execution_mode`** — the batch loop is
 unconditionally serial. The enum is dead-but-declared metadata.

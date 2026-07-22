@@ -13,7 +13,7 @@ use std::rc::Rc;
 
 use aj_agent::events::AgentId;
 use aj_agent::queue::MessageQueues;
-use aj_app::actions::{AjAction, ChordKey, ChordPhase, ChordSpec, default_global_bindings};
+use aj_app::actions::{AjAction, ChordKey, ChordPhase, ChordSpec, global_bindings};
 use vaxis::key::{Key, Modifiers, name_map};
 use vaxis::vxfw::{Activator, BindingPhase, Entry, Keymap, TextArea};
 
@@ -159,21 +159,20 @@ fn activator(spec: &ChordSpec) -> Activator {
     Activator::new(codepoint, mods)
 }
 
-/// Whether `key` activates `action_id`'s default chord.
+/// Whether `key` activates `action_id`'s effective chord.
 ///
 /// Overlay-local chords (Spec F) are matched at-target rather than through the
 /// global keymap, but they must still read the same source of truth as their
-/// hint labels. Resolving the action's default chord here (the same data
-/// [`aj_app::keybindings::default_action_shortcut`] renders) keeps match and
-/// label from drifting. Keybindings are not user-configurable, so the default
-/// chord is the effective binding.
+/// hint labels. Resolving the action's effective chord here (the same data
+/// [`aj_app::keybindings::action_shortcut`] renders) keeps match and label from
+/// drifting, and picks up a user `[keybindings]` override the same way.
 ///
-/// Panics if `action_id` has no default chord, since these callers pass
-/// compile-time action constants whose chords the data layer guarantees.
+/// Panics if `action_id` has no chord, since these callers pass compile-time
+/// action constants whose chords the data layer guarantees.
 pub(crate) fn action_matches(key: &Key, action_id: &str) -> bool {
-    let chord = aj_app::keybindings::default_chord(action_id)
+    let chord = aj_app::keybindings::effective_chord(action_id)
         .and_then(aj_app::actions::parse_chord)
-        .unwrap_or_else(|| panic!("aj knows the default chord for {action_id}"));
+        .unwrap_or_else(|| panic!("aj knows the effective chord for {action_id}"));
     activator(&chord).accepts(key)
 }
 
@@ -200,7 +199,7 @@ pub(crate) fn build_keymap() -> Keymap<AjAction, HostCtx> {
         Entry::sequence(vec![ctrl_c, ctrl_c], AjAction::Quit).with_enabled(can_arm_quit),
     ];
 
-    for binding in default_global_bindings() {
+    for binding in global_bindings() {
         let phase = match binding.phase {
             ChordPhase::Capture => BindingPhase::Capture,
             ChordPhase::Bubble => BindingPhase::Bubble,
@@ -213,7 +212,7 @@ pub(crate) fn build_keymap() -> Keymap<AjAction, HostCtx> {
         // PageUp/PageDown (Spec E section 1 routes the page keys to the
         // chat only when nothing is capturing).
         //
-        // NOTE(aljoscha): the `default_global_bindings` phase puts the page
+        // NOTE(aljoscha): the `global_bindings` phase puts the page
         // and Home/End chords in the capture phase, ahead of the focused
         // editor, whose `TextArea` otherwise consumes PageUp/PageDown for its
         // own multi-line scroll and Home/End for line start/end. That editor

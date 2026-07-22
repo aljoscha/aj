@@ -51,7 +51,7 @@ static EDIT_KEY_LABEL: LazyLock<String> =
 /// binding table. Follows user `[keybindings]` overrides once those
 /// land.
 static STEER_KEY_LABEL: LazyLock<String> = LazyLock::new(|| {
-    aj_app::keybindings::default_action_shortcut(aj_app::keybindings::ACTION_SUBMIT_STEERING)
+    aj_app::keybindings::action_shortcut(aj_app::keybindings::ACTION_SUBMIT_STEERING)
         .expect("aj.message.steer has a default chord")
 });
 

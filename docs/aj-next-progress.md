@@ -1,5 +1,10 @@
 # aj-next Plan Implementation Progress
 
+> **Status: historical.** This file tracked the early core/models refactor
+> phases only. It is kept as a record and is not maintained. For the state of
+> the `aj-next` frontend see `aj-next-vaxis-plan.md` (marked implemented);
+> `git log` is authoritative throughout.
+
 Tracking file for `docs/aj-next-plan.md`. Each item maps to a step
 in §2 (Phase 0), §4 (Phase 1), or §5 (Phase 2). Use `git log` for
 the authoritative state; this file is the bridge between the plan

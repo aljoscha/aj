@@ -36,7 +36,8 @@ use aj_app::theme::{
 use aj_app::turn::{TurnStart, Turns, running_work_counts, turn_policy};
 use aj_conf::skills::Skill;
 use aj_conf::{
-    Config, ConfigDiagnostic, ConfigSpeed, ConfigThinkingDisplay, ConfigVerbosity, Severity,
+    AgentEnv, Config, ConfigDiagnostic, ConfigSpeed, ConfigThinkingDisplay, ConfigVerbosity,
+    Severity,
 };
 use aj_models::auth::{AuthError, AuthStorage};
 use aj_models::registry::ModelInfo;
@@ -173,6 +174,12 @@ async fn build_world(
     persistence: &ConversationPersistence,
 ) -> Result<World> {
     let config = layers.effective();
+
+    // Install the user's `[keybindings]` overrides before the keymap is built
+    // or any hint renders. Rejected entries are surfaced as a startup warning
+    // in the notice block below.
+    let keybinding_problems = aj_app::actions::install_keybindings(config.keybindings.clone());
+
     let speed = match args.speed.as_deref() {
         Some(s) => Some(s.parse::<ConfigSpeed>().map_err(anyhow::Error::msg)?),
         None => config.speed,
@@ -272,29 +279,21 @@ async fn build_world(
         };
         let _ = reduce(&mut chat, &mut core.lifecycle, event);
     }
-    // The context listing and skill warnings describe the freshly-loaded
-    // env, which only governs a fresh session. A resumed session keeps its
-    // assembled prompt in the log, so we skip them there. Context folds as an
-    // Info notice leading the fresh-session block, ahead of the skill and
-    // sandbox warnings, matching aj. Any config diagnostics above still precede
-    // it. The splash box surfaces only warning-level notices, so context lives
-    // in scrollback only, never the box.
-    if matches!(spec, SessionSpec::Create { .. }) {
-        let _ = reduce(
-            &mut chat,
-            &mut core.lifecycle,
-            notice_event(&aj_app::notices::build_context_notice(
-                &core.env,
-                strikethrough,
-            )),
-        );
-        for d in &core.env.skill_diagnostics {
-            let _ = reduce(
-                &mut chat,
-                &mut core.lifecycle,
-                warning_event(&d.to_string()),
-            );
+    if !keybinding_problems.is_empty() {
+        let mut msg = String::from("Some keybindings in config.toml were ignored:");
+        for problem in &keybinding_problems {
+            msg.push_str(&format!("\n  - {problem}"));
         }
+        let _ = reduce(&mut chat, &mut core.lifecycle, warning_event(&msg));
+    }
+    // The context listing and skill warnings describe the freshly-loaded env,
+    // which governs only a fresh session, so `fresh_env_notices` returns them
+    // for a Create and nothing for a resume. Folding them here, ahead of the
+    // sandbox/auth/tmux warnings, keeps the context leading the fresh-session
+    // block. The same helper feeds the in-process new-session path, so a
+    // `/new` surfaces identical env context and skill problems.
+    for event in fresh_env_notices(&spec, &core.env) {
+        let _ = reduce(&mut chat, &mut core.lifecycle, event);
     }
     if aj_app::notices::sandbox_warning_enabled() {
         let _ = reduce(
@@ -357,8 +356,8 @@ async fn build_world(
 
 /// A freshly built session ready to install over the running one: the new
 /// core, the seeded chat model, and the notices to fold after install (the
-/// switch/create confirmation, the fresh session's context listing, plus any
-/// resume-restore notices).
+/// switch/create confirmation, the fresh session's env notices from
+/// [`fresh_env_notices`], plus any resume-restore notices).
 struct NextSession {
     core: SessionCore,
     chat: ChatState,
@@ -366,7 +365,7 @@ struct NextSession {
     /// by this build's drain and swapped onto the world in
     /// [`install_next_session`]. See [`World::deferred_subs`].
     deferred_subs: HashSet<usize>,
-    notices: Vec<String>,
+    notices: Vec<AgentEvent>,
     /// Whether the requested build failed and this session is the
     /// previous-session fallback. The branch flow gates the prompt handoff
     /// on it: a successful build with a requested head override guarantees
@@ -391,7 +390,7 @@ async fn build_next_session(
     branch: bool,
 ) -> Result<NextSession> {
     let config = world.config.lock().expect("config mutex poisoned").clone();
-    let (mut core, seed, notice, is_fresh, fell_back) = match SessionCore::build(
+    let (mut core, seed, notice, fell_back) = match SessionCore::build(
         &config,
         &world.run_config,
         &world.persistence,
@@ -400,13 +399,7 @@ async fn build_next_session(
     ) {
         Ok((core, seed)) => {
             let notice = switch_notice(&spec, &core.session_id);
-            (
-                core,
-                seed,
-                notice,
-                matches!(spec, SessionSpec::Create { .. }),
-                false,
-            )
+            (core, seed, notice, false)
         }
         Err(err) => {
             // The requested build failed. Fall back to the session that
@@ -424,8 +417,7 @@ async fn build_next_session(
                 &fallback,
                 world.restore.as_ref(),
             )?;
-            // The fallback resumes an existing session, so it is never fresh.
-            (core, seed, failure, false, true)
+            (core, seed, failure, true)
         }
     };
 
@@ -463,10 +455,10 @@ async fn build_next_session(
     }
 
     // Order: the switch/create confirmation, then (for a fresh switch) the
-    // context listing folded as an Info notice, then any resume-restore
-    // notices. The confirmation is the switch acknowledgment, so context
-    // follows it rather than leading. The caller folds these after install so
-    // they sit on top of the replayed history.
+    // fresh-env notices (context listing plus any skill warnings), then any
+    // resume-restore notices. The confirmation is the switch acknowledgment,
+    // so the env notices follow it rather than lead. The caller folds these
+    // after install so they sit on top of the replayed history.
     //
     // A successful branch build leads with no confirmation: its wording
     // depends on whether a prompt is handed off, which only the run loop
@@ -475,15 +467,22 @@ async fn build_next_session(
     // failure notice.
     let mut notices = Vec::new();
     if !(branch && !fell_back) {
-        notices.push(notice);
+        notices.push(notice_event(&notice));
     }
-    if is_fresh {
-        notices.push(aj_app::notices::build_context_notice(
-            &core.env,
-            strikethrough,
-        ));
+    // Gate the fresh-env notices on `!fell_back`, not just the spec: on a
+    // fallback the built `core` is the resumed previous session, not the
+    // requested Create, so a Create request that fell back must not describe
+    // the fallback's env as if it were freshly started. When we did not fall
+    // back, the built session matches the requested `spec`, so passing `spec`
+    // is correct.
+    if !fell_back {
+        notices.extend(fresh_env_notices(&spec, &core.env));
     }
-    notices.append(&mut core.restore_notices);
+    notices.extend(
+        std::mem::take(&mut core.restore_notices)
+            .iter()
+            .map(|n| notice_event(n)),
+    );
     Ok(NextSession {
         core,
         chat,
@@ -562,8 +561,12 @@ fn install_next_session(world: &mut World, shell: &Rc<RefCell<Shell>>, next: Nex
     sync_editor_chrome(world, shell);
     // Folded after the install so they land in the new session's chat, on
     // top of any replayed history.
-    for notice in next.notices {
-        fold_notice(world, &notice);
+    for event in next.notices {
+        let _ = reduce(
+            &mut world.chat.borrow_mut(),
+            &mut world.core.lifecycle,
+            event,
+        );
     }
 }
 
@@ -690,6 +693,32 @@ fn warning_event(text: &str) -> AgentEvent {
         agent_id: AgentId::Main,
         text: text.to_string(),
     }
+}
+
+/// Notices describing the freshly-loaded env for a fresh session: the
+/// `Context:` listing as an Info notice, followed by one warning per
+/// skill-discovery diagnostic. Empty for a resume, whose assembled prompt is
+/// fixed in its log and so is not governed by the env read now.
+///
+/// Both the process-start path ([`build_world`]) and the in-process
+/// new-session path ([`build_next_session`]) fold these, so a `/new` surfaces
+/// the same context listing and skill problems a cold start does. The splash
+/// box shows warning- and error-level notices only, so the Info context
+/// listing stays in scrollback while a skill warning can surface in the box.
+fn fresh_env_notices(spec: &SessionSpec, env: &AgentEnv) -> Vec<AgentEvent> {
+    if !matches!(spec, SessionSpec::Create { .. }) {
+        return Vec::new();
+    }
+    let mut events = vec![notice_event(&aj_app::notices::build_context_notice(
+        env,
+        strikethrough,
+    ))];
+    events.extend(
+        env.skill_diagnostics
+            .iter()
+            .map(|d| warning_event(&d.to_string())),
+    );
+    events
 }
 
 /// Fold `text` into the chat model as a Main-agent notice row.
@@ -1496,7 +1525,7 @@ fn branch_switch_notice(prompt_present: bool) -> &'static str {
 fn apply_branch_switch_notice(next: &mut NextSession, is_branch: bool, prompt_present: bool) {
     if is_branch && !next.fell_back {
         next.notices
-            .insert(0, branch_switch_notice(prompt_present).to_string());
+            .insert(0, notice_event(branch_switch_notice(prompt_present)));
     }
 }
 
@@ -5924,6 +5953,36 @@ mod tests {
             .expect("build world")
     }
 
+    /// A `[keybindings]` override for an unknown action is rejected at startup
+    /// and surfaced as a warning notice in the transcript, which the splash box
+    /// shows. The override being invalid means the process-global store stays
+    /// empty, so this does not disturb other tests' default resolution.
+    #[tokio::test]
+    async fn bad_keybindings_override_surfaces_a_startup_warning() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut layers = default_layers();
+        layers
+            .user
+            .keybindings
+            .insert("aj.not.a.real.action".to_string(), "ctrl+z".to_string());
+        let world = scripted_world_with_layers(&dir, "streaming-text", layers).await;
+
+        let chat = world.chat.borrow();
+        let has_warning = chat
+            .transcript(AgentId::Main)
+            .expect("main transcript")
+            .entries()
+            .iter()
+            .any(|e| {
+                matches!(
+                    &e.kind,
+                    EntryKind::Notice(n)
+                        if n.level == NoticeLevel::Warning && n.text.contains("keybindings")
+                )
+            });
+        assert!(has_warning, "expected a keybindings warning notice");
+    }
+
     /// Drive one scripted turn to completion so the session's log lands on disk
     /// and can be resumed by the session-switch paths.
     async fn persist_session(world: &mut World) {
@@ -6691,6 +6750,63 @@ mod tests {
         assert!(!has_context, "a resumed session folds no context notice");
     }
 
+    /// `fresh_env_notices` produces the fresh-session env block: a leading Info
+    /// context listing followed by one warning per skill diagnostic for a
+    /// Create, and nothing for a Resume (whose prompt is fixed in its log).
+    /// This is the shared unit both the cold-start and `/new` paths fold, so a
+    /// skill problem introduced before a `/new` surfaces just as it does on a
+    /// cold start.
+    #[test]
+    fn fresh_env_notices_carries_context_and_skill_warnings_for_create_only() {
+        let env = AgentEnv {
+            working_directory: std::path::PathBuf::from("/tmp/project"),
+            git_root_directory: None,
+            operating_system: "linux".to_string(),
+            today_date: "2026-01-01".to_string(),
+            system_prompt: aj_conf::SystemPrompt {
+                content: "prompt".to_string(),
+                source: aj_conf::SystemPromptSource::Builtin,
+            },
+            context_files: Vec::new(),
+            skills: Vec::new(),
+            skill_diagnostics: vec![aj_conf::skills::SkillDiagnostic {
+                path: std::path::PathBuf::from("/tmp/project/.aj/skills/broken"),
+                message: "missing description".to_string(),
+            }],
+        };
+
+        let create = fresh_env_notices(
+            &SessionSpec::Create {
+                entry: SessionEntry::Switch,
+            },
+            &env,
+        );
+        assert!(
+            matches!(&create[0], AgentEvent::Notice { text, .. } if text.contains("Context:")),
+            "the context listing leads as an Info notice: {create:?}"
+        );
+        assert!(
+            create.iter().any(|e| matches!(
+                e,
+                AgentEvent::Warning { text, .. } if text.contains("missing description")
+            )),
+            "a skill diagnostic folds as a warning: {create:?}"
+        );
+
+        let resume = fresh_env_notices(
+            &SessionSpec::Resume {
+                session_id: "s".to_string(),
+                entry: SessionEntry::Switch,
+                head: None,
+            },
+            &env,
+        );
+        assert!(
+            resume.is_empty(),
+            "a resume folds no env notices: {resume:?}"
+        );
+    }
+
     /// A session switch folds the fresh session's context as an Info notice: a
     /// fresh switch carries the context string in its deferred notices, a resume
     /// (and the resume-fallback) does not, and installing a fresh switch folds
@@ -6700,7 +6816,8 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         let previous_id = world.core.session_id.clone();
-        let has_context = |notices: &[String]| notices.iter().any(|n| n.contains("Context:"));
+        let has_context =
+            |notices: &[AgentEvent]| notices.iter().any(|e| event_text(e).contains("Context:"));
 
         let fresh = build_next_session(
             &world,
@@ -6776,7 +6893,7 @@ mod tests {
         install_next_session(&mut world, &shell, fresh);
         let folded = main_notices(&world);
         assert!(
-            has_context(&folded),
+            folded.iter().any(|n| n.contains("Context:")),
             "install folds the fresh context: {folded:?}"
         );
     }
@@ -9170,7 +9287,7 @@ mod tests {
         };
         let rows = flatten(&shell.borrow_mut().draw(&ctx)).join("\n");
         let resolved =
-            aj_app::keybindings::default_action_shortcut(aj_app::keybindings::ACTION_PALETTE_OPEN)
+            aj_app::keybindings::action_shortcut(aj_app::keybindings::ACTION_PALETTE_OPEN)
                 .expect("palette-open has a default chord");
         assert!(
             rows.contains(&resolved),
@@ -10749,6 +10866,17 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The text carried by a host-side notice event, for asserting on the
+    /// deferred notices a session build produces.
+    fn event_text(event: &AgentEvent) -> &str {
+        match event {
+            AgentEvent::Notice { text, .. }
+            | AgentEvent::Warning { text, .. }
+            | AgentEvent::Error { text, .. } => text,
+            other => panic!("expected a notice event, got {other:?}"),
+        }
     }
 
     /// The picker snapshot lists the main agent, a running sub-agent, and
@@ -12492,6 +12620,7 @@ mod tests {
         assert!(
             next.notices
                 .first()
+                .map(event_text)
                 .is_some_and(|n| n.contains("Failed to branch the conversation")
                     && n.contains("invalid conversation head")
                     && n.contains("does-not-exist")),

@@ -22,7 +22,7 @@ use std::rc::{Rc, Weak};
 use std::time::Instant;
 
 use aj_app::chat::{ChatState, EntryKind, NoticeLevel};
-use aj_app::keybindings::{ACTION_PALETTE_OPEN, default_action_shortcut};
+use aj_app::keybindings::{ACTION_PALETTE_OPEN, action_shortcut};
 use aj_app::theme::{ColorMode, ThemeRgb};
 use vaxis::cell::{Cell, Character, Color, Style};
 use vaxis::mouse;
@@ -217,7 +217,7 @@ impl Splash {
     /// keybinding-hint color, the rest muted. The key resolves through the
     /// keybinding data so it is never a literal (mirrors the copy hint).
     fn hint_spans(&self) -> Vec<TextSpan> {
-        let key = default_action_shortcut(ACTION_PALETTE_OPEN).unwrap_or_default();
+        let key = action_shortcut(ACTION_PALETTE_OPEN).unwrap_or_default();
         vec![
             TextSpan {
                 text: key,

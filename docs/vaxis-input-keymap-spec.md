@@ -1,6 +1,6 @@
 # Spec F: input dispatch, keymap, and leader sequences
 
-## Status: proposal (not started)
+## Status: implemented
 
 Companion to `docs/aj-next-vaxis-plan.md`. This spec defines how `aj-next` routes
 keyboard input: how global chords coexist with focused-widget input, a keymap
@@ -141,11 +141,11 @@ cheap.
 as `<leader> x`, which the compiler expands into `Sequence([leader, x])`. The
 leader is data, so a user can rebind it.
 
-**Compilation (in `aj-app`).** `aj-app` builds `Keymap<AjAction>` by merging the
-default bindings with the user's `[keybindings]` config, deduplicating, and
-expanding leaders. This mirrors the merge `aj` already does for its keybinding
-registry, extended with sequences, phase, and the leader. The compiled keymap is
-handed to the controller at construction.
+**Compilation (in `aj-app`).** `aj-app` merges the default bindings with the
+user's `[keybindings]` config (`install_keybindings`), deduplicating, and
+rejecting entries that name an unknown action, fail to parse, or collide with
+another global binding. The frontend then compiles the effective bindings into
+its `Keymap<AjAction>` and hands it to the controller at construction.
 
 **Context predicates.** The `enabled` predicate centralizes the context-
 sensitivity that `aj` scatters as `if overlay.is_open()` checks (palette-open is
@@ -156,10 +156,10 @@ hardcoding availability.
 **Hint labels are resolved, never hardcoded.** Any keyboard shortcut printed in
 the UI (expand hints, footer hints, pending-box hints, overlay subtitles, the
 help screen) must resolve through the keybinding data (`aj-app`'s
-`default_action_shortcut` today, the merged user keymap once `[keybindings]`
-config lands), formatted by the shared `format_keybinding`. `aj` already works
-this way via `format_action_shortcut`, and `aj-next` must too: a rebound action
-then relabels every hint automatically, and no string literal can drift from
+`action_shortcut`, which returns the user's `[keybindings]` override or the
+built-in default), formatted by the shared `format_keybinding`. `aj` classic
+works this way via `format_action_shortcut`, and `aj-next` does too: a rebound
+action relabels every hint automatically, and no string literal can drift from
 the actual binding. The only exceptions are the `fixed_keys` labels (Ctrl+C,
 Ctrl+Y), which are deliberately not rebindable and have named constants for
 their labels.

@@ -18,10 +18,11 @@ use crate::status::StatusState;
 use crate::transcript::TranscriptStyles;
 
 /// Display label of the agent-picker chord shown in the activity
-/// part, resolved from the shared default binding table. Follows user
-/// `[keybindings]` overrides once those land.
+/// part, resolved from the shared binding data, so it reflects a user
+/// `[keybindings]` override. Cached on first render, which is after the
+/// overrides are installed at startup.
 static AGENT_PICKER_KEY_LABEL: LazyLock<String> = LazyLock::new(|| {
-    aj_app::keybindings::default_action_shortcut(aj_app::keybindings::ACTION_AGENT_PICKER)
+    aj_app::keybindings::action_shortcut(aj_app::keybindings::ACTION_AGENT_PICKER)
         .expect("aj.agent.open has a default chord")
 });
 

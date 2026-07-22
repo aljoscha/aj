@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use aj_agent::events::AgentId;
 use aj_agent::tool::{TaskId, TaskKind, TaskStatus};
 use aj_app::chat::{AgentEntry, ChatState, SubAgentStatus};
-use aj_app::keybindings::{ACTION_AGENT_TOGGLE_SCOPE, ACTION_TASK_KILL, default_action_shortcut};
+use aj_app::keybindings::{ACTION_AGENT_TOGGLE_SCOPE, ACTION_TASK_KILL, action_shortcut};
 use vaxis::vxfw::{
     DrawContext, Event, EventContext, FilterableSelect, OverlayWindow, RelativePoint, SelectItem,
     SubSurface, Surface, Widget, WidgetRef, draw_widget, to_widget_ref,
@@ -155,7 +155,7 @@ impl AgentPicker {
     /// toggle hint names the scope it would switch *to*, and the kill
     /// hint appears only while a running task is listed.
     fn subtitle(&self) -> String {
-        let scope = default_action_shortcut(ACTION_AGENT_TOGGLE_SCOPE)
+        let scope = action_shortcut(ACTION_AGENT_TOGGLE_SCOPE)
             .expect("aj.agent.toggle_scope has a default chord");
         let scope_target = match self.scope {
             Scope::All => "running agents",
@@ -166,8 +166,7 @@ impl AgentPicker {
         let mut hint =
             format!("{confirm} to observe  \u{2022}  {scope} {scope_target}  \u{2022}  ");
         if self.has_killable_tasks() {
-            let kill = default_action_shortcut(ACTION_TASK_KILL)
-                .expect("aj.task.kill has a default chord");
+            let kill = action_shortcut(ACTION_TASK_KILL).expect("aj.task.kill has a default chord");
             hint.push_str(&format!("{kill} kill task  \u{2022}  "));
         }
         hint.push_str(&format!("{close} to close"));
@@ -885,8 +884,8 @@ mod tests {
             stack: Rc::clone(&stack),
             editor: Rc::clone(&editor),
         };
-        let scope = default_action_shortcut(ACTION_AGENT_TOGGLE_SCOPE).unwrap();
-        let kill = default_action_shortcut(ACTION_TASK_KILL).unwrap();
+        let scope = action_shortcut(ACTION_AGENT_TOGGLE_SCOPE).unwrap();
+        let kill = action_shortcut(ACTION_TASK_KILL).unwrap();
 
         let no_tasks = make(Vec::new());
         let sub = no_tasks.subtitle();

@@ -26,7 +26,7 @@ use aj_app::chat::{
 };
 use aj_app::footer::format_tokens;
 use aj_app::keybindings::{
-    ACTION_BRANCH_MESSAGE, ACTION_COPY_MESSAGE, ACTION_THINKING_TOGGLE, default_action_shortcut,
+    ACTION_BRANCH_MESSAGE, ACTION_COPY_MESSAGE, ACTION_THINKING_TOGGLE, action_shortcut,
     format_keybinding,
 };
 use aj_app::markdown::{Emphasis, RenderOpts};
@@ -1209,8 +1209,8 @@ fn task_outcome_tag(outcome: &TaskOutcome) -> u8 {
 /// muted, the way an overlay styles the key hints in its chrome. Both the copy
 /// and branch shortcuts share the one line (`y to copy · b to branch`).
 fn copy_label_spans(styles: &TranscriptStyles) -> Vec<TextSpan> {
-    let copy_key = default_action_shortcut(ACTION_COPY_MESSAGE).unwrap_or_default();
-    let branch_key = default_action_shortcut(ACTION_BRANCH_MESSAGE).unwrap_or_default();
+    let copy_key = action_shortcut(ACTION_COPY_MESSAGE).unwrap_or_default();
+    let branch_key = action_shortcut(ACTION_BRANCH_MESSAGE).unwrap_or_default();
     let key_span = |text: String| TextSpan {
         text,
         style: styles.accent,
@@ -1311,11 +1311,12 @@ fn entry_spans(entry: &Entry, styles: &TranscriptStyles) -> Vec<TextSpan> {
 }
 
 /// Display label of the thinking-toggle chord shown on collapsed thinking
-/// blocks, resolved from the shared default binding table. This is the
-/// `aj.thinking.toggle` chord (default `alt+t`), distinct from the tools-expand
-/// chord in [`crate::tool_cell::EXPAND_KEY_LABEL`].
+/// blocks, resolved from the shared binding data, so it reflects a user
+/// `[keybindings]` override. This is the `aj.thinking.toggle` chord (default
+/// `alt+t`), distinct from the tools-expand chord in
+/// [`crate::tool_cell::EXPAND_KEY_LABEL`].
 static THINKING_EXPAND_KEY_LABEL: LazyLock<String> = LazyLock::new(|| {
-    default_action_shortcut(ACTION_THINKING_TOGGLE).expect("aj.thinking.toggle has a default chord")
+    action_shortcut(ACTION_THINKING_TOGGLE).expect("aj.thinking.toggle has a default chord")
 });
 
 /// Build the [`MarkdownView`] for an assistant entry: one segment per content
@@ -2700,17 +2701,23 @@ impl TranscriptView {
     /// user wants to read history, so new content must stop yanking
     /// the viewport to the bottom.
     fn observe_mouse(&mut self, ctx: &mut EventContext, event: &Event, m: &mouse::Mouse) {
-        // NOTE: the bars self-stamp their surface, so the bus can also reach
-        // them directly, yet this manual forward is not double dispatch. The
-        // transcript is an ancestor of the bars in the hit path, so during a
-        // drag this capture-phase forward consumes the event before the bus's
-        // capture walk descends to the bars, and a thumb press is consumed at
-        // the bars target before the bubble phase climbs back to the
-        // transcript. A motion neither consumes reaches the bars' handlers
-        // twice, once via the bus and once here, but those are idempotent
-        // (hover only tracks position, capture is inert unless dragging), so
-        // there is no double effect. The follow-up that removes this forward
-        // drops the redundancy.
+        // NOTE: the bars self-stamp their surface, so the bus can reach them
+        // directly, yet we still forward here on purpose. Forwarding lets the
+        // transcript branch on the bars' consume result within the same event:
+        // a thumb drag drops follow-tail and cancels the glide, and the content
+        // selection below runs only when the bars declined, so grabbing the
+        // thumb scrolls rather than selects. Relying on bus routing alone would
+        // force us to infer the drag from state a prior event set, which is
+        // subtler for no gain.
+        //
+        // This forward is not double dispatch. The transcript is an ancestor of
+        // the bars in the hit path, so during a drag this capture-phase forward
+        // consumes the event before the bus's capture walk descends to the
+        // bars, and a thumb press is consumed at the bars target before the
+        // bubble phase climbs back to the transcript. A motion neither consumes
+        // reaches the bars' handlers twice, once via the bus and once here, but
+        // those are idempotent (hover only tracks position, capture is inert
+        // unless dragging), so there is no double effect.
         self.bars.borrow_mut().capture_event(ctx, event);
         if ctx.consume_event {
             if m.kind == mouse::Type::Drag {
@@ -3627,7 +3634,7 @@ mod tests {
             "\u{251b}",
             "bottom-right"
         );
-        let key = default_action_shortcut(ACTION_COPY_MESSAGE).expect("copy chord bound");
+        let key = action_shortcut(ACTION_COPY_MESSAGE).expect("copy chord bound");
         assert!(
             crate::test_support::rows(&bordered)[last_row].contains(&format!("{key} to copy")),
             "copy hint on the bottom edge: {:?}",
@@ -3660,9 +3667,8 @@ mod tests {
         let last_row = usize::from(bordered.size.height) - 2;
         let row = crate::test_support::rows(&bordered)[last_row].clone();
 
-        let copy_key = default_action_shortcut(ACTION_COPY_MESSAGE).expect("copy chord bound");
-        let branch_key =
-            default_action_shortcut(ACTION_BRANCH_MESSAGE).expect("branch chord bound");
+        let copy_key = action_shortcut(ACTION_COPY_MESSAGE).expect("copy chord bound");
+        let branch_key = action_shortcut(ACTION_BRANCH_MESSAGE).expect("branch chord bound");
         assert!(
             row.contains(&format!("{copy_key} to copy")),
             "copy shortcut on the hint line: {row:?}",
@@ -3767,12 +3773,12 @@ mod tests {
         // A collapsed block with a body advertises the expand chord, resolved
         // from the shared binding data (the thinking-toggle chord, alt+t by
         // default), not the tools-expand chord (alt+o).
-        let key = default_action_shortcut(ACTION_THINKING_TOGGLE).unwrap();
+        let key = action_shortcut(ACTION_THINKING_TOGGLE).unwrap();
         assert_eq!(
             rows,
             vec![format!("Thinking… ({key} to expand)"), String::new()]
         );
-        let tools_key = default_action_shortcut(aj_app::keybindings::ACTION_TOOLS_EXPAND).unwrap();
+        let tools_key = action_shortcut(aj_app::keybindings::ACTION_TOOLS_EXPAND).unwrap();
         assert_ne!(key, tools_key, "the two chords differ by default");
         assert!(
             !rows[0].contains(&tools_key),
@@ -4176,9 +4182,9 @@ mod tests {
         let _ = view.draw(&ctx);
         assert!(view.follow_tail);
 
-        // In the app the bar column now hit-tests to the bars directly. Here
-        // we drive the transcript's still-present forwarding path via
-        // handle_event, where the bars grab the press.
+        // The bar column hit-tests to the bars directly, so here we drive the
+        // transcript's forwarding path via handle_event, where the bars grab
+        // the press.
         let mut ec = EventContext::new();
         view.handle_event(&mut ec, &mouse(39, 10, mouse::Type::Press));
         assert!(ec.consume_event, "the thumb grabbed the press");

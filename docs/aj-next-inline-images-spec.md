@@ -1,6 +1,6 @@
 # Spec: `aj-next` inline images
 
-## Status: accepted, not started
+## Status: implemented
 
 Companion to `docs/aj-next-vaxis-plan.md`, track **9-Chrome**. This spec covers
 rendering tool-result images inline in the `aj-next` transcript, using the
