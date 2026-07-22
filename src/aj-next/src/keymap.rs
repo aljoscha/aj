@@ -339,6 +339,30 @@ mod tests {
         }
     }
 
+    /// Build the `Key` a `ChordSpec` activates, mirroring [`activator`], so a
+    /// test can drive a compiled binding's chord through the keymap.
+    fn key_of(spec: &ChordSpec) -> Key {
+        let codepoint = match spec.key {
+            ChordKey::Char(c) => u32::from(c),
+            ChordKey::Named(name) => name_map(name).expect("vaxis knows the key name"),
+            ChordKey::F(n) => name_map(&format!("f{n}")).expect("vaxis knows the f-key"),
+        };
+        let mut mods = Modifiers::empty();
+        if spec.ctrl {
+            mods |= Modifiers::CTRL;
+        }
+        if spec.alt {
+            mods |= Modifiers::ALT;
+        }
+        if spec.shift {
+            mods |= Modifiers::SHIFT;
+        }
+        if spec.super_mod {
+            mods |= Modifiers::SUPER;
+        }
+        key(codepoint, mods)
+    }
+
     #[test]
     fn activator_translates_chars_named_keys_and_fkeys() {
         let alt_up = activator(&parse_chord("alt+up").unwrap());
@@ -355,6 +379,44 @@ mod tests {
 
         let super_k = activator(&parse_chord("super+k").unwrap());
         assert_eq!(super_k, Activator::new(u32::from('k'), Modifiers::SUPER));
+    }
+
+    /// Drift guard: `aj_app::actions::ALWAYS_ON_ACTION_IDS` must match the
+    /// keymap's predicates. An always-on global is one that fires both under a
+    /// modal overlay and idle, i.e. its predicate ignores overlay and focus
+    /// state. `install_keybindings` checks overlay-local overrides against that
+    /// declared set, so if the two disagree the shadow check guards the wrong
+    /// chords. Computing the set from the compiled keymap keeps aj-app's
+    /// declaration honest.
+    #[test]
+    fn always_on_globals_match_aj_app_declaration() {
+        use std::collections::BTreeSet;
+
+        let keymap = build_keymap();
+        let idle = ctx(false);
+        let modal = ctx(false);
+        push_scrim(&modal);
+
+        let mut fires_regardless: BTreeSet<&str> = BTreeSet::new();
+        for binding in global_bindings() {
+            let k = key_of(&binding.chord);
+            let idle_hit =
+                keymap.match_single(&k, BindingPhase::Capture, &idle) == Some(&binding.action);
+            let modal_hit =
+                keymap.match_single(&k, BindingPhase::Capture, &modal) == Some(&binding.action);
+            if idle_hit && modal_hit {
+                fires_regardless.insert(binding.action.action_id().expect("global has an id"));
+            }
+        }
+
+        let declared: BTreeSet<&str> = aj_app::actions::ALWAYS_ON_ACTION_IDS
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(
+            fires_regardless, declared,
+            "the always-on set drifted from the keymap predicates",
+        );
     }
 
     /// The compiled keymap resolves the ctrl+c ambiguity by predicate:

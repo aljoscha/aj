@@ -18,7 +18,7 @@
 //! widget, so they are that widget's data, not part of the global
 //! action vocabulary.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::keybindings::{
@@ -354,6 +354,19 @@ impl fmt::Display for KeybindingProblem {
 /// login dialog's Ctrl+Y copy.
 const RESERVED_CHORDS: &[&str] = &["ctrl+c", "ctrl+y"];
 
+/// The global actions the frontend binds with an always-true predicate, so they
+/// fire regardless of overlay or focus state. Because they pre-empt at-target
+/// dispatch even while an overlay is up, an overlay-local override may not land
+/// on one of their effective chords, or it would be silently shadowed.
+///
+/// This mirrors the frontend keymap's predicates. The frontend has a drift
+/// guard asserting the two stay in sync.
+pub const ALWAYS_ON_ACTION_IDS: &[&str] = &[
+    ACTION_THINKING_TOGGLE,
+    ACTION_TOOLS_EXPAND,
+    ACTION_CLIPBOARD_PASTE_IMAGE,
+];
+
 /// The canonical `&'static str` action id matching `key`, or `None` when `key`
 /// names no known `aj.*` action.
 fn known_action_id(key: &str) -> Option<&'static str> {
@@ -363,32 +376,42 @@ fn known_action_id(key: &str) -> Option<&'static str> {
         .find(|id| *id == key)
 }
 
+/// Of two colliding actions, the one whose override to drop. An action sitting
+/// on its built-in default cannot be dropped, so we blame whichever is an
+/// accepted override, and the later-sorting id when both are. At least one is
+/// always an override, since the built-in defaults are collision-free.
+fn blame_of(
+    a: &'static str,
+    b: &'static str,
+    accepted: &BTreeMap<&'static str, ChordSpec>,
+) -> &'static str {
+    match (accepted.contains_key(a), accepted.contains_key(b)) {
+        (true, true) => a.max(b),
+        (true, false) => a,
+        (false, true) => b,
+        (false, false) => unreachable!("built-in defaults are collision-free"),
+    }
+}
+
 /// Validate the user's `[keybindings]` overrides and install the accepted set
 /// into the process-global store [`effective_chord`] reads.
 ///
 /// Each entry is `(action_id, chord)`. An entry is rejected, and reported as a
 /// [`KeybindingProblem`], when its action is unknown, its chord does not parse,
-/// or its chord would collide with a reserved key or with another global
-/// binding. A rejected action keeps its built-in default. Accepted entries
-/// replace (not extend) their action's default. Restating an action's own
-/// default is a no-op: neither stored nor reported. Call once at startup,
-/// before the keymap is built or any hint renders.
+/// or its chord is reserved. Beyond that, the accepted set must leave the final
+/// bindings collision-free: the global chords stay mutually distinct, and an
+/// overlay-local chord may not equal an always-on global chord (those fire even
+/// while an overlay is up, so they would shadow it). An override that breaks
+/// that is dropped with a [`KeybindingProblem::Conflict`] and its action keeps
+/// its built-in default. Accepted entries replace (not extend) their action's
+/// default. Restating an action's own default is a silent no-op. Call once at
+/// startup, before the keymap is built or any hint renders.
 ///
-/// Overlay-local actions (Spec F) are matched at-target by the focused overlay,
-/// so their overrides are not collision-checked against each other (they may
-/// share a chord by design). We also do not check them against the always-on
-/// global chords (thinking-toggle, tools-expand, paste-image), which fire even
-/// while an overlay is up, so an overlay-local override landing on one of those
-/// is accepted but shadowed at runtime. This is a known gap.
-///
-/// NOTE: conflict resolution is a single greedy pass over the entries in
-/// action-id order (they arrive from a sorted map), with the built-in defaults
-/// as the collision baseline. An override is rejected whenever its target still
-/// belongs to another action at that point in the pass. A consequence is that
-/// any set of rebinds that only becomes collision-free once several apply
-/// together (a two-chord swap, or a longer chain where one rebind frees the
-/// chord another wants) is rejected. Rebind onto a chord no default uses to
-/// avoid that.
+/// Collisions are judged on the final assignment, not on intermediate states,
+/// so a swap (two actions trading chords) or a longer chain (one rebind freeing
+/// the chord another wants) is accepted whole. Only a genuine clash, two
+/// actions left on the same chord, is rejected, and then the later-sorting
+/// action id is the one dropped.
 pub fn install_keybindings<I>(overrides: I) -> Vec<KeybindingProblem>
 where
     I: IntoIterator<Item = (String, String)>,
@@ -397,23 +420,21 @@ where
         .iter()
         .filter_map(|c| parse_chord(c))
         .collect();
-
-    // The action ids whose chords must stay distinct, and the default chord
-    // each starts from. Seeded from `default_chord` (not `effective_chord`) so
-    // the collision baseline is the built-in bindings even if a prior install
-    // left overrides in the store.
     let global_ids: Vec<&'static str> = global_bindings()
         .iter()
         .filter_map(|b| b.action.action_id())
         .collect();
-    let mut effective: HashMap<&'static str, ChordSpec> = global_ids
+    let overlay_local_ids: Vec<&'static str> = AJ_KEYBINDINGS
         .iter()
-        .filter_map(|id| Some((*id, parse_chord(default_chord(id)?)?)))
+        .map(|(id, _, _)| *id)
+        .filter(|id| !global_ids.contains(id))
         .collect();
 
-    let mut accepted: BTreeMap<&'static str, &'static str> = BTreeMap::new();
+    // Phase 0: validate each entry on its own. Survivors are real moves off the
+    // default; unknown / unparseable / reserved / no-op entries are settled here
+    // so the collision pass only weighs genuine rebinds.
+    let mut candidates: Vec<(&'static str, ChordSpec, String)> = Vec::new();
     let mut problems = Vec::new();
-
     for (key, chord) in overrides {
         let Some(action_id) = known_action_id(&key) else {
             problems.push(KeybindingProblem::UnknownAction { action: key });
@@ -423,11 +444,10 @@ where
             problems.push(KeybindingProblem::InvalidChord { action: key, chord });
             continue;
         };
-        // Restating an action's own default is a no-op: leave it out of the
-        // store (so `effective_chord` returns the default) rather than run it
-        // through the reserved/conflict checks. Without this, restating the one
-        // default that is a reserved chord (close-all's ctrl+c) reports a
-        // spurious conflict.
+        // Restating an action's own default is a silent no-op: leaving it out of
+        // the store lets `effective_chord` return the default, and skips the
+        // reserved/collision checks, which would otherwise flag the one default
+        // that is a reserved chord (close-all's ctrl+c).
         if default_chord(action_id).and_then(parse_chord) == Some(spec) {
             continue;
         }
@@ -439,30 +459,82 @@ where
             });
             continue;
         }
-        if global_ids.contains(&action_id) {
-            // Clashes if another global action already claims this chord,
-            // whether by default or by an override accepted earlier in the loop.
-            let clash = effective
-                .iter()
-                .find(|&(&id, &c)| id != action_id && c == spec)
-                .map(|(&id, _)| id);
-            if let Some(other) = clash {
-                problems.push(KeybindingProblem::Conflict {
-                    action: key,
-                    chord,
-                    with: format!("the binding for {other:?}"),
-                });
-                continue;
-            }
-            effective.insert(action_id, spec);
-        }
-        // Leak the lowercased canonical chord so the store hands back
-        // `&'static str`, the same borrow `default_chord` yields.
-        let leaked: &'static str = Box::leak(chord.to_ascii_lowercase().into_boxed_str());
-        accepted.insert(action_id, leaked);
+        candidates.push((action_id, spec, chord));
     }
 
-    set_overrides(accepted);
+    // Phase 1: resolve collisions on the *final* assignment (accepted override
+    // else default), not on the intermediate states a greedy pass would see, so
+    // a swap or chain of rebinds that ends collision-free is accepted whole. We
+    // start optimistic with every candidate accepted, then drop one offender at
+    // a time until the assignment is clean. This terminates because each step
+    // removes an override and the all-defaults floor is collision-free (see
+    // `defaults_are_collision_free`).
+    let mut accepted: BTreeMap<&'static str, ChordSpec> = candidates
+        .iter()
+        .map(|(id, spec, _)| (*id, *spec))
+        .collect();
+
+    loop {
+        let offender: Option<(&'static str, String)> = {
+            let chord_of = |id: &str| -> ChordSpec {
+                accepted.get(id).copied().unwrap_or_else(|| {
+                    parse_chord(default_chord(id).expect("known action id"))
+                        .expect("built-in default parses")
+                })
+            };
+
+            let mut found: Option<(&'static str, String)> = None;
+            // C1: two global actions may not share a chord.
+            'c1: for (i, a) in global_ids.iter().enumerate() {
+                for b in &global_ids[i + 1..] {
+                    if chord_of(a) == chord_of(b) {
+                        let blame = blame_of(a, b, &accepted);
+                        let other = if blame == *a { *b } else { *a };
+                        found = Some((blame, format!("the binding for {other:?}")));
+                        break 'c1;
+                    }
+                }
+            }
+            // C2: an overlay-local chord may not equal an always-on global's.
+            if found.is_none() {
+                'c2: for o in &overlay_local_ids {
+                    for g in ALWAYS_ON_ACTION_IDS {
+                        if chord_of(o) == chord_of(g) {
+                            let blame = if accepted.contains_key(*o) { *o } else { *g };
+                            let other = if blame == *o { *g } else { *o };
+                            found = Some((blame, format!("the binding for {other:?}")));
+                            break 'c2;
+                        }
+                    }
+                }
+            }
+            found
+        };
+
+        let Some((blame, with)) = offender else { break };
+        accepted.remove(blame);
+        let chord = candidates
+            .iter()
+            .find(|(id, _, _)| *id == blame)
+            .map(|(_, _, chord)| chord.clone())
+            .expect("a blamed action is an accepted candidate");
+        problems.push(KeybindingProblem::Conflict {
+            action: blame.to_string(),
+            chord,
+            with,
+        });
+    }
+
+    // Leak the lowercased canonical chord of each surviving candidate so the
+    // store hands back `&'static str`, the same borrow `default_chord` yields.
+    let mut store: BTreeMap<&'static str, &'static str> = BTreeMap::new();
+    for (id, _, chord) in &candidates {
+        if accepted.contains_key(id) {
+            let leaked: &'static str = Box::leak(chord.to_ascii_lowercase().into_boxed_str());
+            store.insert(id, leaked);
+        }
+    }
+    set_overrides(store);
     problems
 }
 
@@ -726,15 +798,13 @@ mod tests {
         set_overrides(BTreeMap::new());
     }
 
-    /// A second override targeting a chord an earlier override already claimed
-    /// is rejected. This is the clash-with-an-accepted-override branch, distinct
-    /// from clashing with a built-in default.
+    /// Two overrides landing on the same chord clash. The collision keeps the
+    /// earlier-sorting action id and drops the other, leaving it on its default.
     #[test]
     fn install_keybindings_rejects_a_clash_with_an_earlier_override() {
         let _guard = STORE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         // Both target ctrl+shift+p (no default uses it). `aj.agent.open` sorts
-        // before `aj.palette.open`, so agent is accepted first and palette then
-        // clashes with agent's accepted override.
+        // before `aj.palette.open`, so palette is the later id and gets dropped.
         let problems = install_keybindings([
             ("aj.agent.open".to_string(), "ctrl+shift+p".to_string()),
             ("aj.palette.open".to_string(), "ctrl+shift+p".to_string()),
@@ -744,7 +814,7 @@ mod tests {
         assert_eq!(
             effective_chord("aj.palette.open"),
             Some("ctrl+o"),
-            "the later override kept its default after clashing"
+            "the later-sorting override was dropped back to its default"
         );
         assert!(problems.iter().any(|p| matches!(
             p,
@@ -791,5 +861,121 @@ mod tests {
         assert_eq!(effective_chord("aj.palette.open"), Some("ctrl+o"));
 
         set_overrides(BTreeMap::new());
+    }
+
+    /// Two global actions trading chords (a swap) is collision-free in the final
+    /// assignment, so both overrides are accepted. This is the case the old
+    /// greedy pass rejected.
+    #[test]
+    fn install_keybindings_accepts_a_swap() {
+        let _guard = STORE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        // Palette (default ctrl+o) and agent (default alt+a) trade chords.
+        let problems = install_keybindings([
+            ("aj.palette.open".to_string(), "alt+a".to_string()),
+            ("aj.agent.open".to_string(), "ctrl+o".to_string()),
+        ]);
+
+        assert!(
+            problems.is_empty(),
+            "a swap is collision-free: {problems:?}"
+        );
+        assert_eq!(effective_chord("aj.palette.open"), Some("alt+a"));
+        assert_eq!(effective_chord("aj.agent.open"), Some("ctrl+o"));
+
+        set_overrides(BTreeMap::new());
+    }
+
+    /// A chain where one rebind frees the chord another wants is accepted whole:
+    /// agent takes the palette's default while the palette moves to a free key.
+    #[test]
+    fn install_keybindings_accepts_a_chain() {
+        let _guard = STORE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let problems = install_keybindings([
+            ("aj.agent.open".to_string(), "ctrl+o".to_string()),
+            ("aj.palette.open".to_string(), "f5".to_string()),
+        ]);
+
+        assert!(
+            problems.is_empty(),
+            "a chain is collision-free: {problems:?}"
+        );
+        assert_eq!(effective_chord("aj.agent.open"), Some("ctrl+o"));
+        assert_eq!(effective_chord("aj.palette.open"), Some("f5"));
+
+        set_overrides(BTreeMap::new());
+    }
+
+    /// An overlay-local override onto an always-on global chord is rejected: the
+    /// always-on global (here tools-expand on alt+o) pre-empts at-target
+    /// dispatch even inside an overlay, so the overlay-local binding would be
+    /// silently shadowed.
+    #[test]
+    fn install_keybindings_rejects_overlay_local_shadowing_an_always_on_global() {
+        let _guard = STORE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let problems = install_keybindings([("aj.usage.reset".to_string(), "alt+o".to_string())]);
+
+        assert_eq!(
+            effective_chord("aj.usage.reset"),
+            Some("r"),
+            "the overlay-local action kept its default"
+        );
+        assert!(problems.iter().any(|p| matches!(
+            p,
+            KeybindingProblem::Conflict { action, with, .. }
+                if action == "aj.usage.reset" && with.contains("aj.tools.expand")
+        )));
+
+        set_overrides(BTreeMap::new());
+    }
+
+    /// Moving an always-on global off its chord frees that chord for an
+    /// overlay-local action: the shadow check reads the always-on global's
+    /// effective chord, not just its default.
+    #[test]
+    fn install_keybindings_allows_overlay_local_onto_a_vacated_always_on_chord() {
+        let _guard = STORE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let problems = install_keybindings([
+            ("aj.tools.expand".to_string(), "f6".to_string()),
+            ("aj.usage.reset".to_string(), "alt+o".to_string()),
+        ]);
+
+        assert!(
+            problems.is_empty(),
+            "alt+o is free once tools-expand moves: {problems:?}"
+        );
+        assert_eq!(effective_chord("aj.tools.expand"), Some("f6"));
+        assert_eq!(effective_chord("aj.usage.reset"), Some("alt+o"));
+
+        set_overrides(BTreeMap::new());
+    }
+
+    /// The built-in defaults satisfy the same constraints the resolver enforces:
+    /// the global chords are mutually distinct and no overlay-local default
+    /// equals an always-on global default. The resolver's termination relies on
+    /// this, since dropping every override reverts to this floor.
+    #[test]
+    fn defaults_are_collision_free() {
+        let global_ids: Vec<&str> = global_bindings()
+            .iter()
+            .filter_map(|b| b.action.action_id())
+            .collect();
+        let spec = |id: &str| parse_chord(default_chord(id).expect("known id")).expect("parses");
+
+        for (i, a) in global_ids.iter().enumerate() {
+            for b in &global_ids[i + 1..] {
+                assert_ne!(spec(a), spec(b), "global default collision: {a} and {b}");
+            }
+        }
+
+        let overlay_local: Vec<&str> = AJ_KEYBINDINGS
+            .iter()
+            .map(|(id, _, _)| *id)
+            .filter(|id| !global_ids.contains(id))
+            .collect();
+        for o in &overlay_local {
+            for g in ALWAYS_ON_ACTION_IDS {
+                assert_ne!(spec(o), spec(g), "overlay-local {o} shadows always-on {g}");
+            }
+        }
     }
 }
