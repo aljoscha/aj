@@ -1,4 +1,4 @@
-//! `edit_file` builtin — exact-string replacement on a single file.
+//! `edit_file` builtin: apply a single string replacement to a file.
 //!
 //! Implements [`aj_agent::tool::ToolDefinition`]. Returns a
 //! [`ToolOutcome`] whose
@@ -7,13 +7,18 @@
 //! the short success summary so the model still sees
 //! a deterministic `"Successfully replaced ..."` line.
 //!
+//! Matching escalates from an exact substring match to a
+//! whitespace-tolerant line fallback. See the `apply_edit` helper for
+//! the details.
+//!
 //! Recoverable errors (path-not-absolute, file-not-found, read /
-//! write failure, zero or ambiguous matches) come back as
-//! `is_error: true` outcomes carrying [`ToolDetails::Text`] so the
-//! model can correct its call instead of aborting the turn.
-//! [`execution_mode`] is overridden to [`ExecutionMode::Sequential`]
-//! because this tool mutates the filesystem — the agent serializes a
-//! batch containing it to avoid interleaved writes.
+//! write failure, no match, ambiguous match, or an identical old/new
+//! string) come back as `is_error: true` outcomes carrying
+//! [`ToolDetails::Text`] so the model can correct its call instead of
+//! aborting the turn. [`execution_mode`] is overridden to
+//! [`ExecutionMode::Sequential`] because this tool mutates the
+//! filesystem, so the agent serializes a batch containing it to avoid
+//! interleaved writes.
 //!
 //! [`execution_mode`]: ToolDefinition::execution_mode
 
@@ -34,6 +39,7 @@ Usage:
 
 - The path parameter must be an absolute path
 - The file must exist
+- old_string and new_string must be different from each other
 - old_string must match exactly one occurrence in the file, you can provide a larger string with more context to make it more unique, or use replace_all to replace all occurences
 - If there are zero matches or multiple matches, the operation will fail
 - If replace_all is set to true, all occurrences of old_string will be replaced with new_string
@@ -104,41 +110,23 @@ impl ToolDefinition for EditFileTool {
             }
         };
 
-        // Count matches to enforce the "exactly one occurrence unless
-        // replace_all" contract before touching the disk. `match_indices`
-        // is non-overlapping, which matches the tool description.
-        let match_count = original_content.matches(&input.old_string).count();
-
-        if match_count == 0 {
-            return Ok(error_outcome(
-                &input.path,
-                format!(
-                    "No occurrences of '{}' found in file '{}'",
-                    input.old_string, input.path
-                ),
-            ));
-        }
-
-        if match_count > 1 && !input.replace_all {
-            return Ok(error_outcome(
-                &input.path,
-                format!(
-                    "Found {} occurrences of '{}' in file '{}'. Exactly one occurrence is required for safe replacement. Set replace_all to true to replace all occurrences.",
-                    match_count, input.old_string, input.path
-                ),
-            ));
-        }
-
-        let new_content = original_content.replace(&input.old_string, &input.new_string);
+        // Normalize once and reuse for both the edit and the diff base, so a
+        // CRLF->LF normalization is not mistaken for an edit in the diff.
+        let normalized = normalize_newlines(&original_content);
+        let new_content = match apply_edit(
+            &normalized,
+            &input.old_string,
+            &input.new_string,
+            input.replace_all,
+        ) {
+            Ok(content) => content,
+            Err(err) => return Ok(error_outcome(&input.path, err.message(&input))),
+        };
 
         let display_path = display_relative(path, &ctx.working_directory());
         // Complete rendering work before mutation so a diff timeout fallback or
         // unexpected panic cannot leave a successful write without an outcome.
-        let details = ToolDetails::Diff(DiffDetails::new(
-            display_path,
-            &original_content,
-            &new_content,
-        ));
+        let details = ToolDetails::Diff(DiffDetails::new(display_path, &normalized, &new_content));
 
         if let Err(e) = fs::write(path, &new_content) {
             return Ok(error_outcome(
@@ -158,6 +146,179 @@ impl ToolDefinition for EditFileTool {
             is_error: false,
         })
     }
+}
+
+/// CRLF is normalized to LF before matching, and the normalized text is
+/// what we write back. Editing a CRLF file therefore rewrites it with LF
+/// line endings, which we accept: normalizing both sides is what lets a
+/// model's LF-only `old_string` match a file saved with CRLF.
+fn normalize_newlines(s: &str) -> String {
+    s.replace("\r\n", "\n")
+}
+
+/// Undo one level of backslash-escaping. Some models emit the search or
+/// replace text with literal escape sequences (`\n`, `\t`, `\\`, `\"`,
+/// `\'`) instead of the real characters, and this maps them back. Both
+/// `\n` and `\\n` end up as a real newline (likewise for tabs); the
+/// dedicated double-backslash step only matters for backslashes not
+/// followed by `n`/`t`.
+fn unescape(s: &str) -> String {
+    s.replace("\\\\n", "\\n")
+        .replace("\\\\t", "\\t")
+        .replace("\\\\", "\\")
+        .replace("\\\"", "\"")
+        .replace("\\'", "'")
+        .replace("\\n", "\n")
+        .replace("\\t", "\t")
+}
+
+/// Leading run of whitespace in `line`, or the whole line when it is
+/// blank or all whitespace.
+fn leading_whitespace(line: &str) -> &str {
+    let end = line
+        .find(|c: char| !c.is_whitespace())
+        .unwrap_or(line.len());
+    &line[..end]
+}
+
+/// Whitespace-tolerant line replacement, used only after an exact match
+/// fails. Slides a window the height of `old_string` over `content` and
+/// takes the first window whose lines are all equal after trimming. The
+/// replacement is re-indented: the matched block's own leading
+/// whitespace (from its first line) is reapplied to each replacement
+/// line while the replacement's relative indentation is preserved.
+///
+/// This is deliberately forgiving and applies at the first matching
+/// window without checking for a second one.
+fn fuzzy_line_replace(content: &str, old_string: &str, new_string: &str) -> Option<String> {
+    let old_lines: Vec<&str> = old_string.split('\n').collect();
+    let file_lines: Vec<&str> = content.split('\n').collect();
+    if old_lines.len() > file_lines.len() {
+        return None;
+    }
+
+    for start in 0..=(file_lines.len() - old_lines.len()) {
+        let window = &file_lines[start..start + old_lines.len()];
+        if !old_lines
+            .iter()
+            .zip(window)
+            .all(|(o, f)| o.trim() == f.trim())
+        {
+            continue;
+        }
+
+        let file_indent = leading_whitespace(file_lines[start]);
+        let new_lines: Vec<&str> = new_string.split('\n').collect();
+        let base_indent = leading_whitespace(new_lines.first().copied().unwrap_or(""));
+        let rebuilt = new_lines.iter().map(|line| {
+            if line.is_empty() {
+                return String::new();
+            }
+            let indent = leading_whitespace(line);
+            // Indentation beyond the replacement's own base indent is
+            // relative and kept. Anything else is dropped so the block
+            // reanchors to the file's actual indentation.
+            let relative = indent.strip_prefix(base_indent).unwrap_or("");
+            format!("{}{}{}", file_indent, relative, &line[indent.len()..])
+        });
+
+        let mut out: Vec<String> =
+            Vec::with_capacity(file_lines.len() - old_lines.len() + new_lines.len());
+        out.extend(file_lines[..start].iter().map(|l| l.to_string()));
+        out.extend(rebuilt);
+        out.extend(
+            file_lines[start + old_lines.len()..]
+                .iter()
+                .map(|l| l.to_string()),
+        );
+        return Some(out.join("\n"));
+    }
+
+    None
+}
+
+/// Reason an edit could not be applied, rendered into a model-facing
+/// message by the caller.
+enum EditError {
+    /// `old_string` equals `new_string`, so the edit is a no-op.
+    Identical,
+    /// `old_string` occurs more than once and `replace_all` is unset.
+    Ambiguous(usize),
+    /// No exact, whitespace-tolerant, or unescaped match was found.
+    NotFound,
+}
+
+impl EditError {
+    fn message(&self, input: &EditFileInput) -> String {
+        match self {
+            EditError::Identical => {
+                "old_string and new_string must be different from each other.".to_string()
+            }
+            EditError::Ambiguous(count) => format!(
+                "Found {} occurrences of '{}' in file '{}'. Exactly one occurrence is required for safe replacement. Set replace_all to true to replace all occurrences.",
+                count, input.old_string, input.path
+            ),
+            EditError::NotFound => format!(
+                "No occurrences of '{}' found in file '{}'",
+                input.old_string, input.path
+            ),
+        }
+    }
+}
+
+/// Apply a single `old_string` -> `new_string` edit to `content` (which
+/// must already be newline-normalized) and return the rewritten file.
+///
+/// Matching escalates through three strategies:
+///
+/// 1. Exact substring. With `replace_all` every occurrence is replaced.
+///    Otherwise the match must be unique, or the call is ambiguous.
+/// 2. A whitespace-tolerant line fallback, only when the exact match
+///    finds nothing: lines must match after trimming, and the
+///    replacement is re-indented to the file's indentation.
+/// 3. The same line fallback retried after undoing one level of
+///    backslash-escaping, for models that emit literal `\n` / `\t`.
+fn apply_edit(
+    content: &str,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+) -> Result<String, EditError> {
+    if old_string == new_string {
+        return Err(EditError::Identical);
+    }
+
+    let old = normalize_newlines(old_string);
+    let new = normalize_newlines(new_string);
+
+    if replace_all {
+        if !content.contains(&old) {
+            return Err(EditError::NotFound);
+        }
+        return Ok(content.replace(&old, &new));
+    }
+
+    if let Some(pos) = content.find(&old) {
+        // A second non-overlapping occurrence makes the target ambiguous
+        // unless the caller opted into replace_all.
+        if content[pos + old.len()..].contains(&old) {
+            return Err(EditError::Ambiguous(content.matches(&old).count()));
+        }
+        return Ok(content.replacen(&old, &new, 1));
+    }
+
+    if let Some(result) = fuzzy_line_replace(content, &old, &new) {
+        return Ok(result);
+    }
+    // Last resort: some models escape the strings. Undo one level and
+    // retry the line fallback against the same normalized file.
+    let old = normalize_newlines(&unescape(old_string));
+    let new = normalize_newlines(&unescape(new_string));
+    if let Some(result) = fuzzy_line_replace(content, &old, &new) {
+        return Ok(result);
+    }
+
+    Err(EditError::NotFound)
 }
 
 /// Resolve `path` against `cwd` for display, falling back to the raw
@@ -414,6 +575,138 @@ mod tests {
         // File should not have been touched.
         let on_disk = fs::read_to_string(&path).expect("read back");
         assert_eq!(on_disk, "foo foo foo\n");
+    }
+
+    /// A CRLF file matches an LF-only `old_string` and is written back
+    /// as LF. Both sides are newline-normalized before matching.
+    #[tokio::test]
+    async fn crlf_file_matches_lf_old_string_and_writes_lf() {
+        let mut file = NamedTempFile::new().expect("temp file");
+        write!(file, "one\r\ntwo\r\nthree\r\n").unwrap();
+        let path = file.path().to_path_buf();
+
+        let mut ctx = DummyToolContext::default();
+        let outcome = EditFileTool
+            .execute(
+                &mut ctx,
+                EditFileInput {
+                    path: path.display().to_string(),
+                    old_string: "two".to_string(),
+                    new_string: "TWO".to_string(),
+                    replace_all: false,
+                },
+            )
+            .await
+            .expect("execute");
+
+        assert!(!outcome.is_error, "outcome: {outcome:?}");
+        let on_disk = fs::read_to_string(&path).expect("read back");
+        assert_eq!(on_disk, "one\nTWO\nthree\n");
+    }
+
+    /// When the exact substring is absent only because of indentation,
+    /// the whitespace-tolerant fallback matches on trimmed lines and
+    /// re-indents the replacement to the file's actual indentation.
+    #[tokio::test]
+    async fn whitespace_tolerant_fallback_reindents_replacement() {
+        let mut file = NamedTempFile::new().expect("temp file");
+        // Body lines are indented two spaces, so the model's unindented
+        // multi-line `old_string` is not an exact substring.
+        write!(file, "fn f() {{\n  a();\n  b();\n}}\n").unwrap();
+        let path = file.path().to_path_buf();
+
+        let mut ctx = DummyToolContext::default();
+        let outcome = EditFileTool
+            .execute(
+                &mut ctx,
+                EditFileInput {
+                    path: path.display().to_string(),
+                    old_string: "a();\nb();".to_string(),
+                    new_string: "a();\nc();".to_string(),
+                    replace_all: false,
+                },
+            )
+            .await
+            .expect("execute");
+
+        assert!(!outcome.is_error, "outcome: {outcome:?}");
+        let on_disk = fs::read_to_string(&path).expect("read back");
+        // The replacement keeps the file's two-space indentation.
+        assert_eq!(on_disk, "fn f() {\n  a();\n  c();\n}\n");
+    }
+
+    /// When nothing matches as-is, the tool retries after undoing one
+    /// level of backslash-escaping, so a model that emitted literal
+    /// `\n` still lands its edit.
+    #[tokio::test]
+    async fn escaped_old_string_matches_after_unescape() {
+        let mut file = NamedTempFile::new().expect("temp file");
+        write!(file, "line1\nline2\n").unwrap();
+        let path = file.path().to_path_buf();
+
+        let mut ctx = DummyToolContext::default();
+        let outcome = EditFileTool
+            .execute(
+                &mut ctx,
+                EditFileInput {
+                    path: path.display().to_string(),
+                    // Literal backslash-n, not a real newline.
+                    old_string: "line1\\nline2".to_string(),
+                    new_string: "line1\\nLINE2".to_string(),
+                    replace_all: false,
+                },
+            )
+            .await
+            .expect("execute");
+
+        assert!(!outcome.is_error, "outcome: {outcome:?}");
+        let on_disk = fs::read_to_string(&path).expect("read back");
+        assert_eq!(on_disk, "line1\nLINE2\n");
+    }
+
+    /// An identical `old_string` / `new_string` is a no-op and surfaces
+    /// as a recoverable error, leaving the file untouched.
+    #[tokio::test]
+    async fn identical_old_and_new_returns_error_outcome() {
+        let mut file = NamedTempFile::new().expect("temp file");
+        write!(file, "hello world\n").unwrap();
+        let path = file.path().to_path_buf();
+
+        let mut ctx = DummyToolContext::default();
+        let outcome = EditFileTool
+            .execute(
+                &mut ctx,
+                EditFileInput {
+                    path: path.display().to_string(),
+                    old_string: "hello".to_string(),
+                    new_string: "hello".to_string(),
+                    replace_all: false,
+                },
+            )
+            .await
+            .expect("execute");
+
+        assert!(outcome.is_error);
+        match &outcome.details {
+            ToolDetails::Text { body, .. } => {
+                assert!(body.contains("must be different"), "body: {body:?}");
+            }
+            other => panic!("expected Text details, got {other:?}"),
+        }
+
+        let on_disk = fs::read_to_string(&path).expect("read back");
+        assert_eq!(on_disk, "hello world\n");
+    }
+
+    /// `unescape` turns literal escape sequences into their characters.
+    #[test]
+    fn unescape_turns_literal_sequences_into_characters() {
+        assert_eq!(unescape("a\\nb"), "a\nb");
+        assert_eq!(unescape("a\\tb"), "a\tb");
+        // A doubled backslash collapses to one.
+        assert_eq!(unescape("a\\\\b"), "a\\b");
+        // An escaped quote becomes a quote.
+        assert_eq!(unescape("a\\\"b"), "a\"b");
     }
 
     /// Locks in `Sequential` execution mode — the agent's batching
