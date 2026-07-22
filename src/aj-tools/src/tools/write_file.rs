@@ -33,7 +33,8 @@ Usage:
 
 - The path parameter must be an absolute path
 - This will overwrite an existing file if there is one at the given path!
-- Prefer editing existing files over creating new ones - only create new files when explicitly required
+- Only create a new file when it is actually needed; don't create files proactively
+- For an existing file, prefer edit_file even for extensive changes. Overwrite with this tool only when you are replacing nearly all of the file's content and the file is small (under ~250 lines)
 - IMPORTANT: Don't use this tool for renaming a file. Prefer to use the bash tool with the mv command.
 "#;
 

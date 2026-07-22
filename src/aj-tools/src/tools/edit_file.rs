@@ -39,10 +39,12 @@ Usage:
 
 - The path parameter must be an absolute path
 - The file must exist
+- Read the file first (for example with read_file) so old_string reflects its exact current content
 - old_string and new_string must be different from each other
 - old_string must match exactly one occurrence in the file, you can provide a larger string with more context to make it more unique, or use replace_all to replace all occurences
 - If there are zero matches or multiple matches, the operation will fail
 - If replace_all is set to true, all occurrences of old_string will be replaced with new_string
+- To replace the entire contents of a file, use write_file instead; it uses fewer tokens because you don't repeat the existing content in old_string
 "#;
 
 #[derive(Clone)]
