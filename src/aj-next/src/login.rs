@@ -202,7 +202,9 @@ fn url_segment(url: &str, style: Style, hyperlinks: bool) -> Segment {
 pub(crate) struct LoginDialog {
     state: Arc<StdMutex<LoginDialogState>>,
     cancel: Arc<AtomicBool>,
-    field: Rc<RefCell<vaxis::vxfw::TextField>>,
+    /// Owned by value and drawn unstamped: the field is never a focus or
+    /// mouse target, so its widget identity is unused.
+    field: vaxis::vxfw::TextField,
     list: Rc<RefCell<ListView>>,
     styles: LoginStyles,
     /// Ephemeral feedback (e.g. the Ctrl+Y "Copied…" line) shown at the
@@ -233,7 +235,7 @@ impl LoginDialog {
         list.draw_cursor = false;
         let list = Rc::new(RefCell::new(list));
 
-        let field = Rc::new(RefCell::new(vaxis::vxfw::TextField::new()));
+        let mut field = vaxis::vxfw::TextField::new();
         {
             // On submit the field hands us its (cleared) contents; deliver
             // them to the awaiting callback. Fires from the field's own
@@ -241,7 +243,7 @@ impl LoginDialog {
             // so the borrows below can't collide with the widget's.
             let pending = Arc::clone(&pending_input);
             let st = Arc::clone(&state);
-            field.borrow_mut().on_submit = Some(Box::new(move |_ctx, value| {
+            field.on_submit = Some(Box::new(move |_ctx, value| {
                 let value = value.trim().to_string();
                 let sender = pending.lock().expect("pending input poisoned").take();
                 match sender {
@@ -350,7 +352,7 @@ impl Widget for LoginDialog {
             });
             row = row.saturating_add(1);
 
-            let field_surface = draw_widget(&to_widget_ref(Rc::clone(&self.field)), &one_row);
+            let field_surface = self.field.draw(&one_row);
             let field_cursor = field_surface.cursor;
             surface.children.push(SubSurface {
                 origin: RelativePoint {
@@ -473,7 +475,7 @@ impl Widget for LoginDialog {
             .input_prompt
             .is_some();
         if prompting {
-            self.field.borrow_mut().handle_event(ctx, event);
+            self.field.handle_event(ctx, event);
         }
         // Read-only otherwise: swallow every key so none leaks to the base
         // layout behind the modal.
