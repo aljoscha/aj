@@ -372,9 +372,9 @@ fn format_key_segment(seg: &str) -> String {
 /// IDs.
 ///
 /// This resolves the built-in default only. Once user `[keybindings]`
-/// overrides land (see `crate::actions::default_global_bindings`), hint
+/// overrides land (see `crate::actions::global_bindings`), hint
 /// surfaces resolve through the merged bindings instead.
-pub fn default_action_shortcut(action_id: &str) -> Option<String> {
+pub fn action_shortcut(action_id: &str) -> Option<String> {
     default_chord(action_id).map(format_keybinding)
 }
 
@@ -427,21 +427,21 @@ mod tests {
     #[test]
     fn default_action_shortcut_resolves_the_table() {
         assert_eq!(
-            default_action_shortcut(ACTION_TOOLS_EXPAND).as_deref(),
+            action_shortcut(ACTION_TOOLS_EXPAND).as_deref(),
             Some("Alt+O")
         );
         assert_eq!(
-            default_action_shortcut(ACTION_SUBMIT_STEERING).as_deref(),
+            action_shortcut(ACTION_SUBMIT_STEERING).as_deref(),
             Some("Alt+Enter")
         );
         assert_eq!(
-            default_action_shortcut(ACTION_CHAT_PAGE_UP).as_deref(),
+            action_shortcut(ACTION_CHAT_PAGE_UP).as_deref(),
             Some("PgUp")
         );
         assert_eq!(
-            default_action_shortcut(ACTION_CHAT_PAGE_DOWN).as_deref(),
+            action_shortcut(ACTION_CHAT_PAGE_DOWN).as_deref(),
             Some("PgDn")
         );
-        assert_eq!(default_action_shortcut("aj.unknown"), None);
+        assert_eq!(action_shortcut("aj.unknown"), None);
     }
 }

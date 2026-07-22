@@ -46,7 +46,7 @@ const BASH_COLLAPSED_LINES: usize = 5;
 /// resolved from the shared default binding table. Follows user
 /// `[keybindings]` overrides once those land.
 pub(crate) static EXPAND_KEY_LABEL: LazyLock<String> = LazyLock::new(|| {
-    aj_app::keybindings::default_action_shortcut(aj_app::keybindings::ACTION_TOOLS_EXPAND)
+    aj_app::keybindings::action_shortcut(aj_app::keybindings::ACTION_TOOLS_EXPAND)
         .expect("aj.tools.expand has a default chord")
 });
 

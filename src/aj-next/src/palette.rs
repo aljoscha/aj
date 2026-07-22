@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use aj_app::commands::{COMMANDS, CommandAction};
-use aj_app::keybindings::default_action_shortcut;
+use aj_app::keybindings::action_shortcut;
 use vaxis::vxfw::{
     EventContext, FilterableSelect, ListView, OverlayWindow, SelectItem, SelectStyles, WidgetRef,
     to_widget_ref,
@@ -201,7 +201,7 @@ fn palette_items() -> Vec<SelectItem> {
         .map(|cmd| {
             let mut item = SelectItem::new(cmd.title, format!("{} {}", cmd.category, cmd.title))
                 .with_prefix(cmd.category);
-            if let Some(short) = cmd.action_id.and_then(default_action_shortcut) {
+            if let Some(short) = cmd.action_id.and_then(action_shortcut) {
                 item = item.with_shortcut(short);
             }
             item
@@ -229,7 +229,7 @@ mod tests {
         // The palette-open command carries a bound action, so its row's
         // shortcut column holds the data-derived chord rather than a literal.
         let items = palette_items();
-        let resolved = default_action_shortcut(aj_app::keybindings::ACTION_PALETTE_OPEN)
+        let resolved = action_shortcut(aj_app::keybindings::ACTION_PALETTE_OPEN)
             .expect("palette-open has a default chord");
         assert!(
             items

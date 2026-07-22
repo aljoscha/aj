@@ -242,7 +242,7 @@ pub struct GlobalBinding {
 /// TODO(aljoscha): merge the user's `[keybindings]` config over these
 /// defaults (replace-not-extend per action, like `aj`'s manager).
 /// Defaults only for now.
-pub fn default_global_bindings() -> Vec<GlobalBinding> {
+pub fn global_bindings() -> Vec<GlobalBinding> {
     let compiled = |action: AjAction, action_id: &str, phase: ChordPhase| {
         let chord = default_chord(action_id).expect("every global action has a default chord");
         GlobalBinding {
@@ -311,7 +311,7 @@ mod tests {
 
     #[test]
     fn parses_the_default_global_chords() {
-        let bindings = default_global_bindings();
+        let bindings = global_bindings();
         let spec = |action: AjAction| {
             bindings
                 .iter()
@@ -386,7 +386,7 @@ mod tests {
     /// closed by its frontend predicate rather than by phase.
     #[test]
     fn every_default_binding_is_capture_phase() {
-        for binding in default_global_bindings() {
+        for binding in global_bindings() {
             assert_eq!(
                 binding.phase,
                 ChordPhase::Capture,

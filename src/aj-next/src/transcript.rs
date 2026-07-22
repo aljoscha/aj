@@ -26,7 +26,7 @@ use aj_app::chat::{
 };
 use aj_app::footer::format_tokens;
 use aj_app::keybindings::{
-    ACTION_BRANCH_MESSAGE, ACTION_COPY_MESSAGE, ACTION_THINKING_TOGGLE, default_action_shortcut,
+    ACTION_BRANCH_MESSAGE, ACTION_COPY_MESSAGE, ACTION_THINKING_TOGGLE, action_shortcut,
     format_keybinding,
 };
 use aj_app::markdown::{Emphasis, RenderOpts};
@@ -1209,8 +1209,8 @@ fn task_outcome_tag(outcome: &TaskOutcome) -> u8 {
 /// muted, the way an overlay styles the key hints in its chrome. Both the copy
 /// and branch shortcuts share the one line (`y to copy · b to branch`).
 fn copy_label_spans(styles: &TranscriptStyles) -> Vec<TextSpan> {
-    let copy_key = default_action_shortcut(ACTION_COPY_MESSAGE).unwrap_or_default();
-    let branch_key = default_action_shortcut(ACTION_BRANCH_MESSAGE).unwrap_or_default();
+    let copy_key = action_shortcut(ACTION_COPY_MESSAGE).unwrap_or_default();
+    let branch_key = action_shortcut(ACTION_BRANCH_MESSAGE).unwrap_or_default();
     let key_span = |text: String| TextSpan {
         text,
         style: styles.accent,
@@ -1315,7 +1315,7 @@ fn entry_spans(entry: &Entry, styles: &TranscriptStyles) -> Vec<TextSpan> {
 /// `aj.thinking.toggle` chord (default `alt+t`), distinct from the tools-expand
 /// chord in [`crate::tool_cell::EXPAND_KEY_LABEL`].
 static THINKING_EXPAND_KEY_LABEL: LazyLock<String> = LazyLock::new(|| {
-    default_action_shortcut(ACTION_THINKING_TOGGLE).expect("aj.thinking.toggle has a default chord")
+    action_shortcut(ACTION_THINKING_TOGGLE).expect("aj.thinking.toggle has a default chord")
 });
 
 /// Build the [`MarkdownView`] for an assistant entry: one segment per content
@@ -3633,7 +3633,7 @@ mod tests {
             "\u{251b}",
             "bottom-right"
         );
-        let key = default_action_shortcut(ACTION_COPY_MESSAGE).expect("copy chord bound");
+        let key = action_shortcut(ACTION_COPY_MESSAGE).expect("copy chord bound");
         assert!(
             crate::test_support::rows(&bordered)[last_row].contains(&format!("{key} to copy")),
             "copy hint on the bottom edge: {:?}",
@@ -3666,9 +3666,8 @@ mod tests {
         let last_row = usize::from(bordered.size.height) - 2;
         let row = crate::test_support::rows(&bordered)[last_row].clone();
 
-        let copy_key = default_action_shortcut(ACTION_COPY_MESSAGE).expect("copy chord bound");
-        let branch_key =
-            default_action_shortcut(ACTION_BRANCH_MESSAGE).expect("branch chord bound");
+        let copy_key = action_shortcut(ACTION_COPY_MESSAGE).expect("copy chord bound");
+        let branch_key = action_shortcut(ACTION_BRANCH_MESSAGE).expect("branch chord bound");
         assert!(
             row.contains(&format!("{copy_key} to copy")),
             "copy shortcut on the hint line: {row:?}",
@@ -3773,12 +3772,12 @@ mod tests {
         // A collapsed block with a body advertises the expand chord, resolved
         // from the shared binding data (the thinking-toggle chord, alt+t by
         // default), not the tools-expand chord (alt+o).
-        let key = default_action_shortcut(ACTION_THINKING_TOGGLE).unwrap();
+        let key = action_shortcut(ACTION_THINKING_TOGGLE).unwrap();
         assert_eq!(
             rows,
             vec![format!("Thinking… ({key} to expand)"), String::new()]
         );
-        let tools_key = default_action_shortcut(aj_app::keybindings::ACTION_TOOLS_EXPAND).unwrap();
+        let tools_key = action_shortcut(aj_app::keybindings::ACTION_TOOLS_EXPAND).unwrap();
         assert_ne!(key, tools_key, "the two chords differ by default");
         assert!(
             !rows[0].contains(&tools_key),

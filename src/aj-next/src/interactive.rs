@@ -9170,7 +9170,7 @@ mod tests {
         };
         let rows = flatten(&shell.borrow_mut().draw(&ctx)).join("\n");
         let resolved =
-            aj_app::keybindings::default_action_shortcut(aj_app::keybindings::ACTION_PALETTE_OPEN)
+            aj_app::keybindings::action_shortcut(aj_app::keybindings::ACTION_PALETTE_OPEN)
                 .expect("palette-open has a default chord");
         assert!(
             rows.contains(&resolved),

@@ -30,7 +30,7 @@ use aj_app::keybindings::{
     ACTION_AGENT_PICKER, ACTION_CHAT_PAGE_DOWN, ACTION_CHAT_PAGE_UP, ACTION_CHAT_SCROLL_BOTTOM,
     ACTION_CHAT_SCROLL_TOP, ACTION_CLIPBOARD_PASTE_IMAGE, ACTION_COPY_MESSAGE, ACTION_DEQUEUE,
     ACTION_HISTORY_OPEN, ACTION_PALETTE_OPEN, ACTION_SUBMIT_STEERING, ACTION_THINKING_TOGGLE,
-    ACTION_TOOLS_EXPAND, ACTION_TRANSCRIPT_FOCUS, AJ_KEYBINDINGS, default_action_shortcut,
+    ACTION_TOOLS_EXPAND, ACTION_TRANSCRIPT_FOCUS, AJ_KEYBINDINGS, action_shortcut,
 };
 use aj_app::theme::{Theme, ThemeColor};
 use aj_app::usage::{ProviderUsageStatus, UsageOutcome, format_window_status, now_unix_ms};
@@ -309,7 +309,7 @@ pub(crate) fn loading_rows() -> Vec<Row> {
 /// editor is focused (open the palette, paste an image, toggle thinking
 /// or tool output, recall or steer a message, open the pickers).
 ///
-/// Resolved through [`default_action_shortcut`] at render time, never a
+/// Resolved through [`action_shortcut`] at render time, never a
 /// literal, so a rebind relabels the row.
 const COMPOSE_GLOBAL_ACTIONS: &[&str] = &[
     ACTION_PALETTE_OPEN,
@@ -355,13 +355,13 @@ enum HelpLine {
 }
 
 /// The `(resolved key label, description)` for a global action, resolving
-/// the label through [`default_action_shortcut`] so it tracks a rebind.
+/// the label through [`action_shortcut`] so it tracks a rebind.
 /// `None` for an action ID absent from [`AJ_KEYBINDINGS`].
 fn global_chord(action_id: &str) -> Option<(String, &'static str)> {
     AJ_KEYBINDINGS
         .iter()
         .find(|(id, _, _)| *id == action_id)
-        .map(|(id, _, desc)| (default_action_shortcut(id).unwrap_or_default(), *desc))
+        .map(|(id, _, desc)| (action_shortcut(id).unwrap_or_default(), *desc))
 }
 
 /// Section 1: the fixed editor editing chords (grouped by their own
@@ -444,7 +444,7 @@ fn command_lines() -> Vec<HelpLine> {
             current = Some(cmd.category);
         }
         let mut desc = cmd.description.to_string();
-        if let Some(short) = cmd.action_id.and_then(default_action_shortcut) {
+        if let Some(short) = cmd.action_id.and_then(action_shortcut) {
             desc.push_str(&format!("  ({short})"));
         }
         lines.push(HelpLine::Entry {
@@ -787,10 +787,10 @@ mod tests {
         }
 
         // A compose-time global flows from the keybinding data: the label on
-        // the palette-open row equals `default_action_shortcut`, so both
+        // the palette-open row equals `action_shortcut`, so both
         // sources feed section 1.
         let resolved =
-            default_action_shortcut(ACTION_PALETTE_OPEN).expect("palette-open has a default chord");
+            action_shortcut(ACTION_PALETTE_OPEN).expect("palette-open has a default chord");
         assert!(
             row_containing(&rows, "Open command palette").contains(&resolved),
             "palette-open row must carry the resolved label {resolved:?}"
@@ -805,7 +805,7 @@ mod tests {
         // `COMPOSE_GLOBAL_ACTIONS`, so dropping a const entry drops its row and
         // fails this named test (its description no longer appears, so
         // `row_containing` panics) rather than only tripping the unused-import
-        // lint. Each expected label is resolved through `default_action_shortcut`,
+        // lint. Each expected label is resolved through `action_shortcut`,
         // never a literal, so a rebind updates the row and the expectation
         // together.
         for id in [
@@ -849,7 +849,7 @@ mod tests {
         for cmd in COMMANDS {
             assert!(blob.contains(cmd.title), "missing command {}", cmd.title);
             // A command with a bound action carries its resolved shortcut.
-            if let Some(short) = cmd.action_id.and_then(default_action_shortcut) {
+            if let Some(short) = cmd.action_id.and_then(action_shortcut) {
                 assert!(
                     row_containing(&rows, cmd.description).contains(&short),
                     "command {} must carry its resolved shortcut {short:?}",
@@ -862,7 +862,7 @@ mod tests {
     #[test]
     fn help_labels_are_resolved_not_hardcoded() {
         let rows = help_rows(&test_styles());
-        // Every compose-time global label equals `default_action_shortcut`,
+        // Every compose-time global label equals `action_shortcut`,
         // so the expectation is generated from the same data the row is. A
         // literal that drifts from the binding fails here.
         for id in COMPOSE_GLOBAL_ACTIONS {

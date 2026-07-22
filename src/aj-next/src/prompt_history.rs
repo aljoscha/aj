@@ -21,7 +21,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use aj_app::keybindings::{ACTION_HISTORY_TOGGLE_SCOPE, default_action_shortcut};
+use aj_app::keybindings::{ACTION_HISTORY_TOGGLE_SCOPE, action_shortcut};
 use aj_session::PromptEntry;
 use vaxis::vxfw::{
     DrawContext, Event, EventContext, FilterableSelect, OverlayWindow, RelativePoint, SelectItem,
@@ -169,7 +169,7 @@ fn truncate_chars(text: &str, max: usize) -> String {
 /// The scope-toggle subtitle, resolved from keybinding data: the toggle
 /// hint names the scope it would switch *to*.
 fn subtitle(scope: HistoryScope) -> String {
-    let toggle = default_action_shortcut(ACTION_HISTORY_TOGGLE_SCOPE)
+    let toggle = action_shortcut(ACTION_HISTORY_TOGGLE_SCOPE)
         .expect("aj.history.toggle_scope has a default chord");
     let scope_target = match scope {
         HistoryScope::All => "this workspace",
@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn subtitle_names_the_scope_to_switch_to() {
-        let toggle = default_action_shortcut(ACTION_HISTORY_TOGGLE_SCOPE).unwrap();
+        let toggle = action_shortcut(ACTION_HISTORY_TOGGLE_SCOPE).unwrap();
         let ws = subtitle(HistoryScope::Workspace);
         assert!(ws.contains(&toggle), "toggle hint resolved from data: {ws}");
         assert!(ws.contains("all workspaces"), "{ws}");

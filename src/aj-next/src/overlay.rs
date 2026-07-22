@@ -16,7 +16,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use aj_app::keybindings::{
-    ACTION_OVERLAY_CLOSE_ALL, default_action_shortcut, fixed_keys, format_keybinding,
+    ACTION_OVERLAY_CLOSE_ALL, action_shortcut, fixed_keys, format_keybinding,
 };
 use aj_app::theme::{Theme, ThemeBg, ThemeColor};
 use vaxis::cell::Style;
@@ -348,7 +348,7 @@ pub(crate) fn close_all(
 // *labels* through `format_keybinding`, a single formatting source, so a
 // display spelling can't drift from a raw "Esc"/"Enter" literal. The close-all
 // chord IS a keymap action (see `crate::keymap`), so it resolves through
-// `default_action_shortcut`, and the copy chord is the fixed Ctrl+Y
+// `action_shortcut`, and the copy chord is the fixed Ctrl+Y
 // convention. Making the in-widget Esc/Enter *handling* rebindable is a
 // tracked follow-up.
 
@@ -378,7 +378,7 @@ pub(crate) fn close_key_label() -> String {
 /// to the parent).
 pub(crate) fn subtitle_close() -> String {
     let cancel = close_key_label();
-    match default_action_shortcut(ACTION_OVERLAY_CLOSE_ALL) {
+    match action_shortcut(ACTION_OVERLAY_CLOSE_ALL) {
         Some(close_all) if close_all != cancel => {
             format!("{cancel} back  \u{2022}  {close_all} close")
         }
@@ -396,7 +396,7 @@ pub(crate) fn subtitle_close() -> String {
 pub(crate) fn subtitle_confirm_close() -> String {
     let confirm = confirm_key_label();
     let cancel = close_key_label();
-    match default_action_shortcut(ACTION_OVERLAY_CLOSE_ALL) {
+    match action_shortcut(ACTION_OVERLAY_CLOSE_ALL) {
         Some(close_all) if close_all != cancel => {
             format!("{confirm} to confirm  \u{2022}  {cancel} back  \u{2022}  {close_all} close")
         }
@@ -581,13 +581,13 @@ mod tests {
 
     /// The subtitle builders resolve their labels through the keybinding
     /// data, never a raw literal. The expectations are themselves derived
-    /// from `format_keybinding`/`default_action_shortcut`, so a rebind moves
+    /// from `format_keybinding`/`action_shortcut`, so a rebind moves
     /// both the rendered label and the assertion together.
     #[test]
     fn subtitle_builders_resolve_labels_from_binding_data() {
         let cancel = format_keybinding("escape");
         let confirm = format_keybinding("enter");
-        let close_all = default_action_shortcut(ACTION_OVERLAY_CLOSE_ALL);
+        let close_all = action_shortcut(ACTION_OVERLAY_CLOSE_ALL);
 
         // Read-only pages: the content overlay's close hint.
         let close = subtitle_close();

@@ -21,7 +21,7 @@ use crate::transcript::TranscriptStyles;
 /// part, resolved from the shared default binding table. Follows user
 /// `[keybindings]` overrides once those land.
 static AGENT_PICKER_KEY_LABEL: LazyLock<String> = LazyLock::new(|| {
-    aj_app::keybindings::default_action_shortcut(aj_app::keybindings::ACTION_AGENT_PICKER)
+    aj_app::keybindings::action_shortcut(aj_app::keybindings::ACTION_AGENT_PICKER)
         .expect("aj.agent.open has a default chord")
 });
 

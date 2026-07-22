@@ -42,7 +42,7 @@ use std::sync::Arc;
 use aj_agent::events::AgentId;
 use aj_app::commands::{THINKING_LEVELS, ThinkingLevel, thinking_level_name, thinking_levels_for};
 use aj_app::footer::format_tokens;
-use aj_app::keybindings::{ACTION_SETTINGS_CLEAR, default_action_shortcut};
+use aj_app::keybindings::{ACTION_SETTINGS_CLEAR, action_shortcut};
 use aj_app::settings::ConfigTarget;
 use aj_conf::{Config, ValueKind};
 use aj_models::ThinkingConfig;
@@ -1403,7 +1403,7 @@ pub(crate) fn open_settings(
 /// clear chord, all labels resolved from keybinding data (Spec F).
 fn settings_subtitle(project_mode: bool) -> String {
     let mut hint = subtitle_edit_close("edit");
-    if project_mode && let Some(clear) = default_action_shortcut(ACTION_SETTINGS_CLEAR) {
+    if project_mode && let Some(clear) = action_shortcut(ACTION_SETTINGS_CLEAR) {
         hint.push_str(&format!("  \u{2022}  {clear} to clear"));
     }
     hint

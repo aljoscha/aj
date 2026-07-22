@@ -14,7 +14,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use aj_app::keybindings::{ACTION_AGENT_PICKER, default_action_shortcut, fixed_keys};
+use aj_app::keybindings::{ACTION_AGENT_PICKER, action_shortcut, fixed_keys};
 use vaxis::vxfw::{DrawContext, Size, Surface};
 
 use crate::corner_box::{CornerBoxBody, corner_box, span};
@@ -202,8 +202,7 @@ pub(crate) fn busy_refusal(what: &str) -> ToastBody {
 /// the picker chord resolves through the keybinding data, falling back to the
 /// literal if the entry ever disappears.
 fn remedy_row() -> String {
-    let picker =
-        default_action_shortcut(ACTION_AGENT_PICKER).unwrap_or_else(|| "Alt+A".to_string());
+    let picker = action_shortcut(ACTION_AGENT_PICKER).unwrap_or_else(|| "Alt+A".to_string());
     format!(
         "{} cancels \u{00b7} {picker} stops tasks",
         fixed_keys::CTRL_C
@@ -535,7 +534,7 @@ mod tests {
                 "Ctrl+C cancels \u{00b7} Alt+A stops tasks".to_string(),
             ]
         );
-        let picker = default_action_shortcut(ACTION_AGENT_PICKER).expect("picker chord bound");
+        let picker = action_shortcut(ACTION_AGENT_PICKER).expect("picker chord bound");
         for what in ["switch branches", "branch", "start a new session"] {
             let body = busy_refusal(what);
             assert_eq!(body.rows.len(), 2, "two rows for {what}");

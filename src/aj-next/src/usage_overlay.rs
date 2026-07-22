@@ -30,7 +30,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use aj_app::keybindings::{ACTION_USAGE_RESET, default_action_shortcut};
+use aj_app::keybindings::{ACTION_USAGE_RESET, action_shortcut};
 use aj_app::usage::{ProviderUsageStatus, UsageOutcome};
 use aj_models::auth::AuthStorage;
 use aj_models::usage::{RateLimitResetSource, ResetOutcome};
@@ -225,7 +225,7 @@ impl UsageOverlay {
         match &self.phase {
             Phase::Display => {
                 if self.has_eligible_provider() {
-                    let reset = default_action_shortcut(ACTION_USAGE_RESET).unwrap_or_default();
+                    let reset = action_shortcut(ACTION_USAGE_RESET).unwrap_or_default();
                     format!("{reset} use a reset  \u{2022}  {}", subtitle_close())
                 } else {
                     subtitle_close()
@@ -1249,8 +1249,7 @@ mod tests {
         // The assertion value is itself derived from the binding table, so
         // a rebind moves both the rendered label and this expectation
         // together (never a literal `r`).
-        let reset =
-            default_action_shortcut(ACTION_USAGE_RESET).expect("usage-reset has a default chord");
+        let reset = action_shortcut(ACTION_USAGE_RESET).expect("usage-reset has a default chord");
         let hint = overlay.footer_hint();
         assert_eq!(
             hint,
@@ -1310,8 +1309,7 @@ mod tests {
         );
         let out = body(&mut overlay);
         let hint = overlay.footer_hint();
-        let reset =
-            default_action_shortcut(ACTION_USAGE_RESET).expect("usage-reset has a default chord");
+        let reset = action_shortcut(ACTION_USAGE_RESET).expect("usage-reset has a default chord");
         assert!(hint.contains(&reset), "{hint}");
         assert_eq!(*overlay.footer_source.borrow(), hint);
         assert!(!out.contains(&hint), "footer leaked into body:\n{out}");
