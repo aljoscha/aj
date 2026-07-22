@@ -376,8 +376,8 @@ pub struct CompactionDetails {
 }
 
 /// Scan summarized messages for file operations, keyed off the builtin
-/// tool names (`read_file`, `edit_file`, `edit_file_multi`,
-/// `write_file`) and their `path` arguments. Carries forward a prior
+/// tool names (`read_file`, `edit_file`, `write_file`) and their `path`
+/// arguments. Carries forward a prior
 /// compaction's details so the running lists don't lose earlier files.
 pub fn extract_file_ops(messages: &[Message], previous: Option<&CompactionDetails>) -> CompactionDetails;
 ```

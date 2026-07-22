@@ -125,7 +125,7 @@ pub fn catalog() -> Vec<(&'static str, &'static str, fn() -> Vec<ProviderScript>
         ),
         (
             "diff-edit",
-            "bash seeds a temp file, then edit_file_multi rewrites two spots (unified-diff panel)",
+            "bash seeds a temp file, then edit_file rewrites two spots (unified-diff panel)",
             diff_edit,
         ),
         (
@@ -428,8 +428,13 @@ two distinct tool panels with their respective outputs.";
 }
 
 /// `diff-edit`: seed a temp file with `bash`, then rewrite two
-/// far-apart lines via `edit_file_multi` so its `ToolDetails::Diff`
+/// far-apart lines via `edit_file` so its `ToolDetails::Diff`
 /// result renders as a unified diff with a hunk separator.
+///
+/// The single `old_string` spans both changed lines and the unchanged
+/// block between them, so one replacement rewrites both spots and the
+/// two changes stay far enough apart for the renderer's `…` hunk
+/// separator to appear.
 ///
 /// Both tools execute for real, like the bash calls in the other
 /// demos. The demo only touches a fixed path under `/tmp` and the
@@ -475,10 +480,8 @@ hunks.";
     });
     let edit_input = serde_json::json!({
         "path": "/tmp/aj-demo-diff.txt",
-        "edits": [
-            { "old_string": "port = 8080", "new_string": "port = 9090" },
-            { "old_string": "log_level = info", "new_string": "log_level = debug" },
-        ]
+        "old_string": "port = 8080\nworkers = 4\nkeepalive = true\nmax_body = 1mb\ntls = off\n\n[client]\ntimeout = 30\nretries = 3\nverbose = false\nlog_level = info",
+        "new_string": "port = 9090\nworkers = 4\nkeepalive = true\nmax_body = 1mb\ntls = off\n\n[client]\ntimeout = 30\nretries = 3\nverbose = false\nlog_level = debug"
     });
 
     let script_1 = builder()
@@ -494,7 +497,7 @@ hunks.";
         .delay(section_delay())
         .tool_call_block_chunked(
             "tu-demo-diff-edit",
-            "edit_file_multi",
+            "edit_file",
             edit_input,
             0,
             Duration::ZERO,

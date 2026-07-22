@@ -32,7 +32,6 @@ use aj_agent::tool::ErasedToolDefinition;
 pub use tools::agent::AgentTool;
 pub use tools::bash::BashTool;
 pub use tools::edit_file::EditFileTool;
-pub use tools::edit_file_multi::EditFileMultiTool;
 pub use tools::read_file::ReadFileTool;
 pub use tools::task::{TaskOutputTool, TaskStopTool};
 pub use tools::todo::{TodoReadTool, TodoWriteTool};
@@ -72,7 +71,6 @@ pub fn get_builtin_tools(options: &BuiltinToolOptions) -> Vec<ErasedToolDefiniti
         ReadFileTool::with_auto_resize(options.image_auto_resize).into(),
         WriteFileTool.into(),
         EditFileTool.into(),
-        EditFileMultiTool.into(),
         TaskOutputTool.into(),
         TaskStopTool.into(),
         TodoReadTool.into(),
