@@ -47,9 +47,9 @@ const MAX_BODY_LINES: usize = 6;
 static EDIT_KEY_LABEL: LazyLock<String> =
     LazyLock::new(|| aj_app::keybindings::format_keybinding("up"));
 
-/// Display label of the steer chord, resolved from the shared default
-/// binding table. Follows user `[keybindings]` overrides once those
-/// land.
+/// Display label of the steer chord, resolved from the shared binding data, so
+/// it reflects a user `[keybindings]` override. Cached on first render, which
+/// is after the overrides are installed at startup.
 static STEER_KEY_LABEL: LazyLock<String> = LazyLock::new(|| {
     aj_app::keybindings::action_shortcut(aj_app::keybindings::ACTION_SUBMIT_STEERING)
         .expect("aj.message.steer has a default chord")

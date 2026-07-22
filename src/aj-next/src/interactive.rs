@@ -280,7 +280,7 @@ async fn build_world(
         let _ = reduce(&mut chat, &mut core.lifecycle, event);
     }
     if !keybinding_problems.is_empty() {
-        let mut msg = String::from("Some keybindings in config.toml were ignored:");
+        let mut msg = String::from("Some keybindings in config.toml had no effect:");
         for problem in &keybinding_problems {
             msg.push_str(&format!("\n  - {problem}"));
         }

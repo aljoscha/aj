@@ -13,9 +13,10 @@
 //!
 //! Only globally-dispatched actions appear here. The overlay-local
 //! bindings in `AJ_KEYBINDINGS` (`aj.history.toggle_scope`,
-//! `aj.agent.toggle_scope`, `aj.task.kill`, `aj.settings.clear`) are
-//! handled at-target by the focused overlay widget, so they are that
-//! widget's data, not part of the global action vocabulary.
+//! `aj.agent.toggle_scope`, `aj.task.kill`, `aj.settings.clear`,
+//! `aj.usage.reset`) are handled at-target by the focused overlay
+//! widget, so they are that widget's data, not part of the global
+//! action vocabulary.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -369,16 +370,25 @@ fn known_action_id(key: &str) -> Option<&'static str> {
 /// [`KeybindingProblem`], when its action is unknown, its chord does not parse,
 /// or its chord would collide with a reserved key or with another global
 /// binding. A rejected action keeps its built-in default. Accepted entries
-/// replace (not extend) their action's default. Call once at startup, before
-/// the keymap is built or any hint renders.
+/// replace (not extend) their action's default. Restating an action's own
+/// default is a no-op: neither stored nor reported. Call once at startup,
+/// before the keymap is built or any hint renders.
 ///
-/// Overlay-local actions (Spec F) are matched at-target and may share a chord
-/// by design, so only the global set is collision-checked.
+/// Overlay-local actions (Spec F) are matched at-target by the focused overlay,
+/// so their overrides are not collision-checked against each other (they may
+/// share a chord by design). We also do not check them against the always-on
+/// global chords (thinking-toggle, tools-expand, paste-image), which fire even
+/// while an overlay is up, so an overlay-local override landing on one of those
+/// is accepted but shadowed at runtime. This is a known gap.
 ///
-/// NOTE: conflict resolution is a single greedy pass in the order the entries
-/// arrive, so a pure swap of two chords (each override taking the other's
-/// default) is rejected rather than applied. Rebinding one side to a free
-/// chord avoids that.
+/// NOTE: conflict resolution is a single greedy pass over the entries in
+/// action-id order (they arrive from a sorted map), with the built-in defaults
+/// as the collision baseline. An override is rejected whenever its target still
+/// belongs to another action at that point in the pass. A consequence is that
+/// any set of rebinds that only becomes collision-free once several apply
+/// together (a two-chord swap, or a longer chain where one rebind frees the
+/// chord another wants) is rejected. Rebind onto a chord no default uses to
+/// avoid that.
 pub fn install_keybindings<I>(overrides: I) -> Vec<KeybindingProblem>
 where
     I: IntoIterator<Item = (String, String)>,
@@ -413,6 +423,14 @@ where
             problems.push(KeybindingProblem::InvalidChord { action: key, chord });
             continue;
         };
+        // Restating an action's own default is a no-op: leave it out of the
+        // store (so `effective_chord` returns the default) rather than run it
+        // through the reserved/conflict checks. Without this, restating the one
+        // default that is a reserved chord (close-all's ctrl+c) reports a
+        // spurious conflict.
+        if default_chord(action_id).and_then(parse_chord) == Some(spec) {
+            continue;
+        }
         if reserved.contains(&spec) {
             problems.push(KeybindingProblem::Conflict {
                 action: key,
@@ -432,7 +450,7 @@ where
                 problems.push(KeybindingProblem::Conflict {
                     action: key,
                     chord,
-                    with: format!("the binding for {other}"),
+                    with: format!("the binding for {other:?}"),
                 });
                 continue;
             }
@@ -556,6 +574,8 @@ mod tests {
     /// closed by its frontend predicate rather than by phase.
     #[test]
     fn every_default_binding_is_capture_phase() {
+        let _guard = STORE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        set_overrides(BTreeMap::new());
         for binding in global_bindings() {
             assert_eq!(
                 binding.phase,
@@ -702,6 +722,73 @@ mod tests {
             problems.is_empty(),
             "overlay-local sharing is allowed: {problems:?}"
         );
+
+        set_overrides(BTreeMap::new());
+    }
+
+    /// A second override targeting a chord an earlier override already claimed
+    /// is rejected. This is the clash-with-an-accepted-override branch, distinct
+    /// from clashing with a built-in default.
+    #[test]
+    fn install_keybindings_rejects_a_clash_with_an_earlier_override() {
+        let _guard = STORE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        // Both target ctrl+shift+p (no default uses it). `aj.agent.open` sorts
+        // before `aj.palette.open`, so agent is accepted first and palette then
+        // clashes with agent's accepted override.
+        let problems = install_keybindings([
+            ("aj.agent.open".to_string(), "ctrl+shift+p".to_string()),
+            ("aj.palette.open".to_string(), "ctrl+shift+p".to_string()),
+        ]);
+
+        assert_eq!(effective_chord("aj.agent.open"), Some("ctrl+shift+p"));
+        assert_eq!(
+            effective_chord("aj.palette.open"),
+            Some("ctrl+o"),
+            "the later override kept its default after clashing"
+        );
+        assert!(problems.iter().any(|p| matches!(
+            p,
+            KeybindingProblem::Conflict { action, .. } if action == "aj.palette.open"
+        )));
+
+        set_overrides(BTreeMap::new());
+    }
+
+    /// Both reserved chords (the Ctrl+C ladder and the login Ctrl+Y copy) are
+    /// rejected for any action, with the reason pinned so a regression that
+    /// changed reserved handling to some other conflict reason is caught.
+    #[test]
+    fn install_keybindings_rejects_reserved_chords() {
+        let _guard = STORE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let problems = install_keybindings([("aj.palette.open".to_string(), "ctrl+y".to_string())]);
+
+        assert_eq!(effective_chord("aj.palette.open"), Some("ctrl+o"));
+        assert!(problems.iter().any(|p| matches!(
+            p,
+            KeybindingProblem::Conflict { action, with, .. }
+                if action == "aj.palette.open" && with == "a reserved key"
+        )));
+
+        set_overrides(BTreeMap::new());
+    }
+
+    /// Restating an action's own default is a silent no-op, even for the one
+    /// default that is a reserved chord (close-all's ctrl+c): no problem, and
+    /// the action keeps its default.
+    #[test]
+    fn install_keybindings_treats_restating_the_default_as_a_noop() {
+        let _guard = STORE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let problems = install_keybindings([
+            ("aj.overlay.close_all".to_string(), "ctrl+c".to_string()),
+            ("aj.palette.open".to_string(), "ctrl+o".to_string()),
+        ]);
+
+        assert!(
+            problems.is_empty(),
+            "restating defaults is a no-op: {problems:?}"
+        );
+        assert_eq!(effective_chord("aj.overlay.close_all"), Some("ctrl+c"));
+        assert_eq!(effective_chord("aj.palette.open"), Some("ctrl+o"));
 
         set_overrides(BTreeMap::new());
     }

@@ -2017,6 +2017,20 @@ bash_rtk = true
     }
 
     #[test]
+    fn keybindings_not_a_table_is_a_diagnostic() {
+        let toml_str = r#"
+keybindings = "nope"
+"#;
+        let (config, diagnostics) = parse_config(toml_str, Path::new("/tmp/config.toml"));
+        assert!(config.keybindings.is_empty());
+        assert!(diagnostics.iter().any(|d| matches!(
+            d,
+            ConfigDiagnostic::InvalidValue { key, error, .. }
+                if key == "keybindings" && error == "keybindings must be a table"
+        )));
+    }
+
+    #[test]
     fn compact_threshold_parses_and_validates_range() {
         let opt = Config::option("compact_threshold").unwrap();
 
