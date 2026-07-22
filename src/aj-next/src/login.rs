@@ -202,7 +202,9 @@ fn url_segment(url: &str, style: Style, hyperlinks: bool) -> Segment {
 pub(crate) struct LoginDialog {
     state: Arc<StdMutex<LoginDialogState>>,
     cancel: Arc<AtomicBool>,
-    field: Rc<RefCell<vaxis::vxfw::TextField>>,
+    /// Owned by value and drawn unstamped: the field is never a focus or
+    /// mouse target, so its widget identity is unused.
+    field: vaxis::vxfw::TextField,
     list: Rc<RefCell<ListView>>,
     styles: LoginStyles,
     /// Ephemeral feedback (e.g. the Ctrl+Y "Copied…" line) shown at the
@@ -233,15 +235,16 @@ impl LoginDialog {
         list.draw_cursor = false;
         let list = Rc::new(RefCell::new(list));
 
-        let field = Rc::new(RefCell::new(vaxis::vxfw::TextField::new()));
+        let mut field = vaxis::vxfw::TextField::new();
         {
             // On submit the field hands us its (cleared) contents; deliver
-            // them to the awaiting callback. Fires from the field's own
-            // handle_event, which we call from `LoginDialog::handle_event`,
-            // so the borrows below can't collide with the widget's.
+            // them to the awaiting callback. Fires from inside
+            // `LoginDialog::handle_event`, which must therefore not hold the
+            // `state` or `pending` locks across the forward into the field,
+            // since we re-take both here.
             let pending = Arc::clone(&pending_input);
             let st = Arc::clone(&state);
-            field.borrow_mut().on_submit = Some(Box::new(move |_ctx, value| {
+            field.on_submit = Some(Box::new(move |_ctx, value| {
                 let value = value.trim().to_string();
                 let sender = pending.lock().expect("pending input poisoned").take();
                 match sender {
@@ -332,7 +335,6 @@ impl Widget for LoginDialog {
             let mut label = Text::new(prompt.clone());
             label.style = self.styles.prompt;
             label.width_basis = WidthBasis::Parent;
-            let label_ref = to_widget_ref(Rc::new(RefCell::new(label)));
             let one_row = ctx.with_constraints(
                 zero,
                 MaxSize {
@@ -340,17 +342,19 @@ impl Widget for LoginDialog {
                     height: Some(1),
                 },
             );
+            // Drawn unstamped, like the field below: a per-frame widget's
+            // identity is unused.
             surface.children.push(SubSurface {
                 origin: RelativePoint {
                     row: i32::from(row),
                     col: 0,
                 },
-                surface: draw_widget(&label_ref, &one_row),
+                surface: label.draw(&one_row),
                 z_index: 0,
             });
             row = row.saturating_add(1);
 
-            let field_surface = draw_widget(&to_widget_ref(Rc::clone(&self.field)), &one_row);
+            let field_surface = self.field.draw(&one_row);
             let field_cursor = field_surface.cursor;
             surface.children.push(SubSurface {
                 origin: RelativePoint {
@@ -378,7 +382,6 @@ impl Widget for LoginDialog {
             let mut text = Text::new(notice.clone());
             text.style = self.styles.notice;
             text.width_basis = WidthBasis::Parent;
-            let notice_ref = to_widget_ref(Rc::new(RefCell::new(text)));
             let one_row = ctx.with_constraints(
                 zero,
                 MaxSize {
@@ -391,7 +394,7 @@ impl Widget for LoginDialog {
                     row: i32::from(row),
                     col: 0,
                 },
-                surface: draw_widget(&notice_ref, &one_row),
+                surface: text.draw(&one_row),
                 z_index: 0,
             });
         }
@@ -473,7 +476,7 @@ impl Widget for LoginDialog {
             .input_prompt
             .is_some();
         if prompting {
-            self.field.borrow_mut().handle_event(ctx, event);
+            self.field.handle_event(ctx, event);
         }
         // Read-only otherwise: swallow every key so none leaks to the base
         // layout behind the modal.
@@ -927,6 +930,25 @@ mod tests {
         assert_eq!(got, "code123");
         // The prompt clears after delivery.
         assert!(state.lock().unwrap().input_prompt.is_none());
+    }
+
+    /// While a prompt is active, the field's cursor is lifted onto the
+    /// dialog's own surface: the field is drawn unstamped and never focused,
+    /// so only the lift can show a cursor.
+    #[test]
+    fn prompt_cursor_is_lifted_onto_the_dialog_surface() {
+        let (mut dialog, state, _pending, _cancel) = make();
+        state.lock().unwrap().input_prompt = Some("paste:".to_string());
+        let mut ctx = EventContext::new();
+        for c in "abc".chars() {
+            dialog.handle_event(
+                &mut ctx,
+                &key_event(u32::from(c), Modifiers::empty(), Some(&c.to_string())),
+            );
+        }
+        let surface = dialog.draw(&crate::test_support::draw_ctx(40, Some(14)));
+        let cursor = surface.cursor.expect("an active prompt shows a cursor");
+        assert_eq!(cursor.col, 3, "the cursor sits after the typed text");
     }
 
     /// Ctrl+Y with a stored URL copies it and leaves a "copied" notice.

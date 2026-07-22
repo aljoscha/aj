@@ -2386,7 +2386,7 @@ fn join_notice(mut notice: String, note: Option<String>) -> String {
 /// window has closed.
 fn revert_setting_row(shell: &Rc<RefCell<Shell>>, id: &str, value: &str) {
     if let Some(ui) = shell.borrow().settings_ui.borrow().as_ref() {
-        ui.list.borrow().set_value(id, value);
+        ui.set_value(id, value);
     }
 }
 
@@ -3178,19 +3178,23 @@ struct Shell {
     /// the focus path, so the Shell forwards from its capturing phase.
     status_line: Rc<RefCell<StatusLine>>,
     /// The Ctrl+C quit-arm hint, floated above the editor while the quit
-    /// sequence is armed. Drawn straight from the live keymap state.
-    quit_hint: Rc<RefCell<QuitHint>>,
+    /// sequence is armed. Drawn straight from the live keymap state. Plain
+    /// `RefCell` (no `Rc`): never shared, the cell exists for the `&self`
+    /// restyle path.
+    quit_hint: RefCell<QuitHint>,
     /// The quit-arm hint's running-work warning, refreshed by the drive
     /// loop on the arming edge (it owns the task registry the widgets
     /// can't reach). Shared with the [`QuitHint`], which reads it at draw.
     quit_hint_warning: Rc<RefCell<Option<String>>>,
     /// The frame-statistics debug overlay, floated in the top-right corner
     /// when `show_frame_stats` is on. Reads the `frame_stats` snapshot below.
-    frame_stats_box: Rc<RefCell<FrameStatsBox>>,
+    /// Plain `RefCell` like `quit_hint`.
+    frame_stats_box: RefCell<FrameStatsBox>,
     /// The toast-stack widget, drawn bottom-right every frame: stacked above
     /// the quit hint when no modal is open, floated over the scrim/overlay
-    /// (z 3) otherwise. Reads the `toasts` stack below.
-    toast_box: Rc<RefCell<Toasts>>,
+    /// (z 3) otherwise. Reads the `toasts` stack below. Plain `RefCell` like
+    /// `quit_hint`.
+    toast_box: RefCell<Toasts>,
     /// The live toast records, shared with the writers (the drive loop's
     /// select-to-copy fold, the overlay confirm closures, [`Shell::show_toast`])
     /// and the `toast_box` that draws them. The drive loop prunes it and
@@ -3420,25 +3424,25 @@ impl Shell {
             .set_widget_ref(Rc::downgrade(&transcript));
         let status_line = StatusLine::new(Rc::clone(&chat), Rc::clone(&status), Rc::clone(&styles));
         let quit_hint_warning: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-        let quit_hint = Rc::new(RefCell::new(QuitHint::new(
+        let quit_hint = RefCell::new(QuitHint::new(
             Rc::clone(&styles),
             Rc::clone(&chrome),
             Rc::clone(&quit_hint_warning),
-        )));
+        ));
         // Off by default; the run loop seeds it from `config.show_frame_stats`
         // after building the Shell, matching the other display toggles.
         let show_frame_stats = Rc::new(Cell::new(false));
         let frame_stats: Rc<Cell<Option<FrameStats>>> = Rc::new(Cell::new(None));
-        let frame_stats_box = Rc::new(RefCell::new(FrameStatsBox::new(
+        let frame_stats_box = RefCell::new(FrameStatsBox::new(
             Rc::clone(&styles),
             Rc::clone(&chrome),
             Rc::clone(&frame_stats),
-        )));
-        let toast_box = Rc::new(RefCell::new(Toasts::new(
+        ));
+        let toast_box = RefCell::new(Toasts::new(
             Rc::clone(&styles),
             Rc::clone(&chrome),
             Rc::clone(&toasts),
-        )));
+        ));
         let pending = Rc::new(RefCell::new(PendingBox::new(
             Rc::clone(&chat),
             queues.clone(),
@@ -10501,7 +10505,7 @@ mod tests {
         let shown = {
             let shell = shell.borrow();
             let ui = shell.settings_ui.borrow();
-            ui.as_ref().unwrap().list.borrow().value_of("auto_compact")
+            ui.as_ref().unwrap().value_of("auto_compact")
         };
         assert_eq!(
             shown.as_deref(),
@@ -10611,11 +10615,7 @@ mod tests {
         {
             let ui = shell.borrow();
             let ui = ui.settings_ui.borrow();
-            ui.as_ref()
-                .unwrap()
-                .list
-                .borrow()
-                .set_value("speed", "fast");
+            ui.as_ref().unwrap().set_value("speed", "fast");
         }
 
         let notice = apply_setting_change(
@@ -10634,7 +10634,7 @@ mod tests {
         let reverted = {
             let ui = shell.borrow();
             let ui = ui.settings_ui.borrow();
-            ui.as_ref().unwrap().list.borrow().value_of("speed")
+            ui.as_ref().unwrap().value_of("speed")
         };
         assert_eq!(reverted.as_deref(), Some("standard"));
     }

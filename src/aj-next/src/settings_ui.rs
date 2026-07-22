@@ -102,11 +102,23 @@ pub(crate) enum SelectorActivity {
 /// the window chrome (so a theme swap re-tints its border). Cleared when the
 /// window closes.
 pub(crate) struct SettingsUi {
-    pub(crate) list: Rc<RefCell<SettingList>>,
-    pub(crate) window: Rc<RefCell<OverlayWindow>>,
+    list: Rc<RefCell<SettingList>>,
+    window: Rc<RefCell<OverlayWindow>>,
 }
 
 impl SettingsUi {
+    /// Set a row's displayed value (an optimistic edit, or a host correction
+    /// after a failed apply). No-op for an unknown id.
+    pub(crate) fn set_value(&self, id: &str, value: &str) {
+        self.list.borrow().set_value(id, value);
+    }
+
+    /// The displayed value of the row with `id`, or `None` for an unknown id.
+    #[cfg(test)]
+    pub(crate) fn value_of(&self, id: &str) -> Option<String> {
+        self.list.borrow().value_of(id)
+    }
+
     /// Re-tint the open window after a runtime theme swap.
     pub(crate) fn restyle(&self, chrome: &OverlayChrome) {
         self.list.borrow().set_styles(chrome.select.clone());
@@ -647,7 +659,7 @@ impl SettingList {
         apply_setting_filter(&mut state, &mut self.list.borrow_mut());
     }
 
-    /// A row's current displayed value, for host reconciliation and tests.
+    /// A row's current displayed value, for tests.
     #[cfg(test)]
     pub(crate) fn value_of(&self, id: &str) -> Option<String> {
         self.state
