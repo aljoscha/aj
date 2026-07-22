@@ -51,8 +51,9 @@ pub(crate) fn half_page_scroll_lines(viewport_height: Option<u16>) -> i32 {
 /// Tint the vertical scroll-bar thumb cells from `style`.
 ///
 /// Applied on each draw so a runtime restyle (theme swap) is reflected without
-/// rebuilding the bars. The hover and drag cells are set for completeness. The
-/// list forwards no mouse events to the bars, so only the base thumb is drawn.
+/// rebuilding the bars. The hover and drag cells are tinted to match: the bars
+/// self-stamp their surface, so they receive mouse events via bus routing and
+/// the hover and drag cells are used while the thumb is hovered or dragged.
 pub(crate) fn apply_thumb_style(bars: &mut ScrollBars<ListView>, style: Style) {
     let cell = |grapheme: &str| Cell {
         char: Character::new(grapheme, 1),

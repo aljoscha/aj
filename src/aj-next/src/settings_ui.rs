@@ -531,7 +531,7 @@ pub(crate) struct SettingList {
     /// vertical thumb. The horizontal bar is off (a settings list has no
     /// horizontal axis), and `ScrollBars` draws the thumb only while the list
     /// overflows its slot.
-    bars: ScrollBars<ListView>,
+    bars: Rc<RefCell<ScrollBars<ListView>>>,
     state: Rc<RefCell<SettingListState>>,
     styles: Rc<RefCell<SelectStyles>>,
     project_mode: bool,
@@ -573,9 +573,9 @@ impl SettingList {
         // Wrap the list in scroll bars for the vertical thumb. The bars own the
         // list behind their shared `view` handle, which we keep a clone of for
         // the widget's own accessors and event handling.
-        let mut bars = ScrollBars::new(list_view);
-        bars.draw_horizontal_scrollbar = false;
-        let list = Rc::clone(&bars.view);
+        let bars = ScrollBars::new(list_view);
+        bars.borrow_mut().draw_horizontal_scrollbar = false;
+        let list = Rc::clone(&bars.borrow().view);
         apply_setting_filter(&mut state.borrow_mut(), &mut list.borrow_mut());
         let prompt = PromptInput::new(FILTER_MARKER, styles.borrow().marker);
         {
@@ -789,27 +789,26 @@ impl Widget for SettingList {
                     height: Some(list_height),
                 },
             );
+            // Tint the thumb from the live styles so a theme swap (via
+            // `set_styles`) is reflected without rebuilding the bars.
+            // `ScrollBars` draws the inner list (stamping its identity
+            // for wheel/key routing) and always reserves the rightmost
+            // list column, whether or not a thumb is currently drawn.
+            // The thumb glyph itself appears only while the list
+            // overflows its slot. This list's `scrollbar_thumb`
+            // resolves to the `Muted` token (`select_styles_from_theme`).
+            // The content, usage, and task-output overlays tint through
+            // this same shared `crate::scroll::apply_thumb_style`, each
+            // fed its own thumb style, so their thumbs pick up the same
+            // treatment.
+            let bars_surface = {
+                let mut bars = self.bars.borrow_mut();
+                crate::scroll::apply_thumb_style(&mut bars, self.styles.borrow().scrollbar_thumb);
+                bars.draw(&list_ctx)
+            };
             surface.children.push(SubSurface {
                 origin: RelativePoint { row: 2, col: 0 },
-                surface: {
-                    // Tint the thumb from the live styles so a theme swap (via
-                    // `set_styles`) is reflected without rebuilding the bars.
-                    // `ScrollBars` draws the inner list (stamping its identity
-                    // for wheel/key routing) and always reserves the rightmost
-                    // list column, whether or not a thumb is currently drawn.
-                    // The thumb glyph itself appears only while the list
-                    // overflows its slot. This list's `scrollbar_thumb`
-                    // resolves to the `Muted` token (`select_styles_from_theme`).
-                    // The content, usage, and task-output overlays tint through
-                    // this same shared `crate::scroll::apply_thumb_style`, each
-                    // fed its own thumb style, so their thumbs pick up the same
-                    // treatment.
-                    crate::scroll::apply_thumb_style(
-                        &mut self.bars,
-                        self.styles.borrow().scrollbar_thumb,
-                    );
-                    self.bars.draw(&list_ctx)
-                },
+                surface: bars_surface,
                 z_index: 0,
             });
         }

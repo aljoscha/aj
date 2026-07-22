@@ -449,9 +449,10 @@ fn merge_ranked(a: Vec<(usize, u32)>, b: Vec<(usize, u32)>) -> Vec<(usize, u32)>
 /// Tint the vertical scroll-bar thumb cells from `style`.
 ///
 /// Applied on each draw so a runtime restyle (theme swap) is reflected
-/// without rebuilding the bars. The hover and drag cells are set for
-/// completeness. The pick list forwards no mouse events to the bars, so
-/// only the base thumb is ever drawn.
+/// without rebuilding the bars. The hover and drag cells are tinted to match:
+/// the bars self-stamp their surface, so they receive mouse events via bus
+/// routing and the hover and drag cells are used while the thumb is hovered or
+/// dragged.
 fn apply_thumb_style(bars: &mut ScrollBars<ListView>, style: Style) {
     let cell = |grapheme: &str| Cell {
         char: Character::new(grapheme, 1),
@@ -471,12 +472,15 @@ pub struct FilterableSelect {
     /// text and its `on_change`.
     prompt: PromptInput,
     list: Rc<RefCell<ListView>>,
-    /// Scroll bars wrapping the list (sharing its `Rc` via `bars.view`), for
-    /// the vertical thumb. `draw` enables the vertical bar per frame only
-    /// when [`Self::show_scrollbar`] is set and the list actually overflows,
-    /// so a list that fits keeps the full width and shows no bar. The
-    /// horizontal bar is always off (a pick list has no horizontal axis).
-    bars: ScrollBars<ListView>,
+    /// Scroll bars wrapping the list, held behind the shared
+    /// `Rc<RefCell<ScrollBars>>` handle (the list `Rc` is shared via the bars'
+    /// `view`). The bars self-stamp their surface, so the vertical thumb
+    /// receives mouse events through the bus. `draw` enables the vertical bar
+    /// per frame only when [`Self::show_scrollbar`] is set and the list
+    /// actually overflows, so a list that fits keeps the full width and shows
+    /// no bar. The horizontal bar is always off (a pick list has no horizontal
+    /// axis).
+    bars: Rc<RefCell<ScrollBars<ListView>>>,
     /// Whether the caller wants a vertical scroll bar when the list overflows
     /// ([`Self::set_show_scrollbar`]). The bar is still hidden while the list
     /// fits.
@@ -518,10 +522,10 @@ impl FilterableSelect {
         // of for the widget's own accessors. A pick list has no horizontal
         // axis, and the vertical bar is opt-in so selectors that don't want
         // it stay pixel-identical (`draw` reserves no column while it is off).
-        let mut bars = ScrollBars::new(list_view);
-        bars.draw_horizontal_scrollbar = false;
-        bars.draw_vertical_scrollbar = false;
-        let list = Rc::clone(&bars.view);
+        let bars = ScrollBars::new(list_view);
+        bars.borrow_mut().draw_horizontal_scrollbar = false;
+        bars.borrow_mut().draw_vertical_scrollbar = false;
+        let list = Rc::clone(&bars.borrow().view);
         full_filter(&mut state.borrow_mut(), &mut list.borrow_mut());
 
         let prompt = PromptInput::new(FILTER_MARKER, styles.borrow().marker);
@@ -680,9 +684,11 @@ impl Widget for FilterableSelect {
             },
         );
         // Keep the marker tinted with the live styles so a theme swap
-        // re-colors it without rebuilding the prompt. Drawn directly (like
-        // `bars`) rather than via `draw_widget`: the prompt's own identity is
-        // unused, the focus target is the field it stamps inside.
+        // re-colors it without rebuilding the prompt. Drawn directly rather
+        // than via `draw_widget`: the prompt's own identity is unused, the
+        // focus target is the field it stamps inside. The bars are also drawn
+        // directly, but they self-stamp their identity, so mouse events reach
+        // them.
         self.prompt.marker_style = self.styles.borrow().marker;
         surface.children.push(SubSurface {
             origin: RelativePoint { row: 0, col: 0 },
@@ -709,16 +715,23 @@ impl Widget for FilterableSelect {
             // fit", knowable here without a trial draw and stable under the
             // one-column narrowing the bar adds (the row count can't change).
             let overflow = self.state.borrow().visible.len() > usize::from(list_height);
-            self.bars.draw_vertical_scrollbar = self.show_scrollbar && overflow;
-            // Tint the thumb from the live styles so a runtime restyle (theme
-            // swap) is reflected without rebuilding the bars. The bars draw
-            // the inner list (stamping its identity for wheel/key routing) and
-            // reserve the rightmost column for the thumb only while the
-            // vertical bar is enabled.
-            apply_thumb_style(&mut self.bars, self.styles.borrow().scrollbar_thumb);
+            // Calling `draw` while holding the `borrow_mut` is safe: the bars'
+            // self-stamp uses `Weak::upgrade`, which does not borrow the
+            // `RefCell`.
+            let bars_surface = {
+                let mut bars = self.bars.borrow_mut();
+                bars.draw_vertical_scrollbar = self.show_scrollbar && overflow;
+                // Tint the thumb from the live styles so a runtime restyle
+                // (theme swap) is reflected without rebuilding the bars. The
+                // bars draw the inner list (stamping its identity for wheel/key
+                // routing) and reserve the rightmost column for the thumb only
+                // while the vertical bar is enabled.
+                apply_thumb_style(&mut bars, self.styles.borrow().scrollbar_thumb);
+                bars.draw(&list_ctx)
+            };
             surface.children.push(SubSurface {
                 origin: RelativePoint { row: 2, col: 0 },
-                surface: self.bars.draw(&list_ctx),
+                surface: bars_surface,
                 z_index: 0,
             });
         }

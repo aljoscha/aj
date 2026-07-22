@@ -50,7 +50,7 @@ pub(crate) struct TaskOutputView {
     /// The row list, shared with `bars` (which draws it). Rebuilt from
     /// the registry snapshot on each refresh.
     list: Rc<RefCell<ListView>>,
-    bars: ScrollBars<ListView>,
+    bars: Rc<RefCell<ScrollBars<ListView>>>,
     status: TaskStatus,
     total_bytes: u64,
     /// Stick to the bottom as new output arrives (tail behavior). Set on
@@ -77,9 +77,9 @@ impl TaskOutputView {
     ) -> TaskOutputView {
         let mut list = ListView::new(Source::Slice(Vec::new()));
         list.draw_cursor = false;
-        let mut bars = ScrollBars::new(list);
-        bars.draw_horizontal_scrollbar = false;
-        let list = Rc::clone(&bars.view);
+        let bars = ScrollBars::new(list);
+        bars.borrow_mut().draw_horizontal_scrollbar = false;
+        let list = Rc::clone(&bars.borrow().view);
         let mut view = TaskOutputView {
             registry,
             id,
@@ -216,13 +216,17 @@ impl Widget for TaskOutputView {
             // NOTE: tint the thumb from the shared Muted color token per-draw,
             // via the shared helper, so it matches every other scrollbar. This
             // is the `Muted` color, not the header's faint `dim_style`.
-            crate::scroll::apply_thumb_style(&mut self.bars, self.thumb_style);
+            let bars_surface = {
+                let mut bars = self.bars.borrow_mut();
+                crate::scroll::apply_thumb_style(&mut bars, self.thumb_style);
+                bars.draw(&body_ctx)
+            };
             surface.children.push(SubSurface {
                 origin: RelativePoint {
                     row: i32::from(HEADER_ROWS),
                     col: 0,
                 },
-                surface: self.bars.draw(&body_ctx),
+                surface: bars_surface,
                 z_index: 0,
             });
         }

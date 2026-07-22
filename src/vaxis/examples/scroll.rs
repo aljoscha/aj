@@ -241,15 +241,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         .collect();
 
     let scroll_view = ScrollView::new(Source::Builder(Box::new(RowSource { rows: builder_rows })));
-    let mut scroll_bars = ScrollBars::new(scroll_view);
+    let scroll_bars = ScrollBars::new(scroll_view);
     // NOTE: an estimate, not the true content height. Playing with this value
     // (or unsetting it via Ctrl-E) shows how it drives the thumb size.
-    scroll_bars.estimated_content_height = Some(800);
+    scroll_bars.borrow_mut().estimated_content_height = Some(800);
 
-    let model: WidgetRef = Rc::new(RefCell::new(ScrollModel {
-        scroll_bars: Rc::new(RefCell::new(scroll_bars)),
-        rows,
-    }));
+    let model: WidgetRef = Rc::new(RefCell::new(ScrollModel { scroll_bars, rows }));
     run(model)
 }
 

@@ -1577,18 +1577,20 @@ fn round_lines(v: f64) -> i32 {
 /// section 1). The bar reserves the rightmost column and hides its
 /// thumb while the transcript fits the viewport.
 ///
-/// The bars stamp the list's widget identity, so content-area mouse
-/// events hit-test to the list itself. This view is always an ancestor
-/// in the hit list, so it observes those events in the capturing phase
-/// (wheel-up disengages follow-tail, an active thumb drag is
-/// intercepted). Events over the bar column hit-test to this view and
-/// are forwarded from [`handle_event`](Widget::handle_event).
+/// The bars stamp both their own surface and the inner list's, so
+/// content-area mouse events hit-test to the list and bar-column events
+/// hit-test to the bars. This view is always an ancestor of both in the
+/// hit list, so it observes those events in the capturing phase (wheel-up
+/// disengages follow-tail, an active thumb drag is intercepted). It also
+/// forwards mouse events to the bars from its own event handlers, which
+/// [`observe_mouse`](Self::observe_mouse) explains stays correct and is not
+/// double dispatch.
 pub struct TranscriptView {
     chat: Rc<RefCell<ChatState>>,
     /// The chat list, shared with `bars`, which draws it and routes
     /// thumb drag-to-jump into it.
     list: Rc<RefCell<ListView>>,
-    bars: ScrollBars<ListView>,
+    bars: Rc<RefCell<ScrollBars<ListView>>>,
     /// Memoized per-entry surfaces, shared into the [`EntryBuilder`]. See
     /// [`EntryRenderCache`]. Owned here so it survives across frames and so a
     /// theme swap or a global-toggle change can clear it.
@@ -1826,10 +1828,10 @@ impl TranscriptView {
         // shorter than the chat slot it sits at the bottom, so the first message
         // lands right above the editor and later ones grow upward.
         list.anchor_short_to_bottom = true;
-        let mut bars = ScrollBars::new(list);
-        bars.draw_horizontal_scrollbar = false;
-        apply_scrollbar_thumbs(&mut bars, &styles);
-        let list = Rc::clone(&bars.view);
+        let bars = ScrollBars::new(list);
+        bars.borrow_mut().draw_horizontal_scrollbar = false;
+        apply_scrollbar_thumbs(&mut bars.borrow_mut(), &styles);
+        let list = Rc::clone(&bars.borrow().view);
         let last_globals = GlobalRenderInputs::read(&chat.borrow());
         TranscriptView {
             chat,
@@ -2538,7 +2540,7 @@ impl TranscriptView {
             image_store: Rc::clone(&self.image_store),
         };
         self.list.borrow_mut().children = Source::Builder(Box::new(builder));
-        apply_scrollbar_thumbs(&mut self.bars, &styles);
+        apply_scrollbar_thumbs(&mut self.bars.borrow_mut(), &styles);
         self.styles = styles;
     }
 }
@@ -2698,7 +2700,18 @@ impl TranscriptView {
     /// user wants to read history, so new content must stop yanking
     /// the viewport to the bottom.
     fn observe_mouse(&mut self, ctx: &mut EventContext, event: &Event, m: &mouse::Mouse) {
-        self.bars.capture_event(ctx, event);
+        // NOTE: the bars self-stamp their surface, so the bus can also reach
+        // them directly, yet this manual forward is not double dispatch. The
+        // transcript is an ancestor of the bars in the hit path, so during a
+        // drag this capture-phase forward consumes the event before the bus's
+        // capture walk descends to the bars, and a thumb press is consumed at
+        // the bars target before the bubble phase climbs back to the
+        // transcript. A motion neither consumes reaches the bars' handlers
+        // twice, once via the bus and once here, but those are idempotent
+        // (hover only tracks position, capture is inert unless dragging), so
+        // there is no double effect. The follow-up that removes this forward
+        // drops the redundancy.
+        self.bars.borrow_mut().capture_event(ctx, event);
         if ctx.consume_event {
             if m.kind == mouse::Type::Drag {
                 // A thumb drag moves the viewport, so it takes over from any
@@ -3194,7 +3207,7 @@ impl Widget for TranscriptView {
         }
         // The bars draw the list one column narrower and add the thumb
         // when the reconciled scroll says the transcript overflows.
-        let bars_surface = self.bars.draw(ctx);
+        let bars_surface = self.bars.borrow_mut().draw(ctx);
         // The draw reconciled any pending wheel scroll, so "we are at
         // the bottom" is now accurate. Landing there re-engages
         // follow-tail (except in focus mode, where the cursor owns the
@@ -3249,7 +3262,7 @@ impl Widget for TranscriptView {
                 }
                 // Thumb hover and press-to-drag live in the bars'
                 // bubbling-phase handler.
-                self.bars.handle_event(ctx, event);
+                self.bars.borrow_mut().handle_event(ctx, event);
                 if ctx.consume_event {
                     return;
                 }
@@ -3269,7 +3282,7 @@ impl Widget for TranscriptView {
             }
             Event::MouseLeave => {
                 self.agent_click = None;
-                self.bars.handle_event(ctx, event);
+                self.bars.borrow_mut().handle_event(ctx, event);
             }
             // Focus in/out drive transcript-focus mode: the transcript is "in
             // focus mode" exactly when it is the focused widget (Spec E
@@ -4163,8 +4176,9 @@ mod tests {
         let _ = view.draw(&ctx);
         assert!(view.follow_tail);
 
-        // The bar column hit-tests to this view, so the press arrives
-        // via handle_event and the bars grab it.
+        // In the app the bar column now hit-tests to the bars directly. Here
+        // we drive the transcript's still-present forwarding path via
+        // handle_event, where the bars grab the press.
         let mut ec = EventContext::new();
         view.handle_event(&mut ec, &mouse(39, 10, mouse::Type::Press));
         assert!(ec.consume_event, "the thumb grabbed the press");

@@ -114,7 +114,7 @@ pub(crate) struct ContentOverlay {
     /// by [`open_content_overlay`] so the host can refill an async
     /// overlay's rows after the initial "Loading…" state.
     list: Rc<RefCell<ListView>>,
-    bars: ScrollBars<ListView>,
+    bars: Rc<RefCell<ScrollBars<ListView>>>,
     /// Tint applied to the scroll-bar thumb on each draw. Defaults to
     /// [`Style::default`] so a bare [`ContentOverlay::new`] draws an
     /// untinted thumb. [`open_content_overlay`] sets it to the chrome's
@@ -132,9 +132,9 @@ impl ContentOverlay {
         // No visible cursor: the body scrolls as a document via
         // `scroll_lines`, so there is no item cursor to render.
         list.draw_cursor = false;
-        let mut bars = ScrollBars::new(list);
-        bars.draw_horizontal_scrollbar = false;
-        let list = Rc::clone(&bars.view);
+        let bars = ScrollBars::new(list);
+        bars.borrow_mut().draw_horizontal_scrollbar = false;
+        let list = Rc::clone(&bars.borrow().view);
         ContentOverlay {
             list,
             bars,
@@ -162,10 +162,14 @@ impl Widget for ContentOverlay {
         // Apply the tint per-draw for parity with the other lists. The thumb
         // style is set once from the chrome at open and never mutated after, so
         // this is parity, not staleness prevention.
-        crate::scroll::apply_thumb_style(&mut self.bars, self.thumb_style);
+        let bars_surface = {
+            let mut bars = self.bars.borrow_mut();
+            crate::scroll::apply_thumb_style(&mut bars, self.thumb_style);
+            bars.draw(ctx)
+        };
         surface.children.push(SubSurface {
             origin: RelativePoint { row: 0, col: 0 },
-            surface: self.bars.draw(ctx),
+            surface: bars_surface,
             z_index: 0,
         });
         surface

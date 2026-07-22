@@ -7,6 +7,23 @@
 //! the inner content, and translates the thumb position into a scroll position
 //! via the view's [`ScrollableView`] scroll accessors.
 //!
+//! # Identity and event routing
+//!
+//! [`draw`](Widget::draw) stamps two identities. It stamps its own returned
+//! surface with the bars' identity (via the `self_ref` handle) so the event
+//! bus finds the bars in the hit path and routes thumb hover and drag to them.
+//! It separately stamps the inner view's surface (via [`draw_widget`]) so wheel
+//! and key events reach the view. A consumer embeds the bars surface directly,
+//! so both identities travel with it and mouse events route with no forwarding
+//! by the consumer.
+//!
+//! NOTE: A widget cannot name its own `Rc` from inside `draw`, so it cannot put
+//! its own identity on the surface it builds there. The bars work around this
+//! by carrying a `Weak` self-handle minted by `Rc::new_cyclic` in
+//! [`new`](ScrollBars::new) and upgrading it to stamp the surface. The inner
+//! view has no such trouble because `draw_widget` assigns its identity from the
+//! outside.
+//!
 //! The bars are sized with floating-point proportions of an estimated content
 //! extent. When no estimate is given we fall back to the number and width of the
 //! children the [`ScrollView`] actually rendered, which is less stable across
@@ -19,7 +36,7 @@
 //! stays the fallback for views without a geometry.
 
 use std::cell::RefCell;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use crate::cell::{Cell, Character, Color, Style};
 use crate::mouse;
@@ -33,8 +50,8 @@ use crate::vxfw::{
 ///
 /// The `as` casts are unavoidable: Rust has no `From` between these integer
 /// widths and `f32`. The values are small screen coordinates and item counts
-/// well within `f32`'s exact range, and the float math mirrors upstream's
-/// proportional thumb sizing.
+/// well within `f32`'s exact range, and the float math uses proportional
+/// thumb sizing.
 mod num {
     #[allow(clippy::as_conversions)]
     pub(super) fn u32_to_f32(v: u32) -> f32 {
@@ -101,11 +118,12 @@ pub trait ScrollableView: Widget {
 /// The wrapped view is held behind an `Rc<RefCell<V>>` so it has a stable
 /// widget identity. [`draw`](Widget::draw) stamps the inner view's surface
 /// with that identity via [`draw_widget`] and appends it as a child, so the
-/// event bus hit-tests and routes wheel and key events to the inner view. The
-/// bars' own hover and thumb-drag interaction stays in this widget's
-/// [`handle_event`](Widget::handle_event) and
-/// [`capture_event`](Widget::capture_event), reaching into the view through
-/// [`ScrollableView`].
+/// event bus hit-tests and routes wheel and key events to the inner view. It
+/// also stamps its own surface with the bars' identity (via the `self_ref`
+/// handle) so the bus routes thumb hover and drag to the bars, whose
+/// interaction lives in this widget's [`handle_event`](Widget::handle_event)
+/// and [`capture_event`](Widget::capture_event) and reaches into the view
+/// through [`ScrollableView`].
 pub struct ScrollBars<V: ScrollableView + 'static = ScrollView> {
     /// The wrapped view. The bars are drawn for this view, and its widget
     /// identity is stamped so the bus routes scroll events to it.
@@ -139,6 +157,10 @@ pub struct ScrollBars<V: ScrollableView + 'static = ScrollView> {
     horizontal_thumb_end_col: u32,
     is_hovering_horizontal_thumb: bool,
     is_dragging_horizontal_thumb: bool,
+    /// Handle `draw` stamps onto its own surface so the event bus routes thumb
+    /// hover and drag to this widget, the way an externally assigned identity
+    /// routes events to the inner view.
+    self_ref: Weak<RefCell<ScrollBars<V>>>,
 }
 
 fn thumb(grapheme: &str) -> Cell {
@@ -161,34 +183,42 @@ fn drag_thumb(grapheme: &str) -> Cell {
 
 impl<V: ScrollableView + 'static> ScrollBars<V> {
     /// Wraps `view` with both bars enabled and the default thumb cells.
-    pub fn new(view: V) -> ScrollBars<V> {
-        ScrollBars {
-            view: Rc::new(RefCell::new(view)),
-            draw_horizontal_scrollbar: true,
-            draw_vertical_scrollbar: true,
-            estimated_content_height: None,
-            estimated_content_width: None,
-            vertical_scrollbar_thumb: thumb("▐"),
-            vertical_scrollbar_hover_thumb: thumb("█"),
-            vertical_scrollbar_drag_thumb: drag_thumb("█"),
-            horizontal_scrollbar_thumb: thumb("▃"),
-            horizontal_scrollbar_hover_thumb: thumb("█"),
-            horizontal_scrollbar_drag_thumb: drag_thumb("█"),
-            last_frame_size: Size {
-                width: 0,
-                height: 0,
-            },
-            last_frame_max_content_width: 0,
-            mouse_offset_into_thumb: 0,
-            vertical_thumb_top_row: 0,
-            vertical_thumb_bottom_row: 0,
-            is_hovering_vertical_thumb: false,
-            is_dragging_vertical_thumb: false,
-            horizontal_thumb_start_col: 0,
-            horizontal_thumb_end_col: 0,
-            is_hovering_horizontal_thumb: false,
-            is_dragging_horizontal_thumb: false,
-        }
+    ///
+    /// Returns the shared `Rc<RefCell<Self>>` handle. Making that the only way
+    /// to construct a `ScrollBars` guarantees the bars are always routable: an
+    /// unroutable one cannot exist, because `draw` stamps its surface with the
+    /// `Weak` self-handle minted here.
+    pub fn new(view: V) -> Rc<RefCell<ScrollBars<V>>> {
+        Rc::new_cyclic(|weak| {
+            RefCell::new(ScrollBars {
+                self_ref: Weak::clone(weak),
+                view: Rc::new(RefCell::new(view)),
+                draw_horizontal_scrollbar: true,
+                draw_vertical_scrollbar: true,
+                estimated_content_height: None,
+                estimated_content_width: None,
+                vertical_scrollbar_thumb: thumb("▐"),
+                vertical_scrollbar_hover_thumb: thumb("█"),
+                vertical_scrollbar_drag_thumb: drag_thumb("█"),
+                horizontal_scrollbar_thumb: thumb("▃"),
+                horizontal_scrollbar_hover_thumb: thumb("█"),
+                horizontal_scrollbar_drag_thumb: drag_thumb("█"),
+                last_frame_size: Size {
+                    width: 0,
+                    height: 0,
+                },
+                last_frame_max_content_width: 0,
+                mouse_offset_into_thumb: 0,
+                vertical_thumb_top_row: 0,
+                vertical_thumb_bottom_row: 0,
+                is_hovering_vertical_thumb: false,
+                is_dragging_vertical_thumb: false,
+                horizontal_thumb_start_col: 0,
+                horizontal_thumb_end_col: 0,
+                is_hovering_horizontal_thumb: false,
+                is_dragging_horizontal_thumb: false,
+            })
+        })
     }
 }
 
@@ -207,9 +237,12 @@ impl<V: ScrollableView + 'static> Widget for ScrollBars<V> {
                 surface: draw_widget(&scroll_view_ref, ctx),
                 z_index: 0,
             });
+            // NOTE: `upgrade()` only bumps the `Rc` strong count, it does not
+            // borrow the `RefCell`, so stamping our own identity from inside
+            // `draw` (which runs behind a `borrow_mut`) is panic-free.
             return Surface {
                 size: ctx.max.size(),
-                widget: None,
+                widget: self.self_ref.upgrade().map(to_widget_ref),
                 cursor: None,
                 buffer: Vec::new(),
                 children,
@@ -320,6 +353,11 @@ impl<V: ScrollableView + 'static> Widget for ScrollBars<V> {
                 (thumb_height, thumb_top)
             };
 
+            // NOTE: the bar surfaces carry no identity on purpose. The outer
+            // surface is the hit target, so `handle_event` reads the mouse in
+            // the outer widget frame and its `col == width - 1` thumb test
+            // holds. Stamping this width-1 child would rebase a thumb click to
+            // its own col 0 and defeat that test.
             let mut scroll_bar = Surface::with_size(Size {
                 width: 1,
                 height: bar_height,
@@ -412,7 +450,7 @@ impl<V: ScrollableView + 'static> Widget for ScrollBars<V> {
 
         Surface {
             size: ctx.max.size(),
-            widget: None,
+            widget: self.self_ref.upgrade().map(to_widget_ref),
             cursor: None,
             buffer: Vec::new(),
             children,
@@ -590,7 +628,7 @@ mod tests {
 
     use super::*;
     use crate::gwidth;
-    use crate::vxfw::{MaxSize, Point, Source, Text, WidgetRef, widget_eq};
+    use crate::vxfw::{HitResult, MaxSize, Phase, Point, Source, Text, WidgetRef, widget_eq};
 
     fn text(s: &str) -> WidgetRef {
         Rc::new(RefCell::new(Text::new(s)))
@@ -608,9 +646,9 @@ mod tests {
         let mut lv = ListView::new(Source::Slice(items));
         lv.draw_cursor = false;
 
-        let mut sb = ScrollBars::new(lv);
-        sb.draw_horizontal_scrollbar = false;
-        let inner = Rc::clone(&sb.view);
+        let sb = ScrollBars::new(lv);
+        sb.borrow_mut().draw_horizontal_scrollbar = false;
+        let inner = Rc::clone(&sb.borrow().view);
 
         let ctx = DrawContext {
             min: Size {
@@ -630,7 +668,7 @@ mod tests {
 
         // Overflowing content: the inner list plus the vertical bar, with a
         // thumb pinned to the top (5 of 20 items visible, thumb row 0).
-        let surface = sb.draw(&ctx);
+        let surface = sb.borrow_mut().draw(&ctx);
         assert_eq!(surface.children.len(), 2);
         let bar = surface
             .children
@@ -650,7 +688,7 @@ mod tests {
             mods: mouse::Modifiers::empty(),
             kind: mouse::Type::Press,
         });
-        sb.handle_event(&mut ec, &press);
+        sb.borrow_mut().handle_event(&mut ec, &press);
         assert!(ec.consume_event, "the press was grabbed by the thumb");
 
         // Dragging two rows down jumps the list: 2/5 of 20 items = item 8.
@@ -664,12 +702,12 @@ mod tests {
             mods: mouse::Modifiers::empty(),
             kind: mouse::Type::Drag,
         });
-        sb.capture_event(&mut ec, &drag);
+        sb.borrow_mut().capture_event(&mut ec, &drag);
         assert!(ec.consume_event, "the drag was intercepted");
         assert_eq!(inner.borrow().scroll_top(), 8);
 
         // Redraw reconciles: the thumb followed the drag away from the top.
-        let surface = sb.draw(&ctx);
+        let surface = sb.borrow_mut().draw(&ctx);
         let bar = surface
             .children
             .iter()
@@ -680,9 +718,9 @@ mod tests {
         // Short content: no bar, just the inner list.
         let mut lv = ListView::new(Source::Slice(vec![text("a"), text("b")]));
         lv.draw_cursor = false;
-        let mut sb = ScrollBars::new(lv);
-        sb.draw_horizontal_scrollbar = false;
-        let surface = sb.draw(&ctx);
+        let sb = ScrollBars::new(lv);
+        sb.borrow_mut().draw_horizontal_scrollbar = false;
+        let surface = sb.borrow_mut().draw(&ctx);
         assert_eq!(surface.children.len(), 1);
     }
 
@@ -696,9 +734,9 @@ mod tests {
         ]));
         sv.wheel_scroll = 1;
 
-        let mut scroll_bars = ScrollBars::new(sv);
-        scroll_bars.estimated_content_height = Some(7);
-        scroll_bars.estimated_content_width = Some(5);
+        let scroll_bars = ScrollBars::new(sv);
+        scroll_bars.borrow_mut().estimated_content_height = Some(7);
+        scroll_bars.borrow_mut().estimated_content_width = Some(5);
 
         let ctx = DrawContext {
             min: Size {
@@ -717,40 +755,40 @@ mod tests {
         };
 
         // Both bars and the scroll view.
-        let surface = scroll_bars.draw(&ctx);
+        let surface = scroll_bars.borrow_mut().draw(&ctx);
         assert_eq!(surface.children.len(), 3);
 
         // Hide only the horizontal scroll bar.
-        scroll_bars.draw_horizontal_scrollbar = false;
-        let surface = scroll_bars.draw(&ctx);
+        scroll_bars.borrow_mut().draw_horizontal_scrollbar = false;
+        let surface = scroll_bars.borrow_mut().draw(&ctx);
         assert_eq!(surface.children.len(), 2);
 
         // Hide only the vertical scroll bar.
-        scroll_bars.draw_horizontal_scrollbar = true;
-        scroll_bars.draw_vertical_scrollbar = false;
-        let surface = scroll_bars.draw(&ctx);
+        scroll_bars.borrow_mut().draw_horizontal_scrollbar = true;
+        scroll_bars.borrow_mut().draw_vertical_scrollbar = false;
+        let surface = scroll_bars.borrow_mut().draw(&ctx);
         assert_eq!(surface.children.len(), 2);
 
         // Hide both scroll bars.
-        scroll_bars.draw_horizontal_scrollbar = false;
-        let surface = scroll_bars.draw(&ctx);
+        scroll_bars.borrow_mut().draw_horizontal_scrollbar = false;
+        let surface = scroll_bars.borrow_mut().draw(&ctx);
         assert_eq!(surface.children.len(), 1);
 
         // Re-enable both bars.
-        scroll_bars.draw_horizontal_scrollbar = true;
-        scroll_bars.draw_vertical_scrollbar = true;
+        scroll_bars.borrow_mut().draw_horizontal_scrollbar = true;
+        scroll_bars.borrow_mut().draw_vertical_scrollbar = true;
 
         // A small estimate still draws the bars when the view knows there is
         // more to render.
-        scroll_bars.estimated_content_height = Some(2);
-        scroll_bars.estimated_content_width = Some(1);
-        let surface = scroll_bars.draw(&ctx);
+        scroll_bars.borrow_mut().estimated_content_height = Some(2);
+        scroll_bars.borrow_mut().estimated_content_width = Some(1);
+        let surface = scroll_bars.borrow_mut().draw(&ctx);
         assert_eq!(surface.children.len(), 3);
 
         // The view can tell whether the bars are needed even without estimates.
-        scroll_bars.estimated_content_height = None;
-        scroll_bars.estimated_content_width = None;
-        let surface = scroll_bars.draw(&ctx);
+        scroll_bars.borrow_mut().estimated_content_height = None;
+        scroll_bars.borrow_mut().estimated_content_width = None;
+        let surface = scroll_bars.borrow_mut().draw(&ctx);
         assert_eq!(surface.children.len(), 3);
     }
 
@@ -766,12 +804,12 @@ mod tests {
         let mut sv = ScrollView::new(Source::Slice(items));
         sv.wheel_scroll = 3;
 
-        let mut sb = ScrollBars::new(sv);
+        let sb = ScrollBars::new(sv);
         // bar_height^2 / estimate = 25 / 12 rounds to a two-row thumb, so a
         // clip would shrink it to one row and the assertions would catch it.
-        sb.estimated_content_height = Some(12);
-        let inner = Rc::clone(&sb.view);
-        let scroll_bars: WidgetRef = Rc::new(RefCell::new(sb));
+        sb.borrow_mut().estimated_content_height = Some(12);
+        let inner = Rc::clone(&sb.borrow().view);
+        let scroll_bars: WidgetRef = to_widget_ref(sb);
 
         let ctx = DrawContext {
             min: Size {
@@ -842,11 +880,11 @@ mod tests {
         let mut sv = ScrollView::new(Source::Slice(items));
         sv.wheel_scroll = 1;
 
-        let mut sb = ScrollBars::new(sv);
-        sb.estimated_content_height = Some(20);
+        let sb = ScrollBars::new(sv);
+        sb.borrow_mut().estimated_content_height = Some(20);
         // Keep a handle to the inner view to inspect its scroll state later.
-        let inner = Rc::clone(&sb.view);
-        let scroll_bars: WidgetRef = Rc::new(RefCell::new(sb));
+        let inner = Rc::clone(&sb.borrow().view);
+        let scroll_bars: WidgetRef = to_widget_ref(sb);
 
         let ctx = DrawContext {
             min: Size {
@@ -915,9 +953,9 @@ mod tests {
         }
         let mut lv = ListView::new(Source::Slice(items));
         lv.draw_cursor = false;
-        let mut sb = ScrollBars::new(lv);
-        sb.draw_horizontal_scrollbar = false;
-        let inner = Rc::clone(&sb.view);
+        let sb = ScrollBars::new(lv);
+        sb.borrow_mut().draw_horizontal_scrollbar = false;
+        let inner = Rc::clone(&sb.borrow().view);
 
         let ctx = DrawContext {
             min: Size {
@@ -936,10 +974,10 @@ mod tests {
         };
 
         // First draw establishes item_count and seeds the geometry.
-        sb.draw(&ctx);
+        sb.borrow_mut().draw(&ctx);
         // Scroll past the three tall items so the top lands on the short run.
         inner.borrow_mut().scroll_lines(30);
-        let surface = sb.draw(&ctx);
+        let surface = sb.borrow_mut().draw(&ctx);
 
         let bar_height: u16 = 10; // No horizontal bar reserved.
         let widget_h_f = f32::from(bar_height);
@@ -992,9 +1030,9 @@ mod tests {
         let items: Vec<WidgetRef> = (0..20).map(|i| text(&i.to_string())).collect();
         let mut lv = ListView::new(Source::Slice(items));
         lv.draw_cursor = false;
-        let mut sb = ScrollBars::new(lv);
-        sb.draw_horizontal_scrollbar = false;
-        let inner = Rc::clone(&sb.view);
+        let sb = ScrollBars::new(lv);
+        sb.borrow_mut().draw_horizontal_scrollbar = false;
+        let inner = Rc::clone(&sb.borrow().view);
 
         let ctx = DrawContext {
             min: Size {
@@ -1012,9 +1050,9 @@ mod tests {
             width_method: gwidth::Method::Unicode,
         };
 
-        sb.draw(&ctx);
+        sb.borrow_mut().draw(&ctx);
         inner.borrow_mut().scroll_lines(8);
-        let surface = sb.draw(&ctx);
+        let surface = sb.borrow_mut().draw(&ctx);
 
         let bar_height: u16 = 5;
         let widget_h_f = f32::from(bar_height);
@@ -1052,5 +1090,224 @@ mod tests {
             .find(|&r| bar.surface.read_cell(0, r).char.grapheme() == "▐")
             .expect("the thumb glyph is present");
         assert_eq!(u32::from(first_thumb_row), geom_top);
+    }
+
+    /// Drawing the bars directly (not through [`draw_widget`]) still yields a
+    /// routable surface: the self-stamp puts the bars' own identity on it, so a
+    /// consumer that embeds the surface hands the bus a hit path that reaches
+    /// the bars.
+    #[test]
+    fn scroll_bars_draw_self_stamps_identity() {
+        use crate::vxfw::ListView;
+
+        let items: Vec<WidgetRef> = (0..20).map(|i| text(&i.to_string())).collect();
+        let mut lv = ListView::new(Source::Slice(items));
+        lv.draw_cursor = false;
+        let bars = ScrollBars::new(lv);
+        bars.borrow_mut().draw_horizontal_scrollbar = false;
+
+        let ctx = DrawContext {
+            min: Size {
+                width: 0,
+                height: 0,
+            },
+            max: MaxSize {
+                width: Some(8),
+                height: Some(5),
+            },
+            cell_size: Size {
+                width: 10,
+                height: 20,
+            },
+            width_method: gwidth::Method::Unicode,
+        };
+
+        // Draw directly, the way the by-value consumers embed the surface.
+        let surface = bars.borrow_mut().draw(&ctx);
+        let stamped = surface
+            .widget
+            .as_ref()
+            .expect("the bars stamp their own surface");
+        assert!(
+            widget_eq(stamped, &to_widget_ref(Rc::clone(&bars))),
+            "the stamped identity is the bars handle"
+        );
+    }
+
+    /// The bars-less early return self-stamps too: a `ScrollBars` with both
+    /// bars disabled still hands back a routable surface, matching the main
+    /// return path. A [`FilterableSelect`] whose list fits hits this path every
+    /// frame, so the second stamp site must not regress to `None`.
+    ///
+    /// [`FilterableSelect`]: crate::vxfw::FilterableSelect
+    #[test]
+    fn scroll_bars_no_bars_draw_self_stamps_identity() {
+        use crate::vxfw::ListView;
+
+        let items: Vec<WidgetRef> = (0..3).map(|i| text(&i.to_string())).collect();
+        let mut lv = ListView::new(Source::Slice(items));
+        lv.draw_cursor = false;
+        let bars = ScrollBars::new(lv);
+        {
+            let mut b = bars.borrow_mut();
+            b.draw_horizontal_scrollbar = false;
+            b.draw_vertical_scrollbar = false;
+        }
+
+        let ctx = DrawContext {
+            min: Size {
+                width: 0,
+                height: 0,
+            },
+            max: MaxSize {
+                width: Some(8),
+                height: Some(5),
+            },
+            cell_size: Size {
+                width: 10,
+                height: 20,
+            },
+            width_method: gwidth::Method::Unicode,
+        };
+
+        let surface = bars.borrow_mut().draw(&ctx);
+        let stamped = surface
+            .widget
+            .as_ref()
+            .expect("the bars-less surface still stamps its own identity");
+        assert!(
+            widget_eq(stamped, &to_widget_ref(Rc::clone(&bars))),
+            "the stamped identity is the bars handle"
+        );
+    }
+
+    /// A self-stamped bars surface is routable through the bus with no consumer
+    /// forwarding: a mouse Press on the thumb followed by a Drag, dispatched by
+    /// the same capture/target/bubble walk the App runs, scrolls the wrapped
+    /// view.
+    #[test]
+    fn scroll_bars_press_then_drag_scrolls_inner_view() {
+        use crate::vxfw::ListView;
+
+        let items: Vec<WidgetRef> = (0..20).map(|i| text(&i.to_string())).collect();
+        let mut lv = ListView::new(Source::Slice(items));
+        lv.draw_cursor = false;
+        let bars = ScrollBars::new(lv);
+        bars.borrow_mut().draw_horizontal_scrollbar = false;
+        let inner = Rc::clone(&bars.borrow().view);
+
+        let ctx = DrawContext {
+            min: Size {
+                width: 0,
+                height: 0,
+            },
+            max: MaxSize {
+                width: Some(8),
+                height: Some(5),
+            },
+            cell_size: Size {
+                width: 10,
+                height: 20,
+            },
+            width_method: gwidth::Method::Unicode,
+        };
+
+        // Draw directly (no `draw_widget` wrapper): the self-stamp is all the
+        // routing needs.
+        let surface = bars.borrow_mut().draw(&ctx);
+
+        // Press on the thumb (last column, top row). It hit-tests to the bars,
+        // whose at-target handler starts the drag.
+        let press = mouse::Mouse {
+            col: 7,
+            row: 0,
+            xoffset: 0,
+            yoffset: 0,
+            button: mouse::Button::Left,
+            mods: mouse::Modifiers::empty(),
+            kind: mouse::Type::Press,
+        };
+        let ec = dispatch_mouse(&surface, press);
+        assert!(ec.consume_event, "the press was grabbed by the thumb");
+        assert!(
+            bars.borrow().is_dragging_vertical_thumb,
+            "the press started a thumb drag"
+        );
+
+        // Drag two rows down over the content area. It hit-tests to the inner
+        // view with the bars as ancestor, so the bars' capture-phase handler
+        // intercepts it and jumps the list (2/5 of 20 items = item 8).
+        let drag = mouse::Mouse {
+            col: 0,
+            row: 2,
+            xoffset: 0,
+            yoffset: 0,
+            button: mouse::Button::Left,
+            mods: mouse::Modifiers::empty(),
+            kind: mouse::Type::Drag,
+        };
+        let ec = dispatch_mouse(&surface, drag);
+        assert!(ec.consume_event, "the drag was intercepted by the bars");
+        assert_eq!(
+            inner.borrow().scroll_top(),
+            8,
+            "the drag scrolled the wrapped view through bus routing"
+        );
+    }
+
+    /// Dispatches `mouse` through `surface` the way the App's mouse handler
+    /// does: hit-test, then walk the capture phase (root to target-exclusive),
+    /// the target, and the bubble phase, stopping on consume. This is the
+    /// routing the self-stamp enables, exercised without a running App. It
+    /// omits the enter/leave diffing and command draining the App also does,
+    /// neither of which affects the routing under test.
+    fn dispatch_mouse(surface: &Surface, mouse: mouse::Mouse) -> EventContext {
+        let mut ec = EventContext::new();
+        let point = Point {
+            col: u16::try_from(mouse.col).expect("col fits u16"),
+            row: u16::try_from(mouse.row).expect("row fits u16"),
+        };
+        let mut hits: Vec<HitResult> = Vec::new();
+        surface.hit_test(point, &mut hits);
+        let Some(target) = hits.pop() else {
+            return ec;
+        };
+
+        ec.phase = Phase::Capturing;
+        for item in &hits {
+            let event = local_mouse_event(mouse, item.local);
+            item.widget.borrow_mut().capture_event(&mut ec, &event);
+            if ec.consume_event {
+                return ec;
+            }
+        }
+
+        ec.phase = Phase::AtTarget;
+        {
+            let event = local_mouse_event(mouse, target.local);
+            target.widget.borrow_mut().handle_event(&mut ec, &event);
+            if ec.consume_event {
+                return ec;
+            }
+        }
+
+        ec.phase = Phase::Bubbling;
+        while let Some(item) = hits.pop() {
+            let event = local_mouse_event(mouse, item.local);
+            item.widget.borrow_mut().handle_event(&mut ec, &event);
+            if ec.consume_event {
+                return ec;
+            }
+        }
+        ec
+    }
+
+    /// Rewrites `mouse`'s coordinates into a widget's local frame, the way the
+    /// App translates a report before delivering it along the hit path.
+    fn local_mouse_event(mouse: mouse::Mouse, local: Point) -> Event {
+        let mut m = mouse;
+        m.col = i16::try_from(local.col).expect("local col fits i16");
+        m.row = i16::try_from(local.row).expect("local row fits i16");
+        Event::Mouse(m)
     }
 }

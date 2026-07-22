@@ -136,7 +136,7 @@ pub(crate) struct UsageOverlay {
     /// The row list, shared with `bars` (which draws it). Rebuilt on every
     /// phase change to match the phase.
     list: Rc<RefCell<ListView>>,
-    bars: ScrollBars<ListView>,
+    bars: Rc<RefCell<ScrollBars<ListView>>>,
     /// Content-column tints for the read-only Display rows, snapshotted at
     /// construction.
     styles: ContentStyles,
@@ -184,9 +184,9 @@ impl UsageOverlay {
         // their own selection band via the row builder, and the read-only
         // page has no cursor.
         list.draw_cursor = false;
-        let mut bars = ScrollBars::new(list);
-        bars.draw_horizontal_scrollbar = false;
-        let list = Rc::clone(&bars.view);
+        let bars = ScrollBars::new(list);
+        bars.borrow_mut().draw_horizontal_scrollbar = false;
+        let list = Rc::clone(&bars.borrow().view);
 
         let mut overlay = UsageOverlay {
             phase: Phase::Display,
@@ -664,10 +664,14 @@ impl Widget for UsageOverlay {
             // NOTE: tint the thumb Muted per-draw, via the shared helper, so
             // it matches every other scrollbar. The style is snapshotted at
             // open, so this is parity with the other lists, not a live restyle.
-            crate::scroll::apply_thumb_style(&mut self.bars, self.styles.muted);
+            let bars_surface = {
+                let mut bars = self.bars.borrow_mut();
+                crate::scroll::apply_thumb_style(&mut bars, self.styles.muted);
+                bars.draw(&body_ctx)
+            };
             surface.children.push(SubSurface {
                 origin: RelativePoint { row: 0, col: 0 },
-                surface: self.bars.draw(&body_ctx),
+                surface: bars_surface,
                 z_index: 0,
             });
         }
