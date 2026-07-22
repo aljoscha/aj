@@ -98,16 +98,16 @@ use crate::usage_overlay::open_usage_overlay;
 /// dispatch. The Shell handles it by moving focus onto the top overlay: the
 /// drive loop owns the session world but has no [`EventContext`] to move focus
 /// itself, so it delegates the focus move to the shell via this event.
-const REFOCUS_OVERLAY_EVENT: &str = "aj-next.refocus-overlay";
+const REFOCUS_OVERLAY_EVENT: &str = "aj.refocus-overlay";
 
 /// App-event name the host posts after a session switch so the Shell
 /// retitles the terminal from its capturing phase. The switch runs in the
 /// drive loop, which has no [`EventContext`] to queue the title command
 /// itself, so it delegates to the shell the same way [`REFOCUS_OVERLAY_EVENT`]
 /// delegates the focus move.
-const SET_TITLE_EVENT: &str = "aj-next.set-title";
+const SET_TITLE_EVENT: &str = "aj.set-title";
 
-/// The app name aj-next brands its terminal window title with, lowercase.
+/// The app name shown in the terminal window title, lowercase.
 const APP_TITLE: &str = "aj";
 
 /// Everything the select loop mutates besides the `AsyncApp`: the
@@ -671,8 +671,8 @@ fn free_session_images(app: &mut AsyncApp, shell: &Rc<RefCell<Shell>>) {
 /// Strike hook for [`aj_app::notices::build_context_notice`], wrapping a
 /// disabled skill's row in the SGR strikethrough markers (`ESC[9m` on,
 /// `ESC[29m` off). The transcript notice renderer parses these into struck
-/// spans. aj-next cannot depend on `aj_tui`, so we spell the markers out here
-/// rather than reuse `aj_tui::style::strikethrough`.
+/// spans. We spell the markers out here rather than depend on a shared style
+/// helper, keeping this crate's markdown-marker use self-contained.
 fn strikethrough(s: &str) -> String {
     format!("\x1b[9m{s}\x1b[29m")
 }
@@ -1078,7 +1078,7 @@ fn handle_editor_submit(world: &mut World, shell: &Rc<RefCell<Shell>>, text: Str
     }
 }
 
-/// Auto-submit the launch prompt (`aj-next <msg>` / `@file ...`) as the
+/// Auto-submit the launch prompt (`aj <msg>` / `@file ...`) as the
 /// initial session's first Main turn. Empty content spawns nothing.
 ///
 /// Kept as a standalone step called from `run` outside the outer session
@@ -3947,7 +3947,7 @@ impl Shell {
         self.pending
             .borrow_mut()
             .set_queues(world.core.message_queues.clone());
-        self.header.borrow_mut().text = format!("aj-next - session {}", world.core.session_id);
+        self.header.borrow_mut().text = format!("{APP_TITLE} - session {}", world.core.session_id);
         self.window_title = aj_app::session::window_title(
             APP_TITLE,
             &world.core.session_id,
@@ -4285,7 +4285,7 @@ fn sync_editor_chrome(world: &World, shell: &Rc<RefCell<Shell>>) {
 /// run on a top-level `block_on` (the `#[tokio::main]` future), not a
 /// spawned task.
 pub async fn run(args: Args) -> Result<()> {
-    // Resolve the launch positionals (`aj-next <msg>` / `continue <id>
+    // Resolve the launch positionals (`aj <msg>` / `continue <id>
     // <msg>`, plus `@file` attachments) into the content to auto-submit.
     // We resolve here, before any terminal setup, so a missing `@file`
     // aborts via `?` while the terminal is still in its normal state
@@ -4328,7 +4328,7 @@ pub async fn run(args: Args) -> Result<()> {
     let theme_name = resolve_theme_name(world_config_theme(&world).as_deref()).to_string();
     let env_mode = ColorMode::detect();
     let theme = ThemeHandle::new(Theme::load_with_mode(&theme_name, env_mode));
-    let header = format!("aj-next - session {}", world.core.session_id);
+    let header = format!("{APP_TITLE} - session {}", world.core.session_id);
     let cwd = world.core.env.working_directory.clone();
     let shell = Rc::new(RefCell::new(Shell::new(
         Rc::clone(&world.chat),
@@ -5499,7 +5499,7 @@ mod tests {
             ThemeHandle::new(Theme::bundled_dark_with_mode(
                 aj_app::theme::ColorMode::Truecolor,
             )),
-            "aj-next".to_string(),
+            "aj".to_string(),
             "",
             PathBuf::from("/tmp"),
         )))
@@ -5515,7 +5515,7 @@ mod tests {
             ThemeHandle::new(Theme::bundled_dark_with_mode(
                 aj_app::theme::ColorMode::Truecolor,
             )),
-            format!("aj-next - session {session_id}"),
+            format!("aj - session {session_id}"),
             session_id,
             PathBuf::from(cwd),
         )
@@ -5634,7 +5634,7 @@ mod tests {
             ThemeHandle::new(Theme::bundled_dark_with_mode(
                 aj_app::theme::ColorMode::Truecolor,
             )),
-            "aj-next".to_string(),
+            "aj".to_string(),
             "",
             cwd,
         )));
@@ -5945,7 +5945,7 @@ mod tests {
     }
 
     async fn scripted_world_with_layers(dir: &TempDir, demo: &str, layers: ConfigLayers) -> World {
-        let args = Args::parse_from(["aj-next", "--scripted", demo]);
+        let args = Args::parse_from(["aj", "--scripted", demo]);
         let auth = AuthStorage::new(dir.path().join("auth.json"));
         let persistence = ConversationPersistence::new(dir.path().join("sessions"));
         build_world(&args, layers, &[], &auth, &persistence)
@@ -5997,7 +5997,7 @@ mod tests {
     /// A world resumed from `session_id`, reusing `dir`'s persistence so the
     /// session written by a prior [`scripted_world`] is found on disk.
     async fn resumed_world(dir: &TempDir, demo: &str, session_id: &str) -> World {
-        let args = Args::parse_from(["aj-next", "--scripted", demo, "continue", session_id]);
+        let args = Args::parse_from(["aj", "--scripted", demo, "continue", session_id]);
         let auth = AuthStorage::new(dir.path().join("auth.json"));
         let persistence = ConversationPersistence::new(dir.path().join("sessions"));
         build_world(&args, default_layers(), &[], &auth, &persistence)
@@ -6041,7 +6041,7 @@ mod tests {
             Rc::clone(&world.status),
             world.core.message_queues.clone(),
             ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor)),
-            "aj-next".to_string(),
+            "aj".to_string(),
             "",
             PathBuf::from("/tmp"),
         )))
@@ -7967,7 +7967,7 @@ mod tests {
     }
 
     /// An empty launch prompt (no positionals, no `@file`) spawns nothing,
-    /// so a bare `aj-next` starts on the idle splash.
+    /// so a bare `aj` starts on the idle splash.
     #[tokio::test]
     async fn empty_launch_prompt_spawns_nothing() {
         let dir = TempDir::new().expect("tempdir");
@@ -8295,7 +8295,7 @@ mod tests {
             ThemeHandle::new(Theme::bundled_dark_with_mode(
                 aj_app::theme::ColorMode::Truecolor,
             )),
-            "aj-next".to_string(),
+            "aj".to_string(),
             "",
             PathBuf::from("/tmp"),
         )));
@@ -8332,7 +8332,7 @@ mod tests {
             ThemeHandle::new(Theme::bundled_dark_with_mode(
                 aj_app::theme::ColorMode::Truecolor,
             )),
-            "aj-next".to_string(),
+            "aj".to_string(),
             "",
             PathBuf::from("/tmp"),
         )));
@@ -9793,7 +9793,7 @@ mod tests {
             Rc::new(RefCell::new(StatusState::default())),
             MessageQueues::default(),
             theme.clone(),
-            "aj-next".to_string(),
+            "aj".to_string(),
             "",
             PathBuf::from("/tmp/project"),
         )));
@@ -10051,7 +10051,7 @@ mod tests {
             Rc::clone(&world.status),
             world.core.message_queues.clone(),
             ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor)),
-            "aj-next".to_string(),
+            "aj".to_string(),
             "",
             PathBuf::from("/tmp"),
         )));
@@ -10072,7 +10072,7 @@ mod tests {
     // ---- Inline images (lazy transmit + free) ----
 
     /// A valid 2x2 RGB PNG, base64-encoded, as a `read_file` tool result would
-    /// carry it. Generated once and pasted in: aj-next has no image encoder.
+    /// carry it. Generated once and pasted in: aj has no image encoder.
     const PNG_2X2_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAADklEQVR4nGOoBwMGCAUAKboF9Rf06ToAAAAASUVORK5CYII=";
 
     /// Reduce a tool-result image entry (start + end) into `chat` and return
@@ -10271,7 +10271,7 @@ mod tests {
             Rc::clone(&world.status),
             world.core.message_queues.clone(),
             ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor)),
-            "aj-next".to_string(),
+            "aj".to_string(),
             "",
             PathBuf::from("/tmp"),
         )));
@@ -11954,7 +11954,7 @@ mod tests {
         // The header id followed the swap.
         assert_eq!(
             shell.borrow().header.borrow().text,
-            format!("aj-next - session {beta}")
+            format!("aj - session {beta}")
         );
         // The pending box reads the new agent's queues (rebound on the
         // swap), so a message queued on the new core previews.

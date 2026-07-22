@@ -249,9 +249,8 @@ pub fn open_browser(url: &str) {
 /// A single display line in the login dialog, tagged so each frontend
 /// can color it through its own theme.
 ///
-/// Frontend-agnostic on purpose: the wording lives here so both the
-/// `aj` and `aj-next` login dialogs render identical copy, while the
-/// per-frontend widget owns the actual styling.
+/// Frontend-agnostic on purpose: the wording lives here while the
+/// frontend widget owns the actual styling.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LoginLine {
     /// Plain informational text.

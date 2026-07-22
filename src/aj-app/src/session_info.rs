@@ -2,9 +2,8 @@
 //!
 //! Turns a [`SessionStats`] into an ordered list of [`InfoRow`]s:
 //! labelled sections, key/value pairs, and blank spacers between
-//! sections. Both frontends build from this one digest and only differ
-//! in how they render the rows (aj -> `SelectList` strings, aj-next ->
-//! styled spans), so the content stays identical across binaries.
+//! sections. The frontend renders these rows as styled spans; keeping
+//! the digest here keeps its content independent of how it is drawn.
 
 use aj_session::SessionStats;
 use chrono::{DateTime, Utc};

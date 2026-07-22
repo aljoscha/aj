@@ -39,7 +39,7 @@ pub(crate) const FRAME_INTERVAL_MS: u32 = 80;
 /// Name of the host-posted [`vaxis::vxfw::UserEvent`] that kicks the splash
 /// animation chain. Widgets can only schedule ticks from an event handler, so
 /// the host posts this once at startup and the Shell forwards it here.
-pub(crate) const SPLASH_WAKE_EVENT: &str = "aj-next.splash.wake";
+pub(crate) const SPLASH_WAKE_EVENT: &str = "aj.splash.wake";
 
 /// Decorative lavender-to-purple gradient for the logo, light to dark.
 ///

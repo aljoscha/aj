@@ -1,10 +1,10 @@
 [package]
-name = "aj-next"
+name = "aj"
 version.workspace = true
 edition.workspace = true
 
 [[bin]]
-name = "aj-next"
+name = "aj"
 path = "src/main.rs"
 
 [dependencies]

@@ -1,9 +1,9 @@
-//! Binary entry point for the `aj-next` CLI, a vaxis-based sibling to `aj`.
+//! Binary entry point for the `aj` CLI.
 //!
 //! Loads `~/.aj/.env`, parses the shared CLI surface
 //! ([`aj_app::cli::args::Args`]), and dispatches. The non-interactive
-//! subcommands and print mode reuse `aj-app` directly, exactly as `aj` does.
-//! The interactive branch is the vaxis frontend (see `interactive`).
+//! subcommands and print mode reuse `aj-app` directly. The interactive branch
+//! is the vaxis frontend (see `interactive`).
 
 use aj_app::cli::args::{Args, Command};
 use aj_conf::Config;

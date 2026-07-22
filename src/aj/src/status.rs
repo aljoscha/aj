@@ -30,7 +30,7 @@ pub(crate) const FRAME_INTERVAL_MS: u32 = 80;
 /// Name of the host-posted [`vaxis::vxfw::UserEvent`] that wakes the
 /// loader when the viewed agent turns busy, so it can arm its tick
 /// chain (widgets can only schedule ticks from an event handler).
-pub(crate) const STATUS_WAKE_EVENT: &str = "aj-next.status.wake";
+pub(crate) const STATUS_WAKE_EVENT: &str = "aj.status.wake";
 
 /// Lifecycle bits the status chrome reads at draw time, mirrored from
 /// the host-owned `AgentLifecycle` once per loop iteration.

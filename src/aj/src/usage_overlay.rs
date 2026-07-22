@@ -908,7 +908,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("aj-next-usage-{}-{n}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aj-usage-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         AuthStorage::with_providers(dir.join("auth.json"), HashMap::new())
     }

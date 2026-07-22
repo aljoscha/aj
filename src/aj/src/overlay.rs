@@ -278,9 +278,9 @@ impl OverlayChrome {
 ///
 /// The prefix (category) column and the secondary column both use `Muted`, and
 /// the shortcut column is the `KeybindingHint` token drawn bold: coloring the
-/// shortcut with the hint token is the ratified E-10 aj-next divergence from
-/// `aj`. Only the palette sets a prefix or shortcut, so those columns are inert
-/// for the other overlays. The label is plain here (the shared default); the
+/// shortcut with the hint token is the ratified E-10 treatment. Only the
+/// palette sets a prefix or shortcut, so those columns are inert for the other
+/// overlays. The label is plain here (the shared default); the
 /// palette bolds its own copy on top, so bold labels are palette-only (see
 /// `crate::palette::open_palette`).
 ///

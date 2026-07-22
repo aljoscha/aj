@@ -533,10 +533,9 @@ fn color_distance(r1: u8, g1: u8, b1: u8, r2: u8, g2: u8, b2: u8) -> u32 {
 /// cube pick, so a deliberate cyan or red tint isn't flattened to gray
 /// on limited terminals.
 ///
-/// This lives here rather than in a frontend because both the `aj`
-/// (ANSI-SGR) and `aj-next` (vaxis) renderers downsample the same
-/// palette, and the mapping must agree between them. It depends only on
-/// std, so it doesn't pull a TUI backend into `aj-app`.
+/// This lives in `aj-app` rather than the frontend because it is pure
+/// palette math with no TUI backend types. It depends only on std, so it
+/// doesn't pull a TUI backend into `aj-app`.
 pub fn rgb_to_256(r: u8, g: u8, b: u8) -> u8 {
     let ri = closest_cube_index(r);
     let gi = closest_cube_index(g);

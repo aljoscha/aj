@@ -2735,8 +2735,8 @@ mod tests {
 
     /// A legacy log with no `SubAgentSpawn` entry still yields a
     /// `SubAgentStart` under `replay_deferring_subs`, synthesized by the
-    /// `bracket_subagent` fallback at the sub's first message. The aj-next
-    /// resume drain seeds `deferred_subs` from that event, so without the
+    /// `bracket_subagent` fallback at the sub's first message. The resume
+    /// drain seeds `deferred_subs` from that event, so without the
     /// synthesized start a legacy sub-agent would never be marked deferred
     /// and never materialize on observe.
     #[test]

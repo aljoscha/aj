@@ -1,9 +1,9 @@
-//! Frontend-agnostic startup notices shared by the terminal frontends:
+//! Frontend-agnostic startup notices for the terminal frontend:
 //! the `Context:` listing and the sandbox warning.
 //!
 //! Both are host-side text the binary surfaces above the editor at
-//! startup. Keeping them here lets `aj` and `aj-next` emit identical
-//! notice strings without reaching into each other.
+//! startup. Keeping them in `aj-app` keeps the notice strings
+//! independent of the frontend.
 
 use aj_conf::{AgentEnv, SystemPromptSource, display_path};
 

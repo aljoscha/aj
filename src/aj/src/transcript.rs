@@ -70,9 +70,8 @@ pub(crate) struct TranscriptStyles {
     pub(crate) user: Style,
     pub(crate) thinking: Style,
     pub(crate) dim: Style,
-    /// Gray tint for the chat scrollbar thumb. This is aj-next chrome with no
-    /// `aj` counterpart (aj has no in-app scrollbar), so it stays a concrete
-    /// gray rather than the faint attribute `dim` carries.
+    /// Gray tint for the chat scrollbar thumb. Concrete app scrollbar chrome, so
+    /// it stays a concrete gray rather than the faint attribute `dim` carries.
     pub(crate) scrollbar_thumb: Style,
     pub(crate) warning: Style,
     pub(crate) error: Style,

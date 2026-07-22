@@ -18,6 +18,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "aj"
+version = "0.1.0"
+dependencies = [
+ "aj-agent",
+ "aj-app",
+ "aj-conf",
+ "aj-models",
+ "aj-session",
+ "aj-tools",
+ "anyhow",
+ "async-trait",
+ "base64",
+ "chrono",
+ "clap",
+ "dotenv",
+ "ignore",
+ "nucleo",
+ "rand 0.9.4",
+ "serde_json",
+ "serial_test",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-segmentation",
+ "vaxis",
+]
+
+[[package]]
 name = "aj-agent"
 version = "0.1.0"
 dependencies = [
@@ -107,36 +137,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
-]
-
-[[package]]
-name = "aj-next"
-version = "0.1.0"
-dependencies = [
- "aj-agent",
- "aj-app",
- "aj-conf",
- "aj-models",
- "aj-session",
- "aj-tools",
- "anyhow",
- "async-trait",
- "base64",
- "chrono",
- "clap",
- "dotenv",
- "ignore",
- "nucleo",
- "rand 0.9.4",
- "serde_json",
- "serial_test",
- "tempfile",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "unicode-segmentation",
- "vaxis",
 ]
 
 [[package]]

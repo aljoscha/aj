@@ -1,5 +1,5 @@
-//! Frontend-agnostic application logic shared by the `aj` (aj-tui) and
-//! `aj-next` (vaxis) binaries.
+//! Frontend-agnostic application logic for the `aj` binary, kept independent of
+//! the TUI backend.
 //!
 //! This crate holds everything a terminal frontend for the agent needs that is
 //! not tied to a specific TUI backend: the CLI surface, model selection, the

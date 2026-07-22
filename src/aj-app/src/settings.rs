@@ -750,10 +750,10 @@ pub async fn confirm_speed_for_main(
 /// one-liner plus the settings-window note the interactive windows show
 /// below the highlighted row.
 ///
-/// This is the single source of the description copy both frontends
-/// render. It is frontend-neutral: an addendum that only applies to one
-/// frontend (e.g. the aj-classic note that `show_frame_stats` only
-/// affects the aj-next TUI) is appended by that frontend, not here.
+/// This is the single source of the description copy the frontend
+/// renders. It is frontend-neutral: an addendum specific to the frontend
+/// (e.g. a note that `show_frame_stats` only affects the frame-stats
+/// overlay) is appended by that frontend, not here.
 pub fn option_description(option: &aj_conf::ConfigOption) -> String {
     match option.name {
         // The model row folds `model_api` + `model_name`, so its text names
@@ -836,9 +836,9 @@ mod tests {
     #[test]
     fn show_frame_stats_is_frontend_neutral() {
         let opt = option("show_frame_stats");
-        // No aj-classic addendum here: the frontend appends it.
+        // No frontend addendum here: the shared description is exactly the
+        // option's own, and the frontend appends any frontend-specific note.
         assert_eq!(option_description(opt), opt.description);
-        assert!(!option_description(opt).contains("aj-next"));
     }
 
     #[test]
