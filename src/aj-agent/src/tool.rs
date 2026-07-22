@@ -20,7 +20,7 @@ use schemars::generate::SchemaSettings;
 use serde::de::{DeserializeOwned, Error as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use similar::{ChangeTag, TextDiff};
+use similar::{ChangeTag, DiffTag, TextDiff};
 use tokio_util::sync::CancellationToken;
 
 use crate::TaskRegistry;
@@ -346,6 +346,107 @@ impl<'de> Deserialize<'de> for DiffDetails {
     {
         Self::from_compact(CompactDiffDetails::deserialize(deserializer)?).map_err(D::Error::custom)
     }
+}
+
+/// Unified-diff context radius: four unchanged lines are kept around each
+/// change, matching the reference differ.
+const WIRE_DIFF_CONTEXT: usize = 4;
+
+/// Model-facing unified diff of an `edit_file` change.
+///
+/// This is a second rendering of the change that [`DiffDetails`] renders
+/// for the UI. They exist separately because the model wants a standard
+/// line-numbered unified diff, while the UI wants our compact display
+/// format.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WireDiff {
+    /// Fenced ```diff block, empty when the sanitized `old` and `new` are
+    /// identical. A change only in stripped control characters therefore
+    /// shows nothing here.
+    pub fenced: String,
+    /// Added lines across the whole diff.
+    pub added: usize,
+    /// Removed lines across the whole diff.
+    pub removed: usize,
+}
+
+/// Builds the model-facing unified diff for an edit from `old` to `new`.
+///
+/// The diff is line-numbered (`@@` hunk headers) and whitespace-sensitive,
+/// so a re-indentation applied by the matcher shows up as a change rather
+/// than being hidden. Both sides are sanitized (control characters
+/// stripped) before diffing, so the diff reflects printable content, not
+/// raw bytes. The fence grows past any backtick run in the body so a diff
+/// that itself contains a code fence cannot break out of the block.
+pub fn wire_diff(path: &str, old: &str, new: &str) -> WireDiff {
+    let path = sanitize_diff_path(path);
+    let old = crate::sanitize_terminal_output(old);
+    let new = crate::sanitize_terminal_output(new);
+
+    let mut config = TextDiff::configure();
+    config.timeout(DIFF_TIMEOUT);
+    let diff = config.diff_lines(&old, &new);
+
+    let mut added = 0;
+    let mut removed = 0;
+    for op in diff.ops() {
+        let (tag, old_range, new_range) = op.as_tag_tuple();
+        match tag {
+            DiffTag::Delete => removed += old_range.end - old_range.start,
+            DiffTag::Insert => added += new_range.end - new_range.start,
+            DiffTag::Replace => {
+                removed += old_range.end - old_range.start;
+                added += new_range.end - new_range.start;
+            }
+            DiffTag::Equal => {}
+        }
+    }
+
+    // Header labels mirror the reference's two-file unified patch. similar
+    // emits them once before the first hunk, and nothing at all when there
+    // are no hunks, which is how the empty-diff case is detected below.
+    //
+    // We keep similar's default `\ No newline at end of file` marker: since
+    // this diff is whitespace-sensitive, a change to the file's trailing
+    // newline is a real change, and the marker is what lets the model tell
+    // an otherwise-identical line pair apart.
+    let body = diff
+        .unified_diff()
+        .context_radius(WIRE_DIFF_CONTEXT)
+        .header(&format!("{path}\toriginal"), &format!("{path}\tmodified"))
+        .to_string();
+
+    let fenced = if body.is_empty() {
+        String::new()
+    } else {
+        let fence = "`".repeat(fence_len(&body));
+        let sep = if body.ends_with('\n') { "" } else { "\n" };
+        format!("{fence}diff\n{body}{sep}{fence}")
+    };
+
+    WireDiff {
+        fenced,
+        added,
+        removed,
+    }
+}
+
+/// Length of a backtick fence, at least three and longer than the longest
+/// backtick run in `body`, so a body with an embedded code fence stays
+/// enclosed. A single pass finds the longest run, avoiding a quadratic
+/// rescan on adversarial input with long backtick runs.
+fn fence_len(body: &str) -> usize {
+    let mut longest = 0;
+    let mut run = 0;
+    for byte in body.bytes() {
+        if byte == b'`' {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    longest.max(2) + 1
 }
 
 /// Semantic role of one canonical diff line.
@@ -1214,6 +1315,83 @@ pub fn derive_schema<T: JsonSchema>() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The model-facing diff is fenced, line-numbered, and carries the
+    /// path in its file headers.
+    #[test]
+    fn wire_diff_emits_fenced_line_numbered_diff() {
+        let w = wire_diff("f.rs", "a\nb\nc\n", "a\nB\nc\n");
+        assert!(w.fenced.starts_with("```diff\n"), "fenced: {}", w.fenced);
+        assert!(
+            w.fenced.contains("--- f.rs\toriginal"),
+            "fenced: {}",
+            w.fenced
+        );
+        assert!(
+            w.fenced.contains("+++ f.rs\tmodified"),
+            "fenced: {}",
+            w.fenced
+        );
+        assert!(w.fenced.contains("@@"), "fenced: {}", w.fenced);
+        assert!(w.fenced.contains("-b\n"), "fenced: {}", w.fenced);
+        assert!(w.fenced.contains("+B\n"), "fenced: {}", w.fenced);
+        assert!(w.fenced.trim_end().ends_with("```"), "fenced: {}", w.fenced);
+        assert_eq!((w.added, w.removed), (1, 1));
+    }
+
+    /// Identical inputs produce no hunks, so the fenced diff is empty.
+    #[test]
+    fn wire_diff_empty_when_unchanged() {
+        let w = wire_diff("f.rs", "a\nb\n", "a\nb\n");
+        assert!(w.fenced.is_empty());
+        assert_eq!((w.added, w.removed), (0, 0));
+    }
+
+    /// A whitespace-only change is shown, since the diff is
+    /// whitespace-sensitive.
+    #[test]
+    fn wire_diff_shows_whitespace_only_change() {
+        let w = wire_diff("f.rs", "  a\n", "    a\n");
+        assert!(w.fenced.contains("-  a\n"), "fenced: {}", w.fenced);
+        assert!(w.fenced.contains("+    a\n"), "fenced: {}", w.fenced);
+    }
+
+    /// The fence grows past a code fence embedded in the content so the
+    /// diff cannot break out of its own block.
+    #[test]
+    fn wire_diff_grows_fence_past_embedded_backticks() {
+        let w = wire_diff("f.rs", "x\n", "```rust\n");
+        assert!(w.fenced.starts_with("````diff\n"), "fenced: {}", w.fenced);
+        assert!(
+            w.fenced.trim_end().ends_with("````"),
+            "fenced: {}",
+            w.fenced
+        );
+    }
+
+    /// Dropping the file's final newline is a real change under a
+    /// whitespace-sensitive diff, shown with the missing-newline marker so
+    /// the otherwise-identical line pair is distinguishable.
+    #[test]
+    fn wire_diff_marks_missing_final_newline() {
+        let w = wire_diff("f.rs", "a\nb\n", "a\nb");
+        assert!(
+            w.fenced.contains("No newline at end of file"),
+            "fenced: {}",
+            w.fenced
+        );
+    }
+
+    /// Two changes farther apart than the context radius produce two
+    /// hunks.
+    #[test]
+    fn wire_diff_emits_multiple_hunks() {
+        let old = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n";
+        let new = "X\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\nY\n";
+        let w = wire_diff("f.rs", old, new);
+        let hunks = w.fenced.lines().filter(|l| l.starts_with("@@")).count();
+        assert_eq!(hunks, 2, "fenced: {}", w.fenced);
+    }
 
     #[test]
     fn tool_details_round_trips_each_variant() {

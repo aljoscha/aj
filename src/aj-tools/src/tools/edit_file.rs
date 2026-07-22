@@ -1,11 +1,11 @@
 //! `edit_file` builtin: apply a single string replacement to a file.
 //!
-//! Implements [`aj_agent::tool::ToolDefinition`]. Returns a
-//! [`ToolOutcome`] whose
-//! `details` is [`ToolDetails::Diff`] on success. It contains the
-//! canonical compact display diff for the replacement. The wire `content` is
-//! the short success summary so the model still sees
-//! a deterministic `"Successfully replaced ..."` line.
+//! Implements [`aj_agent::tool::ToolDefinition`]. On success the
+//! [`ToolOutcome`] carries the change on two channels: `details` is a
+//! [`ToolDetails::Diff`] holding the compact display diff for the UI, and
+//! the wire `content` is a line-numbered unified diff (via
+//! [`aj_agent::tool::wire_diff`]) so the model sees exactly what changed.
+//! A change larger than the size cap is summarized instead of shown.
 //!
 //! Matching escalates from an exact substring match to a
 //! whitespace-tolerant line fallback. See the `apply_edit` helper for
@@ -26,7 +26,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use aj_agent::tool::{
-    DiffDetails, ExecutionMode, ToolContext, ToolDefinition, ToolDetails, ToolOutcome,
+    DiffDetails, ExecutionMode, ToolContext, ToolDefinition, ToolDetails, ToolOutcome, WireDiff,
+    wire_diff,
 };
 use aj_models::types::UserContent;
 use schemars::JsonSchema;
@@ -130,7 +131,8 @@ impl ToolDefinition for EditFileTool {
         let display_path = display_relative(path, &ctx.working_directory());
         // Complete rendering work before mutation so a diff timeout fallback or
         // unexpected panic cannot leave a successful write without an outcome.
-        let details = ToolDetails::Diff(DiffDetails::new(display_path, &normalized, &new_content));
+        let details = ToolDetails::Diff(DiffDetails::new(&display_path, &normalized, &new_content));
+        let wire = wire_diff(&display_path, &normalized, &new_content);
 
         if let Err(e) = fs::write(path, &new_content) {
             return Ok(error_outcome(
@@ -139,13 +141,8 @@ impl ToolDefinition for EditFileTool {
             ));
         }
 
-        let return_value = format!(
-            "Successfully replaced '{}' with '{}' in file '{}'",
-            input.old_string, input.new_string, input.path
-        );
-
         Ok(ToolOutcome {
-            content: vec![UserContent::text(return_value)],
+            content: vec![UserContent::text(render_wire_content(&display_path, wire))],
             details,
             is_error: false,
         })
@@ -339,6 +336,26 @@ fn display_relative(path: &Path, cwd: &Path) -> String {
     path.strip_prefix(cwd).unwrap_or(path).display().to_string()
 }
 
+/// Cap on the fenced diff returned to the model. A larger change is
+/// summarized instead so a broad rewrite cannot flood the context.
+const WIRE_DIFF_MAX_BYTES: usize = 16 * 1024;
+
+/// Renders the model-facing result for a successful edit: the fenced
+/// unified diff, or a short summary when the change is empty or exceeds
+/// the size cap.
+fn render_wire_content(path: &str, wire: WireDiff) -> String {
+    if wire.fenced.is_empty() {
+        return format!("Edited {path} (no changes to show)");
+    }
+    if wire.fenced.len() > WIRE_DIFF_MAX_BYTES {
+        return format!(
+            "Edited {path} (diff too large to show: +{}/-{} lines)",
+            wire.added, wire.removed
+        );
+    }
+    wire.fenced
+}
+
 /// Build a [`ToolOutcome`] for a recoverable error. The model gets the
 /// human-readable error string as the tool result and `is_error: true`
 /// so it can correct the call; the user sees the same string in the
@@ -397,9 +414,11 @@ mod tests {
 
         assert!(!outcome.is_error);
         let wire = extract_text(&outcome.content);
-        assert!(wire.starts_with("Successfully replaced"), "wire: {wire:?}");
-        assert!(wire.contains("beta"), "wire: {wire:?}");
-        assert!(wire.contains("BETA"), "wire: {wire:?}");
+        // The model sees a fenced, line-numbered unified diff of the change.
+        assert!(wire.starts_with("```diff\n"), "wire: {wire:?}");
+        assert!(wire.contains("@@"), "wire: {wire:?}");
+        assert!(wire.contains("-alpha beta gamma"), "wire: {wire:?}");
+        assert!(wire.contains("+alpha BETA gamma"), "wire: {wire:?}");
 
         match &outcome.details {
             ToolDetails::Diff(diff) => {
@@ -612,6 +631,11 @@ mod tests {
             .expect("execute");
 
         assert!(!outcome.is_error, "outcome: {outcome:?}");
+        let wire = extract_text(&outcome.content);
+        // The wire diff is LF-only and shows the single changed line.
+        assert!(!wire.contains('\r'), "wire: {wire:?}");
+        assert!(wire.contains("-two"), "wire: {wire:?}");
+        assert!(wire.contains("+TWO"), "wire: {wire:?}");
         let on_disk = fs::read_to_string(&path).expect("read back");
         assert_eq!(on_disk, "one\nTWO\nthree\n");
     }
@@ -642,6 +666,11 @@ mod tests {
             .expect("execute");
 
         assert!(!outcome.is_error, "outcome: {outcome:?}");
+        let wire = extract_text(&outcome.content);
+        // The re-indented replacement is visible in the model-facing diff,
+        // keeping the file's two-space indentation.
+        assert!(wire.contains("-  b();"), "wire: {wire:?}");
+        assert!(wire.contains("+  c();"), "wire: {wire:?}");
         let on_disk = fs::read_to_string(&path).expect("read back");
         // The replacement keeps the file's two-space indentation.
         assert_eq!(on_disk, "fn f() {\n  a();\n  c();\n}\n");
@@ -719,6 +748,64 @@ mod tests {
         assert_eq!(unescape("a\\\\b"), "a\\b");
         // An escaped quote becomes a quote.
         assert_eq!(unescape("a\\\"b"), "a\"b");
+    }
+
+    /// Over the size cap, the wire content collapses to a one-line
+    /// summary with change counts instead of a huge diff.
+    #[test]
+    fn render_wire_content_summarizes_over_cap() {
+        let wire = WireDiff {
+            fenced: "x".repeat(WIRE_DIFF_MAX_BYTES + 1),
+            added: 5,
+            removed: 3,
+        };
+        let out = render_wire_content("f.rs", wire);
+        assert!(out.contains("diff too large to show"), "{out}");
+        assert!(out.contains("+5/-3"), "{out}");
+    }
+
+    /// A byte-identical result (no hunks) surfaces a short note rather
+    /// than an empty fenced block.
+    #[test]
+    fn render_wire_content_notes_no_textual_change() {
+        let wire = WireDiff {
+            fenced: String::new(),
+            added: 0,
+            removed: 0,
+        };
+        let out = render_wire_content("f.rs", wire);
+        assert!(out.contains("no changes to show"), "{out}");
+    }
+
+    /// A change large enough to exceed the wire cap collapses to the
+    /// summary line when driven through the real tool, not just a
+    /// synthetic `WireDiff`.
+    #[tokio::test]
+    async fn large_edit_collapses_to_summary_through_execute() {
+        let mut file = NamedTempFile::new().expect("temp file");
+        // 4000 identical lines: replacing the token on every line yields a
+        // diff well past the 16KB cap.
+        write!(file, "{}", "x\n".repeat(4000)).unwrap();
+        let path = file.path().to_path_buf();
+
+        let mut ctx = DummyToolContext::default();
+        let outcome = EditFileTool
+            .execute(
+                &mut ctx,
+                EditFileInput {
+                    path: path.display().to_string(),
+                    old_string: "x".to_string(),
+                    new_string: "yy".to_string(),
+                    replace_all: true,
+                },
+            )
+            .await
+            .expect("execute");
+
+        assert!(!outcome.is_error, "outcome: {outcome:?}");
+        let wire = extract_text(&outcome.content);
+        assert!(wire.contains("diff too large to show"), "wire: {wire:?}");
+        assert!(wire.contains("+4000/-4000"), "wire: {wire:?}");
     }
 
     /// A `new_string` that begins with a blank line: the replacement's
