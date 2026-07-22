@@ -110,11 +110,13 @@ impl ToolDefinition for EditFileTool {
             }
         };
 
-        // Normalize once and reuse for both the edit and the diff base, so a
-        // CRLF->LF normalization is not mistaken for an edit in the diff.
+        // Diff against the normalized original so a CRLF->LF normalization
+        // is not mistaken for an edit. apply_edit normalizes internally and
+        // derives its result from the same normalized text, so this base
+        // matches what gets written.
         let normalized = normalize_newlines(&original_content);
         let new_content = match apply_edit(
-            &normalized,
+            &original_content,
             &input.old_string,
             &input.new_string,
             input.replace_all,
@@ -209,7 +211,12 @@ fn fuzzy_line_replace(content: &str, old_string: &str, new_string: &str) -> Opti
 
         let file_indent = leading_whitespace(file_lines[start]);
         let new_lines: Vec<&str> = new_string.split('\n').collect();
-        let base_indent = leading_whitespace(new_lines.first().copied().unwrap_or(""));
+        // Base indent is the leading whitespace run of the whole
+        // new_string, so a leading blank line makes it span the newline.
+        // When it does, no single line's indent starts with it, so every
+        // line reanchors to file_indent. This mirrors the reference's
+        // `/^\s*/` taken over the entire string rather than the first line.
+        let base_indent = leading_whitespace(new_string);
         let rebuilt = new_lines.iter().map(|line| {
             if line.is_empty() {
                 return String::new();
@@ -239,6 +246,7 @@ fn fuzzy_line_replace(content: &str, old_string: &str, new_string: &str) -> Opti
 
 /// Reason an edit could not be applied, rendered into a model-facing
 /// message by the caller.
+#[derive(Debug)]
 enum EditError {
     /// `old_string` equals `new_string`, so the edit is a no-op.
     Identical,
@@ -266,8 +274,9 @@ impl EditError {
     }
 }
 
-/// Apply a single `old_string` -> `new_string` edit to `content` (which
-/// must already be newline-normalized) and return the rewritten file.
+/// Apply a single `old_string` -> `new_string` edit to `content` and
+/// return the rewritten file. Line endings are normalized to LF on all
+/// inputs before matching, so the returned content uses LF.
 ///
 /// Matching escalates through three strategies:
 ///
@@ -288,6 +297,7 @@ fn apply_edit(
         return Err(EditError::Identical);
     }
 
+    let content = normalize_newlines(content);
     let old = normalize_newlines(old_string);
     let new = normalize_newlines(new_string);
 
@@ -307,14 +317,14 @@ fn apply_edit(
         return Ok(content.replacen(&old, &new, 1));
     }
 
-    if let Some(result) = fuzzy_line_replace(content, &old, &new) {
+    if let Some(result) = fuzzy_line_replace(&content, &old, &new) {
         return Ok(result);
     }
     // Last resort: some models escape the strings. Undo one level and
     // retry the line fallback against the same normalized file.
     let old = normalize_newlines(&unescape(old_string));
     let new = normalize_newlines(&unescape(new_string));
-    if let Some(result) = fuzzy_line_replace(content, &old, &new) {
+    if let Some(result) = fuzzy_line_replace(&content, &old, &new) {
         return Ok(result);
     }
 
@@ -707,6 +717,46 @@ mod tests {
         assert_eq!(unescape("a\\\\b"), "a\\b");
         // An escaped quote becomes a quote.
         assert_eq!(unescape("a\\\"b"), "a\"b");
+    }
+
+    /// A `new_string` that begins with a blank line: the replacement's
+    /// base indent is the whole string's leading whitespace run, which
+    /// spans the blank line, so each real line reanchors to the file's
+    /// indentation rather than keeping its own.
+    #[test]
+    fn fuzzy_reindent_with_leading_blank_line_in_new() {
+        let out = apply_edit("  a\n  b\n", "a\nb", "\n    b2", false).unwrap();
+        assert_eq!(out, "\n  b2\n");
+    }
+
+    /// A replacement line indented less than the replacement's own first
+    /// line drops its indentation and reanchors to the file indent.
+    #[test]
+    fn fuzzy_reindent_drops_indent_not_under_base() {
+        let out = apply_edit(
+            "def outer():\n        inner()\n        cleanup()\n",
+            "    inner()\n    cleanup()",
+            "    inner()\n  done()",
+            false,
+        )
+        .unwrap();
+        assert_eq!(out, "def outer():\n        inner()\n        done()\n");
+    }
+
+    /// A deeper replacement line keeps its indentation relative to the
+    /// replacement's base indent, added on top of the file indent.
+    #[test]
+    fn fuzzy_reindent_keeps_relative_deeper_indent() {
+        let out = apply_edit("  a\n  b\n", "a\nb", "a\n    nested", false).unwrap();
+        assert_eq!(out, "  a\n      nested\n");
+    }
+
+    /// replace_all normalizes CRLF and replaces every occurrence, writing
+    /// LF back.
+    #[test]
+    fn replace_all_after_crlf_normalization() {
+        let out = apply_edit("x\r\ny\r\nx\r\n", "x", "z", true).unwrap();
+        assert_eq!(out, "z\ny\nz\n");
     }
 
     /// Locks in `Sequential` execution mode — the agent's batching
