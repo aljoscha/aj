@@ -357,11 +357,6 @@ pub fn effective_chord(action_id: &str) -> Option<&'static str> {
 ///
 /// Splits on `+`, maps modifier and named-key segments to their
 /// display labels, title-cases everything else, and rejoins.
-///
-/// NOTE: `aj-tui` carries the same formatter for the `aj` binary
-/// (bound to its own keybindings manager). Both format the canonical
-/// chord grammar of [`AJ_KEYBINDINGS`], so their display spellings
-/// must agree.
 pub fn format_keybinding(canonical: &str) -> String {
     canonical
         .split('+')

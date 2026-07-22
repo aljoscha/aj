@@ -4,12 +4,12 @@
 //! This crate holds everything a terminal frontend for the agent needs that is
 //! not tied to a specific TUI backend: the CLI surface, model selection, the
 //! session composition root, the turn driver, keybinding data, and the
-//! non-interactive (print / subcommand) entry points. The binaries supply the
+//! non-interactive (print / subcommand) entry points. The binary supplies the
 //! rendering.
 //!
-//! Invariant: `aj-app` must never depend on `aj-tui` or `vaxis`. That is what
-//! keeps it shareable between the two frontends, and it is enforced in CI (see
-//! `scripts/check-no-tui-dep.sh`).
+//! Invariant: `aj-app` must never depend on the `vaxis` TUI backend. That is
+//! what keeps the core independent of the frontend, and it is enforced in CI
+//! (see `scripts/check-no-tui-dep.sh`).
 
 use std::time::Duration;
 

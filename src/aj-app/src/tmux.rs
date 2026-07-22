@@ -88,10 +88,9 @@ pub fn build_warning(opts: TmuxOptions) -> Option<String> {
 /// tmux-derived but rewraps escapes unreliably, so we refuse to probe
 /// it and callers fall back to conservative defaults.
 ///
-/// We deliberately duplicate this probe rather than share the one in
-/// `aj-tui`, so `aj-app` stays independent of any TUI backend (the same
-/// reason [`TmuxOptions`] is duplicated). It is a live probe of the
-/// server, not a snapshot, so each frontend gets the current state.
+/// This probe lives in `aj-app` rather than the frontend, so the core stays
+/// independent of any TUI backend. It is a live probe of the server, not a
+/// snapshot, so the frontend gets the current state.
 pub fn options() -> Option<TmuxOptions> {
     if std::env::var_os("TMUX").is_none() || std::env::var_os("CMUX_WORKSPACE_ID").is_some() {
         return None;

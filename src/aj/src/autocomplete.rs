@@ -519,7 +519,7 @@ impl AutocompleteProvider for CombinedAutocompleteProvider {
         // One walker rooted at the configured project base, regardless
         // of directory separators in the prefix. Nucleo's
         // `match_paths()` scoring already rewards hits at path
-        // delimiter boundaries, so a prefix like `src/aj-tui/foo`
+        // delimiter boundaries, so a prefix like `src/aj-app/foo`
         // naturally promotes paths containing those segments in
         // order — the session does not need to re-root or re-walk
         // when the user types a `/`.
@@ -974,7 +974,7 @@ fn path_has_git_component(path: &Path) -> bool {
 
 /// One entry stored in the nucleo matcher. The `path` is the full
 /// display-style relative path (e.g. `"src/autocomplete.rs"` or
-/// `"src/aj-tui/"`) and is what nucleo fuzzy-matches the user's
+/// `"src/aj-app/"`) and is what nucleo fuzzy-matches the user's
 /// needle against. `is_directory` is retained so the snapshot
 /// builder can format labels and values correctly.
 #[derive(Clone)]
