@@ -2700,17 +2700,23 @@ impl TranscriptView {
     /// user wants to read history, so new content must stop yanking
     /// the viewport to the bottom.
     fn observe_mouse(&mut self, ctx: &mut EventContext, event: &Event, m: &mouse::Mouse) {
-        // NOTE: the bars self-stamp their surface, so the bus can also reach
-        // them directly, yet this manual forward is not double dispatch. The
-        // transcript is an ancestor of the bars in the hit path, so during a
-        // drag this capture-phase forward consumes the event before the bus's
-        // capture walk descends to the bars, and a thumb press is consumed at
-        // the bars target before the bubble phase climbs back to the
-        // transcript. A motion neither consumes reaches the bars' handlers
-        // twice, once via the bus and once here, but those are idempotent
-        // (hover only tracks position, capture is inert unless dragging), so
-        // there is no double effect. The follow-up that removes this forward
-        // drops the redundancy.
+        // NOTE: the bars self-stamp their surface, so the bus can reach them
+        // directly, yet we still forward here on purpose. Forwarding lets the
+        // transcript branch on the bars' consume result within the same event:
+        // a thumb drag drops follow-tail and cancels the glide, and the content
+        // selection below runs only when the bars declined, so grabbing the
+        // thumb scrolls rather than selects. Relying on bus routing alone would
+        // force us to infer the drag from state a prior event set, which is
+        // subtler for no gain.
+        //
+        // This forward is not double dispatch. The transcript is an ancestor of
+        // the bars in the hit path, so during a drag this capture-phase forward
+        // consumes the event before the bus's capture walk descends to the
+        // bars, and a thumb press is consumed at the bars target before the
+        // bubble phase climbs back to the transcript. A motion neither consumes
+        // reaches the bars' handlers twice, once via the bus and once here, but
+        // those are idempotent (hover only tracks position, capture is inert
+        // unless dragging), so there is no double effect.
         self.bars.borrow_mut().capture_event(ctx, event);
         if ctx.consume_event {
             if m.kind == mouse::Type::Drag {
@@ -4176,9 +4182,9 @@ mod tests {
         let _ = view.draw(&ctx);
         assert!(view.follow_tail);
 
-        // In the app the bar column now hit-tests to the bars directly. Here
-        // we drive the transcript's still-present forwarding path via
-        // handle_event, where the bars grab the press.
+        // The bar column hit-tests to the bars directly, so here we drive the
+        // transcript's forwarding path via handle_event, where the bars grab
+        // the press.
         let mut ec = EventContext::new();
         view.handle_event(&mut ec, &mouse(39, 10, mouse::Type::Press));
         assert!(ec.consume_event, "the thumb grabbed the press");
