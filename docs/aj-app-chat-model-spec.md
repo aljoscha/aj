@@ -1,6 +1,6 @@
 # Spec C: transcript model + `AgentEvent` reducer
 
-## Status: proposal (not started)
+## Status: implemented
 
 Companion to `docs/aj-next-vaxis-plan.md`. This spec defines the one true
 interface for `aj-next`'s interactive rendering: a backend-neutral **chat model**

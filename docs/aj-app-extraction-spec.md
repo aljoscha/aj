@@ -1,6 +1,6 @@
 # Spec D: `aj-app` extraction
 
-## Status: proposal (not started)
+## Status: implemented
 
 Companion to `docs/aj-next-vaxis-plan.md`. This spec covers the first and
 largest piece of that plan: extracting the frontend-agnostic parts of the `aj`

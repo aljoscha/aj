@@ -1,6 +1,6 @@
 # Spec B: `vxfw` multi-line editor
 
-## Status: proposal (not started)
+## Status: implemented
 
 Companion to `docs/aj-next-vaxis-plan.md`. This spec ports the `aj-tui` prompt
 editor to a new `vxfw` widget in the `vaxis` crate (decision: approach a+b, a new

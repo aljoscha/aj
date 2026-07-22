@@ -1,6 +1,6 @@
 # Spec E: alt-screen UX
 
-## Status: proposal (not started)
+## Status: implemented
 
 Companion to `docs/aj-next-vaxis-plan.md`. This spec covers the user-facing
 consequences of moving from `aj-tui`'s native-scrollback model to `aj-next`'s

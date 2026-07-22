@@ -1,6 +1,12 @@
 # `aj-next`: a vaxis-based sibling binary + shared `aj-app`
 
-## Status: proposal (not started)
+## Status: implemented
+
+Phases 0 through 9 have landed. `aj-app` and `aj-next` both ship. This document
+is kept as the design record. Where it and the shipped code disagree, the code
+and the companion specs (`aj-app-extraction-spec.md`, the `vaxis-*-spec.md`
+family, `vaxis-altscreen-ux-spec.md`) are authoritative. The per-phase notes
+below describe the plan as executed, not outstanding work.
 
 ## Goal
 
@@ -382,14 +388,15 @@ persist.
 
 Mouse interactions, image protocols (kitty/iterm via `vaxis::image`), OSC 52
 clipboard, terminal title, tmux notice, shutdown banner, theme hot-reload.
-Decide the endgame (keep both binaries, or cut over `aj-next` -> `aj` later).
+The endgame is resolved: `aj-next` becomes the sole frontend. `aj` classic and
+its aj-tui-only dependencies are removed and `aj-next` is renamed to `aj`.
 
 ### Phase 9 execution breakdown
 
-Phases 0-8 are done. What the plan calls "Phase 9" spans two big deferred
-components (the editor and the transcript UX, each owned by a companion spec)
-plus the small chrome items. We execute it in ordered sub-chunks, each landing
-green with the implementer/reviewer loop and its own commit:
+Phases 0 through 9 are done. What the plan called "Phase 9" spanned two big
+deferred components (the editor and the transcript UX, each owned by a companion
+spec) plus the small chrome items. It was executed in ordered sub-chunks, each
+landing green with the implementer/reviewer loop and its own commit:
 
 - **9-Editor (Spec B).** The largest piece, so it is phased as Spec B lays out.
   - **B1a: shared editing primitives into `vaxis`.** Port `KillRing` and
@@ -409,12 +416,12 @@ green with the implementer/reviewer loop and its own commit:
     through the host `select!`.
 - **9-Markdown.** A markdown renderer for assistant, user, and compaction text
   (plain-wrapped today). The single biggest visual-parity gap.
-- **9-Transcript (Spec E, remaining).** The alt-screen transcript UX: the chat
-  scroll model (page keys done, Shift+Home/End and Alt+j/k line-scroll
-  remaining), the transcript-focus keyboard mode (done), entry-relative selection
-  and copy (mouse select-to-copy done, keyboard Shift+arrow selection and the
-  structured copy-message / copy-code actions remaining), and the splash empty
-  state. In-transcript search is dropped (Spec E, E-5).
+- **9-Transcript (Spec E).** The alt-screen transcript UX: the chat scroll model
+  (mouse wheel, PageUp/PageDown, mode-aware Home/End), the transcript-focus
+  keyboard mode, entry-relative mouse select-to-copy, the focused-message copy,
+  and the splash empty state. Per Spec E there is no character-level keyboard
+  selection (E-2), no copy-code-block action (E-2), and no in-transcript search
+  (E-5).
 - **9-Chrome.** Image protocols (kitty/iTerm2), remaining mouse interactions,
   terminal title, tmux notice, and the small wired-up stubs (launch-prompt input,
   clipboard image paste, palette subtitle labels, palette-to-selector Esc
@@ -431,6 +438,15 @@ green with the implementer/reviewer loop and its own commit:
   keymap-resolved chord drives a provider-select / confirm / consume state
   machine off the UI thread). Two divergences are kept by decision: the larger
   `Large` placement and the scrollbar thumb.
+- **9-Keybindings (user config).** A `[keybindings]` table in `config.toml`
+  (action id to chord) that overrides the built-in defaults. `aj-app`'s
+  `install_keybindings` validates each entry (rejecting unknown actions,
+  unparseable chords, reserved keys, and chords that collide with another
+  global binding) and installs the accepted set into a process-global store.
+  `effective_chord` and every resolver built on it (hints, `global_bindings`,
+  overlay-local matching) then prefer the override. Rejected entries surface as
+  a startup warning notice. Keybindings are not editable from the settings
+  window, so the field sits outside `Config::OPTIONS` and is parsed on its own.
 - **9-Debug-overlay.** A small, opt-in frame-statistics box for diagnosing
   render-loop health. Off by default, toggled by a new `show_frame_stats` `bool`
   in `aj-conf`'s `Config` + `Config::OPTIONS` (so the settings window picks it up
@@ -575,10 +591,10 @@ debug aids. It resolves the seam question raised in Spec A (A-3).
 ## Risks and notes
 
 - **The editor is the biggest single component.** The `aj-tui` editor is rich.
-  Re-authoring it on vaxis (D6) is the largest widget-level task and a likely
-  schedule risk. Scope it early. As of now `aj-next` still runs on the stopgap
-  single-line `TextField` and the `TextArea` port (Spec B) has not started, so it
-  is the main outstanding interactive-shell gap.
+  Re-authoring it on vaxis (D6) is the largest widget-level task and was a likely
+  schedule risk, so it was scoped early. The `TextArea` port (Spec B) has since
+  landed (9-Editor), so `aj-next` runs on the full multi-line editor rather than
+  the stopgap `TextField`.
 
 - **Phase 3 (`SessionCore` extraction) is the riskiest refactor of `aj`.** It
   moves the lifecycle-truth sets out of the pump. Keep it isolated and lean on
