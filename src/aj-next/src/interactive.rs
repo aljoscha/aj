@@ -173,6 +173,12 @@ async fn build_world(
     persistence: &ConversationPersistence,
 ) -> Result<World> {
     let config = layers.effective();
+
+    // Install the user's `[keybindings]` overrides before the keymap is built
+    // or any hint renders. Rejected entries are surfaced as a startup warning
+    // in the notice block below.
+    let keybinding_problems = aj_app::actions::install_keybindings(config.keybindings.clone());
+
     let speed = match args.speed.as_deref() {
         Some(s) => Some(s.parse::<ConfigSpeed>().map_err(anyhow::Error::msg)?),
         None => config.speed,
@@ -271,6 +277,13 @@ async fn build_world(
             },
         };
         let _ = reduce(&mut chat, &mut core.lifecycle, event);
+    }
+    if !keybinding_problems.is_empty() {
+        let mut msg = String::from("Some keybindings in config.toml were ignored:");
+        for problem in &keybinding_problems {
+            msg.push_str(&format!("\n  - {problem}"));
+        }
+        let _ = reduce(&mut chat, &mut core.lifecycle, warning_event(&msg));
     }
     // The context listing and skill warnings describe the freshly-loaded
     // env, which only governs a fresh session. A resumed session keeps its
@@ -5922,6 +5935,36 @@ mod tests {
         build_world(&args, layers, &[], &auth, &persistence)
             .await
             .expect("build world")
+    }
+
+    /// A `[keybindings]` override for an unknown action is rejected at startup
+    /// and surfaced as a warning notice in the transcript, which the splash box
+    /// shows. The override being invalid means the process-global store stays
+    /// empty, so this does not disturb other tests' default resolution.
+    #[tokio::test]
+    async fn bad_keybindings_override_surfaces_a_startup_warning() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut layers = default_layers();
+        layers
+            .user
+            .keybindings
+            .insert("aj.not.a.real.action".to_string(), "ctrl+z".to_string());
+        let world = scripted_world_with_layers(&dir, "streaming-text", layers).await;
+
+        let chat = world.chat.borrow();
+        let has_warning = chat
+            .transcript(AgentId::Main)
+            .expect("main transcript")
+            .entries()
+            .iter()
+            .any(|e| {
+                matches!(
+                    &e.kind,
+                    EntryKind::Notice(n)
+                        if n.level == NoticeLevel::Warning && n.text.contains("keybindings")
+                )
+            });
+        assert!(has_warning, "expected a keybindings warning notice");
     }
 
     /// Drive one scripted turn to completion so the session's log lands on disk

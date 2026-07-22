@@ -159,21 +159,20 @@ fn activator(spec: &ChordSpec) -> Activator {
     Activator::new(codepoint, mods)
 }
 
-/// Whether `key` activates `action_id`'s default chord.
+/// Whether `key` activates `action_id`'s effective chord.
 ///
 /// Overlay-local chords (Spec F) are matched at-target rather than through the
 /// global keymap, but they must still read the same source of truth as their
-/// hint labels. Resolving the action's default chord here (the same data
-/// [`aj_app::keybindings::action_shortcut`] renders) keeps match and
-/// label from drifting. Keybindings are not user-configurable, so the default
-/// chord is the effective binding.
+/// hint labels. Resolving the action's effective chord here (the same data
+/// [`aj_app::keybindings::action_shortcut`] renders) keeps match and label from
+/// drifting, and picks up a user `[keybindings]` override the same way.
 ///
-/// Panics if `action_id` has no default chord, since these callers pass
-/// compile-time action constants whose chords the data layer guarantees.
+/// Panics if `action_id` has no chord, since these callers pass compile-time
+/// action constants whose chords the data layer guarantees.
 pub(crate) fn action_matches(key: &Key, action_id: &str) -> bool {
-    let chord = aj_app::keybindings::default_chord(action_id)
+    let chord = aj_app::keybindings::effective_chord(action_id)
         .and_then(aj_app::actions::parse_chord)
-        .unwrap_or_else(|| panic!("aj knows the default chord for {action_id}"));
+        .unwrap_or_else(|| panic!("aj knows the effective chord for {action_id}"));
     activator(&chord).accepts(key)
 }
 

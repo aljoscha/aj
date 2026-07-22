@@ -649,6 +649,13 @@ pub struct Config {
     /// `git status > out` captures rtk's compressed output in the
     /// file, not the raw form.
     pub bash_rtk: bool,
+    /// User keybinding overrides, `aj.*` action id to chord string (e.g.
+    /// `"aj.palette.open" = "ctrl+p"`), parsed from the `[keybindings]`
+    /// table. Structural only here: the value is any string, and the
+    /// interactive frontend validates the action ids and chord grammar
+    /// (rejecting unknown actions, unparseable chords, and conflicts) when it
+    /// installs them, surfacing rejects as a startup notice. Empty by default.
+    pub keybindings: BTreeMap<String, String>,
 }
 
 impl Default for Config {
@@ -678,6 +685,7 @@ impl Default for Config {
             compact_threshold: 0.85,
             compact_keep_recent: 20_000,
             bash_rtk: false,
+            keybindings: BTreeMap::new(),
         }
     }
 }
@@ -1218,6 +1226,35 @@ fn parse_config(content: &str, path: &Path) -> (Config, Vec<ConfigDiagnostic>) {
     let mut diagnostics = Vec::new();
 
     for (key, value) in table {
+        // `[keybindings]` is a free-form action-id-to-chord table rather than
+        // a fixed option, so it is parsed here instead of through the option
+        // table. Only the shape is checked (a table of string values); the
+        // action ids and chord grammar are validated by the frontend when it
+        // installs the overrides.
+        if key == "keybindings" {
+            match value.as_table() {
+                Some(entries) => {
+                    for (action, chord) in entries {
+                        match chord.as_str() {
+                            Some(chord) => {
+                                config.keybindings.insert(action.clone(), chord.to_string());
+                            }
+                            None => diagnostics.push(ConfigDiagnostic::InvalidValue {
+                                path: path.to_path_buf(),
+                                key: format!("keybindings.{action}"),
+                                error: "chord must be a string".to_string(),
+                            }),
+                        }
+                    }
+                }
+                None => diagnostics.push(ConfigDiagnostic::InvalidValue {
+                    path: path.to_path_buf(),
+                    key,
+                    error: "keybindings must be a table".to_string(),
+                }),
+            }
+            continue;
+        }
         match Config::option(&key) {
             Some(option) => {
                 if let Err(e) = option.apply_toml(value, &mut config) {
@@ -1938,6 +1975,45 @@ bash_rtk = true
         assert!(!config.show_token_usage);
         assert!(config.show_frame_stats);
         assert!(config.bash_rtk);
+    }
+
+    #[test]
+    fn keybindings_table_parses_into_the_map() {
+        let toml_str = r#"
+[keybindings]
+"aj.palette.open" = "ctrl+p"
+"aj.thinking.toggle" = "alt+y"
+"#;
+        let (config, diagnostics) = parse_config(toml_str, Path::new("/tmp/config.toml"));
+        assert!(diagnostics.is_empty(), "unexpected: {diagnostics:?}");
+        assert_eq!(
+            config
+                .keybindings
+                .get("aj.palette.open")
+                .map(String::as_str),
+            Some("ctrl+p")
+        );
+        assert_eq!(
+            config
+                .keybindings
+                .get("aj.thinking.toggle")
+                .map(String::as_str),
+            Some("alt+y")
+        );
+    }
+
+    #[test]
+    fn keybindings_non_string_value_is_a_diagnostic() {
+        let toml_str = r#"
+[keybindings]
+"aj.palette.open" = 42
+"#;
+        let (config, diagnostics) = parse_config(toml_str, Path::new("/tmp/config.toml"));
+        assert!(config.keybindings.is_empty());
+        assert!(diagnostics.iter().any(|d| matches!(
+            d,
+            ConfigDiagnostic::InvalidValue { key, .. } if key == "keybindings.aj.palette.open"
+        )));
     }
 
     #[test]

@@ -1,13 +1,15 @@
 //! The typed keymap data layer: the global action vocabulary, the chord
-//! grammar parser, and the default binding table.
+//! grammar parser, the default binding table, and the merge of the user's
+//! `[keybindings]` overrides onto it ([`install_keybindings`]).
 //!
 //! This module is the frontend-neutral half of the keymap boundary. It
 //! knows the `aj.*` action IDs and their default chords (from
-//! [`crate::keybindings::AJ_KEYBINDINGS`]) and compiles them into
-//! [`ChordSpec`]s, a representation with no key-event types in it. A
-//! frontend translates a `ChordSpec` into its own activator type (the
-//! vaxis frontend maps [`ChordKey::Named`] names through vaxis's key-name
-//! table) and attaches its own context predicates and handlers.
+//! [`crate::keybindings::AJ_KEYBINDINGS`]), validates and installs any user
+//! overrides, and compiles the effective bindings into [`ChordSpec`]s, a
+//! representation with no key-event types in it. A frontend translates a
+//! `ChordSpec` into its own activator type (the vaxis frontend maps
+//! [`ChordKey::Named`] names through vaxis's key-name table) and attaches its
+//! own context predicates and handlers.
 //!
 //! Only globally-dispatched actions appear here. The overlay-local
 //! bindings in `AJ_KEYBINDINGS` (`aj.history.toggle_scope`,

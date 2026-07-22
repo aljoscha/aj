@@ -1311,9 +1311,10 @@ fn entry_spans(entry: &Entry, styles: &TranscriptStyles) -> Vec<TextSpan> {
 }
 
 /// Display label of the thinking-toggle chord shown on collapsed thinking
-/// blocks, resolved from the shared default binding table. This is the
-/// `aj.thinking.toggle` chord (default `alt+t`), distinct from the tools-expand
-/// chord in [`crate::tool_cell::EXPAND_KEY_LABEL`].
+/// blocks, resolved from the shared binding data, so it reflects a user
+/// `[keybindings]` override. This is the `aj.thinking.toggle` chord (default
+/// `alt+t`), distinct from the tools-expand chord in
+/// [`crate::tool_cell::EXPAND_KEY_LABEL`].
 static THINKING_EXPAND_KEY_LABEL: LazyLock<String> = LazyLock::new(|| {
     action_shortcut(ACTION_THINKING_TOGGLE).expect("aj.thinking.toggle has a default chord")
 });

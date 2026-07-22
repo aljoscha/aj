@@ -43,8 +43,9 @@ pub(crate) const REPORT_COLLAPSED_LINES: usize = TEXT_COLLAPSED_LINES;
 const BASH_COLLAPSED_LINES: usize = 5;
 
 /// Display label of the tools-expand chord shown in collapse hints,
-/// resolved from the shared default binding table. Follows user
-/// `[keybindings]` overrides once those land.
+/// resolved from the shared binding data, so it reflects a user
+/// `[keybindings]` override. Cached on first render, which is after the
+/// overrides are installed at startup.
 pub(crate) static EXPAND_KEY_LABEL: LazyLock<String> = LazyLock::new(|| {
     aj_app::keybindings::action_shortcut(aj_app::keybindings::ACTION_TOOLS_EXPAND)
         .expect("aj.tools.expand has a default chord")
