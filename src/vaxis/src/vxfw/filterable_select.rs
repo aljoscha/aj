@@ -3,13 +3,13 @@
 //! Most selector overlays are the same shape: a one-line filter input above a
 //! navigable result list, where typing filters and re-ranks the rows, the
 //! arrow keys move the highlight, Enter confirms the highlighted row, and
-//! Escape cancels. This widget owns that mechanics, composing a [`TextField`]
-//! filter over a [`ListView`], with a [`FuzzyMatcher`] ranking the rows as the
-//! filter text changes.
+//! Escape cancels. This widget owns that mechanics, composing a
+//! [`PromptInput`] filter over a [`ListView`], with a [`FuzzyMatcher`] ranking
+//! the rows as the filter text changes.
 //!
 //! # Focus and key routing
 //!
-//! Focus belongs on the filter [`TextField`] (see
+//! Focus belongs on the prompt's inner field (see
 //! [`focus_target`](FilterableSelect::focus_target)) so its cursor renders
 //! and printable keys edit the query. The select widget is the field's
 //! ancestor on the focus path, so it intercepts the selector chords in its
@@ -37,8 +37,8 @@ use crate::fuzzy::FuzzyMatcher;
 use crate::key::{Key, Modifiers};
 use crate::vxfw::{
     Builder, DrawContext, Event, EventContext, ListView, MaxSize, PromptInput, RelativePoint,
-    RichText, ScrollBars, Size, Source, SubSurface, Surface, TextField, TextSpan, Widget,
-    WidgetRef, WidthBasis, draw_widget, to_widget_ref,
+    RichText, ScrollBars, Size, Source, SubSurface, Surface, TextSpan, Widget, WidgetRef,
+    WidthBasis,
 };
 
 /// The marker drawn before a filter overlay's query input, so the input reads
@@ -162,7 +162,7 @@ struct SelectState {
     /// retained so streamed batches can be merged into the ranking without a
     /// full rescore.
     visible: Vec<(usize, u32)>,
-    /// The current filter text, mirrored from the `TextField` on change.
+    /// The current filter text, mirrored from the filter field on change.
     query: String,
     matcher: FuzzyMatcher,
     /// Widest `prefix` across all items (0 when none set), the width of the
@@ -463,14 +463,13 @@ fn apply_thumb_style(bars: &mut ScrollBars<ListView>, style: Style) {
     bars.vertical_scrollbar_drag_thumb = cell("\u{2588}");
 }
 
-/// A fuzzy-filterable select list: a [`TextField`] filter row, a blank
+/// A fuzzy-filterable select list: a [`PromptInput`] filter row, a blank
 /// separator row, and a [`ListView`] of the matching rows below.
 pub struct FilterableSelect {
-    filter: Rc<RefCell<TextField>>,
-    /// The filter field wrapped behind the [`FILTER_MARKER`] prompt marker,
-    /// drawn on the top row. Shares the field `Rc` with `filter`, which stays
-    /// the focus target and owns the query and its `on_change`.
-    prompt: Rc<RefCell<PromptInput>>,
+    /// The filter input behind the [`FILTER_MARKER`] prompt marker, drawn on
+    /// the top row. Its inner field is the focus target and owns the query
+    /// text and its `on_change`.
+    prompt: PromptInput,
     list: Rc<RefCell<ListView>>,
     /// Scroll bars wrapping the list (sharing its `Rc` via `bars.view`), for
     /// the vertical thumb. `draw` enables the vertical bar per frame only
@@ -525,15 +524,15 @@ impl FilterableSelect {
         let list = Rc::clone(&bars.view);
         full_filter(&mut state.borrow_mut(), &mut list.borrow_mut());
 
-        let filter = Rc::new(RefCell::new(TextField::new()));
+        let prompt = PromptInput::new(FILTER_MARKER, styles.borrow().marker);
         {
             let state = Rc::clone(&state);
             let list = Rc::clone(&list);
-            // NOTE: this fires from the TextField's own handle_event, at
+            // NOTE: this fires from the inner field's own handle_event, at
             // which point the select's capturing borrow has already been
             // released, so borrowing the shared state and list here cannot
             // collide with the widget's own borrows.
-            filter.borrow_mut().on_change = Some(Box::new(move |ctx, text| {
+            prompt.set_on_change(move |ctx, text| {
                 let mut state = state.borrow_mut();
                 let mut list = list.borrow_mut();
                 // A pure append can only shrink the match set (see
@@ -548,20 +547,10 @@ impl FilterableSelect {
                     full_filter(&mut state, &mut list);
                 }
                 ctx.redraw = true;
-            }));
+            });
         }
 
-        // Wrap the field behind the shared filter marker so the query reads as
-        // a prompt. The field stays the focus target, so its cursor renders
-        // (offset by the marker) and printables reach it.
-        let prompt = Rc::new(RefCell::new(PromptInput::new(
-            to_widget_ref(Rc::clone(&filter)),
-            FILTER_MARKER,
-            styles.borrow().marker,
-        )));
-
         FilterableSelect {
-            filter,
             prompt,
             list,
             bars,
@@ -586,7 +575,7 @@ impl FilterableSelect {
     /// The widget the host should focus while this select is active: the
     /// filter field, so its cursor renders and printables edit the query.
     pub fn focus_target(&self) -> WidgetRef {
-        to_widget_ref(Rc::clone(&self.filter))
+        self.prompt.focus_target()
     }
 
     /// The current filter text.
@@ -691,11 +680,13 @@ impl Widget for FilterableSelect {
             },
         );
         // Keep the marker tinted with the live styles so a theme swap
-        // re-colors it without rebuilding the prompt.
-        self.prompt.borrow_mut().marker_style = self.styles.borrow().marker;
+        // re-colors it without rebuilding the prompt. Drawn directly (like
+        // `bars`) rather than via `draw_widget`: the prompt's own identity is
+        // unused, the focus target is the field it stamps inside.
+        self.prompt.marker_style = self.styles.borrow().marker;
         surface.children.push(SubSurface {
             origin: RelativePoint { row: 0, col: 0 },
-            surface: draw_widget(&to_widget_ref(Rc::clone(&self.prompt)), &filter_ctx),
+            surface: self.prompt.draw(&filter_ctx),
             z_index: 0,
         });
 
@@ -809,8 +800,10 @@ mod tests {
         select.capture_event(&mut ctx, event);
         if !ctx.consume_event {
             ctx.phase = crate::vxfw::Phase::AtTarget;
-            let filter = Rc::clone(&select.filter);
-            filter.borrow_mut().handle_event(&mut ctx, event);
+            select
+                .focus_target()
+                .borrow_mut()
+                .handle_event(&mut ctx, event);
         }
     }
 
@@ -964,6 +957,21 @@ mod tests {
                 row: 0,
                 col: i32::try_from(FILTER_MARKER.chars().count()).unwrap(),
             },
+        );
+
+        // A runtime restyle re-tints the marker on the next draw.
+        let swapped = Color::Index(41);
+        select.set_styles(SelectStyles {
+            marker: Style {
+                fg: swapped,
+                ..Style::default()
+            },
+            ..SelectStyles::default()
+        });
+        let surface = select.draw(&draw_ctx(30, 10));
+        assert_eq!(
+            surface.children[0].surface.buffer[0].style.fg, swapped,
+            "set_styles re-tints the marker on the next draw"
         );
     }
 

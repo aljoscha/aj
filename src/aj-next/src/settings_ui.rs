@@ -520,11 +520,10 @@ struct SelectedRow {
 /// A navigable, filterable list of editable settings rows. See the module
 /// docs for the edit flow.
 pub(crate) struct SettingList {
-    filter: Rc<RefCell<TextField>>,
-    /// The filter field wrapped behind the [`FILTER_MARKER`] prompt marker,
-    /// drawn on the top row. Shares the field `Rc` with `filter`, which stays
-    /// the focus target and owns the query and its `on_change`.
-    prompt: Rc<RefCell<PromptInput>>,
+    /// The filter input behind the [`FILTER_MARKER`] prompt marker, drawn on
+    /// the top row. Its inner field is the focus target and owns the query
+    /// text and its `on_change`.
+    prompt: PromptInput,
     /// The row list, shared with `bars` (which draws it) so event handling and
     /// the value accessors drive the same list the thumb reflects.
     list: Rc<RefCell<ListView>>,
@@ -578,27 +577,18 @@ impl SettingList {
         bars.draw_horizontal_scrollbar = false;
         let list = Rc::clone(&bars.view);
         apply_setting_filter(&mut state.borrow_mut(), &mut list.borrow_mut());
-        let filter = Rc::new(RefCell::new(TextField::new()));
+        let prompt = PromptInput::new(FILTER_MARKER, styles.borrow().marker);
         {
             let state = Rc::clone(&state);
             let list = Rc::clone(&list);
-            filter.borrow_mut().on_change = Some(Box::new(move |ctx, text| {
+            prompt.set_on_change(move |ctx, text| {
                 let mut state = state.borrow_mut();
                 state.query = text.to_string();
                 apply_setting_filter(&mut state, &mut list.borrow_mut());
                 ctx.redraw = true;
-            }));
+            });
         }
-        // Wrap the field behind the shared filter marker so the query reads as
-        // a prompt, matching the other filter overlays. The field stays the
-        // focus target.
-        let prompt = Rc::new(RefCell::new(PromptInput::new(
-            to_widget_ref(Rc::clone(&filter)),
-            FILTER_MARKER,
-            styles.borrow().marker,
-        )));
         SettingList {
-            filter,
             prompt,
             list,
             bars,
@@ -613,7 +603,7 @@ impl SettingList {
     }
 
     pub(crate) fn focus_target(&self) -> WidgetRef {
-        to_widget_ref(Rc::clone(&self.filter))
+        self.prompt.focus_target()
     }
 
     /// Replace the row styles (a runtime theme swap).
@@ -752,11 +742,13 @@ impl Widget for SettingList {
             },
         );
         // Keep the marker tinted with the live styles so a theme swap
-        // re-colors it without rebuilding the prompt.
-        self.prompt.borrow_mut().marker_style = self.styles.borrow().marker;
+        // re-colors it without rebuilding the prompt. Drawn directly (like
+        // `bars`) rather than via `draw_widget`: the prompt's own identity is
+        // unused, the focus target is the field it stamps inside.
+        self.prompt.marker_style = self.styles.borrow().marker;
         surface.children.push(SubSurface {
             origin: RelativePoint { row: 0, col: 0 },
-            surface: draw_widget(&to_widget_ref(Rc::clone(&self.prompt)), &filter_ctx),
+            surface: self.prompt.draw(&filter_ctx),
             z_index: 0,
         });
         // Reserve a description panel below the list: a blank separator plus
@@ -2095,6 +2087,21 @@ mod tests {
         assert_eq!(
             grid[0][0].style.fg, marker_fg,
             "the marker carries the marker style"
+        );
+
+        // A runtime restyle re-tints the marker on the next draw.
+        let swapped = Color::Index(41);
+        list.set_styles(SelectStyles {
+            marker: Style {
+                fg: swapped,
+                ..Style::default()
+            },
+            ..SelectStyles::default()
+        });
+        let after = flatten(&list.draw(&draw_ctx(60, Some(20))));
+        assert_eq!(
+            after[0][0].style.fg, swapped,
+            "set_styles re-tints the marker on the next draw"
         );
     }
 
