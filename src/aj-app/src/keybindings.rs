@@ -6,6 +6,15 @@
 //! manager machinery that resolves chords to actions (and merges these
 //! with a backend's own bindings) lives per-binary, since it is bound to
 //! that backend's key types.
+//!
+//! The user's `[keybindings]` overrides, on the other hand, are pure
+//! action-id-to-chord-string data with no key types, so they live here in a
+//! process-global store that [`crate::actions::install_keybindings`] fills
+//! once at startup. [`effective_chord`] and everything built on it then
+//! resolve the override in preference to the built-in default.
+
+use std::collections::BTreeMap;
+use std::sync::RwLock;
 
 /// Action ID for the "fold / unfold thinking blocks" toggle.
 pub const ACTION_THINKING_TOGGLE: &str = "aj.thinking.toggle";
@@ -298,11 +307,47 @@ pub const AJ_KEYBINDINGS: &[(&str, &str, &str)] = &[
 
 /// The default chord for `action_id`, from [`AJ_KEYBINDINGS`]. `None`
 /// for unknown action IDs.
+///
+/// This is the built-in binding, ignoring any user override. Callers that
+/// want the binding actually in effect want [`effective_chord`].
 pub fn default_chord(action_id: &str) -> Option<&'static str> {
     AJ_KEYBINDINGS
         .iter()
         .find(|(id, _, _)| *id == action_id)
         .map(|(_, chord, _)| *chord)
+}
+
+/// The user's keybinding overrides, action id to effective chord. Empty until
+/// [`crate::actions::install_keybindings`] runs.
+///
+/// The values are leaked to `&'static str` so [`effective_chord`] returns the
+/// same borrow [`default_chord`] does, which keeps every downstream resolver's
+/// signature. The override set is bounded by [`AJ_KEYBINDINGS`] and installed
+/// once at startup, so the leak is a fixed one-time cost.
+static USER_OVERRIDES: RwLock<BTreeMap<&'static str, &'static str>> = RwLock::new(BTreeMap::new());
+
+/// Install the validated user overrides, replacing any prior set.
+///
+/// Called once at startup by [`crate::actions::install_keybindings`], which
+/// has already dropped the rejected entries and leaked the accepted chord
+/// strings.
+pub(crate) fn set_overrides(overrides: BTreeMap<&'static str, &'static str>) {
+    *USER_OVERRIDES
+        .write()
+        .expect("keybinding overrides lock poisoned") = overrides;
+}
+
+/// The chord actually in effect for `action_id`: the user override if one is
+/// installed, else the built-in [`default_chord`]. `None` for unknown ids.
+pub fn effective_chord(action_id: &str) -> Option<&'static str> {
+    if let Some(chord) = USER_OVERRIDES
+        .read()
+        .expect("keybinding overrides lock poisoned")
+        .get(action_id)
+    {
+        return Some(chord);
+    }
+    default_chord(action_id)
 }
 
 /// Convert a canonical keybinding string like `"ctrl+o"` or
@@ -367,15 +412,13 @@ fn format_key_segment(seg: &str) -> String {
     }
 }
 
-/// The default chord for `action_id` formatted for display via
-/// [`format_keybinding`], for hint labels. `None` for unknown action
-/// IDs.
+/// The chord in effect for `action_id` formatted for display via
+/// [`format_keybinding`], for hint labels. `None` for unknown action IDs.
 ///
-/// This resolves the built-in default only. Once user `[keybindings]`
-/// overrides land (see `crate::actions::global_bindings`), hint
-/// surfaces resolve through the merged bindings instead.
+/// Resolves through [`effective_chord`], so a hint tracks a user rebind
+/// rather than always showing the built-in default.
 pub fn action_shortcut(action_id: &str) -> Option<String> {
-    default_chord(action_id).map(format_keybinding)
+    effective_chord(action_id).map(format_keybinding)
 }
 
 /// Canonical display labels for keyboard chords that are deliberately
@@ -397,8 +440,17 @@ pub mod fixed_keys {
     pub const CTRL_Y: &str = "Ctrl+Y";
 }
 
+/// Serializes tests that read or write the global override store. `cargo
+/// test` runs tests in parallel and the store is process-wide, so a test
+/// asserting default resolution and one installing overrides would race
+/// without this. Held across both this module's tests and `crate::actions`'.
+#[cfg(test)]
+pub(crate) static STORE_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     #[test]
@@ -425,7 +477,9 @@ mod tests {
     }
 
     #[test]
-    fn default_action_shortcut_resolves_the_table() {
+    fn action_shortcut_resolves_the_table() {
+        let _guard = STORE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        set_overrides(BTreeMap::new());
         assert_eq!(
             action_shortcut(ACTION_TOOLS_EXPAND).as_deref(),
             Some("Alt+O")
@@ -443,5 +497,25 @@ mod tests {
             Some("PgDn")
         );
         assert_eq!(action_shortcut("aj.unknown"), None);
+    }
+
+    /// An installed override wins over the default for both the chord lookup
+    /// and the display label, while an un-overridden action keeps its default.
+    #[test]
+    fn overrides_win_over_defaults() {
+        let _guard = STORE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        set_overrides(BTreeMap::from([(ACTION_TOOLS_EXPAND, "ctrl+shift+o")]));
+
+        assert_eq!(effective_chord(ACTION_TOOLS_EXPAND), Some("ctrl+shift+o"));
+        assert_eq!(
+            action_shortcut(ACTION_TOOLS_EXPAND).as_deref(),
+            Some("Ctrl+Shift+O")
+        );
+        // default_chord ignores the override.
+        assert_eq!(default_chord(ACTION_TOOLS_EXPAND), Some("alt+o"));
+        // An un-overridden action still resolves its default.
+        assert_eq!(effective_chord(ACTION_PALETTE_OPEN), Some("ctrl+o"));
+
+        set_overrides(BTreeMap::new());
     }
 }
