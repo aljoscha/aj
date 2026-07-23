@@ -857,7 +857,7 @@ fn build_banded_row(item: &MenuItem, selected: bool, styles: &SelectStyles) -> W
 /// Uniqueness is all the endpoint needs. The version/variant bits keep it a
 /// well-formed UUID for servers that validate the shape.
 fn new_idempotency_key() -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = [0u8; 16];
     rand::rng().fill_bytes(&mut bytes);
     bytes[6] = (bytes[6] & 0x0f) | 0x40;

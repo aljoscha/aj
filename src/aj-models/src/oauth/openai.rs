@@ -37,7 +37,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use rand::TryRngCore;
+use rand::TryRng;
 use reqwest::Client;
 use tokio::net::TcpListener;
 
@@ -351,7 +351,7 @@ fn build_authorize_url(challenge: &str, state: &str, originator: &str) -> String
 /// attacker has no realistic chance of guessing the value.
 fn generate_state() -> Result<String, OAuthError> {
     let mut bytes = [0u8; STATE_BYTES];
-    rand::rngs::OsRng
+    rand::rngs::SysRng
         .try_fill_bytes(&mut bytes)
         .map_err(|err| OAuthError::Other(format!("CSPRNG failed: {err}")))?;
     let mut hex = String::with_capacity(STATE_BYTES * 2);

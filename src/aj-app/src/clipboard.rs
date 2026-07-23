@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use image::{DynamicImage, ImageBuffer, ImageFormat};
-use rand::RngCore;
+use rand::Rng;
 
 /// MIME types we'll request from `wl-paste`, in preference order.
 /// PNG first (lossless), then JPEG (compact), then WebP / GIF.

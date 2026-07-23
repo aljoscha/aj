@@ -12,7 +12,7 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use rand::TryRngCore;
+use rand::TryRng;
 use sha2::{Digest, Sha256};
 
 /// A PKCE verifier/challenge pair.
@@ -60,7 +60,7 @@ pub fn generate_pkce() -> Result<PkcePair, PkceError> {
 /// same reason as [`generate_pkce`].
 pub fn random_token() -> Result<String, PkceError> {
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng
+    rand::rngs::SysRng
         .try_fill_bytes(&mut bytes)
         .map_err(|err| PkceError::Random(err.to_string()))?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
