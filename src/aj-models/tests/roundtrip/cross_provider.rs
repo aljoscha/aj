@@ -27,6 +27,10 @@
 //!    `StopReason::Error` (or `Aborted`) followed by a tool result that
 //!    references one of its tool calls. Asserts both the assistant and
 //!    its result are dropped from the output.
+//! 6. **Unpaired tool-result drop** (rule 6) — a `ToolResultMessage`
+//!    that answers no tool call in the request (its call was summarized
+//!    away or belonged to a dropped turn). Asserts it is dropped and its
+//!    id never reaches the output.
 //!
 //! Each test asserts the expected output sequence position-by-position
 //! so cross-talk between rules — e.g. an orphan synthesis firing for a
@@ -438,6 +442,10 @@ fn transform_anthropic_to_completions_full_history() {
 //   matching tool result — orphan synthesized.
 // - Rule 5: aborted Completions assistant + its tool result are
 //   dropped.
+// - Rule 6: a dangling tool result carrying a foreign OpenAI Responses
+//   composite id (`call_id|item_id`) whose owning assistant is absent
+//   (summarized away). It is dropped, and the `|` never reaches the
+//   Anthropic wire.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -491,6 +499,13 @@ fn transform_completions_to_anthropic_full_history() {
     );
     let errored_tool_result = tool_result_msg(errored_call_id, "bash", "should disappear");
 
+    // Rule 6: a dangling tool result whose owning assistant was
+    // summarized away, carrying a foreign OpenAI Responses composite id.
+    // It must be dropped so the `|` never reaches the Anthropic wire.
+    let dangling_call_id = "call_summarized|fc_summarized_item";
+    let dangling_tool_result =
+        tool_result_msg(dangling_call_id, "read_file", "orphaned by compaction");
+
     let history = vec![
         user_msg("read file please"),
         Message::Assistant(same_target_assistant),
@@ -501,6 +516,7 @@ fn transform_completions_to_anthropic_full_history() {
         user_msg("thanks"),
         Message::Assistant(errored_assistant),
         errored_tool_result,
+        dangling_tool_result,
         user_msg("done?"),
     ];
 
@@ -597,6 +613,32 @@ fn transform_completions_to_anthropic_full_history() {
         }),
         "rule 5: errored turn's tool result must be dropped"
     );
+
+    // Rule 6: the dangling result is gone, and no id on the wire carries
+    // the foreign composite `|` that Anthropic would reject.
+    assert!(
+        out.iter().all(|m| match m {
+            Message::ToolResult(tr) => tr.tool_call_id != dangling_call_id,
+            _ => true,
+        }),
+        "rule 6: dangling tool result must be dropped"
+    );
+    for m in &out {
+        match m {
+            Message::ToolResult(tr) => assert!(
+                !tr.tool_call_id.contains('|'),
+                "no tool_result id may reach the Anthropic wire with a pipe"
+            ),
+            Message::Assistant(a) => {
+                for c in &a.content {
+                    if let AssistantContent::ToolCall(tc) = c {
+                        assert!(!tc.id.contains('|'), "no tool_call id may carry a pipe");
+                    }
+                }
+            }
+            Message::User(_) => {}
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -5,8 +5,9 @@
 //! rewritten so the target API accepts them: encrypted reasoning tied to
 //! the source model is dropped or demoted, tool-call IDs are coerced into
 //! the target's character class and length limits, orphaned tool calls
-//! get synthetic error results, and incomplete (errored/aborted) turns
-//! are skipped along with their dangling tool results.
+//! get synthetic error results, incomplete (errored/aborted) turns are
+//! skipped along with their dangling tool results, and a tool result that
+//! answers no tool call in the request is dropped.
 //!
 //! Capability downgrade follows the same call: images on a
 //! non-vision target collapse into a fixed placeholder string.
@@ -56,8 +57,8 @@ pub const ORPHAN_TOOL_RESULT_TEXT: &str = "No result provided";
 /// Transform a message history so it can be replayed against `target`.
 ///
 /// Applies the cross-provider rewrites (thinking blocks, signatures,
-/// tool-call IDs, orphans, errored turns) followed by the capability
-/// downgrade (images on non-vision targets).
+/// tool-call IDs, orphans, errored turns, unpaired tool results)
+/// followed by the capability downgrade (images on non-vision targets).
 ///
 /// The function never mutates the input slice; the returned vector
 /// contains owned, freshly-constructed messages.
@@ -78,8 +79,9 @@ pub fn transform_messages(messages: &[Message], target: &ModelInfo) -> Vec<Messa
 
     // Pass 2: rewrite tool-result IDs via the map, drop errored/aborted
     // assistants and any tool results that referenced their tool calls
-    // (rule 5), and synthesize error results for orphaned tool calls
-    // (rule 4).
+    // (rule 5), synthesize error results for orphaned tool calls (rule
+    // 4), and drop any tool result that answers no tool call in the
+    // request (rule 6).
     let pass2 = align_tool_results(pass1, &id_map);
 
     // downgrade images when the target does not accept image input.
@@ -320,14 +322,15 @@ fn short_hash(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Pass 2: tool-result alignment (rules 4–5)
+// Pass 2: tool-result alignment (rules 4–6)
 // ---------------------------------------------------------------------------
 
 /// Walk pass-1 output to:
 ///   - rewrite `ToolResultMessage.tool_call_id` via the id map,
 ///   - skip errored/aborted assistants and drop their tool results,
 ///   - emit synthetic error results for orphaned tool calls when the
-///     assistant turn closes (next non-tool-result message or EOF).
+///     assistant turn closes (next non-tool-result message or EOF),
+///   - drop a tool result that answers no kept tool call in the request.
 fn align_tool_results(messages: Vec<Message>, id_map: &HashMap<String, String>) -> Vec<Message> {
     let mut out: Vec<Message> = Vec::with_capacity(messages.len());
     // Tool calls from the most recent kept assistant message that are
@@ -335,25 +338,16 @@ fn align_tool_results(messages: Vec<Message>, id_map: &HashMap<String, String>) 
     let mut pending: Vec<ToolCall> = Vec::new();
     // Result IDs we've already emitted for the current pending set.
     let mut seen_results: HashSet<String> = HashSet::new();
-    // Tool-call IDs (post-normalization) belonging to assistants we
-    // dropped under rule 5; matching tool results disappear too.
-    let mut dropped_call_ids: HashSet<String> = HashSet::new();
 
     for msg in messages {
         match msg {
             Message::Assistant(a) => {
                 close_pending(&mut out, &mut pending, &mut seen_results);
                 if matches!(a.stop_reason, StopReason::Error | StopReason::Aborted) {
-                    // Rule 5: drop the message and remember its tool
-                    // call IDs so any later results referencing them
-                    // are dropped too. Pass-1 already normalized those
-                    // IDs to match what pass-2 will rewrite results
-                    // into, so the comparison works directly.
-                    for block in &a.content {
-                        if let AssistantContent::ToolCall(tc) = block {
-                            dropped_call_ids.insert(tc.id.clone());
-                        }
-                    }
+                    // Rule 5: drop the errored/aborted turn. We leave
+                    // `pending` empty and record none of its calls, so
+                    // the tool results that referenced them fail the
+                    // membership check below and are dropped with it.
                     continue;
                 }
                 pending = a
@@ -371,7 +365,17 @@ fn align_tool_results(messages: Vec<Message>, id_map: &HashMap<String, String>) 
                 if let Some(new_id) = id_map.get(&tr.tool_call_id) {
                     tr.tool_call_id = new_id.clone();
                 }
-                if dropped_call_ids.contains(&tr.tool_call_id) {
+                // Rule 6: keep a result only if it answers a tool call
+                // from the current assistant turn. A result that answers
+                // no call in the request is dangling: its call was
+                // summarized away by compaction, or belonged to a dropped
+                // errored turn (rule 5). Both providers reject an
+                // unpaired tool_result, and a foreign composite id
+                // (`{call_id}|{item_id}`) that reaches the Anthropic wire
+                // this way also trips its `tool_use_id` character-class
+                // check, so we drop the result rather than emit an id
+                // that references nothing.
+                if !pending.iter().any(|tc| tc.id == tr.tool_call_id) {
                     continue;
                 }
                 seen_results.insert(tr.tool_call_id.clone());
@@ -1219,6 +1223,63 @@ mod tests {
         ];
         let out = transform_messages(&messages, &target);
         assert_eq!(out.len(), 1);
+        assert!(matches!(out[0], Message::User(_)));
+    }
+
+    // -- Dangling tool result drop (rule 6) ---------------------------
+
+    #[test]
+    fn dangling_tool_result_with_foreign_id_is_dropped() {
+        // A tool_result whose owning assistant tool_call is absent from
+        // the request: its call was summarized into a compaction summary,
+        // or crash-recovery repair synthesized the result and it was
+        // later separated from its call. It carries an OpenAI Responses
+        // composite id. Rule 6 drops it rather than let the pipe reach the
+        // Anthropic wire, where it would trip the tool_use_id
+        // character-class check (and the result would be unpaired anyway).
+        let target = model("anthropic", "anthropic-messages", "claude-x", false);
+        let summary = Message::User(UserMessage::text("<summary>...</summary>"));
+        let dangling = tool_result("call_abc|fc_item", "read_file", "leftover");
+        let out = transform_messages(&[summary, dangling], &target);
+        assert_eq!(out.len(), 1, "the dangling result is dropped");
+        assert!(matches!(out[0], Message::User(_)));
+    }
+
+    #[test]
+    fn paired_result_survives_alongside_a_dangling_one() {
+        // Rule 6 must not over-drop: a result that answers a kept call is
+        // preserved (and sanitized via the id map) even when a dangling
+        // result for a summarized call sits next to it.
+        let target = model("anthropic", "anthropic-messages", "claude-x", false);
+        let dangling = tool_result("old_call|fc_old", "read_file", "summarized");
+        let asst = assistant(
+            "anthropic",
+            "anthropic-messages",
+            "claude-x",
+            vec![tool_call("toolu_live", "ls")],
+        );
+        let live = tool_result("toolu_live", "ls", "ok");
+        let out = transform_messages(&[dangling, Message::Assistant(asst), live], &target);
+        // Dangling result dropped; assistant + its live result kept.
+        assert_eq!(out.len(), 2);
+        assert!(matches!(out[0], Message::Assistant(_)));
+        let Message::ToolResult(tr) = &out[1] else {
+            panic!("expected the live tool result to survive");
+        };
+        assert_eq!(tr.tool_call_id, "toolu_live");
+    }
+
+    #[test]
+    fn dangling_tool_result_with_valid_id_is_still_dropped() {
+        // The drop is about pairing, not the character class: a result
+        // whose id is already pattern-valid but answers no call in the
+        // request is dropped too. Anthropic rejects an unpaired
+        // tool_result regardless of whether its id is well-formed.
+        let target = model("anthropic", "anthropic-messages", "claude-x", false);
+        let summary = Message::User(UserMessage::text("<summary>...</summary>"));
+        let dangling = tool_result("toolu_summarized", "read_file", "leftover");
+        let out = transform_messages(&[summary, dangling], &target);
+        assert_eq!(out.len(), 1, "the unpaired result is dropped");
         assert!(matches!(out[0], Message::User(_)));
     }
 
