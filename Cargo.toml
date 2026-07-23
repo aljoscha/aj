@@ -62,8 +62,8 @@ thiserror = "2.0"
 tokio = { version = "1.45", features = ["full"] }
 tokio-retry2 = { version = "0.9", features = ["jitter"] }
 tokio-util = { version = "0.7", default-features = false }
-toml = "0.8"
-toml_edit = "0.22"
+toml = "1.1"
+toml_edit = "0.25"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", default-features = false, features = ["env-filter", "fmt", "ansi"] }
 unicode-segmentation = "1.12"
