@@ -164,7 +164,7 @@ impl TtyReader {
 
 impl io::Read for TtyReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        Ok(nix::unistd::read(self.fd.as_raw_fd(), buf)?)
+        Ok(nix::unistd::read(&self.fd, buf)?)
     }
 }
 
@@ -174,7 +174,10 @@ impl Tty for PosixTty {
     }
 
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        Ok(nix::unistd::read(self.fd, buf)?)
+        // SAFETY: `self.fd` is an open tty for the lifetime of `self`, so the
+        // borrow used for this single read cannot outlive the descriptor.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(self.fd) };
+        Ok(nix::unistd::read(borrowed, buf)?)
     }
 
     fn get_winsize(&self) -> io::Result<Winsize> {
@@ -564,7 +567,7 @@ mod tests {
         let mut buf = [0u8; 5];
         let mut got = 0;
         while got < buf.len() {
-            let n = nix::unistd::read(master.as_raw_fd(), &mut buf[got..]).expect("read master");
+            let n = nix::unistd::read(&master, &mut buf[got..]).expect("read master");
             assert!(n > 0, "master read returned EOF");
             got += n;
         }
@@ -635,7 +638,7 @@ mod tests {
 
         // The master must have received the reset bytes recover wrote.
         let mut buf = vec![0u8; 256];
-        let n = nix::unistd::read(master.as_raw_fd(), &mut buf).expect("read master");
+        let n = nix::unistd::read(&master, &mut buf).expect("read master");
         let out = &buf[..n];
         let expected: Vec<u8> = [
             ctlseqs::CSI_U_POP,

@@ -27,7 +27,7 @@
 //! read works on both.
 
 use std::io;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -146,7 +146,10 @@ where
 
 /// Reads from a raw fd, blocking until bytes are available.
 fn read_fd(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
-    nix::unistd::read(fd, buf).map_err(io::Error::from)
+    // SAFETY: the caller owns `fd` for the duration of the read loop, so
+    // borrowing it for this single syscall cannot outlive the owner.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    nix::unistd::read(borrowed, buf).map_err(io::Error::from)
 }
 
 #[cfg(test)]

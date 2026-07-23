@@ -740,7 +740,7 @@ impl PtyMaster {
     /// than a zero-length read. We translate it to `Ok(0)` so the parser flushes
     /// the final print run and the reader loop terminates cleanly.
     fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match nix::unistd::read(self.fd.as_raw_fd(), buf) {
+        match nix::unistd::read(&self.fd, buf) {
             Ok(n) => Ok(n),
             Err(nix::errno::Errno::EIO) => Ok(0),
             Err(e) => Err(e.into()),
