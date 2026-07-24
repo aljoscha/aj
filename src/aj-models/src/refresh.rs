@@ -365,8 +365,10 @@ pub async fn refresh_user_cache_from(
             tracing::warn!(
                 "OpenRouter model list fetch failed ({err}); keeping previously cached OpenRouter models"
             );
-            let mut models = parse_models_dev(&models_dev_body)?;
-            let cached = cached_openrouter_models(&dest);
+            let raw = parse_models_dev_raw(&models_dev_body)?;
+            let mut models = map_models_dev(&raw);
+            let mut cached = cached_openrouter_models(&dest);
+            refresh_openrouter_families(&mut cached, &openrouter_family_lookup(&raw));
             let source = if cached.is_empty() {
                 "models.dev"
             } else {
@@ -429,11 +431,13 @@ fn build_catalog_from_json(
     models_dev_body: &str,
     openrouter_body: Option<&str>,
 ) -> Result<Catalog, RefreshError> {
-    let mut models = parse_models_dev(models_dev_body)?;
+    let raw = parse_models_dev_raw(models_dev_body)?;
+    let mut models = map_models_dev(&raw);
+    let openrouter_families = openrouter_family_lookup(&raw);
 
     let source = match openrouter_body {
         Some(body) => {
-            models.extend(parse_openrouter(body)?);
+            models.extend(parse_openrouter(body, &openrouter_families)?);
             "models.dev+openrouter"
         }
         None => "models.dev",
@@ -449,12 +453,18 @@ fn parse_models_dev(body: &str) -> Result<Vec<ModelInfo>, RefreshError> {
     // The top-level object is keyed by provider id; we only care about
     // a fixed subset, so parse into a flexible map and look up the keys
     // we need. Unknown providers are ignored silently.
-    let raw: HashMap<String, RawProvider> =
-        serde_json::from_str(body).map_err(|source| RefreshError::Parse {
-            context: "parsing models.dev response as JSON".to_string(),
-            source,
-        })?;
+    let raw = parse_models_dev_raw(body)?;
+    Ok(map_models_dev(&raw))
+}
 
+fn parse_models_dev_raw(body: &str) -> Result<HashMap<String, RawProvider>, RefreshError> {
+    serde_json::from_str(body).map_err(|source| RefreshError::Parse {
+        context: "parsing models.dev response as JSON".to_string(),
+        source,
+    })
+}
+
+fn map_models_dev(raw: &HashMap<String, RawProvider>) -> Vec<ModelInfo> {
     let mut models = Vec::new();
     for fixed in PROVIDER_FIXED_VALUES {
         let Some(provider) = raw.get(fixed.upstream_key) else {
@@ -483,13 +493,32 @@ fn parse_models_dev(body: &str) -> Result<Vec<ModelInfo>, RefreshError> {
             models.push(mapped);
         }
     }
-    Ok(models)
+    models
+}
+
+fn openrouter_family_lookup(raw: &HashMap<String, RawProvider>) -> HashMap<String, String> {
+    raw.get(OPENROUTER_PROVIDER_ID)
+        .into_iter()
+        .flat_map(|provider| &provider.models)
+        .filter_map(|(id, model)| model.family.clone().map(|family| (id.clone(), family)))
+        .collect()
+}
+
+fn refresh_openrouter_families(models: &mut [ModelInfo], families: &HashMap<String, String>) {
+    for model in models {
+        if model.provider == OPENROUTER_PROVIDER_ID {
+            model.family = families.get(&model.id).cloned();
+        }
+    }
 }
 
 /// Parse OpenRouter's `/api/v1/models` payload into the mapped,
 /// tool-filtered model list. Drops models that lack tool support or
 /// cannot emit text (e.g. pure image generators).
-fn parse_openrouter(body: &str) -> Result<Vec<ModelInfo>, RefreshError> {
+fn parse_openrouter(
+    body: &str,
+    families: &HashMap<String, String>,
+) -> Result<Vec<ModelInfo>, RefreshError> {
     let list: OpenRouterList =
         serde_json::from_str(body).map_err(|source| RefreshError::Parse {
             context: "parsing openrouter models response as JSON".to_string(),
@@ -517,7 +546,7 @@ fn parse_openrouter(body: &str) -> Result<Vec<ModelInfo>, RefreshError> {
         {
             continue;
         }
-        models.push(map_openrouter_model(m));
+        models.push(map_openrouter_model(m, families.get(&m.id).cloned()));
     }
     Ok(models)
 }
@@ -736,8 +765,9 @@ fn map_model(fixed: &ProviderFixedValues, id: &str, m: &RawModel) -> ModelInfo {
 /// Normalize a single OpenRouter `/models` entry into our [`ModelInfo`]
 /// shape. The full slash-namespaced id is kept verbatim (e.g.
 /// `anthropic/claude-sonnet-4`). All entries map to the Responses wire
-/// shape against OpenRouter's base URL.
-fn map_openrouter_model(m: &OpenRouterModel) -> ModelInfo {
+/// shape against OpenRouter's base URL. `family` comes from the matching
+/// model in models.dev's `openrouter` provider catalog.
+fn map_openrouter_model(m: &OpenRouterModel, family: Option<String>) -> ModelInfo {
     let arch = m.architecture.as_ref();
     let pricing = m.pricing.as_ref();
 
@@ -753,8 +783,7 @@ fn map_openrouter_model(m: &OpenRouterModel) -> ModelInfo {
     ModelInfo {
         id: m.id.clone(),
         name: m.name.clone().unwrap_or_else(|| m.id.clone()),
-        // OpenRouter's DTO has no authoritative models.dev family.
-        family: None,
+        family,
         api: OPENROUTER_API.to_string(),
         provider: OPENROUTER_PROVIDER_ID.to_string(),
         base_url: OPENROUTER_BASE_URL.to_string(),
@@ -947,6 +976,7 @@ mod tests {
             "models": {
                 "gpt-test": {
                     "name": "GPT Test",
+                    "family": "gpt",
                     "tool_call": true,
                     "reasoning": false,
                     "limit": {"context": 128000, "output": 16000},
@@ -970,6 +1000,12 @@ mod tests {
                     "tool_call": true,
                     "modalities": {"input": ["text", "image"]}
                 }
+            }
+        },
+        "openrouter": {
+            "models": {
+                "openai/gpt-test": {"family": "gpt"},
+                "vendor/reasoner-1": {"family": "reasoner"}
             }
         }
     }"#;
@@ -1253,6 +1289,11 @@ mod tests {
     const OPENROUTER_FIXTURE: &str = r#"{
         "data": [
             {
+                "id": "openai/gpt-test",
+                "name": "OpenAI: GPT Test",
+                "supported_parameters": ["tools"]
+            },
+            {
                 "id": "vendor/reasoner-1",
                 "name": "Vendor Reasoner 1",
                 "context_length": 200000,
@@ -1317,15 +1358,26 @@ mod tests {
         let ids: Vec<&str> = or.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(
             ids,
-            vec!["vendor/chat-1", "vendor/minimal", "vendor/reasoner-1"]
+            vec![
+                "openai/gpt-test",
+                "vendor/chat-1",
+                "vendor/minimal",
+                "vendor/reasoner-1"
+            ]
         );
+
+        let gpt = or
+            .iter()
+            .find(|m| m.id == "openai/gpt-test")
+            .expect("GPT model present");
+        assert_eq!(gpt.family.as_deref(), Some("gpt"));
 
         let reasoner = or
             .iter()
             .find(|m| m.id == "vendor/reasoner-1")
             .expect("reasoner present");
         assert_eq!(reasoner.api, "openai-responses");
-        assert_eq!(reasoner.family, None);
+        assert_eq!(reasoner.family.as_deref(), Some("reasoner"));
         assert_eq!(reasoner.base_url, "https://openrouter.ai/api/v1");
         assert!(reasoner.reasoning);
         // OpenRouter models are never Anthropic-adaptive, whatever their
@@ -1405,6 +1457,37 @@ mod tests {
             .count();
         assert_eq!(carried.len(), expected);
         assert!(carried.iter().all(|m| m.provider == "openrouter"));
+    }
+
+    #[test]
+    fn cached_openrouter_models_receive_current_models_dev_families() {
+        let mut models = build_catalog_from_json(FIXTURE, Some(OPENROUTER_FIXTURE))
+            .expect("parses")
+            .models;
+        for model in &mut models {
+            if model.provider == OPENROUTER_PROVIDER_ID {
+                model.family = None;
+            }
+        }
+        let raw = parse_models_dev_raw(FIXTURE).expect("models.dev fixture parses");
+
+        refresh_openrouter_families(&mut models, &openrouter_family_lookup(&raw));
+
+        let gpt = models
+            .iter()
+            .find(|m| m.provider == OPENROUTER_PROVIDER_ID && m.id == "openai/gpt-test")
+            .expect("GPT model present");
+        assert_eq!(gpt.family.as_deref(), Some("gpt"));
+        let unmatched = models
+            .iter()
+            .find(|m| m.provider == OPENROUTER_PROVIDER_ID && m.id == "vendor/chat-1")
+            .expect("unmatched model present");
+        assert_eq!(unmatched.family, None);
+        let native = models
+            .iter()
+            .find(|m| m.provider == "openai" && m.id == "gpt-test")
+            .expect("native GPT model present");
+        assert_eq!(native.family.as_deref(), Some("gpt"));
     }
 
     #[test]
