@@ -1,6 +1,6 @@
 {
   "schema_version": 3,
-  "updated_at": 1784887308240,
+  "updated_at": 1784915598652,
   "source": "models.dev",
   "models": [
     {
@@ -295,6 +295,40 @@
     {
       "id": "claude-opus-4-8",
       "name": "Claude Opus 4.8",
+      "family": "claude-opus",
+      "api": "anthropic-messages",
+      "provider": "anthropic",
+      "base_url": "https://api.anthropic.com",
+      "reasoning": true,
+      "reasoning_options": [
+        {
+          "type": "effort",
+          "values": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        }
+      ],
+      "supports_verbosity": false,
+      "input": [
+        "text",
+        "image"
+      ],
+      "cost": {
+        "input": 5.0,
+        "output": 25.0,
+        "cache_read": 0.5,
+        "cache_write": 6.25
+      },
+      "context_window": 1000000,
+      "max_tokens": 128000
+    },
+    {
+      "id": "claude-opus-5",
+      "name": "Claude Opus 5",
       "family": "claude-opus",
       "api": "anthropic-messages",
       "provider": "anthropic",
@@ -709,38 +743,6 @@
       "max_tokens": 128000
     },
     {
-      "id": "gpt-5-codex",
-      "name": "GPT-5-Codex",
-      "family": "gpt-codex",
-      "api": "openai-responses",
-      "provider": "openai",
-      "base_url": "https://api.openai.com/v1",
-      "reasoning": true,
-      "reasoning_options": [
-        {
-          "type": "effort",
-          "values": [
-            "low",
-            "medium",
-            "high"
-          ]
-        }
-      ],
-      "supports_verbosity": true,
-      "input": [
-        "text",
-        "image"
-      ],
-      "cost": {
-        "input": 1.25,
-        "output": 10.0,
-        "cache_read": 0.125,
-        "cache_write": 0.0
-      },
-      "context_window": 400000,
-      "max_tokens": 128000
-    },
-    {
       "id": "gpt-5-mini",
       "name": "GPT-5 Mini",
       "family": "gpt-mini",
@@ -870,133 +872,6 @@
       "max_tokens": 128000
     },
     {
-      "id": "gpt-5.1-chat-latest",
-      "name": "GPT-5.1 Chat",
-      "family": "gpt-codex",
-      "api": "openai-responses",
-      "provider": "openai",
-      "base_url": "https://api.openai.com/v1",
-      "reasoning": true,
-      "reasoning_options": [
-        {
-          "type": "effort",
-          "values": [
-            "medium"
-          ]
-        }
-      ],
-      "supports_verbosity": true,
-      "input": [
-        "text",
-        "image"
-      ],
-      "cost": {
-        "input": 1.25,
-        "output": 10.0,
-        "cache_read": 0.125,
-        "cache_write": 0.0
-      },
-      "context_window": 128000,
-      "max_tokens": 16384
-    },
-    {
-      "id": "gpt-5.1-codex",
-      "name": "GPT-5.1 Codex",
-      "family": "gpt-codex",
-      "api": "openai-responses",
-      "provider": "openai",
-      "base_url": "https://api.openai.com/v1",
-      "reasoning": true,
-      "reasoning_options": [
-        {
-          "type": "effort",
-          "values": [
-            "low",
-            "medium",
-            "high"
-          ]
-        }
-      ],
-      "supports_verbosity": true,
-      "input": [
-        "text",
-        "image"
-      ],
-      "cost": {
-        "input": 1.25,
-        "output": 10.0,
-        "cache_read": 0.125,
-        "cache_write": 0.0
-      },
-      "context_window": 400000,
-      "max_tokens": 128000
-    },
-    {
-      "id": "gpt-5.1-codex-max",
-      "name": "GPT-5.1 Codex Max",
-      "family": "gpt-codex",
-      "api": "openai-responses",
-      "provider": "openai",
-      "base_url": "https://api.openai.com/v1",
-      "reasoning": true,
-      "reasoning_options": [
-        {
-          "type": "effort",
-          "values": [
-            "low",
-            "medium",
-            "high",
-            "xhigh"
-          ]
-        }
-      ],
-      "supports_verbosity": true,
-      "input": [
-        "text",
-        "image"
-      ],
-      "cost": {
-        "input": 1.25,
-        "output": 10.0,
-        "cache_read": 0.125,
-        "cache_write": 0.0
-      },
-      "context_window": 400000,
-      "max_tokens": 128000
-    },
-    {
-      "id": "gpt-5.1-codex-mini",
-      "name": "GPT-5.1 Codex mini",
-      "family": "gpt-codex",
-      "api": "openai-responses",
-      "provider": "openai",
-      "base_url": "https://api.openai.com/v1",
-      "reasoning": true,
-      "reasoning_options": [
-        {
-          "type": "effort",
-          "values": [
-            "low",
-            "medium",
-            "high"
-          ]
-        }
-      ],
-      "supports_verbosity": true,
-      "input": [
-        "text",
-        "image"
-      ],
-      "cost": {
-        "input": 0.25,
-        "output": 2.0,
-        "cache_read": 0.025,
-        "cache_write": 0.0
-      },
-      "context_window": 400000,
-      "max_tokens": 128000
-    },
-    {
       "id": "gpt-5.2",
       "name": "GPT-5.2",
       "family": "gpt",
@@ -1059,39 +934,6 @@
       },
       "context_window": 128000,
       "max_tokens": 16384
-    },
-    {
-      "id": "gpt-5.2-codex",
-      "name": "GPT-5.2 Codex",
-      "family": "gpt-codex",
-      "api": "openai-responses",
-      "provider": "openai",
-      "base_url": "https://api.openai.com/v1",
-      "reasoning": true,
-      "reasoning_options": [
-        {
-          "type": "effort",
-          "values": [
-            "low",
-            "medium",
-            "high",
-            "xhigh"
-          ]
-        }
-      ],
-      "supports_verbosity": true,
-      "input": [
-        "text",
-        "image"
-      ],
-      "cost": {
-        "input": 1.75,
-        "output": 14.0,
-        "cache_read": 0.175,
-        "cache_write": 0.0
-      },
-      "context_window": 400000,
-      "max_tokens": 128000
     },
     {
       "id": "gpt-5.2-pro",
@@ -1758,36 +1600,6 @@
       "max_tokens": 100000
     },
     {
-      "id": "o3-deep-research",
-      "name": "o3-deep-research",
-      "family": "o",
-      "api": "openai-responses",
-      "provider": "openai",
-      "base_url": "https://api.openai.com/v1",
-      "reasoning": true,
-      "reasoning_options": [
-        {
-          "type": "effort",
-          "values": [
-            "medium"
-          ]
-        }
-      ],
-      "supports_verbosity": false,
-      "input": [
-        "text",
-        "image"
-      ],
-      "cost": {
-        "input": 10.0,
-        "output": 40.0,
-        "cache_read": 2.5,
-        "cache_write": 0.0
-      },
-      "context_window": 200000,
-      "max_tokens": 100000
-    },
-    {
       "id": "o3-mini",
       "name": "o3-mini",
       "family": "o-mini",
@@ -1877,36 +1689,6 @@
         "input": 1.1,
         "output": 4.4,
         "cache_read": 0.275,
-        "cache_write": 0.0
-      },
-      "context_window": 200000,
-      "max_tokens": 100000
-    },
-    {
-      "id": "o4-mini-deep-research",
-      "name": "o4-mini-deep-research",
-      "family": "o-mini",
-      "api": "openai-responses",
-      "provider": "openai",
-      "base_url": "https://api.openai.com/v1",
-      "reasoning": true,
-      "reasoning_options": [
-        {
-          "type": "effort",
-          "values": [
-            "medium"
-          ]
-        }
-      ],
-      "supports_verbosity": false,
-      "input": [
-        "text",
-        "image"
-      ],
-      "cost": {
-        "input": 2.0,
-        "output": 8.0,
-        "cache_read": 0.5,
         "cache_write": 0.0
       },
       "context_window": 200000,
