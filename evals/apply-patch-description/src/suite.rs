@@ -101,10 +101,13 @@ pub enum TaskParameters {
         path: String,
         old: String,
         new: String,
+        retry_count: u32,
     },
     MultilineEdit {
         path: String,
         symbol: String,
+        boundary: i32,
+        increment: i32,
     },
     Insertion {
         path: String,
@@ -114,50 +117,63 @@ pub enum TaskParameters {
     Removal {
         path: String,
         key: String,
+        retained_value: u32,
     },
     IndentationSensitive {
         path: String,
         section: String,
+        timeout: u32,
     },
     NearbyChanges {
         path: String,
         first: String,
         second: String,
+        amount: i32,
     },
     TwoRelatedSourceFiles {
         model_path: String,
         view_path: String,
         symbol: String,
+        default_limit: u32,
     },
     SourcePlusTest {
         source_path: String,
         test_path: String,
         symbol: String,
+        boundary: i32,
     },
     ThreeFileConfiguration {
         paths: [String; 3],
         key: String,
+        values: [u32; 3],
     },
     AddFile {
         path: String,
         content_token: String,
+        number: u32,
     },
     DeleteFile {
         path: String,
+        number: u32,
     },
     RenameWithContent {
         old_path: String,
         new_path: String,
+        old_symbol: String,
         symbol: String,
+        multiplier: u32,
     },
     RepeatedBlocks {
         path: String,
         target_label: String,
+        old_limit: u32,
+        new_limit: u32,
     },
     RepeatedMethods {
         path: String,
         target_type: String,
         method: String,
+        suffix: u32,
     },
     EndOfFile {
         path: String,
@@ -167,6 +183,8 @@ pub enum TaskParameters {
         path: String,
         lane: UncommonTextLane,
         token: String,
+        marker_width: u8,
+        number: u32,
     },
 }
 

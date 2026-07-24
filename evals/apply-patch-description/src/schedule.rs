@@ -287,6 +287,24 @@ pub fn validate_universe(
     Ok(())
 }
 
+/// Verifies the self-contained identity hash of one generated task instance.
+pub fn validate_task_instance_identity(instance: &TaskInstance) -> Result<(), ScheduleError> {
+    let material = serde_json::to_vec(&(
+        &instance.task_id,
+        &instance.archetype_id,
+        &instance.task_seed,
+        instance.universe_index,
+        &instance.parameters,
+        &instance.suite_revision,
+    ))
+    .map_err(|error| ScheduleError(format!("cannot serialize task identity: {error}")))?;
+    let expected = hash_framed(b"aj-apply-patch-eval-instance-v1", &[&material]);
+    if instance.instance_hash != expected {
+        return Err(ScheduleError("task instance identity hash mismatch".into()));
+    }
+    Ok(())
+}
+
 /// Regenerates and verifies all schedule identities and hashes.
 pub fn validate_schedule(
     manifest: &SuiteManifest,
@@ -549,15 +567,19 @@ fn make_instance(
 
 fn parameters(kind: ParameterKind, token: &str, index: u32) -> TaskParameters {
     let path = |stem: &str, extension: &str| format!("src/{stem}_{token}.{extension}");
+    let number = 3 + index % 7;
     match kind {
         ParameterKind::UniqueReplacement => TaskParameters::UniqueReplacement {
             path: path("record", "txt"),
             old: format!("old_{token}"),
             new: format!("new_{token}"),
+            retry_count: number,
         },
         ParameterKind::MultilineEdit => TaskParameters::MultilineEdit {
-            path: path("service", "rs"),
+            path: path("service", "py"),
             symbol: format!("service_{token}"),
+            boundary: i32::try_from(number).unwrap(),
+            increment: i32::try_from(number + 2).unwrap(),
         },
         ParameterKind::Insertion => TaskParameters::Insertion {
             path: path("list", "txt"),
@@ -567,25 +589,30 @@ fn parameters(kind: ParameterKind, token: &str, index: u32) -> TaskParameters {
         ParameterKind::Removal => TaskParameters::Removal {
             path: path("options", "toml"),
             key: format!("obsolete_{token}"),
+            retained_value: number,
         },
         ParameterKind::IndentationSensitive => TaskParameters::IndentationSensitive {
             path: path("config", "yaml"),
             section: format!("section_{token}"),
+            timeout: number * 10,
         },
         ParameterKind::NearbyChanges => TaskParameters::NearbyChanges {
-            path: path("nearby", "rs"),
+            path: path("nearby", "py"),
             first: format!("first_{token}"),
             second: format!("second_{token}"),
+            amount: i32::try_from(number).unwrap(),
         },
         ParameterKind::TwoRelatedSourceFiles => TaskParameters::TwoRelatedSourceFiles {
-            model_path: path("model", "rs"),
-            view_path: path("view", "rs"),
+            model_path: path("model", "py"),
+            view_path: path("view", "py"),
             symbol: format!("Record{token}"),
+            default_limit: number * 5,
         },
         ParameterKind::SourcePlusTest => TaskParameters::SourcePlusTest {
-            source_path: path("math", "rs"),
-            test_path: format!("tests/math_{token}.rs"),
+            source_path: path("math", "py"),
+            test_path: format!("tests/math_{token}_test.py"),
             symbol: format!("calculate_{token}"),
+            boundary: i32::try_from(number).unwrap(),
         },
         ParameterKind::ThreeFileConfiguration => TaskParameters::ThreeFileConfiguration {
             paths: [
@@ -594,27 +621,35 @@ fn parameters(kind: ParameterKind, token: &str, index: u32) -> TaskParameters {
                 format!("config/prod_{token}.toml"),
             ],
             key: format!("setting_{token}"),
+            values: [number * 10, number * 10 + 1, number * 10 + 2],
         },
         ParameterKind::AddFile => TaskParameters::AddFile {
             path: path("generated", "txt"),
             content_token: token.into(),
+            number,
         },
         ParameterKind::DeleteFile => TaskParameters::DeleteFile {
             path: path("obsolete", "txt"),
+            number,
         },
         ParameterKind::RenameWithContent => TaskParameters::RenameWithContent {
-            old_path: path("old", "rs"),
-            new_path: path("new", "rs"),
+            old_path: path("old", "py"),
+            new_path: path("new", "py"),
+            old_symbol: format!("legacy_{token}"),
             symbol: format!("renamed_{token}"),
+            multiplier: number,
         },
         ParameterKind::RepeatedBlocks => TaskParameters::RepeatedBlocks {
             path: path("blocks", "txt"),
             target_label: format!("target_{token}"),
+            old_limit: number,
+            new_limit: number + 4,
         },
         ParameterKind::RepeatedMethods => TaskParameters::RepeatedMethods {
-            path: path("methods", "rs"),
+            path: path("methods", "py"),
             target_type: format!("Type{token}"),
             method: "render".into(),
+            suffix: number,
         },
         ParameterKind::EndOfFile => TaskParameters::EndOfFile {
             path: path("tail", "txt"),
@@ -628,6 +663,8 @@ fn parameters(kind: ParameterKind, token: &str, index: u32) -> TaskParameters {
                 UncommonTextLane::Crlf
             },
             token: token.into(),
+            marker_width: u8::try_from(7 + index % 3).unwrap(),
+            number,
         },
     }
 }

@@ -3,6 +3,7 @@
 pub mod analysis;
 pub mod artifacts;
 pub mod descriptions;
+pub mod fixtures;
 pub mod rng;
 pub mod schedule;
 pub mod snapshot;
