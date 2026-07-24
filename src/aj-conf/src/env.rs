@@ -127,15 +127,15 @@ pub struct AgentEnv {
 
 impl AgentEnv {
     /// Read the environment from the real host: working directory, `$HOME`,
-    /// and the current date. Delegates the discovery itself to
-    /// `discover`. `disabled_skills` carries the
-    /// `disabled_skills` config value. Matching skills are discovered but
-    /// marked disabled.
+    /// and the current date.
+    ///
+    /// `disabled_skills` carries the `disabled_skills` config value. Matching
+    /// skills are discovered but marked disabled.
     pub fn new(builtin_system_prompt: &str, disabled_skills: &[String]) -> Self {
         let working_directory = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let home = home_dir();
         let today_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        Self::discover(
+        Self::discover_at(
             working_directory,
             home.as_deref(),
             today_date,
@@ -144,14 +144,12 @@ impl AgentEnv {
         )
     }
 
-    /// Discover the environment from explicit inputs: git root, instruction
-    /// files, skills, and the base system prompt (`builtin_system_prompt`
-    /// unless an override file exists, see `resolve_system_prompt`).
+    /// Discovers the environment from explicit host inputs.
     ///
-    /// Takes the working directory, `$HOME`, and date as parameters rather
-    /// than reading them, so discovery can be driven hermetically in tests.
-    /// [`AgentEnv::new`] is the real-host wrapper.
-    fn discover(
+    /// Resolves the git root, instruction files, skills, and system prompt
+    /// relative to `working_directory` and `home`. The supplied date is used
+    /// unchanged.
+    pub fn discover_at(
         working_directory: PathBuf,
         home: Option<&Path>,
         today_date: String,
@@ -305,7 +303,7 @@ mod tests {
         let home = crate::test_temp_dir("discover-home");
         let cwd = crate::test_temp_dir("discover-cwd");
 
-        let env = AgentEnv::discover(
+        let env = AgentEnv::discover_at(
             cwd.clone(),
             Some(&home),
             "2026-01-02".to_string(),
@@ -351,7 +349,7 @@ mod tests {
 
     #[test]
     fn display_format_is_stable() {
-        let env = AgentEnv::discover(
+        let env = AgentEnv::discover_at(
             PathBuf::from("/work"),
             None,
             "2026-01-02".to_string(),
