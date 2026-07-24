@@ -232,6 +232,119 @@ fn line(text: impl Into<String>, style: Style) -> Line {
     vec![span(text, style)]
 }
 
+fn fenced_diff_lines<'a>(
+    body_lines: impl IntoIterator<Item = &'a str>,
+    styles: &TranscriptStyles,
+) -> Vec<Line> {
+    let mut fence = None;
+    body_lines
+        .into_iter()
+        .map(|text| {
+            if let Some((fence_len, line_index)) = fence.as_mut() {
+                let trimmed = text.trim();
+                let closing_ticks = trimmed.bytes().take_while(|byte| *byte == b'`').count();
+                if closing_ticks >= *fence_len && closing_ticks == trimmed.len() {
+                    fence = None;
+                    return line(text, styles.dim);
+                }
+                let style = if *line_index < 2 {
+                    styles.dim
+                } else if text.starts_with('+') {
+                    styles.diff_add
+                } else if text.starts_with('-') {
+                    styles.diff_remove
+                } else {
+                    styles.dim
+                };
+                *line_index += 1;
+                return line(text, style);
+            }
+
+            let trimmed = text.trim();
+            let ticks = trimmed.bytes().take_while(|byte| *byte == b'`').count();
+            if ticks >= 3 && trimmed[ticks..].trim() == "diff" {
+                fence = Some((ticks, 0));
+                line(text, styles.dim)
+            } else {
+                line(text, styles.text)
+            }
+        })
+        .collect()
+}
+
+fn text_details_body(
+    summary: &str,
+    body: &str,
+    expanded: bool,
+    styles: &TranscriptStyles,
+    fenced_diff: bool,
+) -> Vec<Line> {
+    let summary = sanitize_terminal_output(summary);
+    let body = sanitize_terminal_output(body);
+    let mut lines = Vec::new();
+    if !summary.is_empty() {
+        lines.push(line(summary, styles.dim));
+    }
+    let mut body_lines: Vec<&str> = body.split('\n').collect();
+    if body_lines.last().is_some_and(|line| line.is_empty()) {
+        body_lines.pop();
+    }
+    if !expanded && body_lines.len() > TEXT_COLLAPSED_LINES {
+        let more = body_lines.len() - TEXT_COLLAPSED_LINES;
+        body_lines.truncate(TEXT_COLLAPSED_LINES);
+        if fenced_diff {
+            lines.extend(fenced_diff_lines(body_lines, styles));
+        } else {
+            lines.extend(body_lines.into_iter().map(|text| line(text, styles.text)));
+        }
+        lines.push(line(expand_hint(more, HintKind::More), styles.dim));
+    } else if fenced_diff {
+        lines.extend(fenced_diff_lines(body_lines, styles));
+    } else {
+        lines.extend(body_lines.into_iter().map(|text| line(text, styles.text)));
+    }
+    lines
+}
+
+fn apply_patch_details_body(
+    details: &ToolDetails,
+    expanded: bool,
+    styles: &TranscriptStyles,
+) -> Vec<Line> {
+    match details {
+        ToolDetails::Text { summary, body } => {
+            text_details_body(summary, body, expanded, styles, true)
+        }
+        _ => details_body(details, expanded, styles),
+    }
+}
+
+fn apply_patch_input_lines(args: &Value, styles: &TranscriptStyles) -> Vec<Line> {
+    let Some(patch) = args
+        .get("patchText")
+        .or_else(|| args.get("patch"))
+        .and_then(Value::as_str)
+    else {
+        return Vec::new();
+    };
+    let patch = sanitize_terminal_output(patch);
+    let mut lines = vec![line("Input:", styles.dim)];
+    lines.extend(patch.trim_end_matches('\n').split('\n').map(|text| {
+        let style = if text.starts_with('+') {
+            styles.diff_add
+        } else if text.starts_with('-') {
+            styles.diff_remove
+        } else if text.starts_with("***") || text.starts_with("@@") || text.starts_with(' ') {
+            styles.dim
+        } else {
+            styles.text
+        };
+        line(text, style)
+    }));
+    lines.push(line("", styles.text));
+    lines
+}
+
 /// Render the body lines for a [`ToolDetails`] variant.
 ///
 /// Raw text fields pass through [`sanitize_terminal_output`] before styling.
@@ -239,28 +352,7 @@ fn line(text: impl Into<String>, style: Style) -> Line {
 fn details_body(details: &ToolDetails, expanded: bool, styles: &TranscriptStyles) -> Vec<Line> {
     match details {
         ToolDetails::Text { summary, body } => {
-            let summary = sanitize_terminal_output(summary);
-            let body = sanitize_terminal_output(body);
-            let mut lines = Vec::new();
-            if !summary.is_empty() {
-                lines.push(line(summary, styles.dim));
-            }
-            let mut body_lines: Vec<&str> = body.split('\n').collect();
-            // Trim a trailing empty line introduced by a body that
-            // ended in `\n`. The bubble's bottom pad already handles
-            // the vertical separation.
-            if body_lines.last().is_some_and(|l| l.is_empty()) {
-                body_lines.pop();
-            }
-            if !expanded && body_lines.len() > TEXT_COLLAPSED_LINES {
-                let more = body_lines.len() - TEXT_COLLAPSED_LINES;
-                body_lines.truncate(TEXT_COLLAPSED_LINES);
-                lines.extend(body_lines.into_iter().map(|l| line(l, styles.text)));
-                lines.push(line(expand_hint(more, HintKind::More), styles.dim));
-            } else {
-                lines.extend(body_lines.into_iter().map(|l| line(l, styles.text)));
-            }
-            lines
+            text_details_body(summary, body, expanded, styles, false)
         }
         ToolDetails::Diff(diff) => diff
             .lines()
@@ -594,8 +686,17 @@ pub(crate) fn build_tool_cell(
         if let Some(ToolDetails::Bash { command, .. }) = &entry.details {
             lines.push(bash_command_line(command, styles));
         }
-    } else if let Some(details) = &entry.details {
-        lines.extend(details_body(details, expanded, styles));
+    } else {
+        if expanded && entry.tool == "apply_patch" {
+            lines.extend(apply_patch_input_lines(&entry.args, styles));
+        }
+        if let Some(details) = &entry.details {
+            if entry.tool == "apply_patch" {
+                lines.extend(apply_patch_details_body(details, expanded, styles));
+            } else {
+                lines.extend(details_body(details, expanded, styles));
+            }
+        }
     }
     Bubble::entry(flatten_lines(lines, styles), Some(bg), styles.text)
 }
@@ -1083,6 +1184,107 @@ mod tests {
             assert!(r.iter().any(|l| l == &format!(" line {i}")), "line {i}");
         }
         assert!(!r.iter().any(|l| l.contains("more lines")), "{r:?}");
+    }
+
+    #[test]
+    fn unrelated_text_tool_does_not_style_fenced_diffs() {
+        let details = ToolDetails::Text {
+            summary: String::new(),
+            body: "```diff\n--- f.txt\toriginal\n+++ f.txt\tmodified\n@@ -1 +1 @@\n-old\n+new\n```"
+                .into(),
+        };
+        let s = styles();
+        let lines = details_body(&details, true, &s);
+
+        assert!(lines.iter().all(|line| line[0].style == s.text));
+    }
+
+    #[test]
+    fn apply_patch_styles_fenced_diff_content_and_closes_robustly() {
+        let details = ToolDetails::Text {
+            summary: String::new(),
+            body: "  ```diff  \n--- f.txt\toriginal\n+++ f.txt\tmodified\n@@ -1 +1 @@\n---old\n+++new\n  ````  \n+ ordinary text".into(),
+        };
+        let s = styles();
+        let lines = apply_patch_details_body(&details, true, &s);
+        let style_of = |needle: &str| {
+            lines
+                .iter()
+                .find(|line| line[0].text == needle)
+                .map(|line| line[0].style)
+                .expect("line present")
+        };
+
+        assert_eq!(style_of("--- f.txt\toriginal"), s.dim);
+        assert_eq!(style_of("+++ f.txt\tmodified"), s.dim);
+        assert_eq!(style_of("---old"), s.diff_remove);
+        assert_eq!(style_of("+++new"), s.diff_add);
+        assert_eq!(style_of("+ ordinary text"), s.text);
+    }
+
+    #[test]
+    fn expanded_apply_patch_shows_and_styles_its_input() {
+        let details = ToolDetails::Text {
+            summary: "Applied patch".into(),
+            body: "Done".into(),
+        };
+        let mut e = done_entry("apply_patch", details, false);
+        e.args = serde_json::json!({
+            "patchText": "*** Begin Patch\n*** Update File: f.txt\n@@\n-old\n+new\n*** End Patch\n"
+        });
+        let s = styles();
+
+        let mut collapsed =
+            build_tool_cell(&e, &no_tasks(), false, false, &s, ImageRender::Disabled);
+        assert!(
+            !rows(&draw(&mut collapsed, 80))
+                .iter()
+                .any(|row| row == " Input:")
+        );
+
+        let mut expanded = build_tool_cell(&e, &no_tasks(), true, false, &s, ImageRender::Disabled);
+        let surface = draw(&mut expanded, 80);
+        let rendered = rows(&surface);
+        assert!(rendered.iter().any(|row| row == " Input:"), "{rendered:?}");
+        assert!(rendered.iter().any(|row| row == " -old"), "{rendered:?}");
+        assert!(rendered.iter().any(|row| row == " +new"), "{rendered:?}");
+
+        let input_lines = apply_patch_input_lines(&e.args, &s);
+        let style_of = |needle: &str| {
+            input_lines
+                .iter()
+                .find(|line| line[0].text == needle)
+                .map(|line| line[0].style)
+                .expect("input line")
+        };
+        assert_eq!(style_of("-old"), s.diff_remove);
+        assert_eq!(style_of("+new"), s.diff_add);
+    }
+
+    #[test]
+    fn expanded_running_apply_patch_shows_sanitized_input_without_details() {
+        let e = entry(
+            "apply_patch",
+            serde_json::json!({
+                "patchText": "*** Begin Patch\n*** Update File: f.txt\n@@\n-old\n+new\u{1b}[31m\n*** End Patch\n"
+            }),
+        );
+        let s = styles();
+
+        let mut cell = build_tool_cell(&e, &no_tasks(), true, false, &s, ImageRender::Disabled);
+        let rendered = rows(&draw(&mut cell, 80));
+
+        assert!(rendered.iter().any(|row| row == " Input:"), "{rendered:?}");
+        assert!(
+            rendered.iter().any(|row| row == " *** Begin Patch"),
+            "{rendered:?}"
+        );
+        assert!(rendered.iter().any(|row| row == " +new"), "{rendered:?}");
+        assert!(
+            rendered.iter().any(|row| row == " *** End Patch"),
+            "{rendered:?}"
+        );
+        assert!(!rendered.iter().any(|row| row.contains('\u{1b}')));
     }
 
     // ---- Compact transcript mode -----------------------------------------
