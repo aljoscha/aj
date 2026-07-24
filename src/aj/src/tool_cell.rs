@@ -329,7 +329,7 @@ fn apply_patch_input_lines(args: &Value, styles: &TranscriptStyles) -> Vec<Line>
     };
     let patch = sanitize_terminal_output(patch);
     let mut lines = vec![line("Input:", styles.dim)];
-    lines.extend(patch.trim_end_matches('\n').split('\n').map(|text| {
+    lines.extend(patch.split('\n').map(|text| {
         let style = if text.starts_with('+') {
             styles.diff_add
         } else if text.starts_with('-') {
@@ -1259,6 +1259,21 @@ mod tests {
         };
         assert_eq!(style_of("-old"), s.diff_remove);
         assert_eq!(style_of("+new"), s.diff_add);
+    }
+
+    #[test]
+    fn expanded_apply_patch_preserves_trailing_blank_input_lines() {
+        let args = serde_json::json!({
+            "patchText": "*** Begin Patch\n*** End Patch\n\n"
+        });
+        let lines = apply_patch_input_lines(&args, &styles());
+        let trailing_blank_lines = lines
+            .iter()
+            .rev()
+            .take_while(|line| line[0].text.is_empty())
+            .count();
+
+        assert_eq!(trailing_blank_lines, 3);
     }
 
     #[test]
