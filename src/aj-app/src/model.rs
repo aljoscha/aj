@@ -50,7 +50,7 @@ pub const DEFAULT_PROVIDER_ID: &str = "anthropic";
 /// in the current catalog — falls back to its first listed entry, so a
 /// catalog refresh that drops or renames the preferred model degrades
 /// gracefully instead of erroring.
-const PREFERRED_DEFAULT_MODELS: &[(&str, &str)] = &[("anthropic", "claude-opus-4-8")];
+const PREFERRED_DEFAULT_MODELS: &[(&str, &str)] = &[("anthropic", "claude-opus-5")];
 
 /// The model-selection triple after applying CLI > env > config
 /// precedence. [`merge`](ModelSelection::merge) is the single place
@@ -452,14 +452,14 @@ mod tests {
     #[test]
     fn pick_model_prefers_provider_default_when_present() {
         // The preferred default is honored even when it isn't first in
-        // the catalog. "claude-opus-4-8" is anthropic's entry in
+        // the catalog. "claude-opus-5" is anthropic's entry in
         // `PREFERRED_DEFAULT_MODELS`.
         let reg = registry(vec![
             sample_model("anthropic", "claude-x", "anthropic-messages"),
-            sample_model("anthropic", "claude-opus-4-8", "anthropic-messages"),
+            sample_model("anthropic", "claude-opus-5", "anthropic-messages"),
         ]);
         let m = pick_model(&reg, "anthropic", None).expect("found");
-        assert_eq!(m.id, "claude-opus-4-8");
+        assert_eq!(m.id, "claude-opus-5");
     }
 
     #[test]
