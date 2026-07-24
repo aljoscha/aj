@@ -1,4 +1,4 @@
-//! Transport-independent implementation of the Codex/Amp `apply_patch` tool.
+//! Transport-independent implementation of the Codex `apply_patch` tool.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -42,11 +42,20 @@ HunkLine    := (" " | "-" | "+") text NEWLINE
 - By default, show **3 lines** of unchanged code immediately above and 3 lines immediately below each change.
 - Treat 3 lines as a minimum, not a target. For large files, repeated code, or any edit that could plausibly match in multiple places, prefer **5-10 lines** of unchanged context on each side.
 - If a change is within the chosen context window of a previous change, do NOT duplicate the first change's context-after lines in the second change's context-before lines.
-- If 3 lines of context is insufficient to uniquely identify the location, use the `@@` operator to indicate the class or function the snippet belongs to.
-- If a code block is repeated, use multiple `@@` statements to narrow the location.
+- If 3 lines of context is insufficient to uniquely identify the location, use the `@@` operator to indicate the class or function the snippet belongs to. For example:
+  `@@ class BaseClass`
+  [3+ lines of pre-context]
+  [changes]
+  [3+ lines of post-context]
+- If a code block is repeated so many times that even a single `@@` header and 3 lines of context cannot uniquely identify it, use multiple `@@` statements to narrow the location:
+  `@@ class BaseClass`
+  `@@ def method():`
+  [3+ lines of pre-context]
+  [changes]
+  [3+ lines of post-context]
 
 ## Additional Rules
-- **When editing conflict markers**, ensure their length matches the file's existing marker length.
+- **When editing conflict markers**, ensure their length matches the file's existing marker length (e.g., jj markers like `<<<<<<<`, `%%%%%%%`, or `\\\\`/longer).
 - For Add File: every content line MUST start with `+` (which gets stripped)
 - For Update File hunks: lines start with ` ` (context), `-` (remove), or `+` (add)
 - Use `*** End of File` marker to anchor changes at end of file
@@ -58,9 +67,9 @@ HunkLine    := (" " | "-" | "+") text NEWLINE
 - Repeated blocks (CSS vars, test mocks, large "god" files): include a *unique* `@@ ...` header, and add 5-10 or more context lines until the target is unique.
 - If you only read part of a file, do not guess. Read more of the file and expand the context until the hunk can match only once.
 - Indentation-sensitive files (Svelte/CSS/TS): keep indentation exactly as in the file (tabs vs spaces). Do not reindent unrelated lines.
-- Insert-only hunks (no `-` lines): avoid unanchored insert-only hunks; include a nearby unchanged context line to show *where* to insert.
+- Insert-only hunks (no `-` lines): avoid unanchored insert-only hunks; include a nearby unchanged context line (either via `@@` header or ` ` context lines) to show *where* to insert.
 - Ambiguous matches are worse than verbose hunks. Prefer a longer patch over a shorter patch that could apply in multiple places.
-- Whitespace drift: avoid changing internal spacing in context lines. Copy context lines from the file.
+- Whitespace drift: avoid changing internal spacing in context lines (e.g., `get: () =>` vs `get:  () =>`). Copy context lines from the file.
 - CRLF files: keep line endings consistent with the file you're patching.
 - If you see `[REDACTED:_____]` in your inputs and edits fail, secret redaction may have changed the text; ask the user to manually make the edit.
 
@@ -75,23 +84,36 @@ Add a new file:
 *** End Patch
 ```
 
-Update a line using surrounding context as the anchor:
+Simple update with context:
 ```
 *** Begin Patch
-*** Update File: src/config.ts
+*** Update File: src/utils/helpers.ts
 @@
- const retries = 3
--const timeout = 1000
-+const timeout = 2000
- export const enabled = true
+ export function processData(input: string) {
+   const normalized = input.trim()
+   if (!normalized) {
+     return 'default'
+   }
+-  return normalized
++  return normalized.toLowerCase()
+ }
+
+ export function formatLabel(label: string) {
+   return label.toUpperCase()
+ }
 *** End Patch
 ```
 
-Update a nested structure with enough context to disambiguate the edit:
+Update a nested structure (include extra context lines to disambiguate the edit):
 ```
 *** Begin Patch
 *** Update File: src/services/user-service.ts
 @@ class UserService
+   constructor(
+     private readonly repo: UserRepo,
+     private readonly logger: Logger,
+   ) {}
+
    async updateUser(id: string, data: UserData) {
      const user = await this.findById(id)
 -    user.name = data.name
@@ -100,19 +122,27 @@ Update a nested structure with enough context to disambiguate the edit:
      await this.save(user)
      return user
    }
+ }
 *** End Patch
 ```
 
-In a repetitive file, use a selector and a larger unique context window:
+Large or repetitive files: prefer 5+ context lines so the hunk matches only once:
 ```
 *** Begin Patch
-*** Update File: src/routes.ts
-@@ function registerAdminRoutes
- router.get('/admin/users', listUsers)
- router.get('/admin/teams', listTeams)
--router.get('/admin/audit', oldAudit)
-+router.get('/admin/audit', auditLog)
- router.get('/admin/settings', settings)
+*** Update File: src/theme/button-tokens.ts
+@@ export const buttonTokens = {
+   primary: {
+     background: colors.blue[500],
+     foreground: colors.white,
+     border: colors.blue[600],
+     hoverBackground: colors.blue[600],
+     activeBackground: colors.blue[700],
+-    focusRing: colors.blue[300],
++    focusRing: colors.cyan[300],
+     disabledBackground: colors.gray[300],
+     disabledForeground: colors.gray[500],
+   },
+   secondary: {
 *** End Patch
 ```
 
@@ -123,26 +153,36 @@ Use multiple `@@` blocks to skip intervening code:
 @@
  const defaultConfig = {
    name: 'myapp',
+   version: '1.0.0',
+   featureFlags: {
+     metrics: true,
+     tracing: false,
+   },
 @@
    logging: {
+     destination: 'stdout',
 -    level: 'info',
 +    level: 'debug',
      format: 'json',
+     redact: ['token'],
    },
+   retries: 3,
 *** End Patch
 ```
 
-Match the existing conflict-marker length when resolving a conflict:
+Editing content within jj conflict markers:
 ```
 *** Begin Patch
-*** Update File: src/version.ts
+*** Update File: src/config.ts
 @@
--<<<<<<< HEAD
--export const version = '1'
--=======
--export const version = '2'
-->>>>>>> feature
-+export const version = '2'
+ <<<<<<< Conflict 1 of 1
+ %%%%%%% Changes from base to side #1
+ \\\       (rebase destination)
+- const API_URL = 'http://localhost:3000'
++ const API_URL = 'https://api.example.com'
+ +++++++ Contents of side #2
+ const API_URL = 'http://staging.example.com'
+ >>>>>>> Conflict 1 of 1 ends
 *** End Patch
 ```
 
@@ -165,6 +205,9 @@ Move a file while changing its contents:
  }
 *** End Patch
 ```"#;
+
+const DIAGNOSTIC_LINE_LIMIT: usize = 240;
+const TRUNCATION_SUFFIX: &str = "… [truncated]";
 
 #[derive(Clone)]
 pub struct ApplyPatchTool;
@@ -713,7 +756,7 @@ fn apply_hunks(path: &str, file: &mut Vec<String>, hunks: Vec<Hunk>) -> Result<(
             format!(
                 "Could not find matching lines {location}.\nExpected to find:\n{}{}",
                 expected_lines(&hunk.old_lines),
-                candidate_mismatch(file, &hunk.old_lines, cursor)
+                candidate_mismatch(file, &hunk.old_lines)
             )
         })?;
         let actual = &file[start..start + old.len()];
@@ -754,7 +797,7 @@ fn expected_lines(lines: &[String]) -> String {
     let mut expected = lines
         .iter()
         .take(3)
-        .map(|line| format!("  {line:?}"))
+        .map(|line| truncate_diagnostic_line(&format!("  {line:?}")))
         .collect::<Vec<_>>()
         .join("\n");
     if lines.len() > 3 {
@@ -763,35 +806,99 @@ fn expected_lines(lines: &[String]) -> String {
     expected
 }
 
-fn candidate_mismatch(file: &[String], expected: &[String], cursor: usize) -> String {
-    let Some(first) = expected.first() else {
-        return String::new();
-    };
-    let candidate = file
+fn candidate_mismatch(file: &[String], expected: &[String]) -> String {
+    let mut line_counts = std::collections::HashMap::new();
+    for line in file {
+        *line_counts.entry(line.trim()).or_insert(0usize) += 1;
+    }
+    let Some((anchor_index, anchor)) = expected
         .iter()
         .enumerate()
-        .skip(cursor.min(file.len()))
-        .max_by_key(|(_, line)| {
-            let tier_score = (0..5)
-                .rev()
-                .find(|tier| equivalent(line, first, *tier))
-                .map_or(0, |tier| 5 - tier);
-            let prefix_score = line
-                .chars()
-                .zip(first.chars())
-                .take_while(|(actual, expected)| actual == expected)
-                .count();
-            tier_score * 1_000 + prefix_score
-        });
-    match candidate {
-        Some((line, actual)) => format!(
-            "\nClosest candidate mismatch at line {}:\n  expected {:?}\n  actual   {:?}",
-            line + 1,
-            first,
-            actual
-        ),
-        None => "\nNo candidate lines remain after the hunk anchor.".into(),
+        .filter_map(|(index, line)| {
+            let needle = line.trim();
+            let count = line_counts.get(needle).copied().unwrap_or_default();
+            (!needle.is_empty() && count > 0).then_some((index, needle, count))
+        })
+        .min_by(|left, right| {
+            left.2
+                .cmp(&right.2)
+                .then_with(|| right.1.len().cmp(&left.1.len()))
+                .then_with(|| left.0.cmp(&right.0))
+        })
+        .map(|(index, needle, _)| (index, needle))
+    else {
+        return String::new();
+    };
+
+    let locations: Vec<usize> = file
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| (line.trim() == anchor).then_some(index))
+        .collect();
+    let closest = locations
+        .iter()
+        .filter_map(|location| location.checked_sub(anchor_index))
+        .map(|start| {
+            let mismatch = expected.iter().enumerate().find_map(|(offset, line)| {
+                (file.get(start + offset) != Some(line)).then_some(offset)
+            });
+            let prefix = mismatch.unwrap_or(expected.len());
+            (start, mismatch, prefix)
+        })
+        .max_by_key(|(start, _, prefix)| (*prefix, std::cmp::Reverse(*start)));
+
+    let mut output = format!(
+        "\n{}",
+        truncate_diagnostic_line(&format!(
+            "Debug hint: {} candidate location(s) for anchor line {:?}.",
+            if locations.len() > 3 {
+                format!("showing 3 of {}", locations.len())
+            } else {
+                format!("found {}", locations.len())
+            },
+            anchor
+        ))
+    );
+    if let Some((start, Some(offset), _)) = closest {
+        let actual = file
+            .get(start + offset)
+            .map_or_else(|| "undefined".into(), |line| format!("{line:?}"));
+        output.push_str(&format!(
+            "\nClosest candidate starts at line {} but differs at line {}:\n{}\n{}",
+            start + 1,
+            start + offset + 1,
+            truncate_diagnostic_line(&format!("  expected {:?}", expected[offset])),
+            truncate_diagnostic_line(&format!("  actual   {actual}"))
+        ));
     }
+    for location in locations.into_iter().take(3) {
+        output.push_str(&format!("\n...around line {}:\n", location + 1));
+        let start = location.saturating_sub(2);
+        let end = file.len().min(location + 3);
+        output.push_str(
+            &file[start..end]
+                .iter()
+                .enumerate()
+                .map(|(offset, line)| {
+                    truncate_diagnostic_line(&format!("{:>5}| {line}", start + offset + 1))
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+    output
+}
+
+fn truncate_diagnostic_line(value: &str) -> String {
+    if value.chars().count() <= DIAGNOSTIC_LINE_LIMIT {
+        return value.into();
+    }
+    let prefix_length = DIAGNOSTIC_LINE_LIMIT - TRUNCATION_SUFFIX.chars().count();
+    format!(
+        "{}{}",
+        value.chars().take(prefix_length).collect::<String>(),
+        TRUNCATION_SUFFIX
+    )
 }
 
 fn adapt_replacement(
@@ -1170,18 +1277,56 @@ mod tests {
 
         let out = run(
             &d,
-            "*** Begin Patch\n*** Update File: f.txt\n@@\n-alpha expected\n+replacement\n*** End Patch",
+            "*** Begin Patch\n*** Update File: f.txt\n@@\n-alpha original\n-tail expected\n+replacement\n*** End Patch",
         )
         .await;
 
         assert!(out.is_error);
-        assert!(body(&out).contains("Closest candidate mismatch at line 2:"));
-        assert!(body(&out).contains("expected \"alpha expected\""));
-        assert!(body(&out).contains("actual   \"alpha original\""));
+        assert!(body(&out).contains(
+            "Debug hint: found 1 candidate location(s) for anchor line \"alpha original\"."
+        ));
+        assert!(body(&out).contains("Closest candidate starts at line 2 but differs at line 3:"));
+        assert!(body(&out).contains("expected \"tail expected\""));
+        assert!(body(&out).contains("actual   \"tail\""));
+        assert!(body(&out).contains("    2| alpha original\n    3| tail"));
+    }
+
+    #[test]
+    fn failed_hunk_diagnostics_truncate_each_line() {
+        let anchor = "a".repeat(300);
+        let expected_tail = "e".repeat(300);
+        let actual_tail = "x".repeat(300);
+        let file = vec![anchor.clone(), actual_tail];
+        let expected = vec![anchor, expected_tail];
+        let diagnostic = format!(
+            "Expected to find:\n{}{}",
+            expected_lines(&expected),
+            candidate_mismatch(&file, &expected)
+        );
+
+        assert!(
+            diagnostic
+                .lines()
+                .all(|line| line.chars().count() <= DIAGNOSTIC_LINE_LIMIT)
+        );
+        assert_eq!(diagnostic.matches(TRUNCATION_SUFFIX).count(), 7);
+    }
+
+    #[test]
+    fn failed_hunk_candidate_ties_choose_first_location() {
+        let file = ["anchor", "first", "between", "anchor", "second"]
+            .map(str::to_string)
+            .to_vec();
+        let expected = ["anchor", "expected"].map(str::to_string).to_vec();
+
+        let diagnostic = candidate_mismatch(&file, &expected);
+
+        assert!(diagnostic.contains("Closest candidate starts at line 1"));
+        assert!(diagnostic.contains("actual   \"first\""));
     }
 
     #[tokio::test]
-    async fn accepts_amp_envelope_heredoc_and_top_level_tolerance() {
+    async fn accepts_heredoc_envelope_and_top_level_tolerance() {
         let d = TempDir::new().unwrap();
         let out = run(
             &d,
