@@ -781,6 +781,7 @@ mod tests {
         ModelInfo {
             id: "scripted-test".into(),
             name: "Scripted".into(),
+            family: None,
             api: "scripted".into(),
             provider: "scripted".into(),
             base_url: "scripted://internal".into(),

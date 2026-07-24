@@ -24,6 +24,7 @@ use aj_models::errors::is_context_overflow;
 use aj_models::types::UserContent;
 use aj_session::ConversationLog;
 use aj_session::compaction::should_compact;
+use aj_tools::builtin_tools_for_model;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -31,6 +32,19 @@ use tokio_util::sync::CancellationToken;
 use crate::compaction::run_compaction;
 use crate::session::{AgentLifecycle, SessionCore, SubAgentOverrides};
 use crate::session_setup::RunConfigSnapshot;
+
+fn tools_for_turn(
+    options: &aj_tools::BuiltinToolOptions,
+    disabled: &[String],
+    family: Option<&str>,
+    include_agent_tool: bool,
+) -> Vec<aj_agent::tool::ErasedToolDefinition> {
+    let mut tools = builtin_tools_for_model(options, disabled, family);
+    if !include_agent_tool {
+        tools.retain(|tool| tool.name != "agent");
+    }
+    tools
+}
 
 /// How a turn sequence begins.
 pub enum TurnStart {
@@ -117,6 +131,12 @@ pub fn apply_turn_config(
                 Arc::clone(&cfg.model_info),
                 stream_options,
             );
+            agent.set_tools(tools_for_turn(
+                &cfg.tool_options,
+                &cfg.disabled_tools,
+                cfg.model_info.family.as_deref(),
+                true,
+            ));
             agent.set_default_thinking(cfg.thinking.clone());
             agent.set_speed(cfg.speed);
         }
@@ -124,11 +144,14 @@ pub fn apply_turn_config(
             // Base session key used to scope the sub-agent's bundle
             // below. Cloned out so we don't hold the run-config lock
             // while taking the sub-overrides lock.
-            let base_session_id = run_config
-                .lock()
-                .expect("run config mutex poisoned")
-                .session_id
-                .clone();
+            let (base_session_id, tool_options, disabled_tools) = {
+                let cfg = run_config.lock().expect("run config mutex poisoned");
+                (
+                    cfg.session_id.clone(),
+                    cfg.tool_options.clone(),
+                    cfg.disabled_tools.clone(),
+                )
+            };
             let overrides = sub_overrides.lock().expect("sub overrides mutex poisoned");
             let Some(entry) = overrides.get(&n) else {
                 return;
@@ -144,6 +167,12 @@ pub fn apply_turn_config(
                     stream_options.session_id = Some(sub_agent_session_id(base, n));
                 }
                 agent.set_provider(Arc::clone(provider), Arc::clone(model_info), stream_options);
+                agent.set_tools(tools_for_turn(
+                    &tool_options,
+                    &disabled_tools,
+                    model_info.family.as_deref(),
+                    false,
+                ));
             }
             if let Some(thinking) = &entry.thinking {
                 agent.set_default_thinking(thinking.clone());
@@ -528,7 +557,7 @@ mod tests {
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
-    use super::{OVERFLOW_GIVEUP, TurnPolicy, TurnStart, drive_turn};
+    use super::{OVERFLOW_GIVEUP, TurnPolicy, TurnStart, drive_turn, tools_for_turn};
     use crate::compaction::{CompactionOutcome, run_compaction};
     use crate::test_support::{
         build_test_agent, finalized_text_message, finalized_text_message_with_usage,
@@ -574,6 +603,21 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn turn_tools_switch_editors_without_restoring_agent_to_subagents() {
+        let options = aj_tools::BuiltinToolOptions::default();
+        let gpt = tools_for_turn(&options, &[], Some("gpt-codex"), true);
+        assert!(gpt.iter().any(|tool| tool.name == "agent"));
+        assert!(gpt.iter().any(|tool| tool.name == "apply_patch"));
+        assert!(gpt.iter().all(|tool| tool.name != "edit_file"));
+
+        let sub = tools_for_turn(&options, &[], Some("claude-sonnet"), false);
+        assert!(sub.iter().all(|tool| tool.name != "agent"));
+        assert!(sub.iter().all(|tool| tool.name != "apply_patch"));
+        assert!(sub.iter().any(|tool| tool.name == "edit_file"));
+        assert!(sub.iter().any(|tool| tool.name == "write_file"));
     }
 
     /// A turn that overflows then succeeds on the recovery retry settles

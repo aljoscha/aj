@@ -129,6 +129,10 @@ pub struct ModelInfo {
     pub id: String,
     /// Human-readable name (e.g. "Claude Sonnet 4").
     pub name: String,
+    /// models.dev's family category. Used to select model-specific
+    /// behavior, such as which editing tool to expose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
     /// API type. One of "anthropic-messages", "openai-completions", or
     /// "openai-responses". Each `(provider, id)` pair has exactly one
     /// `api` — there is no duplication.
@@ -183,7 +187,7 @@ pub struct ModelInfo {
 /// differs is ignored in favour of the bundled seed (see
 /// [`load_active_catalog`]), so an incompatible or stale cache is a clean
 /// miss rather than a subtle bug.
-pub const CATALOG_SCHEMA_VERSION: u32 = 2;
+pub const CATALOG_SCHEMA_VERSION: u32 = 3;
 
 /// On-disk catalog format shared by the bundled seed and the user cache.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -235,6 +239,8 @@ pub struct OverrideTarget {
 pub struct OverridePatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -742,6 +748,9 @@ pub(crate) fn apply_override(models: &mut [ModelInfo], entry: &OverrideEntry) {
     if let Some(v) = &p.name {
         model.name = v.clone();
     }
+    if let Some(v) = &p.family {
+        model.family = Some(v.clone());
+    }
     if let Some(v) = &p.api {
         model.api = v.clone();
     }
@@ -784,6 +793,7 @@ mod tests {
         ModelInfo {
             id: id.into(),
             name: id.into(),
+            family: None,
             api: "anthropic-messages".into(),
             provider: provider.into(),
             base_url: "https://example.invalid".into(),
@@ -869,6 +879,7 @@ mod tests {
                     id: "claude-opus".into(),
                 },
                 patch: OverridePatch {
+                    family: Some("claude-opus".into()),
                     reasoning_options: Some(vec![ReasoningOption::Effort {
                         values: vec![ThinkingLevel::Low],
                     }]),
@@ -889,6 +900,7 @@ mod tests {
         // The Effort control the override installs makes the Anthropic
         // model derive as adaptive.
         assert!(supports_adaptive_thinking(m));
+        assert_eq!(m.family.as_deref(), Some("claude-opus"));
         assert_eq!(m.cost.cache_read, 0.5);
         // Untouched fields remain.
         assert_eq!(m.context_window, 200_000);
@@ -1123,6 +1135,27 @@ mod tests {
         let cat: Catalog = serde_json::from_str(json).expect("parses");
         assert_eq!(cat.schema_version, 0);
         assert_ne!(cat.schema_version, CATALOG_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn schema_two_cache_is_rejected() {
+        let json = r#"{"schema_version":2,"updated_at":0,"source":"old","models":[]}"#;
+        let cat: Catalog = serde_json::from_str(json).expect("parses");
+        assert_ne!(cat.schema_version, CATALOG_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn family_serde_defaults_and_skips_none() {
+        let model = sample_model("anthropic", "claude-x");
+        let json = serde_json::to_string(&model).expect("serializes");
+        assert!(!json.contains("family"));
+        let without_family: ModelInfo = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(without_family.family, None);
+
+        let mut value = serde_json::to_value(&model).expect("serializes");
+        value["family"] = serde_json::json!("claude-sonnet");
+        let back: ModelInfo = serde_json::from_value(value).expect("deserializes");
+        assert_eq!(back.family.as_deref(), Some("claude-sonnet"));
     }
 
     #[test]
@@ -1420,6 +1453,7 @@ mod tests {
         let mut models = vec![ModelInfo {
             id: "gpt-5.5".into(),
             name: "gpt-5.5 (from cache)".into(),
+            family: None,
             api: "openai-codex-responses".into(),
             provider: CODEX_PROVIDER_ID.into(),
             base_url: "https://chatgpt.com/backend-api".into(),
@@ -1467,6 +1501,7 @@ mod tests {
         let stray = ModelInfo {
             id: "claude-zoo".into(),
             name: "Claude Zoo".into(),
+            family: None,
             api: "anthropic-messages".into(),
             provider: "anthropic".into(),
             base_url: "https://api.anthropic.com".into(),

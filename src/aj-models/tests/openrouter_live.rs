@@ -25,6 +25,7 @@ fn model() -> ModelInfo {
     ModelInfo {
         id: MODEL_ID.into(),
         name: MODEL_ID.into(),
+        family: None,
         api: "openai-responses".into(),
         provider: "openrouter".into(),
         base_url: "https://openrouter.ai/api/v1".into(),

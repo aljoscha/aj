@@ -1,11 +1,12 @@
 {
-  "schema_version": 2,
-  "updated_at": 1784562737707,
+  "schema_version": 3,
+  "updated_at": 1784887308240,
   "source": "models.dev",
   "models": [
     {
       "id": "claude-fable-5",
       "name": "Claude Fable 5",
+      "family": "claude-fable",
       "api": "anthropic-messages",
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
@@ -39,6 +40,7 @@
     {
       "id": "claude-haiku-4-5",
       "name": "Claude Haiku 4.5 (latest)",
+      "family": "claude-haiku",
       "api": "anthropic-messages",
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
@@ -66,6 +68,7 @@
     {
       "id": "claude-haiku-4-5-20251001",
       "name": "Claude Haiku 4.5",
+      "family": "claude-haiku",
       "api": "anthropic-messages",
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
@@ -93,6 +96,7 @@
     {
       "id": "claude-opus-4-1",
       "name": "Claude Opus 4.1 (latest)",
+      "family": "claude-opus",
       "api": "anthropic-messages",
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
@@ -120,6 +124,7 @@
     {
       "id": "claude-opus-4-1-20250805",
       "name": "Claude Opus 4.1",
+      "family": "claude-opus",
       "api": "anthropic-messages",
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
@@ -147,6 +152,7 @@
     {
       "id": "claude-opus-4-5",
       "name": "Claude Opus 4.5 (latest)",
+      "family": "claude-opus",
       "api": "anthropic-messages",
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
@@ -182,6 +188,7 @@
     {
       "id": "claude-opus-4-5-20251101",
       "name": "Claude Opus 4.5",
+      "family": "claude-opus",
       "api": "anthropic-messages",
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
@@ -217,6 +224,7 @@
     {
       "id": "claude-opus-4-6",
       "name": "Claude Opus 4.6",
+      "family": "claude-opus",
       "api": "anthropic-messages",
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
@@ -253,6 +261,7 @@
     {
       "id": "claude-opus-4-7",
       "name": "Claude Opus 4.7",
+      "family": "claude-opus",
       "api": "anthropic-messages",
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
@@ -286,6 +295,7 @@
     {
       "id": "claude-opus-4-8",
       "name": "Claude Opus 4.8",
+      "family": "claude-opus",
       "api": "anthropic-messages",
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
@@ -319,6 +329,7 @@
     {
       "id": "claude-sonnet-4-5",
       "name": "Claude Sonnet 4.5 (latest)",
+      "family": "claude-sonnet",
       "api": "anthropic-messages",
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
@@ -346,6 +357,7 @@
     {
       "id": "claude-sonnet-4-5-20250929",
       "name": "Claude Sonnet 4.5",
+      "family": "claude-sonnet",
       "api": "anthropic-messages",
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
@@ -373,6 +385,7 @@
     {
       "id": "claude-sonnet-4-6",
       "name": "Claude Sonnet 4.6",
+      "family": "claude-sonnet",
       "api": "anthropic-messages",
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
@@ -409,6 +422,7 @@
     {
       "id": "claude-sonnet-5",
       "name": "Claude Sonnet 5",
+      "family": "claude-sonnet",
       "api": "anthropic-messages",
       "provider": "anthropic",
       "base_url": "https://api.anthropic.com",
@@ -445,6 +459,7 @@
     {
       "id": "gpt-4",
       "name": "GPT-4",
+      "family": "gpt",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -465,6 +480,7 @@
     {
       "id": "gpt-4-turbo",
       "name": "GPT-4 Turbo",
+      "family": "gpt",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -486,6 +502,7 @@
     {
       "id": "gpt-4.1",
       "name": "GPT-4.1",
+      "family": "gpt",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -507,6 +524,7 @@
     {
       "id": "gpt-4.1-mini",
       "name": "GPT-4.1 mini",
+      "family": "gpt-mini",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -528,6 +546,7 @@
     {
       "id": "gpt-4.1-nano",
       "name": "GPT-4.1 nano",
+      "family": "gpt-nano",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -549,6 +568,7 @@
     {
       "id": "gpt-4o",
       "name": "GPT-4o",
+      "family": "gpt",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -570,6 +590,7 @@
     {
       "id": "gpt-4o-2024-05-13",
       "name": "GPT-4o (2024-05-13)",
+      "family": "gpt",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -591,6 +612,7 @@
     {
       "id": "gpt-4o-2024-08-06",
       "name": "GPT-4o (2024-08-06)",
+      "family": "gpt",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -612,6 +634,7 @@
     {
       "id": "gpt-4o-2024-11-20",
       "name": "GPT-4o (2024-11-20)",
+      "family": "gpt",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -633,6 +656,7 @@
     {
       "id": "gpt-4o-mini",
       "name": "GPT-4o mini",
+      "family": "gpt-mini",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -654,6 +678,7 @@
     {
       "id": "gpt-5",
       "name": "GPT-5",
+      "family": "gpt",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -686,6 +711,7 @@
     {
       "id": "gpt-5-codex",
       "name": "GPT-5-Codex",
+      "family": "gpt-codex",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -717,6 +743,7 @@
     {
       "id": "gpt-5-mini",
       "name": "GPT-5 Mini",
+      "family": "gpt-mini",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -749,6 +776,7 @@
     {
       "id": "gpt-5-nano",
       "name": "GPT-5 Nano",
+      "family": "gpt-nano",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -781,6 +809,7 @@
     {
       "id": "gpt-5-pro",
       "name": "GPT-5 Pro",
+      "family": "gpt-pro",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -810,6 +839,7 @@
     {
       "id": "gpt-5.1",
       "name": "GPT-5.1",
+      "family": "gpt",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -842,6 +872,7 @@
     {
       "id": "gpt-5.1-chat-latest",
       "name": "GPT-5.1 Chat",
+      "family": "gpt-codex",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -871,6 +902,7 @@
     {
       "id": "gpt-5.1-codex",
       "name": "GPT-5.1 Codex",
+      "family": "gpt-codex",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -902,6 +934,7 @@
     {
       "id": "gpt-5.1-codex-max",
       "name": "GPT-5.1 Codex Max",
+      "family": "gpt-codex",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -934,6 +967,7 @@
     {
       "id": "gpt-5.1-codex-mini",
       "name": "GPT-5.1 Codex mini",
+      "family": "gpt-codex",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -965,6 +999,7 @@
     {
       "id": "gpt-5.2",
       "name": "GPT-5.2",
+      "family": "gpt",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -998,6 +1033,7 @@
     {
       "id": "gpt-5.2-chat-latest",
       "name": "GPT-5.2 Chat",
+      "family": "gpt-codex",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -1027,6 +1063,7 @@
     {
       "id": "gpt-5.2-codex",
       "name": "GPT-5.2 Codex",
+      "family": "gpt-codex",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -1059,6 +1096,7 @@
     {
       "id": "gpt-5.2-pro",
       "name": "GPT-5.2 Pro",
+      "family": "gpt-pro",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -1090,6 +1128,7 @@
     {
       "id": "gpt-5.3-chat-latest",
       "name": "GPT-5.3 Chat (latest)",
+      "family": "gpt",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -1111,6 +1150,7 @@
     {
       "id": "gpt-5.3-codex",
       "name": "GPT-5.3 Codex",
+      "family": "gpt-codex",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -1144,6 +1184,7 @@
     {
       "id": "gpt-5.3-codex-spark",
       "name": "GPT-5.3 Codex Spark",
+      "family": "gpt-codex-spark",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -1177,6 +1218,7 @@
     {
       "id": "gpt-5.4",
       "name": "GPT-5.4",
+      "family": "gpt",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -1219,6 +1261,7 @@
     {
       "id": "gpt-5.4-mini",
       "name": "GPT-5.4 mini",
+      "family": "gpt-mini",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -1252,6 +1295,7 @@
     {
       "id": "gpt-5.4-nano",
       "name": "GPT-5.4 nano",
+      "family": "gpt-nano",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -1285,6 +1329,7 @@
     {
       "id": "gpt-5.4-pro",
       "name": "GPT-5.4 Pro",
+      "family": "gpt-pro",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -1325,6 +1370,7 @@
     {
       "id": "gpt-5.5",
       "name": "GPT-5.5",
+      "family": "gpt",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -1367,6 +1413,7 @@
     {
       "id": "gpt-5.5-pro",
       "name": "GPT-5.5 Pro",
+      "family": "gpt-pro",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -1407,6 +1454,7 @@
     {
       "id": "gpt-5.6",
       "name": "GPT-5.6",
+      "family": "gpt-sol",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -1450,6 +1498,7 @@
     {
       "id": "gpt-5.6-luna",
       "name": "GPT-5.6 Luna",
+      "family": "gpt-luna",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -1493,6 +1542,7 @@
     {
       "id": "gpt-5.6-sol",
       "name": "GPT-5.6 Sol",
+      "family": "gpt-sol",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -1536,6 +1586,7 @@
     {
       "id": "gpt-5.6-terra",
       "name": "GPT-5.6 Terra",
+      "family": "gpt-terra",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -1579,6 +1630,7 @@
     {
       "id": "gpt-realtime-2.1",
       "name": "GPT-Realtime-2.1",
+      "family": "gpt",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -1612,6 +1664,7 @@
     {
       "id": "o1",
       "name": "o1",
+      "family": "o",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -1643,6 +1696,7 @@
     {
       "id": "o1-pro",
       "name": "o1-pro",
+      "family": "o-pro",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -1674,6 +1728,7 @@
     {
       "id": "o3",
       "name": "o3",
+      "family": "o",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -1705,6 +1760,7 @@
     {
       "id": "o3-deep-research",
       "name": "o3-deep-research",
+      "family": "o",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -1734,6 +1790,7 @@
     {
       "id": "o3-mini",
       "name": "o3-mini",
+      "family": "o-mini",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -1764,6 +1821,7 @@
     {
       "id": "o3-pro",
       "name": "o3-pro",
+      "family": "o-pro",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -1795,6 +1853,7 @@
     {
       "id": "o4-mini",
       "name": "o4-mini",
+      "family": "o-mini",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",
@@ -1826,6 +1885,7 @@
     {
       "id": "o4-mini-deep-research",
       "name": "o4-mini-deep-research",
+      "family": "o-mini",
       "api": "openai-responses",
       "provider": "openai",
       "base_url": "https://api.openai.com/v1",

@@ -525,6 +525,7 @@ mod tests {
         ModelInfo {
             id: id.into(),
             name: id.into(),
+            family: None,
             api: api.into(),
             provider: provider.into(),
             base_url: "https://example.test".into(),

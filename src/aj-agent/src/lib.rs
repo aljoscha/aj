@@ -727,6 +727,26 @@ impl Agent {
         self.stream_options = stream_options;
     }
 
+    /// Replace the complete active tool catalog mid-session.
+    ///
+    /// The provider-facing definitions and executable lookup are rebuilt
+    /// together so a model switch cannot advertise stale tools or execute a
+    /// tool that is no longer visible to the model.
+    pub fn set_tools(&mut self, tools: Vec<ErasedToolDefinition>) {
+        self.tools = tools
+            .iter()
+            .map(|tool| UnifiedToolDefinition {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters: tool.input_schema.clone(),
+            })
+            .collect();
+        self.tool_definitions = tools
+            .into_iter()
+            .map(|tool| (tool.name.clone(), tool))
+            .collect();
+    }
+
     /// Borrow the agent's current default thinking configuration.
     ///
     /// `None` means "no extended thinking". The selector overlays in
@@ -3567,6 +3587,7 @@ mod event_protocol_tests {
         ModelInfo {
             id: SCRIPT_MODEL.to_string(),
             name: SCRIPT_MODEL.to_string(),
+            family: None,
             api: SCRIPT_API.to_string(),
             provider: SCRIPT_PROVIDER.to_string(),
             base_url: "scripted://internal".to_string(),
@@ -3959,6 +3980,19 @@ mod event_protocol_tests {
             ..AgentSeed::default()
         });
         agent
+    }
+
+    #[test]
+    fn set_tools_replaces_wire_and_execution_catalogs_together() {
+        let ping: ErasedToolDefinition = PingTool.into();
+        let mut agent = build_agent(Vec::new(), vec![ping]);
+        assert_eq!(agent.tools.len(), 1);
+        assert!(agent.tool_definitions.contains_key("ping"));
+
+        agent.set_tools(Vec::new());
+
+        assert!(agent.tools.is_empty());
+        assert!(agent.tool_definitions.is_empty());
     }
 
     #[test]

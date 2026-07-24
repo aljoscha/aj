@@ -794,6 +794,7 @@ mod tests {
         ModelInfo {
             id: id.into(),
             name: id.into(),
+            family: None,
             api: API_NAME.into(),
             provider: "openai-codex".into(),
             base_url: DEFAULT_BASE_URL.into(),

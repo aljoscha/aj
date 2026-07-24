@@ -86,6 +86,7 @@ fn scripted_model_info(name: &str) -> ModelInfo {
     ModelInfo {
         id: format!("scripted/{name}"),
         name: format!("scripted: {name}"),
+        family: None,
         api: "scripted".to_string(),
         provider: "scripted".to_string(),
         base_url: "scripted://internal".to_string(),

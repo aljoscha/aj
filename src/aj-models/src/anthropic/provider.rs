@@ -1416,6 +1416,7 @@ mod tests {
         ModelInfo {
             id: "claude-sonnet-4".into(),
             name: "Claude Sonnet 4".into(),
+            family: None,
             api: API_NAME.into(),
             provider: "anthropic".into(),
             base_url: "https://api.anthropic.com".into(),

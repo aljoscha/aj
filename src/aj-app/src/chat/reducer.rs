@@ -2665,6 +2665,7 @@ mod tests {
         let catalog_model = ModelInfo {
             id: "gpt-sub".into(),
             name: "gpt-sub".into(),
+            family: None,
             api: "anthropic-messages".into(),
             provider: "openai".into(),
             base_url: "https://example.invalid".into(),

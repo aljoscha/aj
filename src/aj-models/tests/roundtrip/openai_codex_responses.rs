@@ -53,6 +53,7 @@ fn fixture_model() -> ModelInfo {
     ModelInfo {
         id: "gpt-5.1".into(),
         name: "GPT-5.1".into(),
+        family: None,
         api: API_NAME.into(),
         provider: PROVIDER_ID.into(),
         base_url: "https://chatgpt.com/backend-api".into(),

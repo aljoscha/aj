@@ -58,6 +58,7 @@ fn target_model(provider: &str, api: &str, id: &str) -> ModelInfo {
     ModelInfo {
         id: id.into(),
         name: id.into(),
+        family: None,
         api: api.into(),
         provider: provider.into(),
         base_url: "https://example.test".into(),

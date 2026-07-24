@@ -30,6 +30,7 @@ pub use sanitize::sanitize_terminal_output;
 use aj_agent::tool::ErasedToolDefinition;
 
 pub use tools::agent::AgentTool;
+pub use tools::apply_patch::ApplyPatchTool;
 pub use tools::bash::BashTool;
 pub use tools::edit_file::EditFileTool;
 pub use tools::read_file::ReadFileTool;
@@ -67,6 +68,7 @@ impl Default for BuiltinToolOptions {
 pub fn get_builtin_tools(options: &BuiltinToolOptions) -> Vec<ErasedToolDefinition> {
     vec![
         AgentTool.into(),
+        ApplyPatchTool.into(),
         BashTool::with_rtk(options.bash_rtk).into(),
         ReadFileTool::with_auto_resize(options.image_auto_resize).into(),
         WriteFileTool.into(),
@@ -76,6 +78,34 @@ pub fn get_builtin_tools(options: &BuiltinToolOptions) -> Vec<ErasedToolDefiniti
         TodoReadTool.into(),
         TodoWriteTool.into(),
     ]
+}
+
+/// Whether a models.dev family uses the Codex patch editing workflow.
+pub fn uses_apply_patch(family: Option<&str>) -> bool {
+    family.is_some_and(|family| family == "gpt" || family.starts_with("gpt-"))
+}
+
+/// Build the builtin catalog for a model family and apply the user's
+/// disabled-tools set.
+///
+/// GPT-family models get the Codex-style patch tool. Other families keep
+/// the string-replacement and whole-file editors they are trained to use.
+pub fn builtin_tools_for_model(
+    options: &BuiltinToolOptions,
+    disabled: &[String],
+    family: Option<&str>,
+) -> Vec<ErasedToolDefinition> {
+    let patch_editor =
+        uses_apply_patch(family) && !disabled.iter().any(|name| name == "apply_patch");
+    let mut tools = get_builtin_tools(options);
+    tools.retain(|tool| {
+        if patch_editor {
+            tool.name != "edit_file" && tool.name != "write_file"
+        } else {
+            tool.name != "apply_patch"
+        }
+    });
+    filter_disabled(tools, disabled)
 }
 
 /// Build the builtin tool catalog with the user's disabled tools
@@ -91,7 +121,13 @@ pub fn builtin_tools(
     options: &BuiltinToolOptions,
     disabled: &[String],
 ) -> Vec<ErasedToolDefinition> {
-    let mut tools = get_builtin_tools(options);
+    filter_disabled(get_builtin_tools(options), disabled)
+}
+
+fn filter_disabled(
+    mut tools: Vec<ErasedToolDefinition>,
+    disabled: &[String],
+) -> Vec<ErasedToolDefinition> {
     if !disabled.is_empty() {
         tools.retain(|tool| !disabled.contains(&tool.name));
         tracing::info!(?disabled, "filtered disabled tools");
@@ -135,5 +171,29 @@ mod tests {
         let opts = BuiltinToolOptions::default();
         let tools = builtin_tools(&opts, &["no_such_tool".to_string()]);
         assert_eq!(tools.len(), get_builtin_tools(&opts).len());
+    }
+
+    #[test]
+    fn model_family_selects_one_editing_workflow() {
+        let opts = BuiltinToolOptions::default();
+        let gpt = builtin_tools_for_model(&opts, &[], Some("gpt-codex"));
+        assert!(gpt.iter().any(|tool| tool.name == "apply_patch"));
+        assert!(
+            gpt.iter()
+                .all(|tool| tool.name != "edit_file" && tool.name != "write_file")
+        );
+        assert!(uses_apply_patch(Some("gpt-sol")));
+        assert!(uses_apply_patch(Some("gpt-mini")));
+
+        let claude = builtin_tools_for_model(&opts, &[], Some("claude-opus"));
+        assert!(claude.iter().all(|tool| tool.name != "apply_patch"));
+        assert!(claude.iter().any(|tool| tool.name == "edit_file"));
+        assert!(claude.iter().any(|tool| tool.name == "write_file"));
+
+        let patch_disabled =
+            builtin_tools_for_model(&opts, &["apply_patch".to_string()], Some("gpt-codex"));
+        assert!(patch_disabled.iter().all(|tool| tool.name != "apply_patch"));
+        assert!(patch_disabled.iter().any(|tool| tool.name == "edit_file"));
+        assert!(patch_disabled.iter().any(|tool| tool.name == "write_file"));
     }
 }

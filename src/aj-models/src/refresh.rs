@@ -135,6 +135,8 @@ struct RawModel {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
+    family: Option<String>,
+    #[serde(default)]
     tool_call: Option<bool>,
     #[serde(default)]
     reasoning: Option<bool>,
@@ -707,6 +709,7 @@ fn map_model(fixed: &ProviderFixedValues, id: &str, m: &RawModel) -> ModelInfo {
     ModelInfo {
         id: id.to_string(),
         name: m.name.clone().unwrap_or_else(|| id.to_string()),
+        family: m.family.clone(),
         api: fixed.api.to_string(),
         provider: fixed.provider_id.to_string(),
         base_url: fixed.base_url.to_string(),
@@ -750,6 +753,8 @@ fn map_openrouter_model(m: &OpenRouterModel) -> ModelInfo {
     ModelInfo {
         id: m.id.clone(),
         name: m.name.clone().unwrap_or_else(|| m.id.clone()),
+        // OpenRouter's DTO has no authoritative models.dev family.
+        family: None,
         api: OPENROUTER_API.to_string(),
         provider: OPENROUTER_PROVIDER_ID.to_string(),
         base_url: OPENROUTER_BASE_URL.to_string(),
@@ -918,6 +923,7 @@ mod tests {
             "models": {
                 "claude-test-tool": {
                     "name": "Claude Test (Tool)",
+                    "family": "claude-sonnet",
                     "tool_call": true,
                     "reasoning": true,
                     "reasoning_options": [
@@ -1014,6 +1020,7 @@ mod tests {
             .find(|m| m.id == "claude-test-tool")
             .expect("claude entry present");
         assert_eq!(claude.api, "anthropic-messages");
+        assert_eq!(claude.family.as_deref(), Some("claude-sonnet"));
         assert_eq!(claude.base_url, "https://api.anthropic.com");
         assert!(claude.reasoning);
         // An Anthropic model advertising an effort control derives as adaptive.
@@ -1318,6 +1325,7 @@ mod tests {
             .find(|m| m.id == "vendor/reasoner-1")
             .expect("reasoner present");
         assert_eq!(reasoner.api, "openai-responses");
+        assert_eq!(reasoner.family, None);
         assert_eq!(reasoner.base_url, "https://openrouter.ai/api/v1");
         assert!(reasoner.reasoning);
         // OpenRouter models are never Anthropic-adaptive, whatever their

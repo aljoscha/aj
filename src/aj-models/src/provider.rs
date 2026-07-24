@@ -178,6 +178,7 @@ mod tests {
         ModelInfo {
             id: "fake-model-1".into(),
             name: "Fake".into(),
+            family: None,
             api: api.into(),
             provider: "fake".into(),
             base_url: "https://example.invalid".into(),

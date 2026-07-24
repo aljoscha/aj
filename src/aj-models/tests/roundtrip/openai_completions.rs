@@ -56,6 +56,7 @@ fn fixture_model() -> ModelInfo {
     ModelInfo {
         id: "gpt-4o".into(),
         name: "GPT-4o".into(),
+        family: None,
         api: "openai-completions".into(),
         provider: "openai".into(),
         base_url: "https://api.openai.com/v1".into(),

@@ -44,6 +44,7 @@ fn fixture_model() -> ModelInfo {
     ModelInfo {
         id: "claude-sonnet-4-20250514".into(),
         name: "Claude Sonnet 4".into(),
+        family: None,
         api: "anthropic-messages".into(),
         provider: "anthropic".into(),
         base_url: "https://api.anthropic.com".into(),

@@ -27,7 +27,7 @@ use aj_models::{
 use aj_session::{
     ConversationLog, ConversationPersistence, EntryId, ThreadFilter, repair_interrupted_tool_uses,
 };
-use aj_tools::{BuiltinToolOptions, builtin_tools};
+use aj_tools::{BuiltinToolOptions, builtin_tools_for_model};
 use anyhow::{Context, Result};
 
 use crate::SYSTEM_PROMPT;
@@ -82,6 +82,11 @@ pub struct RunConfigSnapshot {
     /// `stream_options` from registry defaults, which would otherwise
     /// drop it. `None` until the log is opened in [`prepare_log`].
     pub session_id: Option<String>,
+    /// Construction options reused when a model switch rebuilds the active
+    /// family-specific tool catalog.
+    pub tool_options: BuiltinToolOptions,
+    /// User-disabled tool names applied after family-specific tool selection.
+    pub disabled_tools: Vec<String>,
 }
 
 /// Dependencies for resume-time settings restoration: the model
@@ -117,6 +122,11 @@ fn build_run_config(
         // Filled in by `prepare_log` once the log (and thus the session
         // id) exists; the initial resolve runs before then.
         session_id: None,
+        tool_options: BuiltinToolOptions {
+            image_auto_resize: config.image_auto_resize,
+            bash_rtk: config.bash_rtk,
+        },
+        disabled_tools: config.disabled_tools.clone(),
     }
 }
 
@@ -343,12 +353,13 @@ pub fn build_agent(
     thinking: Option<ThinkingConfig>,
     speed: Option<Speed>,
 ) -> BuiltAgent {
-    let tools = builtin_tools(
+    let tools = builtin_tools_for_model(
         &BuiltinToolOptions {
             image_auto_resize: config.image_auto_resize,
             bash_rtk: config.bash_rtk,
         },
         &config.disabled_tools,
+        model_info.family.as_deref(),
     );
     let include_skills = tools.iter().any(|tool| tool.name == "read_file");
     let env = AgentEnv::new(SYSTEM_PROMPT, &config.disabled_skills);
