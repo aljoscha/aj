@@ -1,0 +1,35 @@
+Apply a patch to one or more files using the Codex patch format.
+
+You MUST read an existing file before patching it.
+
+Wrap the patch in `*** Begin Patch` and `*** End Patch`. Each file operation
+starts with one of these headers:
+
+- `*** Add File: <path>` creates a file. Prefix every content line with `+`.
+- `*** Delete File: <path>` deletes a file. Nothing follows the header.
+- `*** Update File: <path>` updates a file. It may be followed by
+  `*** Move to: <new path>` to rename it.
+
+An update contains one or more hunks starting with `@@`, optionally followed by
+a class, function, or other selector. Within a hunk, prefix unchanged context
+with a space, removed lines with `-`, and added lines with `+`.
+
+Include at least 3 unchanged lines before and after a change when available.
+Use enough context or a selector to identify the location uniquely. Do not
+repeat overlapping context between adjacent hunks. Use `*** End of File` after
+a hunk that must match the end of the file.
+
+Multiple file operations may appear in one patch. Paths may be relative or
+absolute.
+
+Example:
+```
+*** Begin Patch
+*** Update File: src/utils.ts
+@@ export function label
+ export function label(value: string) {
+-  return value
++  return value.trim()
+ }
+*** End Patch
+```

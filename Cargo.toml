@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "evals/apply-patch-description",
     "src/aj",
     "src/aj-agent",
     "src/aj-app",

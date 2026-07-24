@@ -1,0 +1,19 @@
+[package]
+name = "aj-apply-patch-eval"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aj-agent = { path = "../../src/aj-agent" }
+aj-tools = { path = "../../src/aj-tools" }
+
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
