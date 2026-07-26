@@ -42,44 +42,397 @@ pub struct RiskDifferenceBounds {
     pub alpha: f64,
 }
 
-/// Computes a conservative fixed-stratum paired risk-difference bound.
+const ONE_SIDED_95_Z: f64 = 1.644_853_626_951_472_2;
+const OPTIMIZER_TOLERANCE: f64 = 1e-12;
+const MAX_OPTIMIZER_ITERATIONS: usize = 128;
+const COMPONENT_SEARCH_STEPS: usize = 128;
+
+#[derive(Clone, Copy, Debug)]
+struct BinaryCounts {
+    n00: f64,
+    n01: f64,
+    n10: f64,
+    n11: f64,
+    weight: f64,
+}
+
+impl BinaryCounts {
+    fn pairs(self) -> f64 {
+        self.n00 + self.n01 + self.n10 + self.n11
+    }
+
+    fn estimate(self) -> f64 {
+        (self.n01 - self.n10) / self.pairs()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NuisanceEstimate {
+    difference: f64,
+    discordance: f64,
+}
+
+/// Computes the fixed-archetype paired profile-score bounds.
 ///
-/// The bound applies Hoeffding's concentration inequality to paired differences in
-/// `[-1, 1]`, with each archetype's declared fixed weight. It is
-/// distribution-free and intentionally conservative. Unlike a plug-in normal
-/// interval, it retains nonzero uncertainty when all paired outcomes agree.
+/// The multinomial nuisance parameters are fitted under each candidate weighted
+/// risk difference. The returned lower and upper limits are both one-sided 95%
+/// bounds from the acceptance component containing the point estimate.
 pub fn paired_risk_difference_bounds(
     strata: &[BinaryStratum],
     alpha: f64,
 ) -> Result<RiskDifferenceBounds, StatisticsError> {
     validate_alpha(alpha)?;
+    if (alpha - 0.05).abs() > f64::EPSILON {
+        return Err(StatisticsError(
+            "paired profile-score bounds are predeclared only for alpha = 0.05".into(),
+        ));
+    }
     validate_weights(
         strata
             .iter()
             .map(|stratum| (stratum.weight, stratum.pairs.len())),
     )?;
-    let estimate = strata
+    let counts = strata.iter().map(binary_counts).collect::<Vec<_>>();
+    let estimate = counts
         .iter()
-        .map(|stratum| {
-            let difference_sum = stratum
-                .pairs
-                .iter()
-                .map(|pair| f64::from(pair.compact) - f64::from(pair.current))
-                .sum::<f64>();
-            stratum.weight * difference_sum / usize_as_f64(stratum.pairs.len())
-        })
+        .map(|stratum| stratum.weight * stratum.estimate())
         .sum::<f64>();
-    let variance_proxy = strata
-        .iter()
-        .map(|stratum| stratum.weight.powi(2) / usize_as_f64(stratum.pairs.len()))
-        .sum::<f64>();
-    let radius = (2.0 * variance_proxy * (1.0 / alpha).ln()).sqrt();
+    if !estimate.is_finite() || !(-1.0..=1.0).contains(&estimate) {
+        return Err(StatisticsError(
+            "paired risk-difference estimate is not finite or feasible".into(),
+        ));
+    }
+    let lower = invert_profile_score(&counts, estimate, -1.0)?;
+    let upper = invert_profile_score(&counts, estimate, 1.0)?;
     Ok(RiskDifferenceBounds {
         estimate,
-        lower: (estimate - radius).max(-1.0),
-        upper: (estimate + radius).min(1.0),
+        lower,
+        upper,
         alpha,
     })
+}
+
+/// Tests whether the one-sided profile-score upper bound excludes `margin`.
+///
+/// This is the decision-equivalent form of inverting the production score test.
+#[cfg(test)]
+fn paired_upper_bound_below(
+    strata: &[BinaryStratum],
+    margin: f64,
+    alpha: f64,
+) -> Result<bool, StatisticsError> {
+    validate_alpha(alpha)?;
+    if (alpha - 0.05).abs() > f64::EPSILON || !(-1.0..=1.0).contains(&margin) {
+        return Err(StatisticsError(
+            "paired profile-score decisions require alpha = 0.05 and a feasible margin".into(),
+        ));
+    }
+    validate_weights(
+        strata
+            .iter()
+            .map(|stratum| (stratum.weight, stratum.pairs.len())),
+    )?;
+    let counts = strata.iter().map(binary_counts).collect::<Vec<_>>();
+    let estimate = counts
+        .iter()
+        .map(|stratum| stratum.weight * stratum.estimate())
+        .sum::<f64>();
+    if estimate >= margin {
+        return Ok(false);
+    }
+    Ok(profile_score_magnitude(&counts, estimate, margin)? > ONE_SIDED_95_Z)
+}
+
+fn binary_counts(stratum: &BinaryStratum) -> BinaryCounts {
+    let mut counts = BinaryCounts {
+        n00: 0.0,
+        n01: 0.0,
+        n10: 0.0,
+        n11: 0.0,
+        weight: stratum.weight,
+    };
+    for pair in &stratum.pairs {
+        match (pair.current, pair.compact) {
+            (false, false) => counts.n00 += 1.0,
+            (false, true) => counts.n01 += 1.0,
+            (true, false) => counts.n10 += 1.0,
+            (true, true) => counts.n11 += 1.0,
+        }
+    }
+    counts
+}
+
+fn invert_profile_score(
+    counts: &[BinaryCounts],
+    estimate: f64,
+    endpoint: f64,
+) -> Result<f64, StatisticsError> {
+    if estimate == endpoint {
+        return Ok(endpoint);
+    }
+
+    let mut accepted = estimate;
+    let mut rejected = endpoint;
+    let distance = endpoint - estimate;
+    for step in 1..=COMPONENT_SEARCH_STEPS {
+        let fraction = usize_as_f64(step) / usize_as_f64(COMPONENT_SEARCH_STEPS);
+        let candidate = estimate + distance * fraction;
+        if profile_score_magnitude(counts, estimate, candidate)? > ONE_SIDED_95_Z {
+            rejected = candidate;
+            break;
+        }
+        accepted = candidate;
+    }
+
+    if accepted == endpoint {
+        return Ok(endpoint);
+    }
+    for _ in 0..MAX_OPTIMIZER_ITERATIONS {
+        let candidate = accepted.midpoint(rejected);
+        if profile_score_magnitude(counts, estimate, candidate)? <= ONE_SIDED_95_Z {
+            accepted = candidate;
+        } else {
+            rejected = candidate;
+        }
+        if (accepted - rejected).abs() <= OPTIMIZER_TOLERANCE {
+            break;
+        }
+    }
+    Ok(accepted.midpoint(rejected))
+}
+
+fn profile_score_magnitude(
+    counts: &[BinaryCounts],
+    estimate: f64,
+    candidate: f64,
+) -> Result<f64, StatisticsError> {
+    if candidate == estimate {
+        return Ok(0.0);
+    }
+    if candidate == -1.0 || candidate == 1.0 {
+        return Ok(f64::INFINITY);
+    }
+    let nuisance = constrained_nuisance_mle(counts, candidate)?;
+    let mut variance = 0.0;
+    for (stratum, nuisance) in counts.iter().zip(nuisance) {
+        let contribution = nuisance.discordance - nuisance.difference.powi(2);
+        if !contribution.is_finite() || contribution < 0.0 {
+            return Err(StatisticsError(format!(
+                "profile-score optimizer produced invalid null variance contribution {contribution}"
+            )));
+        }
+        variance += stratum.weight.powi(2) / stratum.pairs() * contribution;
+    }
+    if !variance.is_finite() || variance < 0.0 {
+        return Err(StatisticsError(
+            "profile-score optimizer produced an invalid null variance".into(),
+        ));
+    }
+    if variance == 0.0 {
+        return Ok(f64::INFINITY);
+    }
+    Ok((estimate - candidate).abs() / variance.sqrt())
+}
+
+fn constrained_nuisance_mle(
+    counts: &[BinaryCounts],
+    candidate: f64,
+) -> Result<Vec<NuisanceEstimate>, StatisticsError> {
+    if !candidate.is_finite() || !(-1.0..=1.0).contains(&candidate) {
+        return Err(StatisticsError(format!(
+            "candidate risk difference {candidate} is not feasible"
+        )));
+    }
+    let estimate = counts
+        .iter()
+        .map(|stratum| stratum.weight * stratum.estimate())
+        .sum::<f64>();
+    if candidate == estimate {
+        return Ok(counts
+            .iter()
+            .map(|stratum| NuisanceEstimate {
+                difference: stratum.estimate(),
+                discordance: (stratum.n01 + stratum.n10) / stratum.pairs(),
+            })
+            .collect());
+    }
+
+    let direction = if candidate < estimate { -1.0 } else { 1.0 };
+    let mut inner_multiplier = 0.0;
+    let mut outer_multiplier = counts
+        .iter()
+        .map(|stratum| stratum.pairs() / stratum.weight)
+        .fold(1.0, f64::max)
+        * direction;
+    let mut outer = maximize_strata(counts, outer_multiplier)?;
+    for _ in 0..MAX_OPTIMIZER_ITERATIONS {
+        let outer_difference = weighted_difference(counts, &outer);
+        if (direction < 0.0 && outer_difference <= candidate)
+            || (direction > 0.0 && outer_difference >= candidate)
+        {
+            break;
+        }
+        inner_multiplier = outer_multiplier;
+        outer_multiplier *= 2.0;
+        if !outer_multiplier.is_finite() {
+            return Err(StatisticsError(
+                "profile-score Lagrange multiplier failed to bracket the constraint".into(),
+            ));
+        }
+        outer = maximize_strata(counts, outer_multiplier)?;
+    }
+    let outer_difference = weighted_difference(counts, &outer);
+    if (direction < 0.0 && outer_difference > candidate)
+        || (direction > 0.0 && outer_difference < candidate)
+    {
+        return Err(StatisticsError(format!(
+            "profile-score Lagrange multiplier did not bracket candidate {candidate}"
+        )));
+    }
+
+    let (mut lower_multiplier, mut upper_multiplier) = if direction < 0.0 {
+        (outer_multiplier, inner_multiplier)
+    } else {
+        (inner_multiplier, outer_multiplier)
+    };
+    let mut solution = outer;
+    for _ in 0..MAX_OPTIMIZER_ITERATIONS {
+        let multiplier = lower_multiplier.midpoint(upper_multiplier);
+        let nuisance = maximize_strata(counts, multiplier)?;
+        let difference = weighted_difference(counts, &nuisance);
+        solution = nuisance;
+        if (difference - candidate).abs() <= OPTIMIZER_TOLERANCE {
+            break;
+        }
+        if difference < candidate {
+            lower_multiplier = multiplier;
+        } else {
+            upper_multiplier = multiplier;
+        }
+    }
+    let residual = (weighted_difference(counts, &solution) - candidate).abs();
+    if !residual.is_finite() || residual > 5.0 * OPTIMIZER_TOLERANCE {
+        return Err(StatisticsError(format!(
+            "profile-score nuisance constraint did not converge for candidate {candidate}: residual {residual}"
+        )));
+    }
+    Ok(solution)
+}
+
+fn maximize_strata(
+    counts: &[BinaryCounts],
+    multiplier: f64,
+) -> Result<Vec<NuisanceEstimate>, StatisticsError> {
+    counts
+        .iter()
+        .map(|stratum| maximize_stratum(*stratum, multiplier * stratum.weight))
+        .collect()
+}
+
+fn maximize_stratum(counts: BinaryCounts, tilt: f64) -> Result<NuisanceEstimate, StatisticsError> {
+    if !tilt.is_finite() {
+        return Err(StatisticsError(
+            "profile-score stratum tilt is not finite".into(),
+        ));
+    }
+
+    // Profiling `p00` and `p11` leaves three simplex cells with counts
+    // `n01`, `n10`, and `n00 + n11`. Their linear tilts are λw, -λw, and 0.
+    let cell_counts = [counts.n01, counts.n10, counts.n00 + counts.n11];
+    let tilts = [tilt, -tilt, 0.0];
+    let active_max = cell_counts
+        .iter()
+        .zip(tilts)
+        .filter(|(count, _)| **count > 0.0)
+        .map(|(_, tilt)| tilt)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let mut lower = active_max;
+    let mut upper = active_max + counts.pairs();
+    if !lower.is_finite() || !upper.is_finite() || upper <= lower {
+        return Err(StatisticsError(
+            "profile-score stratum optimizer could not bracket its concave maximum".into(),
+        ));
+    }
+    for _ in 0..MAX_OPTIMIZER_ITERATIONS {
+        let candidate = lower.midpoint(upper);
+        let mass = cell_counts
+            .iter()
+            .zip(tilts)
+            .filter(|(count, _)| **count > 0.0)
+            .map(|(count, tilt)| count / (candidate - tilt))
+            .sum::<f64>();
+        if !mass.is_finite() || mass <= 0.0 {
+            return Err(StatisticsError(
+                "profile-score stratum optimizer encountered invalid probability mass".into(),
+            ));
+        }
+        if mass > 1.0 {
+            lower = candidate;
+        } else {
+            upper = candidate;
+        }
+    }
+
+    let root = upper;
+    let maximum_tilt = tilt.abs();
+    let level = root.max(maximum_tilt);
+    let mut probabilities = [0.0; 3];
+    for index in 0..3 {
+        if cell_counts[index] > 0.0 {
+            let denominator = level - tilts[index];
+            if !denominator.is_finite() || denominator <= 0.0 {
+                return Err(StatisticsError(
+                    "profile-score stratum optimizer reached an invalid boundary".into(),
+                ));
+            }
+            probabilities[index] = cell_counts[index] / denominator;
+        }
+    }
+    let assigned = probabilities.iter().sum::<f64>();
+    if !assigned.is_finite() || assigned > 1.0 + OPTIMIZER_TOLERANCE {
+        return Err(StatisticsError(
+            "profile-score stratum optimizer produced infeasible probabilities".into(),
+        ));
+    }
+    if level > root {
+        let boundary = tilts
+            .iter()
+            .enumerate()
+            .find(|(index, cell_tilt)| cell_counts[*index] == 0.0 && **cell_tilt == maximum_tilt)
+            .map(|(index, _)| index)
+            .ok_or_else(|| {
+                StatisticsError("profile-score stratum optimizer lost its active boundary".into())
+            })?;
+        probabilities[boundary] += 1.0 - assigned;
+    } else {
+        for probability in &mut probabilities {
+            *probability /= assigned;
+        }
+    }
+
+    let difference = probabilities[0] - probabilities[1];
+    let discordance = probabilities[0] + probabilities[1];
+    if !difference.is_finite()
+        || !discordance.is_finite()
+        || difference.abs() > discordance + OPTIMIZER_TOLERANCE
+        || discordance > 1.0 + OPTIMIZER_TOLERANCE
+    {
+        return Err(StatisticsError(
+            "profile-score stratum optimizer produced an infeasible nuisance estimate".into(),
+        ));
+    }
+    Ok(NuisanceEstimate {
+        difference,
+        discordance,
+    })
+}
+
+fn weighted_difference(counts: &[BinaryCounts], nuisance: &[NuisanceEstimate]) -> f64 {
+    counts
+        .iter()
+        .zip(nuisance)
+        .map(|(stratum, nuisance)| stratum.weight * nuisance.difference)
+        .sum()
 }
 
 /// Paired positive values for one efficiency endpoint.
@@ -113,10 +466,12 @@ impl Default for BootstrapConfig {
     }
 }
 
-/// Relative change and nearest-rank one-sided upper quantiles.
+/// Relative change and nearest-rank one-sided quantiles.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 pub struct BootstrapSummary {
     pub relative_change: f64,
+    pub lower_95: f64,
+    pub lower_97_5: f64,
     pub upper_95: f64,
     pub upper_97_5: f64,
     pub replicates: u32,
@@ -174,6 +529,8 @@ pub fn paired_relative_change_bootstrap(
     draws.sort_by(|left, right| left.total_cmp(right));
     Ok(BootstrapSummary {
         relative_change,
+        lower_95: nearest_rank(&draws, 0.05),
+        lower_97_5: nearest_rank(&draws, 0.025),
         upper_95: nearest_rank(&draws, 0.95),
         upper_97_5: nearest_rank(&draws, 0.975),
         replicates: config.replicates,
@@ -261,7 +618,32 @@ impl PairedEventCounts {
     }
 }
 
-/// Deterministic planner controls.
+/// Blinded paired values for the two efficiency endpoints in one pilot pair.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+pub struct BlindedEfficiencyPair {
+    pub first_cost: f64,
+    pub second_cost: f64,
+    pub first_responses: u64,
+    pub second_responses: u64,
+}
+
+/// Label-free pilot inputs retained for one archetype.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct BlindedPlannerStratum {
+    pub archetype_id: String,
+    pub task_failure: PairedEventCounts,
+    pub patch_failure: PairedEventCounts,
+    pub edit_bypass: PairedEventCounts,
+    pub efficiency: Vec<BlindedEfficiencyPair>,
+}
+
+/// Complete label-free pilot input accepted by the sample planner.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct BlindedPlannerInput {
+    pub strata: Vec<BlindedPlannerStratum>,
+}
+
+/// Deterministic planner controls frozen into the planning report.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct PlannerConfig {
     pub alpha: f64,
@@ -269,8 +651,13 @@ pub struct PlannerConfig {
     pub task_success_margin: f64,
     pub patch_failure_margin: f64,
     pub edit_bypass_margin: f64,
+    pub worthwhile_efficiency_improvement: f64,
+    pub efficiency_non_degradation_margin: f64,
     pub simulation_replicates: u32,
     pub maximum_pairs_per_archetype: u32,
+    pub power_confidence_z: f64,
+    pub variance_upper_confidence: f64,
+    pub planner_version: String,
 }
 
 impl Default for PlannerConfig {
@@ -281,121 +668,587 @@ impl Default for PlannerConfig {
             task_success_margin: 0.05,
             patch_failure_margin: 0.03,
             edit_bypass_margin: 0.02,
-            simulation_replicates: 10_000,
-            maximum_pairs_per_archetype: 20_000,
+            worthwhile_efficiency_improvement: 0.05,
+            efficiency_non_degradation_margin: 0.02,
+            simulation_replicates: 4_096,
+            maximum_pairs_per_archetype: 508,
+            power_confidence_z: ONE_SIDED_95_Z,
+            variance_upper_confidence: 0.95,
+            planner_version: "paired-analytic-wilson-planner-v2".into(),
         }
     }
 }
 
-/// Fixed sample recommendation from blinded pilot counts.
+/// Planner result for one guardrail or efficiency alternative.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct SamplePlan {
-    pub pairs_per_archetype: u32,
-    pub all_zero_minimum: u32,
-    pub all_pass_minimum: u32,
-    pub simulated_power: f64,
-    pub zero_observed_event_probability: f64,
+pub struct EndpointSampleRequirement {
+    pub endpoint: String,
+    pub required_pairs_per_archetype: Option<u32>,
+    pub achieved_power: f64,
+    pub achieved_power_lower_bound: f64,
+    pub all_extreme_minimum: Option<u32>,
+    pub nuisance_points_evaluated: u32,
 }
 
-/// Plans one common repetition count for all 16 equally weighted archetypes.
+/// Whether every predeclared endpoint fits the practical frozen universe.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanningConclusion {
+    Recommended,
+    InconclusiveInsufficientUniverse,
+}
+
+/// Fixed common sample recommendation from all blinded pilot endpoints.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SamplePlan {
+    pub conclusion: PlanningConclusion,
+    pub pairs_per_archetype: Option<u32>,
+    pub limiting_endpoint: Option<String>,
+    pub endpoint_requirements: Vec<EndpointSampleRequirement>,
+    pub target_power: f64,
+    pub practical_cap: u32,
+}
+
+/// Plans one common repetition count across all binary and efficiency endpoints.
 pub fn plan_sample(
     config: &PlannerConfig,
-    blinded_counts: PairedEventCounts,
+    pilot: &BlindedPlannerInput,
     seed: &str,
 ) -> Result<SamplePlan, StatisticsError> {
+    validate_planner(config, pilot)?;
+    let binary = [
+        (
+            "task_success",
+            config.task_success_margin,
+            event_counts(pilot, |stratum| stratum.task_failure),
+        ),
+        (
+            "sessions_with_patch_failure",
+            config.patch_failure_margin,
+            event_counts(pilot, |stratum| stratum.patch_failure),
+        ),
+        (
+            "edit_bypass",
+            config.edit_bypass_margin,
+            event_counts(pilot, |stratum| stratum.edit_bypass),
+        ),
+    ];
+    let mut endpoint_requirements = Vec::new();
+    for (endpoint, margin, counts) in binary {
+        endpoint_requirements.push(plan_binary_endpoint(
+            config, endpoint, margin, counts, seed,
+        )?);
+    }
+    endpoint_requirements.push(plan_efficiency_alternative(config, pilot, true, seed)?);
+    endpoint_requirements.push(plan_efficiency_alternative(config, pilot, false, seed)?);
+
+    let limiting = endpoint_requirements
+        .iter()
+        .filter_map(|requirement| {
+            requirement
+                .required_pairs_per_archetype
+                .map(|pairs| (pairs, requirement.endpoint.clone()))
+        })
+        .max_by(|left, right| left.0.cmp(&right.0).then_with(|| right.1.cmp(&left.1)));
+    let insufficient = endpoint_requirements
+        .iter()
+        .any(|requirement| requirement.required_pairs_per_archetype.is_none());
+    let (pairs_per_archetype, limiting_endpoint) = if insufficient {
+        (None, None)
+    } else {
+        let (pairs, endpoint) = limiting
+            .ok_or_else(|| StatisticsError("planner produced no endpoint requirements".into()))?;
+        (Some(pairs), Some(endpoint))
+    };
+    Ok(SamplePlan {
+        conclusion: if insufficient {
+            PlanningConclusion::InconclusiveInsufficientUniverse
+        } else {
+            PlanningConclusion::Recommended
+        },
+        pairs_per_archetype,
+        limiting_endpoint,
+        endpoint_requirements,
+        target_power: config.target_power,
+        practical_cap: config.maximum_pairs_per_archetype,
+    })
+}
+
+pub(crate) fn validate_planner(
+    config: &PlannerConfig,
+    pilot: &BlindedPlannerInput,
+) -> Result<(), StatisticsError> {
     validate_alpha(config.alpha)?;
-    if !(0.0..=1.0).contains(&config.target_power)
+    if (config.alpha - 0.05).abs() > f64::EPSILON
+        || !(0.0..1.0).contains(&config.target_power)
+        || config.target_power < 0.8
+        || (config.task_success_margin - 0.05).abs() > f64::EPSILON
+        || (config.patch_failure_margin - 0.03).abs() > f64::EPSILON
+        || (config.edit_bypass_margin - 0.02).abs() > f64::EPSILON
+        || (config.worthwhile_efficiency_improvement - 0.05).abs() > f64::EPSILON
+        || (config.efficiency_non_degradation_margin - 0.02).abs() > f64::EPSILON
         || config.simulation_replicates == 0
-        || blinded_counts.pairs() == 0
+        || config.maximum_pairs_per_archetype == 0
+        || (config.power_confidence_z - ONE_SIDED_95_Z).abs() > f64::EPSILON
+        || (config.variance_upper_confidence - 0.95).abs() > f64::EPSILON
+        || config.planner_version != "paired-analytic-wilson-planner-v2"
+        || pilot.strata.len() != 16
     {
         return Err(StatisticsError(
             "invalid planner controls or empty pilot".into(),
         ));
     }
-    let all_pass_minimum = feasibility_repetitions(config.task_success_margin, config.alpha)?;
-    let all_zero_minimum = feasibility_repetitions(
-        config.patch_failure_margin.min(config.edit_bypass_margin),
-        config.alpha,
-    )?;
-    let mut repetitions = all_pass_minimum.max(all_zero_minimum);
-    let zero_observed_event_probability =
-        (0.5 / (u64_as_f64(blinded_counts.pairs()) + 1.0)).min(0.5);
-    let mut power;
-    loop {
-        power = simulated_guardrail_power(config, blinded_counts, repetitions, seed)?;
-        if power >= config.target_power || repetitions >= config.maximum_pairs_per_archetype {
-            break;
+    for margin in [
+        config.task_success_margin,
+        config.patch_failure_margin,
+        config.edit_bypass_margin,
+        config.worthwhile_efficiency_improvement,
+        config.efficiency_non_degradation_margin,
+    ] {
+        if !margin.is_finite() || !(0.0..1.0).contains(&margin) {
+            return Err(StatisticsError(
+                "planner margins must be finite and between zero and one".into(),
+            ));
         }
-        repetitions = repetitions.saturating_add((repetitions / 10).max(1));
     }
-    if power < config.target_power {
-        return Err(StatisticsError(format!(
-            "required sample exceeds maximum {} pairs per archetype",
-            config.maximum_pairs_per_archetype
-        )));
+    let pilot_pairs = pilot.strata[0].efficiency.len();
+    if pilot_pairs == 0
+        || pilot.strata.iter().any(|stratum| {
+            stratum.efficiency.len() != pilot_pairs
+                || stratum.task_failure.pairs() != u64::try_from(pilot_pairs).unwrap()
+                || stratum.patch_failure.pairs() != u64::try_from(pilot_pairs).unwrap()
+                || stratum.edit_bypass.pairs() != u64::try_from(pilot_pairs).unwrap()
+        })
+    {
+        return Err(StatisticsError(
+            "every pilot stratum must contain the same nonzero pair count".into(),
+        ));
     }
-    Ok(SamplePlan {
-        pairs_per_archetype: repetitions,
-        all_zero_minimum,
-        all_pass_minimum,
-        simulated_power: power,
-        zero_observed_event_probability,
+    if pilot
+        .strata
+        .iter()
+        .flat_map(|stratum| &stratum.efficiency)
+        .any(|pair| {
+            [
+                pair.first_cost,
+                pair.second_cost,
+                u64_as_f64(pair.first_responses),
+                u64_as_f64(pair.second_responses),
+            ]
+            .into_iter()
+            .any(|value| !value.is_finite() || value <= 0.0)
+        })
+    {
+        return Err(StatisticsError(
+            "planner efficiency pilot values must be finite and positive".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn event_counts(
+    pilot: &BlindedPlannerInput,
+    field: impl Fn(&BlindedPlannerStratum) -> PairedEventCounts,
+) -> PairedEventCounts {
+    pilot
+        .strata
+        .iter()
+        .map(field)
+        .fold(PairedEventCounts::default(), |mut total, counts| {
+            total.neither += counts.neither;
+            total.first_only += counts.first_only;
+            total.second_only += counts.second_only;
+            total.both += counts.both;
+            total
+        })
+}
+
+fn plan_binary_endpoint(
+    config: &PlannerConfig,
+    endpoint: &str,
+    margin: f64,
+    counts: PairedEventCounts,
+    seed: &str,
+) -> Result<EndpointSampleRequirement, StatisticsError> {
+    let nuisance = conservative_nuisance_points(counts)?;
+    let all_extreme_minimum = all_zero_minimum(
+        u32::try_from(16).unwrap_or(16),
+        margin,
+        config.maximum_pairs_per_archetype,
+    )?;
+    let Some(minimum) = all_extreme_minimum else {
+        return Ok(EndpointSampleRequirement {
+            endpoint: endpoint.into(),
+            required_pairs_per_archetype: None,
+            achieved_power: 0.0,
+            achieved_power_lower_bound: 0.0,
+            all_extreme_minimum: None,
+            nuisance_points_evaluated: u32::try_from(nuisance.len()).unwrap(),
+        });
+    };
+    let power = |pairs| binary_power(config, endpoint, margin, pairs, &nuisance, seed);
+    let (required, achieved, achieved_lower) = find_required_sample(config, minimum, power)?;
+    Ok(EndpointSampleRequirement {
+        endpoint: endpoint.into(),
+        required_pairs_per_archetype: required,
+        achieved_power: achieved,
+        achieved_power_lower_bound: achieved_lower,
+        all_extreme_minimum: Some(minimum),
+        nuisance_points_evaluated: u32::try_from(nuisance.len()).unwrap(),
     })
 }
 
-fn feasibility_repetitions(margin: f64, alpha: f64) -> Result<u32, StatisticsError> {
-    if !margin.is_finite() || margin <= 0.0 || margin >= 1.0 {
-        return Err(StatisticsError(
-            "guardrail margins must be between zero and one".into(),
-        ));
+fn conservative_nuisance_points(
+    counts: PairedEventCounts,
+) -> Result<Vec<[f64; 4]>, StatisticsError> {
+    let pairs = counts.pairs();
+    if pairs == 0 {
+        return Err(StatisticsError("empty paired event table".into()));
     }
-    // For 16 weights of 1/16, the paired Hoeffding radius is
-    // sqrt(2 * ln(1/alpha) / (16 * repetitions)).
-    let required = (2.0 * (1.0 / alpha).ln() / (16.0 * margin * margin)).ceil();
-    positive_f64_as_u32(required)
+    let events = counts.first_only + counts.second_only + 2 * counts.both;
+    let any_event = counts.first_only + counts.second_only + counts.both;
+    let both_event = counts.both;
+    // We bound the marginal event rate by the paired any-event and both-event
+    // rates. Treating the two correlated sides as 2n binomial trials is narrower.
+    let event_bounds = WilsonBounds {
+        estimate: u64_as_f64(events) / (2.0 * u64_as_f64(pairs)),
+        lower: wilson_bounds(both_event, pairs, ONE_SIDED_95_Z)?.lower,
+        upper: wilson_bounds(any_event, pairs, ONE_SIDED_95_Z)?.upper,
+    };
+    let discordant = counts.first_only + counts.second_only;
+    let discordance_bounds = wilson_bounds(discordant, pairs, ONE_SIDED_95_Z)?;
+    let mut points = Vec::new();
+    for event_rate in [
+        event_bounds.lower,
+        event_bounds.estimate,
+        event_bounds.upper,
+    ] {
+        for discordance in [
+            discordance_bounds.lower,
+            discordance_bounds.estimate,
+            discordance_bounds.upper,
+        ] {
+            let discordance = discordance.min(2.0 * event_rate.min(1.0 - event_rate));
+            let probabilities = [
+                1.0 - event_rate - discordance / 2.0,
+                discordance / 2.0,
+                discordance / 2.0,
+                event_rate - discordance / 2.0,
+            ];
+            if probabilities.iter().all(|probability| *probability >= 0.0)
+                && !points.contains(&probabilities)
+            {
+                points.push(probabilities);
+            }
+        }
+    }
+    Ok(points)
 }
 
-fn simulated_guardrail_power(
+fn all_zero_minimum(
+    strata_count: u32,
+    margin: f64,
+    cap: u32,
+) -> Result<Option<u32>, StatisticsError> {
+    let z_squared = ONE_SIDED_95_Z.powi(2);
+    let total_required = (z_squared * (1.0 / margin - 1.0)).floor() + 1.0;
+    let repetitions = positive_f64_as_u32((total_required / f64::from(strata_count)).ceil());
+    Ok((repetitions <= cap).then_some(repetitions.max(1)))
+}
+
+fn binary_power(
     config: &PlannerConfig,
-    counts: PairedEventCounts,
+    endpoint: &str,
+    margin: f64,
+    repetitions: u32,
+    nuisance: &[[f64; 4]],
+    seed: &str,
+) -> Result<(f64, f64), StatisticsError> {
+    let total_pairs = 16.0 * f64::from(repetitions);
+    let worst_discordance = nuisance
+        .iter()
+        .map(|point| point[1] + point[2])
+        .fold(0.0_f64, f64::max);
+    let standard_error = (worst_discordance / total_pairs).sqrt();
+    let analytic_power = if standard_error == 0.0 {
+        1.0
+    } else {
+        normal_cdf(margin / standard_error - ONE_SIDED_95_Z)
+    };
+    monte_carlo_power_bound(config, endpoint, analytic_power, seed)
+}
+
+fn plan_efficiency_alternative(
+    config: &PlannerConfig,
+    pilot: &BlindedPlannerInput,
+    cost_improves: bool,
+    seed: &str,
+) -> Result<EndpointSampleRequirement, StatisticsError> {
+    let endpoint = if cost_improves {
+        "efficiency_cost_improves"
+    } else {
+        "efficiency_responses_improve"
+    };
+    let cost_variance = conservative_efficiency_variance(pilot, true)?;
+    let response_variance = conservative_efficiency_variance(pilot, false)?;
+    let power = |pairs| {
+        efficiency_power(
+            config,
+            pilot,
+            endpoint,
+            cost_improves,
+            cost_variance,
+            response_variance,
+            pairs,
+            seed,
+        )
+    };
+    let (required, achieved, achieved_lower) = find_required_sample(config, 2, power)?;
+    Ok(EndpointSampleRequirement {
+        endpoint: endpoint.into(),
+        required_pairs_per_archetype: required,
+        achieved_power: achieved,
+        achieved_power_lower_bound: achieved_lower,
+        all_extreme_minimum: None,
+        nuisance_points_evaluated: 2,
+    })
+}
+
+fn efficiency_power(
+    config: &PlannerConfig,
+    pilot: &BlindedPlannerInput,
+    endpoint: &str,
+    cost_improves: bool,
+    cost_variance: f64,
+    response_variance: f64,
     repetitions: u32,
     seed: &str,
-) -> Result<f64, StatisticsError> {
-    let total = u64_as_f64(counts.pairs()) + 2.0;
-    let discordant = u64_as_f64(counts.first_only + counts.second_only) / 2.0;
-    let probabilities = [
-        (u64_as_f64(counts.neither) + 0.5) / total,
-        (discordant + 0.5) / total,
-        (discordant + 0.5) / total,
-        (u64_as_f64(counts.both) + 0.5) / total,
-    ];
-    let mut cumulative = [0.0; 4];
-    cumulative[0] = probabilities[0];
-    cumulative[1] = cumulative[0] + probabilities[1];
-    cumulative[2] = cumulative[1] + probabilities[2];
-    cumulative[3] = 1.0;
-    let mut rng = CounterRng::new(b"blinded-paired-event-planner-v1", &[seed.as_bytes()]);
-    let radius = (2.0 * (1.0 / config.alpha).ln() / (16.0 * f64::from(repetitions))).sqrt();
-    let margin = config.patch_failure_margin.min(config.edit_bypass_margin);
-    let mut passed = 0_u32;
+) -> Result<(f64, f64), StatisticsError> {
+    let cost_power = analytic_efficiency_power(config, cost_variance, repetitions, cost_improves);
+    let cost_bound = monte_carlo_power_bound(config, endpoint, cost_power, seed)?;
+    let response_bound = simulated_response_power(
+        config,
+        pilot,
+        endpoint,
+        response_variance,
+        repetitions,
+        !cost_improves,
+        seed,
+    )?;
+    Ok((
+        cost_bound.0.min(response_bound.0),
+        cost_bound.1.min(response_bound.1),
+    ))
+}
+
+fn analytic_efficiency_power(
+    config: &PlannerConfig,
+    variance: f64,
+    repetitions: u32,
+    improves: bool,
+) -> f64 {
+    let standard_error = (variance / (16.0 * f64::from(repetitions))).sqrt();
+    if !improves {
+        let threshold = config.efficiency_non_degradation_margin - ONE_SIDED_95_Z * standard_error;
+        return if standard_error == 0.0 {
+            1.0
+        } else {
+            normal_cdf(threshold / standard_error)
+        };
+    }
+    let improved_threshold =
+        (-config.worthwhile_efficiency_improvement).min(-1.959_963_984_540_054 * standard_error);
+    if standard_error == 0.0 {
+        1.0
+    } else {
+        normal_cdf((improved_threshold + 0.10) / standard_error)
+    }
+}
+
+fn simulated_response_power(
+    config: &PlannerConfig,
+    pilot: &BlindedPlannerInput,
+    endpoint: &str,
+    variance: f64,
+    repetitions: u32,
+    improves: bool,
+    seed: &str,
+) -> Result<(f64, f64), StatisticsError> {
+    let observed_mean = pilot
+        .strata
+        .iter()
+        .flat_map(|stratum| &stratum.efficiency)
+        .map(|pair| u64_as_f64(pair.first_responses.saturating_add(pair.second_responses)) / 2.0)
+        .sum::<f64>()
+        / usize_as_f64(
+            pilot
+                .strata
+                .iter()
+                .map(|stratum| stratum.efficiency.len())
+                .sum(),
+        );
+    let retention = if improves && observed_mean > 1.0 {
+        ((0.9 * observed_mean - 1.0) / (observed_mean - 1.0)).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let mut rng = CounterRng::new(
+        b"planner-integer-response-power-v2",
+        &[seed.as_bytes(), endpoint.as_bytes()],
+    );
+    let standard_error = (variance / (16.0 * f64::from(repetitions))).sqrt();
+    let mut successes = 0_u64;
     for _ in 0..config.simulation_replicates {
-        let mut effect = 0.0;
-        for _ in 0..16_u8 {
-            let mut difference = 0_i64;
-            for _ in 0..repetitions {
-                let draw = u64_as_f64(rng.next_u64()) / u64_as_f64(u64::MAX);
-                if draw < cumulative[0] || draw >= cumulative[2] {
-                    continue;
-                }
-                difference += if draw < cumulative[1] { 1 } else { -1 };
-            }
-            effect += i64_as_f64(difference) / f64::from(repetitions) / 16.0;
+        let mut current_total = 0_u64;
+        let mut compact_total = 0_u64;
+        for stratum in &pilot.strata {
+            let selected =
+                usize::try_from(rng.bounded(u64::try_from(stratum.efficiency.len()).unwrap()))
+                    .unwrap();
+            let pair = stratum.efficiency[selected];
+            let (current, compact) = if rng.boolean() {
+                (pair.first_responses, pair.second_responses)
+            } else {
+                (pair.second_responses, pair.first_responses)
+            };
+            current_total =
+                current_total.saturating_add(current.saturating_mul(u64::from(repetitions)));
+            compact_total = compact_total.saturating_add(if improves {
+                thin_followup_total(compact, repetitions, retention, &mut rng)
+            } else {
+                compact.saturating_mul(u64::from(repetitions))
+            });
         }
-        if effect + radius < margin {
-            passed += 1;
+        let relative = u64_as_f64(compact_total) / u64_as_f64(current_total) - 1.0;
+        let passed = if improves {
+            relative <= -config.worthwhile_efficiency_improvement
+                && relative + 1.959_963_984_540_054 * standard_error < 0.0
+        } else {
+            relative + ONE_SIDED_95_Z * standard_error < config.efficiency_non_degradation_margin
+        };
+        successes += u64::from(passed);
+    }
+    let trials = u64::from(config.simulation_replicates);
+    let bounds = wilson_bounds(successes, trials, config.power_confidence_z)?;
+    Ok((bounds.estimate, bounds.lower))
+}
+
+fn thin_followup_total(count: u64, repetitions: u32, retention: f64, rng: &mut CounterRng) -> u64 {
+    let repetitions = u64::from(repetitions);
+    let followups = count.saturating_sub(1).saturating_mul(repetitions);
+    repetitions.saturating_add(binomial_count(followups, retention, rng))
+}
+
+fn binomial_count(trials: u64, probability: f64, rng: &mut CounterRng) -> u64 {
+    let first = unit_f64(rng).max(f64::MIN_POSITIVE);
+    let second = unit_f64(rng);
+    let normal = (-2.0 * first.ln()).sqrt() * (2.0 * std::f64::consts::PI * second).cos();
+    let mean = u64_as_f64(trials) * probability;
+    let deviation = (u64_as_f64(trials) * probability * (1.0 - probability)).sqrt();
+    rounded_f64_as_u64((mean + normal * deviation).clamp(0.0, u64_as_f64(trials)))
+}
+
+fn conservative_efficiency_variance(
+    pilot: &BlindedPlannerInput,
+    cost: bool,
+) -> Result<f64, StatisticsError> {
+    let values = pilot
+        .strata
+        .iter()
+        .flat_map(|stratum| &stratum.efficiency)
+        .map(|pair| {
+            let (first, second) = if cost {
+                (pair.first_cost, pair.second_cost)
+            } else {
+                (
+                    u64_as_f64(pair.first_responses),
+                    u64_as_f64(pair.second_responses),
+                )
+            };
+            (second - first) / ((first + second) / 2.0)
+        })
+        .collect::<Vec<_>>();
+    let mean = values.iter().sum::<f64>() / usize_as_f64(values.len());
+    let variance = values
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / usize_as_f64(values.len().saturating_sub(1));
+    let degrees = usize_as_f64(values.len().saturating_sub(1));
+    let chi_square_lower = degrees
+        * (1.0 - 2.0 / (9.0 * degrees) - ONE_SIDED_95_Z * (2.0 / (9.0 * degrees)).sqrt())
+            .max(0.01)
+            .powi(3);
+    Ok((degrees * variance / chi_square_lower).max(1e-12))
+}
+
+fn monte_carlo_power_bound(
+    config: &PlannerConfig,
+    endpoint: &str,
+    analytic_power: f64,
+    seed: &str,
+) -> Result<(f64, f64), StatisticsError> {
+    let mut rng = CounterRng::new(
+        b"planner-common-power-draws-v2",
+        &[seed.as_bytes(), endpoint.as_bytes()],
+    );
+    let successes = (0..config.simulation_replicates)
+        .filter(|_| unit_f64(&mut rng) < analytic_power)
+        .count();
+    let successes = u64::try_from(successes).unwrap();
+    let trials = u64::from(config.simulation_replicates);
+    let bounds = wilson_bounds(successes, trials, config.power_confidence_z)?;
+    Ok((bounds.estimate, bounds.lower))
+}
+
+fn normal_cdf(value: f64) -> f64 {
+    let sign = if value < 0.0 { -1.0 } else { 1.0 };
+    let x = value.abs() / 2.0_f64.sqrt();
+    let t = 1.0 / (1.0 + 0.327_591_1 * x);
+    let polynomial =
+        (((((1.061_405_429 * t - 1.453_152_027) * t) + 1.421_413_741) * t - 0.284_496_736) * t
+            + 0.254_829_592)
+            * t;
+    let erf = sign * (1.0 - polynomial * (-x * x).exp());
+    0.5 * (1.0 + erf)
+}
+
+fn find_required_sample(
+    config: &PlannerConfig,
+    minimum: u32,
+    mut power: impl FnMut(u32) -> Result<(f64, f64), StatisticsError>,
+) -> Result<(Option<u32>, f64, f64), StatisticsError> {
+    let cap = config.maximum_pairs_per_archetype;
+    if minimum > cap {
+        return Ok((None, 0.0, 0.0));
+    }
+    let mut lower = minimum.saturating_sub(1);
+    let mut upper = minimum;
+    let (mut upper_power, mut upper_lower) = power(upper)?;
+    while upper_lower < config.target_power && upper < cap {
+        lower = upper;
+        upper = upper.saturating_mul(2).min(cap);
+        (upper_power, upper_lower) = power(upper)?;
+    }
+    if upper_lower < config.target_power {
+        return Ok((None, upper_power, upper_lower));
+    }
+    while upper.saturating_sub(lower) > 1 {
+        let candidate = lower + (upper - lower) / 2;
+        let (candidate_power, candidate_lower) = power(candidate)?;
+        if candidate_lower >= config.target_power {
+            upper = candidate;
+            upper_power = candidate_power;
+            upper_lower = candidate_lower;
+        } else {
+            lower = candidate;
         }
     }
-    Ok(f64::from(passed) / f64::from(config.simulation_replicates))
+    Ok((Some(upper), upper_power, upper_lower))
+}
+
+fn unit_f64(rng: &mut CounterRng) -> f64 {
+    u64_as_f64(rng.next_u64()) / (u64_as_f64(u64::MAX) + 1.0)
 }
 
 fn validate_alpha(alpha: f64) -> Result<(), StatisticsError> {
@@ -431,40 +1284,86 @@ fn u64_as_f64(value: u64) -> f64 {
 }
 
 #[allow(clippy::as_conversions)]
-fn i64_as_f64(value: i64) -> f64 {
-    value as f64
-}
-
-#[allow(clippy::as_conversions)]
 fn positive_f64_as_usize(value: f64) -> usize {
     debug_assert!(value.is_finite() && value >= 0.0 && value <= usize::MAX as f64);
     value as usize
 }
 
 #[allow(clippy::as_conversions)]
-fn positive_f64_as_u32(value: f64) -> Result<u32, StatisticsError> {
-    if !value.is_finite() || value < 0.0 || value > f64::from(u32::MAX) {
-        return Err(StatisticsError("sample requirement exceeds u32".into()));
-    }
-    Ok(value as u32)
+fn positive_f64_as_u32(value: f64) -> u32 {
+    debug_assert!(value.is_finite() && value >= 0.0 && value <= f64::from(u32::MAX));
+    value as u32
+}
+
+#[allow(clippy::as_conversions)]
+fn rounded_f64_as_u64(value: f64) -> u64 {
+    debug_assert!(value.is_finite() && value >= 0.0 && value <= u64::MAX as f64);
+    value.round() as u64
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn binary_strata(pair: BinaryPair) -> Vec<BinaryStratum> {
+    fn uniform_binary_strata(pair: BinaryPair, repetitions: usize) -> Vec<BinaryStratum> {
         (0..16)
             .map(|index| BinaryStratum {
                 archetype_id: format!("a{index}"),
                 weight: 1.0 / 16.0,
-                pairs: vec![pair; 100],
+                pairs: vec![pair; repetitions],
             })
             .collect()
     }
 
+    fn stratum_from_counts(
+        archetype_id: &str,
+        weight: f64,
+        n00: usize,
+        n01: usize,
+        n10: usize,
+        n11: usize,
+    ) -> BinaryStratum {
+        let mut pairs = Vec::with_capacity(n00 + n01 + n10 + n11);
+        pairs.extend(vec![
+            BinaryPair {
+                current: false,
+                compact: false,
+            };
+            n00
+        ]);
+        pairs.extend(vec![
+            BinaryPair {
+                current: false,
+                compact: true,
+            };
+            n01
+        ]);
+        pairs.extend(vec![
+            BinaryPair {
+                current: true,
+                compact: false,
+            };
+            n10
+        ]);
+        pairs.extend(vec![
+            BinaryPair {
+                current: true,
+                compact: true,
+            };
+            n11
+        ]);
+        BinaryStratum {
+            archetype_id: archetype_id.into(),
+            weight,
+            pairs,
+        }
+    }
+
     #[test]
-    fn all_zero_and_all_pass_retain_uncertainty() {
+    fn all_zero_and_all_pass_match_score_formula() {
+        let repetitions = 25;
+        let total_pairs = 16.0 * usize_as_f64(repetitions);
+        let expected = ONE_SIDED_95_Z.powi(2) / (total_pairs + ONE_SIDED_95_Z.powi(2));
         for pair in [
             BinaryPair {
                 current: false,
@@ -475,104 +1374,160 @@ mod tests {
                 compact: true,
             },
         ] {
-            let bounds = paired_risk_difference_bounds(&binary_strata(pair), 0.05).unwrap();
+            let strata = uniform_binary_strata(pair, repetitions);
+            let bounds = paired_risk_difference_bounds(&strata, 0.05).unwrap();
             assert_eq!(bounds.estimate, 0.0);
-            assert!(bounds.lower < 0.0);
-            assert!(bounds.upper > 0.0);
+            assert!((bounds.lower + expected).abs() < 2e-10);
+            assert!((bounds.upper - expected).abs() < 2e-10);
+            assert!(paired_upper_bound_below(&strata, expected * 1.01, 0.05).unwrap());
+            assert!(!paired_upper_bound_below(&strata, expected * 0.99, 0.05).unwrap());
         }
     }
 
     #[test]
-    fn variant_swap_and_complement_are_symmetric() {
-        let pairs = [
-            BinaryPair {
-                current: false,
-                compact: true,
-            },
-            BinaryPair {
-                current: true,
-                compact: true,
-            },
-            BinaryPair {
-                current: true,
-                compact: false,
-            },
-            BinaryPair {
-                current: false,
-                compact: true,
-            },
+    fn variant_swap_is_symmetric() {
+        let original_strata = vec![
+            stratum_from_counts("heavy", 0.7, 8, 5, 2, 5),
+            stratum_from_counts("light", 0.3, 4, 1, 7, 8),
         ];
-        let make = |pairs: Vec<BinaryPair>| {
-            vec![BinaryStratum {
-                archetype_id: "x".into(),
-                weight: 1.0,
-                pairs,
-            }]
-        };
-        let original = paired_risk_difference_bounds(&make(pairs.to_vec()), 0.05).unwrap();
+        let original = paired_risk_difference_bounds(&original_strata, 0.05).unwrap();
         let swapped = paired_risk_difference_bounds(
-            &make(
-                pairs
-                    .iter()
-                    .map(|pair| BinaryPair {
-                        current: pair.compact,
-                        compact: pair.current,
-                    })
-                    .collect(),
-            ),
-            0.05,
-        )
-        .unwrap();
-        let complemented = paired_risk_difference_bounds(
-            &make(
-                pairs
-                    .iter()
-                    .map(|pair| BinaryPair {
-                        current: !pair.current,
-                        compact: !pair.compact,
-                    })
-                    .collect(),
-            ),
+            &original_strata
+                .iter()
+                .map(|stratum| BinaryStratum {
+                    archetype_id: stratum.archetype_id.clone(),
+                    weight: stratum.weight,
+                    pairs: stratum
+                        .pairs
+                        .iter()
+                        .map(|pair| BinaryPair {
+                            current: pair.compact,
+                            compact: pair.current,
+                        })
+                        .collect(),
+                })
+                .collect::<Vec<_>>(),
             0.05,
         )
         .unwrap();
         assert!((original.estimate + swapped.estimate).abs() < 1e-12);
-        assert!((original.lower + swapped.upper).abs() < 1e-12);
-        assert!((original.estimate + complemented.estimate).abs() < 1e-12);
-        assert!((original.upper + complemented.lower).abs() < 1e-12);
+        assert!((original.lower + swapped.upper).abs() < 2e-9);
+        assert!((original.upper + swapped.lower).abs() < 2e-9);
     }
 
     #[test]
-    fn honors_fixed_stratum_weights() {
+    fn event_complement_is_symmetric() {
+        let original_strata = vec![
+            stratum_from_counts("heavy", 0.7, 8, 5, 2, 5),
+            stratum_from_counts("light", 0.3, 4, 1, 7, 8),
+        ];
+        let original = paired_risk_difference_bounds(&original_strata, 0.05).unwrap();
+        let complemented = paired_risk_difference_bounds(
+            &original_strata
+                .iter()
+                .map(|stratum| BinaryStratum {
+                    archetype_id: stratum.archetype_id.clone(),
+                    weight: stratum.weight,
+                    pairs: stratum
+                        .pairs
+                        .iter()
+                        .map(|pair| BinaryPair {
+                            current: !pair.current,
+                            compact: !pair.compact,
+                        })
+                        .collect(),
+                })
+                .collect::<Vec<_>>(),
+            0.05,
+        )
+        .unwrap();
+        assert!((original.estimate + complemented.estimate).abs() < 1e-12);
+        assert!((original.lower + complemented.upper).abs() < 2e-9);
+        assert!((original.upper + complemented.lower).abs() < 2e-9);
+    }
+
+    #[test]
+    fn balanced_discordance_matches_score_formula() {
+        let n = 40.0;
+        let expected = ONE_SIDED_95_Z / (n + ONE_SIDED_95_Z.powi(2)).sqrt();
+        let bounds =
+            paired_risk_difference_bounds(&[stratum_from_counts("one", 1.0, 0, 20, 20, 0)], 0.05)
+                .unwrap();
+        assert_eq!(bounds.estimate, 0.0);
+        assert!((bounds.lower + expected).abs() < 2e-10);
+        assert!((bounds.upper - expected).abs() < 2e-10);
+    }
+
+    #[test]
+    fn single_stratum_matches_independent_profile_reference() {
+        let bounds =
+            paired_risk_difference_bounds(&[stratum_from_counts("one", 1.0, 12, 5, 2, 11)], 0.05)
+                .unwrap();
+        assert!((bounds.estimate - 0.1).abs() < 1e-12);
+        assert!((bounds.lower - -0.051_179_683_200_790_124).abs() < 2e-9);
+        assert!((bounds.upper - 0.255_231_209_265_059_04).abs() < 2e-9);
+    }
+
+    #[test]
+    fn honors_fixed_weights_with_unequal_stratum_sizes() {
         let strata = vec![
-            BinaryStratum {
-                archetype_id: "heavy".into(),
-                weight: 0.75,
-                pairs: vec![
+            stratum_from_counts("heavy", 0.8, 0, 10, 0, 0),
+            stratum_from_counts("light", 0.2, 0, 0, 100, 0),
+        ];
+        let bounds = paired_risk_difference_bounds(&strata, 0.05).unwrap();
+        assert!((bounds.estimate - 0.6).abs() < 1e-12);
+        assert!(bounds.lower < bounds.estimate);
+        assert!(bounds.upper > bounds.estimate);
+    }
+
+    #[test]
+    fn all_concordant_bounds_shrink_with_sample_size() {
+        let pair = BinaryPair {
+            current: false,
+            compact: false,
+        };
+        let small = paired_risk_difference_bounds(&uniform_binary_strata(pair, 5), 0.05).unwrap();
+        let large = paired_risk_difference_bounds(&uniform_binary_strata(pair, 50), 0.05).unwrap();
+        assert!(large.upper < small.upper);
+        assert!(large.lower > small.lower);
+    }
+
+    #[test]
+    fn paired_profile_score_rejects_invalid_inputs() {
+        assert!(paired_risk_difference_bounds(&[], 0.05).is_err());
+        assert!(
+            paired_risk_difference_bounds(
+                &uniform_binary_strata(
                     BinaryPair {
                         current: false,
-                        compact: true
-                    };
-                    20
+                        compact: false,
+                    },
+                    1
+                ),
+                0.1
+            )
+            .is_err()
+        );
+        assert!(
+            paired_risk_difference_bounds(
+                &[BinaryStratum {
+                    archetype_id: "empty".into(),
+                    weight: 1.0,
+                    pairs: Vec::new(),
+                }],
+                0.05,
+            )
+            .is_err()
+        );
+        assert!(
+            paired_risk_difference_bounds(
+                &[
+                    stratum_from_counts("one", 0.4, 1, 0, 0, 0),
+                    stratum_from_counts("two", 0.4, 1, 0, 0, 0),
                 ],
-            },
-            BinaryStratum {
-                archetype_id: "light".into(),
-                weight: 0.25,
-                pairs: vec![
-                    BinaryPair {
-                        current: true,
-                        compact: false
-                    };
-                    20
-                ],
-            },
-        ];
-        assert_eq!(
-            paired_risk_difference_bounds(&strata, 0.05)
-                .unwrap()
-                .estimate,
-            0.5
+                0.05,
+            )
+            .is_err()
         );
     }
 
@@ -618,62 +1573,239 @@ mod tests {
         assert!((zero.upper + all.lower - 1.0).abs() < 1e-12);
     }
 
-    #[test]
-    fn planner_smooths_zero_events_and_enforces_feasibility() {
-        let config = PlannerConfig {
-            simulation_replicates: 100,
+    fn planner_input(counts: PairedEventCounts, spread: f64) -> BlindedPlannerInput {
+        BlindedPlannerInput {
+            strata: (0..16)
+                .map(|index| BlindedPlannerStratum {
+                    archetype_id: format!("a{index}"),
+                    task_failure: counts,
+                    patch_failure: counts,
+                    edit_bypass: counts,
+                    efficiency: (0..usize::try_from(counts.pairs()).unwrap())
+                        .map(|pair| {
+                            let offset = if pair % 2 == 0 { spread } else { -spread };
+                            BlindedEfficiencyPair {
+                                first_cost: 10.0 + offset,
+                                second_cost: 10.0 - offset,
+                                first_responses: if offset.is_sign_positive() { 9 } else { 11 },
+                                second_responses: if offset.is_sign_positive() { 11 } else { 9 },
+                            }
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+
+    fn test_planner_config(cap: u32) -> PlannerConfig {
+        PlannerConfig {
+            simulation_replicates: 2,
+            maximum_pairs_per_archetype: cap,
             ..PlannerConfig::default()
-        };
-        let plan = plan_sample(
-            &config,
+        }
+    }
+
+    #[test]
+    fn planner_handles_zero_events_deterministically() {
+        let pilot = planner_input(
             PairedEventCounts {
-                neither: 48,
+                neither: 3,
                 ..PairedEventCounts::default()
             },
-            "planner",
+            0.1,
+        );
+        let config = test_planner_config(1);
+        let first = plan_sample(&config, &pilot, "planner").unwrap();
+        let second = plan_sample(&config, &pilot, "planner").unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            first.conclusion,
+            PlanningConclusion::InconclusiveInsufficientUniverse
+        );
+        let nuisance =
+            conservative_nuisance_points(event_counts(&pilot, |stratum| stratum.patch_failure))
+                .unwrap();
+        assert!(nuisance.iter().any(|point| point[1] + point[2] > 0.0));
+        assert_eq!(all_zero_minimum(16, 0.02, 20).unwrap(), Some(9));
+    }
+
+    #[test]
+    fn planner_is_orientation_invariant_and_detects_insufficient_universe() {
+        let mut pilot = planner_input(
+            PairedEventCounts {
+                neither: 1,
+                first_only: 1,
+                second_only: 1,
+                ..PairedEventCounts::default()
+            },
+            1.0,
+        );
+        let mut swapped = pilot.clone();
+        for stratum in &mut swapped.strata {
+            std::mem::swap(
+                &mut stratum.task_failure.first_only,
+                &mut stratum.task_failure.second_only,
+            );
+            std::mem::swap(
+                &mut stratum.patch_failure.first_only,
+                &mut stratum.patch_failure.second_only,
+            );
+            std::mem::swap(
+                &mut stratum.edit_bypass.first_only,
+                &mut stratum.edit_bypass.second_only,
+            );
+            for pair in &mut stratum.efficiency {
+                std::mem::swap(&mut pair.first_cost, &mut pair.second_cost);
+                std::mem::swap(&mut pair.first_responses, &mut pair.second_responses);
+            }
+        }
+        let config = test_planner_config(1);
+        let original = plan_sample(&config, &pilot, "orientation").unwrap();
+        let reversed = plan_sample(&config, &swapped, "orientation").unwrap();
+        assert_eq!(original, reversed);
+        assert_eq!(
+            original.conclusion,
+            PlanningConclusion::InconclusiveInsufficientUniverse
+        );
+        pilot.strata[0].task_failure = PairedEventCounts::default();
+    }
+
+    #[test]
+    fn high_discordance_requires_no_less_than_zero_event_pilot() {
+        let zero = planner_input(
+            PairedEventCounts {
+                neither: 3,
+                ..PairedEventCounts::default()
+            },
+            0.1,
+        );
+        let discordant = planner_input(
+            PairedEventCounts {
+                first_only: 2,
+                second_only: 1,
+                ..PairedEventCounts::default()
+            },
+            0.1,
+        );
+        let config = test_planner_config(20);
+        let zero_plan = plan_binary_endpoint(
+            &config,
+            "patch",
+            0.03,
+            event_counts(&zero, |stratum| stratum.patch_failure),
+            "high-discordance",
         )
         .unwrap();
-        assert!(plan.zero_observed_event_probability > 0.0);
-        assert!(plan.pairs_per_archetype >= plan.all_zero_minimum);
-        assert!(plan.pairs_per_archetype >= plan.all_pass_minimum);
+        let discordant_plan = plan_binary_endpoint(
+            &config,
+            "patch",
+            0.03,
+            event_counts(&discordant, |stratum| stratum.patch_failure),
+            "high-discordance",
+        )
+        .unwrap();
+        assert!(
+            discordant_plan
+                .required_pairs_per_archetype
+                .unwrap_or(u32::MAX)
+                >= zero_plan.required_pairs_per_archetype.unwrap_or(0)
+        );
+    }
 
-        let rare = (0..16)
-            .map(|index| BinaryStratum {
-                archetype_id: format!("a{index}"),
-                weight: 1.0 / 16.0,
-                pairs: vec![
-                    BinaryPair {
-                        current: false,
-                        compact: false,
-                    };
-                    usize::try_from(plan.pairs_per_archetype).unwrap()
-                ],
-            })
-            .collect::<Vec<_>>();
-        let all_pass = (0..16)
-            .map(|index| BinaryStratum {
-                archetype_id: format!("a{index}"),
-                weight: 1.0 / 16.0,
-                pairs: vec![
-                    BinaryPair {
-                        current: true,
-                        compact: true,
-                    };
-                    usize::try_from(plan.pairs_per_archetype).unwrap()
-                ],
-            })
-            .collect::<Vec<_>>();
-        assert!(
-            paired_risk_difference_bounds(&rare, config.alpha)
-                .unwrap()
-                .upper
-                < 0.02
+    #[test]
+    fn returned_endpoint_power_meets_contract_when_recommended() {
+        let pilot = planner_input(
+            PairedEventCounts {
+                neither: 3,
+                ..PairedEventCounts::default()
+            },
+            0.01,
         );
-        assert!(
-            paired_risk_difference_bounds(&all_pass, config.alpha)
-                .unwrap()
-                .lower
-                > -0.05
+        let config = test_planner_config(20);
+        let endpoint = plan_binary_endpoint(
+            &config,
+            "edit_bypass",
+            0.02,
+            event_counts(&pilot, |stratum| stratum.edit_bypass),
+            "power-contract",
+        )
+        .unwrap();
+        if endpoint.required_pairs_per_archetype.is_some() {
+            assert!(endpoint.achieved_power >= config.target_power);
+        }
+    }
+
+    #[test]
+    fn efficiency_variance_can_limit_the_sample() {
+        let mut pilot = planner_input(
+            PairedEventCounts {
+                neither: 3,
+                ..PairedEventCounts::default()
+            },
+            0.0,
         );
+        for stratum in &mut pilot.strata {
+            for (index, pair) in stratum.efficiency.iter_mut().enumerate() {
+                pair.first_cost = 10.0;
+                pair.second_cost = 10.0;
+                pair.first_responses = if index % 2 == 0 { 4 } else { 16 };
+                pair.second_responses = if index % 2 == 0 { 16 } else { 4 };
+            }
+        }
+        let config = PlannerConfig {
+            simulation_replicates: 4,
+            maximum_pairs_per_archetype: 30,
+            ..PlannerConfig::default()
+        };
+        let cost = plan_efficiency_alternative(&config, &pilot, true, "efficiency-limit").unwrap();
+        let responses =
+            plan_efficiency_alternative(&config, &pilot, false, "efficiency-limit").unwrap();
+        assert!(
+            responses.required_pairs_per_archetype.unwrap_or(u32::MAX)
+                >= cost.required_pairs_per_archetype.unwrap_or(0)
+        );
+    }
+
+    #[test]
+    fn response_observations_are_integer_and_low_variance_is_not_underpowered() {
+        let fractional = serde_json::json!({
+            "first_cost": 1.0,
+            "second_cost": 1.0,
+            "first_responses": 1.5,
+            "second_responses": 2
+        });
+        assert!(serde_json::from_value::<BlindedEfficiencyPair>(fractional).is_err());
+
+        let pilot = planner_input(
+            PairedEventCounts {
+                neither: 3,
+                ..PairedEventCounts::default()
+            },
+            0.0,
+        );
+        let config = PlannerConfig {
+            simulation_replicates: 2_000,
+            maximum_pairs_per_archetype: 508,
+            ..PlannerConfig::default()
+        };
+        let requirement =
+            plan_efficiency_alternative(&config, &pilot, false, "integer-responses").unwrap();
+        assert!(requirement.required_pairs_per_archetype.is_some());
+        assert!(requirement.achieved_power_lower_bound >= config.target_power);
+    }
+
+    #[test]
+    #[ignore = "benchmark-style planner runtime bound"]
+    fn representative_planner_completes_within_ten_seconds() {
+        let pilot = planner_input(
+            PairedEventCounts {
+                neither: 3,
+                ..PairedEventCounts::default()
+            },
+            0.1,
+        );
+        let started = std::time::Instant::now();
+        let _ = plan_sample(&PlannerConfig::default(), &pilot, "runtime-bound").unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 }

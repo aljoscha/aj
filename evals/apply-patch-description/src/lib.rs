@@ -3,12 +3,18 @@
 pub mod analysis;
 pub mod artifacts;
 pub mod descriptions;
+pub mod docker;
 pub mod fixtures;
+pub mod planning;
+pub mod protocol;
 pub mod rng;
+pub mod runner;
+pub mod runtime;
 pub mod schedule;
 pub mod snapshot;
 pub mod statistics;
 pub mod suite;
+pub mod worker;
 
 use sha2::{Digest, Sha256};
 

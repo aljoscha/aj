@@ -105,6 +105,14 @@ pub struct VerificationReport {
     pub reasons: Vec<String>,
     pub changed_path_allowlist: ChangedPathAllowlistResult,
     pub visible_check: VisibleCheckMetadata,
+    pub hidden_check: HiddenCheckMetadata,
+}
+
+/// Parent-owned authoritative checks that are not written into the fixture.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HiddenCheckMetadata {
+    pub contract_passed: bool,
+    pub behavior_result: Option<CommandResult>,
 }
 
 #[derive(Debug)]
@@ -208,6 +216,7 @@ pub fn verify_candidate(
     authoritative_root: &Path,
     candidate_root: &Path,
     check_result: Option<&CommandResult>,
+    hidden_result: Option<&CommandResult>,
 ) -> Result<VerificationReport, FixtureError> {
     let (manifest, archetype) = validate_instance(instance)?;
     if fixture.task_id != instance.task_id || fixture.instance_hash != instance.instance_hash {
@@ -279,13 +288,105 @@ pub fn verify_candidate(
         VisibleCheckOutcome::Failed => reasons.push("the visible check failed".into()),
         VisibleCheckOutcome::NotRequired | VisibleCheckOutcome::Passed => {}
     }
+    let reasons_before_contract = reasons.len();
     check_contract(instance, &plan, candidate_root, &mut reasons)?;
+    let contract_passed = reasons.len() == reasons_before_contract;
+    if hidden_behavior_script(instance)?.is_some()
+        && !hidden_result.is_some_and(|result| result.exit_code == Some(0))
+    {
+        reasons.push("the hidden authoritative behavior check failed".into());
+    }
     Ok(VerificationReport {
         passed: reasons.is_empty(),
         reasons,
         changed_path_allowlist: allowlist,
         visible_check,
+        hidden_check: HiddenCheckMetadata {
+            contract_passed,
+            behavior_result: hidden_result.cloned(),
+        },
     })
+}
+
+/// Generates the broad authoritative behavior check without exposing it in the fixture.
+pub fn hidden_behavior_script(instance: &TaskInstance) -> Result<Option<String>, FixtureError> {
+    validate_instance(instance)?;
+    let script = match &instance.parameters {
+        TaskParameters::MultilineEdit {
+            path,
+            symbol,
+            boundary,
+            increment,
+        } => Some(format!(
+            "import runpy\nm=runpy.run_path({path:?})\nf=m[{symbol:?}]\nfor value in range(-257,258):\n assert f(value)==(max(value,{boundary})+{increment})*2\n"
+        )),
+        TaskParameters::IndentationSensitive {
+            path,
+            section,
+            timeout,
+        } => Some(format!(
+            "from pathlib import Path\nlines=Path({path:?}).read_text().splitlines()\nassert lines.count('  {section}:')==1\ns=lines.index('  {section}:')\ne=next((i for i in range(s+1,len(lines)) if lines[i] and not lines[i].startswith('    ')),len(lines))\nassert lines[s+1:e].count('    timeout: {timeout}')==1\nassert lines.count('  neighbor:')==1 and lines[-1]=='    enabled: false'\n"
+        )),
+        TaskParameters::NearbyChanges {
+            path,
+            first,
+            second,
+            amount,
+        } => Some(format!(
+            "import runpy\nm=runpy.run_path({path:?})\nfor value in range(-257,258):\n assert m[{first:?}](value)==value*{amount}\n assert m[{second:?}](value)==value+{amount}\n assert m['stable_helper'](value)==value\n"
+        )),
+        TaskParameters::TwoRelatedSourceFiles {
+            model_path,
+            view_path,
+            symbol,
+            default_limit,
+        } => Some(format!(
+            "import runpy\nmodel=runpy.run_path({model_path:?}); view=runpy.run_path({view_path:?})\nfor i in range(-64,65):\n name='name-'+str(i)+'-\\u2603'\n r=model[{symbol:?}](name)\n assert r.name==name and r.limit=={default_limit}\n assert view['format_record'](r)==f'name={{name}} limit={default_limit}'\n r=model[{symbol:?}](name,i)\n assert view['format_record'](r)==f'name={{name}} limit={{i}}'\n"
+        )),
+        TaskParameters::SourcePlusTest {
+            source_path,
+            symbol,
+            boundary,
+            ..
+        } => Some(format!(
+            "import runpy\nf=runpy.run_path({source_path:?})[{symbol:?}]\nfor value in range({low},{high}):\n try:\n  result=f(value)\n  assert value>={boundary} and result==value*2\n except ValueError:\n  assert value<{boundary}\n",
+            low = boundary - 257,
+            high = boundary + 258,
+        )),
+        TaskParameters::ThreeFileConfiguration { paths, key, values } => Some(format!(
+            "from pathlib import Path\nfor path,value,lane in zip({paths:?},{values:?},range(3)):\n lines=Path(path).read_text().splitlines()\n assert lines==[f'name = \"lane-{{lane}}\"',f'{key} = {{value}}','stable = true']\n"
+        )),
+        TaskParameters::RenameWithContent {
+            old_path,
+            new_path,
+            old_symbol,
+            symbol,
+            multiplier,
+        } => Some(format!(
+            "from pathlib import Path\nimport runpy\nassert not Path({old_path:?}).exists()\nm=runpy.run_path({new_path:?}); assert {old_symbol:?} not in m\nf=m[{symbol:?}]\nfor value in range(-257,258): assert f(value)==value*{multiplier}\n"
+        )),
+        TaskParameters::RepeatedBlocks {
+            path,
+            target_label,
+            old_limit,
+            new_limit,
+        } => Some(block_check_script(
+            path,
+            target_label,
+            *old_limit,
+            *new_limit,
+        )),
+        TaskParameters::RepeatedMethods {
+            path,
+            target_type,
+            method,
+            suffix,
+        } => Some(format!(
+            "import runpy\nm=runpy.run_path({path:?}); peer=m['Peer'](); target=m[{target_type:?}]()\nfor value in [str(i) for i in range(-128,129)]+['','a:b','\\u2603','line\\nfeed']:\n assert peer.{method}(value)==f'peer:{{value}}'\n assert target.{method}(value)==f'target:{{value}}:{suffix}'\n"
+        )),
+        _ => None,
+    };
+    Ok(script)
 }
 
 fn check_metadata(
@@ -1214,6 +1315,26 @@ mod tests {
             .map(|_| CommandResult::success())
     }
 
+    fn hidden_result(instance: &TaskInstance) -> Option<CommandResult> {
+        hidden_behavior_script(instance)
+            .unwrap()
+            .map(|_| CommandResult::success())
+    }
+
+    fn run_hidden(instance: &TaskInstance, root: &Path) -> Option<CommandResult> {
+        let script = hidden_behavior_script(instance).unwrap()?;
+        let output = std::process::Command::new("python3")
+            .args(["-I", "-B", "-c", &script])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        Some(CommandResult {
+            exit_code: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+
     #[test]
     fn every_archetype_is_deterministic_and_enforces_verification() {
         for instance in instances() {
@@ -1226,12 +1347,14 @@ mod tests {
             assert!(!authoritative.path().join("AGENTS.md").exists());
 
             let result = check_result(&fixture);
+            let hidden = hidden_result(&instance);
             let untouched = verify_candidate(
                 &instance,
                 &fixture,
                 authoritative.path(),
                 duplicate.path(),
                 result.as_ref(),
+                hidden.as_ref(),
             )
             .unwrap();
             assert!(!untouched.passed, "{}", instance.task_id);
@@ -1244,6 +1367,7 @@ mod tests {
                 authoritative.path(),
                 duplicate.path(),
                 result.as_ref(),
+                hidden.as_ref(),
             )
             .unwrap();
             assert!(valid.passed, "{}: {:?}", instance.task_id, valid.reasons);
@@ -1263,6 +1387,7 @@ mod tests {
                 authoritative.path(),
                 duplicate.path(),
                 result.as_ref(),
+                hidden.as_ref(),
             )
             .unwrap();
             assert!(!unrelated.passed, "{}", instance.task_id);
@@ -1296,16 +1421,106 @@ mod tests {
             apply_canonical_change(instance, candidate.path()).unwrap();
             make_alternative(instance, candidate.path()).unwrap();
             let result = check_result(&fixture);
+            let hidden = hidden_result(instance);
             let report = verify_candidate(
                 instance,
                 &fixture,
                 authoritative.path(),
                 candidate.path(),
                 result.as_ref(),
+                hidden.as_ref(),
             )
             .unwrap();
             assert!(report.passed, "{}: {:?}", archetype.id, report.reasons);
         }
+    }
+
+    #[test]
+    fn hidden_behavior_rejects_three_point_special_casing() {
+        let instance = instances()
+            .into_iter()
+            .find(|instance| matches!(instance.parameters, TaskParameters::MultilineEdit { .. }))
+            .unwrap();
+        let authoritative = tempfile::tempdir().unwrap();
+        let candidate = tempfile::tempdir().unwrap();
+        let fixture = materialize(&instance, authoritative.path()).unwrap();
+        materialize(&instance, candidate.path()).unwrap();
+        let TaskParameters::MultilineEdit {
+            path,
+            symbol,
+            boundary,
+            increment,
+        } = &instance.parameters
+        else {
+            unreachable!()
+        };
+        write_file(
+            candidate.path(),
+            path,
+            format!(
+                "def {symbol}(value):\n    if value in ({low}, {boundary}, {high}):\n        return (max(value, {boundary}) + {increment}) * 2\n    return 0\n",
+                low = boundary - 2,
+                high = boundary + 3,
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let visible = CommandResult::success();
+        let hidden = run_hidden(&instance, candidate.path()).unwrap();
+        assert_ne!(hidden.exit_code, Some(0));
+        let report = verify_candidate(
+            &instance,
+            &fixture,
+            authoritative.path(),
+            candidate.path(),
+            Some(&visible),
+            Some(&hidden),
+        )
+        .unwrap();
+        assert!(!report.passed);
+        assert!(
+            report
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("hidden"))
+        );
+    }
+
+    #[test]
+    fn authoritative_verification_uses_pre_verifier_bytes() {
+        let instance = instances()
+            .into_iter()
+            .find(|instance| {
+                matches!(
+                    instance.parameters,
+                    TaskParameters::UniqueReplacement { .. }
+                )
+            })
+            .unwrap();
+        let authoritative = tempfile::tempdir().unwrap();
+        let candidate = tempfile::tempdir().unwrap();
+        let before = tempfile::tempdir().unwrap();
+        let fixture = materialize(&instance, authoritative.path()).unwrap();
+        materialize(&instance, candidate.path()).unwrap();
+        materialize(&instance, before.path()).unwrap();
+
+        apply_canonical_change(&instance, candidate.path()).unwrap();
+        let report = verify_candidate(
+            &instance,
+            &fixture,
+            authoritative.path(),
+            before.path(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!report.passed);
+        assert!(
+            report
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("baseline"))
+        );
     }
 
     fn make_alternative(instance: &TaskInstance, root: &Path) -> Result<(), FixtureError> {

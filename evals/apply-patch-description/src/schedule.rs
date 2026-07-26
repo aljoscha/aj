@@ -6,10 +6,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::descriptions::{DescriptionVariant, FrozenDescription, load};
 use crate::hash_framed;
+use crate::planning::MainPlanningRecord;
 use crate::rng::CounterRng;
 use crate::suite::{
     ArchetypeManifest, ParameterKind, SuiteManifest, TaskParameters, UncommonTextLane,
-    suite_revision,
+    committed_manifest, suite_revision,
 };
 
 /// Error returned while freezing a universe or schedule.
@@ -108,16 +109,46 @@ pub struct FrozenSchedule {
     pub smoke: Vec<PairScheduleRecord>,
     pub pilot: Vec<PairScheduleRecord>,
     pub main: Vec<PairScheduleRecord>,
+    #[serde(default)]
+    pub planning_hash: Option<String>,
     pub schedule_hash: String,
 }
 
+/// Whether the confirmatory schedule has been selected from the frozen universe.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "state", content = "record", rename_all = "snake_case")]
+pub enum MainPlanning {
+    Unplanned,
+    Planned(MainPlanningRecord),
+}
+
+impl Default for MainPlanning {
+    fn default() -> Self {
+        Self::Unplanned
+    }
+}
+
 /// Serialized output of the non-live `freeze` command.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct FrozenPlan {
     pub manifest: SuiteManifest,
     pub descriptions: [FrozenDescription; 2],
     pub universe: FrozenUniverse,
     pub schedule: FrozenSchedule,
+    #[serde(default)]
+    pub planning: MainPlanning,
+}
+
+impl FrozenPlan {
+    /// Returns the frozen main planning record or rejects an unplanned plan.
+    pub fn require_planned_main(&self) -> Result<&MainPlanningRecord, ScheduleError> {
+        match &self.planning {
+            MainPlanning::Unplanned => Err(ScheduleError(
+                "main schedule has not been planned from the blinded pilot".into(),
+            )),
+            MainPlanning::Planned(record) => Ok(record),
+        }
+    }
 }
 
 /// Creates the deterministic maximum task universe.
@@ -159,18 +190,27 @@ pub fn freeze_universe(
     })
 }
 
-/// Selects non-overlapping smoke, pilot, and main pairs.
+/// Selects non-overlapping smoke, pilot, and optionally main pairs.
 pub fn freeze_schedule(
     manifest: &SuiteManifest,
     universe: &FrozenUniverse,
     main_repetitions: u32,
 ) -> Result<FrozenSchedule, ScheduleError> {
     validate_universe(manifest, universe)?;
-    if main_repetitions == 0 || main_repetitions + 4 > universe.instances_per_archetype {
+    if main_repetitions + 4 > universe.instances_per_archetype {
         return Err(ScheduleError(
             "main repetitions do not fit the frozen universe".into(),
         ));
     }
+    build_schedule(manifest, universe, main_repetitions, None)
+}
+
+fn build_schedule(
+    manifest: &SuiteManifest,
+    universe: &FrozenUniverse,
+    main_repetitions: u32,
+    planning_hash: Option<String>,
+) -> Result<FrozenSchedule, ScheduleError> {
     let run_id = hash_framed(
         b"aj-apply-patch-eval-run-id-v1",
         &[
@@ -211,7 +251,7 @@ pub fn freeze_schedule(
         &mut used,
     )?;
 
-    let material = serde_json::to_vec(&(&smoke, &pilot, &main))
+    let material = serde_json::to_vec(&(&smoke, &pilot, &main, &planning_hash))
         .map_err(|error| ScheduleError(format!("cannot serialize schedule: {error}")))?;
     let schedule_hash = hash_framed(
         b"aj-apply-patch-eval-schedule-v1",
@@ -230,6 +270,7 @@ pub fn freeze_schedule(
         smoke,
         pilot,
         main,
+        planning_hash,
         schedule_hash,
     })
 }
@@ -311,11 +352,12 @@ pub fn validate_schedule(
     universe: &FrozenUniverse,
     schedule: &FrozenSchedule,
 ) -> Result<(), ScheduleError> {
-    let expected = freeze_schedule(
+    let expected = build_schedule(
         manifest,
         universe,
         u32::try_from(schedule.main.len() / manifest.archetypes.len())
             .map_err(|_| ScheduleError("main schedule size exceeds u32".into()))?,
+        schedule.planning_hash.clone(),
     )?;
     if schedule != &expected {
         return Err(ScheduleError("schedule identities or hash mismatch".into()));
@@ -323,14 +365,58 @@ pub fn validate_schedule(
     Ok(())
 }
 
-/// Freezes a universe and uses all remaining instances for the main schedule.
+/// Verifies the committed foundation, schedule, and staged planning state.
+pub fn validate_frozen_plan(plan: &FrozenPlan) -> Result<(), ScheduleError> {
+    let committed = committed_manifest().map_err(|error| ScheduleError(error.to_string()))?;
+    if plan.manifest != committed
+        || plan.descriptions
+            != [
+                load(DescriptionVariant::Current),
+                load(DescriptionVariant::CompactV1),
+            ]
+    {
+        return Err(ScheduleError(
+            "frozen plan does not match the committed suite and descriptions".into(),
+        ));
+    }
+    validate_schedule(&plan.manifest, &plan.universe, &plan.schedule)?;
+    match &plan.planning {
+        MainPlanning::Unplanned
+            if plan.schedule.main.is_empty() && plan.schedule.planning_hash.is_none() =>
+        {
+            Ok(())
+        }
+        MainPlanning::Planned(record) => {
+            record.validate()?;
+            let selected = plan
+                .schedule
+                .main
+                .iter()
+                .map(|pair| pair.pair_id.as_str())
+                .collect::<Vec<_>>();
+            if plan.schedule.planning_hash.as_deref() != Some(&record.planning_hash)
+                || selected != record.selected_main_pair_ids
+            {
+                return Err(ScheduleError(
+                    "main schedule does not match its frozen planning record".into(),
+                ));
+            }
+            Ok(())
+        }
+        MainPlanning::Unplanned => Err(ScheduleError(
+            "unplanned plan contains a confirmatory schedule or planning hash".into(),
+        )),
+    }
+}
+
+/// Freezes a universe and the excluded smoke and pilot schedules.
 pub fn freeze_plan(
     manifest: &SuiteManifest,
     run_seed: &str,
     instances_per_archetype: u32,
 ) -> Result<FrozenPlan, ScheduleError> {
     let universe = freeze_universe(manifest, run_seed, instances_per_archetype)?;
-    let schedule = freeze_schedule(manifest, &universe, instances_per_archetype - 4)?;
+    let schedule = freeze_schedule(manifest, &universe, 0)?;
     Ok(FrozenPlan {
         manifest: manifest.clone(),
         descriptions: [
@@ -339,7 +425,61 @@ pub fn freeze_plan(
         ],
         universe,
         schedule,
+        planning: MainPlanning::Unplanned,
     })
+}
+
+/// Selects the fixed main prefix and binds it to a frozen planning record.
+pub fn finalize_main_schedule(
+    plan: &FrozenPlan,
+    record: MainPlanningRecord,
+) -> Result<FrozenPlan, ScheduleError> {
+    if !matches!(plan.planning, MainPlanning::Unplanned) || !plan.schedule.main.is_empty() {
+        return Err(ScheduleError("main schedule is already planned".into()));
+    }
+    validate_frozen_plan(plan)?;
+    record.validate()?;
+    let repetitions = record.recommended_pairs_per_archetype;
+    if repetitions == 0 || repetitions + 4 > plan.universe.instances_per_archetype {
+        return Err(ScheduleError(
+            "recommended main repetitions do not fit the frozen universe".into(),
+        ));
+    }
+    let schedule = build_schedule(
+        &plan.manifest,
+        &plan.universe,
+        repetitions,
+        Some(record.planning_hash.clone()),
+    )?;
+    let selected = schedule
+        .main
+        .iter()
+        .map(|pair| pair.pair_id.clone())
+        .collect::<Vec<_>>();
+    if selected != record.selected_main_pair_ids {
+        return Err(ScheduleError(
+            "planning record selected pair IDs do not match the deterministic main prefix".into(),
+        ));
+    }
+    Ok(FrozenPlan {
+        manifest: plan.manifest.clone(),
+        descriptions: plan.descriptions.clone(),
+        universe: plan.universe.clone(),
+        schedule,
+        planning: MainPlanning::Planned(record),
+    })
+}
+
+/// Returns the deterministic main pair IDs without finalizing a plan.
+pub fn planned_main_pair_ids(
+    plan: &FrozenPlan,
+    repetitions: u32,
+) -> Result<Vec<String>, ScheduleError> {
+    if !matches!(plan.planning, MainPlanning::Unplanned) || !plan.schedule.main.is_empty() {
+        return Err(ScheduleError("expected an unplanned frozen plan".into()));
+    }
+    let schedule = build_schedule(&plan.manifest, &plan.universe, repetitions, None)?;
+    Ok(schedule.main.into_iter().map(|pair| pair.pair_id).collect())
 }
 
 fn select_phase(
@@ -684,16 +824,10 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.schedule.smoke.len(), 16);
         assert_eq!(first.schedule.pilot.len(), 48);
-        assert_eq!(first.schedule.main.len(), 48);
+        assert!(first.schedule.main.is_empty());
 
         let mut task_ids = HashSet::new();
-        for pair in first
-            .schedule
-            .smoke
-            .iter()
-            .chain(&first.schedule.pilot)
-            .chain(&first.schedule.main)
-        {
+        for pair in first.schedule.smoke.iter().chain(&first.schedule.pilot) {
             assert!(task_ids.insert(&pair.task_id));
             assert_eq!(pair.trials[0].pair_id, pair.trials[1].pair_id);
             assert_ne!(pair.trials[0].variant, pair.trials[1].variant);
@@ -708,11 +842,7 @@ mod tests {
     fn order_and_uncommon_lane_alternate_within_each_archetype() {
         let manifest = committed_manifest().unwrap();
         let plan = freeze_plan(&manifest, "alternation", 8).unwrap();
-        for phase in [
-            &plan.schedule.smoke,
-            &plan.schedule.pilot,
-            &plan.schedule.main,
-        ] {
+        for phase in [&plan.schedule.smoke, &plan.schedule.pilot] {
             let mut by_archetype: HashMap<&str, Vec<&PairScheduleRecord>> = HashMap::new();
             for pair in phase {
                 by_archetype
@@ -758,5 +888,43 @@ mod tests {
         let mut corrupted = first.universe.clone();
         corrupted.instances[0].task_seed = "corrupt".into();
         assert!(validate_universe(&manifest, &corrupted).is_err());
+    }
+
+    #[test]
+    fn deterministic_main_prefix_preserves_excluded_pair_identities() {
+        let manifest = committed_manifest().unwrap();
+        let plan = freeze_plan(&manifest, "staged", 9).unwrap();
+        let smoke = plan
+            .schedule
+            .smoke
+            .iter()
+            .map(|pair| pair.pair_id.clone())
+            .collect::<Vec<_>>();
+        let pilot = plan
+            .schedule
+            .pilot
+            .iter()
+            .map(|pair| pair.pair_id.clone())
+            .collect::<Vec<_>>();
+        let ids = planned_main_pair_ids(&plan, 3).unwrap();
+        assert_eq!(ids.len(), 48);
+        assert_eq!(planned_main_pair_ids(&plan, 3).unwrap(), ids);
+        assert_eq!(
+            plan.schedule
+                .smoke
+                .iter()
+                .map(|pair| pair.pair_id.clone())
+                .collect::<Vec<_>>(),
+            smoke
+        );
+        assert_eq!(
+            plan.schedule
+                .pilot
+                .iter()
+                .map(|pair| pair.pair_id.clone())
+                .collect::<Vec<_>>(),
+            pilot
+        );
+        assert!(planned_main_pair_ids(&plan, 6).is_err());
     }
 }

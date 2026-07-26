@@ -102,6 +102,13 @@ system instructions, provider options, and builtin tool set, except that the
 `agent` tool and background bash are disabled for both variants. Sub-agents add
 a second model policy and make attribution to the patch description unclear.
 
+The Codex adapter does not serialize `StreamOptions.max_tokens`. The frozen
+contract therefore uses the model catalog or server maximum as the enforceable
+per-request output ceiling and records it by that name. It does not claim that a
+smaller client cap is sent. The parent also bounds request count and aggregate
+completed output usage, but completed-usage enforcement cannot stop tokens
+before the provider reports them.
+
 The runner obtains builtin tools normally, finds the erased definition named
 `apply_patch`, and replaces only its `description` field for `compact-v1`. The
 input schema, execution closure, execution mode, and all other tool descriptions
@@ -132,7 +139,13 @@ memorized solutions while preserving the same structural task.
 Each task has an independent verifier and a changed-path allowlist. Verifiers
 prefer behavior tests over exact diffs. Exact expected contents are appropriate
 for narrow data or configuration edits. Every verifier also rejects unrelated
-changes.
+changes. Model-visible `check.py` files are coarse smoke checks only. The
+authoritative verifier generates hidden checks from the frozen task parameters
+inside the verifier guest. Those checks exercise broad deterministic domains,
+boundary and breaking inputs, related files, indentation, rename behavior, and
+ambiguous repeated structures. Hidden check sources and cases are never written
+into the model-visible repository. `task_passed` requires the hidden check to
+pass.
 
 The initial suite contains 16 task archetypes with this weighting:
 
@@ -267,6 +280,14 @@ successful task, and first-response AJ-recorded cost. Keep cache categories
 separate and include the cache-write sensitivity range. Total tokens are not a
 cost substitute.
 
+The generated report includes per-variant distributions for every token
+category, total tokens, duration, tool rounds, total calls, calls by tool, and
+recovery rounds. It also includes patch-classification counts, absolute task
+success, edit-bypass and terminal-failure counts, final-assistant-text counts
+and byte lengths, and content-addressed text blob references. Cache-write
+sensitivity reports the full possible relative decision range, not only variant
+means.
+
 ### Edit bypass
 
 The fixture manifest declares the filesystem paths and metadata that constitute
@@ -305,31 +326,52 @@ because it avoids the behavior under evaluation.
 
 The sample planner targets at least 80% power for each binary guardrail under no
 true degradation, using one-sided 5% alpha and the exact analysis margins below.
-It uses paired event-count simulation or enumeration with blinded pooled event
-counts and paired correlations. For each nuisance quantity, the planner uses the
-point in its one-sided 95% interval that produces the largest required sample.
-It does not use a normal approximation or plug in an event probability of zero
-when no pilot event was observed. It also requires enough pairs that the score
-method's all-zero upper bound can clear each rare-event margin and its all-pass
-lower bound can clear the task-success margin. For efficiency, it targets 80%
-power to pass the full rule below under each of two alternatives. In each
-alternative, one endpoint has a true 10% improvement and the other has no true
-change. Pilot sessions are never included in main inference. If the required
-fixed sample is impractical, the result is inconclusive. Margins and thresholds
-are not weakened.
+It uses a conservative analytic paired-score approximation over the one-sided
+95% nuisance region for pooled event and discordance rates. It never substitutes
+zero for an unobserved pilot event. It also requires enough pairs that the exact
+score method's all-zero upper bound can clear each rare-event margin and its
+all-pass lower bound can clear the task-success margin.
 
-`--max-cost-usd` is an admission control based on AJ-recorded catalog cost, not
-an interrupt. Before the main run, freeze a per-pair reserve from the blinded
-pilot's one-sided 95% upper bound for pair cost. The fixed main run starts only
-if its budget covers that reserve for every planned pair. During the run, the
-runner starts a pair only if the remaining reserve covers both trials, then lets
-both finish even if the estimate is exceeded.
+For efficiency, the planner uses paired relative observations and a one-sided
+95% upper confidence bound for their variance. Model-response observations are
+integers. A response-improvement alternative retains the mandatory first
+response and treats only follow-up responses as removable. The two alternatives
+remain a true 10% improvement in one endpoint and no true change in the other.
+The planner evaluates achieved power with deterministic common random numbers
+and requires a one-sided 95% Wilson lower bound of at least 80%, not a simulated
+point estimate. It uses monotone bracketing and binary search up to a practical
+frozen cap. The exact algorithm version, replicate count, seed, variance method,
+and confidence controls are frozen in the planning record.
+Pilot sessions are never included in main inference. If the required fixed
+sample is impractical, the result is inconclusive. Margins and thresholds are
+not weakened. Final confirmatory analysis still uses 100,000 bootstrap
+replicates.
+
+`--max-cost-usd` is a conservative catalog admission control, not an interrupt
+or invoice control. The hard per-pair reserve covers both trials at the maximum
+request count, full catalog input context, catalog or server output ceiling,
+the highest applicable catalog rates, cache-read pricing, and cache-write
+sensitivity. Smoke and pilot use the same reserve. The fixed main run starts
+only if its budget covers this reserve for every remaining planned pair. During
+the run, the runner starts a pair only if the remaining reserve covers both
+trials, then lets both finish even if the estimate is exceeded. The blinded
+pilot's one-sided 95% pair-cost reserve is frozen and reported as an additional
+empirical diagnostic. It is not the hard budget guard.
 `--max-trials` must admit an even number of trials. Both controls are checked
 only between adjacent pairs. A process interruption or invalid trial leaves an
 incomplete pair. Its records are retained, the whole pair is rerun with the same
 seeds, and neither attempt enters main inference. If budget or interruption
 prevents the full frozen sample from completing, the partial result is
 descriptive and cannot support shipping.
+
+Smoke and pilot commands accept only the original unplanned plan. Pilot requires
+every valid smoke completion marker in the same artifact stream. Main accepts
+only a planned plan. Planning freezes the unplanned schedule hash and a
+deterministic hash over sorted excluded completion-marker hashes, referenced
+trial hashes, and their identities. The blinded summary and both reserves are
+bound by the same planning hash. Main admission and analysis recompute this
+commitment from the same stream. Immutable unreferenced failed or incomplete
+attempts remain in the stream but do not enter the commitment or reduction.
 
 Provider failures are retried according to the normal provider policy and
 recorded separately. Exhausted retries make the trial and its pair invalid under
@@ -385,6 +427,11 @@ the host. The parent must enforce all of these conditions:
   Its generated fixture is the only persistent writable mount. A bounded guest
   tmpfs holds temporary `HOME` and `TMPDIR` data. It has no host worktree, home
   directory, credential files, container socket, or unrelated host mount.
+- The image has a required OCI provenance label set from a build argument. Its
+  value is the clean source `HEAD`, or the exact dirty-worktree provenance hash
+  when a dirty build is explicitly supported. Preflight and every live run
+  compare the label with host source provenance and fail closed on a mismatch.
+  Every trial records Docker's exact immutable image ID.
 - The worker receives a temporary `HOME` and a minimal allowlisted environment.
   Provider credentials remain in the parent. The worker's provider reaches a
   parent-owned IPC broker through a non-inheritable capability created for that
@@ -395,6 +442,11 @@ the host. The parent must enforce all of these conditions:
   access is denied.
 - CPU, memory, process, disk, and wall-clock limits are fixed. Absolute and
   parent-relative paths can affect only the disposable guest filesystem.
+- Every Docker command and one-shot helper has a fixed parent deadline followed
+  by explicit container kill, wait, and removal. The whole-trial deadline covers
+  volume creation, fixture generation, baseline capture, worker initialization,
+  final capture, verification, and cleanup. Preflight has its own overall
+  deadline and includes a helper that never writes a protocol frame.
 - The parent owns the artifact directory outside the worker's writable area.
   The model and its tools cannot alter events, snapshots, diffs, or result
   records after capture.
@@ -429,7 +481,9 @@ The verifier guest has the same filesystem, environment, network, process, and
 resource containment, but no model-broker capability. Verifier commands and
 acceptance logic are immutable parent-owned inputs. The parent snapshots the
 verifier copy before and after the command, records verifier mutations, and
-never derives the agent diff from verifier state.
+never derives the agent diff from verifier state. The candidate mount is
+read-only. Authoritative checks inspect a separate copy of the pre-verifier
+bytes. Any mutation or attempted source repair fails verification.
 
 Write immutable JSONL trial records plus a generated JSON and Markdown summary.
 Each trial record must include:
@@ -443,6 +497,8 @@ Each trial record must include:
 - ordered per-tool mutation deltas, final agent diff, and changed paths
 - pre-verifier and post-verifier hashes and verifier mutation paths
 - conversation-log path and provider error details
+- exact image ID, source provenance, UTC date, runtime limits, catalog or server
+  output ceiling, system-prompt hash, and normalized actual payload hashes
 
 The parent flushes each trial record before continuing and writes a complete-pair
 marker only after both valid records are durable. Resume skips only marked
@@ -450,13 +506,25 @@ complete pairs. An unmarked pair is rerun in full under a new attempt ID while
 old records remain immutable. `--max-cost-usd`, `--max-trials`, and `--seed` are
 required controls.
 
+Resume rejects any scheduled attempt or completion marker with a different
+image ID, source provenance, UTC date, runtime limit, model catalog, model,
+effort, system prompt, or relevant provider control. Analysis applies the same
+single-context requirement. The first attempt freezes the UTC date and every
+later phase reuses it. Credential or model resolution failure after the
+first pair is known creates a durable zero-usage `infrastructure_failed` attempt
+for that pair. It consumes one of the bounded pair attempts without fabricating
+model usage.
+
 ## Harness verification
 
 Before any paid run, test the runner with `ScriptedProvider` plus a capturing
 provider wrapper. `ScriptedProvider` alone is insufficient because it ignores
 the request `Context`. For a fixed synthetic trial identity, capture `Context`,
 `StreamOptions`, or the serialized payload through `on_payload` and assert that
-the two variants differ only in the exact `apply_patch` description bytes. Also
+the two variants differ only in the exact `apply_patch` description bytes. The
+paid-path equality hash is derived from each actual `on_payload` JSON value. It
+normalizes only the opaque cache identity and `apply_patch` description. Model,
+instructions, input, tools, and all stable provider fields remain covered. Also
 test:
 
 - successful patch on the first call
@@ -476,9 +544,12 @@ test:
 - paired workers exposing the same canonical path and identical model context
   outside the description and opaque trial identities
 - verifier mutations detected without changing the captured agent diff
+- a three-point behavior special case and a self-repairing verifier candidate
+  rejected by hidden checks over pre-verifier bytes
 - verifier guest unable to reach the model broker, host files, credentials, or
   unrestricted network
 - resume rerunning an incomplete pair without duplicating a complete pair
+- resume rejecting mixed image, source, date, limits, and provider controls
 - budget and trial stops occurring only between complete pairs
 - all-zero rare-event input producing a nonzero-width score bound
 

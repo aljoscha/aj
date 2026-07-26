@@ -1,0 +1,25 @@
+FROM rust:1.96-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS build
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY evals/apply-patch-description ./evals/apply-patch-description
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --locked --release -p aj-apply-patch-eval \
+    && cp target/release/aj-apply-patch-eval /aj-apply-patch-eval
+
+FROM ubuntu:24.04@sha256:786a8b558f7be160c6c8c4a54f9a57274f3b4fb1491cf65146521ae77ff1dc54
+ARG AJ_EVAL_SOURCE_PROVENANCE
+RUN test -n "$AJ_EVAL_SOURCE_PROVENANCE"
+LABEL org.aj.eval.source-provenance="$AJ_EVAL_SOURCE_PROVENANCE"
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        git \
+        python3 \
+        ripgrep \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir /workspace
+COPY --from=build /aj-apply-patch-eval /usr/local/bin/aj-apply-patch-eval
+ENTRYPOINT ["/usr/local/bin/aj-apply-patch-eval"]
