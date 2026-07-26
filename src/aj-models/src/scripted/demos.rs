@@ -138,6 +138,11 @@ pub fn catalog() -> Vec<(&'static str, &'static str, fn() -> Vec<ProviderScript>
             "bash launched with run_in_background: task badge lifecycle plus the completion notice",
             background_task,
         ),
+        (
+            "background-agent-failure",
+            "background sub-agent fails: failed agent box plus an error completion notice",
+            background_agent_failure,
+        ),
     ]
 }
 
@@ -640,6 +645,64 @@ launch cell's badge should now show the terminal status.";
     let script_3 = builder().start().text_block(wrap).done(DoneReason::Stop);
 
     vec![script_1, script_2, script_3]
+}
+
+/// `background-agent-failure`: launch a detached sub-agent whose model
+/// request fails, then show its failed completion notification to the
+/// parent.
+///
+/// Parent and child share one scripted-provider queue. The sequential
+/// bash call follows the background launch as a barrier in the same tool
+/// batch, keeping the parent occupied while the child consumes the error
+/// script. The notice is therefore queued before the parent proceeds to
+/// the final script.
+fn background_agent_failure() -> Vec<ProviderScript> {
+    let intro = "I'll launch a background sub-agent whose scripted model \
+request will fail. A short foreground command keeps this tool batch open so \
+the detached failure and its notification arrive before I continue.";
+    let wrap = "The background sub-agent failed as expected. Its box should \
+show a failed status, and the completion notification above should include \
+the scripted provider error.";
+
+    let parent_tools = builder()
+        .start()
+        .text_block(intro)
+        .delay(section_delay())
+        .tool_call_block_chunked(
+            "agent-call-background-failure",
+            "agent",
+            serde_json::json!({
+                "task": "Demonstrate failure delivery from a detached sub-agent.",
+                "description": "Background sub-agent that intentionally fails.",
+                "run_in_background": true,
+            }),
+            0,
+            Duration::ZERO,
+        )
+        .tool_call_block_chunked(
+            "background-failure-barrier",
+            "bash",
+            serde_json::json!({
+                "command": "sleep 1",
+                "timeout": 5,
+                "description": "Keep the parent busy while the background sub-agent fails."
+            }),
+            0,
+            Duration::ZERO,
+        )
+        .done(DoneReason::ToolUse);
+
+    let child_failure = builder().start().error(
+        ErrorReason::Error,
+        AssistantError::new(
+            ErrorCategory::InvalidRequest,
+            "scripted: intentional background sub-agent failure",
+        ),
+    );
+
+    let parent_wrap = builder().start().text_block(wrap).done(DoneReason::Stop);
+
+    vec![parent_tools, child_failure, parent_wrap]
 }
 
 // ===========================================================================
