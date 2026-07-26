@@ -178,6 +178,7 @@ impl ToolDefinition for AgentTool {
 mod tests {
     use super::*;
     use aj_agent::TaskRegistry;
+    use aj_agent::events::AgentId;
     use aj_agent::tool::{SpawnedAgent, StartedTask, TaskKind, TaskOutputSource, TodoItem};
     use std::path::PathBuf;
     use std::pin::Pin;
@@ -238,6 +239,10 @@ mod tests {
             self.tasks.task_registry()
         }
 
+        fn agent_id(&self) -> AgentId {
+            self.tasks.agent_id()
+        }
+
         fn start_background_task(
             &mut self,
             kind: TaskKind,
@@ -293,6 +298,10 @@ mod tests {
 
         fn task_registry(&self) -> TaskRegistry {
             self.tasks.task_registry()
+        }
+
+        fn agent_id(&self) -> AgentId {
+            self.tasks.agent_id()
         }
 
         fn start_background_task(

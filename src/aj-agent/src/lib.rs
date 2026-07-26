@@ -1993,7 +1993,7 @@ impl Agent {
             stream_options: self.stream_options.clone(),
             sub_agent_tools,
             parent_bus: self.bus.clone(),
-            parent_agent_id: self.agent_id,
+            agent_id: self.agent_id,
             cancellation: self.cancellation.child_token(),
             block_images: self.block_images,
             default_thinking: self.default_thinking.clone(),
@@ -2803,10 +2803,12 @@ struct SessionContextWrapper<'a> {
     /// correlation events on this bus before / after the child
     /// runs.
     parent_bus: EventBus,
-    /// Identifier of the parent agent that owns this wrapper. The
-    /// `parent` field of [`AgentEvent::SubAgentStart`] /
-    /// [`AgentEvent::SubAgentEnd`].
-    parent_agent_id: AgentId,
+    /// Identity of the agent whose tool call this wrapper serves.
+    /// Surfaced through [`ToolContext::agent_id`], recorded as the
+    /// owner of the background tasks this agent starts, and carried as
+    /// the `parent` of [`AgentEvent::SubAgentStart`] /
+    /// [`AgentEvent::SubAgentEnd`] for the children it spawns.
+    agent_id: AgentId,
     /// Cancellation token surfaced through
     /// [`ToolContext::cancellation`]. Derived from the parent
     /// agent's token via [`CancellationToken::child_token`] so a
@@ -2887,7 +2889,7 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
             // built from below.
             self.parent_bus
                 .emit(AgentEvent::SubAgentStart {
-                    parent: self.parent_agent_id,
+                    parent: self.agent_id,
                     child: child_id,
                     task: task.clone(),
                     background: matches!(mode, SpawnMode::Background),
@@ -3042,7 +3044,7 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
                     kind,
                     agent_id,
                     task_id: id,
-                    parent: self.parent_agent_id,
+                    parent: self.agent_id,
                     parent_bus: self.parent_bus.clone(),
                     registry: self.task_registry.clone(),
                     cancel,
@@ -3086,7 +3088,7 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
             };
             self.parent_bus
                 .emit(AgentEvent::SubAgentEnd {
-                    parent: self.parent_agent_id,
+                    parent: self.agent_id,
                     child: child_id,
                     report,
                     conclusion,
@@ -3113,7 +3115,7 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
         partial: ToolDetails,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'b>> {
         let event = AgentEvent::ToolExecutionUpdate {
-            agent_id: self.parent_agent_id,
+            agent_id: self.agent_id,
             call_id: self.call_id.clone(),
             tool: self.tool_name.clone(),
             args: self.tool_args.clone(),
@@ -3141,19 +3143,28 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
         self.task_registry.clone()
     }
 
+    fn agent_id(&self) -> AgentId {
+        self.agent_id
+    }
+
     fn start_background_task(
         &mut self,
         kind: TaskKind,
         label: String,
         output: Arc<dyn TaskOutputSource>,
     ) -> StartedTask {
-        let (id, cancel) =
-            self.task_registry
-                .register(self.parent_agent_id, kind, label.clone(), output);
+        // The owner comes from `agent_id()` rather than the field, so
+        // the identity that owns a task and the identity the `task_*`
+        // tools authorize against are one expression and cannot drift
+        // apart.
+        let owner = self.agent_id();
+        let (id, cancel) = self
+            .task_registry
+            .register(owner, kind, label.clone(), output);
         let events = TaskEventSink::new(
             self.parent_bus.clone(),
             self.task_registry.clone(),
-            self.parent_agent_id,
+            owner,
             id,
             self.call_id.clone(),
             label,
@@ -6847,6 +6858,105 @@ mod event_protocol_tests {
 
         assert_eq!(registry.ids(), vec![1, 2], "both spawns retained");
         assert_eq!(tool_result_ids(&agent), vec!["tu-1", "tu-2"]);
+    }
+
+    /// Output source for a task with no driver behind it.
+    struct NoOutput;
+
+    impl crate::tool::TaskOutputSource for NoOutput {
+        fn snapshot(&self) -> crate::tool::TaskRead {
+            crate::tool::TaskRead::default()
+        }
+    }
+
+    /// Tool that starts a background task and records both the
+    /// identity it ran as and the owner the registry recorded for the
+    /// task.
+    #[derive(Clone)]
+    struct StartTaskTool {
+        observed: Arc<Mutex<Vec<(AgentId, AgentId)>>>,
+    }
+
+    impl ToolDefinition for StartTaskTool {
+        type Input = PingInput;
+
+        fn name(&self) -> &'static str {
+            "start_task"
+        }
+
+        fn description(&self) -> &'static str {
+            "Test tool that starts a background task"
+        }
+
+        async fn execute(
+            &self,
+            ctx: &mut dyn ToolContext,
+            _input: PingInput,
+        ) -> Result<ToolOutcome, crate::BoxError> {
+            let caller = ctx.agent_id();
+            let started = ctx.start_background_task(
+                TaskKind::Bash {
+                    command: "sleep 30".to_string(),
+                },
+                "sleep 30".to_string(),
+                Arc::new(NoOutput),
+            );
+            let registry = ctx.task_registry();
+            let owner = registry
+                .summary(started.id)
+                .expect("the task is registered synchronously")
+                .owner;
+            self.observed.lock().unwrap().push((caller, owner));
+            // There is no driver to ever flip this entry, so retire it
+            // here rather than leave the registry with a phantom
+            // `Running` task.
+            registry.set_status(started.id, TaskStatus::Exited(Some(0)));
+            Ok(ToolOutcome {
+                content: vec![aj_models::types::UserContent::text("started".to_string())],
+                details: ToolDetails::Text {
+                    summary: "start_task".to_string(),
+                    body: String::new(),
+                },
+                is_error: false,
+            })
+        }
+    }
+
+    /// The identity a tool call runs as is the identity its background
+    /// tasks are owned by, all the way through the production
+    /// [`ToolContext`]: a task a sub-agent starts is owned by that
+    /// sub-agent, not by the agent that spawned it.
+    #[tokio::test]
+    async fn sub_agent_owns_the_task_it_starts() {
+        let observed: Arc<Mutex<Vec<(AgentId, AgentId)>>> = Arc::new(Mutex::new(Vec::new()));
+        let start_task = StartTaskTool {
+            observed: Arc::clone(&observed),
+        };
+        // The parent delegates, the child starts a task, then both
+        // wrap up. The child inherits the parent's catalog minus
+        // `agent`, so `start_task` is available to it.
+        let scripts = vec![
+            finalize_script(finalize_tool_use("tu-1", "agent")),
+            finalize_script(finalize_tool_use("tu-2", "start_task")),
+            finalize_script(finalize_text("sub done")),
+            finalize_script(finalize_text("parent done")),
+        ];
+        let mut agent = build_agent(
+            scripts,
+            vec![SpawnTool::blocking().into(), start_task.into()],
+        );
+        agent.set_task_registry(TaskRegistry::default());
+
+        agent
+            .run_single_turn("delegate".to_string())
+            .await
+            .expect("turn");
+
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![(AgentId::Sub(1), AgentId::Sub(1))],
+            "the child's tool call must run as, and own its tasks as, Sub(1)"
+        );
     }
 }
 

@@ -1399,6 +1399,10 @@ mod tests {
             self.inner.task_registry()
         }
 
+        fn agent_id(&self) -> aj_agent::events::AgentId {
+            self.inner.agent_id()
+        }
+
         fn start_background_task(
             &mut self,
             kind: aj_agent::tool::TaskKind,

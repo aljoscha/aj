@@ -24,7 +24,8 @@ use tokio_util::sync::CancellationToken;
 /// in-memory; `spawn_agent` returns an error; `emit_update` discards
 /// snapshots; `cancellation` returns a fresh token that never fires.
 /// Background tasks register against the (default) `task_registry`
-/// and emit on a bus with no subscribers.
+/// and emit on a bus with no subscribers, owned by `agent_id`, which
+/// defaults to [`AgentId::Main`].
 pub struct DummyToolContext {
     /// Working directory returned by [`ToolContext::working_directory`].
     pub working_directory: PathBuf,
@@ -39,6 +40,18 @@ pub struct DummyToolContext {
     /// Bus the task event sinks emit on. Fresh (no subscribers) by
     /// default; tests can subscribe to observe task events.
     pub bus: EventBus,
+    /// Identity surfaced by [`ToolContext::agent_id`] and recorded as
+    /// the owner of tasks started through this context.
+    pub agent_id: AgentId,
+}
+
+impl DummyToolContext {
+    /// Run as `agent_id` instead of the default [`AgentId::Main`], so
+    /// tests can exercise ownership scoping across agents.
+    pub fn with_agent_id(mut self, agent_id: AgentId) -> Self {
+        self.agent_id = agent_id;
+        self
+    }
 }
 
 impl Default for DummyToolContext {
@@ -49,6 +62,7 @@ impl Default for DummyToolContext {
             cancellation: CancellationToken::new(),
             task_registry: TaskRegistry::default(),
             bus: EventBus::new(),
+            agent_id: AgentId::Main,
         }
     }
 }
@@ -93,6 +107,10 @@ impl ToolContext for DummyToolContext {
         self.task_registry.clone()
     }
 
+    fn agent_id(&self) -> AgentId {
+        self.agent_id
+    }
+
     fn start_background_task(
         &mut self,
         kind: TaskKind,
@@ -101,11 +119,11 @@ impl ToolContext for DummyToolContext {
     ) -> StartedTask {
         let (id, cancel) = self
             .task_registry
-            .register(AgentId::Main, kind, label.clone(), output);
+            .register(self.agent_id, kind, label.clone(), output);
         let events = TaskEventSink::new(
             self.bus.clone(),
             self.task_registry.clone(),
-            AgentId::Main,
+            self.agent_id,
             id,
             "dummy-call".to_string(),
             label,

@@ -175,9 +175,10 @@ at the end for orchestration.
    the existing bash tool cell in place — no new box type for live
    output.
 10. **Sub-agents may start background bash tasks** (they inherit the
-    toolset); ownership and notices are scoped to the spawning agent.
-    Background *agent* spawns remain main-only because the `agent`
-    tool stays filtered out of sub-agent toolsets.
+    toolset). Ownership and notices are scoped to the spawning agent,
+    and the `task_*` tools authorize against the same ownership
+    (§4.4). Background *agent* spawns remain main-only because the
+    `agent` tool stays filtered out of sub-agent toolsets.
 
 ---
 
@@ -390,13 +391,38 @@ Both are thin wrappers over the registry; default
   `read_file` on the spill path. Details: `ToolDetails::Bash` with
   `task_id` set, `exit_code` populated once terminal. For agent
   tasks: status while running, the final report once done
-  (`ToolDetails::Text`). Unknown id → `is_error` outcome listing live
-  ids.
+  (`ToolDetails::Text`). Unknown id → `is_error` outcome naming the id
+  as unknown.
 - **`task_stop { id }`** — cancels the task token, awaits the terminal
   status (bounded), returns the final status and output tail. Stopping
   an agent-backed task cancels the child's run token; the sub-agent's
   handle stays in `SubAgentRegistry` (it's re-promptable, per the
   steering spec).
+
+**Authorization.** Ids are session-wide, so an agent can name a task it
+never started. Both tools resolve an id only for the agent that owns
+it. Nobody reaches across, in either direction: a sub-agent cannot
+touch its parent's or a sibling's work, and a parent cannot interfere
+with a running sub-agent's. The rule needs no notion of an agent tree,
+so it survives any change to the shape of one.
+
+A task therefore becomes unreachable through these tools once its owner
+finishes, which is accepted rather than worked around. Reparenting to
+the spawner or killing the task at owner exit would both buy back
+agent-level reach at the cost of machinery and of a lifetime rule that
+has to be explained. Three things already cover the gap: the output
+stays readable in the owner's transcript, where the completion notice
+also lands, the task picker lists and kills tasks regardless of owner,
+and `shutdown_background_tasks` kills whatever is still running when
+the session ends, including at the end of a `--print` run.
+
+A refused id is its own outcome, distinct from an unknown one:
+`Background task #{id} belongs to another agent.`, `is_error: true`.
+Existence is not hidden — spill files are readable, `ps` shows sibling
+commands, and the monotonic id space leaks the count anyway — and
+claiming an id the caller was just handed doesn't exist reads as a bug.
+Both error outcomes append the caller's *own* live ids, which is a
+helpful-response concern rather than a secrecy one.
 
 ### 4.5 `agent` background mode
 
@@ -626,8 +652,12 @@ produces today, so renderers share one code path.
   report.
 - **Blocking `task_output` cancelled by Ctrl+C** → the tool call
   resolves as the standard cancelled outcome; the task is unaffected.
-- **Unknown / already-terminal ids** → `is_error` outcome listing
-  live ids (unknown), or an immediate normal report (terminal).
+- **Unknown / already-terminal ids** → `is_error` outcome naming the
+  id as unknown, or an immediate normal report (terminal). Both error
+  outcomes list the caller's own live ids.
+- **An id owned by another agent** → `is_error` outcome saying the
+  task belongs to another agent (§4.4). The task is left alone,
+  `task_stop` never reaches the kill.
 - **Sub-agent-owned task finishes after the sub-agent's run ended** →
   trigger 1 wakes the sub-agent in its own chat; the user inspects the
   result by switching views. No escalation to Main.
@@ -701,9 +731,11 @@ produces today, so renderers share one code path.
    active-id generalization to `Agent|Task` is the sketched path if
    the inline cell proves too cramped).
 4. **No `task_list` tool.** Ids arrive in started results and notices,
-   the unknown-id error lists live ids, and the alt+a picker covers
-   the human side. A list tool would mostly duplicate what the model
-   already holds in context.
+   an error outcome lists the caller's own live ids, and the alt+a
+   picker covers the human side. A list tool would mostly duplicate
+   what the model already holds in context. Note the listing is
+   caller-scoped, so it is a correction aid for the caller's own
+   tasks, not a session-wide inventory.
 5. **No multi-task wait.** Blocking `task_output` takes one id;
    auto-wake covers "react to whichever finishes first", and print
    mode waits serially. An any-of wait is the first thing to add back

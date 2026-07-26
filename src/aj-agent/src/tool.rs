@@ -1257,6 +1257,11 @@ pub trait ToolContext: Send {
     /// Shared task registry handle (for the `task_*` tools).
     fn task_registry(&self) -> TaskRegistry;
 
+    /// Identity of the agent this tool call runs as. Owner of the
+    /// tasks this agent starts, and the scope the `task_*` tools
+    /// resolve ids in.
+    fn agent_id(&self) -> AgentId;
+
     /// Register a background task and get the plumbing its detached
     /// driver needs: the task id, a cancel token (child of the
     /// registry root, NOT of the per-turn token), and an event sink.
@@ -1267,6 +1272,10 @@ pub trait ToolContext: Send {
     /// leave a phantom `Running` registry entry with no driver to
     /// ever flip it. The driver must emit [`TaskEventSink::started`]
     /// before any other task event.
+    ///
+    /// The task is recorded as owned by [`ToolContext::agent_id`],
+    /// which is also the identity the `task_*` tools authorize
+    /// against and the recipient of the completion notice.
     ///
     /// NOTE: ids are allocated by the registry, not by session state,
     /// so detached drivers never need the `&mut SessionState` borrow

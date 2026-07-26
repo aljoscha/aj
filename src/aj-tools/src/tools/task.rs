@@ -7,11 +7,15 @@
 //! run with the default [`ExecutionMode::Parallel`] so they never
 //! serialize a tool batch.
 //!
+//! Ids are session-wide, so both tools authorize before acting: see
+//! [`may_resolve`] for who may resolve whose tasks.
+//!
 //! [`ExecutionMode::Parallel`]: aj_agent::tool::ExecutionMode::Parallel
 
 use std::time::Duration;
 
 use aj_agent::TaskRegistry;
+use aj_agent::events::AgentId;
 use aj_agent::tool::{
     BashStreamTruncation, TaskId, TaskKind, TaskStatus, ToolContext, ToolDefinition, ToolDetails,
     ToolOutcome,
@@ -92,8 +96,11 @@ impl ToolDefinition for TaskOutputTool {
         input: Self::Input,
     ) -> Result<ToolOutcome, aj_agent::BoxError> {
         let registry = ctx.task_registry();
-        let Some(status) = registry.status(input.id) else {
-            return Ok(unknown_id_outcome(&registry, input.id));
+        let caller = ctx.agent_id();
+        let status = match resolve(&registry, caller, input.id) {
+            Resolved::Allowed(status) => status,
+            Resolved::Foreign => return Ok(foreign_id_outcome(&registry, caller, input.id)),
+            Resolved::Unknown => return Ok(unknown_id_outcome(&registry, caller, input.id)),
         };
         if input.block && !status.is_terminal() {
             // The turn token cancels the *wait*, never the task: a
@@ -108,7 +115,7 @@ impl ToolDefinition for TaskOutputTool {
                 _ = tokio::time::sleep(Duration::from_secs(input.timeout)) => {}
             }
         }
-        Ok(report_outcome(&registry, input.id))
+        Ok(report_outcome(&registry, caller, input.id))
     }
 }
 
@@ -138,14 +145,59 @@ impl ToolDefinition for TaskStopTool {
         input: Self::Input,
     ) -> Result<ToolOutcome, aj_agent::BoxError> {
         let registry = ctx.task_registry();
-        let Some(status) = registry.status(input.id) else {
-            return Ok(unknown_id_outcome(&registry, input.id));
+        let caller = ctx.agent_id();
+        let status = match resolve(&registry, caller, input.id) {
+            Resolved::Allowed(status) => status,
+            Resolved::Foreign => return Ok(foreign_id_outcome(&registry, caller, input.id)),
+            Resolved::Unknown => return Ok(unknown_id_outcome(&registry, caller, input.id)),
         };
         if !status.is_terminal() {
             registry.kill(input.id);
             let _ = tokio::time::timeout(STOP_GRACE, registry.wait_terminal(input.id)).await;
         }
-        Ok(report_outcome(&registry, input.id))
+        Ok(report_outcome(&registry, caller, input.id))
+    }
+}
+
+/// Whether `caller` is allowed to read or stop a task owned by
+/// `owner`. An agent acts only on tasks it started.
+///
+/// Nobody reaches across, in either direction. A sub-agent cannot
+/// touch its parent's or a sibling's work, and a parent cannot
+/// interfere with a running sub-agent's. Ownership needs no notion of
+/// an agent tree, so nothing here has to change if the shape of that
+/// tree ever does.
+///
+/// A task whose owner has finished is therefore unreachable through
+/// these tools. That is deliberate. Its output stays readable in the
+/// owner's transcript, the task picker can kill it, and session
+/// shutdown kills whatever is left.
+fn may_resolve(caller: AgentId, owner: AgentId) -> bool {
+    caller == owner
+}
+
+/// How an id resolves for a given caller.
+enum Resolved {
+    /// The caller may act on the task, which is in this status.
+    Allowed(TaskStatus),
+    /// The task exists but another agent owns it.
+    Foreign,
+    /// No task with this id in the session.
+    Unknown,
+}
+
+/// Resolve `id` for `caller`, applying [`may_resolve`].
+///
+/// Task ids are session-wide, so an id names a task regardless of who
+/// asks. A caller that may not act on one is told so rather than told
+/// the task doesn't exist: ids are handed around between agents, and
+/// pretending an id the caller was just given is unknown reads as a
+/// bug to model and user alike.
+fn resolve(registry: &TaskRegistry, caller: AgentId, id: TaskId) -> Resolved {
+    match registry.summary(id) {
+        None => Resolved::Unknown,
+        Some(summary) if may_resolve(caller, summary.owner) => Resolved::Allowed(summary.status),
+        Some(_) => Resolved::Foreign,
     }
 }
 
@@ -155,12 +207,12 @@ impl ToolDefinition for TaskStopTool {
 /// markers onto [`ToolDetails::Bash`] (with `task_id` set and
 /// `exit_code` populated once terminal); agent-backed tasks render
 /// what [`aj_agent::tool::TaskRead`] gives as [`ToolDetails::Text`].
-fn report_outcome(registry: &TaskRegistry, id: TaskId) -> ToolOutcome {
+fn report_outcome(registry: &TaskRegistry, caller: AgentId, id: TaskId) -> ToolOutcome {
     let Some(summary) = registry.summary(id) else {
-        return unknown_id_outcome(registry, id);
+        return unknown_id_outcome(registry, caller, id);
     };
     let Some((status, read)) = registry.read(id) else {
-        return unknown_id_outcome(registry, id);
+        return unknown_id_outcome(registry, caller, id);
     };
 
     let header = match status {
@@ -263,13 +315,43 @@ fn truncate_stream_tail(tail: &str) -> (String, Option<BashStreamTruncation>) {
     (tt.content, Some(summary))
 }
 
-/// `is_error` outcome for an id the registry doesn't know, listing the
-/// live task ids so the model can correct itself.
-fn unknown_id_outcome(registry: &TaskRegistry, id: TaskId) -> ToolOutcome {
+/// `is_error` outcome for an id that names no task in the session.
+fn unknown_id_outcome(registry: &TaskRegistry, caller: AgentId, id: TaskId) -> ToolOutcome {
+    error_outcome(
+        registry,
+        caller,
+        id,
+        format!("No background task with id {id}."),
+        "unknown id",
+    )
+}
+
+/// `is_error` outcome for a task the caller may not act on.
+fn foreign_id_outcome(registry: &TaskRegistry, caller: AgentId, id: TaskId) -> ToolOutcome {
+    error_outcome(
+        registry,
+        caller,
+        id,
+        format!("Background task #{id} belongs to another agent."),
+        "not your task",
+    )
+}
+
+/// Compose an `is_error` outcome from `reason`, appending `caller`'s
+/// own live task ids so the model can correct itself. The listing is
+/// caller-scoped because it is there to help the caller, not to keep
+/// other agents' tasks secret.
+fn error_outcome(
+    registry: &TaskRegistry,
+    caller: AgentId,
+    id: TaskId,
+    reason: String,
+    summary: &str,
+) -> ToolOutcome {
     let live: Vec<String> = registry
         .snapshot()
         .into_iter()
-        .filter(|s| !s.status.is_terminal())
+        .filter(|s| s.owner == caller && !s.status.is_terminal())
         .map(|s| format!("#{} ({})", s.id, s.label))
         .collect();
     let live_text = if live.is_empty() {
@@ -277,11 +359,11 @@ fn unknown_id_outcome(registry: &TaskRegistry, id: TaskId) -> ToolOutcome {
     } else {
         live.join(", ")
     };
-    let body = format!("No background task with id {id}. Live tasks: {live_text}");
+    let body = format!("{reason} Your live tasks: {live_text}");
     ToolOutcome {
         content: vec![UserContent::text(body.clone())],
         details: ToolDetails::Text {
-            summary: format!("task #{id}: unknown id"),
+            summary: format!("task #{id}: {summary}"),
             body,
         },
         is_error: true,
@@ -291,6 +373,7 @@ fn unknown_id_outcome(registry: &TaskRegistry, id: TaskId) -> ToolOutcome {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use aj_agent::TaskRegistry;
@@ -595,6 +678,171 @@ mod tests {
         std::fs::remove_file(spill).ok();
     }
 
+    /// Register a `Running` task owned by `owner`, standing in for a
+    /// task the calling agent never started. The cancel token comes
+    /// back so a test can tell whether a denied `task_stop` still
+    /// reached [`TaskRegistry::kill`]: there is no driver here, so the
+    /// status stays `Running` either way.
+    fn register_foreign(
+        registry: &TaskRegistry,
+        owner: AgentId,
+        label: &str,
+    ) -> (TaskId, tokio_util::sync::CancellationToken) {
+        let output: Arc<dyn aj_agent::tool::TaskOutputSource> = Arc::new(StubAgentOutput {
+            report: std::sync::Mutex::new(None),
+        });
+        registry.register(
+            owner,
+            TaskKind::Agent {
+                agent_id: 7,
+                task: "sibling work".to_string(),
+            },
+            label.to_string(),
+            output,
+        )
+    }
+
+    /// Ids are session-wide, so a caller can name a task it does not
+    /// own. A sub-agent asking about a sibling's task is told the task
+    /// belongs to another agent, not that the id is unknown.
+    #[tokio::test]
+    async fn sibling_task_output_is_denied() {
+        let mut ctx = DummyToolContext::default().with_agent_id(AgentId::Sub(1));
+        let registry = ctx.task_registry();
+        let (id, _cancel) = register_foreign(&registry, AgentId::Sub(2), "sibling work");
+
+        let outcome = read_task(&mut ctx, id, false, 30).await;
+        assert!(outcome.is_error);
+        let wire = extract_text(&outcome.content);
+        assert!(
+            wire.contains(&format!("Background task #{id} belongs to another agent")),
+            "wire: {wire:?}"
+        );
+    }
+
+    /// A sub-agent may not read its parent's tasks either: the scope
+    /// runs downward, not upward.
+    #[tokio::test]
+    async fn parent_owned_task_output_is_denied_to_sub_agent() {
+        let mut ctx = DummyToolContext::default().with_agent_id(AgentId::Sub(1));
+        let registry = ctx.task_registry();
+        let (id, _cancel) = register_foreign(&registry, AgentId::Main, "parent work");
+
+        let outcome = read_task(&mut ctx, id, false, 30).await;
+        assert!(outcome.is_error);
+        let wire = extract_text(&outcome.content);
+        assert!(
+            wire.contains(&format!("Background task #{id} belongs to another agent")),
+            "wire: {wire:?}"
+        );
+    }
+
+    /// A denied `task_stop` never reaches the kill: neither for a
+    /// sibling's task nor for the parent's.
+    #[tokio::test]
+    async fn denied_task_stop_does_not_kill() {
+        let mut ctx = DummyToolContext::default().with_agent_id(AgentId::Sub(1));
+        let registry = ctx.task_registry();
+        let (sibling, sibling_cancel) =
+            register_foreign(&registry, AgentId::Sub(2), "sibling work");
+        let (parent, parent_cancel) = register_foreign(&registry, AgentId::Main, "parent work");
+
+        for (id, cancel) in [(sibling, sibling_cancel), (parent, parent_cancel)] {
+            let outcome = TaskStopTool
+                .execute(&mut ctx, TaskStopInput { id })
+                .await
+                .expect("task_stop executes");
+            assert!(outcome.is_error);
+            let wire = extract_text(&outcome.content);
+            assert!(
+                wire.contains(&format!("Background task #{id} belongs to another agent")),
+                "wire: {wire:?}"
+            );
+            assert!(
+                !cancel.is_cancelled(),
+                "task #{id} must not have been cancelled"
+            );
+            assert_eq!(registry.status(id), Some(TaskStatus::Running));
+        }
+    }
+
+    /// Ownership scoping doesn't get in the caller's own way: a
+    /// sub-agent reads and stops the task it started.
+    #[tokio::test]
+    async fn owned_task_is_readable_and_stoppable() {
+        let mut ctx = DummyToolContext::default().with_agent_id(AgentId::Sub(1));
+        let (id, spill) = start_background(&mut ctx, "sleep 30").await;
+
+        let read = read_task(&mut ctx, id, false, 30).await;
+        assert!(!read.is_error);
+        let wire = extract_text(&read.content);
+        assert!(wire.contains("still running"), "wire: {wire:?}");
+
+        let stop = TaskStopTool
+            .execute(&mut ctx, TaskStopInput { id })
+            .await
+            .expect("task_stop executes");
+        assert!(!stop.is_error);
+        assert_eq!(ctx.task_registry().status(id), Some(TaskStatus::Killed));
+
+        std::fs::remove_file(spill).ok();
+    }
+
+    /// Ownership does not reach down either: a parent may not read or
+    /// stop a task its own sub-agent started, and the refusal does not
+    /// leak the task's label.
+    #[tokio::test]
+    async fn main_cannot_resolve_a_sub_agents_task() {
+        let mut ctx = DummyToolContext::default();
+        let registry = ctx.task_registry();
+        let (id, cancel) = register_foreign(&registry, AgentId::Sub(1), "child work");
+
+        let read = read_task(&mut ctx, id, false, 30).await;
+        assert!(read.is_error);
+        let wire = extract_text(&read.content);
+        assert!(
+            wire.contains(&format!("Background task #{id} belongs to another agent")),
+            "wire: {wire:?}"
+        );
+        assert!(
+            !wire.contains("child work"),
+            "label must not leak: {wire:?}"
+        );
+
+        let stop = TaskStopTool
+            .execute(&mut ctx, TaskStopInput { id })
+            .await
+            .expect("task_stop executes");
+        assert!(stop.is_error);
+        assert!(
+            !cancel.is_cancelled(),
+            "the kill must not have been reached"
+        );
+        assert_eq!(registry.status(id), Some(TaskStatus::Running));
+    }
+
+    /// The live listing on an error outcome shows the caller's own
+    /// running tasks and nobody else's.
+    #[tokio::test]
+    async fn error_outcome_lists_only_callers_live_tasks() {
+        let mut ctx = DummyToolContext::default().with_agent_id(AgentId::Sub(1));
+        let (own_id, spill) = start_background(&mut ctx, "sleep 30").await;
+        let registry = ctx.task_registry();
+        let (foreign_id, _cancel) = register_foreign(&registry, AgentId::Sub(2), "sibling work");
+
+        let outcome = read_task(&mut ctx, 999, false, 30).await;
+        assert!(outcome.is_error);
+        let wire = extract_text(&outcome.content);
+        assert!(
+            wire.contains(&format!("#{own_id} (sleep 30)")),
+            "wire: {wire:?}"
+        );
+        assert!(!wire.contains(&format!("#{foreign_id}")), "wire: {wire:?}");
+
+        registry.kill(own_id);
+        std::fs::remove_file(spill).ok();
+    }
+
     /// Output source standing in for an agent-backed task: no
     /// streams, just an optional report like the production driver
     /// stores at finish.
@@ -660,6 +908,250 @@ mod tests {
         match &finished.details {
             ToolDetails::Text { body, .. } => assert_eq!(body, "the final report"),
             other => panic!("expected Text details, got {other:?}"),
+        }
+    }
+}
+
+/// End-to-end cover for the identity the scoping rests on: a real
+/// [`aj_agent::Agent`] driving a real sub-agent through the production
+/// [`ToolContext`], with the real `agent` / `bash` / `task_output`
+/// tools and a scripted provider.
+#[cfg(test)]
+mod production_identity_tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use aj_agent::events::{AgentEvent, AgentId};
+    use aj_agent::tool::{TaskKind, TaskOutputSource, TaskRead};
+    use aj_agent::{Agent, AgentSeed, TaskRegistry};
+    use aj_models::provider::Provider;
+    use aj_models::registry::{InputModality, ModelCost, ModelInfo};
+    use aj_models::scripted::{ExhaustedBehavior, ProviderScript, ScriptedProvider};
+    use aj_models::streaming::{AssistantMessageEvent, DoneReason};
+    use aj_models::types::{
+        AssistantContent, AssistantMessage, StopReason, StreamOptions, TextContent, ToolCall,
+        UserContent,
+    };
+
+    use super::TaskOutputTool;
+    use crate::tools::agent::AgentTool;
+    use crate::tools::bash::BashTool;
+
+    const SCRIPTED: &str = "scripted";
+
+    fn model_info() -> ModelInfo {
+        ModelInfo {
+            id: SCRIPTED.to_string(),
+            name: SCRIPTED.to_string(),
+            family: None,
+            api: SCRIPTED.to_string(),
+            provider: SCRIPTED.to_string(),
+            base_url: "scripted://internal".to_string(),
+            reasoning: false,
+            reasoning_options: Vec::new(),
+            supports_verbosity: false,
+            input: vec![InputModality::Text],
+            cost: ModelCost::default(),
+            context_window: 0,
+            max_tokens: 0,
+        }
+    }
+
+    fn message(content: Vec<AssistantContent>, stop_reason: StopReason) -> AssistantMessage {
+        AssistantMessage {
+            content,
+            api: SCRIPTED.to_string(),
+            provider: SCRIPTED.to_string(),
+            model: SCRIPTED.to_string(),
+            response_id: None,
+            usage: Default::default(),
+            stop_reason,
+            error: None,
+            timestamp: 0,
+        }
+    }
+
+    /// One scripted inference that finalizes on a single tool call.
+    fn call(id: &str, tool: &str, arguments: serde_json::Value) -> Vec<AssistantMessageEvent> {
+        script(
+            message(
+                vec![AssistantContent::ToolCall(ToolCall {
+                    id: id.to_string(),
+                    name: tool.to_string(),
+                    arguments,
+                })],
+                StopReason::ToolUse,
+            ),
+            DoneReason::ToolUse,
+        )
+    }
+
+    /// One scripted inference that finalizes on text.
+    fn text(body: &str) -> Vec<AssistantMessageEvent> {
+        script(
+            message(
+                vec![AssistantContent::Text(TextContent {
+                    text: body.to_string(),
+                    text_signature: None,
+                })],
+                StopReason::Stop,
+            ),
+            DoneReason::Stop,
+        )
+    }
+
+    fn script(message: AssistantMessage, reason: DoneReason) -> Vec<AssistantMessageEvent> {
+        vec![
+            AssistantMessageEvent::Start {
+                partial: message.clone(),
+            },
+            AssistantMessageEvent::Done { reason, message },
+        ]
+    }
+
+    /// Stands in for a task with no driver behind it.
+    struct NoOutput;
+
+    impl TaskOutputSource for NoOutput {
+        fn snapshot(&self) -> TaskRead {
+            TaskRead::default()
+        }
+    }
+
+    fn text_of(content: &[UserContent]) -> String {
+        content
+            .iter()
+            .filter_map(|c| match c {
+                UserContent::Text(t) => Some(t.text.as_str()),
+                UserContent::Image(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    /// A sub-agent resolves the task it started and is refused the
+    /// main agent's, with every identity coming from the production
+    /// wrapper rather than a test double.
+    #[tokio::test]
+    async fn sub_agent_resolves_its_own_task_but_not_mains() {
+        let registry = TaskRegistry::default();
+        // Main's task takes id #1; the child's backgrounded command
+        // takes #2, so the scripted calls can name both up front.
+        let (main_task, _cancel) = registry.register(
+            AgentId::Main,
+            TaskKind::Bash {
+                command: "sleep 30".to_string(),
+            },
+            "main work".to_string(),
+            Arc::new(NoOutput),
+        );
+        assert_eq!(main_task, 1);
+
+        let scripts = vec![
+            call("p-1", "agent", serde_json::json!({"task": "work"})),
+            call(
+                "c-1",
+                "bash",
+                serde_json::json!({
+                    "command": "sleep 30",
+                    "description": "child background work",
+                    "run_in_background": true,
+                }),
+            ),
+            call(
+                "c-2",
+                "task_output",
+                serde_json::json!({"id": 2, "block": false}),
+            ),
+            call(
+                "c-3",
+                "task_output",
+                serde_json::json!({"id": 1, "block": false}),
+            ),
+            text("child done"),
+            text("parent done"),
+        ]
+        .into_iter()
+        .map(ProviderScript::from_events)
+        .collect();
+        let provider: Arc<dyn Provider> =
+            Arc::new(ScriptedProvider::new(scripts).on_exhausted(ExhaustedBehavior::Panic));
+
+        let mut agent = Agent::with_provider(
+            std::env::temp_dir(),
+            vec![
+                AgentTool.into(),
+                BashTool::default().into(),
+                TaskOutputTool.into(),
+            ],
+            Vec::new(),
+            provider,
+            Arc::new(model_info()),
+            StreamOptions::default(),
+            None,
+        );
+        agent.seed_session(AgentSeed {
+            assembled_system_prompt: Some("test system prompt".to_string()),
+            ..AgentSeed::default()
+        });
+        agent.set_task_registry(registry.clone());
+
+        // Every `task_output` result, in completion order, with the
+        // agent that asked.
+        type Reads = Arc<Mutex<Vec<(AgentId, bool, String)>>>;
+        let reads: Reads = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&reads);
+        let _handle = agent.subscribe(aj_agent::bus::listener_from_sync(move |event| {
+            if let AgentEvent::ToolExecutionEnd {
+                agent_id,
+                tool,
+                content,
+                is_error,
+                ..
+            } = event
+            {
+                if tool == "task_output" {
+                    sink.lock()
+                        .unwrap()
+                        .push((*agent_id, *is_error, text_of(content)));
+                }
+            }
+        }));
+
+        agent
+            .run_single_turn("delegate".to_string())
+            .await
+            .expect("turn");
+
+        let reads = reads.lock().unwrap().clone();
+        assert_eq!(reads.len(), 2, "both reads reported: {reads:?}");
+
+        let (own_agent, own_error, own_wire) = &reads[0];
+        assert_eq!(*own_agent, AgentId::Sub(1));
+        assert!(!own_error, "the child's own task must resolve: {own_wire}");
+        assert!(
+            own_wire.contains("Background task #2 still running"),
+            "wire: {own_wire}"
+        );
+
+        let (main_agent, main_error, main_wire) = &reads[1];
+        assert_eq!(*main_agent, AgentId::Sub(1));
+        assert!(main_error, "Main's task must be refused: {main_wire}");
+        assert!(
+            main_wire.contains("Background task #1 belongs to another agent"),
+            "wire: {main_wire}"
+        );
+
+        // The child's command dies with the registry root. Main's
+        // stand-in entry has no driver, so only the real task is worth
+        // waiting on.
+        registry.shutdown();
+        let spill = registry.read(2).and_then(|(_, read)| read.spill_path);
+        tokio::time::timeout(Duration::from_secs(5), registry.wait_terminal(2))
+            .await
+            .expect("the child's command exits on shutdown");
+        if let Some(path) = spill {
+            std::fs::remove_file(path).ok();
         }
     }
 }
