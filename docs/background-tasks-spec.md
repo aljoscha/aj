@@ -135,7 +135,8 @@ at the end for orchestration.
 4. **The original tool result is the "started" result**, returned
    immediately — there is no launch window. A command that dies 50ms
    in surfaces through its completion notice at the next drain point,
-   which is at worst one inference step later than an inline result;
+   which is one inference step later than an inline result once the
+   current tool batch returns (see §4.6 for the bound);
    in exchange there is exactly one result shape, no watch channel,
    and no notice-suppression logic. For bash the started result
    carries the spill path; the real outcome arrives later via
@@ -321,9 +322,10 @@ SessionState` borrow that makes foreground tools block today.
 
 ```rust
 /// Run the command in the background. The call returns immediately
-/// with a task id and the output path; use task_output to read or
-/// wait, task_stop to kill. `timeout` is ignored in background mode —
-/// the task runs until it exits or is stopped.
+/// with a task id and the path the output is written to, which you
+/// can read with read_file (supports offset/limit). `timeout` is
+/// ignored in background mode: the task runs until it exits or is
+/// stopped, and you are notified when it completes.
 #[serde(default)]
 pub run_in_background: bool,
 ```
@@ -344,9 +346,8 @@ Execution in background mode:
 
    ```
    Started background task #3: cargo build --release
-   Output is being written to <spill path>; read it with read_file
-   (supports offset/limit) or task_output(3). You will be notified
-   when it completes.
+   Output is being written to <spill path>, read it with read_file
+   (supports offset/limit). You will be notified when it completes.
    ```
 
 `ToolDetails::Bash` gains `task_id: Option<TaskId>` (serde-defaulted
@@ -361,14 +362,18 @@ when they are spelled out):
   the condition holds* (`until grep -q "Ready" dev.log; do sleep 0.5;
   done`) — one task, one notice — instead of polling in the
   foreground.
-- Don't babysit a task with blocking `task_output` calls; keep
-  working, the completion notice arrives on its own.
+- You do not need to wait for a background task, the completion
+  notice reaches you once it finishes. Never wait by sleeping in the
+  foreground: no notice can arrive while a foreground command runs, so
+  sleeping only delays the report.
 - Double-forking daemons escape the process group and our kill —
   prefer supervising the process in the foreground of a background
   task over `nohup`-style detachment.
-- In print mode there is no auto-wake; wait for outstanding tasks
-  explicitly (`task_output` with `block`) before finishing, or they
-  are killed at exit.
+
+Only the `task_*` tools' own descriptions name them. `bash` and `agent`
+describe the ids and notices they produce without naming a tool, so
+disabling a `task_*` tool cannot leave the model holding a dangling
+reference.
 
 ### 4.4 `task_output`, `task_stop` (`aj-tools`)
 
@@ -486,7 +491,18 @@ Drain points, both holding `&mut self` on the owning agent:
    user's new message, in arrival order.
 2. **In `execute_turn` after a tool batch completes**, before the
    `continue` that triggers the next inference — notices that arrived
-   mid-run reach the model at the first opportunity.
+   mid-run reach the model at the first *legal* opportunity.
+
+A notice is a user-role message, and the provider requires the user
+message following an assistant message with `tool_use` blocks to lead
+with the matching `tool_result` blocks. So a notice can never be
+inserted between a tool batch's dispatch and its results, and the
+earliest legal delivery is after the batch's last result. Delivery
+latency is therefore bounded by the running tool batch, and since a
+foreground tool call may run arbitrarily long, it is not bounded in
+wall-clock time. This is why the tool descriptions tell the model that
+a background task needs no waiting and that sleeping in the foreground
+only delays the notice.
 
 Each drained notice becomes one user-role wire message:
 
@@ -502,9 +518,11 @@ emission the prompt path uses (lib.rs:651-675), so it renders and
 persists like any other message. Injecting user-role messages adjacent
 to tool results is the same wire shape the failed-turn re-prompt path
 already produces; providers accept consecutive user-role messages.
-Sub-agent drain points are identical (`run_single_turn_inner` shares
-`execute_turn`), so a sub-agent that backgrounded a command hears
-about it inside its own run or on its next continuation.
+There are three call sites for the drain, not two: the two prompt tops
+(`run_top_level_turn_inner` and `run_single_turn_inner`) each call it
+explicitly, and `execute_turn` covers the post-batch point for both
+paths. So a sub-agent that backgrounded a command hears about it inside
+its own run or at the start of its next continuation.
 
 Notices arriving while the owner is idle (or surviving past a turn's
 end) do not wait for the user — they wake the owner (§4.7).
@@ -560,8 +578,10 @@ task ownership is only acquired by a live run in this process
 Wake turns apply the current run-config and count usage like any
 other turn. In print mode there is no trigger loop: the run ends when
 the main turn (and any blocking `task_output`s the model issued)
-complete, and remaining tasks are killed at exit — noted in the tool
-description so the model waits explicitly before finishing there.
+complete, and remaining tasks are killed at exit. The tool
+descriptions say nothing about this. Which frontend is driving is a
+harness concern, and guidance the model can only act on in one mode
+is guidance it will misapply in the other.
 
 ### 4.8 Cancellation & lifecycle
 
@@ -637,8 +657,8 @@ produces today, so renderers share one code path.
 
 - **Command dies right after launch** (typo, missing binary, bound
   port) → the started result has already returned; `TaskEnd` fires
-  and the notice lands at the next drain point — at worst one
-  inference step after launch. No special casing.
+  and the notice lands at the next drain point, which is after the
+  tool batch in flight returns (§4.6). No special casing.
 - **Task finishes between "started" result and first read** → the
   read reports the terminal status; the notice still arrives. A
   duplicated tail is a few tokens — the price of an unconditional
@@ -677,9 +697,10 @@ produces today, so renderers share one code path.
   `TaskEnd`; shutdown kills the task tree; queued notices die with the
   process (they are only persisted once drained into a transcript).
 - **Print mode** → works (registry defaults), but tasks pending when
-  the run ends are killed at exit; the model should wait with a
-  blocking `task_output` before finishing. Worth one line in the tool
-  description.
+  the run ends are killed at exit and a notice queued after the final
+  turn is never drained. The tool descriptions stay silent on it, per
+  §4.7: the model cannot tell which frontend is driving, so mode-specific
+  advice would be misapplied in the other one.
 - **Notice content vs. context budget** → notice bodies use the same
   per-stream budgets as bash results; a misbehaving firehose costs at
   most one bash-result's worth of context per notice.

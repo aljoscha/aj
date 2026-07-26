@@ -60,9 +60,10 @@ The sub-agent will return a comprehensive report that you can use to inform your
 
 Set run_in_background: true to keep working while the sub-agent runs: the call
 returns immediately with a task id, and the sub-agent's report is delivered to
-you as a completion notice when it finishes. Don't babysit a background
-sub-agent with task_output calls, since the notice arrives on its own. Use
-task_stop(id) if you need to stop it early.
+you as a completion notice when it finishes. You do not need to wait for it,
+keep working and the notice reaches you. Never wait by sleeping in the
+foreground: no notice can arrive while a foreground command is running, so
+sleeping only delays the report by the length of the sleep.
 
 Parallel agents share your filesystem. When you launch several agents at once
 (several agent calls in one message, or multiple background agents), they run
@@ -91,8 +92,8 @@ pub struct AgentInput {
     pub description: Option<String>,
 
     /// Run the sub-agent in the background. The call returns immediately with
-    /// a task id; the report arrives as a completion notice when the run
-    /// finishes. Use task_output to check on it or task_stop to stop it.
+    /// a task id, and the report arrives as a completion notice when the run
+    /// finishes.
     #[serde(default)]
     pub run_in_background: bool,
 }
@@ -158,8 +159,7 @@ impl ToolDefinition for AgentTool {
                 let summary = format!("agent {agent_id} started in background (task #{task_id})");
                 let wire = format!(
                     "{summary}. You will be notified when it completes and \
-                     delivers its report; use task_output({task_id}) to check on it or \
-                     task_stop({task_id}) to stop it."
+                     delivers its report."
                 );
                 Ok(ToolOutcome {
                     content: vec![UserContent::text(wire)],

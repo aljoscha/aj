@@ -318,8 +318,9 @@ async fn run_inner<W: Write + Send + 'static>(
     // run can be killed at exit instead of orphaned. Print mode has
     // no wake-trigger loop: a notice queued after the final turn is
     // never drained, and whatever still runs when the prompt returns
-    // is killed below — the bash tool description tells the model to
-    // wait with a blocking `task_output` before finishing here.
+    // is killed below. The tool descriptions deliberately don't mention
+    // this: the model can't tell which frontend is driving, so the
+    // advice would be misapplied in interactive mode.
     let task_registry = TaskRegistry::default();
     agent.set_task_registry(task_registry.clone());
 

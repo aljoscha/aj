@@ -87,20 +87,20 @@ working directory of the agent session.
   respects `.gitignore` by default. Use `read_file` for reading file contents
   rather than `cat`.
 - Set `run_in_background: true` for long-running work: the call returns
-  immediately with a task id and the path the output is written to; read it
-  with read_file (supports offset/limit) or task_output, kill it with
-  task_stop. `timeout` is ignored in background mode — the task runs until it
-  exits or is stopped, and you are notified when it completes.
+  immediately with a task id and the path the output is written to, which you
+  can read with read_file (supports offset/limit). `timeout` is ignored in
+  background mode: the task runs until it exits or is stopped, and you are
+  notified when it completes.
 - For "wait until X is ready", background a command that exits when the
   condition holds (e.g. `until grep -q "Ready" dev.log; do sleep 0.5; done`)
   — one task, one completion notice — instead of polling in the foreground.
-- Don't babysit a background task with blocking task_output calls; keep
-  working, the completion notice arrives on its own.
-- Double-forking daemons escape the process group, so task_stop can't kill
-  them. Prefer supervising the process in the foreground of a background task
-  over nohup-style detachment.
-- In print mode there is no auto-wake: wait for outstanding tasks explicitly
-  (task_output with block) before finishing, or they are killed at exit.
+- You do not need to wait for a background task. Keep working and the
+  completion notice reaches you once it finishes. Never wait by sleeping in
+  the foreground: no notice can arrive while a foreground command is running,
+  so sleeping only delays the report by the length of the sleep.
+- Double-forking daemons escape the process group, so stopping the task can't
+  kill them. Prefer supervising the process in the foreground of a background
+  task over nohup-style detachment.
 "#;
 
 /// Maximum bytes preserved per stream in the in-memory rolling tail
@@ -160,9 +160,9 @@ pub struct BashInput {
     /// A description explaining what the command does and why you want to run it.
     pub description: String,
     /// Run the command in the background. The call returns immediately
-    /// with a task id and the output path; use task_output to read or
-    /// wait, task_stop to kill. `timeout` is ignored in background mode —
-    /// the task runs until it exits or is stopped.
+    /// with a task id and the output path, and a completion notice
+    /// arrives when the task finishes. `timeout` is ignored in
+    /// background mode, the task runs until it exits or is stopped.
     #[serde(default)]
     pub run_in_background: bool,
 }
@@ -423,9 +423,9 @@ impl ToolDefinition for BashTool {
 
             let wire = format!(
                 "Started background task #{id}: {command}\n\
-                 Output is being written to {path}; read it with read_file \
-                 (supports offset/limit) or task_output({id}). You will be \
-                 notified when it completes.",
+                 Output is being written to {path}, read it with read_file \
+                 (supports offset/limit). You will be notified when it \
+                 completes.",
                 path = spill_path.display(),
             );
             return Ok(ToolOutcome {
@@ -2061,7 +2061,10 @@ mod tests {
             wire.starts_with("Started background task #1: echo hello; sleep 0.2"),
             "wire: {wire:?}"
         );
-        assert!(wire.contains("task_output(1)"), "wire: {wire:?}");
+        assert!(
+            wire.contains("notified when it completes"),
+            "the started result promises the completion notice: {wire:?}"
+        );
         let spill_path = match &outcome.details {
             ToolDetails::Bash {
                 task_id: Some(1),
