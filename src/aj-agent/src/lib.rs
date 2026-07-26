@@ -5780,6 +5780,78 @@ mod event_protocol_tests {
         );
     }
 
+    /// A detached sub-agent failure reaches its owner as a failed task
+    /// notification containing the child's error.
+    #[tokio::test]
+    async fn background_spawn_failure_delivers_failed_notice() {
+        // The parent stops after launching the task. The detached child
+        // consumes the error script, then the owner's wake consumes the
+        // final script after draining the queued notification.
+        let scripts = vec![
+            finalize_script(finalize_tool_use("tu-1", "agent")),
+            overflow_error_script(),
+            finalize_script(finalize_text("reacted")),
+        ];
+
+        let (tool, started) = SpawnTool::background();
+        let mut agent = build_agent(scripts, vec![tool.into()]);
+        let tasks = TaskRegistry::default();
+        agent.set_task_registry(tasks.clone());
+        let stop_hook: crate::hooks::ShouldStopAfterTurnHook =
+            Arc::new(|| Box::pin(async { true }));
+        agent.set_should_stop_after_turn(Some(stop_hook));
+
+        let conclusions: Arc<Mutex<Vec<SubAgentConclusion>>> = Arc::new(Mutex::new(Vec::new()));
+        let conclusions_clone = Arc::clone(&conclusions);
+        let _handle = agent.subscribe(listener_from_sync(move |event| {
+            if let AgentEvent::SubAgentEnd { conclusion, .. } = event {
+                conclusions_clone.lock().unwrap().push(*conclusion);
+            }
+        }));
+
+        agent
+            .prompt("delegate".to_string(), CancellationToken::new())
+            .await
+            .expect("parent prompt");
+        assert_eq!(*started.lock().unwrap(), vec![(1, 1)]);
+
+        wait_until(|| tasks.has_notices(AgentId::Main), "failure notice").await;
+        assert_eq!(tasks.status(1), Some(TaskStatus::Exited(Some(1))));
+        assert_eq!(
+            *conclusions.lock().unwrap(),
+            vec![SubAgentConclusion::Failed]
+        );
+        let (_, read) = tasks.read(1).expect("task readable");
+        assert_eq!(
+            read.report.as_deref(),
+            Some("sub-agent failed: prompt is too long: 250000 tokens > 200000 maximum")
+        );
+
+        let outcome = agent
+            .wake(CancellationToken::new())
+            .await
+            .expect("wake runs");
+        assert_eq!(outcome, crate::WakeOutcome::Ran);
+
+        let notification = agent
+            .messages()
+            .iter()
+            .find_map(|message| match &message.kind {
+                crate::message::AgentMessageKind::TaskNotification(notification) => {
+                    Some(notification)
+                }
+                crate::message::AgentMessageKind::Wire(_) => None,
+            })
+            .expect("failure notification delivered");
+        assert_eq!(notification.kind, TaskNotificationKind::Agent);
+        assert_eq!(notification.outcome, TaskOutcome::Failed { code: None });
+        assert_eq!(
+            notification.body,
+            "Background task #1 finished: agent 1 — sub-agent failed: prompt is too long: \
+             250000 tokens > 200000 maximum"
+        );
+    }
+
     /// Killing an agent-backed task cancels the child's run through
     /// the task token: the run aborts, the task ends `Killed` with a
     /// kill notice, and the sub-agent handle stays retained (it's
