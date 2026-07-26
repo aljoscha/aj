@@ -296,7 +296,8 @@ pub struct TaskEventSink { /* bus clone, owner, task_id, call_id */ }
 impl TaskEventSink {
     /// Emit `TaskOutput` (drivers self-throttle, ~10/s).
     pub async fn output(&self, partial: ToolDetails);
-    /// Flip the registry status, emit `TaskEnd`, queue the notice.
+    /// Queue the notice and record the terminal status together,
+    /// then emit `TaskEnd`.
     pub async fn finished(&self, status: TaskStatus, notice: TaskNotice);
 }
 ```

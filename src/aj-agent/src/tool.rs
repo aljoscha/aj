@@ -1070,14 +1070,16 @@ impl TaskEventSink {
         }
     }
 
-    /// Flip the registry status to `status`, queue `notice`, and emit
+    /// Queue `notice`, record the terminal `status`, and emit
     /// [`AgentEvent::TaskEnd`].
+    ///
+    /// The notice and the status land in the registry together, so
+    /// every observer that learns of the termination finds the notice
+    /// already present.
     pub async fn finished(&self, status: TaskStatus, notice: TaskNotice) {
-        self.registry.set_status(self.task_id, status);
-        // Queue the notice before announcing TaskEnd: the binary's
-        // wake trigger fires off TaskEnd, and the woken agent must
-        // find the notice already queued.
-        self.registry.push_notice(notice);
+        self.registry.finish(self.task_id, status, notice);
+        // TaskEnd comes last: the binary's wake trigger fires off it,
+        // and the woken agent must find the notice already queued.
         let result = self
             .bus
             .emit(AgentEvent::TaskEnd {

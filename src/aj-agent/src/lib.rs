@@ -2075,7 +2075,7 @@ struct TaskEntry {
     /// Child of the registry's root token. Cancelled by
     /// [`TaskRegistry::kill`] or transitively by
     /// [`TaskRegistry::shutdown`]; the task's driver observes it and
-    /// flips the status via [`TaskRegistry::set_status`].
+    /// flips the status via [`TaskRegistry::finish`].
     cancel: CancellationToken,
     output: Arc<dyn TaskOutputSource>,
     /// Usage accumulated by an agent-backed task's run, recorded by
@@ -2201,12 +2201,41 @@ impl TaskRegistry {
         }
     }
 
-    /// Record task `id`'s new status. Called by the driver (through
-    /// [`TaskEventSink::finished`]) when the task terminates. No-op
-    /// for unknown ids.
+    /// Record task `id`'s new status. No-op for unknown ids.
+    ///
+    /// A terminating driver goes through [`TaskRegistry::finish`]
+    /// instead, so its notice and its status flip land together.
     pub fn set_status(&self, id: TaskId, status: TaskStatus) {
         {
             let mut inner = self.inner.lock().expect("task registry mutex poisoned");
+            if let Some(entry) = inner.entries.get_mut(&id) {
+                entry.status = status;
+            }
+        }
+        self.status_changed.notify_waiters();
+    }
+
+    /// Terminate task `id`: queue `notice` and record `status` under a
+    /// single lock acquisition. No-op on the status for unknown ids,
+    /// the notice is queued regardless (it is keyed by owner, not by
+    /// task).
+    ///
+    /// The two mutations share the lock because the status flip is
+    /// what releases [`TaskRegistry::wait_terminal`] waiters, and a
+    /// released waiter must always find the notice already queued.
+    /// Otherwise a blocking read could return, its tool batch
+    /// finalize, and the post-batch notice drain run, all before the
+    /// notice existed, stranding it until the next drain point. Like
+    /// [`TaskRegistry::set_status`] we notify only after dropping the
+    /// lock so a woken waiter never contends on it.
+    pub fn finish(&self, id: TaskId, status: TaskStatus, notice: TaskNotice) {
+        {
+            let mut inner = self.inner.lock().expect("task registry mutex poisoned");
+            inner
+                .notices
+                .entry(notice.owner)
+                .or_default()
+                .push_back(notice);
             if let Some(entry) = inner.entries.get_mut(&id) {
                 entry.status = status;
             }
