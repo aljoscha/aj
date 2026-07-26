@@ -1,16 +1,21 @@
 //! The live footer: one dim row of session facts under the editor.
 //!
-//! Reads the shared [`ChatState`] (model line, context usage, tasks)
-//! and [`StatusState`] (running sub-agent count) at draw time, so it
-//! refreshes on every frame without any event-driven sync of its own.
+//! Reads the shared [`ChatState`] (model line, context usage, tasks),
+//! [`StatusState`] (running sub-agent count), and the session's
+//! [`TaskRegistry`] (notices queued for the viewed agent) at draw
+//! time, so it refreshes on every frame without any event-driven sync
+//! of its own.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::LazyLock;
 
+use aj_agent::TaskRegistry;
 use aj_agent::tool::{TaskKind, TaskStatus};
 use aj_app::chat::ChatState;
-use aj_app::footer::{UsageSeverity, context_usage_display, format_agent_activity};
+use aj_app::footer::{
+    UsageSeverity, context_usage_display, format_agent_activity, format_pending_notices,
+};
 use vaxis::cell::Style;
 use vaxis::vxfw::{DrawContext, Event, EventContext, RichText, Surface, TextSpan, Widget};
 
@@ -33,6 +38,10 @@ pub(crate) struct FooterLine {
     styles: Rc<TranscriptStyles>,
     /// Working-directory display string, fixed for the session.
     cwd: String,
+    /// The session's task registry, read for the viewed agent's queued
+    /// notices. Session-scoped, so a session switch replaces it
+    /// through [`FooterLine::set_task_registry`].
+    task_registry: TaskRegistry,
 }
 
 impl FooterLine {
@@ -41,13 +50,25 @@ impl FooterLine {
         status: Rc<RefCell<StatusState>>,
         styles: Rc<TranscriptStyles>,
         cwd: String,
+        task_registry: TaskRegistry,
     ) -> FooterLine {
         FooterLine {
             chat,
             status,
             styles,
             cwd,
+            task_registry,
         }
+    }
+
+    /// Point the footer at another session's task registry.
+    pub(crate) fn set_task_registry(&mut self, task_registry: TaskRegistry) {
+        self.task_registry = task_registry;
+    }
+
+    /// Notices queued for `owner` in the session's registry.
+    pub(crate) fn pending_notices(&self, owner: aj_agent::events::AgentId) -> usize {
+        self.task_registry.pending_notices(owner)
     }
 
     /// Replace the palette styles, for a runtime theme swap.
@@ -105,6 +126,12 @@ impl Widget for FooterLine {
                 dim,
             )]);
         }
+        // Notices queued for the viewed agent: tasks that finished but
+        // whose completion the agent has not been handed yet, because a
+        // notice can only be delivered between tool batches.
+        if let Some(text) = format_pending_notices(self.pending_notices(active)) {
+            parts.push(vec![span(text, dim)]);
+        }
 
         // One-column left indent matching the chat scrollback's inset,
         // parts joined with `  ·  `. Softwrap off: a long cwd or model
@@ -130,6 +157,7 @@ mod tests {
     use std::sync::Arc;
 
     use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
+    use aj_agent::tool::TaskNotice;
     use aj_agent::types::TokenUsage;
     use aj_app::chat::reduce;
     use aj_app::session::AgentLifecycle;
@@ -159,12 +187,34 @@ mod tests {
     }
 
     fn footer(chat: Rc<RefCell<ChatState>>, status: StatusState) -> FooterLine {
+        footer_with_registry(chat, status, TaskRegistry::default())
+    }
+
+    fn footer_with_registry(
+        chat: Rc<RefCell<ChatState>>,
+        status: StatusState,
+        task_registry: TaskRegistry,
+    ) -> FooterLine {
         FooterLine::new(
             chat,
             Rc::new(RefCell::new(status)),
             styles(),
             "/home/user/proj".into(),
+            task_registry,
         )
+    }
+
+    fn notice(owner: AgentId, task_id: usize) -> TaskNotice {
+        TaskNotice {
+            owner,
+            task_id,
+            kind: TaskKind::Bash {
+                command: "make".into(),
+            },
+            label: "make".into(),
+            status: TaskStatus::Exited(Some(0)),
+            body: "exit 0".into(),
+        }
     }
 
     fn usage(tokens: u64) -> TokenUsage {
@@ -312,6 +362,47 @@ mod tests {
         let r = draw_rows(&mut f, 80);
         assert!(!r[0].contains("agent ("), "{r:?}");
         assert!(!r[0].contains("task ("), "{r:?}");
+    }
+
+    #[test]
+    fn footer_hides_notice_part_when_nothing_is_queued() {
+        let mut f = footer(chat_with_window(200_000), StatusState::default());
+        let r = draw_rows(&mut f, 80);
+        assert!(!r[0].contains("pending"), "{r:?}");
+    }
+
+    #[test]
+    fn footer_shows_a_single_pending_notice() {
+        let registry = TaskRegistry::default();
+        registry.push_notice(notice(AgentId::Main, 1));
+        let mut f =
+            footer_with_registry(chat_with_window(200_000), StatusState::default(), registry);
+        let r = draw_rows(&mut f, 100);
+        assert!(r[0].ends_with("1 notice pending"), "{r:?}");
+    }
+
+    #[test]
+    fn footer_pluralizes_several_pending_notices() {
+        let registry = TaskRegistry::default();
+        for id in 1..=3 {
+            registry.push_notice(notice(AgentId::Main, id));
+        }
+        let mut f =
+            footer_with_registry(chat_with_window(200_000), StatusState::default(), registry);
+        let r = draw_rows(&mut f, 100);
+        assert!(r[0].ends_with("3 notices pending"), "{r:?}");
+    }
+
+    /// The count is scoped to the viewed agent: another agent's queued
+    /// notices are that agent's footer's business.
+    #[test]
+    fn footer_ignores_notices_owned_by_another_agent() {
+        let registry = TaskRegistry::default();
+        registry.push_notice(notice(AgentId::Sub(1), 1));
+        let mut f =
+            footer_with_registry(chat_with_window(200_000), StatusState::default(), registry);
+        let r = draw_rows(&mut f, 100);
+        assert!(!r[0].contains("pending"), "{r:?}");
     }
 
     /// Softwrap is off: a narrow terminal truncates the row with an

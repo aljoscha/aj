@@ -15,10 +15,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use aj_agent::TurnError;
 use aj_agent::events::{AgentEvent, AgentId, CompactionReason};
 use aj_agent::queue::MessageQueues;
 use aj_agent::types::UsageSummary;
+use aj_agent::{TaskRegistry, TurnError};
 use aj_app::actions::AjAction;
 use aj_app::chat::{ChatState, reduce};
 use aj_app::cli::args::{Args, Command};
@@ -3358,6 +3358,7 @@ impl Shell {
         chat: Rc<RefCell<ChatState>>,
         status: Rc<RefCell<StatusState>>,
         queues: MessageQueues,
+        task_registry: TaskRegistry,
         theme: ThemeHandle,
         header: String,
         session_id: &str,
@@ -3482,6 +3483,7 @@ impl Shell {
             status,
             Rc::clone(&styles),
             cwd_display,
+            task_registry,
         )));
         // The empty-state splash and the transcript share the chat slot. The
         // `ChatSlot` wrapper draws whichever fits the current state, so the
@@ -3947,6 +3949,9 @@ impl Shell {
         self.pending
             .borrow_mut()
             .set_queues(world.core.message_queues.clone());
+        self.footer
+            .borrow_mut()
+            .set_task_registry(world.core.task_registry.clone());
         self.header.borrow_mut().text = format!("{APP_TITLE} - session {}", world.core.session_id);
         self.window_title = aj_app::session::window_title(
             APP_TITLE,
@@ -4334,6 +4339,7 @@ pub async fn run(args: Args) -> Result<()> {
         Rc::clone(&world.chat),
         Rc::clone(&world.status),
         world.core.message_queues.clone(),
+        world.core.task_registry.clone(),
         theme.clone(),
         header,
         &world.core.session_id,
@@ -5496,6 +5502,7 @@ mod tests {
             chat,
             Rc::new(RefCell::new(StatusState::default())),
             MessageQueues::default(),
+            TaskRegistry::default(),
             ThemeHandle::new(Theme::bundled_dark_with_mode(
                 aj_app::theme::ColorMode::Truecolor,
             )),
@@ -5512,6 +5519,7 @@ mod tests {
             empty_chat(),
             Rc::new(RefCell::new(StatusState::default())),
             MessageQueues::default(),
+            TaskRegistry::default(),
             ThemeHandle::new(Theme::bundled_dark_with_mode(
                 aj_app::theme::ColorMode::Truecolor,
             )),
@@ -5557,6 +5565,43 @@ mod tests {
         assert_ne!(
             shell.window_title, "aj - old-session - oldproj",
             "rebind must retitle for the switched-to session"
+        );
+    }
+
+    /// A session switch must repoint the footer at the new session's task
+    /// registry. The registry is session-scoped, so without the swap the
+    /// footer keeps reading the torn-down session's queues and the
+    /// pending-notice indicator silently never fires again.
+    #[tokio::test]
+    async fn rebind_repoints_the_footer_at_the_new_task_registry() {
+        let dir = TempDir::new().expect("tempdir");
+        let world = scripted_world(&dir, "streaming-text").await;
+        world
+            .core
+            .task_registry
+            .push_notice(aj_agent::tool::TaskNotice {
+                owner: AgentId::Main,
+                task_id: 1,
+                kind: aj_agent::tool::TaskKind::Bash {
+                    command: "make".into(),
+                },
+                label: "make".into(),
+                status: aj_agent::tool::TaskStatus::Exited(Some(0)),
+                body: "exit 0".into(),
+            });
+
+        let mut shell = titled_shell("old-session", "/home/me/oldproj");
+        assert_eq!(
+            shell.footer.borrow().pending_notices(AgentId::Main),
+            0,
+            "a fresh shell holds its own empty registry"
+        );
+
+        shell.rebind(&world);
+        assert_eq!(
+            shell.footer.borrow().pending_notices(AgentId::Main),
+            1,
+            "rebind must repoint the footer at the switched-to session's registry"
         );
     }
 
@@ -5631,6 +5676,7 @@ mod tests {
             empty_chat(),
             Rc::new(RefCell::new(StatusState::default())),
             MessageQueues::default(),
+            TaskRegistry::default(),
             ThemeHandle::new(Theme::bundled_dark_with_mode(
                 aj_app::theme::ColorMode::Truecolor,
             )),
@@ -6040,6 +6086,7 @@ mod tests {
             Rc::clone(&world.chat),
             Rc::clone(&world.status),
             world.core.message_queues.clone(),
+            world.core.task_registry.clone(),
             ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor)),
             "aj".to_string(),
             "",
@@ -8292,6 +8339,7 @@ mod tests {
             Rc::clone(&world.chat),
             Rc::clone(&world.status),
             world.core.message_queues.clone(),
+            world.core.task_registry.clone(),
             ThemeHandle::new(Theme::bundled_dark_with_mode(
                 aj_app::theme::ColorMode::Truecolor,
             )),
@@ -8329,6 +8377,7 @@ mod tests {
             Rc::clone(&world.chat),
             Rc::clone(&world.status),
             world.core.message_queues.clone(),
+            world.core.task_registry.clone(),
             ThemeHandle::new(Theme::bundled_dark_with_mode(
                 aj_app::theme::ColorMode::Truecolor,
             )),
@@ -9792,6 +9841,7 @@ mod tests {
             chat,
             Rc::new(RefCell::new(StatusState::default())),
             MessageQueues::default(),
+            TaskRegistry::default(),
             theme.clone(),
             "aj".to_string(),
             "",
@@ -10050,6 +10100,7 @@ mod tests {
             Rc::clone(&world.chat),
             Rc::clone(&world.status),
             world.core.message_queues.clone(),
+            world.core.task_registry.clone(),
             ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor)),
             "aj".to_string(),
             "",
@@ -10270,6 +10321,7 @@ mod tests {
             Rc::clone(&world.chat),
             Rc::clone(&world.status),
             world.core.message_queues.clone(),
+            world.core.task_registry.clone(),
             ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor)),
             "aj".to_string(),
             "",

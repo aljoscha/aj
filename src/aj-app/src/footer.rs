@@ -136,6 +136,21 @@ pub fn format_agent_activity(agents: usize, tasks: usize, open_hint: &str) -> St
     format!("{} ({open_hint})", parts.join(", "))
 }
 
+/// Format the footer's pending-notice part as `"1 notice pending"` /
+/// `"3 notices pending"`. Returns `None` for a count of 0 so the
+/// caller drops the part entirely.
+///
+/// A notice is queued when a background task finishes and delivered
+/// to the agent at its next drain point, so a nonzero count means the
+/// task is done but the agent has not been told yet.
+pub fn format_pending_notices(count: usize) -> Option<String> {
+    if count == 0 {
+        return None;
+    }
+    let noun = if count == 1 { "notice" } else { "notices" };
+    Some(format!("{count} {noun} pending"))
+}
+
 /// Displayable state for one agent: its settings identity plus the
 /// context-occupancy pair.
 #[derive(Debug, Clone)]
@@ -448,6 +463,19 @@ mod tests {
         .expect("rendered");
         assert_eq!(d.ratio, "20k/200k");
         assert_eq!(d.percent.as_deref(), Some("(10.0%)"));
+    }
+
+    #[test]
+    fn format_pending_notices_pluralizes_and_drops_zero() {
+        assert_eq!(format_pending_notices(0), None);
+        assert_eq!(
+            format_pending_notices(1).as_deref(),
+            Some("1 notice pending"),
+        );
+        assert_eq!(
+            format_pending_notices(3).as_deref(),
+            Some("3 notices pending"),
+        );
     }
 
     #[test]

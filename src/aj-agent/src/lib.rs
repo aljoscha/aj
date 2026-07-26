@@ -2356,6 +2356,14 @@ impl TaskRegistry {
         inner.notices.get(&owner).is_some_and(|q| !q.is_empty())
     }
 
+    /// How many notices are queued for `owner`, 0 when it has none.
+    /// A frontend polls this to show that finished tasks are waiting
+    /// to be delivered.
+    pub fn pending_notices(&self, owner: AgentId) -> usize {
+        let inner = self.inner.lock().expect("task registry mutex poisoned");
+        inner.notices.get(&owner).map_or(0, |q| q.len())
+    }
+
     /// Cancel the session-scoped root token, which cancels every
     /// task's child token. Callers then await driver quiescence with
     /// a bounded grace via [`TaskRegistry::quiesce`].
