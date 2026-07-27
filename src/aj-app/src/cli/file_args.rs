@@ -1,9 +1,8 @@
 //! Resolution of `@file` arguments into prompt content.
 //!
 //! The CLI treats any positional argument beginning with `@` as a file
-//! attachment (the `@` is stripped by [`crate::cli::initial_input`]
-//! before the path reaches here). Each path is resolved relative to
-//! the process working directory (with `~` expansion), then:
+//! attachment. Each path is resolved relative to the process working
+//! directory after stripping one leading `@`, then:
 //!
 //! - Text files become a `<file name="ABS">…</file>` block appended to
 //!   the combined prompt text, so the model sees the contents with
@@ -18,12 +17,13 @@
 //! aborts before starting a turn), mirroring the one-shot nature of a
 //! launch prompt. Empty files are skipped.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 
 use aj_models::types::UserContent;
 use aj_tools::image::{self, ResizeOptions};
+use aj_tools::path::resolve_read_path;
 
 /// Outcome of resolving a batch of `@file` arguments.
 #[derive(Debug)]
@@ -37,8 +37,8 @@ pub struct ResolvedFiles {
     pub images: Vec<UserContent>,
 }
 
-/// Resolve `@file` arguments (paths, `@`-prefix already stripped) into
-/// prompt text plus image attachments, relative to `cwd`.
+/// Resolve `@file` arguments into prompt text plus image attachments,
+/// relative to `cwd`.
 ///
 /// Returns an error on the first missing or unreadable file.
 pub fn process_file_args(
@@ -50,7 +50,7 @@ pub fn process_file_args(
     let mut images = Vec::new();
 
     for arg in file_args {
-        let path = resolve_path(arg, cwd);
+        let path = resolve_read_path(arg, cwd);
         let display = path.display().to_string();
 
         let metadata =
@@ -112,32 +112,6 @@ fn append_image(
         }
     }
     Ok(())
-}
-
-/// Resolve a user-supplied path to an absolute path for display and IO.
-///
-/// Expands a leading `~/`, joins relative paths onto `cwd`, and makes
-/// the result lexically absolute. We deliberately do not canonicalize:
-/// symlinks are left intact and the path is normalized without touching
-/// the filesystem, so the `<file name>` we show matches what the user
-/// typed.
-fn resolve_path(arg: &str, cwd: &Path) -> PathBuf {
-    let expanded = expand_tilde(arg);
-    let joined = if expanded.is_absolute() {
-        expanded
-    } else {
-        cwd.join(expanded)
-    };
-    std::path::absolute(&joined).unwrap_or(joined)
-}
-
-fn expand_tilde(arg: &str) -> PathBuf {
-    if let Some(rest) = arg.strip_prefix("~/")
-        && let Some(home) = std::env::home_dir()
-    {
-        return home.join(rest);
-    }
-    PathBuf::from(arg)
 }
 
 #[cfg(test)]

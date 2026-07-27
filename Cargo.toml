@@ -68,7 +68,9 @@ toml_edit = "0.25"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", default-features = false, features = ["env-filter", "fmt", "ansi"] }
 unicode-segmentation = "1.12"
+unicode-normalization = "0.1"
 unicode-width = "0.2"
+url = "2"
 
 [workspace.lints.rust]
 unknown_lints = "allow"

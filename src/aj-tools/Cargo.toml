@@ -24,6 +24,8 @@ tempfile = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+unicode-normalization = { workspace = true }
+url = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }

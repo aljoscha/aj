@@ -21,14 +21,15 @@
 //! line-based `offset` / `limit` parameters are rejected on image
 //! paths.
 
+use std::{fs, path::Path, path::PathBuf};
+
 use aj_agent::tool::{ToolContext, ToolDefinition, ToolDetails, ToolOutcome};
 use aj_models::types::UserContent;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
-use std::{fs, path::PathBuf};
 
 use crate::image::{self, ResizeOptions, ResizedImage};
+use crate::path::resolve_read_path;
 use crate::truncate::{READ_MAX_BYTES, READ_MAX_LINES, TruncatedBy, format_size, truncate_head};
 
 const DESCRIPTION: &str = r#"
@@ -37,7 +38,7 @@ an error will be returned.
 
 Usage:
 
-- The path parameter must be an absolute path
+- Relative, absolute, `~/`, `file://`, and `@`-prefixed paths are accepted
 - Supports text files and images (PNG, JPEG, GIF, WebP). Images are returned as
   attachments; the offset/limit parameters do not apply to images.
 - For text files: results include line numbers, starting at 1. Output is capped
@@ -77,7 +78,7 @@ impl Default for ReadFileTool {
 
 #[derive(JsonSchema, Serialize, Deserialize, Clone, Debug)]
 pub struct ReadFileInput {
-    /// The absolute path to the file to read.
+    /// The path to the file to read.
     path: String,
     /// The line number to start reading from (1-indexed). If not provided, starts from the beginning.
     #[serde(default)]
@@ -103,16 +104,10 @@ impl ToolDefinition for ReadFileTool {
         ctx: &mut dyn ToolContext,
         input: Self::Input,
     ) -> Result<ToolOutcome, aj_agent::BoxError> {
-        let path = Path::new(&input.path);
-        if !path.is_absolute() {
-            return Ok(error_outcome(
-                &input.path,
-                format!("Path must be absolute, got: {}", input.path),
-            ));
-        }
+        let path = resolve_read_path(&input.path, &ctx.working_directory());
 
-        let display_path_bare = display_relative(path, &ctx.working_directory());
-        if let Some(source_mime) = image::detect_mime_type_from_file(path) {
+        let display_path_bare = display_relative(&path, &ctx.working_directory());
+        if let Some(source_mime) = image::detect_mime_type_from_file(&path) {
             // Non-vision warning omitted: `aj_models::transform` already substitutes
             // a placeholder when the target model can't see images, so the model
             // never receives a broken attachment.
@@ -123,7 +118,7 @@ impl ToolDefinition for ReadFileTool {
                 ));
             }
             return Ok(read_image_outcome(
-                input.path.clone(),
+                path.display().to_string(),
                 display_path_bare,
                 source_mime,
                 self.auto_resize,
@@ -131,12 +126,12 @@ impl ToolDefinition for ReadFileTool {
             .await);
         }
 
-        let content = match fs::read_to_string(&input.path) {
+        let content = match fs::read_to_string(&path) {
             Ok(content) => content,
             Err(e) => {
                 return Ok(error_outcome(
                     &input.path,
-                    format!("Failed to read file '{}': {}", input.path, e),
+                    format!("Failed to read file '{}': {}", path.display(), e),
                 ));
             }
         };
@@ -178,11 +173,12 @@ impl ToolDefinition for ReadFileTool {
         if trunc.first_line_exceeds_limit {
             let line_size = slice.first().map(|l| l.len()).unwrap_or(0);
             let start_line_display = start_idx + 1;
+            let quoted_path = shell_quote_path(&path);
             let escape = format!(
                 "[Line {start_line_display} is {}, exceeds {} limit. Use bash: sed -n '{start_line_display}p' {} | head -c {}]",
                 format_size(line_size),
                 format_size(READ_MAX_BYTES),
-                input.path,
+                quoted_path,
                 READ_MAX_BYTES,
             );
             return Ok(ToolOutcome {
@@ -275,6 +271,10 @@ impl ToolDefinition for ReadFileTool {
 /// path when stripping fails (e.g. the file lives outside the cwd).
 fn display_relative(path: &Path, cwd: &Path) -> String {
     path.strip_prefix(cwd).unwrap_or(path).display().to_string()
+}
+
+fn shell_quote_path(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
 }
 
 /// Build a `ToolOutcome` for a recoverable error. The model gets the
@@ -444,11 +444,13 @@ pub fn format_for_display(lines: &[&str]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
+    use aj_models::types::UserContent;
+    use tempfile::{NamedTempFile, TempDir};
+
     use super::*;
     use crate::testing::DummyToolContext;
-    use aj_models::types::UserContent;
-    use std::io::Write;
-    use tempfile::NamedTempFile;
 
     fn extract_text(content: &[UserContent]) -> String {
         content
@@ -589,8 +591,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relative_path_returns_error_outcome() {
-        let mut ctx = DummyToolContext::default();
+    async fn relative_path_resolves_against_working_directory() {
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::create_dir(dir.path().join("relative")).expect("create dir");
+        std::fs::write(dir.path().join("relative/file.txt"), "contents").expect("write");
+        let mut ctx = DummyToolContext {
+            working_directory: dir.path().to_path_buf(),
+            ..Default::default()
+        };
         let outcome = ReadFileTool::new()
             .execute(
                 &mut ctx,
@@ -603,13 +611,8 @@ mod tests {
             .await
             .expect("execute");
 
-        assert!(outcome.is_error);
-        match &outcome.details {
-            ToolDetails::Text { body, .. } => {
-                assert!(body.starts_with("Path must be absolute"), "body: {body:?}");
-            }
-            other => panic!("expected Text details, got {other:?}"),
-        }
+        assert!(!outcome.is_error);
+        assert!(extract_text(&outcome.content).contains("contents"));
     }
 
     #[tokio::test]
@@ -793,6 +796,32 @@ mod tests {
         let wire = extract_text(&outcome.content);
         assert!(wire.starts_with("[Line 3 is "), "wire: {wire:?}");
         assert!(wire.contains("sed -n '3p'"), "wire: {wire:?}");
+    }
+
+    #[tokio::test]
+    async fn huge_line_escape_quotes_resolved_path() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("huge file's.txt");
+        std::fs::write(&path, "z".repeat(60 * 1024)).expect("write");
+        let mut ctx = DummyToolContext {
+            working_directory: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        let outcome = ReadFileTool::new()
+            .execute(
+                &mut ctx,
+                ReadFileInput {
+                    path: "huge file's.txt".to_string(),
+                    offset: None,
+                    limit: None,
+                },
+            )
+            .await
+            .expect("execute");
+
+        let wire = extract_text(&outcome.content);
+        assert!(wire.contains(&shell_quote_path(&path)), "wire: {wire:?}");
     }
 
     // -------------------------------------------------------------
