@@ -11,6 +11,7 @@
 //! carries the structured result); `aj-tools` is wire-only.
 
 pub mod image;
+pub mod path;
 /// Test-only [`aj_agent::tool::ToolContext`] doubles for exercising tools
 /// without a live agent runtime. Gated behind `cfg(test)` plus the `testing`
 /// feature so it never ships in the production public API. Other crates'

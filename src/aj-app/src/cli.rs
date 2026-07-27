@@ -71,9 +71,10 @@ pub fn initial_input(args: &Args, cwd: &Path, image_auto_resize: bool) -> Result
     let mut file_args = Vec::new();
     let mut messages = Vec::new();
     for token in positionals {
-        match token.strip_prefix('@') {
-            Some(path) => file_args.push(path.to_string()),
-            None => messages.push(token.as_str()),
+        if token.starts_with('@') {
+            file_args.push(token.to_string());
+        } else {
+            messages.push(token.as_str());
         }
     }
 
@@ -101,7 +102,9 @@ pub fn initial_input(args: &Args, cwd: &Path, image_auto_resize: bool) -> Result
 mod tests {
     use std::path::Path;
 
+    use aj_models::types::UserContent;
     use clap::Parser;
+    use tempfile::tempdir;
 
     use crate::cli::args::Args;
     use crate::cli::initial_input;
@@ -155,5 +158,22 @@ mod tests {
             content_text(&["aj", "continue", "ID", "do", "thing"]).as_deref(),
             Some("do thing")
         );
+    }
+
+    #[test]
+    fn strips_only_the_attachment_marker() {
+        let dir = tempdir().expect("tempdir");
+        let file = dir.path().join("@note.txt");
+        std::fs::write(&file, "contents").expect("write");
+        let parsed = Args::parse_from(["aj", "@@note.txt"]);
+
+        let content = initial_input(&parsed, dir.path(), true)
+            .expect("resolve")
+            .into_content();
+        let UserContent::Text(text) = &content[0] else {
+            panic!("expected text content");
+        };
+        assert!(text.text.contains("contents"));
+        assert!(text.text.contains(&file.display().to_string()));
     }
 }
