@@ -62,7 +62,7 @@ impl InitialInput {
 /// positional consumption keeps the two disjoint). `@file` arguments
 /// are resolved into `<file>` text + image attachments; a missing file
 /// is an error.
-pub fn initial_input(args: &Args, cwd: &Path) -> Result<InitialInput> {
+pub fn initial_input(args: &Args, cwd: &Path, image_auto_resize: bool) -> Result<InitialInput> {
     let positionals: &[String] = match &args.command {
         Some(Command::Continue { prompt, .. }) if !prompt.is_empty() => prompt,
         _ => &args.prompt,
@@ -77,7 +77,7 @@ pub fn initial_input(args: &Args, cwd: &Path) -> Result<InitialInput> {
         }
     }
 
-    let resolved = file_args::process_file_args(&file_args, cwd)?;
+    let resolved = file_args::process_file_args(&file_args, cwd, image_auto_resize)?;
 
     // File text is prepended to the joined messages so the model sees
     // the attachments before the question, all as one launch turn.
@@ -109,7 +109,7 @@ mod tests {
     /// Flatten the launch turn's text content for assertions.
     fn content_text(args: &[&str]) -> Option<String> {
         let parsed = Args::parse_from(args);
-        let content = initial_input(&parsed, Path::new("/"))
+        let content = initial_input(&parsed, Path::new("/"), true)
             .expect("resolve")
             .into_content();
         if content.is_empty() {
@@ -143,7 +143,7 @@ mod tests {
     fn empty_when_no_positionals() {
         let parsed = Args::parse_from(["aj"]);
         assert!(
-            initial_input(&parsed, Path::new("/"))
+            initial_input(&parsed, Path::new("/"), true)
                 .expect("resolve")
                 .is_empty()
         );

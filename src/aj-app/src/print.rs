@@ -178,7 +178,7 @@ async fn run_inner<W: Write + Send + 'static>(
     // back on, so an empty result is a hard error rather than a quiet
     // no-op.
     let content = {
-        let input = crate::cli::initial_input(&args, &cwd)?;
+        let input = crate::cli::initial_input(&args, &cwd, config.image_auto_resize)?;
         if input.is_empty() {
             bail!("aj --print requires a prompt argument");
         }
@@ -551,7 +551,7 @@ mod tests {
     /// Resolve a CLI invocation into its launch content (paths resolved
     /// against `/`, which has no `@file` args in these tests).
     fn content(args: &[&str]) -> Vec<aj_models::types::UserContent> {
-        crate::cli::initial_input(&parse(args), std::path::Path::new("/"))
+        crate::cli::initial_input(&parse(args), std::path::Path::new("/"), true)
             .expect("resolve")
             .into_content()
     }
@@ -567,7 +567,8 @@ mod tests {
     #[test]
     fn empty_input_when_no_prompt_supplied() {
         let input =
-            crate::cli::initial_input(&parse(&["--print"]), std::path::Path::new("/")).unwrap();
+            crate::cli::initial_input(&parse(&["--print"]), std::path::Path::new("/"), true)
+                .unwrap();
         assert!(input.is_empty());
     }
 
@@ -597,7 +598,7 @@ mod tests {
         // positionals: print mode still requires a prompt, so the
         // bail in `run` fires off this empty result.
         let args = parse(&["--print", "continue", "session-abc"]);
-        let input = crate::cli::initial_input(&args, std::path::Path::new("/")).unwrap();
+        let input = crate::cli::initial_input(&args, std::path::Path::new("/"), true).unwrap();
         assert!(input.is_empty());
     }
 
@@ -618,7 +619,7 @@ mod tests {
             }
             other => panic!("expected Continue command, got {other:?}"),
         }
-        let input = crate::cli::initial_input(&args, std::path::Path::new("/")).unwrap();
+        let input = crate::cli::initial_input(&args, std::path::Path::new("/"), true).unwrap();
         assert!(input.is_empty());
     }
 

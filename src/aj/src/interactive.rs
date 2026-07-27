@@ -4290,15 +4290,6 @@ fn sync_editor_chrome(world: &World, shell: &Rc<RefCell<Shell>>) {
 /// run on a top-level `block_on` (the `#[tokio::main]` future), not a
 /// spawned task.
 pub async fn run(args: Args) -> Result<()> {
-    // Resolve the launch positionals (`aj <msg>` / `continue <id>
-    // <msg>`, plus `@file` attachments) into the content to auto-submit.
-    // We resolve here, before any terminal setup, so a missing `@file`
-    // aborts via `?` while the terminal is still in its normal state
-    // rather than leaving the user stranded on the alt screen.
-    let launch_content =
-        aj_app::cli::initial_input(&args, &std::env::current_dir().unwrap_or_default())?
-            .into_content();
-
     // Configuration mirrors `aj`: user config overlaid with the
     // per-project layer, CLI > env > config precedence downstream. The
     // layers are kept editable behind [`ConfigLayers`] so the settings
@@ -4312,6 +4303,16 @@ pub async fn run(args: Args) -> Result<()> {
         project: project_layer,
         project_path: Config::project_config_file_path(),
     };
+
+    // Resolve launch attachments before terminal setup so failures leave
+    // the terminal untouched. Image handling uses the effective project-over-user
+    // setting, just like images read later through the read_file tool.
+    let launch_content = aj_app::cli::initial_input(
+        &args,
+        &std::env::current_dir().unwrap_or_default(),
+        layers.effective().image_auto_resize,
+    )?
+    .into_content();
 
     let auth = AuthStorage::at_default_path().context("failed to open ~/.aj/auth.json")?;
     let sessions_dir = Config::get_sessions_dir_path()?;
