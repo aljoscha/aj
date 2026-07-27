@@ -1471,6 +1471,27 @@ struct Selection {
     caret: SelPos,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectionUnit {
+    Character,
+    Word,
+    Line,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WordClass {
+    Whitespace,
+    Delimiter,
+    Regular,
+}
+
+#[derive(Clone, Copy)]
+struct LastClick {
+    at: Instant,
+    pos: SelPos,
+    count: u8,
+}
+
 /// The `(entry, line)` a screen row displays, produced by the per-frame walk
 /// over realized entries. Used by the highlight to decide, per visible row,
 /// which cells the selection covers.
@@ -1540,6 +1561,10 @@ const SCROLL_ANIM_MIN_LINES: f64 = 2.0;
 /// it was scrolled toward, so the message never lands flush against the top or
 /// bottom. Clamped away at the transcript ends, where there is nothing to show.
 const FOCUS_SCROLL_MARGIN: u16 = 3;
+/// Terminal mouse reports do not carry the desktop's configured double-click
+/// interval. Five hundred milliseconds matches the common desktop default.
+const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
+const WORD_DELIMITERS: &str = "./\\()\"'-:,.;<>~!@#$%^&*|+=[]{}?│";
 /// Per-line pacing for the glide, clamped to
 /// [`SCROLL_ANIM_MIN_MS`]`..=`[`SCROLL_ANIM_MAX_MS`]. Roughly constant speed
 /// for short and medium jumps, capped so a long jump stays snappy (the
@@ -1658,6 +1683,13 @@ pub struct TranscriptView {
     /// left-button press-drag over the content and kept highlighted after the
     /// release copies it, until the next plain click or Esc clears it.
     selection: Option<Selection>,
+    /// The complete unit selected by the current press. A multi-click drag
+    /// keeps this word or rendered line selected while extending by whole units.
+    selection_origin: Option<Selection>,
+    selection_unit: SelectionUnit,
+    /// Recent press metadata used to derive double and triple clicks because
+    /// terminal mouse protocols provide neither click counts nor timestamps.
+    last_click: Option<LastClick>,
     /// The last select-to-copy record. Written on the release that copies a
     /// real range. The drive loop edge-detects fresh records and raises the
     /// copy toast.
@@ -1721,17 +1753,6 @@ impl GlobalRenderInputs {
     }
 }
 
-/// The graphemes of `row`, trailing blank cells trimmed. Interior blanks are
-/// kept, so only the run of blanks at the end (default padding, or a selection
-/// that ran to end-of-line) is dropped.
-fn row_text(row: &[Cell]) -> String {
-    let end = row
-        .iter()
-        .rposition(|cell| !cell.char.grapheme().trim().is_empty())
-        .map_or(0, |i| i + 1);
-    row[..end].iter().map(|cell| cell.char.grapheme()).collect()
-}
-
 /// The first content column of a rendered entry row, past the shared chrome
 /// indent every entry carries.
 ///
@@ -1747,6 +1768,57 @@ fn content_start(row: &[Cell]) -> usize {
         .take_while(|cell| cell.char.grapheme().trim().is_empty())
         .count();
     blanks.min(usize::from(PADDING_X))
+}
+
+fn content_end(row: &[Cell]) -> usize {
+    row.iter()
+        .rposition(|cell| !cell.char.grapheme().trim().is_empty())
+        .map_or_else(|| content_start(row), |i| i + 1)
+}
+
+fn word_class(grapheme: &str) -> WordClass {
+    if grapheme.chars().all(char::is_whitespace) {
+        WordClass::Whitespace
+    } else if grapheme
+        .chars()
+        .next()
+        .is_some_and(|ch| WORD_DELIMITERS.contains(ch))
+    {
+        WordClass::Delimiter
+    } else {
+        WordClass::Regular
+    }
+}
+
+/// Expand a display-column range so neither endpoint splits a wide grapheme.
+fn expand_to_graphemes(row: &[Cell], from: usize, to: usize) -> (usize, usize) {
+    let mut expanded = (from.min(row.len()), to.min(row.len()));
+    let mut col = 0;
+    while col < row.len() {
+        let next = col
+            .saturating_add(usize::from(row[col].char.width.max(1)))
+            .min(row.len());
+        if col < expanded.1 && next > expanded.0 {
+            expanded.0 = expanded.0.min(col);
+            expanded.1 = expanded.1.max(next);
+        }
+        col = next;
+    }
+    expanded
+}
+
+/// Read a cell range once per grapheme, preserving selected whitespace while
+/// dropping layout padding beyond the row's last content cell.
+fn cell_range_text(row: &[Cell], from: usize, to: usize) -> String {
+    let (from, to) = expand_to_graphemes(row, from, to.min(content_end(row)));
+    let mut out = String::new();
+    let mut col = from;
+    while col < to {
+        let cell = &row[col];
+        out.push_str(cell.char.grapheme());
+        col = col.saturating_add(usize::from(cell.char.width.max(1)));
+    }
+    out
 }
 
 /// Read the graphemes of the cell range `a..=b` out of `lines`, joining rows
@@ -1781,7 +1853,7 @@ fn extract_from_lines(lines: &[Vec<Cell>], a: (usize, usize), b: (usize, usize))
         if row != start_row {
             out.push('\n');
         }
-        out.push_str(&row_text(&cells[from..to]));
+        out.push_str(&cell_range_text(cells, from, to));
     }
     out
 }
@@ -1857,6 +1929,9 @@ impl TranscriptView {
             agent_hit_rows: Vec::new(),
             agent_hit_width: 0,
             selection: None,
+            selection_origin: None,
+            selection_unit: SelectionUnit::Character,
+            last_click: None,
             selection_copied,
             last_view: Size {
                 width: 0,
@@ -1910,6 +1985,8 @@ impl TranscriptView {
         // A fresh session's entries are unrelated to the old selection's anchor
         // entry, so drop it rather than highlight stale content.
         self.selection = None;
+        self.selection_origin = None;
+        self.last_click = None;
         // An in-flight glide targets a position in the outgoing content, which
         // the swap invalidates (a focus glide by entry index, a page glide by
         // line delta). Cancel it so its remaining scroll does not land on the
@@ -1931,7 +2008,14 @@ impl TranscriptView {
 
     /// Cancel any in-flight sub-agent box click.
     pub(crate) fn cancel_agent_click(&mut self) {
+        self.cancel_selection_gesture();
+    }
+
+    fn cancel_selection_gesture(&mut self) {
         self.agent_click = None;
+        self.selection_origin = None;
+        self.selection_unit = SelectionUnit::Character;
+        self.last_click = None;
     }
 
     /// Record the view's own `WidgetRef` (as a `Weak`), so focus navigation can
@@ -2718,6 +2802,7 @@ impl TranscriptView {
         // unless dragging), so there is no double effect.
         self.bars.borrow_mut().capture_event(ctx, event);
         if ctx.consume_event {
+            self.cancel_selection_gesture();
             if m.kind == mouse::Type::Drag {
                 // A thumb drag moves the viewport, so it takes over from any
                 // in-flight glide and leaves the tail.
@@ -2821,6 +2906,136 @@ impl TranscriptView {
         self.agent_hit_rows.get(row).copied().flatten()
     }
 
+    fn click_count(&mut self, pos: SelPos, now: Instant) -> u8 {
+        let count = self.last_click.map_or(1, |last| {
+            let nearby = last.pos.entry == pos.entry
+                && last.pos.line == pos.line
+                && last.pos.col.abs_diff(pos.col) <= 1;
+            if nearby
+                && now
+                    .checked_duration_since(last.at)
+                    .is_some_and(|elapsed| elapsed <= MULTI_CLICK_INTERVAL)
+                && last.count < 3
+            {
+                last.count + 1
+            } else {
+                1
+            }
+        });
+        self.last_click = Some(LastClick {
+            at: now,
+            pos,
+            count,
+        });
+        count
+    }
+
+    fn selection_for_unit(&mut self, pos: SelPos, unit: SelectionUnit) -> Selection {
+        match unit {
+            SelectionUnit::Character => Selection {
+                anchor: pos,
+                caret: pos,
+            },
+            SelectionUnit::Word => self.word_at(pos),
+            SelectionUnit::Line => self.line_at(pos),
+        }
+    }
+
+    fn line_at(&mut self, pos: SelPos) -> Selection {
+        let rows = self.entry_rows(pos.entry, self.content_width());
+        if pos.line >= rows.len() {
+            return Selection {
+                anchor: pos,
+                caret: pos,
+            };
+        }
+        Selection {
+            anchor: SelPos {
+                entry: pos.entry,
+                line: pos.line,
+                col: 0,
+            },
+            caret: SelPos {
+                entry: pos.entry,
+                line: pos.line,
+                col: usize::from(self.content_width()),
+            },
+        }
+    }
+
+    fn word_at(&mut self, pos: SelPos) -> Selection {
+        let rows = self.entry_rows(pos.entry, self.content_width());
+        if pos.line >= rows.len() {
+            return Selection {
+                anchor: pos,
+                caret: pos,
+            };
+        }
+
+        let mut cells = Vec::new();
+        let row = &rows[pos.line];
+        let mut col = content_start(row);
+        let end = content_end(row);
+        while col < end {
+            let cell = &row[col];
+            let width = usize::from(cell.char.width.max(1));
+            let next = col.saturating_add(width).min(row.len());
+            let class = word_class(cell.char.grapheme());
+            cells.push((
+                SelPos {
+                    entry: pos.entry,
+                    line: pos.line,
+                    col,
+                },
+                SelPos {
+                    entry: pos.entry,
+                    line: pos.line,
+                    col: next,
+                },
+                class,
+            ));
+            col = next;
+        }
+
+        let Some(mut index) = cells
+            .iter()
+            .position(|(start, end, _)| pos >= *start && pos < *end)
+        else {
+            return Selection {
+                anchor: pos,
+                caret: pos,
+            };
+        };
+        let class = cells[index].2;
+        let mut end = index;
+        while index > 0 && cells[index - 1].2 == class {
+            index -= 1;
+        }
+        while end + 1 < cells.len() && cells[end + 1].2 == class {
+            end += 1;
+        }
+        Selection {
+            anchor: cells[index].0,
+            caret: cells[end].1,
+        }
+    }
+
+    fn extend_unit_selection(origin: Selection, target: Selection) -> Selection {
+        if target.caret <= origin.anchor {
+            Selection {
+                anchor: origin.caret,
+                caret: target.anchor,
+            }
+        } else if target.anchor >= origin.caret {
+            Selection {
+                anchor: origin.anchor,
+                caret: target.caret,
+            }
+        } else {
+            origin
+        }
+    }
+
     /// Snapshot the visible sub-agent boxes from the geometry just drawn.
     fn record_agent_hit_map(&mut self) {
         let height = usize::from(self.last_view.height);
@@ -2854,25 +3069,34 @@ impl TranscriptView {
     fn handle_selection_mouse(&mut self, ctx: &mut EventContext, m: &mouse::Mouse) {
         match m.kind {
             mouse::Type::Press => {
-                self.agent_click = if m.mods.is_empty() {
+                let Some(pos) = self.point_to_sel(m.row, m.col) else {
+                    return;
+                };
+                let count = if m.mods.is_empty() {
+                    self.click_count(pos, Instant::now())
+                } else {
+                    self.last_click = None;
+                    1
+                };
+                self.agent_click = if count == 1 && m.mods.is_empty() {
                     self.subagent_at_point(m.row, m.col)
                 } else {
                     None
                 };
-                // A press anchors a fresh (zero-width) selection and stops the
-                // viewport chasing the tail so the anchor stays put.
-                let Some(pos) = self.point_to_sel(m.row, m.col) else {
-                    return;
+                self.selection_unit = match count {
+                    2 => SelectionUnit::Word,
+                    3 => SelectionUnit::Line,
+                    _ => SelectionUnit::Character,
                 };
-                self.selection = Some(Selection {
-                    anchor: pos,
-                    caret: pos,
-                });
+                let selection = self.selection_for_unit(pos, self.selection_unit);
+                self.selection = Some(selection);
+                self.selection_origin = Some(selection);
                 self.follow_tail = false;
                 ctx.redraw = true;
             }
             mouse::Type::Drag => {
                 self.agent_click = None;
+                self.last_click = None;
                 // Dragging past the top or bottom edge auto-scrolls by the
                 // overshoot so a selection can span more than one screen. The
                 // revealed rows extend the selection on subsequent frames. A
@@ -2891,15 +3115,16 @@ impl TranscriptView {
                     ctx.redraw = true;
                     return;
                 };
-                match self.selection.as_mut() {
-                    Some(sel) => sel.caret = caret,
+                let target = self.selection_for_unit(caret, self.selection_unit);
+                match self.selection_origin {
+                    Some(origin) => {
+                        self.selection = Some(Self::extend_unit_selection(origin, target));
+                    }
                     // A drag with no prior press is not expected, but start a
                     // selection at the caret rather than drop the interaction.
                     None => {
-                        self.selection = Some(Selection {
-                            anchor: caret,
-                            caret,
-                        })
+                        self.selection = Some(target);
+                        self.selection_origin = Some(target);
                     }
                 }
                 ctx.redraw = true;
@@ -2939,6 +3164,8 @@ impl TranscriptView {
                     }
                     ctx.redraw = true;
                 }
+                self.selection_origin = None;
+                self.selection_unit = SelectionUnit::Character;
                 if let Some(id) = observe
                     && let Some(on_observe) = self.on_observe_agent.as_mut()
                 {
@@ -3117,6 +3344,7 @@ impl TranscriptView {
             // Semantic selection: don't highlight the chrome indent margin, so
             // the painted span matches the copied text.
             let from = from.max(content_start(row));
+            let (from, to) = expand_to_graphemes(row, from, to);
             for (c, cell) in row.iter().enumerate() {
                 let mut cell = cell.clone();
                 if to > from {
@@ -3259,7 +3487,7 @@ impl Widget for TranscriptView {
         match event {
             Event::Mouse(m) => {
                 if !matches!(m.button, mouse::Button::Left | mouse::Button::None) {
-                    self.agent_click = None;
+                    self.cancel_selection_gesture();
                 }
                 self.observe_mouse(ctx, event, m);
                 if ctx.consume_event {
@@ -3286,7 +3514,7 @@ impl Widget for TranscriptView {
                 self.list.borrow_mut().handle_event(ctx, event);
             }
             Event::MouseLeave => {
-                self.agent_click = None;
+                self.cancel_selection_gesture();
                 self.bars.borrow_mut().handle_event(ctx, event);
             }
             // Focus in/out drive transcript-focus mode: the transcript is "in
@@ -3294,7 +3522,10 @@ impl Widget for TranscriptView {
             // section 1). FocusOut also fires when an opening overlay steals
             // focus, which cleanly exits the mode.
             Event::FocusIn => self.enter_focus_mode(ctx),
-            Event::FocusOut => self.exit_focus_mode(ctx),
+            Event::FocusOut => {
+                self.cancel_selection_gesture();
+                self.exit_focus_mode(ctx);
+            }
             // Drives the smooth focus and page glides (see `ScrollAnim`), a
             // no-op once the animation is done and the tick chain has stopped.
             Event::Tick => self.advance_scroll_anim(ctx),
@@ -3304,6 +3535,7 @@ impl Widget for TranscriptView {
                 // highlight and a second exits focus.
                 if key.matches(Key::ESCAPE, Modifiers::empty()) && self.selection.is_some() {
                     self.selection = None;
+                    self.cancel_selection_gesture();
                     return ctx.consume_and_redraw();
                 }
                 // Item navigation, live only while focused (see
@@ -7165,6 +7397,66 @@ mod tests {
         );
         // A degenerate range is empty.
         assert_eq!(extract_from_lines(&lines, (1, 0), (1, 0)), "");
+
+        let spaced = cells("a   b");
+        assert_eq!(
+            cell_range_text(&spaced, 1, 4),
+            "   ",
+            "selected whitespace is not mistaken for layout padding",
+        );
+
+        let wide = vec![
+            Cell {
+                char: Character::new("中", 2),
+                ..Cell::default()
+            },
+            Cell::default(),
+            Cell {
+                char: Character::new("x", 1),
+                ..Cell::default()
+            },
+        ];
+        assert_eq!(cell_range_text(&wide, 0, 3), "中x");
+        assert_eq!(
+            cell_range_text(&wide, 1, 2),
+            "中",
+            "a continuation-column range expands to the complete grapheme",
+        );
+    }
+
+    #[test]
+    fn word_classes_match_terminal_selection_conventions() {
+        assert_eq!(word_class(" "), WordClass::Whitespace);
+        assert_eq!(word_class("\t"), WordClass::Whitespace);
+        assert_eq!(word_class("/"), WordClass::Delimiter);
+        assert_eq!(word_class("-"), WordClass::Delimiter);
+        assert_eq!(word_class("_"), WordClass::Regular);
+        assert_eq!(word_class("é"), WordClass::Regular);
+        assert_eq!(word_class("🦀"), WordClass::Regular);
+    }
+
+    #[test]
+    fn click_count_requires_nearby_presses_inside_the_interval() {
+        let chat = chat_with_notices(1);
+        let mut view = transcript_view(&chat);
+        let pos = SelPos {
+            entry: entry_id(&chat, 0),
+            line: 0,
+            col: 2,
+        };
+        let now = Instant::now();
+        assert_eq!(view.click_count(pos, now), 1);
+        assert_eq!(view.click_count(pos, now + Duration::from_millis(499)), 2);
+        assert_eq!(
+            view.click_count(pos, now + Duration::from_millis(1_000)),
+            1,
+            "the interval is measured from the immediately preceding press",
+        );
+        assert_eq!(
+            view.click_count(SelPos { col: 4, ..pos }, now + Duration::from_millis(1_001),),
+            1,
+            "movement beyond one cell starts a new sequence",
+        );
     }
 
     /// `content_start` skips at most the one-column chrome margin: a plain
@@ -7584,6 +7876,81 @@ mod tests {
             view.selection.is_some(),
             "a real range stays highlighted after copy",
         );
+    }
+
+    #[test]
+    fn double_click_selects_and_drags_by_terminal_word_classes() {
+        let chat = chat_with_notices(20);
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(40, 10);
+        view.follow_tail = false;
+        view.list.borrow_mut().scroll_lines(-1000);
+        let _ = view.draw(&ctx);
+
+        // The first click starts the multi-click sequence. The second press on
+        // the `o` in "row 1" selects the complete regular-character run.
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &mouse(2, 2, mouse::Type::Press));
+        view.handle_event(&mut ec, &mouse(2, 2, mouse::Type::Release));
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &mouse(2, 2, mouse::Type::Press));
+        let word = view.selection.expect("double-click selected a word");
+        assert_eq!(
+            view.extract_selection(view.content_width(), word.anchor, word.caret),
+            "row",
+        );
+
+        // Dragging onto the digit snaps the moving edge to that whole run and
+        // retains the whitespace between the two words.
+        view.handle_event(&mut ec, &mouse(5, 2, mouse::Type::Drag));
+        let selection = view.selection.expect("word drag kept a selection");
+        assert_eq!(
+            view.extract_selection(view.content_width(), selection.anchor, selection.caret,),
+            "row 1",
+        );
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &mouse(5, 2, mouse::Type::Release));
+        let copied = ec.cmds.iter().find_map(|cmd| match cmd {
+            vaxis::vxfw::Command::CopyToClipboard(text) => Some(text.as_str()),
+            _ => None,
+        });
+        assert_eq!(copied, Some("row 1"));
+    }
+
+    #[test]
+    fn triple_click_selects_the_complete_rendered_line() {
+        let chat = chat_with_notices(20);
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(40, 10);
+        view.follow_tail = false;
+        view.list.borrow_mut().scroll_lines(-1000);
+        let _ = view.draw(&ctx);
+
+        for _ in 0..2 {
+            let mut ec = EventContext::new();
+            view.handle_event(&mut ec, &mouse(2, 2, mouse::Type::Press));
+            view.handle_event(&mut ec, &mouse(2, 2, mouse::Type::Release));
+        }
+        let mut ec = EventContext::new();
+        view.handle_event(&mut ec, &mouse(2, 2, mouse::Type::Press));
+        let line = view.selection.expect("triple-click selected a line");
+        assert_eq!(
+            view.extract_selection(view.content_width(), line.anchor, line.caret),
+            "row 1",
+        );
+        assert_eq!(line.anchor.col, 0, "line selection starts at the edge");
+        assert_eq!(
+            line.caret.col,
+            usize::from(view.content_width()),
+            "line selection reaches the right edge",
+        );
+
+        view.handle_event(&mut ec, &mouse(2, 2, mouse::Type::Release));
+        let copied = ec.cmds.iter().find_map(|cmd| match cmd {
+            vaxis::vxfw::Command::CopyToClipboard(text) => Some(text.as_str()),
+            _ => None,
+        });
+        assert_eq!(copied, Some("row 1"));
     }
 
     /// A select-to-copy release records the copied character count in the
