@@ -41,7 +41,11 @@ pub struct ResolvedFiles {
 /// prompt text plus image attachments, relative to `cwd`.
 ///
 /// Returns an error on the first missing or unreadable file.
-pub fn process_file_args(file_args: &[String], cwd: &Path) -> Result<ResolvedFiles> {
+pub fn process_file_args(
+    file_args: &[String],
+    cwd: &Path,
+    image_auto_resize: bool,
+) -> Result<ResolvedFiles> {
     let mut text = String::new();
     let mut images = Vec::new();
 
@@ -58,7 +62,14 @@ pub fn process_file_args(file_args: &[String], cwd: &Path) -> Result<ResolvedFil
         }
 
         match image::detect_mime_type_from_file(&path) {
-            Some(mime) => append_image(&path, &display, mime, &mut text, &mut images)?,
+            Some(mime) => append_image(
+                &path,
+                &display,
+                mime,
+                image_auto_resize,
+                &mut text,
+                &mut images,
+            )?,
             None => {
                 let content = std::fs::read_to_string(&path)
                     .with_context(|| format!("could not read @file as text: {display}"))?;
@@ -78,11 +89,17 @@ fn append_image(
     path: &Path,
     display: &str,
     mime: &'static str,
+    auto_resize: bool,
     text: &mut String,
     images: &mut Vec<UserContent>,
 ) -> Result<()> {
     let bytes = std::fs::read(path).with_context(|| format!("could not read @file: {display}"))?;
-    match image::resize_image(&bytes, mime, &ResizeOptions::default()) {
+    let processed = if auto_resize {
+        image::resize_image(&bytes, mime, &ResizeOptions::default())
+    } else {
+        image::passthrough_image(&bytes, mime)
+    };
+    match processed {
         Some(resized) => {
             let note = image::format_dimension_note(&resized).unwrap_or_default();
             text.push_str(&format!("<file name=\"{display}\">{note}</file>\n"));
@@ -127,6 +144,7 @@ fn expand_tilde(arg: &str) -> PathBuf {
 mod tests {
     use std::io::Write;
 
+    use aj_models::types::UserContent;
     use tempfile::tempdir;
 
     use crate::cli::file_args::process_file_args;
@@ -138,7 +156,7 @@ mod tests {
         std::fs::write(&file, "hello world").expect("write");
 
         let resolved =
-            process_file_args(&[file.display().to_string()], dir.path()).expect("resolve");
+            process_file_args(&[file.display().to_string()], dir.path(), true).expect("resolve");
         assert!(resolved.images.is_empty());
         assert_eq!(
             resolved.text,
@@ -151,7 +169,8 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         std::fs::write(dir.path().join("rel.txt"), "x").expect("write");
 
-        let resolved = process_file_args(&["rel.txt".to_string()], dir.path()).expect("resolve");
+        let resolved =
+            process_file_args(&["rel.txt".to_string()], dir.path(), true).expect("resolve");
         assert!(resolved.text.contains("rel.txt"));
         assert!(resolved.text.contains(">\nx\n<"));
     }
@@ -163,7 +182,7 @@ mod tests {
         std::fs::File::create(&file).expect("create");
 
         let resolved =
-            process_file_args(&[file.display().to_string()], dir.path()).expect("resolve");
+            process_file_args(&[file.display().to_string()], dir.path(), true).expect("resolve");
         assert!(resolved.text.is_empty());
         assert!(resolved.images.is_empty());
     }
@@ -171,7 +190,7 @@ mod tests {
     #[test]
     fn missing_file_is_an_error() {
         let dir = tempdir().expect("tempdir");
-        let err = process_file_args(&["does-not-exist.txt".to_string()], dir.path())
+        let err = process_file_args(&["does-not-exist.txt".to_string()], dir.path(), true)
             .expect_err("should error");
         assert!(err.to_string().contains("not found"), "{err}");
     }
@@ -185,7 +204,7 @@ mod tests {
         handle.flush().expect("flush");
 
         let resolved =
-            process_file_args(&[file.display().to_string()], dir.path()).expect("resolve");
+            process_file_args(&[file.display().to_string()], dir.path(), true).expect("resolve");
         assert_eq!(resolved.images.len(), 1);
         // A small image fits the budget unscaled, so no dimension note.
         assert_eq!(
@@ -203,5 +222,31 @@ mod tests {
             .write_to(&mut std::io::Cursor::new(&mut buf), ImageFormat::Png)
             .expect("encode png");
         buf
+    }
+
+    #[test]
+    fn disabled_auto_resize_attaches_original_image() {
+        use base64::Engine;
+        use image::{ImageFormat, Rgba, RgbaImage};
+
+        let dir = tempdir().expect("tempdir");
+        let file = dir.path().join("wide.png");
+        let image = RgbaImage::from_pixel(2001, 1, Rgba([10, 20, 30, 255]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut std::io::Cursor::new(&mut bytes), ImageFormat::Png)
+            .expect("encode png");
+        std::fs::write(&file, &bytes).expect("write");
+
+        let resolved =
+            process_file_args(&[file.display().to_string()], dir.path(), false).expect("resolve");
+        let UserContent::Image(attached) = &resolved.images[0] else {
+            panic!("expected image attachment");
+        };
+        assert_eq!(
+            attached.data,
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        );
+        assert!(!resolved.text.contains("Multiply coordinates"));
     }
 }
