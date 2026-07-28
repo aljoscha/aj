@@ -422,8 +422,15 @@ async fn run_inner<W: Write + Send + 'static>(
 
     // Make sure the sink is flushed before exit so callers piping into
     // another process don't lose buffered bytes.
-    let _ = out.lock().expect("print sink mutex poisoned").flush();
+    flush_output(&out)?;
     Ok(())
+}
+
+fn flush_output<W: Write>(out: &Arc<Mutex<W>>) -> Result<()> {
+    out.lock()
+        .expect("print sink mutex poisoned")
+        .flush()
+        .context("failed to flush print output to stdout")
 }
 
 /// Map a finished turn's outcome to the print run's process result.
@@ -512,7 +519,6 @@ fn print_final_assistant_text<W: Write>(agent: &Agent, out: &Arc<Mutex<W>>) -> R
             writeln!(w, "{}", t.text).context("failed to write assistant text to stdout")?;
         }
     }
-    w.flush().ok();
     Ok(())
 }
 
@@ -524,6 +530,32 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    struct FlushFailWriter(Vec<u8>);
+
+    impl Write for FlushFailWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("injected flush failure"))
+        }
+    }
+
+    #[test]
+    fn final_flush_failure_is_propagated_with_context() {
+        let sink = Arc::new(Mutex::new(FlushFailWriter(Vec::new())));
+        sink.lock().unwrap().write_all(b"output").unwrap();
+
+        let error = flush_output(&sink).expect_err("flush must fail");
+        assert_eq!(error.to_string(), "failed to flush print output to stdout");
+        assert!(
+            format!("{error:#}").contains("injected flush failure"),
+            "error chain preserves the I/O cause"
+        );
+    }
 
     /// Parse a CLI string into [`Args`] the same way `main.rs` does
     /// at startup. Convenient for tests that exercise the dispatch
