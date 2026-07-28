@@ -422,7 +422,9 @@ fn install_panic_hook() {
 mod tests {
     use std::os::fd::AsFd;
     use std::sync::atomic::AtomicUsize;
+    use std::time::{Duration, Instant};
 
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
     use nix::pty::openpty;
     use serial_test::serial;
 
@@ -636,10 +638,8 @@ mod tests {
             assert_eq!(after.local_flags, original.local_flags);
         }
 
-        // The master must have received the reset bytes recover wrote.
-        let mut buf = vec![0u8; 256];
-        let n = nix::unistd::read(&master, &mut buf).expect("read master");
-        let out = &buf[..n];
+        // The master must have received the reset bytes recover wrote. PTYs may
+        // expose consecutive writes across multiple reads.
         let expected: Vec<u8> = [
             ctlseqs::CSI_U_POP,
             ctlseqs::MOUSE_RESET,
@@ -648,6 +648,22 @@ mod tests {
         ]
         .concat()
         .into_bytes();
+        fcntl(&master, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).expect("set master nonblocking");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut out = Vec::new();
+        while !out
+            .windows(expected.len())
+            .any(|window| window == expected.as_slice())
+            && Instant::now() < deadline
+        {
+            let mut buf = [0u8; 256];
+            match nix::unistd::read(&master, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(nix::errno::Errno::EAGAIN) => std::thread::sleep(Duration::from_millis(5)),
+                Err(err) => panic!("read master: {err}"),
+            }
+        }
         assert!(
             out.windows(expected.len())
                 .any(|w| w == expected.as_slice()),
