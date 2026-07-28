@@ -37,6 +37,13 @@ pub(crate) struct ContextLine {
 /// visual distinction. Same content and order as [`build_context_notice`],
 /// which joins this.
 pub(crate) fn context_lines(env: &AgentEnv) -> Vec<ContextLine> {
+    context_lines_with_display(env, display_path)
+}
+
+fn context_lines_with_display(
+    env: &AgentEnv,
+    display: impl Fn(&std::path::Path) -> String,
+) -> Vec<ContextLine> {
     let bullet = "  - ".to_string();
     let mut lines = vec![ContextLine {
         bullet: String::new(),
@@ -50,7 +57,7 @@ pub(crate) fn context_lines(env: &AgentEnv) -> Vec<ContextLine> {
             source.label()
         ),
         SystemPromptSource::Override(path) => {
-            format!("{} ({})", display_path(path), source.label())
+            format!("{} ({})", display(path), source.label())
         }
     };
     lines.push(ContextLine {
@@ -61,7 +68,7 @@ pub(crate) fn context_lines(env: &AgentEnv) -> Vec<ContextLine> {
     for file in &env.context_files {
         lines.push(ContextLine {
             bullet: bullet.clone(),
-            text: format!("{} ({})", display_path(&file.path), file.kind.label()),
+            text: format!("{} ({})", display(&file.path), file.kind.label()),
             struck: false,
         });
     }
@@ -75,11 +82,7 @@ pub(crate) fn context_lines(env: &AgentEnv) -> Vec<ContextLine> {
         };
         lines.push(ContextLine {
             bullet: bullet.clone(),
-            text: format!(
-                "{} (skill: {}{marker})",
-                display_path(&skill.path),
-                skill.name
-            ),
+            text: format!("{} (skill: {}{marker})", display(&skill.path), skill.name),
             struck: !skill.enabled,
         });
     }
@@ -95,7 +98,20 @@ pub(crate) fn context_lines(env: &AgentEnv) -> Vec<ContextLine> {
 /// `strike` applies to the row content only, never the bullet, matching the
 /// structured split.
 pub fn build_context_notice(env: &AgentEnv, strike: fn(&str) -> String) -> String {
-    context_lines(env)
+    render_context_lines(context_lines(env), strike)
+}
+
+#[cfg(test)]
+fn build_context_notice_with_display(
+    env: &AgentEnv,
+    strike: fn(&str) -> String,
+    display: impl Fn(&std::path::Path) -> String,
+) -> String {
+    render_context_lines(context_lines_with_display(env, display), strike)
+}
+
+fn render_context_lines(lines: Vec<ContextLine>, strike: fn(&str) -> String) -> String {
+    lines
         .into_iter()
         .map(|line| {
             let content = if line.struck {
@@ -119,11 +135,14 @@ pub const SANDBOX_WARNING: &str = "WARNING: AJ has no sandboxing or permission c
 /// Returns `true` when the sandbox warning should be shown, i.e. when
 /// `AJ_DISABLE_SANDBOX_WARNING` is unset in the environment.
 ///
-/// Uses `std::env::var("AJ_DISABLE_SANDBOX_WARNING").is_err()`, so
-/// setting the var to any value (including the empty string) suppresses
-/// the warning.
+/// Setting the var to any value (including the empty string) suppresses the
+/// warning.
 pub fn sandbox_warning_enabled() -> bool {
-    std::env::var("AJ_DISABLE_SANDBOX_WARNING").is_err()
+    sandbox_warning_enabled_for(std::env::var_os("AJ_DISABLE_SANDBOX_WARNING").is_some())
+}
+
+fn sandbox_warning_enabled_for(disable_var_is_present: bool) -> bool {
+    !disable_var_is_present
 }
 
 #[cfg(test)]
@@ -134,7 +153,10 @@ mod tests {
         AgentEnv, ContextFile, ContextFileKind, SystemPrompt, SystemPromptSource, skills::Skill,
     };
 
-    use super::{SANDBOX_WARNING, build_context_notice, context_lines, sandbox_warning_enabled};
+    use super::{
+        SANDBOX_WARNING, build_context_notice, build_context_notice_with_display, context_lines,
+        sandbox_warning_enabled_for,
+    };
 
     /// Sentinel `strike` hook: wraps the row in a visible marker so a
     /// test can assert exactly which rows the hook fires on.
@@ -171,12 +193,8 @@ mod tests {
     }
 
     #[test]
-    fn build_context_notice_lists_files_with_label_and_tildified_path() {
-        // `display_path` tildifies under `$HOME`, so build the path
-        // off the live `HOME` env var to keep the assertion stable
-        // across machines.
-        let home = std::env::var("HOME").expect("HOME set in test env");
-        let user_path = PathBuf::from(&home).join(".agents/AGENTS.md");
+    fn build_context_notice_lists_files_with_label_and_display_path() {
+        let user_path = PathBuf::from("/var/user/.agents/AGENTS.md");
         let project_path = PathBuf::from("/var/project/AGENTS.md");
         let env = env_with(vec![
             ContextFile {
@@ -191,29 +209,26 @@ mod tests {
             },
         ]);
 
-        let notice = build_context_notice(&env, strike);
+        let notice =
+            build_context_notice_with_display(&env, strike, |path| path.display().to_string());
         let expected = "Context:\n  \
              - builtin (system prompt; override with ~/.agents/SYSTEM_PROMPT.md)\n  \
-             - ~/.agents/AGENTS.md (user instructions)\n  \
+             - /var/user/.agents/AGENTS.md (user instructions)\n  \
              - /var/project/AGENTS.md (project instructions)";
         assert_eq!(notice, expected);
     }
 
     #[test]
-    fn build_context_notice_override_shows_tildified_prompt_path() {
-        // `display_path` tildifies under `$HOME`, so build the path
-        // off the live `HOME` env var to keep the assertion stable
-        // across machines.
-        let home = std::env::var("HOME").expect("HOME set in test env");
-        let path = PathBuf::from(&home).join(".agents/SYSTEM_PROMPT.md");
+    fn build_context_notice_override_shows_prompt_path() {
+        let path = PathBuf::from("/var/user/.agents/SYSTEM_PROMPT.md");
         let mut env = env_with(Vec::new());
         env.system_prompt = SystemPrompt {
             content: "override prompt".to_string(),
             source: SystemPromptSource::Override(path),
         };
         assert_eq!(
-            build_context_notice(&env, strike),
-            "Context:\n  - ~/.agents/SYSTEM_PROMPT.md (system prompt)"
+            build_context_notice_with_display(&env, strike, |path| path.display().to_string()),
+            "Context:\n  - /var/user/.agents/SYSTEM_PROMPT.md (system prompt)"
         );
     }
 
@@ -233,7 +248,8 @@ mod tests {
             skill("gamma", true, true),
         ];
 
-        let notice = build_context_notice(&env, strike);
+        let notice =
+            build_context_notice_with_display(&env, strike, |path| path.display().to_string());
         // The hook fires on the disabled row (and only that one): the
         // enabled and model-invocation-disabled rows stay unwrapped.
         let expected = format!(
@@ -284,49 +300,8 @@ mod tests {
 
     #[test]
     fn sandbox_warning_enabled_tracks_env_var_presence() {
-        // SAFETY: tests in this module run on a single thread so
-        // mutating the process env is fine. We save/restore the
-        // pre-existing value so other tests aren't disturbed.
-        let prev = std::env::var("AJ_DISABLE_SANDBOX_WARNING").ok();
-
-        // SAFETY: single-threaded test runner per `cargo test`'s
-        // default. No other test reads this var concurrently.
-        unsafe {
-            std::env::remove_var("AJ_DISABLE_SANDBOX_WARNING");
-        }
-        assert!(
-            sandbox_warning_enabled(),
-            "warning should show when the var is absent"
-        );
-
-        // SAFETY: same scope as above.
-        unsafe {
-            std::env::set_var("AJ_DISABLE_SANDBOX_WARNING", "1");
-        }
-        assert!(
-            !sandbox_warning_enabled(),
-            "warning should be suppressed when the var is set"
-        );
-
-        // `is_err()` semantics: even an empty value counts as "set"
-        // and suppresses the warning.
-        // SAFETY: same scope as above.
-        unsafe {
-            std::env::set_var("AJ_DISABLE_SANDBOX_WARNING", "");
-        }
-        assert!(
-            !sandbox_warning_enabled(),
-            "warning should stay suppressed when the var is set to the empty string"
-        );
-
-        // Restore.
-        // SAFETY: same scope as above.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("AJ_DISABLE_SANDBOX_WARNING", v),
-                None => std::env::remove_var("AJ_DISABLE_SANDBOX_WARNING"),
-            }
-        }
+        assert!(sandbox_warning_enabled_for(false));
+        assert!(!sandbox_warning_enabled_for(true));
     }
 
     #[test]

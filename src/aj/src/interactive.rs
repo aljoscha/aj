@@ -5175,15 +5175,16 @@ async fn drive(
             // input, typed input always wins. `drain_events` still coalesces the
             // whole channel into one batch, so a burst collapses into one redraw.
             maybe_event = world.core.event_rx.recv() => {
-                // `None` (channel closed) can't happen while the core
-                // holds its forwarder subscription. Treat it as a
-                // no-op rather than tearing the session down.
-                if let Some(event) = maybe_event {
-                    let (redraw, wake_targets) = drain_events(world, event);
-                    spawn_wakes(world, wake_targets);
-                    if redraw {
-                        app.request_redraw();
-                    }
+                // Losing the agent bus means this session can no longer
+                // observe turn progress. It is also permanently ready, so
+                // treating closure as a no-op would spin this select loop.
+                let Some(event) = maybe_event else {
+                    break Err(anyhow::anyhow!("agent event channel closed"));
+                };
+                let (redraw, wake_targets) = drain_events(world, event);
+                spawn_wakes(world, wake_targets);
+                if redraw {
+                    app.request_redraw();
                 }
             }
 
@@ -11854,7 +11855,6 @@ mod tests {
     async fn session_selector_fills_and_confirms_a_switch() {
         let dir = TempDir::new().expect("tempdir");
         let alpha = create_disk_session(&dir, "alpha session prompt").await;
-        std::thread::sleep(std::time::Duration::from_millis(2));
 
         let (mut world, shell, mut app, mut writer, root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
@@ -11966,7 +11966,6 @@ mod tests {
     async fn switch_rebuilds_the_session_and_accumulates_usage() {
         let dir = TempDir::new().expect("tempdir");
         let beta = create_disk_session(&dir, "beta session prompt").await;
-        std::thread::sleep(std::time::Duration::from_millis(2));
 
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         run_prompt(&mut world, "alpha session prompt").await;
