@@ -376,7 +376,7 @@ fn build_request(
         };
         (
             Some(Reasoning {
-                effort: Some(map_reasoning_effort(reasoning)),
+                effort: responses_reasoning_effort(model, reasoning),
                 summary: Some(summary),
             }),
             vec![ResponseIncludable::ReasoningEncryptedContent],
@@ -464,16 +464,15 @@ fn build_system_item(model: &ModelInfo, prompt: &str) -> ResponseInputItem {
     }
 }
 
-/// Map the unified [`ThinkingLevel`] onto the OpenAI `reasoning_effort`
-/// enum, one wire value per rung. Shared by the Responses and Codex
-/// providers.
+/// Returns the reasoning effort serialized by the Responses adapters.
 ///
-/// [`ThinkingLevel::Off`] maps to `none`. This is only reached for a
-/// model whose vocabulary advertises off (enforced by
-/// [`validate_thinking_level`]), so we never send `none` to a model that
-/// rejects it.
-pub(super) fn map_reasoning_effort(level: &ThinkingLevel) -> ReasoningEffort {
-    match level {
+/// Non-reasoning models omit the reasoning object. [`ThinkingLevel::Off`]
+/// maps to `none` for reasoning models whose vocabulary advertises it.
+pub fn responses_reasoning_effort(
+    model: &ModelInfo,
+    level: &ThinkingLevel,
+) -> Option<ReasoningEffort> {
+    model.reasoning.then_some(match level {
         ThinkingLevel::Off => ReasoningEffort::None,
         ThinkingLevel::Minimal => ReasoningEffort::Minimal,
         ThinkingLevel::Low => ReasoningEffort::Low,
@@ -481,7 +480,7 @@ pub(super) fn map_reasoning_effort(level: &ThinkingLevel) -> ReasoningEffort {
         ThinkingLevel::High => ReasoningEffort::High,
         ThinkingLevel::XHigh => ReasoningEffort::XHigh,
         ThinkingLevel::Max => ReasoningEffort::Max,
-    }
+    })
 }
 
 pub(super) fn map_service_tier(tier: &ServiceTier) -> OpenAIServiceTier {
@@ -1748,7 +1747,7 @@ mod tests {
             &ThinkingLevel::Off,
         );
         let r = req.reasoning.expect("reasoning set");
-        // `off` is sent verbatim as `reasoning_effort: "none"`; the
+        // `off` is sent verbatim as `reasoning_effort: "none"`. The
         // model's vocabulary is checked upstream, so we never floor here.
         assert!(matches!(r.effort, Some(ReasoningEffort::None)));
         assert!(matches!(r.summary, Some(ReasoningSummaryMode::Auto)));

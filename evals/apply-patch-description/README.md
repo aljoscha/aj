@@ -24,6 +24,9 @@ cargo run -p aj-apply-patch-eval -- \
 cargo run -p aj-apply-patch-eval -- freeze \
   --seed apply-patch-description-v1 \
   --universe-per-archetype 512 \
+  --provider openai-codex \
+  --model gpt-5.6-sol \
+  --reasoning low \
   --output eval-artifacts/unplanned-plan.json
 
 cargo run -p aj-apply-patch-eval -- run \
@@ -88,11 +91,39 @@ JSONL stream. Main accepts only the planned file. It recomputes the exact pilot
 completion-stream digest before any provider call. Set main `--max-trials` to at
 least twice the selected pair count in `planning-report.json`.
 
-The planner uses conservative paired score and variance approximations, common
-deterministic Monte Carlo draws, and a one-sided Wilson lower confidence bound
-on achieved power. Its algorithm version, simulation count, confidence
-controls, seed, and nuisance inputs are frozen in the planning record. Final
-inference still uses 100,000 paired bootstrap replicates.
+Provider, model, and reasoning are selected only by `freeze`. The defaults are
+`openai-codex`, `gpt-5.6-sol`, and `low`. Freeze resolves the local catalog
+entry, checks that the reasoning level is supported, checks that the model's
+tool family exposes `apply_patch`, and checks that its provider adapter uses a
+supported Responses payload. It binds the catalog entry and normalized tool
+catalog into the plan and schedule hashes. Later commands have no model override
+and fail if the local catalog no longer matches.
+
+Use a separate plan, records file, artifact directory, pilot, main sample, and
+analysis for every model or reasoning level. Results from different models are
+not pooled into one shipping decision. For example, a second model starts with
+a distinct freeze command and output directory:
+
+```bash
+cargo run -p aj-apply-patch-eval -- freeze \
+  --seed apply-patch-description-v1-other-model \
+  --universe-per-archetype 512 \
+  --provider <provider> \
+  --model <model-id> \
+  --reasoning <level> \
+  --output eval-artifacts-other-model/unplanned-plan.json
+```
+
+The planner uses conservative paired score and variance approximations. It uses
+exactly 512 deterministic Monte Carlo replicates with joint cost and response
+draws, and a one-sided Wilson lower confidence bound on achieved power. It scans
+the complete efficiency power curve up to the practical cap. Its algorithm
+version, simulation count, confidence controls, seed, and nuisance inputs are
+frozen in the planning record. Final inference still uses 100,000 paired
+bootstrap replicates. A zero current mean makes that relative endpoint explicit
+and undefined, which forces an inconclusive shipping decision. A defined point
+estimate whose bootstrap includes a zero-current resample is reported with
+unbounded confidence bounds and is also inconclusive.
 
 Every phase reserves a conservative catalog estimate for the maximum request
 count, full catalog input context, catalog output ceiling, cache-read pricing,
@@ -132,7 +163,10 @@ without a confirmatory pair marker. The mandatory preflight cancels an attached
 guest during a delayed write, checks that its name is absent, and proves that no
 later fixture mutation occurs. Docker commands and one-shot helpers have fixed
 deadlines. The whole-trial deadline includes volume creation, fixture setup,
-snapshots, worker execution, verification, and cleanup.
+snapshots, worker execution, verification, and cleanup. A deadline before the
+first provider request is a retryable infrastructure failure. A deadline after
+a captured request preserves observed usage and becomes a valid `timed_out`
+outcome only after cleanup is confirmed.
 
 Generated fixtures are Git repositories rooted at `/workspace`, with a fixed
 local author and deterministic initial commit. Records retain the baseline
@@ -171,15 +205,15 @@ container resources are also enforced by the parent.
 
 Before credentials are resolved, the parent constructs both typed first-request
 contexts using the same code and frozen UTC date as the worker. It verifies the
-canonical path, system prompt, date, model, low effort, messages, tool order,
-schemas, and that only `apply_patch.description` differs. Production
+canonical path, system prompt, date, model, frozen reasoning effort, messages,
+tool order, schemas, and that only `apply_patch.description` differs. Production
 `on_payload` validation necessarily occurs after the provider constructs its
 serialized request. An invalid payload cancels and drains that request before a
 `runner_internal` result. Every request records a hash of the actual serialized
 payload after normalizing only the opaque cache key and the `apply_patch`
 description. Model, instructions, input, tools, and every stable provider option
 remain in the hash. Paired first hashes must match before a completion marker is
-written.
+written. The reasoning effort in these checks is the value frozen in the plan.
 
 The frozen catalog disables only `agent` and rejects background bash. The
 `task_output` and `task_stop` tools remain present symmetrically because they can

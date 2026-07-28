@@ -8,7 +8,7 @@ use aj_apply_patch_eval::docker::{
     copy_worker, fixture_worker, probe_worker, snapshot_worker, tool_worker, verify_worker,
 };
 use aj_apply_patch_eval::planning::plan_main;
-use aj_apply_patch_eval::runner::{RunOptions, run, run_preflight};
+use aj_apply_patch_eval::runner::{RunOptions, freeze_model_selection, run, run_preflight};
 use aj_apply_patch_eval::schedule::{FrozenPlan, SchedulePhase, freeze_plan};
 use aj_apply_patch_eval::suite::committed_manifest;
 use aj_apply_patch_eval::worker::run_worker;
@@ -59,6 +59,12 @@ enum Command {
         output: PathBuf,
         #[arg(long)]
         universe_per_archetype: u32,
+        #[arg(long, default_value = "openai-codex")]
+        provider: String,
+        #[arg(long, default_value = "gpt-5.6-sol")]
+        model: String,
+        #[arg(long, default_value = "low")]
+        reasoning: String,
     },
     /// Blind the complete pilot and freeze the confirmatory main schedule.
     PlanMain {
@@ -150,9 +156,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
             seed,
             output,
             universe_per_archetype,
+            provider,
+            model,
+            reasoning,
         } => {
             let manifest = committed_manifest()?;
-            let plan = freeze_plan(&manifest, &seed, universe_per_archetype)?;
+            let model = freeze_model_selection(&provider, &model, &reasoning)?;
+            let plan = freeze_plan(&manifest, &seed, universe_per_archetype, model)?;
             write(&output, &serde_json::to_vec_pretty(&plan)?)?;
         }
         Command::PlanMain {

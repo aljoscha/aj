@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::descriptions::DescriptionVariant;
-use crate::schedule::SchedulePhase;
+use crate::schedule::{PairScheduleRecord, SchedulePhase};
 use crate::{hash_framed, sha256_hex};
 
 static NEXT_BLOB_TEMPORARY: AtomicU64 = AtomicU64::new(0);
@@ -69,6 +69,8 @@ pub struct TrialMetadata {
     pub provider: String,
     pub model: String,
     pub reasoning_effort: String,
+    #[serde(default)]
+    pub tool_catalog_hash: String,
     pub fixture_revision: String,
 }
 
@@ -90,7 +92,7 @@ impl TrialRecord {
         runtime: Value,
     ) -> Result<Self, ArtifactError> {
         let mut record = Self {
-            schema_version: 1,
+            schema_version: 2,
             identity,
             metadata,
             runtime,
@@ -109,7 +111,7 @@ impl TrialRecord {
         ))
         .map_err(|error| ArtifactError(format!("cannot hash trial record: {error}")))?;
         Ok(hash_framed(
-            b"aj-apply-patch-eval-trial-record-v1",
+            b"aj-apply-patch-eval-trial-record-v2",
             &[&bytes],
         ))
     }
@@ -175,6 +177,65 @@ pub struct ResumeState {
     pub truncated_final_line: bool,
 }
 
+/// Marker and ordered trials proven to match one exact frozen pair.
+#[derive(Debug)]
+pub struct CompletedPair<'a> {
+    pub marker: &'a PairCompleteRecord,
+    pub trials: [&'a TrialRecord; 2],
+}
+
+/// Resolves a completion marker and validates its full frozen pair identity.
+pub fn completed_pair<'a>(
+    state: &'a ResumeState,
+    schedule_hash: &str,
+    pair: &PairScheduleRecord,
+) -> Result<CompletedPair<'a>, ArtifactError> {
+    let marker = state
+        .completion_markers
+        .get(&PairKey {
+            run_id: pair.run_id.clone(),
+            pair_id: pair.pair_id.clone(),
+        })
+        .ok_or_else(|| ArtifactError(format!("missing complete pair {}", pair.pair_id)))?;
+    if marker.identity.run_id != pair.run_id
+        || marker.identity.pair_id != pair.pair_id
+        || marker.identity.task_id != pair.task_id
+        || marker.identity.instance_hash != pair.instance_hash
+        || marker.identity.schedule_hash != schedule_hash
+        || marker.identity.phase != pair.phase
+    {
+        return Err(ArtifactError(format!(
+            "completion marker {} does not match its frozen pair",
+            pair.pair_id
+        )));
+    }
+    let trials = marker.trial_record_hashes.each_ref().map(|hash| {
+        state
+            .trials_by_hash
+            .get(hash)
+            .expect("scan validated marker trial references")
+    });
+    for (trial, scheduled) in trials.iter().zip(&pair.trials) {
+        if trial.identity.run_id != scheduled.run_id
+            || trial.identity.pair_id != scheduled.pair_id
+            || trial.identity.task_id != scheduled.task_id
+            || trial.identity.instance_hash != scheduled.instance_hash
+            || trial.identity.archetype_id != pair.archetype_id
+            || trial.identity.schedule_hash != schedule_hash
+            || trial.identity.phase != scheduled.phase
+            || trial.identity.repetition != scheduled.archetype_repetition
+            || trial.identity.variant != scheduled.variant
+            || trial.identity.order_index != scheduled.order_index
+        {
+            return Err(ArtifactError(format!(
+                "completion marker {} references a trial outside its frozen slot",
+                pair.pair_id
+            )));
+        }
+    }
+    Ok(CompletedPair { marker, trials })
+}
+
 /// Scans JSONL, ignoring at most one incomplete final line.
 pub fn scan(path: &Path) -> Result<ResumeState, ArtifactError> {
     if !path.exists() {
@@ -219,7 +280,13 @@ fn apply_record(
 ) -> Result<(), ArtifactError> {
     match record {
         ArtifactRecord::Trial(trial) => {
-            if trial.schema_version != 1 || trial.record_hash != trial.computed_hash()? {
+            if trial.schema_version != 2 {
+                return Err(ArtifactError(format!(
+                    "unsupported trial schema version {} at line {line}",
+                    trial.schema_version
+                )));
+            }
+            if trial.record_hash != trial.computed_hash()? {
                 return Err(ArtifactError(format!("invalid trial hash at line {line}")));
             }
             if trial.identity.order_index > 1 {
@@ -468,6 +535,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::schedule::{PairScheduleRecord, TrialScheduleRecord};
 
     fn identity(variant: DescriptionVariant, order_index: u8, attempt: &str) -> TrialIdentity {
         TrialIdentity {
@@ -497,6 +565,37 @@ mod tests {
         }
     }
 
+    fn scheduled_pair() -> PairScheduleRecord {
+        let trial = |variant, order_index| TrialScheduleRecord {
+            run_id: "run".into(),
+            pair_id: "pair".into(),
+            task_id: "task".into(),
+            instance_hash: "instance".into(),
+            phase: SchedulePhase::Main,
+            phase_repetition: 0,
+            archetype_repetition: 0,
+            variant,
+            order_index,
+            trial_identity_hash: format!("trial-{order_index}"),
+        };
+        PairScheduleRecord {
+            run_id: "run".into(),
+            pair_id: "pair".into(),
+            archetype_id: "insertion".into(),
+            task_id: "task".into(),
+            instance_hash: "instance".into(),
+            phase: SchedulePhase::Main,
+            phase_repetition: 0,
+            archetype_repetition: 0,
+            uncommon_text_lane: None,
+            trials: [
+                trial(DescriptionVariant::Current, 0),
+                trial(DescriptionVariant::CompactV1, 1),
+            ],
+            pair_identity_hash: "pair-identity".into(),
+        }
+    }
+
     fn metadata() -> TrialMetadata {
         TrialMetadata {
             task_seed: "task-seed".into(),
@@ -514,6 +613,7 @@ mod tests {
             provider: "provider".into(),
             model: "model".into(),
             reasoning_effort: "low".into(),
+            tool_catalog_hash: "tools".into(),
             fixture_revision: "fixture".into(),
         }
     }
@@ -554,6 +654,35 @@ mod tests {
         let state = scan(&path).unwrap();
         assert_eq!(state.trials_by_hash.len(), 3);
         assert_eq!(state.complete_pairs.len(), 1);
+    }
+
+    #[test]
+    fn old_trial_schema_has_a_precise_diagnostic() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("records.jsonl");
+        let record = TrialRecord::new(
+            identity(DescriptionVariant::Current, 0, "old"),
+            metadata(),
+            json!({}),
+        )
+        .unwrap();
+        let mut value = serde_json::to_value(ArtifactRecord::Trial(record)).unwrap();
+        value["schema_version"] = json!(1);
+        value["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("tool_catalog_hash");
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&value).unwrap()),
+        )
+        .unwrap();
+        let error = scan(&path).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported trial schema version 1")
+        );
     }
 
     #[test]
@@ -622,6 +751,32 @@ mod tests {
                 .to_string()
                 .contains("already complete")
         );
+    }
+
+    #[test]
+    fn completed_pair_rejects_a_marker_with_the_wrong_task_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("records.jsonl");
+        let mut first_identity = identity(DescriptionVariant::Current, 0, "attempt");
+        first_identity.task_id = "wrong-task".into();
+        let mut second_identity = identity(DescriptionVariant::CompactV1, 1, "attempt");
+        second_identity.task_id = "wrong-task".into();
+        let first = TrialRecord::new(first_identity, metadata(), json!({"valid": true})).unwrap();
+        let second = TrialRecord::new(second_identity, metadata(), json!({"valid": true})).unwrap();
+        let mut log = ArtifactLog::open(&path).unwrap();
+        log.append_trial(&first).unwrap();
+        log.append_trial(&second).unwrap();
+        let mut wrong = completion("attempt");
+        wrong.task_id = "wrong-task".into();
+        log.complete_pair(
+            wrong,
+            [first.record_hash.clone(), second.record_hash.clone()],
+        )
+        .unwrap();
+
+        let state = scan(&path).unwrap();
+        let error = completed_pair(&state, "schedule", &scheduled_pair()).unwrap_err();
+        assert!(error.to_string().contains("does not match its frozen pair"));
     }
 
     #[test]

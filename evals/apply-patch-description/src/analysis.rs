@@ -1,14 +1,14 @@
 //! Complete confirmatory analysis of the frozen main schedule.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::artifacts::{PairKey, TrialRecord, scan};
+use crate::artifacts::{TrialRecord, completed_pair, scan};
 use crate::descriptions::DescriptionVariant;
-use crate::planning::validate_pilot_evidence;
+use crate::planning::{FrozenPilotRuntimeContext, validate_pilot_evidence};
 use crate::runtime::{PatchClassification, RuntimeLimits, SourceProvenance, TerminalStatus};
 use crate::schedule::{FrozenPlan, PairScheduleRecord, SchedulePhase, validate_frozen_plan};
 use crate::statistics::{
@@ -38,6 +38,7 @@ pub struct RuntimeMetrics {
     pub edit_bypass: bool,
     pub aj_recorded_catalog_cost: f64,
     pub model_responses: u64,
+    pub provider_requests: u32,
     pub image_id: String,
     pub source_provenance: SourceProvenance,
     pub utc_date: String,
@@ -251,6 +252,19 @@ pub fn analyze_records_with_config(
     }
 
     let state = scan(records).map_err(|error| AnalysisError(error.to_string()))?;
+    if state
+        .trials_by_hash
+        .values()
+        .any(|trial| trial.identity.run_id != plan.schedule.run_id)
+        || state
+            .completion_markers
+            .values()
+            .any(|marker| marker.identity.run_id != plan.schedule.run_id)
+    {
+        return Err(AnalysisError(
+            "records mix different frozen runs or model selections".into(),
+        ));
+    }
     let expected = plan
         .schedule
         .main
@@ -273,27 +287,35 @@ pub fn analyze_records_with_config(
         }
     }
 
+    let pilot_context = &planning.pilot_evidence.runtime_context;
+    let mut attempts_by_pair = BTreeMap::<&str, BTreeSet<&str>>::new();
+    for trial in state.trials_by_hash.values().filter(|trial| {
+        trial.identity.run_id == plan.schedule.run_id && trial.identity.phase == SchedulePhase::Main
+    }) {
+        let pair = expected
+            .get(trial.identity.pair_id.as_str())
+            .ok_or_else(|| AnalysisError("records contain an unplanned main trial".into()))?;
+        validate_trial(&plan.schedule.schedule_hash, pair, trial)?;
+        let runtime = parse_metrics(trial)?;
+        validate_pilot_runtime_context(trial, &runtime, pilot_context)?;
+        attempts_by_pair
+            .entry(&trial.identity.pair_id)
+            .or_default()
+            .insert(&trial.identity.attempt_id);
+    }
+    if attempts_by_pair.values().any(|attempts| attempts.len() > 2) {
+        return Err(AnalysisError(
+            "main records exceed the frozen two-attempt limit".into(),
+        ));
+    }
+
     let mut pairs_by_archetype: BTreeMap<String, Vec<(RuntimeMetrics, RuntimeMetrics)>> =
         BTreeMap::new();
     let mut baseline: Option<&TrialRecord> = None;
     for pair in &plan.schedule.main {
-        let marker = state
-            .completion_markers
-            .get(&PairKey {
-                run_id: pair.run_id.clone(),
-                pair_id: pair.pair_id.clone(),
-            })
-            .ok_or_else(|| AnalysisError(format!("missing frozen main pair {}", pair.pair_id)))?;
-        validate_marker(plan, pair, marker)?;
-        let first = state
-            .trials_by_hash
-            .get(&marker.trial_record_hashes[0])
-            .ok_or_else(|| AnalysisError("main marker lost its first trial".into()))?;
-        let second = state
-            .trials_by_hash
-            .get(&marker.trial_record_hashes[1])
-            .ok_or_else(|| AnalysisError("main marker lost its second trial".into()))?;
-        validate_trials(pair, first, second)?;
+        let completed = completed_pair(&state, &plan.schedule.schedule_hash, pair)
+            .map_err(|error| AnalysisError(error.to_string()))?;
+        let [first, second] = completed.trials;
         validate_frozen_context(plan, first)?;
         validate_frozen_context(plan, second)?;
         if let Some(reference) = baseline {
@@ -311,15 +333,14 @@ pub fn analyze_records_with_config(
         let (current, compact) = variants(first, second)?;
         let current_metrics = metrics(current)?;
         let compact_metrics = metrics(compact)?;
+        validate_pilot_runtime_context(current, &current_metrics, pilot_context)?;
+        validate_pilot_runtime_context(compact, &compact_metrics, pilot_context)?;
         if !current_metrics.valid || !compact_metrics.valid {
             return Err(AnalysisError(
                 "a completed main pair contains an invalid trial".into(),
             ));
         }
-        if current_metrics.normalized_first_request_hash.is_none()
-            || current_metrics.normalized_first_request_hash
-                != compact_metrics.normalized_first_request_hash
-        {
+        if !payloads_equivalent(&current_metrics, &compact_metrics) {
             return Err(AnalysisError(
                 "paired actual first-request payload hashes differ".into(),
             ));
@@ -370,45 +391,69 @@ pub fn analyze_records_with_config(
     })
 }
 
-fn validate_marker(
-    plan: &FrozenPlan,
+fn validate_trial(
+    schedule_hash: &str,
     pair: &PairScheduleRecord,
-    marker: &crate::artifacts::PairCompleteRecord,
+    trial: &TrialRecord,
 ) -> Result<(), AnalysisError> {
-    if marker.identity.run_id != pair.run_id
-        || marker.identity.pair_id != pair.pair_id
-        || marker.identity.task_id != pair.task_id
-        || marker.identity.instance_hash != pair.instance_hash
-        || marker.identity.phase != SchedulePhase::Main
-        || marker.identity.schedule_hash != plan.schedule.schedule_hash
+    let scheduled = pair
+        .trials
+        .iter()
+        .find(|scheduled| {
+            scheduled.order_index == trial.identity.order_index
+                && scheduled.variant == trial.identity.variant
+        })
+        .ok_or_else(|| AnalysisError("main trial occupies no frozen pair slot".into()))?;
+    if trial.identity.run_id != scheduled.run_id
+        || trial.identity.pair_id != scheduled.pair_id
+        || trial.identity.task_id != scheduled.task_id
+        || trial.identity.instance_hash != scheduled.instance_hash
+        || trial.identity.archetype_id != pair.archetype_id
+        || trial.identity.schedule_hash != schedule_hash
+        || trial.identity.phase != scheduled.phase
+        || trial.identity.repetition != scheduled.archetype_repetition
     {
         return Err(AnalysisError(
-            "main completion marker does not match its exact frozen schedule identity".into(),
+            "main trial does not match its exact frozen schedule identity".into(),
         ));
     }
     Ok(())
 }
 
-fn validate_trials(
-    pair: &PairScheduleRecord,
-    first: &TrialRecord,
-    second: &TrialRecord,
+fn validate_pilot_runtime_context(
+    trial: &TrialRecord,
+    runtime: &RuntimeMetrics,
+    frozen: &FrozenPilotRuntimeContext,
 ) -> Result<(), AnalysisError> {
-    for (trial, scheduled) in [first, second].into_iter().zip(&pair.trials) {
-        if trial.identity.run_id != scheduled.run_id
-            || trial.identity.pair_id != scheduled.pair_id
-            || trial.identity.task_id != scheduled.task_id
-            || trial.identity.instance_hash != scheduled.instance_hash
-            || trial.identity.archetype_id != pair.archetype_id
-            || trial.identity.phase != scheduled.phase
-            || trial.identity.repetition != scheduled.archetype_repetition
-            || trial.identity.variant != scheduled.variant
-            || trial.identity.order_index != scheduled.order_index
-        {
-            return Err(AnalysisError(
-                "main trial does not match its exact frozen schedule identity".into(),
-            ));
-        }
+    let unresolved = runtime.terminal_status == TerminalStatus::InfrastructureFailed
+        && runtime.provider_requests == 0;
+    let reserve_matches = (runtime.conservative_catalog_pair_reserve
+        - frozen.conservative_catalog_pair_reserve)
+        .abs()
+        <= 1e-9;
+    if runtime.image_id != frozen.image_id
+        || runtime.source_provenance != frozen.source_provenance
+        || runtime.utc_date != frozen.utc_date
+        || runtime.limits != frozen.limits
+        || (!unresolved && runtime.system_prompt_hash != frozen.system_prompt_hash)
+        || (unresolved
+            && !runtime.system_prompt_hash.is_empty()
+            && runtime.system_prompt_hash != frozen.system_prompt_hash)
+        || (!unresolved && !reserve_matches)
+        || (unresolved && runtime.conservative_catalog_pair_reserve != 0.0 && !reserve_matches)
+        || trial.metadata.aj_revision != frozen.aj_revision
+        || trial.metadata.model_catalog_hash != frozen.model_catalog_hash
+        || trial.metadata.provider != frozen.provider
+        || trial.metadata.model != frozen.model
+        || trial.metadata.reasoning_effort != frozen.reasoning_effort
+        || trial.metadata.tool_catalog_hash != frozen.tool_catalog_hash
+        || trial.metadata.suite_revision != frozen.suite_revision
+        || trial.metadata.current_description != frozen.current_description
+        || trial.metadata.compact_description != frozen.compact_description
+    {
+        return Err(AnalysisError(
+            "main trial differs from the runtime context frozen by the pilot".into(),
+        ));
     }
     Ok(())
 }
@@ -458,6 +503,19 @@ fn same_analysis_context(left: &TrialRecord, right: &TrialRecord) -> bool {
         && left.metadata.provider == right.metadata.provider
         && left.metadata.model == right.metadata.model
         && left.metadata.reasoning_effort == right.metadata.reasoning_effort
+        && left.metadata.tool_catalog_hash == right.metadata.tool_catalog_hash
+}
+
+fn payloads_equivalent(current: &RuntimeMetrics, compact: &RuntimeMetrics) -> bool {
+    let current_valid =
+        current.provider_requests == 0 || current.normalized_first_request_hash.is_some();
+    let compact_valid =
+        compact.provider_requests == 0 || compact.normalized_first_request_hash.is_some();
+    current_valid
+        && compact_valid
+        && (current.provider_requests == 0
+            || compact.provider_requests == 0
+            || current.normalized_first_request_hash == compact.normalized_first_request_hash)
 }
 
 fn variants<'a>(
@@ -474,22 +532,22 @@ fn variants<'a>(
 }
 
 fn metrics(trial: &TrialRecord) -> Result<RuntimeMetrics, AnalysisError> {
-    let metrics: RuntimeMetrics =
-        serde_json::from_value(trial.runtime.clone()).map_err(|error| {
-            AnalysisError(format!(
-                "trial {} is missing required runtime metrics: {error}",
-                trial.record_hash
-            ))
-        })?;
-    if !metrics.aj_recorded_catalog_cost.is_finite()
-        || metrics.aj_recorded_catalog_cost < 0.0
-        || metrics.model_responses == 0
-    {
+    let metrics = parse_metrics(trial)?;
+    if !metrics.aj_recorded_catalog_cost.is_finite() || metrics.aj_recorded_catalog_cost < 0.0 {
         return Err(AnalysisError(
-            "main trial has invalid cost or model-response metrics".into(),
+            "main trial has invalid catalog-cost metrics".into(),
         ));
     }
     Ok(metrics)
+}
+
+fn parse_metrics(trial: &TrialRecord) -> Result<RuntimeMetrics, AnalysisError> {
+    serde_json::from_value(trial.runtime.clone()).map_err(|error| {
+        AnalysisError(format!(
+            "trial {} is missing required runtime metrics: {error}",
+            trial.record_hash
+        ))
+    })
 }
 
 fn binary_summaries(
@@ -569,9 +627,13 @@ fn efficiency_summaries(
                 current: distribution(&current),
                 compact: distribution(&compact),
                 absolute_change: distribution(&compact).mean - distribution(&current).mean,
-                establishes_benefit: bootstrap.relative_change <= -0.05
+                establishes_benefit: bootstrap.defined
+                    && bootstrap.bounds_defined
+                    && bootstrap.relative_change <= -0.05
                     && bootstrap.upper_97_5 < 0.0,
-                passes_non_degradation: bootstrap.upper_95 < 0.02,
+                passes_non_degradation: bootstrap.defined
+                    && bootstrap.bounds_defined
+                    && bootstrap.upper_95 < 0.02,
                 bootstrap,
             })
         })
@@ -638,7 +700,7 @@ pub fn decide(
         .collect::<Vec<_>>();
     let efficiency_harm = efficiency
         .iter()
-        .filter(|endpoint| endpoint.bootstrap.lower_95 > 0.02)
+        .filter(|endpoint| endpoint.bootstrap.bounds_defined && endpoint.bootstrap.lower_95 > 0.02)
         .map(|endpoint| endpoint.endpoint.clone())
         .collect::<Vec<_>>();
     if !material.is_empty() || !efficiency_harm.is_empty() {
@@ -665,6 +727,24 @@ pub fn decide(
     }
     if !cost_case && !response_case {
         reasons.push("neither efficiency case is established".into());
+    }
+    for endpoint in efficiency
+        .iter()
+        .filter(|endpoint| !endpoint.bootstrap.defined)
+    {
+        reasons.push(format!(
+            "{} relative change is undefined because the current weighted mean is zero",
+            endpoint.endpoint
+        ));
+    }
+    for endpoint in efficiency
+        .iter()
+        .filter(|endpoint| endpoint.bootstrap.defined && !endpoint.bootstrap.bounds_defined)
+    {
+        reasons.push(format!(
+            "{} bootstrap bounds are unbounded because a resample has no current observations",
+            endpoint.endpoint
+        ));
     }
     DecisionSummary {
         decision: ShippingDecision::Inconclusive,
@@ -1052,6 +1132,35 @@ pub fn render_markdown(report: &AnalysisReport) -> String {
     }
     output.push_str("\n## Efficiency and tails\n\n| Endpoint | Current mean / median / p95 | Compact mean / median / p95 | Absolute | Relative | Upper 95% | Upper 97.5% |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n");
     for endpoint in &report.efficiency {
+        if !endpoint.bootstrap.defined {
+            output.push_str(&format!(
+                "| {} | {:.6} / {:.6} / {:.6} | {:.6} / {:.6} / {:.6} | {:.6} | undefined | undefined | undefined |\n",
+                endpoint.endpoint,
+                endpoint.current.mean,
+                endpoint.current.median,
+                endpoint.current.p95,
+                endpoint.compact.mean,
+                endpoint.compact.median,
+                endpoint.compact.p95,
+                endpoint.absolute_change,
+            ));
+            continue;
+        }
+        if !endpoint.bootstrap.bounds_defined {
+            output.push_str(&format!(
+                "| {} | {:.6} / {:.6} / {:.6} | {:.6} / {:.6} / {:.6} | {:.6} | {:.4} | unbounded | unbounded |\n",
+                endpoint.endpoint,
+                endpoint.current.mean,
+                endpoint.current.median,
+                endpoint.current.p95,
+                endpoint.compact.mean,
+                endpoint.compact.median,
+                endpoint.compact.p95,
+                endpoint.absolute_change,
+                endpoint.bootstrap.relative_change,
+            ));
+            continue;
+        }
         output.push_str(&format!(
             "| {} | {:.6} / {:.6} / {:.6} | {:.6} / {:.6} / {:.6} | {:.6} | {:.4} | {:.4} | {:.4} |\n",
             endpoint.endpoint,
@@ -1115,7 +1224,10 @@ fn positive_f64_as_usize(value: f64) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
+    use crate::artifacts::{RecordedDescription, TrialIdentity, TrialMetadata, TrialRecord};
 
     fn bounds(estimate: f64, lower: f64, upper: f64) -> RiskDifferenceBounds {
         RiskDifferenceBounds {
@@ -1166,6 +1278,8 @@ mod tests {
                 },
                 absolute_change: -1.0,
                 bootstrap: BootstrapSummary {
+                    defined: true,
+                    bounds_defined: true,
                     relative_change: if benefit && index == 0 { -0.1 } else { 0.0 },
                     lower_95: if harm { 0.03 } else { -0.02 },
                     lower_97_5: -0.03,
@@ -1207,5 +1321,108 @@ mod tests {
             decide(&binary(true, false), &endpoints).decision,
             ShippingDecision::ShipCompactV1
         );
+    }
+
+    #[test]
+    fn main_runtime_must_match_the_exact_pilot_context() {
+        let current = RecordedDescription {
+            sha256: "current".into(),
+            byte_length: 100,
+        };
+        let compact = RecordedDescription {
+            sha256: "compact".into(),
+            byte_length: 50,
+        };
+        let source = SourceProvenance {
+            head: "head".into(),
+            dirty: false,
+            worktree_hash: None,
+        };
+        let limits = RuntimeLimits {
+            wall_timeout_seconds: 600,
+            max_provider_requests: 12,
+            max_model_responses: 12,
+            provider_output_token_ceiling: 128_000,
+            aggregate_observed_output_token_ceiling: 1_536_000,
+        };
+        let frozen = FrozenPilotRuntimeContext {
+            image_id: "sha256:image-a".into(),
+            source_provenance: source.clone(),
+            utc_date: "2026-07-24".into(),
+            limits: limits.clone(),
+            system_prompt_hash: "system".into(),
+            aj_revision: "head".into(),
+            model_catalog_hash: "catalog".into(),
+            provider: "openai-codex".into(),
+            model: "gpt-5.6-sol".into(),
+            reasoning_effort: "low".into(),
+            tool_catalog_hash: "tools".into(),
+            suite_revision: "suite".into(),
+            current_description: current.clone(),
+            compact_description: compact.clone(),
+            conservative_catalog_pair_reserve: 100.0,
+        };
+        let trial = TrialRecord::new(
+            TrialIdentity {
+                run_id: "run".into(),
+                pair_id: "pair".into(),
+                attempt_id: "attempt".into(),
+                task_id: "task".into(),
+                instance_hash: "instance".into(),
+                archetype_id: "insertion".into(),
+                schedule_hash: "schedule".into(),
+                phase: SchedulePhase::Main,
+                repetition: 0,
+                variant: DescriptionVariant::Current,
+                order_index: 0,
+            },
+            TrialMetadata {
+                task_seed: "seed".into(),
+                current_description: current,
+                compact_description: compact,
+                aj_revision: "head".into(),
+                suite_revision: "suite".into(),
+                model_catalog_hash: "catalog".into(),
+                provider: "openai-codex".into(),
+                model: "gpt-5.6-sol".into(),
+                reasoning_effort: "low".into(),
+                tool_catalog_hash: "tools".into(),
+                fixture_revision: "fixture".into(),
+            },
+            json!({}),
+        )
+        .unwrap();
+        let runtime_json = json!({
+            "valid": true,
+            "task_passed": true,
+            "sessions_with_patch_failure": false,
+            "edit_bypass": false,
+            "aj_recorded_catalog_cost": 1.0,
+            "model_responses": 1,
+            "provider_requests": 1,
+            "image_id": "sha256:image-a",
+            "source_provenance": source,
+            "utc_date": "2026-07-24",
+            "limits": limits,
+            "system_prompt_hash": "system",
+            "terminal_status": "passed",
+            "usage": {"input":1,"output":1,"cache_read":0,"cache_write":0,"total_tokens":2},
+            "duration_millis": 1,
+            "tool_rounds": 1,
+            "total_tool_calls": 1,
+            "tool_calls_by_name": {"apply_patch":1},
+            "recovery_rounds": 0,
+            "patch_calls": [],
+            "final_assistant_text": "done",
+            "final_assistant_text_blob": null,
+            "normalized_first_request_hash": "payload",
+            "conservative_catalog_pair_reserve": 100.0
+        });
+        let runtime: RuntimeMetrics = serde_json::from_value(runtime_json).unwrap();
+        validate_pilot_runtime_context(&trial, &runtime, &frozen).unwrap();
+
+        let mut changed = runtime;
+        changed.image_id = "sha256:image-b".into();
+        assert!(validate_pilot_runtime_context(&trial, &changed, &frozen).is_err());
     }
 }

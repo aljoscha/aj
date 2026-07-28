@@ -94,13 +94,21 @@ repetition reduce that variance. They do not eliminate it.
 
 ## Controls
 
-The primary evaluation uses `openai-codex/gpt-5.6-sol` with
-`ThinkingConfig::Low` set explicitly. The runner must verify that the resolved
-catalog entry supports this effort and that a captured serialized request sends
-`low`. It refuses paid runs if either assertion fails. It uses the production
-system instructions, provider options, and builtin tool set, except that the
-`agent` tool and background bash are disabled for both variants. Sub-agents add
-a second model policy and make attribution to the patch description unclear.
+The default evaluation uses `openai-codex/gpt-5.6-sol` with low reasoning.
+`freeze` may select another provider, model, and reasoning level from the local
+catalog. It freezes the selected catalog entry, capability identity, normalized
+tool catalog, and reasoning level before smoke. The runner verifies that the
+entry supports the selected effort, exposes `apply_patch`, and sends the frozen
+effort through a supported Responses payload. It refuses paid runs if any
+assertion fails or the local catalog changes. It uses the production system
+instructions, provider options, and builtin tool set, except that the `agent`
+tool and background bash are disabled for both variants. Sub-agents add a second
+model policy and make attribution to the patch description unclear.
+
+Each provider, model, and reasoning selection is a separate estimand with its
+own frozen plan, records, pilot, main sample, and decision. Trials from different
+selections are never pooled. The model selection is a fixed control within one
+run, not another treatment.
 
 The Codex adapter does not serialize `StreamOptions.max_tokens`. The frozen
 contract therefore uses the model catalog or server maximum as the enforceable
@@ -335,13 +343,25 @@ all-pass lower bound can clear the task-success margin.
 For efficiency, the planner uses paired relative observations and a one-sided
 95% upper confidence bound for their variance. Model-response observations are
 integers. A response-improvement alternative retains the mandatory first
-response and treats only follow-up responses as removable. The two alternatives
-remain a true 10% improvement in one endpoint and no true change in the other.
-The planner evaluates achieved power with deterministic common random numbers
-and requires a one-sided 95% Wilson lower bound of at least 80%, not a simulated
-point estimate. It uses monotone bracketing and binary search up to a practical
-frozen cap. The exact algorithm version, replicate count, seed, variance method,
-and confidence controls are frozen in the planning record.
+response when one was observed and treats only follow-up responses as removable.
+A zero-response timeout remains zero. Follow-up removal uses exact independent
+Bernoulli draws. Retention accounts for the observed fraction with any response,
+so zero-response mixtures preserve a true 10% mean improvement. If retaining a
+mandatory first response makes that reduction impossible, the response-benefit
+alternative is infeasible. The two alternatives remain a true 10% improvement
+in one endpoint and no true change in the other. Each Monte Carlo replicate draws
+every planned paired cost and response observation jointly and independently
+within its archetype. Both conditions in the corresponding shipping alternative
+must pass in the same replicate. It does not multiply one sampled pilot pair by
+the planned repetition count.
+The planner evaluates achieved power with 512 deterministic Monte Carlo
+replicates using common random numbers. It requires a one-sided 95% Wilson lower
+bound of at least 80%, not a simulated point estimate. It evaluates the complete
+deterministic efficiency power curve up to the practical frozen cap, so the
+search does not assume that finite Monte Carlo results are monotone. Efficiency
+planning has a frozen minimum of two pairs per archetype. The exact
+algorithm version, fixed replicate count, seed, variance method, and confidence
+controls are frozen in the planning record.
 Pilot sessions are never included in main inference. If the required fixed
 sample is impractical, the result is inconclusive. Margins and thresholds are
 not weakened. Final confirmatory analysis still uses 100,000 bootstrap
@@ -446,7 +466,11 @@ the host. The parent must enforce all of these conditions:
   by explicit container kill, wait, and removal. The whole-trial deadline covers
   volume creation, fixture generation, baseline capture, worker initialization,
   final capture, verification, and cleanup. Preflight has its own overall
-  deadline and includes a helper that never writes a protocol frame.
+  deadline and includes a helper that never writes a protocol frame. Expiry
+  cancels provider work and waits for bounded containment cleanup. Expiry before
+  the first provider request is retryable infrastructure failure. Expiry after a
+  captured request preserves observed usage and is `timed_out` only when cleanup
+  is confirmed. Otherwise it is `runner_internal`.
 - The parent owns the artifact directory outside the worker's writable area.
   The model and its tools cannot alter events, snapshots, diffs, or result
   records after capture.
@@ -536,7 +560,7 @@ test:
 - usage and AJ-recorded catalog cost accumulation across successful, error,
   aborted, and retried assistant `MessageEnd` events
 - missing cache-write usage identified and included in the sensitivity range
-- `ThinkingConfig::Low` present in the captured model request
+- the reasoning level frozen by the plan present in the captured model request
 - API background bash rejected, shell-level background descendants reaped, and
   the task registry quiescent before snapshot
 - broker capability unavailable to tool child processes and request limits

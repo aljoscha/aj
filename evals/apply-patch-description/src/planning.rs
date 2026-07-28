@@ -6,12 +6,12 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::artifacts::{PairKey, TrialRecord, scan};
+use crate::artifacts::{RecordedDescription, TrialRecord, completed_pair, scan};
 use crate::hash_framed;
 use crate::runtime::{RuntimeLimits, SourceProvenance};
 use crate::schedule::{
-    FrozenPlan, MainPlanning, PairScheduleRecord, ScheduleError, SchedulePhase,
-    finalize_main_schedule, planned_main_pair_ids, validate_frozen_plan,
+    FrozenPlan, MainPlanning, ScheduleError, SchedulePhase, finalize_main_schedule,
+    planned_main_pair_ids, validate_frozen_plan,
 };
 use crate::statistics::{
     BlindedEfficiencyPair, BlindedPlannerInput, BlindedPlannerStratum, PairedEventCounts,
@@ -47,6 +47,7 @@ struct PilotRuntimeMetrics {
     edit_bypass: bool,
     aj_recorded_catalog_cost: f64,
     model_responses: u64,
+    provider_requests: u32,
     image_id: String,
     source_provenance: SourceProvenance,
     utc_date: String,
@@ -69,6 +70,10 @@ pub struct FrozenPilotRuntimeContext {
     pub provider: String,
     pub model: String,
     pub reasoning_effort: String,
+    pub tool_catalog_hash: String,
+    pub suite_revision: String,
+    pub current_description: RecordedDescription,
+    pub compact_description: RecordedDescription,
     pub conservative_catalog_pair_reserve: f64,
 }
 
@@ -424,29 +429,15 @@ fn reduce_pilot(
     let mut marker_hashes = Vec::new();
     let mut trial_hashes = Vec::new();
     for pair in plan.schedule.smoke.iter().chain(&plan.schedule.pilot) {
-        let marker = state
-            .completion_markers
-            .get(&PairKey {
-                run_id: pair.run_id.clone(),
-                pair_id: pair.pair_id.clone(),
-            })
-            .ok_or_else(|| PlanningError(format!("missing complete pair {}", pair.pair_id)))?;
-        validate_marker_identity(plan, pair, marker)?;
-        let first = state
-            .trials_by_hash
-            .get(&marker.trial_record_hashes[0])
-            .ok_or_else(|| PlanningError("completion marker lost its first trial".into()))?;
-        let second = state
-            .trials_by_hash
-            .get(&marker.trial_record_hashes[1])
-            .ok_or_else(|| PlanningError("completion marker lost its second trial".into()))?;
-        validate_scheduled_trials(pair, first, second)?;
+        let completed = completed_pair(&state, &plan.schedule.schedule_hash, pair)
+            .map_err(|error| PlanningError(error.to_string()))?;
+        let marker = completed.marker;
+        let [first, second] = completed.trials;
+        validate_trial_plan_context(plan, pair, first)?;
+        validate_trial_plan_context(plan, pair, second)?;
         let first_metrics = runtime_metrics(first)?;
         let second_metrics = runtime_metrics(second)?;
-        if first_metrics.normalized_first_request_hash.is_none()
-            || first_metrics.normalized_first_request_hash
-                != second_metrics.normalized_first_request_hash
-        {
+        if !payloads_equivalent(&first_metrics, &second_metrics) {
             return Err(PlanningError(
                 "excluded pair has unequal actual first-request payload hashes".into(),
             ));
@@ -529,6 +520,43 @@ fn reduce_pilot(
     Ok((summary, reserve_inputs(pair_costs), evidence))
 }
 
+fn validate_trial_plan_context(
+    plan: &FrozenPlan,
+    pair: &crate::schedule::PairScheduleRecord,
+    trial: &TrialRecord,
+) -> Result<(), PlanningError> {
+    let model = plan
+        .model
+        .as_ref()
+        .ok_or_else(|| PlanningError("frozen plan has no model selection".into()))?;
+    let instance = plan
+        .universe
+        .instances
+        .iter()
+        .find(|instance| instance.instance_hash == pair.instance_hash)
+        .ok_or_else(|| PlanningError("frozen pair has no task instance".into()))?;
+    let current = &plan.descriptions[0];
+    let compact = &plan.descriptions[1];
+    let metadata = &trial.metadata;
+    if metadata.task_seed != instance.task_seed
+        || metadata.current_description.sha256 != current.sha256
+        || metadata.current_description.byte_length != current.byte_length
+        || metadata.compact_description.sha256 != compact.sha256
+        || metadata.compact_description.byte_length != compact.byte_length
+        || metadata.suite_revision != plan.universe.suite_revision
+        || metadata.model_catalog_hash != model.catalog_hash
+        || metadata.provider != model.provider
+        || metadata.model != model.model
+        || metadata.reasoning_effort != model.reasoning
+        || metadata.tool_catalog_hash != model.tool_catalog_hash
+    {
+        return Err(PlanningError(
+            "excluded trial metadata differs from the frozen plan".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn runtime_context_for(
     trial: &TrialRecord,
     runtime: &PilotRuntimeMetrics,
@@ -544,51 +572,22 @@ fn runtime_context_for(
         provider: trial.metadata.provider.clone(),
         model: trial.metadata.model.clone(),
         reasoning_effort: trial.metadata.reasoning_effort.clone(),
+        tool_catalog_hash: trial.metadata.tool_catalog_hash.clone(),
+        suite_revision: trial.metadata.suite_revision.clone(),
+        current_description: trial.metadata.current_description.clone(),
+        compact_description: trial.metadata.compact_description.clone(),
         conservative_catalog_pair_reserve: runtime.conservative_catalog_pair_reserve,
     }
 }
 
-fn validate_marker_identity(
-    plan: &FrozenPlan,
-    pair: &PairScheduleRecord,
-    marker: &crate::artifacts::PairCompleteRecord,
-) -> Result<(), PlanningError> {
-    if marker.identity.run_id != pair.run_id
-        || marker.identity.pair_id != pair.pair_id
-        || marker.identity.task_id != pair.task_id
-        || marker.identity.instance_hash != pair.instance_hash
-        || marker.identity.phase != pair.phase
-        || marker.identity.schedule_hash != plan.schedule.schedule_hash
-    {
-        return Err(PlanningError(
-            "completion marker does not match the frozen smoke/pilot schedule".into(),
-        ));
+fn payloads_equivalent(first: &PilotRuntimeMetrics, second: &PilotRuntimeMetrics) -> bool {
+    if first.provider_requests == 0 && second.provider_requests == 0 {
+        return true;
     }
-    Ok(())
-}
-
-fn validate_scheduled_trials(
-    pair: &PairScheduleRecord,
-    first: &TrialRecord,
-    second: &TrialRecord,
-) -> Result<(), PlanningError> {
-    for (trial, scheduled) in [first, second].into_iter().zip(&pair.trials) {
-        if trial.identity.run_id != scheduled.run_id
-            || trial.identity.pair_id != scheduled.pair_id
-            || trial.identity.task_id != scheduled.task_id
-            || trial.identity.instance_hash != scheduled.instance_hash
-            || trial.identity.archetype_id != pair.archetype_id
-            || trial.identity.phase != scheduled.phase
-            || trial.identity.repetition != scheduled.archetype_repetition
-            || trial.identity.variant != scheduled.variant
-            || trial.identity.order_index != scheduled.order_index
-        {
-            return Err(PlanningError(
-                "durable trial does not match its frozen schedule identity".into(),
-            ));
-        }
-    }
-    Ok(())
+    first.provider_requests > 0
+        && second.provider_requests > 0
+        && first.normalized_first_request_hash.is_some()
+        && first.normalized_first_request_hash == second.normalized_first_request_hash
 }
 
 fn runtime_metrics(trial: &TrialRecord) -> Result<PilotRuntimeMetrics, PlanningError> {
@@ -596,8 +595,7 @@ fn runtime_metrics(trial: &TrialRecord) -> Result<PilotRuntimeMetrics, PlanningE
         .map_err(|error| PlanningError(format!("invalid pilot runtime projection: {error}")))?;
     if !metrics.valid
         || !metrics.aj_recorded_catalog_cost.is_finite()
-        || metrics.aj_recorded_catalog_cost <= 0.0
-        || metrics.model_responses == 0
+        || metrics.aj_recorded_catalog_cost < 0.0
     {
         return Err(PlanningError(
             "pilot contains invalid required metrics".into(),
@@ -683,10 +681,10 @@ mod tests {
         TrialRecord,
     };
     use crate::descriptions::{DescriptionVariant, load};
-    use crate::schedule::{PairScheduleRecord, freeze_plan};
+    use crate::schedule::{PairScheduleRecord, freeze_plan, test_model_selection};
     use crate::suite::committed_manifest;
 
-    fn metadata(plan: &FrozenPlan) -> TrialMetadata {
+    fn metadata(plan: &FrozenPlan, pair: &PairScheduleRecord) -> TrialMetadata {
         let recorded = |variant| {
             let value = load(variant);
             RecordedDescription {
@@ -694,16 +692,24 @@ mod tests {
                 byte_length: value.byte_length,
             }
         };
+        let model = plan.model.as_ref().unwrap();
+        let instance = plan
+            .universe
+            .instances
+            .iter()
+            .find(|instance| instance.instance_hash == pair.instance_hash)
+            .unwrap();
         TrialMetadata {
-            task_seed: "seed".into(),
+            task_seed: instance.task_seed.clone(),
             current_description: recorded(DescriptionVariant::Current),
             compact_description: recorded(DescriptionVariant::CompactV1),
             aj_revision: "head".into(),
             suite_revision: plan.universe.suite_revision.clone(),
-            model_catalog_hash: "catalog".into(),
-            provider: "openai-codex".into(),
-            model: "gpt-5.6-sol".into(),
-            reasoning_effort: "low".into(),
+            model_catalog_hash: model.catalog_hash.clone(),
+            provider: model.provider.clone(),
+            model: model.model.clone(),
+            reasoning_effort: model.reasoning.clone(),
+            tool_catalog_hash: model.tool_catalog_hash.clone(),
             fixture_revision: "fixture".into(),
         }
     }
@@ -716,6 +722,7 @@ mod tests {
             "edit_bypass": false,
             "aj_recorded_catalog_cost": cost,
             "model_responses": 2,
+            "provider_requests": 2,
             "image_id": "sha256:image",
             "source_provenance": {"head":"head","dirty":false,"worktree_hash":null},
             "utc_date": "2026-07-24",
@@ -749,7 +756,7 @@ mod tests {
                     variant: scheduled.variant,
                     order_index: scheduled.order_index,
                 },
-                metadata(plan),
+                metadata(plan, pair),
                 runtime(true, 1.0 + f64::from(scheduled.order_index)),
             )
             .unwrap()
@@ -778,7 +785,7 @@ mod tests {
     #[test]
     fn reducer_uses_only_marker_referenced_attempts_and_binds_exact_stream() {
         let manifest = committed_manifest().unwrap();
-        let plan = freeze_plan(&manifest, "planning-evidence", 6).unwrap();
+        let plan = freeze_plan(&manifest, "planning-evidence", 6, test_model_selection()).unwrap();
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("records.jsonl");
         let mut log = ArtifactLog::open(&path).unwrap();
@@ -797,10 +804,13 @@ mod tests {
                 variant: pair.trials[0].variant,
                 order_index: 0,
             },
-            metadata(&plan),
+            metadata(&plan, pair),
             runtime(false, 0.0),
         )
         .unwrap();
+        let mut mismatched = abandoned.clone();
+        mismatched.metadata.model = "wrong-model".into();
+        assert!(validate_trial_plan_context(&plan, pair, &mismatched).is_err());
         log.append_trial(&abandoned).unwrap();
         for pair in plan.schedule.smoke.iter().chain(&plan.schedule.pilot) {
             append_pair(&mut log, &plan, pair);
@@ -811,7 +821,7 @@ mod tests {
             &plan,
             &path,
             PlannerConfig {
-                simulation_replicates: 100,
+                simulation_replicates: 512,
                 maximum_pairs_per_archetype: 1,
                 ..PlannerConfig::default()
             },
@@ -879,8 +889,8 @@ mod tests {
             planner_input: pilot,
         };
         let config = PlannerConfig {
-            simulation_replicates: 100,
-            maximum_pairs_per_archetype: 508,
+            simulation_replicates: 512,
+            maximum_pairs_per_archetype: 1,
             ..PlannerConfig::default()
         };
         let fake = SamplePlan {
@@ -889,7 +899,7 @@ mod tests {
             limiting_endpoint: Some("fake".into()),
             endpoint_requirements: Vec::new(),
             target_power: 0.8,
-            practical_cap: 508,
+            practical_cap: 1,
         };
         let evidence = PilotEvidenceDigest {
             unplanned_schedule_hash: "schedule".into(),
@@ -917,6 +927,16 @@ mod tests {
                 provider: "provider".into(),
                 model: "model".into(),
                 reasoning_effort: "low".into(),
+                tool_catalog_hash: "tools".into(),
+                suite_revision: "suite".into(),
+                current_description: RecordedDescription {
+                    sha256: "current".into(),
+                    byte_length: 1,
+                },
+                compact_description: RecordedDescription {
+                    sha256: "compact".into(),
+                    byte_length: 1,
+                },
                 conservative_catalog_pair_reserve: 1.0,
             },
         };

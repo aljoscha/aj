@@ -57,6 +57,7 @@ pub struct WorkerModel {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WorkerInit {
     pub model: WorkerModel,
+    pub reasoning: ThinkingLevel,
     pub variant: DescriptionVariant,
     pub prompt: String,
     pub session_id: String,

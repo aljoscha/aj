@@ -379,7 +379,7 @@ async fn execute_worker(init: WorkerInit, client: Arc<IpcClient>) -> WorkerResul
         provider,
         model,
         options,
-        Some(ThinkingConfig::Low),
+        thinking_config(init.reasoning),
     );
     let registry = TaskRegistry::default();
     agent.set_task_registry(registry.clone());
@@ -449,6 +449,18 @@ async fn execute_worker(init: WorkerInit, client: Arc<IpcClient>) -> WorkerResul
         },
         metrics,
         registry_quiescent,
+    }
+}
+
+fn thinking_config(level: ThinkingLevel) -> Option<ThinkingConfig> {
+    match level {
+        ThinkingLevel::Off => None,
+        ThinkingLevel::Minimal => Some(ThinkingConfig::Minimal),
+        ThinkingLevel::Low => Some(ThinkingConfig::Low),
+        ThinkingLevel::Medium => Some(ThinkingConfig::Medium),
+        ThinkingLevel::High => Some(ThinkingConfig::High),
+        ThinkingLevel::XHigh => Some(ThinkingConfig::XHigh),
+        ThinkingLevel::Max => Some(ThinkingConfig::Max),
     }
 }
 
@@ -689,5 +701,22 @@ mod tests {
         assert!(event.is_terminal());
         assert_eq!(event.partial().stop_reason, StopReason::Aborted);
         parent_task.abort();
+    }
+
+    #[test]
+    fn frozen_reasoning_maps_without_remapping() {
+        assert_eq!(thinking_config(ThinkingLevel::Off), None);
+        assert_eq!(
+            thinking_config(ThinkingLevel::Minimal),
+            Some(ThinkingConfig::Minimal)
+        );
+        assert_eq!(
+            thinking_config(ThinkingLevel::High),
+            Some(ThinkingConfig::High)
+        );
+        assert_eq!(
+            thinking_config(ThinkingLevel::Max),
+            Some(ThinkingConfig::Max)
+        );
     }
 }

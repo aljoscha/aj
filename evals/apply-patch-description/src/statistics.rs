@@ -469,6 +469,8 @@ impl Default for BootstrapConfig {
 /// Relative change and nearest-rank one-sided quantiles.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 pub struct BootstrapSummary {
+    pub defined: bool,
+    pub bounds_defined: bool,
     pub relative_change: f64,
     pub lower_95: f64,
     pub lower_97_5: f64,
@@ -493,12 +495,19 @@ pub fn paired_relative_change_bootstrap(
             .map(|stratum| (stratum.weight, stratum.pairs.len())),
     )?;
     validate_efficiency(strata)?;
-    let relative_change = relative_change(strata.iter().map(|stratum| {
+    let (weighted_current, weighted_compact) = strata.iter().fold((0.0, 0.0), |total, stratum| {
         let count = usize_as_f64(stratum.pairs.len());
         let current = stratum.pairs.iter().map(|pair| pair.current).sum::<f64>() / count;
         let compact = stratum.pairs.iter().map(|pair| pair.compact).sum::<f64>() / count;
-        (stratum.weight, current, compact)
-    }))?;
+        (
+            total.0 + stratum.weight * current,
+            total.1 + stratum.weight * compact,
+        )
+    });
+    if weighted_current <= 0.0 {
+        return Ok(undefined_bootstrap(config.replicates));
+    }
+    let relative_change = weighted_compact / weighted_current - 1.0;
 
     let mut rng = CounterRng::new(b"paired-efficiency-bootstrap-v1", &[config.seed.as_bytes()]);
     let mut draws = Vec::with_capacity(usize::try_from(config.replicates).unwrap());
@@ -520,14 +529,23 @@ pub fn paired_relative_change_bootstrap(
             weighted_compact += stratum.weight * compact / count;
         }
         if weighted_current <= 0.0 {
-            return Err(StatisticsError(
-                "bootstrap sampled a nonpositive current mean".into(),
-            ));
+            return Ok(BootstrapSummary {
+                defined: true,
+                bounds_defined: false,
+                relative_change,
+                lower_95: 0.0,
+                lower_97_5: 0.0,
+                upper_95: 0.0,
+                upper_97_5: 0.0,
+                replicates: config.replicates,
+            });
         }
         draws.push(weighted_compact / weighted_current - 1.0);
     }
     draws.sort_by(|left, right| left.total_cmp(right));
     Ok(BootstrapSummary {
+        defined: true,
+        bounds_defined: true,
         relative_change,
         lower_95: nearest_rank(&draws, 0.05),
         lower_97_5: nearest_rank(&draws, 0.025),
@@ -535,6 +553,19 @@ pub fn paired_relative_change_bootstrap(
         upper_97_5: nearest_rank(&draws, 0.975),
         replicates: config.replicates,
     })
+}
+
+fn undefined_bootstrap(replicates: u32) -> BootstrapSummary {
+    BootstrapSummary {
+        defined: false,
+        bounds_defined: false,
+        relative_change: 0.0,
+        lower_95: 0.0,
+        lower_97_5: 0.0,
+        upper_95: 0.0,
+        upper_97_5: 0.0,
+        replicates,
+    }
 }
 
 fn validate_efficiency(strata: &[EfficiencyStratum]) -> Result<(), StatisticsError> {
@@ -553,18 +584,6 @@ fn validate_efficiency(strata: &[EfficiencyStratum]) -> Result<(), StatisticsErr
         ));
     }
     Ok(())
-}
-
-fn relative_change(values: impl Iterator<Item = (f64, f64, f64)>) -> Result<f64, StatisticsError> {
-    let (current, compact) = values.fold((0.0, 0.0), |(current, compact), (weight, a, b)| {
-        (current + weight * a, compact + weight * b)
-    });
-    if current <= 0.0 {
-        return Err(StatisticsError(
-            "current weighted mean must be positive".into(),
-        ));
-    }
-    Ok(compact / current - 1.0)
 }
 
 fn nearest_rank(sorted: &[f64], quantile: f64) -> f64 {
@@ -670,11 +689,11 @@ impl Default for PlannerConfig {
             edit_bypass_margin: 0.02,
             worthwhile_efficiency_improvement: 0.05,
             efficiency_non_degradation_margin: 0.02,
-            simulation_replicates: 4_096,
+            simulation_replicates: 512,
             maximum_pairs_per_archetype: 508,
             power_confidence_z: ONE_SIDED_95_Z,
             variance_upper_confidence: 0.95,
-            planner_version: "paired-analytic-wilson-planner-v2".into(),
+            planner_version: "paired-joint-wilson-planner-v4".into(),
         }
     }
 }
@@ -739,8 +758,7 @@ pub fn plan_sample(
             config, endpoint, margin, counts, seed,
         )?);
     }
-    endpoint_requirements.push(plan_efficiency_alternative(config, pilot, true, seed)?);
-    endpoint_requirements.push(plan_efficiency_alternative(config, pilot, false, seed)?);
+    endpoint_requirements.extend(plan_efficiency_alternatives(config, pilot, seed)?);
 
     let limiting = endpoint_requirements
         .iter()
@@ -787,11 +805,11 @@ pub(crate) fn validate_planner(
         || (config.edit_bypass_margin - 0.02).abs() > f64::EPSILON
         || (config.worthwhile_efficiency_improvement - 0.05).abs() > f64::EPSILON
         || (config.efficiency_non_degradation_margin - 0.02).abs() > f64::EPSILON
-        || config.simulation_replicates == 0
+        || config.simulation_replicates != 512
         || config.maximum_pairs_per_archetype == 0
         || (config.power_confidence_z - ONE_SIDED_95_Z).abs() > f64::EPSILON
         || (config.variance_upper_confidence - 0.95).abs() > f64::EPSILON
-        || config.planner_version != "paired-analytic-wilson-planner-v2"
+        || config.planner_version != "paired-joint-wilson-planner-v4"
         || pilot.strata.len() != 16
     {
         return Err(StatisticsError(
@@ -812,7 +830,7 @@ pub(crate) fn validate_planner(
         }
     }
     let pilot_pairs = pilot.strata[0].efficiency.len();
-    if pilot_pairs == 0
+    if pilot_pairs != 3
         || pilot.strata.iter().any(|stratum| {
             stratum.efficiency.len() != pilot_pairs
                 || stratum.task_failure.pairs() != u64::try_from(pilot_pairs).unwrap()
@@ -821,7 +839,7 @@ pub(crate) fn validate_planner(
         })
     {
         return Err(StatisticsError(
-            "every pilot stratum must contain the same nonzero pair count".into(),
+            "every planner stratum must contain the frozen three pilot pairs".into(),
         ));
     }
     if pilot
@@ -829,18 +847,13 @@ pub(crate) fn validate_planner(
         .iter()
         .flat_map(|stratum| &stratum.efficiency)
         .any(|pair| {
-            [
-                pair.first_cost,
-                pair.second_cost,
-                u64_as_f64(pair.first_responses),
-                u64_as_f64(pair.second_responses),
-            ]
-            .into_iter()
-            .any(|value| !value.is_finite() || value <= 0.0)
+            [pair.first_cost, pair.second_cost]
+                .into_iter()
+                .any(|value| !value.is_finite() || value < 0.0)
         })
     {
         return Err(StatisticsError(
-            "planner efficiency pilot values must be finite and positive".into(),
+            "planner cost values must be finite and nonnegative".into(),
         ));
     }
     Ok(())
@@ -978,174 +991,221 @@ fn binary_power(
     monte_carlo_power_bound(config, endpoint, analytic_power, seed)
 }
 
+#[cfg(test)]
 fn plan_efficiency_alternative(
     config: &PlannerConfig,
     pilot: &BlindedPlannerInput,
     cost_improves: bool,
     seed: &str,
 ) -> Result<EndpointSampleRequirement, StatisticsError> {
-    let endpoint = if cost_improves {
-        "efficiency_cost_improves"
-    } else {
-        "efficiency_responses_improve"
-    };
+    let alternatives = plan_efficiency_alternatives(config, pilot, seed)?;
+    Ok(alternatives[usize::from(!cost_improves)].clone())
+}
+
+fn plan_efficiency_alternatives(
+    config: &PlannerConfig,
+    pilot: &BlindedPlannerInput,
+    seed: &str,
+) -> Result<[EndpointSampleRequirement; 2], StatisticsError> {
     let cost_variance = conservative_efficiency_variance(pilot, true)?;
     let response_variance = conservative_efficiency_variance(pilot, false)?;
-    let power = |pairs| {
-        efficiency_power(
-            config,
-            pilot,
-            endpoint,
-            cost_improves,
-            cost_variance,
-            response_variance,
-            pairs,
-            seed,
-        )
-    };
-    let (required, achieved, achieved_lower) = find_required_sample(config, 2, power)?;
-    Ok(EndpointSampleRequirement {
+    let curves =
+        simulated_efficiency_power_curves(config, pilot, cost_variance, response_variance, seed)?;
+    Ok([
+        efficiency_requirement(config, "efficiency_cost_improves", &curves[0]),
+        efficiency_requirement(config, "efficiency_responses_improve", &curves[1]),
+    ])
+}
+
+fn efficiency_requirement(
+    config: &PlannerConfig,
+    endpoint: &str,
+    curve: &[(f64, f64)],
+) -> EndpointSampleRequirement {
+    let required = (2..=config.maximum_pairs_per_archetype)
+        .find(|pairs| curve[usize::try_from(*pairs - 1).unwrap()].1 >= config.target_power);
+    let measured = required.unwrap_or(config.maximum_pairs_per_archetype);
+    let (achieved, achieved_lower) = curve[usize::try_from(measured - 1).unwrap()];
+    EndpointSampleRequirement {
         endpoint: endpoint.into(),
         required_pairs_per_archetype: required,
         achieved_power: achieved,
         achieved_power_lower_bound: achieved_lower,
         all_extreme_minimum: None,
         nuisance_points_evaluated: 2,
-    })
+    }
 }
 
-fn efficiency_power(
+fn simulated_efficiency_power_curves(
     config: &PlannerConfig,
     pilot: &BlindedPlannerInput,
-    endpoint: &str,
-    cost_improves: bool,
     cost_variance: f64,
     response_variance: f64,
-    repetitions: u32,
     seed: &str,
-) -> Result<(f64, f64), StatisticsError> {
-    let cost_power = analytic_efficiency_power(config, cost_variance, repetitions, cost_improves);
-    let cost_bound = monte_carlo_power_bound(config, endpoint, cost_power, seed)?;
-    let response_bound = simulated_response_power(
-        config,
-        pilot,
-        endpoint,
-        response_variance,
-        repetitions,
-        !cost_improves,
-        seed,
-    )?;
-    Ok((
-        cost_bound.0.min(response_bound.0),
-        cost_bound.1.min(response_bound.1),
-    ))
-}
-
-fn analytic_efficiency_power(
-    config: &PlannerConfig,
-    variance: f64,
-    repetitions: u32,
-    improves: bool,
-) -> f64 {
-    let standard_error = (variance / (16.0 * f64::from(repetitions))).sqrt();
-    if !improves {
-        let threshold = config.efficiency_non_degradation_margin - ONE_SIDED_95_Z * standard_error;
-        return if standard_error == 0.0 {
-            1.0
-        } else {
-            normal_cdf(threshold / standard_error)
-        };
-    }
-    let improved_threshold =
-        (-config.worthwhile_efficiency_improvement).min(-1.959_963_984_540_054 * standard_error);
-    if standard_error == 0.0 {
-        1.0
-    } else {
-        normal_cdf((improved_threshold + 0.10) / standard_error)
-    }
-}
-
-fn simulated_response_power(
-    config: &PlannerConfig,
-    pilot: &BlindedPlannerInput,
-    endpoint: &str,
-    variance: f64,
-    repetitions: u32,
-    improves: bool,
-    seed: &str,
-) -> Result<(f64, f64), StatisticsError> {
-    let observed_mean = pilot
+) -> Result<[Vec<(f64, f64)>; 2], StatisticsError> {
+    let observations = pilot
         .strata
         .iter()
         .flat_map(|stratum| &stratum.efficiency)
-        .map(|pair| u64_as_f64(pair.first_responses.saturating_add(pair.second_responses)) / 2.0)
-        .sum::<f64>()
-        / usize_as_f64(
-            pilot
-                .strata
-                .iter()
-                .map(|stratum| stratum.efficiency.len())
-                .sum(),
+        .flat_map(|pair| [pair.first_responses, pair.second_responses])
+        .collect::<Vec<_>>();
+    let (response_improvement_feasible, retention) = response_improvement_retention(&observations);
+    let curve_len = usize::try_from(config.maximum_pairs_per_archetype).unwrap();
+    let mut successes = [vec![0_u64; curve_len], vec![0_u64; curve_len]];
+    for simulation in 0..config.simulation_replicates {
+        let simulation = simulation.to_be_bytes();
+        let mut rng = CounterRng::new(
+            b"planner-joint-efficiency-power-v4",
+            &[seed.as_bytes(), &simulation],
         );
-    let retention = if improves && observed_mean > 1.0 {
-        ((0.9 * observed_mean - 1.0) / (observed_mean - 1.0)).clamp(0.0, 1.0)
+        let mut current_cost = 0.0;
+        let mut compact_cost = 0.0;
+        let mut current_total = 0_u64;
+        let mut compact_total = 0_u64;
+        let mut improved_compact_total = 0_u64;
+        for repetitions in 1..=config.maximum_pairs_per_archetype {
+            for stratum in &pilot.strata {
+                let choices = u64::try_from(stratum.efficiency.len())
+                    .unwrap()
+                    .saturating_mul(2);
+                let (choice, thinning_draw) = choice_and_unit(choices, &mut rng);
+                let selected = usize::try_from(choice / 2).unwrap();
+                let pair = stratum.efficiency[selected];
+                let (current_pair_cost, compact_pair_cost, current, compact) = if choice % 2 == 1 {
+                    (
+                        pair.first_cost,
+                        pair.second_cost,
+                        pair.first_responses,
+                        pair.second_responses,
+                    )
+                } else {
+                    (
+                        pair.second_cost,
+                        pair.first_cost,
+                        pair.second_responses,
+                        pair.first_responses,
+                    )
+                };
+                current_cost += current_pair_cost;
+                compact_cost += compact_pair_cost;
+                current_total = current_total.saturating_add(current);
+                compact_total = compact_total.saturating_add(compact);
+                improved_compact_total = improved_compact_total.saturating_add(
+                    thin_followup_total_with_unit(compact, 1, retention, thinning_draw),
+                );
+            }
+            let repetitions_f64 = f64::from(repetitions);
+            let cost_error = (cost_variance / (16.0 * repetitions_f64)).sqrt();
+            let response_error = (response_variance / (16.0 * repetitions_f64)).sqrt();
+            let cost_improvement = scalar_relative_change(current_cost, compact_cost * 0.9);
+            let cost_unchanged = scalar_relative_change(current_cost, compact_cost);
+            let response_unchanged =
+                scalar_relative_change(u64_as_f64(current_total), u64_as_f64(compact_total));
+            let response_improvement = scalar_relative_change(
+                u64_as_f64(current_total),
+                u64_as_f64(improved_compact_total),
+            );
+            let index = usize::try_from(repetitions - 1).unwrap();
+            successes[0][index] += u64::from(
+                efficiency_condition(cost_improvement, cost_error, true, config)
+                    && efficiency_condition(response_unchanged, response_error, false, config),
+            );
+            successes[1][index] += u64::from(
+                response_improvement_feasible
+                    && efficiency_condition(cost_unchanged, cost_error, false, config)
+                    && efficiency_condition(response_improvement, response_error, true, config),
+            );
+        }
+    }
+    let trials = u64::from(config.simulation_replicates);
+    let mut curves = [Vec::with_capacity(curve_len), Vec::with_capacity(curve_len)];
+    for alternative in 0..2 {
+        for value in &successes[alternative] {
+            let bounds = wilson_bounds(*value, trials, config.power_confidence_z)?;
+            curves[alternative].push((bounds.estimate, bounds.lower));
+        }
+    }
+    Ok(curves)
+}
+
+fn response_improvement_retention(observations: &[u64]) -> (bool, f64) {
+    let count = usize_as_f64(observations.len());
+    let observed_mean = observations
+        .iter()
+        .map(|value| u64_as_f64(*value))
+        .sum::<f64>()
+        / count;
+    let positive_fraction =
+        usize_as_f64(observations.iter().filter(|value| **value > 0).count()) / count;
+    let target_mean = 0.9 * observed_mean;
+    let feasible = target_mean + f64::EPSILON >= positive_fraction;
+    let retention = if feasible && observed_mean > positive_fraction {
+        ((target_mean - positive_fraction) / (observed_mean - positive_fraction)).clamp(0.0, 1.0)
     } else {
         1.0
     };
-    let mut rng = CounterRng::new(
-        b"planner-integer-response-power-v2",
-        &[seed.as_bytes(), endpoint.as_bytes()],
-    );
-    let standard_error = (variance / (16.0 * f64::from(repetitions))).sqrt();
-    let mut successes = 0_u64;
-    for _ in 0..config.simulation_replicates {
-        let mut current_total = 0_u64;
-        let mut compact_total = 0_u64;
-        for stratum in &pilot.strata {
-            let selected =
-                usize::try_from(rng.bounded(u64::try_from(stratum.efficiency.len()).unwrap()))
-                    .unwrap();
-            let pair = stratum.efficiency[selected];
-            let (current, compact) = if rng.boolean() {
-                (pair.first_responses, pair.second_responses)
-            } else {
-                (pair.second_responses, pair.first_responses)
-            };
-            current_total =
-                current_total.saturating_add(current.saturating_mul(u64::from(repetitions)));
-            compact_total = compact_total.saturating_add(if improves {
-                thin_followup_total(compact, repetitions, retention, &mut rng)
-            } else {
-                compact.saturating_mul(u64::from(repetitions))
-            });
-        }
-        let relative = u64_as_f64(compact_total) / u64_as_f64(current_total) - 1.0;
-        let passed = if improves {
-            relative <= -config.worthwhile_efficiency_improvement
-                && relative + 1.959_963_984_540_054 * standard_error < 0.0
-        } else {
-            relative + ONE_SIDED_95_Z * standard_error < config.efficiency_non_degradation_margin
-        };
-        successes += u64::from(passed);
-    }
-    let trials = u64::from(config.simulation_replicates);
-    let bounds = wilson_bounds(successes, trials, config.power_confidence_z)?;
-    Ok((bounds.estimate, bounds.lower))
+    (feasible, retention)
 }
 
+fn efficiency_condition(
+    relative: f64,
+    standard_error: f64,
+    improves: bool,
+    config: &PlannerConfig,
+) -> bool {
+    if improves {
+        relative <= -config.worthwhile_efficiency_improvement
+            && relative + 1.959_963_984_540_054 * standard_error < 0.0
+    } else {
+        relative + ONE_SIDED_95_Z * standard_error < config.efficiency_non_degradation_margin
+    }
+}
+
+#[cfg(test)]
 fn thin_followup_total(count: u64, repetitions: u32, retention: f64, rng: &mut CounterRng) -> u64 {
+    thin_followup_total_with_unit(count, repetitions, retention, unit_f64(rng))
+}
+
+fn thin_followup_total_with_unit(count: u64, repetitions: u32, retention: f64, draw: f64) -> u64 {
     let repetitions = u64::from(repetitions);
     let followups = count.saturating_sub(1).saturating_mul(repetitions);
-    repetitions.saturating_add(binomial_count(followups, retention, rng))
+    let mandatory = u64::from(count > 0).saturating_mul(repetitions);
+    mandatory.saturating_add(binomial_count(followups, retention, draw))
 }
 
-fn binomial_count(trials: u64, probability: f64, rng: &mut CounterRng) -> u64 {
-    let first = unit_f64(rng).max(f64::MIN_POSITIVE);
-    let second = unit_f64(rng);
-    let normal = (-2.0 * first.ln()).sqrt() * (2.0 * std::f64::consts::PI * second).cos();
-    let mean = u64_as_f64(trials) * probability;
-    let deviation = (u64_as_f64(trials) * probability * (1.0 - probability)).sqrt();
-    rounded_f64_as_u64((mean + normal * deviation).clamp(0.0, u64_as_f64(trials)))
+fn binomial_count(trials: u64, probability: f64, target: f64) -> u64 {
+    if trials == 0 || probability <= 0.0 {
+        return 0;
+    }
+    if probability >= 1.0 {
+        return trials;
+    }
+    let odds = probability / (1.0 - probability);
+    let mut probability_mass = (1.0 - probability).powf(u64_as_f64(trials));
+    let mut cumulative = probability_mass;
+    let mut successes = 0;
+    while target > cumulative && successes < trials {
+        probability_mass *= u64_as_f64(trials - successes) / u64_as_f64(successes + 1) * odds;
+        successes += 1;
+        cumulative += probability_mass;
+    }
+    successes
+}
+
+fn choice_and_unit(upper: u64, rng: &mut CounterRng) -> (u64, f64) {
+    if upper > 256 {
+        return (rng.bounded(upper), unit_f64(rng));
+    }
+    debug_assert!(upper > 0);
+    let zone = 256 - 256 % upper;
+    loop {
+        let draw = rng.next_u64();
+        let choice = draw >> 56;
+        if choice < zone {
+            let unit = u64_as_f64(draw & ((1_u64 << 56) - 1)) / 72_057_594_037_927_936.0;
+            return (choice % upper, unit);
+        }
+    }
 }
 
 fn conservative_efficiency_variance(
@@ -1165,7 +1225,7 @@ fn conservative_efficiency_variance(
                     u64_as_f64(pair.second_responses),
                 )
             };
-            (second - first) / ((first + second) / 2.0)
+            symmetric_relative_change(first, second)
         })
         .collect::<Vec<_>>();
     let mean = values.iter().sum::<f64>() / usize_as_f64(values.len());
@@ -1180,6 +1240,23 @@ fn conservative_efficiency_variance(
             .max(0.01)
             .powi(3);
     Ok((degrees * variance / chi_square_lower).max(1e-12))
+}
+
+fn scalar_relative_change(current: f64, compact: f64) -> f64 {
+    if current == 0.0 {
+        if compact == 0.0 { 0.0 } else { f64::INFINITY }
+    } else {
+        compact / current - 1.0
+    }
+}
+
+fn symmetric_relative_change(first: f64, second: f64) -> f64 {
+    let mean = (first + second) / 2.0;
+    if mean == 0.0 {
+        0.0
+    } else {
+        (second - first) / mean
+    }
 }
 
 fn monte_carlo_power_bound(
@@ -1293,12 +1370,6 @@ fn positive_f64_as_usize(value: f64) -> usize {
 fn positive_f64_as_u32(value: f64) -> u32 {
     debug_assert!(value.is_finite() && value >= 0.0 && value <= f64::from(u32::MAX));
     value as u32
-}
-
-#[allow(clippy::as_conversions)]
-fn rounded_f64_as_u64(value: f64) -> u64 {
-    debug_assert!(value.is_finite() && value >= 0.0 && value <= u64::MAX as f64);
-    value.round() as u64
 }
 
 #[cfg(test)]
@@ -1565,6 +1636,71 @@ mod tests {
     }
 
     #[test]
+    fn all_zero_efficiency_is_explicitly_undefined() {
+        let strata = (0..16)
+            .map(|index| EfficiencyStratum {
+                archetype_id: format!("a{index}"),
+                weight: 1.0 / 16.0,
+                pairs: vec![EfficiencyPair {
+                    current: 0.0,
+                    compact: 0.0,
+                }],
+            })
+            .collect::<Vec<_>>();
+        let summary = paired_relative_change_bootstrap(
+            &strata,
+            &BootstrapConfig {
+                replicates: 10,
+                seed: "zero".into(),
+            },
+        )
+        .unwrap();
+        assert!(!summary.defined);
+        assert!(!summary.bounds_defined);
+    }
+
+    #[test]
+    fn sparse_defined_endpoint_reports_unbounded_bootstrap() {
+        let strata = (0..16)
+            .map(|index| EfficiencyStratum {
+                archetype_id: format!("a{index}"),
+                weight: 1.0 / 16.0,
+                pairs: if index == 0 {
+                    vec![
+                        EfficiencyPair {
+                            current: 1.0,
+                            compact: 1.0,
+                        },
+                        EfficiencyPair {
+                            current: 0.0,
+                            compact: 0.0,
+                        },
+                    ]
+                } else {
+                    vec![
+                        EfficiencyPair {
+                            current: 0.0,
+                            compact: 0.0,
+                        };
+                        2
+                    ]
+                },
+            })
+            .collect::<Vec<_>>();
+        let summary = paired_relative_change_bootstrap(
+            &strata,
+            &BootstrapConfig {
+                replicates: 100,
+                seed: "sparse".into(),
+            },
+        )
+        .unwrap();
+        assert!(summary.defined);
+        assert!(!summary.bounds_defined);
+        assert_eq!(summary.relative_change, 0.0);
+    }
+
+    #[test]
     fn wilson_never_collapses_at_extremes() {
         let zero = wilson_bounds(0, 20, 1.96).unwrap();
         let all = wilson_bounds(20, 20, 1.96).unwrap();
@@ -1599,7 +1735,7 @@ mod tests {
 
     fn test_planner_config(cap: u32) -> PlannerConfig {
         PlannerConfig {
-            simulation_replicates: 2,
+            simulation_replicates: 512,
             maximum_pairs_per_archetype: cap,
             ..PlannerConfig::default()
         }
@@ -1627,6 +1763,77 @@ mod tests {
                 .unwrap();
         assert!(nuisance.iter().any(|point| point[1] + point[2] > 0.0));
         assert_eq!(all_zero_minimum(16, 0.02, 20).unwrap(), Some(9));
+    }
+
+    #[test]
+    fn planner_requires_the_frozen_simulation_count() {
+        let pilot = planner_input(
+            PairedEventCounts {
+                neither: 3,
+                ..PairedEventCounts::default()
+            },
+            0.1,
+        );
+        let config = PlannerConfig {
+            simulation_replicates: 511,
+            maximum_pairs_per_archetype: 1,
+            ..PlannerConfig::default()
+        };
+        assert!(plan_sample(&config, &pilot, "replicate-contract").is_err());
+
+        let malformed = planner_input(
+            PairedEventCounts {
+                neither: 129,
+                ..PairedEventCounts::default()
+            },
+            0.1,
+        );
+        assert!(plan_sample(&PlannerConfig::default(), &malformed, "oversized-pilot").is_err());
+    }
+
+    #[test]
+    fn response_thinning_preserves_zero_and_uses_exact_extremes() {
+        let mut rng = CounterRng::new(b"thinning-test", &[]);
+        assert_eq!(thin_followup_total(0, 4, 0.5, &mut rng), 0);
+        assert_eq!(thin_followup_total(5, 3, 0.0, &mut rng), 3);
+        assert_eq!(thin_followup_total(5, 3, 1.0, &mut rng), 15);
+
+        let (feasible, retention) = response_improvement_retention(&[0, 4]);
+        assert!(feasible);
+        assert!((0.5 + retention * 1.5 - 1.8).abs() < 1e-12);
+        assert!(!response_improvement_retention(&[0, 1]).0);
+    }
+
+    #[test]
+    fn planner_accepts_zero_response_timeout_observations() {
+        let mut pilot = planner_input(
+            PairedEventCounts {
+                neither: 3,
+                ..PairedEventCounts::default()
+            },
+            0.0,
+        );
+        for stratum in &mut pilot.strata {
+            for pair in &mut stratum.efficiency {
+                pair.first_cost = 0.0;
+                pair.second_cost = 0.0;
+                pair.first_responses = 0;
+                pair.second_responses = 0;
+            }
+        }
+        let plan = plan_sample(
+            &PlannerConfig {
+                maximum_pairs_per_archetype: 1,
+                ..PlannerConfig::default()
+            },
+            &pilot,
+            "zero-response",
+        )
+        .unwrap();
+        assert_eq!(
+            plan.conclusion,
+            PlanningConclusion::InconclusiveInsufficientUniverse
+        );
     }
 
     #[test]
@@ -1767,6 +1974,84 @@ mod tests {
     }
 
     #[test]
+    fn joint_efficiency_power_does_not_treat_marginals_as_joint() {
+        let pilot = BlindedPlannerInput {
+            strata: (0..16)
+                .map(|index| BlindedPlannerStratum {
+                    archetype_id: format!("a{index}"),
+                    task_failure: PairedEventCounts {
+                        neither: 1,
+                        ..PairedEventCounts::default()
+                    },
+                    patch_failure: PairedEventCounts {
+                        neither: 1,
+                        ..PairedEventCounts::default()
+                    },
+                    edit_bypass: PairedEventCounts {
+                        neither: 1,
+                        ..PairedEventCounts::default()
+                    },
+                    efficiency: vec![BlindedEfficiencyPair {
+                        first_cost: 20.0,
+                        second_cost: 10.0,
+                        first_responses: 10,
+                        second_responses: 20,
+                    }],
+                })
+                .collect(),
+        };
+        let config = PlannerConfig {
+            maximum_pairs_per_archetype: 1,
+            ..PlannerConfig::default()
+        };
+        let curves = simulated_efficiency_power_curves(
+            &config,
+            &pilot,
+            conservative_efficiency_variance(&pilot, true).unwrap(),
+            conservative_efficiency_variance(&pilot, false).unwrap(),
+            "joint-condition",
+        )
+        .unwrap();
+        assert!(curves[0][0].0 < 0.25, "joint curve: {:?}", curves[0][0]);
+    }
+
+    #[test]
+    fn response_simulation_averages_independent_asymmetric_pairs() {
+        let mut pilot = planner_input(
+            PairedEventCounts {
+                neither: 3,
+                ..PairedEventCounts::default()
+            },
+            0.0,
+        );
+        for stratum in &mut pilot.strata {
+            for (index, pair) in stratum.efficiency.iter_mut().enumerate() {
+                pair.first_responses = if index % 2 == 0 { 4 } else { 16 };
+                pair.second_responses = if index % 2 == 0 { 16 } else { 4 };
+            }
+        }
+        let config = PlannerConfig {
+            simulation_replicates: 512,
+            maximum_pairs_per_archetype: 64,
+            ..PlannerConfig::default()
+        };
+        let response_variance = conservative_efficiency_variance(&pilot, false).unwrap();
+        let cost_variance = conservative_efficiency_variance(&pilot, true).unwrap();
+        let curves = simulated_efficiency_power_curves(
+            &config,
+            &pilot,
+            cost_variance,
+            response_variance,
+            "independent-asymmetric",
+        )
+        .unwrap();
+        let curve = &curves[1];
+        let small = curve[1];
+        let large = curve[63];
+        assert!(large.1 > small.1, "small={small:?}, large={large:?}");
+    }
+
+    #[test]
     fn response_observations_are_integer_and_low_variance_is_not_underpowered() {
         let fractional = serde_json::json!({
             "first_cost": 1.0,
@@ -1784,8 +2069,8 @@ mod tests {
             0.0,
         );
         let config = PlannerConfig {
-            simulation_replicates: 2_000,
-            maximum_pairs_per_archetype: 508,
+            simulation_replicates: 512,
+            maximum_pairs_per_archetype: 80,
             ..PlannerConfig::default()
         };
         let requirement =

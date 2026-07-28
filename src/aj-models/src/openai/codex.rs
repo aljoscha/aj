@@ -58,8 +58,8 @@ use crate::types::ServiceTier;
 
 use super::errors::classify_client_error_with;
 use super::responses::{
-    CostMultiplierFn, StreamState, convert_messages, empty_partial, map_reasoning_effort,
-    map_service_tier, verbosity_text_config,
+    CostMultiplierFn, StreamState, convert_messages, empty_partial, map_service_tier,
+    responses_reasoning_effort, verbosity_text_config,
 };
 #[cfg(any(test, feature = "test-support"))]
 use super::responses::{append_assistant_message, parse_assistant_input_items_with_api};
@@ -698,7 +698,7 @@ fn build_request(
 
     // reasoning configuration. Non-reasoning models reject the
     // `reasoning` parameter entirely. For reasoning models we send the
-    // requested effort verbatim; `off` reaches here only for a model
+    // requested effort verbatim. `off` reaches here only for a model
     // whose vocabulary includes it (validated above), so it maps to an
     // explicit `reasoning_effort: "none"`.
     let (reasoning_cfg, include) = if model.reasoning {
@@ -709,7 +709,7 @@ fn build_request(
         };
         (
             Some(Reasoning {
-                effort: Some(map_reasoning_effort(reasoning)),
+                effort: responses_reasoning_effort(model, reasoning),
                 summary: Some(summary),
             }),
             vec![ResponseIncludable::ReasoningEncryptedContent],
@@ -718,7 +718,7 @@ fn build_request(
         (None, Vec::new())
     };
 
-    // `prompt_cache_key` from session_id; `prompt_cache_retention`
+    // `prompt_cache_key` comes from session_id. `prompt_cache_retention` is
     // never sent for Codex (the backend doesn't expose retention tuning).
     let prompt_cache_key = options.session_id.clone();
 

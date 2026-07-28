@@ -128,9 +128,31 @@ impl Default for MainPlanning {
     }
 }
 
+/// Model and local capability identity fixed before any evaluation attempt.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FrozenModelSelection {
+    pub provider: String,
+    pub model: String,
+    pub reasoning: String,
+    pub catalog_hash: String,
+    pub catalog_source: String,
+    pub catalog_updated_at: i64,
+    pub model_capability_hash: String,
+    pub family: Option<String>,
+    pub api: String,
+    pub context_window: u64,
+    pub max_tokens: u64,
+    pub tool_catalog_hash: String,
+    pub selection_hash: String,
+}
+
 /// Serialized output of the non-live `freeze` command.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct FrozenPlan {
+    #[serde(default)]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub model: Option<FrozenModelSelection>,
     pub manifest: SuiteManifest,
     pub descriptions: [FrozenDescription; 2],
     pub universe: FrozenUniverse,
@@ -194,6 +216,7 @@ pub fn freeze_universe(
 pub fn freeze_schedule(
     manifest: &SuiteManifest,
     universe: &FrozenUniverse,
+    model_selection_hash: &str,
     main_repetitions: u32,
 ) -> Result<FrozenSchedule, ScheduleError> {
     validate_universe(manifest, universe)?;
@@ -202,12 +225,19 @@ pub fn freeze_schedule(
             "main repetitions do not fit the frozen universe".into(),
         ));
     }
-    build_schedule(manifest, universe, main_repetitions, None)
+    build_schedule(
+        manifest,
+        universe,
+        model_selection_hash,
+        main_repetitions,
+        None,
+    )
 }
 
 fn build_schedule(
     manifest: &SuiteManifest,
     universe: &FrozenUniverse,
+    model_selection_hash: &str,
     main_repetitions: u32,
     planning_hash: Option<String>,
 ) -> Result<FrozenSchedule, ScheduleError> {
@@ -217,6 +247,7 @@ fn build_schedule(
             universe.run_seed.as_bytes(),
             universe.suite_revision.as_bytes(),
             universe.universe_hash.as_bytes(),
+            model_selection_hash.as_bytes(),
         ],
     );
     let mut used = vec![
@@ -251,8 +282,9 @@ fn build_schedule(
         &mut used,
     )?;
 
-    let material = serde_json::to_vec(&(&smoke, &pilot, &main, &planning_hash))
-        .map_err(|error| ScheduleError(format!("cannot serialize schedule: {error}")))?;
+    let material =
+        serde_json::to_vec(&(&smoke, &pilot, &main, &planning_hash, model_selection_hash))
+            .map_err(|error| ScheduleError(format!("cannot serialize schedule: {error}")))?;
     let schedule_hash = hash_framed(
         b"aj-apply-patch-eval-schedule-v1",
         &[
@@ -350,11 +382,13 @@ pub fn validate_task_instance_identity(instance: &TaskInstance) -> Result<(), Sc
 pub fn validate_schedule(
     manifest: &SuiteManifest,
     universe: &FrozenUniverse,
+    model_selection_hash: &str,
     schedule: &FrozenSchedule,
 ) -> Result<(), ScheduleError> {
     let expected = build_schedule(
         manifest,
         universe,
+        model_selection_hash,
         u32::try_from(schedule.main.len() / manifest.archetypes.len())
             .map_err(|_| ScheduleError("main schedule size exceeds u32".into()))?,
         schedule.planning_hash.clone(),
@@ -367,6 +401,33 @@ pub fn validate_schedule(
 
 /// Verifies the committed foundation, schedule, and staged planning state.
 pub fn validate_frozen_plan(plan: &FrozenPlan) -> Result<(), ScheduleError> {
+    if plan.schema_version != 2 {
+        return Err(ScheduleError(format!(
+            "unsupported frozen plan schema version {}, expected 2. Re-run freeze",
+            plan.schema_version
+        )));
+    }
+    let model = plan.model.as_ref().ok_or_else(|| {
+        ScheduleError("frozen plan schema is missing its model selection. Re-run freeze".into())
+    })?;
+    let mut unhashed_model = model.clone();
+    unhashed_model.selection_hash.clear();
+    let model_material = serde_json::to_vec(&unhashed_model)
+        .map_err(|error| ScheduleError(format!("cannot hash frozen model selection: {error}")))?;
+    if model.provider.is_empty()
+        || model.model.is_empty()
+        || model.reasoning.is_empty()
+        || model.catalog_hash.is_empty()
+        || model.model_capability_hash.is_empty()
+        || model.tool_catalog_hash.is_empty()
+        || model.selection_hash
+            != hash_framed(
+                b"aj-apply-patch-eval-model-selection-v1",
+                &[&model_material],
+            )
+    {
+        return Err(ScheduleError("invalid frozen model selection".into()));
+    }
     let committed = committed_manifest().map_err(|error| ScheduleError(error.to_string()))?;
     if plan.manifest != committed
         || plan.descriptions
@@ -379,7 +440,12 @@ pub fn validate_frozen_plan(plan: &FrozenPlan) -> Result<(), ScheduleError> {
             "frozen plan does not match the committed suite and descriptions".into(),
         ));
     }
-    validate_schedule(&plan.manifest, &plan.universe, &plan.schedule)?;
+    validate_schedule(
+        &plan.manifest,
+        &plan.universe,
+        &model.selection_hash,
+        &plan.schedule,
+    )?;
     match &plan.planning {
         MainPlanning::Unplanned
             if plan.schedule.main.is_empty() && plan.schedule.planning_hash.is_none() =>
@@ -414,10 +480,13 @@ pub fn freeze_plan(
     manifest: &SuiteManifest,
     run_seed: &str,
     instances_per_archetype: u32,
+    model: FrozenModelSelection,
 ) -> Result<FrozenPlan, ScheduleError> {
     let universe = freeze_universe(manifest, run_seed, instances_per_archetype)?;
-    let schedule = freeze_schedule(manifest, &universe, 0)?;
+    let schedule = build_schedule(manifest, &universe, &model.selection_hash, 0, None)?;
     Ok(FrozenPlan {
+        schema_version: 2,
+        model: Some(model),
         manifest: manifest.clone(),
         descriptions: [
             load(DescriptionVariant::Current),
@@ -427,6 +496,28 @@ pub fn freeze_plan(
         schedule,
         planning: MainPlanning::Unplanned,
     })
+}
+
+#[cfg(test)]
+pub(crate) fn test_model_selection() -> FrozenModelSelection {
+    let mut model = FrozenModelSelection {
+        provider: "openai-codex".into(),
+        model: "gpt-5.6-sol".into(),
+        reasoning: "low".into(),
+        catalog_hash: "catalog".into(),
+        catalog_source: "test".into(),
+        catalog_updated_at: 1,
+        model_capability_hash: "capability".into(),
+        family: Some("gpt-5.6".into()),
+        api: "codex".into(),
+        context_window: 400_000,
+        max_tokens: 128_000,
+        tool_catalog_hash: "tools".into(),
+        selection_hash: String::new(),
+    };
+    let bytes = serde_json::to_vec(&model).unwrap();
+    model.selection_hash = hash_framed(b"aj-apply-patch-eval-model-selection-v1", &[&bytes]);
+    model
 }
 
 /// Selects the fixed main prefix and binds it to a frozen planning record.
@@ -448,6 +539,11 @@ pub fn finalize_main_schedule(
     let schedule = build_schedule(
         &plan.manifest,
         &plan.universe,
+        &plan
+            .model
+            .as_ref()
+            .ok_or_else(|| ScheduleError("frozen plan has no model selection".into()))?
+            .selection_hash,
         repetitions,
         Some(record.planning_hash.clone()),
     )?;
@@ -462,6 +558,8 @@ pub fn finalize_main_schedule(
         ));
     }
     Ok(FrozenPlan {
+        schema_version: plan.schema_version,
+        model: plan.model.clone(),
         manifest: plan.manifest.clone(),
         descriptions: plan.descriptions.clone(),
         universe: plan.universe.clone(),
@@ -478,7 +576,17 @@ pub fn planned_main_pair_ids(
     if !matches!(plan.planning, MainPlanning::Unplanned) || !plan.schedule.main.is_empty() {
         return Err(ScheduleError("expected an unplanned frozen plan".into()));
     }
-    let schedule = build_schedule(&plan.manifest, &plan.universe, repetitions, None)?;
+    let schedule = build_schedule(
+        &plan.manifest,
+        &plan.universe,
+        &plan
+            .model
+            .as_ref()
+            .ok_or_else(|| ScheduleError("frozen plan has no model selection".into()))?
+            .selection_hash,
+        repetitions,
+        None,
+    )?;
     Ok(schedule.main.into_iter().map(|pair| pair.pair_id).collect())
 }
 
@@ -819,8 +927,8 @@ mod tests {
     #[test]
     fn phases_are_deterministic_disjoint_and_pair_only() {
         let manifest = committed_manifest().unwrap();
-        let first = freeze_plan(&manifest, "schedule-seed", 7).unwrap();
-        let second = freeze_plan(&manifest, "schedule-seed", 7).unwrap();
+        let first = freeze_plan(&manifest, "schedule-seed", 7, test_model_selection()).unwrap();
+        let second = freeze_plan(&manifest, "schedule-seed", 7, test_model_selection()).unwrap();
         assert_eq!(first, second);
         assert_eq!(first.schedule.smoke.len(), 16);
         assert_eq!(first.schedule.pilot.len(), 48);
@@ -841,7 +949,7 @@ mod tests {
     #[test]
     fn order_and_uncommon_lane_alternate_within_each_archetype() {
         let manifest = committed_manifest().unwrap();
-        let plan = freeze_plan(&manifest, "alternation", 8).unwrap();
+        let plan = freeze_plan(&manifest, "alternation", 8, test_model_selection()).unwrap();
         for phase in [&plan.schedule.smoke, &plan.schedule.pilot] {
             let mut by_archetype: HashMap<&str, Vec<&PairScheduleRecord>> = HashMap::new();
             for pair in phase {
@@ -871,8 +979,8 @@ mod tests {
     #[test]
     fn identities_change_with_seed_and_are_self_consistent() {
         let manifest = committed_manifest().unwrap();
-        let first = freeze_plan(&manifest, "one", 5).unwrap();
-        let other = freeze_plan(&manifest, "two", 5).unwrap();
+        let first = freeze_plan(&manifest, "one", 5, test_model_selection()).unwrap();
+        let other = freeze_plan(&manifest, "two", 5, test_model_selection()).unwrap();
         assert_ne!(first.universe.universe_hash, other.universe.universe_hash);
         assert_ne!(first.schedule.schedule_hash, other.schedule.schedule_hash);
         for instance in &first.universe.instances {
@@ -884,7 +992,13 @@ mod tests {
             assert_eq!(instance.parameters.kind(), archetype.parameter_kind);
         }
         validate_universe(&manifest, &first.universe).unwrap();
-        validate_schedule(&manifest, &first.universe, &first.schedule).unwrap();
+        validate_schedule(
+            &manifest,
+            &first.universe,
+            &first.model.as_ref().unwrap().selection_hash,
+            &first.schedule,
+        )
+        .unwrap();
         let mut corrupted = first.universe.clone();
         corrupted.instances[0].task_seed = "corrupt".into();
         assert!(validate_universe(&manifest, &corrupted).is_err());
@@ -893,7 +1007,7 @@ mod tests {
     #[test]
     fn deterministic_main_prefix_preserves_excluded_pair_identities() {
         let manifest = committed_manifest().unwrap();
-        let plan = freeze_plan(&manifest, "staged", 9).unwrap();
+        let plan = freeze_plan(&manifest, "staged", 9, test_model_selection()).unwrap();
         let smoke = plan
             .schedule
             .smoke

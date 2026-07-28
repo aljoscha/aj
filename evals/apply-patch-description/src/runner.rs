@@ -3,10 +3,14 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use aj_models::auth::AuthStorage;
+use aj_models::openai::responses::responses_reasoning_effort;
 use aj_models::provider::Provider;
 use aj_models::registry::{ModelInfo, ModelRegistry, calculate_cost, validate_thinking_level};
 use aj_models::streaming::AssistantMessageEvent;
@@ -24,7 +28,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::artifacts::{
     ArtifactLog, BlobStore, PairCompletionIdentity, PairKey, RecordedDescription, TrialIdentity,
-    TrialMetadata, TrialRecord, scan,
+    TrialMetadata, TrialRecord, completed_pair, scan,
 };
 use crate::descriptions::{DescriptionVariant, load};
 use crate::docker::{
@@ -45,14 +49,15 @@ use crate::runtime::{
     VerifierRecord, WorkerMetrics, WorkerResult, WorkerTerminal, admit_pair,
 };
 use crate::schedule::{
-    FrozenPlan, MainPlanning, PairScheduleRecord, SchedulePhase, TaskInstance, TrialScheduleRecord,
-    validate_frozen_plan,
+    FrozenModelSelection, FrozenPlan, MainPlanning, PairScheduleRecord, SchedulePhase,
+    TaskInstance, TrialScheduleRecord, validate_frozen_plan,
 };
 use crate::snapshot::{FilesystemSnapshot, SnapshotDelta, delta};
 use crate::worker::initial_context;
 use crate::{hash_framed, sha256_hex, suite};
 
 const PROVIDER_ID: &str = "openai-codex";
+#[cfg(test)]
 const MODEL_ID: &str = "gpt-5.6-sol";
 const PREFLIGHT_TOTAL_TIMEOUT: Duration = Duration::from_secs(360);
 
@@ -98,6 +103,7 @@ struct TrustedModel {
     model: Arc<ModelInfo>,
     stream_options: StreamOptions,
     catalog_hash: String,
+    reasoning: ThinkingLevel,
 }
 
 #[derive(Clone)]
@@ -123,6 +129,90 @@ pub async fn run_preflight(image: &str) -> Result<(), RunnerError> {
     })
     .await
     .map_err(|_| RunnerError("preflight exceeded its overall deadline".into()))?
+}
+
+/// Resolves and freezes a local model catalog entry without loading credentials.
+pub fn freeze_model_selection(
+    provider: &str,
+    model_id: &str,
+    reasoning: &str,
+) -> Result<FrozenModelSelection, RunnerError> {
+    let reasoning = parse_reasoning(reasoning)?;
+    let registry = ModelRegistry::load();
+    freeze_model_selection_from_registry(&registry, provider, model_id, reasoning)
+}
+
+fn freeze_model_selection_from_registry(
+    registry: &ModelRegistry,
+    provider: &str,
+    model_id: &str,
+    reasoning: ThinkingLevel,
+) -> Result<FrozenModelSelection, RunnerError> {
+    let model = registry.get(provider, model_id).ok_or_else(|| {
+        RunnerError(format!(
+            "model {provider}/{model_id} is not in the registry"
+        ))
+    })?;
+    validate_thinking_level(model, &reasoning).map_err(RunnerError)?;
+    if !matches!(
+        model.api.as_str(),
+        "openai-codex-responses" | "openai-responses"
+    ) {
+        return Err(RunnerError(format!(
+            "model {provider}/{model_id} uses unsupported evaluation API {}",
+            model.api
+        )));
+    }
+    let tools = expected_tools(DescriptionVariant::Current, model.family.as_deref());
+    if !tools.iter().any(|tool| tool.name == "apply_patch") {
+        return Err(RunnerError(format!(
+            "model {provider}/{model_id} uses a tool family without apply_patch"
+        )));
+    }
+    let model_capability_hash = serde_json::to_vec(model)
+        .map(|bytes| hash_framed(b"aj-apply-patch-eval-model-capability-v1", &[&bytes]))
+        .map_err(|error| RunnerError(format!("cannot hash model capability: {error}")))?;
+    let tool_catalog_hash = tool_catalog_hash(&tools)?;
+    let mut selection = FrozenModelSelection {
+        provider: provider.into(),
+        model: model_id.into(),
+        reasoning: reasoning.as_str().into(),
+        catalog_hash: registry_hash(registry)?,
+        catalog_source: registry.source_label().into(),
+        catalog_updated_at: registry.updated_at,
+        model_capability_hash,
+        family: model.family.clone(),
+        api: model.api.clone(),
+        context_window: model.context_window,
+        max_tokens: model.max_tokens,
+        tool_catalog_hash,
+        selection_hash: String::new(),
+    };
+    let bytes = serde_json::to_vec(&selection)
+        .map_err(|error| RunnerError(format!("cannot hash model selection: {error}")))?;
+    selection.selection_hash = hash_framed(b"aj-apply-patch-eval-model-selection-v1", &[&bytes]);
+    Ok(selection)
+}
+
+fn parse_reasoning(value: &str) -> Result<ThinkingLevel, RunnerError> {
+    match value {
+        "off" => Ok(ThinkingLevel::Off),
+        "minimal" => Ok(ThinkingLevel::Minimal),
+        "low" => Ok(ThinkingLevel::Low),
+        "medium" => Ok(ThinkingLevel::Medium),
+        "high" => Ok(ThinkingLevel::High),
+        "xhigh" => Ok(ThinkingLevel::XHigh),
+        "max" => Ok(ThinkingLevel::Max),
+        _ => Err(RunnerError(format!(
+            "unsupported reasoning level {value}. Expected off, minimal, low, medium, high, xhigh, or max"
+        ))),
+    }
+}
+
+fn frozen_model(plan: &FrozenPlan) -> Result<&FrozenModelSelection, RunnerError> {
+    plan.model
+        .as_ref()
+        .ok_or_else(|| RunnerError("frozen plan has no model selection. Re-run freeze".into()))
 }
 
 /// Executes complete adjacent pairs from one frozen phase.
@@ -177,31 +267,9 @@ pub async fn run(options: RunOptions) -> Result<(), RunnerError> {
                 .map_err(|error| RunnerError(error.to_string()))?;
         }
     }
-    let (model, catalog_hash) = match resolve_model_metadata() {
-        Ok(resolved) => resolved,
-        Err(error) => {
-            persist_resolution_failure(&options, &plan, &state, &run_state, None, &error)?;
-            return Err(error);
-        }
-    };
-    unpaid_request_preflight(&model, &run_state.utc_date)?;
-    let trusted = match resolve_trusted_model(Arc::clone(&model), catalog_hash.clone()).await {
-        Ok(trusted) => trusted,
-        Err(error) => {
-            persist_resolution_failure(
-                &options,
-                &plan,
-                &state,
-                &run_state,
-                Some((&model, &catalog_hash)),
-                &error,
-            )?;
-            return Err(error);
-        }
-    };
-    let revision = run_state.source.revision_label();
-    let descriptions = recorded_descriptions();
-    validate_resume_context(&plan, &state, &options, &trusted, &run_state)?;
+    validate_resume_before_resolution(&plan, &state, &options, &run_state)?;
+    let (model, catalog_hash, reasoning) = resolve_model_metadata(&plan)?;
+    unpaid_request_preflight(&model, reasoning, &run_state.utc_date)?;
     let pairs = phase_pairs(&plan, options.phase);
     let incomplete = pairs
         .iter()
@@ -212,7 +280,7 @@ pub async fn run(options: RunOptions) -> Result<(), RunnerError> {
             })
         })
         .count();
-    let pair_reserve = pair_reserve(options.phase, &plan, &trusted, options.max_model_responses)?;
+    let pair_reserve = pair_reserve(options.phase, &plan, &model, options.max_model_responses)?;
     let mut spent = recorded_spend(&state, options.phase);
     if options.phase == SchedulePhase::Main
         && spent + pair_reserve * usize_as_f64(incomplete) > options.max_cost_usd
@@ -221,6 +289,35 @@ pub async fn run(options: RunOptions) -> Result<(), RunnerError> {
             "main run budget cannot reserve {pair_reserve:.6} USD for each of {incomplete} incomplete pairs"
         )));
     }
+    if incomplete == 0
+        || admit_pair(
+            0,
+            options.max_trials,
+            spent,
+            options.max_cost_usd,
+            pair_reserve,
+        ) != AdmissionDecision::Admit
+    {
+        return Ok(());
+    }
+    let trusted =
+        match resolve_trusted_model(Arc::clone(&model), catalog_hash.clone(), reasoning).await {
+            Ok(trusted) => trusted,
+            Err(error) => {
+                persist_resolution_failure(
+                    &options,
+                    &plan,
+                    &state,
+                    &run_state,
+                    (&model, &catalog_hash, reasoning),
+                    &error,
+                )?;
+                return Err(error);
+            }
+        };
+    let revision = run_state.source.revision_label();
+    let descriptions = recorded_descriptions();
+    validate_resume_context(&plan, &state, &options, &trusted, &run_state)?;
 
     let blobs = BlobStore::new(options.artifact_dir.join("blobs"))
         .map_err(|error| RunnerError(error.to_string()))?;
@@ -299,7 +396,7 @@ pub async fn run(options: RunOptions) -> Result<(), RunnerError> {
                     &run_state,
                 )
                 .await?;
-                if execution.valid {
+                if execution.valid && execution.provider_requests > 0 {
                     match (
                         first_context_hash.as_ref(),
                         execution.normalized_first_request_hash.as_ref(),
@@ -312,7 +409,7 @@ pub async fn run(options: RunOptions) -> Result<(), RunnerError> {
                         ),
                         (_, None) => mark_runner_internal(
                             &mut execution,
-                            "valid trial has no normalized first-request hash",
+                            "trial with a provider request has no normalized first-request hash",
                         ),
                     }
                 }
@@ -326,7 +423,8 @@ pub async fn run(options: RunOptions) -> Result<(), RunnerError> {
                     model_catalog_hash: trusted.catalog_hash.clone(),
                     provider: trusted.model.provider.clone(),
                     model: trusted.model.id.clone(),
-                    reasoning_effort: "low".into(),
+                    reasoning_effort: trusted.reasoning.as_str().into(),
+                    tool_catalog_hash: frozen_model(&plan)?.tool_catalog_hash.clone(),
                     fixture_revision: execution.baseline_root_hash.clone().unwrap_or_default(),
                 };
                 let record = TrialRecord::new(
@@ -470,27 +568,13 @@ fn require_complete_pairs(
     message: &str,
 ) -> Result<(), RunnerError> {
     for pair in pairs {
-        let key = PairKey {
-            run_id: pair.run_id.clone(),
-            pair_id: pair.pair_id.clone(),
-        };
-        let marker = state.completion_markers.get(&key).ok_or_else(|| {
+        let completed = completed_pair(state, schedule_hash, pair).map_err(|error| {
             RunnerError(format!(
-                "{message} in the same record stream: {}",
+                "{message} in the same record stream: {}: {error}",
                 pair.pair_id
             ))
         })?;
-        if marker.identity.schedule_hash != schedule_hash || marker.identity.phase != pair.phase {
-            return Err(RunnerError(format!(
-                "completed pair {} belongs to a different frozen phase context",
-                pair.pair_id
-            )));
-        }
-        for hash in &marker.trial_record_hashes {
-            let trial = state
-                .trials_by_hash
-                .get(hash)
-                .ok_or_else(|| RunnerError("completion marker lost a trial record".into()))?;
+        for trial in completed.trials {
             if !trial
                 .runtime
                 .get("valid")
@@ -507,12 +591,158 @@ fn require_complete_pairs(
     Ok(())
 }
 
+fn validate_resume_before_resolution(
+    plan: &FrozenPlan,
+    state: &crate::artifacts::ResumeState,
+    options: &RunOptions,
+    run_state: &FrozenRunState,
+) -> Result<(), RunnerError> {
+    let frozen = frozen_model(plan)?;
+    if state
+        .trials_by_hash
+        .values()
+        .any(|trial| trial.identity.run_id != plan.schedule.run_id)
+        || state
+            .completion_markers
+            .values()
+            .any(|marker| marker.identity.run_id != plan.schedule.run_id)
+    {
+        return Err(RunnerError(
+            "record stream contains a different frozen run. Use separate artifacts per model and plan"
+                .into(),
+        ));
+    }
+    let pairs = match options.phase {
+        SchedulePhase::Pilot => plan
+            .schedule
+            .smoke
+            .iter()
+            .chain(&plan.schedule.pilot)
+            .collect::<Vec<_>>(),
+        _ => phase_pairs(plan, options.phase).iter().collect(),
+    };
+    let pair_ids = pairs
+        .iter()
+        .map(|pair| pair.pair_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let expected_limits = RuntimeLimits {
+        wall_timeout_seconds: options.timeout.as_secs(),
+        max_provider_requests: options.max_model_responses,
+        max_model_responses: options.max_model_responses,
+        provider_output_token_ceiling: frozen.max_tokens,
+        aggregate_observed_output_token_ceiling: frozen
+            .max_tokens
+            .saturating_mul(u64::from(options.max_model_responses)),
+    };
+    let tools = expected_tools(DescriptionVariant::Current, frozen.family.as_deref());
+    let context = initial_context(&run_state.utc_date, "resume-context", &tools);
+    let system_prompt_hash = sha256_hex(
+        context
+            .system_prompt
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    let descriptions = recorded_descriptions();
+    let revision = run_state.source.revision_label();
+
+    for pair in &pairs {
+        let key = PairKey {
+            run_id: pair.run_id.clone(),
+            pair_id: pair.pair_id.clone(),
+        };
+        if state.completion_markers.contains_key(&key) {
+            completed_pair(state, &plan.schedule.schedule_hash, pair)
+                .map_err(|error| RunnerError(error.to_string()))?;
+        }
+        let attempt_count = state
+            .trials_by_hash
+            .values()
+            .filter(|trial| {
+                trial.identity.run_id == pair.run_id && trial.identity.pair_id == pair.pair_id
+            })
+            .map(|trial| trial.identity.attempt_id.as_str())
+            .collect::<BTreeSet<_>>()
+            .len();
+        if attempt_count > 2 {
+            return Err(RunnerError(format!(
+                "resumed pair {} exceeds the two-attempt limit",
+                pair.pair_id
+            )));
+        }
+    }
+
+    for trial in state.trials_by_hash.values().filter(|trial| {
+        trial.identity.run_id == plan.schedule.run_id
+            && pair_ids.contains(trial.identity.pair_id.as_str())
+    }) {
+        let pair = pairs
+            .iter()
+            .find(|pair| pair.pair_id == trial.identity.pair_id)
+            .expect("pair id came from the frozen phase set");
+        let scheduled = pair
+            .trials
+            .iter()
+            .find(|scheduled| {
+                scheduled.order_index == trial.identity.order_index
+                    && scheduled.variant == trial.identity.variant
+            })
+            .ok_or_else(|| {
+                RunnerError(format!(
+                    "resumed pair {} has a trial outside its frozen slots",
+                    pair.pair_id
+                ))
+            })?;
+        if trial.identity.task_id != scheduled.task_id
+            || trial.identity.instance_hash != scheduled.instance_hash
+            || trial.identity.archetype_id != pair.archetype_id
+            || trial.identity.schedule_hash != plan.schedule.schedule_hash
+            || trial.identity.phase != scheduled.phase
+            || trial.identity.repetition != scheduled.archetype_repetition
+        {
+            return Err(RunnerError(format!(
+                "resumed pair {} has a mixed frozen trial identity",
+                pair.pair_id
+            )));
+        }
+        let runtime: RuntimeRecord =
+            serde_json::from_value(trial.runtime.clone()).map_err(|error| {
+                RunnerError(format!("cannot validate resumed runtime context: {error}"))
+            })?;
+        let unresolved = runtime.terminal_status == TerminalStatus::InfrastructureFailed
+            && runtime.provider_requests == 0;
+        if runtime.image_id != run_state.image_id
+            || runtime.source_provenance != run_state.source
+            || runtime.utc_date != run_state.utc_date
+            || runtime.limits != expected_limits
+            || (!unresolved
+                && !runtime.system_prompt_hash.is_empty()
+                && runtime.system_prompt_hash != system_prompt_hash)
+            || trial.metadata.current_description != descriptions[0]
+            || trial.metadata.compact_description != descriptions[1]
+            || trial.metadata.aj_revision != revision
+            || trial.metadata.suite_revision != plan.universe.suite_revision
+            || trial.metadata.model_catalog_hash != frozen.catalog_hash
+            || trial.metadata.provider != frozen.provider
+            || trial.metadata.model != frozen.model
+            || trial.metadata.reasoning_effort != frozen.reasoning
+            || trial.metadata.tool_catalog_hash != frozen.tool_catalog_hash
+        {
+            return Err(RunnerError(format!(
+                "resumed pair {} has a different immutable runtime context",
+                trial.identity.pair_id
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn persist_resolution_failure(
     options: &RunOptions,
     plan: &FrozenPlan,
     state: &crate::artifacts::ResumeState,
     run_state: &FrozenRunState,
-    resolved: Option<(&ModelInfo, &str)>,
+    resolved: (&ModelInfo, &str, ThinkingLevel),
     error: &RunnerError,
 ) -> Result<(), RunnerError> {
     let Some(pair) = phase_pairs(plan, options.phase).iter().find(|pair| {
@@ -536,18 +766,12 @@ fn persist_resolution_failure(
     }
     let blobs = BlobStore::new(options.artifact_dir.join("blobs"))
         .map_err(|error| RunnerError(error.to_string()))?;
-    let (max_tokens, catalog_hash, provider, model, reserve) = resolved.map_or_else(
-        || (0, String::new(), PROVIDER_ID.into(), MODEL_ID.into(), 0.0),
-        |(model, catalog_hash)| {
-            (
-                model.max_tokens,
-                catalog_hash.to_string(),
-                model.provider.clone(),
-                model.id.clone(),
-                conservative_catalog_pair_reserve(model, options.max_model_responses),
-            )
-        },
-    );
+    let (resolved_model, catalog_hash, _) = resolved;
+    let max_tokens = resolved_model.max_tokens;
+    let catalog_hash = catalog_hash.to_string();
+    let provider = resolved_model.provider.clone();
+    let model = resolved_model.id.clone();
+    let reserve = conservative_catalog_pair_reserve(resolved_model, options.max_model_responses);
     let limits = RuntimeLimits {
         wall_timeout_seconds: options.timeout.as_secs(),
         max_provider_requests: options.max_model_responses,
@@ -565,7 +789,13 @@ fn persist_resolution_failure(
         run_state,
         &blobs,
         reserve,
+        true,
     );
+    if runtime.conversation_jsonl_blob.is_none() {
+        return Err(RunnerError(runtime.worker_error.clone().unwrap_or_else(
+            || "cannot store credential failure artifact".into(),
+        )));
+    }
     runtime.terminal_status = TerminalStatus::InfrastructureFailed;
     let descriptions = recorded_descriptions();
     let record = TrialRecord::new(
@@ -579,7 +809,8 @@ fn persist_resolution_failure(
             model_catalog_hash: catalog_hash,
             provider,
             model,
-            reasoning_effort: "low".into(),
+            reasoning_effort: frozen_model(plan)?.reasoning.clone(),
+            tool_catalog_hash: frozen_model(plan)?.tool_catalog_hash.clone(),
             fixture_revision: String::new(),
         },
         serde_json::to_value(runtime).map_err(|error| RunnerError(error.to_string()))?,
@@ -591,34 +822,45 @@ fn persist_resolution_failure(
         .map_err(|error| RunnerError(error.to_string()))
 }
 
-fn resolve_model_metadata() -> Result<(Arc<ModelInfo>, String), RunnerError> {
+fn resolve_model_metadata(
+    plan: &FrozenPlan,
+) -> Result<(Arc<ModelInfo>, String, ThinkingLevel), RunnerError> {
+    let frozen = frozen_model(plan)?;
+    let reasoning = parse_reasoning(&frozen.reasoning)?;
     let registry = ModelRegistry::load();
+    let current = freeze_model_selection_from_registry(
+        &registry,
+        &frozen.provider,
+        &frozen.model,
+        reasoning,
+    )?;
+    if &current != frozen {
+        return Err(RunnerError(
+            "local model catalog or capability identity differs from the frozen plan".into(),
+        ));
+    }
     let model = registry
-        .get(PROVIDER_ID, MODEL_ID)
+        .get(&frozen.provider, &frozen.model)
         .cloned()
-        .ok_or_else(|| {
-            RunnerError(format!(
-                "model {PROVIDER_ID}/{MODEL_ID} is not in the registry"
-            ))
-        })?;
-    validate_thinking_level(&model, &ThinkingLevel::Low).map_err(RunnerError)?;
-    let catalog_hash = registry_hash(&registry)?;
-    Ok((Arc::new(model), catalog_hash))
+        .ok_or_else(|| RunnerError("frozen model disappeared from the local registry".into()))?;
+    Ok((Arc::new(model), frozen.catalog_hash.clone(), reasoning))
 }
 
 async fn resolve_trusted_model(
     model: Arc<ModelInfo>,
     catalog_hash: String,
+    reasoning: ThinkingLevel,
 ) -> Result<TrustedModel, RunnerError> {
     let auth = AuthStorage::at_default_path().map_err(|error| RunnerError(error.to_string()))?;
     if auth
-        .get_api_key(PROVIDER_ID)
+        .get_api_key(&model.provider)
         .await
         .map_err(|error| RunnerError(error.to_string()))?
         .is_none()
     {
         return Err(RunnerError(format!(
-            "no credentials resolved for {PROVIDER_ID}"
+            "no credentials resolved for {}",
+            model.provider
         )));
     }
     let resolved = aj_app::model::from_model_info(&auth, (*model).clone(), None)
@@ -628,16 +870,16 @@ async fn resolve_trusted_model(
         model: resolved.model_info,
         stream_options: resolved.stream_options,
         catalog_hash,
+        reasoning,
     })
 }
 
-fn unpaid_request_preflight(model: &ModelInfo, date: &str) -> Result<(), RunnerError> {
-    if model.provider != PROVIDER_ID || model.id != MODEL_ID {
-        return Err(RunnerError(
-            "unpaid preflight resolved an unexpected model".into(),
-        ));
-    }
-    validate_thinking_level(model, &ThinkingLevel::Low).map_err(RunnerError)?;
+fn unpaid_request_preflight(
+    model: &ModelInfo,
+    reasoning: ThinkingLevel,
+    date: &str,
+) -> Result<(), RunnerError> {
+    validate_thinking_level(model, &reasoning).map_err(RunnerError)?;
     let prompt = "Unpaid request-construction preflight.";
     let current_tools = expected_tools(DescriptionVariant::Current, model.family.as_deref());
     let compact_tools = expected_tools(DescriptionVariant::CompactV1, model.family.as_deref());
@@ -651,8 +893,20 @@ fn unpaid_request_preflight(model: &ModelInfo, date: &str) -> Result<(), RunnerE
         ));
     }
 
-    let current_payload = request_shape(model, &current, "preflight-cache-key", model.max_tokens);
-    let compact_payload = request_shape(model, &compact, "preflight-cache-key", model.max_tokens);
+    let current_payload = request_shape(
+        model,
+        reasoning,
+        &current,
+        "preflight-cache-key",
+        model.max_tokens,
+    );
+    let compact_payload = request_shape(
+        model,
+        reasoning,
+        &compact,
+        "preflight-cache-key",
+        model.max_tokens,
+    );
     if normalized_request_hash(&current_payload, "preflight-cache-key")?
         != normalized_request_hash(&compact_payload, "preflight-cache-key")?
     {
@@ -660,13 +914,9 @@ fn unpaid_request_preflight(model: &ModelInfo, date: &str) -> Result<(), RunnerE
             "unpaid provider request contexts differ outside apply_patch.description".into(),
         ));
     }
-    if current_payload
-        .pointer("/reasoning/effort")
-        .and_then(Value::as_str)
-        != Some("low")
-    {
+    if !payload_has_reasoning(&current_payload, model, reasoning) {
         return Err(RunnerError(
-            "unpaid provider request does not serialize low reasoning".into(),
+            "unpaid provider request does not serialize frozen reasoning".into(),
         ));
     }
     Ok(())
@@ -706,21 +956,38 @@ fn apply_patch_description(context: &Context) -> Result<&str, RunnerError> {
         .ok_or_else(|| RunnerError("provider context has no apply_patch tool".into()))
 }
 
-fn request_shape(model: &ModelInfo, context: &Context, cache_key: &str, max_tokens: u64) -> Value {
+fn request_shape(
+    model: &ModelInfo,
+    reasoning: ThinkingLevel,
+    context: &Context,
+    cache_key: &str,
+    max_tokens: u64,
+) -> Value {
     let options = StreamOptions {
         session_id: Some(cache_key.to_string()),
         max_tokens: Some(max_tokens),
         ..StreamOptions::default()
     };
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "model": model.id,
         "provider": model.provider,
-        "reasoning": {"effort": "low"},
         "prompt_cache_key": cache_key,
         "max_output_tokens": max_tokens,
         "stream_options": options,
         "context": context,
-    })
+    });
+    if let Some(effort) = responses_reasoning_effort(model, &reasoning) {
+        payload["reasoning"] = serde_json::json!({"effort": effort});
+    }
+    payload
+}
+
+fn payload_has_reasoning(payload: &Value, model: &ModelInfo, reasoning: ThinkingLevel) -> bool {
+    let actual = payload.pointer("/reasoning/effort");
+    match responses_reasoning_effort(model, &reasoning) {
+        Some(expected) => serde_json::to_value(expected).ok().as_ref() == actual,
+        None => payload.get("reasoning").is_none(),
+    }
 }
 
 fn normalized_request_hash(payload: &Value, session_id: &str) -> Result<String, RunnerError> {
@@ -761,6 +1028,14 @@ fn normalize_apply_patch_description(value: &mut Value) -> Result<(), RunnerErro
         .ok_or_else(|| RunnerError("apply_patch tool has no description".into()))?;
     *description = Value::String("<apply-patch-description>".into());
     Ok(())
+}
+
+fn tool_catalog_hash(tools: &[ToolDefinition]) -> Result<String, RunnerError> {
+    let mut value = serde_json::json!({"tools": tools});
+    normalize_apply_patch_description(&mut value)?;
+    serde_json::to_vec(&value)
+        .map(|bytes| hash_framed(b"aj-apply-patch-eval-tool-catalog-v1", &[&bytes]))
+        .map_err(|error| RunnerError(format!("cannot hash tool catalog: {error}")))
 }
 
 fn registry_hash(registry: &ModelRegistry) -> Result<String, RunnerError> {
@@ -909,10 +1184,10 @@ fn recorded_spend(state: &crate::artifacts::ResumeState, phase: SchedulePhase) -
 fn pair_reserve(
     phase: SchedulePhase,
     plan: &FrozenPlan,
-    trusted: &TrustedModel,
+    model: &ModelInfo,
     max_requests: u32,
 ) -> Result<f64, RunnerError> {
-    let catalog = conservative_catalog_pair_reserve(&trusted.model, max_requests);
+    let catalog = conservative_catalog_pair_reserve(model, max_requests);
     if phase != SchedulePhase::Main {
         return Ok(catalog);
     }
@@ -1017,7 +1292,8 @@ fn validate_resume_context(
             || frozen.model_catalog_hash != trusted.catalog_hash
             || frozen.provider != trusted.model.provider
             || frozen.model != trusted.model.id
-            || frozen.reasoning_effort != "low"
+            || frozen.reasoning_effort != trusted.reasoning.as_str()
+            || frozen.tool_catalog_hash != frozen_model(plan)?.tool_catalog_hash
             || (frozen.conservative_catalog_pair_reserve - reserve).abs() > 1e-9
         {
             return Err(RunnerError(
@@ -1048,7 +1324,8 @@ fn validate_resume_context(
             || (!unresolved && trial.metadata.model_catalog_hash != trusted.catalog_hash)
             || (!unresolved && trial.metadata.provider != trusted.model.provider)
             || (!unresolved && trial.metadata.model != trusted.model.id)
-            || trial.metadata.reasoning_effort != "low"
+            || trial.metadata.reasoning_effort != trusted.reasoning.as_str()
+            || trial.metadata.tool_catalog_hash != frozen_model(plan)?.tool_catalog_hash
         {
             return Err(RunnerError(format!(
                 "resumed pair {} has a different immutable runtime context",
@@ -1110,49 +1387,74 @@ async fn run_trial(
     run_cancel: CancellationToken,
     run_state: &FrozenRunState,
 ) -> Result<RuntimeRecord, RunnerError> {
-    let fallback_limits = RuntimeLimits {
-        wall_timeout_seconds: options.timeout.as_secs(),
-        max_provider_requests: options.max_model_responses,
-        max_model_responses: options.max_model_responses,
-        provider_output_token_ceiling: trusted.model.max_tokens,
-        aggregate_observed_output_token_ceiling: trusted
-            .model
-            .max_tokens
-            .saturating_mul(u64::from(options.max_model_responses)),
+    let started = Instant::now();
+    let trial_cancel = CancellationToken::new();
+    let deadline_expired = Arc::new(AtomicBool::new(false));
+    let deadline_task = {
+        let trial_cancel = trial_cancel.clone();
+        let deadline_expired = Arc::clone(&deadline_expired);
+        let run_cancel = run_cancel.clone();
+        let timeout = options.timeout;
+        tokio::spawn(async move {
+            tokio::select! {
+                () = tokio::time::sleep(timeout) => {
+                    deadline_expired.store(true, Ordering::SeqCst);
+                    trial_cancel.cancel();
+                }
+                () = run_cancel.cancelled() => trial_cancel.cancel(),
+            }
+        })
     };
-    let reserve = conservative_catalog_pair_reserve(&trusted.model, options.max_model_responses);
-    match tokio::time::timeout(
-        options.timeout,
-        run_trial_inner(
-            options,
-            trusted,
-            instance,
-            scheduled,
-            _attempt_id,
-            blobs,
-            run_cancel,
-            run_state,
-        ),
+    let result = run_trial_inner(
+        options,
+        trusted,
+        instance,
+        scheduled,
+        _attempt_id,
+        blobs,
+        trial_cancel,
+        run_state,
     )
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => {
-            let mut runtime = setup_failure_runtime(
-                "whole-trial deadline expired".into(),
-                opaque_cache_key(&rand::random::<[u8; 32]>()),
-                fallback_limits,
-                run_state,
-                blobs,
-                reserve,
-            );
-            runtime.terminal_status = TerminalStatus::TimedOut;
-            runtime.valid = true;
-            runtime.duration_millis =
-                u64::try_from(options.timeout.as_millis()).unwrap_or(u64::MAX);
-            Ok(runtime)
-        }
+    .await;
+    deadline_task.abort();
+    let mut runtime = result?;
+    runtime.duration_millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    apply_deadline_outcome(
+        &mut runtime,
+        deadline_expired.load(Ordering::SeqCst),
+        options.timeout,
+    );
+    Ok(runtime)
+}
+
+fn apply_deadline_outcome(runtime: &mut RuntimeRecord, expired: bool, timeout: Duration) {
+    if !expired {
+        return;
     }
+    runtime.duration_millis = runtime
+        .duration_millis
+        .max(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX));
+    if matches!(
+        runtime.terminal_status,
+        TerminalStatus::RunnerInternal | TerminalStatus::InfrastructureFailed
+    ) {
+        return;
+    }
+    if !runtime.containment_cleanup_confirmed {
+        mark_runner_internal(
+            runtime,
+            "whole-trial deadline expired and containment cleanup was not confirmed",
+        );
+        return;
+    }
+    if runtime.normalized_first_request_hash.is_none() {
+        runtime.terminal_status = TerminalStatus::InfrastructureFailed;
+        runtime.valid = false;
+    } else {
+        runtime.terminal_status = TerminalStatus::TimedOut;
+        runtime.valid = true;
+    }
+    runtime.task_passed = false;
 }
 
 async fn run_trial_inner(
@@ -1187,10 +1489,24 @@ async fn run_trial_inner(
                 run_state,
                 blobs,
                 catalog_pair_reserve,
+                false,
             ));
         }
     };
-    let fixture_output: FixtureWorkerOutput = match run_helper(
+    if run_cancel.is_cancelled() {
+        let cleanup = volume.cleanup().await;
+        let cleanup_confirmed = cleanup.is_ok();
+        return Ok(setup_cancelled_runtime(
+            setup_error_with_cleanup("fixture volume creation", "trial cancelled", cleanup),
+            cache_key,
+            runtime_limits,
+            run_state,
+            blobs,
+            catalog_pair_reserve,
+            cleanup_confirmed,
+        ));
+    }
+    let fixture_output: FixtureWorkerOutput = match run_helper_cancellable(
         &options.image,
         "__fixture-worker",
         &volume,
@@ -1198,20 +1514,36 @@ async fn run_trial_inner(
         &FixtureWorkerInput {
             instance: instance.clone(),
         },
+        &run_cancel,
     )
     .await
     {
         Ok(output) => output,
         Err(error) => {
             let cleanup = volume.cleanup().await;
-            return Ok(setup_failure_runtime(
-                setup_error_with_cleanup("fixture materialization", error, cleanup),
-                cache_key,
-                runtime_limits,
-                run_state,
-                blobs,
-                catalog_pair_reserve,
-            ));
+            let cleanup_confirmed = cleanup.is_ok();
+            let message = setup_error_with_cleanup("fixture materialization", &error, cleanup);
+            return Ok(if clean_helper_cancellation(&error, &run_cancel) {
+                setup_cancelled_runtime(
+                    message,
+                    cache_key,
+                    runtime_limits,
+                    run_state,
+                    blobs,
+                    catalog_pair_reserve,
+                    cleanup_confirmed,
+                )
+            } else {
+                setup_failure_runtime(
+                    message,
+                    cache_key,
+                    runtime_limits,
+                    run_state,
+                    blobs,
+                    catalog_pair_reserve,
+                    cleanup_confirmed,
+                )
+            });
         }
     };
     let baseline_output = match snapshot_volume(
@@ -1219,20 +1551,36 @@ async fn run_trial_inner(
         &volume,
         true,
         Some(&fixture_output.baseline_commit),
+        Some(&run_cancel),
     )
     .await
     {
         Ok(output) => output,
         Err(error) => {
             let cleanup = volume.cleanup().await;
-            return Ok(setup_failure_runtime(
-                setup_error_with_cleanup("baseline snapshot", error, cleanup),
-                cache_key,
-                runtime_limits,
-                run_state,
-                blobs,
-                catalog_pair_reserve,
-            ));
+            let cleanup_confirmed = cleanup.is_ok();
+            let message = setup_error_with_cleanup("baseline snapshot", &error, cleanup);
+            return Ok(if clean_helper_cancellation(&error, &run_cancel) {
+                setup_cancelled_runtime(
+                    message,
+                    cache_key,
+                    runtime_limits,
+                    run_state,
+                    blobs,
+                    catalog_pair_reserve,
+                    cleanup_confirmed,
+                )
+            } else {
+                setup_failure_runtime(
+                    message,
+                    cache_key,
+                    runtime_limits,
+                    run_state,
+                    blobs,
+                    catalog_pair_reserve,
+                    cleanup_confirmed,
+                )
+            });
         }
     };
     let baseline = baseline_output.snapshot;
@@ -1242,6 +1590,7 @@ async fn run_trial_inner(
         .is_some_and(|git| git.diff.is_empty() && git.status.is_empty())
     {
         let cleanup = volume.cleanup().await;
+        let cleanup_confirmed = cleanup.is_ok();
         return Ok(setup_failure_runtime(
             setup_error_with_cleanup(
                 "baseline Git validation",
@@ -1253,10 +1602,12 @@ async fn run_trial_inner(
             run_state,
             blobs,
             catalog_pair_reserve,
+            cleanup_confirmed,
         ));
     }
     if baseline.root_hash != fixture_output.fixture.baseline_revision {
         let cleanup = volume.cleanup().await;
+        let cleanup_confirmed = cleanup.is_ok();
         let error = match cleanup {
             Ok(()) => "fixture helper and trusted snapshot helper disagree".into(),
             Err(cleanup) => format!(
@@ -1270,10 +1621,12 @@ async fn run_trial_inner(
             run_state,
             blobs,
             catalog_pair_reserve,
+            cleanup_confirmed,
         ));
     }
     let init = WorkerInit {
         model: worker_model(&trusted.model),
+        reasoning: trusted.reasoning,
         variant: scheduled.variant,
         prompt: fixture_output.fixture.prompt.clone(),
         session_id: cache_key.clone(),
@@ -1297,8 +1650,16 @@ async fn run_trial_inner(
     let baseline_commit = fixture_output.baseline_commit;
     execution.baseline_commit = Some(baseline_commit.clone());
 
-    if execution.containment_cleanup_confirmed {
-        match snapshot_volume(&options.image, &volume, true, Some(&baseline_commit)).await {
+    if execution.containment_cleanup_confirmed && !execution.cancelled && !execution.timed_out {
+        match snapshot_volume(
+            &options.image,
+            &volume,
+            true,
+            Some(&baseline_commit),
+            Some(&run_cancel),
+        )
+        .await
+        {
             Ok(final_output) => {
                 let final_snapshot = final_output.snapshot;
                 execution.record_between_boundary(final_snapshot.clone());
@@ -1307,12 +1668,16 @@ async fn run_trial_inner(
                 execution.final_snapshot_valid = true;
                 execution.git_artifacts = final_output.git;
             }
+            Err(error) if clean_helper_cancellation(&error, &run_cancel) => {
+                execution.cancelled = true;
+                execution.final_delta = delta(&execution.baseline, &execution.final_snapshot);
+            }
             Err(error) => {
                 execution.internal_error = Some(format!("final snapshot failed: {error}"));
                 execution.final_delta = delta(&execution.baseline, &execution.final_snapshot);
             }
         }
-    } else {
+    } else if !execution.containment_cleanup_confirmed {
         execution.internal_error = Some(match execution.internal_error.take() {
             Some(error) => format!("{error}; containment cleanup was not confirmed"),
             None => "containment cleanup was not confirmed".into(),
@@ -1335,16 +1700,18 @@ async fn run_trial_inner(
                 }
                 execution.verifier = Some(verifier);
             }
-            Err(_) if run_cancel.is_cancelled() => {
+            Err(error) if clean_helper_cancellation(&error, &run_cancel) => {
                 execution.cancelled = true;
             }
             Err(error) => {
+                execution.containment_cleanup_confirmed = false;
                 execution.internal_error = Some(format!("verifier isolation failed: {error}"));
             }
         }
     }
     if let Err(error) = volume.cleanup().await {
         execution.internal_error = Some(format!("fixture volume cleanup failed: {error}"));
+        execution.containment_cleanup_confirmed = false;
         execution.final_snapshot_valid = false;
         execution.git_artifacts = None;
         execution.verifier = None;
@@ -1422,18 +1789,18 @@ async fn snapshot_volume(
     volume: &FixtureVolume,
     include_git_artifacts: bool,
     baseline_commit: Option<&str>,
+    cancel: Option<&CancellationToken>,
 ) -> Result<SnapshotWorkerOutput, RunnerError> {
-    run_helper(
-        image,
-        "__snapshot-worker",
-        volume,
-        true,
-        &SnapshotWorkerInput {
-            include_git_artifacts,
-            baseline_commit: baseline_commit.map(str::to_string),
-        },
-    )
-    .await
+    let input = SnapshotWorkerInput {
+        include_git_artifacts,
+        baseline_commit: baseline_commit.map(str::to_string),
+    };
+    match cancel {
+        Some(cancel) => {
+            run_helper_cancellable(image, "__snapshot-worker", volume, true, &input, cancel).await
+        }
+        None => run_helper(image, "__snapshot-worker", volume, true, &input).await,
+    }
     .map_err(Into::into)
 }
 
@@ -1452,6 +1819,16 @@ fn setup_error_with_cleanup(
     }
 }
 
+fn clean_helper_cancellation(error: &impl fmt::Display, cancel: &CancellationToken) -> bool {
+    cancel.is_cancelled() && error.to_string() == "Docker helper cancelled"
+}
+
+fn benign_broker_cancellation(error: &RunnerError, cancel: &CancellationToken) -> bool {
+    clean_helper_cancellation(error, cancel)
+        || cancel.is_cancelled()
+            && error.to_string() == "provider request did not terminate after cancellation"
+}
+
 fn setup_failure_runtime(
     mut error: String,
     cache_key: String,
@@ -1459,6 +1836,7 @@ fn setup_failure_runtime(
     run_state: &FrozenRunState,
     blobs: &BlobStore,
     catalog_pair_reserve: f64,
+    containment_cleanup_confirmed: bool,
 ) -> RuntimeRecord {
     let conversation_jsonl_blob = match blobs.put(&[]) {
         Ok(hash) => Some(hash),
@@ -1477,6 +1855,7 @@ fn setup_failure_runtime(
         edit_bypass: false,
         aj_recorded_catalog_cost: 0.0,
         model_responses: 0,
+        provider_requests: 0,
         usage: aj_models::types::Usage::default(),
         usage_field_presence: UsageFieldPresence {
             input: None,
@@ -1526,6 +1905,7 @@ fn setup_failure_runtime(
         provider_errors: Vec::new(),
         provider_error_details: Vec::new(),
         worker_error: Some(error),
+        containment_cleanup_confirmed,
         isolation_contract: "docker_attach_v2: setup failed before a confirmatory final snapshot"
             .into(),
         evaluator_api_limitations: Vec::new(),
@@ -1535,6 +1915,30 @@ fn setup_failure_runtime(
         conservative_catalog_pair_reserve: catalog_pair_reserve,
         final_assistant_text_blob: None,
     }
+}
+
+fn setup_cancelled_runtime(
+    error: String,
+    cache_key: String,
+    limits: RuntimeLimits,
+    run_state: &FrozenRunState,
+    blobs: &BlobStore,
+    catalog_pair_reserve: f64,
+    containment_cleanup_confirmed: bool,
+) -> RuntimeRecord {
+    let mut runtime = setup_failure_runtime(
+        error,
+        cache_key,
+        limits,
+        run_state,
+        blobs,
+        catalog_pair_reserve,
+        containment_cleanup_confirmed,
+    );
+    if containment_cleanup_confirmed && runtime.conversation_jsonl_blob.is_some() {
+        runtime.terminal_status = TerminalStatus::Cancelled;
+    }
+    runtime
 }
 
 async fn execute_container(
@@ -1634,6 +2038,7 @@ async fn execute_container(
             expected_tools,
             expected_system_prompt: expected_context.system_prompt.unwrap_or_default(),
             expected_prompt: init.prompt,
+            reasoning: trusted.reasoning,
             provider_cancel: provider_cancel.clone(),
             execution: &mut execution,
         };
@@ -1657,13 +2062,17 @@ async fn execute_container(
     match &drive {
         DriveOutcome::TimedOut(result) => {
             execution.timed_out = true;
-            if let Err(error) = result {
+            if let Err(error) = result
+                && !benign_broker_cancellation(error, &provider_cancel)
+            {
                 execution.internal_error = Some(error.to_string());
             }
         }
         DriveOutcome::Cancelled(result) => {
             execution.cancelled = true;
-            if let Err(error) = result {
+            if let Err(error) = result
+                && !benign_broker_cancellation(error, &provider_cancel)
+            {
                 execution.internal_error = Some(error.to_string());
             }
         }
@@ -1737,6 +2146,7 @@ struct Broker<'a> {
     expected_tools: Vec<ToolDefinition>,
     expected_system_prompt: String,
     expected_prompt: String,
+    reasoning: ThinkingLevel,
     provider_cancel: CancellationToken,
     execution: &'a mut TrialExecution,
 }
@@ -1784,8 +2194,8 @@ impl Broker<'_> {
         self.snapshot_boundary().await?;
         self.execution.provider_requests = self.execution.provider_requests.saturating_add(1);
         let request_number = self.execution.provider_requests;
-        if observed_reasoning != ThinkingLevel::Low {
-            return Err(RunnerError("worker requested non-low reasoning".into()));
+        if observed_reasoning != self.reasoning {
+            return Err(RunnerError("worker requested non-frozen reasoning".into()));
         }
         if request_number > self.max_requests {
             self.provider_cancel.cancel();
@@ -1818,17 +2228,25 @@ impl Broker<'_> {
         let captured = Arc::clone(&payloads);
         let expected_tools = self.expected_tools.clone();
         let expected_session = self.session_id.clone();
+        let model = Arc::clone(&self.model);
         let payload_cancel = self.provider_cancel.clone();
+        let reasoning = self.reasoning;
         let mut options = self.trusted_options.clone();
         options.session_id = Some(self.session_id.clone());
         options.max_tokens = Some(self.max_output_tokens);
         options.on_payload = Some(OnPayload::new(move |payload| {
-            let validation = validate_payload(payload, &expected_tools, &expected_session)
-                .and_then(|()| {
-                    normalized_request_hash(payload, &expected_session)
-                        .map(|hash| (payload.clone(), hash))
-                })
-                .map_err(|error| error.to_string());
+            let validation = validate_payload(
+                payload,
+                &expected_tools,
+                &expected_session,
+                &model,
+                reasoning,
+            )
+            .and_then(|()| {
+                normalized_request_hash(payload, &expected_session)
+                    .map(|hash| (payload.clone(), hash))
+            })
+            .map_err(|error| error.to_string());
             if validation.is_err() {
                 payload_cancel.cancel();
             }
@@ -1840,7 +2258,7 @@ impl Broker<'_> {
         options.cancel = Some(self.provider_cancel.clone());
         let simple = SimpleStreamOptions {
             base: options,
-            reasoning: ThinkingLevel::Low,
+            reasoning: self.reasoning,
         };
         let mut stream = self.provider.stream_simple(&self.model, &context, &simple);
         let mut events = Vec::new();
@@ -1919,10 +2337,20 @@ impl Broker<'_> {
         arguments: Value,
         stdin: &mut tokio::process::ChildStdin,
     ) -> Result<(), RunnerError> {
-        let before = match snapshot_volume(self.image, self.volume, false, None).await {
+        let before = match snapshot_volume(
+            self.image,
+            self.volume,
+            false,
+            None,
+            Some(&self.provider_cancel),
+        )
+        .await
+        {
             Ok(output) => output.snapshot,
             Err(error) => {
-                self.execution.containment_cleanup_confirmed = false;
+                if !clean_helper_cancellation(&error, &self.provider_cancel) {
+                    self.execution.containment_cleanup_confirmed = false;
+                }
                 return Err(error);
             }
         };
@@ -1958,15 +2386,27 @@ impl Broker<'_> {
             {
                 Ok(outcome) => outcome,
                 Err(error) => {
-                    self.execution.containment_cleanup_confirmed = false;
+                    if !clean_helper_cancellation(&error, &self.provider_cancel) {
+                        self.execution.containment_cleanup_confirmed = false;
+                    }
                     return Err(error.into());
                 }
             }
         };
-        let after = match snapshot_volume(self.image, self.volume, false, None).await {
+        let after = match snapshot_volume(
+            self.image,
+            self.volume,
+            false,
+            None,
+            Some(&self.provider_cancel),
+        )
+        .await
+        {
             Ok(output) => output.snapshot,
             Err(error) => {
-                self.execution.containment_cleanup_confirmed = false;
+                if !clean_helper_cancellation(&error, &self.provider_cancel) {
+                    self.execution.containment_cleanup_confirmed = false;
+                }
                 return Err(error);
             }
         };
@@ -2034,10 +2474,20 @@ impl Broker<'_> {
     }
 
     async fn snapshot_boundary(&mut self) -> Result<(), RunnerError> {
-        let snapshot = match snapshot_volume(self.image, self.volume, false, None).await {
+        let snapshot = match snapshot_volume(
+            self.image,
+            self.volume,
+            false,
+            None,
+            Some(&self.provider_cancel),
+        )
+        .await
+        {
             Ok(output) => output.snapshot,
             Err(error) => {
-                self.execution.containment_cleanup_confirmed = false;
+                if !clean_helper_cancellation(&error, &self.provider_cancel) {
+                    self.execution.containment_cleanup_confirmed = false;
+                }
                 return Err(error);
             }
         };
@@ -2050,10 +2500,12 @@ fn validate_payload(
     payload: &Value,
     expected_tools: &[ToolDefinition],
     session_id: &str,
+    model: &ModelInfo,
+    reasoning: ThinkingLevel,
 ) -> Result<(), RunnerError> {
-    if payload.pointer("/reasoning/effort").and_then(Value::as_str) != Some("low") {
+    if !payload_has_reasoning(payload, model, reasoning) {
         return Err(RunnerError(
-            "captured paid request does not send low reasoning effort".into(),
+            "captured paid request does not send frozen reasoning effort".into(),
         ));
     }
     if payload.get("prompt_cache_key").and_then(Value::as_str) != Some(session_id) {
@@ -2405,6 +2857,15 @@ fn finish_runtime(
     let final_delta = execution
         .final_snapshot_valid
         .then_some(execution.final_delta.clone());
+    let mut evaluator_api_limitations = vec![
+        "The production serialized payload callback runs after provider request construction. The equivalent typed request is validated before credentials, and an invalid production payload is cancelled and drained before the trial fails closed.".into(),
+        "Normalized Usage does not preserve cache-read or cache-write field presence. Zero cache-read usage has unknown presence, and the cache-write sensitivity range spans zero through reported input tokens.".into(),
+    ];
+    if trusted.model.provider == PROVIDER_ID {
+        evaluator_api_limitations.push(
+            "The public Codex provider omits StreamOptions.max_tokens from its wire request. The catalog or server maximum is therefore the per-request output ceiling. The parent also enforces request count and fails closed after completed normalized usage first exceeds the aggregate observed output-token ceiling. Tokens emitted before completed usage is reported cannot be interrupted by that observed-usage check.".into(),
+        );
+    }
     Ok(RuntimeRecord {
         terminal_status: status,
         valid,
@@ -2413,6 +2874,7 @@ fn finish_runtime(
         edit_bypass: execution.edit_bypass,
         aj_recorded_catalog_cost: usage.cost.total,
         model_responses: execution.parent_metrics.model_responses,
+        provider_requests: execution.provider_requests,
         usage: usage.clone(),
         usage_field_presence: UsageFieldPresence {
             input: None,
@@ -2481,12 +2943,9 @@ fn finish_runtime(
         worker_error: execution
             .internal_error
             .or_else(|| execution.worker.and_then(|worker| worker.error)),
+        containment_cleanup_confirmed: execution.containment_cleanup_confirmed,
         isolation_contract: "docker_attach_v2: parent-named containers, explicit kill/wait/rm, network=none, read_only_root, cap_drop=all, no_new_privileges, bounded_tmpfs_volume, fixed_pids_memory_cpu_ulimits".into(),
-        evaluator_api_limitations: vec![
-            "The production serialized payload callback runs after provider request construction. The equivalent typed request is validated before credentials, and an invalid production payload is cancelled and drained before the trial fails closed.".into(),
-            "The public Codex provider omits StreamOptions.max_tokens from its wire request. The catalog or server maximum is therefore the per-request output ceiling. The parent also enforces request count and fails closed after completed normalized usage first exceeds the aggregate observed output-token ceiling. Tokens emitted before completed usage is reported cannot be interrupted by that observed-usage check.".into(),
-            "Normalized Usage does not preserve cache-read or cache-write field presence. Zero cache-read usage has unknown presence, and the cache-write sensitivity range spans zero through reported input tokens.".into(),
-        ],
+        evaluator_api_limitations,
         image_id: run_state.image_id.clone(),
         source_provenance: run_state.source.clone(),
         utc_date: run_state.utc_date.clone(),
@@ -2524,13 +2983,53 @@ fn conversation_jsonl(messages: &[Message]) -> Result<Vec<u8>, RunnerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schedule::{freeze_plan, freeze_schedule};
+    use crate::schedule::{freeze_plan, freeze_schedule, test_model_selection};
     use crate::suite::committed_manifest;
+
+    fn model_plan(seed: &str) -> FrozenPlan {
+        let model = freeze_model_selection(PROVIDER_ID, MODEL_ID, "low").unwrap();
+        freeze_plan(&committed_manifest().unwrap(), seed, 6, model).unwrap()
+    }
+
+    fn timeout_runtime(provider_requests: u32, cleanup_confirmed: bool) -> RuntimeRecord {
+        let temp = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::new(temp.path()).unwrap();
+        let run_state = FrozenRunState {
+            utc_date: "2026-07-24".into(),
+            image_id: "sha256:image".into(),
+            source: SourceProvenance {
+                head: "head".into(),
+                dirty: false,
+                worktree_hash: None,
+            },
+        };
+        let mut runtime = setup_failure_runtime(
+            "cancelled".into(),
+            "cache".into(),
+            RuntimeLimits {
+                wall_timeout_seconds: 10,
+                max_provider_requests: 2,
+                max_model_responses: 2,
+                provider_output_token_ceiling: 100,
+                aggregate_observed_output_token_ceiling: 200,
+            },
+            &run_state,
+            &blobs,
+            1.0,
+            cleanup_confirmed,
+        );
+        runtime.terminal_status = TerminalStatus::Cancelled;
+        runtime.provider_requests = provider_requests;
+        runtime.usage.output = 7;
+        runtime.usage.total_tokens = 7;
+        runtime.aj_recorded_catalog_cost = 0.25;
+        runtime
+    }
 
     #[test]
     fn excluded_phases_require_unplanned_state_and_complete_smoke() {
         let manifest = committed_manifest().unwrap();
-        let plan = freeze_plan(&manifest, "phase-state", 6).unwrap();
+        let plan = freeze_plan(&manifest, "phase-state", 6, test_model_selection()).unwrap();
         require_unplanned_phase(&plan, "smoke").unwrap();
         let error = require_complete_pairs(
             &plan.schedule.smoke,
@@ -2542,8 +3041,249 @@ mod tests {
         assert!(error.to_string().contains("pilot requires smoke"));
 
         let mut invalid = plan.clone();
-        invalid.schedule = freeze_schedule(&manifest, &invalid.universe, 1).unwrap();
+        invalid.schedule = freeze_schedule(
+            &manifest,
+            &invalid.universe,
+            &invalid.model.as_ref().unwrap().selection_hash,
+            1,
+        )
+        .unwrap();
         assert!(require_unplanned_phase(&invalid, "pilot").is_err());
+    }
+
+    #[test]
+    fn whole_trial_deadline_preserves_usage_and_requires_cleanup() {
+        let mut before_request = timeout_runtime(0, true);
+        apply_deadline_outcome(&mut before_request, true, Duration::from_secs(10));
+        assert_eq!(
+            before_request.terminal_status,
+            TerminalStatus::InfrastructureFailed
+        );
+        assert!(!before_request.valid);
+
+        let mut paid = timeout_runtime(1, true);
+        paid.normalized_first_request_hash = Some("captured".into());
+        apply_deadline_outcome(&mut paid, true, Duration::from_secs(10));
+        assert_eq!(paid.terminal_status, TerminalStatus::TimedOut);
+        assert!(paid.valid);
+        assert_eq!(paid.usage.output, 7);
+        assert_eq!(paid.aj_recorded_catalog_cost, 0.25);
+
+        let mut cleanup_failed = timeout_runtime(1, false);
+        cleanup_failed.normalized_first_request_hash = Some("captured".into());
+        apply_deadline_outcome(&mut cleanup_failed, true, Duration::from_secs(10));
+        assert_eq!(
+            cleanup_failed.terminal_status,
+            TerminalStatus::RunnerInternal
+        );
+        assert!(!cleanup_failed.valid);
+
+        let mut runner_failure = timeout_runtime(1, true);
+        runner_failure.normalized_first_request_hash = Some("captured".into());
+        mark_runner_internal(&mut runner_failure, "broken final artifact");
+        apply_deadline_outcome(&mut runner_failure, true, Duration::from_secs(10));
+        assert_eq!(
+            runner_failure.terminal_status,
+            TerminalStatus::RunnerInternal
+        );
+
+        let mut provider_failure = timeout_runtime(1, true);
+        provider_failure.normalized_first_request_hash = Some("captured".into());
+        provider_failure.terminal_status = TerminalStatus::InfrastructureFailed;
+        apply_deadline_outcome(&mut provider_failure, true, Duration::from_secs(10));
+        assert_eq!(
+            provider_failure.terminal_status,
+            TerminalStatus::InfrastructureFailed
+        );
+        assert!(!provider_failure.valid);
+
+        let temp = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::new(temp.path()).unwrap();
+        let cancelled = setup_cancelled_runtime(
+            "cancelled during setup".into(),
+            "cache".into(),
+            RuntimeLimits {
+                wall_timeout_seconds: 10,
+                max_provider_requests: 2,
+                max_model_responses: 2,
+                provider_output_token_ceiling: 100,
+                aggregate_observed_output_token_ceiling: 200,
+            },
+            &FrozenRunState {
+                utc_date: "2026-07-24".into(),
+                image_id: "sha256:image".into(),
+                source: SourceProvenance {
+                    head: "head".into(),
+                    dirty: false,
+                    worktree_hash: None,
+                },
+            },
+            &blobs,
+            1.0,
+            true,
+        );
+        assert_eq!(cancelled.terminal_status, TerminalStatus::Cancelled);
+        assert!(!cancelled.valid);
+
+        let corrupt = tempfile::tempdir().unwrap();
+        std::fs::write(corrupt.path().join(sha256_hex(&[])), b"corrupt").unwrap();
+        let corrupt_blobs = BlobStore::new(corrupt.path()).unwrap();
+        let artifact_failure = setup_cancelled_runtime(
+            "cancelled during setup".into(),
+            "cache".into(),
+            cancelled.limits,
+            &FrozenRunState {
+                utc_date: "2026-07-24".into(),
+                image_id: "sha256:image".into(),
+                source: SourceProvenance {
+                    head: "head".into(),
+                    dirty: false,
+                    worktree_hash: None,
+                },
+            },
+            &corrupt_blobs,
+            1.0,
+            true,
+        );
+        assert_eq!(
+            artifact_failure.terminal_status,
+            TerminalStatus::RunnerInternal
+        );
+
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert!(benign_broker_cancellation(
+            &RunnerError("provider request did not terminate after cancellation".into()),
+            &cancellation
+        ));
+    }
+
+    #[test]
+    fn freeze_rejects_unknown_models_and_reasoning_levels() {
+        assert!(freeze_model_selection("missing", "missing", "low").is_err());
+        assert!(freeze_model_selection(PROVIDER_ID, MODEL_ID, "turbo").is_err());
+        let frozen = freeze_model_selection(PROVIDER_ID, MODEL_ID, "low").unwrap();
+        assert_eq!(frozen.provider, PROVIDER_ID);
+        assert_eq!(frozen.model, MODEL_ID);
+        assert_eq!(frozen.reasoning, "low");
+        assert!(!frozen.tool_catalog_hash.is_empty());
+    }
+
+    #[test]
+    fn reasoning_off_matches_responses_wire_contract() {
+        let registry = ModelRegistry::load();
+        let non_reasoning = registry.get("openai", "gpt-4.1").unwrap();
+        let reasoning = registry.get("openai", "gpt-5.4").unwrap();
+        let context = Context::new("test");
+        let non_reasoning_payload = request_shape(
+            non_reasoning,
+            ThinkingLevel::Off,
+            &context,
+            "cache",
+            non_reasoning.max_tokens,
+        );
+        let reasoning_payload = request_shape(
+            reasoning,
+            ThinkingLevel::Off,
+            &context,
+            "cache",
+            reasoning.max_tokens,
+        );
+        assert!(non_reasoning_payload.get("reasoning").is_none());
+        assert_eq!(
+            reasoning_payload
+                .pointer("/reasoning/effort")
+                .and_then(Value::as_str),
+            Some("none")
+        );
+        assert!(payload_has_reasoning(
+            &non_reasoning_payload,
+            non_reasoning,
+            ThinkingLevel::Off
+        ));
+        assert!(payload_has_reasoning(
+            &reasoning_payload,
+            reasoning,
+            ThinkingLevel::Off
+        ));
+    }
+
+    #[test]
+    fn incompatible_resume_is_rejected_before_resolution_failure_can_append() {
+        let plan = model_plan("resume-before-credentials");
+        let pair = &plan.schedule.smoke[0];
+        let scheduled = &pair.trials[0];
+        let frozen = plan.model.as_ref().unwrap();
+        let options = RunOptions {
+            phase: SchedulePhase::Smoke,
+            plan: PathBuf::new(),
+            records: PathBuf::new(),
+            artifact_dir: PathBuf::new(),
+            image: "sha256:image".into(),
+            max_cost_usd: 1.0,
+            max_trials: 2,
+            timeout: Duration::from_secs(10),
+            max_model_responses: 2,
+        };
+        let run_state = FrozenRunState {
+            utc_date: "2026-07-24".into(),
+            image_id: "sha256:image".into(),
+            source: SourceProvenance {
+                head: "head".into(),
+                dirty: false,
+                worktree_hash: None,
+            },
+        };
+        let mut runtime = timeout_runtime(0, true);
+        runtime.terminal_status = TerminalStatus::InfrastructureFailed;
+        runtime.image_id = run_state.image_id.clone();
+        runtime.source_provenance = run_state.source.clone();
+        runtime.utc_date = run_state.utc_date.clone();
+        runtime.limits = RuntimeLimits {
+            wall_timeout_seconds: 10,
+            max_provider_requests: 2,
+            max_model_responses: 2,
+            provider_output_token_ceiling: frozen.max_tokens,
+            aggregate_observed_output_token_ceiling: frozen.max_tokens.saturating_mul(2),
+        };
+        let descriptions = recorded_descriptions();
+        let record = TrialRecord::new(
+            trial_identity(&plan, pair, scheduled, "attempt"),
+            TrialMetadata {
+                task_seed: find_instance(&plan, pair).unwrap().task_seed.clone(),
+                current_description: descriptions[0].clone(),
+                compact_description: descriptions[1].clone(),
+                aj_revision: run_state.source.revision_label(),
+                suite_revision: plan.universe.suite_revision.clone(),
+                model_catalog_hash: frozen.catalog_hash.clone(),
+                provider: frozen.provider.clone(),
+                model: frozen.model.clone(),
+                reasoning_effort: frozen.reasoning.clone(),
+                tool_catalog_hash: frozen.tool_catalog_hash.clone(),
+                fixture_revision: String::new(),
+            },
+            serde_json::to_value(runtime).unwrap(),
+        )
+        .unwrap();
+        let mut state = crate::artifacts::ResumeState::default();
+        state
+            .trials_by_hash
+            .insert(record.record_hash.clone(), record.clone());
+        validate_resume_before_resolution(&plan, &state, &options, &run_state).unwrap();
+
+        let mut incompatible_runtime = record.runtime.clone();
+        incompatible_runtime["image_id"] = Value::String("sha256:other".into());
+        let incompatible = TrialRecord::new(
+            record.identity.clone(),
+            record.metadata.clone(),
+            incompatible_runtime,
+        )
+        .unwrap();
+        state.trials_by_hash.clear();
+        state
+            .trials_by_hash
+            .insert(incompatible.record_hash.clone(), incompatible);
+        assert!(validate_resume_before_resolution(&plan, &state, &options, &run_state).is_err());
     }
 
     #[test]
@@ -2564,7 +3304,8 @@ mod tests {
 
     #[test]
     fn unpaid_contexts_differ_only_in_frozen_description() {
-        let (model, _) = resolve_model_metadata().unwrap();
+        let plan = model_plan("unpaid-context");
+        let (model, _, reasoning) = resolve_model_metadata(&plan).unwrap();
         let current_tools = expected_tools(DescriptionVariant::Current, model.family.as_deref());
         let compact_tools = expected_tools(DescriptionVariant::CompactV1, model.family.as_deref());
         let current = initial_context("2026-07-24", "prompt", &current_tools);
@@ -2575,12 +3316,13 @@ mod tests {
             serde_json::to_value(&current.messages).unwrap(),
             serde_json::to_value(&compact.messages).unwrap()
         );
-        unpaid_request_preflight(&model, "2026-07-24").unwrap();
+        unpaid_request_preflight(&model, reasoning, "2026-07-24").unwrap();
     }
 
     #[test]
     fn normalized_pair_request_hashes_ignore_only_cache_key_and_description() {
-        let (model, _) = resolve_model_metadata().unwrap();
+        let plan = model_plan("normalized-pair");
+        let (model, _, reasoning) = resolve_model_metadata(&plan).unwrap();
         let current = initial_context(
             "2026-07-24",
             "prompt",
@@ -2591,8 +3333,8 @@ mod tests {
             "prompt",
             &expected_tools(DescriptionVariant::CompactV1, model.family.as_deref()),
         );
-        let current = request_shape(&model, &current, "same", 100);
-        let compact = request_shape(&model, &compact, "same", 100);
+        let current = request_shape(&model, reasoning, &current, "same", 100);
+        let compact = request_shape(&model, reasoning, &compact, "same", 100);
         assert_eq!(
             normalized_request_hash(&current, "same").unwrap(),
             normalized_request_hash(&compact, "same").unwrap()
@@ -2607,7 +3349,8 @@ mod tests {
 
     #[test]
     fn normalized_serialized_payload_detects_stable_input_and_option_changes() {
-        let (model, _) = resolve_model_metadata().unwrap();
+        let plan = model_plan("serialized-payload");
+        let (model, _, _) = resolve_model_metadata(&plan).unwrap();
         let payload = |variant, cache: &str| {
             let context = initial_context(
                 "2026-07-24",
