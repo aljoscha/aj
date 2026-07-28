@@ -357,16 +357,21 @@ impl ToolDefinition for BashTool {
 
         let stdout_state = Arc::new(Mutex::new(StreamState::new()));
         let stderr_state = Arc::new(Mutex::new(StreamState::new()));
+        let capture_error = Arc::new(Mutex::new(None));
 
         let stdout_reader = tokio::spawn(read_stream(
             stdout,
             Arc::clone(&stdout_state),
             Arc::clone(&spill),
+            Arc::clone(&capture_error),
+            "stdout",
         ));
         let stderr_reader = tokio::spawn(read_stream(
             stderr,
             Arc::clone(&stderr_state),
             Arc::clone(&spill),
+            Arc::clone(&capture_error),
+            "stderr",
         ));
 
         if input.run_in_background {
@@ -414,6 +419,7 @@ impl ToolDefinition for BashTool {
                 stderr_reader,
                 stdout_state,
                 stderr_state,
+                capture_error,
                 spill_path: spill_path.clone(),
                 command: command.clone(),
                 task_id: id,
@@ -488,8 +494,9 @@ impl ToolDefinition for BashTool {
         // when the child terminates). Awaiting them ensures every
         // captured byte is in `stdout_state` / `stderr_state` before
         // we build the outcome.
-        let _ = stdout_reader.await;
-        let _ = stderr_reader.await;
+        await_reader(stdout_reader, &capture_error).await;
+        await_reader(stderr_reader, &capture_error).await;
+        let capture_error = capture_error.lock().unwrap().clone();
 
         // Finalize per-stream: apply truncate_tail to the rolling tail
         // (after dropping any leading partial line) and produce the
@@ -522,7 +529,7 @@ impl ToolDefinition for BashTool {
             ChildExit::Cancelled | ChildExit::TimedOut => None,
         };
 
-        let wire = build_wire_content(
+        let mut wire = build_wire_content(
             &stdout_str,
             &stderr_str,
             stdout_truncation.as_ref(),
@@ -532,12 +539,16 @@ impl ToolDefinition for BashTool {
             input.timeout,
             full_output_path.as_deref(),
         );
+        if let Some(error) = &capture_error {
+            wire.push_str(&format!("\nOutput capture failed: {error}"));
+        }
 
         // Cancellation and timeout are exceptional outcomes the model
         // should know to recover from; a non-zero exit code from a
         // command that ran to completion is a normal "the command
         // failed" signal that the wire content already conveys.
-        let is_error = matches!(outcome_kind, ChildExit::Cancelled | ChildExit::TimedOut);
+        let is_error = capture_error.is_some()
+            || matches!(outcome_kind, ChildExit::Cancelled | ChildExit::TimedOut);
 
         Ok(ToolOutcome {
             content: vec![UserContent::text(wire)],
@@ -698,7 +709,10 @@ impl SpillState {
         match self.file.as_mut() {
             Some(SpillFile::Temp(f)) => f.as_file_mut().write_all(bytes),
             Some(SpillFile::Kept { file, .. }) => file.write_all(bytes),
-            None => Ok(()),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "spill file is unavailable",
+            )),
         }
     }
 
@@ -731,6 +745,8 @@ async fn read_stream<R>(
     mut reader: R,
     state: Arc<Mutex<StreamState>>,
     spill: Arc<Mutex<SpillState>>,
+    capture_error: Arc<Mutex<Option<String>>>,
+    stream_name: &'static str,
 ) where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -745,17 +761,37 @@ async fn read_stream<R>(
                 // tail is what gets surfaced to the model and the UI.
                 {
                     let mut spill = spill.lock().unwrap();
-                    let _ = spill.write_all(chunk);
+                    if let Err(error) = spill.write_all(chunk) {
+                        record_capture_error(
+                            &capture_error,
+                            format!("{stream_name} spill write: {error}"),
+                        );
+                        return;
+                    }
                 }
                 {
                     let mut s = state.lock().unwrap();
                     s.append_chunk(chunk);
                 }
             }
-            // A read error before EOF (rare) — treat it the same as
-            // EOF and let the rest of the pipeline finish.
-            Err(_) => return,
+            Err(error) => {
+                record_capture_error(&capture_error, format!("{stream_name} pipe read: {error}"));
+                return;
+            }
         }
+    }
+}
+
+fn record_capture_error(error_slot: &Mutex<Option<String>>, error: String) {
+    let mut slot = error_slot.lock().unwrap();
+    if slot.is_none() {
+        *slot = Some(error);
+    }
+}
+
+async fn await_reader(reader: tokio::task::JoinHandle<()>, capture_error: &Mutex<Option<String>>) {
+    if let Err(error) = reader.await {
+        record_capture_error(capture_error, format!("capture reader task: {error}"));
     }
 }
 
@@ -816,6 +852,7 @@ struct BackgroundBash {
     stderr_reader: tokio::task::JoinHandle<()>,
     stdout_state: Arc<Mutex<StreamState>>,
     stderr_state: Arc<Mutex<StreamState>>,
+    capture_error: Arc<Mutex<Option<String>>>,
     spill_path: PathBuf,
     command: String,
     task_id: TaskId,
@@ -835,6 +872,7 @@ async fn drive_background_bash(task: BackgroundBash) {
         stderr_reader,
         stdout_state,
         stderr_state,
+        capture_error,
         spill_path,
         command,
         task_id,
@@ -852,7 +890,7 @@ async fn drive_background_bash(task: BackgroundBash) {
     // `None` forces the leading-edge emit so the TUI cell shows the
     // running command immediately.
     let mut last_totals: Option<(u64, u64)> = None;
-    let status = loop {
+    let process_status = loop {
         let now = Instant::now();
         if now.duration_since(last_update) >= UPDATE_DEBOUNCE {
             let totals = (
@@ -902,8 +940,10 @@ async fn drive_background_bash(task: BackgroundBash) {
     // Readers exit when their pipe closes; awaiting them guarantees
     // the final tails and the spill file are complete before the
     // notice renders.
-    let _ = stdout_reader.await;
-    let _ = stderr_reader.await;
+    await_reader(stdout_reader, &capture_error).await;
+    await_reader(stderr_reader, &capture_error).await;
+    let capture_error = capture_error.lock().unwrap().clone();
+    let status = background_terminal_status(process_status, capture_error.is_some());
 
     let (stdout_str, stdout_truncation) = {
         let s = stdout_state.lock().unwrap();
@@ -928,6 +968,9 @@ async fn drive_background_bash(task: BackgroundBash) {
     if !tail.is_empty() {
         body.push('\n');
         body.push_str(&tail);
+    }
+    if let Some(error) = capture_error {
+        body.push_str(&format!("\nOutput capture failed: {error}"));
     }
     if !body.ends_with('\n') {
         body.push('\n');
@@ -954,7 +997,20 @@ pub(crate) fn task_status_text(status: TaskStatus) -> String {
         TaskStatus::Running => "still running".to_string(),
         TaskStatus::Exited(Some(code)) => format!("exit code {code}"),
         TaskStatus::Exited(None) => "terminated by signal".to_string(),
+        TaskStatus::CaptureFailed(Some(code)) => {
+            format!("output capture failed after exit code {code}")
+        }
+        TaskStatus::CaptureFailed(None) => {
+            "output capture failed after termination by signal".to_string()
+        }
         TaskStatus::Killed => "killed".to_string(),
+    }
+}
+
+fn background_terminal_status(status: TaskStatus, capture_failed: bool) -> TaskStatus {
+    match (status, capture_failed) {
+        (TaskStatus::Exited(code), true) => TaskStatus::CaptureFailed(code),
+        (status, _) => status,
     }
 }
 
@@ -1285,8 +1341,80 @@ mod tests {
     use crate::testing::DummyToolContext;
     use aj_models::types::UserContent;
     use std::path::Path;
+    use std::pin::Pin;
     use std::sync::Mutex as StdMutex;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, ReadBuf};
     use tokio_util::sync::CancellationToken;
+
+    struct FailingReader;
+
+    impl AsyncRead for FailingReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "injected read failure",
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn read_stream_surfaces_pipe_read_failure() {
+        let state = Arc::new(Mutex::new(StreamState::new()));
+        let spill = Arc::new(Mutex::new(SpillState::new().expect("spill")));
+        let error = Arc::new(Mutex::new(None));
+
+        read_stream(FailingReader, state, spill, Arc::clone(&error), "stdout").await;
+
+        assert_eq!(
+            error.lock().unwrap().as_deref(),
+            Some("stdout pipe read: injected read failure")
+        );
+    }
+
+    #[tokio::test]
+    async fn read_stream_surfaces_spill_write_failure() {
+        let state = Arc::new(Mutex::new(StreamState::new()));
+        let mut unavailable_spill = SpillState::new().expect("spill");
+        unavailable_spill.file = None;
+        let spill = Arc::new(Mutex::new(unavailable_spill));
+        let error = Arc::new(Mutex::new(None));
+
+        read_stream(
+            &b"captured bytes"[..],
+            Arc::clone(&state),
+            spill,
+            Arc::clone(&error),
+            "stderr",
+        )
+        .await;
+
+        assert_eq!(
+            error.lock().unwrap().as_deref(),
+            Some("stderr spill write: spill file is unavailable")
+        );
+        assert_eq!(state.lock().unwrap().total_bytes_seen, 0);
+    }
+
+    #[test]
+    fn background_capture_failure_does_not_report_process_success() {
+        assert_eq!(
+            background_terminal_status(TaskStatus::Exited(Some(0)), true),
+            TaskStatus::CaptureFailed(Some(0))
+        );
+        assert_eq!(
+            background_terminal_status(TaskStatus::Exited(Some(7)), true),
+            TaskStatus::CaptureFailed(Some(7))
+        );
+        assert_eq!(
+            background_terminal_status(TaskStatus::Killed, true),
+            TaskStatus::Killed
+        );
+    }
 
     #[tokio::test]
     async fn rtk_hook_check_rewrites_known_commands() {

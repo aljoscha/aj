@@ -89,9 +89,35 @@ fn task_outcome(kind: TaskNotificationKind, status: TaskStatus) -> TaskOutcome {
         (TaskNotificationKind::Bash, TaskStatus::Exited(Some(code))) => {
             TaskOutcome::Failed { code: Some(code) }
         }
+        (TaskNotificationKind::Bash, TaskStatus::CaptureFailed(code)) => TaskOutcome::Failed {
+            code: code.filter(|code| *code != 0),
+        },
         (TaskNotificationKind::Bash, TaskStatus::Exited(None) | TaskStatus::Running) => {
             TaskOutcome::Failed { code: None }
         }
+    }
+}
+
+#[cfg(test)]
+mod task_outcome_tests {
+    use super::*;
+
+    #[test]
+    fn capture_failure_never_maps_to_success() {
+        assert_eq!(
+            task_outcome(
+                TaskNotificationKind::Bash,
+                TaskStatus::CaptureFailed(Some(0)),
+            ),
+            TaskOutcome::Failed { code: None }
+        );
+        assert_eq!(
+            task_outcome(
+                TaskNotificationKind::Bash,
+                TaskStatus::CaptureFailed(Some(7)),
+            ),
+            TaskOutcome::Failed { code: Some(7) }
+        );
     }
 }
 

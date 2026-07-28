@@ -968,6 +968,10 @@ fn task_status_fingerprint(status: Option<TaskStatus>, hasher: &mut DefaultHashe
             3u8.hash(hasher);
             code.hash(hasher);
         }
+        Some(TaskStatus::CaptureFailed(code)) => {
+            4u8.hash(hasher);
+            code.hash(hasher);
+        }
     }
 }
 
@@ -2313,6 +2317,12 @@ impl TranscriptView {
     /// applies the exact remainder, and also stops early the moment the
     /// viewport reaches the edge it heads for.
     fn advance_scroll_anim(&mut self, ctx: &mut EventContext) {
+        self.advance_scroll_anim_at(ctx, Instant::now());
+    }
+
+    /// Clock-controlled implementation used by deterministic animation tests.
+    /// Production ticks pass [`Instant::now`] through the wrapper above.
+    fn advance_scroll_anim_at(&mut self, ctx: &mut EventContext, now: Instant) {
         // This delivery consumes the pending tick; a continuing glide re-arms
         // below via `schedule_scroll_tick`.
         self.scroll_tick_scheduled = false;
@@ -2325,7 +2335,8 @@ impl TranscriptView {
         {
             return;
         }
-        let t = (anim.start.elapsed().as_secs_f64() / anim.duration.as_secs_f64()).clamp(0.0, 1.0);
+        let elapsed = now.saturating_duration_since(anim.start);
+        let t = (elapsed.as_secs_f64() / anim.duration.as_secs_f64()).clamp(0.0, 1.0);
         if t >= 1.0 {
             match anim.completion {
                 ScrollCompletion::Focus(anchor) => self.snap_focus(anchor),
@@ -5200,20 +5211,23 @@ mod tests {
         );
     }
 
-    /// Deliver ticks (with a real sleep, since the glide is wall-clock timed)
-    /// and redraw until the focus-scroll animation finishes. Bounded so a stuck
-    /// animation fails the test rather than hanging.
+    /// Advance through deterministic animation frames and redraw. Intermediate
+    /// draws measure newly visible items before the final focus snap.
     fn settle_scroll_anim(view: &Rc<RefCell<TranscriptView>>, ctx: &DrawContext) {
-        for _ in 0..200 {
-            if view.borrow().scroll_anim.is_none() {
-                return;
-            }
+        let Some((start, duration)) = ({
+            let view = view.borrow();
+            view.scroll_anim
+                .as_ref()
+                .map(|anim| (anim.start, anim.duration))
+        }) else {
+            return;
+        };
+        for frame in 1..=10 {
+            let now = start + duration.mul_f64(f64::from(frame) / 10.0);
             view.borrow_mut()
-                .handle_event(&mut EventContext::new(), &Event::Tick);
+                .advance_scroll_anim_at(&mut EventContext::new(), now);
             let _ = view.borrow_mut().draw(ctx);
-            std::thread::sleep(Duration::from_millis(3));
         }
-        panic!("scroll animation did not finish");
     }
 
     /// Editor-mode page scrolling glides the viewport instead of snapping, and
@@ -5303,10 +5317,14 @@ mod tests {
         let before = top_line(&view);
         view.borrow_mut().page_up(&mut EventContext::new());
 
-        // One frame: the viewport has moved up, but not all the way.
-        std::thread::sleep(Duration::from_millis(3));
+        // Halfway through: the viewport has moved up, but not all the way.
+        let halfway = {
+            let view = view.borrow();
+            let anim = view.scroll_anim.as_ref().expect("animation in flight");
+            anim.start + anim.duration / 2
+        };
         view.borrow_mut()
-            .handle_event(&mut EventContext::new(), &Event::Tick);
+            .advance_scroll_anim_at(&mut EventContext::new(), halfway);
         let _ = view.borrow_mut().draw(&ctx);
         let mid = top_line(&view);
 

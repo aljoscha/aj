@@ -267,7 +267,7 @@ fn report_outcome(registry: &TaskRegistry, caller: AgentId, id: TaskId) -> ToolO
     }
 
     let exit_code = match status {
-        TaskStatus::Exited(code) => code,
+        TaskStatus::Exited(code) | TaskStatus::CaptureFailed(code) => code,
         TaskStatus::Running | TaskStatus::Killed => None,
     };
     ToolOutcome {

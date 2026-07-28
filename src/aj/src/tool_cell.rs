@@ -116,7 +116,9 @@ fn derive_status(entry: &ToolEntry, tasks: &BTreeMap<TaskId, TaskInfo>) -> Visua
     };
     match tasks.get(&id).map(|info| info.status) {
         Some(TaskStatus::Exited(Some(0))) => VisualStatus::Succeeded,
-        Some(TaskStatus::Exited(_)) | Some(TaskStatus::Killed) => VisualStatus::Failed,
+        Some(TaskStatus::Exited(_))
+        | Some(TaskStatus::CaptureFailed(_))
+        | Some(TaskStatus::Killed) => VisualStatus::Failed,
         Some(TaskStatus::Running) | None => base,
     }
 }
@@ -167,6 +169,12 @@ fn task_badge(entry: &ToolEntry, tasks: &BTreeMap<TaskId, TaskInfo>) -> Option<S
         None | Some(TaskStatus::Running) => format!("[task #{id}]"),
         Some(TaskStatus::Exited(Some(code))) => format!("[task #{id} · exited {code}]"),
         Some(TaskStatus::Exited(None)) => format!("[task #{id} · terminated by signal]"),
+        Some(TaskStatus::CaptureFailed(Some(code))) => {
+            format!("[task #{id} · capture failed, exited {code}]")
+        }
+        Some(TaskStatus::CaptureFailed(None)) => {
+            format!("[task #{id} · capture failed, signalled]")
+        }
         Some(TaskStatus::Killed) => format!("[task #{id} · killed]"),
     })
 }
