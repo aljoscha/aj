@@ -16,8 +16,9 @@
 //!
 //! [`execution_mode`]: ToolDefinition::execution_mode
 
+use std::fs::OpenOptions;
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::{fs, io};
 
 use aj_agent::tool::{
     DiffDetails, ExecutionMode, ToolContext, ToolDefinition, ToolDetails, ToolOutcome,
@@ -80,12 +81,30 @@ impl ToolDefinition for WriteFileTool {
             ));
         }
 
-        // Read the previous content before writing so the display diff can be
-        // constructed before the filesystem mutation.
-        let original_content = match fs::read_to_string(path) {
-            Ok(content) => Some(content),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(_) => None,
+        // Keep an existing target open from validation through mutation. This
+        // prevents a path replacement between reading and truncating from
+        // causing us to overwrite content we never validated as UTF-8.
+        let mut existing_file = match OpenOptions::new().read(true).write(true).open(path) {
+            Ok(file) => Some(file),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Ok(error_outcome(
+                    &input.path,
+                    format!("Failed to open existing file '{}': {}", input.path, e),
+                ));
+            }
+        };
+        let original_content = if let Some(file) = existing_file.as_mut() {
+            let mut content = String::new();
+            if let Err(e) = file.read_to_string(&mut content) {
+                return Ok(error_outcome(
+                    &input.path,
+                    format!("Failed to read existing file '{}': {}", input.path, e),
+                ));
+            }
+            Some(content)
+        } else {
+            None
         };
         let file_existed = original_content.is_some();
 
@@ -100,7 +119,18 @@ impl ToolDefinition for WriteFileTool {
             &input.content,
         ));
 
-        if let Err(e) = fs::write(path, &input.content) {
+        let write_result = if let Some(mut file) = existing_file {
+            file.set_len(0)
+                .and_then(|()| file.seek(std::io::SeekFrom::Start(0)).map(|_| ()))
+                .and_then(|()| file.write_all(input.content.as_bytes()))
+        } else {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .and_then(|mut file| file.write_all(input.content.as_bytes()))
+        };
+        if let Err(e) = write_result {
             return Ok(error_outcome(
                 &input.path,
                 format!("Failed to write file '{}': {}", input.path, e),
@@ -146,6 +176,7 @@ mod tests {
     use super::*;
     use crate::testing::DummyToolContext;
     use aj_models::types::UserContent;
+    use std::fs;
     use std::io::Write;
     use tempfile::{NamedTempFile, TempDir};
 
@@ -253,6 +284,33 @@ mod tests {
 
         let on_disk = fs::read_to_string(&path).expect("read back");
         assert_eq!(on_disk, "new content\n");
+    }
+
+    /// An existing file that cannot be decoded as UTF-8 must not be
+    /// mistaken for a missing file and overwritten.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_utf8_existing_file_is_unchanged_and_returns_error() {
+        let dir = TempDir::new().expect("temp dir");
+        let target = dir.path().join("binary.dat");
+        let original = [0xff, 0xfe, 0x00, 0x61];
+        fs::write(&target, original).expect("write fixture");
+
+        let mut ctx = DummyToolContext::default();
+        let outcome = WriteFileTool
+            .execute(
+                &mut ctx,
+                WriteFileInput {
+                    path: target.display().to_string(),
+                    content: "replacement".to_string(),
+                },
+            )
+            .await
+            .expect("execute");
+
+        assert!(outcome.is_error);
+        assert!(extract_text(&outcome.content).contains("Failed to read existing file"));
+        assert_eq!(fs::read(target).expect("read back"), original);
     }
 
     /// Non-absolute paths surface as a recoverable error outcome

@@ -340,7 +340,7 @@ fn status_glyph(status: TaskStatus) -> &'static str {
     match status {
         TaskStatus::Running => "\u{2026}",
         TaskStatus::Exited(Some(0)) => "\u{2713}",
-        TaskStatus::Exited(_) | TaskStatus::Killed => "\u{2717}",
+        TaskStatus::Exited(_) | TaskStatus::CaptureFailed(_) | TaskStatus::Killed => "\u{2717}",
     }
 }
 
@@ -350,6 +350,8 @@ fn status_word(status: TaskStatus) -> String {
         TaskStatus::Running => "running".to_string(),
         TaskStatus::Exited(Some(code)) => format!("exited {code}"),
         TaskStatus::Exited(None) => "signalled".to_string(),
+        TaskStatus::CaptureFailed(Some(code)) => format!("capture failed, exited {code}"),
+        TaskStatus::CaptureFailed(None) => "capture failed, signalled".to_string(),
         TaskStatus::Killed => "killed".to_string(),
     }
 }

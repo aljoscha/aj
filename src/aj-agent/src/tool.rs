@@ -861,6 +861,9 @@ pub enum TaskStatus {
     /// Process exited (code is `None` when signal-killed), or the
     /// agent-backed run completed/failed.
     Exited(Option<i32>),
+    /// The process exited, but its complete stdout/stderr could not be
+    /// captured. The code retains the process's independent exit status.
+    CaptureFailed(Option<i32>),
     /// Killed via `task_stop`, the TUI, or shutdown.
     Killed,
 }
