@@ -1,9 +1,8 @@
 # Audit remediation — working backlog
 
-Companion to `docs/audit/audit-plan.md` (the audit) and
-`docs/audit/findings/` (the 23 reports + `_SUMMARY.md`). This file turns
-those findings into a **priority-ordered, human-in-the-loop backlog** for
-fixing.
+This file turns the 23 reports and `_SUMMARY.md` under
+`docs/audit/findings/` into a **priority-ordered, human-in-the-loop
+backlog** for fixing.
 
 The driving loop, in any session, is:
 
