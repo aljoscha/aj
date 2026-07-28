@@ -5591,6 +5591,7 @@ mod tests {
     async fn aborts_active_at_autocomplete_when_typing_continues() {
         struct SlowProvider {
             calls: Arc<AtomicUsize>,
+            first_entered: Arc<Notify>,
             release: Arc<Notify>,
             first_call_saw_cancel: Arc<AtomicBool>,
         }
@@ -5606,6 +5607,7 @@ mod tests {
                 let call_n = self.calls.fetch_add(1, Ordering::SeqCst);
                 if call_n == 0 {
                     // First call: wait to be released, or to be cancelled.
+                    self.first_entered.notify_one();
                     tokio::select! {
                         _ = opts.cancel.cancelled() => {
                             self.first_call_saw_cancel.store(true, Ordering::SeqCst);
@@ -5638,18 +5640,20 @@ mod tests {
 
         let mut ed = editor();
         let calls = Arc::new(AtomicUsize::new(0));
+        let first_entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let first_call_saw_cancel = Arc::new(AtomicBool::new(false));
         ed.set_autocomplete_provider(Arc::new(SlowProvider {
             calls: Arc::clone(&calls),
+            first_entered: Arc::clone(&first_entered),
             release: Arc::clone(&release),
             first_call_saw_cancel: Arc::clone(&first_call_saw_cancel),
         }));
 
         // First request. Tab fires immediately (no @ debounce).
         send(&mut ed, &tab());
-        // Give the worker time to reach the `select!` inside get_suggestions.
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Prove the worker reached the provider before superseding it.
+        first_entered.notified().await;
 
         // Second Tab: cancels the first request before releasing it.
         send(&mut ed, &tab());

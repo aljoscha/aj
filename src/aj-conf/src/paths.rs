@@ -66,7 +66,11 @@ pub(crate) fn project_dirs_upward(
 /// Render `path` for display. If it lives under `$HOME`, abbreviate the home
 /// prefix to `~`.
 pub fn display_path(path: &Path) -> String {
-    if let Some(home) = home_dir() {
+    display_path_with_home(path, home_dir().as_deref())
+}
+
+fn display_path_with_home(path: &Path, home: Option<&Path>) -> String {
+    if let Some(home) = home {
         if let Ok(rel) = path.strip_prefix(&home) {
             return format!("~/{}", rel.display());
         }
@@ -203,28 +207,19 @@ mod tests {
 
     #[test]
     fn test_display_path_tildifies_home() {
-        // Pin HOME to a known value so the test is deterministic regardless
-        // of the user running it.
-        // SAFETY: tests are single-threaded per-binary by default, but env
-        // mutation is still process-wide. We restore the prior value below.
-        let prior_home = env::var("HOME").ok();
-        unsafe {
-            env::set_var("HOME", "/home/test-user");
-        }
-
+        let home = Path::new("/home/test-user");
         let inside = PathBuf::from("/home/test-user/.agents/AGENTS.md");
-        assert_eq!(display_path(&inside), "~/.agents/AGENTS.md");
+        assert_eq!(
+            display_path_with_home(&inside, Some(home)),
+            "~/.agents/AGENTS.md"
+        );
 
         let outside = PathBuf::from("/etc/hosts");
-        assert_eq!(display_path(&outside), "/etc/hosts");
-
-        // Restore.
-        unsafe {
-            match prior_home {
-                Some(value) => env::set_var("HOME", value),
-                None => env::remove_var("HOME"),
-            }
-        }
+        assert_eq!(display_path_with_home(&outside, Some(home)), "/etc/hosts");
+        assert_eq!(
+            display_path_with_home(&inside, None),
+            inside.display().to_string()
+        );
     }
 
     #[test]
