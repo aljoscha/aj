@@ -79,7 +79,7 @@ pub struct AutocompleteSuggestions {
     pub items: Vec<AutocompleteItem>,
     /// The substring of input the widget considers "already typed".
     /// [`AutocompleteProvider::apply_completion`] replaces exactly
-    /// `prefix.len()` characters ending at the cursor.
+    /// `prefix.len()` bytes ending at the cursor.
     pub prefix: String,
 }
 
@@ -135,8 +135,8 @@ pub trait AutocompleteProvider: Send + Sync {
         opts: SuggestOpts,
     ) -> Option<AutocompleteSuggestions>;
 
-    /// Splices the selected item's `value` into `lines` at the cursor,
-    /// replacing exactly `prefix` characters before the cursor.
+    /// Splices the selected item's `value` into `lines` at the UTF-8 byte
+    /// offset `cursor_col`, replacing exactly `prefix.len()` bytes before it.
     ///
     /// Synchronous by design: a pure in-memory string operation that runs on
     /// the UI thread between keystrokes.

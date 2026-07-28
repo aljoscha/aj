@@ -101,6 +101,12 @@ fn finds_unclosed_quote_when_trailing() {
     assert_eq!(find_unclosed_quote_start("\"closed\""), None);
 }
 
+#[test]
+fn byte_slice_clamps_out_of_range_and_non_boundary_offsets() {
+    assert_eq!(safe_slice("éclair", 0, 1), "");
+    assert_eq!(safe_slice("éclair", 0, usize::MAX), "éclair");
+}
+
 // ---------------------------------------------------------------------------
 // Provider: prefix extraction, @-fuzzy search, and direct path completion
 // ---------------------------------------------------------------------------
@@ -143,7 +149,7 @@ mod provider {
         line: &str,
         force: bool,
     ) -> Option<AutocompleteSuggestions> {
-        suggest_at(provider, line, line.chars().count(), force)
+        suggest_at(provider, line, line.len(), force)
     }
 
     fn suggest_at(
@@ -193,6 +199,62 @@ mod provider {
         let path = provider_root.path().join(sub);
         fs::create_dir_all(&path).expect("mkdir");
         path
+    }
+
+    #[test]
+    fn non_ascii_before_at_prefix_uses_byte_cursor_for_suggestion_and_completion() {
+        let tmp = TempDir::new().unwrap();
+        setup_folder(
+            tmp.path(),
+            FolderShape {
+                dirs: &[],
+                files: &[("main.rs", "fn main() {}")],
+            },
+        );
+        let provider = CombinedAutocompleteProvider::new(tmp.path());
+        let line = "café @ma tail";
+        let cursor = "café @ma".len();
+
+        let result = suggest_at(&provider, line, cursor, false).expect("suggestions");
+        assert_eq!(result.prefix, "@ma");
+        let target = result
+            .items
+            .iter()
+            .find(|item| item.value == "@main.rs")
+            .expect("main.rs suggestion");
+        let applied =
+            provider.apply_completion(&[line.to_string()], 0, cursor, target, &result.prefix);
+
+        assert_eq!(applied.lines, ["café @main.rs  tail"]);
+        assert_eq!(applied.cursor_col, "café @main.rs ".len());
+    }
+
+    #[test]
+    fn non_ascii_before_direct_path_uses_byte_cursor_for_suggestion_and_completion() {
+        let tmp = TempDir::new().unwrap();
+        setup_folder(
+            tmp.path(),
+            FolderShape {
+                dirs: &[],
+                files: &[("main.rs", "fn main() {}")],
+            },
+        );
+        let provider = CombinedAutocompleteProvider::new(tmp.path());
+        let line = "café ./ma tail";
+        let cursor = "café ./ma".len();
+
+        let result = suggest_at(&provider, line, cursor, false).expect("suggestions");
+        assert_eq!(result.prefix, "./ma");
+        let target = result
+            .items
+            .iter()
+            .find(|item| item.value == "./main.rs")
+            .expect("main.rs suggestion");
+        let applied =
+            provider.apply_completion(&[line.to_string()], 0, cursor, target, &result.prefix);
+
+        assert_eq!(applied.lines, ["café ./main.rs tail"]);
+        assert_eq!(applied.cursor_col, "café ./main.rs".len());
     }
 
     // -- should_trigger_file_completion --
@@ -586,7 +648,7 @@ mod provider {
 
         let provider = CombinedAutocompleteProvider::new(&base);
         let line = "@\"my folder/\"";
-        let cursor = line.chars().count() - 1; // inside the closing quote
+        let cursor = line.len() - 1; // inside the closing quote
         let result = suggest_at(&provider, line, cursor, false).expect("suggestions");
         let vs = values(&result);
         assert!(vs.iter().any(|v| v == "@\"my folder/test.txt\""));
@@ -607,7 +669,7 @@ mod provider {
 
         let provider = CombinedAutocompleteProvider::new(&base);
         let line = "@\"my folder/te\"";
-        let cursor = line.chars().count() - 1;
+        let cursor = line.len() - 1;
         let result = suggest_at(&provider, line, cursor, false).expect("suggestions");
         let target = result
             .items
@@ -862,7 +924,7 @@ mod provider {
 
         let provider = CombinedAutocompleteProvider::new(tmp.path());
         let line = "\"my folder/\"";
-        let cursor = line.chars().count() - 1;
+        let cursor = line.len() - 1;
         let result = suggest_at(&provider, line, cursor, true).expect("suggestions");
         let vs = values(&result);
         assert!(vs.iter().any(|v| v == "\"my folder/test.txt\""));
@@ -882,7 +944,7 @@ mod provider {
 
         let provider = CombinedAutocompleteProvider::new(tmp.path());
         let line = "\"my folder/te\"";
-        let cursor = line.chars().count() - 1;
+        let cursor = line.len() - 1;
         let result = suggest_at(&provider, line, cursor, true).expect("suggestions");
         let target = result
             .items
@@ -957,6 +1019,27 @@ mod session {
     }
 
     // -- Session creation vs. other contexts --
+
+    #[tokio::test]
+    async fn session_extracts_at_prefix_after_non_ascii_text_with_byte_cursor() {
+        let tmp = TempDir::new().unwrap();
+        setup(
+            tmp.path(),
+            FolderShape {
+                dirs: &[],
+                files: &["readme.md"],
+            },
+        );
+        let provider = CombinedAutocompleteProvider::new(tmp.path());
+        let line = "café @re";
+        let lines = vec![line.to_string()];
+
+        let session = provider
+            .try_start_session(&lines, 0, line.len(), noop_notify())
+            .expect("streaming session");
+
+        assert_eq!(session.prefix(), "@re");
+    }
 
     #[tokio::test]
     async fn try_start_session_returns_some_on_at_context() {
