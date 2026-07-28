@@ -542,9 +542,10 @@ impl AutocompleteProvider for CombinedAutocompleteProvider {
         prefix: &str,
     ) -> CompletionApplied {
         let current = lines.get(cursor_line).map(String::as_str).unwrap_or("");
-        let split = cursor_col.saturating_sub(prefix.chars().count());
+        let cursor_col = valid_byte_offset(current, cursor_col);
+        let split = cursor_col.saturating_sub(prefix.len());
         let before_prefix = safe_slice(current, 0, split);
-        let after_cursor_raw = safe_slice(current, cursor_col, current.chars().count());
+        let after_cursor_raw = safe_slice(current, cursor_col, current.len());
 
         let is_quoted_prefix = prefix.starts_with('"') || prefix.starts_with("@\"");
         let has_leading_quote_after = after_cursor_raw.starts_with('"');
@@ -562,16 +563,16 @@ impl AutocompleteProvider for CombinedAutocompleteProvider {
             let new_line = format!("{before_prefix}{}{suffix}{after_cursor}", item.value);
             let has_trailing_quote = item.value.ends_with('"');
             let cursor_offset = if is_directory && has_trailing_quote {
-                item.value.chars().count() - 1
+                item.value.len() - 1
             } else {
-                item.value.chars().count()
+                item.value.len()
             };
             let mut new_lines = lines.to_vec();
             new_lines[cursor_line] = new_line;
             return CompletionApplied {
                 lines: new_lines,
                 cursor_line,
-                cursor_col: before_prefix.chars().count() + cursor_offset + suffix.chars().count(),
+                cursor_col: before_prefix.len() + cursor_offset + suffix.len(),
             };
         }
 
@@ -580,16 +581,16 @@ impl AutocompleteProvider for CombinedAutocompleteProvider {
         let is_directory = item.label.ends_with('/');
         let has_trailing_quote = item.value.ends_with('"');
         let cursor_offset = if is_directory && has_trailing_quote {
-            item.value.chars().count() - 1
+            item.value.len() - 1
         } else {
-            item.value.chars().count()
+            item.value.len()
         };
         let mut new_lines = lines.to_vec();
         new_lines[cursor_line] = new_line;
         CompletionApplied {
             lines: new_lines,
             cursor_line,
-            cursor_col: before_prefix.chars().count() + cursor_offset,
+            cursor_col: before_prefix.len() + cursor_offset,
         }
     }
 }
@@ -611,26 +612,26 @@ struct ParsedPrefix {
     is_quoted_prefix: bool,
 }
 
-/// Byte-offset helpers that treat a `char`-indexed view of `s`.
+/// Clamp a byte offset to `s`'s length and then to the preceding UTF-8
+/// boundary. TextArea supplies boundary-aligned byte offsets; the fallback
+/// keeps malformed provider input from panicking.
+fn valid_byte_offset(s: &str, offset: usize) -> usize {
+    let mut offset = offset.min(s.len());
+    while !s.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
+}
+
+/// Slice using UTF-8 byte offsets, clamping malformed offsets as described by
+/// [`valid_byte_offset`]. An empty slice is returned for a reversed range.
 fn safe_slice(s: &str, start: usize, end: usize) -> &str {
-    let mut byte_start = s.len();
-    let mut byte_end = s.len();
-    for (idx, (byte_idx, _)) in s.char_indices().enumerate() {
-        if idx == start {
-            byte_start = byte_idx;
-        }
-        if idx == end {
-            byte_end = byte_idx;
-            break;
-        }
-    }
-    if start == 0 {
-        byte_start = 0;
-    }
+    let start = valid_byte_offset(s, start);
+    let end = valid_byte_offset(s, end);
     if end <= start {
         return "";
     }
-    &s[byte_start..byte_end]
+    &s[start..end]
 }
 
 fn to_display_path(value: &str) -> String {
@@ -1022,7 +1023,7 @@ pub struct FuzzyFileSession {
     /// The full `@`-prefixed token the session will replace when
     /// a suggestion is applied. Tracked across
     /// [`Self::update`] calls so [`apply_completion`] knows how
-    /// many chars to consume.
+    /// many bytes to consume.
     at_prefix: String,
     /// Whether the prefix started with `@"` (drives value quoting
     /// in [`Self::snapshot`]).
