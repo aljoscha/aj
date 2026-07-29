@@ -12,7 +12,7 @@ use crate::fixtures::{CommandResult, VerificationReport};
 use crate::snapshot::{FilesystemSnapshot, SnapshotDelta};
 
 /// Maximum fresh isolated attempts allowed for one scheduled pair.
-pub const MAX_PAIR_ATTEMPTS: usize = 8;
+pub const MAX_PAIR_ATTEMPTS: usize = 32;
 
 /// Ordered terminal taxonomy for one trial.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -901,7 +901,7 @@ mod tests {
         )
         .err()
         .unwrap();
-        assert!(error.to_string().contains("8-attempt limit"));
+        assert!(error.to_string().contains("32-attempt limit"));
     }
 
     #[test]

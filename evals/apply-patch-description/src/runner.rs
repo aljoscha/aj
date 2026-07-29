@@ -3324,11 +3324,17 @@ mod tests {
         );
         assert_eq!(pair_attempt_delay(0, 0), None);
         assert_eq!(pair_attempt_delay(3, 0), Some(Duration::from_secs(4)));
+        let delays = (1..MAX_PAIR_ATTEMPTS)
+            .map(|prior_attempts| pair_attempt_delay(prior_attempts, 0).unwrap())
+            .collect::<Vec<_>>();
         assert_eq!(
-            (1..MAX_PAIR_ATTEMPTS)
-                .map(|prior_attempts| pair_attempt_delay(prior_attempts, 0).unwrap())
-                .collect::<Vec<_>>(),
-            [1, 2, 4, 8, 16, 16, 16].map(Duration::from_secs)
+            &delays[..5],
+            [1, 2, 4, 8, 16].map(Duration::from_secs).as_slice()
+        );
+        assert!(
+            delays[5..]
+                .iter()
+                .all(|delay| *delay == Duration::from_secs(16))
         );
 
         let cancel = CancellationToken::new();

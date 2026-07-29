@@ -212,7 +212,7 @@ not task failures. `runner_internal` stops the run for investigation.
 `infrastructure_failed` and `cancelled` preserve the attempt and rerun the entire
 pair with the same seeds. Transparent provider retries are disabled in the
 worker, so usage, latency, mutations, and cancellation from a failed request
-cannot enter a valid replacement. A pair has at most eight fresh isolated
+cannot enter a valid replacement. A pair has at most 32 fresh isolated
 attempts with bounded backoff. Statuses four through seven set `task_passed` to
 false. Status eight sets it to true. This makes the valid-trial intent-to-treat
 denominator ordered and exhaustive.
@@ -402,7 +402,7 @@ attempts remain in the stream but do not enter the commitment or reduction.
 The evaluation worker disables transparent provider retries. Any retryable
 provider or transport failure immediately invalidates the trial and its pair.
 The runner recreates the whole pair in fresh isolation with bounded backoff,
-subject to the cumulative trial budget and the eight-attempt pair cap. Every
+subject to the cumulative trial budget and the 32-attempt pair cap. Every
 attempt remains in artifacts, but only a clean complete attempt can receive a
 completion marker.
 

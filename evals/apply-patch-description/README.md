@@ -36,7 +36,7 @@ cargo run -p aj-apply-patch-eval -- run \
   --artifact-dir eval-artifacts \
   --image "$IMAGE" \
   --max-cost-usd 6000 \
-  --max-trials 256 \
+  --max-trials 1024 \
   --timeout-seconds 600 \
   --max-model-responses 12
 
@@ -47,7 +47,7 @@ cargo run -p aj-apply-patch-eval -- run \
   --artifact-dir eval-artifacts \
   --image "$IMAGE" \
   --max-cost-usd 18000 \
-  --max-trials 768 \
+  --max-trials 3072 \
   --timeout-seconds 600 \
   --max-model-responses 12
 
@@ -59,7 +59,7 @@ cargo run -p aj-apply-patch-eval -- plan-main \
 
 MAIN_TRIALS=$(python3 -c '
 import json
-print(16 * len(json.load(open("eval-artifacts/planning-report.json"))["selected_main_pair_ids"]))
+print(64 * len(json.load(open("eval-artifacts/planning-report.json"))["selected_main_pair_ids"]))
 ')
 MAIN_BUDGET=$(python3 -c '
 import json
@@ -232,6 +232,6 @@ Credential or model resolution failures create a durable zero-usage
 Retryable provider failures also invalidate the attempt immediately. The worker
 does not retry them in place because their usage, latency, and partial effects
 must not enter a valid observation. The entire pair is recreated in fresh
-isolation, with bounded backoff and at most eight attempts. Resume derives the
+isolation, with bounded backoff and at most 32 attempts. Resume derives the
 next backoff from the durable attempt count and recovers an unmarked clean
 complete attempt before starting replacement work.
