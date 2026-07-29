@@ -400,10 +400,7 @@ pub mod anthropic {
     fn spend_note(spend: &OAuthSpend) -> Option<String> {
         if spend.enabled == Some(false) {
             return Some(match spend.disabled_reason.as_deref() {
-                Some(reason) => format!(
-                    "Usage credits: off ({})",
-                    humanize_identifier(reason).to_lowercase()
-                ),
+                Some(reason) => format!("Usage credits: off ({})", disabled_reason_text(reason)),
                 None => "Usage credits: off".to_string(),
             });
         }
@@ -421,24 +418,48 @@ pub mod anthropic {
                 "Usage credits: {:.0}% used",
                 percent.clamp(0.0, 100.0)
             )),
-            (None, None, None) => spend.disabled_reason.as_deref().map(|reason| {
-                format!(
-                    "Usage credits: {}",
-                    humanize_identifier(reason).to_lowercase()
-                )
-            }),
+            (None, None, None) => spend
+                .disabled_reason
+                .as_deref()
+                .map(|reason| format!("Usage credits: {}", disabled_reason_text(reason))),
             (None, Some(limit), _) => Some(format!("Usage credits: limit {limit}")),
         }
     }
 
+    /// Render a provider `disabled_reason` code as readable text.
+    ///
+    /// The codes are internal identifiers, so several of them read as
+    /// broken English once de-snake-cased. We phrase the known ones and
+    /// humanize the rest, which keeps a code we've never seen readable
+    /// instead of hidden.
+    fn disabled_reason_text(reason: &str) -> String {
+        let text = match reason {
+            // Despite the name, this is the spend cap being hit for the
+            // current period, not an admin switching credits off. The
+            // "until" refers to a reset date the usage endpoint never
+            // sends (only the `anthropic-ratelimit-unified-overage-reset`
+            // response header carries it).
+            "org_level_disabled_until" | "org_spend_cap_reached" => "monthly spend limit reached",
+            "org_level_disabled" | "org_service_level_disabled" => {
+                "turned off by your organization"
+            }
+            "member_level_disabled" | "member_zero_credit_limit" => "disabled by your admin",
+            "seat_tier_level_disabled" | "seat_tier_zero_credit_limit" => {
+                "not included in your seat"
+            }
+            "group_zero_credit_limit" => "your group's limit is zero",
+            "overage_not_provisioned" | "no_limits_configured" => "not set up",
+            other => return humanize_identifier(other).to_lowercase(),
+        };
+        text.to_string()
+    }
+
     fn extra_usage_note(extra: &OAuthExtraUsage) -> Option<String> {
         if extra.is_enabled != Some(true) {
-            return extra.disabled_reason.as_deref().map(|reason| {
-                format!(
-                    "Usage credits: off ({})",
-                    humanize_identifier(reason).to_lowercase()
-                )
-            });
+            return extra
+                .disabled_reason
+                .as_deref()
+                .map(|reason| format!("Usage credits: off ({})", disabled_reason_text(reason)));
         }
         let decimals = extra.decimal_places.unwrap_or(2);
         let used = format_money_minor(
@@ -612,6 +633,41 @@ pub mod anthropic {
                 extra_usage_note(&disabled).unwrap(),
                 "Usage credits: off (out of credits)"
             );
+        }
+
+        #[test]
+        fn disabled_reason_phrases_known_codes_and_humanizes_the_rest() {
+            let spend: OAuthSpend = serde_json::from_str(
+                r#"{"enabled": false, "disabled_reason": "org_level_disabled_until"}"#,
+            )
+            .unwrap();
+            assert_eq!(
+                spend_note(&spend).unwrap(),
+                "Usage credits: off (monthly spend limit reached)"
+            );
+
+            let extra: OAuthExtraUsage = serde_json::from_str(
+                r#"{"is_enabled": false, "disabled_reason": "org_level_disabled_until"}"#,
+            )
+            .unwrap();
+            assert_eq!(
+                extra_usage_note(&extra).unwrap(),
+                "Usage credits: off (monthly spend limit reached)"
+            );
+
+            // The plain code is an admin switching credits off, the
+            // `_until` code is the spend cap for the period. Same prefix,
+            // different meaning.
+            assert_eq!(
+                disabled_reason_text("org_level_disabled"),
+                "turned off by your organization"
+            );
+            assert_eq!(
+                disabled_reason_text("seat_tier_zero_credit_limit"),
+                "not included in your seat"
+            );
+            assert_eq!(disabled_reason_text("out_of_credits"), "out of credits");
+            assert_eq!(disabled_reason_text("brand_new_code"), "brand new code");
         }
     }
 }
