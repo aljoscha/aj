@@ -16,7 +16,7 @@ dotenv = { workspace = true }
 futures = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 sha2 = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

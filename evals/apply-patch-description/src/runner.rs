@@ -16,7 +16,7 @@ use aj_models::registry::{ModelInfo, ModelRegistry, calculate_cost, validate_thi
 use aj_models::streaming::AssistantMessageEvent;
 use aj_models::types::{
     AssistantContent, Context, ErrorCategory, Message, OnPayload, SimpleStreamOptions,
-    StreamOptions, ThinkingLevel, ToolDefinition, ToolResultMessage, UserMessage,
+    StreamOptions, ThinkingLevel, ToolDefinition, ToolResultMessage, Usage, UserMessage,
 };
 use aj_tools::tools::apply_patch::ApplyPatchInput;
 use aj_tools::tools::bash::BashInput;
@@ -2711,8 +2711,7 @@ fn finish_runtime(
     catalog_pair_reserve: f64,
 ) -> Result<RuntimeRecord, RunnerError> {
     if let Some(worker) = &execution.worker
-        && serde_json::to_value(&worker.metrics.usage).ok()
-            != serde_json::to_value(&execution.parent_metrics.usage).ok()
+        && !usage_bits_equal(&worker.metrics.usage, &execution.parent_metrics.usage)
     {
         execution.internal_error = Some("worker and parent usage accounting disagree".into());
     }
@@ -2954,6 +2953,34 @@ fn finish_runtime(
     })
 }
 
+fn usage_bits_equal(left: &Usage, right: &Usage) -> bool {
+    let left_costs = [
+        left.cost.input,
+        left.cost.output,
+        left.cost.cache_read,
+        left.cost.cache_write,
+        left.cost.total,
+    ];
+    let right_costs = [
+        right.cost.input,
+        right.cost.output,
+        right.cost.cache_read,
+        right.cost.cache_write,
+        right.cost.total,
+    ];
+    left.input == right.input
+        && left.output == right.output
+        && left.cache_read == right.cache_read
+        && left.cache_write == right.cache_write
+        && left.total_tokens == right.total_tokens
+        && left_costs.iter().all(|value| value.is_finite())
+        && right_costs.iter().all(|value| value.is_finite())
+        && left_costs
+            .iter()
+            .zip(right_costs)
+            .all(|(left, right)| left.to_bits() == right.to_bits())
+}
+
 fn store_blob(
     blobs: &BlobStore,
     bytes: &[u8],
@@ -3156,6 +3183,21 @@ mod tests {
             &RunnerError("provider request did not terminate after cancellation".into()),
             &cancellation
         ));
+    }
+
+    #[test]
+    fn usage_reconciliation_compares_every_cost_bit() {
+        let mut left = Usage::default();
+        let mut right = Usage::default();
+        left.input = 1;
+        right.input = 1;
+        assert!(usage_bits_equal(&left, &right));
+
+        right.cost.cache_write = -0.0;
+        assert!(!usage_bits_equal(&left, &right));
+        right.cost.cache_write = 0.0;
+        right.cost.total = f64::NAN;
+        assert!(!usage_bits_equal(&left, &right));
     }
 
     #[test]

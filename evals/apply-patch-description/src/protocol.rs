@@ -254,9 +254,45 @@ where
 
 #[cfg(test)]
 mod tests {
+    use aj_models::types::{AssistantMessage, StopReason, Usage, UsageCost};
     use tokio::io::{AsyncWriteExt, duplex};
 
     use super::*;
+    use crate::runtime::{WorkerMetrics, WorkerTerminal};
+
+    fn fractional_usage() -> Usage {
+        Usage {
+            input: 297,
+            output: 39,
+            cache_read: 2560,
+            cache_write: 73,
+            total_tokens: 2969,
+            cost: UsageCost {
+                input: (5.0 / 1_000_000.0) * 297.0,
+                output: (30.0 / 1_000_000.0) * 39.0,
+                cache_read: (0.5 / 1_000_000.0) * 2560.0,
+                cache_write: (6.25 / 1_000_000.0) * 73.0,
+                total: 0.00439125,
+            },
+        }
+    }
+
+    fn assert_usage_bits_eq(actual: &Usage, expected: &Usage) {
+        assert_eq!(actual.input, expected.input);
+        assert_eq!(actual.output, expected.output);
+        assert_eq!(actual.cache_read, expected.cache_read);
+        assert_eq!(actual.cache_write, expected.cache_write);
+        assert_eq!(actual.total_tokens, expected.total_tokens);
+        for (actual, expected) in [
+            (actual.cost.input, expected.cost.input),
+            (actual.cost.output, expected.cost.output),
+            (actual.cost.cache_read, expected.cost.cache_read),
+            (actual.cost.cache_write, expected.cost.cache_write),
+            (actual.cost.total, expected.cost.total),
+        ] {
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+    }
 
     #[tokio::test]
     async fn frames_round_trip_without_cross_request_confusion() {
@@ -285,6 +321,61 @@ mod tests {
         let second: ParentResponse = read_frame(&mut right).await.unwrap().unwrap();
         assert_eq!((first.id(), second.id()), (9, 3));
         writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn parent_frames_preserve_usage_cost_bits() {
+        let usage = fractional_usage();
+        let response = ParentResponse::ProviderEvent {
+            id: 1,
+            event: AssistantMessageEvent::Start {
+                partial: AssistantMessage {
+                    content: Vec::new(),
+                    api: "openai-codex-responses".into(),
+                    provider: "openai-codex".into(),
+                    model: "gpt-5.6-sol".into(),
+                    response_id: None,
+                    usage: usage.clone(),
+                    stop_reason: StopReason::Stop,
+                    error: None,
+                    timestamp: 0,
+                },
+            },
+        };
+        let (mut left, mut right) = duplex(4096);
+        write_frame(&mut left, &response).await.unwrap();
+        let decoded: ParentResponse = read_frame(&mut right).await.unwrap().unwrap();
+        let ParentResponse::ProviderEvent {
+            event: AssistantMessageEvent::Start { partial },
+            ..
+        } = decoded
+        else {
+            panic!("unexpected protocol response");
+        };
+        assert_usage_bits_eq(&partial.usage, &usage);
+    }
+
+    #[tokio::test]
+    async fn worker_frames_preserve_usage_cost_bits() {
+        let usage = fractional_usage();
+        let request = WorkerRequest::Finished {
+            result: WorkerResult {
+                terminal: WorkerTerminal::Completed,
+                error: None,
+                metrics: WorkerMetrics {
+                    usage: usage.clone(),
+                    ..WorkerMetrics::default()
+                },
+                registry_quiescent: true,
+            },
+        };
+        let (mut left, mut right) = duplex(4096);
+        write_frame(&mut left, &request).await.unwrap();
+        let decoded: WorkerRequest = read_frame(&mut right).await.unwrap().unwrap();
+        let WorkerRequest::Finished { result } = decoded else {
+            panic!("unexpected protocol request");
+        };
+        assert_usage_bits_eq(&result.metrics.usage, &usage);
     }
 
     #[tokio::test]
