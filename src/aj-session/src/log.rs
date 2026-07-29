@@ -4,7 +4,7 @@
 //! directory. `ConversationLog` holds the in-memory image and writes
 //! every append to disk before mutating the in-memory maps, so a
 //! crashed process never leaves the two diverging beyond the last
-//! line (which [`ConversationLog::resume`] tolerates with a warning).
+//! line (which [`ConversationLog::resume`] repairs with a warning).
 //!
 //! `ConversationView` is a short-lived, crate-internal mutation handle
 //! that tracks a head pointer and routes appends to a specific thread
@@ -12,8 +12,8 @@
 //! one JSONL line per call; the write reaches the OS before the call
 //! returns, so the entry survives a crash of *this* process. It is
 //! deliberately not `fsync`'d, so a host crash or power loss can still
-//! lose the most recent line(s). [`ConversationLog::resume`] tolerates
-//! a torn final line with a warning.
+//! lose the most recent line(s). [`ConversationLog::resume`] drops a
+//! torn final line with a warning before reopening the log for append.
 //!
 //! [`Conversation`] is the read-only linearized projection consumed
 //! by the wire layer. It carries the materialized [`AgentMessage`]
@@ -476,18 +476,19 @@ impl Conversation {
 ///
 /// Entries are written to disk before they are inserted into the in-memory
 /// maps, so a failed write never leaves the two diverging. A process crash
-/// truncates at most the last line, which [ConversationLog::resume] tolerates
-/// with a warning.
+/// truncates at most the last line, which [ConversationLog::resume] drops
+/// with a warning before reopening the log for append.
 ///
 /// Concurrent writers are tolerated rather than locked out: the same session
 /// can be resumed in two processes at once (`aj continue <id>` twice). Entry
 /// ids are random (see `mint_id`), so the two writers practically never mint
-/// the same id, and each entry line is appended with its own `O_APPEND`
-/// write, so concurrent appends interleave whole lines instead of tearing
-/// one. Neither writer corrupts the file. They do both anchor to the same
-/// head, though, so they grow two sibling branches: on the next resume one
-/// becomes the head and the other writer's tail is left off the linearized
-/// path (still on disk, just not replayed). We accept that over a lock.
+/// the same id. Each entry's JSON and newline are passed to `write_all` as one
+/// buffer on an `O_APPEND` file, minimizing opportunities for interleaving.
+/// `write_all` can still issue multiple writes after a short write, so this is
+/// not an all-or-nothing commit. The writers both anchor to the same head, so
+/// they grow two sibling branches: on the next resume one becomes the head
+/// and the other writer's tail is left off the linearized path (still on disk,
+/// just not replayed). We accept that over a lock.
 pub struct ConversationLog {
     path: PathBuf,
     session_id: String,
@@ -589,8 +590,10 @@ impl ConversationLog {
     /// so subsequent appends pick up where the previous session left off.
     ///
     /// If the final line of the file is truncated or otherwise malformed,
-    /// it is dropped with a warning. A parse failure on any non-final
-    /// line is a real corruption and surfaces as an error.
+    /// it is truncated from disk with a warning. A valid final record without
+    /// a newline is preserved and terminated before another record is
+    /// appended. A parse failure on any non-final line is a real corruption
+    /// and surfaces as an error.
     pub fn resume(
         persistence: &crate::persistence::ConversationPersistence,
         session_id: &str,
@@ -605,7 +608,10 @@ impl ConversationLog {
         let mut pending_line = String::new();
         let mut current_line = String::new();
         let mut pending_line_number = None;
+        let mut pending_line_start = None;
         let mut physical_line_number = 0;
+        let mut next_line_start = 0_u64;
+        let mut snapshot_ends_with_newline = snapshot_len == 0;
         let mut corruption = None;
 
         let mut entries: HashMap<EntryId, ConversationEntry> = HashMap::new();
@@ -613,10 +619,14 @@ impl ConversationLog {
 
         loop {
             current_line.clear();
-            if reader.read_line(&mut current_line)? == 0 {
+            let current_line_start = next_line_start;
+            let bytes_read = reader.read_line(&mut current_line)?;
+            if bytes_read == 0 {
                 break;
             }
+            next_line_start += u64::try_from(bytes_read).expect("line length fits u64");
             physical_line_number += 1;
+            snapshot_ends_with_newline = current_line.ends_with('\n');
 
             if corruption.is_some() {
                 continue;
@@ -647,6 +657,7 @@ impl ConversationLog {
 
             std::mem::swap(&mut pending_line, &mut current_line);
             pending_line_number = Some(physical_line_number);
+            pending_line_start = Some(current_line_start);
         }
 
         let unread_snapshot_bytes = reader.get_ref().limit();
@@ -667,6 +678,7 @@ impl ConversationLog {
             )));
         }
 
+        let mut truncate_to = None;
         if pending_line_number.is_some() {
             match serde_json::from_str::<ConversationEntry>(&pending_line) {
                 Ok(entry) => {
@@ -678,12 +690,19 @@ impl ConversationLog {
                         "dropping truncated trailing entry in {}: {err}",
                         path.display()
                     );
+                    truncate_to = pending_line_start;
                 }
             }
         }
 
         drop(reader);
-        let file = OpenOptions::new().append(true).open(&path)?;
+        if let Some(len) = truncate_to {
+            OpenOptions::new().write(true).open(&path)?.set_len(len)?;
+        }
+        let mut file = OpenOptions::new().append(true).open(&path)?;
+        if truncate_to.is_none() && !snapshot_ends_with_newline {
+            file.write_all(b"\n")?;
+        }
 
         // Backfill each message entry's in-memory id from its on-disk entry
         // id, so replay, reseeding, and the reducer see ids for free. We do
@@ -849,15 +868,10 @@ impl ConversationLog {
             // initialise it empty.
             let queued: Vec<String> = self.pending_writes.drain(..).collect();
             let file = self.ensure_open()?;
-            // Write each entry as one buffer (line + trailing newline)
-            // rather than as separate line and newline writes. Under
-            // `O_APPEND` the kernel makes a single append write atomic
-            // against other appenders, so a second process writing the
-            // same file (the same session resumed twice) interleaves
-            // whole lines instead of tearing one mid-line. A very large
-            // line can still split across writes, but that's the same
-            // exposure as any append-only log, and far less likely than
-            // the id collisions that random ids remove.
+            // Pass each entry as one buffer (line + trailing newline) rather
+            // than making separate body and newline calls. This narrows the
+            // interleaving window, but `write_all` may still issue multiple
+            // writes after a short write. Resume repairs such a torn tail.
             for line in &queued {
                 file.write_all(format!("{line}\n").as_bytes())?;
             }
@@ -1583,10 +1597,50 @@ mod tests {
         )
         .expect("rewrite fixture log");
 
-        let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume log");
+        let mut resumed = ConversationLog::resume(&persistence, &session_id).expect("resume log");
 
         assert_eq!(resumed.order.len(), 2);
         assert_eq!(resumed.entries.len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read repaired log"),
+            format!("{}\n{}\n", records[0], records[1])
+        );
+
+        ConversationView::user(&mut resumed)
+            .add_message(user_text("after repair"))
+            .expect("append after repair");
+        drop(resumed);
+
+        let resumed_again =
+            ConversationLog::resume(&persistence, &session_id).expect("resume repaired log");
+        assert_eq!(resumed_again.order.len(), 3);
+        assert_eq!(resumed_again.entries.len(), 3);
+    }
+
+    #[test]
+    fn resume_terminates_valid_final_record_before_appending() {
+        let (persistence, session_id, records) = resume_fixture();
+        let path = persistence.session_path(&session_id);
+        std::fs::write(&path, format!("{}\n{}", records[0], records[1]))
+            .expect("remove trailing newline");
+
+        let mut resumed = ConversationLog::resume(&persistence, &session_id).expect("resume log");
+
+        assert_eq!(resumed.order.len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read repaired log"),
+            format!("{}\n{}\n", records[0], records[1])
+        );
+
+        ConversationView::user(&mut resumed)
+            .add_message(user_text("after boundary repair"))
+            .expect("append after boundary repair");
+        drop(resumed);
+
+        let resumed_again =
+            ConversationLog::resume(&persistence, &session_id).expect("resume repaired log");
+        assert_eq!(resumed_again.order.len(), 3);
+        assert_eq!(resumed_again.entries.len(), 3);
     }
 
     #[test]
