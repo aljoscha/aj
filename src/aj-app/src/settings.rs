@@ -774,19 +774,24 @@ pub fn option_description(option: &aj_conf::ConfigOption) -> String {
             option,
             "\"default\" leaves the server default. Takes effect next turn.",
         ),
-        "disabled_tools" | "disabled_skills" => describe(
+        // The tool catalog is rebuilt at the start of every turn from the
+        // effective config, so everything feeding it lands next turn.
+        "disabled_tools" => describe(
             option,
-            "Toggles apply when the picker closes; takes effect for new sessions.",
+            "Toggles apply when the picker closes. Takes effect next turn.",
         ),
-        "image_auto_resize" | "image_block" | "syntax_highlighting" => {
-            describe(option, "Takes effect for new sessions.")
-        }
+        "image_auto_resize" | "bash_rtk" => describe(option, "Takes effect next turn."),
+        "disabled_skills" => describe(
+            option,
+            "Toggles apply when the picker closes. Takes effect for new sessions.",
+        ),
+        "image_block" => describe(option, "Takes effect for new sessions."),
         "compact_threshold" => describe(option, "A fraction between 0.0 and 1.0."),
         "compact_keep_recent" => describe(option, "A positive number of tokens."),
         // Plain schema string: thinking, theme, show_thinking_block,
-        // show_token_usage, show_image_in_terminal, auto_compact, bash_rtk,
-        // show_frame_stats, and model_name (folded into the model row, never
-        // shown alone).
+        // show_token_usage, show_image_in_terminal, compact_transcript,
+        // auto_compact, syntax_highlighting, show_frame_stats, and
+        // model_name (folded into the model row, never shown alone).
         _ => option.description.to_string(),
     }
 }
@@ -829,8 +834,10 @@ mod tests {
 
     #[test]
     fn plain_option_returns_the_schema_string() {
-        let thinking = option("thinking");
-        assert_eq!(option_description(thinking), thinking.description);
+        for name in ["thinking", "syntax_highlighting", "compact_transcript"] {
+            let opt = option(name);
+            assert_eq!(option_description(opt), opt.description, "option {name}");
+        }
     }
 
     #[test]
@@ -862,15 +869,15 @@ mod tests {
             ),
             (
                 "disabled_tools",
-                "Toggles apply when the picker closes; takes effect for new sessions.",
+                "Toggles apply when the picker closes. Takes effect next turn.",
             ),
             (
                 "disabled_skills",
-                "Toggles apply when the picker closes; takes effect for new sessions.",
+                "Toggles apply when the picker closes. Takes effect for new sessions.",
             ),
-            ("image_auto_resize", "Takes effect for new sessions."),
+            ("image_auto_resize", "Takes effect next turn."),
+            ("bash_rtk", "Takes effect next turn."),
             ("image_block", "Takes effect for new sessions."),
-            ("syntax_highlighting", "Takes effect for new sessions."),
             ("compact_threshold", "A fraction between 0.0 and 1.0."),
             ("compact_keep_recent", "A positive number of tokens."),
         ];

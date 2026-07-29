@@ -88,8 +88,6 @@ pub fn scripted_run_config(messages: Vec<AssistantMessage>) -> Arc<StdMutex<RunC
         speed: None,
         model_key: ("scripted".to_string(), "scripted".to_string()),
         session_id: None,
-        tool_options: aj_tools::BuiltinToolOptions::default(),
-        disabled_tools: Vec::new(),
     }))
 }
 
@@ -113,8 +111,6 @@ pub fn scripted_run_config_with_window(
         speed: None,
         model_key: ("scripted".to_string(), "scripted".to_string()),
         session_id: None,
-        tool_options: aj_tools::BuiltinToolOptions::default(),
-        disabled_tools: Vec::new(),
     }))
 }
 

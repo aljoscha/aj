@@ -31,7 +31,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::compaction::run_compaction;
 use crate::session::{AgentLifecycle, SessionCore, SubAgentOverrides};
-use crate::session_setup::RunConfigSnapshot;
+use crate::session_setup::{RunConfigSnapshot, builtin_tool_options};
 
 fn tools_for_turn(
     options: &aj_tools::BuiltinToolOptions,
@@ -87,7 +87,7 @@ pub struct TurnPolicy {
 /// `auto_compact`); a sub-agent continuation gets neither, since
 /// compaction operates on the log's USER (Main) thread. Queued-work
 /// delivery is not a policy knob — the loop wakes idle agents directly.
-pub fn turn_policy(target: AgentId, config: &Arc<std::sync::Mutex<Config>>) -> TurnPolicy {
+fn turn_policy(target: AgentId, config: &Arc<std::sync::Mutex<Config>>) -> TurnPolicy {
     let c = config.lock().expect("config mutex poisoned");
     let main = target == AgentId::Main;
     TurnPolicy {
@@ -101,22 +101,33 @@ pub fn turn_policy(target: AgentId, config: &Arc<std::sync::Mutex<Config>>) -> T
 /// turn.
 ///
 /// **Main** stamps the full [`RunConfigSnapshot`]: the run config is
-/// the main agent's configuration — the selectors stage into it and
-/// it persists to `config.toml` — so a main turn picks up any model /
-/// thinking change made since the last turn.
+/// the main agent's configuration, the selectors stage into it and it
+/// persists to `config.toml`, so a main turn picks up any model /
+/// thinking change made since the last turn. Its tool catalog is
+/// rebuilt from the effective `config`, so a `disabled_tools` (or
+/// `bash_rtk` / `image_auto_resize`) change lands on the next turn
+/// too, and sub-agents spawned during that turn inherit the rebuilt
+/// catalog.
 ///
-/// **Sub-agents** own their settings (inherited from the parent at
-/// spawn); only the axes the user explicitly staged in
-/// `sub_overrides` are applied. Entries are kept (not drained) and
-/// re-applied idempotently each turn — an entry is the user's
-/// standing choice for that agent. A sub-agent with no entry stamps
-/// nothing and runs with whatever it already holds.
-pub fn apply_turn_config(
+/// **Sub-agents** own their settings, inherited from the parent at
+/// spawn. Only the axes the user explicitly staged in `sub_overrides`
+/// are applied. Entries are kept (not drained) and re-applied
+/// idempotently each turn, since an entry is the user's standing
+/// choice for that agent. A sub-agent with no entry stamps nothing and
+/// runs with whatever it already holds.
+pub(crate) fn apply_turn_config(
     target: AgentId,
     agent: &mut Agent,
+    config: &std::sync::Mutex<Config>,
     run_config: &std::sync::Mutex<RunConfigSnapshot>,
     sub_overrides: &std::sync::Mutex<HashMap<usize, SubAgentOverrides>>,
 ) {
+    // Cloned out before any other lock is taken, so this never nests
+    // with the run-config or sub-overrides locks.
+    let (tool_options, disabled_tools) = {
+        let c = config.lock().expect("config mutex poisoned");
+        (builtin_tool_options(&c), c.disabled_tools.clone())
+    };
     match target {
         AgentId::Main => {
             let cfg = run_config.lock().expect("run config mutex poisoned");
@@ -131,9 +142,14 @@ pub fn apply_turn_config(
                 Arc::clone(&cfg.model_info),
                 stream_options,
             );
+            // NOTE: the same exclusion list also gates the skills listing
+            // in the system prompt (`read_file` is how skills are opened),
+            // and that prompt is frozen for the life of the session. So
+            // disabling `read_file` here leaves the listing in place, and
+            // enabling it does not make a missing listing appear.
             agent.set_tools(tools_for_turn(
-                &cfg.tool_options,
-                &cfg.disabled_tools,
+                &tool_options,
+                &disabled_tools,
                 cfg.model_info.family.as_deref(),
                 true,
             ));
@@ -144,13 +160,9 @@ pub fn apply_turn_config(
             // Base session key used to scope the sub-agent's bundle
             // below. Cloned out so we don't hold the run-config lock
             // while taking the sub-overrides lock.
-            let (base_session_id, tool_options, disabled_tools) = {
+            let base_session_id = {
                 let cfg = run_config.lock().expect("run config mutex poisoned");
-                (
-                    cfg.session_id.clone(),
-                    cfg.tool_options.clone(),
-                    cfg.disabled_tools.clone(),
-                )
+                cfg.session_id.clone()
             };
             let overrides = sub_overrides.lock().expect("sub overrides mutex poisoned");
             let Some(entry) = overrides.get(&n) else {
@@ -167,6 +179,11 @@ pub fn apply_turn_config(
                     stream_options.session_id = Some(sub_agent_session_id(base, n));
                 }
                 agent.set_provider(Arc::clone(provider), Arc::clone(model_info), stream_options);
+                // The new model may want a different editor tool, so the
+                // catalog has to be rebuilt, and a rebuild can only use the
+                // live exclusion list. A sub whose model the user changed
+                // therefore also picks up a `disabled_tools` change, while
+                // one without an override keeps what it inherited.
                 agent.set_tools(tools_for_turn(
                     &tool_options,
                     &disabled_tools,
@@ -244,10 +261,16 @@ impl Turns {
     /// Spawn a turn sequence for `target`: resolve the agent handle,
     /// mint the per-sequence cancel token (kept in the cancel map,
     /// which the host's Ctrl+C fires), and drive `start` plus its
-    /// automatic continuations via [`drive_turn`]. The spawned task
-    /// re-stamps the staged run config before each inference. Returns
-    /// `false` without spawning when `target` has no live handle
-    /// (e.g. a resumed sub-agent).
+    /// automatic continuations via [`drive_turn`]. Returns `false`
+    /// without spawning when `target` has no live handle (e.g. a
+    /// resumed sub-agent).
+    ///
+    /// The two config handles differ in freshness. The compaction
+    /// [`TurnPolicy`] is derived from `config` once here, so the whole
+    /// sequence runs under one policy. The staged run config and the
+    /// config-derived tool catalog are re-read before the sequence's
+    /// first inference and before each automatic continuation, by
+    /// [`apply_turn_config`].
     ///
     /// Callers must not spawn for a target already being driven (they
     /// gate via [`Turns::is_busy`] / [`Turns::spawn_wake`]): a second
@@ -256,10 +279,10 @@ impl Turns {
     pub fn spawn(
         &mut self,
         core: &SessionCore,
+        config: &Arc<std::sync::Mutex<Config>>,
         run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
         target: AgentId,
         start: TurnStart,
-        policy: TurnPolicy,
     ) -> bool {
         debug_assert!(
             !self.is_driving(target),
@@ -268,6 +291,8 @@ impl Turns {
         let Some(handle) = core.resolve_agent(target) else {
             return false;
         };
+        let policy = turn_policy(target, config);
+        let config_for_turn = Arc::clone(config);
         let run_config_for_turn = Arc::clone(run_config);
         let sub_overrides_for_turn = Arc::clone(&core.sub_overrides);
         let log = Arc::clone(&core.log);
@@ -281,7 +306,13 @@ impl Turns {
                 &policy,
                 start,
                 |agent: &mut Agent| {
-                    apply_turn_config(target, agent, &run_config_for_turn, &sub_overrides_for_turn);
+                    apply_turn_config(
+                        target,
+                        agent,
+                        &config_for_turn,
+                        &run_config_for_turn,
+                        &sub_overrides_for_turn,
+                    );
                 },
                 turn_cancel,
             )
@@ -303,13 +334,13 @@ impl Turns {
         &mut self,
         owner: AgentId,
         core: &SessionCore,
+        config: &Arc<std::sync::Mutex<Config>>,
         run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
-        policy: TurnPolicy,
     ) {
         if self.is_busy(&core.lifecycle, owner) {
             return;
         }
-        self.spawn(core, run_config, owner, TurnStart::Wake, policy);
+        self.spawn(core, config, run_config, owner, TurnStart::Wake);
     }
 
     /// Await the next completed turn, or pend forever when no turn is
@@ -546,18 +577,21 @@ fn wrap_overflow_giveup(err: TurnError) -> TurnError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
 
     use aj_agent::TurnError;
     use aj_agent::bus::listener_from_sync;
-    use aj_agent::events::{AgentEvent, CompactionReason};
+    use aj_agent::events::{AgentEvent, AgentId, CompactionReason};
+    use aj_conf::Config;
     use aj_models::types::{AssistantContent, AssistantMessage};
     use aj_session::{ConversationEntryKind, ConversationPersistence, ThreadFilter};
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
-    use super::{OVERFLOW_GIVEUP, TurnPolicy, TurnStart, drive_turn, tools_for_turn};
+    use super::{
+        OVERFLOW_GIVEUP, TurnPolicy, TurnStart, apply_turn_config, drive_turn, tools_for_turn,
+    };
     use crate::compaction::{CompactionOutcome, run_compaction};
     use crate::test_support::{
         build_test_agent, finalized_text_message, finalized_text_message_with_usage,
@@ -603,6 +637,57 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Main's catalog is derived from the effective config at turn
+    /// start, so a `disabled_tools` change is live for the next turn of
+    /// the session it was made in.
+    #[test]
+    fn main_turn_rebuilds_the_catalog_from_the_live_config() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let run_config = scripted_run_config(vec![]);
+        let (mut agent, _log, _persistence) = build_test_agent(&persistence, &run_config);
+        let config = Mutex::new(Config::default());
+        let overrides = Mutex::new(HashMap::new());
+        assert!(agent.tool_names().contains(&"bash"), "enabled at build");
+
+        config.lock().unwrap().disabled_tools = vec!["bash".to_string()];
+        apply_turn_config(AgentId::Main, &mut agent, &config, &run_config, &overrides);
+
+        let names = agent.tool_names();
+        assert!(!names.contains(&"bash"), "got: {names:?}");
+        assert!(names.contains(&"agent"), "main keeps the sub-agent tool");
+        assert!(names.contains(&"read_file"), "other tools untouched");
+    }
+
+    /// A sub-agent with no staged override is left entirely alone, tool
+    /// catalog included, even when the config has moved since it was
+    /// spawned.
+    #[test]
+    fn sub_turn_without_an_override_stamps_nothing() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let run_config = scripted_run_config(vec![]);
+        let (mut agent, _log, _persistence) = build_test_agent(&persistence, &run_config);
+        let config = Mutex::new(Config::default());
+        let overrides = Mutex::new(HashMap::new());
+        let tools: Vec<String> = agent.tool_names().iter().map(|n| n.to_string()).collect();
+        let thinking = agent.default_thinking();
+        let model = agent.model_info().id.clone();
+
+        config.lock().unwrap().disabled_tools = vec!["bash".to_string()];
+        apply_turn_config(
+            AgentId::Sub(1),
+            &mut agent,
+            &config,
+            &run_config,
+            &overrides,
+        );
+
+        assert_eq!(agent.tool_names(), tools);
+        assert_eq!(agent.default_thinking(), thinking);
+        assert_eq!(agent.model_info().id, model);
     }
 
     #[test]

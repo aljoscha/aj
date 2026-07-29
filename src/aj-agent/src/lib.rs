@@ -193,9 +193,11 @@ pub struct Agent {
     assembled_system_prompt: String,
     tool_definitions: HashMap<String, ErasedToolDefinition>,
     tools: Vec<UnifiedToolDefinition>,
-    /// Names of builtin tools to exclude when spawning subagents.
-    /// Mirrors the filter applied to the top-level agent so
-    /// subagents inherit the same tool restrictions.
+    /// The exclusion list handed to [`Agent::with_provider`], forwarded
+    /// verbatim to agents spawned from here. Nothing filters by it: a
+    /// child's catalog is a clone of this agent's, so the restriction is
+    /// already baked in. It is therefore a construction-time value that
+    /// can lag `tools` once the catalog is re-stamped mid-session.
     disabled_tools: Vec<String>,
     /// Unified provider handle used by the inference loop. Supplied
     /// directly by [`Agent::with_provider`] / [`Agent::set_provider`].
@@ -761,6 +763,12 @@ impl Agent {
         self.provider = provider;
         self.model_info = model_info;
         self.stream_options = stream_options;
+    }
+
+    /// Names of the tools currently advertised to the model, in the order
+    /// they are sent.
+    pub fn tool_names(&self) -> Vec<&str> {
+        self.tools.iter().map(|tool| tool.name.as_str()).collect()
     }
 
     /// Replace the complete active tool catalog mid-session.

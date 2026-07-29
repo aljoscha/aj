@@ -33,7 +33,7 @@ use aj_app::shutdown::{format_resume_hint, format_session_usage_header, format_u
 use aj_app::theme::{
     ColorMode, Theme, ThemeBg, ThemeColor, ThemeHandle, ThemeWatcherGuard, watch_user_theme,
 };
-use aj_app::turn::{TurnStart, Turns, running_work_counts, turn_policy};
+use aj_app::turn::{TurnStart, Turns, running_work_counts};
 use aj_conf::skills::Skill;
 use aj_conf::{
     AgentEnv, Config, ConfigDiagnostic, ConfigSpeed, ConfigThinkingDisplay, ConfigVerbosity,
@@ -980,10 +980,9 @@ fn drain_events(world: &mut World, first: AgentEvent) -> (bool, Vec<AgentId>) {
 /// one batch are harmless.
 fn spawn_wakes(world: &mut World, targets: Vec<AgentId>) {
     for id in targets {
-        let policy = turn_policy(id, &world.config);
         world
             .turns
-            .spawn_wake(id, &world.core, &world.run_config, policy);
+            .spawn_wake(id, &world.core, &world.config, &world.run_config);
     }
 }
 
@@ -1055,15 +1054,14 @@ fn handle_submit(world: &mut World, text: String) -> bool {
         world.core.message_queues.append_follow_up(target, &trimmed);
         return true;
     }
-    let policy = turn_policy(target, &world.config);
     // The user's message row arrives back over the bus as
     // `MessageEnd { User }`, so nothing is inserted into the model here.
     let spawned = world.turns.spawn(
         &world.core,
+        &world.config,
         &world.run_config,
         target,
         TurnStart::Prompt(trimmed),
-        policy,
     );
     if !spawned {
         fold_notice(world, "This agent can't be prompted.");
@@ -1089,13 +1087,12 @@ fn auto_submit_launch(world: &mut World, content: Vec<UserContent>) {
     if content.is_empty() {
         return;
     }
-    let policy = turn_policy(AgentId::Main, &world.config);
     world.turns.spawn(
         &world.core,
+        &world.config,
         &world.run_config,
         AgentId::Main,
         TurnStart::Content(content),
-        policy,
     );
 }
 
@@ -1126,10 +1123,9 @@ fn handle_turn_join(
     // Live `TaskEnd`/`AgentEnd` events trigger the same wake mid-select
     // (see `drain_events`), covering tasks that finish between turns.
     if world.core.task_registry.has_notices(id) || world.core.message_queues.has_pending(id) {
-        let policy = turn_policy(id, &world.config);
         world
             .turns
-            .spawn_wake(id, &world.core, &world.run_config, policy);
+            .spawn_wake(id, &world.core, &world.config, &world.run_config);
     }
     match result {
         Ok(()) => Ok(()),
@@ -1614,16 +1610,15 @@ async fn apply_command_action(
             if world.turns.is_busy(&world.core.lifecycle, AgentId::Main) {
                 fold_notice(world, &session_busy_notice("compact"));
             } else {
-                let policy = turn_policy(AgentId::Main, &world.config);
                 world.turns.spawn(
                     &world.core,
+                    &world.config,
                     &world.run_config,
                     AgentId::Main,
                     TurnStart::Compact {
                         reason: CompactionReason::Manual,
                         instructions: None,
                     },
-                    policy,
                 );
             }
             ActionEffect::Redraw

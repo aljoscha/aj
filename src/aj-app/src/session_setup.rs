@@ -55,6 +55,12 @@ use crate::model::{ModelSelection, ResolvedModel};
 /// Print mode has no loop, so it builds one of these, optionally
 /// overwrites it with the resumed log's recorded settings, and reads
 /// it once to build its agent.
+///
+/// What lives here is what the user stages for the *next* turn. Values
+/// that are simply read from the effective config, like the tool
+/// catalog's inputs, are deliberately not copied in. The interactive
+/// turn reads those from the effective config itself, so a settings
+/// change cannot leave a stale copy behind here.
 pub struct RunConfigSnapshot {
     /// Provider handle the next turn streams against.
     pub provider: Arc<dyn Provider>,
@@ -82,11 +88,6 @@ pub struct RunConfigSnapshot {
     /// `stream_options` from registry defaults, which would otherwise
     /// drop it. `None` until the log is opened in [`prepare_log`].
     pub session_id: Option<String>,
-    /// Construction options reused when a model switch rebuilds the active
-    /// family-specific tool catalog.
-    pub tool_options: BuiltinToolOptions,
-    /// User-disabled tool names applied after family-specific tool selection.
-    pub disabled_tools: Vec<String>,
 }
 
 /// Dependencies for resume-time settings restoration: the model
@@ -122,11 +123,6 @@ fn build_run_config(
         // Filled in by `prepare_log` once the log (and thus the session
         // id) exists; the initial resolve runs before then.
         session_id: None,
-        tool_options: BuiltinToolOptions {
-            image_auto_resize: config.image_auto_resize,
-            bash_rtk: config.bash_rtk,
-        },
-        disabled_tools: config.disabled_tools.clone(),
     }
 }
 
@@ -323,6 +319,14 @@ pub(crate) fn restore_session_settings(
     notices
 }
 
+/// The builtin-tool construction options `config` selects.
+pub(crate) fn builtin_tool_options(config: &Config) -> BuiltinToolOptions {
+    BuiltinToolOptions {
+        image_auto_resize: config.image_auto_resize,
+        bash_rtk: config.bash_rtk,
+    }
+}
+
 /// An agent plus the host context the caller needs after construction:
 /// the [`AgentEnv`] it was built against (for a startup context
 /// notice, the footer, and editor autocomplete) and whether the active
@@ -354,10 +358,7 @@ pub fn build_agent(
     speed: Option<Speed>,
 ) -> BuiltAgent {
     let tools = builtin_tools_for_model(
-        &BuiltinToolOptions {
-            image_auto_resize: config.image_auto_resize,
-            bash_rtk: config.bash_rtk,
-        },
+        &builtin_tool_options(config),
         &config.disabled_tools,
         model_info.family.as_deref(),
     );
