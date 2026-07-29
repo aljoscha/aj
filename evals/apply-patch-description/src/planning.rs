@@ -1,6 +1,6 @@
 //! Blinded pilot reduction and deterministic main-schedule planning.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 
@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::artifacts::{RecordedDescription, TrialRecord, completed_pair, scan};
 use crate::hash_framed;
-use crate::runtime::{RuntimeLimits, SourceProvenance};
+use crate::runtime::{MAX_PAIR_ATTEMPTS, RuntimeLimits, SourceProvenance};
 use crate::schedule::{
     FrozenPlan, MainPlanning, ScheduleError, SchedulePhase, finalize_main_schedule,
     planned_main_pair_ids, validate_frozen_plan,
@@ -407,6 +407,42 @@ fn reduce_pilot(
             ));
         }
     }
+    let mut attempts_by_pair = BTreeMap::<&str, BTreeSet<&str>>::new();
+    for trial in state
+        .trials_by_hash
+        .values()
+        .filter(|trial| trial.identity.run_id == plan.schedule.run_id)
+    {
+        let Some(pair) = expected.get(trial.identity.pair_id.as_str()) else {
+            if matches!(
+                trial.identity.phase,
+                SchedulePhase::Smoke | SchedulePhase::Pilot
+            ) {
+                return Err(PlanningError(
+                    "records contain an unscheduled smoke/pilot trial".into(),
+                ));
+            }
+            continue;
+        };
+        if trial.identity.phase != pair.phase {
+            return Err(PlanningError(
+                "smoke/pilot trial has the wrong frozen phase".into(),
+            ));
+        }
+        attempts_by_pair
+            .entry(&trial.identity.pair_id)
+            .or_default()
+            .insert(&trial.identity.attempt_id);
+    }
+    if attempts_by_pair
+        .values()
+        .any(|attempts| attempts.len() > MAX_PAIR_ATTEMPTS)
+    {
+        return Err(PlanningError(format!(
+            "smoke/pilot records exceed the frozen {MAX_PAIR_ATTEMPTS}-attempt limit"
+        )));
+    }
+
     let mut strata = plan
         .manifest
         .archetypes
@@ -715,28 +751,31 @@ mod tests {
     }
 
     fn runtime(valid: bool, cost: f64) -> serde_json::Value {
-        json!({
-            "valid": valid,
-            "task_passed": true,
-            "sessions_with_patch_failure": false,
-            "edit_bypass": false,
-            "aj_recorded_catalog_cost": cost,
-            "model_responses": 2,
-            "provider_requests": 2,
-            "image_id": "sha256:image",
-            "source_provenance": {"head":"head","dirty":false,"worktree_hash":null},
-            "utc_date": "2026-07-24",
-            "limits": {
+        let mut runtime =
+            serde_json::to_value(crate::runtime::completed_runtime_fixture()).unwrap();
+        let object = runtime.as_object_mut().unwrap();
+        object.insert("valid".into(), json!(valid));
+        object.insert("aj_recorded_catalog_cost".into(), json!(cost));
+        object.insert("image_id".into(), json!("sha256:image"));
+        object.insert(
+            "source_provenance".into(),
+            json!({"head":"head","dirty":false,"worktree_hash":null}),
+        );
+        object.insert("utc_date".into(), json!("2026-07-24"));
+        object.insert(
+            "limits".into(),
+            json!({
                 "wall_timeout_seconds": 600,
                 "max_provider_requests": 12,
                 "max_model_responses": 12,
                 "provider_output_token_ceiling": 128000,
                 "aggregate_observed_output_token_ceiling": 1536000
-            },
-            "system_prompt_hash": "system",
-            "conservative_catalog_pair_reserve": 100.0,
-            "normalized_first_request_hash": "payload"
-        })
+            }),
+        );
+        object.insert("system_prompt_hash".into(), json!("system"));
+        object.insert("conservative_catalog_pair_reserve".into(), json!(100.0));
+        object.insert("normalized_first_request_hash".into(), json!("payload"));
+        runtime
     }
 
     fn append_pair(log: &mut ArtifactLog, plan: &FrozenPlan, pair: &PairScheduleRecord) {
@@ -840,6 +879,29 @@ mod tests {
             outcome.report.pilot_evidence.unplanned_schedule_hash,
             plan.schedule.schedule_hash
         );
+
+        let mut log = ArtifactLog::open(&path).unwrap();
+        for index in 0..MAX_PAIR_ATTEMPTS - 1 {
+            let mut identity = abandoned.identity.clone();
+            identity.attempt_id = format!("extra-{index}");
+            log.append_trial(
+                &TrialRecord::new(identity, metadata(&plan, pair), runtime(false, 0.0)).unwrap(),
+            )
+            .unwrap();
+        }
+        drop(log);
+        let error = plan_main_with_config(
+            &plan,
+            &path,
+            PlannerConfig {
+                simulation_replicates: 512,
+                maximum_pairs_per_archetype: 1,
+                ..PlannerConfig::default()
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("8-attempt limit"));
     }
 
     #[test]

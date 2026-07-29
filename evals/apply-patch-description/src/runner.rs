@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -28,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::artifacts::{
     ArtifactLog, BlobStore, PairCompletionIdentity, PairKey, RecordedDescription, TrialIdentity,
-    TrialMetadata, TrialRecord, completed_pair, scan,
+    TrialMetadata, TrialRecord, completed_pair, pair_attempt_count, recoverable_pair, scan,
 };
 use crate::descriptions::{DescriptionVariant, load};
 use crate::docker::{
@@ -43,7 +44,7 @@ use crate::protocol::{
     VerifyWorkerOutput, WorkerInit, WorkerModel, WorkerRequest, read_frame, write_frame,
 };
 use crate::runtime::{
-    AdmissionDecision, CacheStratum, CacheWriteSensitivity, MutationAttribution,
+    AdmissionDecision, CacheStratum, CacheWriteSensitivity, MAX_PAIR_ATTEMPTS, MutationAttribution,
     MutationLedgerEntry, PatchCallRecord, PatchClassification, ProviderErrorRecord, RuntimeLimits,
     RuntimeRecord, SourceProvenance, TerminalStatus, ToolOutcomeRecord, UsageFieldPresence,
     VerifierRecord, WorkerMetrics, WorkerResult, WorkerTerminal, admit_pair,
@@ -215,6 +216,30 @@ fn frozen_model(plan: &FrozenPlan) -> Result<&FrozenModelSelection, RunnerError>
         .ok_or_else(|| RunnerError("frozen plan has no model selection. Re-run freeze".into()))
 }
 
+struct RunLock {
+    _file: File,
+}
+
+impl RunLock {
+    fn acquire(records: &Path) -> Result<Self, RunnerError> {
+        if let Some(parent) = records.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| RunnerError(error.to_string()))?;
+        }
+        let mut lock_path = records.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(PathBuf::from(lock_path))
+            .map_err(|error| RunnerError(format!("cannot open run lock: {error}")))?;
+        file.try_lock()
+            .map_err(|error| RunnerError(format!("records stream is already in use: {error}")))?;
+        Ok(Self { _file: file })
+    }
+}
+
 /// Executes complete adjacent pairs from one frozen phase.
 pub async fn run(options: RunOptions) -> Result<(), RunnerError> {
     if options.max_trials == 0 || options.max_trials % 2 != 0 {
@@ -230,6 +255,7 @@ pub async fn run(options: RunOptions) -> Result<(), RunnerError> {
     if options.max_model_responses == 0 {
         return Err(RunnerError("--max-model-responses must be positive".into()));
     }
+    let _run_lock = RunLock::acquire(&options.records)?;
     let source = source_provenance().await?;
     let image = validate_image(&options.image).await?;
     if image.source_provenance != source.revision_label() {
@@ -241,7 +267,7 @@ pub async fn run(options: RunOptions) -> Result<(), RunnerError> {
     }
     run_preflight(&options.image).await?;
     let plan = load_plan(&options.plan)?;
-    let state = scan(&options.records).map_err(|error| RunnerError(error.to_string()))?;
+    let mut state = scan(&options.records).map_err(|error| RunnerError(error.to_string()))?;
     let run_state = FrozenRunState {
         utc_date: frozen_utc_date(&plan, &state, options.phase)?,
         image_id: image.id,
@@ -268,6 +294,8 @@ pub async fn run(options: RunOptions) -> Result<(), RunnerError> {
         }
     }
     validate_resume_before_resolution(&plan, &state, &options, &run_state)?;
+    recover_complete_attempts(&plan, &state, &options.records, options.phase)?;
+    state = scan(&options.records).map_err(|error| RunnerError(error.to_string()))?;
     let (model, catalog_hash, reasoning) = resolve_model_metadata(&plan)?;
     unpaid_request_preflight(&model, reasoning, &run_state.utc_date)?;
     let pairs = phase_pairs(&plan, options.phase);
@@ -281,6 +309,7 @@ pub async fn run(options: RunOptions) -> Result<(), RunnerError> {
         })
         .count();
     let pair_reserve = pair_reserve(options.phase, &plan, &model, options.max_model_responses)?;
+    let mut started_trials = recorded_trial_count(&state, options.phase, &plan.schedule.run_id);
     let mut spent = recorded_spend(&state, options.phase);
     if options.phase == SchedulePhase::Main
         && spent + pair_reserve * usize_as_f64(incomplete) > options.max_cost_usd
@@ -291,7 +320,7 @@ pub async fn run(options: RunOptions) -> Result<(), RunnerError> {
     }
     if incomplete == 0
         || admit_pair(
-            0,
+            started_trials,
             options.max_trials,
             spent,
             options.max_cost_usd,
@@ -330,7 +359,6 @@ pub async fn run(options: RunOptions) -> Result<(), RunnerError> {
             signal_cancel.cancel();
         }
     });
-    let mut started_trials = 0_u64;
     for pair in pairs {
         let key = PairKey {
             run_id: pair.run_id.clone(),
@@ -351,32 +379,29 @@ pub async fn run(options: RunOptions) -> Result<(), RunnerError> {
         }
 
         let instance = find_instance(&plan, pair)?;
-        let prior_attempts = state
-            .trials_by_hash
-            .values()
-            .filter(|record| {
-                record.identity.run_id == pair.run_id && record.identity.pair_id == pair.pair_id
-            })
-            .map(|record| record.identity.attempt_id.as_str())
-            .collect::<BTreeSet<_>>()
-            .len();
-        let attempts_allowed = 2_usize.saturating_sub(prior_attempts);
+        let prior_attempts = pair_attempt_count(&state, &pair.run_id, &pair.pair_id);
+        let attempts_allowed = MAX_PAIR_ATTEMPTS.saturating_sub(prior_attempts);
         if attempts_allowed == 0 {
             break;
         }
         let mut completed = false;
         for retry in 0..attempts_allowed {
-            if retry > 0 {
-                if run_cancel.is_cancelled()
-                    || admit_pair(
-                        started_trials,
-                        options.max_trials,
-                        spent,
-                        options.max_cost_usd,
-                        pair_reserve,
-                    ) != AdmissionDecision::Admit
-                {
-                    break;
+            if retry > 0
+                && admit_pair(
+                    started_trials,
+                    options.max_trials,
+                    spent,
+                    options.max_cost_usd,
+                    pair_reserve,
+                ) != AdmissionDecision::Admit
+            {
+                break;
+            }
+            if let Some(delay) = pair_attempt_delay(prior_attempts, retry) {
+                tokio::select! {
+                    biased;
+                    () = run_cancel.cancelled() => break,
+                    () = tokio::time::sleep(delay) => {}
                 }
             }
             let attempt_id = format!("{:032x}", rand::random::<u128>());
@@ -384,7 +409,10 @@ pub async fn run(options: RunOptions) -> Result<(), RunnerError> {
             let mut retry_pair = false;
             let mut first_context_hash: Option<String> = None;
             for scheduled in &pair.trials {
-                started_trials += 1;
+                if !start_pair_member(&run_cancel, &mut started_trials) {
+                    retry_pair = true;
+                    break;
+                }
                 let mut execution = run_trial(
                     &options,
                     &trusted,
@@ -448,10 +476,18 @@ pub async fn run(options: RunOptions) -> Result<(), RunnerError> {
                 );
                 records.push(record);
             }
-            if records.iter().all(|record| {
-                serde_json::from_value::<RuntimeRecord>(record.runtime.clone())
-                    .is_ok_and(|runtime| runtime.valid)
-            }) {
+            if records.len() == 2
+                && records.iter().all(|record| {
+                    serde_json::from_value::<RuntimeRecord>(record.runtime.clone()).is_ok_and(
+                        |runtime| {
+                            runtime.valid
+                                && runtime.stream_retries == 0
+                                && runtime.provider_errors.is_empty()
+                                && runtime.provider_error_details.is_empty()
+                        },
+                    )
+                })
+            {
                 log.complete_pair(
                     PairCompletionIdentity {
                         run_id: pair.run_id.clone(),
@@ -655,18 +691,10 @@ fn validate_resume_before_resolution(
             completed_pair(state, &plan.schedule.schedule_hash, pair)
                 .map_err(|error| RunnerError(error.to_string()))?;
         }
-        let attempt_count = state
-            .trials_by_hash
-            .values()
-            .filter(|trial| {
-                trial.identity.run_id == pair.run_id && trial.identity.pair_id == pair.pair_id
-            })
-            .map(|trial| trial.identity.attempt_id.as_str())
-            .collect::<BTreeSet<_>>()
-            .len();
-        if attempt_count > 2 {
+        let attempt_count = pair_attempt_count(state, &pair.run_id, &pair.pair_id);
+        if attempt_count > MAX_PAIR_ATTEMPTS {
             return Err(RunnerError(format!(
-                "resumed pair {} exceeds the two-attempt limit",
+                "resumed pair {} exceeds the {MAX_PAIR_ATTEMPTS}-attempt limit",
                 pair.pair_id
             )));
         }
@@ -761,7 +789,7 @@ fn persist_resolution_failure(
         })
         .map(|trial| trial.identity.attempt_id.as_str())
         .collect::<BTreeSet<_>>();
-    if attempts.len() >= 2 {
+    if attempts.len() >= MAX_PAIR_ATTEMPTS {
         return Ok(());
     }
     let blobs = BlobStore::new(options.artifact_dir.join("blobs"))
@@ -1167,6 +1195,47 @@ fn trial_identity(
     }
 }
 
+fn recover_complete_attempts(
+    plan: &FrozenPlan,
+    state: &crate::artifacts::ResumeState,
+    records: &Path,
+    phase: SchedulePhase,
+) -> Result<(), RunnerError> {
+    let recoverable = phase_pairs(plan, phase)
+        .iter()
+        .map(|pair| recoverable_pair(state, &plan.schedule.schedule_hash, pair))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| RunnerError(error.to_string()))?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    if recoverable.is_empty() {
+        return Ok(());
+    }
+
+    let mut log = ArtifactLog::open(records).map_err(|error| RunnerError(error.to_string()))?;
+    for pair in recoverable {
+        log.complete_pair(pair.identity, pair.trial_record_hashes)
+            .map_err(|error| RunnerError(error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn recorded_trial_count(
+    state: &crate::artifacts::ResumeState,
+    phase: SchedulePhase,
+    run_id: &str,
+) -> u64 {
+    u64::try_from(
+        state
+            .trials_by_hash
+            .values()
+            .filter(|record| record.identity.phase == phase && record.identity.run_id == run_id)
+            .count(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
 fn recorded_spend(state: &crate::artifacts::ResumeState, phase: SchedulePhase) -> f64 {
     state
         .trials_by_hash
@@ -1479,6 +1548,17 @@ async fn run_trial_inner(
         aggregate_observed_output_token_ceiling: max_output_tokens
             .saturating_mul(u64::from(options.max_model_responses)),
     };
+    if run_cancel.is_cancelled() {
+        return Ok(setup_cancelled_runtime(
+            "trial cancelled before fixture volume creation".into(),
+            cache_key,
+            runtime_limits,
+            run_state,
+            blobs,
+            catalog_pair_reserve,
+            true,
+        ));
+    }
     let mut volume = match FixtureVolume::create(&options.image, &instance.archetype_id).await {
         Ok(volume) => volume,
         Err(error) => {
@@ -2264,6 +2344,14 @@ impl Broker<'_> {
         let mut events = Vec::new();
         let mut buffered_bytes = 0_usize;
         while let Some(event) = stream.next().await {
+            if matches!(
+                &event,
+                AssistantMessageEvent::Error { error, .. } if error.error.is_none()
+            ) {
+                return Err(RunnerError(
+                    "provider terminal error lacks structured error details".into(),
+                ));
+            }
             let terminal = event.is_terminal();
             let event_bytes = serde_json::to_vec(&event)
                 .map_err(|error| RunnerError(format!("cannot size provider event: {error}")))?
@@ -2686,15 +2774,13 @@ impl TrialExecution {
             self.parent_metrics
                 .provider_errors
                 .push(error.message.clone());
-            self.provider_infrastructure_failed = matches!(
+            self.provider_infrastructure_failed |= matches!(
                 error.category,
                 ErrorCategory::RateLimit
                     | ErrorCategory::Auth
                     | ErrorCategory::Overloaded
                     | ErrorCategory::Transient
             );
-        } else {
-            self.provider_infrastructure_failed = false;
         }
         self.parent_metrics
             .transcript_wire_messages
@@ -2802,27 +2888,14 @@ fn finish_runtime(
         .verifier
         .as_ref()
         .is_some_and(|verifier| verifier.report.passed);
-    let status = if execution.internal_error.is_some()
-        || worker_terminal == Some(WorkerTerminal::RunnerInternal)
-    {
-        TerminalStatus::RunnerInternal
-    } else if worker_terminal == Some(WorkerTerminal::ModelFailed)
-        && execution.provider_infrastructure_failed
-    {
-        TerminalStatus::InfrastructureFailed
-    } else if execution.cancelled || worker_terminal == Some(WorkerTerminal::Cancelled) {
-        TerminalStatus::Cancelled
-    } else if execution.timed_out {
-        TerminalStatus::TimedOut
-    } else if worker_terminal == Some(WorkerTerminal::TurnLimit) {
-        TerminalStatus::TurnLimit
-    } else if worker_terminal == Some(WorkerTerminal::ModelFailed) || worker_terminal.is_none() {
-        TerminalStatus::ModelFailed
-    } else if !verifier_passed {
-        TerminalStatus::VerifierFailed
-    } else {
-        TerminalStatus::Passed
-    };
+    let status = classify_terminal_status(
+        execution.internal_error.is_some(),
+        worker_terminal,
+        execution.provider_infrastructure_failed,
+        execution.cancelled,
+        execution.timed_out,
+        verifier_passed,
+    );
     let valid = status.valid();
     let task_passed = status == TerminalStatus::Passed;
     let verifier = execution.verifier.map(|verifier| VerifierRecord {
@@ -2951,6 +3024,47 @@ fn finish_runtime(
         conservative_catalog_pair_reserve: catalog_pair_reserve,
         final_assistant_text_blob,
     })
+}
+
+fn classify_terminal_status(
+    internal_error: bool,
+    worker_terminal: Option<WorkerTerminal>,
+    provider_infrastructure_failed: bool,
+    cancelled: bool,
+    timed_out: bool,
+    verifier_passed: bool,
+) -> TerminalStatus {
+    if internal_error || worker_terminal == Some(WorkerTerminal::RunnerInternal) {
+        TerminalStatus::RunnerInternal
+    } else if provider_infrastructure_failed {
+        TerminalStatus::InfrastructureFailed
+    } else if cancelled || worker_terminal == Some(WorkerTerminal::Cancelled) {
+        TerminalStatus::Cancelled
+    } else if timed_out {
+        TerminalStatus::TimedOut
+    } else if worker_terminal == Some(WorkerTerminal::TurnLimit) {
+        TerminalStatus::TurnLimit
+    } else if worker_terminal == Some(WorkerTerminal::ModelFailed) || worker_terminal.is_none() {
+        TerminalStatus::ModelFailed
+    } else if !verifier_passed {
+        TerminalStatus::VerifierFailed
+    } else {
+        TerminalStatus::Passed
+    }
+}
+
+fn pair_attempt_delay(prior_attempts: usize, retry: usize) -> Option<Duration> {
+    let ordinal = prior_attempts.saturating_add(retry);
+    (ordinal > 0).then(|| Duration::from_secs(1_u64 << ordinal.saturating_sub(1).min(4)))
+}
+
+fn start_pair_member(cancel: &CancellationToken, started_trials: &mut u64) -> bool {
+    if cancel.is_cancelled() {
+        false
+    } else {
+        *started_trials = started_trials.saturating_add(1);
+        true
+    }
 }
 
 fn usage_bits_equal(left: &Usage, right: &Usage) -> bool {
@@ -3183,6 +3297,97 @@ mod tests {
             &RunnerError("provider request did not terminate after cancellation".into()),
             &cancellation
         ));
+    }
+
+    #[test]
+    fn records_stream_allows_only_one_live_runner() {
+        let temp = tempfile::tempdir().unwrap();
+        let records = temp.path().join("records.jsonl");
+        let first = RunLock::acquire(&records).unwrap();
+        assert!(RunLock::acquire(&records).is_err());
+        drop(first);
+        RunLock::acquire(&records).unwrap();
+    }
+
+    #[test]
+    fn provider_failure_invalidates_attempt_after_worker_recovery() {
+        assert_eq!(
+            classify_terminal_status(
+                false,
+                Some(WorkerTerminal::Completed),
+                true,
+                false,
+                false,
+                true,
+            ),
+            TerminalStatus::InfrastructureFailed
+        );
+        assert_eq!(pair_attempt_delay(0, 0), None);
+        assert_eq!(pair_attempt_delay(3, 0), Some(Duration::from_secs(4)));
+        assert_eq!(
+            (1..MAX_PAIR_ATTEMPTS)
+                .map(|prior_attempts| pair_attempt_delay(prior_attempts, 0).unwrap())
+                .collect::<Vec<_>>(),
+            [1, 2, 4, 8, 16, 16, 16].map(Duration::from_secs)
+        );
+
+        let cancel = CancellationToken::new();
+        let mut started = 1;
+        cancel.cancel();
+        assert!(!start_pair_member(&cancel, &mut started));
+        assert_eq!(started, 1);
+    }
+
+    #[test]
+    fn resumed_trial_records_consume_the_phase_trial_limit() {
+        let mut state = crate::artifacts::ResumeState::default();
+        let record = TrialRecord::new(
+            TrialIdentity {
+                run_id: "run".into(),
+                pair_id: "pair".into(),
+                attempt_id: "attempt".into(),
+                task_id: "task".into(),
+                instance_hash: "instance".into(),
+                archetype_id: "insertion".into(),
+                schedule_hash: "schedule".into(),
+                phase: SchedulePhase::Pilot,
+                repetition: 0,
+                variant: DescriptionVariant::Current,
+                order_index: 0,
+            },
+            TrialMetadata {
+                task_seed: "seed".into(),
+                current_description: RecordedDescription {
+                    sha256: "current".into(),
+                    byte_length: 1,
+                },
+                compact_description: RecordedDescription {
+                    sha256: "compact".into(),
+                    byte_length: 1,
+                },
+                aj_revision: "head".into(),
+                suite_revision: "suite".into(),
+                model_catalog_hash: "catalog".into(),
+                provider: "provider".into(),
+                model: "model".into(),
+                reasoning_effort: "low".into(),
+                tool_catalog_hash: "tools".into(),
+                fixture_revision: "fixture".into(),
+            },
+            serde_json::json!({"aj_recorded_catalog_cost": 0.0}),
+        )
+        .unwrap();
+        state
+            .trials_by_hash
+            .insert(record.record_hash.clone(), record);
+
+        let started = recorded_trial_count(&state, SchedulePhase::Pilot, "run");
+        assert_eq!(started, 1);
+        assert_eq!(
+            admit_pair(started, 2, 0.0, 1.0, 1.0),
+            AdmissionDecision::TrialLimit
+        );
+        assert_eq!(recorded_trial_count(&state, SchedulePhase::Smoke, "run"), 0);
     }
 
     #[test]

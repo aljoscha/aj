@@ -198,8 +198,8 @@ The runner assigns exactly one terminal status using this ordered taxonomy:
 
 1. `runner_internal`: the sandbox, event accounting, snapshots, or artifact
    contract failed.
-2. `infrastructure_failed`: provider or transport retries were exhausted, or
-   credentials and model resolution failed.
+2. `infrastructure_failed`: the attempt saw a retryable provider or transport
+   failure, or credentials and model resolution failed.
 3. `cancelled`: an operator or parent shutdown interrupted the trial.
 4. `timed_out`: the predeclared trial timeout expired.
 5. `turn_limit`: the predeclared model-turn limit was reached.
@@ -210,9 +210,12 @@ The runner assigns exactly one terminal status using this ordered taxonomy:
 The first applicable status wins. The first three statuses are invalid trials,
 not task failures. `runner_internal` stops the run for investigation.
 `infrastructure_failed` and `cancelled` preserve the attempt and rerun the entire
-pair with the same seeds at most once. Statuses four through seven set
-`task_passed` to false. Status eight sets it to true. This makes the valid-trial
-intent-to-treat denominator ordered and exhaustive.
+pair with the same seeds. Transparent provider retries are disabled in the
+worker, so usage, latency, mutations, and cancellation from a failed request
+cannot enter a valid replacement. A pair has at most eight fresh isolated
+attempts with bounded backoff. Statuses four through seven set `task_passed` to
+false. Status eight sets it to true. This makes the valid-trial intent-to-treat
+denominator ordered and exhaustive.
 
 ### Patch reliability
 
@@ -261,10 +264,11 @@ messages.
 
 ### Cost and tokens
 
-An evaluator event collector sums usage from every assistant `MessageEnd`,
-including terminal error and aborted messages and attempts that the provider or
-agent later retries. It does not use `Agent::accumulated_usage`, which only
-accounts for successful turns. Record:
+An evaluator event collector sums usage from every assistant `MessageEnd`
+within an attempt, including terminal error and aborted messages. It does not use
+`Agent::accumulated_usage`, which only accounts for successful turns. An attempt
+that observes a provider failure remains in immutable artifacts but cannot enter
+a completion marker, pilot reduction, or main inference. Record:
 
 - input tokens
 - output tokens
@@ -377,10 +381,12 @@ the run, the runner starts a pair only if the remaining reserve covers both
 trials, then lets both finish even if the estimate is exceeded. The blinded
 pilot's one-sided 95% pair-cost reserve is frozen and reported as an additional
 empirical diagnostic. It is not the hard budget guard.
-`--max-trials` must admit an even number of trials. Both controls are checked
-only between adjacent pairs. A process interruption or invalid trial leaves an
-incomplete pair. Its records are retained, the whole pair is rerun with the same
-seeds, and neither attempt enters main inference. If budget or interruption
+`--max-trials` must admit an even number of trials. It is a cumulative per-phase
+limit across resumed commands, and every durable trial record from that phase
+consumes it. Both controls are checked only before starting a fresh adjacent
+pair attempt. A process interruption or invalid trial leaves an incomplete pair.
+Its records are retained, the whole pair is rerun with the same seeds, and
+neither attempt enters main inference. If budget or interruption
 prevents the full frozen sample from completing, the partial result is
 descriptive and cannot support shipping.
 
@@ -393,10 +399,12 @@ bound by the same planning hash. Main admission and analysis recompute this
 commitment from the same stream. Immutable unreferenced failed or incomplete
 attempts remain in the stream but do not enter the commitment or reduction.
 
-Provider failures are retried according to the normal provider policy and
-recorded separately. Exhausted retries make the trial and its pair invalid under
-the taxonomy above. If its one pair rerun also fails, the fixed sample is
-incomplete and cannot support shipping. Every attempt remains in artifacts.
+The evaluation worker disables transparent provider retries. Any retryable
+provider or transport failure immediately invalidates the trial and its pair.
+The runner recreates the whole pair in fresh isolation with bounded backoff,
+subject to the cumulative trial budget and the eight-attempt pair cap. Every
+attempt remains in artifacts, but only a clean complete attempt can receive a
+completion marker.
 
 ## Analysis and decision rule
 
@@ -525,10 +533,11 @@ Each trial record must include:
   output ceiling, system-prompt hash, and normalized actual payload hashes
 
 The parent flushes each trial record before continuing and writes a complete-pair
-marker only after both valid records are durable. Resume skips only marked
-complete pairs. An unmarked pair is rerun in full under a new attempt ID while
-old records remain immutable. `--max-cost-usd`, `--max-trials`, and `--seed` are
-required controls.
+marker only after both valid records are durable. On resume, it first recovers
+the earliest unmarked attempt whose two durable records exactly match the frozen
+pair and contain no provider retry or error evidence. Other unmarked pairs are
+rerun in full under a new attempt ID while old records remain immutable.
+`--max-cost-usd`, `--max-trials`, and `--seed` are required controls.
 
 Resume rejects any scheduled attempt or completion marker with a different
 image ID, source provenance, UTC date, runtime limit, model catalog, model,

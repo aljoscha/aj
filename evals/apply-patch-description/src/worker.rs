@@ -381,6 +381,9 @@ async fn execute_worker(init: WorkerInit, client: Arc<IpcClient>) -> WorkerResul
         options,
         thinking_config(init.reasoning),
     );
+    // A provider failure invalidates the whole isolated attempt. Retrying here
+    // would mix its usage and latency into an otherwise successful record.
+    agent.set_stream_retry_limit(0);
     let registry = TaskRegistry::default();
     agent.set_task_registry(registry.clone());
 

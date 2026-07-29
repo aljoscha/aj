@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use crate::artifacts::{TrialRecord, completed_pair, scan};
 use crate::descriptions::DescriptionVariant;
 use crate::planning::{FrozenPilotRuntimeContext, validate_pilot_evidence};
-use crate::runtime::{PatchClassification, RuntimeLimits, SourceProvenance, TerminalStatus};
+use crate::runtime::{
+    MAX_PAIR_ATTEMPTS, PatchClassification, RuntimeLimits, SourceProvenance, TerminalStatus,
+};
 use crate::schedule::{FrozenPlan, PairScheduleRecord, SchedulePhase, validate_frozen_plan};
 use crate::statistics::{
     BinaryPair, BinaryStratum, BootstrapConfig, BootstrapSummary, EfficiencyPair,
@@ -289,12 +291,19 @@ pub fn analyze_records_with_config(
 
     let pilot_context = &planning.pilot_evidence.runtime_context;
     let mut attempts_by_pair = BTreeMap::<&str, BTreeSet<&str>>::new();
-    for trial in state.trials_by_hash.values().filter(|trial| {
-        trial.identity.run_id == plan.schedule.run_id && trial.identity.phase == SchedulePhase::Main
-    }) {
-        let pair = expected
-            .get(trial.identity.pair_id.as_str())
-            .ok_or_else(|| AnalysisError("records contain an unplanned main trial".into()))?;
+    for trial in state
+        .trials_by_hash
+        .values()
+        .filter(|trial| trial.identity.run_id == plan.schedule.run_id)
+    {
+        let Some(pair) = expected.get(trial.identity.pair_id.as_str()) else {
+            if trial.identity.phase == SchedulePhase::Main {
+                return Err(AnalysisError(
+                    "records contain an unplanned main trial".into(),
+                ));
+            }
+            continue;
+        };
         validate_trial(&plan.schedule.schedule_hash, pair, trial)?;
         let runtime = parse_metrics(trial)?;
         validate_pilot_runtime_context(trial, &runtime, pilot_context)?;
@@ -303,10 +312,13 @@ pub fn analyze_records_with_config(
             .or_default()
             .insert(&trial.identity.attempt_id);
     }
-    if attempts_by_pair.values().any(|attempts| attempts.len() > 2) {
-        return Err(AnalysisError(
-            "main records exceed the frozen two-attempt limit".into(),
-        ));
+    if attempts_by_pair
+        .values()
+        .any(|attempts| attempts.len() > MAX_PAIR_ATTEMPTS)
+    {
+        return Err(AnalysisError(format!(
+            "main records exceed the frozen {MAX_PAIR_ATTEMPTS}-attempt limit"
+        )));
     }
 
     let mut pairs_by_archetype: BTreeMap<String, Vec<(RuntimeMetrics, RuntimeMetrics)>> =

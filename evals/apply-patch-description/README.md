@@ -36,7 +36,7 @@ cargo run -p aj-apply-patch-eval -- run \
   --artifact-dir eval-artifacts \
   --image "$IMAGE" \
   --max-cost-usd 6000 \
-  --max-trials 32 \
+  --max-trials 256 \
   --timeout-seconds 600 \
   --max-model-responses 12
 
@@ -47,7 +47,7 @@ cargo run -p aj-apply-patch-eval -- run \
   --artifact-dir eval-artifacts \
   --image "$IMAGE" \
   --max-cost-usd 18000 \
-  --max-trials 96 \
+  --max-trials 768 \
   --timeout-seconds 600 \
   --max-model-responses 12
 
@@ -59,7 +59,7 @@ cargo run -p aj-apply-patch-eval -- plan-main \
 
 MAIN_TRIALS=$(python3 -c '
 import json
-print(2 * len(json.load(open("eval-artifacts/planning-report.json"))["selected_main_pair_ids"]))
+print(16 * len(json.load(open("eval-artifacts/planning-report.json"))["selected_main_pair_ids"]))
 ')
 MAIN_BUDGET=$(python3 -c '
 import json
@@ -85,11 +85,13 @@ cargo run -p aj-apply-patch-eval -- analyze \
   --output-markdown eval-artifacts/summary.md
 ```
 
-`--max-trials` must be even. Smoke and pilot accept only the original unplanned
-plan. Pilot also requires every smoke pair to be valid and complete in the same
-JSONL stream. Main accepts only the planned file. It recomputes the exact pilot
+`--max-trials` must be even and is cumulative for the selected phase across
+resumes. Every durable trial record in that phase consumes the limit. Smoke and
+pilot accept only the original unplanned plan. Pilot also requires every smoke
+pair to be valid and complete in the same JSONL stream. Main accepts only the
+planned file. It recomputes the exact pilot
 completion-stream digest before any provider call. Set main `--max-trials` to at
-least twice the selected pair count in `planning-report.json`.
+least sixteen times the selected pair count in `planning-report.json`.
 
 Provider, model, and reasoning are selected only by `freeze`. The defaults are
 `openai-codex`, `gpt-5.6-sol`, and `low`. Freeze resolves the local catalog
@@ -226,5 +228,10 @@ unknown, and include the declared cache-write sensitivity range from zero
 through reported input tokens.
 The recorded catalog cost is AJ's normalized estimate, not invoice cost.
 Credential or model resolution failures create a durable zero-usage
-`infrastructure_failed` attempt for the first scheduled incomplete pair. The
-normal two-attempt pair bound still applies.
+`infrastructure_failed` attempt for the first scheduled incomplete pair.
+Retryable provider failures also invalidate the attempt immediately. The worker
+does not retry them in place because their usage, latency, and partial effects
+must not enter a valid observation. The entire pair is recreated in fresh
+isolation, with bounded backoff and at most eight attempts. Resume derives the
+next backoff from the durable attempt count and recovers an unmarked clean
+complete attempt before starting replacement work.

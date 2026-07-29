@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::descriptions::DescriptionVariant;
-use crate::schedule::{PairScheduleRecord, SchedulePhase};
+use crate::runtime::RuntimeRecord;
+use crate::schedule::{PairScheduleRecord, SchedulePhase, TrialScheduleRecord};
 use crate::{hash_framed, sha256_hex};
 
 static NEXT_BLOB_TEMPORARY: AtomicU64 = AtomicU64::new(0);
@@ -175,6 +176,8 @@ pub struct ResumeState {
     pub complete_pairs: BTreeSet<PairKey>,
     pub completion_markers: BTreeMap<PairKey, PairCompleteRecord>,
     pub truncated_final_line: bool,
+    trial_record_order: Vec<String>,
+    trial_identities: BTreeSet<(String, String, String, u8)>,
 }
 
 /// Marker and ordered trials proven to match one exact frozen pair.
@@ -182,6 +185,82 @@ pub struct ResumeState {
 pub struct CompletedPair<'a> {
     pub marker: &'a PairCompleteRecord,
     pub trials: [&'a TrialRecord; 2],
+}
+
+/// An unmarked durable pair attempt that can be completed without rerunning it.
+#[derive(Debug)]
+pub struct RecoverablePair {
+    pub identity: PairCompletionIdentity,
+    pub trial_record_hashes: [String; 2],
+}
+
+/// Returns the number of distinct attempts recorded for one pair.
+pub fn pair_attempt_count(state: &ResumeState, run_id: &str, pair_id: &str) -> usize {
+    state
+        .trials_by_hash
+        .values()
+        .filter(|trial| trial.identity.run_id == run_id && trial.identity.pair_id == pair_id)
+        .map(|trial| trial.identity.attempt_id.as_str())
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
+/// Finds the earliest complete valid attempt that lacks a completion marker.
+pub fn recoverable_pair(
+    state: &ResumeState,
+    schedule_hash: &str,
+    pair: &PairScheduleRecord,
+) -> Result<Option<RecoverablePair>, ArtifactError> {
+    let key = PairKey {
+        run_id: pair.run_id.clone(),
+        pair_id: pair.pair_id.clone(),
+    };
+    if state.complete_pairs.contains(&key) {
+        return Ok(None);
+    }
+
+    let mut attempts = BTreeMap::<&str, [Option<&TrialRecord>; 2]>::new();
+    for hash in &state.trial_record_order {
+        let trial = &state.trials_by_hash[hash];
+        if trial.identity.run_id != pair.run_id || trial.identity.pair_id != pair.pair_id {
+            continue;
+        }
+        let scheduled = &pair.trials[usize::from(trial.identity.order_index)];
+        if !trial_matches_slot(trial, schedule_hash, pair, scheduled) {
+            return Err(ArtifactError(format!(
+                "unmarked trial for pair {} is outside its frozen slot",
+                pair.pair_id
+            )));
+        }
+        if validate_completed_trial(trial, 0).is_err() {
+            continue;
+        }
+        let attempt = attempts
+            .entry(&trial.identity.attempt_id)
+            .or_insert([None, None]);
+        attempt[usize::from(trial.identity.order_index)] = Some(trial);
+        if let [Some(first), Some(second)] = *attempt {
+            if first.metadata != second.metadata {
+                return Err(ArtifactError(format!(
+                    "unmarked pair attempt {} has mixed metadata",
+                    pair.pair_id
+                )));
+            }
+            return Ok(Some(RecoverablePair {
+                identity: PairCompletionIdentity {
+                    run_id: pair.run_id.clone(),
+                    pair_id: pair.pair_id.clone(),
+                    attempt_id: first.identity.attempt_id.clone(),
+                    task_id: pair.task_id.clone(),
+                    instance_hash: pair.instance_hash.clone(),
+                    schedule_hash: schedule_hash.to_string(),
+                    phase: pair.phase,
+                },
+                trial_record_hashes: [first.record_hash.clone(), second.record_hash.clone()],
+            }));
+        }
+    }
+    Ok(None)
 }
 
 /// Resolves a completion marker and validates its full frozen pair identity.
@@ -216,17 +295,7 @@ pub fn completed_pair<'a>(
             .expect("scan validated marker trial references")
     });
     for (trial, scheduled) in trials.iter().zip(&pair.trials) {
-        if trial.identity.run_id != scheduled.run_id
-            || trial.identity.pair_id != scheduled.pair_id
-            || trial.identity.task_id != scheduled.task_id
-            || trial.identity.instance_hash != scheduled.instance_hash
-            || trial.identity.archetype_id != pair.archetype_id
-            || trial.identity.schedule_hash != schedule_hash
-            || trial.identity.phase != scheduled.phase
-            || trial.identity.repetition != scheduled.archetype_repetition
-            || trial.identity.variant != scheduled.variant
-            || trial.identity.order_index != scheduled.order_index
-        {
+        if !trial_matches_slot(trial, schedule_hash, pair, scheduled) {
             return Err(ArtifactError(format!(
                 "completion marker {} references a trial outside its frozen slot",
                 pair.pair_id
@@ -234,6 +303,24 @@ pub fn completed_pair<'a>(
         }
     }
     Ok(CompletedPair { marker, trials })
+}
+
+fn trial_matches_slot(
+    trial: &TrialRecord,
+    schedule_hash: &str,
+    pair: &PairScheduleRecord,
+    scheduled: &TrialScheduleRecord,
+) -> bool {
+    trial.identity.run_id == scheduled.run_id
+        && trial.identity.pair_id == scheduled.pair_id
+        && trial.identity.task_id == scheduled.task_id
+        && trial.identity.instance_hash == scheduled.instance_hash
+        && trial.identity.archetype_id == pair.archetype_id
+        && trial.identity.schedule_hash == schedule_hash
+        && trial.identity.phase == scheduled.phase
+        && trial.identity.repetition == scheduled.archetype_repetition
+        && trial.identity.variant == scheduled.variant
+        && trial.identity.order_index == scheduled.order_index
 }
 
 /// Scans JSONL, ignoring at most one incomplete final line.
@@ -292,6 +379,13 @@ fn apply_record(
             if trial.identity.order_index > 1 {
                 return Err(ArtifactError(format!("invalid trial order at line {line}")));
             }
+            let logical_identity = logical_trial_identity(&trial);
+            if !state.trial_identities.insert(logical_identity) {
+                return Err(ArtifactError(format!(
+                    "duplicate logical trial identity at line {line}"
+                )));
+            }
+            state.trial_record_order.push(trial.record_hash.clone());
             if state
                 .trials_by_hash
                 .insert(trial.record_hash.clone(), trial)
@@ -357,6 +451,7 @@ fn validate_marker(
             ))
         })?;
     for trial in [first, second] {
+        validate_completed_trial(trial, line)?;
         let identity = &trial.identity;
         if identity.run_id != marker.identity.run_id
             || identity.pair_id != marker.identity.pair_id
@@ -385,10 +480,36 @@ fn validate_marker(
     Ok(())
 }
 
+fn logical_trial_identity(trial: &TrialRecord) -> (String, String, String, u8) {
+    (
+        trial.identity.run_id.clone(),
+        trial.identity.pair_id.clone(),
+        trial.identity.attempt_id.clone(),
+        trial.identity.order_index,
+    )
+}
+
+fn validate_completed_trial(trial: &TrialRecord, line: usize) -> Result<(), ArtifactError> {
+    let runtime: RuntimeRecord =
+        serde_json::from_value(trial.runtime.clone()).map_err(|error| {
+            ArtifactError(format!(
+                "pair completion references an invalid runtime at line {line}: {error}"
+            ))
+        })?;
+    if runtime.completion_eligible() {
+        Ok(())
+    } else {
+        Err(ArtifactError(format!(
+            "pair completion references an invalid or provider-contaminated trial at line {line}"
+        )))
+    }
+}
+
 /// Writer that flushes and syncs every complete JSONL line.
 pub struct ArtifactLog {
     path: PathBuf,
     file: File,
+    trial_identities: BTreeSet<(String, String, String, u8)>,
 }
 
 impl ArtifactLog {
@@ -405,7 +526,11 @@ impl ArtifactLog {
             fs::create_dir_all(parent)?;
         }
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        Ok(Self { path, file })
+        Ok(Self {
+            path,
+            file,
+            trial_identities: state.trial_identities,
+        })
     }
 
     /// Appends and synchronizes one immutable trial record.
@@ -415,7 +540,15 @@ impl ArtifactLog {
                 "refusing to append a trial with an invalid hash".into(),
             ));
         }
-        self.append(&ArtifactRecord::Trial(trial.clone()))
+        let identity = logical_trial_identity(trial);
+        if self.trial_identities.contains(&identity) {
+            return Err(ArtifactError(
+                "refusing to append a duplicate logical trial identity".into(),
+            ));
+        }
+        self.append(&ArtifactRecord::Trial(trial.clone()))?;
+        self.trial_identities.insert(identity);
+        Ok(())
     }
 
     /// Validates two durable trials, then appends and synchronizes their marker.
@@ -535,6 +668,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::runtime::MAX_PAIR_ATTEMPTS;
     use crate::schedule::{PairScheduleRecord, TrialScheduleRecord};
 
     fn identity(variant: DescriptionVariant, order_index: u8, attempt: &str) -> TrialIdentity {
@@ -596,6 +730,10 @@ mod tests {
         }
     }
 
+    fn clean_runtime() -> Value {
+        serde_json::to_value(crate::runtime::completed_runtime_fixture()).unwrap()
+    }
+
     fn metadata() -> TrialMetadata {
         TrialMetadata {
             task_seed: "task-seed".into(),
@@ -635,13 +773,13 @@ mod tests {
         let first = TrialRecord::new(
             identity(DescriptionVariant::Current, 0, "attempt-2"),
             metadata(),
-            json!({}),
+            clean_runtime(),
         )
         .unwrap();
         let second = TrialRecord::new(
             identity(DescriptionVariant::CompactV1, 1, "attempt-2"),
             metadata(),
-            json!({}),
+            clean_runtime(),
         )
         .unwrap();
         log.append_trial(&first).unwrap();
@@ -731,13 +869,13 @@ mod tests {
         let first = TrialRecord::new(
             identity(DescriptionVariant::Current, 0, "attempt"),
             metadata(),
-            json!({}),
+            clean_runtime(),
         )
         .unwrap();
         let second = TrialRecord::new(
             identity(DescriptionVariant::CompactV1, 1, "attempt"),
             metadata(),
-            json!({}),
+            clean_runtime(),
         )
         .unwrap();
         log.append_trial(&first).unwrap();
@@ -761,8 +899,8 @@ mod tests {
         first_identity.task_id = "wrong-task".into();
         let mut second_identity = identity(DescriptionVariant::CompactV1, 1, "attempt");
         second_identity.task_id = "wrong-task".into();
-        let first = TrialRecord::new(first_identity, metadata(), json!({"valid": true})).unwrap();
-        let second = TrialRecord::new(second_identity, metadata(), json!({"valid": true})).unwrap();
+        let first = TrialRecord::new(first_identity, metadata(), clean_runtime()).unwrap();
+        let second = TrialRecord::new(second_identity, metadata(), clean_runtime()).unwrap();
         let mut log = ArtifactLog::open(&path).unwrap();
         log.append_trial(&first).unwrap();
         log.append_trial(&second).unwrap();
@@ -777,6 +915,141 @@ mod tests {
         let state = scan(&path).unwrap();
         let error = completed_pair(&state, "schedule", &scheduled_pair()).unwrap_err();
         assert!(error.to_string().contains("does not match its frozen pair"));
+    }
+
+    #[test]
+    fn scanner_rejects_reused_logical_trial_slots() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("records.jsonl");
+        let first = TrialRecord::new(
+            identity(DescriptionVariant::Current, 0, "attempt"),
+            metadata(),
+            json!({"valid": false}),
+        )
+        .unwrap();
+        let second = TrialRecord::new(
+            first.identity.clone(),
+            metadata(),
+            json!({"valid": false, "different": true}),
+        )
+        .unwrap();
+        let mut log = ArtifactLog::open(&path).unwrap();
+        log.append_trial(&first).unwrap();
+        assert!(
+            log.append_trial(&second)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate logical trial identity")
+        );
+        drop(log);
+        assert_eq!(scan(&path).unwrap().trials_by_hash.len(), 1);
+    }
+
+    #[test]
+    fn marked_trials_reject_provider_contamination_and_missing_fields() {
+        for contaminated in [
+            json!({
+                "valid": true,
+                "stream_retries": 1,
+                "provider_errors": [],
+                "provider_error_details": []
+            }),
+            json!({
+                "valid": true,
+                "stream_retries": 0,
+                "provider_errors": ["retryable"],
+                "provider_error_details": []
+            }),
+            json!({
+                "valid": true,
+                "stream_retries": 0,
+                "provider_errors": [],
+                "provider_error_details": [{"message": "retryable"}]
+            }),
+            json!({"valid": true}),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("records.jsonl");
+            let first = TrialRecord::new(
+                identity(DescriptionVariant::Current, 0, "attempt"),
+                metadata(),
+                contaminated,
+            )
+            .unwrap();
+            let second = TrialRecord::new(
+                identity(DescriptionVariant::CompactV1, 1, "attempt"),
+                metadata(),
+                clean_runtime(),
+            )
+            .unwrap();
+            let mut marker = PairCompleteRecord {
+                schema_version: 1,
+                identity: completion("attempt"),
+                trial_record_hashes: [first.record_hash.clone(), second.record_hash.clone()],
+                record_hash: String::new(),
+            };
+            marker.record_hash = marker.computed_hash().unwrap();
+            let records = [
+                ArtifactRecord::Trial(first),
+                ArtifactRecord::Trial(second),
+                ArtifactRecord::PairComplete(marker),
+            ];
+            let bytes = records
+                .iter()
+                .map(|record| format!("{}\n", serde_json::to_string(record).unwrap()))
+                .collect::<String>();
+            fs::write(&path, bytes).unwrap();
+
+            assert!(scan(&path).unwrap_err().to_string().contains("invalid"));
+        }
+    }
+
+    #[test]
+    fn recovers_the_final_unmarked_complete_attempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("records.jsonl");
+        let mut log = ArtifactLog::open(&path).unwrap();
+        for attempt in 0..MAX_PAIR_ATTEMPTS - 1 {
+            let abandoned = TrialRecord::new(
+                identity(
+                    DescriptionVariant::Current,
+                    0,
+                    &format!("attempt-{attempt}"),
+                ),
+                metadata(),
+                json!({"valid": false}),
+            )
+            .unwrap();
+            log.append_trial(&abandoned).unwrap();
+        }
+        let attempt = format!("attempt-{}", MAX_PAIR_ATTEMPTS - 1);
+        let first = TrialRecord::new(
+            identity(DescriptionVariant::Current, 0, &attempt),
+            metadata(),
+            clean_runtime(),
+        )
+        .unwrap();
+        let second = TrialRecord::new(
+            identity(DescriptionVariant::CompactV1, 1, &attempt),
+            metadata(),
+            clean_runtime(),
+        )
+        .unwrap();
+        log.append_trial(&first).unwrap();
+        log.append_trial(&second).unwrap();
+        drop(log);
+
+        let state = scan(&path).unwrap();
+        assert_eq!(pair_attempt_count(&state, "run", "pair"), MAX_PAIR_ATTEMPTS);
+        let recoverable = recoverable_pair(&state, "schedule", &scheduled_pair())
+            .unwrap()
+            .unwrap();
+        assert_eq!(recoverable.identity.attempt_id, attempt);
+        ArtifactLog::open(&path)
+            .unwrap()
+            .complete_pair(recoverable.identity, recoverable.trial_record_hashes)
+            .unwrap();
+        assert!(completed_pair(&scan(&path).unwrap(), "schedule", &scheduled_pair()).is_ok());
     }
 
     #[test]

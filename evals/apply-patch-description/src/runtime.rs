@@ -11,6 +11,9 @@ use serde_json::Value;
 use crate::fixtures::{CommandResult, VerificationReport};
 use crate::snapshot::{FilesystemSnapshot, SnapshotDelta};
 
+/// Maximum fresh isolated attempts allowed for one scheduled pair.
+pub const MAX_PAIR_ATTEMPTS: usize = 8;
+
 /// Ordered terminal taxonomy for one trial.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -268,6 +271,18 @@ pub struct RuntimeRecord {
     pub final_assistant_text_blob: Option<String>,
 }
 
+impl RuntimeRecord {
+    /// Whether this record can participate in a durable completed pair.
+    pub fn completion_eligible(&self) -> bool {
+        self.valid
+            && self.valid == self.terminal_status.valid()
+            && self.task_passed == (self.terminal_status == TerminalStatus::Passed)
+            && self.stream_retries == 0
+            && self.provider_errors.is_empty()
+            && self.provider_error_details.is_empty()
+    }
+}
+
 /// Mutable worker-side event collector. The event bus invokes this inline.
 #[derive(Debug, Default)]
 pub struct EventCollector {
@@ -372,6 +387,108 @@ pub fn analyzer_projection(
 ) -> Result<crate::analysis::RuntimeMetrics, String> {
     let value: Value = serde_json::to_value(record).map_err(|error| error.to_string())?;
     serde_json::from_value(value).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+use crate::snapshot::{EntryKind, SnapshotEntry, delta};
+
+#[cfg(test)]
+fn completed_snapshot_fixture(path: &str, hash: &str, root_hash: &str) -> FilesystemSnapshot {
+    FilesystemSnapshot {
+        entries: vec![SnapshotEntry {
+            path: path.into(),
+            kind: EntryKind::File,
+            unix_mode: 0o644,
+            file_length: Some(1),
+            file_sha256: Some(hash.into()),
+            symlink_target: None,
+            symlink_target_sha256: None,
+        }],
+        root_hash: root_hash.into(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn completed_runtime_fixture() -> RuntimeRecord {
+    let baseline = completed_snapshot_fixture("file", "before", "baseline");
+    let final_snapshot = completed_snapshot_fixture("file", "after", "final");
+    RuntimeRecord {
+        terminal_status: TerminalStatus::Passed,
+        valid: true,
+        task_passed: true,
+        sessions_with_patch_failure: false,
+        edit_bypass: false,
+        aj_recorded_catalog_cost: 0.25,
+        model_responses: 2,
+        provider_requests: 2,
+        usage: Usage::default(),
+        usage_field_presence: UsageFieldPresence {
+            input: Some(true),
+            output: Some(true),
+            cache_read: Some(true),
+            cache_write: None,
+            source: "test".into(),
+        },
+        cache_stratum: CacheStratum::ZeroRead,
+        cache_write_sensitivity: CacheWriteSensitivity {
+            lower_aj_recorded_catalog_cost: 0.25,
+            upper_aj_recorded_catalog_cost: 0.3,
+            upper_assumed_cache_write_tokens: 10,
+        },
+        limits: RuntimeLimits {
+            wall_timeout_seconds: 10,
+            max_provider_requests: 2,
+            max_model_responses: 2,
+            provider_output_token_ceiling: 100,
+            aggregate_observed_output_token_ceiling: 100,
+        },
+        first_response_aj_recorded_catalog_cost: Some(0.1),
+        tool_rounds: 1,
+        total_tool_calls: 1,
+        tool_calls_by_name: BTreeMap::from([("apply_patch".into(), 1)]),
+        apply_patch_attempts: 1,
+        successful_patch_calls: 1,
+        recovery_rounds: 0,
+        stream_retries: 0,
+        duration_millis: 10,
+        final_assistant_text: "done".into(),
+        prompt: "change file".into(),
+        verifier_command: None,
+        patch_calls: Vec::new(),
+        tool_outcomes: Vec::new(),
+        mutation_ledger: Vec::new(),
+        baseline_root_hash: Some(baseline.root_hash.clone()),
+        final_snapshot: Some(final_snapshot.clone()),
+        final_snapshot_blob: Some("blob".into()),
+        final_delta: Some(delta(&baseline, &final_snapshot)),
+        baseline_commit: Some("commit".into()),
+        final_diff_blob: Some("diff".into()),
+        final_status_blob: Some("status".into()),
+        changed_paths: vec!["file".into()],
+        verifier: None,
+        payload_hashes: Vec::new(),
+        normalized_model_context_hashes: vec!["context".into()],
+        normalized_first_request_hash: Some("context".into()),
+        system_prompt_hash: "system".into(),
+        cache_key_hash: "cache".into(),
+        transcript_wire_messages: Vec::new(),
+        conversation_jsonl_blob: Some("transcript".into()),
+        provider_errors: Vec::new(),
+        provider_error_details: Vec::new(),
+        worker_error: None,
+        containment_cleanup_confirmed: true,
+        isolation_contract: "test".into(),
+        evaluator_api_limitations: Vec::new(),
+        image_id: "sha256:image".into(),
+        source_provenance: SourceProvenance {
+            head: "head".into(),
+            dirty: true,
+            worktree_hash: Some("dirty".into()),
+        },
+        utc_date: "2026-07-24".into(),
+        conservative_catalog_pair_reserve: 1.0,
+        final_assistant_text_blob: Some("final-text".into()),
+    }
 }
 
 #[cfg(test)]
@@ -548,6 +665,20 @@ mod tests {
             conservative_catalog_pair_reserve: 1.0,
             final_assistant_text_blob: Some("final-text".into()),
         }
+    }
+
+    #[test]
+    fn completion_eligibility_requires_consistent_clean_runtime() {
+        let mut record = runtime_record();
+        assert!(record.completion_eligible());
+        record.stream_retries = 1;
+        assert!(!record.completion_eligible());
+        record.stream_retries = 0;
+        record.terminal_status = TerminalStatus::InfrastructureFailed;
+        assert!(!record.completion_eligible());
+        record.terminal_status = TerminalStatus::Passed;
+        record.task_passed = false;
+        assert!(!record.completion_eligible());
     }
 
     #[test]
