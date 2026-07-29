@@ -260,8 +260,9 @@ pub enum ErrorCategory {
     /// Provider-overload response (Anthropic 529, OpenAI 503 overload
     /// body). Retryable with backoff.
     Overloaded,
-    /// 5xx, transport error, or stream drop mid-response. Retryable,
-    /// but note that partial output may already have been emitted.
+    /// 5xx, an unmapped failure frame that arrived after a 200 OK, a
+    /// transport error, or a stream drop mid-response. Retryable, but
+    /// note that partial output may already have been emitted.
     Transient,
     /// 400 whose message matches the context-overflow patterns.
     /// Not retryable without reducing context.

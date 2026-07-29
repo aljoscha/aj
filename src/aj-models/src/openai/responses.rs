@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::cancel::{SelectOutcome, select_cancel};
-use crate::errors::classify_openai_error;
+use crate::errors::classify_openai_stream_failure;
 use crate::openai::errors::classify_client_error;
 use crate::partial_json::parse_streaming_json;
 use crate::provider::Provider;
@@ -1130,7 +1130,7 @@ impl StreamState {
                 self.final_response = Some(response);
             }
             ResponseStreamEvent::Error { code, message, .. } => {
-                self.finish_error = Some(error_from_code(code.as_deref(), message));
+                self.finish_error = Some(classify_openai_stream_failure(code.as_deref(), message));
                 self.finish_status = Some(ResponseStatus::Failed);
             }
             ResponseStreamEvent::WebSearchCallInProgress { .. }
@@ -1593,18 +1593,23 @@ fn classify_status(
 
 pub(super) fn error_from_response(response: &Response) -> AssistantError {
     if let Some(err) = &response.error {
-        return error_from_code(Some(err.code.as_str()), err.message.clone());
+        return classify_openai_stream_failure(Some(err.code.as_str()), err.message.clone());
     }
-    let message = response
+    // No `error` object. An `incomplete_details` reason is a structured
+    // signal we don't map, so it stays terminal rather than being
+    // retried on a guess. With neither, the server failed the response
+    // and told us nothing, which is what
+    // `classify_openai_stream_failure` exists to handle.
+    match response
         .incomplete_details
         .as_ref()
         .and_then(|d| d.reason.clone())
-        .unwrap_or_else(|| "openai-responses: response failed".to_string());
-    AssistantError::new(ErrorCategory::Unknown, message)
-}
-
-pub(super) fn error_from_code(code: Option<&str>, message: String) -> AssistantError {
-    classify_openai_error(code, None, None, None, message)
+    {
+        Some(reason) => AssistantError::new(ErrorCategory::Unknown, reason),
+        None => {
+            classify_openai_stream_failure(None, "openai-responses: response failed".to_string())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1926,6 +1931,31 @@ mod tests {
         );
         assert_eq!(sr, StopReason::Length);
         assert!(dr.is_some());
+    }
+
+    #[test]
+    fn error_from_response_keeps_a_reason_terminal_and_promotes_silence() {
+        let mut response: Response = serde_json::from_str(
+            r#"{"id":"resp_1","object":"response","created_at":0,"model":"gpt-5",
+                "output":[],"parallel_tool_calls":true,"tools":[],"status":"failed"}"#,
+        )
+        .expect("minimal failed response must deserialize");
+
+        // Failed with nothing at all: retry is the only useful response.
+        assert_eq!(
+            error_from_response(&response).category,
+            ErrorCategory::Transient
+        );
+
+        // A reason is a signal we don't map, so it must not be retried on
+        // a guess.
+        response.incomplete_details = Some(openai_sdk::types::responses::IncompleteDetails {
+            reason: Some("content_filter".into()),
+        });
+        assert_eq!(
+            error_from_response(&response).category,
+            ErrorCategory::Unknown
+        );
     }
 
     #[test]

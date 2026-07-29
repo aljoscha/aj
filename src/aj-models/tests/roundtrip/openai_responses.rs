@@ -348,14 +348,15 @@ fn incomplete_length_is_clean_done() {
 
 #[test]
 fn response_failed_is_classified_error() {
-    // A `response.failed` terminates with an error whose category derives
-    // from the wire error code. A bare `server_error` carries no HTTP
-    // status on the SSE frame, so it lands in `Unknown` (deliberately not
-    // auto-retried) rather than `Transient`.
+    // A `response.failed` terminates with an error classified from the
+    // wire error code. `server_error` maps to nothing specific and the
+    // frame carries no HTTP status, so it falls back on having arrived
+    // after a 200 OK: retryable `Transient` rather than a terminal
+    // `Unknown`.
     let parsed = replay_fixture("response_failed");
     assert_eq!(parsed.stop_reason, StopReason::Error);
     assert_eq!(
         parsed.error.as_ref().map(|e| e.category),
-        Some(ErrorCategory::Unknown)
+        Some(ErrorCategory::Transient)
     );
 }

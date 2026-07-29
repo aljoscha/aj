@@ -5,6 +5,12 @@
 //! `classify_*` helpers below. Callers then key retry behaviour off
 //! [`ErrorCategory`] without ever pattern-matching message strings.
 //!
+//! Where the failure arrived matters as much as what it says. An HTTP
+//! error body is classified by status and typed tag. A failure frame
+//! that arrives after a 200 OK has neither, so
+//! [`classify_openai_stream_failure`] classifies it on the strength of
+//! that position instead.
+//!
 //! `is_context_overflow` is the public entry point for callers that
 //! want to know whether a turn failed because the request didn't fit
 //! in the model's context window. It uses `error.category` as the
@@ -240,6 +246,31 @@ pub fn classify_openai_error(
         retry_after_ms,
         http_status,
     }
+}
+
+/// Classify a failure frame that arrived after a 200 OK: an OpenAI
+/// Responses `response.failed`, or a top-level SSE `error` event.
+///
+/// The server accepted the request and only then gave up, so a failure
+/// we can't place lands on [`ErrorCategory::Transient`] rather than the
+/// terminal [`ErrorCategory::Unknown`]. Re-issuing the request is the
+/// only useful response, and it matches how we already treat a stream
+/// that drops without any terminal frame at all.
+///
+/// A recognized `code` still decides, so a rate limit or a bad request
+/// keeps its category. A context overflow also stays terminal:
+/// re-issuing an oversized request can never succeed.
+pub fn classify_openai_stream_failure(code: Option<&str>, message: String) -> AssistantError {
+    let mut error = classify_openai_error(code, None, None, None, message);
+    // These frames carry no status, so an unrecognized code leaves
+    // `classify_openai_error` with nothing to go on but the position of
+    // the frame. Overflow prose is the one shape we must not promote:
+    // `is_context_overflow` reads it back out of `Unknown` to decide
+    // whether to compact and retry with less context.
+    if error.category == ErrorCategory::Unknown && !message_matches_overflow(&error.message) {
+        error.category = ErrorCategory::Transient;
+    }
+    error
 }
 
 /// Classify an OpenAI Chat Completions terminal `finish_reason` that
@@ -634,6 +665,67 @@ mod tests {
             classify_openai_responses_failure(Some("failed"), None, None, "x".into()).category,
             ErrorCategory::Unknown
         );
+    }
+
+    // -------- post-200 failure frames --------
+
+    /// Prose observed on real `response.failed` frames. The wire carries
+    /// no HTTP status on these, and the codes vary by endpoint, so the
+    /// position of the frame is the only dependable signal.
+    const OBSERVED_FAILURE_PROSE: &[&str] = &[
+        "Our servers are currently overloaded. Please try again later.",
+        "An error occurred while processing your request. You can retry your request, \
+         or contact us through our help center at help.openai.com if the error \
+         persists. Please include the request ID 8008eb6f-6d8a-4ac9-9112-053f8e0bbfd8 \
+         in your message.",
+        "Network connection lost.",
+    ];
+
+    #[test]
+    fn unmapped_stream_failure_is_retryable() {
+        // Every code we have seen on these frames, plus the absence of
+        // one, has to end up retryable. Enumerating prose or codes would
+        // strand whatever the next endpoint sends instead.
+        for message in OBSERVED_FAILURE_PROSE {
+            for code in [None, Some("server_error"), Some("upstream_error")] {
+                let err = classify_openai_stream_failure(code, (*message).into());
+                assert_eq!(
+                    err.category,
+                    ErrorCategory::Transient,
+                    "code={code:?} message={message}"
+                );
+                assert!(err.category.is_retryable());
+            }
+        }
+    }
+
+    #[test]
+    fn recognized_code_still_decides_a_stream_failure() {
+        for (code, expect) in [
+            ("rate_limit_exceeded", ErrorCategory::RateLimit),
+            ("context_length_exceeded", ErrorCategory::ContextOverflow),
+            ("insufficient_quota", ErrorCategory::InvalidRequest),
+            ("invalid_api_key", ErrorCategory::Auth),
+        ] {
+            let err = classify_openai_stream_failure(Some(code), "whatever".into());
+            assert_eq!(err.category, expect, "code={code}");
+        }
+    }
+
+    #[test]
+    fn overflow_shaped_stream_failure_stays_terminal() {
+        // Re-issuing an oversized request can only fail again. Staying
+        // out of the retryable categories also keeps the failure visible
+        // to `is_context_overflow`, which drives compact-and-retry.
+        for message in [
+            "prompt is too long: 250000 > 200000 tokens",
+            "Internal error: please reduce the length of the messages",
+        ] {
+            let err = classify_openai_stream_failure(None, message.into());
+            assert_eq!(err.category, ErrorCategory::Unknown, "message={message}");
+            assert!(!err.category.is_retryable());
+            assert!(is_context_overflow(&assistant_with_error(err), None));
+        }
     }
 
     // -------- Header parsing --------

@@ -2243,11 +2243,22 @@ arrive as `response.failed` or top-level `error` SSE events with
 | Responses failure | Category |
 |---|---|
 | `response.status == failed`, `error.code` matches a known HTTP-level code above | as per that code |
-| `response.status == failed`, unknown code | `Unknown` |
+| `response.status == failed`, message matches §10.5 patterns | `ContextOverflow` |
+| `response.status == failed`, unknown or absent `error.code` | `Transient` |
+| `response.status == failed`, no `error`, `incomplete_details.reason` present | `Unknown` |
 | `response.status == cancelled` | `Aborted` |
 | `response.status == incomplete`, `incomplete_details.reason == content_filter` | `ContentFilter` |
 | `response.refusal` delta terminates response | `ContentFilter` |
-| SSE `error` event | `Unknown` (finer if `code` maps to a known category) |
+| SSE `error` event | same mapping as `response.status == failed` |
+
+These frames arrive after a 200 OK, so they carry no HTTP status, and
+the codes on them vary by endpoint. What we do know is that the server
+accepted the request and only then gave up, so that position is the
+classifying signal: a failure frame we can't otherwise place is
+`Transient`, which matches how a stream that drops without any terminal
+frame is already treated. Two things still outrank it. A recognized
+`code` decides on its own, and a context overflow stays terminal
+because re-issuing an oversized request cannot succeed.
 
 **Transport and stream failures (any api).**
 

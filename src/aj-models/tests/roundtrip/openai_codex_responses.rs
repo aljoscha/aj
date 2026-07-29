@@ -405,6 +405,25 @@ fn truncated_stream_is_transient_error() {
 }
 
 #[test]
+fn response_failed_with_unmapped_code_is_retryable() {
+    // The failure that stranded turns in the field: the endpoint accepts
+    // the request, then fails it with a code we have no mapping for. It
+    // arrives after a 200 OK and so carries no HTTP status, which leaves
+    // the position of the frame as the only signal. It must be retryable,
+    // or the turn dies on a failure the server invited us to retry.
+    let parsed = replay_fixture("response_failed");
+    assert_eq!(parsed.stop_reason, StopReason::Error);
+    assert_eq!(
+        parsed.error.as_ref().map(|e| e.category),
+        Some(ErrorCategory::Transient)
+    );
+    assert_eq!(
+        parsed.error.as_ref().map(|e| e.message.as_str()),
+        Some("Our servers are currently overloaded. Please try again later.")
+    );
+}
+
+#[test]
 fn error_frame_preserves_partial_and_classifies_error() {
     // A top-level `error` frame (here `rate_limit_exceeded`) is
     // forwarded into the shared state machine, so the turn finalizes as
