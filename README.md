@@ -34,12 +34,12 @@ AJ talks to Anthropic and OpenAI models, and you can authenticate either way.
 
 ```bash
 aj                          # start an interactive session in the current project
-aj "explain this codebase"  # prefill the first message, then drop into the TUI
+aj "explain this codebase"  # submit a first message on launch
 ```
 
 ## Using AJ
 
-Everything beyond chatting lives in the **command palette**, opened with
+Most actions live in the **command palette**, opened with
 `Ctrl+O`. From there you can switch model, set the reasoning effort, start or
 resume a session, log in or out, check usage across providers, toggle skills,
 open settings, and more.
@@ -52,6 +52,9 @@ A handful of keys worth knowing:
 | `Shift+Enter` | Insert a newline |
 | `Ctrl+O` | Open the command palette |
 | `Ctrl+R` | Search your prompt history |
+| `Tab` | Focus the transcript, then step through older user messages |
+| `Shift+Tab` | Step back toward newer user messages |
+| `b` | Branch from the focused message |
 | `Ctrl+C` | Interrupt the current turn (press again when idle to quit) |
 
 ## Sessions
@@ -66,6 +69,12 @@ aj continue <id>       # resume a specific session
 ```
 
 You can also resume a session or start a fresh one from the command palette.
+
+Press `Tab` to focus the transcript and move through earlier user messages.
+Press `b` on a focused message to edit it and continue from that point,
+creating a new branch while preserving the existing conversation. Open
+**session tree** from the command palette to view the branches in the current
+session and switch between them.
 
 ## Print mode
 
@@ -82,16 +91,13 @@ requires `--print`.
 
 ## Feature highlights
 
-- **Minimal system prompt.** The built-in prompt is deliberately tiny, just a
-  short role statement and a few guidelines. Swap it out wholesale by creating
-  `~/.agents/SYSTEM_PROMPT.md` (or `~/.claude/SYSTEM_PROMPT.md`). Project and
-  user `AGENTS.md` or `CLAUDE.md` files are layered on top as extra context.
+- **Minimal system prompt.** AJ keeps its built-in prompt deliberately small.
+  Replace it with `~/.agents/SYSTEM_PROMPT.md` or
+  `~/.claude/SYSTEM_PROMPT.md`. Project and user guidance files are layered on
+  top.
 - **Skills.** AJ supports skills, discovered from the usual `skills/`
   directories under `.aj/`, `.agents/`, and `.claude/` in your project or home
   directory. Enable or disable them in the config.
-- **Switch model mid-conversation.** Change provider or model at any point from
-  the command palette. The change takes effect on your next turn, and the rest
-  of the conversation carries over.
 - **Queue and steer.** While AJ is working, `Enter` queues a follow-up for when
   the turn finishes, and `Alt+Enter` steers by injecting your message into the
   running turn at the next step.
