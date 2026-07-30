@@ -50,8 +50,8 @@ pub struct Args {
 
     /// Output format for print mode. `text` (default) renders
     /// human-readable lines; `json` writes one JSONL event per
-    /// line. Implies `--print` when set.
-    #[arg(long, value_enum, default_value_t = PrintFormat::Text)]
+    /// line. Requires `--print` when set explicitly.
+    #[arg(long, value_enum, default_value_t = PrintFormat::Text, requires = "print")]
     pub format: PrintFormat,
 
     /// Free-form launch input. Each positional argument is either a
@@ -125,4 +125,30 @@ pub enum Command {
     /// Refresh the user model catalog at `~/.aj/models.json` from
     /// `https://models.dev/api.json`.
     UpdateModels,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[test]
+    fn explicit_format_requires_print_mode() {
+        let error = Args::try_parse_from(["aj", "--format", "json", "hello"])
+            .expect_err("--format without --print must be rejected");
+
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn default_format_does_not_require_print_mode() {
+        let args = Args::try_parse_from(["aj", "hello"]).expect("interactive arguments parse");
+
+        assert!(!args.print);
+        assert_eq!(args.format, PrintFormat::Text);
+    }
 }
