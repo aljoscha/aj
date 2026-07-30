@@ -57,7 +57,8 @@ cargo run -p aj-apply-patch-eval -- plan-main \
   --output-plan eval-artifacts/planned-main.json \
   --output-report eval-artifacts/planning-report.json
 cargo run -p aj-apply-patch-eval -- analyze-pilot \
-  --plan eval-artifacts/planned-main.json \
+  --plan eval-artifacts/unplanned-plan.json \
+  --planning-report eval-artifacts/planning-report.json \
   --records eval-artifacts/records.jsonl \
   --output-json eval-artifacts/pilot-summary.json \
   --output-markdown eval-artifacts/pilot-summary.md
@@ -106,20 +107,27 @@ supported Responses payload. It binds the catalog entry and normalized tool
 catalog into the plan and schedule hashes. Later commands have no model override
 and fail if the local catalog no longer matches.
 
-`analyze-pilot` accepts only the planned main file. It first recomputes the exact
-blinded smoke and pilot evidence frozen by `plan-main`, then restores treatment
-labels for exactly the 48 marked pilot pairs. Smoke pairs and unmarked abandoned
-attempts do not enter the report sample. The JSON and Markdown are descriptive
-exploratory artifacts. They cannot support or alter a shipping decision and do
-not contain inferential results, thresholds, or a sample recommendation.
+`analyze-pilot` accepts the original unplanned plan and the durable planning
+report. It deterministically reruns `plan-main` with the frozen default controls
+and requires the complete recomputed planning report, including its hash,
+blinded summary, evidence, configuration, sample result, selected IDs, and
+reserve, to equal the supplied report before it restores treatment labels. This
+works whether planning recommended a main sample or was inconclusive. Exactly
+the 48 marked pilot pairs enter the report. Smoke pairs, unmarked abandoned
+attempts, and any partial main run do not enter it. The JSON and Markdown are
+descriptive exploratory artifacts. They cannot support or alter a shipping
+decision and do not contain inferential results, thresholds, or a sample
+recommendation.
 
 Use a separate plan, records file, artifact directory, pilot report, main sample,
 and analysis for every provider, model, or reasoning level. Results from
-different levels are not pooled into one shipping decision. The operational
-target for completing one 48-pair pilot is 1 to 2 hours. This is a planning
-target, not a guarantee, because provider latency, bounded retries, and local
-capacity can extend it. For example, a second model or reasoning level starts
-with a distinct freeze command and output directory:
+different levels are not pooled into one shipping decision. The runner
+executes adjacent pairs serially to preserve provider, cache, and pair-order
+controls. It emits no pilot result until all 48 pairs are complete. The
+operational target for completing one pilot is 1 to 2 hours. This is a planning
+target, not a guarantee. Endpoint latency, bounded retries, and local capacity
+can extend the run beyond that target. For example, a second model or reasoning
+level starts with a distinct freeze command and output directory:
 
 ```bash
 cargo run -p aj-apply-patch-eval -- freeze \

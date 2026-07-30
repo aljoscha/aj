@@ -274,12 +274,20 @@ pub struct RuntimeRecord {
 impl RuntimeRecord {
     /// Whether this record can participate in a durable completed pair.
     pub fn completion_eligible(&self) -> bool {
+        let total_tokens = self
+            .usage
+            .input
+            .checked_add(self.usage.output)
+            .and_then(|total| total.checked_add(self.usage.cache_read))
+            .and_then(|total| total.checked_add(self.usage.cache_write));
         self.valid
             && self.valid == self.terminal_status.valid()
             && self.task_passed == (self.terminal_status == TerminalStatus::Passed)
             && self.stream_retries == 0
             && self.provider_errors.is_empty()
             && self.provider_error_details.is_empty()
+            && total_tokens == Some(self.usage.total_tokens)
+            && self.usage.output <= self.limits.aggregate_observed_output_token_ceiling
     }
 }
 
@@ -678,6 +686,21 @@ mod tests {
         assert!(!record.completion_eligible());
         record.terminal_status = TerminalStatus::Passed;
         record.task_passed = false;
+        assert!(!record.completion_eligible());
+
+        let mut record = runtime_record();
+        record.usage.input = 1;
+        assert!(!record.completion_eligible());
+
+        let mut record = runtime_record();
+        record.usage.input = u64::MAX;
+        record.usage.output = 1;
+        record.usage.total_tokens = u64::MAX;
+        assert!(!record.completion_eligible());
+
+        let mut record = runtime_record();
+        record.usage.output = 101;
+        record.usage.total_tokens = 101;
         assert!(!record.completion_eligible());
     }
 

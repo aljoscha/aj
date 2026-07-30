@@ -10,7 +10,7 @@ use crate::analysis::{RuntimeMetrics, validate_pilot_runtime_context};
 use crate::artifacts::{TrialRecord, completed_pair, scan};
 use crate::descriptions::DescriptionVariant;
 use crate::hash_framed;
-use crate::planning::{FrozenPilotRuntimeContext, validate_pilot_evidence};
+use crate::planning::{FrozenPilotRuntimeContext, PlanningReport, plan_main};
 use crate::runtime::MAX_PAIR_ATTEMPTS;
 use crate::schedule::{FrozenPlan, PairScheduleRecord, SchedulePhase, validate_frozen_plan};
 
@@ -55,9 +55,7 @@ pub struct PilotModelIdentity {
 pub struct PilotReportIdentities {
     pub run_id: String,
     pub universe_hash: String,
-    pub planned_schedule_hash: String,
     pub unplanned_schedule_hash: String,
-    pub planning_hash: String,
     pub planning_report_hash: String,
     pub blinded_pilot_hash: String,
     pub pilot_completion_stream_hash: String,
@@ -187,24 +185,26 @@ struct PilotPair {
 /// Analyzes exactly the 48 marker-referenced pilot pairs after planning is frozen.
 pub fn analyze_pilot_records(
     plan: &FrozenPlan,
+    planning_report: &PlanningReport,
     records: &Path,
 ) -> Result<ExploratoryPilotReport, PilotAnalysisError> {
     validate_frozen_plan(plan).map_err(error)?;
-    let planning = plan.require_planned_main().map_err(error)?;
-    planning.validate().map_err(error)?;
 
-    // This must run before treatment labels are projected into the report.
-    validate_pilot_evidence(plan, records).map_err(error)?;
-
-    if plan.schedule.planning_hash.as_deref() != Some(&planning.planning_hash) {
+    // We compare the complete blinded planning result before projecting labels.
+    let recomputed = plan_main(plan, records).map_err(error)?;
+    if recomputed.report != *planning_report {
         return Err(PilotAnalysisError(
-            "schedule is not bound to the frozen planning hash".into(),
+            "planning report does not exactly match deterministic blinded planning".into(),
         ));
     }
     validate_pilot_shape(plan)?;
 
     let state = scan(records).map_err(error)?;
-    validate_stream_scope(plan, &state, &planning.pilot_evidence.runtime_context)?;
+    validate_stream_scope(
+        plan,
+        &state,
+        &planning_report.pilot_evidence.runtime_context,
+    )?;
     let observed_smoke_pairs = state
         .completion_markers
         .values()
@@ -220,7 +220,7 @@ pub fn analyze_pilot_records(
     for scheduled in &plan.schedule.pilot {
         let completed = completed_pair(
             &state,
-            &planning.pilot_evidence.unplanned_schedule_hash,
+            &planning_report.pilot_evidence.unplanned_schedule_hash,
             scheduled,
         )
         .map_err(error)?;
@@ -231,13 +231,13 @@ pub fn analyze_pilot_records(
         validate_pilot_runtime_context(
             current_trial,
             &current,
-            &planning.pilot_evidence.runtime_context,
+            &planning_report.pilot_evidence.runtime_context,
         )
         .map_err(error)?;
         validate_pilot_runtime_context(
             compact_trial,
             &compact,
-            &planning.pilot_evidence.runtime_context,
+            &planning_report.pilot_evidence.runtime_context,
         )
         .map_err(error)?;
         if !payloads_equivalent(&current, &compact) {
@@ -302,20 +302,21 @@ pub fn analyze_pilot_records(
         });
     let all = pairs.iter().collect::<Vec<_>>();
     let mut report = ExploratoryPilotReport {
-        schema_version: 1,
+        schema_version: 2,
         analysis_kind: "exploratory_pilot_descriptive".into(),
         shipping_eligible: false,
         identities: PilotReportIdentities {
             run_id: plan.schedule.run_id.clone(),
             universe_hash: plan.universe.universe_hash.clone(),
-            planned_schedule_hash: plan.schedule.schedule_hash.clone(),
-            unplanned_schedule_hash: planning.pilot_evidence.unplanned_schedule_hash.clone(),
-            planning_hash: planning.planning_hash.clone(),
-            planning_report_hash: planning.planning_report_hash.clone(),
-            blinded_pilot_hash: planning.blinded_pilot_hash.clone(),
-            pilot_completion_stream_hash: planning.pilot_evidence.completion_stream_hash.clone(),
+            unplanned_schedule_hash: planning_report.unplanned_schedule_hash.clone(),
+            planning_report_hash: planning_report.report_hash.clone(),
+            blinded_pilot_hash: planning_report.blinded_pilot_hash.clone(),
+            pilot_completion_stream_hash: planning_report
+                .pilot_evidence
+                .completion_stream_hash
+                .clone(),
         },
-        provenance: planning.pilot_evidence.runtime_context.clone(),
+        provenance: planning_report.pilot_evidence.runtime_context.clone(),
         model: PilotModelIdentity {
             provider: model.provider.clone(),
             model: model.model.clone(),
@@ -385,7 +386,6 @@ fn validate_stream_scope(
             "records stream has a truncated final line".into(),
         ));
     }
-    let planning = plan.require_planned_main().map_err(error)?;
     let excluded = plan
         .schedule
         .smoke
@@ -393,14 +393,10 @@ fn validate_stream_scope(
         .chain(&plan.schedule.pilot)
         .map(|pair| (pair.pair_id.as_str(), pair))
         .collect::<BTreeMap<_, _>>();
-    let main = plan
-        .schedule
-        .main
-        .iter()
-        .map(|pair| (pair.pair_id.as_str(), pair))
-        .collect::<BTreeMap<_, _>>();
-
     for marker in state.completion_markers.values() {
+        if marker.identity.phase == SchedulePhase::Main {
+            continue;
+        }
         if marker.identity.run_id != plan.schedule.run_id {
             return Err(PilotAnalysisError(
                 "records mix different frozen runs or model selections".into(),
@@ -408,22 +404,14 @@ fn validate_stream_scope(
         }
         let expected = match marker.identity.phase {
             SchedulePhase::Smoke | SchedulePhase::Pilot => {
-                if marker.identity.schedule_hash != planning.pilot_evidence.unplanned_schedule_hash
-                {
+                if marker.identity.schedule_hash != plan.schedule.schedule_hash {
                     return Err(PilotAnalysisError(
                         "records mix smoke or pilot schedule hashes".into(),
                     ));
                 }
                 excluded.get(marker.identity.pair_id.as_str())
             }
-            SchedulePhase::Main => {
-                if marker.identity.schedule_hash != plan.schedule.schedule_hash {
-                    return Err(PilotAnalysisError(
-                        "records mix main schedule hashes".into(),
-                    ));
-                }
-                main.get(marker.identity.pair_id.as_str())
-            }
+            SchedulePhase::Main => continue,
         };
         if expected.is_none_or(|pair| pair.phase != marker.identity.phase) {
             return Err(PilotAnalysisError(
@@ -434,6 +422,9 @@ fn validate_stream_scope(
 
     let mut attempts = BTreeMap::<(&str, &str), BTreeSet<&str>>::new();
     for trial in state.trials_by_hash.values() {
+        if trial.identity.phase == SchedulePhase::Main {
+            continue;
+        }
         if trial.identity.run_id != plan.schedule.run_id {
             return Err(PilotAnalysisError(
                 "records mix different frozen runs or model selections".into(),
@@ -441,21 +432,14 @@ fn validate_stream_scope(
         }
         let expected = match trial.identity.phase {
             SchedulePhase::Smoke | SchedulePhase::Pilot => {
-                if trial.identity.schedule_hash != planning.pilot_evidence.unplanned_schedule_hash {
+                if trial.identity.schedule_hash != plan.schedule.schedule_hash {
                     return Err(PilotAnalysisError(
                         "records mix smoke or pilot schedule hashes".into(),
                     ));
                 }
                 excluded.get(trial.identity.pair_id.as_str())
             }
-            SchedulePhase::Main => {
-                if trial.identity.schedule_hash != plan.schedule.schedule_hash {
-                    return Err(PilotAnalysisError(
-                        "records mix main schedule hashes".into(),
-                    ));
-                }
-                main.get(trial.identity.pair_id.as_str())
-            }
+            SchedulePhase::Main => continue,
         }
         .ok_or_else(|| PilotAnalysisError("records contain an unscheduled trial".into()))?;
         validate_trial_slot(expected, trial)?;
@@ -712,7 +696,7 @@ fn compute_report_hash(report: &ExploratoryPilotReport) -> Result<String, PilotA
     let bytes = serde_json::to_vec(&unhashed)
         .map_err(|serialize_error| PilotAnalysisError(serialize_error.to_string()))?;
     Ok(hash_framed(
-        b"apply-patch-exploratory-pilot-report-v1",
+        b"apply-patch-exploratory-pilot-report-v2",
         &[&bytes],
     ))
 }
@@ -728,11 +712,11 @@ pub fn render_pilot_markdown(report: &ExploratoryPilotReport) -> String {
     ));
     output.push_str("## Frozen identities\n\n");
     output.push_str(&format!(
-        "- Run: `{}`\n- Universe: `{}`\n- Unplanned schedule: `{}`\n- Planning: `{}`\n- Pilot evidence: `{}`\n- Provider/model/reasoning: `{}` / `{}` / `{}`\n\n",
+        "- Run: `{}`\n- Universe: `{}`\n- Unplanned schedule: `{}`\n- Planning report: `{}`\n- Pilot evidence: `{}`\n- Provider/model/reasoning: `{}` / `{}` / `{}`\n\n",
         report.identities.run_id,
         report.identities.universe_hash,
         report.identities.unplanned_schedule_hash,
-        report.identities.planning_hash,
+        report.identities.planning_report_hash,
         report.identities.pilot_completion_stream_hash,
         report.model.provider,
         report.model.model,
@@ -845,6 +829,7 @@ mod tests {
 
     struct Fixture {
         plan_json: Vec<u8>,
+        planning_report_json: Vec<u8>,
         records: Vec<u8>,
         abandoned_hash: String,
     }
@@ -860,7 +845,7 @@ mod tests {
         let plan = freeze_plan(
             &manifest,
             "exploratory-pilot-report-tests",
-            512,
+            6,
             test_model_selection(),
         )
         .unwrap();
@@ -876,26 +861,27 @@ mod tests {
         }
         drop(log);
         let outcome = plan_main(&plan, &records_path).unwrap();
-        let planned = outcome.planned_plan.unwrap_or_else(|| {
-            panic!(
-                "test pilot must produce a complete main recommendation: {}",
-                serde_json::to_string_pretty(&outcome.report.sample_plan).unwrap()
-            )
-        });
         Fixture {
-            plan_json: serde_json::to_vec(&planned).unwrap(),
+            plan_json: serde_json::to_vec(&plan).unwrap(),
+            planning_report_json: serde_json::to_vec(&outcome.report).unwrap(),
             records: fs::read(records_path).unwrap(),
             abandoned_hash,
         }
     }
 
-    fn write_fixture() -> (tempfile::TempDir, FrozenPlan, std::path::PathBuf) {
+    fn write_fixture() -> (
+        tempfile::TempDir,
+        FrozenPlan,
+        PlanningReport,
+        std::path::PathBuf,
+    ) {
         let fixture = fixture();
         let temp = tempfile::tempdir().unwrap();
         let records = temp.path().join("records.jsonl");
         fs::write(&records, &fixture.records).unwrap();
         let plan = serde_json::from_slice(&fixture.plan_json).unwrap();
-        (temp, plan, records)
+        let planning_report = serde_json::from_slice(&fixture.planning_report_json).unwrap();
+        (temp, plan, planning_report, records)
     }
 
     fn metadata(plan: &FrozenPlan, pair: &PairScheduleRecord) -> TrialMetadata {
@@ -995,6 +981,7 @@ mod tests {
         );
         object.insert("system_prompt_hash".into(), json!("system"));
         object.insert("conservative_catalog_pair_reserve".into(), json!(100.0));
+        object.insert("baseline_root_hash".into(), json!("fixture-v1"));
         object.insert("image_id".into(), json!("sha256:test-image"));
         object.insert(
             "source_provenance".into(),
@@ -1030,10 +1017,7 @@ mod tests {
                 task_id: pair.task_id.clone(),
                 instance_hash: pair.instance_hash.clone(),
                 archetype_id: pair.archetype_id.clone(),
-                schedule_hash: plan.require_planned_main().map_or_else(
-                    |_| plan.schedule.schedule_hash.clone(),
-                    |planning| planning.pilot_evidence.unplanned_schedule_hash.clone(),
-                ),
+                schedule_hash: plan.schedule.schedule_hash.clone(),
                 phase: pair.phase,
                 repetition: scheduled.archetype_repetition,
                 variant: scheduled.variant,
@@ -1074,12 +1058,20 @@ mod tests {
 
     #[test]
     fn report_is_exact_descriptive_deterministic_and_excludes_unmarked_and_smoke() {
-        let (_temp, plan, records) = write_fixture();
-        let first = analyze_pilot_records(&plan, &records).unwrap();
-        let second = analyze_pilot_records(&plan, &records).unwrap();
+        let (_temp, plan, planning_report, records) = write_fixture();
+        let first = analyze_pilot_records(&plan, &planning_report, &records).unwrap();
+        let second = analyze_pilot_records(&plan, &planning_report, &records).unwrap();
         assert_eq!(first, second);
         assert_eq!(first.report_hash, compute_report_hash(&first).unwrap());
         assert_eq!(first.analysis_kind, "exploratory_pilot_descriptive");
+        assert_eq!(
+            planning_report.sample_plan.conclusion,
+            crate::statistics::PlanningConclusion::InconclusiveInsufficientUniverse
+        );
+        assert_eq!(
+            first.identities.planning_report_hash,
+            planning_report.report_hash
+        );
         assert!(!first.shipping_eligible);
         assert_eq!(first.completeness.observed_pilot_pairs, 48);
         assert_eq!(first.completeness.report_sample_pairs, 48);
@@ -1140,44 +1132,259 @@ mod tests {
     }
 
     #[test]
-    fn serialized_report_recursively_omits_shipping_and_inferential_keys() {
-        let (_temp, plan, records) = write_fixture();
-        let value = serde_json::to_value(analyze_pilot_records(&plan, &records).unwrap()).unwrap();
-        let forbidden = BTreeSet::from([
-            "decision",
-            "guardrail_passed",
-            "material_harm",
-            "establishes_benefit",
-            "passes_non_degradation",
-            "bounds",
-            "confidence_interval",
-            "p_value",
-            "power",
-            "sample_plan",
-        ]);
-        assert_no_forbidden_keys(&value, &forbidden);
+    fn serialized_report_matches_the_exact_descriptive_schema() {
+        let (_temp, plan, planning_report, records) = write_fixture();
+        let value =
+            serde_json::to_value(analyze_pilot_records(&plan, &planning_report, &records).unwrap())
+                .unwrap();
+        assert_descriptive_schema(&value, "root").unwrap();
+
+        for forbidden in [
+            "shipping_decision",
+            "confidence_bounds",
+            "p_values",
+            "achieved_power",
+            "threshold_passed",
+            "sample_recommendation",
+            "unexpected_key",
+        ] {
+            let mut contaminated = value.clone();
+            contaminated
+                .as_object_mut()
+                .unwrap()
+                .insert(forbidden.into(), Value::Null);
+            assert!(assert_descriptive_schema(&contaminated, "root").is_err());
+        }
     }
 
-    fn assert_no_forbidden_keys(value: &Value, forbidden: &BTreeSet<&str>) {
+    fn assert_descriptive_schema(value: &Value, path: &str) -> Result<(), String> {
         match value {
+            Value::Object(object) if path == "root.by_archetype" => {
+                for value in object.values() {
+                    assert_descriptive_schema(value, "root.by_archetype.*")?;
+                }
+            }
+            Value::Object(object) if path == "root.completeness.observed_pairs_per_archetype" => {
+                if object.values().any(|value| !value.is_number()) {
+                    return Err(format!("non-numeric archetype count at {path}"));
+                }
+            }
             Value::Object(object) => {
+                let expected = allowed_schema_keys(path)
+                    .ok_or_else(|| format!("unexpected object at {path}"))?;
+                let actual = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
+                let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+                if actual != expected {
+                    return Err(format!(
+                        "schema keys differ at {path}: actual {actual:?}, expected {expected:?}"
+                    ));
+                }
                 for (key, value) in object {
-                    assert!(!forbidden.contains(key.as_str()), "forbidden key {key}");
-                    assert_no_forbidden_keys(value, forbidden);
+                    let child = format!("{path}.{key}");
+                    assert_descriptive_schema(value, &child)?;
                 }
             }
             Value::Array(values) => {
+                let child = format!("{path}[]");
                 for value in values {
-                    assert_no_forbidden_keys(value, forbidden);
+                    assert_descriptive_schema(value, &child)?;
                 }
             }
             _ => {}
         }
+        Ok(())
+    }
+
+    fn allowed_schema_keys(path: &str) -> Option<&'static [&'static str]> {
+        match path {
+            "root" => Some(&[
+                "schema_version",
+                "analysis_kind",
+                "shipping_eligible",
+                "identities",
+                "provenance",
+                "model",
+                "descriptions",
+                "completeness",
+                "treatment_order_counts",
+                "pair_evidence",
+                "overall",
+                "by_archetype",
+                "report_hash",
+            ]),
+            "root.identities" => Some(&[
+                "run_id",
+                "universe_hash",
+                "unplanned_schedule_hash",
+                "planning_report_hash",
+                "blinded_pilot_hash",
+                "pilot_completion_stream_hash",
+            ]),
+            "root.provenance" => Some(&[
+                "image_id",
+                "source_provenance",
+                "utc_date",
+                "limits",
+                "system_prompt_hash",
+                "aj_revision",
+                "model_catalog_hash",
+                "provider",
+                "model",
+                "reasoning_effort",
+                "tool_catalog_hash",
+                "suite_revision",
+                "current_description",
+                "compact_description",
+                "conservative_catalog_pair_reserve",
+            ]),
+            "root.provenance.source_provenance" => Some(&["head", "dirty", "worktree_hash"]),
+            "root.provenance.limits" => Some(&[
+                "wall_timeout_seconds",
+                "max_provider_requests",
+                "max_model_responses",
+                "provider_output_token_ceiling",
+                "aggregate_observed_output_token_ceiling",
+            ]),
+            "root.provenance.current_description" | "root.provenance.compact_description" => {
+                Some(&["sha256", "byte_length"])
+            }
+            "root.model" => Some(&[
+                "provider",
+                "model",
+                "reasoning",
+                "model_selection_hash",
+                "model_catalog_hash",
+                "model_capability_hash",
+                "tool_catalog_hash",
+            ]),
+            "root.descriptions[]" => Some(&["variant", "sha256", "byte_length"]),
+            "root.completeness" => Some(&[
+                "expected_smoke_pairs",
+                "observed_smoke_pairs",
+                "expected_pilot_pairs",
+                "observed_pilot_pairs",
+                "expected_archetypes",
+                "observed_archetypes",
+                "expected_pairs_per_archetype",
+                "observed_pairs_per_archetype",
+                "report_sample_pairs",
+                "report_sample_sessions",
+                "smoke_pairs_in_report_sample",
+            ]),
+            "root.treatment_order_counts" => {
+                Some(&["ab_current_then_compact_v1", "ba_compact_v1_then_current"])
+            }
+            "root.pair_evidence[]" => Some(&[
+                "pair_id",
+                "pair_identity_hash",
+                "archetype_id",
+                "archetype_repetition",
+                "task_id",
+                "instance_hash",
+                "attempt_id",
+                "treatment_order",
+                "completion_marker_hash",
+                "current_trial_record_hash",
+                "compact_v1_trial_record_hash",
+            ]),
+            "root.overall" | "root.by_archetype.*" => {
+                Some(&["pair_count", "binary_outcomes", "continuous_endpoints"])
+            }
+            "root.overall.binary_outcomes[]" | "root.by_archetype.*.binary_outcomes[]" => Some(&[
+                "endpoint",
+                "current",
+                "compact_v1",
+                "paired_discordance",
+                "observed_difference_compact_v1_minus_current",
+            ]),
+            "root.overall.binary_outcomes[].current"
+            | "root.overall.binary_outcomes[].compact_v1"
+            | "root.by_archetype.*.binary_outcomes[].current"
+            | "root.by_archetype.*.binary_outcomes[].compact_v1" => {
+                Some(&["count", "observations", "rate"])
+            }
+            "root.overall.binary_outcomes[].paired_discordance"
+            | "root.by_archetype.*.binary_outcomes[].paired_discordance" => {
+                Some(&["neither", "current_only", "compact_v1_only", "both"])
+            }
+            "root.overall.continuous_endpoints[]"
+            | "root.by_archetype.*.continuous_endpoints[]" => Some(&[
+                "endpoint",
+                "current",
+                "compact_v1",
+                "absolute_mean_difference_compact_v1_minus_current",
+                "relative_mean_difference_compact_v1_minus_current",
+                "within_pair_difference_compact_v1_minus_current",
+            ]),
+            "root.overall.continuous_endpoints[].current"
+            | "root.overall.continuous_endpoints[].compact_v1"
+            | "root.overall.continuous_endpoints[].within_pair_difference_compact_v1_minus_current"
+            | "root.by_archetype.*.continuous_endpoints[].current"
+            | "root.by_archetype.*.continuous_endpoints[].compact_v1"
+            | "root.by_archetype.*.continuous_endpoints[].within_pair_difference_compact_v1_minus_current" => {
+                Some(&["count", "minimum", "mean", "median", "p95", "maximum"])
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn planning_report_must_match_every_recomputed_field() {
+        let (_temp, plan, mut planning_report, records) = write_fixture();
+        planning_report.sample_plan.practical_cap += 1;
+        let error = analyze_pilot_records(&plan, &planning_report, &records).unwrap_err();
+        assert!(error.to_string().contains("does not exactly match"));
+    }
+
+    #[test]
+    fn partial_main_markers_do_not_enter_or_block_the_pilot_report() {
+        let (_temp, plan, planning_report, records) = write_fixture();
+        let pair = &plan.schedule.pilot[0];
+        let source = trial(&plan, pair, &pair.trials[0], "main-source", None);
+        let main_records = [
+            (DescriptionVariant::Current, 0),
+            (DescriptionVariant::CompactV1, 1),
+        ]
+        .map(|(variant, order_index)| {
+            let mut identity = source.identity.clone();
+            identity.pair_id = "partial-main-pair".into();
+            identity.attempt_id = "partial-main-attempt".into();
+            identity.schedule_hash = "planned-main-schedule".into();
+            identity.phase = SchedulePhase::Main;
+            identity.variant = variant;
+            identity.order_index = order_index;
+            TrialRecord::new(identity, source.metadata.clone(), source.runtime.clone()).unwrap()
+        });
+        let mut log = ArtifactLog::open(&records).unwrap();
+        for record in &main_records {
+            log.append_trial(record).unwrap();
+        }
+        log.complete_pair(
+            PairCompletionIdentity {
+                run_id: plan.schedule.run_id.clone(),
+                pair_id: "partial-main-pair".into(),
+                attempt_id: "partial-main-attempt".into(),
+                task_id: source.identity.task_id.clone(),
+                instance_hash: source.identity.instance_hash.clone(),
+                schedule_hash: "planned-main-schedule".into(),
+                phase: SchedulePhase::Main,
+            },
+            [
+                main_records[0].record_hash.clone(),
+                main_records[1].record_hash.clone(),
+            ],
+        )
+        .unwrap();
+        drop(log);
+
+        let report = analyze_pilot_records(&plan, &planning_report, &records).unwrap();
+        assert_eq!(report.completeness.report_sample_pairs, PILOT_PAIRS);
+        assert_eq!(report.pair_evidence.len(), PILOT_PAIRS);
     }
 
     #[test]
     fn missing_pilot_marker_is_rejected() {
-        let (temp, plan, records) = write_fixture();
+        let (temp, plan, planning_report, records) = write_fixture();
         let mut lines = fs::read_to_string(&records)
             .unwrap()
             .lines()
@@ -1189,14 +1396,14 @@ mod tests {
             .unwrap();
         lines.remove(marker);
         fs::write(&records, format!("{}\n", lines.join("\n"))).unwrap();
-        let error = analyze_pilot_records(&plan, &records).unwrap_err();
+        let error = analyze_pilot_records(&plan, &planning_report, &records).unwrap_err();
         assert!(error.to_string().contains("missing complete pair"));
         drop(temp);
     }
 
     #[test]
     fn mixed_run_and_abandoned_context_contamination_are_rejected() {
-        let (_temp, plan, records) = write_fixture();
+        let (_temp, plan, planning_report, records) = write_fixture();
         let pair = &plan.schedule.pilot[0];
         let mut foreign = trial(&plan, pair, &pair.trials[0], "foreign", None);
         foreign.identity.run_id = "foreign-run".into();
@@ -1206,13 +1413,13 @@ mod tests {
             .append_trial(&foreign)
             .unwrap();
         assert!(
-            analyze_pilot_records(&plan, &records)
+            analyze_pilot_records(&plan, &planning_report, &records)
                 .unwrap_err()
                 .to_string()
                 .contains("mix different frozen runs")
         );
 
-        let (_temp, plan, records) = write_fixture();
+        let (_temp, plan, planning_report, records) = write_fixture();
         let pair = &plan.schedule.pilot[0];
         let mut contaminated_metadata = metadata(&plan, pair);
         contaminated_metadata.provider = "wrong-provider".into();
@@ -1228,7 +1435,7 @@ mod tests {
             .append_trial(&contaminated)
             .unwrap();
         assert!(
-            analyze_pilot_records(&plan, &records)
+            analyze_pilot_records(&plan, &planning_report, &records)
                 .unwrap_err()
                 .to_string()
                 .contains("runtime context frozen by the pilot")
@@ -1236,13 +1443,13 @@ mod tests {
     }
     #[test]
     fn truncated_final_record_is_rejected() {
-        let (_temp, plan, records) = write_fixture();
+        let (_temp, plan, planning_report, records) = write_fixture();
         let mut bytes = fs::read(&records).unwrap();
         bytes.extend_from_slice(b"{\"record_type\":\"trial\"");
         fs::write(&records, bytes).unwrap();
 
         assert!(
-            analyze_pilot_records(&plan, &records)
+            analyze_pilot_records(&plan, &planning_report, &records)
                 .unwrap_err()
                 .to_string()
                 .contains("truncated final line")
@@ -1251,7 +1458,7 @@ mod tests {
 
     #[test]
     fn provider_contamination_in_marked_evidence_is_rejected() {
-        let (_temp, plan, records) = write_fixture();
+        let (_temp, plan, planning_report, records) = write_fixture();
         let mut stream = fs::read_to_string(&records)
             .unwrap()
             .lines()
@@ -1308,7 +1515,7 @@ mod tests {
         fs::write(&records, bytes).unwrap();
 
         assert!(
-            analyze_pilot_records(&plan, &records)
+            analyze_pilot_records(&plan, &planning_report, &records)
                 .unwrap_err()
                 .to_string()
                 .contains("provider-contaminated")

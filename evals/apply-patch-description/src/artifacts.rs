@@ -1005,6 +1005,45 @@ mod tests {
     }
 
     #[test]
+    fn marked_trials_reject_inconsistent_or_excessive_usage() {
+        let mut inconsistent = clean_runtime();
+        inconsistent["usage"]["input"] = json!(1);
+
+        let mut excessive = clean_runtime();
+        excessive["usage"]["output"] = json!(101);
+        excessive["usage"]["total_tokens"] = json!(101);
+
+        for malformed in [inconsistent, excessive] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("records.jsonl");
+            let first = TrialRecord::new(
+                identity(DescriptionVariant::Current, 0, "attempt"),
+                metadata(),
+                malformed,
+            )
+            .unwrap();
+            let second = TrialRecord::new(
+                identity(DescriptionVariant::CompactV1, 1, "attempt"),
+                metadata(),
+                clean_runtime(),
+            )
+            .unwrap();
+            let mut log = ArtifactLog::open(&path).unwrap();
+            log.append_trial(&first).unwrap();
+            log.append_trial(&second).unwrap();
+            assert!(
+                log.complete_pair(
+                    completion("attempt"),
+                    [first.record_hash.clone(), second.record_hash.clone()],
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("invalid or provider-contaminated")
+            );
+        }
+    }
+
+    #[test]
     fn recovers_the_final_unmarked_complete_attempt() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("records.jsonl");

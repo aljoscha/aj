@@ -55,6 +55,7 @@ struct PilotRuntimeMetrics {
     system_prompt_hash: String,
     conservative_catalog_pair_reserve: f64,
     normalized_first_request_hash: Option<String>,
+    baseline_root_hash: Option<String>,
 }
 
 /// Frozen runtime controls shared by every excluded trial used for planning.
@@ -245,6 +246,7 @@ impl MainPlanningRecord {
 
 /// Serializable output of the blinded planner command.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlanningReport {
     pub schema_version: u32,
     pub run_id: String,
@@ -469,10 +471,10 @@ fn reduce_pilot(
             .map_err(|error| PlanningError(error.to_string()))?;
         let marker = completed.marker;
         let [first, second] = completed.trials;
-        validate_trial_plan_context(plan, pair, first)?;
-        validate_trial_plan_context(plan, pair, second)?;
         let first_metrics = runtime_metrics(first)?;
         let second_metrics = runtime_metrics(second)?;
+        validate_trial_plan_context(plan, pair, first, &first_metrics)?;
+        validate_trial_plan_context(plan, pair, second, &second_metrics)?;
         if !payloads_equivalent(&first_metrics, &second_metrics) {
             return Err(PlanningError(
                 "excluded pair has unequal actual first-request payload hashes".into(),
@@ -560,6 +562,7 @@ fn validate_trial_plan_context(
     plan: &FrozenPlan,
     pair: &crate::schedule::PairScheduleRecord,
     trial: &TrialRecord,
+    metrics: &PilotRuntimeMetrics,
 ) -> Result<(), PlanningError> {
     let model = plan
         .model
@@ -588,6 +591,13 @@ fn validate_trial_plan_context(
     {
         return Err(PlanningError(
             "excluded trial metadata differs from the frozen plan".into(),
+        ));
+    }
+    if metrics.baseline_root_hash.as_deref() != Some(&metadata.fixture_revision)
+        || metadata.aj_revision != metrics.source_provenance.revision_label()
+    {
+        return Err(PlanningError(
+            "excluded trial metadata contradicts runtime provenance".into(),
         ));
     }
     Ok(())
@@ -756,6 +766,7 @@ mod tests {
         let object = runtime.as_object_mut().unwrap();
         object.insert("valid".into(), json!(valid));
         object.insert("aj_recorded_catalog_cost".into(), json!(cost));
+        object.insert("baseline_root_hash".into(), json!("fixture"));
         object.insert("image_id".into(), json!("sha256:image"));
         object.insert(
             "source_provenance".into(),
@@ -847,9 +858,27 @@ mod tests {
             runtime(false, 0.0),
         )
         .unwrap();
+        let metrics: PilotRuntimeMetrics =
+            serde_json::from_value(abandoned.runtime.clone()).unwrap();
         let mut mismatched = abandoned.clone();
         mismatched.metadata.model = "wrong-model".into();
-        assert!(validate_trial_plan_context(&plan, pair, &mismatched).is_err());
+        assert!(validate_trial_plan_context(&plan, pair, &mismatched, &metrics).is_err());
+        let mut mismatched = abandoned.clone();
+        mismatched.metadata.fixture_revision = "wrong-fixture".into();
+        assert!(
+            validate_trial_plan_context(&plan, pair, &mismatched, &metrics)
+                .unwrap_err()
+                .to_string()
+                .contains("contradicts runtime provenance")
+        );
+        let mut mismatched = abandoned.clone();
+        mismatched.metadata.aj_revision = "wrong-revision".into();
+        assert!(
+            validate_trial_plan_context(&plan, pair, &mismatched, &metrics)
+                .unwrap_err()
+                .to_string()
+                .contains("contradicts runtime provenance")
+        );
         log.append_trial(&abandoned).unwrap();
         for pair in plan.schedule.smoke.iter().chain(&plan.schedule.pilot) {
             append_pair(&mut log, &plan, pair);

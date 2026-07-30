@@ -372,12 +372,16 @@ not weakened. Final confirmatory analysis still uses 100,000 bootstrap
 replicates.
 ### Exploratory pilot report
 
-After `plan-main` has frozen a valid planned main file, `analyze-pilot` may
+After `plan-main` has durably frozen its planning report, `analyze-pilot` may
 restore treatment labels and produce a descriptive report over the 48 pilot
-pairs. The command must first validate the complete smoke and pilot evidence
-against the unplanned schedule hash committed by planning. Its report sample is
-exactly the three marker-referenced pilot pairs from each of the 16 archetypes.
-Smoke pairs and every unmarked abandoned attempt are excluded.
+pairs. The command accepts the original unplanned plan and the planning report,
+then reruns deterministic planning under the frozen default controls. Before
+revealing labels, it requires exact equality of the complete report, including
+the report hash, blinded summary, evidence, planner configuration, sample
+result, selected IDs, and reserve. This applies to recommended and inconclusive
+planning outcomes. Its report sample is exactly the three marker-referenced
+pilot pairs from each of the 16 archetypes. Smoke pairs, every unmarked abandoned
+attempt, and partial main records are excluded.
 
 The pilot report is structurally separate from confirmatory analysis. It is not
 eligible for a shipping decision and cannot emit a shipping disposition,
@@ -389,10 +393,11 @@ identities and hashes so it can be reproduced from the frozen plan and JSONL
 stream.
 
 Every provider, model, and reasoning level uses independent plan, records,
-artifact, pilot-report, and confirmatory-report files. Levels are not pooled. A
-48-pair pilot has an operational target of 1 to 2 hours, but this is not
-guaranteed. Provider latency, bounded pair retries, and available local capacity
-can extend the run.
+artifact, pilot-report, and confirmatory-report files. Levels are not pooled.
+Pairs run serially to preserve provider and cache controls plus adjacency. No
+pilot result is emitted until all 48 pairs complete. A pilot has an operational
+target of 1 to 2 hours, but this is not guaranteed. Endpoint latency, bounded
+pair retries, and available local capacity can extend the run beyond the target.
 
 `--max-cost-usd` is a conservative catalog admission control, not an interrupt
 or invoice control. The hard per-pair reserve covers both trials at the maximum
