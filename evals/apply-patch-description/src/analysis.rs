@@ -432,7 +432,7 @@ fn validate_trial(
     Ok(())
 }
 
-fn validate_pilot_runtime_context(
+pub(crate) fn validate_pilot_runtime_context(
     trial: &TrialRecord,
     runtime: &RuntimeMetrics,
     frozen: &FrozenPilotRuntimeContext,

@@ -5,6 +5,7 @@ pub mod artifacts;
 pub mod descriptions;
 pub mod docker;
 pub mod fixtures;
+pub mod pilot_analysis;
 pub mod planning;
 pub mod protocol;
 pub mod rng;

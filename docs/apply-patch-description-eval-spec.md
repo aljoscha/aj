@@ -370,6 +370,29 @@ Pilot sessions are never included in main inference. If the required fixed
 sample is impractical, the result is inconclusive. Margins and thresholds are
 not weakened. Final confirmatory analysis still uses 100,000 bootstrap
 replicates.
+### Exploratory pilot report
+
+After `plan-main` has frozen a valid planned main file, `analyze-pilot` may
+restore treatment labels and produce a descriptive report over the 48 pilot
+pairs. The command must first validate the complete smoke and pilot evidence
+against the unplanned schedule hash committed by planning. Its report sample is
+exactly the three marker-referenced pilot pairs from each of the 16 archetypes.
+Smoke pairs and every unmarked abandoned attempt are excluded.
+
+The pilot report is structurally separate from confirmatory analysis. It is not
+eligible for a shipping decision and cannot emit a shipping disposition,
+guardrail or harm result, inferential interval, significance result, statistical
+power claim, threshold result, or sample recommendation. It reports only
+observed variant counts, rates, paired discordance, distributions, and
+compact-v1 minus current differences. The report includes deterministic evidence
+identities and hashes so it can be reproduced from the frozen plan and JSONL
+stream.
+
+Every provider, model, and reasoning level uses independent plan, records,
+artifact, pilot-report, and confirmatory-report files. Levels are not pooled. A
+48-pair pilot has an operational target of 1 to 2 hours, but this is not
+guaranteed. Provider latency, bounded pair retries, and available local capacity
+can extend the run.
 
 `--max-cost-usd` is a conservative catalog admission control, not an interrupt
 or invoice control. The hard per-pair reserve covers both trials at the maximum

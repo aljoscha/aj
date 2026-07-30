@@ -7,6 +7,7 @@ use aj_apply_patch_eval::analysis::{analyze_records, render_markdown};
 use aj_apply_patch_eval::docker::{
     copy_worker, fixture_worker, probe_worker, snapshot_worker, tool_worker, verify_worker,
 };
+use aj_apply_patch_eval::pilot_analysis::{analyze_pilot_records, render_pilot_markdown};
 use aj_apply_patch_eval::planning::plan_main;
 use aj_apply_patch_eval::runner::{RunOptions, freeze_model_selection, run, run_preflight};
 use aj_apply_patch_eval::schedule::{FrozenPlan, SchedulePhase, freeze_plan};
@@ -76,6 +77,17 @@ enum Command {
         output_plan: PathBuf,
         #[arg(long)]
         output_report: PathBuf,
+    },
+    /// Analyze the excluded pilot descriptively after main planning is frozen.
+    AnalyzePilot {
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long)]
+        records: PathBuf,
+        #[arg(long)]
+        output_json: PathBuf,
+        #[arg(long)]
+        output_markdown: PathBuf,
     },
     /// Analyze exactly the frozen confirmatory main schedule.
     Analyze {
@@ -180,6 +192,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 )
             })?;
             write(&output_plan, &serde_json::to_vec_pretty(&planned)?)?;
+        }
+        Command::AnalyzePilot {
+            plan,
+            records,
+            output_json,
+            output_markdown,
+        } => {
+            let plan = read_plan(&plan)?;
+            let report = analyze_pilot_records(&plan, &records)?;
+            write(&output_json, &serde_json::to_vec_pretty(&report)?)?;
+            write(&output_markdown, render_pilot_markdown(&report).as_bytes())?;
         }
         Command::Analyze {
             plan,
