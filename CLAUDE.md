@@ -21,24 +21,30 @@ AJ is an AI-driven agent for software engineering. The agent follows a
 minimal loop pattern, focusing on providing the right set of builtin tools
 rather than complex scaffolding.
 
-The workspace splits into focused crates (run `cargo tree` for the
-exact dependency edges):
+The workspace splits into focused crates under `src/` (run
+`cargo tree` for the exact dependency edges):
 
 - `aj-models` — wire layer: provider SDKs, unified `Message` /
-  `AssistantMessage` / streaming types, model registry.
+  `AssistantMessage` / streaming types, model registry, the scripted
+  provider used by tests.
 - `aj-agent` — the `Agent` runtime, the typed `AgentEvent` bus, the
-  tool trait, `ToolDetails` for structured tool rendering, and the
-  `TaskRegistry` for background tasks (detached bash commands and
-  sub-agent runs that outlive their turn).
+  tool trait, `ToolDetails` for structured tool rendering, message
+  queues, and the `TaskRegistry` for background tasks (detached bash
+  commands and sub-agent runs that outlive their turn).
 - `aj-session` — on-disk session format, `ConversationLog`, replay. The
   user-facing surface (CLI, storage) says "session"; internally a
   session's `ConversationLog` holds threads and branches, so both terms
   are intentional.
 - `aj-tools` — the builtin tool implementations.
-- `aj-tui` — in-process text-UI framework (layout, components, theming).
+- `aj-app` — frontend-agnostic application logic: CLI surface, session
+  composition (`SessionCore`), the turn driver, the `ChatState`
+  reducer, print mode, settings. CI (`scripts/check-no-tui-dep.sh`)
+  keeps it free of TUI dependencies.
 - `aj-conf` — `~/.aj/config.toml` loader and path helpers.
-- `aj` — the binary: CLI parsing, print mode, interactive TUI, command
-  palette, selectors.
+- `vaxis` (+ `vaxis-derive`, `vaxis-ucd`) — the terminal-UI framework
+  (rendering, widgets, layout, input).
+- `aj` — the binary: interactive TUI, command palette, selectors,
+  overlays, wiring `aj-app` to `vaxis`.
 - `anthropic-sdk` / `openai-sdk` — thin async clients used by
   `aj-models`'s provider adapters.
 
@@ -84,8 +90,8 @@ commit secrets.
 
 - Prefix the subject with a scope followed by a colon: `<scope>: <summary>`.
   The scope is the affected crate or area (e.g. `aj`, `aj-models`,
-  `aj-tui`, `workspace`). Comma-separate multiple scopes:
-  `aj-tui,aj: ...`.
+  `vaxis`, `workspace`, `docs`). Comma-separate multiple scopes:
+  `aj-app,aj: ...`.
 - A Conventional-Commits type may wrap the scope when it adds signal:
   `feat(history): ...`, `perf(history): ...`. Plain `scope:` is fine for
   everything else.
