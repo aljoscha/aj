@@ -129,9 +129,13 @@ Three roles, one protocol:
   `aj --listen <addr>` (interactive TUI plus embedded server). A host
   process serves the sessions of exactly one working directory, the
   one it was started in. Each host persists a stable random `host_id`
-  in per-working-directory state (never in user-global state, two
-  hosts on one machine must not share an id). The default listen
-  address for a bare `--listen` is `127.0.0.1:6161`.
+  in the project's session store (a `host-id` file in
+  `~/.aj/sessions/<project>/`, next to the logs it identifies), never
+  in user-global state or the working directory itself. The id names
+  the session store, not the process: session ids are unique within a
+  store, which is what makes `<host_id>:<session_id>` globally unique
+  (section 6.2). The default listen address for a bare `--listen` is
+  `127.0.0.1:6161`.
 - **Gateway**: `aj gateway --listen <addr> [--config <file>]`.
   Speaks the client side of the protocol toward hosts and the server
   side toward clients. Implements the same session-facing API as a
@@ -239,7 +243,7 @@ existing session id (the timestamp filename stem). A gateway
 namespaces ids as `<host_id>:<session_id>` (colon, which is valid in a
 URL path segment) and treats them as opaque in its own API. Clients
 never parse session ids. Cross-host uniqueness rests on `host_id`,
-which is why it is per working directory (section 4).
+which is why it names the session store (section 4).
 
 ### 6.3 Frames
 
