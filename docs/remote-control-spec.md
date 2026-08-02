@@ -418,7 +418,7 @@ viewed agent to that parameter:
 
 | Command | Body | Semantics |
 |---|---|---|
-| `POST /v1/sessions` | optional settings, optional first prompt | Create a session in the host's working directory. |
+| `POST /v1/sessions` | optional settings, optional first prompt | Create a session in the host's working directory. Settings resolution per section 8. |
 | `.../{id}/prompt` | text or content blocks | Exactly `handle_submit`: run a turn if idle, queue follow-up if busy. |
 | `.../{id}/steer` | text, optional agent | Queue steering (or promote pending follow-up when text is empty), as today. |
 | `.../{id}/cancel` | optional agent | Cancel the running turn, with the existing foreground-sub-agent-cancels-main cascade. |
@@ -549,6 +549,17 @@ dynamic enrollment (VMs it provisions, or explicit
 /v1/hosts/{id}` removes. Enrolled hosts persist in gateway state so
 restarts recover the full set.
 
+Gateway configuration is a TOML file (`--config <file>`, defaulting to
+`~/.aj/gateway.toml`): a list of static host addresses, and a
+provisioner section selecting the backend with its backend-specific
+settings (for local-process: the workspace root to create session dirs
+under and optionally the `aj` binary to spawn, for ember: the golden
+VM name, default resources, and the VM user). Runtime state (dynamic
+enrollments, VM records) lives under `~/.aj/gateway/`. A session host
+needs no configuration file of its own: the listen address, plus its
+auto-minted per-working-directory `host_id`, is all there is, the rest
+is its normal local aj environment.
+
 ### 7.2 Provisioning
 
 A backend trait with a deliberately small contract: provision a new
@@ -655,6 +666,18 @@ re-push refreshes it. When attaching to a host that we did not
 provision, the host's own local files apply, provenance rules only
 govern hosts we create.
 
+Orthogonal to file provenance, **per-session inference settings
+follow the creator**. The host supplies the environment (workspace,
+skills, keys, catalog, tool availability), but the model, thinking
+level, speed, and verbosity of a session belong to whoever creates
+it: a connect-mode client resolves its own configured defaults and
+sends them with the create command, and explicit create settings win
+over the host's config defaults, which apply only when the creator
+sends none. A requested model must be servable by the host (present
+in its catalog, with credentials), otherwise the create fails with a
+clear error rather than silently substituting. After creation the
+settings command mutates them, from any client, as peers.
+
 ## 9. Client TUI
 
 ### 9.1 Connect mode
@@ -691,7 +714,11 @@ single-session use) lists sessions:
   connected to a gateway).
 
 Keyboard model, exact layout, and glyph choices are left to
-implementation taste within existing TUI conventions.
+implementation taste within existing TUI conventions, with one
+requirement: new interactions (sidebar toggle and focus, session
+switching, remote session creation) are `AjAction`s riding the
+existing keybinding system, so they get default chords and user
+overrides like every other action.
 
 ## 10. Crate layout
 
