@@ -1,9 +1,35 @@
 # Remote control: implementation manual
 
-This is the working manual for the agent implementing
-`docs/remote-control-spec.md`. Read the spec first, in full. This
-document adds what the spec deliberately leaves out: where things live
-in the code today, the order of work, and the rules of engagement.
+This is the working manual and prompt for the agent implementing the
+remote-control and VM-provisioning feature in this repository. Your
+task is to implement `docs/remote-control-spec.md`, phase by phase.
+
+Read, in this order, before writing anything: the spec in full,
+`CLAUDE.md` (build commands, code style, commit conventions), and the
+"Map of the existing code" below. This document adds what the spec
+deliberately leaves out: where things live in the code today, the
+order of work, and the rules of engagement.
+
+## The working loop
+
+The spec is the source of truth and the implementation derives from
+it, never the other way around. When reality disagrees with the spec,
+the loop is:
+
+1. **Trivial factual drift** (a file moved, a function was renamed, a
+   line reference is stale): fix the stale reference in the docs in
+   the same commit and mention it in your phase report. No pause
+   needed.
+2. **Anything design-level** (a protocol rule doesn't survive contact
+   with the code, an assumption about existing behavior is wrong, a
+   phase's approach won't work as described, a test the spec requires
+   cannot be written as specified): **stop working on that thread**.
+   Write a short report: what you were doing, what the spec says, what
+   you found instead, evidence (code, failing test, trace), and one or
+   two options if you see them. Then hand back. The spec gets amended
+   through review, and you continue implementing against the amended
+   spec. Do not silently deviate, and do not redesign unilaterally,
+   even when your workaround seems obviously right.
 
 ## Rules of engagement
 
@@ -14,12 +40,12 @@ in the code today, the order of work, and the rules of engagement.
   maps them to phases. It is fine to adjust tests as understanding
   improves, it is not fine to write the implementation first and
   backfill tests that mirror it.
-- **The spec is the contract, but not scripture.** When reality
-  disagrees with the spec (an assumption about existing code is wrong,
-  a protocol detail doesn't survive contact), do not silently deviate.
-  Update the spec in the same commit and call the change out
-  prominently in your report, so it can be reviewed as a design
-  decision, not discovered as drift.
+- **Test quality is a first-class deliverable.** The protocol is only
+  trustworthy through the reducer-equivalence harness and the
+  sharp-edge cases, treat them as the product. Never weaken an
+  assertion, shrink a comparison, or skip a named case to get green.
+  If a required test cannot pass, that is a design finding, report it
+  (working loop, point 2).
 - One phase per commit series, green before moving on: `cargo fmt`,
   `cargo check`, `cargo clippy --workspace --all-targets`,
   `cargo test`. Follow the commit conventions in CLAUDE.md.
@@ -233,7 +259,7 @@ machine documented in the report (what was run, what happened).
 ## Reporting
 
 At the end of each phase, produce a short report: what landed, test
-inventory, any spec deviations (with the spec already updated), any
-surfaced assumptions or debt worth a follow-up. Findings that imply a
-design or scope change stop the work and go back for discussion, they
-are not decided unilaterally.
+inventory, any doc-drift fixes (working loop, point 1), any surfaced
+assumptions or debt worth a follow-up. Design-level findings follow
+the working loop, point 2: they stop the affected work and go back for
+spec amendment, they are not decided unilaterally.
