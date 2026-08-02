@@ -210,12 +210,16 @@ tool end and its durable message, reconnect with a running tool and
 sub, mid-sub-run attach, zero-suffix reconnect with an open sub
 concluded in the gap, stale-epoch drops, task refetch after
 `caught_up`, settings visibility for a mid-session joiner, seq
-non-contiguity).
+non-contiguity, identity-gate accept and reject paths).
 
 Then: the HTTP server over the host layer, the HTTP client, `aj
 serve`, `--listen` (flag and `AJ_LISTEN` environment variable),
 `aj connect` (single focused session), hello and capability handshake,
-heartbeats, bounded per-client queues with coalescing and eviction.
+heartbeats, bounded per-client queues with coalescing and eviction,
+and the connection identity gate (spec 6.11). Put the gate's peer
+lookup behind a small trait so tests can fake the whois resolver, the
+real implementation queries tailscaled's local API (the unix socket
+that `tailscale whois --json` wraps).
 
 Acceptance: equivalence harness green including fault injection, a
 human can run `aj serve` in one terminal and `aj connect` in another

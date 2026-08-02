@@ -55,9 +55,13 @@ Goals:
 
 Non-goals:
 
-- Authentication and transport encryption. We assume a trusted network
-  (tailscale or similar). Servers bind to explicitly given addresses,
-  never to a public interface by default.
+- Transport encryption. Tailscale's WireGuard mesh provides it, aj
+  never terminates TLS itself. Connection identity, however, is in
+  scope: the control port is remote code execution, and section 6.11
+  defines its protection layers. What stays out of scope is
+  per-connection human re-authentication (Tailscale SSH check-mode
+  parity), which tailscale offers only for SSH, see 6.11 for the
+  posture and the tunnel fallback.
 - Tool approvals or any client-to-agent mid-turn decision channel.
   Status is working / idle, nothing more (the Shelley model).
 - A web UI. The transport choice (HTTP + SSE) keeps that door open but
@@ -521,6 +525,50 @@ especially with long-lived VMs. Rules:
   and decoding must survive forward-compat fixtures (extra fields,
   unknown variants, unknown frame kinds).
 
+### 6.11 Securing the control port
+
+An attached client can run arbitrary commands through the agent, so
+the control port is remote code execution and gets SSH-grade
+treatment. The protocol itself stays credential-free, protection is
+layered around it:
+
+- **Bind discipline.** Hosts and gateways bind loopback or a tailnet
+  interface address, never a public interface. The bare `--listen`
+  default is loopback. The VM unit's `0.0.0.0` bind is the exception
+  and is safe because ember guest networks are host-private (the
+  guest IP is unreachable off the VM host).
+- **Tailnet policy.** A tailnet's default policy allows every device
+  to reach every port of every other device, so deployments must
+  restrict the control port with a grant/ACL (deny-by-default once
+  defined, enforced on the receiving node): only the owner's devices
+  may reach port 6161 on aj hosts and gateways. The reference systemd
+  units (section 7.4) ship with a sample policy snippet.
+- **Identity gate.** The server verifies every connection's peer
+  against the local tailscale daemon: a whois lookup on the remote
+  address (tailscaled's local API, what `tailscale whois` wraps)
+  resolves the peer's machine, user, tags, and granted capabilities.
+  A connection is accepted only when the lookup resolves and the
+  peer's user is in the configured allowlist or carries the aj app
+  capability granted in the tailnet policy file. Rejections are 403
+  and every accepted connection is logged with its resolved identity.
+  This is defense in depth against policy misconfiguration and gives
+  every action an attributable identity. The gate has three modes,
+  configured per process (flag or environment, no config file
+  needed): `local` (default, loopback peers only), `tailscale` (the
+  whois gate), and `open` (explicit opt-out, for the host-private VM
+  bind). Serving a non-loopback address in `local` mode refuses to
+  start rather than silently serving unauthenticated.
+
+What this deliberately does not provide is per-connection human
+re-authentication. Tailscale's check mode (browser SSO re-auth on a
+`checkPeriod`) exists only for Tailscale SSH, not for generic TCP.
+The posture is device-level trust, the same as key-based SSH: tailnet
+node-key expiry re-authenticates devices periodically, and the
+identity gate names who did what. Whoever wants check-mode semantics
+today binds the host to loopback and tunnels the control port through
+Tailscale SSH with `action: check`, which composes cleanly with
+everything here.
+
 ## 7. The gateway
 
 ### 7.1 Aggregation
@@ -560,9 +608,10 @@ settings (for local-process: the workspace root to create session dirs
 under and optionally the `aj` binary to spawn, for ember: the golden
 VM name, default resources, and the VM user). Runtime state (dynamic
 enrollments, VM records) lives under `~/.aj/gateway/`. A session host
-needs no configuration file of its own: the listen address, plus its
-auto-minted per-working-directory `host_id`, is all there is, the rest
-is its normal local aj environment.
+needs no configuration file of its own: the listen address and the
+identity-gate settings (section 6.11), given as flags or environment,
+plus its auto-minted per-working-directory `host_id`, is all there
+is, the rest is its normal local aj environment.
 
 ### 7.2 Provisioning
 
@@ -621,12 +670,13 @@ Everything long-running runs under systemd:
 
 - In the VM: `aj-serve.service`, `Restart=on-failure`, journal
   logging, `WorkingDirectory=` the workspace dir, and
-  `AJ_LISTEN=0.0.0.0:6161` in the unit environment. 6161 is the
-  fixed control-port convention between image and provisioner, the
-  provisioner dials `guest_ip:6161`. The unit is baked into the golden
-  image but not enabled at boot, the provisioner starts it after the
-  profile bundle lands (the bundle must exist before the first session
-  is created).
+  `AJ_LISTEN=0.0.0.0:6161` in the unit environment with the identity
+  gate in `open` mode (the guest network is host-private, section
+  6.11). 6161 is the fixed control-port convention between image and
+  provisioner, the provisioner dials `guest_ip:6161`. The unit is
+  baked into the golden image but not enabled at boot, the
+  provisioner starts it after the profile bundle lands (the bundle
+  must exist before the first session is created).
 - On the gateway machine: a documented unit for `aj gateway`. The repo
   ships both unit files as reference material with the docs, aj does
   not install them.
@@ -803,7 +853,9 @@ zero durable entries follow the cursor but an open sub concluded in
 the gap, head switch refused while busy, stale-epoch frames dropped,
 task-table refetch after `caught_up`, queue enqueue visibility on a
 second client, slow-client eviction and recovery, settings visibility
-for a mid-session joiner, seq non-contiguity tolerated.
+for a mid-session joiner, seq non-contiguity tolerated, and the
+identity gate (loopback-only refusal in `local` mode, accept and
+reject paths in `tailscale` mode against a faked whois resolver).
 
 ## 12. Phasing
 
@@ -821,8 +873,8 @@ before the next begins.
 - **Phase 2, single-session remote**: HTTP server and client,
   `aj serve`, `aj --listen` (flag and `AJ_LISTEN` environment
   variable), `aj connect` viewing/controlling one session, the full
-  attach/catch-up protocol, reducer-equivalence harness including
-  fault injection.
+  attach/catch-up protocol, the connection identity gate (section
+  6.11), reducer-equivalence harness including fault injection.
 - **Phase 3, multiplexing**: unified stream with many sessions, the
   sidebar, session switching, session creation over the wire, the
   gateway with aggregation over static hosts plus the `/v1/hosts`
