@@ -1,17 +1,19 @@
-//! Catch-up equivalence for the chat reducer: a client that loses its
+//! Catch-up equivalence for the client fold: a client that loses its
 //! connection mid-turn and re-attaches has to converge on the same
 //! durable-derived state as one that never dropped (spec 2, 6.5, 11.2).
 //!
 //! The turn is a real scripted-provider run, so the frames are the exact
 //! shapes the agent emits, tagged with their log entries by the same
 //! forwarder a session host uses. The suffix a re-attach applies is the
-//! real `project_suffix` output, not a filtered replay of the live stream.
+//! real `project_suffix` output, not a filtered replay of the live stream,
+//! and the fold under test is the real [`SessionClient`].
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
 use aj_app::chat::{ChatState, reduce};
+use aj_app::client::SessionClient;
 use aj_app::session::AgentLifecycle;
 use aj_app::test_support::{
     CanonicalState, assert_canonical_eq, assert_no_dangling, build_tagged_test_agent,
@@ -19,114 +21,131 @@ use aj_app::test_support::{
 };
 use aj_models::types::{AssistantContent, StopReason, ToolCall};
 use aj_session::{ConversationPersistence, LogSnapshot, TaggedEvent, project_suffix};
+use aj_wire::{DurableEvent, Frame};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
-/// One attached client, applying spec 6.5's client rules over a stream of
-/// tagged frames.
+/// The session every frame in this harness belongs to.
+const SESSION: &str = "harness-session";
+
+/// The epoch the host serves under. One materialization means one epoch,
+/// which the client adopts on its first attach and keeps across every
+/// re-attach.
+const EPOCH: &str = "epoch-1";
+
+/// One attached client: the fold under test plus the [`ChatState`] it
+/// folds into, which stays outside [`SessionClient`] because the TUI holds
+/// it behind widgets it cannot repoint.
 struct Client {
+    client: SessionClient,
     chat: ChatState,
-    life: AgentLifecycle,
-    /// Last durable seq applied, which is what the cursor invariant
-    /// compares against.
-    applied: Option<u64>,
-    /// Last durable seq committed, which is what a re-attach offers. It
-    /// lags `applied` by one durable frame, because a log entry can
-    /// project a trailing untagged event and a connection that dropped in
-    /// between would otherwise claim an entry it only partly applied.
-    committed: Option<u64>,
-    /// Whether the lossy frames still to come are stale by construction.
-    ///
-    /// Spec 6.5 has the server drop the lossy frames that were in flight
-    /// when an attach was served, because a cumulative snapshot delivered
-    /// after the durable frame that superseded it resurrects stale
-    /// transient state. Here the backfill is projected from the finished
-    /// log, so it supersedes every snapshot left in the stream, and the
-    /// faithful model of that rule is to drop all of them from the
-    /// re-attach on.
-    drop_lossy: bool,
 }
 
 impl Client {
-    fn new() -> Self {
-        Self {
+    /// A client that has just attached an empty session: the host serves
+    /// the opening `state`, an empty backfill, and `caught_up` at seq 0.
+    fn attached() -> Self {
+        let mut this = Self {
+            client: SessionClient::new(SESSION.to_string()),
             chat: ChatState::new(scripted_settings(), 200_000, Arc::new(Vec::new())),
-            life: AgentLifecycle::default(),
-            applied: None,
-            committed: None,
-            drop_lossy: false,
-        }
+        };
+        this.client.expect_attach();
+        this.apply(state_frame(EPOCH, 0, false));
+        this.apply(caught_up_frame(EPOCH, 0));
+        this
     }
 
-    /// Apply one frame.
-    ///
-    /// `advance` is false inside a backfill block, which the client treats
-    /// atomically: it advances its cursor once to the block's `last_seq`
-    /// rather than per frame.
-    fn apply(&mut self, frame: &TaggedEvent, advance: bool) {
-        if let Some(entry) = &frame.entry {
-            // Cursor invariant: a durable frame at or below the last
-            // applied seq is a duplicate. This is de-duplication, not the
-            // correctness mechanism, because the entry's trailing events
-            // carry no tag and still apply below.
-            if self.applied.is_some_and(|applied| entry.seq <= applied) {
-                return;
-            }
-            if advance {
-                self.committed = self.applied;
-                self.applied = Some(entry.seq);
-            }
-            let _ = reduce(
-                &mut self.chat,
-                &mut self.life,
-                frame.event.clone(),
-                Some(&entry.id),
-            );
-            return;
-        }
-        if self.drop_lossy && is_lossy(&frame.event) {
-            return;
-        }
-        let _ = reduce(&mut self.chat, &mut self.life, frame.event.clone(), None);
+    fn apply(&mut self, frame: Frame) {
+        let _ = self.client.apply(&mut self.chat, frame);
     }
 
-    /// Re-attach: quiesce, apply the suffix the server projects from the
-    /// cursor we offer, then adopt the block's high-water mark.
-    fn reattach(&mut self, log: &LogSnapshot) {
-        self.chat.quiesce(&mut self.life);
-        // The attach block opens with a `state` frame, whose `working`
-        // seeds the lifecycle. Nothing else can: it is not derivable from
-        // projected events, and a bracket whose `AgentEnd` fell into the
-        // disconnected window would otherwise leave the spinner stuck
-        // forever. This host is idle, the turn having finished.
-        for agent in self.life.running_agents() {
-            self.life.mark_idle(agent);
-        }
+    /// Apply one live frame of the recorded run.
+    fn live(&mut self, tagged: &TaggedEvent) {
+        self.apply(event_frame(EPOCH, tagged));
+    }
+
+    /// The attach block the host serves for the cursor this client offers:
+    /// the opening `state`, the projected suffix, `caught_up`, then the
+    /// conclusion sweep the host runs for every sub-agent it knows to be
+    /// idle.
+    fn reattach(&mut self, log: &LogSnapshot, epoch: &str) {
+        self.client.expect_attach();
+        // A real client names its cursor in the stream request. A cursor
+        // from another epoch says nothing about this one, so the server
+        // serves everything instead.
+        let cursor = self
+            .client
+            .cursor()
+            .filter(|cursor| cursor.epoch == epoch)
+            .map(|cursor| cursor.seq);
         // The projection leaves open exactly the brackets of the runs the
-        // host knows are still live. This simulated attach is served
-        // against a finished log, so the host knows of none.
-        let backfill = project_suffix(log, self.committed, &BTreeSet::new());
-        for frame in &backfill.events {
-            self.apply(frame, false);
+        // host knows are still live. This attach is served against a
+        // finished log, so the host knows of none.
+        let backfill = project_suffix(log, cursor, &BTreeSet::new());
+        // The block's opening `state` carries the `working` seed, which no
+        // projected event can carry: a bracket whose `AgentEnd` fell into
+        // the disconnected window would otherwise leave a spinner running
+        // forever. This host is idle, the turn having finished.
+        self.apply(state_frame(epoch, log.last_seq(), false));
+        for tagged in &backfill.events {
+            self.apply(event_frame(epoch, tagged));
         }
-        // After `caught_up` every sub-agent the host knows to be idle is
-        // concluded, which is what unwedges a box whose `SubAgentEnd` fell
+        self.apply(caught_up_frame(epoch, log.last_seq()));
+        // After `caught_up` the host concludes every sub-agent it knows to
+        // be idle, which is what unwedges a box whose `SubAgentEnd` fell
         // into the disconnected window with no durable entry behind it.
-        for agent in self.chat.agents() {
-            if let AgentId::Sub(n) = agent.id
-                && !backfill.open_subs.contains(&n)
-            {
-                self.chat.conclude_sub_box(n);
+        for child in log.sub_agent_ids() {
+            if !backfill.open_subs.contains(&child) {
+                self.apply(agent_end_frame(epoch, AgentId::Sub(child)));
             }
         }
-        // `caught_up`: the block advances the cursor once.
-        self.applied = Some(log.last_seq());
-        self.committed = self.applied;
-        self.drop_lossy = true;
     }
 
     fn canonical(&self) -> CanonicalState {
-        CanonicalState::of(&self.chat, &self.life)
+        CanonicalState::of(&self.chat, self.client.lifecycle())
+    }
+}
+
+fn event_frame(epoch: &str, tagged: &TaggedEvent) -> Frame {
+    Frame::Event {
+        session: SESSION.to_string(),
+        epoch: epoch.to_string(),
+        durability: tagged.entry.as_ref().map(|entry| DurableEvent {
+            seq: entry.seq,
+            entry_id: entry.id.clone(),
+        }),
+        event: tagged.event.clone().into(),
+    }
+}
+
+fn state_frame(epoch: &str, last_seq: u64, working: bool) -> Frame {
+    Frame::State {
+        session: SESSION.to_string(),
+        epoch: epoch.to_string(),
+        working,
+        settings: scripted_settings(),
+        last_seq,
+    }
+}
+
+fn caught_up_frame(epoch: &str, last_seq: u64) -> Frame {
+    Frame::CaughtUp {
+        session: SESSION.to_string(),
+        epoch: epoch.to_string(),
+        last_seq,
+    }
+}
+
+fn agent_end_frame(epoch: &str, agent_id: AgentId) -> Frame {
+    Frame::Event {
+        session: SESSION.to_string(),
+        epoch: epoch.to_string(),
+        durability: None,
+        event: AgentEvent::AgentEnd {
+            agent_id,
+            messages: Vec::new(),
+        }
+        .into(),
     }
 }
 
@@ -219,9 +238,9 @@ async fn recorded_turn(
 
 /// Fold every frame with no interruption: the reference state.
 fn uninterrupted(frames: &[TaggedEvent]) -> Client {
-    let mut client = Client::new();
+    let mut client = Client::attached();
     for frame in frames {
-        client.apply(frame, true);
+        client.live(frame);
     }
     client
 }
@@ -235,17 +254,36 @@ const TURN_ROWS: usize = 6;
 /// `cut` frames and a re-attach that resumes live delivery at `resume`,
 /// losing everything in between, and require the same canonical state as
 /// the uninterrupted fold.
-fn sweep(frames: &[TaggedEvent], log: &LogSnapshot, expected: &CanonicalState) {
+///
+/// `expected_pairs` is pinned by the caller so a change that quietly
+/// shortens the recorded stream cannot shrink the sweep with it.
+fn sweep(
+    frames: &[TaggedEvent],
+    log: &LogSnapshot,
+    expected: &CanonicalState,
+    expected_pairs: usize,
+) {
     let mut pairs = 0;
     for cut in 0..=frames.len() {
         for resume in cut..=frames.len() {
-            let mut client = Client::new();
+            let mut client = Client::attached();
             for frame in &frames[..cut] {
-                client.apply(frame, true);
+                client.live(frame);
             }
-            client.reattach(log);
+            client.reattach(log, EPOCH);
             for frame in &frames[resume..] {
-                client.apply(frame, true);
+                // Spec 6.5 has the server drop the lossy frames that were
+                // in flight when an attach was served, because a
+                // cumulative snapshot delivered after the durable frame
+                // that superseded it resurrects stale transient state: a
+                // `MessageUpdate` for a message the backfill already
+                // finalized would paint a second, unfinalized copy of it.
+                // This backfill is projected from the finished log, so it
+                // supersedes every snapshot left in the stream.
+                if is_lossy(&frame.event) {
+                    continue;
+                }
+                client.live(frame);
             }
             assert_canonical_eq(
                 &client.canonical(),
@@ -258,6 +296,7 @@ fn sweep(frames: &[TaggedEvent], log: &LogSnapshot, expected: &CanonicalState) {
     }
     let n = frames.len() + 1;
     assert_eq!(pairs, n * (n + 1) / 2, "every pair was exercised");
+    assert_eq!(pairs, expected_pairs, "the sweep covers the whole stream");
 }
 
 #[tokio::test]
@@ -288,7 +327,7 @@ async fn every_cut_and_resume_of_a_tool_turn_converges() {
     );
     assert_no_dangling(&reference.chat);
 
-    sweep(&frames, &log, &expected);
+    sweep(&frames, &log, &expected, 528);
 }
 
 #[tokio::test]
@@ -310,18 +349,62 @@ async fn every_cut_and_resume_of_a_sub_agent_turn_converges() {
     );
     assert_no_dangling(&reference.chat);
 
-    sweep(&frames, &log, &expected);
+    sweep(&frames, &log, &expected, 1176);
 }
 
-/// The degenerate cursor: a client with complete state re-attaches offering
-/// nothing and gets the whole log back, which is what a stale epoch (a head
-/// switch, a host restart) produces. Every event of the real projection is
-/// therefore applied a second time.
+/// A host restart mints a fresh epoch, so the cursor the client offers is
+/// stale and the whole log comes back under the new epoch. The client
+/// drops everything it built under the old epoch and rebuilds from the
+/// full backfill, which has to land on the same state.
+#[tokio::test]
+async fn an_attach_under_a_new_epoch_rebuilds_the_same_state() {
+    for (_dir, frames, log) in [scripted_tool_turn().await, scripted_sub_agent_turn().await] {
+        let mut client = uninterrupted(&frames);
+        let expected = client.canonical();
+        assert_eq!(
+            expected
+                .agent(AgentId::Main)
+                .expect("main transcript")
+                .entries
+                .len(),
+            TURN_ROWS,
+            "the compared state is a whole turn",
+        );
+
+        client.reattach(&log, "epoch-2");
+
+        assert_canonical_eq(
+            &client.canonical(),
+            &expected,
+            "full backfill under a new epoch",
+        );
+        assert_no_dangling(&client.chat);
+        assert_eq!(
+            client.client.cursor().map(|cursor| cursor.epoch),
+            Some("epoch-2".to_string()),
+            "the client offers the adopted epoch",
+        );
+    }
+}
+
+/// The degenerate re-application: every event of the real projection,
+/// durable frames included, applied a second time onto complete state.
+///
+/// This folds through `reduce` rather than through [`SessionClient`]
+/// deliberately. The client's cursor invariant drops the durable frames of
+/// entries it already applied, and spec 6.5 is explicit that the invariant
+/// is a de-duplication optimization rather than the correctness mechanism.
+/// Idempotent application is, so this pins the property the invariant is
+/// not allowed to stand in for.
 #[tokio::test]
 async fn reapplying_the_whole_projected_suffix_changes_nothing() {
     for (_dir, frames, log) in [scripted_tool_turn().await, scripted_sub_agent_turn().await] {
-        let mut client = uninterrupted(&frames);
-        let before = client.canonical();
+        let mut chat = ChatState::new(scripted_settings(), 200_000, Arc::new(Vec::new()));
+        let mut life = AgentLifecycle::default();
+        for tagged in &frames {
+            fold(&mut chat, &mut life, tagged);
+        }
+        let before = CanonicalState::of(&chat, &life);
         // The comparison is worthless if the state is empty.
         assert_eq!(
             before
@@ -332,24 +415,34 @@ async fn reapplying_the_whole_projected_suffix_changes_nothing() {
             TURN_ROWS,
             "the compared state is a whole turn",
         );
+        let backfill = project_suffix(&log, None, &BTreeSet::new());
         assert!(
-            !project_suffix(&log, None, &BTreeSet::new())
-                .events
-                .is_empty(),
+            !backfill.events.is_empty(),
             "the projection emits events to re-apply",
         );
 
-        client.applied = None;
-        client.committed = None;
-        client.reattach(&log);
+        for tagged in &backfill.events {
+            fold(&mut chat, &mut life, tagged);
+        }
 
         assert_canonical_eq(
-            &client.canonical(),
+            &CanonicalState::of(&chat, &life),
             &before,
             "full backfill over complete state",
         );
-        assert_no_dangling(&client.chat);
+        assert_no_dangling(&chat);
     }
+}
+
+/// Fold one tagged event straight into the reducer, handing it the log
+/// entry a durable frame's envelope would carry.
+fn fold(chat: &mut ChatState, life: &mut AgentLifecycle, tagged: &TaggedEvent) {
+    let _ = reduce(
+        chat,
+        life,
+        tagged.event.clone(),
+        tagged.entry.as_ref().map(|entry| &entry.id),
+    );
 }
 
 /// A guard on the harness itself: durable identity is what absorbs the
