@@ -22,8 +22,8 @@ use aj_agent::{Agent, TaskRegistry, TaskSummary, TurnError, sub_agent_session_id
 use aj_conf::Config;
 use aj_models::errors::is_context_overflow;
 use aj_models::types::UserContent;
-use aj_session::ConversationLog;
 use aj_session::compaction::should_compact;
+use aj_session::{AppendHandoff, ConversationLog};
 use aj_tools::builtin_tools_for_model;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinSet;
@@ -303,6 +303,10 @@ impl Turns {
             let result = drive_turn(
                 &mut a,
                 &log,
+                // No forwarder is installed on this path, so nothing
+                // reads what a compaction files. The session host owns
+                // the real handoff.
+                &AppendHandoff::default(),
                 &policy,
                 start,
                 |agent: &mut Agent| {
@@ -432,9 +436,13 @@ pub fn running_work_counts(driven_turns: usize, tasks: &[TaskSummary]) -> (usize
 ///
 /// The single `cancel` token covers the whole sequence: one fire stops
 /// the in-flight inference and every continuation.
+///
+/// `handoff` is the session's compaction append handoff, threaded to
+/// every `run_compaction` this drives (see [`AppendHandoff`]).
 pub async fn drive_turn(
     agent: &mut Agent,
     log: &Arc<TokioMutex<ConversationLog>>,
+    handoff: &AppendHandoff,
     policy: &TurnPolicy,
     start: TurnStart,
     mut reconfigure: impl FnMut(&mut Agent),
@@ -450,6 +458,7 @@ pub async fn drive_turn(
             let _ = run_compaction(
                 agent,
                 log,
+                handoff,
                 reason,
                 instructions.as_deref(),
                 policy.keep_recent,
@@ -494,6 +503,7 @@ pub async fn drive_turn(
             let _ = run_compaction(
                 agent,
                 log,
+                handoff,
                 CompactionReason::Overflow,
                 None,
                 policy.keep_recent,
@@ -526,6 +536,7 @@ pub async fn drive_turn(
             let _ = run_compaction(
                 agent,
                 log,
+                handoff,
                 CompactionReason::Threshold,
                 None,
                 policy.keep_recent,
@@ -585,7 +596,7 @@ mod tests {
     use aj_agent::events::{AgentEvent, AgentId, CompactionReason};
     use aj_conf::Config;
     use aj_models::types::{AssistantContent, AssistantMessage};
-    use aj_session::{ConversationEntryKind, ConversationPersistence, ThreadFilter};
+    use aj_session::{AppendHandoff, ConversationEntryKind, ConversationPersistence, ThreadFilter};
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
@@ -720,6 +731,7 @@ mod tests {
         let result = drive_turn(
             &mut agent,
             &log,
+            &AppendHandoff::default(),
             &policy,
             TurnStart::Prompt("hi".into()),
             |_| {},
@@ -754,6 +766,7 @@ mod tests {
         let result = drive_turn(
             &mut agent,
             &log,
+            &AppendHandoff::default(),
             &policy,
             TurnStart::Prompt("hi".into()),
             |_| {},
@@ -796,6 +809,7 @@ mod tests {
         let result = drive_turn(
             &mut agent,
             &log,
+            &AppendHandoff::default(),
             &policy,
             TurnStart::Prompt("hi".into()),
             |_| {},
@@ -827,6 +841,7 @@ mod tests {
         let result = drive_turn(
             &mut agent,
             &log,
+            &AppendHandoff::default(),
             &policy,
             TurnStart::Prompt("hi".into()),
             |_| {},
@@ -861,6 +876,7 @@ mod tests {
         let result = drive_turn(
             &mut agent,
             &log,
+            &AppendHandoff::default(),
             &policy,
             TurnStart::Prompt("hi".into()),
             |_| {},
@@ -906,6 +922,7 @@ mod tests {
         let result = drive_turn(
             &mut agent,
             &log,
+            &AppendHandoff::default(),
             &policy,
             TurnStart::Prompt("X".repeat(2000)),
             |_| {},
@@ -1006,6 +1023,7 @@ mod tests {
         let outcome = run_compaction(
             &mut agent,
             &log,
+            &AppendHandoff::default(),
             CompactionReason::Manual,
             None,
             100,
@@ -1080,6 +1098,7 @@ mod tests {
         let result = drive_turn(
             &mut agent,
             &log,
+            &AppendHandoff::default(),
             &policy,
             TurnStart::Prompt("hi".into()),
             |_| {},

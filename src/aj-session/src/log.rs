@@ -21,7 +21,7 @@
 //! helpers (`last_message`, `messages`, etc.) the binary uses to
 //! decide thinking efforts and resume state.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
 use std::{
     fs::{self, File, OpenOptions},
@@ -640,6 +640,16 @@ impl LogSnapshot {
         self.entries.values().filter_map(|e| e.agent_id).max()
     }
 
+    /// Every sub-agent id that appears in the log, on any branch and
+    /// whether its run has finished or not.
+    ///
+    /// A host sweeping the sub-agent boxes a backfill may have left
+    /// unconcluded needs the full set, not just the runs the projection
+    /// left open.
+    pub fn sub_agent_ids(&self) -> BTreeSet<usize> {
+        self.entries.values().filter_map(|e| e.agent_id).collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.order.is_empty()
     }
@@ -718,24 +728,6 @@ impl LogSnapshot {
         self.entries
             .values()
             .find(|e| matches!(e.entry, ConversationEntryKind::SystemPrompt { .. }))
-    }
-
-    /// Append position and id of the most recent
-    /// [`ConversationEntryKind::Compaction`] entry on `filter`'s thread.
-    ///
-    /// The compaction checkpoint is written by the compaction run, not by
-    /// the persistence listener, so a listener that needs the entry a
-    /// `CompactionEnd` event belongs to resolves it through here. Sound
-    /// because at most one compaction runs per session at a time.
-    pub fn latest_compaction(&self, filter: ThreadFilter) -> Option<EntryRef> {
-        self.order.iter().enumerate().rev().find_map(|(index, id)| {
-            let entry = self.entries.get(id)?;
-            let is_compaction = matches!(entry.entry, ConversationEntryKind::Compaction { .. });
-            (is_compaction && filter.matches(entry)).then(|| EntryRef {
-                seq: u64::try_from(index).expect("log index fits u64") + 1,
-                id: id.clone(),
-            })
-        })
     }
 }
 
@@ -1284,11 +1276,6 @@ impl ConversationLog {
     /// See [`LogSnapshot::system_prompt_id`].
     pub fn system_prompt_id(&self) -> Option<&EntryId> {
         self.core.system_prompt_id()
-    }
-
-    /// See [`LogSnapshot::latest_compaction`].
-    pub fn latest_compaction(&self, filter: ThreadFilter) -> Option<EntryRef> {
-        self.core.latest_compaction(filter)
     }
 
     /// Record the assembled system prompt as the root [ThreadKind::Meta]

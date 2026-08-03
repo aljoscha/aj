@@ -35,7 +35,7 @@
 //! prompt, snapshot the thread for replay, and display the final
 //! usage summary.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use aj_agent::BoxError;
 use aj_agent::bus::Listener;
@@ -45,17 +45,42 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::log::{ConversationLog, ConversationView, EntryRef, ThreadFilter};
+use crate::replay::TaggedEvent;
 
-/// One event as it left the bus, paired with the log entry it appended.
+/// Log identity of an entry whose event has not been emitted yet.
 ///
-/// `entry` is `Some` exactly for the durable events (spec 6.4): the
-/// `MessageEnd` that persisted a message, the `SubAgentStart` that wrote
-/// a spawn root, and the `CompactionEnd` of a compaction that recorded a
-/// checkpoint.
-#[derive(Debug, Clone)]
-pub struct PersistedEvent {
-    pub entry: Option<EntryRef>,
-    pub event: AgentEvent,
+/// Compaction appends its checkpoint and then emits `CompactionEnd` for
+/// it. Filing the entry here lets the forwarder tag that event from the
+/// append rather than inferring it at delivery time, which would race the
+/// concurrent appends a background sub-agent makes.
+///
+/// The emit has to happen while the append still holds the log guard.
+/// Otherwise another durable append can land between the checkpoint and
+/// its event, and the forwarded seqs stop being monotone, which spec
+/// section 5 forbids. A bus listener must therefore not take the log lock
+/// for `CompactionEnd`, or it deadlocks against the emitting append.
+///
+/// One slot: at most one compaction runs per session at a time, and a
+/// filed entry is taken by the very next `CompactionEnd`.
+#[derive(Clone, Default)]
+pub struct AppendHandoff {
+    entry: Arc<StdMutex<Option<EntryRef>>>,
+}
+
+impl AppendHandoff {
+    /// Hand `entry` to the next `CompactionEnd` the forwarder sees.
+    pub fn file(&self, entry: EntryRef) {
+        *self.entry.lock().expect("append handoff mutex poisoned") = Some(entry);
+    }
+
+    /// Take the filed entry, leaving the slot empty. `None` when the
+    /// compaction appended nothing (it failed or was canceled).
+    pub fn take(&self) -> Option<EntryRef> {
+        self.entry
+            .lock()
+            .expect("append handoff mutex poisoned")
+            .take()
+    }
 }
 
 /// Build a [`Listener`] that writes every finalized
@@ -85,7 +110,9 @@ pub fn persistence_listener(log: Arc<TokioMutex<ConversationLog>>) -> Listener {
 ///
 /// The tag is taken at the append site. A consumer that instead read the
 /// log's length when it received the event would race concurrent
-/// sub-agent appends and mis-number the event (spec section 5).
+/// sub-agent appends and mis-number the event (spec section 5). The one
+/// durable event this listener does not append itself is `CompactionEnd`,
+/// whose entry is filed on `handoff` by the compaction run.
 ///
 /// The send is non-blocking and a closed receiver is ignored, so a slow
 /// or absent consumer can never stall or fail a turn even though the bus
@@ -93,18 +120,26 @@ pub fn persistence_listener(log: Arc<TokioMutex<ConversationLog>>) -> Listener {
 /// sink its guarantee: an event it receives is already on disk.
 pub fn persisting_forwarder(
     log: Arc<TokioMutex<ConversationLog>>,
-    sink: UnboundedSender<PersistedEvent>,
+    handoff: AppendHandoff,
+    sink: UnboundedSender<TaggedEvent>,
 ) -> Listener {
     Arc::new(move |event: &AgentEvent| {
         let log = Arc::clone(&log);
+        let handoff = handoff.clone();
         let sink = sink.clone();
         let event = event.clone();
         Box::pin(async move {
             let entry = match persist(&log, &event).await? {
                 Some(entry) => Some(entry),
-                None => compaction_entry(&log, &event).await,
+                // NOTE: taking the handoff must not take the log lock:
+                // the compaction run emits `CompactionEnd` while holding
+                // it (see [`AppendHandoff`]).
+                None => match &event {
+                    AgentEvent::CompactionEnd { .. } => handoff.take(),
+                    _ => None,
+                },
             };
-            let _ = sink.send(PersistedEvent { entry, event });
+            let _ = sink.send(TaggedEvent { entry, event });
             Ok(())
         })
     })
@@ -113,7 +148,8 @@ pub fn persisting_forwarder(
 /// Write whatever `event` persists and return the appended entry, or
 /// `None` for an event that persists nothing. Takes the log lock only in
 /// the arms that write, so the streaming events (by far the most
-/// frequent) never contend for it.
+/// frequent) never contend for it, and `CompactionEnd` never takes it at
+/// all (see [`AppendHandoff`]).
 async fn persist(
     log: &TokioMutex<ConversationLog>,
     event: &AgentEvent,
@@ -155,34 +191,6 @@ async fn persist(
         }
         _ => Ok(None),
     }
-}
-
-/// The `Compaction` entry a [`AgentEvent::CompactionEnd`] belongs to,
-/// `None` for any other event.
-///
-/// The checkpoint is appended by the compaction run rather than by this
-/// listener, so the entry is resolved by lookup instead of returned from
-/// an append. Sound because at most one compaction runs per session at a
-/// time and the bus awaits this listener inline, right after the append.
-/// A failed or canceled compaction appends nothing and carries no
-/// summary, which is what the summary match gates on.
-async fn compaction_entry(
-    log: &TokioMutex<ConversationLog>,
-    event: &AgentEvent,
-) -> Option<EntryRef> {
-    let AgentEvent::CompactionEnd {
-        agent_id,
-        summary: Some(_),
-        ..
-    } = event
-    else {
-        return None;
-    };
-    let filter = match agent_id {
-        AgentId::Main => ThreadFilter::USER,
-        AgentId::Sub(n) => ThreadFilter::subagent(*n),
-    };
-    log.lock().await.latest_compaction(filter)
 }
 
 /// Append one finalized message to the log on behalf of `agent_id`.
@@ -232,11 +240,12 @@ mod tests {
     use tempfile::TempDir;
     use tokio::sync::Mutex as TokioMutex;
 
-    use super::{PersistedEvent, persistence_listener, persisting_forwarder};
+    use super::{AppendHandoff, persistence_listener, persisting_forwarder};
     use crate::log::{
         ConversationEntry, ConversationEntryKind, ConversationLog, ConversationView, ThreadFilter,
     };
     use crate::persistence::ConversationPersistence;
+    use crate::replay::TaggedEvent;
 
     /// Set up a temp sessions dir + a fresh log with a frozen system
     /// prompt root.
@@ -745,9 +754,7 @@ mod tests {
     /// Drain everything the forwarder has already sent. The forwarder
     /// sends inline while the bus awaits it, so by the time an `emit`
     /// returns its event is in the channel.
-    fn drained(
-        rx: &mut tokio::sync::mpsc::UnboundedReceiver<PersistedEvent>,
-    ) -> Vec<PersistedEvent> {
+    fn drained(rx: &mut tokio::sync::mpsc::UnboundedReceiver<TaggedEvent>) -> Vec<TaggedEvent> {
         let mut out = Vec::new();
         while let Ok(event) = rx.try_recv() {
             out.push(event);
@@ -755,20 +762,26 @@ mod tests {
         out
     }
 
-    /// Append position and id of every entry in the log, for checking
-    /// what a tag names.
-    async fn positions(log: &Arc<TokioMutex<ConversationLog>>) -> Vec<(u64, String)> {
+    /// The id of the entry at 1-based append position `seq`.
+    ///
+    /// By index rather than by filtering the entries: a hole in the
+    /// append order would shift what a filtered position names, and a tag
+    /// is exactly a position.
+    async fn entry_id_at(log: &Arc<TokioMutex<ConversationLog>>, seq: u64) -> Option<String> {
+        let index = usize::try_from(seq).expect("fits usize") - 1;
         log.lock()
             .await
-            .entries_in_order()
+            .core()
+            .entry_in_append_order(index)
+            .map(|entry| entry.id.clone())
+    }
+
+    /// The durable positions the sink saw, in delivery order. Spec section
+    /// 5 requires these to be strictly increasing.
+    fn durable_seqs(forwarded: &[TaggedEvent]) -> Vec<u64> {
+        forwarded
             .iter()
-            .enumerate()
-            .map(|(index, entry)| {
-                (
-                    u64::try_from(index).expect("fits u64") + 1,
-                    entry.id.clone(),
-                )
-            })
+            .filter_map(|tagged| tagged.entry.as_ref().map(|entry| entry.seq))
             .collect()
     }
 
@@ -776,8 +789,9 @@ mod tests {
     async fn forwarder_tags_the_durable_events_and_forwards_the_rest() {
         let (_dir, log) = fresh_log();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handoff = AppendHandoff::default();
         let bus = EventBus::new();
-        let _h = bus.subscribe(persisting_forwarder(Arc::clone(&log), tx));
+        let _h = bus.subscribe(persisting_forwarder(Arc::clone(&log), handoff.clone(), tx));
 
         let user = user_msg("hi");
         bus.emit(AgentEvent::MessageEnd {
@@ -804,16 +818,18 @@ mod tests {
         .expect("emit sub message");
 
         // A compaction checkpoint is written by the compaction run, not by
-        // the listener, so the forwarder has to resolve its entry.
+        // the listener, so the run files it on the handoff.
         let first_kept = log
             .lock()
             .await
             .latest_leaf(ThreadFilter::USER)
             .expect("user leaf");
-        log.lock()
+        let checkpoint = log
+            .lock()
             .await
             .append_compaction(ThreadFilter::USER, "summary".into(), first_kept, 100, None)
             .expect("append the compaction checkpoint");
+        handoff.file(checkpoint);
         bus.emit(AgentEvent::CompactionEnd {
             agent_id: AgentId::Main,
             reason: aj_agent::events::CompactionReason::Manual,
@@ -852,14 +868,21 @@ mod tests {
             "every event is forwarded, exactly the durable ones tagged"
         );
 
-        let positions = positions(&log).await;
-        for persisted in &forwarded {
-            let Some(entry) = &persisted.entry else {
+        for tagged in &forwarded {
+            let Some(entry) = &tagged.entry else {
                 continue;
             };
-            let index = usize::try_from(entry.seq).expect("fits usize") - 1;
-            assert_eq!(entry.id, positions[index].1, "tag names its own entry");
+            assert_eq!(
+                Some(entry.id.clone()),
+                entry_id_at(&log, entry.seq).await,
+                "tag names its own entry"
+            );
         }
+        assert_eq!(
+            durable_seqs(&forwarded),
+            vec![2, 3, 4, 5],
+            "durable positions reach the sink in increasing order"
+        );
         // A `MessageEnd`'s tag is the message's own id: that is what lets a
         // remote client rebuild the id its reducer keys transcript entries
         // and branch targets on.
@@ -890,12 +913,16 @@ mod tests {
         ));
     }
 
+    /// A failed or canceled compaction appends nothing and files nothing,
+    /// so its `CompactionEnd` is not durable even though an earlier
+    /// checkpoint exists in the log.
     #[tokio::test]
-    async fn forwarder_leaves_a_summary_less_compaction_end_untagged() {
+    async fn forwarder_leaves_a_compaction_end_that_filed_nothing_untagged() {
         let (_dir, log) = fresh_log();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handoff = AppendHandoff::default();
         let bus = EventBus::new();
-        let _h = bus.subscribe(persisting_forwarder(Arc::clone(&log), tx));
+        let _h = bus.subscribe(persisting_forwarder(Arc::clone(&log), handoff.clone(), tx));
 
         bus.emit(AgentEvent::MessageEnd {
             agent_id: AgentId::Main,
@@ -903,17 +930,27 @@ mod tests {
         })
         .await
         .expect("emit user message");
-        // An earlier successful compaction exists, so the gate has to be
-        // the event's own summary, not the presence of a checkpoint.
         let first_kept = log
             .lock()
             .await
             .latest_leaf(ThreadFilter::USER)
             .expect("user leaf");
-        log.lock()
+        let earlier = log
+            .lock()
             .await
             .append_compaction(ThreadFilter::USER, "earlier".into(), first_kept, 100, None)
             .expect("append the compaction checkpoint");
+        handoff.file(earlier);
+        bus.emit(AgentEvent::CompactionEnd {
+            agent_id: AgentId::Main,
+            reason: aj_agent::events::CompactionReason::Manual,
+            tokens_before: 100,
+            tokens_after: 10,
+            summary: Some("earlier".into()),
+            error: None,
+        })
+        .await
+        .expect("emit the earlier compaction end");
         let _ = drained(&mut rx);
 
         bus.emit(AgentEvent::CompactionEnd {
@@ -935,12 +972,90 @@ mod tests {
         );
     }
 
+    /// A tool batch persists one entry per result, so the forwarder has to
+    /// tag each result's `MessageEnd` with its own entry. Tagging from the
+    /// log's length at delivery time would give them all the same
+    /// position.
+    #[tokio::test]
+    async fn forwarder_tags_each_result_of_a_tool_batch_with_its_own_entry() {
+        let (_dir, log) = fresh_log();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let bus = EventBus::new();
+        let _h = bus.subscribe(persisting_forwarder(
+            Arc::clone(&log),
+            AppendHandoff::default(),
+            tx,
+        ));
+
+        bus.emit(AgentEvent::MessageEnd {
+            agent_id: AgentId::Main,
+            message: user_msg("read three files"),
+        })
+        .await
+        .expect("emit the prompt");
+        let batch = AgentMessage::wire(Message::Assistant(AssistantMessage {
+            content: (1..=3)
+                .map(|n| {
+                    AssistantContent::ToolCall(aj_models::types::ToolCall {
+                        id: format!("tu-{n}"),
+                        name: "read_file".into(),
+                        arguments: serde_json::json!({"path": format!("/tmp/{n}")}),
+                    })
+                })
+                .collect(),
+            ..AssistantMessage::empty()
+        }));
+        bus.emit(AgentEvent::MessageEnd {
+            agent_id: AgentId::Main,
+            message: batch,
+        })
+        .await
+        .expect("emit the batch");
+        let results: Vec<AgentMessage> = (1..=3)
+            .map(|n| tool_result(&format!("tu-{n}"), "read_file", &format!("body {n}")))
+            .collect();
+        for result in &results {
+            bus.emit(AgentEvent::MessageEnd {
+                agent_id: AgentId::Main,
+                message: result.clone(),
+            })
+            .await
+            .expect("emit a tool result");
+        }
+
+        let forwarded = drained(&mut rx);
+        // Entry 1 is the system prompt: the prompt, the batch and its
+        // three results follow.
+        assert_eq!(durable_seqs(&forwarded), vec![2, 3, 4, 5, 6]);
+        for tagged in &forwarded {
+            let entry = tagged.entry.as_ref().expect("every MessageEnd is durable");
+            assert_eq!(
+                Some(entry.id.clone()),
+                entry_id_at(&log, entry.seq).await,
+                "tag names its own entry"
+            );
+        }
+        let tagged_results: Vec<&str> = forwarded[2..]
+            .iter()
+            .map(|tagged| tagged.entry.as_ref().expect("durable").id.as_str())
+            .collect();
+        let expected: Vec<&str> = results.iter().map(|message| message.id()).collect();
+        assert_eq!(
+            tagged_results, expected,
+            "each result is tagged with its own message id"
+        );
+    }
+
     #[tokio::test]
     async fn forwarder_survives_a_dropped_receiver() {
         let (_dir, log) = fresh_log();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let bus = EventBus::new();
-        let _h = bus.subscribe(persisting_forwarder(Arc::clone(&log), tx));
+        let _h = bus.subscribe(persisting_forwarder(
+            Arc::clone(&log),
+            AppendHandoff::default(),
+            tx,
+        ));
         drop(rx);
 
         // The bus awaits listeners inline and a listener error is a fatal

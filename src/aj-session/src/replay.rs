@@ -77,12 +77,12 @@
 //!
 //! ## Live logs
 //!
-//! [`replay`] treats the log as dead: at end of log it force-closes any
-//! sub-agent bracket that is still open. A live session serving a
-//! catch-up backfill needs the same projection with different endings,
-//! which is [`project_suffix`]: it emits only the entries after a
-//! cursor, tags the durable ones with their append position, and leaves
-//! an open bracket open.
+//! [`replay`] treats the log as dead: every sub-agent bracket still open
+//! at end of log is force-closed. A live session serving a catch-up
+//! backfill needs the same projection with different endings, which is
+//! [`project_suffix`]: it emits only the entries after a cursor, tags
+//! the durable ones with their append position, and leaves the brackets
+//! of the runs the caller knows are still running open.
 //!
 //! ## Timestamps
 //!
@@ -100,7 +100,7 @@
 //! [`ConversationEntry::timestamp`]: crate::log::ConversationEntry::timestamp
 //! [`ConversationLog::stats`]: crate::log::ConversationLog::stats
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use aj_agent::events::{AgentEvent, AgentId, AgentSettings, CompactionReason, SubAgentConclusion};
 use aj_agent::message::{AgentMessage, AgentMessageKind};
@@ -111,22 +111,27 @@ use serde_json::Value;
 
 use crate::compaction::estimate_conversation_context;
 use crate::log::{
-    Conversation, ConversationEntry, ConversationEntryKind, ConversationLog, EntryRef, LogSnapshot,
-    ThreadFilter, ThreadKind,
+    Conversation, ConversationEntry, ConversationEntryKind, ConversationLog, EntryId, EntryRef,
+    LogSnapshot, ThreadFilter, ThreadKind,
 };
 use crate::tool_details::resolve_tool_details;
 
-/// One projected event and the log entry it derives from.
+/// One event paired with the log entry it stands for.
 ///
-/// `entry` is `Some` exactly for the events that are durable live (see
-/// [`project_suffix`]), so a client can advance its cursor on the same
-/// events whether they arrive live or in a backfill. It is absent for
-/// bracketing frames the projection synthesizes and for every event of
-/// an entry at or below the cursor: their entry is already applied, and
-/// tagging them would make the client's cursor invariant drop them
-/// (spec 6.5).
+/// Both origins produce this shape, which is what lets a host fan one
+/// stream out without converting: the persisting forwarder tags an event
+/// with the entry it just appended, and [`project_suffix`] tags a
+/// projected event with the entry it derives from.
+///
+/// `entry` is `Some` exactly for the events that are durable (spec 6.4),
+/// so a client can advance its cursor on the same events whether they
+/// arrive live or in a backfill. It is absent for everything a live run
+/// emits without persisting, for bracketing frames the projection
+/// synthesizes, and for every projected event of an entry at or below the
+/// cursor: their entry is already applied, and tagging them would make
+/// the client's cursor invariant drop them (spec 6.5).
 #[derive(Debug, Clone)]
-pub struct ProjectedEvent {
+pub struct TaggedEvent {
     pub entry: Option<EntryRef>,
     pub event: AgentEvent,
 }
@@ -134,12 +139,12 @@ pub struct ProjectedEvent {
 /// The projected durable suffix of a live log.
 #[derive(Debug, Clone)]
 pub struct Backfill {
-    pub events: Vec<ProjectedEvent>,
-    /// Sub-agents whose bracket the projection leaves open at end of log.
-    /// A live log's open run has its real `SubAgentEnd` still coming, so
-    /// the caller (not the projection) decides how to conclude a run it
-    /// knows is idle.
-    pub open_subs: Vec<usize>,
+    pub events: Vec<TaggedEvent>,
+    /// The runs whose bracket the projection left open, which is exactly
+    /// the `live_subs` it saw (see [`project_suffix`]). Their real
+    /// `SubAgentEnd` is still coming live, so concluding them is the
+    /// caller's decision, not the projection's.
+    pub open_subs: BTreeSet<usize>,
 }
 
 /// Project the events of every entry after `cursor`, for a live log.
@@ -148,13 +153,16 @@ pub struct Backfill {
 /// map, the usage accumulators, the settings-notice gate and the
 /// sub-agent bracketing state are complete: events of entries at or
 /// below the cursor are computed and dropped, never skipped. `None`
-/// projects the whole log.
+/// projects the whole log, and so does a cursor beyond the log's
+/// `last_seq`, which cannot name a position in this materialization
+/// (spec 6.5 treats it as an epoch mismatch).
 ///
-/// Two deviations from dead-log [`replay`], both required by spec 6.5:
-/// an open sub-agent bracket is not force-closed at end of log, and a
-/// run whose bracket opened at or below the cursor has its
-/// `SubAgentStart` re-synthesized before its first emitted event so the
-/// suffix is well-bracketed.
+/// `live_subs` names the sub-agents the caller knows are still running.
+/// Every other run's bracket is force-closed exactly as dead-log
+/// [`replay`] closes it, and theirs is left open for the real
+/// `SubAgentEnd` to close live (spec 6.5). A run whose bracket opened at
+/// or below the cursor has its `SubAgentStart` re-synthesized before its
+/// first emitted event, so the suffix is well-bracketed.
 ///
 /// Which events carry an [`EntryRef`]: exactly the ones a live run
 /// persists or synthesizes as durable, so live flow and backfill agree
@@ -163,12 +171,45 @@ pub struct Backfill {
 /// `CompactionEnd` of a `Compaction` entry, and the `Notice` of a
 /// settings entry. At most one event per entry is tagged, which is what
 /// makes the client's per-frame cursor advance well-defined.
-pub fn project_suffix(log: &LogSnapshot, cursor: Option<u64>) -> Backfill {
-    let mut walk = Replay::suffix(log, cursor);
-    let events: Vec<ProjectedEvent> = walk.by_ref().collect();
+pub fn project_suffix(
+    log: &LogSnapshot,
+    cursor: Option<u64>,
+    live_subs: &BTreeSet<usize>,
+) -> Backfill {
+    // This is the one place that knows `last_seq`, so the out-of-range
+    // clamp lives here rather than at every caller.
+    let cursor = cursor.filter(|seq| *seq <= log.last_seq());
+    let mut walk = Replay::suffix(log, cursor, live_subs.clone());
+    let events: Vec<TaggedEvent> = walk.by_ref().collect();
     Backfill {
         events,
         open_subs: walk.open_subs(),
+    }
+}
+
+impl LogSnapshot {
+    /// The [`AgentEvent::Notice`] the projection derives from a settings
+    /// entry, `None` when it derives none (or when `entry` is not a
+    /// settings entry on the active path).
+    ///
+    /// A settings entry before its thread's first message projects
+    /// nothing, so a host that synthesized a notice unconditionally would
+    /// emit a live frame that no backfill regenerates. Asking here is
+    /// what keeps the two in agreement.
+    ///
+    /// This runs the projection rather than restating its rule. That is a
+    /// walk of the log per call, which a settings change can afford.
+    pub fn project_settings_entry(&self, entry: &EntryId) -> Option<AgentEvent> {
+        // `live_subs` is irrelevant: it only affects bracketing frames,
+        // and those are never tagged with a settings entry.
+        project_suffix(self, None, &BTreeSet::new())
+            .events
+            .into_iter()
+            .find_map(|tagged| {
+                let tagged_entry = tagged.entry?;
+                (tagged_entry.id == *entry && matches!(tagged.event, AgentEvent::Notice { .. }))
+                    .then_some(tagged.event)
+            })
     }
 }
 
@@ -253,7 +294,7 @@ struct Replay<'a> {
     log: &'a LogSnapshot,
     next_entry: usize,
     state: ReplayState,
-    pending: VecDeque<ProjectedEvent>,
+    pending: VecDeque<TaggedEvent>,
     finished: bool,
     /// When set, sub-agent content events are withheld (see
     /// [`replay_deferring_subs`]). Bracketing and report capture are
@@ -270,10 +311,10 @@ struct Replay<'a> {
     /// effect on the walk's state and their events dropped, so the walk
     /// yields only the suffix after it. `None` yields everything.
     cursor: Option<u64>,
-    /// Whether an open sub-agent bracket is force-closed at end of log.
-    /// That heuristic belongs to a dead log: for a live one the real
-    /// `SubAgentEnd` is still coming (spec 6.5).
-    close_at_eof: bool,
+    /// The sub-agents whose bracket is never force-closed, because the
+    /// caller knows they are still running (see [`project_suffix`]).
+    /// Dead-log replay leaves this empty and closes every run.
+    live_subs: BTreeSet<usize>,
 }
 
 impl<'a> Replay<'a> {
@@ -295,22 +336,22 @@ impl<'a> Replay<'a> {
             defer_subs,
             included: included_entries(log),
             cursor: None,
-            close_at_eof: true,
+            live_subs: BTreeSet::new(),
         }
     }
 
-    fn suffix(log: &'a LogSnapshot, cursor: Option<u64>) -> Self {
+    fn suffix(log: &'a LogSnapshot, cursor: Option<u64>, live_subs: BTreeSet<usize>) -> Self {
         Self {
             cursor,
-            close_at_eof: false,
+            live_subs,
             ..Self::with_mode(log, false)
         }
     }
 
-    /// The sub-agent runs still open, valid once the walk is exhausted.
-    /// At most one, since sub-agent entries of one run are contiguous.
-    fn open_subs(&self) -> Vec<usize> {
-        self.state.open_sub.into_iter().collect()
+    /// The sub-agent runs whose bracket is still open, valid once the
+    /// walk is exhausted.
+    fn open_subs(&self) -> BTreeSet<usize> {
+        self.state.open_runs.keys().copied().collect()
     }
 }
 
@@ -383,7 +424,7 @@ fn included_entries(log: &LogSnapshot) -> Option<HashSet<String>> {
 }
 
 impl Iterator for Replay<'_> {
-    type Item = ProjectedEvent;
+    type Item = TaggedEvent;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -415,12 +456,17 @@ impl Iterator for Replay<'_> {
                             id: entry.id.clone(),
                         });
                         let mut projected = VecDeque::new();
-                        self.state
-                            .bracket_subagent(entry, at.clone(), keep, &mut projected);
+                        self.state.bracket_subagent(
+                            entry,
+                            at.clone(),
+                            keep,
+                            &self.live_subs,
+                            &mut projected,
+                        );
                         if self.defer_subs && matches!(agent_id_for(entry), Some(AgentId::Sub(_))) {
                             // Deferred mode withholds a sub-agent's content
                             // events but still advances the report that
-                            // `close_open_sub` reads, so the `SubAgentEnd`
+                            // `close_run` reads, so the `SubAgentEnd`
                             // matches full replay byte for byte.
                             self.state.capture_sub_report_from_entry(entry);
                         } else {
@@ -437,15 +483,46 @@ impl Iterator for Replay<'_> {
 
             if !self.finished {
                 self.finished = true;
-                if self.close_at_eof {
-                    self.state.close_open_sub(true, &mut self.pending);
-                }
+                self.state
+                    .close_finished_runs(None, &self.live_subs, true, &mut self.pending);
                 continue;
             }
 
             return None;
         }
     }
+}
+
+/// Bracket state of one sub-agent run the walk has opened and not yet
+/// closed. Keyed per run rather than held as a single "current run":
+/// a background sub-agent's entries interleave with its parent's, so
+/// several runs can be open at once.
+#[derive(Default)]
+struct OpenRun {
+    /// The run's [`AgentEvent::SubAgentStart`], kept so a suffix whose
+    /// cursor falls inside the run can re-synthesize it. `None` until
+    /// the run's `SubAgentSpawn` entry, or the legacy fallback at its
+    /// first `Message` entry, produces one. A run that reaches its close
+    /// with `None` still gets a balanced bracket from a synthesized
+    /// start.
+    start: Option<AgentEvent>,
+    /// Whether `start` reached the output. False while the run opened on
+    /// an entry the walk dropped, which is what tells the suffix
+    /// projection to re-synthesize the start.
+    start_delivered: bool,
+    /// Concatenated text of the most recent `Sub` assistant message seen
+    /// during the run. After its last assistant message this holds the
+    /// final report carried on the closing [`AgentEvent::SubAgentEnd`].
+    report: String,
+    /// How the run concluded, carried on the closing
+    /// [`AgentEvent::SubAgentEnd`]. Derived from the run's last assistant
+    /// message stop reason: `Length` -> `Truncated`, `Error`/`Aborted`
+    /// and an interrupted `ToolUse` terminal -> `Failed`, otherwise
+    /// `Completed`. This reconstructs the conclusion on resume without
+    /// any dedicated on-disk entry, because a failed, aborted, or
+    /// interrupted run's terminal message is itself persisted with the
+    /// matching stop reason.
+    conclusion: SubAgentConclusion,
 }
 
 /// Per-walk projection state.
@@ -468,39 +545,9 @@ struct ReplayState {
     /// `aj_agent::Agent::prompt`: `UsageUpdate` carries the
     /// pre-add total, and the per-turn delta is added afterwards).
     usage_accumulators: HashMap<AgentId, Usage>,
-    /// The `Sub(n)` index of the sub-agent run currently being
-    /// walked, if any. Sub-agent entries are contiguous in append
-    /// order (a sub-agent runs fully within one parent tool call),
-    /// so a single open run is enough to bracket each sub run with
-    /// [`AgentEvent::SubAgentStart`] / [`AgentEvent::SubAgentEnd`].
-    open_sub: Option<usize>,
-    /// Whether the open run's [`AgentEvent::SubAgentStart`] has been
-    /// emitted yet. Set by the run's `SubAgentSpawn` entry or, for
-    /// logs without one, by the legacy fallback at the run's first
-    /// `Message` entry; checked again at run close so a run with
-    /// neither still gets a balanced bracket.
-    open_sub_started: bool,
-    /// The open run's [`AgentEvent::SubAgentStart`], kept so a suffix
-    /// whose cursor falls inside the run can re-synthesize it.
-    open_sub_start: Option<AgentEvent>,
-    /// Whether `open_sub_start` reached the output. False while the run
-    /// opened on an entry the walk dropped, which is what tells the
-    /// suffix projection to re-synthesize the start.
-    open_sub_start_delivered: bool,
-    /// Concatenated text of the most recent `Sub` assistant message
-    /// seen during the open run. After the run's last assistant
-    /// message this holds the final report carried on the closing
-    /// [`AgentEvent::SubAgentEnd`].
-    open_sub_report: String,
-    /// How the open sub run concluded, carried on the closing
-    /// [`AgentEvent::SubAgentEnd`]. Derived from the run's last assistant
-    /// message stop reason: `Length` -> `Truncated`, `Error`/`Aborted` and
-    /// an interrupted `ToolUse` terminal -> `Failed`, otherwise
-    /// `Completed`. This reconstructs the conclusion on resume without any
-    /// dedicated on-disk entry, because a failed, aborted, or interrupted
-    /// run's terminal message is itself persisted with the matching stop
-    /// reason.
-    open_sub_conclusion: SubAgentConclusion,
+    /// The sub-agent runs currently open, by `Sub(n)` index. Ordered so
+    /// that closing several at once is deterministic.
+    open_runs: BTreeMap<usize, OpenRun>,
     /// Agents for which at least one `Message` entry has been
     /// projected. Settings entries emit a [`AgentEvent::Notice`]
     /// only for agents present here; seed entries (before any
@@ -562,67 +609,61 @@ fn sub_start_event(
 /// Tag `event` as the durable frame of the entry it derives from. `at` is
 /// `None` when the entry has no known position (single-thread
 /// projection) or sits at or below a suffix cursor.
-fn durable(at: Option<EntryRef>, event: AgentEvent) -> ProjectedEvent {
-    ProjectedEvent { entry: at, event }
+fn durable(at: Option<EntryRef>, event: AgentEvent) -> TaggedEvent {
+    TaggedEvent { entry: at, event }
 }
 
 /// One projected event that stands for no log entry of its own:
 /// bracketing frames and everything a live run emits without persisting.
-fn transient(event: AgentEvent) -> ProjectedEvent {
-    ProjectedEvent { entry: None, event }
+fn transient(event: AgentEvent) -> TaggedEvent {
+    TaggedEvent { entry: None, event }
 }
 
 impl ReplayState {
     /// Emit [`AgentEvent::SubAgentStart`] / [`AgentEvent::SubAgentEnd`]
-    /// correlation events around a sub-agent's contiguous run, before
-    /// the entry's own events are projected.
+    /// correlation events around a sub-agent's run, before the entry's
+    /// own events are projected.
     ///
-    /// Transitions are keyed off `agent_id_for`: leaving an open
-    /// `Sub(k)` (to `Main` or a different sub) closes it with the
-    /// accumulated report. Entering a `Sub(n)` with no run open
-    /// opens one. The run's [`AgentEvent::SubAgentStart`] is emitted
-    /// from its `SubAgentSpawn` entry (task + settings snapshot);
-    /// legacy logs whose sub threads lead with the task user message
-    /// instead emit it at the run's first `Message` entry, with the
-    /// task from its user text and default settings. `Meta` entries
-    /// carry no agent id and never transition.
+    /// Transitions are keyed off `agent_id_for`: an entry for `Main` or a
+    /// different sub closes the runs that [`Self::close_finished_runs`]
+    /// considers finished. Entering a `Sub(n)` with no run open opens
+    /// one. The run's [`AgentEvent::SubAgentStart`] is emitted from its
+    /// `SubAgentSpawn` entry (task + settings snapshot); legacy logs
+    /// whose sub threads lead with the task user message instead emit it
+    /// at the run's first `Message` entry, with the task from its user
+    /// text and default settings. `Meta` entries carry no agent id and
+    /// never transition.
     ///
-    /// `keep` is false while the walk is dropping this entry's events
-    /// (it sits at or below a suffix cursor), which is what makes the
-    /// run's start re-synthesizable later.
+    /// `keep` is false while the walk is dropping this entry's events (it
+    /// sits at or below a suffix cursor), which is what makes the run's
+    /// start re-synthesizable later. `live_subs` is the set of runs whose
+    /// bracket must not be force-closed here.
     fn bracket_subagent(
         &mut self,
         entry: &ConversationEntry,
         at: Option<EntryRef>,
         keep: bool,
-        out: &mut VecDeque<ProjectedEvent>,
+        live_subs: &BTreeSet<usize>,
+        out: &mut VecDeque<TaggedEvent>,
     ) {
         let Some(current) = agent_id_for(entry) else {
             return;
         };
 
-        if let Some(k) = self.open_sub {
-            if current != AgentId::Sub(k) {
-                self.close_open_sub(keep, out);
-            }
-        }
+        let current_sub = match current {
+            AgentId::Sub(n) => Some(n),
+            AgentId::Main => None,
+        };
+        self.close_finished_runs(current_sub, live_subs, keep, out);
 
-        let AgentId::Sub(n) = current else {
+        let Some(n) = current_sub else {
             return;
         };
-        if self.open_sub.is_none() {
-            self.open_sub = Some(n);
-            self.open_sub_started = false;
-            self.open_sub_start = None;
-            self.open_sub_start_delivered = false;
-            self.open_sub_report.clear();
-            self.open_sub_conclusion = SubAgentConclusion::Completed;
-        }
-        if self.open_sub_started {
+        if self.open_runs.entry(n).or_default().start.is_some() {
             // The run may have opened on an entry this walk dropped, in
             // which case its start has to be re-synthesized here so the
             // suffix stays well-bracketed (spec 6.5).
-            self.deliver_open_sub_start(keep, out);
+            self.deliver_start(n, keep, out);
             return;
         }
         match &entry.entry {
@@ -632,6 +673,7 @@ impl ReplayState {
                 settings,
             } => {
                 self.open_run(
+                    n,
                     sub_start_event(n, task.clone(), *background, settings.clone()),
                     at,
                     keep,
@@ -646,6 +688,7 @@ impl ReplayState {
                 // start stays untagged: this entry's durable frame is
                 // its own `MessageEnd`.
                 self.open_run(
+                    n,
                     sub_start_event(n, subagent_task(entry), false, fallback_settings()),
                     None,
                     keep,
@@ -664,62 +707,90 @@ impl ReplayState {
         }
     }
 
-    /// Emit `start` as the open run's [`AgentEvent::SubAgentStart`] and
+    /// Emit `start` as run `n`'s [`AgentEvent::SubAgentStart`] and
     /// remember it for a possible re-synthesis.
     fn open_run(
         &mut self,
+        n: usize,
         start: AgentEvent,
         at: Option<EntryRef>,
         keep: bool,
-        out: &mut VecDeque<ProjectedEvent>,
+        out: &mut VecDeque<TaggedEvent>,
     ) {
         out.push_back(durable(at, start.clone()));
-        self.open_sub_started = true;
-        self.open_sub_start = Some(start);
-        self.open_sub_start_delivered = keep;
+        let run = self.open_runs.entry(n).or_default();
+        run.start = Some(start);
+        run.start_delivered = keep;
     }
 
-    /// Re-emit the open run's start when it was computed for an entry the
-    /// walk dropped. Untagged: its spawn root is at or below the cursor,
-    /// so a durable tag would make the client's cursor invariant drop the
+    /// Re-emit run `n`'s start when it was computed for an entry the walk
+    /// dropped. Untagged: its spawn root is at or below the cursor, so a
+    /// durable tag would make the client's cursor invariant drop the
     /// bracket (spec 6.5).
-    fn deliver_open_sub_start(&mut self, keep: bool, out: &mut VecDeque<ProjectedEvent>) {
-        if !keep || self.open_sub_start_delivered {
+    fn deliver_start(&mut self, n: usize, keep: bool, out: &mut VecDeque<TaggedEvent>) {
+        let Some(run) = self.open_runs.get_mut(&n) else {
+            return;
+        };
+        if !keep || run.start_delivered {
             return;
         }
-        if let Some(start) = self.open_sub_start.clone() {
+        if let Some(start) = run.start.clone() {
             out.push_back(transient(start));
-            self.open_sub_start_delivered = true;
+            run.start_delivered = true;
         }
     }
 
-    /// Close the currently open sub-agent run, if any, emitting its
-    /// [`AgentEvent::SubAgentEnd`] with the accumulated report. A
-    /// run that produced neither a `SubAgentSpawn` entry nor a
-    /// `Message` entry has no start yet; emit one with an empty task
-    /// and default settings so the bracketing stays balanced.
-    fn close_open_sub(&mut self, keep: bool, out: &mut VecDeque<ProjectedEvent>) {
-        if let Some(k) = self.open_sub.take() {
-            if self.open_sub_started {
-                self.deliver_open_sub_start(keep, out);
-            } else {
-                out.push_back(transient(sub_start_event(
-                    k,
-                    String::new(),
-                    false,
-                    fallback_settings(),
-                )));
-            }
-            self.open_sub_started = false;
-            self.open_sub_start = None;
-            self.open_sub_start_delivered = false;
-            out.push_back(transient(AgentEvent::SubAgentEnd {
-                parent: AgentId::Main,
-                child: AgentId::Sub(k),
-                report: std::mem::take(&mut self.open_sub_report),
-                conclusion: std::mem::take(&mut self.open_sub_conclusion),
-            }));
+    /// Force-close every open run except the ones in `live_subs` and,
+    /// when the walk is entering `current`, that run.
+    ///
+    /// A sub-agent's conclusion is never persisted, so this transition
+    /// heuristic is the only way a finished run's box gets concluded from
+    /// a log. It is right for a run that has finished and wrong for one
+    /// that is still going, which is exactly the distinction `live_subs`
+    /// carries: dead-log replay passes an empty set and closes
+    /// everything, while a live backfill keeps the host's running runs
+    /// open for their real `SubAgentEnd`.
+    fn close_finished_runs(
+        &mut self,
+        current: Option<usize>,
+        live_subs: &BTreeSet<usize>,
+        keep: bool,
+        out: &mut VecDeque<TaggedEvent>,
+    ) {
+        let finished: Vec<usize> = self
+            .open_runs
+            .keys()
+            .copied()
+            .filter(|n| Some(*n) != current && !live_subs.contains(n))
+            .collect();
+        for n in finished {
+            self.close_run(n, keep, out);
         }
+    }
+
+    /// Close run `n`, emitting its [`AgentEvent::SubAgentEnd`] with the
+    /// accumulated report. A run that produced neither a `SubAgentSpawn`
+    /// entry nor a `Message` entry has no start yet; emit one with an
+    /// empty task and default settings so the bracketing stays balanced.
+    fn close_run(&mut self, n: usize, keep: bool, out: &mut VecDeque<TaggedEvent>) {
+        self.deliver_start(n, keep, out);
+        let Some(run) = self.open_runs.remove(&n) else {
+            return;
+        };
+        if run.start.is_none() {
+            out.push_back(transient(sub_start_event(
+                n,
+                String::new(),
+                false,
+                fallback_settings(),
+            )));
+        }
+        out.push_back(transient(AgentEvent::SubAgentEnd {
+            parent: AgentId::Main,
+            child: AgentId::Sub(n),
+            report: run.report,
+            conclusion: run.conclusion,
+        }));
     }
 
     /// Translate one entry into zero or more events, appending them
@@ -735,7 +806,7 @@ impl ReplayState {
         entry: &ConversationEntry,
         at: Option<EntryRef>,
         log: Option<&LogSnapshot>,
-        out: &mut VecDeque<ProjectedEvent>,
+        out: &mut VecDeque<TaggedEvent>,
     ) {
         let agent_id = match agent_id_for(entry) {
             Some(id) => id,
@@ -864,22 +935,23 @@ impl ReplayState {
         agent_id: AgentId,
         at: Option<EntryRef>,
         text: String,
-        out: &mut VecDeque<ProjectedEvent>,
+        out: &mut VecDeque<TaggedEvent>,
     ) {
         if self.seen_message.contains(&agent_id) {
             out.push_back(durable(at, AgentEvent::Notice { agent_id, text }));
         }
     }
 
-    /// Fold `assistant`'s text into the open sub-agent run's report, and
+    /// Fold `assistant`'s text into the sub-agent run's report, and
     /// capture the run's conclusion from `assistant`'s stop reason.
     ///
     /// Both overwrite rather than accumulate: the report is the most
     /// recent sub-agent assistant message's text, and the conclusion its
-    /// stop reason (see [`conclusion_from_stop_reason`]). `bracket_subagent`
-    /// resets them on open, so after the run's last assistant message they
-    /// hold the final report and conclusion `close_open_sub` reads onto the
-    /// `SubAgentEnd`. A no-op unless `agent_id` is the open sub.
+    /// stop reason (see [`conclusion_from_stop_reason`]). A run starts out
+    /// with an empty report and `Completed`, so after its last assistant
+    /// message these hold the final report and conclusion `close_run`
+    /// reads onto the `SubAgentEnd`. A no-op unless `agent_id` names an
+    /// open run.
     ///
     /// Split out from projection so deferred replay can advance the
     /// report without cloning the sub-agent's messages into events. The
@@ -890,16 +962,18 @@ impl ReplayState {
         agent_id: AgentId,
         assistant: &aj_models::types::AssistantMessage,
     ) {
-        if matches!((self.open_sub, agent_id), (Some(n), AgentId::Sub(m)) if n == m) {
-            let mut report = String::new();
-            for c in &assistant.content {
-                if let AssistantContent::Text(t) = c {
-                    report.push_str(&t.text);
-                }
+        let AgentId::Sub(n) = agent_id else { return };
+        let Some(run) = self.open_runs.get_mut(&n) else {
+            return;
+        };
+        let mut report = String::new();
+        for c in &assistant.content {
+            if let AssistantContent::Text(t) = c {
+                report.push_str(&t.text);
             }
-            self.open_sub_report = report;
-            self.open_sub_conclusion = conclusion_from_stop_reason(&assistant.stop_reason);
         }
+        run.report = report;
+        run.conclusion = conclusion_from_stop_reason(&assistant.stop_reason);
     }
 
     /// Advance the open sub-agent run's report from `entry` without
@@ -932,7 +1006,7 @@ impl ReplayState {
         at: Option<EntryRef>,
         agent_msg: &AgentMessage,
         assistant: &aj_models::types::AssistantMessage,
-        out: &mut VecDeque<ProjectedEvent>,
+        out: &mut VecDeque<TaggedEvent>,
     ) {
         // MessageStart carries an empty placeholder (with identity
         // stamped from the finalized message) so renderers open
@@ -1021,7 +1095,7 @@ impl ReplayState {
         at: Option<EntryRef>,
         agent_msg: &AgentMessage,
         tr: &aj_models::types::ToolResultMessage,
-        out: &mut VecDeque<ProjectedEvent>,
+        out: &mut VecDeque<TaggedEvent>,
     ) {
         // Look up the tool name and input args captured from the
         // preceding assistant message's tool_call block. Missing
@@ -3421,8 +3495,310 @@ mod tests {
         }
     }
 
+    /// A second settings snapshot, so a log with two concurrent runs can
+    /// tell each run's remembered start from the other's.
+    fn other_sub_settings() -> AgentSettings {
+        AgentSettings {
+            provider: "openai".to_string(),
+            model_id: "gpt-sub".to_string(),
+            thinking: "high".to_string(),
+            speed: "standard".to_string(),
+            verbosity: "high".to_string(),
+        }
+    }
+
+    /// Two background sub-agents spawned in one parent turn, interleaving
+    /// with each other and with the parent in append order.
+    ///
+    /// Append positions: 1 system prompt, 2 user, 3 parent assistant,
+    /// 4 spawn root of sub 1, 5 spawn root of sub 2, 6 sub-1 user, 7
+    /// sub-2 user, 8 sub-1 assistant, 9 parent assistant, 10 sub-2
+    /// assistant, 11 sub-1 report, 12 sub-2 report.
+    fn log_with_two_background_subs() -> (PathBuf, ConversationLog) {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.clone());
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("sp");
+
+        let parent_head = {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(user_msg("hi")).expect("u");
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "delegating twice".into(),
+                text_signature: None,
+            })]))
+            .expect("a");
+            view.head().cloned().expect("head")
+        };
+
+        let mut first = log
+            .append_subagent_spawn(
+                1,
+                parent_head.clone(),
+                "first bg task",
+                true,
+                &sub_settings(),
+            )
+            .expect("spawn 1")
+            .id;
+        let mut second = log
+            .append_subagent_spawn(
+                2,
+                parent_head,
+                "second bg task",
+                true,
+                &other_sub_settings(),
+            )
+            .expect("spawn 2")
+            .id;
+
+        first = {
+            let mut view = ConversationView::subagent(&mut log, first, 1);
+            view.add_message(user_msg("first bg task"))
+                .expect("sub 1 u");
+            view.head().cloned().expect("sub 1 head")
+        };
+        second = {
+            let mut view = ConversationView::subagent(&mut log, second, 2);
+            view.add_message(user_msg("second bg task"))
+                .expect("sub 2 u");
+            view.head().cloned().expect("sub 2 head")
+        };
+        first = {
+            let mut view = ConversationView::subagent(&mut log, first, 1);
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "sub one step".into(),
+                text_signature: None,
+            })]))
+            .expect("sub 1 step");
+            view.head().cloned().expect("sub 1 head")
+        };
+
+        // The parent takes a turn while both subs are open, so each sub's
+        // remaining entries land after it in append order.
+        {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "main while both run".into(),
+                text_signature: None,
+            })]))
+            .expect("a");
+        }
+
+        second = {
+            let mut view = ConversationView::subagent(&mut log, second, 2);
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "sub two step".into(),
+                text_signature: None,
+            })]))
+            .expect("sub 2 step");
+            view.head().cloned().expect("sub 2 head")
+        };
+        {
+            let mut view = ConversationView::subagent(&mut log, first, 1);
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "sub one report".into(),
+                text_signature: None,
+            })]))
+            .expect("sub 1 report");
+        }
+        {
+            let mut view = ConversationView::subagent(&mut log, second, 2);
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "sub two report".into(),
+                text_signature: None,
+            })]))
+            .expect("sub 2 report");
+        }
+
+        (dir, log)
+    }
+
+    /// A legacy sub-agent run: no `SubAgentSpawn` root, the sub thread
+    /// leads with its task user message.
+    ///
+    /// Append positions: 1 system prompt, 2 user, 3 parent assistant,
+    /// 4 sub user, 5 sub assistant.
+    fn log_with_legacy_sub() -> (PathBuf, ConversationLog) {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.clone());
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("sp");
+
+        let parent_head = {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(user_msg("hi")).expect("u");
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "delegating".into(),
+                text_signature: None,
+            })]))
+            .expect("a");
+            view.head().cloned().expect("head")
+        };
+        {
+            let mut view = ConversationView::subagent(&mut log, parent_head, 1);
+            view.add_message(user_msg("legacy subtask")).expect("sub u");
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "legacy report".into(),
+                text_signature: None,
+            })]))
+            .expect("sub a");
+        }
+
+        (dir, log)
+    }
+
+    /// A user-thread branch point with an abandoned sibling, head left on
+    /// the active branch.
+    ///
+    /// Append positions: 1 system prompt, 2 user "common", 3 active
+    /// assistant, 4 abandoned user, 5 abandoned assistant, 6 active user,
+    /// 7 active assistant. Entries 4 and 5 are off the head's path, so
+    /// the projection skips them and its tagged positions have a gap in
+    /// the middle rather than only at the front.
+    fn log_with_abandoned_sibling_branch() -> (PathBuf, ConversationLog) {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.clone());
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("sp");
+
+        let common = {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(user_msg("common")).expect("common").id
+        };
+        let active = {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "active reply".into(),
+                text_signature: None,
+            })]))
+            .expect("active reply")
+            .id
+        };
+
+        log.set_head(common).expect("rewind to the branch point");
+        {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(user_msg("abandoned"))
+                .expect("abandoned u");
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "abandoned reply".into(),
+                text_signature: None,
+            })]))
+            .expect("abandoned a");
+        }
+
+        log.set_head(active)
+            .expect("head back on the active branch");
+        {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(user_msg("more")).expect("more");
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "final reply".into(),
+                text_signature: None,
+            })]))
+            .expect("final reply");
+        }
+
+        (dir, log)
+    }
+
+    /// One assistant turn carrying three tool calls, followed by the
+    /// three tool results.
+    ///
+    /// Append positions: 1 system prompt, 2 user, 3 assistant with the
+    /// batch, 4/5/6 the tool results.
+    fn tool_batch_log() -> (PathBuf, ConversationLog) {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.clone());
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("sp");
+        {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(user_msg("read three files")).expect("u");
+            view.add_message(assistant_msg(
+                (1..=3)
+                    .map(|n| {
+                        AssistantContent::ToolCall(ToolCall {
+                            id: format!("call-{n}"),
+                            name: "read_file".into(),
+                            arguments: json!({"path": format!("/tmp/{n}")}),
+                        })
+                    })
+                    .collect(),
+            ))
+            .expect("a");
+            for n in 1..=3 {
+                view.add_message(tool_result_msg(
+                    &format!("call-{n}"),
+                    "read_file",
+                    &format!("body {n}"),
+                    None,
+                ))
+                .expect("tool result");
+            }
+        }
+        (dir, log)
+    }
+
+    /// A settings change on a sub-agent's own thread, mid-run.
+    ///
+    /// Append positions: 1 system prompt, 2 user, 3 parent assistant,
+    /// 4 spawn root, 5 sub user, 6 sub assistant, 7 sub thinking change,
+    /// 8 sub assistant.
+    fn log_with_sub_settings_change() -> (PathBuf, ConversationLog) {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.clone());
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("sp");
+
+        let parent_head = {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(user_msg("hi")).expect("u");
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "delegating".into(),
+                text_signature: None,
+            })]))
+            .expect("a");
+            view.head().cloned().expect("head")
+        };
+        let sub_head = log
+            .append_subagent_spawn(1, parent_head, "subtask", false, &sub_settings())
+            .expect("spawn root")
+            .id;
+        {
+            let mut view = ConversationView::subagent(&mut log, sub_head, 1);
+            view.add_message(user_msg("subtask")).expect("sub u");
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "working".into(),
+                text_signature: None,
+            })]))
+            .expect("sub a");
+        }
+        log.append_thinking_change(ThreadFilter::subagent(1), "high")
+            .expect("sub thinking change");
+        {
+            let leaf = log
+                .latest_leaf(ThreadFilter::subagent(1))
+                .expect("sub leaf");
+            let mut view = ConversationView::subagent(&mut log, leaf, 1);
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "sub report".into(),
+                text_signature: None,
+            })]))
+            .expect("sub report");
+        }
+
+        (dir, log)
+    }
+
     fn wire(event: &AgentEvent) -> Value {
         serde_json::to_value(event).expect("events serialize")
+    }
+
+    /// The sub-agent ids a projection should treat as still running.
+    fn live(ids: impl IntoIterator<Item = usize>) -> BTreeSet<usize> {
+        ids.into_iter().collect()
     }
 
     /// The projected event kinds of one entry position, for readable
@@ -3441,24 +3817,284 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn full_suffix_matches_replay_but_leaves_the_open_sub_open() {
-        let (_dir, log) = open_sub_log();
-        let replayed: Vec<Value> = replay(&log).map(|event| wire(&event)).collect();
-        let backfill = project_suffix(&log.snapshot(), None);
-        let projected: Vec<Value> = backfill
+    /// The wire form of every event in `backfill`, for comparing a
+    /// projection against a replay.
+    fn projected_values(backfill: &Backfill) -> Vec<Value> {
+        backfill
             .events
             .iter()
             .map(|projected| wire(&projected.event))
-            .collect();
+            .collect()
+    }
 
-        // Dead-log replay force-closes the open bracket at EOF; a live
-        // backfill must not, because the real `SubAgentEnd` is still
-        // coming (spec 6.5).
+    /// With no cursor and no live runs, the suffix projection *is*
+    /// dead-log replay: same events in the same order, EOF closes
+    /// included. Every deviation is driven by a cursor or by `live_subs`,
+    /// which is what lets the two paths share one state machine.
+    fn assert_full_suffix_matches_replay(log: &ConversationLog, label: &str) {
+        let replayed: Vec<Value> = replay(log).map(|event| wire(&event)).collect();
+        let backfill = project_suffix(&log.snapshot(), None, &BTreeSet::new());
+        assert_eq!(
+            projected_values(&backfill),
+            replayed,
+            "suffix and replay disagree for the {label} log"
+        );
+        assert!(
+            backfill.open_subs.is_empty(),
+            "with no live runs every bracket is closed ({label})"
+        );
+    }
+
+    #[test]
+    fn a_cursorless_suffix_with_no_live_subs_equals_replay() {
+        let fixtures: Vec<(&str, (PathBuf, ConversationLog))> = vec![
+            ("seeded main-thread", seeded_log()),
+            ("foreground sub", log_with_foreground_sub()),
+            ("background sub", log_with_background_sub()),
+            ("two background subs", log_with_two_background_subs()),
+            ("legacy sub", log_with_legacy_sub()),
+            (
+                "abandoned sibling branch",
+                log_with_abandoned_sibling_branch(),
+            ),
+            ("sub-thread settings change", log_with_sub_settings_change()),
+            ("tool batch", tool_batch_log()),
+            ("open sub", open_sub_log()),
+        ];
+        for (label, (_dir, log)) in &fixtures {
+            assert_full_suffix_matches_replay(log, label);
+        }
+    }
+
+    #[test]
+    fn full_suffix_leaves_a_live_runs_bracket_open() {
+        let (_dir, log) = open_sub_log();
+        let replayed: Vec<Value> = replay(&log).map(|event| wire(&event)).collect();
+        let backfill = project_suffix(&log.snapshot(), None, &live([1]));
+
+        // Dead-log replay force-closes the bracket at EOF. A live
+        // backfill must not, because the real `SubAgentEnd` for a running
+        // sub is still coming (spec 6.5).
         let (last, head) = replayed.split_last().expect("replay is not empty");
         assert_eq!(last["type"], "sub_agent_end");
-        assert_eq!(projected, head, "the suffix is replay minus the EOF close");
-        assert_eq!(backfill.open_subs, vec![1]);
+        assert_eq!(
+            projected_values(&backfill),
+            head,
+            "the suffix is replay minus the EOF close"
+        );
+        assert_eq!(backfill.open_subs, live([1]));
+    }
+
+    /// A background sub-agent's entries straddle its parent's, so closing
+    /// every open run on an agent transition would fabricate a
+    /// `SubAgentEnd` for a run that is still going and then re-open its
+    /// bracket from the legacy fallback.
+    #[test]
+    fn a_live_background_run_keeps_its_bracket_open_across_parent_entries() {
+        let (_dir, log) = log_with_background_sub();
+        let backfill = project_suffix(&log.snapshot(), None, &live([1]));
+
+        assert!(
+            !backfill
+                .events
+                .iter()
+                .any(|projected| matches!(projected.event, AgentEvent::SubAgentEnd { .. })),
+            "a live run is never concluded by the projection: {:?}",
+            kinds(&backfill)
+        );
+        let starts: Vec<&AgentEvent> = backfill
+            .events
+            .iter()
+            .map(|projected| &projected.event)
+            .filter(|event| matches!(event, AgentEvent::SubAgentStart { .. }))
+            .collect();
+        assert_eq!(starts.len(), 1, "the run opens exactly once: {starts:#?}");
+        // The parent's interleaved turn is projected between the sub's
+        // own entries, with the bracket still open around them.
+        let main_between = backfill
+            .events
+            .iter()
+            .filter(|projected| matches!(projected.event.agent_id(), AgentId::Main))
+            .count();
+        assert!(main_between > 0, "the parent's entries project too");
+        assert_eq!(backfill.open_subs, live([1]));
+    }
+
+    #[test]
+    fn two_live_background_runs_both_stay_open_with_their_real_starts() {
+        let (_dir, log) = log_with_two_background_subs();
+        let backfill = project_suffix(&log.snapshot(), None, &live([1, 2]));
+
+        assert!(
+            !backfill
+                .events
+                .iter()
+                .any(|projected| matches!(projected.event, AgentEvent::SubAgentEnd { .. })),
+            "neither live run is concluded: {:?}",
+            kinds(&backfill)
+        );
+        let starts: Vec<(usize, String, bool, AgentSettings)> = backfill
+            .events
+            .iter()
+            .filter_map(|projected| match &projected.event {
+                AgentEvent::SubAgentStart {
+                    child: AgentId::Sub(n),
+                    task,
+                    background,
+                    settings,
+                    ..
+                } => Some((*n, task.clone(), *background, settings.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            starts,
+            vec![
+                (1, "first bg task".to_string(), true, sub_settings()),
+                (2, "second bg task".to_string(), true, other_sub_settings()),
+            ],
+            "each run keeps its spawn root's task, mode and settings"
+        );
+        assert_eq!(backfill.open_subs, live([1, 2]));
+    }
+
+    /// The transition close is the only way a finished run's box gets
+    /// concluded from a log (a conclusion is never persisted), so it must
+    /// still fire for every run the caller does not name as live.
+    #[test]
+    fn a_finished_run_is_still_concluded() {
+        let (_dir, log) = log_with_foreground_sub();
+        let backfill = project_suffix(&log.snapshot(), None, &BTreeSet::new());
+
+        let ends: Vec<(AgentId, String, SubAgentConclusion)> = backfill
+            .events
+            .iter()
+            .filter_map(|projected| match &projected.event {
+                AgentEvent::SubAgentEnd {
+                    child,
+                    report,
+                    conclusion,
+                    ..
+                } => Some((*child, report.clone(), *conclusion)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ends,
+            vec![(
+                AgentId::Sub(1),
+                "final sub report".to_string(),
+                SubAgentConclusion::Completed,
+            )]
+        );
+        assert!(backfill.open_subs.is_empty());
+    }
+
+    /// A cursor inside a live run whose bracket has already survived an
+    /// interleaved parent entry re-synthesizes the start from the spawn
+    /// root the run remembers, not from the legacy fallback.
+    #[test]
+    fn a_cursor_inside_an_interleaved_live_run_resynthesizes_its_real_start() {
+        let (_dir, log) = log_with_two_background_subs();
+        // Position 9 is the parent's interleaved turn: both runs opened
+        // below it and both continue above it.
+        let backfill = project_suffix(&log.snapshot(), Some(9), &live([1, 2]));
+
+        let starts: Vec<(usize, String, bool, AgentSettings, Option<u64>)> = backfill
+            .events
+            .iter()
+            .filter_map(|projected| match &projected.event {
+                AgentEvent::SubAgentStart {
+                    child: AgentId::Sub(n),
+                    task,
+                    background,
+                    settings,
+                    ..
+                } => Some((
+                    *n,
+                    task.clone(),
+                    *background,
+                    settings.clone(),
+                    projected.entry.as_ref().map(|entry| entry.seq),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            starts,
+            vec![
+                (
+                    2,
+                    "second bg task".to_string(),
+                    true,
+                    other_sub_settings(),
+                    None,
+                ),
+                (1, "first bg task".to_string(), true, sub_settings(), None),
+            ],
+            "each run re-synthesizes its own start, untagged, when its \
+             first suffix entry arrives"
+        );
+        assert_eq!(backfill.open_subs, live([1, 2]));
+    }
+
+    #[test]
+    fn a_cursor_of_zero_projects_the_whole_log() {
+        let (_dir, log) = open_sub_log();
+        let snapshot = log.snapshot();
+        assert_eq!(
+            kinds(&project_suffix(&snapshot, Some(0), &live([1]))),
+            kinds(&project_suffix(&snapshot, None, &live([1]))),
+        );
+    }
+
+    #[test]
+    fn a_cursor_at_the_last_position_projects_nothing() {
+        let (_dir, log) = open_sub_log();
+        let snapshot = log.snapshot();
+        let backfill = project_suffix(&snapshot, Some(snapshot.last_seq()), &live([1]));
+        assert!(
+            backfill.events.is_empty(),
+            "a caught-up client gets an empty suffix: {:?}",
+            kinds(&backfill)
+        );
+        assert_eq!(
+            backfill.open_subs,
+            live([1]),
+            "an empty suffix still reports the live run, so the caller can \
+             conclude it"
+        );
+    }
+
+    /// Spec 6.5: a cursor beyond `last_seq` cannot name a position in
+    /// this materialization, so it reads as no cursor at all. Silently
+    /// serving an empty suffix instead would lose the client's whole
+    /// history.
+    #[test]
+    fn a_cursor_beyond_the_last_position_projects_the_whole_log() {
+        let (_dir, log) = open_sub_log();
+        let snapshot = log.snapshot();
+        let full = kinds(&project_suffix(&snapshot, None, &live([1])));
+        for cursor in [snapshot.last_seq() + 1, u64::MAX] {
+            assert_eq!(
+                kinds(&project_suffix(&snapshot, Some(cursor), &live([1]))),
+                full,
+                "cursor {cursor} must fall back to a full backfill"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_log_projects_an_empty_backfill() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let log = ConversationLog::create(&persistence).expect("create log");
+        let snapshot = log.snapshot();
+        for cursor in [None, Some(0), Some(1), Some(u64::MAX)] {
+            let backfill = project_suffix(&snapshot, cursor, &BTreeSet::new());
+            assert!(backfill.events.is_empty(), "cursor {cursor:?}");
+            assert!(backfill.open_subs.is_empty(), "cursor {cursor:?}");
+        }
     }
 
     #[test]
@@ -3466,7 +4102,7 @@ mod tests {
         let (_dir, log) = open_sub_log();
         // Cursor at the assistant message that carries the tool call, so
         // its tool_call map entry and its usage are below the cursor.
-        let backfill = project_suffix(&log.snapshot(), Some(4));
+        let backfill = project_suffix(&log.snapshot(), Some(4), &live([1]));
 
         assert_eq!(
             kinds(&backfill),
@@ -3531,7 +4167,7 @@ mod tests {
         let (_dir, log) = open_sub_log();
         // Cursor inside the sub's run: its spawn root (9) and first
         // message (10) are below the cursor, its assistant turn is not.
-        let backfill = project_suffix(&log.snapshot(), Some(10));
+        let backfill = project_suffix(&log.snapshot(), Some(10), &live([1]));
 
         let first = backfill.events.first().expect("suffix is not empty");
         match &first.event {
@@ -3564,7 +4200,7 @@ mod tests {
                 (None, "usage_update".to_string()),
             ]
         );
-        assert_eq!(backfill.open_subs, vec![1]);
+        assert_eq!(backfill.open_subs, live([1]));
     }
 
     #[test]
@@ -3572,7 +4208,7 @@ mod tests {
         let (_dir, log) = open_sub_log();
         // The spawn root sits exactly at the cursor, so it is dropped and
         // the run is open at the boundary just the same.
-        let backfill = project_suffix(&log.snapshot(), Some(9));
+        let backfill = project_suffix(&log.snapshot(), Some(9), &live([1]));
         assert_eq!(
             kinds(&backfill),
             vec![
@@ -3586,6 +4222,43 @@ mod tests {
         );
     }
 
+    /// A legacy run has no spawn root to tag, so its re-synthesized start
+    /// is untagged for the same reason a spawn-rooted one is: the client
+    /// has already applied everything at or below its cursor.
+    #[test]
+    fn a_legacy_run_resynthesizes_an_untagged_start_inside_the_run() {
+        let (_dir, log) = log_with_legacy_sub();
+        // Position 4 is the run's first entry (its task message), which
+        // is also where the legacy fallback opened the bracket.
+        let backfill = project_suffix(&log.snapshot(), Some(4), &live([1]));
+
+        assert_eq!(
+            kinds(&backfill),
+            vec![
+                (None, "sub_agent_start".to_string()),
+                (None, "message_start".to_string()),
+                (Some(5), "message_end".to_string()),
+                (None, "usage_update".to_string()),
+            ]
+        );
+        match &backfill.events[0].event {
+            AgentEvent::SubAgentStart {
+                child,
+                task,
+                background,
+                settings,
+                ..
+            } => {
+                assert_eq!(*child, AgentId::Sub(1));
+                assert_eq!(task, "legacy subtask", "taken from the task message");
+                assert!(!background, "a legacy log carries no run mode");
+                assert_eq!(*settings, fallback_settings());
+            }
+            other => panic!("expected a re-synthesized SubAgentStart, got {other:?}"),
+        }
+        assert_eq!(backfill.open_subs, live([1]));
+    }
+
     #[test]
     fn suffix_below_a_spawn_root_keeps_its_start_durable() {
         let (_dir, log) = open_sub_log();
@@ -3593,7 +4266,7 @@ mod tests {
         // entry's durable frame and must be emitted with its position: a
         // client whose cursor stops short of the spawn would otherwise
         // never learn the sub exists.
-        let backfill = project_suffix(&log.snapshot(), Some(8));
+        let backfill = project_suffix(&log.snapshot(), Some(8), &live([1]));
         let first = backfill.events.first().expect("suffix is not empty");
         assert!(matches!(first.event, AgentEvent::SubAgentStart { .. }));
         assert_eq!(
@@ -3604,10 +4277,101 @@ mod tests {
     }
 
     #[test]
+    fn a_sub_thread_settings_change_projects_a_tagged_notice_in_place() {
+        let (_dir, log) = log_with_sub_settings_change();
+        let backfill = project_suffix(&log.snapshot(), None, &live([1]));
+
+        assert_eq!(
+            kinds(&backfill),
+            vec![
+                (None, "message_start".to_string()),
+                (Some(2), "message_end".to_string()),
+                (None, "message_start".to_string()),
+                (Some(3), "message_end".to_string()),
+                (None, "usage_update".to_string()),
+                (Some(4), "sub_agent_start".to_string()),
+                (None, "message_start".to_string()),
+                (Some(5), "message_end".to_string()),
+                (None, "message_start".to_string()),
+                (Some(6), "message_end".to_string()),
+                (None, "usage_update".to_string()),
+                (Some(7), "notice".to_string()),
+                (None, "message_start".to_string()),
+                (Some(8), "message_end".to_string()),
+                (None, "usage_update".to_string()),
+            ],
+            "the notice sits between the sub's two turns"
+        );
+        let notice = backfill
+            .events
+            .iter()
+            .find(|projected| matches!(projected.event, AgentEvent::Notice { .. }))
+            .expect("the mid-run settings entry projects a notice");
+        match &notice.event {
+            AgentEvent::Notice { agent_id, text } => {
+                assert_eq!(*agent_id, AgentId::Sub(1), "on the sub's own thread");
+                assert_eq!(text, "Thinking effort set to high.");
+            }
+            other => panic!("expected a notice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_settings_entry_answers_what_the_projection_emits() {
+        let (_dir, log) = open_sub_log();
+        let snapshot = log.snapshot();
+        let entry_at = |seq: u64| {
+            snapshot
+                .entry_in_append_order(usize::try_from(seq).expect("fits usize") - 1)
+                .expect("position exists")
+                .id
+                .clone()
+        };
+
+        // Position 2 is the seed model change, ahead of any message on
+        // its thread, so it projects nothing and the host must not
+        // synthesize a notice for it.
+        assert!(snapshot.project_settings_entry(&entry_at(2)).is_none());
+
+        // Position 6 is the mid-session thinking change.
+        let projected = snapshot
+            .project_settings_entry(&entry_at(6))
+            .expect("a mid-session settings entry projects a notice");
+        let from_backfill = project_suffix(&snapshot, Some(5), &live([1]))
+            .events
+            .into_iter()
+            .find(|tagged| tagged.entry.as_ref().is_some_and(|entry| entry.seq == 6))
+            .expect("the backfill tags that entry")
+            .event;
+        assert_eq!(
+            wire(&projected),
+            wire(&from_backfill),
+            "the answer must be exactly what a backfill regenerates"
+        );
+
+        // A message entry is not a settings entry.
+        assert!(snapshot.project_settings_entry(&entry_at(3)).is_none());
+    }
+
+    #[test]
+    fn sub_agent_ids_reports_every_sub_in_the_log() {
+        let (_dir, log) = log_with_two_background_subs();
+        assert_eq!(log.snapshot().sub_agent_ids(), live([1, 2]));
+
+        // A finished run counts too: the host sweeps concluded boxes as
+        // well as running ones.
+        let (_dir, log) = log_with_foreground_sub();
+        assert_eq!(log.snapshot().sub_agent_ids(), live([1]));
+
+        let (_dir, log) = seeded_log();
+        assert!(log.snapshot().sub_agent_ids().is_empty());
+    }
+
+    #[test]
     fn full_suffix_tags_exactly_the_durable_events() {
         let (_dir, log) = open_sub_log();
         let snapshot = log.snapshot();
-        let backfill = project_suffix(&snapshot, None);
+        let backfill = project_suffix(&snapshot, None, &live([1]));
 
         assert_eq!(
             kinds(&backfill),
@@ -3635,7 +4399,12 @@ mod tests {
             ]
         );
 
-        // Every tag names its own entry, and no entry carries two.
+        assert_tags_name_their_own_entry(&snapshot, &backfill);
+    }
+
+    /// Every tag names its own entry, and no entry carries two: that is
+    /// what makes a client's per-frame cursor advance well-defined.
+    fn assert_tags_name_their_own_entry(snapshot: &LogSnapshot, backfill: &Backfill) {
         let mut seen: Vec<u64> = Vec::new();
         for projected in &backfill.events {
             let Some(entry) = &projected.entry else {
@@ -3662,10 +4431,43 @@ mod tests {
         }
     }
 
+    /// A tool batch persists one entry per result, so the projection must
+    /// tag each result's own `MessageEnd` and nothing else.
+    #[test]
+    fn a_tool_result_batch_tags_each_result_entry_once() {
+        let (_dir, log) = tool_batch_log();
+        let snapshot = log.snapshot();
+        let backfill = project_suffix(&snapshot, None, &BTreeSet::new());
+
+        assert_eq!(
+            kinds(&backfill),
+            vec![
+                (None, "message_start".to_string()),
+                (Some(2), "message_end".to_string()),
+                (None, "message_start".to_string()),
+                (Some(3), "message_end".to_string()),
+                (None, "usage_update".to_string()),
+                (None, "tool_execution_start".to_string()),
+                (None, "message_start".to_string()),
+                (Some(4), "message_end".to_string()),
+                (None, "tool_execution_end".to_string()),
+                (None, "tool_execution_start".to_string()),
+                (None, "message_start".to_string()),
+                (Some(5), "message_end".to_string()),
+                (None, "tool_execution_end".to_string()),
+                (None, "tool_execution_start".to_string()),
+                (None, "message_start".to_string()),
+                (Some(6), "message_end".to_string()),
+                (None, "tool_execution_end".to_string()),
+            ]
+        );
+        assert_tags_name_their_own_entry(&snapshot, &backfill);
+    }
+
     #[test]
     fn seed_entries_leave_a_gap_before_the_first_tagged_position() {
         let (_dir, log) = open_sub_log();
-        let backfill = project_suffix(&log.snapshot(), None);
+        let backfill = project_suffix(&log.snapshot(), None, &live([1]));
         let first_tagged = backfill
             .events
             .iter()
@@ -3675,6 +4477,38 @@ mod tests {
         // seqs start above 1 and are not contiguous. Clients must tolerate
         // that (spec 6.4).
         assert_eq!(first_tagged.seq, 3);
-        assert!(first_tagged.seq > 1);
+    }
+
+    /// An abandoned branch's entries occupy interior positions that
+    /// project nothing, so a client cannot do gap detection on seq at
+    /// all, not even "the gaps are all at the front" (spec 6.4).
+    #[test]
+    fn an_abandoned_branch_leaves_an_interior_gap_in_the_tagged_positions() {
+        let (_dir, log) = log_with_abandoned_sibling_branch();
+        let snapshot = log.snapshot();
+        let backfill = project_suffix(&snapshot, None, &BTreeSet::new());
+
+        let tagged: Vec<u64> = backfill
+            .events
+            .iter()
+            .filter_map(|projected| projected.entry.as_ref().map(|entry| entry.seq))
+            .collect();
+        assert_eq!(
+            tagged,
+            vec![2, 3, 6, 7],
+            "positions 4 and 5 are the abandoned branch"
+        );
+        assert_tags_name_their_own_entry(&snapshot, &backfill);
+        assert_eq!(
+            user_texts(
+                &backfill
+                    .events
+                    .iter()
+                    .map(|p| p.event.clone())
+                    .collect::<Vec<_>>()
+            ),
+            vec!["common".to_string(), "more".to_string()],
+            "the abandoned branch's messages are not projected"
+        );
     }
 }

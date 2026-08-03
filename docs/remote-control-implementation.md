@@ -132,12 +132,13 @@ Verified starting points (line references drift, re-check):
   lock and filter live durable frames at or below `last_seq` for that
   stream (spec section 5's backfill-boundary rule).
 - `src/aj-session/src/replay.rs` — `replay`,
-  `replay_deferring_subs`, `project_thread`. Backfill is a
-  suffix-filtered projection with the live-log deviations of spec 6.5
-  (no force-closing of open sub brackets, re-synthesized
-  `SubAgentStart` at the cursor boundary). Study `close_open_sub` and
-  the fallback-`SubAgentStart` re-open path first, both are dead-log
-  heuristics that must not leak into live backfill unchanged.
+  `replay_deferring_subs`, `project_thread`, `project_suffix`. Backfill
+  is a suffix-filtered projection with the live-log deviations of spec
+  6.5 (a running sub-agent's bracket is not force-closed,
+  re-synthesized `SubAgentStart` at the cursor boundary). Study
+  `close_finished_runs` and the fallback-`SubAgentStart` re-open path
+  first, both are dead-log heuristics that must not leak into live
+  backfill unchanged.
 - `src/aj-session/src/listener.rs` — `persistence_listener`. Durable
   events are the ones this listener acts on, plus the settings and
   compaction projections that the host synthesizes live (no bus event

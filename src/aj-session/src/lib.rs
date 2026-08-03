@@ -50,7 +50,7 @@ pub use compaction::{
     CompactionDetails, CompactionPlan, ContextEstimate, estimate_context_tokens,
     prepare_compaction, should_compact,
 };
-pub use listener::{PersistedEvent, persistence_listener, persisting_forwarder};
+pub use listener::{AppendHandoff, persistence_listener, persisting_forwarder};
 pub use lock::SessionLock;
 pub use log::{
     Conversation, ConversationEntry, ConversationEntryKind, ConversationError, ConversationLog,
@@ -63,7 +63,7 @@ pub use prompt_history::{
 };
 pub use repair::repair_interrupted_tool_uses;
 pub use replay::{
-    Backfill, ProjectedEvent, project_suffix, project_thread, replay, replay_deferring_subs,
+    Backfill, TaggedEvent, project_suffix, project_thread, replay, replay_deferring_subs,
 };
 pub use stats::SessionStats;
 pub use tool_details::resolve_tool_details;

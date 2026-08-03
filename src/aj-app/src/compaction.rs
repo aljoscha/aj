@@ -14,7 +14,7 @@ use aj_agent::message::AgentMessage;
 use aj_agent::{Agent, TurnError};
 use aj_models::types::{AssistantContent, Message, StopReason};
 use aj_session::compaction as planning;
-use aj_session::{ConversationLog, ThreadFilter};
+use aj_session::{AppendHandoff, ConversationLog, ThreadFilter};
 use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
 
@@ -46,9 +46,15 @@ pub enum CompactionOutcome {
 /// long summary doesn't block log writers. Cancellation is honored by
 /// the `complete_oneshot` calls; an abort before the persist step leaves
 /// the log untouched.
+///
+/// `handoff` carries the checkpoint's log identity to whoever tags the
+/// `CompactionEnd` this emits (see [`AppendHandoff`]). A run that
+/// persists nothing files nothing, so its `CompactionEnd` stays
+/// untagged.
 pub async fn run_compaction(
     agent: &mut Agent,
     log: &Arc<TokioMutex<ConversationLog>>,
+    handoff: &AppendHandoff,
     reason: CompactionReason,
     custom_instructions: Option<&str>,
     keep_recent_tokens: u64,
@@ -142,22 +148,26 @@ pub async fn run_compaction(
     // them without parsing the structured sections.
     summary.push_str(&format_file_ops(&plan.file_ops));
 
-    // Persist the checkpoint and reseed the live transcript from the
-    // post-compaction projection. `log` and `agent` are distinct locks,
-    // so holding the log guard while reseeding the agent is safe.
+    // Persist the checkpoint, reseed the live transcript from the
+    // post-compaction projection, and emit the `CompactionEnd` for the
+    // checkpoint, all under one log guard. `log` and `agent` are distinct
+    // locks, so holding the log guard while reseeding the agent is safe.
     emit_progress(agent, reason, CompactionPhase::Saving).await;
     let tokens_after = {
         let mut log_guard = log.lock().await;
-        if let Err(err) = log_guard.append_compaction(
+        let checkpoint = match log_guard.append_compaction(
             ThreadFilter::USER,
             summary.clone(),
             plan.first_kept_entry_id.clone(),
             plan.tokens_before,
             Some(plan.file_ops.clone()),
         ) {
-            drop(log_guard);
-            return finish_failed(agent, reason, plan.tokens_before, err.to_string()).await;
-        }
+            Ok(entry) => entry,
+            Err(err) => {
+                drop(log_guard);
+                return finish_failed(agent, reason, plan.tokens_before, err.to_string()).await;
+            }
+        };
         let head = log_guard.head().cloned().expect("head exists after append");
         let conversation = log_guard.linearize(&head, ThreadFilter::USER);
         let mut messages = conversation.agent_messages();
@@ -174,22 +184,28 @@ pub async fn run_compaction(
         // size instead, which is what the next turn will actually send.
         let after = planning::estimate_conversation_context(&conversation).tokens;
         agent.reseed_transcript(messages);
+
+        handoff.file(checkpoint);
+        // The emit happens under the guard on purpose: a durable append
+        // landing between the checkpoint and its event (a background
+        // sub-agent's `MessageEnd`) would make the forwarded seqs
+        // non-monotone, which spec section 5 forbids. A listener must
+        // therefore not take the log lock for `CompactionEnd`.
+        if let Err(err) = agent
+            .emit_event(AgentEvent::CompactionEnd {
+                agent_id: AgentId::Main,
+                reason,
+                tokens_before: plan.tokens_before,
+                tokens_after: after,
+                summary: Some(summary),
+                error: None,
+            })
+            .await
+        {
+            tracing::warn!("failed to emit CompactionEnd: {err}");
+        }
         after
     };
-
-    if let Err(err) = agent
-        .emit_event(AgentEvent::CompactionEnd {
-            agent_id: AgentId::Main,
-            reason,
-            tokens_before: plan.tokens_before,
-            tokens_after,
-            summary: Some(summary),
-            error: None,
-        })
-        .await
-    {
-        tracing::warn!("failed to emit CompactionEnd: {err}");
-    }
 
     CompactionOutcome::Compacted {
         tokens_before: plan.tokens_before,
@@ -406,5 +422,175 @@ mod tests {
         let mut msgs = vec![user("hi"), assistant(StopReason::Stop, vec![])];
         trim_trailing_failed_assistant(&mut msgs);
         assert_eq!(msgs.len(), 2);
+    }
+
+    /// What the sink observed across one compaction, plus whether a
+    /// concurrent durable append managed to land inside the checkpoint's
+    /// window.
+    struct RaceOutcome {
+        /// Whether the racing append found the log lock free while
+        /// `CompactionEnd` was being delivered.
+        interleaved: bool,
+        /// The durable positions the sink saw, in delivery order.
+        durable: Vec<u64>,
+        /// The position `CompactionEnd` was tagged with.
+        compaction_end: Option<u64>,
+    }
+
+    /// Drive two turns and then a compaction, with the tagging forwarder
+    /// installed and a listener that models a concurrent durable append
+    /// landing while `CompactionEnd` is delivered.
+    ///
+    /// The racer uses `try_lock` deliberately: a real concurrent appender
+    /// (a background sub-agent's `MessageEnd` through the same forwarder)
+    /// gets its append in exactly when the log lock is free at that
+    /// moment, and blocks until after the event otherwise.
+    async fn compaction_with_a_racing_append() -> RaceOutcome {
+        use std::sync::Mutex as StdMutex;
+
+        use aj_agent::events::AgentEvent;
+        use aj_session::{
+            AppendHandoff, ConversationEntryKind, ConversationPersistence, TaggedEvent, ThreadKind,
+            persisting_forwarder,
+        };
+        use tempfile::TempDir;
+        use tokio_util::sync::CancellationToken;
+
+        use crate::test_support::{build_test_agent, finalized_text_message, scripted_run_config};
+
+        let dir = TempDir::new().expect("tempdir");
+        let store = ConversationPersistence::new(dir.path().to_path_buf());
+        let run_config = scripted_run_config(vec![
+            finalized_text_message("first answer"),
+            finalized_text_message("second answer"),
+            finalized_text_message("SUMMARY"),
+        ]);
+        let (mut agent, log, persistence) = build_test_agent(&store, &run_config);
+        // The forwarder replaces the plain persistence listener: it is the
+        // one that tags, and two persisting listeners would append every
+        // message twice.
+        drop(persistence);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let interleaved = Arc::new(StdMutex::new(false));
+
+        // Subscribed before the forwarder, so a durable append it manages
+        // to make reaches the sink before `CompactionEnd` does.
+        let racer_log = Arc::clone(&log);
+        let racer_sink = tx.clone();
+        let racer_flag = Arc::clone(&interleaved);
+        let _racer = agent.subscribe(Arc::new(move |event: &AgentEvent| {
+            let log = Arc::clone(&racer_log);
+            let sink = racer_sink.clone();
+            let flag = Arc::clone(&racer_flag);
+            let is_compaction_end = matches!(event, AgentEvent::CompactionEnd { .. });
+            Box::pin(async move {
+                if !is_compaction_end {
+                    return Ok(());
+                }
+                let Ok(mut guard) = log.try_lock() else {
+                    return Ok(());
+                };
+                *flag.lock().expect("flag mutex poisoned") = true;
+                let message = user("interleaved");
+                let parent = guard.head().cloned().expect("the log has a head");
+                let entry = guard
+                    .append(
+                        Some(parent),
+                        ThreadKind::User,
+                        None,
+                        ConversationEntryKind::Message {
+                            message: message.clone(),
+                        },
+                    )
+                    .expect("append the interleaved message");
+                let _ = sink.send(TaggedEvent {
+                    entry: Some(entry),
+                    event: AgentEvent::MessageEnd {
+                        agent_id: AgentId::Main,
+                        message,
+                    },
+                });
+                Ok(())
+            })
+        }));
+
+        let handoff = AppendHandoff::default();
+        let _forwarder =
+            agent.subscribe(persisting_forwarder(Arc::clone(&log), handoff.clone(), tx));
+
+        agent
+            .prompt("first question".to_string(), CancellationToken::new())
+            .await
+            .expect("first turn");
+        // A long second prompt so the keep-recent cut leaves the first
+        // turn to summarize.
+        agent
+            .prompt(
+                format!("second question {}", "X".repeat(2000)),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("second turn");
+
+        let outcome = run_compaction(
+            &mut agent,
+            &log,
+            &handoff,
+            CompactionReason::Manual,
+            None,
+            100,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            matches!(outcome, CompactionOutcome::Compacted { .. }),
+            "expected a compaction, got {outcome:?}"
+        );
+
+        let mut durable = Vec::new();
+        let mut compaction_end = None;
+        while let Ok(tagged) = rx.try_recv() {
+            let Some(entry) = tagged.entry else { continue };
+            if matches!(tagged.event, AgentEvent::CompactionEnd { .. }) {
+                compaction_end = Some(entry.seq);
+            }
+            durable.push(entry.seq);
+        }
+        RaceOutcome {
+            interleaved: *interleaved.lock().expect("flag mutex poisoned"),
+            durable,
+            compaction_end,
+        }
+    }
+
+    /// The checkpoint's append and the `CompactionEnd` that stands for it
+    /// have to be one atomic step. Emitting after dropping the log guard
+    /// lets another durable append take a higher position and reach the
+    /// sink first.
+    #[tokio::test]
+    async fn compaction_end_is_emitted_under_the_log_guard() {
+        let outcome = compaction_with_a_racing_append().await;
+        assert!(
+            !outcome.interleaved,
+            "no durable append may land between the checkpoint and its event"
+        );
+    }
+
+    /// Spec section 5: live durable frames reach a stream in strictly
+    /// increasing seq order.
+    #[tokio::test]
+    async fn durable_seqs_reach_the_sink_in_increasing_order() {
+        let outcome = compaction_with_a_racing_append().await;
+        assert!(
+            outcome.durable.windows(2).all(|pair| pair[0] < pair[1]),
+            "durable seqs must strictly increase, got {:?}",
+            outcome.durable
+        );
+        assert_eq!(
+            outcome.compaction_end,
+            outcome.durable.last().copied(),
+            "the checkpoint is the log's newest entry when its event is sent"
+        );
     }
 }

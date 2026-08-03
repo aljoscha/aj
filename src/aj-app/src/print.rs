@@ -397,6 +397,9 @@ async fn run_inner<W: Write + Send + 'static>(
     let prompt_result = crate::turn::drive_turn(
         &mut agent,
         &log,
+        // Print mode has no tagged event stream, so nothing reads what a
+        // compaction files here.
+        &aj_session::AppendHandoff::default(),
         &policy,
         crate::turn::TurnStart::Content(content),
         |_| {},
