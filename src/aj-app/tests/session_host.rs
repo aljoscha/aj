@@ -3600,3 +3600,114 @@ async fn shutdown_releases_every_session() {
         .is_some()
     {}
 }
+
+// ---------------------------------------------------------------------------
+// 17. Wire round-trip
+// ---------------------------------------------------------------------------
+
+/// Every frame the host publishes survives the wire codec byte-identically,
+/// on the live path and in a full backfill.
+///
+/// `Frame`'s serializer validates as it writes: a `MessageEnd` whose message
+/// id is not its `entry_id`, or that carries no durability at all, is a hard
+/// error rather than a frame with a wrong field. Nothing in this phase
+/// serializes a frame, so a host that published one of those would look
+/// healthy until a stream writer existed, which is why the check lives here
+/// rather than waiting for one.
+#[tokio::test]
+async fn every_published_frame_round_trips_through_the_wire_codec() {
+    let harness = Harness::with_provider(scripted(sub_agent_turn(), 1, Duration::from_millis(5)));
+    let session = harness.create().await;
+    let mut stream = harness
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+    let mut frames = frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+
+    harness.prompt(&session, "delegate it").await;
+    frames.extend(until_idle(&mut stream).await);
+    // A settings change as well, for the notice and `state` frames the host
+    // synthesizes itself.
+    harness
+        .host
+        .command(
+            &session,
+            Command::Settings(SettingsChange {
+                agent: AgentId::Main,
+                persist: PersistAction::None,
+                axis: SettingsAxis::Thinking(Some(aj_models::ThinkingConfig::High)),
+            }),
+        )
+        .await
+        .expect("thinking change");
+    frames.extend(
+        frames_until(&mut stream, "the settings state frame", |frame| {
+            matches!(frame, Frame::State { .. })
+        })
+        .await,
+    );
+    // Give the directory tick room, so a `list` frame is in the sample too.
+    tokio::time::sleep(LIST_SETTLE).await;
+    frames.extend(drained(&mut stream));
+
+    // The same history as a full backfill: projected `MessageEnd`s, the
+    // sub-agent bracketing, and the conclusion sweep behind `caught_up`.
+    let mut second = harness
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("re-attach");
+    frames.extend(
+        frames_until(&mut second, "the backfill's caught_up", |frame| {
+            matches!(frame, Frame::CaughtUp { .. })
+        })
+        .await,
+    );
+    frames.extend(drained(&mut second));
+
+    let mut durable_messages = 0;
+    for frame in &frames {
+        if matches!(frame, Frame::Event { durability: Some(_), event, .. }
+            if matches!(event.known(), Some(AgentEvent::MessageEnd { .. })))
+        {
+            durable_messages += 1;
+        }
+        let json = serde_json::to_string(frame)
+            .unwrap_or_else(|err| panic!("the host published a frame the codec rejects: {err}"));
+        let decoded: Frame = serde_json::from_str(&json)
+            .unwrap_or_else(|err| panic!("a published frame does not decode: {err}\n{json}"));
+        let again = serde_json::to_string(&decoded).expect("a decoded frame re-serializes");
+        assert_eq!(json, again, "a published frame does not round-trip");
+    }
+
+    // The sample is only worth anything if it covered the frame kinds that
+    // carry rules of their own.
+    assert!(
+        frames.len() > 40,
+        "the sample is a whole session: {} frames",
+        frames.len(),
+    );
+    assert!(
+        durable_messages >= 8,
+        "including the durable message frames the codec validates: {durable_messages}",
+    );
+    for wanted in ["state", "caught_up", "list"] {
+        assert!(
+            frames.iter().any(|frame| {
+                serde_json::to_value(frame).expect("serializes")["kind"] == wanted
+            }),
+            "the sample covers the {wanted} frame kind",
+        );
+    }
+    harness.host.shutdown().await;
+}
