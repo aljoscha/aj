@@ -73,6 +73,7 @@ name = "aj-app"
 version = "0.1.0"
 dependencies = [
  "aj-agent",
+ "aj-app",
  "aj-conf",
  "aj-models",
  "aj-session",

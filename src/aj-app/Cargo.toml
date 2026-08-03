@@ -37,6 +37,12 @@ tempfile = { workspace = true }
 # crate is testable in isolation and not only via workspace feature
 # unification.
 tokio = { workspace = true, features = ["test-util"] }
+# Integration tests under `tests/` link the crate as an external
+# dependency, so they see `test_support` only if the feature is enabled
+# for that link. Without this the module is reachable only under
+# `cargo test --workspace`, where `aj`'s dev-dependency happens to turn
+# the feature on and the resolver unifies it.
+aj-app = { path = ".", features = ["test-support"] }
 
 [features]
 # Exposes the `test_support` module (scripted-provider / run-config
