@@ -14,7 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
 
-use aj_agent::bus::SubscriptionHandle;
+use aj_agent::bus::{EventBus, SubscriptionHandle};
 use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
 use aj_agent::queue::MessageQueues;
 use aj_agent::types::UsageSummary;
@@ -24,7 +24,10 @@ use aj_models::provider::Provider;
 use aj_models::registry::ModelInfo;
 use aj_models::types::{Speed, StreamOptions};
 use aj_models::{ThinkingConfig, speed_name, thinking_config_name, verbosity_name};
-use aj_session::{ConversationLog, ConversationPersistence, EntryId, persistence_listener};
+use aj_session::{
+    AppendHandoff, ConversationLog, ConversationPersistence, EntryId, TaggedEvent,
+    persistence_listener, persisting_forwarder,
+};
 use anyhow::Result;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -233,6 +236,10 @@ pub struct SessionCore {
     /// Shared because a submit handler spawns a task that holds it
     /// across `agent.prompt(...).await`.
     pub agent: Arc<TokioMutex<Agent>>,
+    /// Clone of the agent's event bus, captured before the agent was
+    /// shared. Subscribing through it needs no agent lock, which matters
+    /// because a turn holds that lock for its whole duration.
+    bus: EventBus,
     /// The environment the agent was built against: base prompt,
     /// AGENTS.md/CLAUDE.md context files, discovered skills, working
     /// directory. The runtime takes only the assembled prompt, so the
@@ -260,29 +267,24 @@ pub struct SessionCore {
     /// resets naturally with the core. A sub-agent with no entry runs
     /// with whatever it already holds (spawn-time inheritance).
     pub sub_overrides: Arc<StdMutex<HashMap<usize, SubAgentOverrides>>>,
+    /// What the session's next turn runs against. Per session, so a
+    /// model change or a resumed session's restored bundle cannot leak
+    /// into another live session (see [`RunConfigSnapshot`]).
+    pub run_config: Arc<StdMutex<RunConfigSnapshot>>,
     /// The session's on-disk conversation log, shared with the
     /// persistence listener.
     pub log: Arc<TokioMutex<ConversationLog>>,
     /// Convenience copy of the log's session id, readable without
     /// locking `log`.
     pub session_id: String,
-    /// Receiver side of the bus->channel forwarder feeding the
-    /// frontend.
-    pub event_rx: UnboundedReceiver<AgentEvent>,
-    /// Agent-lifecycle truth. Whoever processes
-    /// `AgentStart`/`AgentEnd` and compaction updates it. The frontend
-    /// reads it to drive spinners, counts, and busy checks.
-    pub lifecycle: AgentLifecycle,
     /// Notices produced by resume-time settings restoration (what was
     /// restored, or why a recorded value was kept out). Pumped onto the
     /// chat scrollback by the caller after install.
     pub restore_notices: Vec<String>,
-    /// Keeps the bus->channel forwarder subscribed; dropped with the
-    /// core.
-    _event_handle: SubscriptionHandle,
-    /// Keeps the persistence listener subscribed; dropped with the
-    /// core.
-    _persistence_handle: SubscriptionHandle,
+    /// Keeps the log-writing listener subscribed; dropped with the core,
+    /// and replaced wholesale by
+    /// [`SessionCore::install_persisting_forwarder`].
+    persistence_handle: SubscriptionHandle,
 }
 
 impl SessionCore {
@@ -307,7 +309,7 @@ impl SessionCore {
     /// loop falls back to the previous session.
     pub fn build(
         config: &Config,
-        run_config: &Arc<StdMutex<RunConfigSnapshot>>,
+        run_config: RunConfigSnapshot,
         persistence: &ConversationPersistence,
         spec: &SessionSpec,
         restore: Option<&RestoreContext>,
@@ -321,6 +323,10 @@ impl SessionCore {
                 head: head.clone(),
             },
         };
+        // Wrapped up front because the steps below share it: `prepare_log`
+        // stamps the session's prompt-cache key onto it, and the turn
+        // driver reads it at every turn start.
+        let run_config = Arc::new(StdMutex::new(run_config));
 
         // Resolve + repair the log and, on a resume with restoration
         // enabled, write its recorded settings back into the shared run
@@ -329,7 +335,7 @@ impl SessionCore {
             mut log,
             transcript,
             restore_notices,
-        } = prepare_log(persistence, &source, config, run_config, restore)?;
+        } = prepare_log(persistence, &source, config, &run_config, restore)?;
 
         // Build a fresh agent off the run-config snapshot, which at this
         // point reflects both runtime `/model` / `/thinking` choices and
@@ -392,11 +398,12 @@ impl SessionCore {
         let message_queues = MessageQueues::default();
         agent.set_message_queues(message_queues.clone());
 
-        // Bus subscriptions: the channel forwarder feeds the frontend in
-        // the main loop; the persistence listener writes events into the
-        // log. Seeding never emits bus events, so subscription order
-        // relative to it is immaterial.
-        let (event_handle, event_rx) = agent.subscribe_channel();
+        // Bus subscriptions: the persistence listener writes events into
+        // the log. Seeding never emits bus events, so subscription order
+        // relative to it is immaterial. A frontend adds its own sink
+        // through [`Self::subscribe_channel`], and a session host swaps
+        // the listener for the tagging forwarder (see
+        // [`Self::install_persisting_forwarder`]).
         let session_id = log.session_id().to_string();
 
         // Read the Main agent's footer seed off the owned agent before
@@ -415,23 +422,66 @@ impl SessionCore {
 
         let log = Arc::new(TokioMutex::new(log));
         let persistence_handle = agent.subscribe(persistence_listener(Arc::clone(&log)));
+        let bus = agent.bus().clone();
 
         let core = SessionCore {
             agent: Arc::new(TokioMutex::new(agent)),
+            bus,
             env,
             registry,
             task_registry,
             message_queues,
             sub_overrides: Arc::new(StdMutex::new(HashMap::new())),
+            run_config,
             log,
             session_id,
-            event_rx,
-            lifecycle: AgentLifecycle::default(),
             restore_notices,
-            _event_handle: event_handle,
-            _persistence_handle: persistence_handle,
+            persistence_handle,
         };
         Ok((core, seed))
+    }
+
+    /// Subscribe a channel sink to the session's event bus.
+    ///
+    /// The returned handle owns the subscription: dropping it detaches the
+    /// sink. Goes through the retained bus clone, so it needs no agent
+    /// lock and is safe to call while a turn holds the agent.
+    pub fn subscribe_channel(&self) -> (SubscriptionHandle, UnboundedReceiver<AgentEvent>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = self.bus.subscribe(aj_agent::bus::listener_from_sync(
+            move |event: &AgentEvent| {
+                // A hung-up receiver is the consumer losing interest, not
+                // an agent-level error: dropping the event keeps the turn
+                // making progress.
+                let _ = tx.send(event.clone());
+            },
+        ));
+        (handle, rx)
+    }
+
+    /// Replace the plain persistence listener with the tagging forwarder
+    /// and return the tagged event stream.
+    ///
+    /// This is how a session host takes ownership of the session's
+    /// durability: the forwarder both writes the log and hands every
+    /// event to the returned stream paired with the entry it appended, so
+    /// the host never has to infer an append position at delivery time.
+    /// Keeping both listeners would append every message twice, hence the
+    /// replacement rather than an addition.
+    ///
+    /// Call this before the first turn. Between [`Self::build`] and here
+    /// nothing emits (seeding is silent), so no event is lost.
+    pub fn install_persisting_forwarder(
+        &mut self,
+        handoff: &AppendHandoff,
+    ) -> UnboundedReceiver<TaggedEvent> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.persistence_handle = self.bus.subscribe(persisting_forwarder(
+            Arc::clone(&self.log),
+            handoff.clone(),
+            tx,
+        ));
+        rx
     }
 
     /// Resolve an `AgentId` to its live handle: the main agent for
@@ -458,49 +508,13 @@ impl SessionCore {
     /// The agent is uniquely held after [`Self::build`] (the bus
     /// subscriptions keep handles, not agent clones), so unwrapping it
     /// out of the `Arc<TokioMutex>` cannot fail. The persistence handle
-    /// is returned so driven turns keep writing to the log. The event
-    /// forwarder is not observed on this path, so its handle drops here.
+    /// is returned so driven turns keep writing to the log.
     #[cfg(any(test, feature = "test-support"))]
     pub fn into_test_agent(self) -> (Agent, Arc<TokioMutex<ConversationLog>>, SubscriptionHandle) {
         let agent = Arc::try_unwrap(self.agent)
             .unwrap_or_else(|_| unreachable!("core.agent is uniquely held after build"))
             .into_inner();
-        (agent, self.log, self._persistence_handle)
-    }
-
-    /// Whether `id` is currently running.
-    pub fn is_running(&self, id: AgentId) -> bool {
-        self.lifecycle.is_running(id)
-    }
-
-    /// Owned snapshot of every agent currently in the running set.
-    pub fn running_agents(&self) -> Vec<AgentId> {
-        self.lifecycle.running_agents()
-    }
-
-    /// Record `id` as running.
-    pub fn mark_running(&mut self, id: AgentId) {
-        self.lifecycle.mark_running(id);
-    }
-
-    /// Remove `id` from the running set. Idempotent.
-    pub fn mark_idle(&mut self, id: AgentId) {
-        self.lifecycle.mark_idle(id);
-    }
-
-    /// Whether `id` has an in-flight host-driven compaction.
-    pub fn is_compacting(&self, id: AgentId) -> bool {
-        self.lifecycle.is_compacting(id)
-    }
-
-    /// Record `id` as compacting.
-    pub fn mark_compacting(&mut self, id: AgentId) {
-        self.lifecycle.mark_compacting(id);
-    }
-
-    /// Clear `id`'s compacting mark. Idempotent.
-    pub fn clear_compacting(&mut self, id: AgentId) {
-        self.lifecycle.clear_compacting(id);
+        (agent, self.log, self.persistence_handle)
     }
 }
 

@@ -213,12 +213,28 @@ const OVERFLOW_GIVEUP: &str =
 pub struct Turns {
     set: JoinSet<(AgentId, Result<(), TurnError>)>,
     cancels: HashMap<AgentId, CancellationToken>,
+    /// The session's compaction append handoff, threaded into every
+    /// `drive_turn` this spawns. A host that fans events out installs its
+    /// own so a compaction's `CompactionEnd` reaches the fan-out tagged
+    /// with the checkpoint entry; a host that does not gets the default,
+    /// which nothing reads.
+    handoff: AppendHandoff,
 }
 
 impl Turns {
-    /// An empty set of driven turns.
+    /// An empty set of driven turns with a handoff nothing reads.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty set of driven turns that files compaction checkpoints on
+    /// `handoff`, which must be the same handoff the session's event
+    /// forwarder takes them from.
+    pub fn with_handoff(handoff: AppendHandoff) -> Self {
+        Self {
+            handoff,
+            ..Self::default()
+        }
     }
 
     /// Whether no driven turn is in flight.
@@ -249,6 +265,19 @@ impl Turns {
         }
     }
 
+    /// Fire every driven turn's cancel token, leaving the turns in flight
+    /// to wind themselves down.
+    ///
+    /// This is the graceful counterpart to [`Self::shutdown`]: a
+    /// cancelled turn emits its synthetic aborted `MessageEnd`s and error
+    /// tool results, so the transcript stays consistent, which an abort
+    /// does not. The caller then drains [`Self::join_next`].
+    pub fn cancel_all(&self) {
+        for token in self.cancels.values() {
+            token.cancel();
+        }
+    }
+
     /// Whether `id` is busy from the host's perspective: a driven turn
     /// or a running turn observed on the bus. `is_running` alone
     /// misses the gap between spawning a turn and its `AgentStart`
@@ -265,12 +294,12 @@ impl Turns {
     /// without spawning when `target` has no live handle (e.g. a
     /// resumed sub-agent).
     ///
-    /// The two config handles differ in freshness. The compaction
+    /// The compaction
     /// [`TurnPolicy`] is derived from `config` once here, so the whole
-    /// sequence runs under one policy. The staged run config and the
-    /// config-derived tool catalog are re-read before the sequence's
-    /// first inference and before each automatic continuation, by
-    /// [`apply_turn_config`].
+    /// sequence runs under one policy. The session's staged run config
+    /// and the config-derived tool catalog are re-read before the
+    /// sequence's first inference and before each automatic
+    /// continuation, by [`apply_turn_config`].
     ///
     /// Callers must not spawn for a target already being driven (they
     /// gate via [`Turns::is_busy`] / [`Turns::spawn_wake`]): a second
@@ -280,7 +309,6 @@ impl Turns {
         &mut self,
         core: &SessionCore,
         config: &Arc<std::sync::Mutex<Config>>,
-        run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
         target: AgentId,
         start: TurnStart,
     ) -> bool {
@@ -293,9 +321,10 @@ impl Turns {
         };
         let policy = turn_policy(target, config);
         let config_for_turn = Arc::clone(config);
-        let run_config_for_turn = Arc::clone(run_config);
+        let run_config_for_turn = Arc::clone(&core.run_config);
         let sub_overrides_for_turn = Arc::clone(&core.sub_overrides);
         let log = Arc::clone(&core.log);
+        let handoff = self.handoff.clone();
         let turn_cancel = CancellationToken::new();
         self.cancels.insert(target, turn_cancel.clone());
         self.set.spawn(async move {
@@ -303,10 +332,7 @@ impl Turns {
             let result = drive_turn(
                 &mut a,
                 &log,
-                // No forwarder is installed on this path, so nothing
-                // reads what a compaction files. The session host owns
-                // the real handoff.
-                &AppendHandoff::default(),
+                &handoff,
                 &policy,
                 start,
                 |agent: &mut Agent| {
@@ -338,13 +364,13 @@ impl Turns {
         &mut self,
         owner: AgentId,
         core: &SessionCore,
+        lifecycle: &AgentLifecycle,
         config: &Arc<std::sync::Mutex<Config>>,
-        run_config: &Arc<std::sync::Mutex<RunConfigSnapshot>>,
     ) {
-        if self.is_busy(&core.lifecycle, owner) {
+        if self.is_busy(lifecycle, owner) {
             return;
         }
-        self.spawn(core, config, run_config, owner, TurnStart::Wake);
+        self.spawn(core, config, owner, TurnStart::Wake);
     }
 
     /// Await the next completed turn, or pend forever when no turn is

@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
+use aj_agent::bus::SubscriptionHandle;
 use aj_agent::events::{AgentEvent, AgentId, CompactionReason};
 use aj_agent::queue::MessageQueues;
 use aj_agent::types::UsageSummary;
@@ -24,8 +25,10 @@ use aj_app::chat::{ChatState, reduce};
 use aj_app::cli::args::{Args, Command};
 use aj_app::commands::{CommandAction, load_model_catalog};
 use aj_app::keybindings::fixed_keys;
-use aj_app::session::{SessionCore, SessionEntry, SessionExit, SessionRequest, SessionSpec};
-use aj_app::session_setup::{RestoreContext, RunConfigSnapshot, build_initial_run_config};
+use aj_app::session::{
+    AgentLifecycle, SessionCore, SessionEntry, SessionExit, SessionRequest, SessionSpec,
+};
+use aj_app::session_setup::{RestoreContext, build_initial_run_config};
 use aj_app::settings::{
     ConfigLayers, ConfigTarget, FooterUpdate, MainConfirm, PersistAction, SpeedConfirm, SubConfirm,
 };
@@ -117,6 +120,18 @@ const APP_TITLE: &str = "aj";
 /// are drivable headlessly in tests, without a terminal.
 struct World {
     core: SessionCore,
+    /// Agent-lifecycle truth for this frontend's view of the session:
+    /// which agents are running, which are compacting. The event fold
+    /// ([`reduce`]) and the turn-join arm are its writers. It lives here
+    /// rather than on the core because a session served to several
+    /// clients has one authoritative lifecycle per owner, and this is
+    /// this frontend's.
+    lifecycle: AgentLifecycle,
+    /// Receiver side of the bus->channel forwarder feeding the drive
+    /// loop's event arm.
+    event_rx: UnboundedReceiver<AgentEvent>,
+    /// Keeps `event_rx`'s subscription alive; dropped with the world.
+    _event_handle: SubscriptionHandle,
     /// The chat model, shared with the [`TranscriptView`]. Only the
     /// loop mutates it (via [`reduce`] and the arm helpers). The view
     /// reads it at draw time. Never borrowed across an await.
@@ -130,7 +145,7 @@ struct World {
     /// Mirror of the lifecycle bits the status chrome (loader,
     /// footer) reads at draw time, shared with those widgets and
     /// refreshed by [`sync_status`] once per loop iteration. The
-    /// `AgentLifecycle` itself stays on `core`, where the reducer and
+    /// `AgentLifecycle` itself stays on `world`, where the reducer and
     /// the turn-join arm mutate it.
     status: Rc<RefCell<StatusState>>,
     config: Arc<StdMutex<Config>>,
@@ -142,7 +157,6 @@ struct World {
     /// window's model submenu. Also seeds [`ChatState`]'s context-window
     /// resolver.
     catalog: Arc<Vec<ModelInfo>>,
-    run_config: Arc<StdMutex<RunConfigSnapshot>>,
     /// In-flight turns keyed by the agent running them, plus the
     /// host's clone of each turn's cancel token.
     turns: Turns,
@@ -190,7 +204,6 @@ async fn build_world(
     });
 
     let (run_config, restore) = build_initial_run_config(args, &config, auth, speed)?;
-    let run_config = Arc::new(StdMutex::new(run_config));
 
     // `aj continue` with neither an explicit id nor a latest session
     // on disk degrades to a fresh session, matching `aj`. The session
@@ -225,8 +238,11 @@ async fn build_world(
         },
     };
 
-    let (mut core, seed) =
-        SessionCore::build(&config, &run_config, persistence, &spec, restore.as_ref())?;
+    let (core, seed) =
+        SessionCore::build(&config, run_config, persistence, &spec, restore.as_ref())?;
+    let mut core = core;
+    let mut lifecycle = AgentLifecycle::default();
+    let (event_handle, event_rx) = core.subscribe_channel();
 
     let catalog = load_model_catalog();
     let mut chat = ChatState::new(seed.settings, seed.context_window, Arc::clone(&catalog));
@@ -257,7 +273,7 @@ async fn build_world(
             {
                 deferred_subs.insert(*n);
             }
-            let _ = reduce(&mut chat, &mut core.lifecycle, event, None);
+            let _ = reduce(&mut chat, &mut lifecycle, event, None);
         }
     }
 
@@ -277,14 +293,14 @@ async fn build_world(
                 text,
             },
         };
-        let _ = reduce(&mut chat, &mut core.lifecycle, event, None);
+        let _ = reduce(&mut chat, &mut lifecycle, event, None);
     }
     if !keybinding_problems.is_empty() {
         let mut msg = String::from("Some keybindings in config.toml had no effect:");
         for problem in &keybinding_problems {
             msg.push_str(&format!("\n  - {problem}"));
         }
-        let _ = reduce(&mut chat, &mut core.lifecycle, warning_event(&msg), None);
+        let _ = reduce(&mut chat, &mut lifecycle, warning_event(&msg), None);
     }
     // The context listing and skill warnings describe the freshly-loaded env,
     // which governs only a fresh session, so `fresh_env_notices` returns them
@@ -293,12 +309,12 @@ async fn build_world(
     // block. The same helper feeds the in-process new-session path, so a
     // `/new` surfaces identical env context and skill problems.
     for event in fresh_env_notices(&spec, &core.env) {
-        let _ = reduce(&mut chat, &mut core.lifecycle, event, None);
+        let _ = reduce(&mut chat, &mut lifecycle, event, None);
     }
     if aj_app::notices::sandbox_warning_enabled() {
         let _ = reduce(
             &mut chat,
-            &mut core.lifecycle,
+            &mut lifecycle,
             warning_event(aj_app::notices::SANDBOX_WARNING),
             None,
         );
@@ -308,7 +324,7 @@ async fn build_world(
     // skipped for the scripted fake provider, which needs no credentials.
     if args.scripted.is_none() {
         let provider_id = {
-            let cfg = run_config.lock().expect("run config mutex poisoned");
+            let cfg = core.run_config.lock().expect("run config mutex poisoned");
             cfg.model_key.0.clone()
         };
         if let Some(key) = args.api_key.clone() {
@@ -329,30 +345,27 @@ async fn build_world(
                 agent_id: AgentId::Main,
                 text,
             };
-            let _ = reduce(&mut chat, &mut core.lifecycle, event, None);
+            let _ = reduce(&mut chat, &mut lifecycle, event, None);
         }
     }
     if let Some(warning) = aj_app::tmux::options().and_then(aj_app::tmux::build_warning) {
-        let _ = reduce(
-            &mut chat,
-            &mut core.lifecycle,
-            warning_event(&warning),
-            None,
-        );
+        let _ = reduce(&mut chat, &mut lifecycle, warning_event(&warning), None);
     }
     for notice in std::mem::take(&mut core.restore_notices) {
-        let _ = reduce(&mut chat, &mut core.lifecycle, notice_event(&notice), None);
+        let _ = reduce(&mut chat, &mut lifecycle, notice_event(&notice), None);
     }
 
     Ok(World {
         core,
+        lifecycle,
+        event_rx,
+        _event_handle: event_handle,
         chat: Rc::new(RefCell::new(chat)),
         deferred_subs,
         status: Rc::new(RefCell::new(StatusState::default())),
         config: Arc::new(StdMutex::new(config)),
         config_layers: Arc::new(StdMutex::new(layers)),
         catalog,
-        run_config,
         turns: Turns::new(),
         auth: auth.clone(),
         persistence: persistence.clone(),
@@ -366,6 +379,13 @@ async fn build_world(
 /// [`fresh_env_notices`], plus any resume-restore notices).
 struct NextSession {
     core: SessionCore,
+    /// The lifecycle this build's replay folded into, swapped onto the
+    /// world with the chat model so the two cannot drift apart.
+    lifecycle: AgentLifecycle,
+    /// Receiver side of the new session's bus->channel forwarder, plus the
+    /// handle keeping it subscribed.
+    event_rx: UnboundedReceiver<AgentEvent>,
+    event_handle: SubscriptionHandle,
     chat: ChatState,
     /// The resumed sub-agent indices whose transcript is deferred, seeded
     /// by this build's drain and swapped onto the world in
@@ -396,9 +416,22 @@ async fn build_next_session(
     branch: bool,
 ) -> Result<NextSession> {
     let config = world.config.lock().expect("config mutex poisoned").clone();
+    // The next session starts from the outgoing session's staged run
+    // config, so a `/model` or `/thinking` change made in this process
+    // carries across the switch. Each session then owns its clone, so a
+    // resume that restores a recorded bundle cannot reach back into the
+    // session it switched away from.
+    let staged = || {
+        world
+            .core
+            .run_config
+            .lock()
+            .expect("run config mutex poisoned")
+            .clone()
+    };
     let (mut core, seed, notice, fell_back) = match SessionCore::build(
         &config,
-        &world.run_config,
+        staged(),
         &world.persistence,
         &spec,
         world.restore.as_ref(),
@@ -418,7 +451,7 @@ async fn build_next_session(
             };
             let (core, seed) = SessionCore::build(
                 &config,
-                &world.run_config,
+                staged(),
                 &world.persistence,
                 &fallback,
                 world.restore.as_ref(),
@@ -445,6 +478,7 @@ async fn build_next_session(
     // sub-agent box, so the seeded set records which indices Observe must
     // materialize (see `build_world`).
     let mut deferred_subs = HashSet::new();
+    let mut lifecycle = AgentLifecycle::default();
     {
         let log = Arc::clone(&core.log);
         let log = log.lock().await;
@@ -456,9 +490,10 @@ async fn build_next_session(
             {
                 deferred_subs.insert(*n);
             }
-            let _ = reduce(&mut chat, &mut core.lifecycle, event, None);
+            let _ = reduce(&mut chat, &mut lifecycle, event, None);
         }
     }
+    let (event_handle, event_rx) = core.subscribe_channel();
 
     // Order: the switch/create confirmation, then (for a fresh switch) the
     // fresh-env notices (context listing plus any skill warnings), then any
@@ -491,6 +526,9 @@ async fn build_next_session(
     );
     Ok(NextSession {
         core,
+        lifecycle,
+        event_rx,
+        event_handle,
         chat,
         deferred_subs,
         notices,
@@ -537,6 +575,13 @@ fn install_next_session(world: &mut World, shell: &Rc<RefCell<Shell>>, next: Nex
     // Swap the deferred-sub set together with the chat, so a prior
     // session's indices can't leak into the new session's Observe path.
     world.deferred_subs = next.deferred_subs;
+    // The lifecycle belongs to the chat model the replay folded it with,
+    // so the two are swapped together. The event stream is the new
+    // session's bus, and its handle has to outlive the swap or the
+    // subscription drops with the old one.
+    world.lifecycle = next.lifecycle;
+    world.event_rx = next.event_rx;
+    world._event_handle = next.event_handle;
     // Status is resynced from the new core once per iteration; reset it so
     // the frame between install and the next sync shows idle chrome.
     *world.status.borrow_mut() = StatusState::default();
@@ -570,7 +615,7 @@ fn install_next_session(world: &mut World, shell: &Rc<RefCell<Shell>>, next: Nex
     for event in next.notices {
         let _ = reduce(
             &mut world.chat.borrow_mut(),
-            &mut world.core.lifecycle,
+            &mut world.lifecycle,
             event,
             None,
         );
@@ -732,7 +777,7 @@ fn fresh_env_notices(spec: &SessionSpec, env: &AgentEnv) -> Vec<AgentEvent> {
 fn fold_notice(world: &mut World, text: &str) {
     let _ = reduce(
         &mut world.chat.borrow_mut(),
-        &mut world.core.lifecycle,
+        &mut world.lifecycle,
         notice_event(text),
         None,
     );
@@ -743,7 +788,7 @@ fn fold_notice(world: &mut World, text: &str) {
 fn fold_warning(world: &mut World, text: &str) {
     let _ = reduce(
         &mut world.chat.borrow_mut(),
-        &mut world.core.lifecycle,
+        &mut world.lifecycle,
         AgentEvent::Warning {
             agent_id: AgentId::Main,
             text: text.to_string(),
@@ -970,7 +1015,7 @@ fn drain_events(world: &mut World, first: AgentEvent) -> (bool, Vec<AgentId>) {
         };
         {
             let mut chat = world.chat.borrow_mut();
-            redraw |= reduce(&mut chat, &mut world.core.lifecycle, event, None).0;
+            redraw |= reduce(&mut chat, &mut world.lifecycle, event, None).0;
         }
         if let Some((id, conditional)) = trigger
             && (!conditional
@@ -979,7 +1024,7 @@ fn drain_events(world: &mut World, first: AgentEvent) -> (bool, Vec<AgentId>) {
         {
             wake_targets.push(id);
         }
-        next = world.core.event_rx.try_recv().ok();
+        next = world.event_rx.try_recv().ok();
     }
     (redraw, wake_targets)
 }
@@ -991,7 +1036,7 @@ fn spawn_wakes(world: &mut World, targets: Vec<AgentId>) {
     for id in targets {
         world
             .turns
-            .spawn_wake(id, &world.core, &world.config, &world.run_config);
+            .spawn_wake(id, &world.core, &world.lifecycle, &world.config);
     }
 }
 
@@ -1002,7 +1047,7 @@ fn spawn_wakes(world: &mut World, targets: Vec<AgentId>) {
 /// submits) shares one sync point and the mirror can't silently drift.
 fn sync_status(world: &World) -> bool {
     let active = world.chat.borrow().active_view();
-    let life = &world.core.lifecycle;
+    let life = &world.lifecycle;
     let next = StatusState {
         running: life.is_running(active),
         compacting: life.is_compacting(active),
@@ -1059,7 +1104,7 @@ fn handle_submit(world: &mut World, text: String) -> bool {
         return false;
     }
     let target = world.chat.borrow().active_view();
-    if world.turns.is_busy(&world.core.lifecycle, target) {
+    if world.turns.is_busy(&world.lifecycle, target) {
         world.core.message_queues.append_follow_up(target, &trimmed);
         return true;
     }
@@ -1068,7 +1113,6 @@ fn handle_submit(world: &mut World, text: String) -> bool {
     let spawned = world.turns.spawn(
         &world.core,
         &world.config,
-        &world.run_config,
         target,
         TurnStart::Prompt(trimmed),
     );
@@ -1099,7 +1143,6 @@ fn auto_submit_launch(world: &mut World, content: Vec<UserContent>) {
     world.turns.spawn(
         &world.core,
         &world.config,
-        &world.run_config,
         AgentId::Main,
         TurnStart::Content(content),
     );
@@ -1121,7 +1164,7 @@ fn handle_turn_join(
     // and `conclude_sub_box` leaves a concluded box untouched.
     for idled in world
         .turns
-        .reap(&mut world.core.lifecycle, &world.core.task_registry, id)
+        .reap(&mut world.lifecycle, &world.core.task_registry, id)
     {
         if let AgentId::Sub(n) = idled {
             world.chat.borrow_mut().conclude_sub_box(n);
@@ -1134,7 +1177,7 @@ fn handle_turn_join(
     if world.core.task_registry.has_notices(id) || world.core.message_queues.has_pending(id) {
         world
             .turns
-            .spawn_wake(id, &world.core, &world.config, &world.run_config);
+            .spawn_wake(id, &world.core, &world.lifecycle, &world.config);
     }
     match result {
         Ok(()) => Ok(()),
@@ -1165,7 +1208,7 @@ fn cancel_viewed_turn(world: &World) -> bool {
     if world.turns.cancel(active) {
         return true;
     }
-    if world.core.is_running(active) {
+    if world.lifecycle.is_running(active) {
         // A sub running its initial spawn is owned by the main turn.
         // Cancelling that token cascades to the child.
         world.turns.cancel(AgentId::Main);
@@ -1302,7 +1345,7 @@ fn handle_steer(world: &mut World, shell: &Rc<RefCell<Shell>>) {
         editor.clear();
         text
     };
-    let busy = world.turns.is_busy(&world.core.lifecycle, target);
+    let busy = world.turns.is_busy(&world.lifecycle, target);
     if busy {
         if text.is_empty() {
             world.core.message_queues.promote(target);
@@ -1616,13 +1659,12 @@ async fn apply_command_action(
             // `/compact` runs as a tracked turn (it owns the turn
             // machinery the palette confirm can't reach). Busy agents get
             // the same notice `aj` folds rather than a silent no-op.
-            if world.turns.is_busy(&world.core.lifecycle, AgentId::Main) {
+            if world.turns.is_busy(&world.lifecycle, AgentId::Main) {
                 fold_notice(world, &session_busy_notice("compact"));
             } else {
                 world.turns.spawn(
                     &world.core,
                     &world.config,
-                    &world.run_config,
                     AgentId::Main,
                     TurnStart::Compact {
                         reason: CompactionReason::Manual,
@@ -2010,7 +2052,7 @@ async fn apply_picker_outcome(
                 if let Some(conv) = conv {
                     let mut chat = world.chat.borrow_mut();
                     for event in project_thread(&conv, AgentId::Sub(n)) {
-                        let _ = reduce(&mut chat, &mut world.core.lifecycle, event, None);
+                        let _ = reduce(&mut chat, &mut world.lifecycle, event, None);
                     }
                 }
                 world.deferred_subs.remove(&n);
@@ -2128,6 +2170,7 @@ fn viewed_thinking(world: &World, target: AgentId) -> Option<ThinkingConfig> {
         .and_then(|s| thinking_config_from_name(&s.thinking))
         .unwrap_or_else(|| {
             world
+                .core
                 .run_config
                 .lock()
                 .expect("run config mutex poisoned")
@@ -2147,6 +2190,7 @@ fn viewed_model(world: &World, target: AgentId) -> (String, String) {
         .map(|s| (s.provider.clone(), s.model_id.clone()))
         .unwrap_or_else(|| {
             world
+                .core
                 .run_config
                 .lock()
                 .expect("run config mutex poisoned")
@@ -2250,7 +2294,7 @@ async fn confirm_thinking(world: &World, target: AgentId, level: Option<Thinking
             let MainConfirm { footer, notice } = aj_app::settings::confirm_thinking_for_main(
                 level,
                 PersistAction::None,
-                &world.run_config,
+                &world.core.run_config,
                 &world.config,
                 &world.config_layers,
                 &world.core,
@@ -2311,7 +2355,7 @@ async fn confirm_model(world: &World, target: AgentId, info: ModelInfo) -> Strin
                 info,
                 PersistAction::None,
                 &world.auth,
-                &world.run_config,
+                &world.core.run_config,
                 &world.config,
                 &world.config_layers,
                 &world.core,
@@ -2449,7 +2493,11 @@ async fn apply_setting_change(
                     .cloned()
             }) else {
                 let active = {
-                    let cfg = world.run_config.lock().expect("run config mutex poisoned");
+                    let cfg = world
+                        .core
+                        .run_config
+                        .lock()
+                        .expect("run config mutex poisoned");
                     format!("{}/{}", cfg.model_key.0, cfg.model_key.1)
                 };
                 revert_setting_row(shell, MODEL_SETTING_ID, &active);
@@ -2459,7 +2507,7 @@ async fn apply_setting_change(
                 info,
                 persist,
                 &world.auth,
-                &world.run_config,
+                &world.core.run_config,
                 &world.config,
                 &world.config_layers,
                 &world.core,
@@ -2469,7 +2517,11 @@ async fn apply_setting_change(
             // The core reports a rebuild failure only as notice text; compare
             // the staged key so the row reverts to the model actually active.
             let active = {
-                let cfg = world.run_config.lock().expect("run config mutex poisoned");
+                let cfg = world
+                    .core
+                    .run_config
+                    .lock()
+                    .expect("run config mutex poisoned");
                 format!("{}/{}", cfg.model_key.0, cfg.model_key.1)
             };
             if active != value {
@@ -2482,7 +2534,7 @@ async fn apply_setting_change(
                 let MainConfirm { footer, notice } = aj_app::settings::confirm_thinking_for_main(
                     level,
                     persist,
-                    &world.run_config,
+                    &world.core.run_config,
                     &world.config,
                     &world.config_layers,
                     &world.core,
@@ -2503,7 +2555,11 @@ async fn apply_setting_change(
                 }
             };
             {
-                let mut cfg = world.run_config.lock().expect("run config mutex poisoned");
+                let mut cfg = world
+                    .core
+                    .run_config
+                    .lock()
+                    .expect("run config mutex poisoned");
                 aj_app::model::apply_thinking_display(&mut cfg.stream_options, display);
             }
             // The "default" sentinel unsets the key in either layer.
@@ -2526,7 +2582,7 @@ async fn apply_setting_change(
                 speed,
                 persist,
                 &world.auth,
-                &world.run_config,
+                &world.core.run_config,
                 &world.config,
                 &world.config_layers,
                 &world.core,
@@ -2557,7 +2613,7 @@ async fn apply_setting_change(
                 aj_app::settings::confirm_verbosity_for_main(
                     verbosity,
                     persist,
-                    &world.run_config,
+                    &world.core.run_config,
                     &world.config,
                     &world.config_layers,
                     &world.core,
@@ -4242,7 +4298,7 @@ impl Widget for Shell {
 /// drive loop's per-iteration sync point, its single writer.
 fn sync_keymap_ctx(world: &World, shell: &Rc<RefCell<Shell>>) {
     let active = world.chat.borrow().active_view();
-    let busy = world.turns.is_busy(&world.core.lifecycle, active);
+    let busy = world.turns.is_busy(&world.lifecycle, active);
     // The global busy flag the session-overlay confirm closures read: any
     // in-flight turn OR background work (background sub-agents + bash tasks),
     // not just the viewed agent. Distinct from `turn_running` above, which is
@@ -5178,7 +5234,7 @@ async fn drive(
             // quiesced, so a typed follow-up or steer would render late. Below
             // input, typed input always wins. `drain_events` still coalesces the
             // whole channel into one batch, so a burst collapses into one redraw.
-            maybe_event = world.core.event_rx.recv() => {
+            maybe_event = world.event_rx.recv() => {
                 // Losing the agent bus means this session can no longer
                 // observe turn progress. It is also permanently ready, so
                 // treating closure as a no-op would spin this select loop.
@@ -5865,7 +5921,7 @@ mod tests {
     #[test]
     fn transcript_box_click_parks_shell_picker_outcome() {
         let chat = empty_chat();
-        let mut lifecycle = aj_app::session::AgentLifecycle::default();
+        let mut lifecycle = AgentLifecycle::default();
         let _ = reduce(
             &mut chat.borrow_mut(),
             &mut lifecycle,
@@ -6042,7 +6098,7 @@ mod tests {
         handle_submit(world, "persist me".to_string());
         let joined = world.turns.join_next().await;
         handle_turn_join(world, joined).expect("turn settles cleanly");
-        if let Ok(first) = world.core.event_rx.try_recv() {
+        if let Ok(first) = world.event_rx.try_recv() {
             let _ = drain_events(world, first);
         }
     }
@@ -6074,7 +6130,7 @@ mod tests {
                 handle_turn_join(world, joined).expect("turn settles cleanly");
             }
             let mut wakes = Vec::new();
-            if let Ok(first) = world.core.event_rx.try_recv() {
+            if let Ok(first) = world.event_rx.try_recv() {
                 let (_, targets) = drain_events(world, first);
                 wakes = targets;
             }
@@ -6249,7 +6305,7 @@ mod tests {
             0,
             Arc::new(Vec::new()),
         );
-        let mut life = aj_app::session::AgentLifecycle::default();
+        let mut life = AgentLifecycle::default();
         {
             let log = world.core.log.lock().await;
             for event in aj_session::replay(&log) {
@@ -7944,7 +8000,7 @@ mod tests {
         assert!(world.turns.is_empty(), "no turn left in flight");
 
         // Event arm: everything the turn emitted is buffered now.
-        let first = world.core.event_rx.try_recv().expect("events buffered");
+        let first = world.event_rx.try_recv().expect("events buffered");
         assert!(drain_events(&mut world, first).0);
 
         {
@@ -8000,7 +8056,7 @@ mod tests {
     }
 
     fn lifecycle_running(world: &World) -> bool {
-        world.core.is_running(AgentId::Main)
+        world.lifecycle.is_running(AgentId::Main)
     }
 
     /// A non-empty launch prompt spawns a Main turn, so the initial
@@ -8074,12 +8130,12 @@ mod tests {
         let mut world = scripted_world(&dir, "streaming-text").await;
 
         handle_submit(&mut world, "go".to_string());
-        world.core.lifecycle.mark_running(AgentId::Sub(1));
+        world.lifecycle.mark_running(AgentId::Sub(1));
 
         let joined = world.turns.join_next().await;
         handle_turn_join(&mut world, joined).expect("turn settles cleanly");
         assert!(
-            !world.core.is_running(AgentId::Sub(1)),
+            !world.lifecycle.is_running(AgentId::Sub(1)),
             "leaked sub swept on the Main join"
         );
     }
@@ -8102,13 +8158,13 @@ mod tests {
             "explore".to_string(),
             Arc::new(NoOutput),
         );
-        world.core.lifecycle.mark_running(AgentId::Sub(1));
+        world.lifecycle.mark_running(AgentId::Sub(1));
 
         handle_submit(&mut world, "go".to_string());
         let joined = world.turns.join_next().await;
         handle_turn_join(&mut world, joined).expect("turn settles cleanly");
         assert!(
-            world.core.is_running(AgentId::Sub(1)),
+            world.lifecycle.is_running(AgentId::Sub(1)),
             "background sub spared while its task runs"
         );
 
@@ -8120,7 +8176,7 @@ mod tests {
         let joined = world.turns.join_next().await;
         handle_turn_join(&mut world, joined).expect("turn settles cleanly");
         assert!(
-            !world.core.is_running(AgentId::Sub(1)),
+            !world.lifecycle.is_running(AgentId::Sub(1)),
             "swept once the background run turned terminal"
         );
     }
@@ -8143,13 +8199,11 @@ mod tests {
         // was already queued) or by the TaskEnd trigger while draining
         // here. Loop until one of the two paths armed a turn.
         while !world.turns.is_driving(AgentId::Main) {
-            let event = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                world.core.event_rx.recv(),
-            )
-            .await
-            .expect("an event arrives before the timeout")
-            .expect("event channel open");
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(10), world.event_rx.recv())
+                    .await
+                    .expect("an event arrives before the timeout")
+                    .expect("event channel open");
             let (_, wake_targets) = drain_events(&mut world, event);
             spawn_wakes(&mut world, wake_targets);
         }
@@ -8160,7 +8214,7 @@ mod tests {
         // the TaskEnd may sit in this tail, and re-waking the idle
         // agent with no notices left would only spawn a no-op turn the
         // test would have to join.
-        while let Ok(event) = world.core.event_rx.try_recv() {
+        while let Ok(event) = world.event_rx.try_recv() {
             let _ = drain_events(&mut world, event);
         }
 
@@ -8254,13 +8308,11 @@ mod tests {
                 .any(|e| matches!(&e.kind, EntryKind::User(u) if u.joined_text() == "first"))
         };
         while !saw_prompt(&world) {
-            let event = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                world.core.event_rx.recv(),
-            )
-            .await
-            .expect("an event arrives before the timeout")
-            .expect("event channel open");
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(10), world.event_rx.recv())
+                    .await
+                    .expect("an event arrives before the timeout")
+                    .expect("event channel open");
             let _ = drain_events(&mut world, event);
         }
 
@@ -8294,7 +8346,7 @@ mod tests {
                 .is_none(),
             "queue drained by the wake",
         );
-        while let Ok(event) = world.core.event_rx.try_recv() {
+        while let Ok(event) = world.event_rx.try_recv() {
             let _ = drain_events(&mut world, event);
         }
         let chat = world.chat.borrow();
@@ -8484,7 +8536,7 @@ mod tests {
 
         let joined = world.turns.join_next().await;
         handle_turn_join(&mut world, joined).expect("turn settles");
-        let first = world.core.event_rx.try_recv().expect("events buffered");
+        let first = world.event_rx.try_recv().expect("events buffered");
         drain_events(&mut world, first);
         let chat = world.chat.borrow();
         let entries = chat
@@ -8508,7 +8560,7 @@ mod tests {
         handle_submit(&mut world, "earlier prompt".to_string());
         let joined = world.turns.join_next().await;
         handle_turn_join(&mut world, joined).expect("turn settles");
-        let first = world.core.event_rx.try_recv().expect("events buffered");
+        let first = world.event_rx.try_recv().expect("events buffered");
         drain_events(&mut world, first);
         for i in 0..40 {
             fold_notice(&mut world, &format!("historical notice {i}"));
@@ -8563,7 +8615,7 @@ mod tests {
         handle_submit(&mut world, "earlier prompt".to_string());
         let joined = world.turns.join_next().await;
         handle_turn_join(&mut world, joined).expect("turn settles");
-        let first = world.core.event_rx.try_recv().expect("events buffered");
+        let first = world.event_rx.try_recv().expect("events buffered");
         drain_events(&mut world, first);
         for i in 0..40 {
             fold_notice(&mut world, &format!("historical notice {i}"));
@@ -8608,7 +8660,7 @@ mod tests {
         handle_submit(&mut world, "earlier prompt".to_string());
         let joined = world.turns.join_next().await;
         handle_turn_join(&mut world, joined).expect("turn settles");
-        let first = world.core.event_rx.try_recv().expect("events buffered");
+        let first = world.event_rx.try_recv().expect("events buffered");
         drain_events(&mut world, first);
         for i in 0..40 {
             fold_notice(&mut world, &format!("historical notice {i}"));
@@ -8801,7 +8853,7 @@ mod tests {
         use aj_agent::message::AgentMessage;
         use aj_models::types::{Message, UserMessage};
 
-        let mut lifecycle = aj_app::session::AgentLifecycle::default();
+        let mut lifecycle = AgentLifecycle::default();
         // Seed a user message so the chat slot shows the transcript rather than
         // the empty-state splash. The notice rows below are the scroll content
         // these callers assert on.
@@ -10149,7 +10201,7 @@ mod tests {
         use aj_agent::message::AgentMessage;
         use aj_models::types::{Message, UserMessage};
 
-        let mut life = aj_app::session::AgentLifecycle::default();
+        let mut life = AgentLifecycle::default();
         let _ = reduce(
             &mut chat.borrow_mut(),
             &mut life,
@@ -10542,7 +10594,7 @@ mod tests {
         );
         // The run config staged it for the next turn.
         assert_eq!(
-            world.run_config.lock().unwrap().thinking,
+            world.core.run_config.lock().unwrap().thinking,
             Some(ThinkingConfig::High)
         );
         // Session-scoped: the user config layer's default is unchanged (still
@@ -10641,7 +10693,7 @@ mod tests {
 
         // Staged into the run config for the next turn.
         assert_eq!(
-            world.run_config.lock().unwrap().thinking,
+            world.core.run_config.lock().unwrap().thinking,
             Some(ThinkingConfig::High)
         );
         // Persisted to the tempdir user config.toml.
@@ -10913,7 +10965,7 @@ mod tests {
         for event in events {
             let _ = reduce(
                 &mut world.chat.borrow_mut(),
-                &mut world.core.lifecycle,
+                &mut world.lifecycle,
                 event,
                 None,
             );
@@ -11025,7 +11077,7 @@ mod tests {
         .await;
         let _ = reduce(
             &mut world.chat.borrow_mut(),
-            &mut world.core.lifecycle,
+            &mut world.lifecycle,
             AgentEvent::SubAgentStart {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
@@ -11100,7 +11152,7 @@ mod tests {
         // the footer settings in place, so the sub's level must survive.
         let _ = reduce(
             &mut world.chat.borrow_mut(),
-            &mut world.core.lifecycle,
+            &mut world.lifecycle,
             AgentEvent::SubAgentStart {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
@@ -11118,7 +11170,7 @@ mod tests {
         );
         let _ = reduce(
             &mut world.chat.borrow_mut(),
-            &mut world.core.lifecycle,
+            &mut world.lifecycle,
             AgentEvent::SubAgentEnd {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
@@ -11129,7 +11181,7 @@ mod tests {
         );
         let _ = reduce(
             &mut world.chat.borrow_mut(),
-            &mut world.core.lifecycle,
+            &mut world.lifecycle,
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(1),
                 messages: Vec::new(),
@@ -11179,7 +11231,7 @@ mod tests {
         // Seed an observable sub-agent to switch the view onto.
         let _ = reduce(
             &mut world.chat.borrow_mut(),
-            &mut world.core.lifecycle,
+            &mut world.lifecycle,
             AgentEvent::SubAgentStart {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
@@ -11242,7 +11294,7 @@ mod tests {
         // Observe a sub-agent so the editor carries an `agent 1` marker.
         let _ = reduce(
             &mut world.chat.borrow_mut(),
-            &mut world.core.lifecycle,
+            &mut world.lifecycle,
             AgentEvent::SubAgentStart {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
@@ -11299,7 +11351,7 @@ mod tests {
         // across the switch.
         let _ = reduce(
             &mut world.chat.borrow_mut(),
-            &mut world.core.lifecycle,
+            &mut world.lifecycle,
             AgentEvent::SubAgentStart {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
@@ -11385,7 +11437,7 @@ mod tests {
         // it.
         let _ = reduce(
             &mut world.chat.borrow_mut(),
-            &mut world.core.lifecycle,
+            &mut world.lifecycle,
             AgentEvent::SubAgentStart {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
@@ -11675,7 +11727,7 @@ mod tests {
         handle_submit(world, prompt.to_string());
         let joined = world.turns.join_next().await;
         handle_turn_join(world, joined).expect("turn settles");
-        while let Ok(event) = world.core.event_rx.try_recv() {
+        while let Ok(event) = world.event_rx.try_recv() {
             let _ = drain_events(world, event);
         }
     }

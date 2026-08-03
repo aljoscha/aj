@@ -143,7 +143,15 @@ pub fn build_test_agent(
     let spec = SessionSpec::Create {
         entry: SessionEntry::Startup,
     };
-    let (core, _seed) = SessionCore::build(&config, run_config, persistence, &spec, None)
+    // The core owns its own run config (one per session), so the shared
+    // fixture is cloned in rather than handed over. Tests that stage a
+    // change through `run_config` after this therefore need
+    // `core.run_config`, not the fixture.
+    let snapshot = run_config
+        .lock()
+        .expect("run config mutex poisoned")
+        .clone();
+    let (core, _seed) = SessionCore::build(&config, snapshot, persistence, &spec, None)
         .expect("build session core");
     core.into_test_agent()
 }

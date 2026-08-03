@@ -61,6 +61,17 @@ use crate::model::{ModelSelection, ResolvedModel};
 /// catalog's inputs, are deliberately not copied in. The interactive
 /// turn reads those from the effective config itself, so a settings
 /// change cannot leave a stale copy behind here.
+///
+/// One of these belongs to exactly one session. A process serving
+/// several live sessions clones its process-wide default per session
+/// (see [`SessionCore::build`]), because the fields below are mutated
+/// per session: the log stamps `session_id` on it, and a resume
+/// overwrites the whole model bundle from the log's record. A shared
+/// snapshot would cross-contaminate prompt-cache keys and model
+/// selection between sessions.
+///
+/// [`SessionCore::build`]: crate::session::SessionCore::build
+#[derive(Clone)]
 pub struct RunConfigSnapshot {
     /// Provider handle the next turn streams against.
     pub provider: Arc<dyn Provider>,
