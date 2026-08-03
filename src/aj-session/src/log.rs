@@ -21,8 +21,7 @@
 //! helpers (`last_message`, `messages`, etc.) the binary uses to
 //! decide thinking efforts and resume state.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::{LazyLock, Mutex};
+use std::collections::{BTreeSet, HashMap};
 use std::{
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Read, Write},
@@ -37,16 +36,6 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::tool_details::{compact_message, expand_message};
-
-/// Session paths this process has minted, so two [`ConversationLog::create`]
-/// calls in the same millisecond cannot pick the same one.
-///
-/// The filesystem check alone cannot see the collision: `create` is lazy,
-/// so a just-minted path has no file until the session's first punctuation
-/// append. Entries are never removed. A minted id costs a short string,
-/// and reusing one has no upside.
-static MINTED_PATHS: LazyLock<Mutex<HashSet<PathBuf>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 #[derive(Debug, Error)]
 pub enum ConversationError {
@@ -772,22 +761,32 @@ impl ConversationLog {
         sessions_dir: &std::path::Path,
         base: &str,
     ) -> Result<(String, PathBuf), ConversationError> {
-        // Hold the reservation across the existence checks so two threads
-        // minting from the same base cannot both pass them.
-        let mut reserved = MINTED_PATHS.lock().expect("minted paths mutex poisoned");
-        let mut take = |stem: &str| -> Option<(String, PathBuf)> {
+        // The reservation has to be an atomic filesystem operation. A
+        // plain existence check cannot see a competing `create`, because
+        // `create` writes nothing: the log file appears only on the first
+        // punctuation append, so two processes minting in the same
+        // millisecond would both find the path free and then share one
+        // session. Claiming the id by `create_new` on its lock-file path
+        // is atomic, and it composes with the later lock:
+        // [`SessionLock::try_acquire`] opens that path with `create(true)`,
+        // so the claim file it finds is the one this minted. An abandoned
+        // claim leaves an empty lock file and nothing else.
+        let take = |stem: &str| -> Result<Option<(String, PathBuf)>, ConversationError> {
             let candidate = sessions_dir.join(format!("{stem}.jsonl"));
-            let free = !candidate.exists() && !reserved.contains(&candidate);
-            free.then(|| {
-                reserved.insert(candidate.clone());
-                (stem.to_string(), candidate)
-            })
+            if candidate.exists() {
+                return Ok(None);
+            }
+            match crate::lock::claim_session_id(sessions_dir, stem) {
+                Ok(()) => Ok(Some((stem.to_string(), candidate))),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+                Err(err) => Err(ConversationError::Io(err)),
+            }
         };
-        if let Some(minted) = take(base) {
+        if let Some(minted) = take(base)? {
             return Ok(minted);
         }
         for n in 1..1000 {
-            if let Some(minted) = take(&format!("{base}_{n}")) {
+            if let Some(minted) = take(&format!("{base}_{n}"))? {
                 return Ok(minted);
             }
         }
@@ -1782,6 +1781,53 @@ mod tests {
             ConversationLog::resume(&persistence, &session_id).expect("resume repaired log");
         assert_eq!(resumed_again.core.order.len(), 3);
         assert_eq!(resumed_again.core.entries.len(), 3);
+    }
+
+    /// `create` has to reserve its id with an atomic filesystem
+    /// operation. Nothing is written to the log file until the first
+    /// punctuation append, so an existence check cannot see a competing
+    /// create, and two sessions minted in the same millisecond would
+    /// otherwise share one file.
+    #[test]
+    fn create_mints_distinct_ids_and_claims_them_on_disk() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.clone());
+
+        let logs: Vec<ConversationLog> = (0..12)
+            .map(|_| ConversationLog::create(&persistence).expect("create log"))
+            .collect();
+        let ids: std::collections::HashSet<&str> =
+            logs.iter().map(|log| log.session_id()).collect();
+        assert_eq!(ids.len(), logs.len(), "every create minted its own id");
+
+        for log in &logs {
+            assert!(
+                !log.path().exists(),
+                "no log file until the first punctuation append"
+            );
+            assert!(
+                crate::lock::lock_path(&dir, log.session_id()).exists(),
+                "the claim is visible on the filesystem"
+            );
+        }
+    }
+
+    /// NOTE: this covers the cross-process hazard only as far as one
+    /// process can. `create_new` is atomic across processes by
+    /// definition, so an in-process assertion that a claimed id is
+    /// refused is the honest test of it. Spawning a second aj process
+    /// from a unit test would buy nothing beyond the same syscall.
+    #[test]
+    fn create_never_reuses_a_claimed_id() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.clone());
+        let first = ConversationLog::create(&persistence).expect("create log");
+
+        let claimed = first.session_id().to_string();
+        let (minted, _) = ConversationLog::mint_unique_path(&dir, &claimed)
+            .expect("minting near a claimed base succeeds");
+        assert_ne!(minted, claimed, "the claimed id is refused");
+        assert_eq!(minted, format!("{claimed}_1"), "and the next one is taken");
     }
 
     #[test]
