@@ -60,13 +60,20 @@ pub(crate) struct SessionStatus {
     ///
     /// Monotone: it only ever grows, because a sub-agent id is minted once
     /// per session. A backfill's `live_subs` is derived from it as "in the
-    /// log and not in here", which is what puts the lag in the safe
-    /// direction. The alternative, tracking the live set directly, lags the
-    /// log: a spawn root reaches disk several bus emits before the host
-    /// consumes the `AgentStart` that would record the run as live, and a
-    /// backfill served in that window would fabricate a conclusion for a
-    /// sub-agent that is still running (spec 6.5).
+    /// log and not in here", plus [`Self::driven_subs`], which is what puts
+    /// the lag in the safe direction. The alternative, tracking the live set
+    /// directly, lags the log: a spawn root reaches disk several bus emits
+    /// before the host consumes the `AgentStart` that would record the run as
+    /// live, and a backfill served in that window would fabricate a
+    /// conclusion for a sub-agent that is still running (spec 6.5).
     pub(crate) finished_subs: BTreeSet<usize>,
+    /// The sub-agents the host is driving a turn for.
+    ///
+    /// A continuation prompt re-opens the run of a sub-agent that already
+    /// finished, and `finished_subs` is monotone, so this is what says "live
+    /// again". It is recorded before the turn's task exists, so no append of
+    /// the new run can land while the run still reads as finished.
+    pub(crate) driven_subs: BTreeSet<usize>,
     pub(crate) last_activity: DateTime<Utc>,
 }
 

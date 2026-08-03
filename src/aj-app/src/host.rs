@@ -799,6 +799,7 @@ impl SessionHost {
             // brackets of runs this host starts open (see
             // `SessionStatus::finished_subs`).
             finished_subs: log.sub_agent_ids(),
+            driven_subs: std::collections::BTreeSet::new(),
             last_activity: Utc::now(),
         };
         drop(log);
@@ -853,7 +854,7 @@ impl SessionHost {
         // The snapshot and the epoch are read under the log lock, because a
         // head switch moves both under it: reading them separately could
         // pair the old projection with the new epoch.
-        let (snapshot, epoch, working_seen, settings_seen, finished_subs) = {
+        let (snapshot, epoch, working_seen, settings_seen, finished_subs, driven_subs) = {
             let log = session.core.log.lock().await;
             let status = session.status();
             (
@@ -862,6 +863,7 @@ impl SessionHost {
                 status.working,
                 status.settings.clone(),
                 status.finished_subs.clone(),
+                status.driven_subs.clone(),
             )
         };
         let boundary = snapshot.last_seq();
@@ -870,8 +872,9 @@ impl SessionHost {
             .as_ref()
             .filter(|cursor| cursor.epoch == epoch)
             .map(|cursor| cursor.seq);
-        // A run the log names and the host has not seen finish is live, so
-        // its bracket stays open. Deriving it this way rather than tracking
+        // A run is live if the log names it and the host has not seen it
+        // finish, or if the host is driving a turn for it (a continuation of
+        // a run that did finish). Deriving it this way rather than tracking
         // the live set keeps the one unavoidable lag (a spawn root reaches
         // disk before the host consumes the run's `AgentStart`) on the safe
         // side: the worst case is a bracket left open a moment too long,
@@ -881,6 +884,7 @@ impl SessionHost {
             .sub_agent_ids()
             .difference(&finished_subs)
             .copied()
+            .chain(driven_subs)
             .collect();
         // Projected outside the log lock: a full backfill walks the whole
         // log, and holding the lock would stall the session's next append

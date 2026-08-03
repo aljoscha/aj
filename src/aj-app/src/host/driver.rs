@@ -195,6 +195,22 @@ impl Driver {
         }
     }
 
+    /// Record whether the host is driving a turn for sub-agent `agent`.
+    ///
+    /// Called on both sides of a spawn, and at reap. A continuation of a
+    /// finished sub-agent starts appending to its thread as soon as its task
+    /// runs, so the record has to exist before the spawn, and has to go away
+    /// again when the spawn did not take.
+    fn note_driven(&self, agent: AgentId, driven: bool) {
+        let AgentId::Sub(n) = agent else { return };
+        let mut status = self.session.status();
+        if driven {
+            status.driven_subs.insert(n);
+        } else {
+            status.driven_subs.remove(&n);
+        }
+    }
+
     /// Handle one completed turn: reap, conclude the sub-agent boxes the
     /// reap swept, wake on queued work, and surface the outcome.
     fn on_join(&mut self, joined: Joined) {
@@ -204,6 +220,7 @@ impl Driver {
             .reap(&mut self.lifecycle, &self.session.core.task_registry, agent)
         {
             self.note_finished(idled);
+            self.note_driven(idled, false);
             // A sub the reap swept emitted no `AgentEnd` of its own, and a
             // remote client cannot conclude its box by reaching into the
             // model the way the local frontend does, so the conclusion
@@ -279,12 +296,16 @@ impl Driver {
     }
 
     fn wake(&mut self, owner: AgentId) {
+        self.note_driven(owner, true);
         self.turns.spawn_wake(
             owner,
             &self.session.core,
             &self.lifecycle,
             &self.shared.config,
         );
+        // The wake is a no-op for a busy owner and refused for one with no
+        // live handle, so what was actually spawned decides.
+        self.note_driven(owner, self.turns.is_driving(owner));
         self.refresh_state();
     }
 
@@ -527,10 +548,15 @@ impl Driver {
     }
 
     fn spawn(&mut self, agent: AgentId, start: TurnStart) -> Result<CommandOutcome, HostError> {
+        // Before the spawn: a sub-agent's turn task can append to its thread
+        // as soon as it runs, and a backfill in between has to see the run as
+        // live rather than as the finished one it continues.
+        self.note_driven(agent, true);
         if !self
             .turns
             .spawn(&self.session.core, &self.shared.config, agent, start)
         {
+            self.note_driven(agent, false);
             return Err(HostError::Conflict {
                 reason: format!("{agent:?} has no live handle and cannot be prompted"),
             });

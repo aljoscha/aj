@@ -2440,6 +2440,93 @@ async fn attaching_as_a_sub_agent_spawns_never_concludes_it() {
     harness.host.shutdown().await;
 }
 
+/// A sub-agent continuation re-opens a run the host already saw finish, so a
+/// backfill served during it must leave that bracket open again.
+///
+/// The record of finished runs is monotone (an id is minted once per
+/// session), so it cannot say this on its own: what the host is driving a
+/// turn for is the other half, recorded before the turn's task exists so no
+/// append of the new run can land while the run still reads as finished.
+#[tokio::test]
+async fn attaching_during_a_sub_agent_continuation_leaves_its_bracket_open() {
+    let mut script = sub_agent_turn();
+    script.push(finalized_text_message(
+        "still here, and taking my time about it",
+    ));
+    let harness = Harness::with_provider(scripted(script, 1, Duration::from_millis(20)));
+    let session = harness.create().await;
+    let mut warm = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "delegate it").await;
+    warm.pump_until_idle().await;
+    assert_ne!(
+        sub_box(&warm.canonical(), 1).0,
+        aj_app::chat::SubAgentStatus::Running,
+        "the first run concluded",
+    );
+
+    // The command returns once the driver has accepted it, so the run is
+    // recorded as driven by the time the attach below is served.
+    harness
+        .host
+        .command(
+            &session,
+            Command::Prompt {
+                agent: AgentId::Sub(1),
+                content: vec![UserContent::text("keep going")],
+            },
+        )
+        .await
+        .expect("a retained sub-agent can be prompted again");
+
+    let mut joiner = harness
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+    let block = frames_until(&mut joiner, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+    let concluded = |frames: &[Frame]| {
+        events(frames).into_iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::AgentEnd {
+                    agent_id: AgentId::Sub(1),
+                    ..
+                }
+            ) || matches!(
+                event,
+                AgentEvent::SubAgentEnd {
+                    child: AgentId::Sub(1),
+                    ..
+                }
+            )
+        })
+    };
+    assert!(
+        !concluded(&block),
+        "the continuation's bracket stays open: {:?}",
+        events(&block)
+            .into_iter()
+            .map(event_kind)
+            .collect::<Vec<_>>(),
+    );
+
+    // The real conclusion arriving after the block is what proves the run
+    // was still live while the block was written.
+    let after = frames_until(&mut joiner, "the continuation to conclude", |frame| {
+        matches!(frame, Frame::Event { event, .. }
+            if matches!(event.known(), Some(AgentEvent::AgentEnd { agent_id: AgentId::Sub(1), .. })))
+    })
+    .await;
+    assert!(concluded(&after));
+    harness.host.shutdown().await;
+}
+
 /// A resumed session's sub-agent boxes are still concluded: nothing runs at
 /// materialization, so every run the log names has finished, which is what
 /// the host seeds its record of finished runs with.
