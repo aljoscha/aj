@@ -164,8 +164,12 @@ Responsibilities:
   to a known-on-disk session), keep live, tear down cleanly on
   shutdown. Idle eviction is out of scope for v1, sessions stay live
   until the host exits.
-- Single-writer safety: materializing a session takes an advisory
-  lock on its log file, released on teardown. A second process (host
+- Single-writer safety: materializing a session takes an advisory lock
+  on the session, held in a lock file beside the log (the log itself is
+  created lazily, so there is not always a file to lock), released on
+  teardown. The lock is taken before anything reads or repairs the log,
+  because resume truncates a torn tail and repair appends tool results,
+  so a refused materialization must not have touched the file. A second process (host
   or plain interactive aj) that hits the lock refuses to materialize
   that session (surfaced as a 409 over the wire). This is what keeps
   `aj --listen` and a gateway-spawned `aj serve` in the same directory
@@ -247,8 +251,10 @@ idle. Clients treat a silent stream (no frame for ~60s) as dead and
 reconnect with backoff.
 
 Error responses carry `{code, message}`. The vocabulary: 400 malformed
-request, 404 unknown session/task/entry, 409 conflict (busy refusal,
-lock conflict), 503 upstream host unreachable (gateway only).
+request, 404 unknown session/task/entry, 409 conflict (busy refusal, lock
+conflict, or a request the host cannot serve such as a model it has no
+credentials for), 500 the host failed internally, 503 upstream host
+unreachable (gateway only).
 
 ### 6.2 Sessions and addressing
 
@@ -540,8 +546,10 @@ needs on demand:
 - `GET /v1/sessions` — the same payload as a `list` frame. Includes
   every session of the host's working directory, on-disk ones as well
   as live ones, with a liveness flag. Attaching or commanding a
-  non-live session materializes it (lock permitting). This is the
-  discovery surface, there is no separate on-disk listing.
+  non-live session materializes it (lock permitting). A read never
+  does, with one exception: the tree read has to parse the log, so it
+  materializes like a command. This is the discovery surface, there is
+  no separate on-disk listing.
 - `GET /v1/sessions/{id}/tasks` — background task table
   (`TaskRegistry` snapshot, with wall-clock timestamps in the wire
   model, the in-memory form uses `Instant`). Clients replace their
@@ -561,7 +569,10 @@ Per-session status in `list` frames and `GET /v1/sessions`:
   background sub-agents surface through `tasks`, not here.
 - `queued`: counts of pending steering / follow-up messages.
 - `tasks`: count of live background tasks.
-- `last_seq` and a last-activity timestamp.
+- `last_seq` and a last-activity timestamp. For a session that is not
+  live, `last_seq` is derived from the store rather than reported as
+  zero, otherwise the unseen-output glyph below could never fire for a
+  session the client has not attached, which is most of them.
 - `unreachable` (gateway only): the owning host connection is down.
 
 There is deliberately no "needs attention" bit on the server. A client
@@ -592,8 +603,16 @@ never be silently dropped for a connected client.
   that client. Eviction over buffering, as in Shelley. Recovery is the
   ordinary re-attach with cursor plus reconciliation (section 6.5),
   which is exactly what makes eviction safe.
-- On the bus side the host subscribes via channels (never inline
-  listeners) so network activity cannot stall or fail a turn.
+- The fan-out consumes a channel, never the bus directly, so network
+  activity cannot stall or fail a turn. The one inline bus listener is
+  the persisting forwarder, which has to be inline: it tags a durable
+  event at the append site and hands it on while the append still holds
+  the log, which is what makes seqs monotone (section 6.4). Its send is
+  non-blocking and a closed receiver is ignored, and **that channel must
+  stay unbounded**. Bounding it would put a blocking send under the log
+  lock and stall every append in the session, which is exactly what this
+  rule exists to prevent. Flow control belongs on the per-client queues,
+  downstream of the fan-out.
 
 ### 6.10 Compatibility
 
