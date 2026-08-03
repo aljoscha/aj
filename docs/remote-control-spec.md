@@ -263,18 +263,24 @@ internally tagged with `kind`:
   cursor semantics apply regardless of whether the nested event type
   is known.
 - `state`: `{kind, session, epoch, working, settings, last_seq}`.
-  Structured per-session state: whether a turn is in flight, the
-  active settings (model identity, thinking, speed, verbosity), and
-  the current durable high-water mark. Sent at the start of an attach
-  (before backfill) and whenever any of it changes. This is how a
-  mid-session joiner learns the active model and seeds its lifecycle
-  spinner, neither of which is derivable from projected events.
-  `working` here is a seed: after the attach block, live lifecycle
-  events are authoritative for the spinner, and the on-change
-  re-emission of `state` self-heals any race between the seed and
-  lifecycle frames already in flight.
+  Structured per-session state: whether the session's **main agent** has
+  a turn in flight, the active settings (model identity, thinking, speed,
+  verbosity), and the current durable high-water mark. Sent at the start
+  of an attach (before backfill) and whenever any of it changes. This is
+  how a mid-session joiner learns the active model and seeds its
+  lifecycle spinner, neither of which is derivable from projected events.
+  `working` is authoritative for the main agent and applies on every
+  `state` frame, which is what self-heals a spinner left running by an
+  `AgentEnd` a client missed. It says nothing about sub-agents: their
+  liveness comes from lifecycle events, from the sub boxes in the
+  transcript, and from the host concluding known-idle subs after
+  `caught_up`. Scoping it to the main agent is what keeps an on-change
+  re-emission from clearing a running background sub-agent's mark, which
+  a single session-wide bool would do.
 - `caught_up`: `{kind, session, epoch, last_seq}`. Ends a backfill
-  (section 6.5).
+  (section 6.5). Only meaningful inside an attach block the client
+  requested: a client must not commit a cursor from a `caught_up` it did
+  not ask for, or it would claim entries it never applied.
 - `list`: `{kind, sessions: [...]}`. The full session list with
   per-session status (section 6.8). Cumulative, the latest frame
   supersedes all earlier ones.
@@ -478,7 +484,8 @@ Client application rules:
   identity on the event itself, so the client hands the frame's
   `entry_id` to its reducer. (This is a deliberate hardening of the
   reducer, which today appends unconditionally.) After `caught_up` the
-  client refetches the task table (section 6.7), because task events are not
+  client refetches the task table and the pending-message queues
+  (section 6.7), because neither task events nor queue updates are
   replayable. A client may instead discard the session's state and
   rebuild from a full backfill, which must produce the same result,
   and is the natural choice when it has no state yet.
@@ -536,7 +543,8 @@ needs on demand:
 Per-session status in `list` frames and `GET /v1/sessions`:
 
 - `live`: materialized in the host, vs on-disk only.
-- `working`: a turn is in flight.
+- `working`: the main agent has a turn in flight (section 6.3). Live
+  background sub-agents surface through `tasks`, not here.
 - `queued`: counts of pending steering / follow-up messages.
 - `tasks`: count of live background tasks.
 - `last_seq` and a last-activity timestamp.
