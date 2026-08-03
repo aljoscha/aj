@@ -3354,8 +3354,13 @@ async fn reads_do_not_materialize_a_cold_session() {
 // ---------------------------------------------------------------------------
 
 /// Shutdown cancels a running turn through the graceful path, so the
-/// transcript keeps its synthetic aborted `MessageEnd`, flushes buffered
-/// log writes, and releases the session lock.
+/// transcript keeps its synthetic aborted `MessageEnd`, and releases the
+/// session lock.
+///
+/// The buffered records asserted on below reached disk because the turn's
+/// own punctuating append drained them, not because teardown flushed: a
+/// record that nothing punctuates is covered where teardown is the only
+/// thing that can force it out.
 #[tokio::test]
 async fn shutdown_cancels_gracefully_and_flushes() {
     let harness = Harness::with_provider(scripted(
@@ -3445,6 +3450,69 @@ async fn shutdown_cancels_gracefully_and_flushes() {
         .expect("try_acquire")
         .expect("shutdown released the session lock");
     drop(reacquired);
+}
+
+/// Teardown flushes a log entry that nothing else would force out.
+///
+/// Non-punctuation entries (settings records, spawn roots) buffer in memory
+/// until the next punctuating append drains them, so a settings change with
+/// no prompt behind it is only on disk because shutdown flushed it. The
+/// prompt first is what materializes the file at all: the flush is a no-op
+/// while the log has none, which is what keeps an abandoned empty session
+/// from leaving one behind.
+#[tokio::test]
+async fn shutdown_flushes_a_settings_record_nothing_punctuates() {
+    let harness = Harness::new(vec![finalized_text_message("on the record")]);
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+    client.pump_until_idle().await;
+
+    harness
+        .host
+        .command(
+            &session,
+            Command::Settings(SettingsChange {
+                agent: AgentId::Main,
+                persist: PersistAction::None,
+                axis: SettingsAxis::Thinking(Some(aj_models::ThinkingConfig::High)),
+            }),
+        )
+        .await
+        .expect("thinking change");
+    // The record is in the log's memory and nowhere else: the change
+    // appended no message behind it.
+    let levels_before = thinking_levels_on_disk(&harness, &session);
+    assert!(
+        !levels_before.iter().any(|level| level == "high"),
+        "the settings record is still buffered: {levels_before:?}",
+    );
+    drop(client);
+
+    harness.host.shutdown().await;
+
+    let levels = thinking_levels_on_disk(&harness, &session);
+    assert_eq!(
+        levels.last().map(String::as_str),
+        Some("high"),
+        "teardown flushed the buffered settings record: {levels:?}",
+    );
+}
+
+/// Every thinking level recorded in the session's log **file**, in append
+/// order. Read off disk rather than through the live log, which answers from
+/// memory whether or not the entry was flushed.
+fn thinking_levels_on_disk(harness: &Harness, session: &str) -> Vec<String> {
+    let path = harness
+        .persistence
+        .sessions_dir()
+        .join(format!("{session}.jsonl"));
+    let raw = std::fs::read_to_string(&path).unwrap_or_default();
+    raw.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|entry| entry["type"] == "thinking_change")
+        .filter_map(|entry| entry["level"].as_str().map(str::to_string))
+        .collect()
 }
 
 /// The frames a cancelled turn publishes still bracket the transcript: the
