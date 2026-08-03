@@ -11,22 +11,43 @@ use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
+/// Where this run's log output goes.
 enum LogDestination<W> {
     Stderr,
     File(W),
+    /// Logs are dropped on the floor.
+    Discard,
 }
 
-fn select_log_destination<W, E>(
-    path: Option<&std::ffi::OsStr>,
-    open: impl FnOnce(&std::ffi::OsStr) -> Result<W, E>,
+/// Picks the log destination, opening `path` with `open` when one is given.
+///
+/// An interactive run must never write to the terminal: the TUI renders to the
+/// same tty, so log lines punch holes in the alt screen. So when we cannot open
+/// a log file there we discard the logs instead of falling back to stderr. The
+/// returned error is the caller's to report, before the TUI takes over.
+fn select_log_destination<P, W, E>(
+    path: Option<P>,
+    interactive: bool,
+    open: impl FnOnce(P) -> Result<W, E>,
 ) -> (LogDestination<W>, Option<E>) {
+    let fallback = if interactive {
+        LogDestination::Discard
+    } else {
+        LogDestination::Stderr
+    };
     let Some(path) = path else {
-        return (LogDestination::Stderr, None);
+        return (fallback, None);
     };
     match open(path) {
         Ok(writer) => (LogDestination::File(writer), None),
-        Err(error) => (LogDestination::Stderr, Some(error)),
+        Err(error) => (fallback, Some(error)),
     }
+}
+
+/// Whether `args` starts the interactive TUI, as opposed to print mode or a
+/// one-shot subcommand.
+fn is_interactive(args: &Args) -> bool {
+    !args.print && matches!(args.command, None | Some(Command::Continue { .. }))
 }
 
 mod agent_picker;
@@ -73,18 +94,38 @@ async fn main() -> Result<()> {
     }
     dotenv::dotenv().ok();
 
-    // Logs go to stderr by default. Set `AJ_LOG_FILE` to redirect them to a
-    // file instead (appended, without ANSI colors), which keeps the
-    // interactive TUI from fighting with log output over the terminal.
-    let log_path = std::env::var_os("AJ_LOG_FILE");
-    let (destination, open_error) = select_log_destination(log_path.as_deref(), |path| {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-    });
+    // Logs never share the terminal with the interactive TUI: an interactive
+    // run writes them to `AJ_LOG_FILE`, or to `~/.aj/logs/aj.log`. Print mode
+    // and the one-shot subcommands keep stderr, which is the CLI convention.
+    // Nothing is emitted at all unless `RUST_LOG` is set, since an empty
+    // `EnvFilter` enables no callsites.
+    let args = Args::parse();
+    let interactive = is_interactive(&args);
+    let log_path = match std::env::var_os("AJ_LOG_FILE") {
+        Some(path) => Some(std::path::PathBuf::from(path)),
+        None if interactive => match Config::log_file_path() {
+            Ok(path) => Some(path),
+            Err(error) => {
+                eprintln!("aj: warning: could not resolve the log file; logs disabled: {error}");
+                None
+            }
+        },
+        None => None,
+    };
+    let (destination, open_error) =
+        select_log_destination(log_path.as_deref(), interactive, |path| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+        });
     if let Some(error) = open_error {
-        eprintln!("aj: warning: could not open AJ_LOG_FILE; logging to stderr: {error}");
+        let fallback = if interactive {
+            "logs disabled"
+        } else {
+            "logging to stderr"
+        };
+        eprintln!("aj: warning: could not open the log file; {fallback}: {error}");
     }
     let builder = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env());
     match destination {
@@ -95,9 +136,8 @@ async fn main() -> Result<()> {
                 .init();
         }
         LogDestination::Stderr => builder.with_ansi(true).init(),
+        LogDestination::Discard => builder.with_writer(std::io::sink).init(),
     }
-
-    let args = Args::parse();
 
     match args.command {
         Some(Command::UpdateModels) => aj_app::handle_update_models_command().await,
@@ -112,31 +152,68 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod startup_tests {
-    use std::ffi::OsStr;
+    use std::path::Path;
 
-    use super::{LogDestination, select_log_destination};
+    use aj_app::cli::args::Args;
+    use clap::Parser;
+
+    use super::{LogDestination, is_interactive, select_log_destination};
 
     #[test]
-    fn logging_defaults_to_stderr_without_a_path() {
-        let (destination, error) = select_log_destination::<(), ()>(None, |_| unreachable!());
+    fn logging_defaults_to_stderr_for_non_interactive_runs() {
+        let (destination, error) =
+            select_log_destination::<&Path, (), ()>(None, false, |_| unreachable!());
         assert!(matches!(destination, LogDestination::Stderr));
+        assert!(error.is_none());
+    }
+
+    #[test]
+    fn interactive_logging_is_discarded_without_a_path() {
+        let (destination, error) =
+            select_log_destination::<&Path, (), ()>(None, true, |_| unreachable!());
+        assert!(matches!(destination, LogDestination::Discard));
         assert!(error.is_none());
     }
 
     #[test]
     fn logging_falls_back_to_stderr_when_logfile_open_fails() {
         let (destination, error) =
-            select_log_destination(Some(OsStr::new("bad.log")), |_| Err::<(), _>("open failed"));
+            select_log_destination(Some(Path::new("bad.log")), false, |_| {
+                Err::<(), _>("open failed")
+            });
         assert!(matches!(destination, LogDestination::Stderr));
+        assert_eq!(error, Some("open failed"));
+    }
+
+    #[test]
+    fn interactive_logging_never_falls_back_to_the_terminal() {
+        let (destination, error) = select_log_destination(Some(Path::new("bad.log")), true, |_| {
+            Err::<(), _>("open failed")
+        });
+        assert!(matches!(destination, LogDestination::Discard));
         assert_eq!(error, Some("open failed"));
     }
 
     #[test]
     fn logging_uses_an_opened_logfile() {
         let (destination, error) =
-            select_log_destination(Some(OsStr::new("aj.log")), |_| Ok::<_, ()>(7));
+            select_log_destination(Some(Path::new("aj.log")), true, |_| Ok::<_, ()>(7));
         assert!(matches!(destination, LogDestination::File(7)));
         assert!(error.is_none());
+    }
+
+    fn args_of(argv: &[&str]) -> Args {
+        Args::try_parse_from(argv).expect("parses")
+    }
+
+    #[test]
+    fn only_the_tui_modes_count_as_interactive() {
+        assert!(is_interactive(&args_of(&["aj"])));
+        assert!(is_interactive(&args_of(&["aj", "continue"])));
+        assert!(is_interactive(&args_of(&["aj", "continue", "abc"])));
+        assert!(!is_interactive(&args_of(&["aj", "--print", "hello"])));
+        assert!(!is_interactive(&args_of(&["aj", "list-sessions"])));
+        assert!(!is_interactive(&args_of(&["aj", "update-models"])));
     }
 }
 

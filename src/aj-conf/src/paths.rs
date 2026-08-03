@@ -190,6 +190,20 @@ impl Config {
         }
     }
 
+    /// Path to the default log file `~/.aj/logs/aj.log`, creating
+    /// `~/.aj/logs` if needed. Does not create the file itself.
+    ///
+    /// Concurrent `aj` processes append to this same file. Log lines stay
+    /// intact because each event is written in one append, but lines from
+    /// different processes interleave.
+    pub fn log_file_path() -> Result<PathBuf, ConfigError> {
+        let logs_dir = Self::get_config_dir()?.join("logs");
+        if !logs_dir.exists() {
+            fs::create_dir_all(&logs_dir)?;
+        }
+        Ok(logs_dir.join("aj.log"))
+    }
+
     /// Path to the base directory holding every project's sessions
     /// subdirectory: `~/.aj/sessions`. Each immediate subdirectory is
     /// one project (named via `path_to_dir_name`). The prompt-history
