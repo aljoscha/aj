@@ -298,14 +298,27 @@ Every frame is in exactly one class:
 
 - **Durable** event frames correspond to persisted log entries: the
   `MessageEnd` that triggers persistence, the `SubAgentStart` that
-  writes the spawn root, and the events the projection derives from
-  settings and compaction entries (which the host synthesizes live,
-  since no bus event exists for them). Durable frames carry `seq` (the
-  entry's append index) and `entry_id`. They are exactly what backfill
-  can regenerate. Seqs are strictly monotone per session but **not
-  contiguous**: some entries project no event (system-prompt roots,
-  seed settings). Clients must not do gap detection on seq, continuity
-  comes from the stream being FIFO plus explicit `reset` signals.
+  writes the spawn root, the `CompactionEnd` whose checkpoint entry the
+  compaction path appends itself, and the notices the projection derives
+  from settings entries (which the host synthesizes live, since no bus
+  event exists for those). Durable frames carry `seq` (the entry's
+  1-based append position, so `0` reads as "nothing durable yet") and
+  `entry_id`. They are exactly what backfill can regenerate. Seqs are
+  strictly monotone per session but **not contiguous**: some entries
+  project no event (system-prompt roots, seed settings). Clients must
+  not do gap detection on seq, continuity comes from the stream being
+  FIFO plus explicit `reset` signals.
+
+  At most one frame per log entry is durable. An entry can project
+  several events (a tool-result entry projects a tool bracket around its
+  `MessageEnd`, an assistant entry projects a trailing `UsageUpdate`) and
+  only one of them carries the tag, in both live flow and backfill, so
+  that "the cursor is at seq N" stays a statement about entries.
+
+  An entry whose event the host emits itself, rather than deriving it
+  from the bus, must be tagged at the append site and reach the fan-out
+  while the append still holds the log, otherwise a concurrent
+  sub-agent append lands in between and the seqs stop being monotone.
 - **Lossy** frames are the three cumulative-snapshot events:
   `MessageUpdate` (keyed by agent id), `ToolExecutionUpdate` (keyed by
   call id), `TaskOutput` (keyed by task id), plus the `list`, `state`,
@@ -327,9 +340,17 @@ Every frame is in exactly one class:
 
 Per session the host maintains:
 
-- **seq**: section 6.4. The client's cursor is the last durable seq it
-  has **applied**. A `last_seq` merely observed in `list` frames for a
-  session the client never attached is glyph data, never a cursor,
+- **seq**: section 6.4. The client tracks two positions: the last durable
+  seq it has **applied**, which is what the cursor invariant below
+  compares against, and the last it has **committed**, which is what it
+  offers on re-attach. An applied seq is committed once a later durable
+  frame or a `caught_up` arrives, because a log entry can project a
+  trailing untagged event (an assistant entry's `UsageUpdate`) and a
+  connection that drops in between would otherwise leave the client
+  claiming an entry it only partly applied. Offering an older cursor is
+  always safe: the server serves one more entry and idempotent
+  application absorbs it. A `last_seq` merely observed in `list` frames
+  for a session the client never attached is glyph data, never a cursor,
   offering it would silently skip that session's entire history.
 - **epoch**: an opaque token minted fresh every time a session is
   materialized, and replaced whenever the linearized history changes
@@ -373,9 +394,17 @@ Backfill projection rules, which differ from dead-log replay:
 - The host projects from the full log so server-side context (tool
   name maps, usage running totals) is complete, and emits only events
   for entries after the cursor.
-- Open sub-agent brackets are **not** force-closed at end of log (that
-  heuristic is for dead logs). The real `SubAgentEnd` arrives live
-  later.
+- A **running** sub-agent's bracket is never force-closed, at the cursor
+  boundary or at end of log. The real `SubAgentEnd` arrives live later.
+  A **finished** sub-agent's bracket still is, because a sub-agent's
+  conclusion is not persisted and reconstructing it from the run's last
+  assistant message is the only way a finished box gets concluded from a
+  log at all. The host therefore tells the projection which sub-agents
+  are still running. A sub-agent whose bracket the projection leaves
+  open because it is running is not concluded; every other sub-agent the
+  host knows to be idle is concluded after `caught_up`, which is what
+  unwedges a box whose `SubAgentEnd` fell into a client's disconnected
+  window even when no durable entry follows its cursor.
 - A sub-agent thread that is open at the cursor boundary gets its
   `SubAgentStart` re-synthesized so the suffix is well-bracketed.
   Synthesized bracketing frames carry no `seq` or `entry_id` (their
@@ -383,6 +412,10 @@ Backfill projection rules, which differ from dead-log replay:
   make the cursor invariant drop them). They are bracketing glue: the
   client ensures the sub's box exists, reusing it when it already
   does.
+- Background sub-agents interleave with their parent, so bracket state
+  is per run. Closing a run because the next entry belongs to another
+  agent would fabricate a conclusion for a live sub and re-open its
+  bracket without its task or settings.
 - Within a backfill, event order follows the projection (thread
   bracketing), not global seq order. The client treats the backfill
   block atomically: it advances its cursor to `caught_up.last_seq`
@@ -402,16 +435,22 @@ Client application rules:
   client drops any frame whose epoch differs from the session's
   current one. This is what keeps a stale in-flight frame from an
   abandoned branch out of the new branch's transcript.
-- **Cursor invariant**: within an epoch, a durable frame with
-  `seq <= cursor` is always dropped as a duplicate, at any time, not
-  just during a specific phase.
+- **Cursor invariant**: within an epoch, a durable frame whose seq is at
+  or below the last applied seq is always dropped as a duplicate, at any
+  time, not just during a specific phase.
 - **Re-attach reconciliation**: when a client re-attaches a session it
   already has state for (after a drop, an eviction, or a `reset`), the
   suffix will re-project things the client partially saw live. Before
   applying the backfill the client quiesces transient-derived
   in-flight state for that session: the unfinalized streaming
-  assistant entry, tool cells still marked running, sub-agent boxes
-  still marked running, and any compaction-in-progress indicator.
+  assistant entry, tool cells still marked running, the transient
+  activity detail on running sub-agent boxes, and any
+  compaction-in-progress indicator. A running sub-agent box itself is
+  not quiesced: its spawn root is durable and it owns the child
+  transcript, so concluding it would show a finished box for a live sub
+  and dropping it would orphan the transcript when the suffix is empty.
+  The host is authoritative for concluding sub-agent boxes (section 6.5's
+  projection rules).
   Application must be idempotent on durable identity: a projected
   tool start for a `call_id` the client already renders updates that
   cell in place, a re-synthesized `SubAgentStart` for a known sub
