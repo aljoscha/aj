@@ -318,6 +318,17 @@ fn notice(frames: &[Frame], text: &str) -> bool {
         .any(|event| matches!(event, AgentEvent::Notice { text: seen, .. } if seen == text))
 }
 
+/// The text of every `Error` event in `frames`.
+fn errors(frames: &[Frame]) -> Vec<String> {
+    events(frames)
+        .into_iter()
+        .filter_map(|event| match event {
+            AgentEvent::Error { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The notice the host publishes for a turn that was cancelled. A turn that
 /// ran to completion publishes none, which is what makes it evidence.
 const CANCELLED: &str = "Turn cancelled.";
@@ -2433,6 +2444,75 @@ async fn a_panicked_turn_leaves_the_session_idle() {
     harness.prompt(&session, "again").await;
     let frames = until_idle(&mut stream).await;
     assert_eq!(assistant_text(&frames), "after the panic");
+    harness.host.shutdown().await;
+}
+
+/// A turn's fatal error belongs to its session, not to the host (spec
+/// section 5): it surfaces as an error frame on that session's stream, the
+/// session stays live and usable, and another session on the same host is
+/// untouched by it.
+///
+/// The fault is a log that cannot be opened. The first punctuating append
+/// creates the file with `create_new`, so a path that is already taken makes
+/// that append fail, and the append runs inside an inline bus listener whose
+/// error is exactly a fatal turn error.
+#[tokio::test]
+async fn a_fatal_turn_error_stays_inside_its_session() {
+    let harness = Harness::new(Vec::new());
+    let broken = harness.create().await;
+    let healthy = harness.create().await;
+    harness
+        .install_script(&broken, vec![finalized_text_message("recovered")])
+        .await;
+    harness
+        .install_script(&healthy, vec![finalized_text_message("all fine here")])
+        .await;
+    let mut broken_client = Client::attach(&harness.host, &broken).await;
+    let mut healthy_client = Client::attach(&harness.host, &healthy).await;
+
+    let log_path = harness
+        .persistence
+        .sessions_dir()
+        .join(format!("{broken}.jsonl"));
+    std::fs::write(&log_path, "").expect("take the path the log wants");
+
+    harness.prompt(&broken, "hi").await;
+    let frames = broken_client.pump_until_idle().await;
+
+    let reported = errors(&frames);
+    assert!(
+        reported.iter().any(|text| text.starts_with("IO error")),
+        "the failed append surfaced as an error frame: {reported:?}",
+    );
+    assert!(
+        !reported.iter().any(|text| text.contains("panicked")),
+        "and as the turn's own error rather than a dead task: {reported:?}",
+    );
+
+    // The host kept serving: the other session runs its turn.
+    harness.prompt(&healthy, "you ok?").await;
+    healthy_client.pump_until_idle().await;
+    assert_eq!(
+        assistant_rows(&healthy_client.chat, AgentId::Main),
+        vec!["all fine here".to_string()],
+        "a fatal error in one session does not touch another",
+    );
+    assert!(
+        errors(&broken_client.drain_into_fold()).is_empty(),
+        "and the other session's turn earned no error of its own",
+    );
+
+    // And the failed session is still live: once the fault clears, the next
+    // prompt runs a turn rather than finding a session the host tore down.
+    std::fs::remove_file(&log_path).expect("clear the fault");
+    harness.prompt(&broken, "again").await;
+    broken_client.pump_until_idle().await;
+    assert!(
+        assistant_rows(&broken_client.chat, AgentId::Main)
+            .iter()
+            .any(|text| text == "recovered"),
+        "the session survived its own fatal turn error",
+    );
     harness.host.shutdown().await;
 }
 
