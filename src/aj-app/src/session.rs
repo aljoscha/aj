@@ -158,7 +158,7 @@ pub struct SubAgentOverrides {
 /// `AgentStart`/`AgentEnd`. An agent can be compacting without being in
 /// `running_agents`, and the spinner treats an agent as busy when it is
 /// in either set, which is how it animates during the summarizer call.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct AgentLifecycle {
     running_agents: HashSet<AgentId>,
     compacting: HashSet<AgentId>,

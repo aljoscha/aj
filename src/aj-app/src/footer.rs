@@ -287,6 +287,20 @@ impl AgentFooters {
         self.agents.get(&id).map(|entry| &entry.settings)
     }
 
+    /// Drop every agent's footer but Main's, and forget Main's occupancy
+    /// numerator.
+    ///
+    /// Used when a client rebuilds its fold from scratch
+    /// ([`ChatState::reset`](crate::chat::ChatState::reset)): the
+    /// sub-agents and the measured turns belong to the history it dropped,
+    /// while Main's settings identity was never stream-derived and stays.
+    pub fn retain_main(&mut self) {
+        self.agents.retain(|id, _| *id == AgentId::Main);
+        if let Some(main) = self.agents.get_mut(&AgentId::Main) {
+            main.last_turn_context_tokens = None;
+        }
+    }
+
     /// Entry for `id`, or Main's when `id` has none. Main always
     /// exists, so this never fails.
     fn resolve(&self, id: AgentId) -> &AgentFooter {

@@ -797,6 +797,39 @@ impl ChatState {
             lifecycle.clear_compacting(agent);
         }
     }
+
+    /// Drop everything the frame stream built, keeping only client-local
+    /// view configuration.
+    ///
+    /// A client calls this when it adopts a different epoch for the session
+    /// (a head switch to another branch, a host restart, spec 6.5).
+    /// Nothing it derived from the old epoch's entries describes the
+    /// history it is about to be served, so the fold restarts from the full
+    /// backfill.
+    ///
+    /// The display flags and the model catalog survive: they come from
+    /// config, not from the stream. Main's footer keeps its settings seed,
+    /// which the stream never wrote either: a client reads the host's
+    /// active settings off the `state` frame. Every other agent's footer
+    /// goes with its transcript, and Main's occupancy numerator goes with
+    /// the turns it measured.
+    pub fn reset(&mut self, lifecycle: &mut AgentLifecycle) {
+        self.transcripts.clear();
+        self.transcripts
+            .insert(AgentId::Main, Transcript::default());
+        self.active_view = AgentId::Main;
+        self.render.clear();
+        self.tasks.clear();
+        self.sub_boxes.clear();
+        self.compaction_phase.clear();
+        self.footers.retain_main();
+        for agent in lifecycle.running_agents() {
+            lifecycle.mark_idle(agent);
+        }
+        for agent in lifecycle.compacting_agents() {
+            lifecycle.clear_compacting(agent);
+        }
+    }
 }
 
 #[cfg(test)]
