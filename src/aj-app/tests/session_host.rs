@@ -2999,6 +2999,93 @@ async fn list_frames_carry_the_directory_and_are_debounced() {
     harness.host.shutdown().await;
 }
 
+/// A `list` frame's status fields are what the sidebar's glyphs and the
+/// client-side "needs attention" derivation hang on (spec 6.8), so each one
+/// is asserted away from its default: a turn in flight, a pending
+/// follow-up, a live background task, and a last-activity stamp that moved.
+#[tokio::test]
+async fn list_frames_report_working_queued_and_live_tasks() {
+    let harness = Harness::with_provider(scripted(
+        vec![
+            calling(
+                "backgrounding it",
+                "call-bash",
+                "bash",
+                serde_json::json!({"command": "sleep 30", "run_in_background": true,
+                                   "description": "sleep"}),
+            ),
+            finalized_text_message("started it"),
+            finalized_text_message(
+                "an answer streamed one character at a time, long enough that the \
+                 directory tick fires several times while the turn runs",
+            ),
+        ],
+        1,
+        Duration::from_millis(10),
+    ));
+    let session = harness.create().await;
+    let mut stream = harness
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+    frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+
+    // The first turn leaves a background task behind, which outlives it.
+    harness.prompt(&session, "background something").await;
+    until_idle(&mut stream).await;
+
+    let before = chrono::Utc::now();
+    harness.prompt(&session, "now answer at length").await;
+    // Busy, so this queues instead of running.
+    harness.prompt(&session, "and this one later").await;
+
+    // The turn keeps events flowing, so the directory tick keeps publishing
+    // while all three conditions hold at once.
+    let frames = frames_until(&mut stream, "a list frame for the busy session", |frame| {
+        matches!(frame, Frame::List { sessions }
+            if sessions.iter().any(|entry| entry.id == session
+                && entry.live
+                && entry.working
+                && entry.queued.follow_up == 1
+                && entry.tasks == 1))
+    })
+    .await;
+    let summary = frames
+        .iter()
+        .rev()
+        .find_map(|frame| match frame {
+            Frame::List { sessions } => sessions.iter().find(|entry| entry.id == session).cloned(),
+            _ => None,
+        })
+        .expect("filtered above");
+    assert_eq!(
+        summary.queued.steering, 0,
+        "a follow-up is not counted as steering: {summary:?}",
+    );
+    assert!(
+        summary.last_activity >= before,
+        "the turn's appends moved the last-activity stamp: {summary:?}",
+    );
+    assert!(summary.last_seq > 0, "and its durable position");
+
+    // Withdraw the follow-up so no wake asks the exhausted script for one
+    // more inference.
+    harness
+        .host
+        .command(&session, Command::Queue(QueueOp::Clear))
+        .await
+        .expect("clear");
+    until_idle(&mut stream).await;
+    harness.host.shutdown().await;
+}
+
 /// Materializing a session publishes a `list` frame saying it is live.
 ///
 /// Without one, every other client's directory keeps reporting the session
