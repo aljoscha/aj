@@ -2591,6 +2591,11 @@ async fn the_attach_block_is_contiguous_and_filters_the_boundary() {
         "the backfill stops at the boundary",
     );
 
+    // End-to-end shape only. Whether a frame at or below the boundary is
+    // actually dropped is decided by the fan-out's own filter, and the unit
+    // test over it (`a_live_stream_filters_durable_frames_at_or_below_its_
+    // boundary`) is the oracle for that: here the assertion holds trivially
+    // whenever nothing below the boundary happened to be in flight.
     let rest = until_idle(&mut stream).await;
     assert!(
         durable(&rest).iter().all(|(seq, _)| *seq > boundary),
@@ -2598,6 +2603,136 @@ async fn the_attach_block_is_contiguous_and_filters_the_boundary() {
         durable(&rest),
     );
     harness.host.shutdown().await;
+}
+
+/// An attach whose state moved while it was projecting publishes one more
+/// `state` frame behind the block, which is what self-heals the change the
+/// block dropped as lossy (spec 6.3).
+///
+/// `working` and `settings` are read before the projection, and a `state`
+/// frame published during it is held and dropped, lossy frames being
+/// droppable by definition. Without the refresh, a client whose block was
+/// served across the change would keep showing the settings the block opened
+/// with until something else moved.
+///
+/// The change has to land inside the span between an attach's status snapshot
+/// and its block delivery, so this hammers attaches back to back (that span
+/// is most of an attach) and flips the settings once underneath them. The
+/// oracle is a bystander stream, already past its own block: it sees the
+/// driver's own `state` frame live, so a second one for the same flip can only
+/// be an attach's refresh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attach_refreshes_state_that_moved_while_it_projected() {
+    let harness = Harness::new(Vec::new());
+    let session = harness.create().await;
+    let mut bystander = harness
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach the bystander");
+    frames_until(&mut bystander, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    let mut attempts = 0;
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no attach ever refreshed the state it snapshotted, after {attempts} attempts",
+        );
+        attempts += 1;
+        // Alternating, so every flip applies and every flip moves the
+        // settings identity a `state` frame carries.
+        let level = (attempts % 2 == 0).then_some(aj_models::ThinkingConfig::High);
+        let expected = aj_models::thinking_config_name(level.as_ref()).to_string();
+        let before = aj_models::thinking_config_name(
+            (attempts % 2 != 0)
+                .then_some(aj_models::ThinkingConfig::High)
+                .as_ref(),
+        )
+        .to_string();
+        let _ = drained(&mut bystander);
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hammer = tokio::spawn({
+            let host = harness.host.clone();
+            let session = session.clone();
+            let stop = Arc::clone(&stop);
+            async move {
+                let mut served = Vec::new();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    served.push(
+                        host.attach(&[AttachRequest {
+                            session: session.clone(),
+                            cursor: None,
+                        }])
+                        .await
+                        .expect("attach"),
+                    );
+                }
+                served
+            }
+        });
+        // Let the loop get going, flip underneath it, then let the attach it
+        // straddled finish.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        harness
+            .host
+            .command(
+                &session,
+                Command::Settings(SettingsChange {
+                    agent: AgentId::Main,
+                    persist: PersistAction::None,
+                    axis: SettingsAxis::Thinking(level),
+                }),
+            )
+            .await
+            .expect("thinking change");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut joiners = hammer.await.expect("the attach loop");
+        assert!(!joiners.is_empty(), "the loop served at least one attach");
+
+        // Both publishes are queued by the time the flip and the attaches
+        // have returned, so nothing here waits for them.
+        let refreshed = states(&drained(&mut bystander), &expected);
+        if refreshed < 2 {
+            continue;
+        }
+        assert_eq!(
+            refreshed, 2,
+            "one `state` frame from the flip, one from the attach that straddled it",
+        );
+        // And the self-heal itself: some client's block opened with the old
+        // settings, and a frame behind the block told it the new ones.
+        let healed = joiners.iter_mut().any(|joiner| {
+            let frames = drained(joiner);
+            let opened_stale = matches!(frames.first(),
+                Some(Frame::State { settings, .. }) if settings.thinking == before);
+            opened_stale && states(&frames[1..], &expected) > 0
+        });
+        assert!(
+            healed,
+            "a block served across the change is followed by the settings it missed",
+        );
+        break;
+    }
+    harness.host.shutdown().await;
+}
+
+/// How many `state` frames in `frames` report `thinking`.
+fn states(frames: &[Frame], thinking: &str) -> usize {
+    frames
+        .iter()
+        .filter(
+            |frame| matches!(frame, Frame::State { settings, .. } if settings.thinking == thinking),
+        )
+        .count()
 }
 
 /// A client that attaches mid-turn converges on the same state as one that
