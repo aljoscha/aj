@@ -489,17 +489,19 @@ pub fn reduce(
                             }));
                     state.sub_boxes.insert(n, (parent, id));
                 } else if entry.is_none() {
-                    // An entry-less start is the bracketing glue a backfill
-                    // synthesizes for a run whose bracket it found open, so
-                    // that run is in progress and the events after it belong
-                    // to it. Re-opening the box is what lets those events
-                    // land: the report refresh on the sub's conclusions
-                    // fires only on a `Running` box, so a client
-                    // re-attaching during a continuation would otherwise
-                    // keep the previous run's report for good (spec 6.5). A
-                    // durable start names a spawn root, and a root is minted
-                    // once per run, so re-serving one for a box we already
-                    // hold leaves its conclusion alone.
+                    // A start that carries no log entry is not a spawn root:
+                    // it is the bracketing glue a projection synthesizes for
+                    // a run whose own start fell below the cursor, so that
+                    // run is in progress and the events after it belong to
+                    // it. Re-opening the box is what lets those events land,
+                    // the report refresh on the sub's conclusions firing only
+                    // on a `Running` box. Without it a client re-attaching
+                    // during a continuation keeps the previous run's report
+                    // for good (spec 6.5).
+                    //
+                    // A durable start names a spawn root, and a root is
+                    // minted once per run, so re-serving one for a box we
+                    // already hold leaves its conclusion alone.
                     state.reopen_sub_box(n);
                 }
                 // Seed the child's footer entry with its spawn-time
@@ -2363,6 +2365,61 @@ mod tests {
         );
         assert!(b.finished_at.is_some(), "its runtime clock stays frozen");
         assert_eq!(b.report.as_deref(), Some("first result"));
+    }
+
+    #[test]
+    fn a_terminal_conclusion_is_not_reopened() {
+        // Both re-open paths, a continuation's `AgentStart(Sub n)` and a
+        // backfill's entry-less `SubAgentStart`, are refused by a box whose
+        // conclusion is terminal. Re-opening one would let the next
+        // `AgentEnd(Sub n)` conclude it `Done` and rewrite a failure into a
+        // success.
+        for conclusion in [SubAgentConclusion::Failed, SubAgentConclusion::Truncated] {
+            for reopening in [
+                AgentEvent::AgentStart {
+                    agent_id: AgentId::Sub(1),
+                },
+                sub_agent_start(1, "scripted", "scripted"),
+            ] {
+                let mut s = state();
+                let mut life = AgentLifecycle::default();
+                apply(
+                    &mut s,
+                    &mut life,
+                    sub_agent_start(1, "scripted", "scripted"),
+                );
+                apply(
+                    &mut s,
+                    &mut life,
+                    AgentEvent::SubAgentEnd {
+                        parent: AgentId::Main,
+                        child: AgentId::Sub(1),
+                        report: "how it ended".into(),
+                        conclusion,
+                    },
+                );
+                let concluded = s.sub_box_mut(1).expect("box").status;
+
+                apply(&mut s, &mut life, reopening);
+                apply(&mut s, &mut life, sub_assistant_end(1, "a later line"));
+                apply(
+                    &mut s,
+                    &mut life,
+                    AgentEvent::AgentEnd {
+                        agent_id: AgentId::Sub(1),
+                        messages: Vec::new(),
+                    },
+                );
+
+                let b = s.sub_box_mut(1).expect("box");
+                assert_eq!(b.status, concluded, "the conclusion stands");
+                assert_eq!(
+                    b.report.as_deref(),
+                    Some("how it ended"),
+                    "and so does the report it came with",
+                );
+            }
+        }
     }
 
     #[test]
