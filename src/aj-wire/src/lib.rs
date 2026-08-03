@@ -237,6 +237,18 @@ impl From<AgentEvent> for DecodedAgentEvent {
     }
 }
 
+impl DecodedAgentEvent {
+    /// The decoded event, or `None` for an event type this build does not
+    /// know. An endpoint client skips the unknown case before its reducer
+    /// (spec 6.10); only a gateway forwards it.
+    pub fn known(&self) -> Option<&AgentEvent> {
+        match self {
+            Self::Known(event) => Some(event.value()),
+            Self::Unknown { .. } => None,
+        }
+    }
+}
+
 impl Serialize for DecodedAgentEvent {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -308,6 +320,47 @@ pub enum Frame {
 }
 
 impl Frame {
+    /// The session a session-scoped frame belongs to, `None` for the
+    /// host-level kinds (`list`, `heartbeat`, `vms`).
+    pub fn session(&self) -> Option<&str> {
+        match self {
+            Self::Event { session, .. }
+            | Self::State { session, .. }
+            | Self::CaughtUp { session, .. }
+            | Self::Reset { session } => Some(session),
+            Self::List { .. } | Self::Heartbeat | Self::Vms { .. } => None,
+        }
+    }
+
+    /// The log position a durable event frame carries (spec 6.4), `None`
+    /// for every other frame.
+    pub fn durable_seq(&self) -> Option<u64> {
+        match self {
+            Self::Event {
+                durability: Some(durability),
+                ..
+            } => Some(durability.seq),
+            _ => None,
+        }
+    }
+
+    /// Whether the frame is lossy, i.e. a cumulative snapshot that a newer
+    /// one supersedes (spec 6.4). Only these may be coalesced or dropped.
+    pub fn is_lossy(&self) -> bool {
+        match self {
+            Self::Event { event, .. } => matches!(
+                event.known(),
+                Some(
+                    AgentEvent::MessageUpdate { .. }
+                        | AgentEvent::ToolExecutionUpdate { .. }
+                        | AgentEvent::TaskOutput { .. }
+                )
+            ),
+            Self::State { .. } | Self::List { .. } | Self::Vms { .. } => true,
+            Self::CaughtUp { .. } | Self::Reset { .. } | Self::Heartbeat => false,
+        }
+    }
+
     fn prepare(&mut self) -> Result<(), FrameValidationError> {
         let Self::Event {
             durability, event, ..
