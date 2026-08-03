@@ -201,9 +201,10 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
                 .get(&agent_id)
                 .and_then(|r| r.tool_index.get(&call_id))
             else {
-                // No cell for this call in this transcript, so there is
-                // nothing to paint into. The tool's end rebuilds the cell
-                // with the authoritative payload, so dropping a
+                // No cell for this call in this transcript: a snapshot
+                // for a cell a quiesce dropped, or for a call this
+                // client never saw open. The tool's end rebuilds the
+                // cell with the authoritative payload, so dropping a
                 // cumulative snapshot loses nothing.
                 return Redraw(false);
             };
@@ -835,9 +836,9 @@ fn reduce_assistant_end(
             .get_mut(&agent_id)
             .and_then(|r| r.current_assistant.take()),
     };
-    // A target that no longer resolves to an assistant entry falls
-    // through to the append below, so a durable message always lands
-    // somewhere renderable.
+    // A target that no longer resolves to an assistant entry (a quiesce
+    // dropped it) falls through to the append below, so a durable
+    // message always lands somewhere renderable.
     let target = target.filter(|&id| {
         matches!(
             state.transcript(agent_id).and_then(|t| t.get(id)),
@@ -3377,6 +3378,275 @@ mod tests {
             kinds,
             vec!["user", "assistant", "usage", "tool", "assistant", "usage"],
         );
+    }
+
+    // ---- Quiesce (spec 6.5's re-attach reconciliation) ------------------
+
+    #[test]
+    fn quiesce_drops_the_streaming_assistant_entry_and_keeps_finalized_ones() {
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        apply(
+            &mut s,
+            &mut life,
+            message_update(AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: "first".into(),
+                partial: text_partial("first"),
+            }),
+        );
+        apply(
+            &mut s,
+            &mut life,
+            assistant_message_end(text_partial("first")),
+        );
+        // A second turn is mid-stream when the connection drops.
+        apply(
+            &mut s,
+            &mut life,
+            message_update(AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: "half".into(),
+                partial: text_partial("half"),
+            }),
+        );
+        assert_eq!(
+            count_kind(&s, AgentId::Main, |k| matches!(k, EntryKind::Assistant(_))),
+            2,
+        );
+
+        s.quiesce(&mut life);
+
+        let assistants: Vec<&AssistantEntry> = entries(&s, AgentId::Main)
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntryKind::Assistant(a) => Some(a),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(assistants.len(), 1, "only the finalized row survives");
+        assert_eq!(assistant_text(&entries(&s, AgentId::Main)[0]), "first");
+        assert_eq!(
+            s.render
+                .get(&AgentId::Main)
+                .and_then(|r| r.current_assistant),
+            None,
+        );
+        assert_no_dangling(&s);
+    }
+
+    #[test]
+    fn quiesce_drops_a_running_tool_cell_and_reprojection_rebuilds_one_done_cell() {
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        let done_call = tool_start(AgentId::Main, "c-done", "bash");
+        apply(&mut s, &mut life, done_call);
+        apply(
+            &mut s,
+            &mut life,
+            tool_end(
+                AgentId::Main,
+                "c-done",
+                "bash",
+                bash_task_details("finished", None),
+            ),
+        );
+        let start = tool_start(AgentId::Main, "c-running", "bash");
+        apply(&mut s, &mut life, start.clone());
+
+        s.quiesce(&mut life);
+
+        let cells: Vec<&ToolEntry> = entries(&s, AgentId::Main)
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntryKind::Tool(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cells.len(), 1, "the running cell is gone");
+        assert_eq!(cells[0].call_id, "c-done", "the concluded cell stays");
+        let render = s.render.get(&AgentId::Main).expect("main render");
+        assert!(
+            !render.tool_index.contains_key("c-running"),
+            "the dropped cell's index entry goes with it",
+        );
+        assert!(render.tool_index.contains_key("c-done"));
+        assert_no_dangling(&s);
+
+        // The suffix regenerates the call that concluded in the gap.
+        apply(&mut s, &mut life, start);
+        apply(
+            &mut s,
+            &mut life,
+            tool_end(
+                AgentId::Main,
+                "c-running",
+                "bash",
+                bash_task_details("late result", None),
+            ),
+        );
+        let rebuilt: Vec<&ToolEntry> = entries(&s, AgentId::Main)
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntryKind::Tool(t) if t.call_id == "c-running" => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rebuilt.len(),
+            1,
+            "exactly one cell for the re-projected call"
+        );
+        assert_eq!(rebuilt[0].status, ToolStatus::Done { is_error: false });
+        assert_no_dangling(&s);
+    }
+
+    #[test]
+    fn quiesce_clears_sub_box_activity_but_keeps_it_running() {
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        apply(
+            &mut s,
+            &mut life,
+            sub_agent_start(1, "scripted", "scripted"),
+        );
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::AgentStart {
+                agent_id: AgentId::Sub(1),
+            },
+        );
+        apply(&mut s, &mut life, sub_assistant_end(1, "still going"));
+        {
+            let b = s.sub_box_mut(1).expect("box");
+            assert_eq!(b.latest_activity.as_deref(), Some("still going"));
+        }
+        let sub_entries = entries(&s, AgentId::Sub(1)).len();
+        assert!(sub_entries > 0, "the sub built a transcript");
+
+        s.quiesce(&mut life);
+
+        let b = s.sub_box_mut(1).expect("the box survives");
+        assert_eq!(b.status, SubAgentStatus::Running, "the host concludes it");
+        assert_eq!(b.latest_activity, None, "transient detail is dropped");
+        assert_eq!(b.report.as_deref(), Some("still going"), "the report stays");
+        assert_eq!(
+            entries(&s, AgentId::Sub(1)).len(),
+            sub_entries,
+            "the child transcript is untouched",
+        );
+        assert!(
+            life.is_running(AgentId::Sub(1)),
+            "quiesce does not touch the running set",
+        );
+        assert_no_dangling(&s);
+    }
+
+    #[test]
+    fn quiesce_clears_the_compaction_indicator() {
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::CompactionStart {
+                agent_id: AgentId::Main,
+                reason: CompactionReason::Manual,
+            },
+        );
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::CompactionProgress {
+                agent_id: AgentId::Main,
+                reason: CompactionReason::Manual,
+                phase: CompactionPhase::Saving,
+            },
+        );
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::CompactionStart {
+                agent_id: AgentId::Sub(1),
+                reason: CompactionReason::Threshold,
+            },
+        );
+
+        s.quiesce(&mut life);
+
+        assert_eq!(s.compaction_phase(AgentId::Main), None);
+        assert!(!life.is_compacting(AgentId::Main));
+        assert!(
+            !life.is_compacting(AgentId::Sub(1)),
+            "every agent's mark is cleared, not just the viewed one",
+        );
+        assert!(life.compacting_agents().is_empty());
+    }
+
+    #[test]
+    fn quiesce_leaves_no_dangling_entry_ids() {
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        // A sub-agent box and a finalized message, both of which survive,
+        // plus a running bash cell that a background task points at from
+        // two directions.
+        apply(
+            &mut s,
+            &mut life,
+            sub_agent_start(1, "scripted", "scripted"),
+        );
+        apply(&mut s, &mut life, user_message_end("run something"));
+        apply(
+            &mut s,
+            &mut life,
+            tool_start(AgentId::Main, "c-bash", "bash"),
+        );
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::TaskStart {
+                agent_id: AgentId::Main,
+                task_id: 1,
+                call_id: "c-bash".into(),
+                kind: TaskKind::Bash {
+                    command: "sleep 5".into(),
+                },
+                label: "sleep 5".into(),
+            },
+        );
+        let cell = s
+            .render
+            .get(&AgentId::Main)
+            .and_then(|r| r.tool_index.get("c-bash").copied())
+            .expect("the launch cell");
+        assert_eq!(s.tasks().get(&1).and_then(|i| i.cell), Some(cell));
+        // The live event order never files a pending linkage for a cell
+        // that is still running (the linkage is recorded by the tool's
+        // end, which also concludes the cell), so it is filed directly
+        // here: quiesce has to hold for any index that can name a cell
+        // it drops.
+        s.pending_task_cells.insert("c-bash".to_string(), cell);
+
+        s.quiesce(&mut life);
+
+        assert!(
+            s.transcript(AgentId::Main)
+                .and_then(|t| t.get(cell))
+                .is_none(),
+            "the running cell is gone",
+        );
+        assert!(
+            !s.pending_task_cells.contains_key("c-bash"),
+            "the launch linkage for a dropped cell is dropped too",
+        );
+        assert_eq!(
+            s.tasks().get(&1).and_then(|i| i.cell),
+            None,
+            "the task's cell snapshot is cleared",
+        );
+        assert_eq!(s.task_cell(1), None, "so the task resolves no cell at all");
+        assert_no_dangling(&s);
     }
 
     // ---- The canonical form itself --------------------------------------

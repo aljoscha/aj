@@ -2,11 +2,12 @@
 //! the reducer maintains around them.
 //!
 //! Everything here is backend-neutral data. Entries are keyed by a
-//! stable [`EntryId`], never a container index, and transcripts only
-//! append within a session, so recorded ids stay valid for the
-//! session's lifetime.
+//! stable [`EntryId`], never a container index. Ids are minted
+//! monotonically and never reused, so a recorded id either names the
+//! entry it was minted for or nothing at all ([`ChatState::quiesce`]
+//! drops in-flight entries).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,6 +20,7 @@ use aj_models::types::{AssistantMessage, UserContent};
 use serde_json::Value;
 
 use crate::footer::AgentFooters;
+use crate::session::AgentLifecycle;
 
 /// Opaque, per-transcript entry id, stable for the session.
 ///
@@ -285,6 +287,10 @@ fn format_turn_usage_line(agent_id: AgentId, usage: &TokenUsage) -> String {
 }
 
 /// One agent's transcript: an append-only list of entries.
+///
+/// "Append-only" holds for the reducer. [`ChatState::quiesce`] is the
+/// one operation that drops entries, and it only ever drops the
+/// in-flight ones a re-attach backfill regenerates.
 #[derive(Debug, Default)]
 pub struct Transcript {
     pub(crate) entries: Vec<Entry>,
@@ -322,6 +328,18 @@ impl Transcript {
             .binary_search_by_key(&id, |e| e.id)
             .ok()
             .map(|i| &mut self.entries[i])
+    }
+
+    /// Drop the entries whose ids are in `ids`.
+    ///
+    /// A removal keeps the remaining ids monotone, so the binary search
+    /// in [`Self::get`] stays valid, and the counter never reuses a
+    /// removed id, so a stale [`EntryId`] resolves to `None` forever
+    /// rather than to a different entry. Callers still owe the
+    /// bookkeeping: an index pointing at a removed entry must go too
+    /// (see [`ChatState::quiesce`]).
+    pub(crate) fn remove(&mut self, ids: &HashSet<EntryId>) {
+        self.entries.retain(|entry| !ids.contains(&entry.id));
     }
 }
 
@@ -680,6 +698,88 @@ impl ChatState {
             .copied()
             .or(info.cell)?;
         Some((info.owner, cell))
+    }
+
+    /// Drop the transient-derived in-flight state before a re-attach
+    /// backfill is applied (spec 6.5's re-attach reconciliation).
+    ///
+    /// Streaming text and running tool cells are wholly transient: the
+    /// durable suffix regenerates a tool cell that concluded in the
+    /// gap, and a tool still running concludes live. A running
+    /// sub-agent box is not transient (its spawn root is durable and it
+    /// owns the child transcript), so only its transient detail is
+    /// cleared. Concluding it is the host's call, because a box shown
+    /// as finished for a live sub, or a dropped box whose child
+    /// transcript then has no anchor, are both worse than a box that
+    /// keeps spinning until the host says otherwise.
+    ///
+    /// Every index that could point at a dropped entry is pruned here,
+    /// so no [`EntryId`] outlives the entry it names.
+    pub fn quiesce(&mut self, lifecycle: &mut AgentLifecycle) {
+        // Collect first: pruning the indexes needs the whole state
+        // while the removals borrow one transcript at a time.
+        let dropped: Vec<(AgentId, HashSet<EntryId>, HashSet<String>)> = self
+            .transcripts
+            .iter()
+            .map(|(&agent, transcript)| {
+                let mut ids = HashSet::new();
+                let mut calls = HashSet::new();
+                for entry in transcript.entries() {
+                    match &entry.kind {
+                        EntryKind::Assistant(a) if !a.finalized => {
+                            ids.insert(entry.id);
+                        }
+                        EntryKind::Tool(t) if t.status == ToolStatus::Running => {
+                            ids.insert(entry.id);
+                            calls.insert(t.call_id.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                (agent, ids, calls)
+            })
+            .collect();
+
+        for (agent, ids, calls) in &dropped {
+            if let Some(transcript) = self.transcripts.get_mut(agent) {
+                transcript.remove(ids);
+            }
+            if let Some(render) = self.render.get_mut(agent) {
+                // Streaming is per-turn and its entry is gone. The
+                // durable ids stay: the entries they name are still
+                // here, and so are the usage rows keyed off the last
+                // finalized assistant message.
+                render.current_assistant = None;
+                render.tool_index.retain(|_, id| !ids.contains(id));
+                render.message_index.retain(|_, id| !ids.contains(id));
+            }
+            // Keyed by `call_id`, not by entry id: the map spans agents
+            // while entry ids are per-transcript counters, so two
+            // agents' entries can share one id.
+            self.pending_task_cells
+                .retain(|call_id, _| !calls.contains(call_id));
+            for info in self.tasks.values_mut() {
+                if info.owner == *agent && info.cell.is_some_and(|cell| ids.contains(&cell)) {
+                    // The cell is gone. A re-projected launch re-enters
+                    // the owner's `tool_index`, which `task_cell`
+                    // consults first, so the task stays routable.
+                    info.cell = None;
+                }
+            }
+        }
+
+        for n in self.sub_boxes.keys().copied().collect::<Vec<_>>() {
+            if let Some(b) = self.sub_box_mut(n)
+                && b.status == SubAgentStatus::Running
+            {
+                b.latest_activity = None;
+            }
+        }
+
+        self.compaction_phase.clear();
+        for agent in lifecycle.compacting_agents() {
+            lifecycle.clear_compacting(agent);
+        }
     }
 }
 
