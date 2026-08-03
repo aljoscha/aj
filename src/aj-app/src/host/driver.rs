@@ -430,7 +430,7 @@ impl Driver {
         self.spawn(agent, TurnStart::Prompt(text))
     }
 
-    fn cancel(&mut self, agent: AgentId) -> CommandOutcome {
+    fn cancel(&self, agent: AgentId) -> CommandOutcome {
         if self.turns.cancel(agent) {
             return CommandOutcome::Accepted;
         }
@@ -442,7 +442,7 @@ impl Driver {
         CommandOutcome::Accepted
     }
 
-    fn queue_op(&mut self, op: QueueOp) -> CommandOutcome {
+    fn queue_op(&self, op: QueueOp) -> CommandOutcome {
         match op {
             QueueOp::Remove { agent } => {
                 let text = self.session.core.message_queues.take_pending(agent);
@@ -474,7 +474,7 @@ impl Driver {
         )
     }
 
-    fn kill_task(&mut self, task: TaskId) -> Result<CommandOutcome, HostError> {
+    fn kill_task(&self, task: TaskId) -> Result<CommandOutcome, HostError> {
         if self.session.core.task_registry.status(task).is_none() {
             return Err(HostError::UnknownTask(task));
         }
@@ -653,7 +653,7 @@ impl Driver {
 
     /// Publish a settings entry's projected notice, or, when it projects
     /// none, just account for the entry it appended.
-    fn publish_notice(&mut self, entry: &EntryRef, notice: Option<AgentEvent>) {
+    fn publish_notice(&self, entry: &EntryRef, notice: Option<AgentEvent>) {
         match notice {
             Some(event) => self.publish_event(Some(entry.clone()), event),
             None => {
@@ -690,7 +690,7 @@ impl Driver {
     /// mid-turn switch would let the running turn persist onto the wrong
     /// branch. On success the queues are cleared, the agent is reseeded
     /// from the new branch, a fresh epoch is minted and `reset` published.
-    async fn head_switch(&mut self, entry: String) -> Result<CommandOutcome, HostError> {
+    async fn head_switch(&self, entry: String) -> Result<CommandOutcome, HostError> {
         let (agents, bash) = running_work_counts(
             self.turns.driven(),
             &self.session.core.task_registry.snapshot(),
