@@ -78,9 +78,8 @@ impl ConversationPersistence {
 
             let metadata = fs::metadata(&path)?;
             let modified = metadata.modified()?;
-            let modified_str = DateTime::<Utc>::from(modified)
-                .format("%Y-%m-%d %H:%M:%S UTC")
-                .to_string();
+            let modified_at = DateTime::<Utc>::from(modified);
+            let modified_str = modified_at.format("%Y-%m-%d %H:%M:%S UTC").to_string();
 
             // Use file size as proxy for conversation length.
             let file_size = metadata.len();
@@ -95,6 +94,7 @@ impl ConversationPersistence {
             sessions.push(SessionMetadata {
                 session_id,
                 modified: modified_str,
+                modified_at,
                 size_display,
             });
         }
@@ -283,7 +283,11 @@ fn read_preview(
 #[derive(Debug, Clone)]
 pub struct SessionMetadata {
     pub session_id: String,
+    /// Modification time, pre-formatted for the `list-sessions` output.
     pub modified: String,
+    /// The same modification time as a value, for callers that render or
+    /// compare it themselves.
+    pub modified_at: DateTime<Utc>,
     pub size_display: String,
 }
 

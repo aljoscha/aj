@@ -184,6 +184,29 @@ impl MessageQueues {
         )
     }
 
+    /// Every agent that has something queued, in unspecified order.
+    ///
+    /// An agent whose queues were drained keeps its (now empty) map entry,
+    /// so this filters on content rather than on presence.
+    pub fn queued_agents(&self) -> Vec<AgentId> {
+        self.lock()
+            .iter()
+            .filter(|(_, q)| !q.steering.is_empty() || !q.follow_up.is_empty())
+            .map(|(agent, _)| *agent)
+            .collect()
+    }
+
+    /// Total pending messages across every agent, as
+    /// `(steering, follow_up)`. The session-wide counts a status line or
+    /// a session list shows.
+    pub fn pending_counts(&self) -> (usize, usize) {
+        self.lock()
+            .values()
+            .fold((0, 0), |(steering, follow_up), q| {
+                (steering + q.steering.len(), follow_up + q.follow_up.len())
+            })
+    }
+
     fn lock(&self) -> MutexGuard<'_, HashMap<AgentId, AgentQueues>> {
         self.inner.lock().expect("message queues mutex poisoned")
     }
@@ -301,5 +324,25 @@ mod tests {
         // Draining one leaves the other intact.
         let _ = q.drain_follow_up(MAIN);
         assert_eq!(q.snapshot(AgentId::Sub(1)).text, "sub msg");
+    }
+
+    /// The session-wide reads see every agent's queue, and a drained
+    /// agent (whose map entry survives the drain) counts as empty.
+    #[test]
+    fn session_wide_reads_span_agents_and_ignore_drained_entries() {
+        let q = MessageQueues::default();
+        assert_eq!(q.pending_counts(), (0, 0));
+        assert!(q.queued_agents().is_empty());
+
+        q.append_follow_up(MAIN, "later");
+        q.append_steering(AgentId::Sub(1), "now");
+        assert_eq!(q.pending_counts(), (1, 1));
+        let mut agents = q.queued_agents();
+        agents.sort_by_key(|agent| format!("{agent:?}"));
+        assert_eq!(agents, vec![MAIN, AgentId::Sub(1)]);
+
+        let _ = q.drain_follow_up(MAIN);
+        assert_eq!(q.pending_counts(), (1, 0));
+        assert_eq!(q.queued_agents(), vec![AgentId::Sub(1)]);
     }
 }
