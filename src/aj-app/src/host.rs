@@ -19,9 +19,16 @@
 //! property of the code. The fan-out subscribes to the bus through a
 //! channel rather than an inline listener, because an inline listener's
 //! stall or error becomes a fatal turn error (spec 6.9): network activity
-//! must never be able to fail a turn. Lock order is log, then session
-//! status, then the subscriber registry; the latter two are std mutexes so
-//! they cannot be held across an await.
+//! must never be able to fail a turn.
+//!
+//! **Locks.** The order is log, then session status, then the subscriber
+//! registry. The log's is an async mutex and is the only one a caller may
+//! hold across an await. The other two are std mutexes, so holding one
+//! across an await would make the driver's future non-`Send` and fail to
+//! compile inside its spawned task, which is what keeps that rule mechanical
+//! rather than a discipline. Both are only ever held to copy a few fields or
+//! to push onto unbounded queues, so no await ever needs to happen under
+//! them.
 
 pub(crate) mod driver;
 mod fanout;
@@ -218,13 +225,25 @@ pub struct AttachRequest {
 
 /// Direct handles into one live session, for a client attached in process.
 ///
-/// Spec section 5 sanctions this: the local frontend attaches "through
-/// direct handles and channels, not through HTTP". It reads draw-time state
-/// off these (the pending-message box re-reads the live queues, the footer
-/// the run config) while every mutation still goes through
-/// [`SessionHost::command`], which is what keeps the local and the remote
-/// path one path. Nothing outside this process can have them, so no
-/// protocol rule may come to depend on them.
+/// Spec section 5 sanctions this: the local frontend attaches "through direct
+/// handles and channels, not through HTTP". It is a **read** surface. The
+/// pending-message box re-reads the live queues at draw time, the footer the
+/// run config and the task registry, and none of that goes through a command.
+///
+/// Mutating through these handles is a convention this type cannot enforce,
+/// because the handles it hands out (the queues, the log, the run config) are
+/// the real ones and carry their own mutators. Breaking the convention is
+/// invisible rather than loud: an enqueue that bypasses
+/// [`SessionHost::command`] publishes no `QueueUpdate`, so every other
+/// client's queue view silently goes stale, and the local and the remote path
+/// stop being one path.
+///
+/// The tests do use them to stage state the command surface cannot reach: an
+/// idle session's queue, which no command can fill because queueing only
+/// happens while an agent is busy.
+///
+/// Nothing outside this process can have them, so no protocol rule may come
+/// to depend on them.
 pub struct LocalHandles {
     pub session_id: String,
     pub queues: MessageQueues,
@@ -297,7 +316,7 @@ impl Drop for HostInner {
         // drivers running (and its session locks held) for the life of the
         // process. Aborting is not the graceful path (no turn cancel, no
         // task quiescing, no log flush), so `shutdown` stays the
-        // documented teardown; this only bounds the damage, loudly.
+        // documented teardown, and this only bounds the damage, loudly.
         let abandoned: Vec<&String> = self.sessions.get_mut().keys().collect();
         if !abandoned.is_empty() {
             tracing::warn!(
@@ -381,14 +400,13 @@ impl SessionHost {
 
     /// Open a stream and serve an attach block for every named session.
     ///
-    /// Per session, in order: the subscriber is registered, the log is
-    /// snapshotted under its lock, the durable suffix is projected outside
-    /// it, and the block (`state`, backfill, `caught_up`, then the
-    /// conclusion sweep) is written in one critical section. Registering
-    /// before snapshotting is what makes the pair atomic with respect to
-    /// the session's event flow: a durable frame published in between is
-    /// either already in the backfill (and filtered against the boundary)
-    /// or above it (and delivered).
+    /// Registering the subscriber and projecting a session's suffix are
+    /// atomic with respect to that session's event flow: a durable frame
+    /// published in between is either already in the backfill (and filtered
+    /// against its boundary) or above it (and delivered), so a client can
+    /// neither miss one nor be served one twice. That is what makes attaching
+    /// a single round trip with no client-side buffer-and-reconcile dance
+    /// (spec 6.5).
     ///
     /// Returning successfully means every named session's block will be
     /// written, which is what [`Attachment::attached`] reports and what a
@@ -416,6 +434,9 @@ impl SessionHost {
         }
         let (id, frames) = self.inner.shared.fanout.register(&names);
         let attachment = Attachment::new(id, frames, names, Arc::clone(&self.inner.shared.fanout));
+        // Registered above before any block is projected: from here on every
+        // frame this host publishes is either held for a block or filtered
+        // against its boundary, which is the atomicity the doc promises.
         for (request, session) in live {
             self.serve_block(id, request, &session).await;
         }
@@ -762,7 +783,7 @@ impl SessionHost {
         // and the agent environment re-reads the context files and skills)
         // while this task holds the session map. Every other
         // materialization waits behind it. Acceptable while a host holds a
-        // handful of sessions; if it starts to hurt, the build moves to the
+        // handful of sessions. If it starts to hurt, the build moves to the
         // blocking pool.
         let config = self
             .inner

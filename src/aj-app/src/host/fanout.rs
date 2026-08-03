@@ -9,9 +9,17 @@
 //! [`AttachState::Attaching`] land in one critical section, so no live
 //! frame can be spliced into the middle of it. The sends themselves are
 //! pushes onto unbounded queues and never block, so holding the lock
-//! across them is safe. Bounded queues with coalescing and eviction
-//! (spec 6.9) replace the unbounded ones later; this is the seam they
-//! slot into.
+//! across them is safe.
+//!
+//! **The queues are unbounded, deliberately for now.** Spec 6.9 wants a
+//! bounded queue per client with lossy coalescing and eviction on overflow,
+//! and this module is the seam that lands in: [`Subscriber::offer`] is the
+//! single place a frame is queued, and it already classifies the frame. Until
+//! a transport exists the only subscribers are in-process and read promptly,
+//! so the memory an unbounded queue can grow is bounded by the session's own
+//! activity. What must not change either way is that queueing never blocks:
+//! the publisher is the session's driver task, and a blocking send here would
+//! stall the session itself.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

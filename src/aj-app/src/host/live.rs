@@ -39,7 +39,7 @@ pub(crate) enum Request {
 /// The per-session state the host publishes, readable without awaiting.
 ///
 /// This is exactly what a `state` frame carries plus what an attach and
-/// the session list need. The driver is its single writer; everyone else
+/// the session list need. The driver is its single writer, everyone else
 /// reads. Keeping it here rather than asking the driver is what lets an
 /// attach and a list build run without a round trip through a task that
 /// may be mid-turn.
@@ -47,7 +47,16 @@ pub(crate) struct SessionStatus {
     /// Opaque token minted per materialization and replaced on a head
     /// switch. Never persisted (spec 6.5).
     pub(crate) epoch: String,
-    /// The session's durable high-water mark.
+    /// The highest durable position this host has **published** a frame for.
+    ///
+    /// Not the log's own `last_seq`: the driver advances this as it publishes,
+    /// so it lags an append whose event has not reached the driver's event arm
+    /// yet. The two marks share a name and surface differently: `caught_up`
+    /// and an attach block's `state` frame carry the log's mark (read under
+    /// its lock, so it covers everything on disk), while `list` frames and an
+    /// on-change `state` frame carry this one. A client is never harmed by the
+    /// lag, since a `list` position is glyph data and never a cursor
+    /// (spec 6.5).
     pub(crate) last_seq: u64,
     /// Whether the **main** agent has a turn in flight (spec 6.3).
     pub(crate) working: bool,

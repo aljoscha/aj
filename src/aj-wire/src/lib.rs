@@ -405,6 +405,13 @@ impl Frame {
 
     /// Whether the frame is lossy, i.e. a cumulative snapshot that a newer
     /// one supersedes (spec 6.4). Only these may be coalesced or dropped.
+    ///
+    /// An event type this build does not know classifies as **reliable**,
+    /// which is the safe side of the decision: an attach holds and flushes it
+    /// rather than dropping it, and a client that cannot keep up is evicted
+    /// rather than left missing it. A newer peer's lossy event costs a
+    /// needless delivery that way, whereas the opposite default would drop a
+    /// one-shot frame whose loss wedges the client.
     pub fn is_lossy(&self) -> bool {
         match self {
             Self::Event { event, .. } => matches!(

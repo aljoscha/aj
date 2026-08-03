@@ -151,8 +151,15 @@ impl SessionClient {
                         return Redraw(false);
                     }
                     // Inside an attach block the cursor does not move per
-                    // frame: backfill order follows the projection, not
-                    // seq order, and `caught_up` commits the block at once.
+                    // frame. Spec 6.5 makes the block atomic and its
+                    // `caught_up` commits it once, which is what lets the
+                    // projection order its events by thread bracketing
+                    // rather than by seq. Today's projection happens to tag
+                    // entries in increasing seq order, so this guard changes
+                    // nothing, but the fold must not come to depend on that:
+                    // a projection free to interleave (a thread-scoped
+                    // backfill would) plus a per-frame advance would drop
+                    // every frame that came out below an earlier one.
                     if self.attach != Attach::Applying {
                         self.committed = self.applied;
                         self.applied = Some(durability.seq);

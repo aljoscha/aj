@@ -15,6 +15,15 @@
 //! hope: the event stream is already in append order (the forwarder sends
 //! under the guard that appended), and a frame this task emits itself is
 //! published only after the stream has been drained up to that append.
+//!
+//! **Request ordering.** Requests are answered one at a time in arrival
+//! order: the loop awaits a command's completion before taking the next.
+//! A caller that got its acceptance therefore knows every command accepted
+//! before it has already taken effect, which is what lets a client sequence
+//! gestures (a settings change and then the prompt that should run under it)
+//! without a barrier of its own. The cost is that a slow command (a head
+//! switch) delays every other client's, which is why refusals are cheap and
+//! reads bypass this task entirely.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,7 +56,7 @@ use crate::turn::{Joined, TurnStart, Turns, running_work_counts};
 ///
 /// NOTE: `SessionHost::shutdown` winds its sessions down one at a time, so a
 /// host holding several wedged sessions pays this per session. Fine while a
-/// host holds a handful; the fix, if it ever matters, is to drive the
+/// host holds a handful. The fix, if it ever matters, is to drive the
 /// teardowns concurrently rather than to shorten the grace.
 const TURN_DRAIN_GRACE: Duration = Duration::from_secs(5);
 
@@ -139,15 +148,15 @@ impl Driver {
     /// and start a wake if the event earned one.
     fn on_event(&mut self, tagged: TaggedEvent) {
         let TaggedEvent { entry, event } = tagged;
-        // The wake trigger is captured before the lifecycle transition and
-        // evaluated after, which is the interactive loop's ordering read
-        // off its reducer: `AgentEnd` marks the owner idle, and
-        // `Turns::spawn_wake` only wakes an idle owner, so evaluating
-        // first would find the owner busy and drop the wake. `TaskEnd`
-        // wakes unconditionally so a completion notice reaches the model
-        // the moment its task finishes; `AgentEnd` only when something is
-        // actually queued, because a sub-agent's initial run ends inside
-        // its parent's turn and never reaches the join arm.
+        // Captured off a borrow, because `publish_event` below takes the
+        // event by value. The wake it decides on has to wait until after
+        // `apply_lifecycle`: `Turns::spawn_wake` refuses a busy owner, and
+        // this `AgentEnd` is what marks the owner idle, so waking any earlier
+        // would find it busy and drop the wake. `TaskEnd` wakes
+        // unconditionally so a completion notice reaches the model the moment
+        // its task finishes. `AgentEnd` only when something is actually
+        // queued, because a sub-agent's initial run ends inside its parent's
+        // turn and never reaches the join arm.
         let trigger = match &event {
             AgentEvent::TaskEnd { agent_id, .. } => Some((*agent_id, false)),
             AgentEvent::AgentEnd { agent_id, .. } => Some((*agent_id, true)),
@@ -267,8 +276,8 @@ impl Driver {
             Ok(()) => {}
             Err(TurnError::Aborted) => {
                 // The agent already emitted the synthetic aborted
-                // `MessageEnd`s, so the transcript is consistent; the
-                // notice only confirms the cancel took effect.
+                // `MessageEnd`s, so the transcript is consistent. The notice
+                // only confirms the cancel took effect.
                 self.publish_event(
                     None,
                     AgentEvent::Notice {
