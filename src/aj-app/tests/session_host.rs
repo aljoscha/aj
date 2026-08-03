@@ -1740,26 +1740,91 @@ async fn every_queue_mutation_publishes_an_update() {
 /// `clear` is session-wide (spec 6.6), and every agent it emptied gets its
 /// own `QueueUpdate`: a client tracks the queues per agent and would keep
 /// showing the ones it was not told about.
+///
+/// Both agents are made busy first, through commands, because that is the
+/// only way the command surface can reach a queued message at all: an idle
+/// agent runs a prompt instead of queueing it. The queue read (spec 6.7) is
+/// asserted here for the same reason, against state the host itself built.
 #[tokio::test]
 async fn clearing_the_queue_empties_every_agent() {
-    let harness = Harness::new(sub_agent_turn());
+    let mut script = sub_agent_turn();
+    // Two slow turns for the two agents to be busy in, long enough that the
+    // prompts below queue behind them rather than starting turns of their own.
+    script.push(finalized_text_message(
+        "the sub-agent taking its time over a continuation",
+    ));
+    script.push(finalized_text_message(
+        "and the main agent taking its time too",
+    ));
+    let harness = Harness::with_provider(scripted(script, 1, Duration::from_millis(20)));
     let session = harness.create().await;
     let mut client = Client::attach(&harness.host, &session).await;
     harness.prompt(&session, "delegate it").await;
     client.pump_until_idle().await;
 
-    // Queued through the in-process handles: an idle agent runs a prompt
-    // instead of queueing it.
-    let handles = harness
+    // The sub through a continuation, main through a fresh turn. Both
+    // commands return once their turn is spawned, so both agents read busy
+    // from here.
+    harness
         .host
-        .local_handles(&session)
+        .command(
+            &session,
+            Command::Prompt {
+                agent: AgentId::Sub(1),
+                content: vec![UserContent::text("keep going")],
+            },
+        )
         .await
-        .expect("live session");
-    handles.queues.append_follow_up(AgentId::Main, "for main");
-    handles
-        .queues
-        .append_follow_up(AgentId::Sub(1), "for the sub");
-    let _ = drained(&mut client.stream);
+        .expect("the retained sub-agent runs a continuation");
+    harness.prompt(&session, "and answer me too").await;
+
+    harness
+        .host
+        .command(
+            &session,
+            Command::Prompt {
+                agent: AgentId::Sub(1),
+                content: vec![UserContent::text("for the sub")],
+            },
+        )
+        .await
+        .expect("queues behind the sub's turn");
+    harness
+        .host
+        .command(
+            &session,
+            Command::Steer {
+                agent: AgentId::Main,
+                text: "for main".to_string(),
+            },
+        )
+        .await
+        .expect("queues as steering behind main's turn");
+    client.drain_into_fold();
+    assert_eq!(
+        queued(&client, AgentId::Sub(1)),
+        (Vec::new(), vec!["for the sub".to_string()]),
+        "both agents were busy, so both prompts queued",
+    );
+    assert_eq!(
+        queued(&client, AgentId::Main),
+        (vec!["for main".to_string()], Vec::new()),
+    );
+
+    // The queue read answers the same state, one entry per agent that has
+    // something queued, main first.
+    let queue = harness.host.queue(&session).await.expect("queue read");
+    assert_eq!(
+        queue
+            .queues
+            .iter()
+            .map(|entry| entry.agent_id)
+            .collect::<Vec<_>>(),
+        vec![AgentId::Main, AgentId::Sub(1)],
+    );
+    assert_eq!(queue.queues[0].steering.len(), 1);
+    assert!(queue.queues[0].follow_up.is_empty());
+    assert_eq!(queue.queues[1].follow_up.len(), 1);
 
     harness
         .host
@@ -1767,8 +1832,7 @@ async fn clearing_the_queue_empties_every_agent() {
         .await
         .expect("clear");
 
-    assert_eq!(handles.queues.pending_counts(), (0, 0));
-    let mut updated: Vec<AgentId> = events(&drained(&mut client.stream))
+    let mut updated: Vec<AgentId> = events(&client.drain_into_fold())
         .into_iter()
         .filter_map(|event| match event {
             AgentEvent::QueueUpdate { agent_id, .. } => Some(*agent_id),
@@ -1786,6 +1850,25 @@ async fn clearing_the_queue_empties_every_agent() {
         vec![AgentId::Main, AgentId::Sub(1)],
         "one update per agent that had something queued",
     );
+    assert!(
+        harness
+            .host
+            .queue(&session)
+            .await
+            .expect("queue read")
+            .queues
+            .is_empty(),
+        "and the session holds nothing pending afterwards",
+    );
+    for agent in [AgentId::Main, AgentId::Sub(1)] {
+        assert_eq!(
+            queued(&client, agent),
+            (Vec::new(), Vec::new()),
+            "the client's own view of {agent:?} is empty too",
+        );
+    }
+
+    client.pump_until_idle().await;
     harness.host.shutdown().await;
 }
 
@@ -3479,10 +3562,10 @@ async fn a_materialization_publishes_the_directory() {
 // 15. Reads
 // ---------------------------------------------------------------------------
 
-/// The reads answer the task table (with wall-clock timestamps), the queue,
-/// the branch tree, and hello with a `host_id` that survives a restart.
+/// The reads answer the task table (with wall-clock timestamps), the branch
+/// tree, and hello with a `host_id` that survives a restart.
 #[tokio::test]
-async fn the_reads_answer_tasks_queue_tree_and_hello() {
+async fn the_reads_answer_tasks_tree_and_hello() {
     let harness = Harness::with_provider(scripted(
         vec![
             calling(
@@ -3513,30 +3596,18 @@ async fn the_reads_answer_tasks_queue_tree_and_hello() {
         task.started_at,
     );
 
-    // The queue read: enqueue the way a busy session would (an idle steer
-    // runs a turn instead of queueing) and read it back.
-    let handles = harness
-        .host
-        .local_handles(&session)
-        .await
-        .expect("live session");
-    handles.queues.append_steering(AgentId::Main, "urgent");
-    handles.queues.append_follow_up(AgentId::Sub(1), "later");
-    let queue = harness.host.queue(&session).await.expect("queue read");
-    assert_eq!(
-        queue
+    // An idle session has nothing queued, so the queue read is asserted where
+    // queue state can be built through commands, in
+    // `clearing_the_queue_empties_every_agent`.
+    assert!(
+        harness
+            .host
+            .queue(&session)
+            .await
+            .expect("queue read")
             .queues
-            .iter()
-            .map(|entry| entry.agent_id)
-            .collect::<Vec<_>>(),
-        vec![AgentId::Main, AgentId::Sub(1)],
-        "one entry per agent with something queued, main first",
+            .is_empty(),
     );
-    assert_eq!(queue.queues[0].steering.len(), 1);
-    assert!(queue.queues[0].follow_up.is_empty());
-    assert_eq!(queue.queues[1].follow_up.len(), 1);
-    handles.queues.clear(AgentId::Main);
-    handles.queues.clear(AgentId::Sub(1));
 
     let tree = harness.host.tree(&session).await.expect("tree read");
     assert!(
