@@ -541,8 +541,19 @@ layered around it:
   to reach every port of every other device, so deployments must
   restrict the control port with a grant/ACL (deny-by-default once
   defined, enforced on the receiving node): only the owner's devices
-  may reach port 6161 on aj hosts and gateways. The reference systemd
-  units (section 7.4) ship with a sample policy snippet.
+  may reach port 6161 on aj hosts and gateways. One trap the sample
+  policy must not fall into: tailscale rules are additive accepts,
+  there is no deny rule, so restricting the port is impossible while
+  a default allow-all rule remains. The sample therefore shows a
+  least-privilege replacement, not an addition: aj machines carry a
+  tag (e.g. `tag:aj-host`), the owner's devices get their broad
+  access spelled out explicitly, and the control port on the tag is
+  granted only to the owner, carrying the aj app capability the
+  identity gate checks. The reference systemd units (section 7.4)
+  ship with that sample. On a strictly single-user tailnet with no
+  shared or third-party nodes, allow-all already means "only my
+  devices" and the policy change is defense in depth, the identity
+  gate is the layer doing the practical work there.
 - **Identity gate.** The server verifies every connection's peer
   against the local tailscale daemon: a whois lookup on the remote
   address (tailscaled's local API, what `tailscale whois` wraps)
