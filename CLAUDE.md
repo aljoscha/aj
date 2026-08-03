@@ -31,6 +31,9 @@ The workspace splits into focused crates under `src/` (run
   tool trait, `ToolDetails` for structured tool rendering, message
   queues, and the `TaskRegistry` for background tasks (detached bash
   commands and sub-agent runs that outlive their turn).
+- `aj-wire`: remote-control protocol models, frame and event
+  compatibility wrappers, and strict JSON codecs. It contains no I/O
+  or HTTP types.
 - `aj-session` — on-disk session format, `ConversationLog`, replay. The
   user-facing surface (CLI, storage) says "session"; internally a
   session's `ConversationLog` holds threads and branches, so both terms

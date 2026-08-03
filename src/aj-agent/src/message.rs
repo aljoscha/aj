@@ -79,11 +79,11 @@ impl AgentMessage {
     }
 
     /// Set the message's id. Used by the log to backfill the id from the
-    /// on-disk entry id when resuming a session.
+    /// on-disk entry id when resuming a session, and by the remote-control
+    /// codec to backfill it from a durable event frame.
     ///
-    /// The log is the only sanctioned caller. Setting an empty id would
-    /// break the non-empty `message_id` contract that the reducer and
-    /// branch operations depend on.
+    /// Setting an empty id would break the non-empty `message_id` contract
+    /// that the reducer and branch operations depend on.
     pub fn set_id(&mut self, id: String) {
         self.id = id;
     }

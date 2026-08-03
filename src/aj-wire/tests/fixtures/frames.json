@@ -1,0 +1,82 @@
+[
+  {
+    "kind": "event",
+    "session": "session-1",
+    "epoch": "epoch-1",
+    "seq": 7,
+    "entry_id": "entry-7",
+    "event": {
+      "type": "message_end",
+      "agent_id": "main",
+      "message": {
+        "role": "user",
+        "content": [{ "type": "text", "text": "hello" }],
+        "timestamp": 10
+      }
+    }
+  },
+  {
+    "kind": "event",
+    "session": "session-1",
+    "epoch": "epoch-1",
+    "event": {
+      "type": "notice",
+      "agent_id": "main",
+      "text": "transient"
+    }
+  },
+  {
+    "kind": "state",
+    "session": "session-1",
+    "epoch": "epoch-1",
+    "working": true,
+    "settings": {
+      "provider": "scripted",
+      "model_id": "scripted-model",
+      "thinking": "off",
+      "speed": "standard",
+      "verbosity": "default"
+    },
+    "last_seq": 7
+  },
+  {
+    "kind": "caught_up",
+    "session": "session-1",
+    "epoch": "epoch-1",
+    "last_seq": 7
+  },
+  {
+    "kind": "list",
+    "sessions": [
+      {
+        "id": "session-1",
+        "live": true,
+        "working": false,
+        "queued": { "steering": 0, "follow_up": 1 },
+        "tasks": 0,
+        "last_seq": 7,
+        "last_activity": "2026-08-03T12:00:00Z",
+        "unreachable": false
+      }
+    ]
+  },
+  {
+    "kind": "reset",
+    "session": "session-1"
+  },
+  {
+    "kind": "heartbeat"
+  },
+  {
+    "kind": "vms",
+    "vms": [
+      {
+        "id": "vm-1",
+        "name": "worker",
+        "state": "ready",
+        "address": "10.0.0.2:6161",
+        "host_id": "host-1"
+      }
+    ]
+  }
+]

@@ -1,0 +1,89 @@
+{
+  "hello": {
+    "protocol": 1,
+    "capabilities": ["events", "vms"],
+    "app_version": "0.1.0",
+    "host_id": "host-1",
+    "working_directory": "/work/project"
+  },
+  "session_list": {
+    "sessions": [
+      {
+        "id": "session-1",
+        "live": true,
+        "working": false,
+        "queued": { "steering": 0, "follow_up": 1 },
+        "tasks": 0,
+        "last_seq": 7,
+        "last_activity": "2026-08-03T12:00:00Z",
+        "unreachable": false
+      }
+    ]
+  },
+  "tasks": {
+    "tasks": [
+      {
+        "id": 3,
+        "owner": { "sub": 2 },
+        "call_id": "call-3",
+        "kind": { "agent": { "agent_id": 2, "task": "inspect code" } },
+        "label": "inspect code",
+        "status": "running",
+        "started_at": "2026-08-03T12:00:01Z"
+      }
+    ]
+  },
+  "queue": {
+    "queues": [
+      {
+        "agent_id": "main",
+        "steering": [],
+        "follow_up": [
+          {
+            "role": "user",
+            "content": [{ "type": "text", "text": "next" }],
+            "timestamp": 12
+          }
+        ]
+      }
+    ]
+  },
+  "tree": {
+    "segments": [
+      {
+        "head": "entry-7",
+        "label": "hello",
+        "message_count": 3,
+        "last_timestamp": "2026-08-03T12:00:02Z",
+        "parent": null,
+        "children": [],
+        "on_active_path": true,
+        "is_leaf": true
+      }
+    ]
+  },
+  "vms": {
+    "vms": [
+      {
+        "id": "vm-2",
+        "name": "starting-worker",
+        "state": "provisioning"
+      },
+      {
+        "id": "vm-3",
+        "name": "failed-worker",
+        "state": "failed",
+        "message": "guest did not become ready"
+      },
+      {
+        "id": "vm-4",
+        "name": "old-worker",
+        "state": "destroyed"
+      }
+    ]
+  },
+  "error": {
+    "code": "session_busy",
+    "message": "the session is working"
+  }
+}

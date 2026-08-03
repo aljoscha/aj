@@ -1,0 +1,13 @@
+[package]
+name = "aj-wire"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aj-agent = { path = "../aj-agent" }
+chrono = { workspace = true, features = ["serde"] }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
+
+[lints]
+workspace = true

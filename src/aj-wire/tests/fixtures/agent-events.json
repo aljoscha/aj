@@ -1,0 +1,239 @@
+[
+  {
+    "type": "agent_start",
+    "agent_id": "main"
+  },
+  {
+    "type": "agent_end",
+    "agent_id": "main",
+    "messages": [
+      {
+        "role": "user",
+        "content": [{ "type": "text", "text": "hello" }],
+        "timestamp": 10
+      }
+    ]
+  },
+  {
+    "type": "turn_start",
+    "agent_id": "main"
+  },
+  {
+    "type": "turn_end",
+    "agent_id": "main",
+    "message": {
+      "content": [],
+      "api": "scripted",
+      "provider": "scripted",
+      "model": "scripted-model",
+      "usage": {
+        "input": 1,
+        "output": 2,
+        "cache_read": 3,
+        "cache_write": 4,
+        "total_tokens": 10,
+        "cost": { "input": 0.0, "output": 0.0, "cache_read": 0.0, "cache_write": 0.0, "total": 0.0 }
+      },
+      "stop_reason": "Stop",
+      "timestamp": 11
+    },
+    "tool_results": []
+  },
+  {
+    "type": "message_start",
+    "agent_id": "main",
+    "message": {
+      "role": "user",
+      "content": [{ "type": "text", "text": "hello" }],
+      "timestamp": 10
+    }
+  },
+  {
+    "type": "message_update",
+    "agent_id": "main",
+    "message": {
+      "role": "assistant",
+      "content": [],
+      "api": "scripted",
+      "provider": "scripted",
+      "model": "scripted-model",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cache_read": 0,
+        "cache_write": 0,
+        "total_tokens": 0,
+        "cost": { "input": 0.0, "output": 0.0, "cache_read": 0.0, "cache_write": 0.0, "total": 0.0 }
+      },
+      "stop_reason": "Stop",
+      "timestamp": 11
+    },
+    "event": {
+      "type": "text_delta",
+      "content_index": 0,
+      "delta": "hi",
+      "partial": {
+        "content": [],
+        "api": "scripted",
+        "provider": "scripted",
+        "model": "scripted-model",
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cache_read": 0,
+          "cache_write": 0,
+          "total_tokens": 0,
+          "cost": { "input": 0.0, "output": 0.0, "cache_read": 0.0, "cache_write": 0.0, "total": 0.0 }
+        },
+        "stop_reason": "Stop",
+        "timestamp": 11
+      }
+    }
+  },
+  {
+    "type": "message_end",
+    "agent_id": "main",
+    "message": {
+      "role": "user",
+      "content": [{ "type": "text", "text": "hello" }],
+      "timestamp": 10
+    }
+  },
+  {
+    "type": "tool_execution_start",
+    "agent_id": "main",
+    "call_id": "call-1",
+    "tool": "read_file",
+    "args": { "path": "README.md" }
+  },
+  {
+    "type": "tool_execution_update",
+    "agent_id": "main",
+    "call_id": "call-1",
+    "tool": "read_file",
+    "args": { "path": "README.md" },
+    "partial": { "kind": "text", "summary": "reading", "body": "partial" },
+    "content": []
+  },
+  {
+    "type": "tool_execution_end",
+    "agent_id": "main",
+    "call_id": "call-1",
+    "tool": "read_file",
+    "result": { "kind": "text", "summary": "done", "body": "contents" },
+    "content": [
+      { "type": "text", "text": "contents" },
+      { "type": "image", "data": "aW1hZ2U=", "mime_type": "image/png" }
+    ],
+    "is_error": false
+  },
+  {
+    "type": "sub_agent_start",
+    "parent": "main",
+    "child": { "sub": 1 },
+    "task": "inspect code",
+    "background": true,
+    "provider": "scripted",
+    "model_id": "scripted-model",
+    "thinking": "off",
+    "speed": "standard",
+    "verbosity": "default"
+  },
+  {
+    "type": "sub_agent_end",
+    "parent": "main",
+    "child": { "sub": 1 },
+    "report": "done",
+    "conclusion": "completed"
+  },
+  {
+    "type": "task_start",
+    "agent_id": "main",
+    "task_id": 1,
+    "call_id": "call-2",
+    "kind": { "bash": { "command": "printf hi" } },
+    "label": "printf hi"
+  },
+  {
+    "type": "task_output",
+    "agent_id": "main",
+    "task_id": 1,
+    "call_id": "call-2",
+    "partial": { "kind": "text", "summary": "running", "body": "hi" }
+  },
+  {
+    "type": "task_end",
+    "agent_id": "main",
+    "task_id": 1,
+    "call_id": "call-2",
+    "status": { "exited": 0 },
+    "label": "printf hi"
+  },
+  {
+    "type": "notice",
+    "agent_id": "main",
+    "text": "notice"
+  },
+  {
+    "type": "warning",
+    "agent_id": "main",
+    "text": "warning"
+  },
+  {
+    "type": "error",
+    "agent_id": "main",
+    "text": "error"
+  },
+  {
+    "type": "stream_retry",
+    "agent_id": "main",
+    "attempt": 2,
+    "delay": { "secs": 1, "nanos": 500000000 },
+    "error": "overloaded"
+  },
+  {
+    "type": "usage_update",
+    "agent_id": "main",
+    "usage": {
+      "accumulated_input": 1,
+      "turn_input": 2,
+      "accumulated_output": 3,
+      "turn_output": 4,
+      "accumulated_cache_write": 5,
+      "turn_cache_write": 6,
+      "accumulated_cache_read": 7,
+      "turn_cache_read": 8
+    }
+  },
+  {
+    "type": "compaction_start",
+    "agent_id": "main",
+    "reason": "manual"
+  },
+  {
+    "type": "compaction_progress",
+    "agent_id": "main",
+    "reason": "threshold",
+    "phase": "summarizing_turn_prefix"
+  },
+  {
+    "type": "compaction_end",
+    "agent_id": "main",
+    "reason": "overflow",
+    "tokens_before": 1000,
+    "tokens_after": 250,
+    "summary": "summary"
+  },
+  {
+    "type": "queue_update",
+    "agent_id": "main",
+    "steering": [
+      {
+        "role": "user",
+        "content": [{ "type": "text", "text": "steer" }],
+        "timestamp": 12
+      }
+    ],
+    "follow_up": []
+  }
+]

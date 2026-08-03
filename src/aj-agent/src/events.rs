@@ -38,6 +38,13 @@ where
     seq.end()
 }
 
+fn deserialize_content_arc<'de, D>(deserializer: D) -> Result<Arc<[UserContent]>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::<UserContent>::deserialize(deserializer).map(Arc::from)
+}
+
 /// Snapshot of an agent's bundle identity: which model it talks to
 /// and at what thinking effort and inference speed.
 ///
@@ -97,7 +104,7 @@ pub enum SubAgentConclusion {
 /// that serializes events): `"main"` for [`AgentId::Main`] and
 /// `{"sub": N}` for [`AgentId::Sub`]. Variant names are lowercased to
 /// match the rest of the event protocol's serde convention.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentId {
     /// The top-level agent.
@@ -118,7 +125,7 @@ pub enum AgentId {
 /// Why a compaction ran. Carried on the compaction lifecycle events so
 /// renderers can distinguish a user-invoked `/compact` from an
 /// automatic threshold trigger or context-overflow recovery.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionReason {
     Manual,
@@ -129,7 +136,7 @@ pub enum CompactionReason {
 /// Stage of an in-flight compaction, carried on
 /// [`AgentEvent::CompactionProgress`] so a renderer can label the
 /// in-progress indicator with the step currently running.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionPhase {
     /// Summarizing the history before the cut point — the main
@@ -154,7 +161,7 @@ pub enum CompactionPhase {
 /// payload fields lifted to the top level. Every variant that the
 /// agent actually emits is fully serializable; round-tripping
 /// through JSONL is part of the print-mode contract.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
     // --- Lifecycle ---------------------------------------------------------
@@ -246,7 +253,10 @@ pub enum AgentEvent {
         /// surfacing partial wire content. `Arc<[…]>` keeps the
         /// event cheap to clone across the bus when an image block
         /// (which can be multiple megabytes of base64) is attached.
-        #[serde(serialize_with = "serialize_content_arc")]
+        #[serde(
+            serialize_with = "serialize_content_arc",
+            deserialize_with = "deserialize_content_arc"
+        )]
         content: Arc<[UserContent]>,
     },
     /// A tool call has finalized. `result` is the structured payload
@@ -264,7 +274,10 @@ pub enum AgentEvent {
         /// reach the raw block payloads without rummaging through
         /// the transcript. `Arc<[…]>` keeps cloning cheap for
         /// image-bearing results.
-        #[serde(serialize_with = "serialize_content_arc")]
+        #[serde(
+            serialize_with = "serialize_content_arc",
+            deserialize_with = "deserialize_content_arc"
+        )]
         content: Arc<[UserContent]>,
         is_error: bool,
     },

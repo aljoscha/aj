@@ -8,6 +8,7 @@ members = [
     "src/aj-models",
     "src/aj-session",
     "src/aj-tools",
+    "src/aj-wire",
     "src/anthropic-sdk",
     "src/openai-sdk",
     "src/vaxis",
