@@ -189,8 +189,13 @@ Responsibilities:
   sub-agent-to-main cascade), compact, settings changes (host applies
   them, writes the settings log entries, and synthesizes the
   corresponding wire frames, both the projected notice event and a
-  refreshed `state` frame), task kill, head/branch switch, session
-  create.
+  refreshed `state` frame). A settings entry that lands before its
+  thread's first message projects no notice, so the durable frame the
+  host publishes for it would have nothing to regenerate from. The host
+  publishes the confirmation untagged in that case: live clients still
+  see it, and it is a transient notice like any other, which is what
+  keeps the pre-first-prompt settings gesture from going silent. Also
+  task kill, head/branch switch, and session create.
 - Head switching: refused with a conflict while a turn is running or
   background tasks are live, mirroring the local busy refusal (a
   mid-turn head switch would let the running turn persist onto the
@@ -206,6 +211,11 @@ Responsibilities:
   consistent), quiesce background tasks, flush log buffers, close
   client streams. Remote clients of a departed host simply lose the
   connection, through a gateway the sessions surface as unreachable.
+- A turn's fatal error belongs to its session, not to the host. It
+  surfaces as an error frame on that session's stream and the session
+  stays live. A host serving several sessions must not exit because one
+  of them hit a disk failure, and the local TUI attached to it should
+  show the error rather than quit.
 
 The local TUI becomes the first client of this interface, attached
 in-process through direct handles and channels, not through HTTP. It
@@ -269,6 +279,10 @@ internally tagged with `kind`:
   of an attach (before backfill) and whenever any of it changes. This is
   how a mid-session joiner learns the active model and seeds its
   lifecycle spinner, neither of which is derivable from projected events.
+  The change trigger is `working` or `settings`, not `last_seq`: every
+  durable frame already carries its own position, and `list` carries it
+  for sessions a client has not attached, so re-emitting `state` per
+  append would double the frame count for nothing.
   `working` is authoritative for the main agent and applies on every
   `state` frame, which is what self-heals a spinner left running by an
   `AgentEnd` a client missed. It says nothing about sub-agents: their
@@ -508,7 +522,7 @@ viewed agent to that parameter:
 | `.../{id}/prompt` | text or content blocks | Exactly `handle_submit`: run a turn if idle, queue follow-up if busy. |
 | `.../{id}/steer` | text, optional agent | Queue steering (or promote pending follow-up when text is empty), as today. |
 | `.../{id}/cancel` | optional agent | Cancel the running turn, with the existing foreground-sub-agent-cancels-main cascade. |
-| `.../{id}/queue` | op: remove (kind, index) or clear | Withdraw or clear pending queued messages. |
+| `.../{id}/queue` | op: remove (optional agent) or clear | Withdraw or clear pending queued messages. Withdrawal returns the text, which is what makes the client's dequeue-into-the-editor gesture work. One agent holds at most one coalesced pending message, so there is no index to address. |
 | `.../{id}/compact` | optional instructions | Manual compaction. |
 | `.../{id}/settings` | model / thinking / speed / verbosity changes | Host applies, logs, and emits the synthesized frames. |
 | `.../{id}/head` | target entry id | Switch the session head. 409 while working or tasks live. Clears queues, new epoch, `reset` frame. |
