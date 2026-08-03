@@ -113,6 +113,7 @@ dependencies = [
  "clap",
  "dotenv",
  "futures",
+ "nix",
  "rand 0.10.2",
  "serde",
  "serde_json",

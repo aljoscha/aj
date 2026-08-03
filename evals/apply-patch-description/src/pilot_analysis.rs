@@ -971,6 +971,7 @@ mod tests {
         object.insert("provider_requests".into(), json!(responses));
         object.get_mut("limits").unwrap()["max_provider_requests"] = json!(12);
         object.get_mut("limits").unwrap()["max_model_responses"] = json!(12);
+        object.get_mut("limits").unwrap()["aggregate_observed_output_token_ceiling"] = json!(1200);
         object.insert(
             "duration_millis".into(),
             json!(if current { 20 } else { 10 }),

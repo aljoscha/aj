@@ -157,7 +157,12 @@ pub struct SourceProvenance {
 }
 
 impl SourceProvenance {
-    /// Formats a revision without representing a dirty tree as clean `HEAD`.
+    /// Returns whether the dirty flag and worktree hash form a valid provenance.
+    pub fn is_valid(&self) -> bool {
+        self.dirty == self.worktree_hash.is_some()
+    }
+
+    /// Formats the source revision for artifact metadata.
     pub fn revision_label(&self) -> String {
         match &self.worktree_hash {
             Some(hash) if self.dirty => format!("{}+dirty.{hash}", self.head),
@@ -280,6 +285,10 @@ impl RuntimeRecord {
             .checked_add(self.usage.output)
             .and_then(|total| total.checked_add(self.usage.cache_read))
             .and_then(|total| total.checked_add(self.usage.cache_write));
+        let expected_aggregate_output_ceiling = self
+            .limits
+            .provider_output_token_ceiling
+            .saturating_mul(u64::from(self.limits.max_model_responses));
         self.valid
             && self.valid == self.terminal_status.valid()
             && self.task_passed == (self.terminal_status == TerminalStatus::Passed)
@@ -287,7 +296,12 @@ impl RuntimeRecord {
             && self.provider_errors.is_empty()
             && self.provider_error_details.is_empty()
             && total_tokens == Some(self.usage.total_tokens)
-            && self.usage.output <= self.limits.aggregate_observed_output_token_ceiling
+            && self.limits.aggregate_observed_output_token_ceiling
+                == expected_aggregate_output_ceiling
+            && self.usage.output <= expected_aggregate_output_ceiling
+            && self.model_responses <= u64::from(self.limits.max_model_responses)
+            && self.provider_requests <= self.limits.max_provider_requests
+            && self.source_provenance.is_valid()
     }
 }
 
@@ -448,7 +462,7 @@ pub(crate) fn completed_runtime_fixture() -> RuntimeRecord {
             max_provider_requests: 2,
             max_model_responses: 2,
             provider_output_token_ceiling: 100,
-            aggregate_observed_output_token_ceiling: 100,
+            aggregate_observed_output_token_ceiling: 200,
         },
         first_response_aj_recorded_catalog_cost: Some(0.1),
         tool_rounds: 1,
@@ -624,7 +638,7 @@ mod tests {
                 max_provider_requests: 2,
                 max_model_responses: 2,
                 provider_output_token_ceiling: 100,
-                aggregate_observed_output_token_ceiling: 100,
+                aggregate_observed_output_token_ceiling: 200,
             },
             first_response_aj_recorded_catalog_cost: Some(0.1),
             tool_rounds: 1,
@@ -699,9 +713,39 @@ mod tests {
         assert!(!record.completion_eligible());
 
         let mut record = runtime_record();
-        record.usage.output = 101;
-        record.usage.total_tokens = 101;
+        record.usage.output = 201;
+        record.usage.total_tokens = 201;
         assert!(!record.completion_eligible());
+    }
+
+    #[test]
+    fn completion_eligibility_recomputes_limits_and_checks_observed_counts() {
+        let mut record = runtime_record();
+        record.limits.aggregate_observed_output_token_ceiling = 201;
+        assert!(!record.completion_eligible());
+
+        let mut record = runtime_record();
+        record.model_responses = 3;
+        assert!(!record.completion_eligible());
+
+        let mut record = runtime_record();
+        record.provider_requests = 3;
+        assert!(!record.completion_eligible());
+    }
+
+    #[test]
+    fn completion_eligibility_rejects_inconsistent_source_provenance() {
+        let mut dirty_without_hash = runtime_record();
+        dirty_without_hash.source_provenance.worktree_hash = None;
+        assert!(dirty_without_hash.source_provenance.dirty);
+        assert!(!dirty_without_hash.source_provenance.is_valid());
+        assert!(!dirty_without_hash.completion_eligible());
+
+        let mut clean_with_hash = runtime_record();
+        clean_with_hash.source_provenance.dirty = false;
+        assert!(clean_with_hash.source_provenance.worktree_hash.is_some());
+        assert!(!clean_with_hash.source_provenance.is_valid());
+        assert!(!clean_with_hash.completion_eligible());
     }
 
     #[test]

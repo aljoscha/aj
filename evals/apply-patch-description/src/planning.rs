@@ -594,6 +594,7 @@ fn validate_trial_plan_context(
         ));
     }
     if metrics.baseline_root_hash.as_deref() != Some(&metadata.fixture_revision)
+        || !metrics.source_provenance.is_valid()
         || metadata.aj_revision != metrics.source_provenance.revision_label()
     {
         return Err(PlanningError(

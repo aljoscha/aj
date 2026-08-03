@@ -1010,8 +1010,8 @@ mod tests {
         inconsistent["usage"]["input"] = json!(1);
 
         let mut excessive = clean_runtime();
-        excessive["usage"]["output"] = json!(101);
-        excessive["usage"]["total_tokens"] = json!(101);
+        excessive["usage"]["output"] = json!(201);
+        excessive["usage"]["total_tokens"] = json!(201);
 
         for malformed in [inconsistent, excessive] {
             let temp = tempfile::tempdir().unwrap();

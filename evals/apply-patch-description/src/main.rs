@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
-use std::path::{Component, Path, PathBuf};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -187,20 +187,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
             output_plan,
             output_report,
         } => {
-            validate_output_paths(
+            let outputs = validate_output_paths(
                 &[plan.as_path(), records.as_path()],
                 &[output_plan.as_path(), output_report.as_path()],
             )?;
+            let output_plan = &outputs[0];
+            let output_report = &outputs[1];
             let unplanned = read_plan(&plan)?;
             let outcome = plan_main(&unplanned, &records)?;
             let report_bytes = serde_json::to_vec_pretty(&outcome.report)?;
-            write(&output_report, &report_bytes)?;
+            write(output_report, &report_bytes)?;
             let planned = outcome.planned_plan.ok_or_else(|| {
                 io::Error::other(
                     "planner is inconclusive because the frozen universe is insufficient",
                 )
             })?;
-            write(&output_plan, &serde_json::to_vec_pretty(&planned)?)?;
+            write(output_plan, &serde_json::to_vec_pretty(&planned)?)?;
         }
         Command::AnalyzePilot {
             plan,
@@ -209,17 +211,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
             output_json,
             output_markdown,
         } => {
-            validate_output_paths(
+            let outputs = validate_output_paths(
                 &[plan.as_path(), planning_report.as_path(), records.as_path()],
                 &[output_json.as_path(), output_markdown.as_path()],
             )?;
+            let output_json = &outputs[0];
+            let output_markdown = &outputs[1];
             let plan = read_plan(&plan)?;
             let planning_report = read_planning_report(&planning_report)?;
             let report = analyze_pilot_records(&plan, &planning_report, &records)?;
             let json = serde_json::to_vec_pretty(&report)?;
             let markdown = render_pilot_markdown(&report);
-            write(&output_json, &json)?;
-            write(&output_markdown, markdown.as_bytes())?;
+            write(output_json, &json)?;
+            write(output_markdown, markdown.as_bytes())?;
         }
         Command::Analyze {
             plan,
@@ -227,16 +231,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
             output_json,
             output_markdown,
         } => {
-            validate_output_paths(
+            let outputs = validate_output_paths(
                 &[plan.as_path(), records.as_path()],
                 &[output_json.as_path(), output_markdown.as_path()],
             )?;
+            let output_json = &outputs[0];
+            let output_markdown = &outputs[1];
             let plan = read_plan(&plan)?;
             let report = analyze_records(&plan, &records)?;
             let json = serde_json::to_vec_pretty(&report)?;
             let markdown = render_markdown(&report);
-            write(&output_json, &json)?;
-            write(&output_markdown, markdown.as_bytes())?;
+            write(output_json, &json)?;
+            write(output_markdown, markdown.as_bytes())?;
         }
         Command::Worker => run_worker().await?,
         Command::ToolWorker => tool_worker().await?,
@@ -259,7 +265,21 @@ fn load_parent_environment() {
 
 static NEXT_OUTPUT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
-fn write(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
+fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_before_publish(path, bytes, || {})
+}
+
+fn write_before_publish(
+    path: &Path,
+    bytes: &[u8],
+    before_publish: impl FnOnce(),
+) -> io::Result<()> {
+    match existing_output(path, bytes)? {
+        Some(true) => return Ok(()),
+        Some(false) => return Err(output_exists_with_different_bytes(path)),
+        None => {}
+    }
+
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
     let name = path
@@ -272,25 +292,73 @@ fn write(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
         std::process::id(),
         temporary_id
     ));
-    let result = (|| -> io::Result<()> {
+    let result = (|| {
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temporary)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        fs::rename(&temporary, path)?;
-        File::open(parent)?.sync_all()?;
-        Ok(())
+        before_publish();
+        match fs::hard_link(&temporary, path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                match existing_output(path, bytes)? {
+                    Some(true) => Ok(()),
+                    Some(false) => Err(output_exists_with_different_bytes(path)),
+                    None => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
     })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
+    let cleanup = fs::remove_file(&temporary);
+    if result.is_ok() {
+        cleanup?;
+        File::open(parent)?.sync_all()?;
+    } else {
+        let _ = cleanup;
     }
-    result?;
-    Ok(())
+    result
 }
 
-fn validate_output_paths(inputs: &[&Path], outputs: &[&Path]) -> io::Result<()> {
+fn existing_output(path: &Path, bytes: &[u8]) -> io::Result<Option<bool>> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let flags = nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_NONBLOCK;
+        options.custom_flags(flags.bits());
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other(format!(
+            "output path is not a regular file: {}",
+            path.display()
+        )));
+    }
+    let mut existing = Vec::new();
+    file.read_to_end(&mut existing)?;
+    Ok(Some(existing == bytes))
+}
+
+fn output_exists_with_different_bytes(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "output path already exists with different bytes: {}",
+            path.display()
+        ),
+    )
+}
+
+fn validate_output_paths(inputs: &[&Path], outputs: &[&Path]) -> io::Result<Vec<PathBuf>> {
     let input_identities = inputs
         .iter()
         .map(|path| path_identity(path, false))
@@ -310,19 +378,20 @@ fn validate_output_paths(inputs: &[&Path], outputs: &[&Path]) -> io::Result<()> 
         }
         output_identities.push(identity);
     }
-    Ok(())
+    Ok(output_identities
+        .into_iter()
+        .map(|identity| identity.resolved)
+        .collect())
 }
 
 struct PathIdentity {
-    lexical: PathBuf,
     resolved: PathBuf,
     file_id: Option<FileId>,
 }
 
 impl PathIdentity {
     fn aliases(&self, other: &Self) -> bool {
-        self.lexical == other.lexical
-            || self.resolved == other.resolved
+        self.resolved == other.resolved
             || self
                 .file_id
                 .zip(other.file_id)
@@ -337,70 +406,68 @@ struct FileId {
 }
 
 fn path_identity(path: &Path, output: bool) -> io::Result<PathIdentity> {
-    let lexical = lexical_absolute(path)?;
+    let absolute = absolute_path(path)?;
     if output {
-        if let Ok(metadata) = fs::symlink_metadata(&lexical) {
-            if metadata.file_type().is_symlink() {
+        match fs::symlink_metadata(&absolute) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(io::Error::other(format!(
                     "output path is a symbolic link: {}",
                     path.display()
                 )));
             }
-            if !metadata.is_file() {
+            Ok(metadata) if !metadata.is_file() => {
                 return Err(io::Error::other(format!(
                     "output path is not a regular file: {}",
                     path.display()
                 )));
             }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
     }
-    let resolved = resolve_allow_missing(&lexical)?;
-    let file_id = fs::metadata(&lexical)
+    let resolved = if output {
+        resolve_allow_missing(&absolute)?
+    } else {
+        absolute.canonicalize()?
+    };
+    let file_id = fs::metadata(&absolute)
         .ok()
         .and_then(|metadata| file_id(&metadata));
-    Ok(PathIdentity {
-        lexical,
-        resolved,
-        file_id,
-    })
+    Ok(PathIdentity { resolved, file_id })
 }
 
-fn lexical_absolute(path: &Path) -> io::Result<PathBuf> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
+fn absolute_path(path: &Path) -> io::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
     } else {
-        std::env::current_dir()?.join(path)
-    };
-    let mut normalized = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            component => normalized.push(component.as_os_str()),
-        }
+        Ok(std::env::current_dir()?.join(path))
     }
-    Ok(normalized)
 }
 
 fn resolve_allow_missing(path: &Path) -> io::Result<PathBuf> {
     let mut existing = path;
     let mut suffix = Vec::new();
-    while !existing.exists() {
-        let name = existing.file_name().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "path has no existing ancestor")
-        })?;
-        suffix.push(name.to_os_string());
-        existing = existing.parent().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "path has no existing ancestor")
-        })?;
+    loop {
+        match existing.canonicalize() {
+            Ok(mut resolved) => {
+                for component in suffix.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let name = existing.file_name().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "path has no existing ancestor")
+                })?;
+                suffix.push(name.to_os_string());
+                existing = existing.parent().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "path has no existing ancestor")
+                })?;
+            }
+            Err(error) => return Err(error),
+        }
     }
-    let mut resolved = existing.canonicalize()?;
-    for component in suffix.iter().rev() {
-        resolved.push(component);
-    }
-    Ok(resolved)
 }
 
 #[cfg(unix)]
@@ -439,18 +506,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn output_boundary_rejects_lexical_aliases_and_replaces_regular_files() {
+    fn output_boundary_rejects_lexical_aliases_and_preserves_existing_files() {
         let temp = tempfile::tempdir().unwrap();
         let input = temp.path().join("input.json");
         fs::write(&input, b"input").unwrap();
-        let lexical_alias = temp.path().join("child").join("..").join("input.json");
+        let child = temp.path().join("child");
+        fs::create_dir(&child).unwrap();
+        let lexical_alias = child.join("..").join("input.json");
         assert!(validate_output_paths(&[&input], &[&lexical_alias]).is_err());
 
         let output = temp.path().join("output.json");
         fs::write(&output, b"old").unwrap();
-        validate_output_paths(&[&input], &[&output]).unwrap();
-        write(&output, b"new").unwrap();
-        assert_eq!(fs::read(output).unwrap(), b"new");
+        let validated = validate_output_paths(&[&input], &[&output]).unwrap();
+        assert!(write(&validated[0], b"new").is_err());
+        assert_eq!(fs::read(&output).unwrap(), b"old");
+        write(&validated[0], b"old").unwrap();
+        assert_eq!(fs::read(output).unwrap(), b"old");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_boundary_resolves_symlinks_before_parent_components() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let protected = temp.path().join("protected");
+        let child = protected.join("child");
+        let safe = temp.path().join("safe");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir(&safe).unwrap();
+        let input = protected.join("input.json");
+        fs::write(&input, b"input").unwrap();
+        symlink(&child, safe.join("link")).unwrap();
+
+        let traversal = safe.join("link").join("..").join("input.json");
+        assert!(validate_output_paths(&[&input], &[&traversal]).is_err());
+
+        let unresolved = safe.join("link").join("..").join("output.json");
+        let validated = validate_output_paths(&[&input], &[&unresolved]).unwrap();
+        assert_eq!(validated, [protected.join("output.json")]);
     }
 
     #[cfg(unix)]
@@ -465,6 +559,8 @@ mod tests {
         let symbolic = temp.path().join("symbolic.json");
         symlink(&input, &symbolic).unwrap();
         assert!(validate_output_paths(&[&input], &[&symbolic]).is_err());
+        assert!(write(&symbolic, b"replacement").is_err());
+        assert_eq!(fs::read(&input).unwrap(), b"input");
 
         let hard = temp.path().join("hard.json");
         fs::hard_link(&input, &hard).unwrap();
@@ -475,5 +571,16 @@ mod tests {
         let second = temp.path().join("second.json");
         fs::hard_link(&first, &second).unwrap();
         assert!(validate_output_paths(&[&input], &[&first, &second]).is_err());
+    }
+
+    #[test]
+    fn output_publication_never_replaces_a_racing_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("output.json");
+        let result = write_before_publish(&output, b"generated", || {
+            fs::write(&output, b"racing writer").unwrap();
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(output).unwrap(), b"racing writer");
     }
 }
