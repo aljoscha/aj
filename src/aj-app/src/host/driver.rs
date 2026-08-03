@@ -85,15 +85,24 @@ impl Driver {
                 // Requests first: a command's refusal has to reflect the
                 // state as of now, and the event arm can be arbitrarily
                 // busy during a streaming turn.
-                request = self.requests.recv() => match request {
-                    Some(Request::Command { command, reply }) => {
-                        let outcome = self.command(command).await;
-                        let _ = reply.send(outcome);
-                    }
-                    // The host asked us to stop, or dropped the session.
-                    Some(Request::Shutdown) | None => {
-                        self.wind_down().await;
-                        return;
+                request = self.requests.recv() => {
+                    // A client that keeps commands in flight would
+                    // otherwise starve the two arms below for as long as it
+                    // keeps going: no frame would reach any client and no
+                    // turn would be reaped. Catching up here also makes the
+                    // refusal below reflect the events already in the
+                    // channel rather than the state before them.
+                    self.catch_up();
+                    match request {
+                        Some(Request::Command { command, reply }) => {
+                            let outcome = self.command(command).await;
+                            let _ = reply.send(outcome);
+                        }
+                        // The host asked us to stop, or dropped the session.
+                        Some(Request::Shutdown) | None => {
+                            self.wind_down().await;
+                            return;
+                        }
                     }
                 },
 
@@ -101,6 +110,20 @@ impl Driver {
 
                 joined = self.turns.join_next() => self.on_join(joined),
             }
+        }
+    }
+
+    /// Make progress on the arms the request arm's priority skips: publish
+    /// everything already on the event stream, then reap the turns that have
+    /// already finished.
+    ///
+    /// Events before joins, because a turn's own events precede its join and
+    /// the frames this task emits at reap time (a swept sub's `AgentEnd`, a
+    /// cancellation notice) belong after them.
+    fn catch_up(&mut self) {
+        self.drain_events();
+        while let Some(joined) = self.turns.try_join_next() {
+            self.on_join(joined);
         }
     }
 
@@ -263,16 +286,25 @@ impl Driver {
     // -- publishing ------------------------------------------------------
 
     fn publish_event(&self, entry: Option<EntryRef>, event: AgentEvent) {
+        // Checked outside the guard below: a failing assert inside it would
+        // poison the status mutex, and every later `status()` would panic on
+        // a lock that is only there to publish frames.
+        if let Some(entry) = &entry {
+            let last_seq = self.session.status().last_seq;
+            debug_assert!(
+                entry.seq > last_seq,
+                "durable seqs must be monotone per session: {} after {last_seq}",
+                entry.seq,
+            );
+        }
         let (epoch, durability) = {
             let mut status = self.session.status();
             if let Some(entry) = &entry {
-                debug_assert!(
-                    entry.seq > status.last_seq,
-                    "durable seqs must be monotone per session: {} after {}",
-                    entry.seq,
-                    status.last_seq
-                );
-                status.last_seq = entry.seq;
+                // Monotone by `max` rather than by assignment: the assert
+                // above is a debug-only guard, and a release build must not
+                // let one out-of-order append walk the high-water mark
+                // backwards and re-serve entries a client already applied.
+                status.last_seq = status.last_seq.max(entry.seq);
                 status.last_activity = Utc::now();
             }
             (
@@ -705,9 +737,10 @@ impl Driver {
     ///
     /// Refused while any turn is driven or any background task is live: a
     /// mid-turn switch would let the running turn persist onto the wrong
-    /// branch. On success the queues are cleared, the agent is reseeded
-    /// from the new branch, a fresh epoch is minted and `reset` published.
-    async fn head_switch(&self, entry: String) -> Result<CommandOutcome, HostError> {
+    /// branch. On success the queues are cleared, the state that belonged to
+    /// the branch being left is reset, the agent is reseeded from the new
+    /// branch, a fresh epoch is minted and `reset` published.
+    async fn head_switch(&mut self, entry: String) -> Result<CommandOutcome, HostError> {
         let (agents, bash) = running_work_counts(
             self.turns.driven(),
             &self.session.core.task_registry.snapshot(),
@@ -717,6 +750,11 @@ impl Driver {
                 reason: format!("{agents} agents and {bash} background tasks are still running"),
             });
         }
+        // Everything already on the event stream belongs to the epoch this
+        // switch is about to replace. Published afterwards it would carry
+        // the new epoch, which no client's epoch filter can reject, and it
+        // would name positions in the history the switch just left.
+        self.drain_events();
 
         // Queued messages belong to the branch being left, so they are
         // cleared once the switch is committed to (`set_head` validated
@@ -732,7 +770,15 @@ impl Driver {
             // belong to it, so they must reach disk before the head moves
             // off them.
             log.flush_pending().map_err(internal)?;
+            let known = log.contains(&entry);
             log.set_head(entry.clone()).map_err(|err| match err {
+                // `set_head` refuses an id it does not know and one whose
+                // role cannot be a head (a sub-agent entry) with the same
+                // error. The first is a 404 and the second a malformed
+                // request, so the two are told apart here (spec 6.1).
+                aj_session::ConversationError::InvalidHead(_) if known => HostError::Invalid(
+                    format!("entry {entry} is not on the user thread and cannot be a head"),
+                ),
                 aj_session::ConversationError::InvalidHead(_) => HostError::UnknownEntry(entry),
                 other => internal(other),
             })?;
@@ -768,17 +814,21 @@ impl Driver {
             status.epoch = mint_epoch();
             status.last_seq = log.last_seq();
             status.last_activity = Utc::now();
+            // Every run the log names is finished: the refusal above
+            // established that nothing is live, and the runs of the
+            // abandoned branch are over by definition.
+            status.finished_subs = log.sub_agent_ids();
             drop(status);
             conversation.agent_messages()
         };
+        self.reset_branch_state();
         self.session.status().settings = settings_of(&self.session.core.run_config);
         // Uncontended: nothing is driven, which the refusal above ensured.
-        self.session
-            .core
-            .agent
-            .lock()
-            .await
-            .reseed_transcript(transcript);
+        {
+            let mut agent = self.session.core.agent.lock().await;
+            agent.reseed_transcript(transcript);
+            agent.clear_todo_list();
+        }
 
         self.shared.fanout.reset_boundaries(self.session.id());
         self.shared.fanout.publish(Frame::Reset {
@@ -787,6 +837,39 @@ impl Driver {
         self.publish_state();
         self.shared.fanout.mark_list_dirty();
         Ok(CommandOutcome::Accepted)
+    }
+
+    /// Drop the per-branch state a head switch leaves behind.
+    ///
+    /// A session switch in the local frontend replaces the whole
+    /// `SessionCore`, so it cannot carry state across a branch. A head
+    /// switch keeps the core (its handles are held by an in-process client
+    /// and by the log's open file), so what would otherwise leak is dropped
+    /// here. Only valid with nothing running, which the refusal in
+    /// [`Self::head_switch`] establishes.
+    ///
+    /// What deliberately survives: the agent's sub-agent counter, so ids
+    /// stay unique across the switch, and its accumulated usage, which
+    /// records tokens this process really spent.
+    fn reset_branch_state(&self) {
+        // The abandoned branch's sub-agents must stop being promptable: a
+        // prompt to one would grow that branch under the new epoch, and
+        // every attached client would fold it into the new branch's
+        // transcript.
+        self.session.core.registry.clear();
+        // Inert once the registry is cleared (an override is only read at
+        // its sub's turn start, and no such turn can start again), dropped
+        // so the map cannot outlive what it describes.
+        self.session
+            .core
+            .sub_overrides
+            .lock()
+            .expect("sub overrides mutex poisoned")
+            .clear();
+        // Terminal entries and undelivered notices of the branch being
+        // left. A client refetches the table after `caught_up` and would
+        // otherwise be handed the other branch's tasks.
+        self.session.core.task_registry.clear();
     }
 
     // -- teardown --------------------------------------------------------

@@ -625,6 +625,18 @@ impl Agent {
         self.transcript = transcript;
     }
 
+    /// Drop the todo list. Contract as [`Self::reseed_transcript`]: no turn
+    /// in flight.
+    ///
+    /// The list is in-memory only, so a resume onto a branch starts with an
+    /// empty one. A host moving a session's head has to clear it for the
+    /// same reason: it holds the plan of the branch being left, and the
+    /// next inference on the new branch would read it back through
+    /// `todo_read`.
+    pub fn clear_todo_list(&mut self) {
+        self.session_state.set_todo_list(Vec::new());
+    }
+
     /// Install a hook fired before every tool call, replacing any
     /// previous hook. Passing the closure inside `Some(...)` enables
     /// the hook; passing `None` clears it. See
@@ -2107,6 +2119,18 @@ impl SubAgentRegistry {
             .copied()
             .collect()
     }
+
+    /// Drop every retained handle, so no `Sub(n)` of the work this registry
+    /// tracked is promptable any more.
+    ///
+    /// For a host that moves a session's head to another branch: the
+    /// sub-agents of the branch it left must not stay addressable, or a
+    /// prompt to one would grow that branch under the new head's epoch.
+    /// Ids are minted per session and never reused, so a cleared registry
+    /// cannot be repopulated with an id it once held.
+    pub fn clear(&self) {
+        self.inner.lock().expect("registry mutex poisoned").clear();
+    }
 }
 
 /// One live background task tracked by the [`TaskRegistry`].
@@ -2383,6 +2407,19 @@ impl TaskRegistry {
                 started_at: entry.started_at,
             })
             .collect()
+    }
+
+    /// Forget every tracked task and every queued notice.
+    ///
+    /// Contract: only valid when nothing is running. A host uses it when a
+    /// session's head moves to another branch, having refused the switch
+    /// while any task was live, so the entries it drops are all terminal and
+    /// belong to the branch being left. The minted-id counter is untouched,
+    /// so a later task cannot reuse an id a client still has output for.
+    pub fn clear(&self) {
+        let mut inner = self.inner.lock().expect("task registry mutex poisoned");
+        inner.entries.clear();
+        inner.notices.clear();
     }
 
     /// Queue a completion notice on its owner's queue.

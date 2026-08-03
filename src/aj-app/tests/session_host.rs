@@ -936,12 +936,16 @@ async fn a_head_switch_is_refused_while_work_is_live() {
     harness.host.shutdown().await;
 }
 
-/// A head switch to an entry that is not in the log is a 404, not a
-/// silently ignored request.
+/// A head switch to an entry that is not in the log is a 404, and one to a
+/// known entry whose role cannot be a head is a malformed request. The
+/// underlying log refuses both with one error, so the host tells them apart
+/// (spec 6.1).
 #[tokio::test]
 async fn a_head_switch_to_an_unknown_entry_is_refused() {
-    let harness = Harness::new(Vec::new());
+    let harness = Harness::new(sub_agent_turn());
     let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+
     let err = harness
         .host
         .command(
@@ -953,6 +957,132 @@ async fn a_head_switch_to_an_unknown_entry_is_refused() {
         .await
         .expect_err("unknown entries are refused");
     assert!(matches!(err, HostError::UnknownEntry(_)), "got {err:?}");
+
+    // A sub-agent entry exists but cannot be a head.
+    harness.prompt(&session, "delegate it").await;
+    client.pump_until_idle().await;
+    let sub_entry = {
+        let handles = harness
+            .host
+            .local_handles(&session)
+            .await
+            .expect("live session");
+        let log = handles.log.lock().await;
+        log.entries_in_order()
+            .into_iter()
+            .find(|entry| entry.agent_id == Some(1))
+            .expect("the sub-agent run wrote entries")
+            .id
+            .clone()
+    };
+    let err = harness
+        .host
+        .command(&session, Command::Head { entry: sub_entry })
+        .await
+        .expect_err("a sub-agent entry cannot be a head");
+    assert!(matches!(err, HostError::Invalid(_)), "got {err:?}");
+    harness.host.shutdown().await;
+}
+
+/// A head switch forgets what belonged to the branch it left: its
+/// sub-agents stop being promptable and its background tasks leave the
+/// table.
+///
+/// Without that, a prompt to a sub-agent of the abandoned branch is
+/// accepted and grows that branch, published as durable frames under the
+/// new epoch, which every attached client folds into the new branch's
+/// transcript.
+#[tokio::test]
+async fn a_head_switch_forgets_the_abandoned_branch() {
+    let harness = Harness::new(background_sub_turn());
+    let session = harness.create().await;
+    let mut stream = harness
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+    frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+    harness.prompt(&session, "kick it off").await;
+    settle(&harness, &session, &mut stream).await;
+
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    assert_eq!(
+        handles.registry.ids(),
+        vec![1],
+        "the background sub-agent is retained and promptable",
+    );
+    assert!(
+        !harness
+            .host
+            .tasks(&session)
+            .await
+            .expect("tasks")
+            .tasks
+            .is_empty(),
+        "and its run is in the task table",
+    );
+    let (head, entries_before) = {
+        let log = handles.log.lock().await;
+        let current = log.head().cloned().expect("a head");
+        let conversation = log.linearize(&current, ThreadFilter::USER);
+        let head = conversation
+            .entries()
+            .iter()
+            .rev()
+            .nth(2)
+            .expect("an earlier entry")
+            .id
+            .clone();
+        (head, log.entries_in_order().len())
+    };
+
+    harness
+        .host
+        .command(&session, Command::Head { entry: head })
+        .await
+        .expect("head switch on an idle session");
+
+    assert!(
+        handles.registry.ids().is_empty(),
+        "the abandoned branch's sub-agents are no longer promptable",
+    );
+    assert!(
+        harness
+            .host
+            .tasks(&session)
+            .await
+            .expect("tasks")
+            .tasks
+            .is_empty(),
+        "and its finished tasks left the table",
+    );
+    let err = harness
+        .host
+        .command(
+            &session,
+            Command::Prompt {
+                agent: AgentId::Sub(1),
+                content: vec![UserContent::text("keep going")],
+            },
+        )
+        .await
+        .expect_err("a sub-agent of the abandoned branch cannot be prompted");
+    assert!(matches!(err, HostError::Conflict { .. }), "got {err:?}");
+    assert_eq!(
+        handles.log.lock().await.entries_in_order().len(),
+        entries_before,
+        "and the refused prompt grew no thread",
+    );
     harness.host.shutdown().await;
 }
 
