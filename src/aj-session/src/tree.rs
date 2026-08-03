@@ -321,6 +321,7 @@ mod tests {
         ConversationView::user(log)
             .add_message(message)
             .expect("append")
+            .id
     }
 
     fn segment_with_head<'a>(tree: &'a SessionTree, head: &str) -> &'a TreeSegment {
@@ -454,7 +455,8 @@ mod tests {
         log.set_head(fork.clone()).expect("set head to fork");
         let settings = log
             .append_model_change(ThreadFilter::USER, "prov", "model")
-            .expect("append settings entry");
+            .expect("append settings entry")
+            .id;
 
         let tree = log.session_tree();
         let seg = segment_with_head(&tree, &settings);
@@ -517,7 +519,8 @@ mod tests {
         };
         let spawn = log
             .append_subagent_spawn(1, spawner.clone(), "do the thing", false, &settings)
-            .expect("spawn root");
+            .expect("spawn root")
+            .id;
         {
             let mut view = ConversationView::subagent(&mut log, spawn, 1);
             view.add_message(user_text("subtask")).expect("sub message");

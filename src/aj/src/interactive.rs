@@ -12533,7 +12533,8 @@ mod tests {
             let sp = log.system_prompt_id().cloned().expect("system prompt id");
             let shared = log
                 .append(Some(sp), ThreadKind::User, None, user("shared question"))
-                .expect("shared");
+                .expect("shared")
+                .id;
             let fork = log
                 .append(
                     Some(shared),
@@ -12541,7 +12542,8 @@ mod tests {
                     None,
                     assistant("shared answer"),
                 )
-                .expect("fork");
+                .expect("fork")
+                .id;
             let branch_a = log
                 .append(
                     Some(fork.clone()),
@@ -12549,10 +12551,12 @@ mod tests {
                     None,
                     user("branch A prompt"),
                 )
-                .expect("branch A");
+                .expect("branch A")
+                .id;
             let branch_b = log
                 .append(Some(fork), ThreadKind::User, None, user("branch B prompt"))
-                .expect("branch B");
+                .expect("branch B")
+                .id;
             (log.session_id().to_string(), branch_a, branch_b)
         };
 
@@ -12711,7 +12715,8 @@ mod tests {
                         message: AgentMessage::wire(Message::User(UserMessage::text("root"))),
                     },
                 )
-                .expect("append the root user message");
+                .expect("append the root user message")
+                .id;
             (log.session_id().to_string(), root_id)
         };
         let mut world = resumed_world(&dir, "streaming-text", &session_id).await;

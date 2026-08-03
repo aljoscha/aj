@@ -50,7 +50,7 @@ pub use compaction::{
 pub use listener::persistence_listener;
 pub use log::{
     Conversation, ConversationEntry, ConversationEntryKind, ConversationError, ConversationLog,
-    EntryId, SessionSettings, ThreadFilter, ThreadKind,
+    EntryId, EntryRef, SessionSettings, ThreadFilter, ThreadKind,
 };
 pub use persistence::{ConversationPersistence, SessionMetadata, SessionPreview};
 pub use prompt_history::{

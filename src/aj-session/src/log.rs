@@ -63,6 +63,20 @@ pub enum ConversationError {
 /// shared counter would produce.
 pub type EntryId = String;
 
+/// Append position and id of one log entry.
+///
+/// `seq` is 1-based: the entry's index in the log's append order plus
+/// one, so `0` reads as "nothing appended yet" and needs no `Option`.
+/// It is stable only within one materialization of the log: a torn tail
+/// is truncated on resume and buffered non-punctuation entries are lost
+/// with the process, so positions must never be persisted or compared
+/// across runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EntryRef {
+    pub seq: u64,
+    pub id: EntryId,
+}
+
 /// Which thread within a conversation log an entry belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -738,7 +752,8 @@ impl ConversationLog {
         &self.session_id
     }
 
-    /// Append one entry to the log. Returns the new entry's id.
+    /// Append one entry to the log. Returns the new entry's
+    /// [`EntryRef`]: its 1-based append position and its id.
     ///
     /// Message entries pass through the session storage codec before they are
     /// serialized. The caller has transferred ownership, so this can compact
@@ -789,7 +804,7 @@ impl ConversationLog {
         thread: ThreadKind,
         agent_id: Option<usize>,
         entry: ConversationEntryKind,
-    ) -> Result<EntryId, ConversationError> {
+    ) -> Result<EntryRef, ConversationError> {
         // Cheap invariant checks. Panics here would indicate an agent-side
         // bug; prefer surfacing as errors.
         match thread {
@@ -890,7 +905,10 @@ impl ConversationLog {
         if thread == ThreadKind::User {
             self.head = Some(id.clone());
         }
-        Ok(id)
+        Ok(EntryRef {
+            seq: self.last_seq(),
+            id,
+        })
     }
 
     /// Open the backing file on first use (lazy init for `create`'d
@@ -1046,6 +1064,13 @@ impl ConversationLog {
         self.order.len()
     }
 
+    /// Append position of the most recent entry, `0` when the log is
+    /// empty. This is the high-water mark of the 1-based positions
+    /// [`Self::append`] hands out (see [`EntryRef`]).
+    pub fn last_seq(&self) -> u64 {
+        u64::try_from(self.order.len()).expect("log length fits u64")
+    }
+
     /// The largest `agent_id` recorded on any entry in the log, or `None`
     /// if no subagent entries exist. Used on resume to seed the session's
     /// subagent counter so freshly-spawned subagents don't reuse ids from
@@ -1116,7 +1141,7 @@ impl ConversationLog {
     /// `pending_writes`. The line hits disk alongside the first
     /// punctuation append (typically the first user message). A log
     /// that never sees a punctuation append leaves no file behind.
-    pub fn set_system_prompt(&mut self, text: String) -> Result<EntryId, ConversationError> {
+    pub fn set_system_prompt(&mut self, text: String) -> Result<EntryRef, ConversationError> {
         if !self.order.is_empty() {
             return Err(ConversationError::InvalidAppend(
                 "system prompt can only be set on an empty log".to_string(),
@@ -1137,7 +1162,7 @@ impl ConversationLog {
         filter: ThreadFilter,
         provider: &str,
         model_id: &str,
-    ) -> Result<EntryId, ConversationError> {
+    ) -> Result<EntryRef, ConversationError> {
         self.append_settings_entry(
             filter,
             ConversationEntryKind::ModelChange {
@@ -1153,7 +1178,7 @@ impl ConversationLog {
         &mut self,
         filter: ThreadFilter,
         level: &str,
-    ) -> Result<EntryId, ConversationError> {
+    ) -> Result<EntryRef, ConversationError> {
         self.append_settings_entry(
             filter,
             ConversationEntryKind::ThinkingChange {
@@ -1168,7 +1193,7 @@ impl ConversationLog {
         &mut self,
         filter: ThreadFilter,
         speed: &str,
-    ) -> Result<EntryId, ConversationError> {
+    ) -> Result<EntryRef, ConversationError> {
         self.append_settings_entry(
             filter,
             ConversationEntryKind::SpeedChange {
@@ -1183,7 +1208,7 @@ impl ConversationLog {
         &mut self,
         filter: ThreadFilter,
         verbosity: &str,
-    ) -> Result<EntryId, ConversationError> {
+    ) -> Result<EntryRef, ConversationError> {
         self.append_settings_entry(
             filter,
             ConversationEntryKind::VerbosityChange {
@@ -1203,7 +1228,7 @@ impl ConversationLog {
         first_kept_entry_id: EntryId,
         tokens_before: u64,
         details: Option<crate::compaction::CompactionDetails>,
-    ) -> Result<EntryId, ConversationError> {
+    ) -> Result<EntryRef, ConversationError> {
         if !self.entries.contains_key(&first_kept_entry_id) {
             return Err(ConversationError::InvalidAppend(format!(
                 "compaction first_kept_entry_id {first_kept_entry_id} not found in log"
@@ -1238,7 +1263,7 @@ impl ConversationLog {
         task: &str,
         background: bool,
         settings: &AgentSettings,
-    ) -> Result<EntryId, ConversationError> {
+    ) -> Result<EntryRef, ConversationError> {
         self.append(
             Some(parent_head),
             ThreadKind::Subagent,
@@ -1260,7 +1285,7 @@ impl ConversationLog {
         &mut self,
         filter: ThreadFilter,
         entry: ConversationEntryKind,
-    ) -> Result<EntryId, ConversationError> {
+    ) -> Result<EntryRef, ConversationError> {
         let parent = self.parent_for_thread_append(filter);
         self.append(parent, filter.thread, filter.agent_id, entry)
     }
@@ -1368,12 +1393,12 @@ impl<'a> ConversationView<'a> {
     pub(crate) fn add_message(
         &mut self,
         message: AgentMessage,
-    ) -> Result<EntryId, ConversationError> {
+    ) -> Result<EntryRef, ConversationError> {
         let entry = ConversationEntryKind::Message { message };
         let parent = self.parent_for_next_append();
-        let id = self.log.append(parent, self.thread, self.agent_id, entry)?;
-        self.head = Some(id.clone());
-        Ok(id)
+        let appended = self.log.append(parent, self.thread, self.agent_id, entry)?;
+        self.head = Some(appended.id.clone());
+        Ok(appended)
     }
 
     /// Determine the `parent_id` for the next append. Normally this is
@@ -1533,10 +1558,12 @@ mod tests {
         }
         let model_id = log
             .append_model_change(ThreadFilter::USER, "prov", "model")
-            .expect("buffer a model change");
+            .expect("buffer a model change")
+            .id;
         let thinking_id = log
             .append_thinking_change(ThreadFilter::USER, "high")
-            .expect("buffer a thinking change");
+            .expect("buffer a thinking change")
+            .id;
         let session_id = log.session_id().to_string();
         log.flush_pending().expect("flush drains the buffer");
         drop(log);
@@ -1728,7 +1755,8 @@ mod tests {
 
         let id = log
             .set_system_prompt("hello world".to_string())
-            .expect("set_system_prompt on empty log");
+            .expect("set_system_prompt on empty log")
+            .id;
 
         assert_eq!(log.system_prompt(), Some("hello world"));
         assert_eq!(log.system_prompt_id(), Some(&id));
@@ -1829,11 +1857,12 @@ mod tests {
 
         let sp_id = log
             .set_system_prompt("the prompt".to_string())
-            .expect("set system prompt");
+            .expect("set system prompt")
+            .id;
 
         let user_id = {
             let mut view = ConversationView::user(&mut log);
-            view.add_message(user_text("hi")).expect("user msg")
+            view.add_message(user_text("hi")).expect("user msg").id
         };
 
         let user_entry = log.entries.get(&user_id).expect("user entry exists");
@@ -1852,7 +1881,7 @@ mod tests {
 
         let user_id = {
             let mut view = ConversationView::user(&mut log);
-            view.add_message(user_text("hi")).expect("user msg")
+            view.add_message(user_text("hi")).expect("user msg").id
         };
 
         assert_eq!(log.latest_leaf(ThreadFilter::USER).as_ref(), Some(&user_id));
@@ -1867,7 +1896,7 @@ mod tests {
 
         let user_id = {
             let mut view = ConversationView::user(&mut log);
-            view.add_message(user_text("hi")).expect("user msg")
+            view.add_message(user_text("hi")).expect("user msg").id
         };
 
         let convo = log.linearize(&user_id, ThreadFilter::USER);
@@ -1896,7 +1925,7 @@ mod tests {
             log.set_system_prompt("p".to_string()).expect("set sp");
             let mut view = ConversationView::user(&mut log);
             view.add_message(user_text("a")).expect("a");
-            let head_b = view.add_message(user_text("b")).expect("b");
+            let head_b = view.add_message(user_text("b")).expect("b").id;
             (log.session_id().to_string(), head_b)
         };
 
@@ -1962,13 +1991,14 @@ mod tests {
 
         let user_id = {
             let mut view = ConversationView::user(&mut log);
-            view.add_message(user_text("hi")).expect("user msg")
+            view.add_message(user_text("hi")).expect("user msg").id
         };
 
         let sub_id = {
             let mut view = ConversationView::subagent(&mut log, user_id.clone(), 1);
             view.add_message(user_text("subtask"))
                 .expect("subagent prompt")
+                .id
         };
 
         let convo = log.linearize(&sub_id, ThreadFilter::subagent(1));
@@ -2174,7 +2204,7 @@ mod tests {
 
         let entry_id = {
             let mut view = ConversationView::user(&mut log);
-            view.add_message(message).expect("user msg")
+            view.add_message(message).expect("user msg").id
         };
         assert_eq!(entry_id, message_id, "append adopts the message id");
 
@@ -2527,11 +2557,13 @@ mod tests {
         log.set_system_prompt("p".into()).expect("set sp");
         let user_id = {
             let mut view = ConversationView::user(&mut log);
-            view.add_message(user_text("hi")).expect("u")
+            view.add_message(user_text("hi")).expect("u").id
         };
         let sub_id = {
             let mut view = ConversationView::subagent(&mut log, user_id, 1);
-            view.add_message(user_text("subtask")).expect("sub prompt")
+            view.add_message(user_text("subtask"))
+                .expect("sub prompt")
+                .id
         };
         log.append_model_change(ThreadFilter::subagent(1), "openai", "gpt-sub")
             .expect("sub mc");
@@ -2564,11 +2596,12 @@ mod tests {
         let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir);
         let mut log = ConversationLog::create(&persistence).expect("create log");
-        let sp_id = log.set_system_prompt("p".into()).expect("set sp");
+        let sp_id = log.set_system_prompt("p".into()).expect("set sp").id;
 
         let mc_id = log
             .append_model_change(ThreadFilter::USER, "anthropic", "claude-x")
-            .expect("model change");
+            .expect("model change")
+            .id;
         let mc_entry = log.entries.get(&mc_id).expect("entry exists");
         assert_eq!(mc_entry.parent_id.as_ref(), Some(&sp_id));
         assert!(matches!(mc_entry.thread, ThreadKind::User));
@@ -2579,7 +2612,7 @@ mod tests {
             let head = log.latest_leaf(ThreadFilter::USER);
             assert_eq!(head.as_ref(), Some(&mc_id));
             let mut view = ConversationView::user(&mut log);
-            view.add_message(user_text("hi")).expect("user msg")
+            view.add_message(user_text("hi")).expect("user msg").id
         };
         let user_entry = log.entries.get(&user_id).expect("entry exists");
         assert_eq!(user_entry.parent_id.as_ref(), Some(&mc_id));
@@ -2604,7 +2637,7 @@ mod tests {
             log.set_system_prompt("p".into()).expect("set sp");
             let user_id = {
                 let mut view = ConversationView::user(&mut log);
-                view.add_message(user_text("hi")).expect("u")
+                view.add_message(user_text("hi")).expect("u").id
             };
             log.append_subagent_spawn(1, user_id, "subtask", true, &spawn_settings())
                 .expect("spawn entry");
@@ -2698,7 +2731,7 @@ mod tests {
         log.set_system_prompt("p".into()).expect("set sp");
         let user_id = {
             let mut view = ConversationView::user(&mut log);
-            view.add_message(user_text("hi")).expect("u")
+            view.add_message(user_text("hi")).expect("u").id
         };
         log.append_subagent_spawn(1, user_id, "subtask", false, &spawn_settings())
             .expect("spawn entry");
@@ -2756,7 +2789,7 @@ mod tests {
                 let mut view = ConversationView::user(&mut log);
                 view.add_message(user_text("one")).expect("u1");
                 view.add_message(assistant_text("a1")).expect("a1");
-                view.add_message(user_text("two")).expect("u2")
+                view.add_message(user_text("two")).expect("u2").id
             };
 
             let details = crate::compaction::CompactionDetails {
@@ -2835,7 +2868,7 @@ mod tests {
             view.add_message(assistant_text("old reply")).expect("a1");
             let kept = view.add_message(user_text("kept question")).expect("u2");
             view.add_message(assistant_text("kept reply")).expect("a2");
-            kept
+            kept.id
         };
 
         log.append_compaction(ThreadFilter::USER, "SUMMARY".into(), kept_user, 999, None)
@@ -2904,7 +2937,7 @@ mod tests {
                 &body,
             ))
             .expect("retained tool result");
-            first_kept
+            first_kept.id
         };
         log.append_compaction(ThreadFilter::USER, "SUMMARY".into(), first_kept, 999, None)
             .expect("compaction");
@@ -2947,6 +2980,106 @@ mod tests {
     }
 
     #[test]
+    fn every_append_returns_its_one_based_position() {
+        let persistence = ConversationPersistence::new(fresh_sessions_dir());
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+
+        let mut refs = vec![
+            log.set_system_prompt("p".to_string())
+                .expect("system prompt"),
+            log.append_model_change(ThreadFilter::USER, "prov", "m")
+                .expect("model change"),
+            log.append_thinking_change(ThreadFilter::USER, "high")
+                .expect("thinking change"),
+            log.append_speed_change(ThreadFilter::USER, "fast")
+                .expect("speed change"),
+            log.append_verbosity_change(ThreadFilter::USER, "low")
+                .expect("verbosity change"),
+        ];
+        // Non-punctuation entries only buffer in memory, yet their
+        // position is handed out right away: it is the in-memory append
+        // index, not a disk offset.
+        assert!(
+            !log.path().exists(),
+            "settings entries must not materialize a file"
+        );
+        assert_eq!(log.last_seq(), 5);
+
+        let user = {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(user_text("hi")).expect("user message")
+        };
+        refs.push(user.clone());
+        let assistant = {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(assistant_tool_use("tu-1", "ping"))
+                .expect("assistant message")
+        };
+        refs.push(assistant.clone());
+        let spawn = log
+            .append_subagent_spawn(1, assistant.id.clone(), "task", false, &spawn_settings())
+            .expect("spawn root");
+        refs.push(spawn.clone());
+        refs.push(
+            log.append_compaction(
+                ThreadFilter::USER,
+                "sum".to_string(),
+                user.id.clone(),
+                42,
+                None,
+            )
+            .expect("compaction"),
+        );
+        refs.push(
+            log.append(
+                Some(spawn.id.clone()),
+                ThreadKind::Subagent,
+                Some(1),
+                ConversationEntryKind::Message {
+                    message: user_text("subtask"),
+                },
+            )
+            .expect("raw append"),
+        );
+
+        let total = u64::try_from(refs.len()).expect("fits u64");
+        assert_eq!(
+            refs.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            (1..=total).collect::<Vec<_>>(),
+            "positions are dense and monotone across entry kinds"
+        );
+        let order: Vec<EntryId> = log
+            .entries_in_order()
+            .into_iter()
+            .map(|entry| entry.id.clone())
+            .collect();
+        for entry_ref in &refs {
+            let index = usize::try_from(entry_ref.seq).expect("fits usize") - 1;
+            assert_eq!(order[index], entry_ref.id, "position indexes its own entry");
+        }
+        assert_eq!(log.last_seq(), total);
+    }
+
+    #[test]
+    fn last_seq_starts_at_zero_and_tracks_the_last_append() {
+        let persistence = ConversationPersistence::new(fresh_sessions_dir());
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        assert_eq!(log.last_seq(), 0, "an empty log has nothing appended yet");
+
+        let prompt = log
+            .set_system_prompt("p".to_string())
+            .expect("system prompt");
+        assert_eq!(log.last_seq(), prompt.seq);
+
+        let user = {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(user_text("hi")).expect("user message")
+        };
+        assert_eq!(log.last_seq(), user.seq);
+        assert_eq!(log.last_seq(), 2);
+    }
+
+    #[test]
     fn appended_ids_are_unique_within_a_log() {
         // The mint-and-retry path must never hand out a duplicate id
         // within one log, even across many appends.
@@ -2961,7 +3094,8 @@ mod tests {
             for i in 0..200 {
                 let id = view
                     .add_message(user_text(&format!("m{i}")))
-                    .expect("append message");
+                    .expect("append message")
+                    .id;
                 assert!(ids.insert(id), "minted a duplicate id");
             }
         }
@@ -2999,11 +3133,11 @@ mod tests {
 
             let id_a = {
                 let mut view = ConversationView::user(&mut log_a);
-                view.add_message(user_text("from a")).expect("a msg")
+                view.add_message(user_text("from a")).expect("a msg").id
             };
             let id_b = {
                 let mut view = ConversationView::user(&mut log_b);
-                view.add_message(user_text("from b")).expect("b msg")
+                view.add_message(user_text("from b")).expect("b msg").id
             };
             (id_a, id_b)
         };
@@ -3039,7 +3173,7 @@ mod tests {
 
         let u1 = {
             let mut view = ConversationView::user(&mut log);
-            view.add_message(user_text("hi")).expect("u1")
+            view.add_message(user_text("hi")).expect("u1").id
         };
         assert_eq!(log.head(), Some(&u1), "user append advances the head");
 
@@ -3047,13 +3181,15 @@ mod tests {
             let mut view = ConversationView::user(&mut log);
             view.add_message(assistant_tool_use("tu-1", "agent"))
                 .expect("a1")
+                .id
         };
         assert_eq!(log.head(), Some(&a1));
 
         // A sub-agent spawn and its messages must not touch the head.
         let spawn = log
             .append_subagent_spawn(1, a1.clone(), "task", false, &spawn_settings())
-            .expect("spawn");
+            .expect("spawn")
+            .id;
         assert_eq!(log.head(), Some(&a1), "sub-agent spawn leaves the head");
         {
             let mut view = ConversationView::subagent(&mut log, spawn, 1);
@@ -3077,10 +3213,11 @@ mod tests {
             log.set_system_prompt("p".to_string()).expect("set sp");
             let (u1, tail) = {
                 let mut view = ConversationView::user(&mut log);
-                let u1 = view.add_message(user_text("first")).expect("u1");
+                let u1 = view.add_message(user_text("first")).expect("u1").id;
                 let tail = view
                     .add_message(assistant_text("first reply"))
-                    .expect("tail");
+                    .expect("tail")
+                    .id;
                 (u1, tail)
             };
 
@@ -3088,7 +3225,7 @@ mod tests {
             log.set_head(u1.clone()).expect("set head to u1");
             let branched = {
                 let mut view = ConversationView::user(&mut log);
-                view.add_message(user_text("branch")).expect("branch")
+                view.add_message(user_text("branch")).expect("branch").id
             };
             // The new entry anchors at the earlier head, not the tail.
             let entry = log.get(&branched).expect("branched entry");
@@ -3107,18 +3244,19 @@ mod tests {
         let dir = fresh_sessions_dir();
         let persistence = ConversationPersistence::new(dir);
         let mut log = ConversationLog::create(&persistence).expect("create log");
-        let sp = log.set_system_prompt("p".to_string()).expect("set sp");
+        let sp = log.set_system_prompt("p".to_string()).expect("set sp").id;
 
         let user_id = {
             let mut view = ConversationView::user(&mut log);
-            view.add_message(user_text("hi")).expect("u")
+            view.add_message(user_text("hi")).expect("u").id
         };
         let spawn = log
             .append_subagent_spawn(1, user_id.clone(), "task", false, &spawn_settings())
-            .expect("spawn");
+            .expect("spawn")
+            .id;
         let sub_msg = {
             let mut view = ConversationView::subagent(&mut log, spawn.clone(), 1);
-            view.add_message(user_text("subtask")).expect("sub u")
+            view.add_message(user_text("subtask")).expect("sub u").id
         };
 
         // Accepts a user entry and the system-prompt meta entry.
@@ -3156,8 +3294,8 @@ mod tests {
             log.set_system_prompt("p".to_string()).expect("set sp");
             let (u1, u2) = {
                 let mut view = ConversationView::user(&mut log);
-                let u1 = view.add_message(user_text("one")).expect("u1");
-                let u2 = view.add_message(user_text("two")).expect("u2");
+                let u1 = view.add_message(user_text("one")).expect("u1").id;
+                let u2 = view.add_message(user_text("two")).expect("u2").id;
                 (u1, u2)
             };
             (log.session_id().to_string(), u1, u2)

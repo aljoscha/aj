@@ -1994,7 +1994,7 @@ mod tests {
                 0,
             ))
             .expect("a1");
-            kept
+            kept.id
         };
         log.append_compaction(
             ThreadFilter::USER,
@@ -2537,7 +2537,8 @@ mod tests {
         let settings = super::fallback_settings();
         let mut sub_head = log
             .append_subagent_spawn(1, user_head.clone(), "bg subtask", true, &settings)
-            .expect("spawn");
+            .expect("spawn")
+            .id;
 
         // First sub turn.
         sub_head = {
@@ -2852,7 +2853,7 @@ mod tests {
 
         let common = {
             let mut view = ConversationView::user(&mut log);
-            view.add_message(user_msg("common")).expect("common")
+            view.add_message(user_msg("common")).expect("common").id
         };
 
         // Branch A off the common parent.
@@ -2896,7 +2897,7 @@ mod tests {
 
         let common = {
             let mut view = ConversationView::user(&mut log);
-            view.add_message(user_msg("common")).expect("common")
+            view.add_message(user_msg("common")).expect("common").id
         };
 
         // Branch A: an assistant turn that spawns sub-agent 1.
@@ -2907,10 +2908,12 @@ mod tests {
                 text_signature: None,
             })]))
             .expect("a")
+            .id
         };
         let spawn_a = log
             .append_subagent_spawn(1, a_a.clone(), "sub A task", false, &fallback_settings())
-            .expect("spawn 1");
+            .expect("spawn 1")
+            .id;
         {
             let mut view = ConversationView::subagent(&mut log, spawn_a, 1);
             view.add_message(user_msg("sub A prompt")).expect("sub a u");
@@ -2930,10 +2933,12 @@ mod tests {
                 text_signature: None,
             })]))
             .expect("b")
+            .id
         };
         let spawn_b = log
             .append_subagent_spawn(2, a_b, "sub B task", false, &fallback_settings())
-            .expect("spawn 2");
+            .expect("spawn 2")
+            .id;
         {
             let mut view = ConversationView::subagent(&mut log, spawn_b, 2);
             view.add_message(user_msg("sub B prompt")).expect("sub b u");
@@ -2982,7 +2987,7 @@ mod tests {
 
         let common = {
             let mut view = ConversationView::user(&mut log);
-            view.add_message(user_msg("common")).expect("common")
+            view.add_message(user_msg("common")).expect("common").id
         };
 
         // Branch A: an assistant turn spawns sub-agent 1.
@@ -2993,10 +2998,12 @@ mod tests {
                 text_signature: None,
             })]))
             .expect("a")
+            .id
         };
         let spawn_a = log
             .append_subagent_spawn(1, a_a.clone(), "sub A task", false, &fallback_settings())
-            .expect("spawn A");
+            .expect("spawn A")
+            .id;
         {
             let mut view = ConversationView::subagent(&mut log, spawn_a, 1);
             view.add_message(user_msg("sub A prompt")).expect("sub a u");
@@ -3017,10 +3024,12 @@ mod tests {
                 text_signature: None,
             })]))
             .expect("b")
+            .id
         };
         let spawn_b = log
             .append_subagent_spawn(1, a_b, "sub B task", false, &fallback_settings())
-            .expect("spawn B");
+            .expect("spawn B")
+            .id;
         {
             let mut view = ConversationView::subagent(&mut log, spawn_b, 1);
             view.add_message(user_msg("sub B prompt")).expect("sub b u");
@@ -3085,6 +3094,7 @@ mod tests {
                 text_signature: None,
             })]))
             .expect("a")
+            .id
         };
         // Legacy sub thread: first entry is the task user message,
         // anchored at the active-path assistant message.

@@ -635,16 +635,19 @@ mod tests {
         let mut log = ConversationLog::create(persistence).expect("create log");
         let sp = log
             .set_system_prompt("prompt".to_string())
-            .expect("system prompt");
+            .expect("system prompt")
+            .id;
         let user = |text: &str| ConversationEntryKind::Message {
             message: AgentMessage::wire(Message::User(UserMessage::text(text))),
         };
         let m1 = log
             .append(Some(sp), ThreadKind::User, None, user("one"))
-            .expect("first user message");
+            .expect("first user message")
+            .id;
         let m2 = log
             .append(Some(m1.clone()), ThreadKind::User, None, user("two"))
-            .expect("second user message");
+            .expect("second user message")
+            .id;
         (log.session_id().to_string(), m1, m2)
     }
 
@@ -748,7 +751,8 @@ mod tests {
             let mut log = ConversationLog::create(&persistence).expect("create log");
             let sp = log
                 .set_system_prompt("prompt".to_string())
-                .expect("system prompt");
+                .expect("system prompt")
+                .id;
             let user = |text: &str| ConversationEntryKind::Message {
                 message: AgentMessage::wire(Message::User(UserMessage::text(text))),
             };
@@ -764,7 +768,8 @@ mod tests {
             };
             let m_branch = log
                 .append(Some(sp.clone()), ThreadKind::User, None, user("branch"))
-                .expect("branch user message");
+                .expect("branch user message")
+                .id;
             let a_branch = log
                 .append(
                     Some(m_branch),
@@ -772,10 +777,12 @@ mod tests {
                     None,
                     tool_call("tu-branch"),
                 )
-                .expect("branch dangling tool_call");
+                .expect("branch dangling tool_call")
+                .id;
             let m_tail = log
                 .append(Some(sp), ThreadKind::User, None, user("tail"))
-                .expect("tail user message");
+                .expect("tail user message")
+                .id;
             log.append(Some(m_tail), ThreadKind::User, None, tool_call("tu-tail"))
                 .expect("tail dangling tool_call");
             (log.session_id().to_string(), a_branch)
