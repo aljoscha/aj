@@ -16,7 +16,9 @@ use std::collections::{HashMap, HashSet};
 use aj_models::types::{AssistantContent, Message, UserContent};
 use chrono::{DateTime, Utc};
 
-use crate::log::{ConversationEntry, ConversationEntryKind, ConversationLog, EntryId, ThreadKind};
+use crate::log::{
+    ConversationEntry, ConversationEntryKind, ConversationLog, EntryId, LogSnapshot, ThreadKind,
+};
 
 /// The branch structure of a session, collapsed to one node per segment.
 ///
@@ -55,12 +57,19 @@ pub struct TreeSegment {
     pub is_leaf: bool,
 }
 
-impl ConversationLog {
+impl LogSnapshot {
     /// Build the [`SessionTree`] on demand from the current log image. Cheap
     /// and in-memory: one pass to index children plus a DFS over the
     /// user-thread forest.
     pub fn session_tree(&self) -> SessionTree {
         SessionTree::build(&self.entries_in_order(), self.head())
+    }
+}
+
+impl ConversationLog {
+    /// See [`LogSnapshot::session_tree`].
+    pub fn session_tree(&self) -> SessionTree {
+        self.core().session_tree()
     }
 }
 

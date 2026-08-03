@@ -50,7 +50,7 @@ pub use compaction::{
 pub use listener::persistence_listener;
 pub use log::{
     Conversation, ConversationEntry, ConversationEntryKind, ConversationError, ConversationLog,
-    EntryId, EntryRef, SessionSettings, ThreadFilter, ThreadKind,
+    EntryId, EntryRef, LogSnapshot, SessionSettings, ThreadFilter, ThreadKind,
 };
 pub use persistence::{ConversationPersistence, SessionMetadata, SessionPreview};
 pub use prompt_history::{
@@ -58,7 +58,9 @@ pub use prompt_history::{
     workspace_history, workspace_history_streaming,
 };
 pub use repair::repair_interrupted_tool_uses;
-pub use replay::{project_thread, replay, replay_deferring_subs};
+pub use replay::{
+    Backfill, ProjectedEvent, project_suffix, project_thread, replay, replay_deferring_subs,
+};
 pub use stats::SessionStats;
 pub use tool_details::resolve_tool_details;
 pub use tree::{SessionTree, TreeSegment};

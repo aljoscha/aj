@@ -484,6 +484,36 @@ impl Conversation {
     }
 }
 
+/// A cloneable, read-only image of a log's entry tree.
+///
+/// Every read-side query lives here, and [`ConversationLog`] delegates to
+/// the copy it owns. Taking a snapshot under the log lock and answering
+/// an expensive read from it (a full projection, say) is what keeps that
+/// read from stalling the session's next append.
+#[derive(Debug, Clone)]
+pub struct LogSnapshot {
+    session_id: String,
+    entries: HashMap<EntryId, ConversationEntry>,
+    /// Insertion order: ids in the order they were appended. The index of
+    /// an id here, plus one, is the entry's [`EntryRef::seq`].
+    order: Vec<EntryId>,
+    /// The user-thread entry the next user-thread append anchors at.
+    ///
+    /// This is the explicit head that replaces the implicit
+    /// "most recently appended user entry" convention. Every
+    /// user-thread [`ConversationLog::append`] advances it (messages,
+    /// settings records, compaction, repair); sub-agent and meta appends
+    /// leave it untouched. [`ConversationLog::set_head`] moves it to an
+    /// earlier entry to start a sibling branch. `None` only while the
+    /// user thread is empty (no user-thread entry yet); the next append
+    /// then anchors at the system-prompt meta entry when one exists, or
+    /// becomes the file root. There is no persisted head pointer:
+    /// `create` starts it `None` and `resume` recovers it via
+    /// [`Self::latest_leaf`], because the most recently appended entry
+    /// is always on the branch that was last written to.
+    head: Option<EntryId>,
+}
+
 /// An append-only, event-sourced log of a conversation and all its subagent
 /// and branch offshoots, held in memory and mirrored to a single JSONL file
 /// on disk.
@@ -504,12 +534,10 @@ impl Conversation {
 /// and the other writer's tail is left off the linearized path (still on disk,
 /// just not replayed). We accept that over a lock.
 pub struct ConversationLog {
+    /// The entry tree. Reads go through here, appends mutate it after the
+    /// line has reached the file.
+    core: LogSnapshot,
     path: PathBuf,
-    session_id: String,
-    entries: HashMap<EntryId, ConversationEntry>,
-    /// Insertion order: ids in the order they were appended. Used to find
-    /// the most recently written entry matching a filter.
-    order: Vec<EntryId>,
     /// Lazily opened: `None` for a freshly-[ConversationLog::create]'d log
     /// that has never had a real ("punctuation") entry appended, `Some`
     /// once we've committed one (or for a [ConversationLog::resume]'d log
@@ -524,21 +552,180 @@ pub struct ConversationLog {
     /// on the next punctuation append. Resume initialises this empty:
     /// anything on disk is already committed, by definition.
     pending_writes: Vec<String>,
-    /// The user-thread entry the next user-thread append anchors at.
+}
+
+impl LogSnapshot {
+    /// The id under which this log is listed by `aj list-sessions`.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Walk back from `head` along parent_id pointers, keeping only
+    /// entries matching `filter`. Returns the entries in chronological
+    /// (root-first) order, wrapped in a read-only [Conversation] view
+    /// that can be handed to the model.
     ///
-    /// This is the explicit head that replaces the implicit
-    /// "most recently appended user entry" convention. Every
-    /// user-thread [`Self::append`] advances it (messages, settings
-    /// records, compaction, repair); sub-agent and meta appends leave
-    /// it untouched. [`Self::set_head`] moves it to an earlier entry to
-    /// start a sibling branch. `None` only while the user thread is
-    /// empty (no user-thread entry yet); the next append then anchors
-    /// at the system-prompt meta entry when one exists, or becomes the
-    /// file root. There is no persisted head pointer: `create` starts
-    /// it `None` and `resume` recovers it via
-    /// [`Self::latest_leaf`], because the most recently appended entry
-    /// is always on the branch that was last written to.
-    head: Option<EntryId>,
+    /// A broken chain (a `parent_id` pointing at an entry not in the log)
+    /// yields a *partial* view rather than an error: the walk stops at the
+    /// break, so the root and everything above it are dropped. Append
+    /// validates that a parent exists, so this only arises on a corrupt or
+    /// hand-edited file (or the sibling-branch case two concurrent writers
+    /// produce). We warn so the truncation is observable but keep going,
+    /// matching the resume/compaction tolerance for damaged logs.
+    pub fn linearize(&self, head: &EntryId, filter: ThreadFilter) -> Conversation {
+        let mut out: Vec<ConversationEntry> = Vec::new();
+        let mut cursor: Option<EntryId> = Some(head.clone());
+        while let Some(id) = cursor {
+            let Some(entry) = self.entries.get(&id) else {
+                tracing::warn!("linearize: entry {id} missing from log, returning a partial chain");
+                break;
+            };
+            if filter.matches(entry) {
+                out.push(entry.clone());
+            }
+            cursor = entry.parent_id.clone();
+        }
+        out.reverse();
+        Conversation::from_entries(self.session_id.clone(), out)
+    }
+
+    /// Most-recently-appended entry matching `filter`, or `None` if none
+    /// exist. Used to pick the default "current" head when resuming.
+    pub fn latest_leaf(&self, filter: ThreadFilter) -> Option<EntryId> {
+        for id in self.order.iter().rev() {
+            if let Some(entry) = self.entries.get(id) {
+                if filter.matches(entry) {
+                    return Some(id.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// The user-thread head: the entry the next user-thread append
+    /// anchors at. `None` only while the user thread is empty. See the
+    /// `head` field for the full contract.
+    pub fn head(&self) -> Option<&EntryId> {
+        self.head.as_ref()
+    }
+
+    /// Total number of entries in the log (across all threads and branches).
+    pub fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    /// Append position of the most recent entry, `0` when the log is
+    /// empty. This is the high-water mark of the 1-based positions
+    /// [`ConversationLog::append`] hands out (see [`EntryRef`]).
+    pub fn last_seq(&self) -> u64 {
+        u64::try_from(self.order.len()).expect("log length fits u64")
+    }
+
+    /// The largest `agent_id` recorded on any entry in the log, or `None`
+    /// if no subagent entries exist. Used on resume to seed the session's
+    /// subagent counter so freshly-spawned subagents don't reuse ids from
+    /// the prior session.
+    pub fn max_agent_id(&self) -> Option<usize> {
+        self.entries.values().filter_map(|e| e.agent_id).max()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+
+    /// Returns the entry at `index` in append order.
+    ///
+    /// An order slot whose map entry is missing is treated the same as an
+    /// out-of-bounds index. Append-order scans must advance past either case.
+    pub(crate) fn entry_in_append_order(&self, index: usize) -> Option<&ConversationEntry> {
+        self.order.get(index).and_then(|id| self.entries.get(id))
+    }
+
+    /// Look up an entry by id. Used by path-aware replay to walk
+    /// parent pointers from the head.
+    pub(crate) fn get(&self, id: &EntryId) -> Option<&ConversationEntry> {
+        self.entries.get(id)
+    }
+
+    /// Returns all entries in the order they were appended.
+    pub fn entries_in_order(&self) -> Vec<&ConversationEntry> {
+        self.order
+            .iter()
+            .filter_map(|id| self.entries.get(id))
+            .collect()
+    }
+
+    /// The persisted system prompt for this session, if one was recorded
+    /// at session creation. Resumed sessions created before system-prompt
+    /// persistence was added will return `None`.
+    pub fn system_prompt(&self) -> Option<&str> {
+        self.system_prompt_entry().map(|e| match &e.entry {
+            ConversationEntryKind::SystemPrompt { text } => text.as_str(),
+            // `system_prompt_entry` only returns SystemPrompt entries.
+            _ => unreachable!("system_prompt_entry returned non-SystemPrompt entry"),
+        })
+    }
+
+    /// The id of the persisted system-prompt entry, if any. Used as the
+    /// parent for the first conversation-thread entry so the parent
+    /// chain remains rooted.
+    pub fn system_prompt_id(&self) -> Option<&EntryId> {
+        self.system_prompt_entry().map(|e| &e.id)
+    }
+
+    /// The parent id for the next append on `filter`'s thread.
+    ///
+    /// The user thread anchors at the explicit [`Self::head`]; a
+    /// sub-agent thread anchors at its own [`Self::latest_leaf`], since
+    /// sub threads are linear per `agent_id` and branching does not
+    /// apply to them. Either falls back to the system-prompt root when
+    /// the thread has no entry yet, mirroring
+    /// [`ConversationView::parent_for_next_append`].
+    fn parent_for_thread_append(&self, filter: ThreadFilter) -> Option<EntryId> {
+        let leaf = match filter.thread {
+            ThreadKind::User => self.head.clone(),
+            // Sub threads are linear per `agent_id`, so they anchor at
+            // their own leaf. Branching does not apply to them.
+            ThreadKind::Subagent => self.latest_leaf(filter),
+            // Settings and compaction appends only ever target the user
+            // or a sub-agent thread. A `Meta` filter is a misuse: a
+            // `ThreadFilter` is never constructed with `thread: Meta`
+            // (see `ThreadFilter::matches`), so reaching here means a
+            // caller built an invalid filter.
+            ThreadKind::Meta => {
+                unreachable!("settings/compaction appends never target the meta thread")
+            }
+        };
+        leaf.or_else(|| self.system_prompt_id().cloned())
+    }
+
+    /// Locate the (single) system-prompt entry by scanning the log. The
+    /// system prompt is the root entry on threads that have one, so this
+    /// is effectively `O(1)` in the common case but stays correct even
+    /// if the log layout ever grows additional meta entries before it.
+    fn system_prompt_entry(&self) -> Option<&ConversationEntry> {
+        self.entries
+            .values()
+            .find(|e| matches!(e.entry, ConversationEntryKind::SystemPrompt { .. }))
+    }
+
+    /// Append position and id of the most recent
+    /// [`ConversationEntryKind::Compaction`] entry on `filter`'s thread.
+    ///
+    /// The compaction checkpoint is written by the compaction run, not by
+    /// the persistence listener, so a listener that needs the entry a
+    /// `CompactionEnd` event belongs to resolves it through here. Sound
+    /// because at most one compaction runs per session at a time.
+    pub fn latest_compaction(&self, filter: ThreadFilter) -> Option<EntryRef> {
+        self.order.iter().enumerate().rev().find_map(|(index, id)| {
+            let entry = self.entries.get(id)?;
+            let is_compaction = matches!(entry.entry, ConversationEntryKind::Compaction { .. });
+            (is_compaction && filter.matches(entry)).then(|| EntryRef {
+                seq: u64::try_from(index).expect("log index fits u64") + 1,
+                id: id.clone(),
+            })
+        })
+    }
 }
 
 impl ConversationLog {
@@ -565,14 +752,16 @@ impl ConversationLog {
         let (session_id, path) = Self::mint_unique_path(sessions_dir, &base)?;
 
         Ok(Self {
+            core: LogSnapshot {
+                session_id,
+                entries: HashMap::new(),
+                order: Vec::new(),
+                // A fresh log has no user-thread entry yet.
+                head: None,
+            },
             path,
-            session_id,
-            entries: HashMap::new(),
-            order: Vec::new(),
             file: None,
             pending_writes: Vec::new(),
-            // A fresh log has no user-thread entry yet.
-            head: None,
         })
     }
 
@@ -730,26 +919,23 @@ impl ConversationLog {
         }
 
         let mut log = Self {
+            core: LogSnapshot {
+                session_id: session_id.to_string(),
+                entries,
+                order,
+                head: None,
+            },
             path,
-            session_id: session_id.to_string(),
-            entries,
-            order,
             file: Some(file),
             // Anything on disk is by definition already committed.
             pending_writes: Vec::new(),
-            head: None,
         };
         // Recover the head from the last-written user entry. The most
         // recently appended entry is always on the branch that was last
         // written to, so its user-thread leaf is the head the next
         // append should anchor at.
-        log.head = log.latest_leaf(ThreadFilter::USER);
+        log.core.head = log.latest_leaf(ThreadFilter::USER);
         Ok(log)
-    }
-
-    /// The id under which this log is listed by `aj list-sessions`.
-    pub fn session_id(&self) -> &str {
-        &self.session_id
     }
 
     /// Append one entry to the log. Returns the new entry's
@@ -826,12 +1012,12 @@ impl ConversationLog {
             _ => {}
         }
         if let Some(parent) = &parent_id {
-            if !self.entries.contains_key(parent) {
+            if !self.core.entries.contains_key(parent) {
                 return Err(ConversationError::InvalidAppend(format!(
                     "parent entry {parent} not found in log"
                 )));
             }
-        } else if !self.order.is_empty() {
+        } else if !self.core.order.is_empty() {
             return Err(ConversationError::InvalidAppend(
                 "log already has a root entry; additional entries must have a parent".to_string(),
             ));
@@ -858,7 +1044,7 @@ impl ConversationLog {
         // id, this append collides with probability ~M/2^128 (M = entries
         // already in the log): negligible, not impossible. `mint_id`
         // already excludes existing ids.
-        if self.entries.contains_key(&id) {
+        if self.core.entries.contains_key(&id) {
             return Err(ConversationError::InvalidAppend(format!(
                 "duplicate entry id {id}: already present in log"
             )));
@@ -895,15 +1081,15 @@ impl ConversationLog {
             self.pending_writes.push(json);
         }
 
-        self.order.push(id.clone());
-        self.entries.insert(id.clone(), record);
+        self.core.order.push(id.clone());
+        self.core.entries.insert(id.clone(), record);
         // Advance the explicit head on every user-thread append, once
         // the entry is committed to the in-memory maps. This single
         // point covers every user-thread writer (messages via the
         // persistence listener, settings, compaction, repair).
         // Sub-agent and meta appends must not touch the head.
         if thread == ThreadKind::User {
-            self.head = Some(id.clone());
+            self.core.head = Some(id.clone());
         }
         Ok(EntryRef {
             seq: self.last_seq(),
@@ -946,59 +1132,10 @@ impl ConversationLog {
     fn mint_id(&self) -> EntryId {
         loop {
             let id = format!("{:032x}", rand::random::<u128>());
-            if !self.entries.contains_key(&id) {
+            if !self.core.entries.contains_key(&id) {
                 return id;
             }
         }
-    }
-
-    /// Walk back from `head` along parent_id pointers, keeping only
-    /// entries matching `filter`. Returns the entries in chronological
-    /// (root-first) order, wrapped in a read-only [Conversation] view
-    /// that can be handed to the model.
-    ///
-    /// A broken chain (a `parent_id` pointing at an entry not in the log)
-    /// yields a *partial* view rather than an error: the walk stops at the
-    /// break, so the root and everything above it are dropped. Append
-    /// validates that a parent exists, so this only arises on a corrupt or
-    /// hand-edited file (or the sibling-branch case two concurrent writers
-    /// produce). We warn so the truncation is observable but keep going,
-    /// matching the resume/compaction tolerance for damaged logs.
-    pub fn linearize(&self, head: &EntryId, filter: ThreadFilter) -> Conversation {
-        let mut out: Vec<ConversationEntry> = Vec::new();
-        let mut cursor: Option<EntryId> = Some(head.clone());
-        while let Some(id) = cursor {
-            let Some(entry) = self.entries.get(&id) else {
-                tracing::warn!("linearize: entry {id} missing from log, returning a partial chain");
-                break;
-            };
-            if filter.matches(entry) {
-                out.push(entry.clone());
-            }
-            cursor = entry.parent_id.clone();
-        }
-        out.reverse();
-        Conversation::from_entries(self.session_id.clone(), out)
-    }
-
-    /// Most-recently-appended entry matching `filter`, or `None` if none
-    /// exist. Used to pick the default "current" head when resuming.
-    pub fn latest_leaf(&self, filter: ThreadFilter) -> Option<EntryId> {
-        for id in self.order.iter().rev() {
-            if let Some(entry) = self.entries.get(id) {
-                if filter.matches(entry) {
-                    return Some(id.clone());
-                }
-            }
-        }
-        None
-    }
-
-    /// The user-thread head: the entry the next user-thread append
-    /// anchors at. `None` only while the user thread is empty. See the
-    /// `head` field for the full contract.
-    pub fn head(&self) -> Option<&EntryId> {
-        self.head.as_ref()
     }
 
     /// Move the user-thread head to `id`, the anchor for the next
@@ -1016,7 +1153,7 @@ impl ConversationLog {
     /// [`ConversationError::InvalidHead`], whose message is fit to
     /// surface to the user.
     pub fn set_head(&mut self, id: EntryId) -> Result<(), ConversationError> {
-        let entry = self.entries.get(&id).ok_or_else(|| {
+        let entry = self.core.entries.get(&id).ok_or_else(|| {
             ConversationError::InvalidHead(format!("entry {id} is not in this session's log"))
         })?;
         let valid = match entry.thread {
@@ -1029,7 +1166,7 @@ impl ConversationLog {
                 "entry {id} is not a user-thread or system-prompt entry"
             )));
         }
-        self.head = Some(id);
+        self.core.head = Some(id);
         Ok(())
     }
 
@@ -1059,28 +1196,16 @@ impl ConversationLog {
         Ok(())
     }
 
-    /// Total number of entries in the log (across all threads and branches).
-    pub fn len(&self) -> usize {
-        self.order.len()
+    /// A cloneable image of the entry tree, for reads that should not
+    /// hold the log lock (see [`LogSnapshot`]).
+    pub fn snapshot(&self) -> LogSnapshot {
+        self.core.clone()
     }
 
-    /// Append position of the most recent entry, `0` when the log is
-    /// empty. This is the high-water mark of the 1-based positions
-    /// [`Self::append`] hands out (see [`EntryRef`]).
-    pub fn last_seq(&self) -> u64 {
-        u64::try_from(self.order.len()).expect("log length fits u64")
-    }
-
-    /// The largest `agent_id` recorded on any entry in the log, or `None`
-    /// if no subagent entries exist. Used on resume to seed the session's
-    /// subagent counter so freshly-spawned subagents don't reuse ids from
-    /// the prior session.
-    pub fn max_agent_id(&self) -> Option<usize> {
-        self.entries.values().filter_map(|e| e.agent_id).max()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.order.is_empty()
+    /// The entry tree behind this log, for in-crate readers that already
+    /// hold the log.
+    pub(crate) fn core(&self) -> &LogSnapshot {
+        &self.core
     }
 
     /// Path on disk of the backing file.
@@ -1088,44 +1213,63 @@ impl ConversationLog {
         &self.path
     }
 
-    /// Returns the entry at `index` in append order.
-    ///
-    /// An order slot whose map entry is missing is treated the same as an
-    /// out-of-bounds index. Append-order scans must advance past either case.
-    pub(crate) fn entry_in_append_order(&self, index: usize) -> Option<&ConversationEntry> {
-        self.order.get(index).and_then(|id| self.entries.get(id))
+    /// The id under which this log is listed by `aj list-sessions`.
+    pub fn session_id(&self) -> &str {
+        self.core.session_id()
     }
 
-    /// Look up an entry by id. Used by path-aware replay to walk
-    /// parent pointers from the head.
-    pub(crate) fn get(&self, id: &EntryId) -> Option<&ConversationEntry> {
-        self.entries.get(id)
+    /// See [`LogSnapshot::linearize`].
+    pub fn linearize(&self, head: &EntryId, filter: ThreadFilter) -> Conversation {
+        self.core.linearize(head, filter)
     }
 
-    /// Returns all entries in the order they were appended.
+    /// See [`LogSnapshot::latest_leaf`].
+    pub fn latest_leaf(&self, filter: ThreadFilter) -> Option<EntryId> {
+        self.core.latest_leaf(filter)
+    }
+
+    /// See [`LogSnapshot::head`].
+    pub fn head(&self) -> Option<&EntryId> {
+        self.core.head()
+    }
+
+    /// See [`LogSnapshot::len`].
+    pub fn len(&self) -> usize {
+        self.core.len()
+    }
+
+    /// See [`LogSnapshot::last_seq`].
+    pub fn last_seq(&self) -> u64 {
+        self.core.last_seq()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.core.is_empty()
+    }
+
+    /// See [`LogSnapshot::max_agent_id`].
+    pub fn max_agent_id(&self) -> Option<usize> {
+        self.core.max_agent_id()
+    }
+
+    /// See [`LogSnapshot::entries_in_order`].
     pub fn entries_in_order(&self) -> Vec<&ConversationEntry> {
-        self.order
-            .iter()
-            .filter_map(|id| self.entries.get(id))
-            .collect()
+        self.core.entries_in_order()
     }
 
-    /// The persisted system prompt for this session, if one was recorded
-    /// at session creation. Resumed sessions created before system-prompt
-    /// persistence was added will return `None`.
+    /// See [`LogSnapshot::system_prompt`].
     pub fn system_prompt(&self) -> Option<&str> {
-        self.system_prompt_entry().map(|e| match &e.entry {
-            ConversationEntryKind::SystemPrompt { text } => text.as_str(),
-            // `system_prompt_entry` only returns SystemPrompt entries.
-            _ => unreachable!("system_prompt_entry returned non-SystemPrompt entry"),
-        })
+        self.core.system_prompt()
     }
 
-    /// The id of the persisted system-prompt entry, if any. Used as the
-    /// parent for the first conversation-thread entry so the parent
-    /// chain remains rooted.
+    /// See [`LogSnapshot::system_prompt_id`].
     pub fn system_prompt_id(&self) -> Option<&EntryId> {
-        self.system_prompt_entry().map(|e| &e.id)
+        self.core.system_prompt_id()
+    }
+
+    /// See [`LogSnapshot::latest_compaction`].
+    pub fn latest_compaction(&self, filter: ThreadFilter) -> Option<EntryRef> {
+        self.core.latest_compaction(filter)
     }
 
     /// Record the assembled system prompt as the root [ThreadKind::Meta]
@@ -1142,7 +1286,7 @@ impl ConversationLog {
     /// punctuation append (typically the first user message). A log
     /// that never sees a punctuation append leaves no file behind.
     pub fn set_system_prompt(&mut self, text: String) -> Result<EntryRef, ConversationError> {
-        if !self.order.is_empty() {
+        if !self.core.order.is_empty() {
             return Err(ConversationError::InvalidAppend(
                 "system prompt can only be set on an empty log".to_string(),
             ));
@@ -1229,12 +1373,12 @@ impl ConversationLog {
         tokens_before: u64,
         details: Option<crate::compaction::CompactionDetails>,
     ) -> Result<EntryRef, ConversationError> {
-        if !self.entries.contains_key(&first_kept_entry_id) {
+        if !self.core.entries.contains_key(&first_kept_entry_id) {
             return Err(ConversationError::InvalidAppend(format!(
                 "compaction first_kept_entry_id {first_kept_entry_id} not found in log"
             )));
         }
-        let parent = self.parent_for_thread_append(filter);
+        let parent = self.core.parent_for_thread_append(filter);
         self.append(
             parent,
             filter.thread,
@@ -1286,44 +1430,8 @@ impl ConversationLog {
         filter: ThreadFilter,
         entry: ConversationEntryKind,
     ) -> Result<EntryRef, ConversationError> {
-        let parent = self.parent_for_thread_append(filter);
+        let parent = self.core.parent_for_thread_append(filter);
         self.append(parent, filter.thread, filter.agent_id, entry)
-    }
-
-    /// The parent id for the next append on `filter`'s thread.
-    ///
-    /// The user thread anchors at the explicit [`Self::head`]; a
-    /// sub-agent thread anchors at its own [`Self::latest_leaf`], since
-    /// sub threads are linear per `agent_id` and branching does not
-    /// apply to them. Either falls back to the system-prompt root when
-    /// the thread has no entry yet, mirroring
-    /// [`ConversationView::parent_for_next_append`].
-    fn parent_for_thread_append(&self, filter: ThreadFilter) -> Option<EntryId> {
-        let leaf = match filter.thread {
-            ThreadKind::User => self.head.clone(),
-            // Sub threads are linear per `agent_id`, so they anchor at
-            // their own leaf. Branching does not apply to them.
-            ThreadKind::Subagent => self.latest_leaf(filter),
-            // Settings and compaction appends only ever target the user
-            // or a sub-agent thread. A `Meta` filter is a misuse: a
-            // `ThreadFilter` is never constructed with `thread: Meta`
-            // (see `ThreadFilter::matches`), so reaching here means a
-            // caller built an invalid filter.
-            ThreadKind::Meta => {
-                unreachable!("settings/compaction appends never target the meta thread")
-            }
-        };
-        leaf.or_else(|| self.system_prompt_id().cloned())
-    }
-
-    /// Locate the (single) system-prompt entry by scanning the log. The
-    /// system prompt is the root entry on threads that have one, so this
-    /// is effectively `O(1)` in the common case but stays correct even
-    /// if the log layout ever grows additional meta entries before it.
-    fn system_prompt_entry(&self) -> Option<&ConversationEntry> {
-        self.entries
-            .values()
-            .find(|e| matches!(e.entry, ConversationEntryKind::SystemPrompt { .. }))
     }
 }
 
@@ -1610,8 +1718,8 @@ mod tests {
 
         let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume log");
 
-        assert_eq!(resumed.order, expected_ids);
-        assert_eq!(resumed.entries.len(), 2);
+        assert_eq!(resumed.core.order, expected_ids);
+        assert_eq!(resumed.core.entries.len(), 2);
     }
 
     #[test]
@@ -1626,8 +1734,8 @@ mod tests {
 
         let mut resumed = ConversationLog::resume(&persistence, &session_id).expect("resume log");
 
-        assert_eq!(resumed.order.len(), 2);
-        assert_eq!(resumed.entries.len(), 2);
+        assert_eq!(resumed.core.order.len(), 2);
+        assert_eq!(resumed.core.entries.len(), 2);
         assert_eq!(
             std::fs::read_to_string(&path).expect("read repaired log"),
             format!("{}\n{}\n", records[0], records[1])
@@ -1640,8 +1748,8 @@ mod tests {
 
         let resumed_again =
             ConversationLog::resume(&persistence, &session_id).expect("resume repaired log");
-        assert_eq!(resumed_again.order.len(), 3);
-        assert_eq!(resumed_again.entries.len(), 3);
+        assert_eq!(resumed_again.core.order.len(), 3);
+        assert_eq!(resumed_again.core.entries.len(), 3);
     }
 
     #[test]
@@ -1653,7 +1761,7 @@ mod tests {
 
         let mut resumed = ConversationLog::resume(&persistence, &session_id).expect("resume log");
 
-        assert_eq!(resumed.order.len(), 2);
+        assert_eq!(resumed.core.order.len(), 2);
         assert_eq!(
             std::fs::read_to_string(&path).expect("read repaired log"),
             format!("{}\n{}\n", records[0], records[1])
@@ -1666,8 +1774,8 @@ mod tests {
 
         let resumed_again =
             ConversationLog::resume(&persistence, &session_id).expect("resume repaired log");
-        assert_eq!(resumed_again.order.len(), 3);
-        assert_eq!(resumed_again.entries.len(), 3);
+        assert_eq!(resumed_again.core.order.len(), 3);
+        assert_eq!(resumed_again.core.entries.len(), 3);
     }
 
     #[test]
@@ -1762,7 +1870,7 @@ mod tests {
         assert_eq!(log.system_prompt_id(), Some(&id));
 
         assert_eq!(log.len(), 1);
-        let entry = log.entries.get(&id).expect("entry exists");
+        let entry = log.core.entries.get(&id).expect("entry exists");
         assert!(matches!(entry.thread, ThreadKind::Meta));
         assert!(entry.parent_id.is_none());
         assert!(matches!(
@@ -1865,7 +1973,7 @@ mod tests {
             view.add_message(user_text("hi")).expect("user msg").id
         };
 
-        let user_entry = log.entries.get(&user_id).expect("user entry exists");
+        let user_entry = log.core.entries.get(&user_id).expect("user entry exists");
         assert_eq!(user_entry.parent_id.as_ref(), Some(&sp_id));
     }
 
@@ -2602,7 +2710,7 @@ mod tests {
             .append_model_change(ThreadFilter::USER, "anthropic", "claude-x")
             .expect("model change")
             .id;
-        let mc_entry = log.entries.get(&mc_id).expect("entry exists");
+        let mc_entry = log.core.entries.get(&mc_id).expect("entry exists");
         assert_eq!(mc_entry.parent_id.as_ref(), Some(&sp_id));
         assert!(matches!(mc_entry.thread, ThreadKind::User));
         assert!(mc_entry.agent_id.is_none());
@@ -2614,7 +2722,7 @@ mod tests {
             let mut view = ConversationView::user(&mut log);
             view.add_message(user_text("hi")).expect("user msg").id
         };
-        let user_entry = log.entries.get(&user_id).expect("entry exists");
+        let user_entry = log.core.entries.get(&user_id).expect("entry exists");
         assert_eq!(user_entry.parent_id.as_ref(), Some(&mc_id));
     }
 
@@ -3080,6 +3188,74 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_answers_reads_like_the_log_and_ignores_later_appends() {
+        let persistence = ConversationPersistence::new(fresh_sessions_dir());
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".to_string())
+            .expect("system prompt");
+        let user = {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(user_text("hi")).expect("user message")
+        };
+        let assistant = {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(assistant_text("ho"))
+                .expect("assistant message")
+        };
+        log.append_subagent_spawn(1, assistant.id.clone(), "task", false, &spawn_settings())
+            .expect("spawn root");
+
+        let snapshot = log.snapshot();
+        let ids = |conv: &Conversation| -> Vec<EntryId> {
+            conv.entries().iter().map(|e| e.id.clone()).collect()
+        };
+        assert_eq!(snapshot.session_id(), log.session_id());
+        assert_eq!(snapshot.len(), log.len());
+        assert_eq!(snapshot.last_seq(), log.last_seq());
+        assert_eq!(snapshot.head(), log.head());
+        assert_eq!(
+            snapshot.latest_leaf(ThreadFilter::USER),
+            log.latest_leaf(ThreadFilter::USER)
+        );
+        assert_eq!(
+            snapshot.latest_leaf(ThreadFilter::subagent(1)),
+            log.latest_leaf(ThreadFilter::subagent(1))
+        );
+        assert_eq!(
+            ids(&snapshot.linearize(&assistant.id, ThreadFilter::USER)),
+            ids(&log.linearize(&assistant.id, ThreadFilter::USER))
+        );
+        for index in 0..=log.len() {
+            assert_eq!(
+                snapshot.entry_in_append_order(index).map(|e| &e.id),
+                log.core().entry_in_append_order(index).map(|e| &e.id),
+                "append-order slot {index} differs"
+            );
+        }
+
+        // The snapshot is a value: appends to the log after it was taken
+        // are invisible to it, which is what lets a projection run
+        // outside the log lock.
+        let later = {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(user_text("later")).expect("later message")
+        };
+        assert_eq!(snapshot.last_seq(), 4);
+        assert_eq!(log.last_seq(), 5);
+        assert!(snapshot.entry_in_append_order(4).is_none());
+        assert_eq!(snapshot.head(), Some(&assistant.id));
+        assert_eq!(log.head(), Some(&later.id));
+        assert!(
+            !ids(&log.linearize(&later.id, ThreadFilter::USER)).is_empty(),
+            "the live log still linearizes its new head"
+        );
+        assert_eq!(
+            ids(&snapshot.linearize(&assistant.id, ThreadFilter::USER)),
+            vec![user.id.clone(), assistant.id.clone()],
+        );
+    }
+
+    #[test]
     fn appended_ids_are_unique_within_a_log() {
         // The mint-and-retry path must never hand out a duplicate id
         // within one log, even across many appends.
@@ -3228,15 +3404,18 @@ mod tests {
                 view.add_message(user_text("branch")).expect("branch").id
             };
             // The new entry anchors at the earlier head, not the tail.
-            let entry = log.get(&branched).expect("branched entry");
+            let entry = log.core().get(&branched).expect("branched entry");
             assert_eq!(entry.parent_id.as_ref(), Some(&u1));
             (log.session_id().to_string(), u1, tail)
         };
 
         // The abandoned tail is still on disk after re-resume.
         let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume");
-        assert!(resumed.get(&tail).is_some(), "abandoned tail stays on disk");
-        assert!(resumed.get(&u1).is_some());
+        assert!(
+            resumed.core().get(&tail).is_some(),
+            "abandoned tail stays on disk"
+        );
+        assert!(resumed.core().get(&u1).is_some());
     }
 
     #[test]

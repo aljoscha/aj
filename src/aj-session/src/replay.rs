@@ -75,6 +75,15 @@
 //! text and default settings (empty provider/model, thinking "off",
 //! speed "standard").
 //!
+//! ## Live logs
+//!
+//! [`replay`] treats the log as dead: at end of log it force-closes any
+//! sub-agent bracket that is still open. A live session serving a
+//! catch-up backfill needs the same projection with different endings,
+//! which is [`project_suffix`]: it emits only the entries after a
+//! cursor, tags the durable ones with their append position, and leaves
+//! an open bracket open.
+//!
 //! ## Timestamps
 //!
 //! Replay does not stamp the synthesized events with a wall-clock time,
@@ -102,10 +111,66 @@ use serde_json::Value;
 
 use crate::compaction::estimate_conversation_context;
 use crate::log::{
-    Conversation, ConversationEntry, ConversationEntryKind, ConversationLog, ThreadFilter,
-    ThreadKind,
+    Conversation, ConversationEntry, ConversationEntryKind, ConversationLog, EntryRef, LogSnapshot,
+    ThreadFilter, ThreadKind,
 };
 use crate::tool_details::resolve_tool_details;
+
+/// One projected event and the log entry it derives from.
+///
+/// `entry` is `Some` exactly for the events that are durable live (see
+/// [`project_suffix`]), so a client can advance its cursor on the same
+/// events whether they arrive live or in a backfill. It is absent for
+/// bracketing frames the projection synthesizes and for every event of
+/// an entry at or below the cursor: their entry is already applied, and
+/// tagging them would make the client's cursor invariant drop them
+/// (spec 6.5).
+#[derive(Debug, Clone)]
+pub struct ProjectedEvent {
+    pub entry: Option<EntryRef>,
+    pub event: AgentEvent,
+}
+
+/// The projected durable suffix of a live log.
+#[derive(Debug, Clone)]
+pub struct Backfill {
+    pub events: Vec<ProjectedEvent>,
+    /// Sub-agents whose bracket the projection leaves open at end of log.
+    /// A live log's open run has its real `SubAgentEnd` still coming, so
+    /// the caller (not the projection) decides how to conclude a run it
+    /// knows is idle.
+    pub open_subs: Vec<usize>,
+}
+
+/// Project the events of every entry after `cursor`, for a live log.
+///
+/// The walk starts at entry 0 regardless of the cursor, so the tool-name
+/// map, the usage accumulators, the settings-notice gate and the
+/// sub-agent bracketing state are complete: events of entries at or
+/// below the cursor are computed and dropped, never skipped. `None`
+/// projects the whole log.
+///
+/// Two deviations from dead-log [`replay`], both required by spec 6.5:
+/// an open sub-agent bracket is not force-closed at end of log, and a
+/// run whose bracket opened at or below the cursor has its
+/// `SubAgentStart` re-synthesized before its first emitted event so the
+/// suffix is well-bracketed.
+///
+/// Which events carry an [`EntryRef`]: exactly the ones a live run
+/// persists or synthesizes as durable, so live flow and backfill agree
+/// on what a cursor covers. That is the `MessageEnd` of a `Message`
+/// entry, the `SubAgentStart` of a `SubAgentSpawn` root, the
+/// `CompactionEnd` of a `Compaction` entry, and the `Notice` of a
+/// settings entry. At most one event per entry is tagged, which is what
+/// makes the client's per-frame cursor advance well-defined.
+pub fn project_suffix(log: &LogSnapshot, cursor: Option<u64>) -> Backfill {
+    let mut walk = Replay::suffix(log, cursor);
+    let events: Vec<ProjectedEvent> = walk.by_ref().collect();
+    Backfill {
+        events,
+        open_subs: walk.open_subs(),
+    }
+}
 
 /// Walks `log` in append order and lazily yields its projected [`AgentEvent`]s.
 ///
@@ -113,7 +178,7 @@ use crate::tool_details::resolve_tool_details;
 /// the current persisted entry, plus events needed to balance an open sub-agent
 /// at EOF.
 pub fn replay(log: &ConversationLog) -> impl Iterator<Item = AgentEvent> + '_ {
-    Replay::new(log)
+    Replay::new(log.core()).map(|projected| projected.event)
 }
 
 /// Like [`replay`], but withholds every sub-agent's projected content
@@ -135,7 +200,7 @@ pub fn replay(log: &ConversationLog) -> impl Iterator<Item = AgentEvent> + '_ {
 /// the main transcript and the sub-agent boxes without paying for
 /// transcripts the user is usually not looking at.
 pub fn replay_deferring_subs(log: &ConversationLog) -> impl Iterator<Item = AgentEvent> + '_ {
-    Replay::deferring_subs(log)
+    Replay::deferring_subs(log.core()).map(|projected| projected.event)
 }
 
 /// Project one already-linearized sub-agent thread into that
@@ -179,40 +244,48 @@ pub fn project_thread(conv: &Conversation, agent: AgentId) -> Vec<AgentEvent> {
             agent_id_for(entry).is_none_or(|id| id == agent),
             "project_thread received an entry for a different agent"
         );
-        state.project_entry(entry, None, &mut out);
+        state.project_entry(entry, None, None, &mut out);
     }
-    out.into()
+    out.into_iter().map(|projected| projected.event).collect()
 }
 
 struct Replay<'a> {
-    log: &'a ConversationLog,
+    log: &'a LogSnapshot,
     next_entry: usize,
     state: ReplayState,
-    pending: VecDeque<AgentEvent>,
+    pending: VecDeque<ProjectedEvent>,
     finished: bool,
     /// When set, sub-agent content events are withheld (see
     /// [`replay_deferring_subs`]). Bracketing and report capture are
     /// unaffected.
     defer_subs: bool,
-    /// The entry ids to project: the active path from [`ConversationLog::head`]
+    /// The entry ids to project: the active path from [`LogSnapshot::head`]
     /// plus the sub-agent threads anchored on it. Append-order entries
     /// outside this set are skipped, so sibling branches on disk don't
     /// interleave into the replayed stream. `None` disables filtering
     /// (a log with no user-thread head), preserving the whole-file
     /// behaviour.
     included: Option<HashSet<String>>,
+    /// Entries at or below this append position are projected for their
+    /// effect on the walk's state and their events dropped, so the walk
+    /// yields only the suffix after it. `None` yields everything.
+    cursor: Option<u64>,
+    /// Whether an open sub-agent bracket is force-closed at end of log.
+    /// That heuristic belongs to a dead log: for a live one the real
+    /// `SubAgentEnd` is still coming (spec 6.5).
+    close_at_eof: bool,
 }
 
 impl<'a> Replay<'a> {
-    fn new(log: &'a ConversationLog) -> Self {
+    fn new(log: &'a LogSnapshot) -> Self {
         Self::with_mode(log, false)
     }
 
-    fn deferring_subs(log: &'a ConversationLog) -> Self {
+    fn deferring_subs(log: &'a LogSnapshot) -> Self {
         Self::with_mode(log, true)
     }
 
-    fn with_mode(log: &'a ConversationLog, defer_subs: bool) -> Self {
+    fn with_mode(log: &'a LogSnapshot, defer_subs: bool) -> Self {
         Self {
             log,
             next_entry: 0,
@@ -221,7 +294,23 @@ impl<'a> Replay<'a> {
             finished: false,
             defer_subs,
             included: included_entries(log),
+            cursor: None,
+            close_at_eof: true,
         }
+    }
+
+    fn suffix(log: &'a LogSnapshot, cursor: Option<u64>) -> Self {
+        Self {
+            cursor,
+            close_at_eof: false,
+            ..Self::with_mode(log, false)
+        }
+    }
+
+    /// The sub-agent runs still open, valid once the walk is exhausted.
+    /// At most one, since sub-agent entries of one run are contiguous.
+    fn open_subs(&self) -> Vec<usize> {
+        self.state.open_sub.into_iter().collect()
     }
 }
 
@@ -253,7 +342,7 @@ impl<'a> Replay<'a> {
 /// thread and chain forward the same way. No transitive closure across
 /// sub threads is needed, since a spawned agent has the `agent` tool
 /// removed and its thread always anchors on the user thread.
-fn included_entries(log: &ConversationLog) -> Option<HashSet<String>> {
+fn included_entries(log: &LogSnapshot) -> Option<HashSet<String>> {
     let head = log.head()?;
 
     // Main path: walk parent pointers from the head, collecting the
@@ -294,7 +383,7 @@ fn included_entries(log: &ConversationLog) -> Option<HashSet<String>> {
 }
 
 impl Iterator for Replay<'_> {
-    type Item = AgentEvent;
+    type Item = ProjectedEvent;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -316,7 +405,18 @@ impl Iterator for Replay<'_> {
                         .as_ref()
                         .is_some_and(|set| !set.contains(&entry.id));
                     if !skip {
-                        self.state.bracket_subagent(entry, &mut self.pending);
+                        let seq = u64::try_from(index).expect("log index fits u64") + 1;
+                        let keep = self.cursor.is_none_or(|cursor| seq > cursor);
+                        // A dropped entry's events may not be tagged: its
+                        // position is already applied by whoever offered
+                        // the cursor.
+                        let at = keep.then(|| EntryRef {
+                            seq,
+                            id: entry.id.clone(),
+                        });
+                        let mut projected = VecDeque::new();
+                        self.state
+                            .bracket_subagent(entry, at.clone(), keep, &mut projected);
                         if self.defer_subs && matches!(agent_id_for(entry), Some(AgentId::Sub(_))) {
                             // Deferred mode withholds a sub-agent's content
                             // events but still advances the report that
@@ -325,7 +425,10 @@ impl Iterator for Replay<'_> {
                             self.state.capture_sub_report_from_entry(entry);
                         } else {
                             self.state
-                                .project_entry(entry, Some(self.log), &mut self.pending);
+                                .project_entry(entry, at, Some(self.log), &mut projected);
+                        }
+                        if keep {
+                            self.pending.append(&mut projected);
                         }
                     }
                 }
@@ -334,7 +437,9 @@ impl Iterator for Replay<'_> {
 
             if !self.finished {
                 self.finished = true;
-                self.state.close_open_sub(&mut self.pending);
+                if self.close_at_eof {
+                    self.state.close_open_sub(true, &mut self.pending);
+                }
                 continue;
             }
 
@@ -375,6 +480,13 @@ struct ReplayState {
     /// `Message` entry; checked again at run close so a run with
     /// neither still gets a balanced bracket.
     open_sub_started: bool,
+    /// The open run's [`AgentEvent::SubAgentStart`], kept so a suffix
+    /// whose cursor falls inside the run can re-synthesize it.
+    open_sub_start: Option<AgentEvent>,
+    /// Whether `open_sub_start` reached the output. False while the run
+    /// opened on an entry the walk dropped, which is what tells the
+    /// suffix projection to re-synthesize the start.
+    open_sub_start_delivered: bool,
     /// Concatenated text of the most recent `Sub` assistant message
     /// seen during the open run. After the run's last assistant
     /// message this holds the final report carried on the closing
@@ -447,6 +559,19 @@ fn sub_start_event(
     }
 }
 
+/// Tag `event` as the durable frame of the entry it derives from. `at` is
+/// `None` when the entry has no known position (single-thread
+/// projection) or sits at or below a suffix cursor.
+fn durable(at: Option<EntryRef>, event: AgentEvent) -> ProjectedEvent {
+    ProjectedEvent { entry: at, event }
+}
+
+/// One projected event that stands for no log entry of its own:
+/// bracketing frames and everything a live run emits without persisting.
+fn transient(event: AgentEvent) -> ProjectedEvent {
+    ProjectedEvent { entry: None, event }
+}
+
 impl ReplayState {
     /// Emit [`AgentEvent::SubAgentStart`] / [`AgentEvent::SubAgentEnd`]
     /// correlation events around a sub-agent's contiguous run, before
@@ -461,14 +586,24 @@ impl ReplayState {
     /// instead emit it at the run's first `Message` entry, with the
     /// task from its user text and default settings. `Meta` entries
     /// carry no agent id and never transition.
-    fn bracket_subagent(&mut self, entry: &ConversationEntry, out: &mut VecDeque<AgentEvent>) {
+    ///
+    /// `keep` is false while the walk is dropping this entry's events
+    /// (it sits at or below a suffix cursor), which is what makes the
+    /// run's start re-synthesizable later.
+    fn bracket_subagent(
+        &mut self,
+        entry: &ConversationEntry,
+        at: Option<EntryRef>,
+        keep: bool,
+        out: &mut VecDeque<ProjectedEvent>,
+    ) {
         let Some(current) = agent_id_for(entry) else {
             return;
         };
 
         if let Some(k) = self.open_sub {
             if current != AgentId::Sub(k) {
-                self.close_open_sub(out);
+                self.close_open_sub(keep, out);
             }
         }
 
@@ -478,10 +613,16 @@ impl ReplayState {
         if self.open_sub.is_none() {
             self.open_sub = Some(n);
             self.open_sub_started = false;
+            self.open_sub_start = None;
+            self.open_sub_start_delivered = false;
             self.open_sub_report.clear();
             self.open_sub_conclusion = SubAgentConclusion::Completed;
         }
         if self.open_sub_started {
+            // The run may have opened on an entry this walk dropped, in
+            // which case its start has to be re-synthesized here so the
+            // suffix stays well-bracketed (spec 6.5).
+            self.deliver_open_sub_start(keep, out);
             return;
         }
         match &entry.entry {
@@ -490,26 +631,26 @@ impl ReplayState {
                 background,
                 settings,
             } => {
-                out.push_back(sub_start_event(
-                    n,
-                    task.clone(),
-                    *background,
-                    settings.clone(),
-                ));
-                self.open_sub_started = true;
+                self.open_run(
+                    sub_start_event(n, task.clone(), *background, settings.clone()),
+                    at,
+                    keep,
+                    out,
+                );
             }
             ConversationEntryKind::Message { .. } => {
                 // Legacy fallback: no spawn entry preceded this
                 // message, so the run's first message (the task
                 // user prompt) opens the bracket. Legacy logs carry
-                // no run mode, so the sub reads as foreground.
-                out.push_back(sub_start_event(
-                    n,
-                    subagent_task(entry),
-                    false,
-                    fallback_settings(),
-                ));
-                self.open_sub_started = true;
+                // no run mode, so the sub reads as foreground. The
+                // start stays untagged: this entry's durable frame is
+                // its own `MessageEnd`.
+                self.open_run(
+                    sub_start_event(n, subagent_task(entry), false, fallback_settings()),
+                    None,
+                    keep,
+                    out,
+                );
             }
             // Settings entries ahead of any message don't open the
             // bracket; the first `Message` entry does. A compaction
@@ -523,28 +664,61 @@ impl ReplayState {
         }
     }
 
+    /// Emit `start` as the open run's [`AgentEvent::SubAgentStart`] and
+    /// remember it for a possible re-synthesis.
+    fn open_run(
+        &mut self,
+        start: AgentEvent,
+        at: Option<EntryRef>,
+        keep: bool,
+        out: &mut VecDeque<ProjectedEvent>,
+    ) {
+        out.push_back(durable(at, start.clone()));
+        self.open_sub_started = true;
+        self.open_sub_start = Some(start);
+        self.open_sub_start_delivered = keep;
+    }
+
+    /// Re-emit the open run's start when it was computed for an entry the
+    /// walk dropped. Untagged: its spawn root is at or below the cursor,
+    /// so a durable tag would make the client's cursor invariant drop the
+    /// bracket (spec 6.5).
+    fn deliver_open_sub_start(&mut self, keep: bool, out: &mut VecDeque<ProjectedEvent>) {
+        if !keep || self.open_sub_start_delivered {
+            return;
+        }
+        if let Some(start) = self.open_sub_start.clone() {
+            out.push_back(transient(start));
+            self.open_sub_start_delivered = true;
+        }
+    }
+
     /// Close the currently open sub-agent run, if any, emitting its
     /// [`AgentEvent::SubAgentEnd`] with the accumulated report. A
     /// run that produced neither a `SubAgentSpawn` entry nor a
     /// `Message` entry has no start yet; emit one with an empty task
     /// and default settings so the bracketing stays balanced.
-    fn close_open_sub(&mut self, out: &mut VecDeque<AgentEvent>) {
+    fn close_open_sub(&mut self, keep: bool, out: &mut VecDeque<ProjectedEvent>) {
         if let Some(k) = self.open_sub.take() {
-            if !self.open_sub_started {
-                out.push_back(sub_start_event(
+            if self.open_sub_started {
+                self.deliver_open_sub_start(keep, out);
+            } else {
+                out.push_back(transient(sub_start_event(
                     k,
                     String::new(),
                     false,
                     fallback_settings(),
-                ));
+                )));
             }
             self.open_sub_started = false;
-            out.push_back(AgentEvent::SubAgentEnd {
+            self.open_sub_start = None;
+            self.open_sub_start_delivered = false;
+            out.push_back(transient(AgentEvent::SubAgentEnd {
                 parent: AgentId::Main,
                 child: AgentId::Sub(k),
                 report: std::mem::take(&mut self.open_sub_report),
                 conclusion: std::mem::take(&mut self.open_sub_conclusion),
-            });
+            }));
         }
     }
 
@@ -553,11 +727,15 @@ impl ReplayState {
     /// estimate the post-compaction occupancy of the reduced
     /// projection. Single-thread projection ([`project_thread`]) passes
     /// `None`: a sub-agent thread never carries a `Compaction` entry.
+    ///
+    /// `at` is the entry's position, carried onto whichever single event
+    /// of this entry is durable (see [`project_suffix`]).
     fn project_entry(
         &mut self,
         entry: &ConversationEntry,
-        log: Option<&ConversationLog>,
-        out: &mut VecDeque<AgentEvent>,
+        at: Option<EntryRef>,
+        log: Option<&LogSnapshot>,
+        out: &mut VecDeque<ProjectedEvent>,
     ) {
         let agent_id = match agent_id_for(entry) {
             Some(id) => id,
@@ -574,19 +752,26 @@ impl ReplayState {
             ConversationEntryKind::ModelChange { provider, model_id } => {
                 self.settings_notice(
                     agent_id,
+                    at,
                     format!("Model set to {provider}/{model_id}."),
                     out,
                 );
             }
             ConversationEntryKind::ThinkingChange { level } => {
-                self.settings_notice(agent_id, format!("Thinking effort set to {level}."), out);
+                self.settings_notice(
+                    agent_id,
+                    at,
+                    format!("Thinking effort set to {level}."),
+                    out,
+                );
             }
             ConversationEntryKind::SpeedChange { speed } => {
-                self.settings_notice(agent_id, format!("Speed set to {speed}."), out);
+                self.settings_notice(agent_id, at, format!("Speed set to {speed}."), out);
             }
             ConversationEntryKind::VerbosityChange { verbosity } => {
                 self.settings_notice(
                     agent_id,
+                    at,
                     format!("Output verbosity set to {verbosity}."),
                     out,
                 );
@@ -623,14 +808,17 @@ impl ReplayState {
                 let tokens_after =
                     estimate_conversation_context(&log.linearize(&entry.id, ThreadFilter::USER))
                         .tokens;
-                out.push_back(AgentEvent::CompactionEnd {
-                    agent_id,
-                    reason: CompactionReason::Manual,
-                    tokens_before: *tokens_before,
-                    tokens_after,
-                    summary: Some(summary.clone()),
-                    error: None,
-                });
+                out.push_back(durable(
+                    at,
+                    AgentEvent::CompactionEnd {
+                        agent_id,
+                        reason: CompactionReason::Manual,
+                        tokens_before: *tokens_before,
+                        tokens_after,
+                        summary: Some(summary.clone()),
+                        error: None,
+                    },
+                ));
             }
             ConversationEntryKind::Message { message: agent_msg } => {
                 self.seen_message.insert(agent_id);
@@ -643,20 +831,23 @@ impl ReplayState {
                         // resume exactly as they rendered live. (The notice has
                         // no stored wire message; it acquires its framing only
                         // when it projects onto the provider.)
-                        out.push_back(AgentEvent::MessageStart {
+                        out.push_back(transient(AgentEvent::MessageStart {
                             agent_id,
                             message: agent_msg.clone(),
-                        });
-                        out.push_back(AgentEvent::MessageEnd {
-                            agent_id,
-                            message: agent_msg.clone(),
-                        });
+                        }));
+                        out.push_back(durable(
+                            at,
+                            AgentEvent::MessageEnd {
+                                agent_id,
+                                message: agent_msg.clone(),
+                            },
+                        ));
                     }
                     AgentMessageKind::Wire(Message::Assistant(a)) => {
-                        self.project_assistant(agent_id, agent_msg, a, out);
+                        self.project_assistant(agent_id, at, agent_msg, a, out);
                     }
                     AgentMessageKind::Wire(Message::ToolResult(tr)) => {
-                        self.project_tool_result(agent_id, agent_msg, tr, out);
+                        self.project_tool_result(agent_id, at, agent_msg, tr, out);
                     }
                 }
             }
@@ -668,9 +859,15 @@ impl ReplayState {
     /// entry — seed entries (session creation) precede any message
     /// on their thread and stay silent, since they never produced a
     /// visible notice live either.
-    fn settings_notice(&self, agent_id: AgentId, text: String, out: &mut VecDeque<AgentEvent>) {
+    fn settings_notice(
+        &self,
+        agent_id: AgentId,
+        at: Option<EntryRef>,
+        text: String,
+        out: &mut VecDeque<ProjectedEvent>,
+    ) {
         if self.seen_message.contains(&agent_id) {
-            out.push_back(AgentEvent::Notice { agent_id, text });
+            out.push_back(durable(at, AgentEvent::Notice { agent_id, text }));
         }
     }
 
@@ -732,9 +929,10 @@ impl ReplayState {
     fn project_assistant(
         &mut self,
         agent_id: AgentId,
+        at: Option<EntryRef>,
         agent_msg: &AgentMessage,
         assistant: &aj_models::types::AssistantMessage,
-        out: &mut VecDeque<AgentEvent>,
+        out: &mut VecDeque<ProjectedEvent>,
     ) {
         // MessageStart carries an empty placeholder (with identity
         // stamped from the finalized message) so renderers open
@@ -753,14 +951,17 @@ impl ReplayState {
             error: assistant.error.clone(),
             timestamp: assistant.timestamp,
         };
-        out.push_back(AgentEvent::MessageStart {
+        out.push_back(transient(AgentEvent::MessageStart {
             agent_id,
             message: AgentMessage::wire(Message::Assistant(empty_start)),
-        });
-        out.push_back(AgentEvent::MessageEnd {
-            agent_id,
-            message: agent_msg.clone(),
-        });
+        }));
+        out.push_back(durable(
+            at,
+            AgentEvent::MessageEnd {
+                agent_id,
+                message: agent_msg.clone(),
+            },
+        ));
 
         // While a sub-agent run is open, record this assistant
         // message's text as the running report; after the run's last
@@ -787,10 +988,10 @@ impl ReplayState {
             accumulated_cache_read: acc.cache_read,
             turn_cache_read: assistant.usage.cache_read,
         };
-        out.push_back(AgentEvent::UsageUpdate {
+        out.push_back(transient(AgentEvent::UsageUpdate {
             agent_id,
             usage: turn_usage,
-        });
+        }));
         acc.input += assistant.usage.input;
         acc.output += assistant.usage.output;
         acc.cache_write += assistant.usage.cache_write;
@@ -817,9 +1018,10 @@ impl ReplayState {
     fn project_tool_result(
         &self,
         agent_id: AgentId,
+        at: Option<EntryRef>,
         agent_msg: &AgentMessage,
         tr: &aj_models::types::ToolResultMessage,
-        out: &mut VecDeque<AgentEvent>,
+        out: &mut VecDeque<ProjectedEvent>,
     ) {
         // Look up the tool name and input args captured from the
         // preceding assistant message's tool_call block. Missing
@@ -848,30 +1050,33 @@ impl ReplayState {
         normalized_result.details =
             Some(serde_json::to_value(&result).expect("resolved ToolDetails always serialize"));
 
-        out.push_back(AgentEvent::ToolExecutionStart {
+        out.push_back(transient(AgentEvent::ToolExecutionStart {
             agent_id,
             call_id: tr.tool_call_id.clone(),
             tool: tool_name.clone(),
             args,
-        });
+        }));
         // MessageStart/End around the tool_result so a replay-driven
         // pump sees the same shape a live agent emits.
-        out.push_back(AgentEvent::MessageStart {
+        out.push_back(transient(AgentEvent::MessageStart {
             agent_id,
             message: normalized_message.clone(),
-        });
-        out.push_back(AgentEvent::MessageEnd {
-            agent_id,
-            message: normalized_message,
-        });
-        out.push_back(AgentEvent::ToolExecutionEnd {
+        }));
+        out.push_back(durable(
+            at,
+            AgentEvent::MessageEnd {
+                agent_id,
+                message: normalized_message,
+            },
+        ));
+        out.push_back(transient(AgentEvent::ToolExecutionEnd {
             agent_id,
             call_id: tr.tool_call_id.clone(),
             tool: tool_name,
             result,
             content: std::sync::Arc::from(tr.content.clone().into_boxed_slice()),
             is_error: tr.is_error,
-        });
+        }));
     }
 }
 
@@ -1120,7 +1325,8 @@ mod tests {
     #[test]
     fn replay_projects_entries_on_demand() {
         let (_dir, log) = seeded_log();
-        let mut events = Replay::new(&log);
+        let snapshot = log.snapshot();
+        let mut events = Replay::new(&snapshot);
 
         assert_eq!(events.next_entry, 0);
         assert!(events.pending.is_empty());
@@ -1129,7 +1335,7 @@ mod tests {
         assert!(events.state.usage_accumulators.is_empty());
 
         assert!(matches!(
-            events.next(),
+            events.next().map(|projected| projected.event),
             Some(AgentEvent::MessageStart {
                 agent_id: AgentId::Main,
                 ..
@@ -3126,5 +3332,349 @@ mod tests {
             )),
             "the legacy sub's task message replays"
         );
+    }
+
+    /// A log that exercises every projection shape the durable tagging
+    /// rules care about, with a sub-agent run left open at end of log.
+    ///
+    /// Append positions, which the suffix tests use as cursors:
+    /// 1 system prompt, 2 seed model change, 3 user, 4 assistant with a
+    /// tool call, 5 tool result, 6 mid-session thinking change,
+    /// 7 assistant, 8 compaction, 9 sub-agent spawn root, 10 sub user,
+    /// 11 sub assistant.
+    fn open_sub_log() -> (PathBuf, ConversationLog) {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.clone());
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("system prompt");
+        log.append_model_change(ThreadFilter::USER, "anthropic", "claude-x")
+            .expect("seed model change");
+        let first_kept = {
+            let mut view = ConversationView::user(&mut log);
+            let user = view.add_message(user_msg("hi")).expect("user msg");
+            view.add_message(assistant_msg_with_usage(
+                vec![AssistantContent::ToolCall(ToolCall {
+                    id: "call-1".into(),
+                    name: "read_file".into(),
+                    arguments: json!({"path": "/tmp/x"}),
+                })],
+                10,
+                5,
+                0,
+                0,
+            ))
+            .expect("assistant with tool call");
+            view.add_message(tool_result_msg("call-1", "read_file", "body", None))
+                .expect("tool result");
+            user.id
+        };
+        log.append_thinking_change(ThreadFilter::USER, "high")
+            .expect("mid-session thinking change");
+        {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(assistant_msg_with_usage(
+                vec![AssistantContent::Text(TextContent {
+                    text: "done".into(),
+                    text_signature: None,
+                })],
+                20,
+                7,
+                0,
+                0,
+            ))
+            .expect("second assistant");
+        }
+        log.append_compaction(ThreadFilter::USER, "summary".into(), first_kept, 500, None)
+            .expect("compaction");
+        let parent_head = log.head().cloned().expect("head present");
+        let spawn = log
+            .append_subagent_spawn(1, parent_head, "do thing", true, &sub_settings())
+            .expect("spawn root");
+        {
+            let mut view = ConversationView::subagent(&mut log, spawn.id, 1);
+            view.add_message(user_msg("subtask")).expect("sub user");
+            view.add_message(assistant_msg_with_usage(
+                vec![AssistantContent::Text(TextContent {
+                    text: "sub reply".into(),
+                    text_signature: None,
+                })],
+                3,
+                2,
+                0,
+                0,
+            ))
+            .expect("sub assistant");
+        }
+        (dir, log)
+    }
+
+    /// The settings snapshot the spawn root of `open_sub_log` carries.
+    /// Deliberately distinct from `fallback_settings` so a
+    /// re-synthesized start can be told apart from a synthesized one.
+    fn sub_settings() -> AgentSettings {
+        AgentSettings {
+            provider: "anthropic".to_string(),
+            model_id: "claude-sub".to_string(),
+            thinking: "medium".to_string(),
+            speed: "fast".to_string(),
+            verbosity: "low".to_string(),
+        }
+    }
+
+    fn wire(event: &AgentEvent) -> Value {
+        serde_json::to_value(event).expect("events serialize")
+    }
+
+    /// The projected event kinds of one entry position, for readable
+    /// assertions about what a suffix contains.
+    fn kinds(backfill: &Backfill) -> Vec<(Option<u64>, String)> {
+        backfill
+            .events
+            .iter()
+            .map(|projected| {
+                let kind = wire(&projected.event)["type"]
+                    .as_str()
+                    .expect("tagged event type")
+                    .to_string();
+                (projected.entry.as_ref().map(|e| e.seq), kind)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn full_suffix_matches_replay_but_leaves_the_open_sub_open() {
+        let (_dir, log) = open_sub_log();
+        let replayed: Vec<Value> = replay(&log).map(|event| wire(&event)).collect();
+        let backfill = project_suffix(&log.snapshot(), None);
+        let projected: Vec<Value> = backfill
+            .events
+            .iter()
+            .map(|projected| wire(&projected.event))
+            .collect();
+
+        // Dead-log replay force-closes the open bracket at EOF; a live
+        // backfill must not, because the real `SubAgentEnd` is still
+        // coming (spec 6.5).
+        let (last, head) = replayed.split_last().expect("replay is not empty");
+        assert_eq!(last["type"], "sub_agent_end");
+        assert_eq!(projected, head, "the suffix is replay minus the EOF close");
+        assert_eq!(backfill.open_subs, vec![1]);
+    }
+
+    #[test]
+    fn suffix_after_cursor_keeps_projection_state_complete() {
+        let (_dir, log) = open_sub_log();
+        // Cursor at the assistant message that carries the tool call, so
+        // its tool_call map entry and its usage are below the cursor.
+        let backfill = project_suffix(&log.snapshot(), Some(4));
+
+        assert_eq!(
+            kinds(&backfill),
+            vec![
+                (None, "tool_execution_start".to_string()),
+                (None, "message_start".to_string()),
+                (Some(5), "message_end".to_string()),
+                (None, "tool_execution_end".to_string()),
+                (Some(6), "notice".to_string()),
+                (None, "message_start".to_string()),
+                (Some(7), "message_end".to_string()),
+                (None, "usage_update".to_string()),
+                (Some(8), "compaction_end".to_string()),
+                (Some(9), "sub_agent_start".to_string()),
+                (None, "message_start".to_string()),
+                (Some(10), "message_end".to_string()),
+                (None, "message_start".to_string()),
+                (Some(11), "message_end".to_string()),
+                (None, "usage_update".to_string()),
+            ],
+            "the suffix starts at the first entry above the cursor"
+        );
+        assert!(
+            backfill
+                .events
+                .iter()
+                .all(|projected| projected.entry.as_ref().is_none_or(|entry| entry.seq > 4)),
+            "no event of an entry at or below the cursor is emitted: {:?}",
+            kinds(&backfill)
+        );
+        // The tool result's entry is the first one above the cursor, and
+        // it resolves against a tool call the walk projected but dropped.
+        match &backfill.events.first().expect("suffix is not empty").event {
+            AgentEvent::ToolExecutionStart { tool, args, .. } => {
+                assert_eq!(tool, "read_file", "not the ('tool', {{}}) fallback");
+                assert_eq!(args, &json!({"path": "/tmp/x"}));
+            }
+            other => panic!("expected the tool result's execution start, got {other:?}"),
+        }
+        // The usage accumulator carries the below-cursor turn's tokens.
+        let usage = backfill
+            .events
+            .iter()
+            .find_map(|projected| match &projected.event {
+                AgentEvent::UsageUpdate {
+                    agent_id: AgentId::Main,
+                    usage,
+                } => Some(usage.clone()),
+                _ => None,
+            })
+            .expect("the above-cursor assistant turn projects a UsageUpdate");
+        assert_eq!(usage.turn_input, 20);
+        assert_eq!(
+            usage.accumulated_input, 10,
+            "accumulated from the below-cursor turn"
+        );
+        assert_eq!(usage.accumulated_output, 5);
+    }
+
+    #[test]
+    fn suffix_inside_an_open_sub_resynthesizes_its_start() {
+        let (_dir, log) = open_sub_log();
+        // Cursor inside the sub's run: its spawn root (9) and first
+        // message (10) are below the cursor, its assistant turn is not.
+        let backfill = project_suffix(&log.snapshot(), Some(10));
+
+        let first = backfill.events.first().expect("suffix is not empty");
+        match &first.event {
+            AgentEvent::SubAgentStart {
+                parent,
+                child,
+                task,
+                background,
+                settings,
+            } => {
+                assert_eq!(*parent, AgentId::Main);
+                assert_eq!(*child, AgentId::Sub(1));
+                assert_eq!(task, "do thing", "the spawn root's real task");
+                assert!(*background, "the spawn root's real run mode");
+                assert_eq!(settings, &sub_settings(), "the spawn root's settings");
+            }
+            other => panic!("expected a re-synthesized SubAgentStart, got {other:?}"),
+        }
+        assert!(
+            first.entry.is_none(),
+            "a bracketing frame whose spawn root is at or below the cursor \
+             must not be tagged durable"
+        );
+        assert_eq!(
+            kinds(&backfill),
+            vec![
+                (None, "sub_agent_start".to_string()),
+                (None, "message_start".to_string()),
+                (Some(11), "message_end".to_string()),
+                (None, "usage_update".to_string()),
+            ]
+        );
+        assert_eq!(backfill.open_subs, vec![1]);
+    }
+
+    #[test]
+    fn suffix_resynthesizes_the_start_of_a_run_opened_at_the_cursor() {
+        let (_dir, log) = open_sub_log();
+        // The spawn root sits exactly at the cursor, so it is dropped and
+        // the run is open at the boundary just the same.
+        let backfill = project_suffix(&log.snapshot(), Some(9));
+        assert_eq!(
+            kinds(&backfill),
+            vec![
+                (None, "sub_agent_start".to_string()),
+                (None, "message_start".to_string()),
+                (Some(10), "message_end".to_string()),
+                (None, "message_start".to_string()),
+                (Some(11), "message_end".to_string()),
+                (None, "usage_update".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn suffix_below_a_spawn_root_keeps_its_start_durable() {
+        let (_dir, log) = open_sub_log();
+        // The spawn root is above the cursor, so its `SubAgentStart` is the
+        // entry's durable frame and must be emitted with its position: a
+        // client whose cursor stops short of the spawn would otherwise
+        // never learn the sub exists.
+        let backfill = project_suffix(&log.snapshot(), Some(8));
+        let first = backfill.events.first().expect("suffix is not empty");
+        assert!(matches!(first.event, AgentEvent::SubAgentStart { .. }));
+        assert_eq!(
+            first.entry.as_ref().map(|entry| entry.seq),
+            Some(9),
+            "the spawn root's own position"
+        );
+    }
+
+    #[test]
+    fn full_suffix_tags_exactly_the_durable_events() {
+        let (_dir, log) = open_sub_log();
+        let snapshot = log.snapshot();
+        let backfill = project_suffix(&snapshot, None);
+
+        assert_eq!(
+            kinds(&backfill),
+            vec![
+                (None, "message_start".to_string()),
+                (Some(3), "message_end".to_string()),
+                (None, "message_start".to_string()),
+                (Some(4), "message_end".to_string()),
+                (None, "usage_update".to_string()),
+                (None, "tool_execution_start".to_string()),
+                (None, "message_start".to_string()),
+                (Some(5), "message_end".to_string()),
+                (None, "tool_execution_end".to_string()),
+                (Some(6), "notice".to_string()),
+                (None, "message_start".to_string()),
+                (Some(7), "message_end".to_string()),
+                (None, "usage_update".to_string()),
+                (Some(8), "compaction_end".to_string()),
+                (Some(9), "sub_agent_start".to_string()),
+                (None, "message_start".to_string()),
+                (Some(10), "message_end".to_string()),
+                (None, "message_start".to_string()),
+                (Some(11), "message_end".to_string()),
+                (None, "usage_update".to_string()),
+            ]
+        );
+
+        // Every tag names its own entry, and no entry carries two.
+        let mut seen: Vec<u64> = Vec::new();
+        for projected in &backfill.events {
+            let Some(entry) = &projected.entry else {
+                continue;
+            };
+            let index = usize::try_from(entry.seq).expect("fits usize") - 1;
+            let logged = snapshot
+                .entry_in_append_order(index)
+                .expect("tagged position exists in the log");
+            assert_eq!(entry.id, logged.id, "tag names its own entry");
+            assert!(
+                !seen.contains(&entry.seq),
+                "position {} is tagged twice",
+                entry.seq
+            );
+            seen.push(entry.seq);
+            if let AgentEvent::MessageEnd { message, .. } = &projected.event {
+                assert_eq!(
+                    entry.id,
+                    message.id(),
+                    "a MessageEnd's tag is its message's own id"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn seed_entries_leave_a_gap_before_the_first_tagged_position() {
+        let (_dir, log) = open_sub_log();
+        let backfill = project_suffix(&log.snapshot(), None);
+        let first_tagged = backfill
+            .events
+            .iter()
+            .find_map(|projected| projected.entry.as_ref())
+            .expect("the suffix tags at least one event");
+        // The system prompt and the seed model change project nothing, so
+        // seqs start above 1 and are not contiguous. Clients must tolerate
+        // that (spec 6.4).
+        assert_eq!(first_tagged.seq, 3);
+        assert!(first_tagged.seq > 1);
     }
 }
