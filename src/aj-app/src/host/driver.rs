@@ -34,7 +34,7 @@ use crate::host::{
     mint_epoch,
 };
 use crate::session::AgentLifecycle;
-use crate::turn::{TurnStart, Turns, running_work_counts};
+use crate::turn::{Joined, TurnStart, Turns, running_work_counts};
 
 /// How long a shutdown waits for cancelled turns to wind themselves down
 /// before falling back to aborting them.
@@ -169,34 +169,11 @@ impl Driver {
 
     /// Handle one completed turn: reap, conclude the sub-agent boxes the
     /// reap swept, wake on queued work, and surface the outcome.
-    fn on_join(
-        &mut self,
-        joined: Result<(AgentId, Result<(), TurnError>), tokio::task::JoinError>,
-    ) {
-        let (id, result) = match joined {
-            Ok(joined) => joined,
-            Err(err) => {
-                // A panicked turn task is fatal for the turn but not for
-                // the host: other sessions keep running, and this one has
-                // no in-flight state left to corrupt. The join carries no
-                // agent id, so the cancel entry can only be cleaned up once
-                // nothing is driven at all, otherwise the agent would read
-                // busy forever and the session would wedge.
-                self.turns.forget_driven_if_idle();
-                self.publish_event(
-                    None,
-                    AgentEvent::Error {
-                        agent_id: AgentId::Main,
-                        text: format!("agent task panicked: {err}"),
-                    },
-                );
-                self.refresh_state();
-                return;
-            }
-        };
+    fn on_join(&mut self, joined: Joined) {
+        let Joined { agent, outcome } = joined;
         for idled in self
             .turns
-            .reap(&mut self.lifecycle, &self.session.core.task_registry, id)
+            .reap(&mut self.lifecycle, &self.session.core.task_registry, agent)
         {
             // A sub the reap swept emitted no `AgentEnd` of its own, and a
             // remote client cannot conclude its box by reaching into the
@@ -215,10 +192,31 @@ impl Driver {
             }
         }
         self.publish_live_subs();
+        let result = match outcome {
+            Ok(result) => result,
+            Err(err) => {
+                // A panicked turn task is fatal for the turn but not for
+                // the host: other sessions keep running, and the reap
+                // above already marked its agent idle, so the session
+                // stays usable. No wake, deliberately: it would re-enter
+                // the code path that just panicked.
+                self.publish_event(
+                    None,
+                    AgentEvent::Error {
+                        agent_id: agent,
+                        text: format!("agent task panicked: {err}"),
+                    },
+                );
+                self.refresh_state();
+                self.shared.fanout.mark_list_dirty();
+                return;
+            }
+        };
         if !self.draining
-            && (self.session.core.task_registry.has_notices(id) || self.session.has_queued(id))
+            && (self.session.core.task_registry.has_notices(agent)
+                || self.session.has_queued(agent))
         {
-            self.wake(id);
+            self.wake(agent);
         }
         match result {
             Ok(()) => {}
@@ -229,7 +227,7 @@ impl Driver {
                 self.publish_event(
                     None,
                     AgentEvent::Notice {
-                        agent_id: id,
+                        agent_id: agent,
                         text: "Turn cancelled.".to_string(),
                     },
                 );
@@ -242,7 +240,7 @@ impl Driver {
                 self.publish_event(
                     None,
                     AgentEvent::Error {
-                        agent_id: id,
+                        agent_id: agent,
                         text: format!("{err}"),
                     },
                 );

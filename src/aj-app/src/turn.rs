@@ -213,12 +213,30 @@ const OVERFLOW_GIVEUP: &str =
 pub struct Turns {
     set: JoinSet<(AgentId, Result<(), TurnError>)>,
     cancels: HashMap<AgentId, CancellationToken>,
+    /// Which agent each spawned task drives.
+    ///
+    /// A panicked task returns no value, so this is the only way to
+    /// attribute it. Without the attribution the agent would keep its
+    /// cancel entry and its running mark and read busy forever, wedging
+    /// the session (see [`Joined`]).
+    tasks: HashMap<tokio::task::Id, AgentId>,
     /// The session's compaction append handoff, threaded into every
     /// `drive_turn` this spawns. A host that fans events out installs its
     /// own so a compaction's `CompactionEnd` reaches the fan-out tagged
     /// with the checkpoint entry; a host that does not gets the default,
     /// which nothing reads.
     handoff: AppendHandoff,
+}
+
+/// One turn the host was driving, as its join set reported it.
+pub struct Joined {
+    /// The agent the turn belonged to, known even for a panicked task.
+    pub agent: AgentId,
+    /// The turn's own outcome, or the join failure when its task panicked
+    /// or was aborted. A panicked turn emitted its `AgentStart` and will
+    /// never emit an `AgentEnd`, so the host has to reap `agent` on this
+    /// arm exactly as it does on the other.
+    pub outcome: Result<Result<(), TurnError>, tokio::task::JoinError>,
 }
 
 impl Turns {
@@ -327,7 +345,7 @@ impl Turns {
         let handoff = self.handoff.clone();
         let turn_cancel = CancellationToken::new();
         self.cancels.insert(target, turn_cancel.clone());
-        self.set.spawn(async move {
+        let handle = self.set.spawn(async move {
             let mut a = handle.lock().await;
             let result = drive_turn(
                 &mut a,
@@ -349,6 +367,7 @@ impl Turns {
             .await;
             (target, result)
         });
+        self.tasks.insert(handle.id(), target);
         true
     }
 
@@ -375,16 +394,52 @@ impl Turns {
 
     /// Await the next completed turn, or pend forever when no turn is
     /// in flight, so a host's `select!` arm stays simple.
-    pub async fn join_next(
-        &mut self,
-    ) -> Result<(AgentId, Result<(), TurnError>), tokio::task::JoinError> {
+    pub async fn join_next(&mut self) -> Joined {
         if self.set.is_empty() {
-            std::future::pending().await
-        } else {
-            self.set
-                .join_next()
-                .await
-                .expect("non-empty JoinSet yields Some")
+            return std::future::pending().await;
+        }
+        let joined = self
+            .set
+            .join_next_with_id()
+            .await
+            .expect("non-empty JoinSet yields Some");
+        self.attribute(joined)
+    }
+
+    /// The next already-completed turn, without waiting.
+    ///
+    /// A host whose select loop prefers another arm reaps through this, so
+    /// a stream of work on that arm cannot leave finished turns unreaped
+    /// (and their agents reading busy) for as long as it lasts.
+    pub fn try_join_next(&mut self) -> Option<Joined> {
+        let joined = self.set.try_join_next_with_id()?;
+        Some(self.attribute(joined))
+    }
+
+    /// Resolve a join result to the agent whose turn it was.
+    fn attribute(
+        &mut self,
+        joined: Result<(tokio::task::Id, (AgentId, Result<(), TurnError>)), tokio::task::JoinError>,
+    ) -> Joined {
+        match joined {
+            Ok((task, (agent, result))) => {
+                self.tasks.remove(&task);
+                Joined {
+                    agent,
+                    outcome: Ok(result),
+                }
+            }
+            Err(err) => {
+                // A panicked task carries no return value, so the agent
+                // comes from the id map. `spawn` records every task there
+                // and only a join or `shutdown` removes it, and neither
+                // can have happened for the task joining here.
+                let agent = self.tasks.remove(&err.id()).unwrap_or(AgentId::Main);
+                Joined {
+                    agent,
+                    outcome: Err(err),
+                }
+            }
         }
     }
 
@@ -425,18 +480,9 @@ impl Turns {
     pub async fn shutdown(&mut self) {
         self.set.shutdown().await;
         self.cancels.clear();
-    }
-
-    /// Drop the cancel tokens when nothing is driven any more.
-    ///
-    /// A turn task that panicked joins as an error rather than as an agent
-    /// id, so [`Self::reap`] cannot be told which entry to remove and the
-    /// agent would read busy forever. Once the join set is empty nothing is
-    /// driven at all, which is enough to clear the map without guessing.
-    pub fn forget_driven_if_idle(&mut self) {
-        if self.set.is_empty() {
-            self.cancels.clear();
-        }
+        // The aborted tasks' joins are consumed inside `shutdown`, so
+        // nothing will attribute them.
+        self.tasks.clear();
     }
 }
 

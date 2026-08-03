@@ -1547,6 +1547,71 @@ async fn killing_a_task_is_accepted_or_a_miss() {
     harness.host.shutdown().await;
 }
 
+/// A panicked turn task is reaped like any other, so the session goes idle
+/// and stays usable. The turn emitted its `AgentStart` and will never emit
+/// an `AgentEnd`, so without the reap the agent would read busy forever:
+/// every `state` and `list` frame would report working, and the next prompt
+/// would queue behind a turn that already died.
+#[tokio::test]
+async fn a_panicked_turn_leaves_the_session_idle() {
+    // An empty script: the scripted provider panics the inference task
+    // rather than inventing a reply.
+    let harness = Harness::new(Vec::new());
+    let session = harness.create().await;
+    let mut stream = harness
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+    frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+
+    harness.prompt(&session, "hi").await;
+    let frames = frames_until(&mut stream, "the panic to surface", |frame| {
+        matches!(
+            frame,
+            Frame::Event { event, .. }
+                if matches!(event.known(), Some(AgentEvent::Error { text, .. })
+                    if text.contains("panicked"))
+        )
+    })
+    .await;
+    assert!(
+        !frames.is_empty(),
+        "the panic surfaces as an error frame on the session's stream",
+    );
+
+    settle(&harness, &session, &mut stream).await;
+    let summary = harness
+        .host
+        .sessions()
+        .await
+        .expect("sessions")
+        .sessions
+        .into_iter()
+        .find(|entry| entry.id == session)
+        .expect("the session is listed");
+    assert!(
+        !summary.working,
+        "the session reports itself idle after the panic",
+    );
+
+    // And the next prompt runs a turn instead of queueing behind the dead
+    // one.
+    harness
+        .install_script(&session, vec![finalized_text_message("after the panic")])
+        .await;
+    harness.prompt(&session, "again").await;
+    let frames = until_idle(&mut stream).await;
+    assert_eq!(assistant_text(&frames), "after the panic");
+    harness.host.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // 10 + 11 + 12 + 13. Attach ordering and convergence
 // ---------------------------------------------------------------------------

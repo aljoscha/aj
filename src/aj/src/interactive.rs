@@ -36,7 +36,7 @@ use aj_app::shutdown::{format_resume_hint, format_session_usage_header, format_u
 use aj_app::theme::{
     ColorMode, Theme, ThemeBg, ThemeColor, ThemeHandle, ThemeWatcherGuard, watch_user_theme,
 };
-use aj_app::turn::{TurnStart, Turns, running_work_counts};
+use aj_app::turn::{Joined, TurnStart, Turns, running_work_counts};
 use aj_conf::skills::Skill;
 use aj_conf::{
     AgentEnv, Config, ConfigDiagnostic, ConfigSpeed, ConfigThinkingDisplay, ConfigVerbosity,
@@ -1151,11 +1151,9 @@ fn auto_submit_launch(world: &mut World, content: Vec<UserContent>) {
 /// Handle one completed turn from the join set. Returns `Err` only for
 /// fatal outcomes (turn task panic, `TurnError::Fatal`), which end the
 /// session.
-fn handle_turn_join(
-    world: &mut World,
-    joined: Result<(AgentId, Result<(), TurnError>), tokio::task::JoinError>,
-) -> Result<()> {
-    let (id, result) = joined.map_err(|join_err| anyhow!("agent task panicked: {join_err}"))?;
+fn handle_turn_join(world: &mut World, joined: Joined) -> Result<()> {
+    let Joined { agent: id, outcome } = joined;
+    let result = outcome.map_err(|join_err| anyhow!("agent task panicked: {join_err}"))?;
     // The spinner and footer resync from the lifecycle each frame, but a
     // sub-agent box's status chip and runtime clock are reducer state
     // flipped by `AgentEnd`/`SubAgentEnd`. A sub the reap sweeps emitted
