@@ -55,6 +55,37 @@ the loop is:
 - Do not refactor beyond what the phase needs. Flag tempting cleanups
   in your report instead.
 
+## Per-phase review pipeline
+
+A phase is not done when its tests pass, it is done when it has
+survived adversarial review. After the phase's work is committed:
+
+1. Run **two adversarial review agents in parallel**. They are
+   read-only: they may read, search, build, and run tests, but must
+   not edit files (two parallel reviewers editing would clobber each
+   other). Each prompt must state the intended behavior, the spec
+   sections in scope, and the commit range to attack, and must say:
+   assume there are bugs, find them and show how things break. A
+   finding needs evidence (a concrete failure scenario, a breaking
+   input or frame trace, a failing test), not a vague concern. Give
+   the two reviewers different lenses so they don't produce the same
+   report, for this project the natural split is one on correctness,
+   concurrency, and protocol edge cases (catch-up, epochs, flow
+   control, races), the other on spec conformance, interface
+   contracts, and test coverage.
+2. Run a **fix pass** that takes both reports, triages them,
+   integrates the valid findings, and amends the phase's commits.
+   Adversarial review produces false positives, rejecting a finding
+   with a short justification is expected, applying everything
+   blindly is not. Findings that imply a design or scope change are
+   not fixed in the pipeline, they go through the working loop
+   (point 2) instead.
+3. If the reviewers found serious issues, run one more review pass
+   over the fixes, then stop. Don't loop endlessly.
+
+The phase report (see Reporting) includes the review outcome: findings
+accepted, findings rejected and why.
+
 ## Map of the existing code
 
 Verified starting points (line references drift, re-check):
