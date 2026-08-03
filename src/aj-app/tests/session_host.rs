@@ -311,6 +311,17 @@ fn events(frames: &[Frame]) -> Vec<&AgentEvent> {
         .collect()
 }
 
+/// Whether `frames` carry a `Notice` reading exactly `text`.
+fn notice(frames: &[Frame], text: &str) -> bool {
+    events(frames)
+        .into_iter()
+        .any(|event| matches!(event, AgentEvent::Notice { text: seen, .. } if seen == text))
+}
+
+/// The notice the host publishes for a turn that was cancelled. A turn that
+/// ran to completion publishes none, which is what makes it evidence.
+const CANCELLED: &str = "Turn cancelled.";
+
 /// One event's `type` tag, for assertion messages that name a sequence of
 /// events without dumping their payloads.
 fn event_kind(event: &AgentEvent) -> String {
@@ -414,12 +425,25 @@ impl Client {
         }
     }
 
-    /// Fold until the session reports idle.
-    async fn pump_until_idle(&mut self) {
-        let frames = until_idle(&mut self.stream).await;
-        for frame in frames {
-            let _ = self.client.apply(&mut self.chat, frame);
+    /// Fold everything already queued on the stream, without waiting. The
+    /// frame a command earns is queued before the command returns, so this
+    /// is enough to see its effect.
+    fn drain_into_fold(&mut self) -> Vec<Frame> {
+        let frames = drained(&mut self.stream);
+        for frame in &frames {
+            let _ = self.client.apply(&mut self.chat, frame.clone());
         }
+        frames
+    }
+
+    /// Fold until the session reports idle, returning what was folded so a
+    /// test can assert on the frames as well as on the resulting state.
+    async fn pump_until_idle(&mut self) -> Vec<Frame> {
+        let frames = until_idle(&mut self.stream).await;
+        for frame in &frames {
+            let _ = self.client.apply(&mut self.chat, frame.clone());
+        }
+        frames
     }
 
     fn canonical(&self) -> CanonicalState {
@@ -465,6 +489,50 @@ fn settings() -> AgentSettings {
         speed: "standard".into(),
         verbosity: "default".into(),
     }
+}
+
+/// The text of every assistant row in `agent`'s transcript, streaming rows
+/// included.
+fn assistant_rows(chat: &ChatState, agent: AgentId) -> Vec<String> {
+    rows(chat, agent, |kind| match kind {
+        aj_app::chat::EntryKind::Assistant(assistant) => Some(
+            assistant
+                .message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    AssistantContent::Text(text) => Some(text.text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        ),
+        _ => None,
+    })
+}
+
+/// The tool every tool cell in `agent`'s transcript names.
+fn tool_cells(chat: &ChatState, agent: AgentId) -> Vec<String> {
+    rows(chat, agent, |kind| match kind {
+        aj_app::chat::EntryKind::Tool(tool) => Some(tool.tool.clone()),
+        _ => None,
+    })
+}
+
+fn rows(
+    chat: &ChatState,
+    agent: AgentId,
+    pick: impl Fn(&aj_app::chat::EntryKind) -> Option<String>,
+) -> Vec<String> {
+    chat.transcript(agent)
+        .map(|transcript| {
+            transcript
+                .entries()
+                .iter()
+                .filter_map(|entry| pick(&entry.kind))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -1459,6 +1527,130 @@ async fn queue_mutations_reach_every_subscriber() {
     harness.host.shutdown().await;
 }
 
+/// A steer with text queues as **steering**, an empty steer promotes the
+/// pending follow-up into the steering slot, and both are visible on the
+/// stream (spec 6.6).
+///
+/// The two slots decide when the agent delivers a message: steering is
+/// injected mid-turn, a follow-up waits for the turn to end. A client reads
+/// them off the `QueueUpdate` payloads, so this asserts on the fold of those
+/// frames rather than on the queues behind the host.
+#[tokio::test]
+async fn a_steer_queues_as_steering_and_an_empty_steer_promotes() {
+    let harness = Harness::with_provider(scripted(
+        vec![finalized_text_message(
+            "an answer streamed slowly enough to queue behind",
+        )],
+        1,
+        Duration::from_millis(30),
+    ));
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+
+    // Busy now, so a prompt queues as a follow-up.
+    harness.prompt(&session, "afterwards").await;
+    client.drain_into_fold();
+    assert_eq!(
+        queued(&client, AgentId::Main),
+        (Vec::new(), vec!["afterwards".to_string()]),
+        "a prompt to a busy agent waits for the turn to end",
+    );
+
+    harness
+        .host
+        .command(
+            &session,
+            Command::Steer {
+                agent: AgentId::Main,
+                text: "steer me".to_string(),
+            },
+        )
+        .await
+        .expect("steer while busy queues");
+    client.drain_into_fold();
+    assert_eq!(
+        queued(&client, AgentId::Main),
+        (vec!["afterwards\nsteer me".to_string()], Vec::new()),
+        "a steer with text moves the pending message into the steering slot",
+    );
+
+    // Back to a follow-up, so the empty steer below has something to
+    // promote.
+    harness
+        .host
+        .command(
+            &session,
+            Command::Queue(QueueOp::Remove {
+                agent: AgentId::Main,
+            }),
+        )
+        .await
+        .expect("withdraw");
+    harness.prompt(&session, "later then").await;
+    client.drain_into_fold();
+    assert_eq!(
+        queued(&client, AgentId::Main),
+        (Vec::new(), vec!["later then".to_string()]),
+    );
+
+    harness
+        .host
+        .command(
+            &session,
+            Command::Steer {
+                agent: AgentId::Main,
+                text: String::new(),
+            },
+        )
+        .await
+        .expect("an empty steer promotes");
+    client.drain_into_fold();
+    assert_eq!(
+        queued(&client, AgentId::Main),
+        (vec!["later then".to_string()], Vec::new()),
+        "an empty steer promotes the pending follow-up rather than dropping it",
+    );
+
+    harness
+        .host
+        .command(&session, Command::Queue(QueueOp::Clear))
+        .await
+        .expect("clear");
+    client.pump_until_idle().await;
+    harness.host.shutdown().await;
+}
+
+/// The `(steering, follow_up)` texts `agent`'s queue holds, as the client
+/// folded them out of the `QueueUpdate` frames.
+fn queued(client: &Client, agent: AgentId) -> (Vec<String>, Vec<String>) {
+    let texts = |messages: &[aj_agent::message::AgentMessage]| {
+        messages
+            .iter()
+            .map(|message| match message.to_projected_wire() {
+                Some(aj_models::types::Message::User(user)) => user
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        UserContent::Text(text) => Some(text.text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+                other => panic!("a queued message is a user message, got {other:?}"),
+            })
+            .collect()
+    };
+    client
+        .client
+        .queue()
+        .queues
+        .iter()
+        .find(|queue| queue.agent_id == agent)
+        .map(|queue| (texts(&queue.steering), texts(&queue.follow_up)))
+        .unwrap_or_default()
+}
+
 /// The enqueue side publishes a `QueueUpdate` at every step, which is what
 /// a second client's queue view is built from.
 #[tokio::test]
@@ -1845,6 +2037,83 @@ async fn a_prompt_runs_when_idle_and_queues_when_busy() {
     harness.host.shutdown().await;
 }
 
+/// Cancelling a running turn stops the work it had left: the tool call the
+/// streaming message carries is never executed and the inference that would
+/// have answered it never runs, and the host publishes the notice that says
+/// so.
+///
+/// The script is the oracle for "stopped". Its second message is only
+/// reachable through the tool call in the first, so a cancel that did
+/// nothing would consume it, and `ExhaustedBehavior::Panic` means the script
+/// is exactly as long as an uncancelled turn needs.
+#[tokio::test]
+async fn a_cancel_stops_the_turn_and_publishes_its_notice() {
+    let harness = Harness::with_provider(scripted(
+        vec![
+            calling(
+                "let me check the list first",
+                "call-1",
+                "todo_read",
+                serde_json::json!({}),
+            ),
+            finalized_text_message("the answer after the tool"),
+        ],
+        1,
+        Duration::from_millis(30),
+    ));
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "check the todos").await;
+    // Cancel while the first message is still streaming, so its tool call
+    // has not been dispatched yet.
+    frames_until(&mut client.stream, "the turn to start streaming", |frame| {
+        matches!(
+            frame,
+            Frame::Event { event, .. }
+                if matches!(event.known(), Some(AgentEvent::MessageUpdate { .. }))
+        )
+    })
+    .await
+    .into_iter()
+    .for_each(|frame| {
+        let _ = client.client.apply(&mut client.chat, frame);
+    });
+
+    harness
+        .host
+        .command(
+            &session,
+            Command::Cancel {
+                agent: AgentId::Main,
+            },
+        )
+        .await
+        .expect("cancel");
+    let frames = client.pump_until_idle().await;
+
+    assert!(
+        notice(&frames, CANCELLED),
+        "the cancel is confirmed on the stream: {:?}",
+        events(&frames)
+            .into_iter()
+            .map(event_kind)
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        tool_cells(&client.chat, AgentId::Main),
+        Vec::<String>::new(),
+        "the cancelled turn never dispatched its tool call",
+    );
+    let answers = assistant_rows(&client.chat, AgentId::Main);
+    assert!(
+        !answers
+            .iter()
+            .any(|text| text.contains("the answer after the tool")),
+        "and never ran the inference that would have answered it: {answers:?}",
+    );
+    harness.host.shutdown().await;
+}
+
 /// Cancelling a foreground sub-agent cascades to the main turn that owns
 /// it, matching the local gesture.
 #[tokio::test]
@@ -1875,7 +2144,11 @@ async fn cancelling_a_foreground_sub_cascades_to_main() {
                 if matches!(event.known(), Some(AgentEvent::AgentStart { agent_id: AgentId::Sub(1) }))
         )
     })
-    .await;
+    .await
+    .into_iter()
+    .for_each(|frame| {
+        let _ = client.client.apply(&mut client.chat, frame);
+    });
     harness
         .host
         .command(
@@ -1887,10 +2160,34 @@ async fn cancelling_a_foreground_sub_cascades_to_main() {
         .await
         .expect("cancel the sub");
 
-    client.pump_until_idle().await;
+    let frames = client.pump_until_idle().await;
     assert!(
         !client.client.working(),
         "the cascade cancelled the main turn too",
+    );
+    // A cancel of a foreground sub fires the main turn's token, because the
+    // child's run is owned by that turn. Without the cascade nothing is
+    // cancelled at all: the sub reports normally, the parent runs its
+    // concluding inference, and neither of the two below holds.
+    assert!(
+        notice(&frames, CANCELLED),
+        "the main turn was cancelled: {:?}",
+        events(&frames)
+            .into_iter()
+            .map(event_kind)
+            .collect::<Vec<_>>(),
+    );
+    let sub_reply = assistant_rows(&client.chat, AgentId::Sub(1));
+    assert!(
+        !sub_reply
+            .iter()
+            .any(|text| text.contains("a slowly streamed sub answer")),
+        "the child's own run was cut short mid-stream: {sub_reply:?}",
+    );
+    let answers = assistant_rows(&client.chat, AgentId::Main);
+    assert!(
+        !answers.iter().any(|text| text == "done"),
+        "and the parent never ran its concluding inference: {answers:?}",
     );
     assert_no_dangling(&client.chat);
     harness.host.shutdown().await;
@@ -3017,9 +3314,17 @@ async fn a_cancelled_turn_publishes_its_terminal_message() {
         )
         .await
         .expect("cancel");
-    client.pump_until_idle().await;
+    let frames = client.pump_until_idle().await;
 
     assert!(!client.client.working(), "the session is idle again");
+    assert!(
+        notice(&frames, CANCELLED),
+        "the turn ended as a cancellation rather than on its own: {:?}",
+        events(&frames)
+            .into_iter()
+            .map(event_kind)
+            .collect::<Vec<_>>(),
+    );
     assert_no_dangling(&client.chat);
     let state = format!("{:?}", client.canonical());
     assert!(
