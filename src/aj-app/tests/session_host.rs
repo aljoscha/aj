@@ -425,15 +425,34 @@ impl Client {
         this
     }
 
-    /// Apply frames up to and including the block's `caught_up`.
-    async fn apply_block(&mut self) {
+    /// Apply frames up to and including the block's `caught_up`, returning
+    /// them so a test can assert on what the block carried.
+    async fn apply_block(&mut self) -> Vec<Frame> {
         let frames = frames_until(&mut self.stream, "caught_up", |frame| {
             matches!(frame, Frame::CaughtUp { .. })
         })
         .await;
-        for frame in frames {
-            let _ = self.client.apply(&mut self.chat, frame);
+        for frame in &frames {
+            let _ = self.client.apply(&mut self.chat, frame.clone());
         }
+        frames
+    }
+
+    /// Attach again, offering `cursor`, and apply the block that follows.
+    ///
+    /// The old stream is dropped only once the new one has been served, so
+    /// nothing is lost in between: this is a client re-attaching to reconcile
+    /// an older cursor, not one recovering from a disconnect.
+    async fn reattach(&mut self, host: &SessionHost, cursor: aj_wire::Cursor) -> Vec<Frame> {
+        self.stream = host
+            .attach(&[AttachRequest {
+                session: self.client.session().to_string(),
+                cursor: Some(cursor),
+            }])
+            .await
+            .expect("re-attach");
+        self.client.expect_attach();
+        self.apply_block().await
     }
 
     /// Fold everything already queued on the stream, without waiting. The
@@ -2902,6 +2921,164 @@ async fn attaching_during_a_sub_agent_continuation_leaves_its_bracket_open() {
     .await;
     assert!(concluded(&after));
     harness.host.shutdown().await;
+}
+
+/// A cursor inside a running sub-agent's run: the block re-synthesizes that
+/// run's `SubAgentStart` from its spawn root, leaves the bracket open, and
+/// the client converges with one that never re-attached.
+///
+/// The spawn root sits at the cursor, so the projection cannot serve the real
+/// start again (it is at the boundary, and tagging a bracketing frame durable
+/// would make the client's cursor invariant drop it). The re-synthesized one
+/// is glue, and it has to carry the spawn root's task, background flag and
+/// settings: without them a client that had lost the box would re-open it as
+/// an unlabelled foreground run.
+#[tokio::test]
+async fn attaching_with_a_cursor_inside_a_live_sub_run_resynthesizes_its_start() {
+    // The parent and the background child share the provider, so which of the
+    // two long messages each gets is up to their interleaving. Both are long,
+    // so the child's run outlives the attach either way.
+    let harness = Harness::with_provider(scripted(
+        vec![
+            calling(
+                "kicking that off",
+                "call-bg",
+                "agent",
+                serde_json::json!({"task": "look into it", "run_in_background": true}),
+            ),
+            finalized_text_message(
+                "meanwhile, here is a long answer streamed one character at a time",
+            ),
+            finalized_text_message("and the background sub-agent reporting back at similar length"),
+            // The task's completion notice wakes the parent once the child is
+            // done, which runs one more inference.
+            finalized_text_message("noted, thanks"),
+        ],
+        1,
+        Duration::from_millis(20),
+    ));
+    let session = harness.create().await;
+    let mut all_along = Client::attach(&harness.host, &session).await;
+    let mut rewinding = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "kick it off").await;
+
+    // The child's first durable entry: its run is under way, so the spawn
+    // root is below the cursor and the suffix carries entries of the run.
+    let sub_started = |frame: &Frame| {
+        matches!(frame, Frame::Event { event, .. }
+            if matches!(event.known(),
+                Some(AgentEvent::MessageEnd { agent_id: AgentId::Sub(1), .. })))
+    };
+    let mut spawn_root = None;
+    for client in [&mut all_along, &mut rewinding] {
+        let frames = frames_until(&mut client.stream, "the child's first entry", sub_started).await;
+        spawn_root = Some(spawn_root_seq(&frames));
+        for frame in &frames {
+            let _ = client.client.apply(&mut client.chat, frame.clone());
+        }
+    }
+    let spawn_root = spawn_root.expect("both clients saw the spawn");
+    let epoch = rewinding.client.cursor().expect("a committed cursor").epoch;
+
+    let block = rewinding
+        .reattach(
+            &harness.host,
+            aj_wire::Cursor {
+                epoch,
+                seq: spawn_root,
+            },
+        )
+        .await;
+
+    let starts: Vec<(AgentId, String, bool, AgentSettings, Option<u64>)> = block
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::Event {
+                durability, event, ..
+            } => match event.known() {
+                Some(AgentEvent::SubAgentStart {
+                    child,
+                    task,
+                    background,
+                    settings,
+                    ..
+                }) => Some((
+                    *child,
+                    task.clone(),
+                    *background,
+                    settings.clone(),
+                    durability.as_ref().map(|durability| durability.seq),
+                )),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        starts,
+        vec![(
+            AgentId::Sub(1),
+            "look into it".to_string(),
+            true,
+            settings(),
+            None,
+        )],
+        "the run's start is re-synthesized with the spawn root's own fields, untagged",
+    );
+    assert!(
+        !events(&block).into_iter().any(|event| matches!(
+            event,
+            AgentEvent::AgentEnd {
+                agent_id: AgentId::Sub(1),
+                ..
+            } | AgentEvent::SubAgentEnd {
+                child: AgentId::Sub(1),
+                ..
+            }
+        )),
+        "and the bracket stays open, the run being live: {:?}",
+        events(&block)
+            .into_iter()
+            .map(event_kind)
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        sub_box(&rewinding.canonical(), 1).0,
+        aj_app::chat::SubAgentStatus::Running,
+        "so the client keeps rendering a running box",
+    );
+
+    for client in [&mut rewinding, &mut all_along] {
+        let frames = settle(&harness, &session, &mut client.stream).await;
+        for frame in &frames {
+            let _ = client.client.apply(&mut client.chat, frame.clone());
+        }
+    }
+
+    assert_canonical_eq(
+        &rewinding.canonical(),
+        &all_along.canonical(),
+        "a cursor inside a live run converges once the run ends",
+    );
+    assert_no_dangling(&rewinding.chat);
+    harness.host.shutdown().await;
+}
+
+/// The durable position of the `SubAgentStart` frame in `frames`: the append
+/// index of the spawn root the host wrote for that run.
+fn spawn_root_seq(frames: &[Frame]) -> u64 {
+    frames
+        .iter()
+        .find_map(|frame| match frame {
+            Frame::Event {
+                durability: Some(durability),
+                event,
+                ..
+            } => matches!(event.known(), Some(AgentEvent::SubAgentStart { .. }))
+                .then_some(durability.seq),
+            _ => None,
+        })
+        .expect("a durable sub-agent start")
 }
 
 /// A resumed session's sub-agent boxes are still concluded: nothing runs at
