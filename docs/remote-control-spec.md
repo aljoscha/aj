@@ -256,7 +256,12 @@ internally tagged with `kind`:
 
 - `event`: `{kind, session, epoch, seq?, entry_id?, event}` where
   `event` is a serialized `AgentEvent`. `seq` and `entry_id` are
-  present if and only if the event is durable (section 6.4).
+  present if and only if the event is durable (section 6.4). On the
+  receive side the nested event decodes through a wire wrapper that
+  distinguishes known from unknown event types, the unknown case
+  retaining the raw JSON (section 6.10). The envelope's epoch and
+  cursor semantics apply regardless of whether the nested event type
+  is known.
 - `state`: `{kind, session, epoch, working, settings, last_seq}`.
   Structured per-session state: whether a turn is in flight, the
   active settings (model identity, thinking, speed, verbosity), and
@@ -278,6 +283,11 @@ internally tagged with `kind`:
   must re-attach the session (section 6.5). Its cursor stays valid to
   offer, the server decides whether it can resume from it.
 - `heartbeat`: `{kind}`.
+
+Session-scoped frames carry their session id in a top-level `session`
+field. That is a load-bearing convention, not a style choice: it is
+what lets a gateway rewrite session ids even in frame kinds it does
+not understand (section 6.10).
 
 Unknown frame kinds, unknown keys in a frame, and unknown `event`
 types must be ignored by clients (section 6.10).
@@ -513,11 +523,26 @@ especially with long-lived VMs. Rules:
   additive and capability-advertised.
 - Servers ignore unknown JSON fields in requests. Clients ignore
   unknown fields in frames and responses.
-- Clients must tolerate unknown frame kinds and unknown event types:
-  the wire decoder for `AgentEvent` has an explicit unknown-tolerant
-  path (an unknown variant that the reducer skips, at most surfacing a
-  debug notice). This is the one place the internally-tagged enum
-  needs deliberate handling rather than a plain derive.
+- Unknown tolerance lives at the wire boundary, never in the domain
+  enum. `AgentEvent` stays closed (every consumer relies on its
+  exhaustive matches and its `agent_id()` contract, which an unknown
+  variant cannot honor) and gains strict deserialization of its known
+  variants. `aj-wire` wraps decoding for events and for frames: a
+  known type decodes strictly (a malformed known event is an error,
+  not a downgrade to unknown), an unknown type retains its tag and
+  complete raw JSON. Unknown events and frames never reach the local
+  event bus or the reducer.
+- Client handling of unknowns: an unknown nested event is skipped
+  before the reducer, but its envelope still applies, the epoch
+  filter runs and a durable unknown event advances the cursor
+  (otherwise every reconnect would refetch an event the client will
+  never understand). Unknown top-level frame kinds may be discarded
+  by endpoint clients outright.
+- Gateway handling of unknowns: forward, don't filter. The retained
+  raw JSON is re-emitted unchanged except for the session-id rewrite,
+  which the top-level `session` convention (section 6.3) makes
+  possible without understanding the frame. This is what lets an
+  older gateway sit between newer hosts and newer clients.
 - New endpoints, frame kinds, and event types arrive with a capability
   string. Probing an endpoint (404 vs 2xx) is a valid fallback check.
 - The pinned-shape tests in `events.rs` extend to round-trip tests:
@@ -789,10 +814,12 @@ overrides like every other action.
 
 - **`aj-wire`** (new): the protocol crate. Frame types, wire versions
   of non-event payloads (list entries, task summaries, tree, hello,
-  queue, VM state), the unknown-tolerant `AgentEvent` decoding
-  including entry-id backfill into message ids, serde round-trip and
-  forward-compat fixtures. No I/O, no HTTP types. Both `aj-app` and
-  anything else can depend on it.
+  queue, VM state), the known/unknown decode wrappers for events and
+  frames (the unknown case retaining raw JSON for gateway
+  forwarding), and entry-id backfill into decoded message ids. Strict
+  deserialization of known `AgentEvent` variants lives with the enum
+  in `aj-agent`, `aj-wire` owns everything version-skew. No I/O, no
+  HTTP types. Both `aj-app` and anything else can depend on it.
 - **`aj-app`**: gains the session-host layer (section 5), the reducer
   hardening (idempotent application, quiesce, canonical form for
   tests, section 11), and the client-side session directory / cursor
@@ -812,11 +839,14 @@ frontends.
 Tests come first in each phase (the implementation manual is explicit
 about ordering). The layers:
 
-1. **Wire tests** (`aj-wire`): round-trip identity for every event
+1. **Wire tests**: strict round-trip identity for every known event
    variant and frame kind, pinned JSON fixtures both directions,
-   forward-compat fixtures (unknown event type, unknown frame kind,
-   extra fields) that must decode, entry-id backfill into decoded
-   message ids.
+   extra unknown fields ignored on known types, malformed known
+   events fail decoding rather than degrading to unknown, unknown
+   event types and frame kinds decode into the raw-retaining wrappers
+   and re-serialize unchanged, durable unknown events keep their
+   envelope so cursor progression works, entry-id backfill into
+   decoded message ids.
 2. **Reducer equivalence** (the core correctness property). The
    comparison operates on a **canonical form** of `ChatState`: a
    projection defined in test support that covers transcript entries
@@ -873,9 +903,11 @@ reject paths in `tailscale` mode against a faked whois resolver).
 Each phase lands green (fmt, check, clippy, tests) and committed
 before the next begins.
 
-- **Phase 0, wire foundations**: `aj-wire` crate, `Deserialize` for
-  `AgentEvent` with the unknown-tolerant path and entry-id backfill,
-  frame types, fixtures. No behavior change anywhere.
+- **Phase 0, wire foundations**: `aj-wire` crate, strict
+  `Deserialize` for known `AgentEvent` variants (in `aj-agent`),
+  the known/unknown event and frame wrappers with raw retention (in
+  `aj-wire`), entry-id backfill, frame types, fixtures. No behavior
+  change anywhere.
 - **Phase 1, the session host and reducer hardening**: the host layer
   in `aj-app`, multi-session capable, seq/epoch bookkeeping, session
   locks, TUI rerouted through it in-process. Reducer idempotency,

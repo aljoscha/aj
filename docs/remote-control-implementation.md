@@ -191,16 +191,20 @@ installed ember before building on it.
 
 Tests first: pinned JSON fixtures for every `AgentEvent` variant
 (reuse/extend the existing shape tests as the source of truth),
-round-trip identity tests, forward-compat fixtures (unknown event
-`type`, unknown frame `kind`, extra fields) that must decode, and
-entry-id backfill into decoded message ids.
+strict round-trip identity tests, extra-unknown-fields-ignored and
+malformed-known-event-fails cases, wrapper fixtures (unknown event
+`type` and unknown frame `kind` decode into the raw-retaining
+wrappers and re-serialize unchanged, durable unknown events keep
+their envelope for cursor progression), and entry-id backfill into
+decoded message ids.
 
-Then: the crate with frame types (spec 6.3), wire models for list
-entries / task summaries / tree / hello / queue / VM state, and
-`Deserialize` for `AgentEvent`. Handle the two known warts
-deliberately: custom deserializers for the `Arc<[UserContent]>`
-fields, and the message-id backfill. The unknown-tolerant decode path
-is a requirement, not an option.
+Then: strict `Deserialize` for known `AgentEvent` variants in
+`aj-agent` (the enum stays closed, no catch-all variant, spec 6.10),
+and in `aj-wire` the frame types (spec 6.3), the known/unknown decode
+wrappers for events and frames, and the wire models for list entries
+/ task summaries / tree / hello / queue / VM state. Handle the two
+known warts deliberately: custom deserializers for the
+`Arc<[UserContent]>` fields, and the message-id backfill.
 
 Acceptance: workspace green, no behavior change, fixtures committed.
 
