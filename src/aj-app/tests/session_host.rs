@@ -1,0 +1,1936 @@
+//! The session host: lifecycle, fan-out, attach, commands, reads
+//! (spec section 5, 6.3-6.9).
+//!
+//! Every test drives the real host over the scripted provider, so the
+//! frames asserted on are the ones a network server would serialize and
+//! the client fold ([`SessionClient`]) would receive.
+
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
+
+use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
+use aj_app::chat::ChatState;
+use aj_app::client::SessionClient;
+use aj_app::host::{
+    AttachRequest, Attachment, Command, CommandOutcome, HostError, HostSetup, QueueOp, SessionHost,
+    SettingsAxis, SettingsChange,
+};
+use aj_app::session_setup::RunConfigSnapshot;
+use aj_app::settings::{ConfigLayers, PersistAction};
+use aj_app::test_support::{
+    CanonicalState, assert_canonical_eq, assert_no_dangling, finalized_text_message,
+    scripted_model_info,
+};
+use aj_conf::{Config, ConfigLayer};
+use aj_models::auth::AuthStorage;
+use aj_models::scripted::{ExhaustedBehavior, ScriptedProvider};
+use aj_models::types::{AssistantContent, AssistantMessage, StopReason, ToolCall, UserContent};
+use aj_session::{ConversationPersistence, SessionLock, ThreadFilter};
+use aj_wire::Frame;
+use tempfile::TempDir;
+
+/// Every wait in this file is bounded by this, so a wedged host fails a
+/// test instead of hanging CI.
+const DEADLINE: Duration = Duration::from_secs(20);
+
+/// A host over a temp sessions store, plus the store handles a test needs
+/// to look behind the host's back (the lock, the on-disk log).
+struct Harness {
+    _dir: TempDir,
+    persistence: ConversationPersistence,
+    host: SessionHost,
+}
+
+impl Harness {
+    /// A host whose sessions run the scripted provider replaying
+    /// `messages`. Every session materialized from this host shares that
+    /// one script, so a test with two concurrent sessions installs a
+    /// per-session provider instead (see [`Harness::install_script`]).
+    fn new(messages: Vec<AssistantMessage>) -> Self {
+        Self::with_provider(scripted(messages, 0, Duration::ZERO))
+    }
+
+    fn with_provider(provider: Arc<ScriptedProvider>) -> Self {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let host = SessionHost::new(HostSetup {
+            config: Arc::new(StdMutex::new(Config::default())),
+            layers: Arc::new(StdMutex::new(ConfigLayers {
+                user: Config::default(),
+                project: ConfigLayer::default(),
+                project_path: None,
+            })),
+            catalog: Arc::new(Vec::new()),
+            run_config: snapshot(provider),
+            restore: None,
+            persistence: persistence.clone(),
+            auth: AuthStorage::new(dir.path().join("auth.json")),
+            working_directory: dir.path().to_path_buf(),
+        })
+        .expect("host");
+        Self {
+            _dir: dir,
+            persistence,
+            host,
+        }
+    }
+
+    /// Point one live session at its own script, so sessions on one host
+    /// can run turns that do not consume each other's messages. Goes
+    /// through the in-process handles, which is also the assertion that
+    /// the run config is per session.
+    async fn install_script(&self, session: &str, messages: Vec<AssistantMessage>) {
+        let handles = self
+            .host
+            .local_handles(session)
+            .await
+            .expect("live session");
+        let mut cfg = handles
+            .run_config
+            .lock()
+            .expect("run config mutex poisoned");
+        cfg.provider = scripted(messages, 0, Duration::ZERO);
+    }
+
+    /// A second host over the same session store, as a restart or a rival
+    /// process would see it.
+    fn revive(&self, messages: Vec<AssistantMessage>) -> Harness {
+        let dir = TempDir::new().expect("tempdir");
+        let host = SessionHost::new(HostSetup {
+            config: Arc::new(StdMutex::new(Config::default())),
+            layers: Arc::new(StdMutex::new(ConfigLayers {
+                user: Config::default(),
+                project: ConfigLayer::default(),
+                project_path: None,
+            })),
+            catalog: Arc::new(Vec::new()),
+            run_config: snapshot(scripted(messages, 0, Duration::ZERO)),
+            restore: None,
+            persistence: self.persistence.clone(),
+            auth: AuthStorage::new(dir.path().join("auth.json")),
+            working_directory: dir.path().to_path_buf(),
+        })
+        .expect("host");
+        Harness {
+            _dir: dir,
+            persistence: self.persistence.clone(),
+            host,
+        }
+    }
+
+    async fn create(&self) -> String {
+        self.host.create().await.expect("create session")
+    }
+
+    async fn prompt(&self, session: &str, text: &str) {
+        self.host
+            .command(session, prompt(text))
+            .await
+            .expect("prompt accepted");
+    }
+}
+
+fn scripted(
+    messages: Vec<AssistantMessage>,
+    chunk_size: usize,
+    chunk_delay: Duration,
+) -> Arc<ScriptedProvider> {
+    Arc::new(
+        ScriptedProvider::from_messages(messages, chunk_size, chunk_delay)
+            .on_exhausted(ExhaustedBehavior::Panic),
+    )
+}
+
+fn snapshot(provider: Arc<ScriptedProvider>) -> RunConfigSnapshot {
+    RunConfigSnapshot {
+        provider,
+        model_info: Arc::new(scripted_model_info()),
+        stream_options: aj_models::types::StreamOptions::default(),
+        thinking: None,
+        speed: None,
+        model_key: ("scripted".to_string(), "scripted".to_string()),
+        session_id: None,
+    }
+}
+
+fn prompt(text: &str) -> Command {
+    Command::Prompt {
+        agent: AgentId::Main,
+        content: vec![UserContent::text(text)],
+    }
+}
+
+/// A message that calls `tool` and stops for its result.
+fn calling(text: &str, call_id: &str, tool: &str, args: serde_json::Value) -> AssistantMessage {
+    let mut message = finalized_text_message(text);
+    message.content.push(AssistantContent::ToolCall(ToolCall {
+        id: call_id.to_string(),
+        name: tool.to_string(),
+        arguments: args,
+    }));
+    message.stop_reason = StopReason::ToolUse;
+    message
+}
+
+/// A turn that spawns a blocking sub-agent, then concludes. The parent and
+/// the child share the provider, so the scripts are consumed in run order.
+fn sub_agent_turn() -> Vec<AssistantMessage> {
+    vec![
+        calling(
+            "delegating that",
+            "call-sub",
+            "agent",
+            serde_json::json!({"task": "look into it"}),
+        ),
+        finalized_text_message("the sub found nothing"),
+        finalized_text_message("nothing to report"),
+    ]
+}
+
+/// A turn that spawns a background sub-agent and keeps working, so the
+/// child's appends interleave with the parent's.
+fn background_sub_turn() -> Vec<AssistantMessage> {
+    vec![
+        calling(
+            "kicking that off",
+            "call-bg",
+            "agent",
+            serde_json::json!({"task": "look into it", "run_in_background": true}),
+        ),
+        finalized_text_message("meanwhile, here is the answer"),
+        finalized_text_message("the background sub is done"),
+        // The background task's completion notice wakes the parent, which
+        // runs one more inference to acknowledge it.
+        finalized_text_message("noted, thanks"),
+    ]
+}
+
+/// Await `future`, failing the test rather than hanging.
+async fn bounded<T>(what: &str, future: impl std::future::Future<Output = T>) -> T {
+    match tokio::time::timeout(DEADLINE, future).await {
+        Ok(value) => value,
+        Err(_) => panic!("timed out waiting for {what}"),
+    }
+}
+
+/// Collect frames until `done` accepts one, that frame included.
+async fn frames_until(
+    stream: &mut Attachment,
+    what: &str,
+    mut done: impl FnMut(&Frame) -> bool,
+) -> Vec<Frame> {
+    let mut out = Vec::new();
+    bounded(what, async {
+        while let Some(frame) = stream.recv().await {
+            let stop = done(&frame);
+            out.push(frame);
+            if stop {
+                return;
+            }
+        }
+        panic!("the stream closed before {what}");
+    })
+    .await;
+    out
+}
+
+/// Whether `frame` is the `state` frame reporting the main agent idle.
+fn idle_state(frame: &Frame) -> bool {
+    matches!(frame, Frame::State { working: false, .. })
+}
+
+/// Frames up to and including the `state` frame that reports the session
+/// idle again. A command that starts a turn publishes `working: true`
+/// before it returns, so the next idle `state` is that turn's end.
+async fn until_idle(stream: &mut Attachment) -> Vec<Frame> {
+    frames_until(stream, "the turn to settle", idle_state).await
+}
+
+/// Drain frames until the session reports itself idle with no live
+/// background task, so a run whose background sub-agent outlives the
+/// parent turn is fully covered.
+async fn settle(harness: &Harness, session: &str, stream: &mut Attachment) -> Vec<Frame> {
+    let mut out = Vec::new();
+    bounded("the session to go quiet", async {
+        loop {
+            out.extend(drained(stream));
+            let list = harness.host.sessions().await.expect("sessions");
+            let quiet = list
+                .sessions
+                .iter()
+                .find(|entry| entry.id == session)
+                .is_some_and(|entry| !entry.working && entry.tasks == 0);
+            if quiet {
+                out.extend(drained(stream));
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    out
+}
+
+/// Everything already queued on the stream, without waiting.
+fn drained(stream: &mut Attachment) -> Vec<Frame> {
+    let mut out = Vec::new();
+    while let Some(frame) = stream.try_recv() {
+        out.push(frame);
+    }
+    out
+}
+
+/// The frames of one session. A stream carries every session's durable and
+/// reliable-transient frames, attached or not (spec 6.5), so a test that
+/// asserts on one session has to say which.
+fn only(frames: Vec<Frame>, session: &str) -> Vec<Frame> {
+    frames
+        .into_iter()
+        .filter(|frame| frame.session() == Some(session))
+        .collect()
+}
+
+fn events(frames: &[Frame]) -> Vec<&AgentEvent> {
+    frames
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::Event { event, .. } => event.known(),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The `(seq, entry_id)` of every durable frame, in delivery order.
+fn durable(frames: &[Frame]) -> Vec<(u64, String)> {
+    frames
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::Event {
+                durability: Some(durability),
+                ..
+            } => Some((durability.seq, durability.entry_id.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The concatenated assistant text of every finalized message.
+fn assistant_text(frames: &[Frame]) -> String {
+    events(frames)
+        .into_iter()
+        .filter_map(|event| match event {
+            AgentEvent::MessageEnd { message, .. } => message.as_stored_wire(),
+            _ => None,
+        })
+        .filter_map(|message| match message {
+            aj_models::types::Message::Assistant(assistant) => Some(assistant),
+            _ => None,
+        })
+        .flat_map(|assistant| {
+            assistant
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    AssistantContent::Text(text) => Some(text.text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn epoch_of(frames: &[Frame]) -> String {
+    frames
+        .iter()
+        .find_map(|frame| match frame {
+            Frame::State { epoch, .. } => Some(epoch.clone()),
+            _ => None,
+        })
+        .expect("a state frame carries the epoch")
+}
+
+/// One attached client: the real fold plus the chat model it folds into.
+struct Client {
+    client: SessionClient,
+    chat: ChatState,
+    stream: Attachment,
+}
+
+impl Client {
+    /// Attach `session` with no cursor and apply the whole attach block.
+    async fn attach(host: &SessionHost, session: &str) -> Self {
+        let stream = host
+            .attach(&[AttachRequest {
+                session: session.to_string(),
+                cursor: None,
+            }])
+            .await
+            .expect("attach");
+        let mut this = Self {
+            client: SessionClient::new(session.to_string()),
+            chat: ChatState::new(settings(), 200_000, Arc::new(Vec::new())),
+            stream,
+        };
+        this.client.expect_attach();
+        this.apply_block().await;
+        this
+    }
+
+    /// Apply frames up to and including the block's `caught_up`.
+    async fn apply_block(&mut self) {
+        let frames = frames_until(&mut self.stream, "caught_up", |frame| {
+            matches!(frame, Frame::CaughtUp { .. })
+        })
+        .await;
+        for frame in frames {
+            let _ = self.client.apply(&mut self.chat, frame);
+        }
+    }
+
+    /// Fold until the session reports idle.
+    async fn pump_until_idle(&mut self) {
+        let frames = until_idle(&mut self.stream).await;
+        for frame in frames {
+            let _ = self.client.apply(&mut self.chat, frame);
+        }
+    }
+
+    fn canonical(&self) -> CanonicalState {
+        CanonicalState::of(&self.chat, self.client.lifecycle())
+    }
+}
+
+/// The thinking effort one live session's run config stages.
+async fn thinking(host: &SessionHost, session: &str) -> Option<aj_models::ThinkingConfig> {
+    let handles = host.local_handles(session).await.expect("live session");
+    let cfg = handles
+        .run_config
+        .lock()
+        .expect("run config mutex poisoned");
+    cfg.thinking.clone()
+}
+
+fn settings() -> AgentSettings {
+    AgentSettings {
+        provider: "scripted".into(),
+        model_id: "scripted".into(),
+        thinking: "off".into(),
+        speed: "standard".into(),
+        verbosity: "default".into(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 1. Creation and materialization
+// ---------------------------------------------------------------------------
+
+/// A created session runs a turn, and its frames carry its id, its epoch,
+/// and the durable positions of the entries the turn appended.
+#[tokio::test]
+async fn a_created_session_runs_a_turn_and_publishes_its_frames() {
+    let harness = Harness::new(vec![finalized_text_message("hello back")]);
+    let session = harness.create().await;
+    let mut stream = harness
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+    let block = frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+    assert!(
+        matches!(&block[0], Frame::State { session: s, .. } if *s == session),
+        "the block opens with this session's state frame",
+    );
+
+    harness.prompt(&session, "hi").await;
+    let frames = until_idle(&mut stream).await;
+
+    assert_eq!(assistant_text(&frames), "hello back");
+    assert!(
+        frames.iter().all(|frame| match frame {
+            Frame::Event { session: s, .. } | Frame::State { session: s, .. } => *s == session,
+            Frame::List { .. } => true,
+            other => panic!("unexpected frame kind {other:?}"),
+        }),
+        "every session-scoped frame names this session",
+    );
+    let seqs: Vec<u64> = durable(&frames).into_iter().map(|(seq, _)| seq).collect();
+    assert!(
+        seqs.windows(2).all(|pair| pair[0] < pair[1]),
+        "live durable seqs are strictly increasing: {seqs:?}",
+    );
+    harness.host.shutdown().await;
+}
+
+/// A session that is only on disk materializes when a client attaches it,
+/// and its backfill carries the recorded turn.
+#[tokio::test]
+async fn attaching_a_known_session_materializes_it() {
+    let harness = Harness::new(vec![finalized_text_message("recorded answer")]);
+    let session = harness.create().await;
+    let mut stream = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+    until_idle(&mut stream.stream).await;
+    drop(stream);
+    harness.host.shutdown().await;
+
+    // A fresh host over the same store knows the session only from disk.
+    let revived = harness.revive(Vec::new());
+    let listed = revived.host.sessions().await.expect("sessions");
+    let summary = listed
+        .sessions
+        .iter()
+        .find(|entry| entry.id == session)
+        .expect("the session is listed from disk");
+    assert!(!summary.live, "it is not materialized yet");
+
+    let client = Client::attach(&revived.host, &session).await;
+    assert!(
+        format!("{:?}", client.canonical()).contains("recorded answer"),
+        "the backfill carries the recorded turn",
+    );
+    assert!(
+        revived
+            .host
+            .sessions()
+            .await
+            .expect("sessions")
+            .sessions
+            .iter()
+            .any(|entry| entry.id == session && entry.live),
+        "attaching materialized it",
+    );
+    drop(client);
+    revived.host.shutdown().await;
+}
+
+/// A command naming a known-on-disk session materializes it too.
+#[tokio::test]
+async fn commanding_a_known_session_materializes_it() {
+    let harness = Harness::new(vec![finalized_text_message("first")]);
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+    client.pump_until_idle().await;
+    drop(client);
+    harness.host.shutdown().await;
+
+    let revived = harness.revive(vec![finalized_text_message("second")]);
+    revived
+        .host
+        .command(
+            &session,
+            Command::Queue(QueueOp::Clear {
+                agent: AgentId::Main,
+            }),
+        )
+        .await
+        .expect("a queue command materializes the session");
+    assert!(
+        revived
+            .host
+            .sessions()
+            .await
+            .expect("sessions")
+            .sessions
+            .iter()
+            .any(|entry| entry.id == session && entry.live),
+    );
+    revived.host.shutdown().await;
+}
+
+/// An unknown session is a 404-shaped error, not a materialization.
+#[tokio::test]
+async fn an_unknown_session_is_refused() {
+    let harness = Harness::new(Vec::new());
+    let err = harness
+        .host
+        .command("not-a-session", prompt("hi"))
+        .await
+        .expect_err("unknown sessions are refused");
+    assert!(matches!(err, HostError::UnknownSession(_)), "got {err:?}");
+    harness.host.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 2. Two concurrent sessions
+// ---------------------------------------------------------------------------
+
+/// Two live sessions on one host run their own turns: their frames carry
+/// their own ids, their epochs differ, their seqs are independent, and
+/// neither session's model bundle or prompt-cache key reaches the other.
+#[tokio::test]
+async fn two_sessions_on_one_host_stay_independent() {
+    let harness = Harness::new(Vec::new());
+    let first = harness.create().await;
+    let second = harness.create().await;
+    assert_ne!(first, second);
+    harness
+        .install_script(&first, vec![finalized_text_message("from the first")])
+        .await;
+    harness
+        .install_script(&second, vec![finalized_text_message("from the second")])
+        .await;
+
+    let mut one = Client::attach(&harness.host, &first).await;
+    let mut two = Client::attach(&harness.host, &second).await;
+
+    harness.prompt(&first, "hi").await;
+    harness.prompt(&second, "hi").await;
+    let first_frames = only(until_idle(&mut one.stream).await, &first);
+    let second_frames = only(until_idle(&mut two.stream).await, &second);
+
+    assert_eq!(assistant_text(&first_frames), "from the first");
+    assert_eq!(assistant_text(&second_frames), "from the second");
+    assert_ne!(
+        epoch_of(&first_frames),
+        epoch_of(&second_frames),
+        "each materialization mints its own epoch",
+    );
+
+    // Per-session seqs: each session's first durable entry is its own
+    // position 1..n in its own log, not a host-wide counter.
+    for (session, frames) in [(&first, &first_frames), (&second, &second_frames)] {
+        let handles = harness
+            .host
+            .local_handles(session)
+            .await
+            .expect("live session");
+        let log = handles.log.lock().await;
+        for (seq, entry_id) in durable(frames) {
+            let index = usize::try_from(seq).expect("seq fits usize") - 1;
+            let entry = log
+                .entries_in_order()
+                .get(index)
+                .map(|entry| entry.id.clone())
+                .unwrap_or_else(|| panic!("no entry at append position {seq}"));
+            assert_eq!(entry, entry_id, "seq {seq} names its own log's entry");
+        }
+    }
+
+    // The prompt-cache key is the session's own id, which is exactly what
+    // one shared run-config snapshot used to get wrong.
+    for session in [&first, &second] {
+        let handles = harness
+            .host
+            .local_handles(session)
+            .await
+            .expect("live session");
+        let cfg = handles
+            .run_config
+            .lock()
+            .expect("run config mutex poisoned");
+        assert_eq!(cfg.session_id.as_deref(), Some(session.as_str()));
+        assert_eq!(
+            cfg.stream_options.session_id.as_deref(),
+            Some(session.as_str())
+        );
+    }
+
+    // And a settings change in one session leaves the other's alone.
+    harness
+        .host
+        .command(
+            &first,
+            Command::Settings(SettingsChange {
+                agent: AgentId::Main,
+                persist: PersistAction::None,
+                axis: SettingsAxis::Thinking(Some(aj_models::ThinkingConfig::High)),
+            }),
+        )
+        .await
+        .expect("thinking change");
+    assert!(
+        thinking(&harness.host, &first).await.is_some(),
+        "the change landed",
+    );
+    assert!(
+        thinking(&harness.host, &second).await.is_none(),
+        "and did not leak into the other session",
+    );
+    harness.host.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 3. Seq assignment against the log
+// ---------------------------------------------------------------------------
+
+/// Every durable frame's seq and entry id name the log entry at that
+/// append position, including while a background sub-agent appends
+/// concurrently with the main agent.
+#[tokio::test]
+async fn durable_frames_name_the_log_entry_at_their_append_position() {
+    let harness = Harness::new(background_sub_turn());
+    let session = harness.create().await;
+    let mut stream = harness
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+    frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+
+    harness.prompt(&session, "delegate it").await;
+    let mut frames = until_idle(&mut stream).await;
+    // The background sub-agent outlives the parent turn: its completion
+    // notice wakes the parent for one more turn, so settling twice covers
+    // the sub's own appends as well as the parent's.
+    frames.extend(settle(&harness, &session, &mut stream).await);
+
+    let tagged = durable(&frames);
+    assert!(
+        tagged.len() >= 5,
+        "the run wrote several entries: {tagged:?}"
+    );
+    let seqs: Vec<u64> = tagged.iter().map(|(seq, _)| *seq).collect();
+    assert!(
+        seqs.windows(2).all(|pair| pair[0] < pair[1]),
+        "strictly increasing per stream even with interleaved appends: {seqs:?}",
+    );
+
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    let log = handles.log.lock().await;
+    let entries = log.entries_in_order();
+    for (seq, entry_id) in &tagged {
+        let index = usize::try_from(*seq).expect("seq fits usize") - 1;
+        assert_eq!(
+            entries.get(index).map(|entry| entry.id.as_str()),
+            Some(entry_id.as_str()),
+            "seq {seq} is the append position of {entry_id}",
+        );
+    }
+    // Both agents appended, so the check above spans two threads.
+    assert!(
+        entries.iter().any(|entry| entry.agent_id == Some(1)),
+        "the background sub-agent wrote to the log",
+    );
+    drop(log);
+    harness.host.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 4 + 5. Epochs and head switching
+// ---------------------------------------------------------------------------
+
+/// Appends leave the epoch alone. A head switch replaces it, clears the
+/// queues, and emits `reset`.
+#[tokio::test]
+async fn a_head_switch_replaces_the_epoch_and_resets_the_stream() {
+    let harness = Harness::new(vec![
+        finalized_text_message("first answer"),
+        finalized_text_message("second answer"),
+    ]);
+    let session = harness.create().await;
+    let mut stream = harness
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+    let block = frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+    let epoch = epoch_of(&block);
+
+    harness.prompt(&session, "one").await;
+    let first = until_idle(&mut stream).await;
+    assert_eq!(epoch_of(&first), epoch, "an append keeps the epoch");
+    harness.prompt(&session, "two").await;
+    let second = until_idle(&mut stream).await;
+    assert_eq!(epoch_of(&second), epoch, "still the same materialization");
+
+    // Branch at the first user message's parent: the head after turn one.
+    let head = {
+        let handles = harness
+            .host
+            .local_handles(&session)
+            .await
+            .expect("live session");
+        let log = handles.log.lock().await;
+        let head = log.head().cloned().expect("a head");
+        let conversation = log.linearize(&head, ThreadFilter::USER);
+        conversation
+            .entries()
+            .iter()
+            .rev()
+            .nth(2)
+            .expect("an earlier entry")
+            .id
+            .clone()
+    };
+
+    // Stage queue state the switch has to clear. Enqueued through the
+    // in-process handles rather than through a command, because an idle
+    // session runs a prompt instead of queueing it and this session has to
+    // stay idle for the switch to be allowed at all.
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    handles.queues.append_follow_up(AgentId::Main, "leftover");
+    let _ = drained(&mut stream);
+
+    harness
+        .host
+        .command(
+            &session,
+            Command::Head {
+                entry: head.clone(),
+            },
+        )
+        .await
+        .expect("head switch on an idle session");
+
+    let frames = frames_until(&mut stream, "the reset frame", |frame| {
+        matches!(frame, Frame::Reset { .. })
+    })
+    .await;
+    assert!(
+        frames
+            .iter()
+            .any(|frame| matches!(frame, Frame::Reset { session: s, .. } if *s == session)),
+    );
+    let after = frames_until(&mut stream, "a state frame under the new epoch", |frame| {
+        matches!(frame, Frame::State { .. })
+    })
+    .await;
+    assert_ne!(epoch_of(&after), epoch, "a head switch mints a fresh epoch",);
+    assert_eq!(
+        handles.queues.pending_counts(),
+        (0, 0),
+        "the switch cleared the session's queues",
+    );
+    assert_eq!(
+        handles.log.lock().await.head().cloned(),
+        Some(head),
+        "the log head moved",
+    );
+    harness.host.shutdown().await;
+}
+
+/// A head switch is refused while a turn runs, and while a background task
+/// is live (spec section 11's "head switch refused while busy").
+#[tokio::test]
+async fn a_head_switch_is_refused_while_work_is_live() {
+    // A slow-streaming turn, so the switch lands mid-turn.
+    let harness = Harness::with_provider(scripted(
+        vec![finalized_text_message("a fairly long answer to stream")],
+        1,
+        Duration::from_millis(20),
+    ));
+    let session = harness.create().await;
+    let mut stream = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+
+    let err = harness
+        .host
+        .command(
+            &session,
+            Command::Head {
+                entry: "whatever".to_string(),
+            },
+        )
+        .await
+        .expect_err("a mid-turn head switch is refused");
+    assert!(matches!(err, HostError::Conflict { .. }), "got {err:?}");
+    stream.pump_until_idle().await;
+
+    // Now with a live background task instead of a turn.
+    let harness = Harness::with_provider(scripted(
+        vec![
+            calling(
+                "backgrounding it",
+                "call-bash",
+                "bash",
+                serde_json::json!({"command": "sleep 30", "run_in_background": true,
+                                   "description": "sleep"}),
+            ),
+            finalized_text_message("started it"),
+        ],
+        0,
+        Duration::ZERO,
+    ));
+    let session = harness.create().await;
+    let mut stream = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "background something").await;
+    stream.pump_until_idle().await;
+    let tasks = harness.host.tasks(&session).await.expect("task table");
+    assert!(
+        tasks
+            .tasks
+            .iter()
+            .any(|task| task.status == aj_agent::tool::TaskStatus::Running),
+        "a background task is live: {tasks:?}",
+    );
+
+    let err = harness
+        .host
+        .command(
+            &session,
+            Command::Head {
+                entry: "whatever".to_string(),
+            },
+        )
+        .await
+        .expect_err("a head switch with live background work is refused");
+    assert!(matches!(err, HostError::Conflict { .. }), "got {err:?}");
+    harness.host.shutdown().await;
+}
+
+/// A head switch to an entry that is not in the log is a 404, not a
+/// silently ignored request.
+#[tokio::test]
+async fn a_head_switch_to_an_unknown_entry_is_refused() {
+    let harness = Harness::new(Vec::new());
+    let session = harness.create().await;
+    let err = harness
+        .host
+        .command(
+            &session,
+            Command::Head {
+                entry: "no-such-entry".to_string(),
+            },
+        )
+        .await
+        .expect_err("unknown entries are refused");
+    assert!(matches!(err, HostError::UnknownEntry(_)), "got {err:?}");
+    harness.host.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 6. Session locks
+// ---------------------------------------------------------------------------
+
+/// A live session holds its advisory lock, so a second writer is refused
+/// until the host tears the session down.
+#[tokio::test]
+async fn a_live_session_holds_its_lock_until_teardown() {
+    let harness = Harness::new(vec![finalized_text_message("on the record")]);
+    let session = harness.create().await;
+    // Punctuate the log, so the session is discoverable on disk and a
+    // second writer's refusal is the lock rather than a missing session.
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+    client.pump_until_idle().await;
+    drop(client);
+
+    assert!(
+        SessionLock::try_acquire(&harness.persistence, &session)
+            .expect("try_acquire")
+            .is_none(),
+        "the host holds the session's lock while it is live",
+    );
+
+    // A second host over the same store cannot materialize it.
+    let rival = harness.revive(Vec::new());
+    let err = rival
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect_err("a locked session cannot be materialized twice");
+    assert!(matches!(err, HostError::Locked(_)), "got {err:?}");
+
+    harness.host.shutdown().await;
+    let reacquired = SessionLock::try_acquire(&harness.persistence, &session)
+        .expect("try_acquire")
+        .expect("the lock is free once the host tore the session down");
+    drop(reacquired);
+    rival.host.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 7. Queue mutations emit QueueUpdate
+// ---------------------------------------------------------------------------
+
+/// Every queue mutation publishes a `QueueUpdate`, on the enqueue side as
+/// well as the drain side, and a second attached subscriber sees them
+/// (spec section 11's "queue enqueue visibility on a second client").
+#[tokio::test]
+async fn queue_mutations_reach_every_subscriber() {
+    let harness = Harness::with_provider(scripted(
+        vec![finalized_text_message("a slowly streamed answer")],
+        1,
+        Duration::from_millis(20),
+    ));
+    let session = harness.create().await;
+    let mut one = Client::attach(&harness.host, &session).await;
+    let mut two = Client::attach(&harness.host, &session).await;
+
+    harness.prompt(&session, "hi").await;
+    // Busy now, so these queue rather than run.
+    harness.prompt(&session, "a follow-up").await;
+    harness
+        .host
+        .command(
+            &session,
+            Command::Steer {
+                agent: AgentId::Main,
+                text: "steer me".to_string(),
+            },
+        )
+        .await
+        .expect("steer while busy queues");
+    harness
+        .host
+        .command(
+            &session,
+            Command::Steer {
+                agent: AgentId::Main,
+                text: String::new(),
+            },
+        )
+        .await
+        .expect("an empty steer promotes");
+    let withdrawn = harness
+        .host
+        .command(
+            &session,
+            Command::Queue(QueueOp::Remove {
+                agent: AgentId::Main,
+            }),
+        )
+        .await
+        .expect("remove");
+    assert!(
+        matches!(&withdrawn, CommandOutcome::Withdrawn(Some(text)) if text.contains("steer me")),
+        "the withdrawn text comes back so a client can restore it: {withdrawn:?}",
+    );
+    harness.prompt(&session, "and another").await;
+    harness
+        .host
+        .command(
+            &session,
+            Command::Queue(QueueOp::Clear {
+                agent: AgentId::Main,
+            }),
+        )
+        .await
+        .expect("clear");
+
+    for client in [&mut one, &mut two] {
+        client.pump_until_idle().await;
+    }
+
+    // Count the queue updates each subscriber saw across its whole stream.
+    for (label, client) in [("first", &one), ("second", &two)] {
+        let seen = client.client.queue();
+        assert!(
+            seen.queues
+                .iter()
+                .all(|queue| queue.steering.is_empty() && queue.follow_up.is_empty()),
+            "the {label} client's queue view ends empty: {seen:?}",
+        );
+    }
+    harness.host.shutdown().await;
+}
+
+/// The enqueue side publishes a `QueueUpdate` at every step, which is what
+/// a second client's queue view is built from.
+#[tokio::test]
+async fn every_queue_mutation_publishes_an_update() {
+    let harness = Harness::with_provider(scripted(
+        vec![finalized_text_message("a slowly streamed answer")],
+        1,
+        Duration::from_millis(20),
+    ));
+    let session = harness.create().await;
+    let mut stream = harness
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+    frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+
+    harness.prompt(&session, "hi").await;
+    let mut updates = 0;
+    for command in [
+        prompt("a follow-up"),
+        Command::Steer {
+            agent: AgentId::Main,
+            text: "steer me".to_string(),
+        },
+        Command::Steer {
+            agent: AgentId::Main,
+            text: String::new(),
+        },
+        Command::Queue(QueueOp::Remove {
+            agent: AgentId::Main,
+        }),
+        prompt("and another"),
+        Command::Queue(QueueOp::Clear {
+            agent: AgentId::Main,
+        }),
+    ] {
+        harness
+            .host
+            .command(&session, command)
+            .await
+            .expect("queue mutation");
+        // The mutation's own update is queued before the command returns.
+        updates += events(&drained(&mut stream))
+            .into_iter()
+            .filter(|event| matches!(event, AgentEvent::QueueUpdate { .. }))
+            .count();
+    }
+    assert_eq!(updates, 6, "one update per mutation");
+    harness.host.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 8. Synthesized settings frames
+// ---------------------------------------------------------------------------
+
+/// A settings change publishes the projected notice tagged with the entry
+/// it appended plus a refreshed `state`, and a client attaching afterwards
+/// regenerates the same notice from the backfill (spec section 11's
+/// "settings visibility for a mid-session joiner").
+#[tokio::test]
+async fn a_settings_change_publishes_the_projected_notice() {
+    let harness = Harness::new(vec![finalized_text_message("hello back")]);
+    let session = harness.create().await;
+    let mut live = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+    live.pump_until_idle().await;
+
+    harness
+        .host
+        .command(
+            &session,
+            Command::Settings(SettingsChange {
+                agent: AgentId::Main,
+                persist: PersistAction::None,
+                axis: SettingsAxis::Thinking(Some(aj_models::ThinkingConfig::High)),
+            }),
+        )
+        .await
+        .expect("thinking change");
+    let frames = frames_until(&mut live.stream, "the settings state frame", |frame| {
+        matches!(frame, Frame::State { .. })
+    })
+    .await;
+
+    let notice = frames
+        .iter()
+        .find_map(|frame| match frame {
+            Frame::Event {
+                durability: Some(durability),
+                event,
+                ..
+            } => match event.known() {
+                Some(AgentEvent::Notice { text, .. }) => {
+                    Some((durability.seq, durability.entry_id.clone(), text.clone()))
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("a durable notice frame");
+    assert!(
+        notice.2.contains("high"),
+        "the projected wording: {notice:?}"
+    );
+    {
+        let handles = harness
+            .host
+            .local_handles(&session)
+            .await
+            .expect("live session");
+        let log = handles.log.lock().await;
+        let entries = log.entries_in_order();
+        let index = usize::try_from(notice.0).expect("seq fits usize") - 1;
+        assert_eq!(
+            entries.get(index).map(|entry| entry.id.as_str()),
+            Some(notice.1.as_str()),
+            "the notice is tagged with the settings entry's append position",
+        );
+    }
+    assert!(
+        frames.iter().any(
+            |frame| matches!(frame, Frame::State { settings, .. } if settings.thinking == "high")
+        ),
+        "the refreshed state frame carries the new settings",
+    );
+
+    for frame in frames {
+        let _ = live.client.apply(&mut live.chat, frame);
+    }
+    let joiner = Client::attach(&harness.host, &session).await;
+    assert_canonical_eq(
+        &joiner.canonical(),
+        &live.canonical(),
+        "a mid-session joiner regenerates the settings notice from the backfill",
+    );
+    harness.host.shutdown().await;
+}
+
+/// A settings change before the thread's first message projects no notice,
+/// so the host publishes none: a live client must never see a row a
+/// backfill cannot regenerate.
+#[tokio::test]
+async fn a_settings_change_before_the_first_prompt_publishes_no_notice() {
+    let harness = Harness::new(vec![finalized_text_message("hello back")]);
+    let session = harness.create().await;
+    let mut stream = harness
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+    frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+
+    harness
+        .host
+        .command(
+            &session,
+            Command::Settings(SettingsChange {
+                agent: AgentId::Main,
+                persist: PersistAction::None,
+                axis: SettingsAxis::Thinking(Some(aj_models::ThinkingConfig::Low)),
+            }),
+        )
+        .await
+        .expect("thinking change");
+    let frames = frames_until(&mut stream, "the settings state frame", |frame| {
+        matches!(frame, Frame::State { .. })
+    })
+    .await;
+
+    assert!(
+        events(&frames)
+            .into_iter()
+            .all(|event| !matches!(event, AgentEvent::Notice { .. })),
+        "a seed settings entry projects nothing, so nothing is published: {frames:?}",
+    );
+    assert!(
+        frames.iter().any(
+            |frame| matches!(frame, Frame::State { settings, .. } if settings.thinking == "low")
+        ),
+        "the state frame still refreshes",
+    );
+    harness.host.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 9. Command semantics
+// ---------------------------------------------------------------------------
+
+/// A prompt runs a turn when the agent is idle and queues when it is busy,
+/// exactly like the local submit gesture.
+#[tokio::test]
+async fn a_prompt_runs_when_idle_and_queues_when_busy() {
+    let harness = Harness::with_provider(scripted(
+        vec![
+            finalized_text_message("a slowly streamed answer"),
+            finalized_text_message("and the follow-up answer"),
+        ],
+        1,
+        Duration::from_millis(20),
+    ));
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+
+    harness.prompt(&session, "first").await;
+    harness.prompt(&session, "queued").await;
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    assert_eq!(
+        handles.queues.pending_counts(),
+        (0, 1),
+        "the second prompt queued as a follow-up",
+    );
+
+    // The post-turn wake starts the follow-up turn before `working` ever
+    // drops, so one settle covers both turns.
+    client.pump_until_idle().await;
+    assert_eq!(
+        handles.queues.pending_counts(),
+        (0, 0),
+        "the wake drained the queue",
+    );
+    let state = format!("{:?}", client.canonical());
+    assert!(
+        state.contains("a slowly streamed answer") && state.contains("the follow-up answer"),
+        "both turns ran: {state}",
+    );
+    harness.host.shutdown().await;
+}
+
+/// Cancelling a foreground sub-agent cascades to the main turn that owns
+/// it, matching the local gesture.
+#[tokio::test]
+async fn cancelling_a_foreground_sub_cascades_to_main() {
+    let harness = Harness::with_provider(scripted(
+        vec![
+            calling(
+                "delegating",
+                "call-sub",
+                "agent",
+                serde_json::json!({"task": "take your time"}),
+            ),
+            finalized_text_message("a slowly streamed sub answer"),
+            finalized_text_message("done"),
+        ],
+        1,
+        Duration::from_millis(30),
+    ));
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "delegate it").await;
+
+    // Wait until the sub-agent's run has started, then cancel the sub.
+    frames_until(&mut client.stream, "the sub-agent to start", |frame| {
+        matches!(
+            frame,
+            Frame::Event { event, .. }
+                if matches!(event.known(), Some(AgentEvent::AgentStart { agent_id: AgentId::Sub(1) }))
+        )
+    })
+    .await;
+    harness
+        .host
+        .command(
+            &session,
+            Command::Cancel {
+                agent: AgentId::Sub(1),
+            },
+        )
+        .await
+        .expect("cancel the sub");
+
+    client.pump_until_idle().await;
+    assert!(
+        !client.client.working(),
+        "the cascade cancelled the main turn too",
+    );
+    assert_no_dangling(&client.chat);
+    harness.host.shutdown().await;
+}
+
+/// Compaction is refused while the main agent is busy.
+#[tokio::test]
+async fn compaction_is_refused_while_busy() {
+    let harness = Harness::with_provider(scripted(
+        vec![finalized_text_message("a slowly streamed answer")],
+        1,
+        Duration::from_millis(20),
+    ));
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+
+    let err = harness
+        .host
+        .command(&session, Command::Compact { instructions: None })
+        .await
+        .expect_err("compaction while busy is refused");
+    assert!(matches!(err, HostError::Conflict { .. }), "got {err:?}");
+    client.pump_until_idle().await;
+    harness.host.shutdown().await;
+}
+
+/// Killing a task the registry does not know is a 404; killing a live one
+/// is accepted.
+#[tokio::test]
+async fn killing_a_task_is_accepted_or_a_miss() {
+    let harness = Harness::with_provider(scripted(
+        vec![
+            calling(
+                "backgrounding it",
+                "call-bash",
+                "bash",
+                serde_json::json!({"command": "sleep 30", "run_in_background": true,
+                                   "description": "sleep"}),
+            ),
+            finalized_text_message("started it"),
+        ],
+        0,
+        Duration::ZERO,
+    ));
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "background something").await;
+    client.pump_until_idle().await;
+
+    let err = harness
+        .host
+        .command(&session, Command::KillTask { task: 999 })
+        .await
+        .expect_err("unknown tasks are refused");
+    assert!(matches!(err, HostError::UnknownTask(_)), "got {err:?}");
+
+    let table = harness.host.tasks(&session).await.expect("task table");
+    let live = table
+        .tasks
+        .iter()
+        .find(|task| task.status == aj_agent::tool::TaskStatus::Running)
+        .expect("a live task");
+    harness
+        .host
+        .command(&session, Command::KillTask { task: live.id })
+        .await
+        .expect("killing a live task is accepted");
+    harness.host.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 10 + 11 + 12 + 13. Attach ordering and convergence
+// ---------------------------------------------------------------------------
+
+/// The attach block is `state`, backfill, `caught_up`, contiguous on the
+/// stream, and no live durable frame at or below the boundary follows it,
+/// even when durable events land while the attach is being served.
+#[tokio::test]
+async fn the_attach_block_is_contiguous_and_filters_the_boundary() {
+    let harness = Harness::with_provider(scripted(
+        vec![
+            finalized_text_message("a slowly streamed first answer"),
+            finalized_text_message("a slowly streamed second answer"),
+        ],
+        1,
+        Duration::from_millis(10),
+    ));
+    let session = harness.create().await;
+    let mut warm = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "one").await;
+    warm.pump_until_idle().await;
+
+    // Attach while the next turn is streaming, so durable events are in
+    // flight in the fan-out as the block is served.
+    harness.prompt(&session, "two").await;
+    let mut stream = harness
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+    let block = frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+
+    // Contiguity: exactly one `state` at the front, one `caught_up` at the
+    // back, and nothing but event frames in between.
+    assert!(matches!(&block[0], Frame::State { .. }), "opens with state");
+    let boundary = match block.last().expect("a block") {
+        Frame::CaughtUp { last_seq, .. } => *last_seq,
+        other => panic!("the block ends with caught_up, got {other:?}"),
+    };
+    assert!(
+        block[1..block.len() - 1]
+            .iter()
+            .all(|frame| matches!(frame, Frame::Event { .. })),
+        "the block is state, backfill, caught_up with nothing spliced in",
+    );
+    assert!(
+        durable(&block).iter().all(|(seq, _)| *seq <= boundary),
+        "the backfill stops at the boundary",
+    );
+
+    let rest = until_idle(&mut stream).await;
+    assert!(
+        durable(&rest).iter().all(|(seq, _)| *seq > boundary),
+        "no live durable frame at or below the boundary is delivered: {:?}",
+        durable(&rest),
+    );
+    harness.host.shutdown().await;
+}
+
+/// A client that attaches mid-turn converges on the same state as one that
+/// was attached from the start. This is the phase-1 shape of the
+/// equivalence harness.
+#[tokio::test]
+async fn attaching_mid_turn_converges_with_a_client_attached_all_along() {
+    let harness = Harness::with_provider(scripted(
+        vec![
+            calling(
+                "let me check the list",
+                "call-1",
+                "todo_read",
+                serde_json::json!({}),
+            ),
+            finalized_text_message("a slowly streamed answer about nothing"),
+        ],
+        1,
+        Duration::from_millis(10),
+    ));
+    let session = harness.create().await;
+    let mut all_along = Client::attach(&harness.host, &session).await;
+
+    harness.prompt(&session, "check the todos").await;
+    // Let the turn get going, then join it mid-flight.
+    frames_until(&mut all_along.stream, "the tool call to finish", |frame| {
+        matches!(
+            frame,
+            Frame::Event { event, .. }
+                if matches!(event.known(), Some(AgentEvent::ToolExecutionEnd { .. }))
+        )
+    })
+    .await
+    .into_iter()
+    .for_each(|frame| {
+        let _ = all_along.client.apply(&mut all_along.chat, frame);
+    });
+    let mut joiner = Client::attach(&harness.host, &session).await;
+
+    all_along.pump_until_idle().await;
+    joiner.pump_until_idle().await;
+
+    assert_canonical_eq(
+        &joiner.canonical(),
+        &all_along.canonical(),
+        "a mid-turn joiner converges",
+    );
+    assert_no_dangling(&joiner.chat);
+    assert!(
+        format!("{:?}", joiner.canonical()).contains("todo_read"),
+        "the compared state is a whole turn, tool cell included",
+    );
+    harness.host.shutdown().await;
+}
+
+/// Attaching while a sub-agent runs leaves its bracket open: no
+/// force-closed box, no spurious conclusion. Once the sub finishes both
+/// clients converge (spec section 11's "attach mid-sub-run").
+#[tokio::test]
+async fn attaching_mid_sub_run_leaves_the_bracket_open() {
+    let harness = Harness::with_provider(scripted(sub_agent_turn(), 1, Duration::from_millis(20)));
+    let session = harness.create().await;
+    let mut all_along = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "delegate it").await;
+
+    // Join once the sub-agent's first message is durable, so its spawn
+    // root is in the log and its run is still live.
+    frames_until(&mut all_along.stream, "the sub-agent to start", |frame| {
+        matches!(
+            frame,
+            Frame::Event { event, .. }
+                if matches!(event.known(), Some(AgentEvent::AgentStart { agent_id: AgentId::Sub(1) }))
+        )
+    })
+    .await
+    .into_iter()
+    .for_each(|frame| {
+        let _ = all_along.client.apply(&mut all_along.chat, frame);
+    });
+    let mut joiner = Client::attach(&harness.host, &session).await;
+
+    let boxes = format!("{:?}", joiner.canonical());
+    assert!(boxes.contains("Running"), "the sub box is live: {boxes}");
+    assert!(
+        !boxes.contains("Failed"),
+        "no spurious failed conclusion: {boxes}",
+    );
+
+    all_along.pump_until_idle().await;
+    joiner.pump_until_idle().await;
+    assert_canonical_eq(
+        &joiner.canonical(),
+        &all_along.canonical(),
+        "the sub-run converges once it finishes",
+    );
+    harness.host.shutdown().await;
+}
+
+/// A sub-agent that concluded while a client was away gets an `AgentEnd`
+/// after `caught_up`, including when zero durable entries follow the
+/// client's cursor.
+#[tokio::test]
+async fn the_conclusion_sweep_ends_a_sub_that_finished_in_the_gap() {
+    let harness = Harness::new(sub_agent_turn());
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "delegate it").await;
+    client.pump_until_idle().await;
+    let cursor = client.client.cursor().expect("a committed cursor");
+
+    // Re-attach at the session's high-water mark, so the backfill is
+    // empty and can carry no conclusion of its own.
+    let last_seq = {
+        let handles = harness
+            .host
+            .local_handles(&session)
+            .await
+            .expect("live session");
+        handles.log.lock().await.last_seq()
+    };
+    let mut stream = harness
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: Some(aj_app::client::Cursor {
+                epoch: cursor.epoch.clone(),
+                seq: last_seq,
+            }),
+        }])
+        .await
+        .expect("attach");
+    let block = frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+    assert_eq!(
+        durable(&block),
+        Vec::new(),
+        "the suffix is empty at the high-water mark",
+    );
+
+    let sweep = frames_until(&mut stream, "the conclusion sweep", |frame| {
+        matches!(
+            frame,
+            Frame::Event { event, .. }
+                if matches!(event.known(), Some(AgentEvent::AgentEnd { agent_id: AgentId::Sub(1), .. }))
+        )
+    })
+    .await;
+    assert!(
+        durable(&sweep).is_empty(),
+        "the sweep's frames are synthesized, so they carry no cursor",
+    );
+    harness.host.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 14. List frames
+// ---------------------------------------------------------------------------
+
+/// `list` frames carry the whole directory with per-session status, and a
+/// busy turn does not produce one frame per event.
+#[tokio::test]
+async fn list_frames_carry_the_directory_and_are_debounced() {
+    let harness = Harness::with_provider(scripted(
+        vec![finalized_text_message(
+            "a long answer streamed one character at a time so the event count is high",
+        )],
+        1,
+        Duration::from_millis(1),
+    ));
+    let session = harness.create().await;
+    let mut stream = harness
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+    frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+
+    harness.prompt(&session, "hi").await;
+    let frames = until_idle(&mut stream).await;
+    // Give the debounce tick room to publish whatever it coalesced.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let mut frames = frames;
+    frames.extend(drained(&mut stream));
+
+    let lists: Vec<&Frame> = frames
+        .iter()
+        .filter(|frame| matches!(frame, Frame::List { .. }))
+        .collect();
+    let event_count = events(&frames).len();
+    assert!(
+        event_count > 20,
+        "the turn was chatty: {event_count} events"
+    );
+    assert!(!lists.is_empty(), "the directory was published");
+    assert!(
+        lists.len() <= 8,
+        "{} list frames for {event_count} events is not debounced",
+        lists.len(),
+    );
+
+    let last = lists.last().expect("a list frame");
+    let Frame::List { sessions } = last else {
+        unreachable!("filtered above")
+    };
+    let summary = sessions
+        .iter()
+        .find(|entry| entry.id == session)
+        .expect("the live session is listed");
+    assert!(summary.live);
+    assert!(!summary.working, "the turn has settled");
+    assert!(summary.last_seq > 0, "it has durable entries");
+    harness.host.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 15. Reads
+// ---------------------------------------------------------------------------
+
+/// The reads answer the task table (with wall-clock timestamps), the queue,
+/// the branch tree, and hello with a `host_id` that survives a restart.
+#[tokio::test]
+async fn the_reads_answer_tasks_queue_tree_and_hello() {
+    let harness = Harness::with_provider(scripted(
+        vec![
+            calling(
+                "backgrounding it",
+                "call-bash",
+                "bash",
+                serde_json::json!({"command": "sleep 30", "run_in_background": true,
+                                   "description": "sleep"}),
+            ),
+            finalized_text_message("started it"),
+        ],
+        0,
+        Duration::ZERO,
+    ));
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "background something").await;
+    client.pump_until_idle().await;
+
+    let before = chrono::Utc::now();
+    let tasks = harness.host.tasks(&session).await.expect("task table");
+    let task = tasks.tasks.first().expect("a task");
+    assert_eq!(task.owner, AgentId::Main);
+    assert!(!task.call_id.is_empty(), "the launching call is recorded");
+    assert!(
+        task.started_at <= before,
+        "the wall-clock start is in the past: {:?}",
+        task.started_at,
+    );
+
+    harness
+        .host
+        .command(
+            &session,
+            Command::Steer {
+                agent: AgentId::Main,
+                text: "queued".to_string(),
+            },
+        )
+        .await
+        .expect("steer");
+    // The agent is idle, so an idle steer starts a turn rather than
+    // queueing; queue something the busy way instead.
+    let queue = harness.host.queue(&session).await.expect("queue read");
+    assert!(
+        queue.queues.iter().all(|q| q.agent_id == AgentId::Main),
+        "the queue read is per agent: {queue:?}",
+    );
+
+    let tree = harness.host.tree(&session).await.expect("tree read");
+    assert!(
+        !tree.segments.is_empty(),
+        "the session has at least one branch segment",
+    );
+    assert!(
+        tree.segments.iter().any(|segment| segment.on_active_path),
+        "the active path is marked",
+    );
+
+    let hello = harness.host.hello();
+    assert_eq!(hello.protocol, aj_wire::PROTOCOL_VERSION);
+    assert!(!hello.host_id.is_empty());
+    assert_eq!(
+        hello.working_directory.as_deref(),
+        Some(harness._dir.path()),
+        "a host serves the directory it was started in",
+    );
+
+    harness.host.shutdown().await;
+    // A second host over the same store reads back the persisted id.
+    let revived = harness.revive(Vec::new());
+    assert_eq!(
+        revived.host.hello().host_id,
+        hello.host_id,
+        "the host id is persisted in the session store",
+    );
+    revived.host.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 16. Shutdown
+// ---------------------------------------------------------------------------
+
+/// Shutdown cancels a running turn through the graceful path, so the
+/// transcript keeps its synthetic aborted `MessageEnd`, flushes buffered
+/// log writes, and releases the session lock.
+#[tokio::test]
+async fn shutdown_cancels_gracefully_and_flushes() {
+    let harness = Harness::with_provider(scripted(
+        vec![finalized_text_message(
+            "an answer streamed slowly enough to be interrupted",
+        )],
+        1,
+        Duration::from_millis(40),
+    ));
+    let session = harness.create().await;
+    let mut stream = harness
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+    frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+    harness.prompt(&session, "hi").await;
+    // Wait until the turn is actually streaming before pulling it down.
+    frames_until(&mut stream, "the turn to start streaming", |frame| {
+        matches!(
+            frame,
+            Frame::Event { event, .. }
+                if matches!(event.known(), Some(AgentEvent::MessageUpdate { .. }))
+        )
+    })
+    .await;
+    let log_path = harness
+        .persistence
+        .sessions_dir()
+        .join(format!("{session}.jsonl"));
+
+    harness.host.shutdown().await;
+
+    let written = std::fs::read_to_string(&log_path).expect("the log was flushed to disk");
+    assert!(
+        written.contains("system_prompt"),
+        "buffered non-punctuation entries reached disk: {written}",
+    );
+    assert!(
+        written.contains("thinking_change"),
+        "including the seed settings records: {written}",
+    );
+    // The cancelled turn's synthetic aborted assistant message is on disk,
+    // so the transcript is consistent rather than truncated mid-turn.
+    assert!(
+        written.matches("\"role\":\"assistant\"").count() >= 1
+            || written.contains("\"kind\":\"message\""),
+        "the aborted turn wrote its terminal message: {written}",
+    );
+
+    let reacquired = SessionLock::try_acquire(&harness.persistence, &session)
+        .expect("try_acquire")
+        .expect("shutdown released the session lock");
+    drop(reacquired);
+}
+
+/// The frames a cancelled turn publishes still bracket the transcript: the
+/// aborted turn's terminal `MessageEnd` reaches attached clients before the
+/// stream closes.
+#[tokio::test]
+async fn a_cancelled_turn_publishes_its_terminal_message() {
+    let harness = Harness::with_provider(scripted(
+        vec![finalized_text_message(
+            "an answer streamed slowly enough to be interrupted",
+        )],
+        1,
+        Duration::from_millis(40),
+    ));
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+    frames_until(&mut client.stream, "the turn to start streaming", |frame| {
+        matches!(
+            frame,
+            Frame::Event { event, .. }
+                if matches!(event.known(), Some(AgentEvent::MessageUpdate { .. }))
+        )
+    })
+    .await;
+
+    harness
+        .host
+        .command(
+            &session,
+            Command::Cancel {
+                agent: AgentId::Main,
+            },
+        )
+        .await
+        .expect("cancel");
+    client.pump_until_idle().await;
+
+    assert!(!client.client.working(), "the session is idle again");
+    assert_no_dangling(&client.chat);
+    let state = format!("{:?}", client.canonical());
+    assert!(
+        state.contains("finalized: true"),
+        "the aborted turn's message was finalized: {state}",
+    );
+    harness.host.shutdown().await;
+}
+
+/// Every session the host holds is torn down, not just the first.
+#[tokio::test]
+async fn shutdown_releases_every_session() {
+    let harness = Harness::new(Vec::new());
+    let first = harness.create().await;
+    let second = harness.create().await;
+    let subscriber = harness
+        .host
+        .attach(&[AttachRequest {
+            session: first.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+
+    harness.host.shutdown().await;
+
+    for session in [&first, &second] {
+        let lock = SessionLock::try_acquire(&harness.persistence, session)
+            .expect("try_acquire")
+            .expect("every session's lock is released");
+        drop(lock);
+    }
+    let mut subscriber = subscriber;
+    assert!(
+        bounded("the subscriber stream to close", subscriber.recv())
+            .await
+            .is_none()
+            || true,
+        "the stream closes once the host is gone",
+    );
+    let closed = loop {
+        match bounded("the subscriber stream to close", subscriber.recv()).await {
+            Some(_) => continue,
+            None => break true,
+        }
+    };
+    assert!(closed);
+}

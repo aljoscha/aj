@@ -29,6 +29,7 @@ pub mod compaction;
 pub mod diff;
 pub mod export;
 pub mod footer;
+pub mod host;
 pub mod keybindings;
 pub mod markdown;
 pub mod model;
