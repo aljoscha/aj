@@ -830,6 +830,26 @@ impl ConversationLog {
         let mut entries: HashMap<EntryId, ConversationEntry> = HashMap::new();
         let mut order: Vec<EntryId> = Vec::new();
 
+        // A duplicated line (a hand-edited log, or one line written
+        // twice) would otherwise give one entry two append positions and
+        // project its message twice. `append` rejects a duplicate id
+        // loudly. On resume we keep the first occurrence and carry on,
+        // since the rest of the file is still usable.
+        let adopt = |order: &mut Vec<EntryId>,
+                     entries: &mut HashMap<EntryId, ConversationEntry>,
+                     entry: ConversationEntry| {
+            if entries.contains_key(&entry.id) {
+                tracing::warn!(
+                    "duplicate entry id {} in {}: keeping the first occurrence",
+                    entry.id,
+                    path.display()
+                );
+                return;
+            }
+            order.push(entry.id.clone());
+            entries.insert(entry.id.clone(), entry);
+        };
+
         loop {
             current_line.clear();
             let current_line_start = next_line_start;
@@ -857,10 +877,7 @@ impl ConversationLog {
 
             if let Some(line_number) = pending_line_number {
                 match serde_json::from_str::<ConversationEntry>(&pending_line) {
-                    Ok(entry) => {
-                        order.push(entry.id.clone());
-                        entries.insert(entry.id.clone(), entry);
-                    }
+                    Ok(entry) => adopt(&mut order, &mut entries, entry),
                     Err(err) => {
                         corruption = Some((line_number, err));
                         continue;
@@ -894,10 +911,7 @@ impl ConversationLog {
         let mut truncate_to = None;
         if pending_line_number.is_some() {
             match serde_json::from_str::<ConversationEntry>(&pending_line) {
-                Ok(entry) => {
-                    order.push(entry.id.clone());
-                    entries.insert(entry.id.clone(), entry);
-                }
+                Ok(entry) => adopt(&mut order, &mut entries, entry),
                 Err(err) => {
                     tracing::warn!(
                         "dropping truncated trailing entry in {}: {err}",
@@ -1781,6 +1795,43 @@ mod tests {
             ConversationLog::resume(&persistence, &session_id).expect("resume repaired log");
         assert_eq!(resumed_again.core.order.len(), 3);
         assert_eq!(resumed_again.core.entries.len(), 3);
+    }
+
+    /// A duplicated line gives one entry two append positions unless
+    /// resume rejects it, which would project its message twice and hand
+    /// the same entry id two seqs.
+    #[test]
+    fn resume_keeps_the_first_occurrence_of_a_duplicated_entry() {
+        let (persistence, session_id, records) = resume_fixture();
+        let path = persistence.session_path(&session_id);
+        std::fs::write(
+            &path,
+            format!("{}\n{}\n{}\n", records[0], records[1], records[1]),
+        )
+        .expect("rewrite fixture log with a duplicated line");
+
+        let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume log");
+
+        assert_eq!(resumed.core.order.len(), 2, "the duplicate is dropped");
+        assert_eq!(resumed.core.entries.len(), 2);
+        assert_eq!(resumed.last_seq(), 2, "positions count the entry once");
+
+        // And the message projects once, at one position.
+        let message_ends: Vec<String> = crate::replay::project_suffix(
+            &resumed.snapshot(),
+            None,
+            &std::collections::BTreeSet::new(),
+        )
+        .events
+        .into_iter()
+        .filter_map(|tagged| match tagged.event {
+            aj_agent::events::AgentEvent::MessageEnd { .. } => {
+                Some(tagged.entry.expect("a MessageEnd is durable").id)
+            }
+            _ => None,
+        })
+        .collect();
+        assert_eq!(message_ends.len(), 1, "got {message_ends:?}");
     }
 
     /// `create` has to reserve its id with an atomic filesystem
