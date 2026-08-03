@@ -454,7 +454,7 @@ impl EntryBuilder {
         let EntryKind::User(user) = &entry.kind else {
             return EntryBorder::None;
         };
-        if self.branch_armed.borrow().as_deref() == Some(user.message_id.as_str()) {
+        if user.message_id.is_some() && *self.branch_armed.borrow() == user.message_id {
             EntryBorder::Branch
         } else if self.focus_mode.get() && idx == cursor {
             EntryBorder::Focus
@@ -2446,7 +2446,10 @@ impl TranscriptView {
         let idx = usize::try_from(self.list.borrow().cursor).ok()?;
         let entry = chat.transcript(chat.active_view())?.entries().get(idx)?;
         match &entry.kind {
-            EntryKind::User(user) => Some(user.message_id.clone()),
+            // A user row with no durable id (nothing in the TUI produces
+            // one, but the type allows it) is not a branch anchor: there
+            // is no log entry to branch from.
+            EntryKind::User(user) => user.message_id.clone(),
             _ => None,
         }
     }
@@ -3720,7 +3723,7 @@ mod tests {
         // span path only carries the spacer.
         let t = transcript_with(EntryKind::User(UserEntry {
             content: vec![UserContent::text("hello")],
-            message_id: String::new(),
+            message_id: None,
         }));
         let spans = entry_spans(&t.entries()[0], &styles());
         assert_eq!(joined(&spans), "\n\n");
@@ -3735,7 +3738,7 @@ mod tests {
         }
         lines.push("SECRET_TAIL_MARKER".to_string());
         TaskNotificationEntry {
-            message_id: String::new(),
+            message_id: None,
             label: "sleep".to_string(),
             kind: aj_agent::message::TaskNotificationKind::Bash,
             outcome: TaskOutcome::Succeeded,
@@ -3759,7 +3762,7 @@ mod tests {
     fn user_bubble_paints_the_tint_and_drops_the_prefix() {
         let user = UserEntry {
             content: vec![UserContent::text("hello world")],
-            message_id: String::new(),
+            message_id: None,
         };
         let s = styles();
         let mut bubble = build_user_bubble(&user, &s, None);
@@ -3816,7 +3819,7 @@ mod tests {
         let ctx = crate::test_support::draw_ctx(40, None);
         let bg = |outcome: TaskOutcome| {
             let entry = TaskNotificationEntry {
-                message_id: String::new(),
+                message_id: None,
                 label: "sleep".into(),
                 kind: aj_agent::message::TaskNotificationKind::Bash,
                 outcome,
@@ -3850,7 +3853,7 @@ mod tests {
     fn focus_border_reuses_the_padding_and_keeps_the_bubble_size() {
         let user = UserEntry {
             content: vec![UserContent::text("ciao?")],
-            message_id: String::new(),
+            message_id: None,
         };
         let s = styles();
         let label = copy_label_spans(&s);
@@ -3898,7 +3901,7 @@ mod tests {
     fn focus_hint_renders_both_copy_and_branch_shortcuts_from_binding_data() {
         let user = UserEntry {
             content: vec![UserContent::text("ciao?")],
-            message_id: String::new(),
+            message_id: None,
         };
         let s = styles();
         let label = copy_label_spans(&s);
@@ -3925,7 +3928,7 @@ mod tests {
         let lines: Vec<String> = (0..30).map(|i| format!("line {i}")).collect();
         let user = UserEntry {
             content: vec![UserContent::text(lines.join("\n"))],
-            message_id: String::new(),
+            message_id: None,
         };
         let r = user_bubble_rows(&user, 80);
         let body = r.join("\n");
@@ -3936,7 +3939,7 @@ mod tests {
     #[test]
     fn short_notification_is_not_truncated() {
         let n = TaskNotificationEntry {
-            message_id: String::new(),
+            message_id: None,
             label: "sleep".into(),
             kind: aj_agent::message::TaskNotificationKind::Bash,
             outcome: TaskOutcome::Succeeded,
@@ -3951,7 +3954,7 @@ mod tests {
     #[test]
     fn assistant_entry_renders_blocks_in_order_and_skips_tool_calls() {
         let t = transcript_with(EntryKind::Assistant(AssistantEntry {
-            message_id: String::new(),
+            message_id: None,
             message: assistant_message(vec![
                 AssistantContent::Thinking(ThinkingContent {
                     thinking: "pondering".into(),
@@ -3985,7 +3988,7 @@ mod tests {
     #[test]
     fn assistant_entry_is_indented_one_column_when_boxed() {
         let t = transcript_with(EntryKind::Assistant(AssistantEntry {
-            message_id: String::new(),
+            message_id: None,
             message: assistant_message(vec![AssistantContent::Text(TextContent {
                 text: "answer".into(),
                 text_signature: None,
@@ -4005,7 +4008,7 @@ mod tests {
     #[test]
     fn hidden_thinking_renders_placeholder() {
         let t = transcript_with(EntryKind::Assistant(AssistantEntry {
-            message_id: String::new(),
+            message_id: None,
             message: assistant_message(vec![AssistantContent::Thinking(ThinkingContent {
                 thinking: "secret".into(),
                 thinking_signature: None,
@@ -4035,7 +4038,7 @@ mod tests {
         // A body-less collapsed block has nothing to reveal, so it stays a bare
         // placeholder with no expand hint.
         let t = transcript_with(EntryKind::Assistant(AssistantEntry {
-            message_id: String::new(),
+            message_id: None,
             message: assistant_message(vec![AssistantContent::Thinking(ThinkingContent {
                 thinking: String::new(),
                 thinking_signature: None,
@@ -4050,7 +4053,7 @@ mod tests {
     #[test]
     fn redacted_thinking_renders_marker_even_when_expanded() {
         let t = transcript_with(EntryKind::Assistant(AssistantEntry {
-            message_id: String::new(),
+            message_id: None,
             message: assistant_message(vec![AssistantContent::Thinking(ThinkingContent {
                 thinking: String::new(),
                 thinking_signature: Some("opaque".into()),
@@ -4098,6 +4101,7 @@ mod tests {
             let t = transcript_with(EntryKind::Notice(NoticeEntry {
                 level,
                 text: "note".into(),
+                entry: None,
             }));
             let spans = entry_spans(&t.entries()[0], &s);
             assert_eq!(spans[0].style, style);
@@ -4114,6 +4118,7 @@ mod tests {
         let t = transcript_with(EntryKind::Notice(NoticeEntry {
             level: NoticeLevel::Info,
             text: "note".into(),
+            entry: None,
         }));
         // The raw spans carry no inset.
         let spans = entry_spans(&t.entries()[0], &s);
@@ -4160,6 +4165,7 @@ mod tests {
         let t = transcript_with(EntryKind::Notice(NoticeEntry {
             level: NoticeLevel::Info,
             text: "pre \x1b[9mstruck\x1b[29m post".into(),
+            entry: None,
         }));
         let spans = entry_spans(&t.entries()[0], &styles());
         let struck = spans
@@ -4190,6 +4196,7 @@ mod tests {
             text: "Context:\n  - builtin (system prompt)\n  - \
                    \x1b[9m~/x/SKILL.md (skill: y, disabled)\x1b[29m"
                 .into(),
+            entry: None,
         }));
         let spans = entry_spans(&t.entries()[0], &styles());
         let struck = spans
@@ -4234,6 +4241,7 @@ mod tests {
             tokens_before: 100_000,
             tokens_after: 25_000,
             summary: summary.into(),
+            entry: None,
         }))
     }
 
@@ -4338,6 +4346,7 @@ mod tests {
                     agent_id: aj_agent::events::AgentId::Main,
                     text: format!("row {i}"),
                 },
+                None,
             );
         }
         Rc::new(RefCell::new(chat))
@@ -5771,7 +5780,7 @@ mod tests {
                 _ => panic!("entry 2 is a user message"),
             }
         };
-        let branch_armed = Rc::new(RefCell::new(Some(armed_id)));
+        let branch_armed = Rc::new(RefCell::new(armed_id));
         let theme = Theme::bundled_dark_with_mode(aj_app::theme::ColorMode::Truecolor);
         // Tall viewport so the whole transcript fits and the assertions are
         // exact.
@@ -5938,7 +5947,7 @@ mod tests {
     }
 
     fn apply(chat: &Rc<RefCell<ChatState>>, life: &mut AgentLifecycle, event: AgentEvent) {
-        let _ = reduce(&mut chat.borrow_mut(), life, event);
+        let _ = reduce(&mut chat.borrow_mut(), life, event, None);
     }
 
     /// A caching builder over `chat` with a fresh cache and a concrete styles
@@ -6491,32 +6500,20 @@ mod tests {
         let chat = empty_chat();
         let mut life = AgentLifecycle::default();
         apply(&chat, &mut life, tool_start(AgentId::Main, "c1", "bash"));
-        apply(
-            &chat,
-            &mut life,
-            tool_end(
-                AgentId::Main,
-                "c1",
-                "bash",
-                bash("run", "line 1\n", Some(0), None),
-            ),
-        );
+        let update = |stdout: &str| AgentEvent::ToolExecutionUpdate {
+            agent_id: AgentId::Main,
+            call_id: "c1".into(),
+            tool: "bash".into(),
+            args: serde_json::json!({}),
+            partial: bash("run", stdout, None, None),
+            content: Vec::new().into(),
+        };
+        apply(&chat, &mut life, update("line 1\n"));
         let builder = caching_builder(&chat);
         let first = draw_and_assert_fresh(&builder, AgentId::Main, 0, 60);
 
-        // The result payload grows (a later TaskOutput-style update).
-        apply(
-            &chat,
-            &mut life,
-            AgentEvent::ToolExecutionUpdate {
-                agent_id: AgentId::Main,
-                call_id: "c1".into(),
-                tool: "bash".into(),
-                args: serde_json::json!({}),
-                partial: bash("run", "line 1\nline 2\nline 3\n", Some(0), None),
-                content: Vec::new().into(),
-            },
-        );
+        // The snapshot grows while the call is still running.
+        apply(&chat, &mut life, update("line 1\nline 2\nline 3\n"));
         let grown = draw_and_assert_fresh(&builder, AgentId::Main, 0, 60);
         assert_eq!(misses(&builder), 2, "output growth rebuilt");
         assert_ne!(
@@ -6595,11 +6592,11 @@ mod tests {
     fn user_entry_fingerprint_tracks_content() {
         let hello = transcript_with(EntryKind::User(UserEntry {
             content: vec![UserContent::text("hello")],
-            message_id: String::new(),
+            message_id: None,
         }));
         let longer = transcript_with(EntryKind::User(UserEntry {
             content: vec![UserContent::text("hello, world")],
-            message_id: String::new(),
+            message_id: None,
         }));
         let chat = empty_chat();
         let fp = |t: &Transcript| entry_fingerprint(&t.entries()[0], &chat.borrow());
@@ -6613,7 +6610,7 @@ mod tests {
     fn task_notification_fingerprint_tracks_outcome() {
         let make = |outcome: TaskOutcome| {
             transcript_with(EntryKind::TaskNotification(TaskNotificationEntry {
-                message_id: String::new(),
+                message_id: None,
                 label: "sleep".into(),
                 kind: aj_agent::message::TaskNotificationKind::Bash,
                 outcome,
@@ -6686,16 +6683,19 @@ mod tests {
             tokens_before: 100_000,
             tokens_after: 25_000,
             summary: "one".into(),
+            entry: None,
         }));
         let other_summary = transcript_with(EntryKind::Compaction(CompactionEntry {
             tokens_before: 100_000,
             tokens_after: 25_000,
             summary: "one two".into(),
+            entry: None,
         }));
         let other_tokens = transcript_with(EntryKind::Compaction(CompactionEntry {
             tokens_before: 90_000,
             tokens_after: 25_000,
             summary: "one".into(),
+            entry: None,
         }));
         let chat = empty_chat();
         let fp = |t: &Transcript| entry_fingerprint(&t.entries()[0], &chat.borrow());
@@ -7254,7 +7254,7 @@ mod tests {
         {
             let mut fresh = ChatState::new(cache_settings(), 0, Arc::new(Vec::new()));
             let mut fresh_life = AgentLifecycle::default();
-            let _ = reduce(&mut fresh, &mut fresh_life, user_end("world"));
+            let _ = reduce(&mut fresh, &mut fresh_life, user_end("world"), None);
             *chat.borrow_mut() = fresh;
         }
         // The rebind hook the shell runs on install.

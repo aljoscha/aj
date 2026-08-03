@@ -17,6 +17,7 @@ use std::collections::HashMap;
 
 use aj_agent::events::{AgentId, AgentSettings};
 use aj_agent::types::TokenUsage;
+use serde::Serialize;
 
 /// Snapshot describing how full the active model's context window is. A
 /// footer renders this as `tokens/window (percent%)`, coloring the
@@ -26,7 +27,7 @@ use aj_agent::types::TokenUsage;
 /// before the first assistant turn — and renders as `?`. A
 /// `context_window` of `0` suppresses the indicator entirely so the
 /// footer stays silent for models with no published window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ContextUsage {
     pub tokens: Option<u64>,
     pub context_window: u64,

@@ -257,7 +257,7 @@ async fn build_world(
             {
                 deferred_subs.insert(*n);
             }
-            let _ = reduce(&mut chat, &mut core.lifecycle, event);
+            let _ = reduce(&mut chat, &mut core.lifecycle, event, None);
         }
     }
 
@@ -277,14 +277,14 @@ async fn build_world(
                 text,
             },
         };
-        let _ = reduce(&mut chat, &mut core.lifecycle, event);
+        let _ = reduce(&mut chat, &mut core.lifecycle, event, None);
     }
     if !keybinding_problems.is_empty() {
         let mut msg = String::from("Some keybindings in config.toml had no effect:");
         for problem in &keybinding_problems {
             msg.push_str(&format!("\n  - {problem}"));
         }
-        let _ = reduce(&mut chat, &mut core.lifecycle, warning_event(&msg));
+        let _ = reduce(&mut chat, &mut core.lifecycle, warning_event(&msg), None);
     }
     // The context listing and skill warnings describe the freshly-loaded env,
     // which governs only a fresh session, so `fresh_env_notices` returns them
@@ -293,13 +293,14 @@ async fn build_world(
     // block. The same helper feeds the in-process new-session path, so a
     // `/new` surfaces identical env context and skill problems.
     for event in fresh_env_notices(&spec, &core.env) {
-        let _ = reduce(&mut chat, &mut core.lifecycle, event);
+        let _ = reduce(&mut chat, &mut core.lifecycle, event, None);
     }
     if aj_app::notices::sandbox_warning_enabled() {
         let _ = reduce(
             &mut chat,
             &mut core.lifecycle,
             warning_event(aj_app::notices::SANDBOX_WARNING),
+            None,
         );
     }
     // Apply a `--api-key` runtime override to the resolved provider, then
@@ -328,14 +329,19 @@ async fn build_world(
                 agent_id: AgentId::Main,
                 text,
             };
-            let _ = reduce(&mut chat, &mut core.lifecycle, event);
+            let _ = reduce(&mut chat, &mut core.lifecycle, event, None);
         }
     }
     if let Some(warning) = aj_app::tmux::options().and_then(aj_app::tmux::build_warning) {
-        let _ = reduce(&mut chat, &mut core.lifecycle, warning_event(&warning));
+        let _ = reduce(
+            &mut chat,
+            &mut core.lifecycle,
+            warning_event(&warning),
+            None,
+        );
     }
     for notice in std::mem::take(&mut core.restore_notices) {
-        let _ = reduce(&mut chat, &mut core.lifecycle, notice_event(&notice));
+        let _ = reduce(&mut chat, &mut core.lifecycle, notice_event(&notice), None);
     }
 
     Ok(World {
@@ -450,7 +456,7 @@ async fn build_next_session(
             {
                 deferred_subs.insert(*n);
             }
-            let _ = reduce(&mut chat, &mut core.lifecycle, event);
+            let _ = reduce(&mut chat, &mut core.lifecycle, event, None);
         }
     }
 
@@ -566,6 +572,7 @@ fn install_next_session(world: &mut World, shell: &Rc<RefCell<Shell>>, next: Nex
             &mut world.chat.borrow_mut(),
             &mut world.core.lifecycle,
             event,
+            None,
         );
     }
 }
@@ -727,6 +734,7 @@ fn fold_notice(world: &mut World, text: &str) {
         &mut world.chat.borrow_mut(),
         &mut world.core.lifecycle,
         notice_event(text),
+        None,
     );
 }
 
@@ -740,6 +748,7 @@ fn fold_warning(world: &mut World, text: &str) {
             agent_id: AgentId::Main,
             text: text.to_string(),
         },
+        None,
     );
 }
 
@@ -961,7 +970,7 @@ fn drain_events(world: &mut World, first: AgentEvent) -> (bool, Vec<AgentId>) {
         };
         {
             let mut chat = world.chat.borrow_mut();
-            redraw |= reduce(&mut chat, &mut world.core.lifecycle, event).0;
+            redraw |= reduce(&mut chat, &mut world.core.lifecycle, event, None).0;
         }
         if let Some((id, conditional)) = trigger
             && (!conditional
@@ -2001,7 +2010,7 @@ async fn apply_picker_outcome(
                 if let Some(conv) = conv {
                     let mut chat = world.chat.borrow_mut();
                     for event in project_thread(&conv, AgentId::Sub(n)) {
-                        let _ = reduce(&mut chat, &mut world.core.lifecycle, event);
+                        let _ = reduce(&mut chat, &mut world.core.lifecycle, event, None);
                     }
                 }
                 world.deferred_subs.remove(&n);
@@ -5873,6 +5882,7 @@ mod tests {
                     verbosity: "default".into(),
                 },
             },
+            None,
         );
         let shell = test_shell_with_chat(chat);
         let surface = shell
@@ -6243,7 +6253,7 @@ mod tests {
         {
             let log = world.core.log.lock().await;
             for event in aj_session::replay(&log) {
-                let _ = reduce(&mut eager, &mut life, event);
+                let _ = reduce(&mut eager, &mut life, event, None);
             }
         }
         eager.set_active_view(view);
@@ -8801,12 +8811,14 @@ mod tests {
                 agent_id: AgentId::Main,
                 message: AgentMessage::wire(Message::User(UserMessage::text("session start"))),
             },
+            None,
         );
         for i in 0..count {
             let _ = reduce(
                 &mut chat.borrow_mut(),
                 &mut lifecycle,
                 notice_event(&format!("line-{i:03}")),
+                None,
             );
         }
     }
@@ -10144,6 +10156,7 @@ mod tests {
                 agent_id: AgentId::Main,
                 message: AgentMessage::wire(Message::User(UserMessage::text("show me the png"))),
             },
+            None,
         );
         let _ = reduce(
             &mut chat.borrow_mut(),
@@ -10154,6 +10167,7 @@ mod tests {
                 tool: "read_file".into(),
                 args: serde_json::json!({"path": "/tmp/pic.png"}),
             },
+            None,
         );
         let _ = reduce(
             &mut chat.borrow_mut(),
@@ -10175,6 +10189,7 @@ mod tests {
                 .into(),
                 is_error: false,
             },
+            None,
         );
         let chat = chat.borrow();
         chat.transcript(AgentId::Main)
@@ -10898,6 +10913,7 @@ mod tests {
                 &mut world.chat.borrow_mut(),
                 &mut world.core.lifecycle,
                 event,
+                None,
             );
         }
     }
@@ -11021,6 +11037,7 @@ mod tests {
                     verbosity: "default".into(),
                 },
             },
+            None,
         );
 
         // The border rests on the main view's minimal tint before the switch.
@@ -11095,6 +11112,7 @@ mod tests {
                     verbosity: "default".into(),
                 },
             },
+            None,
         );
         let _ = reduce(
             &mut world.chat.borrow_mut(),
@@ -11105,6 +11123,7 @@ mod tests {
                 report: "done".into(),
                 conclusion: aj_agent::events::SubAgentConclusion::Completed,
             },
+            None,
         );
         let _ = reduce(
             &mut world.chat.borrow_mut(),
@@ -11113,6 +11132,7 @@ mod tests {
                 agent_id: AgentId::Sub(1),
                 messages: Vec::new(),
             },
+            None,
         );
 
         // Observe the finished sub-agent and reconcile the chrome.
@@ -11171,6 +11191,7 @@ mod tests {
                     verbosity: "default".into(),
                 },
             },
+            None,
         );
 
         // Observing the sub-agent inlays its `agent N` marker.
@@ -11233,6 +11254,7 @@ mod tests {
                     verbosity: "default".into(),
                 },
             },
+            None,
         );
         let _ = apply_picker_outcome(
             &mut world,
@@ -11289,6 +11311,7 @@ mod tests {
                     verbosity: "default".into(),
                 },
             },
+            None,
         );
         let _ = apply_picker_outcome(
             &mut world,
@@ -11374,6 +11397,7 @@ mod tests {
                     verbosity: "default".into(),
                 },
             },
+            None,
         );
         world.chat.borrow_mut().set_active_view(AgentId::Sub(1));
 

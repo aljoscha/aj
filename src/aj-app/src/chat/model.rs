@@ -5,9 +5,14 @@
 //! stable [`EntryId`], never a container index. Ids are minted
 //! monotonically and never reused, so a recorded id either names the
 //! entry it was minted for or nothing at all ([`ChatState::quiesce`]
-//! drops in-flight entries).
+//! drops the unfinalized streaming entries).
+//!
+//! Durable identity is spelled `Option<String>` throughout: the log
+//! entry an entry derives from, or `None` for a row with no durable
+//! origin. Nothing here uses an empty string for "no identity", because
+//! several rows can carry one and keying on it would alias them.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,6 +22,7 @@ use aj_agent::tool::{TaskId, TaskKind, TaskStatus, ToolDetails};
 use aj_agent::types::TokenUsage;
 use aj_models::registry::ModelInfo;
 use aj_models::types::{AssistantMessage, UserContent};
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::footer::AgentFooters;
@@ -57,10 +63,11 @@ pub enum EntryKind {
 /// A user message appended from `MessageEnd { User }`.
 #[derive(Debug)]
 pub struct UserEntry {
-    /// Id of the originating user `AgentMessage` / log entry, used to
-    /// anchor branch operations. Non-empty within the TUI: live messages
-    /// mint it, replayed messages are backfilled on resume.
-    pub message_id: String,
+    /// Id of the originating user `AgentMessage`, which is also its log
+    /// entry id, used to anchor branch operations. `Some` within the
+    /// TUI: live messages mint it, replayed messages are backfilled on
+    /// resume.
+    pub message_id: Option<String>,
     /// The authoritative wire content blocks.
     pub content: Vec<UserContent>,
 }
@@ -81,8 +88,9 @@ impl UserEntry {
 /// same text projected to the model.
 #[derive(Debug)]
 pub struct TaskNotificationEntry {
-    /// Id of the originating notice `AgentMessage` / log entry.
-    pub message_id: String,
+    /// Id of the originating notice `AgentMessage`, which is also its
+    /// log entry id.
+    pub message_id: Option<String>,
     /// Command line (bash) or task description (agent).
     pub label: String,
     /// What kind of work ran.
@@ -109,11 +117,11 @@ pub(crate) fn joined_user_text(content: &[UserContent]) -> String {
 /// An assistant message, streamed or replayed.
 #[derive(Debug)]
 pub struct AssistantEntry {
-    /// Id of the originating assistant `AgentMessage` / log entry, the
-    /// durable identity a re-applied `MessageEnd` updates in place.
-    /// Empty while the entry is still streaming: only `MessageEnd`
-    /// carries the id the log adopts.
-    pub message_id: String,
+    /// Id of the originating assistant `AgentMessage`, which is also its
+    /// log entry id: the durable identity a re-applied `MessageEnd`
+    /// updates in place. `None` while the entry is still streaming, since
+    /// only `MessageEnd` carries the id the log adopts.
+    pub message_id: Option<String>,
     /// The latest `AssistantMessage` snapshot. `MessageUpdate` carries
     /// a cumulative `partial: AssistantMessage`, so the reducer stores
     /// the snapshot rather than replaying deltas. On `MessageEnd` this
@@ -127,7 +135,7 @@ pub struct AssistantEntry {
 }
 
 /// Execution status of a tool cell.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum ToolStatus {
     Running,
     Done { is_error: bool },
@@ -165,7 +173,7 @@ pub struct ToolEntry {
 }
 
 /// Run status of a sub-agent box.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum SubAgentStatus {
     Running,
     /// Finished cleanly.
@@ -218,10 +226,16 @@ pub struct CompactionEntry {
     pub tokens_before: u64,
     pub tokens_after: u64,
     pub summary: String,
+    /// The compaction checkpoint log entry this row reports on:
+    /// `CompactionEnd` carries no identity of its own, so the entry the
+    /// event derives from is what makes a re-served checkpoint update
+    /// this row instead of adding a second one. `None` for a locally
+    /// emitted end (nothing re-serves it), which appends.
+    pub entry: Option<String>,
 }
 
 /// Severity of a transient notice row.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum NoticeLevel {
     Info,
     Warning,
@@ -233,6 +247,13 @@ pub enum NoticeLevel {
 pub struct NoticeEntry {
     pub level: NoticeLevel,
     pub text: String,
+    /// What this notice derives from, when that has durable identity:
+    /// the settings log entry behind a projected notice, or the assistant
+    /// message behind an in-band error line. Keyed on so a re-served
+    /// suffix updates the row it already produced. `None` for every
+    /// locally raised notice (warnings, retry cadence, a compaction
+    /// failure), which appends.
+    pub entry: Option<String>,
 }
 
 /// Per-turn token usage row, stored structured so views format it
@@ -290,7 +311,8 @@ fn format_turn_usage_line(agent_id: AgentId, usage: &TokenUsage) -> String {
 ///
 /// "Append-only" holds for the reducer. [`ChatState::quiesce`] is the
 /// one operation that drops entries, and it only ever drops the
-/// in-flight ones a re-attach backfill regenerates.
+/// unfinalized streaming assistant entry, whose message is re-rendered
+/// from its `MessageEnd`.
 #[derive(Debug, Default)]
 pub struct Transcript {
     pub(crate) entries: Vec<Entry>,
@@ -330,30 +352,51 @@ impl Transcript {
             .map(|i| &mut self.entries[i])
     }
 
-    /// Drop the entries whose ids are in `ids`.
+    /// Drop every entry `keep` rejects.
     ///
     /// A removal keeps the remaining ids monotone, so the binary search
     /// in [`Self::get`] stays valid, and the counter never reuses a
     /// removed id, so a stale [`EntryId`] resolves to `None` forever
-    /// rather than to a different entry. Callers still owe the
-    /// bookkeeping: an index pointing at a removed entry must go too
-    /// (see [`ChatState::quiesce`]).
-    pub(crate) fn remove(&mut self, ids: &HashSet<EntryId>) {
-        self.entries.retain(|entry| !ids.contains(&entry.id));
+    /// rather than to a different entry.
+    ///
+    /// Every owner of an [`EntryId`] still owes its own bookkeeping, and
+    /// that inventory is per-owner rather than one list: the reducer's
+    /// own indexes (see [`ChatState::quiesce`], the only caller), and on
+    /// the TUI side the image store and the render / text caches, which
+    /// key on [`EntryId`] as well. Those are inert under a removal,
+    /// because ids are never reused, so a stale key simply never
+    /// resolves. What a removal does shift is anything keyed on the
+    /// *positional* index, which is how a transcript view's focus cursor
+    /// addresses rows. Reconciling that cursor is a client-side concern
+    /// (phase 1d), not this method's.
+    pub(crate) fn retain(&mut self, keep: impl FnMut(&Entry) -> bool) {
+        self.entries.retain(keep);
     }
 }
 
 /// Per-agent streaming bookkeeping. One per agent, so streaming events
 /// route to the right entry inside that agent's own transcript.
 ///
-/// The two indexes are the agent's durable-identity maps: they outlive
-/// a turn so a re-applied event finds the entry it already produced
-/// instead of appending a second one. Streaming state
+/// Three of the four fields are the agent's durable-identity state: the
+/// two indexes and the last finalized assistant id. They outlive a turn
+/// so a re-applied event finds the entry it already produced instead of
+/// appending a second one. Streaming state
 /// ([`Self::current_assistant`]) is per-turn and cleared on `AgentEnd`.
 #[derive(Debug, Default)]
 pub struct AgentRender {
     /// The in-flight assistant entry for this agent, or `None` between
     /// turns.
+    ///
+    /// The lazy materialization this drives (the first painting
+    /// `MessageUpdate` opens the entry) rests on a stream contract: no
+    /// `MessageUpdate` for a message may arrive after that message's
+    /// `MessageEnd`, or after a backfill finalized it. Otherwise the
+    /// update opens a second, unfinalized copy of a message that is
+    /// already rendered, and nothing later removes it. Live flow honors
+    /// this because the accumulator emits the updates before the end.
+    /// Across an attach boundary it is the server's job: spec 6.5 drops
+    /// the lossy frames that were in flight when the attach was served,
+    /// exactly so a stale snapshot cannot land after the backfill.
     pub(crate) current_assistant: Option<EntryId>,
     /// `tool_use_id` -> the tool entry it maps to, in this agent's
     /// transcript.
@@ -387,13 +430,6 @@ pub struct TaskInfo {
     /// When the reducer saw `TaskEnd`, freezing the displayed
     /// runtime.
     pub finished_at: Option<Instant>,
-    /// The launch cell in the owner's transcript, snapshotted at
-    /// `TaskStart`. A background task outlives the turn that launched
-    /// it, and this snapshot is what keeps `TaskOutput` / `TaskEnd`
-    /// routable when the owner's `tool_index` has no entry for the
-    /// call. `None` when the launching call has no cell (the `agent`
-    /// tool renders as a sub-agent box, not a tool cell).
-    pub cell: Option<EntryId>,
 }
 
 /// A known agent, snapshotted for the agent picker: the main agent or a
@@ -432,17 +468,6 @@ pub struct ChatState {
     /// scope can list finished tasks. Task events are transient, so a
     /// resumed session starts with an empty map.
     pub(crate) tasks: BTreeMap<TaskId, TaskInfo>,
-    /// Launch cells recorded at `ToolExecutionEnd` for bash results
-    /// carrying a `task_id`, keyed by the launching `call_id`. The
-    /// detached driver's `TaskStart` is unordered relative to the
-    /// tool result, so this map is the linkage a `TaskStart` consults
-    /// when the owner's `tool_index` holds no cell for the call.
-    /// Entries are consumed at `TaskStart`, removed even when the
-    /// `tool_index` lookup wins. Residue (a replayed launch whose
-    /// `TaskStart` never comes, or a live one whose `TaskStart` beat
-    /// its `ToolExecutionEnd`) is inert: call ids are
-    /// provider-generated and never collide.
-    pub(crate) pending_task_cells: HashMap<String, EntryId>,
     /// Per-agent footer store (model line + context occupancy).
     pub(crate) footers: AgentFooters,
     /// Model catalog, for resolving a settings identity's context
@@ -491,7 +516,6 @@ impl ChatState {
             active_view: AgentId::Main,
             render: HashMap::new(),
             tasks: BTreeMap::new(),
-            pending_task_cells: HashMap::new(),
             footers: AgentFooters::new(main_settings, main_context_window),
             catalog,
             sub_boxes: HashMap::new(),
@@ -658,6 +682,11 @@ impl ChatState {
     /// freezes its runtime clock. A box already carrying a
     /// `SubAgentEnd` conclusion (`Done`/`Truncated`/`Failed`) and a
     /// missing box are left untouched.
+    ///
+    /// A conclusion is therefore stable under a re-delivered lifecycle
+    /// bracket with one exception, which is the point of that exception:
+    /// `AgentStart(Sub n)` re-opens a `Done` box for a continuation
+    /// re-run, and this concludes that re-run as `Done` again.
     pub fn conclude_sub_box(&mut self, n: usize) {
         if let Some(b) = self.sub_box_mut(n)
             && b.status == SubAgentStatus::Running
@@ -685,87 +714,74 @@ impl ChatState {
         }
     }
 
-    /// Resolve task `id`'s launch cell: the owner plus the cell's
-    /// entry id in the owner's transcript. Prefers the `tool_index`
-    /// (by `call_id`) and falls back to the id snapshotted at
-    /// `TaskStart`.
+    /// Resolve task `id`'s launch cell: the owner plus the cell's entry
+    /// id in the owner's transcript.
+    ///
+    /// Keyed on the launching `call_id` through the owner's `tool_index`,
+    /// which outlives the turn, so a background task that runs past its
+    /// turn stays routable. `None` for a task whose launching call has no
+    /// cell: an agent-kind task (the `agent` tool renders as a sub-agent
+    /// box), or a client that never saw the call's bracket. The lookup is
+    /// live rather than snapshotted at `TaskStart`, so a cell that shows
+    /// up afterwards (a late `ToolExecutionEnd` building it on miss)
+    /// starts receiving the task's output.
     pub(crate) fn task_cell(&self, id: TaskId) -> Option<(AgentId, EntryId)> {
         let info = self.tasks.get(&id)?;
         let cell = self
             .render
-            .get(&info.owner)
-            .and_then(|r| r.tool_index.get(&info.call_id))
-            .copied()
-            .or(info.cell)?;
+            .get(&info.owner)?
+            .tool_index
+            .get(&info.call_id)
+            .copied()?;
         Some((info.owner, cell))
     }
 
-    /// Drop the transient-derived in-flight state before a re-attach
+    /// Drop the transient-derived in-flight detail before a re-attach
     /// backfill is applied (spec 6.5's re-attach reconciliation).
     ///
-    /// Streaming text and running tool cells are wholly transient: the
-    /// durable suffix regenerates a tool cell that concluded in the
-    /// gap, and a tool still running concludes live. A running
-    /// sub-agent box is not transient (its spawn root is durable and it
-    /// owns the child transcript), so only its transient detail is
-    /// cleared. Concluding it is the host's call, because a box shown
-    /// as finished for a live sub, or a dropped box whose child
-    /// transcript then has no anchor, are both worse than a box that
-    /// keeps spinning until the host says otherwise.
+    /// This clears transient *detail* and never durable identity or
+    /// structure. The unfinalized streaming assistant entry goes, since
+    /// the message it renders concludes either in the suffix or live. A
+    /// running tool cell stays, keeping its `call_id`, tool name and
+    /// arguments, and loses only the partial result the lossy
+    /// `ToolExecutionUpdate` painted: a tool that has not finished has no
+    /// log entry, so no backfill would ever regenerate the cell, and
+    /// dropping it would lose its arguments for good. A running
+    /// sub-agent box keeps its status, report and child transcript and
+    /// loses its activity line, because concluding it would show a
+    /// finished box for a live sub and dropping it would orphan the child
+    /// transcript. The host is authoritative for concluding sub boxes.
     ///
-    /// Every index that could point at a dropped entry is pruned here,
-    /// so no [`EntryId`] outlives the entry it names.
+    /// Deliberately kept: `last_finalized_assistant`. It is what anchors
+    /// the trailing `UsageUpdate` of a re-served assistant entry, whose
+    /// own durable frame the cursor invariant drops, so clearing it would
+    /// grow a second usage row on every re-attach.
+    ///
+    /// NOTE: clearing `compaction_phase` costs the phase label of a
+    /// compaction that is still running. Nothing re-seeds it: the `state`
+    /// frame carries `working`, which is already true during a compaction
+    /// (it runs as a tracked turn), so only the label is missing and only
+    /// until the next `CompactionProgress`. Surfacing it would be a client
+    /// concern, not a wire one.
     pub fn quiesce(&mut self, lifecycle: &mut AgentLifecycle) {
-        // Collect first: pruning the indexes needs the whole state
-        // while the removals borrow one transcript at a time.
-        let dropped: Vec<(AgentId, HashSet<EntryId>, HashSet<String>)> = self
-            .transcripts
-            .iter()
-            .map(|(&agent, transcript)| {
-                let mut ids = HashSet::new();
-                let mut calls = HashSet::new();
-                for entry in transcript.entries() {
-                    match &entry.kind {
-                        EntryKind::Assistant(a) if !a.finalized => {
-                            ids.insert(entry.id);
-                        }
-                        EntryKind::Tool(t) if t.status == ToolStatus::Running => {
-                            ids.insert(entry.id);
-                            calls.insert(t.call_id.clone());
-                        }
-                        _ => {}
-                    }
-                }
-                (agent, ids, calls)
-            })
-            .collect();
-
-        for (agent, ids, calls) in &dropped {
-            if let Some(transcript) = self.transcripts.get_mut(agent) {
-                transcript.remove(ids);
-            }
-            if let Some(render) = self.render.get_mut(agent) {
-                // Streaming is per-turn and its entry is gone. The
-                // durable ids stay: the entries they name are still
-                // here, and so are the usage rows keyed off the last
-                // finalized assistant message.
-                render.current_assistant = None;
-                render.tool_index.retain(|_, id| !ids.contains(id));
-                render.message_index.retain(|_, id| !ids.contains(id));
-            }
-            // Keyed by `call_id`, not by entry id: the map spans agents
-            // while entry ids are per-transcript counters, so two
-            // agents' entries can share one id.
-            self.pending_task_cells
-                .retain(|call_id, _| !calls.contains(call_id));
-            for info in self.tasks.values_mut() {
-                if info.owner == *agent && info.cell.is_some_and(|cell| ids.contains(&cell)) {
-                    // The cell is gone. A re-projected launch re-enters
-                    // the owner's `tool_index`, which `task_cell`
-                    // consults first, so the task stays routable.
-                    info.cell = None;
+        for transcript in self.transcripts.values_mut() {
+            // The streaming entry is the only transcript structure that
+            // is purely transient: it carries no durable identity and no
+            // index names it, so dropping it needs no bookkeeping beyond
+            // the streaming slot below.
+            transcript
+                .retain(|entry| !matches!(&entry.kind, EntryKind::Assistant(a) if !a.finalized));
+            for entry in &mut transcript.entries {
+                if let EntryKind::Tool(tool) = &mut entry.kind
+                    && tool.status == ToolStatus::Running
+                {
+                    tool.details = None;
+                    tool.content = Arc::from(Vec::<UserContent>::new());
                 }
             }
+        }
+        for render in self.render.values_mut() {
+            render.current_assistant = None;
         }
 
         for n in self.sub_boxes.keys().copied().collect::<Vec<_>>() {
@@ -844,10 +860,12 @@ mod tests {
         let a = t.append(EntryKind::Notice(NoticeEntry {
             level: NoticeLevel::Info,
             text: "one".into(),
+            entry: None,
         }));
         let b = t.append(EntryKind::Notice(NoticeEntry {
             level: NoticeLevel::Warning,
             text: "two".into(),
+            entry: None,
         }));
         assert_ne!(a, b);
         match &t.get(a).expect("entry a").kind {
@@ -885,6 +903,7 @@ mod tests {
             .append(EntryKind::Notice(NoticeEntry {
                 level: NoticeLevel::Warning,
                 text: "startup warning".into(),
+                entry: None,
             }));
         assert!(
             !chat.has_conversation(),
@@ -895,7 +914,7 @@ mod tests {
             .get_mut(&AgentId::Main)
             .expect("main transcript")
             .append(EntryKind::User(UserEntry {
-                message_id: String::new(),
+                message_id: None,
                 content: Vec::new(),
             }));
         assert!(

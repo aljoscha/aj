@@ -7,6 +7,7 @@
 //! is a separate bus subscriber, so nothing downstream needs the event
 //! intact.
 
+use std::collections::btree_map::Entry as BTreeMapEntry;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -18,6 +19,7 @@ use aj_models::types::{
     AssistantContent, AssistantMessage, ErrorCategory, Message, StopReason, UserContent,
     UserMessage,
 };
+use aj_session::EntryId as LogEntryId;
 use serde_json::Value;
 
 use crate::chat::model::{
@@ -35,7 +37,26 @@ pub struct Redraw(pub bool);
 
 /// Fold `event` into the model, updating the shared lifecycle sets
 /// alongside it.
-pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: AgentEvent) -> Redraw {
+///
+/// `entry` is the log entry the event derives from: `Some` for a durable
+/// frame (the wire envelope's `entry_id`, spec 6.4), `None` for a
+/// locally emitted event, for a live non-durable one, and for every
+/// event of a dead-log replay.
+///
+/// It is the durable identity of the effects whose event carries none of
+/// its own: a compaction checkpoint's summary row and a projected
+/// settings notice. Handing it in is what lets a re-served backfill
+/// update those rows in place instead of appending a second one, which
+/// the cursor invariant cannot do for them (spec 6.5). Passing `None`
+/// for an event that is in fact durable is safe when the fold starts
+/// from fresh state, which is what local resume does, and grows
+/// duplicate rows under re-application.
+pub fn reduce(
+    state: &mut ChatState,
+    lifecycle: &mut AgentLifecycle,
+    event: AgentEvent,
+    entry: Option<&LogEntryId>,
+) -> Redraw {
     match event {
         // ---- Lifecycle ----------------------------------------------------
         //
@@ -47,20 +68,21 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
             lifecycle.mark_running(agent_id);
             // A continuation re-prompt emits no `SubAgentStart`, so
             // `AgentStart(Sub n)` is what flips a re-prompted box back
-            // to `Running`. Defensive: skip when the box doesn't exist
-            // yet.
+            // to `Running`. Only a `Done` box re-opens, because that is
+            // the genuine continuation case: a `Failed` or `Truncated`
+            // conclusion is terminal, and re-opening it would let the
+            // paired `AgentEnd` conclude the box `Done` and quietly
+            // rewrite a failure into a success. A box that is missing or
+            // already running is left alone.
             if let AgentId::Sub(n) = agent_id
                 && let Some(b) = state.sub_box_mut(n)
+                && b.status == SubAgentStatus::Done
             {
                 b.status = SubAgentStatus::Running;
-                // A continuation re-run (the box already has an end recorded)
-                // restarts the clock so the runtime times the new run, not the
-                // wall-clock since first spawn. The initial run has no end yet,
-                // so its `started_at` is left untouched.
-                if b.finished_at.is_some() {
-                    b.started_at = Instant::now();
-                    b.finished_at = None;
-                }
+                // The clock restarts so the runtime times the new run,
+                // not the wall-clock since first spawn.
+                b.started_at = Instant::now();
+                b.finished_at = None;
             }
             Redraw(true)
         }
@@ -115,13 +137,16 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
         } => reduce_message_update(state, agent_id, event),
         AgentEvent::MessageEnd { agent_id, message } => {
             // The arms below consume `message.kind`, and `id()` borrows
-            // the whole message, so read the durable id up front. Tool
-            // results render through `ToolExecutionEnd` and get no entry
-            // of their own, so they need no identity.
+            // the whole message, so read the durable id up front. It is
+            // also the message's log entry id, which the log adopts on
+            // append and the wire codec backfills on decode, so these
+            // arms need no separate `entry`. Tool results render through
+            // `ToolExecutionEnd` and get no entry of their own, so they
+            // need no identity.
             let message_id = match &message.kind {
                 AgentMessageKind::Wire(Message::User(_) | Message::Assistant(_))
-                | AgentMessageKind::TaskNotification(_) => message.id().to_string(),
-                AgentMessageKind::Wire(Message::ToolResult(_)) => String::new(),
+                | AgentMessageKind::TaskNotification(_) => durable_id(message.id()),
+                AgentMessageKind::Wire(Message::ToolResult(_)) => None,
             };
             match message.kind {
                 AgentMessageKind::Wire(Message::User(user)) => {
@@ -170,16 +195,11 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
             // re-projected start refreshes the cell rather than adding a
             // second one. Status and result stay untouched, so a start
             // re-delivered after the call finished cannot un-finish it.
-            let known = state
-                .render
-                .get(&agent_id)
-                .and_then(|r| r.tool_index.get(&call_id))
-                .copied();
-            if let Some(id) = known
-                && let Some(entry) = state.tool_entry_mut(agent_id, id)
+            if let Some(id) = indexed_tool(state, agent_id, &call_id)
+                && let Some(cell) = state.tool_entry_mut(agent_id, id)
             {
-                entry.tool = tool;
-                entry.args = args;
+                cell.tool = tool;
+                cell.args = args;
             } else {
                 append_tool_entry(state, agent_id, call_id, tool, args);
             }
@@ -196,23 +216,28 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
             if tool == "agent" {
                 return Redraw(false);
             }
-            let Some(&id) = state
-                .render
-                .get(&agent_id)
-                .and_then(|r| r.tool_index.get(&call_id))
-            else {
+            let Some(id) = indexed_tool(state, agent_id, &call_id) else {
                 // No cell for this call in this transcript: a snapshot
-                // for a cell a quiesce dropped, or for a call this
-                // client never saw open. The tool's end rebuilds the
-                // cell with the authoritative payload, so dropping a
-                // cumulative snapshot loses nothing.
+                // for a call this client never saw open. The call's end
+                // builds the cell from its result, so only this partial
+                // view of it is lost.
                 return Redraw(false);
             };
-            if let Some(entry) = state.tool_entry_mut(agent_id, id) {
-                entry.details = Some(partial);
-                entry.content = content;
+            // A cumulative snapshot paints a running cell only. Once the
+            // call concluded, `ToolExecutionEnd` put the authoritative
+            // result there, and a snapshot arriving late (one that was in
+            // flight at an attach boundary, or that raced the result)
+            // must not overwrite it with a partial. Correctness never
+            // depends on a lossy frame (spec 6.4), so dropping it is the
+            // only safe reading. `TaskOutput` freezes the same way.
+            match state.tool_entry_mut(agent_id, id) {
+                Some(cell) if cell.status == ToolStatus::Running => {
+                    cell.details = Some(partial);
+                    cell.content = content;
+                    Redraw(true)
+                }
+                _ => Redraw(false),
             }
-            Redraw(true)
         }
         AgentEvent::ToolExecutionEnd {
             agent_id,
@@ -233,12 +258,8 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
             // `current_assistant`) so a subsequent assistant text chunk
             // opens a fresh entry *after* the tool rather than reusing
             // a pre-tool one.
-            let id = match state
-                .render
-                .get(&agent_id)
-                .and_then(|r| r.tool_index.get(&call_id))
-            {
-                Some(&id) => id,
+            let id = match indexed_tool(state, agent_id, &call_id) {
+                Some(id) => id,
                 None => append_tool_entry(
                     state,
                     agent_id,
@@ -247,29 +268,28 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
                     Value::Object(Default::default()),
                 ),
             };
-            // A bash result carrying a task id is a background launch.
-            // Record the cell so a `TaskStart` arriving after the
-            // owner's `AgentEnd` can still find it. A fast task can
-            // already have reached `TaskEnd`, which froze the cell
-            // around the final `TaskOutput` snapshot. The launch
-            // result's empty snapshot must not clobber that.
+            // A bash result carrying a task id is a background launch,
+            // and a tracked task's cell body belongs to its `TaskOutput`
+            // snapshots, not to the launch result: the launch's own
+            // snapshot is empty, so re-projecting this bracket would
+            // blank whatever the task has streamed since (`TaskEnd` never
+            // repaints, and the next snapshot is not guaranteed either).
+            // An untracked task (a resumed cell, or a client that never
+            // saw `TaskStart`) has nobody else to paint it, so the result
+            // lands.
             let mut frozen = false;
             if let ToolDetails::Bash {
                 task_id: Some(task_id),
                 ..
             } = &result
             {
-                state.pending_task_cells.insert(call_id.clone(), id);
-                frozen = state
-                    .tasks
-                    .get(task_id)
-                    .is_some_and(|info| info.status.is_terminal());
+                frozen = state.tasks.contains_key(task_id);
             }
-            if let Some(entry) = state.tool_entry_mut(agent_id, id) {
-                entry.status = ToolStatus::Done { is_error };
+            if let Some(cell) = state.tool_entry_mut(agent_id, id) {
+                cell.status = ToolStatus::Done { is_error };
                 if !frozen {
-                    entry.details = Some(result);
-                    entry.content = content;
+                    cell.details = Some(result);
+                    cell.content = content;
                 }
             }
             Redraw(true)
@@ -277,15 +297,26 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
 
         // ---- Notices --------------------------------------------------------
         AgentEvent::Notice { agent_id, text } => {
-            append_notice(state, agent_id, NoticeLevel::Info, text);
+            // The projected notice of a settings entry is durable, and
+            // `entry` is the only identity it has: a re-served suffix
+            // updates the row it already produced instead of appending a
+            // second one. A locally raised notice carries none and
+            // appends.
+            record_notice(
+                state,
+                agent_id,
+                NoticeLevel::Info,
+                text,
+                entry.map(String::as_str),
+            );
             Redraw(true)
         }
         AgentEvent::Warning { agent_id, text } => {
-            append_notice(state, agent_id, NoticeLevel::Warning, text);
+            record_notice(state, agent_id, NoticeLevel::Warning, text, None);
             Redraw(true)
         }
         AgentEvent::Error { agent_id, text } => {
-            append_notice(state, agent_id, NoticeLevel::Error, text);
+            record_notice(state, agent_id, NoticeLevel::Error, text, None);
             Redraw(true)
         }
         AgentEvent::StreamRetry {
@@ -301,7 +332,7 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
                 "Retrying inference (attempt {attempt}, in {}ms)…",
                 delay.as_millis()
             );
-            append_notice(state, agent_id, NoticeLevel::Warning, text);
+            record_notice(state, agent_id, NoticeLevel::Warning, text, None);
             Redraw(true)
         }
 
@@ -320,7 +351,7 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
                 .and_then(|r| r.last_finalized_assistant.clone());
             let existing = after
                 .as_deref()
-                .and_then(|id| indexed_usage_row(state, agent_id, id));
+                .and_then(|after| indexed_row(state, agent_id, after, usage_origin));
             match existing {
                 Some(id) => {
                     if let Some(EntryKind::TurnUsage(row)) = state
@@ -378,38 +409,60 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
             // an error is a failure, a summary is a success, neither is
             // a cancellation that wrote nothing.
             if let Some(err) = error {
-                append_notice(
+                // The failure and cancel branches append no log entry, so
+                // they have no durable identity to key on and none is
+                // needed: no entry exists for a backfill to regenerate
+                // them from, and the frame that carries them is
+                // reliable-transient, delivered exactly once.
+                record_notice(
                     state,
                     agent_id,
                     NoticeLevel::Warning,
                     format!("Compaction failed: {err}"),
+                    None,
                 );
             } else if let Some(summary) = summary {
-                // Append-only on purpose: a compaction's `CompactionEnd`
-                // is the single durable frame of its checkpoint entry,
-                // so the protocol's cursor invariant already keeps a
-                // re-attach from re-applying it, and a synthetic
-                // identity would be dead weight. The same holds for the
-                // notices below.
-                state
-                    .transcripts
-                    .entry(agent_id)
-                    .or_default()
-                    .append(EntryKind::Compaction(CompactionEntry {
-                        tokens_before,
-                        tokens_after,
-                        summary,
-                    }));
+                // A successful compaction appends its checkpoint entry,
+                // and `CompactionEnd` carries no identity of its own, so
+                // that entry is the row's key. The cursor invariant is not
+                // enough on its own: it is a de-duplication optimization
+                // (spec 6.5), and a client that offers an older cursor or
+                // re-attaches under a fresh epoch is served the entry
+                // again.
+                let existing =
+                    entry.and_then(|entry| indexed_row(state, agent_id, entry, compaction_origin));
+                match existing {
+                    Some(id) => {
+                        if let Some(EntryKind::Compaction(row)) =
+                            entry_kind_mut(state, agent_id, id)
+                        {
+                            row.tokens_before = tokens_before;
+                            row.tokens_after = tokens_after;
+                            row.summary = summary;
+                        }
+                    }
+                    None => {
+                        state.transcripts.entry(agent_id).or_default().append(
+                            EntryKind::Compaction(CompactionEntry {
+                                tokens_before,
+                                tokens_after,
+                                summary,
+                                entry: entry.cloned(),
+                            }),
+                        );
+                    }
+                }
                 // No `UsageUpdate` follows a compaction, so refresh the
                 // footer occupancy directly to the post-compaction
                 // estimate.
                 state.footers.set_context_tokens(agent_id, tokens_after);
             } else {
-                append_notice(
+                record_notice(
                     state,
                     agent_id,
                     NoticeLevel::Info,
                     "Compaction canceled.".to_string(),
+                    None,
                 );
             }
             Redraw(true)
@@ -490,37 +543,42 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
             kind,
             label,
         } => {
-            // Resolve the launch cell: from the owner's `tool_index`,
-            // else from the linkage recorded at `ToolExecutionEnd`.
-            // `TaskStart` is unordered relative to that result. Both
-            // lookups key on the launching `call_id`, so an agent-kind
-            // task (whose `agent` tool has no cell, it renders as a
-            // sub-agent box) misses both and keeps `cell = None`.
-            let pending = state.pending_task_cells.remove(&call_id);
-            let cell = state
-                .render
-                .get(&agent_id)
-                .and_then(|r| r.tool_index.get(&call_id))
-                .copied()
-                .or(pending);
-            if let Some(cell_id) = cell
-                && let Some(entry) = state.tool_entry_mut(agent_id, cell_id)
+            // The launch cell is the owner's tool cell for the launching
+            // `call_id`. `TaskStart` is unordered relative to the
+            // launch's own `ToolExecutionEnd`, but either side of that
+            // race leaves the cell in `tool_index`, which outlives the
+            // turn, so one lookup covers both. An agent-kind task has no
+            // cell at all (its `agent` tool renders as a sub-agent box),
+            // so it misses and stays unbadged.
+            if let Some(id) = indexed_tool(state, agent_id, &call_id)
+                && let Some(cell) = state.tool_entry_mut(agent_id, id)
             {
-                entry.task = Some(task_id);
+                cell.task = Some(task_id);
             }
-            state.tasks.insert(
-                task_id,
-                TaskInfo {
-                    kind,
-                    label,
-                    owner: agent_id,
-                    call_id,
-                    status: TaskStatus::Running,
-                    started_at: Instant::now(),
-                    finished_at: None,
-                    cell,
-                },
-            );
+            match state.tasks.entry(task_id) {
+                BTreeMapEntry::Vacant(slot) => {
+                    slot.insert(TaskInfo {
+                        kind,
+                        label,
+                        owner: agent_id,
+                        call_id,
+                        status: TaskStatus::Running,
+                        started_at: Instant::now(),
+                        finished_at: None,
+                    });
+                }
+                // A re-applied start refreshes what the event carries and
+                // nothing else: overwriting the whole entry would
+                // un-finish a task that already ended and restart its
+                // runtime clock.
+                BTreeMapEntry::Occupied(mut slot) => {
+                    let info = slot.get_mut();
+                    info.kind = kind;
+                    info.label = label;
+                    info.owner = agent_id;
+                    info.call_id = call_id;
+                }
+            }
             Redraw(true)
         }
         AgentEvent::TaskOutput {
@@ -535,13 +593,13 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
             if frozen {
                 return Redraw(false);
             }
-            let Some((owner, cell)) = state.task_cell(task_id) else {
+            let Some((owner, id)) = state.task_cell(task_id) else {
                 return Redraw(false);
             };
-            if let Some(entry) = state.tool_entry_mut(owner, cell) {
+            if let Some(cell) = state.tool_entry_mut(owner, id) {
                 // `TaskOutput` carries no wire content, only the
                 // cumulative `ToolDetails` snapshot.
-                entry.details = Some(partial);
+                cell.details = Some(partial);
             }
             Redraw(true)
         }
@@ -628,7 +686,7 @@ fn reduce_message_update(
                     // The streaming envelope mints a fresh id per event,
                     // so a partial has no durable identity yet. The
                     // finalizing `MessageEnd` fills it in.
-                    message_id: String::new(),
+                    message_id: None,
                     message: partial,
                     finalized: false,
                 }));
@@ -645,13 +703,13 @@ fn reduce_user_end(
     state: &mut ChatState,
     agent_id: AgentId,
     user: UserMessage,
-    message_id: String,
+    message_id: Option<String>,
 ) -> Redraw {
     let text = joined_user_text(&user.content);
     if text.is_empty() {
         return Redraw(false);
     }
-    if let Some(id) = indexed_message(state, agent_id, &message_id)
+    if let Some(id) = indexed_message(state, agent_id, message_id.as_deref())
         && let Some(EntryKind::User(entry)) = entry_kind_mut(state, agent_id, id)
     {
         entry.content = user.content;
@@ -665,7 +723,7 @@ fn reduce_user_end(
             message_id: message_id.clone(),
             content: user.content,
         }));
-    remember_message(state, agent_id, message_id, id);
+    remember_message(state, agent_id, message_id.as_deref(), id);
     Redraw(true)
 }
 
@@ -676,9 +734,9 @@ fn reduce_task_notification_end(
     state: &mut ChatState,
     agent_id: AgentId,
     notification: TaskNotification,
-    message_id: String,
+    message_id: Option<String>,
 ) -> Redraw {
-    if let Some(id) = indexed_message(state, agent_id, &message_id)
+    if let Some(id) = indexed_message(state, agent_id, message_id.as_deref())
         && let Some(EntryKind::TaskNotification(entry)) = entry_kind_mut(state, agent_id, id)
     {
         entry.label = notification.label;
@@ -698,57 +756,143 @@ fn reduce_task_notification_end(
             outcome: notification.outcome,
             body: notification.body,
         }));
-    remember_message(state, agent_id, message_id, id);
+    remember_message(state, agent_id, message_id.as_deref(), id);
     Redraw(true)
 }
 
 /// The entry `message_id` already produced in `agent_id`'s transcript,
 /// when this client rendered that message before.
-///
-/// An empty id is never an identity: several entries can carry one (a
-/// message deserialized outside the log's backfill path), so keying on
-/// it would alias unrelated rows.
-fn indexed_message(state: &ChatState, agent_id: AgentId, message_id: &str) -> Option<EntryId> {
-    if message_id.is_empty() {
-        return None;
-    }
+fn indexed_message(
+    state: &ChatState,
+    agent_id: AgentId,
+    message_id: Option<&str>,
+) -> Option<EntryId> {
     state
         .render
         .get(&agent_id)?
         .message_index
-        .get(message_id)
+        .get(message_id?)
         .copied()
 }
 
 /// Record `id` as the entry for durable `message_id`.
-fn remember_message(state: &mut ChatState, agent_id: AgentId, message_id: String, id: EntryId) {
-    if message_id.is_empty() {
+fn remember_message(
+    state: &mut ChatState,
+    agent_id: AgentId,
+    message_id: Option<&str>,
+    id: EntryId,
+) {
+    let Some(message_id) = message_id else {
         return;
-    }
+    };
     state
         .render
         .entry(agent_id)
         .or_default()
         .message_index
-        .insert(message_id, id);
+        .insert(message_id.to_string(), id);
 }
 
-/// The usage row `agent_id` already holds for the assistant message
-/// `after`, if this client applied that update before.
-fn indexed_usage_row(state: &ChatState, agent_id: AgentId, after: &str) -> Option<EntryId> {
-    // A usage row sits directly after the message it reports on, so the
-    // reverse scan settles in a step or two on the live path.
+/// The cell a tool event belongs to in `agent_id`'s transcript.
+///
+/// A non-empty `call_id` is durable identity and resolves through the
+/// index, which outlives the turn, so a re-projected bracket finds the
+/// cell it already produced. The id is assumed unique for the session,
+/// which holds because providers mint one per call.
+///
+/// An empty `call_id` is not an identity: the OpenAI adapter builds a
+/// `ToolCall` with an empty id and fills it in only when the wire delta
+/// carries one, so indexing it would collapse every id-less call in the
+/// session onto a single cell. Such a call is instead correlated only
+/// while it runs, which is enough for live flow (its update and its
+/// result arrive before it concludes) and is all that can be done: a
+/// re-served bracket for an id-less call has nothing to match on and
+/// renders a second cell.
+fn indexed_tool(state: &ChatState, agent_id: AgentId, call_id: &str) -> Option<EntryId> {
+    if call_id.is_empty() {
+        return running_unidentified_cell(state, agent_id);
+    }
+    state
+        .render
+        .get(&agent_id)?
+        .tool_index
+        .get(call_id)
+        .copied()
+}
+
+/// The most recent still-running cell with no `call_id`.
+fn running_unidentified_cell(state: &ChatState, agent_id: AgentId) -> Option<EntryId> {
     state
         .transcript(agent_id)?
         .entries()
         .iter()
         .rev()
         .find_map(|entry| match &entry.kind {
-            EntryKind::TurnUsage(row) if row.after_message_id.as_deref() == Some(after) => {
+            EntryKind::Tool(cell)
+                if cell.call_id.is_empty() && cell.status == ToolStatus::Running =>
+            {
                 Some(entry.id)
             }
             _ => None,
         })
+}
+
+/// The durable identity of a wire id, or `None` when it has none.
+///
+/// An empty id is never an identity: several messages can carry one (a
+/// message deserialized outside the log's backfill path), so keying on it
+/// would alias unrelated rows.
+fn durable_id(id: &str) -> Option<String> {
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// The row in `agent_id`'s transcript that durable identity `origin`
+/// already produced, matched through `key`.
+///
+/// A reverse scan rather than a third index: the row a re-applied event
+/// looks for sits at or near the tail (a usage row follows the message it
+/// reports on, a notice follows the entry that raised it), so the walk
+/// settles in a step or two on the live path, and a miss costs one pass
+/// over a transcript small enough that views walk it entry by entry every
+/// frame.
+fn indexed_row(
+    state: &ChatState,
+    agent_id: AgentId,
+    origin: &str,
+    key: impl Fn(&EntryKind) -> Option<&str>,
+) -> Option<EntryId> {
+    state
+        .transcript(agent_id)?
+        .entries()
+        .iter()
+        .rev()
+        .find(|entry| key(&entry.kind) == Some(origin))
+        .map(|entry| entry.id)
+}
+
+/// Durable identity of a usage row: the assistant message it reports on.
+fn usage_origin(kind: &EntryKind) -> Option<&str> {
+    match kind {
+        EntryKind::TurnUsage(row) => row.after_message_id.as_deref(),
+        _ => None,
+    }
+}
+
+/// Durable identity of a notice row: the log entry or message it derives
+/// from.
+fn notice_origin(kind: &EntryKind) -> Option<&str> {
+    match kind {
+        EntryKind::Notice(row) => row.entry.as_deref(),
+        _ => None,
+    }
+}
+
+/// Durable identity of a compaction row: its checkpoint log entry.
+fn compaction_origin(kind: &EntryKind) -> Option<&str> {
+    match kind {
+        EntryKind::Compaction(row) => row.entry.as_deref(),
+        _ => None,
+    }
 }
 
 /// Mutable payload of entry `id` in `agent_id`'s transcript.
@@ -766,7 +910,7 @@ fn reduce_assistant_end(
     state: &mut ChatState,
     agent_id: AgentId,
     assistant: AssistantMessage,
-    message_id: String,
+    message_id: Option<String>,
 ) -> Redraw {
     // A failed turn carries its error in-band on the finalized
     // assistant message. We render it here, on `MessageEnd`, so it
@@ -829,16 +973,19 @@ fn reduce_assistant_end(
     // slot is only consulted (and released) when this message is new to
     // us, so a re-application cannot steal another turn's in-flight
     // entry.
-    let target = match indexed_message(state, agent_id, &message_id) {
+    let target = match indexed_message(state, agent_id, message_id.as_deref()) {
         Some(id) => Some(id),
         None => state
             .render
             .get_mut(&agent_id)
             .and_then(|r| r.current_assistant.take()),
     };
-    // A target that no longer resolves to an assistant entry (a quiesce
-    // dropped it) falls through to the append below, so a durable
-    // message always lands somewhere renderable.
+    // Defensive: a target that no longer resolves to an assistant entry
+    // falls through to the append below, so a durable message always
+    // lands somewhere renderable. Nothing produces that state today
+    // (quiesce drops only unfinalized entries, and it clears the
+    // streaming slot that names them in the same pass), so this is a
+    // guard against a future index leak, not a live case.
     let target = target.filter(|&id| {
         matches!(
             state.transcript(agent_id).and_then(|t| t.get(id)),
@@ -873,7 +1020,7 @@ fn reduce_assistant_end(
         None => {}
     }
     if let Some(id) = landed {
-        remember_message(state, agent_id, message_id.clone(), id);
+        remember_message(state, agent_id, message_id.as_deref(), id);
     }
     // Recorded even when the message rendered no entry (a tool-use-only
     // turn): the trailing `UsageUpdate` still reports on this message
@@ -882,7 +1029,7 @@ fn reduce_assistant_end(
         .render
         .entry(agent_id)
         .or_default()
-        .last_finalized_assistant = (!message_id.is_empty()).then_some(message_id);
+        .last_finalized_assistant = message_id.clone();
     // A sub-agent's box renders its report, not the sub's transcript, so keep
     // the report fresh from the sub's latest conclusion while it runs. A
     // continuation or steering re-run completes through `AgentEnd(Sub n)`,
@@ -914,7 +1061,19 @@ fn reduce_assistant_end(
         changed = true;
     }
     if let Some(line) = error_line {
-        append_notice(state, agent_id, NoticeLevel::Error, line);
+        // The notice derives from this assistant message, so that
+        // message is its durable identity and a re-served suffix updates
+        // the row it already produced. Keying it directly on the message
+        // rather than through `message_index` is what covers the
+        // content-less error shape, which renders no assistant entry at
+        // all and so never enters that index.
+        record_notice(
+            state,
+            agent_id,
+            NoticeLevel::Error,
+            line,
+            message_id.as_deref(),
+        );
         changed = true;
     }
     Redraw(changed)
@@ -946,7 +1105,9 @@ fn append_tool_entry(
             header_only,
         }));
     let render = state.render.entry(agent_id).or_default();
-    render.tool_index.insert(call_id, id);
+    if !call_id.is_empty() {
+        render.tool_index.insert(call_id, id);
+    }
     // A tool call that arrives mid-turn means the assistant message
     // that emitted it is finished as far as the stream is concerned.
     // Drop the streaming target so post-tool assistant text opens a
@@ -955,13 +1116,37 @@ fn append_tool_entry(
     id
 }
 
-/// Append a notice row to `agent_id`'s transcript.
-fn append_notice(state: &mut ChatState, agent_id: AgentId, level: NoticeLevel, text: String) {
+/// Append a notice row, or update in place the row that `origin` already
+/// produced.
+///
+/// `origin` is the durable identity the notice derives from: the settings
+/// log entry behind a projected notice, the assistant message behind an
+/// in-band error line. `None` is "no durable identity" and appends
+/// unconditionally, which is what every locally raised notice carries.
+fn record_notice(
+    state: &mut ChatState,
+    agent_id: AgentId,
+    level: NoticeLevel,
+    text: String,
+    origin: Option<&str>,
+) {
+    if let Some(origin) = origin
+        && let Some(id) = indexed_row(state, agent_id, origin, notice_origin)
+        && let Some(EntryKind::Notice(row)) = entry_kind_mut(state, agent_id, id)
+    {
+        row.level = level;
+        row.text = text;
+        return;
+    }
     state
         .transcripts
         .entry(agent_id)
         .or_default()
-        .append(EntryKind::Notice(NoticeEntry { level, text }));
+        .append(EntryKind::Notice(NoticeEntry {
+            level,
+            text,
+            entry: origin.map(str::to_string),
+        }));
 }
 
 /// Collapse `s`'s runs of whitespace into single spaces, yielding one line.
@@ -992,7 +1177,10 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use crate::chat::model::Entry;
-    use crate::test_support::{CanonicalState, build_test_agent, scripted_run_config};
+    use crate::test_support::{
+        CanonicalState, assert_no_dangling, build_test_agent, dangling_entry_ids,
+        scripted_run_config,
+    };
 
     fn main_settings() -> AgentSettings {
         AgentSettings {
@@ -1016,7 +1204,7 @@ mod tests {
 
     /// Dispatch `event`, discarding the redraw signal.
     fn apply(state: &mut ChatState, life: &mut AgentLifecycle, event: AgentEvent) {
-        let _ = reduce(state, life, event);
+        let _ = reduce(state, life, event, None);
     }
 
     fn entries(state: &ChatState, id: AgentId) -> &[Entry] {
@@ -1190,11 +1378,38 @@ mod tests {
     }
 
     fn tool_start(agent_id: AgentId, call_id: &str, tool: &str) -> AgentEvent {
+        tool_start_with_args(agent_id, call_id, tool, serde_json::json!({}))
+    }
+
+    fn tool_start_with_args(
+        agent_id: AgentId,
+        call_id: &str,
+        tool: &str,
+        args: Value,
+    ) -> AgentEvent {
         AgentEvent::ToolExecutionStart {
             agent_id,
             call_id: call_id.into(),
             tool: tool.into(),
+            args,
+        }
+    }
+
+    /// A `ToolExecutionUpdate`: the lossy cumulative snapshot a running
+    /// tool paints its cell with.
+    fn tool_update(
+        agent_id: AgentId,
+        call_id: &str,
+        tool: &str,
+        partial: ToolDetails,
+    ) -> AgentEvent {
+        AgentEvent::ToolExecutionUpdate {
+            agent_id,
+            call_id: call_id.into(),
+            tool: tool.into(),
             args: serde_json::json!({}),
+            partial,
+            content: Arc::from(Vec::<UserContent>::new()),
         }
     }
 
@@ -1575,7 +1790,7 @@ mod tests {
         let rows = entries(&s, AgentId::Main);
         assert_eq!(rows.len(), 1);
         match &rows[0].kind {
-            EntryKind::User(u) => assert_eq!(u.message_id, expected_id),
+            EntryKind::User(u) => assert_eq!(u.message_id.as_deref(), Some(expected_id.as_str())),
             other => panic!("unexpected kind: {other:?}"),
         }
     }
@@ -2426,11 +2641,15 @@ mod tests {
             EntryKind::Tool(t) => assert_eq!(t.task, Some(1), "cell carries the task badge"),
             other => panic!("unexpected kind: {other:?}"),
         }
-        // Remove-on-consume: the fallback entry is claimed exactly
-        // once.
-        assert!(
-            s.pending_task_cells.is_empty(),
-            "consumed linkage is removed"
+        // The linkage is the surviving `tool_index` entry, not a
+        // snapshot: the index is what outlives the turn.
+        assert_eq!(
+            s.task_cell(1),
+            s.render
+                .get(&AgentId::Main)
+                .and_then(|r| r.tool_index.get("c1").copied())
+                .map(|cell| (AgentId::Main, cell)),
+            "the task routes through the owner's tool index",
         );
 
         // Live tail still lands in the launch cell.
@@ -2510,8 +2729,8 @@ mod tests {
 
         // The agent task tracks no cell, and the replayed bash cell
         // stays unclaimed.
-        let info = s.tasks().get(&1).expect("tracked task");
-        assert_eq!(info.cell, None, "agent tasks have no launch cell");
+        assert!(s.tasks().contains_key(&1), "the task is tracked");
+        assert_eq!(s.task_cell(1), None, "agent tasks have no launch cell");
         match &entries(&s, AgentId::Main)[0].kind {
             EntryKind::Tool(t) => assert_eq!(t.task, None, "replayed cell stays unclaimed"),
             other => panic!("unexpected kind: {other:?}"),
@@ -2875,6 +3094,7 @@ mod tests {
                 steering: Vec::new(),
                 follow_up: Vec::new(),
             },
+            None,
         );
         assert!(redraw.0, "QueueUpdate is a redraw ping");
         assert!(entries(&s, AgentId::Main).is_empty(), "no entry appended");
@@ -2885,6 +3105,7 @@ mod tests {
             AgentEvent::TurnStart {
                 agent_id: AgentId::Main,
             },
+            None,
         );
         assert!(!redraw.0, "TurnStart is bookkeeping only");
     }
@@ -2925,7 +3146,7 @@ mod tests {
         );
         let mut life = AgentLifecycle::default();
         for event in recorded.lock().unwrap().drain(..) {
-            let _ = reduce(&mut s, &mut life, event);
+            let _ = reduce(&mut s, &mut life, event, None);
         }
 
         assert!(!life.is_running(AgentId::Main), "turn settled idle");
@@ -2976,64 +3197,6 @@ mod tests {
             .collect();
         assert_eq!(tools.len(), 1, "expected exactly one tool cell");
         tools[0]
-    }
-
-    /// Every index that names an entry resolves to one that is still
-    /// there. A dangling [`EntryId`] renders as a missing box, an
-    /// unroutable task, or a duplicate cell, so this is asserted rather
-    /// than eyeballed.
-    fn assert_no_dangling(state: &ChatState) {
-        let resolves = |agent: AgentId, id: EntryId| {
-            state
-                .transcript(agent)
-                .and_then(|t| t.get(id))
-                .is_some_and(|e| e.id == id)
-        };
-        for (&n, &(parent, id)) in &state.sub_boxes {
-            assert!(resolves(parent, id), "sub_boxes[{n}] dangles");
-            let kind = state
-                .transcript(parent)
-                .and_then(|t| t.get(id))
-                .map(|e| &e.kind);
-            assert!(
-                matches!(kind, Some(EntryKind::SubAgent(_))),
-                "sub_boxes[{n}] does not name a box",
-            );
-        }
-        for (&agent, render) in &state.render {
-            if let Some(id) = render.current_assistant {
-                assert!(
-                    resolves(agent, id),
-                    "current_assistant for {agent:?} dangles"
-                );
-            }
-            for (call_id, &id) in &render.tool_index {
-                assert!(resolves(agent, id), "tool_index[{call_id}] dangles");
-            }
-            for (message_id, &id) in &render.message_index {
-                assert!(resolves(agent, id), "message_index[{message_id}] dangles");
-            }
-        }
-        for (&id, info) in state.tasks() {
-            if let Some(cell) = info.cell {
-                assert!(resolves(info.owner, cell), "tasks[{id}].cell dangles");
-            }
-            if let Some((owner, cell)) = state.task_cell(id) {
-                assert!(resolves(owner, cell), "task_cell({id}) dangles");
-            }
-        }
-        // `pending_task_cells` carries no agent, so it is checked
-        // against the transcript of the agent that owns the call.
-        for (call_id, &id) in &state.pending_task_cells {
-            let owner = state
-                .render
-                .iter()
-                .find(|(_, render)| render.tool_index.contains_key(call_id))
-                .map(|(&agent, _)| agent);
-            if let Some(owner) = owner {
-                assert!(resolves(owner, id), "pending_task_cells[{call_id}] dangles",);
-            }
-        }
     }
 
     #[test]
@@ -3151,7 +3314,7 @@ mod tests {
         assert_eq!(assistants.len(), 1, "one row for one message");
         assert!(assistants[0].finalized);
         assert!(
-            !assistants[0].message_id.is_empty(),
+            assistants[0].message_id.is_some(),
             "the finalized row carries its durable id",
         );
         assert_no_dangling(&s);
@@ -3296,88 +3459,679 @@ mod tests {
         assert_no_dangling(&s);
     }
 
-    /// The strongest case: a real scripted turn, tool call included,
-    /// folded once and then re-applied the way a backfill delivers it.
-    ///
-    /// `MessageUpdate` is left out of the re-application because no
-    /// backfill carries one: it is a lossy cumulative snapshot the log
-    /// projection never emits, and its envelope mints a fresh message id
-    /// per event, so it carries no durable identity to be idempotent on.
-    /// Every other event of the turn is fed again verbatim.
-    #[tokio::test]
-    async fn scripted_turn_reapplied_as_a_backfill_changes_nothing() {
-        use crate::test_support::finalized_text_message;
+    /// Stamp a fixed durable id on a `MessageEnd`, so a test can re-apply
+    /// the same message with a different payload. Live messages mint a
+    /// fresh id each time, which is exactly what a re-served suffix does
+    /// not do.
+    fn with_id(event: AgentEvent, id: &str) -> AgentEvent {
+        let AgentEvent::MessageEnd {
+            agent_id,
+            mut message,
+        } = event
+        else {
+            panic!("with_id expects a MessageEnd");
+        };
+        message.set_id(id.to_string());
+        AgentEvent::MessageEnd { agent_id, message }
+    }
 
-        let dir = TempDir::new().expect("tempdir");
-        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
-        let mut calling = finalized_text_message("let me check the list");
-        calling.content.push(AssistantContent::ToolCall(ToolCall {
-            id: "call-1".into(),
+    /// An assistant `MessageEnd` whose only content is a tool call: a
+    /// tool-use-only turn, which renders no assistant entry.
+    fn tool_use_only_end(call_id: &str) -> AgentEvent {
+        assistant_message_end(partial_with(vec![AssistantContent::ToolCall(ToolCall {
+            id: call_id.into(),
             name: "todo_read".into(),
             arguments: serde_json::json!({}),
-        }));
-        calling.stop_reason = StopReason::ToolUse;
-        let run_config =
-            scripted_run_config(vec![calling, finalized_text_message("nothing on it")]);
-        let (mut agent, _log, _persistence) = build_test_agent(&persistence, &run_config);
+        })]))
+    }
 
-        let recorded: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let sink = Arc::clone(&recorded);
-        let _handle = agent.subscribe(listener_from_sync(move |event| {
-            sink.lock().unwrap().push(event.clone());
-        }));
-        agent
-            .prompt("check the todos".into(), CancellationToken::new())
-            .await
-            .expect("scripted turn");
-        let events = recorded.lock().unwrap().clone();
-        assert!(
-            events.iter().any(|e| matches!(
-                e,
-                AgentEvent::ToolExecutionEnd { tool, .. } if tool == "todo_read"
-            )),
-            "the turn ran its tool call",
-        );
+    fn compaction_end(summary: &str, tokens_after: u64) -> AgentEvent {
+        AgentEvent::CompactionEnd {
+            agent_id: AgentId::Main,
+            reason: CompactionReason::Manual,
+            tokens_before: 1_000,
+            tokens_after,
+            summary: Some(summary.to_string()),
+            error: None,
+        }
+    }
 
+    fn notices(state: &ChatState, id: AgentId) -> Vec<(NoticeLevel, String)> {
+        entries(state, id)
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntryKind::Notice(n) => Some((n.level, n.text.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn usage_rows(state: &ChatState, id: AgentId) -> Vec<&TurnUsageEntry> {
+        entries(state, id)
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntryKind::TurnUsage(u) => Some(u),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_reapplied_tool_start_alone_does_not_unfinish_a_done_cell() {
+        // The suffix re-projects the whole bracket, but a client can see
+        // the start again with the end still to come (the two are
+        // separate frames). The start refreshes tool and args only.
         let mut s = state();
         let mut life = AgentLifecycle::default();
-        for event in events.iter().cloned() {
-            let _ = reduce(&mut s, &mut life, event);
-        }
-        let once = canon(&s, &life);
-
-        for event in events
-            .iter()
-            .filter(|e| !matches!(e, AgentEvent::MessageUpdate { .. }))
-            .cloned()
-        {
-            let _ = reduce(&mut s, &mut life, event);
-        }
-
-        assert_eq!(
-            canon(&s, &life),
-            once,
-            "the backfill re-application drifted"
+        let start = tool_start_with_args(
+            AgentId::Main,
+            "c1",
+            "bash",
+            serde_json::json!({"command": "ls"}),
         );
+        apply(&mut s, &mut life, start.clone());
+        apply(
+            &mut s,
+            &mut life,
+            tool_end(
+                AgentId::Main,
+                "c1",
+                "bash",
+                bash_task_details("the result", None),
+            ),
+        );
+        let before = canon(&s, &life);
+
+        apply(&mut s, &mut life, start);
+
+        assert_eq!(canon(&s, &life), before, "the start alone changed state");
+        let cell = only_tool(&s, AgentId::Main);
+        assert_eq!(
+            cell.status,
+            ToolStatus::Done { is_error: false },
+            "a re-served start must not un-finish the call",
+        );
+        assert!(cell.details.is_some(), "and must not drop its result");
+    }
+
+    #[test]
+    fn a_reapplied_message_end_with_a_changed_payload_updates_the_row() {
+        // The suffix can carry a payload that differs from what the live
+        // frame carried (a projection reads the persisted form), so the
+        // row has to be rewritten, not merely left alone.
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        apply(
+            &mut s,
+            &mut life,
+            with_id(user_message_end("hello"), "m-user"),
+        );
+        apply(
+            &mut s,
+            &mut life,
+            with_id(assistant_message_end(text_partial("first")), "m-assistant"),
+        );
+        apply(
+            &mut s,
+            &mut life,
+            with_id(
+                task_notification_end("cargo build", TaskOutcome::Succeeded),
+                "m-notice",
+            ),
+        );
+
+        apply(
+            &mut s,
+            &mut life,
+            with_id(user_message_end("hello, edited"), "m-user"),
+        );
+        apply(
+            &mut s,
+            &mut life,
+            with_id(
+                assistant_message_end(text_partial("revised")),
+                "m-assistant",
+            ),
+        );
+        apply(
+            &mut s,
+            &mut life,
+            with_id(
+                task_notification_end("cargo test", TaskOutcome::Killed),
+                "m-notice",
+            ),
+        );
+
+        let rows = entries(&s, AgentId::Main);
+        assert_eq!(rows.len(), 3, "three messages, three rows");
+        match &rows[0].kind {
+            EntryKind::User(u) => assert_eq!(u.joined_text(), "hello, edited"),
+            other => panic!("unexpected kind: {other:?}"),
+        }
+        assert_eq!(assistant_text(&rows[1]), "revised");
+        match &rows[2].kind {
+            EntryKind::TaskNotification(n) => {
+                assert_eq!(n.label, "cargo test");
+                assert_eq!(n.outcome, TaskOutcome::Killed);
+                assert_eq!(n.body, "killed");
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
         assert_no_dangling(&s);
-        // The fold is only worth comparing if it built the whole turn.
-        let kinds: Vec<&str> = entries(&s, AgentId::Main)
+    }
+
+    #[test]
+    fn a_tool_use_only_turn_still_anchors_its_usage_row() {
+        // The message renders no entry, so nothing but
+        // `last_finalized_assistant` can key its trailing usage row. A
+        // re-served entry has to overwrite that row rather than add one.
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        let message = with_id(tool_use_only_end("c1"), "m-tools");
+        apply(&mut s, &mut life, message.clone());
+        assert_eq!(
+            s.render
+                .get(&AgentId::Main)
+                .and_then(|r| r.last_finalized_assistant.as_deref()),
+            Some("m-tools"),
+            "the anchor is recorded even with no row to show",
+        );
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::UsageUpdate {
+                agent_id: AgentId::Main,
+                usage: token_usage([100, 10, 0, 0]),
+            },
+        );
+
+        apply(&mut s, &mut life, message);
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::UsageUpdate {
+                agent_id: AgentId::Main,
+                usage: token_usage([200, 20, 0, 0]),
+            },
+        );
+
+        let rows = usage_rows(&s, AgentId::Main);
+        assert_eq!(rows.len(), 1, "one usage row for one message");
+        assert_eq!(rows[0].after_message_id.as_deref(), Some("m-tools"));
+        assert_eq!(rows[0].usage.turn_input, 200, "the later value wins");
+    }
+
+    #[test]
+    fn a_late_tool_update_cannot_repaint_a_concluded_cell() {
+        // A cumulative snapshot is lossy, so correctness never depends on
+        // one (spec 6.4). One that arrives after the call's authoritative
+        // result must therefore be dropped, not painted.
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        let authoritative = ToolDetails::Text {
+            summary: "todo_read".into(),
+            body: "AUTHORITATIVE RESULT".into(),
+        };
+        apply(
+            &mut s,
+            &mut life,
+            tool_start(AgentId::Main, "c1", "todo_read"),
+        );
+        apply(
+            &mut s,
+            &mut life,
+            tool_end(AgentId::Main, "c1", "todo_read", authoritative.clone()),
+        );
+        let before = canon(&s, &life);
+
+        let redraw = reduce(
+            &mut s,
+            &mut life,
+            tool_update(
+                AgentId::Main,
+                "c1",
+                "todo_read",
+                ToolDetails::Text {
+                    summary: "todo_read".into(),
+                    body: "stale partial".into(),
+                },
+            ),
+            None,
+        );
+
+        assert!(!redraw.0, "a dropped snapshot is not a redraw");
+        assert_eq!(canon(&s, &life), before, "the stale snapshot landed");
+        let cell = only_tool(&s, AgentId::Main);
+        assert_eq!(cell.status, ToolStatus::Done { is_error: false });
+        assert_eq!(
+            cell.details
+                .as_ref()
+                .map(|d| serde_json::to_value(d).unwrap()),
+            Some(serde_json::to_value(&authoritative).unwrap()),
+            "the result stands",
+        );
+    }
+
+    #[test]
+    fn a_reprojected_background_launch_keeps_the_live_task_output() {
+        // A background launch's cell is `Done` the moment the spawn
+        // returns, and its body then belongs to the task's snapshots. A
+        // re-projected bracket must not blank what the task streamed.
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        let launch = tool_end(AgentId::Main, "c1", "bash", bash_task_details("", Some(1)));
+        apply(&mut s, &mut life, tool_start(AgentId::Main, "c1", "bash"));
+        apply(&mut s, &mut life, launch.clone());
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::TaskStart {
+                agent_id: AgentId::Main,
+                task_id: 1,
+                call_id: "c1".into(),
+                kind: TaskKind::Bash {
+                    command: "sleep 5".into(),
+                },
+                label: "sleep 5".into(),
+            },
+        );
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::TaskOutput {
+                agent_id: AgentId::Main,
+                task_id: 1,
+                call_id: "c1".into(),
+                partial: bash_task_details("half way there\n", Some(1)),
+            },
+        );
+
+        // The re-attach suffix re-projects the launch bracket.
+        apply(&mut s, &mut life, tool_start(AgentId::Main, "c1", "bash"));
+        apply(&mut s, &mut life, launch);
+
+        match only_tool(&s, AgentId::Main)
+            .details
+            .as_ref()
+            .expect("details")
+        {
+            ToolDetails::Bash { stdout, .. } => {
+                assert_eq!(stdout, "half way there\n", "the live tail survives")
+            }
+            other => panic!("expected bash details, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_task_start_cannot_paint_another_agents_cell_with_the_same_call_id() {
+        // Call ids are unique per provider run, not per session, so two
+        // agents can hold the same one, and an `EntryId` is a per
+        // transcript counter, so the same id names an unrelated entry in
+        // another transcript. A task's launch cell therefore has to be
+        // resolved in the owner's own transcript.
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        apply(
+            &mut s,
+            &mut life,
+            sub_agent_start(1, "scripted", "scripted"),
+        );
+        // The sub's own first row, so its "dup" cell lands on the same
+        // entry id as Main's unrelated `read_file` cell below.
+        apply(&mut s, &mut life, sub_assistant_end(1, "on it"));
+        apply(
+            &mut s,
+            &mut life,
+            tool_start(AgentId::Sub(1), "dup", "bash"),
+        );
+        apply(
+            &mut s,
+            &mut life,
+            tool_end(
+                AgentId::Sub(1),
+                "dup",
+                "bash",
+                bash_task_details("", Some(1)),
+            ),
+        );
+        apply(
+            &mut s,
+            &mut life,
+            tool_start(AgentId::Main, "c-read", "read_file"),
+        );
+        apply(
+            &mut s,
+            &mut life,
+            tool_end(
+                AgentId::Main,
+                "c-read",
+                "read_file",
+                ToolDetails::Text {
+                    summary: "read_file".into(),
+                    body: "file contents".into(),
+                },
+            ),
+        );
+        // The hazard only exists while the two ids collide, so the setup
+        // asserts that it does.
+        let sub_cell = s
+            .render
+            .get(&AgentId::Sub(1))
+            .and_then(|r| r.tool_index.get("dup").copied())
+            .expect("the sub's launch cell");
+        let main_read = s
+            .render
+            .get(&AgentId::Main)
+            .and_then(|r| r.tool_index.get("c-read").copied())
+            .expect("main's read cell");
+        assert_eq!(
+            sub_cell, main_read,
+            "the two transcripts really do share this entry id",
+        );
+
+        // Main launches nothing under "dup", so its task resolves no cell.
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::TaskStart {
+                agent_id: AgentId::Main,
+                task_id: 1,
+                call_id: "dup".into(),
+                kind: TaskKind::Bash {
+                    command: "sleep 5".into(),
+                },
+                label: "sleep 5".into(),
+            },
+        );
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::TaskOutput {
+                agent_id: AgentId::Main,
+                task_id: 1,
+                call_id: "dup".into(),
+                partial: bash_task_details("TASK TAIL", Some(1)),
+            },
+        );
+
+        assert_eq!(s.task_cell(1), None, "no cell in Main's transcript");
+        let main_cell = only_tool(&s, AgentId::Main);
+        assert_eq!(main_cell.tool, "read_file");
+        assert_eq!(main_cell.task, None, "the unrelated cell keeps no badge");
+        match main_cell.details.as_ref().expect("details") {
+            ToolDetails::Text { body, .. } => assert_eq!(body, "file contents"),
+            other => panic!("expected text details, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_reapplied_task_start_does_not_resurrect_a_finished_task() {
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        let start = AgentEvent::TaskStart {
+            agent_id: AgentId::Main,
+            task_id: 1,
+            call_id: "c1".into(),
+            kind: TaskKind::Bash {
+                command: "sleep 5".into(),
+            },
+            label: "sleep 5".into(),
+        };
+        apply(&mut s, &mut life, start.clone());
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::TaskEnd {
+                agent_id: AgentId::Main,
+                task_id: 1,
+                call_id: "c1".into(),
+                status: TaskStatus::Exited(Some(0)),
+                label: "sleep 5".into(),
+            },
+        );
+        let (started_at, finished_at) = {
+            let info = s.tasks().get(&1).expect("tracked task");
+            (info.started_at, info.finished_at)
+        };
+
+        apply(&mut s, &mut life, start);
+
+        let info = s.tasks().get(&1).expect("tracked task");
+        assert_eq!(
+            info.status,
+            TaskStatus::Exited(Some(0)),
+            "a re-applied start must not un-finish the task",
+        );
+        assert_eq!(info.finished_at, finished_at, "nor unfreeze its runtime");
+        assert_eq!(info.started_at, started_at, "nor restart its clock");
+    }
+
+    #[test]
+    fn a_redelivered_agent_bracket_does_not_rewrite_a_terminal_sub_conclusion() {
+        // `AgentStart(Sub n)` re-opens a box for a continuation re-run,
+        // which is a `Done` box. Re-opening a failed one would let the
+        // paired `AgentEnd` conclude it `Done` and lose the failure.
+        for (conclusion, expected) in [
+            (SubAgentConclusion::Failed, SubAgentStatus::Failed),
+            (SubAgentConclusion::Truncated, SubAgentStatus::Truncated),
+        ] {
+            let mut s = state();
+            let mut life = AgentLifecycle::default();
+            apply(
+                &mut s,
+                &mut life,
+                sub_agent_start(1, "scripted", "scripted"),
+            );
+            apply(
+                &mut s,
+                &mut life,
+                AgentEvent::AgentStart {
+                    agent_id: AgentId::Sub(1),
+                },
+            );
+            apply(
+                &mut s,
+                &mut life,
+                AgentEvent::SubAgentEnd {
+                    parent: AgentId::Main,
+                    child: AgentId::Sub(1),
+                    report: "it broke".to_string(),
+                    conclusion,
+                },
+            );
+            apply(
+                &mut s,
+                &mut life,
+                AgentEvent::AgentEnd {
+                    agent_id: AgentId::Sub(1),
+                    messages: Vec::new(),
+                },
+            );
+            let before = canon(&s, &life);
+
+            apply(
+                &mut s,
+                &mut life,
+                AgentEvent::AgentStart {
+                    agent_id: AgentId::Sub(1),
+                },
+            );
+            apply(
+                &mut s,
+                &mut life,
+                AgentEvent::AgentEnd {
+                    agent_id: AgentId::Sub(1),
+                    messages: Vec::new(),
+                },
+            );
+
+            let b = s.sub_box_mut(1).expect("the box");
+            assert_eq!(b.status, expected, "a terminal conclusion is terminal");
+            assert_eq!(b.report.as_deref(), Some("it broke"));
+            assert!(b.finished_at.is_some(), "and stays frozen");
+            assert_eq!(
+                canon(&s, &life),
+                before,
+                "the re-delivered bracket changed state",
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_call_id_does_not_collapse_tool_cells() {
+        // The OpenAI adapter builds a `ToolCall` with an empty id and
+        // fills it only when the wire delta carries one. The index now
+        // outlives the turn, so keying on an empty id would make every
+        // id-less call in the session share one cell. The bracket of one
+        // such call still has to correlate, which it does through the
+        // cell that is still running.
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        for tool in ["bash", "read_file"] {
+            apply(&mut s, &mut life, tool_start(AgentId::Main, "", tool));
+            apply(
+                &mut s,
+                &mut life,
+                tool_end(
+                    AgentId::Main,
+                    "",
+                    tool,
+                    ToolDetails::Text {
+                        summary: tool.into(),
+                        body: format!("{tool} output"),
+                    },
+                ),
+            );
+        }
+
+        let cells: Vec<&ToolEntry> = entries(&s, AgentId::Main)
             .iter()
-            .map(|e| match &e.kind {
-                EntryKind::User(_) => "user",
-                EntryKind::Assistant(_) => "assistant",
-                EntryKind::Tool(_) => "tool",
-                EntryKind::TurnUsage(_) => "usage",
-                EntryKind::Notice(_) => "notice",
-                EntryKind::SubAgent(_) => "sub",
-                EntryKind::Compaction(_) => "compaction",
-                EntryKind::TaskNotification(_) => "notification",
+            .filter_map(|e| match &e.kind {
+                EntryKind::Tool(t) => Some(t),
+                _ => None,
             })
             .collect();
-        assert_eq!(
-            kinds,
-            vec!["user", "assistant", "usage", "tool", "assistant", "usage"],
+        assert_eq!(cells.len(), 2, "one cell per call");
+        assert_eq!(cells[0].tool, "bash");
+        assert_eq!(cells[1].tool, "read_file");
+        assert!(
+            s.render
+                .get(&AgentId::Main)
+                .is_none_or(|r| r.tool_index.is_empty()),
+            "an id with no identity is not indexed",
         );
+        assert_no_dangling(&s);
+    }
+
+    #[test]
+    fn a_reserved_compaction_checkpoint_updates_its_row() {
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        let entry = "e-checkpoint".to_string();
+        let _ = reduce(
+            &mut s,
+            &mut life,
+            compaction_end("the summary", 400),
+            Some(&entry),
+        );
+        let _ = reduce(
+            &mut s,
+            &mut life,
+            compaction_end("the summary, reprojected", 400),
+            Some(&entry),
+        );
+
+        let rows: Vec<&CompactionEntry> = entries(&s, AgentId::Main)
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntryKind::Compaction(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows.len(), 1, "one row per checkpoint entry");
+        assert_eq!(rows[0].summary, "the summary, reprojected");
+        assert_eq!(rows[0].entry.as_deref(), Some("e-checkpoint"));
+
+        // A compaction with no durable identity (nothing re-serves it)
+        // keeps appending.
+        let _ = reduce(&mut s, &mut life, compaction_end("local", 300), None);
+        let _ = reduce(&mut s, &mut life, compaction_end("local", 300), None);
+        assert_eq!(
+            count_kind(&s, AgentId::Main, |k| matches!(k, EntryKind::Compaction(_))),
+            3,
+        );
+    }
+
+    #[test]
+    fn a_reserved_settings_notice_updates_its_row() {
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        let entry = "e-model-change".to_string();
+        let notice = |text: &str| AgentEvent::Notice {
+            agent_id: AgentId::Main,
+            text: text.to_string(),
+        };
+        let _ = reduce(
+            &mut s,
+            &mut life,
+            notice("Model set to openai/gpt-5."),
+            Some(&entry),
+        );
+        // The re-served text stands in for a projection that renders the
+        // same entry differently: the row is rewritten, not just left
+        // undisturbed.
+        let _ = reduce(
+            &mut s,
+            &mut life,
+            notice("Model set to openai/gpt-5 (reprojected)."),
+            Some(&entry),
+        );
+        assert_eq!(
+            notices(&s, AgentId::Main),
+            vec![(
+                NoticeLevel::Info,
+                "Model set to openai/gpt-5 (reprojected).".to_string()
+            )],
+            "one row per settings entry, updated in place",
+        );
+
+        // A notice with no durable origin still appends: every locally
+        // raised one is a distinct line.
+        let _ = reduce(&mut s, &mut life, notice("Restored settings."), None);
+        let _ = reduce(&mut s, &mut life, notice("Restored settings."), None);
+        assert_eq!(notices(&s, AgentId::Main).len(), 3);
+    }
+
+    #[test]
+    fn a_reapplied_errored_assistant_end_does_not_duplicate_its_error_notice() {
+        // Two shapes: one that renders an assistant row (so the message is
+        // in `message_index`) and one that renders none, which is why the
+        // notice keys on the message rather than on its row.
+        for content in [Vec::new(), text_partial("partial answer").content] {
+            let mut s = state();
+            let mut life = AgentLifecycle::default();
+            let failed = |text: &str| {
+                let mut message = partial_with(content.clone());
+                message.stop_reason = StopReason::Error;
+                message.error = Some(AssistantError::new(ErrorCategory::InvalidRequest, text));
+                with_id(assistant_message_end(message), "m-failed")
+            };
+
+            apply(&mut s, &mut life, failed("boom"));
+            let once = canon(&s, &life);
+            apply(&mut s, &mut life, failed("boom"));
+            assert_eq!(canon(&s, &life), once, "the re-application drifted");
+
+            // A re-served error line is rewritten rather than duplicated.
+            apply(&mut s, &mut life, failed("boom, reprojected"));
+            assert_eq!(
+                notices(&s, AgentId::Main),
+                vec![(NoticeLevel::Error, "Error: boom, reprojected".to_string())],
+                "one notice per failed message (content blocks: {})",
+                content.len(),
+            );
+            assert_no_dangling(&s);
+        }
     }
 
     // ---- Quiesce (spec 6.5's re-attach reconciliation) ------------------
@@ -3436,11 +4190,18 @@ mod tests {
     }
 
     #[test]
-    fn quiesce_drops_a_running_tool_cell_and_reprojection_rebuilds_one_done_cell() {
+    fn quiesce_keeps_a_running_tool_cell_and_clears_only_its_partial_result() {
+        // A tool that has not finished has no log entry, so no backfill
+        // can regenerate its cell: dropping it would lose the call's
+        // arguments for good. Only the partial result the lossy
+        // `ToolExecutionUpdate` painted goes.
         let mut s = state();
         let mut life = AgentLifecycle::default();
-        let done_call = tool_start(AgentId::Main, "c-done", "bash");
-        apply(&mut s, &mut life, done_call);
+        apply(
+            &mut s,
+            &mut life,
+            tool_start(AgentId::Main, "c-done", "bash"),
+        );
         apply(
             &mut s,
             &mut life,
@@ -3451,8 +4212,26 @@ mod tests {
                 bash_task_details("finished", None),
             ),
         );
-        let start = tool_start(AgentId::Main, "c-running", "bash");
-        apply(&mut s, &mut life, start.clone());
+        apply(
+            &mut s,
+            &mut life,
+            tool_start_with_args(
+                AgentId::Main,
+                "c-running",
+                "bash",
+                serde_json::json!({"command": "sleep 5"}),
+            ),
+        );
+        apply(
+            &mut s,
+            &mut life,
+            tool_update(
+                AgentId::Main,
+                "c-running",
+                "bash",
+                bash_task_details("half way there\n", None),
+            ),
+        );
 
         s.quiesce(&mut life);
 
@@ -3463,18 +4242,27 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(cells.len(), 1, "the running cell is gone");
-        assert_eq!(cells[0].call_id, "c-done", "the concluded cell stays");
+        assert_eq!(cells.len(), 2, "both cells survive");
+        assert_eq!(cells[1].call_id, "c-running");
+        assert_eq!(cells[1].status, ToolStatus::Running);
+        assert_eq!(
+            cells[1].args,
+            serde_json::json!({"command": "sleep 5"}),
+            "the running call keeps its arguments",
+        );
+        assert!(
+            cells[1].details.is_none(),
+            "and loses the partial result a snapshot painted",
+        );
         let render = s.render.get(&AgentId::Main).expect("main render");
         assert!(
-            !render.tool_index.contains_key("c-running"),
-            "the dropped cell's index entry goes with it",
+            render.tool_index.contains_key("c-running"),
+            "the surviving cell keeps its index entry",
         );
         assert!(render.tool_index.contains_key("c-done"));
         assert_no_dangling(&s);
 
-        // The suffix regenerates the call that concluded in the gap.
-        apply(&mut s, &mut life, start);
+        // The call concludes live, into the cell that was kept.
         apply(
             &mut s,
             &mut life,
@@ -3492,12 +4280,13 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            rebuilt.len(),
-            1,
-            "exactly one cell for the re-projected call"
-        );
+        assert_eq!(rebuilt.len(), 1, "exactly one cell for the call");
         assert_eq!(rebuilt[0].status, ToolStatus::Done { is_error: false });
+        assert_eq!(
+            rebuilt[0].args,
+            serde_json::json!({"command": "sleep 5"}),
+            "still with its arguments",
+        );
         assert_no_dangling(&s);
     }
 
@@ -3541,6 +4330,51 @@ mod tests {
             "quiesce does not touch the running set",
         );
         assert_no_dangling(&s);
+    }
+
+    #[test]
+    fn quiesce_keeps_the_last_finalized_assistant_anchor() {
+        // The anchor is what the trailing `UsageUpdate` of a re-served
+        // entry keys its row on, and the cursor invariant drops that
+        // entry's own durable frame, so clearing the anchor here would
+        // grow a second usage row on every re-attach.
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        let message = with_id(assistant_message_end(text_partial("answer")), "m-answer");
+        apply(&mut s, &mut life, message);
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::UsageUpdate {
+                agent_id: AgentId::Main,
+                usage: token_usage([100, 10, 0, 0]),
+            },
+        );
+
+        s.quiesce(&mut life);
+
+        assert_eq!(
+            s.render
+                .get(&AgentId::Main)
+                .and_then(|r| r.last_finalized_assistant.as_deref()),
+            Some("m-answer"),
+            "quiesce keeps durable identity",
+        );
+        // The suffix re-serves that entry. Its durable frame is dropped as
+        // a duplicate, so the trailing usage update is all that lands, and
+        // the anchor is the only thing that can route it to its row.
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::UsageUpdate {
+                agent_id: AgentId::Main,
+                usage: token_usage([200, 20, 0, 0]),
+            },
+        );
+        let rows = usage_rows(&s, AgentId::Main);
+        assert_eq!(rows.len(), 1, "one usage row for one message");
+        assert_eq!(rows[0].after_message_id.as_deref(), Some("m-answer"));
+        assert_eq!(rows[0].usage.turn_input, 200);
     }
 
     #[test]
@@ -3588,9 +4422,9 @@ mod tests {
     fn quiesce_leaves_no_dangling_entry_ids() {
         let mut s = state();
         let mut life = AgentLifecycle::default();
-        // A sub-agent box and a finalized message, both of which survive,
-        // plus a running bash cell that a background task points at from
-        // two directions.
+        // A sub-agent box, a finalized message, and a running bash cell a
+        // background task routes through: every index that names an entry
+        // has to still resolve afterwards.
         apply(
             &mut s,
             &mut life,
@@ -3615,38 +4449,69 @@ mod tests {
                 label: "sleep 5".into(),
             },
         );
-        let cell = s
-            .render
-            .get(&AgentId::Main)
-            .and_then(|r| r.tool_index.get("c-bash").copied())
-            .expect("the launch cell");
-        assert_eq!(s.tasks().get(&1).and_then(|i| i.cell), Some(cell));
-        // The live event order never files a pending linkage for a cell
-        // that is still running (the linkage is recorded by the tool's
-        // end, which also concludes the cell), so it is filed directly
-        // here: quiesce has to hold for any index that can name a cell
-        // it drops.
-        s.pending_task_cells.insert("c-bash".to_string(), cell);
+        // A second turn is mid-stream when the connection drops, so
+        // quiesce has an entry to actually drop.
+        apply(
+            &mut s,
+            &mut life,
+            message_update(AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: "half".into(),
+                partial: text_partial("half"),
+            }),
+        );
+        let cell = s.task_cell(1).expect("the launch cell");
 
         s.quiesce(&mut life);
 
-        assert!(
-            s.transcript(AgentId::Main)
-                .and_then(|t| t.get(cell))
-                .is_none(),
-            "the running cell is gone",
-        );
-        assert!(
-            !s.pending_task_cells.contains_key("c-bash"),
-            "the launch linkage for a dropped cell is dropped too",
-        );
         assert_eq!(
-            s.tasks().get(&1).and_then(|i| i.cell),
-            None,
-            "the task's cell snapshot is cleared",
+            s.task_cell(1),
+            Some(cell),
+            "the running launch cell, and the task's route to it, survive",
         );
-        assert_eq!(s.task_cell(1), None, "so the task resolves no cell at all");
         assert_no_dangling(&s);
+    }
+
+    /// The dangling check is only worth running if it can fail. Nothing
+    /// the reducer does produces a dangling id (which is why quiesce needs
+    /// no index pruning), so the state is built by hand: an unfinalized
+    /// assistant entry recorded in `message_index`, which quiesce then
+    /// drops.
+    #[test]
+    fn the_dangling_check_fires_on_a_stale_index_entry() {
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        apply(
+            &mut s,
+            &mut life,
+            message_update(AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: "half".into(),
+                partial: text_partial("half"),
+            }),
+        );
+        let streaming = s
+            .render
+            .get(&AgentId::Main)
+            .and_then(|r| r.current_assistant)
+            .expect("the streaming entry");
+        s.render
+            .entry(AgentId::Main)
+            .or_default()
+            .message_index
+            .insert("m-never-finalized".to_string(), streaming);
+        assert!(
+            dangling_entry_ids(&s).is_empty(),
+            "the index resolves before the entry goes"
+        );
+
+        s.quiesce(&mut life);
+
+        assert_eq!(
+            dangling_entry_ids(&s),
+            vec!["message_index[m-never-finalized] for Main dangles".to_string()],
+            "the checker names the stale index entry",
+        );
     }
 
     // ---- The canonical form itself --------------------------------------
@@ -3678,7 +4543,7 @@ mod tests {
             let mut s = state();
             let mut life = AgentLifecycle::default();
             for event in events {
-                let _ = reduce(&mut s, &mut life, event);
+                let _ = reduce(&mut s, &mut life, event, None);
             }
             (s, life)
         };
@@ -3703,6 +4568,32 @@ mod tests {
         second.set_active_view(AgentId::Sub(1));
 
         assert_eq!(canon(&first, &first_life), canon(&second, &second_life));
+    }
+
+    #[test]
+    fn canonical_form_separates_states_that_differ_only_in_hidden_settings() {
+        // The footer's model line renders model id plus thinking, so a
+        // difference in provider, speed or verbosity would be invisible to
+        // an oracle built on that string. Spec 6.3's `state` frame carries
+        // all four, and settings visibility for a mid-session joiner is a
+        // named sharp edge (spec 11), so the oracle carries the snapshot.
+        let life = AgentLifecycle::default();
+        let reference = canon(&state(), &life);
+        let mutations: [fn(&mut AgentSettings); 3] = [
+            |s| s.provider = "openai".into(),
+            |s| s.speed = "fast".into(),
+            |s| s.verbosity = "high".into(),
+        ];
+        for mutate in mutations {
+            let mut settings = main_settings();
+            mutate(&mut settings);
+            let variant = ChatState::new(settings.clone(), 200_000, Arc::new(Vec::new()));
+            assert_ne!(
+                canon(&variant, &life),
+                reference,
+                "{settings:?} reads as the same state",
+            );
+        }
     }
 
     #[test]

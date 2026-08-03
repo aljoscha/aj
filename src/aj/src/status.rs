@@ -307,6 +307,7 @@ mod tests {
                     reason: CompactionReason::Manual,
                     phase,
                 },
+                None,
             );
             let r = rows(&line);
             assert!(r[0].ends_with(label), "{phase:?}: {r:?}");
@@ -326,6 +327,7 @@ mod tests {
                 summary: Some("s".into()),
                 error: None,
             },
+            None,
         );
         line.borrow_mut().status.borrow_mut().compacting = false;
         line.borrow_mut().status.borrow_mut().running = true;

@@ -816,7 +816,6 @@ mod tests {
                 status,
                 started_at: Instant::now(),
                 finished_at: None,
-                cell: None,
             },
         );
         map
@@ -1772,6 +1771,7 @@ mod tests {
                 tool: "bash".into(),
                 args: serde_json::json!({"command": "echo hi"}),
             },
+            None,
         );
         let _ = reduce(
             &mut chat,
@@ -1784,6 +1784,7 @@ mod tests {
                 content: Vec::new().into(),
                 is_error: false,
             },
+            None,
         );
         let chat = Rc::new(RefCell::new(chat));
         let theme = Theme::bundled_dark_with_mode(ColorMode::Truecolor);

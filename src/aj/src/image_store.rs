@@ -137,6 +137,7 @@ mod tests {
                 t.append(EntryKind::Notice(NoticeEntry {
                     level: NoticeLevel::Info,
                     text: format!("notice {i}"),
+                    entry: None,
                 }))
             })
             .collect()

@@ -529,7 +529,7 @@ mod tests {
             },
         ];
         for event in events {
-            let _ = reduce(chat, life, event);
+            let _ = reduce(chat, life, event, None);
         }
     }
 
@@ -549,7 +549,7 @@ mod tests {
             },
         ];
         for event in events {
-            let _ = reduce(chat, life, event);
+            let _ = reduce(chat, life, event, None);
         }
     }
 
@@ -569,7 +569,7 @@ mod tests {
                 messages: Vec::new(),
             },
         ] {
-            let _ = reduce(chat, life, event);
+            let _ = reduce(chat, life, event, None);
         }
     }
 
@@ -733,6 +733,7 @@ mod tests {
                 report: report.into(),
                 conclusion: aj_agent::events::SubAgentConclusion::Completed,
             },
+            None,
         );
         let _ = reduce(
             &mut chat,
@@ -741,6 +742,7 @@ mod tests {
                 agent_id: AgentId::Sub(0),
                 messages: Vec::new(),
             },
+            None,
         );
         let r = rows(&draw_box(&chat, 40));
         let alpha = r.iter().position(|l| l.contains("ALPHA")).expect("ALPHA");
@@ -773,6 +775,7 @@ mod tests {
                 report,
                 conclusion: aj_agent::events::SubAgentConclusion::Completed,
             },
+            None,
         );
         let _ = reduce(
             &mut chat,
@@ -781,6 +784,7 @@ mod tests {
                 agent_id: AgentId::Sub(0),
                 messages: Vec::new(),
             },
+            None,
         );
 
         // Collapsed: the first REPORT_COLLAPSED_LINES lines plus a fold hint,
@@ -989,6 +993,7 @@ mod tests {
                     report: "outcome text".into(),
                     conclusion,
                 },
+                None,
             );
             let r = rows(&draw_box(&chat, 60));
             assert!(
@@ -1026,6 +1031,7 @@ mod tests {
                     verbosity: "default".into(),
                 },
             },
+            None,
         );
         let width = 40;
         let surface = draw_box(&chat, width);

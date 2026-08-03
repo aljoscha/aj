@@ -318,8 +318,13 @@ mod tests {
             let bash = |cmd: &str| TaskKind::Bash {
                 command: cmd.into(),
             };
-            let _ = reduce(&mut c, &mut life, start(1, bash("sleep 5"), "sleep 5"));
-            let _ = reduce(&mut c, &mut life, start(2, bash("make"), "make"));
+            let _ = reduce(
+                &mut c,
+                &mut life,
+                start(1, bash("sleep 5"), "sleep 5"),
+                None,
+            );
+            let _ = reduce(&mut c, &mut life, start(2, bash("make"), "make"), None);
             let _ = reduce(
                 &mut c,
                 &mut life,
@@ -331,6 +336,7 @@ mod tests {
                     },
                     "sub task",
                 ),
+                None,
             );
             // Task 2 finished: it drops out of the running count.
             let _ = reduce(
@@ -343,6 +349,7 @@ mod tests {
                     status: TaskStatus::Exited(Some(0)),
                     label: "make".into(),
                 },
+                None,
             );
         }
         let mut f = footer(

@@ -799,6 +799,7 @@ mod tests {
                 agent_id: AgentId::Main,
                 text: text.to_string(),
             },
+            None,
         );
     }
 
@@ -811,6 +812,7 @@ mod tests {
                 agent_id: AgentId::Main,
                 text: text.to_string(),
             },
+            None,
         );
     }
 
@@ -823,6 +825,7 @@ mod tests {
                 agent_id: AgentId::Main,
                 text: text.to_string(),
             },
+            None,
         );
     }
 
