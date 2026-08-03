@@ -8094,6 +8094,7 @@ mod tests {
 
         let (task_id, _cancel) = world.core.task_registry.register(
             AgentId::Main,
+            "test-call".to_string(),
             aj_agent::tool::TaskKind::Agent {
                 agent_id: 1,
                 task: "explore".to_string(),
@@ -10871,6 +10872,7 @@ mod tests {
     fn register_bash_task(world: &World, command: &str) -> aj_agent::tool::TaskId {
         let (id, _cancel) = world.core.task_registry.register(
             AgentId::Main,
+            "test-call".to_string(),
             aj_agent::tool::TaskKind::Bash {
                 command: command.to_string(),
             },

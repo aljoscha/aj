@@ -1143,6 +1143,7 @@ mod turns_tests {
     fn register_agent_task(registry: &TaskRegistry, n: usize) -> usize {
         let (id, _cancel) = registry.register(
             AgentId::Main,
+            "test-call".to_string(),
             TaskKind::Agent {
                 agent_id: n,
                 task: "explore".to_string(),

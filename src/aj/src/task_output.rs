@@ -465,6 +465,7 @@ mod tests {
         let registry = TaskRegistry::default();
         let (id, _cancel) = registry.register(
             AgentId::Main,
+            "test-call".to_string(),
             TaskKind::Bash {
                 command: "echo hi".to_string(),
             },

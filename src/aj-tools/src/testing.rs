@@ -117,9 +117,13 @@ impl ToolContext for DummyToolContext {
         label: String,
         output: Arc<dyn TaskOutputSource>,
     ) -> StartedTask {
-        let (id, cancel) = self
-            .task_registry
-            .register(self.agent_id, kind, label.clone(), output);
+        let (id, cancel) = self.task_registry.register(
+            self.agent_id,
+            "dummy-call".to_string(),
+            kind,
+            label.clone(),
+            output,
+        );
         let events = TaskEventSink::new(
             self.bus.clone(),
             self.task_registry.clone(),

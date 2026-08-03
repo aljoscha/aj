@@ -693,6 +693,7 @@ mod tests {
         });
         registry.register(
             owner,
+            "test-call".to_string(),
             TaskKind::Agent {
                 agent_id: 7,
                 task: "sibling work".to_string(),
@@ -876,6 +877,7 @@ mod tests {
             Arc::<StubAgentOutput>::clone(&output);
         let (id, _cancel) = registry.register(
             AgentId::Main,
+            "test-call".to_string(),
             TaskKind::Agent {
                 agent_id: 2,
                 task: "investigate".to_string(),
@@ -1039,6 +1041,7 @@ mod production_identity_tests {
         // takes #2, so the scripted calls can name both up front.
         let (main_task, _cancel) = registry.register(
             AgentId::Main,
+            "test-call".to_string(),
             TaskKind::Bash {
                 command: "sleep 30".to_string(),
             },

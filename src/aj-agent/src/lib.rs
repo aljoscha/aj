@@ -2112,6 +2112,11 @@ impl SubAgentRegistry {
 /// One live background task tracked by the [`TaskRegistry`].
 struct TaskEntry {
     owner: AgentId,
+    /// The tool call that launched the task. Recorded here, not just on
+    /// the `TaskStart` event, because a client that rebuilds its task
+    /// table from a registry snapshot has no other way to route the
+    /// task's output back to the cell that launched it.
+    call_id: String,
     kind: TaskKind,
     label: String,
     status: TaskStatus,
@@ -2136,6 +2141,9 @@ pub struct TaskSummary {
     pub id: TaskId,
     /// Agent that owns the task and receives its notices.
     pub owner: AgentId,
+    /// Tool call that launched the task, which is how its output finds
+    /// the cell that started it.
+    pub call_id: String,
     /// What kind of work the task runs.
     pub kind: TaskKind,
     /// Display label (command / task description).
@@ -2195,6 +2203,7 @@ impl TaskRegistry {
     pub fn register(
         &self,
         owner: AgentId,
+        call_id: String,
         kind: TaskKind,
         label: String,
         output: Arc<dyn TaskOutputSource>,
@@ -2207,6 +2216,7 @@ impl TaskRegistry {
             id,
             TaskEntry {
                 owner,
+                call_id,
                 kind,
                 label,
                 status: TaskStatus::Running,
@@ -2328,6 +2338,7 @@ impl TaskRegistry {
         inner.entries.get(&id).map(|entry| TaskSummary {
             id,
             owner: entry.owner,
+            call_id: entry.call_id.clone(),
             kind: entry.kind.clone(),
             label: entry.label.clone(),
             status: entry.status,
@@ -2365,6 +2376,7 @@ impl TaskRegistry {
             .map(|(id, entry)| TaskSummary {
                 id: *id,
                 owner: entry.owner,
+                call_id: entry.call_id.clone(),
                 kind: entry.kind.clone(),
                 label: entry.label.clone(),
                 status: entry.status,
@@ -2612,6 +2624,7 @@ mod task_registry_tests {
     ) -> (usize, CancellationToken) {
         registry.register(
             owner,
+            "test-call".to_string(),
             TaskKind::Bash {
                 command: command.to_string(),
             },
@@ -2681,6 +2694,7 @@ mod task_registry_tests {
 
         let (id, _) = registry.register(
             AgentId::Main,
+            "test-call".to_string(),
             TaskKind::Agent {
                 agent_id: 7,
                 task: "research".to_string(),
@@ -3210,9 +3224,9 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
         // tools authorize against are one expression and cannot drift
         // apart.
         let owner = self.agent_id();
-        let (id, cancel) = self
-            .task_registry
-            .register(owner, kind, label.clone(), output);
+        let (id, cancel) =
+            self.task_registry
+                .register(owner, self.call_id.clone(), kind, label.clone(), output);
         let events = TaskEventSink::new(
             self.parent_bus.clone(),
             self.task_registry.clone(),
