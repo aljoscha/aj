@@ -140,6 +140,13 @@ pub struct TaggedEvent {
 #[derive(Debug, Clone)]
 pub struct Backfill {
     pub events: Vec<TaggedEvent>,
+    /// Every sub-agent run the walk saw on the projected path, whether its
+    /// bracket was closed or left open.
+    ///
+    /// A caller concluding the runs a backfill left unconcluded needs this
+    /// rather than the log's full sub-agent set: the latter spans abandoned
+    /// branches, whose runs the projection never mentions.
+    pub subs: BTreeSet<usize>,
     /// The runs whose bracket the projection left open, which is exactly
     /// the `live_subs` it saw (see [`project_suffix`]). Their real
     /// `SubAgentEnd` is still coming live, so concluding them is the
@@ -183,6 +190,7 @@ pub fn project_suffix(
     let events: Vec<TaggedEvent> = walk.by_ref().collect();
     Backfill {
         events,
+        subs: walk.seen_subs(),
         open_subs: walk.open_subs(),
     }
 }
@@ -352,6 +360,11 @@ impl<'a> Replay<'a> {
     /// walk is exhausted.
     fn open_subs(&self) -> BTreeSet<usize> {
         self.state.open_runs.keys().copied().collect()
+    }
+
+    /// Every sub-agent run the walk entered, valid once it is exhausted.
+    fn seen_subs(&self) -> BTreeSet<usize> {
+        self.state.seen_subs.clone()
     }
 }
 
@@ -548,6 +561,10 @@ struct ReplayState {
     /// The sub-agent runs currently open, by `Sub(n)` index. Ordered so
     /// that closing several at once is deterministic.
     open_runs: BTreeMap<usize, OpenRun>,
+    /// Every run the walk has entered, whether still open or already
+    /// closed. Only the projected path contributes, which is what a caller
+    /// concluding unconcluded runs needs (see [`Backfill::subs`]).
+    seen_subs: BTreeSet<usize>,
     /// Agents for which at least one `Message` entry has been
     /// projected. Settings entries emit a [`AgentEvent::Notice`]
     /// only for agents present here; seed entries (before any
@@ -659,6 +676,7 @@ impl ReplayState {
         let Some(n) = current_sub else {
             return;
         };
+        self.seen_subs.insert(n);
         if self.open_runs.entry(n).or_default().start.is_some() {
             // The run may have opened on an entry this walk dropped, in
             // which case its start has to be re-synthesized here so the
@@ -4256,6 +4274,92 @@ mod tests {
             }
             other => panic!("expected a re-synthesized SubAgentStart, got {other:?}"),
         }
+        assert_eq!(backfill.open_subs, live([1]));
+    }
+
+    /// The runs a backfill reports are the ones it walked, so a caller
+    /// concluding what the projection left open never touches an abandoned
+    /// branch's sub-agent.
+    #[test]
+    fn a_backfill_reports_only_the_runs_on_the_projected_path() {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir);
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("sp");
+        let common = {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(user_msg("common")).expect("common").id
+        };
+
+        // The active branch delegates to sub 1.
+        let active = {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "active".into(),
+                text_signature: None,
+            })]))
+            .expect("active")
+            .id
+        };
+        let spawn_active = log
+            .append_subagent_spawn(
+                1,
+                active.clone(),
+                "active task",
+                false,
+                &fallback_settings(),
+            )
+            .expect("spawn 1")
+            .id;
+        {
+            let mut view = ConversationView::subagent(&mut log, spawn_active, 1);
+            view.add_message(user_msg("active prompt")).expect("sub u");
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "active report".into(),
+                text_signature: None,
+            })]))
+            .expect("sub a");
+        }
+
+        // An abandoned sibling delegates to sub 2.
+        log.set_head(common).expect("rewind to the branch point");
+        let abandoned = {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "abandoned".into(),
+                text_signature: None,
+            })]))
+            .expect("abandoned")
+            .id
+        };
+        let spawn_abandoned = log
+            .append_subagent_spawn(2, abandoned, "abandoned task", false, &fallback_settings())
+            .expect("spawn 2")
+            .id;
+        {
+            let mut view = ConversationView::subagent(&mut log, spawn_abandoned, 2);
+            view.add_message(user_msg("abandoned prompt"))
+                .expect("sub u");
+        }
+        log.set_head(active).expect("head back on the active path");
+
+        let snapshot = log.snapshot();
+        assert_eq!(
+            snapshot.sub_agent_ids(),
+            live([1, 2]),
+            "the log names both runs, on either branch",
+        );
+        let backfill = project_suffix(&snapshot, None, &BTreeSet::new());
+        assert_eq!(
+            backfill.subs,
+            live([1]),
+            "only the run anchored on the projected path is reported",
+        );
+        assert!(backfill.open_subs.is_empty(), "no run was said to be live");
+
+        // A live run is reported too, and stays open.
+        let backfill = project_suffix(&snapshot, None, &live([1]));
+        assert_eq!(backfill.subs, live([1]));
         assert_eq!(backfill.open_subs, live([1]));
     }
 

@@ -621,6 +621,15 @@ impl LogSnapshot {
         u64::try_from(self.order.len()).expect("log length fits u64")
     }
 
+    /// Whether `id` names an entry of this log, on any thread or branch.
+    ///
+    /// A caller that distinguishes "no such entry" from "that entry cannot
+    /// be a head" needs this: [`ConversationLog::set_head`] refuses both
+    /// with the same error.
+    pub fn contains(&self, id: &EntryId) -> bool {
+        self.entries.contains_key(id)
+    }
+
     /// The largest `agent_id` recorded on any entry in the log, or `None`
     /// if no subagent entries exist. Used on resume to seed the session's
     /// subagent counter so freshly-spawned subagents don't reuse ids from
@@ -1265,6 +1274,11 @@ impl ConversationLog {
     /// See [`LogSnapshot::last_seq`].
     pub fn last_seq(&self) -> u64 {
         self.core.last_seq()
+    }
+
+    /// See [`LogSnapshot::contains`].
+    pub fn contains(&self, id: &EntryId) -> bool {
+        self.core.contains(id)
     }
 
     pub fn is_empty(&self) -> bool {

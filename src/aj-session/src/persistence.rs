@@ -96,6 +96,7 @@ impl ConversationPersistence {
                 modified: modified_str,
                 modified_at,
                 size_display,
+                size_bytes: file_size,
             });
         }
 
@@ -130,6 +131,45 @@ impl ConversationPersistence {
     pub fn get_latest_session_id(&self) -> Result<Option<String>, ConversationError> {
         let sessions = self.list_sessions()?;
         Ok(sessions.first().map(|t| t.session_id.clone()))
+    }
+
+    /// The durable high-water mark a resume of `session_id` would report,
+    /// read off the file rather than by building the log.
+    ///
+    /// This is what `last_seq` means for a session that is not live (spec
+    /// 6.8). It mirrors [`crate::ConversationLog::resume`]'s tolerance:
+    /// blank lines do not count and a malformed line (which for a resume
+    /// is the torn tail it truncates) is skipped. Each line's JSON is
+    /// validated but not decoded into an entry, which keeps this cheap on
+    /// a large log. A missing file counts zero, since a session that has
+    /// not punctuated yet has nothing durable.
+    ///
+    /// The one place it can disagree with a resume: a duplicated entry id,
+    /// which a resume adopts once and this counts twice. Only a
+    /// hand-edited log has one.
+    pub fn stored_last_seq(&self, session_id: &str) -> Result<u64, ConversationError> {
+        let path = self.session_path(session_id);
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(err) => return Err(err.into()),
+        };
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        let mut entries = 0;
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 {
+                return Ok(entries);
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if serde_json::from_str::<serde::de::IgnoredAny>(trimmed).is_ok() {
+                entries += 1;
+            }
+        }
     }
 
     /// List sessions with rich per-session previews — first user
@@ -289,6 +329,11 @@ pub struct SessionMetadata {
     /// compare it themselves.
     pub modified_at: DateTime<Utc>,
     pub size_display: String,
+    /// File size in bytes. Paired with `modified_at` it fingerprints the
+    /// file, which is what lets a caller cache anything it derived from
+    /// the file's contents (see
+    /// [`ConversationPersistence::stored_last_seq`]).
+    pub size_bytes: u64,
 }
 
 /// Richer per-session snapshot used by the interactive session
@@ -572,6 +617,48 @@ mod tests {
         assert_eq!(p.message_count, 3);
         assert_eq!(p.first_user_message.as_deref(), Some("hello world"));
         assert!(p.size_bytes > 0);
+    }
+
+    /// `stored_last_seq` is the count of entries a resume would adopt, read
+    /// off the file: the same number the resumed log reports, and it
+    /// tolerates the torn tail a resume truncates.
+    #[test]
+    fn stored_last_seq_matches_what_a_resume_reports() {
+        let (_dir, persistence) = fixture();
+        let mut log = ConversationLog::create(&persistence).expect("create");
+        log.set_system_prompt("p".into()).expect("system prompt");
+        append_user_then_assistant(&mut log, "hello", "hi");
+        let session_id = log.session_id().to_string();
+        let live_last_seq = log.last_seq();
+        drop(log);
+
+        assert_eq!(
+            persistence.stored_last_seq(&session_id).expect("count"),
+            live_last_seq,
+        );
+        assert_eq!(
+            persistence
+                .stored_last_seq("no-such-session")
+                .expect("count"),
+            0,
+            "a session with nothing on disk has nothing durable",
+        );
+
+        // A torn trailing line is what a resume truncates, so it counts for
+        // neither of them.
+        let path = persistence.session_path(&session_id);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("reopen the log");
+        std::io::Write::write_all(&mut file, b"{\"id\":\"torn\"").expect("append a torn line");
+        drop(file);
+        assert_eq!(
+            persistence.stored_last_seq(&session_id).expect("count"),
+            live_last_seq,
+        );
+        let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume");
+        assert_eq!(resumed.last_seq(), live_last_seq);
     }
 
     #[test]

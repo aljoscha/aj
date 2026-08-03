@@ -122,6 +122,12 @@ pub fn persistence_listener(log: Arc<TokioMutex<ConversationLog>>) -> Listener {
 /// or absent consumer can never stall or fail a turn even though the bus
 /// awaits this listener inline. That inline position is what gives the
 /// sink its guarantee: an event it receives is already on disk.
+///
+/// **`sink` must be an unbounded channel.** The send above happens while
+/// this listener holds the log, so a bounded channel would put a blocking
+/// send under the log lock and stall every append in the session (spec
+/// 6.9). Flow control belongs on the per-client queues downstream of the
+/// consumer, never here.
 pub fn persisting_forwarder(
     log: Arc<TokioMutex<ConversationLog>>,
     handoff: AppendHandoff,
