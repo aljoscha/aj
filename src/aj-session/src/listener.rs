@@ -98,7 +98,11 @@ pub fn persistence_listener(log: Arc<TokioMutex<ConversationLog>>) -> Listener {
         let log = Arc::clone(&log);
         let event = event.clone();
         Box::pin(async move {
-            persist(&log, &event).await?;
+            // Only the arms that write take the lock, so the streaming
+            // events (by far the most frequent) never contend for it.
+            if appends(&event) {
+                persist(&mut *log.lock().await, &event)?;
+            }
             Ok(())
         })
     })
@@ -129,31 +133,47 @@ pub fn persisting_forwarder(
         let sink = sink.clone();
         let event = event.clone();
         Box::pin(async move {
-            let entry = match persist(&log, &event).await? {
-                Some(entry) => Some(entry),
-                // NOTE: taking the handoff must not take the log lock:
-                // the compaction run emits `CompactionEnd` while holding
-                // it (see [`AppendHandoff`]).
-                None => match &event {
+            if appends(&event) {
+                // The send happens under the guard that did the append, so
+                // the sink's order is the log's order. If we released the
+                // lock first, another append could commit and forward a
+                // higher position while this event was still in flight, and
+                // the seqs a consumer sees would stop being monotone.
+                let mut guard = log.lock().await;
+                let entry = persist(&mut guard, &event)?;
+                let _ = sink.send(TaggedEvent { entry, event });
+            } else {
+                // NOTE: this branch must not take the log lock. The
+                // compaction run emits `CompactionEnd` while holding it
+                // (see [`AppendHandoff`]), so locking here would deadlock
+                // against the very append the event belongs to. That same
+                // emit-under-the-guard is what keeps `CompactionEnd`
+                // ordered without a lock of our own.
+                let entry = match &event {
                     AgentEvent::CompactionEnd { .. } => handoff.take(),
                     _ => None,
-                },
-            };
-            let _ = sink.send(TaggedEvent { entry, event });
+                };
+                let _ = sink.send(TaggedEvent { entry, event });
+            }
             Ok(())
         })
     })
 }
 
+/// Whether [`persist`] writes an entry for `event`, which is what decides
+/// whether the log lock is taken at all. Kept next to `persist` so the two
+/// cannot disagree: a mismatch either misses an append or takes the lock
+/// for every streaming update.
+fn appends(event: &AgentEvent) -> bool {
+    matches!(
+        event,
+        AgentEvent::SubAgentStart { .. } | AgentEvent::MessageEnd { .. }
+    )
+}
+
 /// Write whatever `event` persists and return the appended entry, or
-/// `None` for an event that persists nothing. Takes the log lock only in
-/// the arms that write, so the streaming events (by far the most
-/// frequent) never contend for it, and `CompactionEnd` never takes it at
-/// all (see [`AppendHandoff`]).
-async fn persist(
-    log: &TokioMutex<ConversationLog>,
-    event: &AgentEvent,
-) -> Result<Option<EntryRef>, BoxError> {
+/// `None` for an event that persists nothing.
+fn persist(log: &mut ConversationLog, event: &AgentEvent) -> Result<Option<EntryRef>, BoxError> {
     match event {
         AgentEvent::SubAgentStart {
             parent,
@@ -165,28 +185,21 @@ async fn persist(
             let AgentId::Sub(child_n) = child else {
                 return Err(format!("SubAgentStart with non-Sub child {child:?}").into());
             };
-            let mut log_guard = log.lock().await;
             // Anchor the spawn root at the main thread's current
             // head. A sub-agent cannot spawn a sub-agent (the
             // `agent` tool is removed from its toolset), so the
             // parent is always the main thread.
-            let parent_head = log_guard.head().cloned().ok_or_else(|| {
+            let parent_head = log.head().cloned().ok_or_else(|| {
                 BoxError::from(format!(
                     "SubAgentStart: parent {parent:?} thread has no head entry to anchor child {child:?} at"
                 ))
             })?;
-            let appended = log_guard.append_subagent_spawn(
-                *child_n,
-                parent_head,
-                task,
-                *background,
-                settings,
-            )?;
+            let appended =
+                log.append_subagent_spawn(*child_n, parent_head, task, *background, settings)?;
             Ok(Some(appended))
         }
         AgentEvent::MessageEnd { agent_id, message } => {
-            let mut log_guard = log.lock().await;
-            let appended = persist_message(&mut log_guard, *agent_id, message.clone())?;
+            let appended = persist_message(log, *agent_id, message.clone())?;
             Ok(Some(appended))
         }
         _ => Ok(None),
