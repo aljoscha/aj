@@ -107,6 +107,11 @@ pub(crate) fn joined_user_text(content: &[UserContent]) -> String {
 /// An assistant message, streamed or replayed.
 #[derive(Debug)]
 pub struct AssistantEntry {
+    /// Id of the originating assistant `AgentMessage` / log entry, the
+    /// durable identity a re-applied `MessageEnd` updates in place.
+    /// Empty while the entry is still streaming: only `MessageEnd`
+    /// carries the id the log adopts.
+    pub message_id: String,
     /// The latest `AssistantMessage` snapshot. `MessageUpdate` carries
     /// a cumulative `partial: AssistantMessage`, so the reducer stores
     /// the snapshot rather than replaying deltas. On `MessageEnd` this
@@ -235,6 +240,13 @@ pub struct TurnUsageEntry {
     /// The emitting agent, for the sub-agent line prefix.
     pub agent_id: AgentId,
     pub usage: TokenUsage,
+    /// The assistant message this row reports on: its durable identity.
+    /// Both the live agent and the log projection emit `UsageUpdate`
+    /// directly after that message's `MessageEnd`, so the row belongs to
+    /// it and a re-applied update overwrites the row instead of adding
+    /// one. `None` for an update that followed no identified message,
+    /// which stays append-only.
+    pub after_message_id: Option<String>,
 }
 
 impl TurnUsageEntry {
@@ -315,6 +327,11 @@ impl Transcript {
 
 /// Per-agent streaming bookkeeping. One per agent, so streaming events
 /// route to the right entry inside that agent's own transcript.
+///
+/// The two indexes are the agent's durable-identity maps: they outlive
+/// a turn so a re-applied event finds the entry it already produced
+/// instead of appending a second one. Streaming state
+/// ([`Self::current_assistant`]) is per-turn and cleared on `AgentEnd`.
 #[derive(Debug, Default)]
 pub struct AgentRender {
     /// The in-flight assistant entry for this agent, or `None` between
@@ -323,6 +340,12 @@ pub struct AgentRender {
     /// `tool_use_id` -> the tool entry it maps to, in this agent's
     /// transcript.
     pub(crate) tool_index: HashMap<String, EntryId>,
+    /// Durable message id -> the entry it produced, covering user,
+    /// finalized assistant and task-notification rows.
+    pub(crate) message_index: HashMap<String, EntryId>,
+    /// Durable id of the last finalized assistant message, which is the
+    /// message a following `UsageUpdate` reports on.
+    pub(crate) last_finalized_assistant: Option<String>,
 }
 
 /// One background task tracked from `TaskStart` / `TaskEnd`. Drives a
@@ -347,11 +370,11 @@ pub struct TaskInfo {
     /// runtime.
     pub finished_at: Option<Instant>,
     /// The launch cell in the owner's transcript, snapshotted at
-    /// `TaskStart`. The owner's `tool_index` is cleared on its
-    /// `AgentEnd`, but a background task outlives the turn, and this
-    /// snapshot is what keeps `TaskOutput` / `TaskEnd` routable
-    /// afterwards. `None` when the launching call has no cell (the
-    /// `agent` tool renders as a sub-agent box, not a tool cell).
+    /// `TaskStart`. A background task outlives the turn that launched
+    /// it, and this snapshot is what keeps `TaskOutput` / `TaskEnd`
+    /// routable when the owner's `tool_index` has no entry for the
+    /// call. `None` when the launching call has no cell (the `agent`
+    /// tool renders as a sub-agent box, not a tool cell).
     pub cell: Option<EntryId>,
 }
 
@@ -394,14 +417,13 @@ pub struct ChatState {
     /// Launch cells recorded at `ToolExecutionEnd` for bash results
     /// carrying a `task_id`, keyed by the launching `call_id`. The
     /// detached driver's `TaskStart` is unordered relative to the
-    /// tool result and may even trail the owner's `AgentEnd`, which
-    /// wipes `tool_index`. This map is the surviving sibling of
-    /// `tool_index` that still links the task to its cell then.
+    /// tool result, so this map is the linkage a `TaskStart` consults
+    /// when the owner's `tool_index` holds no cell for the call.
     /// Entries are consumed at `TaskStart`, removed even when the
-    /// live `tool_index` lookup wins. Residue (a replayed launch
-    /// whose `TaskStart` never comes, or a live one whose
-    /// `TaskStart` beat its `ToolExecutionEnd`) is inert: call ids
-    /// are provider-generated and never collide.
+    /// `tool_index` lookup wins. Residue (a replayed launch whose
+    /// `TaskStart` never comes, or a live one whose `TaskStart` beat
+    /// its `ToolExecutionEnd`) is inert: call ids are
+    /// provider-generated and never collide.
     pub(crate) pending_task_cells: HashMap<String, EntryId>,
     /// Per-agent footer store (model line + context occupancy).
     pub(crate) footers: AgentFooters,
@@ -646,10 +668,9 @@ impl ChatState {
     }
 
     /// Resolve task `id`'s launch cell: the owner plus the cell's
-    /// entry id in the owner's transcript. Prefers the live
-    /// `tool_index` (by `call_id`) and falls back to the id
-    /// snapshotted at `TaskStart`, which is what survives the owner's
-    /// `AgentEnd` clearing its tool bookkeeping.
+    /// entry id in the owner's transcript. Prefers the `tool_index`
+    /// (by `call_id`) and falls back to the id snapshotted at
+    /// `TaskStart`.
     pub(crate) fn task_cell(&self, id: TaskId) -> Option<(AgentId, EntryId)> {
         let info = self.tasks.get(&id)?;
         let cell = self

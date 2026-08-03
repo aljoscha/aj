@@ -69,10 +69,11 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
             // Each agent owns its streaming bookkeeping, so an agent's
             // end clears only its own entry. The main agent's pending
             // `agent` tool call (whose body is a sub-agent run) is
-            // unaffected.
+            // unaffected. The durable-identity indexes stay: a
+            // re-applied event for a cell or message this agent already
+            // rendered has to find it, whichever turn it came from.
             if let Some(render) = state.render.get_mut(&agent_id) {
                 render.current_assistant = None;
-                render.tool_index.clear();
             }
             // On the live path the trailing `SubAgentEnd` carries the
             // real conclusion and sets the final
@@ -113,22 +114,21 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
             agent_id, event, ..
         } => reduce_message_update(state, agent_id, event),
         AgentEvent::MessageEnd { agent_id, message } => {
-            // The user and task-notification arms consume the id, so
-            // read it under a borrow here and skip the copy for the
-            // other arms. We cannot hoist the read into the arm itself:
-            // the by-value match below moves `message.kind`, and `id()`
-            // borrows the whole message.
+            // The arms below consume `message.kind`, and `id()` borrows
+            // the whole message, so read the durable id up front. Tool
+            // results render through `ToolExecutionEnd` and get no entry
+            // of their own, so they need no identity.
             let message_id = match &message.kind {
-                AgentMessageKind::Wire(Message::User(_))
+                AgentMessageKind::Wire(Message::User(_) | Message::Assistant(_))
                 | AgentMessageKind::TaskNotification(_) => message.id().to_string(),
-                _ => String::new(),
+                AgentMessageKind::Wire(Message::ToolResult(_)) => String::new(),
             };
             match message.kind {
                 AgentMessageKind::Wire(Message::User(user)) => {
                     reduce_user_end(state, agent_id, user, message_id)
                 }
                 AgentMessageKind::Wire(Message::Assistant(assistant)) => {
-                    reduce_assistant_end(state, agent_id, assistant)
+                    reduce_assistant_end(state, agent_id, assistant, message_id)
                 }
                 AgentMessageKind::Wire(Message::ToolResult(_)) => {
                     // Tool results render through the dedicated
@@ -166,7 +166,23 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
             {
                 b.latest_activity = Some(tool.clone());
             }
-            append_tool_entry(state, agent_id, call_id, tool, args);
+            // A `call_id` we already render is the same call: a
+            // re-projected start refreshes the cell rather than adding a
+            // second one. Status and result stay untouched, so a start
+            // re-delivered after the call finished cannot un-finish it.
+            let known = state
+                .render
+                .get(&agent_id)
+                .and_then(|r| r.tool_index.get(&call_id))
+                .copied();
+            if let Some(id) = known
+                && let Some(entry) = state.tool_entry_mut(agent_id, id)
+            {
+                entry.tool = tool;
+                entry.args = args;
+            } else {
+                append_tool_entry(state, agent_id, call_id, tool, args);
+            }
             Redraw(true)
         }
         AgentEvent::ToolExecutionUpdate {
@@ -185,8 +201,10 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
                 .get(&agent_id)
                 .and_then(|r| r.tool_index.get(&call_id))
             else {
-                // No mapped cell: a stale update after the owner's
-                // `AgentEnd` wiped the index. Drop it.
+                // No cell for this call in this transcript, so there is
+                // nothing to paint into. The tool's end rebuilds the cell
+                // with the authoritative payload, so dropping a
+                // cumulative snapshot loses nothing.
                 return Redraw(false);
             };
             if let Some(entry) = state.tool_entry_mut(agent_id, id) {
@@ -292,11 +310,39 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
             // rendered footer tracks the viewed agent, so views repaint
             // it only when `agent_id == active_view`.
             state.footers.record_turn_usage(agent_id, &usage);
-            state
-                .transcripts
-                .entry(agent_id)
-                .or_default()
-                .append(EntryKind::TurnUsage(TurnUsageEntry { agent_id, usage }));
+            // The row belongs to the assistant message it follows, which
+            // is this row's durable identity, so a re-applied update
+            // overwrites its row instead of adding one.
+            let after = state
+                .render
+                .get(&agent_id)
+                .and_then(|r| r.last_finalized_assistant.clone());
+            let existing = after
+                .as_deref()
+                .and_then(|id| indexed_usage_row(state, agent_id, id));
+            match existing {
+                Some(id) => {
+                    if let Some(EntryKind::TurnUsage(row)) = state
+                        .transcripts
+                        .get_mut(&agent_id)
+                        .and_then(|t| t.get_mut(id))
+                        .map(|e| &mut e.kind)
+                    {
+                        row.usage = usage;
+                    }
+                }
+                None => {
+                    state
+                        .transcripts
+                        .entry(agent_id)
+                        .or_default()
+                        .append(EntryKind::TurnUsage(TurnUsageEntry {
+                            agent_id,
+                            usage,
+                            after_message_id: after,
+                        }));
+                }
+            }
             Redraw(true)
         }
 
@@ -338,6 +384,12 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
                     format!("Compaction failed: {err}"),
                 );
             } else if let Some(summary) = summary {
+                // Append-only on purpose: a compaction's `CompactionEnd`
+                // is the single durable frame of its checkpoint entry,
+                // so the protocol's cursor invariant already keeps a
+                // re-attach from re-applying it, and a synthetic
+                // identity would be dead weight. The same holds for the
+                // notices below.
                 state
                     .transcripts
                     .entry(agent_id)
@@ -437,14 +489,12 @@ pub fn reduce(state: &mut ChatState, lifecycle: &mut AgentLifecycle, event: Agen
             kind,
             label,
         } => {
-            // Resolve the launch cell: from the live `tool_index` when
-            // the owner's turn is still running, else from the linkage
-            // recorded at `ToolExecutionEnd`. `TaskStart` is unordered
-            // relative to that result and may even trail the owner's
-            // `AgentEnd`, which wipes `tool_index`. Both lookups key
-            // on the launching `call_id`, so an agent-kind task (whose
-            // `agent` tool has no cell, it renders as a sub-agent box)
-            // misses both and keeps `cell = None`.
+            // Resolve the launch cell: from the owner's `tool_index`,
+            // else from the linkage recorded at `ToolExecutionEnd`.
+            // `TaskStart` is unordered relative to that result. Both
+            // lookups key on the launching `call_id`, so an agent-kind
+            // task (whose `agent` tool has no cell, it renders as a
+            // sub-agent box) misses both and keeps `cell = None`.
             let pending = state.pending_task_cells.remove(&call_id);
             let cell = state
                 .render
@@ -574,6 +624,10 @@ fn reduce_message_update(
                 .entry(agent_id)
                 .or_default()
                 .append(EntryKind::Assistant(AssistantEntry {
+                    // The streaming envelope mints a fresh id per event,
+                    // so a partial has no durable identity yet. The
+                    // finalizing `MessageEnd` fills it in.
+                    message_id: String::new(),
                     message: partial,
                     finalized: false,
                 }));
@@ -596,14 +650,21 @@ fn reduce_user_end(
     if text.is_empty() {
         return Redraw(false);
     }
-    state
+    if let Some(id) = indexed_message(state, agent_id, &message_id)
+        && let Some(EntryKind::User(entry)) = entry_kind_mut(state, agent_id, id)
+    {
+        entry.content = user.content;
+        return Redraw(true);
+    }
+    let id = state
         .transcripts
         .entry(agent_id)
         .or_default()
         .append(EntryKind::User(UserEntry {
-            message_id,
+            message_id: message_id.clone(),
             content: user.content,
         }));
+    remember_message(state, agent_id, message_id, id);
     Redraw(true)
 }
 
@@ -616,18 +677,86 @@ fn reduce_task_notification_end(
     notification: TaskNotification,
     message_id: String,
 ) -> Redraw {
-    state
+    if let Some(id) = indexed_message(state, agent_id, &message_id)
+        && let Some(EntryKind::TaskNotification(entry)) = entry_kind_mut(state, agent_id, id)
+    {
+        entry.label = notification.label;
+        entry.kind = notification.kind;
+        entry.outcome = notification.outcome;
+        entry.body = notification.body;
+        return Redraw(true);
+    }
+    let id = state
         .transcripts
         .entry(agent_id)
         .or_default()
         .append(EntryKind::TaskNotification(TaskNotificationEntry {
-            message_id,
+            message_id: message_id.clone(),
             label: notification.label,
             kind: notification.kind,
             outcome: notification.outcome,
             body: notification.body,
         }));
+    remember_message(state, agent_id, message_id, id);
     Redraw(true)
+}
+
+/// The entry `message_id` already produced in `agent_id`'s transcript,
+/// when this client rendered that message before.
+///
+/// An empty id is never an identity: several entries can carry one (a
+/// message deserialized outside the log's backfill path), so keying on
+/// it would alias unrelated rows.
+fn indexed_message(state: &ChatState, agent_id: AgentId, message_id: &str) -> Option<EntryId> {
+    if message_id.is_empty() {
+        return None;
+    }
+    state
+        .render
+        .get(&agent_id)?
+        .message_index
+        .get(message_id)
+        .copied()
+}
+
+/// Record `id` as the entry for durable `message_id`.
+fn remember_message(state: &mut ChatState, agent_id: AgentId, message_id: String, id: EntryId) {
+    if message_id.is_empty() {
+        return;
+    }
+    state
+        .render
+        .entry(agent_id)
+        .or_default()
+        .message_index
+        .insert(message_id, id);
+}
+
+/// The usage row `agent_id` already holds for the assistant message
+/// `after`, if this client applied that update before.
+fn indexed_usage_row(state: &ChatState, agent_id: AgentId, after: &str) -> Option<EntryId> {
+    // A usage row sits directly after the message it reports on, so the
+    // reverse scan settles in a step or two on the live path.
+    state
+        .transcript(agent_id)?
+        .entries()
+        .iter()
+        .rev()
+        .find_map(|entry| match &entry.kind {
+            EntryKind::TurnUsage(row) if row.after_message_id.as_deref() == Some(after) => {
+                Some(entry.id)
+            }
+            _ => None,
+        })
+}
+
+/// Mutable payload of entry `id` in `agent_id`'s transcript.
+fn entry_kind_mut(state: &mut ChatState, agent_id: AgentId, id: EntryId) -> Option<&mut EntryKind> {
+    state
+        .transcripts
+        .get_mut(&agent_id)
+        .and_then(|t| t.get_mut(id))
+        .map(|e| &mut e.kind)
 }
 
 /// Handle `MessageEnd { Assistant }`: finalize the in-flight entry (or
@@ -636,6 +765,7 @@ fn reduce_assistant_end(
     state: &mut ChatState,
     agent_id: AgentId,
     assistant: AssistantMessage,
+    message_id: String,
 ) -> Redraw {
     // A failed turn carries its error in-band on the finalized
     // assistant message. We render it here, on `MessageEnd`, so it
@@ -693,37 +823,65 @@ fn reduce_assistant_end(
             })
             .collect()
     });
-    let current = state
-        .render
-        .get_mut(&agent_id)
-        .and_then(|r| r.current_assistant.take());
+    // Durable identity wins over the streaming slot: a re-applied
+    // `MessageEnd` updates the entry it already produced. The streaming
+    // slot is only consulted (and released) when this message is new to
+    // us, so a re-application cannot steal another turn's in-flight
+    // entry.
+    let target = match indexed_message(state, agent_id, &message_id) {
+        Some(id) => Some(id),
+        None => state
+            .render
+            .get_mut(&agent_id)
+            .and_then(|r| r.current_assistant.take()),
+    };
+    // A target that no longer resolves to an assistant entry falls
+    // through to the append below, so a durable message always lands
+    // somewhere renderable.
+    let target = target.filter(|&id| {
+        matches!(
+            state.transcript(agent_id).and_then(|t| t.get(id)),
+            Some(entry) if matches!(entry.kind, EntryKind::Assistant(_))
+        )
+    });
     let mut changed = false;
-    match current {
+    let mut landed = None;
+    match target {
         Some(id) => {
-            if let Some(EntryKind::Assistant(entry)) = state
-                .transcripts
-                .get_mut(&agent_id)
-                .and_then(|t| t.get_mut(id))
-                .map(|e| &mut e.kind)
-            {
+            if let Some(EntryKind::Assistant(entry)) = entry_kind_mut(state, agent_id, id) {
                 entry.message = assistant;
                 entry.finalized = true;
+                entry.message_id = message_id.clone();
                 changed = true;
+                landed = Some(id);
             }
         }
         None if has_renderable => {
-            state
+            let id = state
                 .transcripts
                 .entry(agent_id)
                 .or_default()
                 .append(EntryKind::Assistant(AssistantEntry {
+                    message_id: message_id.clone(),
                     message: assistant,
                     finalized: true,
                 }));
             changed = true;
+            landed = Some(id);
         }
         None => {}
     }
+    if let Some(id) = landed {
+        remember_message(state, agent_id, message_id.clone(), id);
+    }
+    // Recorded even when the message rendered no entry (a tool-use-only
+    // turn): the trailing `UsageUpdate` still reports on this message
+    // and keys its row off this id.
+    state
+        .render
+        .entry(agent_id)
+        .or_default()
+        .last_finalized_assistant = (!message_id.is_empty()).then_some(message_id);
     // A sub-agent's box renders its report, not the sub's transcript, so keep
     // the report fresh from the sub's latest conclusion while it runs. A
     // continuation or steering re-run completes through `AgentEnd(Sub n)`,
@@ -833,7 +991,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use crate::chat::model::Entry;
-    use crate::test_support::{build_test_agent, scripted_run_config};
+    use crate::test_support::{CanonicalState, build_test_agent, scripted_run_config};
 
     fn main_settings() -> AgentSettings {
         AgentSettings {
@@ -2168,8 +2326,8 @@ mod tests {
             other => panic!("unexpected kind: {other:?}"),
         }
 
-        // The owning turn ends. This wipes the agent's tool_index, so
-        // subsequent routing exercises the TaskStart snapshot.
+        // The owning turn ends. A background task outlives it, so its
+        // output still has to route into the launch cell.
         apply(
             &mut s,
             &mut life,
@@ -2223,9 +2381,8 @@ mod tests {
     #[test]
     fn task_start_after_owner_agent_end_still_finds_the_launch_cell() {
         // The detached driver emits `TaskStart` and in the extreme it
-        // lands only after the owner's `AgentEnd` already wiped the
-        // `tool_index`. The linkage recorded at `ToolExecutionEnd` is
-        // what keeps the badge and the live tail working then.
+        // lands only after the owner's turn is over. The badge and the
+        // live tail have to keep working across that boundary.
         let mut s = state();
         let mut life = AgentLifecycle::default();
         apply(
@@ -2263,7 +2420,7 @@ mod tests {
             },
         );
 
-        // The cell got its task linkage despite the wiped index.
+        // The cell got its task linkage.
         match &entries(&s, AgentId::Main)[0].kind {
             EntryKind::Tool(t) => assert_eq!(t.task, Some(1), "cell carries the task badge"),
             other => panic!("unexpected kind: {other:?}"),
@@ -2443,8 +2600,12 @@ mod tests {
         );
 
         let sub = s.render.get(&AgentId::Sub(1)).expect("sub render");
-        assert!(sub.tool_index.is_empty());
-        assert_eq!(sub.current_assistant, None);
+        assert_eq!(sub.current_assistant, None, "streaming is per-turn");
+        assert_eq!(
+            sub.tool_index.len(),
+            1,
+            "the durable-identity index outlives the turn",
+        );
         let main = s.render.get(&AgentId::Main).expect("main render");
         assert_eq!(main.tool_index.len(), 1, "main bookkeeping untouched");
         assert!(main.current_assistant.is_some());
@@ -2789,5 +2950,592 @@ mod tests {
             [AssistantContent::Text(t)] => assert_eq!(t.text, "hello from scripted"),
             other => panic!("expected one text block, got {other:?}"),
         }
+    }
+
+    // ---- Idempotent re-application (spec 6.5) ---------------------------
+    //
+    // A re-attach backfill re-projects entries the client already saw, so
+    // applying a projected event twice has to leave the same state. The
+    // canonical form is the oracle: it is what the phase-2 equivalence
+    // harness compares, so a difference these tests miss is one that
+    // harness misses too.
+
+    fn canon(state: &ChatState, life: &AgentLifecycle) -> CanonicalState {
+        CanonicalState::of(state, life)
+    }
+
+    /// The single tool cell in `id`'s transcript.
+    fn only_tool(state: &ChatState, id: AgentId) -> &ToolEntry {
+        let tools: Vec<&ToolEntry> = entries(state, id)
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntryKind::Tool(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tools.len(), 1, "expected exactly one tool cell");
+        tools[0]
+    }
+
+    /// Every index that names an entry resolves to one that is still
+    /// there. A dangling [`EntryId`] renders as a missing box, an
+    /// unroutable task, or a duplicate cell, so this is asserted rather
+    /// than eyeballed.
+    fn assert_no_dangling(state: &ChatState) {
+        let resolves = |agent: AgentId, id: EntryId| {
+            state
+                .transcript(agent)
+                .and_then(|t| t.get(id))
+                .is_some_and(|e| e.id == id)
+        };
+        for (&n, &(parent, id)) in &state.sub_boxes {
+            assert!(resolves(parent, id), "sub_boxes[{n}] dangles");
+            let kind = state
+                .transcript(parent)
+                .and_then(|t| t.get(id))
+                .map(|e| &e.kind);
+            assert!(
+                matches!(kind, Some(EntryKind::SubAgent(_))),
+                "sub_boxes[{n}] does not name a box",
+            );
+        }
+        for (&agent, render) in &state.render {
+            if let Some(id) = render.current_assistant {
+                assert!(
+                    resolves(agent, id),
+                    "current_assistant for {agent:?} dangles"
+                );
+            }
+            for (call_id, &id) in &render.tool_index {
+                assert!(resolves(agent, id), "tool_index[{call_id}] dangles");
+            }
+            for (message_id, &id) in &render.message_index {
+                assert!(resolves(agent, id), "message_index[{message_id}] dangles");
+            }
+        }
+        for (&id, info) in state.tasks() {
+            if let Some(cell) = info.cell {
+                assert!(resolves(info.owner, cell), "tasks[{id}].cell dangles");
+            }
+            if let Some((owner, cell)) = state.task_cell(id) {
+                assert!(resolves(owner, cell), "task_cell({id}) dangles");
+            }
+        }
+        // `pending_task_cells` carries no agent, so it is checked
+        // against the transcript of the agent that owns the call.
+        for (call_id, &id) in &state.pending_task_cells {
+            let owner = state
+                .render
+                .iter()
+                .find(|(_, render)| render.tool_index.contains_key(call_id))
+                .map(|(&agent, _)| agent);
+            if let Some(owner) = owner {
+                assert!(resolves(owner, id), "pending_task_cells[{call_id}] dangles",);
+            }
+        }
+    }
+
+    #[test]
+    fn reapplied_tool_start_updates_the_cell_in_place() {
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        let start = tool_start(AgentId::Main, "c1", "bash");
+        apply(&mut s, &mut life, start.clone());
+        let before = canon(&s, &life);
+
+        apply(&mut s, &mut life, start);
+
+        assert_eq!(canon(&s, &life), before, "re-applied start changed state");
+        let cell = only_tool(&s, AgentId::Main);
+        assert_eq!(cell.call_id, "c1");
+        assert_eq!(
+            cell.status,
+            ToolStatus::Running,
+            "the cell the index names is the one that is still running",
+        );
+        assert_no_dangling(&s);
+    }
+
+    #[test]
+    fn reapplied_tool_end_after_agent_end_does_not_duplicate_the_cell() {
+        // The turn that ran the tool is over. A backfill re-projects the
+        // whole bracket, and the cell it belongs to has to be found even
+        // though nothing about the call is in flight any more.
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        let start = tool_start(AgentId::Main, "c1", "bash");
+        let end = tool_end(
+            AgentId::Main,
+            "c1",
+            "bash",
+            bash_task_details("output", None),
+        );
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::AgentStart {
+                agent_id: AgentId::Main,
+            },
+        );
+        apply(&mut s, &mut life, start.clone());
+        apply(&mut s, &mut life, end.clone());
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::AgentEnd {
+                agent_id: AgentId::Main,
+                messages: Vec::new(),
+            },
+        );
+        let before = canon(&s, &life);
+
+        apply(&mut s, &mut life, start);
+        apply(&mut s, &mut life, end);
+
+        assert_eq!(canon(&s, &life), before, "re-applied bracket changed state");
+        assert_eq!(
+            only_tool(&s, AgentId::Main).status,
+            ToolStatus::Done { is_error: false },
+        );
+        assert_no_dangling(&s);
+    }
+
+    #[test]
+    fn reapplied_user_message_end_updates_the_row_in_place() {
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        let user = user_message_end("hello");
+        apply(&mut s, &mut life, user.clone());
+        let before = canon(&s, &life);
+
+        apply(&mut s, &mut life, user);
+
+        assert_eq!(canon(&s, &life), before);
+        assert_eq!(
+            count_kind(&s, AgentId::Main, |k| matches!(k, EntryKind::User(_))),
+            1
+        );
+        assert_no_dangling(&s);
+    }
+
+    #[test]
+    fn reapplied_assistant_message_end_updates_the_row_in_place() {
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        // The live shape: streaming opens the entry, `MessageEnd`
+        // finalizes it and stamps its durable id.
+        apply(
+            &mut s,
+            &mut life,
+            message_update(AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: "answer".into(),
+                partial: text_partial("answer"),
+            }),
+        );
+        let assistant = assistant_message_end(text_partial("answer"));
+        apply(&mut s, &mut life, assistant.clone());
+        let before = canon(&s, &life);
+
+        apply(&mut s, &mut life, assistant);
+
+        assert_eq!(canon(&s, &life), before);
+        let assistants: Vec<&AssistantEntry> = entries(&s, AgentId::Main)
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntryKind::Assistant(a) => Some(a),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(assistants.len(), 1, "one row for one message");
+        assert!(assistants[0].finalized);
+        assert!(
+            !assistants[0].message_id.is_empty(),
+            "the finalized row carries its durable id",
+        );
+        assert_no_dangling(&s);
+    }
+
+    #[test]
+    fn reapplied_task_notification_end_updates_the_row_in_place() {
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        let notice = task_notification_end("cargo build", TaskOutcome::Succeeded);
+        apply(&mut s, &mut life, notice.clone());
+        let before = canon(&s, &life);
+
+        apply(&mut s, &mut life, notice);
+
+        assert_eq!(canon(&s, &life), before);
+        assert_eq!(
+            count_kind(&s, AgentId::Main, |k| matches!(
+                k,
+                EntryKind::TaskNotification(_)
+            )),
+            1,
+        );
+        assert_no_dangling(&s);
+    }
+
+    #[test]
+    fn reapplied_usage_update_overwrites_the_row_for_its_message() {
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        let assistant = assistant_message_end(text_partial("answer"));
+        apply(&mut s, &mut life, assistant.clone());
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::UsageUpdate {
+                agent_id: AgentId::Main,
+                usage: token_usage([100, 10, 0, 0]),
+            },
+        );
+
+        // The re-projected suffix carries the same message and its
+        // trailing usage. The numbers stand in for a projection whose
+        // accumulators read differently: the last application wins.
+        apply(&mut s, &mut life, assistant);
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::UsageUpdate {
+                agent_id: AgentId::Main,
+                usage: token_usage([200, 20, 0, 0]),
+            },
+        );
+
+        let rows: Vec<&TurnUsageEntry> = entries(&s, AgentId::Main)
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntryKind::TurnUsage(u) => Some(u),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows.len(), 1, "one usage row for one message");
+        assert_eq!(rows[0].usage.turn_input, 200, "the later value wins");
+        assert_eq!(rows[0].usage.turn_output, 20);
+        assert_eq!(
+            s.footers().context_usage(AgentId::Main).tokens,
+            Some(200),
+            "the footer follows the row",
+        );
+        assert_no_dangling(&s);
+    }
+
+    #[test]
+    fn resynthesized_sub_agent_start_reuses_the_box_and_keeps_its_footer() {
+        // A suffix whose sub-agent thread is open at the cursor boundary
+        // gets its `SubAgentStart` re-synthesized from the run's
+        // remembered task, run mode and settings. The box and the
+        // footer it seeded have to survive that.
+        let catalog_model = ModelInfo {
+            id: "gpt-sub".into(),
+            name: "gpt-sub".into(),
+            family: None,
+            api: "anthropic-messages".into(),
+            provider: "openai".into(),
+            base_url: "https://example.invalid".into(),
+            reasoning: false,
+            reasoning_options: Vec::new(),
+            supports_verbosity: false,
+            input: vec![aj_models::registry::InputModality::Text],
+            cost: aj_models::registry::ModelCost::default(),
+            context_window: 400_000,
+            max_tokens: 100,
+        };
+        let mut s = state_with_catalog(vec![catalog_model]);
+        let mut life = AgentLifecycle::default();
+        let start = sub_agent_start(1, "openai", "gpt-sub");
+        apply(&mut s, &mut life, start.clone());
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::AgentStart {
+                agent_id: AgentId::Sub(1),
+            },
+        );
+        apply(&mut s, &mut life, sub_assistant_end(1, "working on it"));
+        apply(
+            &mut s,
+            &mut life,
+            AgentEvent::UsageUpdate {
+                agent_id: AgentId::Sub(1),
+                usage: token_usage([1_000, 10, 0, 0]),
+            },
+        );
+        let before = canon(&s, &life);
+        let box_id = s.sub_boxes.get(&1).copied().expect("sub box recorded");
+
+        apply(&mut s, &mut life, start);
+
+        assert_eq!(
+            canon(&s, &life),
+            before,
+            "re-synthesized start changed state"
+        );
+        assert_eq!(
+            s.sub_boxes.get(&1).copied(),
+            Some(box_id),
+            "the box is reused, not re-appended",
+        );
+        assert_eq!(
+            s.footers().model_line(AgentId::Sub(1)).as_deref(),
+            Some("gpt-sub off"),
+            "the sub keeps its model line",
+        );
+        assert_eq!(
+            s.footers().context_usage(AgentId::Sub(1)),
+            crate::footer::ContextUsage {
+                tokens: Some(1_000),
+                context_window: 400_000,
+            },
+            "and its occupancy accounting",
+        );
+        assert_no_dangling(&s);
+    }
+
+    /// The strongest case: a real scripted turn, tool call included,
+    /// folded once and then re-applied the way a backfill delivers it.
+    ///
+    /// `MessageUpdate` is left out of the re-application because no
+    /// backfill carries one: it is a lossy cumulative snapshot the log
+    /// projection never emits, and its envelope mints a fresh message id
+    /// per event, so it carries no durable identity to be idempotent on.
+    /// Every other event of the turn is fed again verbatim.
+    #[tokio::test]
+    async fn scripted_turn_reapplied_as_a_backfill_changes_nothing() {
+        use crate::test_support::finalized_text_message;
+
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let mut calling = finalized_text_message("let me check the list");
+        calling.content.push(AssistantContent::ToolCall(ToolCall {
+            id: "call-1".into(),
+            name: "todo_read".into(),
+            arguments: serde_json::json!({}),
+        }));
+        calling.stop_reason = StopReason::ToolUse;
+        let run_config =
+            scripted_run_config(vec![calling, finalized_text_message("nothing on it")]);
+        let (mut agent, _log, _persistence) = build_test_agent(&persistence, &run_config);
+
+        let recorded: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&recorded);
+        let _handle = agent.subscribe(listener_from_sync(move |event| {
+            sink.lock().unwrap().push(event.clone());
+        }));
+        agent
+            .prompt("check the todos".into(), CancellationToken::new())
+            .await
+            .expect("scripted turn");
+        let events = recorded.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ToolExecutionEnd { tool, .. } if tool == "todo_read"
+            )),
+            "the turn ran its tool call",
+        );
+
+        let mut s = state();
+        let mut life = AgentLifecycle::default();
+        for event in events.iter().cloned() {
+            let _ = reduce(&mut s, &mut life, event);
+        }
+        let once = canon(&s, &life);
+
+        for event in events
+            .iter()
+            .filter(|e| !matches!(e, AgentEvent::MessageUpdate { .. }))
+            .cloned()
+        {
+            let _ = reduce(&mut s, &mut life, event);
+        }
+
+        assert_eq!(
+            canon(&s, &life),
+            once,
+            "the backfill re-application drifted"
+        );
+        assert_no_dangling(&s);
+        // The fold is only worth comparing if it built the whole turn.
+        let kinds: Vec<&str> = entries(&s, AgentId::Main)
+            .iter()
+            .map(|e| match &e.kind {
+                EntryKind::User(_) => "user",
+                EntryKind::Assistant(_) => "assistant",
+                EntryKind::Tool(_) => "tool",
+                EntryKind::TurnUsage(_) => "usage",
+                EntryKind::Notice(_) => "notice",
+                EntryKind::SubAgent(_) => "sub",
+                EntryKind::Compaction(_) => "compaction",
+                EntryKind::TaskNotification(_) => "notification",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["user", "assistant", "usage", "tool", "assistant", "usage"],
+        );
+    }
+
+    // ---- The canonical form itself --------------------------------------
+
+    #[test]
+    fn canonical_form_ignores_instants_display_flags_and_active_view() {
+        // Both states fold the same events, so their durable content
+        // matches while every wall-clock stamp differs.
+        let events = vec![
+            sub_agent_start(1, "scripted", "scripted"),
+            AgentEvent::AgentStart {
+                agent_id: AgentId::Sub(1),
+            },
+            sub_assistant_end(1, "done here"),
+            AgentEvent::SubAgentEnd {
+                parent: AgentId::Main,
+                child: AgentId::Sub(1),
+                report: "done here".to_string(),
+                conclusion: SubAgentConclusion::Completed,
+            },
+            user_message_end("hello"),
+            assistant_message_end(text_partial("hi")),
+            AgentEvent::UsageUpdate {
+                agent_id: AgentId::Main,
+                usage: token_usage([10, 1, 0, 0]),
+            },
+        ];
+        let fold = |events: Vec<AgentEvent>| {
+            let mut s = state();
+            let mut life = AgentLifecycle::default();
+            for event in events {
+                let _ = reduce(&mut s, &mut life, event);
+            }
+            (s, life)
+        };
+        let (first, first_life) = fold(events.clone());
+        std::thread::sleep(Duration::from_millis(2));
+        let (mut second, second_life) = fold(events);
+
+        let started = |state: &ChatState| match &entries(state, AgentId::Main)[0].kind {
+            EntryKind::SubAgent(b) => b.started_at,
+            other => panic!("expected the sub box first, got {other:?}"),
+        };
+        assert_ne!(
+            started(&first),
+            started(&second),
+            "the two folds really do carry different instants",
+        );
+
+        second.show_thinking_block = !second.show_thinking_block;
+        second.show_token_usage = !second.show_token_usage;
+        second.compact_transcript = !second.compact_transcript;
+        second.tools_expanded = !second.tools_expanded;
+        second.set_active_view(AgentId::Sub(1));
+
+        assert_eq!(canon(&first, &first_life), canon(&second, &second_life));
+    }
+
+    #[test]
+    fn canonical_form_separates_states_that_differ_in_covered_fields() {
+        // One base fold, then one variant per covered field. Each has to
+        // read as a different state, otherwise the oracle is blind to
+        // that field.
+        let base = || {
+            let mut s = state();
+            let mut life = AgentLifecycle::default();
+            apply(
+                &mut s,
+                &mut life,
+                sub_agent_start(1, "scripted", "scripted"),
+            );
+            apply(&mut s, &mut life, tool_start(AgentId::Main, "c1", "bash"));
+            (s, life)
+        };
+        let (s, life) = base();
+        let reference = canon(&s, &life);
+
+        let (mut tool_done, mut tool_done_life) = base();
+        apply(
+            &mut tool_done,
+            &mut tool_done_life,
+            tool_end(AgentId::Main, "c1", "bash", bash_task_details("out", None)),
+        );
+        assert_ne!(
+            canon(&tool_done, &tool_done_life),
+            reference,
+            "tool status is covered",
+        );
+
+        let (mut concluded, mut concluded_life) = base();
+        apply(
+            &mut concluded,
+            &mut concluded_life,
+            AgentEvent::SubAgentEnd {
+                parent: AgentId::Main,
+                child: AgentId::Sub(1),
+                report: "failed hard".to_string(),
+                conclusion: SubAgentConclusion::Failed,
+            },
+        );
+        assert_ne!(
+            canon(&concluded, &concluded_life),
+            reference,
+            "a sub-agent's conclusion is covered",
+        );
+
+        let (mut used, mut used_life) = base();
+        apply(
+            &mut used,
+            &mut used_life,
+            AgentEvent::UsageUpdate {
+                agent_id: AgentId::Main,
+                usage: token_usage([10, 1, 0, 0]),
+            },
+        );
+        let used_canon = canon(&used, &used_life);
+        assert_ne!(used_canon, reference, "a usage row is covered");
+        let (mut used_more, mut used_more_life) = base();
+        apply(
+            &mut used_more,
+            &mut used_more_life,
+            AgentEvent::UsageUpdate {
+                agent_id: AgentId::Main,
+                usage: token_usage([20, 1, 0, 0]),
+            },
+        );
+        assert_ne!(
+            canon(&used_more, &used_more_life),
+            used_canon,
+            "and so is what a usage row reports",
+        );
+
+        let (mut noticed, mut noticed_life) = base();
+        apply(
+            &mut noticed,
+            &mut noticed_life,
+            AgentEvent::Warning {
+                agent_id: AgentId::Main,
+                text: "heads up".into(),
+            },
+        );
+        assert_ne!(
+            canon(&noticed, &noticed_life),
+            reference,
+            "a notice is covered",
+        );
+
+        // Two folds of the same text under different message ids are
+        // different states: branch targets resolve through that id.
+        let mut left = state();
+        let mut left_life = AgentLifecycle::default();
+        apply(&mut left, &mut left_life, user_message_end("hello"));
+        let mut right = state();
+        let mut right_life = AgentLifecycle::default();
+        apply(&mut right, &mut right_life, user_message_end("hello"));
+        assert_ne!(
+            canon(&left, &left_life),
+            canon(&right, &right_life),
+            "a message id is covered",
+        );
     }
 }

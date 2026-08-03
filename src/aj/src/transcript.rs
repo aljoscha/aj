@@ -3951,6 +3951,7 @@ mod tests {
     #[test]
     fn assistant_entry_renders_blocks_in_order_and_skips_tool_calls() {
         let t = transcript_with(EntryKind::Assistant(AssistantEntry {
+            message_id: String::new(),
             message: assistant_message(vec![
                 AssistantContent::Thinking(ThinkingContent {
                     thinking: "pondering".into(),
@@ -3984,6 +3985,7 @@ mod tests {
     #[test]
     fn assistant_entry_is_indented_one_column_when_boxed() {
         let t = transcript_with(EntryKind::Assistant(AssistantEntry {
+            message_id: String::new(),
             message: assistant_message(vec![AssistantContent::Text(TextContent {
                 text: "answer".into(),
                 text_signature: None,
@@ -4003,6 +4005,7 @@ mod tests {
     #[test]
     fn hidden_thinking_renders_placeholder() {
         let t = transcript_with(EntryKind::Assistant(AssistantEntry {
+            message_id: String::new(),
             message: assistant_message(vec![AssistantContent::Thinking(ThinkingContent {
                 thinking: "secret".into(),
                 thinking_signature: None,
@@ -4032,6 +4035,7 @@ mod tests {
         // A body-less collapsed block has nothing to reveal, so it stays a bare
         // placeholder with no expand hint.
         let t = transcript_with(EntryKind::Assistant(AssistantEntry {
+            message_id: String::new(),
             message: assistant_message(vec![AssistantContent::Thinking(ThinkingContent {
                 thinking: String::new(),
                 thinking_signature: None,
@@ -4046,6 +4050,7 @@ mod tests {
     #[test]
     fn redacted_thinking_renders_marker_even_when_expanded() {
         let t = transcript_with(EntryKind::Assistant(AssistantEntry {
+            message_id: String::new(),
             message: assistant_message(vec![AssistantContent::Thinking(ThinkingContent {
                 thinking: String::new(),
                 thinking_signature: Some("opaque".into()),
@@ -4119,6 +4124,7 @@ mod tests {
 
         let t = transcript_with(EntryKind::TurnUsage(aj_app::chat::TurnUsageEntry {
             agent_id: aj_agent::events::AgentId::Main,
+            after_message_id: None,
             usage: aj_agent::types::TokenUsage {
                 accumulated_input: 0,
                 turn_input: 0,

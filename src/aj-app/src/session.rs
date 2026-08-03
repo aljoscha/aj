@@ -193,6 +193,13 @@ impl AgentLifecycle {
         self.compacting.contains(&id)
     }
 
+    /// Owned snapshot of every agent currently marked compacting.
+    /// Order is unspecified, and the caller can mutate the set while
+    /// iterating the returned `Vec`.
+    pub fn compacting_agents(&self) -> Vec<AgentId> {
+        self.compacting.iter().copied().collect()
+    }
+
     /// Record `id` as compacting.
     pub fn mark_compacting(&mut self, id: AgentId) {
         self.compacting.insert(id);
