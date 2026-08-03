@@ -426,6 +426,18 @@ impl Turns {
         self.set.shutdown().await;
         self.cancels.clear();
     }
+
+    /// Drop the cancel tokens when nothing is driven any more.
+    ///
+    /// A turn task that panicked joins as an error rather than as an agent
+    /// id, so [`Self::reap`] cannot be told which entry to remove and the
+    /// agent would read busy forever. Once the join set is empty nothing is
+    /// driven at all, which is enough to clear the map without guessing.
+    pub fn forget_driven_if_idle(&mut self) {
+        if self.set.is_empty() {
+            self.cancels.clear();
+        }
+    }
 }
 
 /// Counts of running work a quit would tear down, for the Ctrl+C

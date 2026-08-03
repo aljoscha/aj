@@ -38,6 +38,9 @@ const DEADLINE: Duration = Duration::from_secs(20);
 struct Harness {
     _dir: TempDir,
     persistence: ConversationPersistence,
+    /// The effective config the host's sessions read, so a test can tune
+    /// what a turn does (the compaction budget, say).
+    config: Arc<StdMutex<Config>>,
     host: SessionHost,
 }
 
@@ -53,8 +56,9 @@ impl Harness {
     fn with_provider(provider: Arc<ScriptedProvider>) -> Self {
         let dir = TempDir::new().expect("tempdir");
         let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let config = Arc::new(StdMutex::new(Config::default()));
         let host = SessionHost::new(HostSetup {
-            config: Arc::new(StdMutex::new(Config::default())),
+            config: Arc::clone(&config),
             layers: Arc::new(StdMutex::new(ConfigLayers {
                 user: Config::default(),
                 project: ConfigLayer::default(),
@@ -71,6 +75,7 @@ impl Harness {
         Self {
             _dir: dir,
             persistence,
+            config,
             host,
         }
     }
@@ -96,8 +101,9 @@ impl Harness {
     /// process would see it.
     fn revive(&self, messages: Vec<AssistantMessage>) -> Harness {
         let dir = TempDir::new().expect("tempdir");
+        let config = Arc::new(StdMutex::new(Config::default()));
         let host = SessionHost::new(HostSetup {
-            config: Arc::new(StdMutex::new(Config::default())),
+            config: Arc::clone(&config),
             layers: Arc::new(StdMutex::new(ConfigLayers {
                 user: Config::default(),
                 project: ConfigLayer::default(),
@@ -114,6 +120,7 @@ impl Harness {
         Harness {
             _dir: dir,
             persistence: self.persistence.clone(),
+            config,
             host,
         }
     }
@@ -409,6 +416,26 @@ async fn thinking(host: &SessionHost, session: &str) -> Option<aj_models::Thinki
         .lock()
         .expect("run config mutex poisoned");
     cfg.thinking.clone()
+}
+
+/// The `(status, finished)` of sub-agent `child`'s box in the main
+/// transcript.
+fn sub_box(state: &CanonicalState, child: usize) -> (aj_app::chat::SubAgentStatus, bool) {
+    state
+        .agent(AgentId::Main)
+        .expect("main transcript")
+        .entries
+        .iter()
+        .find_map(|entry| match entry {
+            aj_app::test_support::CanonicalEntry::SubAgent {
+                child: n,
+                status,
+                finished,
+                ..
+            } if *n == child => Some((*status, *finished)),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no box for sub-agent {child}"))
 }
 
 fn settings() -> AgentSettings {
@@ -1364,6 +1391,118 @@ async fn compaction_is_refused_while_busy() {
     harness.host.shutdown().await;
 }
 
+/// A manual compaction's `CompactionEnd` is durable, tagged with the
+/// checkpoint entry the compaction appended. Nothing on the bus carries
+/// that identity, so it can only come from the append handoff the host
+/// shares with its event forwarder.
+#[tokio::test]
+async fn a_compaction_end_is_tagged_with_its_checkpoint_entry() {
+    let harness = Harness::new(vec![
+        finalized_text_message("first answer"),
+        finalized_text_message("second answer"),
+        finalized_text_message("SUMMARY of the earlier work"),
+    ]);
+    // Keep almost nothing verbatim, so a two-turn session has something to
+    // summarize.
+    harness
+        .config
+        .lock()
+        .expect("config mutex poisoned")
+        .compact_keep_recent = 10;
+    let session = harness.create().await;
+    let mut stream = harness
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+    frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+    harness.prompt(&session, "one").await;
+    until_idle(&mut stream).await;
+    // A large second prompt, so the keep-recent cut lands on it and the
+    // first turn is left as the range to summarize.
+    harness
+        .prompt(&session, &format!("two {}", "X".repeat(2000)))
+        .await;
+    until_idle(&mut stream).await;
+
+    harness
+        .host
+        .command(&session, Command::Compact { instructions: None })
+        .await
+        .expect("compact on an idle session");
+    let frames = until_idle(&mut stream).await;
+
+    let end = frames
+        .iter()
+        .find_map(|frame| match frame {
+            Frame::Event {
+                durability, event, ..
+            } => match event.known() {
+                Some(AgentEvent::CompactionEnd { summary, .. }) => {
+                    Some((durability.clone(), summary.clone()))
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("the compaction ended");
+    assert!(
+        end.1.is_some(),
+        "the compaction wrote a summary, so it appended a checkpoint",
+    );
+    let durability = end.0.expect("a successful compaction's end is durable");
+
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    let log = handles.log.lock().await;
+    let entries = log.entries_in_order();
+    let index = usize::try_from(durability.seq).expect("seq fits usize") - 1;
+    let entry = entries.get(index).expect("an entry at that position");
+    assert_eq!(entry.id, durability.entry_id);
+    assert!(
+        matches!(
+            entry.entry,
+            aj_session::ConversationEntryKind::Compaction { .. }
+        ),
+        "the tagged entry is the compaction checkpoint: {:?}",
+        entry.entry,
+    );
+    drop(log);
+    harness.host.shutdown().await;
+}
+
+/// A blank prompt is refused rather than sent as an empty user message,
+/// matching the local submit gesture's refusal.
+#[tokio::test]
+async fn a_blank_prompt_is_refused() {
+    let harness = Harness::new(Vec::new());
+    let session = harness.create().await;
+    for content in [Vec::new(), vec![UserContent::text("   \n ")]] {
+        let err = harness
+            .host
+            .command(
+                &session,
+                Command::Prompt {
+                    agent: AgentId::Main,
+                    content,
+                },
+            )
+            .await
+            .expect_err("a blank prompt is refused");
+        assert!(matches!(err, HostError::Invalid(_)), "got {err:?}");
+    }
+    harness.host.shutdown().await;
+}
+
 /// Killing a task the registry does not know is a 404; killing a live one
 /// is accepted.
 #[tokio::test]
@@ -1552,12 +1691,13 @@ async fn attaching_mid_sub_run_leaves_the_bracket_open() {
     });
     let mut joiner = Client::attach(&harness.host, &session).await;
 
-    let boxes = format!("{:?}", joiner.canonical());
-    assert!(boxes.contains("Running"), "the sub box is live: {boxes}");
-    assert!(
-        !boxes.contains("Failed"),
-        "no spurious failed conclusion: {boxes}",
+    let joined = sub_box(&joiner.canonical(), 1);
+    assert_eq!(
+        joined.0,
+        aj_app::chat::SubAgentStatus::Running,
+        "the projection left the live sub's bracket open",
     );
+    assert!(!joined.1, "and did not freeze its runtime clock");
 
     all_along.pump_until_idle().await;
     joiner.pump_until_idle().await;
@@ -1731,24 +1871,30 @@ async fn the_reads_answer_tasks_queue_tree_and_hello() {
         task.started_at,
     );
 
-    harness
+    // The queue read: enqueue the way a busy session would (an idle steer
+    // runs a turn instead of queueing) and read it back.
+    let handles = harness
         .host
-        .command(
-            &session,
-            Command::Steer {
-                agent: AgentId::Main,
-                text: "queued".to_string(),
-            },
-        )
+        .local_handles(&session)
         .await
-        .expect("steer");
-    // The agent is idle, so an idle steer starts a turn rather than
-    // queueing; queue something the busy way instead.
+        .expect("live session");
+    handles.queues.append_steering(AgentId::Main, "urgent");
+    handles.queues.append_follow_up(AgentId::Sub(1), "later");
     let queue = harness.host.queue(&session).await.expect("queue read");
-    assert!(
-        queue.queues.iter().all(|q| q.agent_id == AgentId::Main),
-        "the queue read is per agent: {queue:?}",
+    assert_eq!(
+        queue
+            .queues
+            .iter()
+            .map(|entry| entry.agent_id)
+            .collect::<Vec<_>>(),
+        vec![AgentId::Main, AgentId::Sub(1)],
+        "one entry per agent with something queued, main first",
     );
+    assert_eq!(queue.queues[0].steering.len(), 1);
+    assert!(queue.queues[0].follow_up.is_empty());
+    assert_eq!(queue.queues[1].follow_up.len(), 1);
+    handles.queues.clear(AgentId::Main);
+    handles.queues.clear(AgentId::Sub(1));
 
     let tree = harness.host.tree(&session).await.expect("tree read");
     assert!(
@@ -1826,22 +1972,51 @@ async fn shutdown_cancels_gracefully_and_flushes() {
 
     harness.host.shutdown().await;
 
-    let written = std::fs::read_to_string(&log_path).expect("the log was flushed to disk");
+    // Read the log back the way a resume would, so the assertions are
+    // about entries rather than about substrings of a file.
+    let reopened =
+        aj_session::ConversationLog::resume(&harness.persistence, &session).expect("resume");
+    let kinds: Vec<&aj_session::ConversationEntryKind> = reopened
+        .entries_in_order()
+        .into_iter()
+        .map(|entry| &entry.entry)
+        .collect();
     assert!(
-        written.contains("system_prompt"),
-        "buffered non-punctuation entries reached disk: {written}",
+        kinds
+            .iter()
+            .any(|kind| matches!(kind, aj_session::ConversationEntryKind::SystemPrompt { .. })),
+        "the buffered system-prompt root reached disk: {kinds:?}",
     );
     assert!(
-        written.contains("thinking_change"),
-        "including the seed settings records: {written}",
+        kinds.iter().any(|kind| matches!(
+            kind,
+            aj_session::ConversationEntryKind::ThinkingChange { .. }
+        )),
+        "and so did the buffered seed settings records: {kinds:?}",
     );
-    // The cancelled turn's synthetic aborted assistant message is on disk,
-    // so the transcript is consistent rather than truncated mid-turn.
-    assert!(
-        written.matches("\"role\":\"assistant\"").count() >= 1
-            || written.contains("\"kind\":\"message\""),
-        "the aborted turn wrote its terminal message: {written}",
+    // The cancelled turn wrote both its user message and the synthetic
+    // aborted assistant message, so the transcript is consistent rather
+    // than truncated mid-turn.
+    let roles: Vec<&str> = reopened
+        .entries_in_order()
+        .into_iter()
+        .filter_map(|entry| match &entry.entry {
+            aj_session::ConversationEntryKind::Message { message } => {
+                match message.as_stored_wire()? {
+                    aj_models::types::Message::User(_) => Some("user"),
+                    aj_models::types::Message::Assistant(_) => Some("assistant"),
+                    aj_models::types::Message::ToolResult(_) => Some("tool_result"),
+                }
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        roles,
+        vec!["user", "assistant"],
+        "the aborted turn is bracketed by its own terminal message",
     );
+    let _ = log_path;
 
     let reacquired = SessionLock::try_acquire(&harness.persistence, &session)
         .expect("try_acquire")
@@ -1918,19 +2093,11 @@ async fn shutdown_releases_every_session() {
             .expect("every session's lock is released");
         drop(lock);
     }
+    // The stream ends rather than stalling: `recv` yields whatever was
+    // queued and then `None`.
     let mut subscriber = subscriber;
-    assert!(
-        bounded("the subscriber stream to close", subscriber.recv())
-            .await
-            .is_none()
-            || true,
-        "the stream closes once the host is gone",
-    );
-    let closed = loop {
-        match bounded("the subscriber stream to close", subscriber.recv()).await {
-            Some(_) => continue,
-            None => break true,
-        }
-    };
-    assert!(closed);
+    while bounded("the subscriber stream to close", subscriber.recv())
+        .await
+        .is_some()
+    {}
 }

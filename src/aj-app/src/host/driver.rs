@@ -178,7 +178,11 @@ impl Driver {
             Err(err) => {
                 // A panicked turn task is fatal for the turn but not for
                 // the host: other sessions keep running, and this one has
-                // no in-flight state left to corrupt.
+                // no in-flight state left to corrupt. The join carries no
+                // agent id, so the cancel entry can only be cleaned up once
+                // nothing is driven at all, otherwise the agent would read
+                // busy forever and the session would wedge.
+                self.turns.forget_driven_if_idle();
                 self.publish_event(
                     None,
                     AgentEvent::Error {
@@ -186,6 +190,7 @@ impl Driver {
                         text: format!("agent task panicked: {err}"),
                     },
                 );
+                self.refresh_state();
                 return;
             }
         };
@@ -375,7 +380,10 @@ impl Driver {
         agent: AgentId,
         content: Vec<UserContent>,
     ) -> Result<CommandOutcome, HostError> {
-        let text = text_of(&content);
+        let text = text_only(&content);
+        if text.as_deref().is_some_and(str::is_empty) || content.is_empty() {
+            return Err(HostError::Invalid("the prompt is empty".to_string()));
+        }
         if self.turns.is_busy(&self.lifecycle, agent) {
             let Some(text) = text else {
                 // The pending-message queues hold text, so an attachment
@@ -581,23 +589,50 @@ impl Driver {
             }
         };
 
-        // Everything appended before the settings entry is already on the
-        // event stream, so draining first keeps the published seqs monotone.
-        self.drain_events();
-
         if let Some(entry) = entry {
             // Ask the projection what a backfill would render rather than
             // restating the wording, and publish nothing when it renders
             // nothing: a settings entry before its thread's first message
             // projects no notice, and a live frame no backfill regenerates
-            // would leave a joiner permanently out of step. The snapshot
-            // is taken under the log lock and projected outside it.
+            // would leave a joiner permanently out of step. The snapshot is
+            // taken under the log lock and projected outside it, because
+            // the projection walks the whole log.
             let snapshot = self.session.core.log.lock().await.snapshot();
-            if let Some(event) = snapshot.project_settings_entry(&entry.id) {
-                self.publish_event(Some(entry), event);
-            } else {
-                self.session.status().last_seq = entry.seq;
+            let notice = snapshot.project_settings_entry(&entry.id);
+
+            // Splice the notice into the stream at its own append
+            // position. The confirm released the log lock before
+            // returning, so a background sub-agent's append can already
+            // sit in the channel carrying a higher position, and
+            // publishing the notice on either side of it unconditionally
+            // would break the monotone-per-stream guarantee. Holding the
+            // log lock for the splice is what stops a further append from
+            // arriving mid-way through it.
+            // Held through a clone, so the guard does not borrow `self`
+            // and the splice below can still publish.
+            let log = Arc::clone(&self.session.core.log);
+            let guard = log.lock().await;
+            let mut buffered = Vec::new();
+            while let Ok(tagged) = self.events.try_recv() {
+                buffered.push(tagged);
             }
+            let mut spliced = false;
+            for tagged in buffered {
+                if !spliced
+                    && tagged
+                        .entry
+                        .as_ref()
+                        .is_some_and(|buffered| buffered.seq > entry.seq)
+                {
+                    self.publish_notice(&entry, notice.clone());
+                    spliced = true;
+                }
+                self.on_event(tagged);
+            }
+            if !spliced {
+                self.publish_notice(&entry, notice);
+            }
+            drop(guard);
         }
         for note in notes {
             // A failed config write or log record is a live-only
@@ -614,6 +649,18 @@ impl Driver {
         self.session.status().settings = settings_of(&self.session.core.run_config);
         self.publish_state();
         Ok(CommandOutcome::Accepted)
+    }
+
+    /// Publish a settings entry's projected notice, or, when it projects
+    /// none, just account for the entry it appended.
+    fn publish_notice(&mut self, entry: &EntryRef, notice: Option<AgentEvent>) {
+        match notice {
+            Some(event) => self.publish_event(Some(entry.clone()), event),
+            None => {
+                let mut status = self.session.status();
+                status.last_seq = status.last_seq.max(entry.seq);
+            }
+        }
     }
 
     /// The catalog entry for the session's active model, the validation
@@ -654,17 +701,16 @@ impl Driver {
             });
         }
 
-        // Queued messages belong to the branch being left, so they go
-        // before the epoch changes: published under the old epoch they
-        // still reach clients, whereas a frame minted after the switch
-        // would be dropped by their epoch filter.
-        for agent in self.session.core.message_queues.queued_agents() {
-            self.session.core.message_queues.clear(agent);
-            self.publish_queue(agent);
-        }
-
+        // Queued messages belong to the branch being left, so they are
+        // cleared once the switch is committed to (`set_head` validated
+        // the target) but before the epoch changes: published under the old
+        // epoch they still reach clients, whereas a frame minted after the
+        // switch would be dropped by their epoch filter.
+        // Cloned so the guard does not borrow `self`: the queue updates
+        // below are published while it is held.
+        let log_handle = Arc::clone(&self.session.core.log);
         let transcript = {
-            let mut log = self.session.core.log.lock().await;
+            let mut log = log_handle.lock().await;
             // The abandoned branch's buffered non-punctuation entries
             // belong to it, so they must reach disk before the head moves
             // off them.
@@ -673,6 +719,10 @@ impl Driver {
                 aj_session::ConversationError::InvalidHead(_) => HostError::UnknownEntry(entry),
                 other => internal(other),
             })?;
+            for agent in self.session.core.message_queues.queued_agents() {
+                self.session.core.message_queues.clear(agent);
+                self.publish_queue(agent);
+            }
             let head = log.head().cloned().expect("set_head installed one");
             let conversation = log.linearize(&head, ThreadFilter::USER);
             repair_interrupted_tool_uses(&mut log, &conversation).map_err(internal)?;
@@ -765,9 +815,10 @@ impl Driver {
     }
 }
 
-/// The plain text of a prompt's content, `None` when it carries anything
-/// that is not text (an image, say).
-fn text_of(content: &[UserContent]) -> Option<String> {
+/// The trimmed text of a prompt whose content is text only, `None` when it
+/// carries anything else (an image, say). An empty string means the prompt
+/// was blank, which the caller refuses rather than sending.
+fn text_only(content: &[UserContent]) -> Option<String> {
     let mut text = String::new();
     for block in content {
         match block {
@@ -780,8 +831,7 @@ fn text_of(content: &[UserContent]) -> Option<String> {
             UserContent::Image(_) => return None,
         }
     }
-    let trimmed = text.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
+    Some(text.trim().to_string())
 }
 
 fn internal(err: impl std::error::Error + Send + Sync + 'static) -> HostError {

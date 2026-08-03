@@ -571,6 +571,13 @@ impl SessionHost {
         // A create mints its id by claiming the lock file, so acquiring the
         // lock after the build cannot lose a race: nobody else can hold
         // that id.
+        //
+        // NOTE: the build does blocking IO (a resume reads the whole log,
+        // and the agent environment re-reads the context files and skills)
+        // while this task holds the session map. Every other
+        // materialization waits behind it. Acceptable while a host holds a
+        // handful of sessions; if it starts to hurt, the build moves to the
+        // blocking pool.
         let config = self
             .inner
             .shared
