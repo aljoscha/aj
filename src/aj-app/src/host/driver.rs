@@ -867,7 +867,11 @@ impl Driver {
             agent.clear_todo_list();
         }
 
-        self.shared.fanout.reset_boundaries(self.session.id());
+        // The backfill boundaries live streams filter against are left
+        // alone. The log is append-only and `set_head` renumbers nothing,
+        // so every position the new epoch mints sits above every boundary
+        // handed out under the old one, and no frame of the new history can
+        // be mistaken for one the old backfill already covered.
         self.shared.fanout.publish(Frame::Reset {
             session: self.session.id().to_string(),
         });

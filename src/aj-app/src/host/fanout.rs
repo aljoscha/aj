@@ -179,27 +179,6 @@ impl Fanout {
             .insert(session.to_string(), AttachState::Live { boundary });
     }
 
-    /// Forget every live stream's backfill boundary for `session`, because
-    /// its seqs no longer describe the history the host will serve.
-    ///
-    /// A head switch keeps the session id but mints a new epoch, and a
-    /// boundary from the old epoch would silently drop the new epoch's
-    /// low-numbered frames. Clients re-attach on the `reset` that follows;
-    /// until they do, their own epoch filter is what keeps the new history
-    /// out of the old one's transcript.
-    ///
-    /// A stream still being served its attach block is left alone: its held
-    /// frames are reliable and dropping them here would lose them, and the
-    /// `reset` itself is among them, so that client re-attaches as soon as
-    /// its block lands.
-    pub(crate) fn reset_boundaries(&self, session: &str) {
-        for subscriber in self.lock().values_mut() {
-            if let Some(state @ AttachState::Live { .. }) = subscriber.attached.get_mut(session) {
-                *state = AttachState::Live { boundary: 0 };
-            }
-        }
-    }
-
     /// Drop every subscriber, closing its stream.
     pub(crate) fn close(&self) {
         self.lock().clear();
@@ -450,30 +429,16 @@ mod tests {
         );
     }
 
-    /// A re-materialization clears a live stream's boundary, because the
-    /// new epoch's positions say nothing about the old one's.
+    /// A `reset` published while a stream's attach block is still being
+    /// written is held and delivered behind it, like any other reliable
+    /// frame. Dropping it would leave that client attached to a session
+    /// whose continuity broke, waiting for a re-attach it was never told
+    /// to make.
     #[test]
-    fn resetting_boundaries_stops_filtering_the_new_epoch() {
-        let fanout = Fanout::default();
-        let (id, mut rx) = fanout.register(&[SESSION.to_string()]);
-        fanout.deliver_block(id, SESSION, vec![caught_up(9)], 9);
-        let _ = drained(&mut rx);
-
-        fanout.reset_boundaries(SESSION);
-        fanout.publish(durable(1));
-
-        assert_eq!(drained(&mut rx), vec!["durable 1"]);
-    }
-
-    /// A stream whose block has not been written yet keeps its held
-    /// frames through a reset: they are reliable, and the `reset` itself is
-    /// among them.
-    #[test]
-    fn resetting_boundaries_leaves_an_in_flight_attach_alone() {
+    fn a_reset_during_an_attach_is_delivered_behind_the_block() {
         let fanout = Fanout::default();
         let (id, mut rx) = fanout.register(&[SESSION.to_string()]);
         fanout.publish(reliable("held"));
-        fanout.reset_boundaries(SESSION);
         fanout.publish(Frame::Reset {
             session: SESSION.to_string(),
         });
