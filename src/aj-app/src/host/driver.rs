@@ -44,6 +44,11 @@ use crate::turn::{Joined, TurnStart, Turns, running_work_counts};
 /// turn emits its synthetic aborted `MessageEnd`s and error tool results),
 /// so we prefer it. A wedged turn must not hang the process, hence the
 /// bound.
+///
+/// NOTE: `SessionHost::shutdown` winds its sessions down one at a time, so a
+/// host holding several wedged sessions pays this per session. Fine while a
+/// host holds a handful; the fix, if it ever matters, is to drive the
+/// teardowns concurrently rather than to shorten the grace.
 const TURN_DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 pub(crate) struct Driver {
@@ -481,9 +486,15 @@ impl Driver {
                 // which is what the local dequeue gesture does.
                 CommandOutcome::Withdrawn(text)
             }
-            QueueOp::Clear { agent } => {
-                self.session.core.message_queues.clear(agent);
-                self.publish_queue(agent);
+            QueueOp::Clear => {
+                // Session-wide (spec 6.6), so every agent that has
+                // something queued gets its own `QueueUpdate`: a client
+                // tracks the queues per agent and would otherwise keep
+                // showing the ones it was not told about.
+                for agent in self.session.core.message_queues.queued_agents() {
+                    self.session.core.message_queues.clear(agent);
+                    self.publish_queue(agent);
+                }
                 CommandOutcome::Accepted
             }
         }

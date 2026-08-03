@@ -570,12 +570,7 @@ async fn commanding_a_known_session_materializes_it() {
     let revived = harness.revive(vec![finalized_text_message("second")]);
     revived
         .host
-        .command(
-            &session,
-            Command::Queue(QueueOp::Clear {
-                agent: AgentId::Main,
-            }),
-        )
+        .command(&session, Command::Queue(QueueOp::Clear))
         .await
         .expect("a queue command materializes the session");
     assert!(
@@ -1397,12 +1392,7 @@ async fn queue_mutations_reach_every_subscriber() {
     harness.prompt(&session, "and another").await;
     harness
         .host
-        .command(
-            &session,
-            Command::Queue(QueueOp::Clear {
-                agent: AgentId::Main,
-            }),
-        )
+        .command(&session, Command::Queue(QueueOp::Clear))
         .await
         .expect("clear");
 
@@ -1462,9 +1452,7 @@ async fn every_queue_mutation_publishes_an_update() {
             agent: AgentId::Main,
         }),
         prompt("and another"),
-        Command::Queue(QueueOp::Clear {
-            agent: AgentId::Main,
-        }),
+        Command::Queue(QueueOp::Clear),
     ] {
         harness
             .host
@@ -1478,6 +1466,58 @@ async fn every_queue_mutation_publishes_an_update() {
             .count();
     }
     assert_eq!(updates, 6, "one update per mutation");
+    harness.host.shutdown().await;
+}
+
+/// `clear` is session-wide (spec 6.6), and every agent it emptied gets its
+/// own `QueueUpdate`: a client tracks the queues per agent and would keep
+/// showing the ones it was not told about.
+#[tokio::test]
+async fn clearing_the_queue_empties_every_agent() {
+    let harness = Harness::new(sub_agent_turn());
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "delegate it").await;
+    client.pump_until_idle().await;
+
+    // Queued through the in-process handles: an idle agent runs a prompt
+    // instead of queueing it.
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    handles.queues.append_follow_up(AgentId::Main, "for main");
+    handles
+        .queues
+        .append_follow_up(AgentId::Sub(1), "for the sub");
+    let _ = drained(&mut client.stream);
+
+    harness
+        .host
+        .command(&session, Command::Queue(QueueOp::Clear))
+        .await
+        .expect("clear");
+
+    assert_eq!(handles.queues.pending_counts(), (0, 0));
+    let mut updated: Vec<AgentId> = events(&drained(&mut client.stream))
+        .into_iter()
+        .filter_map(|event| match event {
+            AgentEvent::QueueUpdate { agent_id, .. } => Some(*agent_id),
+            _ => None,
+        })
+        .collect();
+    // Each update is a full snapshot for its own agent, so the order they
+    // are published in carries nothing.
+    updated.sort_by_key(|agent| match agent {
+        AgentId::Main => (0, 0),
+        AgentId::Sub(n) => (1, *n),
+    });
+    assert_eq!(
+        updated,
+        vec![AgentId::Main, AgentId::Sub(1)],
+        "one update per agent that had something queued",
+    );
     harness.host.shutdown().await;
 }
 
@@ -2616,6 +2656,99 @@ async fn the_reads_answer_tasks_queue_tree_and_hello() {
         hello.host_id,
         "the host id is persisted in the session store",
     );
+    revived.host.shutdown().await;
+}
+
+/// The task and queue reads answer a session that is not live without
+/// materializing it (spec 6.7), and the directory reports its durable
+/// high-water mark from the store rather than as zero. The tree read is the
+/// one exception: it has to parse the log, so it materializes.
+#[tokio::test]
+async fn reads_do_not_materialize_a_cold_session() {
+    let harness = Harness::new(vec![finalized_text_message("on the record")]);
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+    client.pump_until_idle().await;
+    let live_last_seq = {
+        let handles = harness
+            .host
+            .local_handles(&session)
+            .await
+            .expect("live session");
+        handles.log.lock().await.last_seq()
+    };
+    drop(client);
+    harness.host.shutdown().await;
+
+    let revived = harness.revive(Vec::new());
+    let is_live = async || {
+        revived
+            .host
+            .sessions()
+            .await
+            .expect("sessions")
+            .sessions
+            .into_iter()
+            .find(|entry| entry.id == session)
+            .expect("the session is listed from disk")
+    };
+    let cold = is_live().await;
+    assert!(!cold.live);
+    assert_eq!(
+        cold.last_seq, live_last_seq,
+        "a cold session's high-water mark comes from the store, not from zero",
+    );
+
+    assert!(
+        revived
+            .host
+            .tasks(&session)
+            .await
+            .expect("tasks")
+            .tasks
+            .is_empty(),
+    );
+    assert!(
+        revived
+            .host
+            .queue(&session)
+            .await
+            .expect("queue")
+            .queues
+            .is_empty(),
+    );
+    assert!(
+        !is_live().await.live,
+        "neither read materialized the session",
+    );
+    assert!(
+        SessionLock::try_acquire(&revived.persistence, &session)
+            .expect("try_acquire")
+            .is_some(),
+        "and neither took its advisory lock",
+    );
+
+    // An unknown session is still a 404 rather than an empty answer.
+    for err in [
+        revived.host.tasks("not-a-session").await.err(),
+        revived.host.queue("not-a-session").await.err(),
+    ] {
+        let err = err.expect("an unknown session is refused");
+        assert!(matches!(err, HostError::UnknownSession(_)), "got {err:?}");
+    }
+
+    // The tree read parses the log, so it materializes like a command.
+    assert!(
+        !revived
+            .host
+            .tree(&session)
+            .await
+            .expect("tree")
+            .segments
+            .is_empty(),
+    );
+    assert!(is_live().await.live, "the tree read materialized it");
     revived.host.shutdown().await;
 }
 

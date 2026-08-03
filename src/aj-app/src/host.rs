@@ -168,13 +168,16 @@ pub enum Command {
     },
 }
 
-/// A withdrawal or a clear of an agent's pending message.
+/// A withdrawal of one agent's pending message, or a clear of the whole
+/// session's queues.
 ///
 /// The queues hold at most one message per agent (the "one message, one
 /// kind" invariant), so a withdrawal names the agent rather than a slot.
+/// A clear takes no agent: spec 6.6 makes it session-wide, and only
+/// `remove` targets an agent.
 pub enum QueueOp {
     Remove { agent: AgentId },
-    Clear { agent: AgentId },
+    Clear,
 }
 
 /// Which settings axis a change moves, and to what.
@@ -261,10 +264,31 @@ struct HostInner {
     host_id: String,
     working_directory: PathBuf,
     sessions: TokioMutex<HashMap<String, LiveEntry>>,
+    /// Wall clock and monotonic clock read at the same moment, for
+    /// projecting a task's `Instant` onto wall time (see [`wall_clock`]).
+    /// Read once per host rather than per call, so the same task's start
+    /// time does not move between two reads of the table.
+    clock_anchor: (DateTime<Utc>, Instant),
+    /// Per-session durable high-water marks for sessions that are not live,
+    /// keyed by the log-file fingerprint they were counted from.
+    ///
+    /// Entries for sessions that have since been removed from the store
+    /// linger, which is bounded by the store's session count and costs a
+    /// `u64` each.
+    cold_last_seq: StdMutex<HashMap<String, CachedLastSeq>>,
     /// Set by [`SessionHost::shutdown`], and never cleared: a host is torn
     /// down once. Every operation refuses afterwards (see
     /// [`SessionHost::alive`]).
     shut_down: AtomicBool,
+}
+
+/// One cold session's entry count, plus the file fingerprint it was counted
+/// from. A file whose modification time and size have not moved cannot have
+/// grown an entry.
+struct CachedLastSeq {
+    modified: DateTime<Utc>,
+    size: u64,
+    last_seq: u64,
 }
 
 impl Drop for HostInner {
@@ -323,6 +347,8 @@ impl SessionHost {
             host_id,
             working_directory,
             sessions: TokioMutex::new(HashMap::new()),
+            clock_anchor: (Utc::now(), Instant::now()),
+            cold_last_seq: StdMutex::new(HashMap::new()),
             shut_down: AtomicBool::new(false),
         });
         spawn_list_publisher(&inner);
@@ -435,6 +461,7 @@ impl SessionHost {
 
         let mut summaries: BTreeMap<String, SessionSummary> = BTreeMap::new();
         for metadata in on_disk {
+            let last_seq = self.cold_last_seq(&metadata);
             summaries.insert(
                 metadata.session_id.clone(),
                 SessionSummary {
@@ -443,7 +470,7 @@ impl SessionHost {
                     working: false,
                     queued: QueueCounts::default(),
                     tasks: 0,
-                    last_seq: 0,
+                    last_seq,
                     last_activity: metadata.modified_at,
                     unreachable: false,
                 },
@@ -461,10 +488,15 @@ impl SessionHost {
 
     /// The session's background-task table, with wall-clock timestamps: the
     /// in-memory registry keeps `Instant`s, which mean nothing off-process.
+    ///
+    /// A session that is not live answers empty rather than being
+    /// materialized for the read (spec 6.7): a cold session has no tasks by
+    /// definition, and paying a resume, an agent rebuild and the advisory
+    /// lock to learn that would be perverse.
     pub async fn tasks(&self, session: &str) -> Result<TaskTable, HostError> {
-        let live = self.live(session).await?;
-        let now_wall = Utc::now();
-        let now = Instant::now();
+        let Some(live) = self.live_or_cold(session).await? else {
+            return Ok(TaskTable::default());
+        };
         let tasks = live
             .core
             .task_registry
@@ -477,15 +509,18 @@ impl SessionHost {
                 kind: task.kind,
                 label: task.label,
                 status: task.status,
-                started_at: wall_clock(now_wall, now, task.started_at),
+                started_at: wall_clock(self.inner.clock_anchor, task.started_at),
             })
             .collect();
         Ok(TaskTable { tasks })
     }
 
-    /// The session's pending steering and follow-up messages.
+    /// The session's pending steering and follow-up messages. Empty, and no
+    /// materialization, for a session that is not live (see [`Self::tasks`]).
     pub async fn queue(&self, session: &str) -> Result<QueueState, HostError> {
-        let live = self.live(session).await?;
+        let Some(live) = self.live_or_cold(session).await? else {
+            return Ok(QueueState::default());
+        };
         let mut agents = live.core.message_queues.queued_agents();
         agents.sort_by_key(|agent| match agent {
             AgentId::Main => (0, 0),
@@ -506,6 +541,10 @@ impl SessionHost {
     }
 
     /// The session's branch tree, for a tree view and head switching.
+    ///
+    /// The one read that materializes (spec 6.7): the tree is derived from
+    /// the log's parent chains, so answering it means parsing the log, which
+    /// is what a materialization does anyway.
     pub async fn tree(&self, session: &str) -> Result<SessionTree, HostError> {
         let live = self.live(session).await?;
         // Cheap and in-memory, but it still walks the log, so snapshot
@@ -599,6 +638,74 @@ impl SessionHost {
         let live = self.materialize(&mut sessions, Some(session)).await?;
         drop(sessions);
         Ok(live)
+    }
+
+    /// The live session for `session`, or `None` when the store knows it but
+    /// this host has not materialized it.
+    ///
+    /// The read path. A read must not materialize (spec 6.7), because doing
+    /// so resumes the log, rebuilds the agent environment and takes the
+    /// session's advisory lock, all to answer a question whose answer for a
+    /// cold session is "nothing".
+    async fn live_or_cold(&self, session: &str) -> Result<Option<Arc<LiveSession>>, HostError> {
+        self.alive()?;
+        if let Some(entry) = self.inner.sessions.lock().await.get(session) {
+            return Ok(Some(Arc::clone(&entry.session)));
+        }
+        if !self.on_disk(session)? {
+            return Err(HostError::UnknownSession(session.to_string()));
+        }
+        Ok(None)
+    }
+
+    /// The durable high-water mark of a session that is not live, counted
+    /// off its log.
+    ///
+    /// Derived rather than reported as zero, because the unseen-output glyph
+    /// a client derives (spec 6.8) is about exactly the sessions it has not
+    /// attached, which is most of them. Counting is O(file) and a list tick
+    /// covers the whole store, hence the cache against the file's
+    /// fingerprint: a log whose modification time and size have not moved
+    /// cannot have grown an entry.
+    ///
+    /// A log that cannot be read counts zero: a directory listing must not
+    /// fail over one unreadable file.
+    fn cold_last_seq(&self, metadata: &aj_session::SessionMetadata) -> u64 {
+        let fingerprint = (metadata.modified_at, metadata.size_bytes);
+        {
+            let cache = self.cold_last_seq_cache();
+            if let Some(cached) = cache.get(&metadata.session_id)
+                && (cached.modified, cached.size) == fingerprint
+            {
+                return cached.last_seq;
+            }
+        }
+        let last_seq = match self.inner.persistence.stored_last_seq(&metadata.session_id) {
+            Ok(last_seq) => last_seq,
+            Err(err) => {
+                tracing::warn!(
+                    session = metadata.session_id,
+                    "could not count the log's entries: {err}"
+                );
+                return 0;
+            }
+        };
+        self.cold_last_seq_cache().insert(
+            metadata.session_id.clone(),
+            CachedLastSeq {
+                modified: fingerprint.0,
+                size: fingerprint.1,
+                last_seq,
+            },
+        );
+        last_seq
+    }
+
+    fn cold_last_seq_cache(&self) -> std::sync::MutexGuard<'_, HashMap<String, CachedLastSeq>> {
+        self.inner
+            .cold_last_seq
+            .lock()
+            .expect("cold last-seq cache mutex poisoned")
     }
 
     /// Take a session's advisory lock, refusing when another writer holds
@@ -885,12 +992,22 @@ fn summarize(session: &Arc<LiveSession>) -> SessionSummary {
     }
 }
 
-/// Project a monotonic `Instant` onto wall clock, using the pair of clocks
-/// read at the same moment. Exact enough for a task table: the two reads
-/// are microseconds apart.
-fn wall_clock(now_wall: DateTime<Utc>, now: Instant, at: Instant) -> DateTime<Utc> {
-    let elapsed = now.saturating_duration_since(at);
-    now_wall - chrono::Duration::from_std(elapsed).unwrap_or_default()
+/// Project a monotonic `Instant` onto wall clock through `anchor`, a pair of
+/// clocks read at the same moment.
+///
+/// The anchor is read once per host rather than per call, so the same task's
+/// reported start time does not move between two reads of the table. Exact
+/// enough for a task table either way: the two clocks drift by microseconds
+/// over a host's lifetime.
+fn wall_clock(anchor: (DateTime<Utc>, Instant), at: Instant) -> DateTime<Utc> {
+    let (wall, instant) = anchor;
+    // Signed: a task started after the anchor is ahead of it, and
+    // `saturating_duration_since` would report it as the anchor itself.
+    if at >= instant {
+        wall + chrono::Duration::from_std(at.duration_since(instant)).unwrap_or_default()
+    } else {
+        wall - chrono::Duration::from_std(instant.duration_since(at)).unwrap_or_default()
+    }
 }
 
 /// Mint a fresh epoch token.
@@ -905,16 +1022,48 @@ pub(crate) fn mint_epoch() -> String {
 /// Read the store's host id, minting and writing one when it has none.
 fn resolve_host_id(sessions_dir: &Path) -> Result<String, HostError> {
     let path = sessions_dir.join(HOST_ID_FILE);
-    match std::fs::read_to_string(&path) {
-        Ok(id) if !id.trim().is_empty() => return Ok(id.trim().to_string()),
-        Ok(_) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(HostError::Internal(Box::new(err))),
+    if let Some(id) = read_host_id(&path)? {
+        return Ok(id);
     }
-    let id = format!("{:032x}", rand::random::<u128>());
     std::fs::create_dir_all(sessions_dir).map_err(|err| HostError::Internal(Box::new(err)))?;
-    std::fs::write(&path, format!("{id}\n")).map_err(|err| HostError::Internal(Box::new(err)))?;
-    Ok(id)
+    let minted = format!("{:032x}", rand::random::<u128>());
+    // `create_new`, because two hosts starting in one store must not both
+    // mint: the store would be advertised under two ids and a gateway would
+    // see one working directory as two hosts. The loser of the race reads
+    // the winner's id back.
+    match std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            std::io::Write::write_all(&mut file, format!("{minted}\n").as_bytes())
+                .map_err(|err| HostError::Internal(Box::new(err)))?;
+            Ok(minted)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            read_host_id(&path)?.ok_or_else(|| {
+                // The file exists and is blank, which only a crash between
+                // the create and the write leaves behind. Overwriting it
+                // would reopen the race this claim exists to close, so this
+                // is the operator's call.
+                HostError::Internal(
+                    format!("{} is empty: remove it to mint a fresh id", path.display()).into(),
+                )
+            })
+        }
+        Err(err) => Err(HostError::Internal(Box::new(err))),
+    }
+}
+
+/// The store's recorded host id, `None` when the file is absent or blank.
+fn read_host_id(path: &Path) -> Result<Option<String>, HostError> {
+    match std::fs::read_to_string(path) {
+        Ok(id) if !id.trim().is_empty() => Ok(Some(id.trim().to_string())),
+        Ok(_) => Ok(None),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(HostError::Internal(Box::new(err))),
+    }
 }
 
 /// Publish `list` frames on a coalescing tick.
