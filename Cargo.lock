@@ -78,6 +78,7 @@ dependencies = [
  "aj-models",
  "aj-session",
  "aj-tools",
+ "aj-wire",
  "anyhow",
  "arboard",
  "base64",
