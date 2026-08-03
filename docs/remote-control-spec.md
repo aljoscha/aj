@@ -378,7 +378,13 @@ buffer-and-reconcile dance. Reliable-transient frames already in
 flight in the fan-out at attach time can still arrive after
 `caught_up` and overlap what the backfill projected, which is one of
 the reasons application must be idempotent (below) on first attach as
-well as on re-attach. A cursor beyond the session's current
+well as on re-attach. Lossy frames in flight at attach time are
+**dropped** rather than delivered, because a cumulative snapshot
+delivered after the durable frame that superseded it resurrects stale
+transient state: a `MessageUpdate` for a message the backfill already
+finalized would paint a second, unfinalized copy of it. Dropping them
+costs at most one coalescing tick of streaming text, which the next
+live snapshot restores. A cursor beyond the session's current
 `last_seq` is treated as an epoch mismatch (full backfill).
 
 Sessions not named in the request still produce live durable and
