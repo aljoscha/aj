@@ -19,7 +19,7 @@ use aj_app::session_setup::RunConfigSnapshot;
 use aj_app::settings::{ConfigLayers, PersistAction};
 use aj_app::test_support::{
     CanonicalState, assert_canonical_eq, assert_no_dangling, finalized_text_message,
-    scripted_model_info,
+    finalized_text_message_with_usage, scripted_model_info,
 };
 use aj_conf::{Config, ConfigLayer};
 use aj_models::auth::AuthStorage;
@@ -3693,8 +3693,9 @@ async fn a_materialization_publishes_the_directory() {
 // 15. Reads
 // ---------------------------------------------------------------------------
 
-/// The reads answer the task table (with wall-clock timestamps), the branch
-/// tree, and hello with a `host_id` that survives a restart.
+/// The reads answer the task table (with wall-clock timestamps), the
+/// session's usage, the branch tree, and hello with a `host_id` that
+/// survives a restart.
 #[tokio::test]
 async fn the_reads_answer_tasks_tree_and_hello() {
     let harness = Harness::with_provider(scripted(
@@ -3706,7 +3707,9 @@ async fn the_reads_answer_tasks_tree_and_hello() {
                 serde_json::json!({"command": "sleep 30", "run_in_background": true,
                                    "description": "sleep"}),
             ),
-            finalized_text_message("started it"),
+            // Carries usage so the usage read below has something real to
+            // report.
+            finalized_text_message_with_usage("started it", 1234),
         ],
         0,
         Duration::ZERO,
@@ -3740,6 +3743,18 @@ async fn the_reads_answer_tasks_tree_and_hello() {
             .is_empty(),
     );
 
+    let usage = harness
+        .host
+        .usage(&session)
+        .await
+        .expect("usage read")
+        .expect("a live session reports its usage");
+    assert_eq!(
+        usage.main_agent_usage.input_tokens, 1234,
+        "the turn's tokens are accounted for: {usage:?}",
+    );
+    assert_eq!(usage.total_usage.input_tokens, 1234);
+
     let tree = harness.host.tree(&session).await.expect("tree read");
     assert!(
         !tree.segments.is_empty(),
@@ -3770,10 +3785,10 @@ async fn the_reads_answer_tasks_tree_and_hello() {
     revived.host.shutdown().await;
 }
 
-/// The task and queue reads answer a session that is not live without
-/// materializing it (spec 6.7), and the directory reports its durable
-/// high-water mark from the store rather than as zero. The tree read is the
-/// one exception: it has to parse the log, so it materializes.
+/// The task, queue and usage reads answer a session that is not live
+/// without materializing it (spec 6.7), and the directory reports its
+/// durable high-water mark from the store rather than as zero. The tree read
+/// is the one exception: it has to parse the log, so it materializes.
 #[tokio::test]
 async fn reads_do_not_materialize_a_cold_session() {
     let harness = Harness::new(vec![finalized_text_message("on the record")]);
@@ -3830,6 +3845,10 @@ async fn reads_do_not_materialize_a_cold_session() {
             .is_empty(),
     );
     assert!(
+        revived.host.usage(&session).await.expect("usage").is_none(),
+        "usage is per process, so a session this host never held spent nothing",
+    );
+    assert!(
         !is_live().await.live,
         "neither read materialized the session",
     );
@@ -3844,6 +3863,7 @@ async fn reads_do_not_materialize_a_cold_session() {
     for err in [
         revived.host.tasks("not-a-session").await.err(),
         revived.host.queue("not-a-session").await.err(),
+        revived.host.usage("not-a-session").await.err(),
     ] {
         let err = err.expect("an unknown session is refused");
         assert!(matches!(err, HostError::UnknownSession(_)), "got {err:?}");

@@ -43,6 +43,7 @@ use std::time::{Duration, Instant};
 use aj_agent::events::AgentId;
 use aj_agent::queue::MessageQueues;
 use aj_agent::tool::TaskId;
+use aj_agent::types::UsageSummary;
 use aj_agent::{BoxError, SubAgentRegistry, TaskRegistry};
 use aj_conf::{AgentEnv, Config};
 use aj_models::ThinkingConfig;
@@ -253,6 +254,13 @@ pub struct LocalHandles {
     pub run_config: Arc<StdMutex<RunConfigSnapshot>>,
     pub sub_overrides: Arc<StdMutex<HashMap<usize, SubAgentOverrides>>>,
     pub env: AgentEnv,
+    /// What resume-time settings restoration did to this session, as
+    /// user-facing lines.
+    ///
+    /// A local frontend folds them into its transcript when it focuses the
+    /// session. Nothing regenerates them, so they are a read rather than a
+    /// frame, and a remote client does not see them.
+    pub restore_notices: Vec<String>,
 }
 
 /// Everything a session's driver needs that is not the session itself.
@@ -590,6 +598,18 @@ impl SessionHost {
         })
     }
 
+    /// The session's accumulated token usage, for an end-of-run report.
+    ///
+    /// `None` for a session that is not live: usage is per process, so a
+    /// session this host never held spent nothing. Locks the agent, so a
+    /// turn in flight holds this up for the length of that turn.
+    pub async fn usage(&self, session: &str) -> Result<Option<UsageSummary>, HostError> {
+        let Some(live) = self.live_or_cold(session).await? else {
+            return Ok(None);
+        };
+        Ok(Some(live.core.usage_summary().await))
+    }
+
     /// Direct handles into a live session, for an in-process client. See
     /// [`LocalHandles`].
     pub async fn local_handles(&self, session: &str) -> Result<LocalHandles, HostError> {
@@ -603,6 +623,7 @@ impl SessionHost {
             run_config: Arc::clone(&live.core.run_config),
             sub_overrides: Arc::clone(&live.core.sub_overrides),
             env: live.core.env.clone(),
+            restore_notices: live.core.restore_notices.clone(),
         })
     }
 

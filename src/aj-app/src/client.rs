@@ -257,6 +257,22 @@ impl SessionClient {
         }
     }
 
+    /// Fold an event the client raised itself, outside the stream.
+    ///
+    /// A frontend still has notices of its own: a config diagnostic, the
+    /// outcome of a login, a refused gesture. They carry no envelope, so
+    /// the epoch and cursor rules have nothing to say about them, and no
+    /// durable identity, so they are appended rather than reconciled. They
+    /// go through this instead of straight to [`reduce`] so they share the
+    /// client's lifecycle sets, which is what keeps the two from drifting
+    /// apart.
+    ///
+    /// Only for events with no host behind them. An event the host
+    /// published belongs in [`Self::apply`], envelope and all.
+    pub fn apply_local(&mut self, chat: &mut ChatState, event: AgentEvent) -> Redraw {
+        reduce(chat, &mut self.lifecycle, event, None)
+    }
+
     /// The cursor to offer on re-attach, absent until a durable position
     /// under a known epoch has been committed.
     pub fn cursor(&self) -> Option<Cursor> {
@@ -1062,6 +1078,35 @@ mod tests {
             !client.needs_reattach(),
             "asking for the attach discharges it",
         );
+    }
+
+    #[test]
+    fn a_local_event_folds_without_an_envelope() {
+        let (mut client, mut chat) = attached();
+        let _ = client.apply(
+            &mut chat,
+            durable(EPOCH, 2, "entry-2", notice("from the host")),
+        );
+
+        // A frontend's own notice: no epoch, no seq, so neither the epoch
+        // filter nor the cursor has anything to say about it.
+        assert!(client.apply_local(&mut chat, notice("raised locally")).0);
+
+        assert_eq!(notices(&chat), vec!["from the host", "raised locally"]);
+        assert_eq!(
+            client.cursor().map(|cursor| cursor.seq),
+            Some(0),
+            "a local event moves no cursor",
+        );
+
+        // And it shares the client's lifecycle rather than a second one.
+        let _ = client.apply_local(
+            &mut chat,
+            AgentEvent::AgentStart {
+                agent_id: AgentId::Main,
+            },
+        );
+        assert!(client.lifecycle().is_running(AgentId::Main));
     }
 
     #[test]
