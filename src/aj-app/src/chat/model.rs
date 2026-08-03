@@ -696,6 +696,27 @@ impl ChatState {
         }
     }
 
+    /// Re-open the `Sub(n)` box for a new run of a sub we already have a
+    /// box for: a `Done` box flips back to `Running` and its runtime clock
+    /// starts over. A missing box and one that is already running are left
+    /// untouched.
+    ///
+    /// Only a `Done` box re-opens, because that is the genuine
+    /// continuation case. A `Truncated` or `Failed` conclusion is terminal,
+    /// and re-opening it would let the new run's plain `AgentEnd` conclude
+    /// the box `Done` and quietly rewrite a failure into a success.
+    pub(crate) fn reopen_sub_box(&mut self, n: usize) {
+        if let Some(b) = self.sub_box_mut(n)
+            && b.status == SubAgentStatus::Done
+        {
+            b.status = SubAgentStatus::Running;
+            // The clock restarts so the runtime times the new run, not the
+            // wall-clock since first spawn.
+            b.started_at = Instant::now();
+            b.finished_at = None;
+        }
+    }
+
     /// Mutable access to the `Sub(n)` box entry, if one exists.
     pub(crate) fn sub_box_mut(&mut self, n: usize) -> Option<&mut SubAgentEntry> {
         let &(parent, id) = self.sub_boxes.get(&n)?;

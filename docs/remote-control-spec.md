@@ -443,7 +443,7 @@ Backfill projection rules, which differ from dead-log replay:
   spawn root is at or below the cursor, tagging them durable would
   make the cursor invariant drop them). They are bracketing glue: the
   client ensures the sub's box exists, reusing it when it already
-  does.
+  does, and reads the run the glue opens as in progress.
 - Background sub-agents interleave with their parent, so bracket state
   is per run. Closing a run because the next entry belongs to another
   agent would fabricate a conclusion for a live sub and re-open its
@@ -497,18 +497,26 @@ Client application rules:
   Application must be idempotent on durable identity, for every
   durable-derived effect and not only the obvious ones: a projected tool
   start for a `call_id` the client already renders updates that cell in
-  place, a re-synthesized `SubAgentStart` for a known sub reuses its box,
-  a re-served transcript row for a known message id updates in place, a
-  re-served compaction checkpoint or settings notice updates its
-  existing row rather than appending a second one. That last pair has no
-  identity on the event itself, so the client hands the frame's
-  `entry_id` to its reducer. (This is a deliberate hardening of the
-  reducer, which today appends unconditionally.) After `caught_up` the
-  client refetches the task table and the pending-message queues
-  (section 6.7), because neither task events nor queue updates are
-  replayable. A client may instead discard the session's state and
-  rebuild from a full backfill, which must produce the same result,
-  and is the natural choice when it has no state yet.
+  place, a re-synthesized `SubAgentStart` for a known sub reuses its box
+  and marks that run in progress, a re-served transcript row for a known
+  message id updates in place, a re-served compaction checkpoint or
+  settings notice updates its existing row rather than appending a second
+  one. That last pair has no identity on the event itself, so the client
+  hands the frame's `entry_id` to its reducer. (This is a deliberate
+  hardening of the reducer, which today appends unconditionally.) A
+  re-synthesized start marks the run in progress because that is its whole
+  purpose: it brackets the events that follow it, and those events only
+  land on a running box. A box's report is refreshed from the sub's own
+  conclusions only while it is running, so a client that re-attached during
+  a continuation would otherwise keep the previous run's report for good. A
+  durable `SubAgentStart` names a spawn root instead, and a spawn root is
+  minted once per run, so re-serving one for a box the client already holds
+  never resurrects its conclusion. After `caught_up` the client refetches
+  the task table and the pending-message queues (section 6.7), because
+  neither task events nor queue updates are replayable. A client may
+  instead discard the session's state and rebuild from a full backfill,
+  which must produce the same result, and is the natural choice when it
+  has no state yet.
 - On `reset`, the client re-attaches (reopens the stream naming the
   session, offering its cursor). The server serves an incremental
   suffix if the epoch still matches, or a full backfill if not.

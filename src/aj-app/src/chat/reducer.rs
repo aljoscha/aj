@@ -47,7 +47,9 @@ pub struct Redraw(pub bool);
 /// its own: a compaction checkpoint's summary row and a projected
 /// settings notice. Handing it in is what lets a re-served backfill
 /// update those rows in place instead of appending a second one, which
-/// the cursor invariant cannot do for them (spec 6.5). Passing `None`
+/// the cursor invariant cannot do for them (spec 6.5). It also tells a
+/// `SubAgentStart` that names a spawn root from the entry-less bracketing
+/// glue a backfill synthesizes for a run in progress. Passing `None`
 /// for an event that is in fact durable is safe when the fold starts
 /// from fresh state, which is what local resume does, and grows
 /// duplicate rows under re-application.
@@ -68,21 +70,9 @@ pub fn reduce(
             lifecycle.mark_running(agent_id);
             // A continuation re-prompt emits no `SubAgentStart`, so
             // `AgentStart(Sub n)` is what flips a re-prompted box back
-            // to `Running`. Only a `Done` box re-opens, because that is
-            // the genuine continuation case: a `Failed` or `Truncated`
-            // conclusion is terminal, and re-opening it would let the
-            // paired `AgentEnd` conclude the box `Done` and quietly
-            // rewrite a failure into a success. A box that is missing or
-            // already running is left alone.
-            if let AgentId::Sub(n) = agent_id
-                && let Some(b) = state.sub_box_mut(n)
-                && b.status == SubAgentStatus::Done
-            {
-                b.status = SubAgentStatus::Running;
-                // The clock restarts so the runtime times the new run,
-                // not the wall-clock since first spawn.
-                b.started_at = Instant::now();
-                b.finished_at = None;
+            // to `Running`.
+            if let AgentId::Sub(n) = agent_id {
+                state.reopen_sub_box(n);
             }
             Redraw(true)
         }
@@ -478,9 +468,8 @@ pub fn reduce(
         } => {
             if let AgentId::Sub(n) = child {
                 // Ensure the child's transcript and the parent-side box
-                // (initially `Running`). The footer count and the box's
-                // re-run status come from the paired `AgentStart(Sub
-                // n)`, not from here.
+                // (initially `Running`). The footer count comes from the
+                // paired `AgentStart(Sub n)`, not from here.
                 state.transcripts.entry(child).or_default();
                 if !state.sub_boxes.contains_key(&n) {
                     let id =
@@ -499,6 +488,19 @@ pub fn reduce(
                                 latest_activity: None,
                             }));
                     state.sub_boxes.insert(n, (parent, id));
+                } else if entry.is_none() {
+                    // An entry-less start is the bracketing glue a backfill
+                    // synthesizes for a run whose bracket it found open, so
+                    // that run is in progress and the events after it belong
+                    // to it. Re-opening the box is what lets those events
+                    // land: the report refresh on the sub's conclusions
+                    // fires only on a `Running` box, so a client
+                    // re-attaching during a continuation would otherwise
+                    // keep the previous run's report for good (spec 6.5). A
+                    // durable start names a spawn root, and a root is minted
+                    // once per run, so re-serving one for a box we already
+                    // hold leaves its conclusion alone.
+                    state.reopen_sub_box(n);
                 }
                 // Seed the child's footer entry with its spawn-time
                 // settings so its view shows a model line and (when
@@ -1044,7 +1046,9 @@ fn reduce_assistant_end(
     // matters for a tool-concluding or interleaved sub whose thread-order
     // last assistant differs from replay's bracket-order report. A live
     // re-run flips the box back to `Running` via `AgentStart(Sub n)` before
-    // its `MessageEnd`s, so the live path still refreshes.
+    // its `MessageEnd`s, so the live path still refreshes, and a backfill
+    // does the same through the re-synthesized `SubAgentStart` that opens
+    // the run's bracket.
     //
     // The report tracks the last assistant text even when empty, mirroring
     // replay's `capture_sub_report`, so a tool-concluding sub shows a thin
@@ -2271,6 +2275,94 @@ mod tests {
         );
         // The empty turn does not blank the last meaningful activity line.
         assert_eq!(b.latest_activity.as_deref(), Some("first result"));
+    }
+
+    #[test]
+    fn a_resynthesized_sub_agent_start_reopens_a_concluded_box() {
+        // The state a client holds once a run of `Sub(1)` has finished: box
+        // `Done`, carrying that run's report.
+        let concluded = || {
+            let mut s = state();
+            let mut life = AgentLifecycle::default();
+            apply(
+                &mut s,
+                &mut life,
+                sub_agent_start(1, "scripted", "scripted"),
+            );
+            apply(
+                &mut s,
+                &mut life,
+                AgentEvent::AgentStart {
+                    agent_id: AgentId::Sub(1),
+                },
+            );
+            apply(&mut s, &mut life, sub_assistant_end(1, "first result"));
+            apply(
+                &mut s,
+                &mut life,
+                AgentEvent::SubAgentEnd {
+                    parent: AgentId::Main,
+                    child: AgentId::Sub(1),
+                    report: "first result".into(),
+                    conclusion: SubAgentConclusion::Completed,
+                },
+            );
+            apply(
+                &mut s,
+                &mut life,
+                AgentEvent::AgentEnd {
+                    agent_id: AgentId::Sub(1),
+                    messages: Vec::new(),
+                },
+            );
+            (s, life)
+        };
+
+        // A re-attach during a continuation: the backfill carries no
+        // `AgentStart(Sub 1)` (nothing persists one), so the entry-less
+        // start it synthesizes to bracket the continuation's entries is the
+        // only signal that the run is under way.
+        let (mut s, mut life) = concluded();
+        let _ = reduce(
+            &mut s,
+            &mut life,
+            sub_agent_start(1, "scripted", "scripted"),
+            None,
+        );
+        {
+            let b = s.sub_box_mut(1).expect("box");
+            assert_eq!(
+                b.status,
+                SubAgentStatus::Running,
+                "the glue marks the run it brackets in progress",
+            );
+            assert!(b.finished_at.is_none(), "and the runtime clock runs again");
+        }
+        // Which is what lets the bracketed entries refresh the report.
+        apply(&mut s, &mut life, sub_assistant_end(1, "second result"));
+        assert_eq!(
+            s.sub_box_mut(1).expect("box").report.as_deref(),
+            Some("second result"),
+        );
+
+        // A durable start names the spawn root of the run this box already
+        // stands for, so re-serving it is a pure read.
+        let (mut s, mut life) = concluded();
+        let root = "e-spawn-root".to_string();
+        let _ = reduce(
+            &mut s,
+            &mut life,
+            sub_agent_start(1, "scripted", "scripted"),
+            Some(&root),
+        );
+        let b = s.sub_box_mut(1).expect("box");
+        assert_eq!(
+            b.status,
+            SubAgentStatus::Done,
+            "a re-served spawn root does not resurrect a concluded box",
+        );
+        assert!(b.finished_at.is_some(), "its runtime clock stays frozen");
+        assert_eq!(b.report.as_deref(), Some("first result"));
     }
 
     #[test]

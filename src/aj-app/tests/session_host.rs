@@ -511,6 +511,23 @@ fn sub_box(state: &CanonicalState, child: usize) -> (aj_app::chat::SubAgentStatu
         .unwrap_or_else(|| panic!("no box for sub-agent {child}"))
 }
 
+/// The report sub-agent `child`'s box renders, which is what a client shows
+/// for a run it is not observing.
+fn sub_report(state: &CanonicalState, child: usize) -> Option<String> {
+    state
+        .agent(AgentId::Main)
+        .expect("main transcript")
+        .entries
+        .iter()
+        .find_map(|entry| match entry {
+            aj_app::test_support::CanonicalEntry::SubAgent {
+                child: n, report, ..
+            } if *n == child => Some(report.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no box for sub-agent {child}"))
+}
+
 fn settings() -> AgentSettings {
     AgentSettings {
         provider: "scripted".into(),
@@ -3297,6 +3314,120 @@ fn spawn_root_seq(frames: &[Frame]) -> u64 {
             _ => None,
         })
         .expect("a durable sub-agent start")
+}
+
+/// A client that re-attaches during a sub-agent continuation converges with
+/// one that was attached all along, the box's report included.
+///
+/// A continuation persists no lifecycle bracket, so the client attached all
+/// along learns that the run re-opened from `AgentStart(Sub 1)` while the
+/// re-attaching one has only the block's re-synthesized `SubAgentStart` to go
+/// on. That start therefore has to mark the run in progress: the box's report
+/// is refreshed from the sub's own conclusions only while the box reads
+/// `Running`, so one left concluded would render the first run's report for
+/// good.
+#[tokio::test]
+async fn attaching_during_a_sub_agent_continuation_converges_on_its_report() {
+    let mut script = sub_agent_turn();
+    script.push(finalized_text_message(
+        "still here, and taking my time about it",
+    ));
+    let harness = Harness::with_provider(scripted(script, 1, Duration::from_millis(20)));
+    let session = harness.create().await;
+    let mut all_along = Client::attach(&harness.host, &session).await;
+    let mut rewinding = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "delegate it").await;
+    for client in [&mut all_along, &mut rewinding] {
+        client.pump_until_idle().await;
+        assert_ne!(
+            sub_box(&client.canonical(), 1).0,
+            aj_app::chat::SubAgentStatus::Running,
+            "the first run concluded",
+        );
+        assert_eq!(
+            sub_report(&client.canonical(), 1).as_deref(),
+            Some("the sub found nothing"),
+            "carrying its report",
+        );
+    }
+
+    // The command returns once the driver has accepted it, so the run is
+    // recorded as driven by the time the attach below is served.
+    harness
+        .host
+        .command(
+            &session,
+            Command::Prompt {
+                agent: AgentId::Sub(1),
+                content: vec![UserContent::text("keep going")],
+            },
+        )
+        .await
+        .expect("a retained sub-agent can be prompted again");
+
+    // The cursor sits at the end of the first run, so the suffix is the
+    // continuation's entries and the spawn root stays below it.
+    let cursor = rewinding.client.cursor().expect("a committed cursor");
+    let block = rewinding.reattach(&harness.host, cursor).await;
+
+    let starts: Vec<Option<u64>> = block
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::Event {
+                durability, event, ..
+            } => matches!(
+                event.known(),
+                Some(AgentEvent::SubAgentStart {
+                    child: AgentId::Sub(1),
+                    ..
+                })
+            )
+            .then(|| durability.as_ref().map(|durability| durability.seq)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        starts,
+        vec![None],
+        "the continuation's bracket opens with a re-synthesized, untagged start: {:?}",
+        events(&block)
+            .into_iter()
+            .map(event_kind)
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        sub_box(&rewinding.canonical(), 1).0,
+        aj_app::chat::SubAgentStatus::Running,
+        "which re-opens the box for the run it brackets",
+    );
+
+    // A sub-agent's run is invisible to the session's `working` flag (spec
+    // 6.3), so each client is pumped to the continuation's own `AgentEnd`.
+    // The reap publishes a second one behind it, which the fold absorbs
+    // idempotently, so the two states compare equal either way.
+    for client in [&mut rewinding, &mut all_along] {
+        let frames = frames_until(&mut client.stream, "the continuation to conclude", |frame| {
+            matches!(frame, Frame::Event { event, .. }
+                if matches!(event.known(), Some(AgentEvent::AgentEnd { agent_id: AgentId::Sub(1), .. })))
+        })
+        .await;
+        for frame in &frames {
+            let _ = client.client.apply(&mut client.chat, frame.clone());
+        }
+    }
+
+    assert_eq!(
+        sub_report(&all_along.canonical(), 1).as_deref(),
+        Some("still here, and taking my time about it"),
+        "the box tracks the continuation's report",
+    );
+    assert_canonical_eq(
+        &rewinding.canonical(),
+        &all_along.canonical(),
+        "a re-attach inside a continuation converges once it ends",
+    );
+    assert_no_dangling(&rewinding.chat);
+    harness.host.shutdown().await;
 }
 
 /// A resumed session's sub-agent boxes are still concluded: nothing runs at
