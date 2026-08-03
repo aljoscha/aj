@@ -3556,20 +3556,24 @@ mod tests {
     }
 
     #[test]
-    fn unpaid_contexts_differ_only_in_frozen_description() {
+    fn unpaid_preflight_rejects_a_promoted_treatment_description() {
         let plan = model_plan("unpaid-context");
         let (model, _, reasoning) = resolve_model_metadata(&plan).unwrap();
         let current_tools = expected_tools(DescriptionVariant::Current, model.family.as_deref());
         let compact_tools = expected_tools(DescriptionVariant::CompactV1, model.family.as_deref());
         let current = initial_context("2026-07-24", "prompt", &current_tools);
         let compact = initial_context("2026-07-24", "prompt", &compact_tools);
-        validate_context_pair(&current, &compact).unwrap();
+        let error = validate_context_pair(&current, &compact).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "provider contexts do not contain the two frozen apply_patch descriptions"
+        );
         assert_eq!(current.system_prompt, compact.system_prompt);
         assert_eq!(
             serde_json::to_value(&current.messages).unwrap(),
             serde_json::to_value(&compact.messages).unwrap()
         );
-        unpaid_request_preflight(&model, reasoning, "2026-07-24").unwrap();
+        assert!(unpaid_request_preflight(&model, reasoning, "2026-07-24").is_err());
     }
 
     #[test]

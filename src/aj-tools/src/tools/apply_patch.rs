@@ -12,199 +12,40 @@ use serde::{Deserialize, Serialize};
 
 const DESCRIPTION: &str = r#"Apply a patch to one or more files using the Codex patch format.
 
-You MUST read the file before applying a patch to it.
+You MUST read an existing file before patching it.
 
-## Patch Format
+Wrap the patch in `*** Begin Patch` and `*** End Patch`. Each file operation
+starts with one of these headers:
 
-The patch must be wrapped in `*** Begin Patch` and `*** End Patch` markers.
+- `*** Add File: <path>` creates a file. Prefix every content line with `+`.
+- `*** Delete File: <path>` deletes a file. Nothing follows the header.
+- `*** Update File: <path>` updates a file. It may be followed by
+  `*** Move to: <new path>` to rename it.
 
-Each operation starts with one of three headers:
-- `*** Add File: <path>` - create a new file. Every following line must start with `+`.
-- `*** Delete File: <path>` - remove an existing file. Nothing follows.
-- `*** Update File: <path>` - patch an existing file (optionally with a rename via `*** Move to:`).
+An update contains one or more hunks starting with `@@`, optionally followed by
+a class, function, or other selector. Within a hunk, prefix unchanged context
+with a space, removed lines with `-`, and added lines with `+`.
 
-### Grammar
+Include at least 3 unchanged lines before and after a change when available.
+Use enough context or a selector to identify the location uniquely. Do not
+repeat overlapping context between adjacent hunks. Use `*** End of File` after
+a hunk that must match the end of the file.
 
-```
-Patch       := Begin { FileOp } End
-Begin       := "*** Begin Patch" NEWLINE
-End         := "*** End Patch" NEWLINE
-FileOp      := AddFile | DeleteFile | UpdateFile
-AddFile     := "*** Add File: " path NEWLINE { "+" line NEWLINE }
-DeleteFile  := "*** Delete File: " path NEWLINE
-UpdateFile  := "*** Update File: " path NEWLINE [ MoveTo ] { Hunk }
-MoveTo      := "*** Move to: " newPath NEWLINE
-Hunk        := "@@" [ " " header ] NEWLINE { HunkLine } [ "*** End of File" NEWLINE ]
-HunkLine    := (" " | "-" | "+") text NEWLINE
-```
+Multiple file operations may appear in one patch. Paths may be relative or
+absolute.
 
-## Context Rules
-- By default, show **3 lines** of unchanged code immediately above and 3 lines immediately below each change.
-- Treat 3 lines as a minimum, not a target. For large files, repeated code, or any edit that could plausibly match in multiple places, prefer **5-10 lines** of unchanged context on each side.
-- If a change is within the chosen context window of a previous change, do NOT duplicate the first change's context-after lines in the second change's context-before lines.
-- If 3 lines of context is insufficient to uniquely identify the location, use the `@@` operator to indicate the class or function the snippet belongs to. For example:
-  `@@ class BaseClass`
-  [3+ lines of pre-context]
-  [changes]
-  [3+ lines of post-context]
-- If a code block is repeated so many times that even a single `@@` header and 3 lines of context cannot uniquely identify it, use multiple `@@` statements to narrow the location:
-  `@@ class BaseClass`
-  `@@ def method():`
-  [3+ lines of pre-context]
-  [changes]
-  [3+ lines of post-context]
-
-## Additional Rules
-- **When editing conflict markers**, ensure their length matches the file's existing marker length (e.g., jj markers like `<<<<<<<`, `%%%%%%%`, or `\\\\`/longer).
-- For Add File: every content line MUST start with `+` (which gets stripped)
-- For Update File hunks: lines start with ` ` (context), `-` (remove), or `+` (add)
-- Use `*** End of File` marker to anchor changes at end of file
-- Multiple files can be patched in a single call
-- File paths can be relative or absolute
-- Don't use apply patch for edits that an available linter or formatter could do based on the instructions in the users AGENTS.md file.
-
-## Reliability Tips (Hard Cases)
-- Repeated blocks (CSS vars, test mocks, large "god" files): include a *unique* `@@ ...` header, and add 5-10 or more context lines until the target is unique.
-- If you only read part of a file, do not guess. Read more of the file and expand the context until the hunk can match only once.
-- Indentation-sensitive files (Svelte/CSS/TS): keep indentation exactly as in the file (tabs vs spaces). Do not reindent unrelated lines.
-- Insert-only hunks (no `-` lines): avoid unanchored insert-only hunks; include a nearby unchanged context line (either via `@@` header or ` ` context lines) to show *where* to insert.
-- Ambiguous matches are worse than verbose hunks. Prefer a longer patch over a shorter patch that could apply in multiple places.
-- Whitespace drift: avoid changing internal spacing in context lines (e.g., `get: () =>` vs `get:  () =>`). Copy context lines from the file.
-- CRLF files: keep line endings consistent with the file you're patching.
-- If you see `[REDACTED:_____]` in your inputs and edits fail, secret redaction may have changed the text; ask the user to manually make the edit.
-
-## Examples
-
-Add a new file:
+Example:
 ```
 *** Begin Patch
-*** Add File: path/to/new/file.ts
-+const hello = 'world'
-+export { hello }
-*** End Patch
-```
-
-Simple update with context:
-```
-*** Begin Patch
-*** Update File: src/utils/helpers.ts
-@@
- export function processData(input: string) {
-   const normalized = input.trim()
-   if (!normalized) {
-     return 'default'
-   }
--  return normalized
-+  return normalized.toLowerCase()
- }
-
- export function formatLabel(label: string) {
-   return label.toUpperCase()
+*** Update File: src/utils.ts
+@@ export function label
+ export function label(value: string) {
+-  return value
++  return value.trim()
  }
 *** End Patch
 ```
-
-Update a nested structure (include extra context lines to disambiguate the edit):
-```
-*** Begin Patch
-*** Update File: src/services/user-service.ts
-@@ class UserService
-   constructor(
-     private readonly repo: UserRepo,
-     private readonly logger: Logger,
-   ) {}
-
-   async updateUser(id: string, data: UserData) {
-     const user = await this.findById(id)
--    user.name = data.name
-+    user.name = data.name?.trim() || user.name
-+    user.updatedAt = new Date()
-     await this.save(user)
-     return user
-   }
- }
-*** End Patch
-```
-
-Large or repetitive files: prefer 5+ context lines so the hunk matches only once:
-```
-*** Begin Patch
-*** Update File: src/theme/button-tokens.ts
-@@ export const buttonTokens = {
-   primary: {
-     background: colors.blue[500],
-     foreground: colors.white,
-     border: colors.blue[600],
-     hoverBackground: colors.blue[600],
-     activeBackground: colors.blue[700],
--    focusRing: colors.blue[300],
-+    focusRing: colors.cyan[300],
-     disabledBackground: colors.gray[300],
-     disabledForeground: colors.gray[500],
-   },
-   secondary: {
-*** End Patch
-```
-
-Use multiple `@@` blocks to skip intervening code:
-```
-*** Begin Patch
-*** Update File: src/config/settings.ts
-@@
- const defaultConfig = {
-   name: 'myapp',
-   version: '1.0.0',
-   featureFlags: {
-     metrics: true,
-     tracing: false,
-   },
-@@
-   logging: {
-     destination: 'stdout',
--    level: 'info',
-+    level: 'debug',
-     format: 'json',
-     redact: ['token'],
-   },
-   retries: 3,
-*** End Patch
-```
-
-Editing content within jj conflict markers:
-```
-*** Begin Patch
-*** Update File: src/config.ts
-@@
- <<<<<<< Conflict 1 of 1
- %%%%%%% Changes from base to side #1
- \\\       (rebase destination)
-- const API_URL = 'http://localhost:3000'
-+ const API_URL = 'https://api.example.com'
- +++++++ Contents of side #2
- const API_URL = 'http://staging.example.com'
- >>>>>>> Conflict 1 of 1 ends
-*** End Patch
-```
-
-Delete a file:
-```
-*** Begin Patch
-*** Delete File: path/to/delete.ts
-*** End Patch
-```
-
-Move a file while changing its contents:
-```
-*** Begin Patch
-*** Update File: src/old-name.ts
-*** Move to: src/new-name.ts
-@@
--export function oldName() {
-+export function newName() {
-   return 'hello'
- }
-*** End Patch
-```"#;
+"#;
 
 const DIAGNOSTIC_LINE_LIMIT: usize = 240;
 const TRUNCATION_SUFFIX: &str = "… [truncated]";
