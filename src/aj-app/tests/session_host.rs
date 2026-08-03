@@ -658,6 +658,52 @@ async fn an_attach_reports_what_it_served_and_refuses_a_duplicate() {
     harness.host.shutdown().await;
 }
 
+/// The store's host id is claimed atomically, so two hosts starting in one
+/// store cannot both mint one: the store would be advertised under two ids
+/// and a gateway would see one working directory as two hosts.
+#[tokio::test]
+async fn the_host_id_is_claimed_not_written_over() {
+    let harness = Harness::new(Vec::new());
+    let path = harness.persistence.sessions_dir().join("host-id");
+    let minted = harness.host.hello().host_id;
+    assert_eq!(
+        std::fs::read_to_string(&path)
+            .expect("the id was written")
+            .trim(),
+        minted,
+        "the id in the store is the one this host reports",
+    );
+
+    // Every later host over the store adopts it rather than minting.
+    for _ in 0..2 {
+        let revived = harness.revive(Vec::new());
+        assert_eq!(revived.host.hello().host_id, minted);
+        revived.host.shutdown().await;
+    }
+
+    // A blank file is a crashed mint. Overwriting it would reopen the race
+    // the claim closes, so it is refused loudly instead.
+    std::fs::write(&path, "\n").expect("blank the id");
+    let err = SessionHost::new(HostSetup {
+        config: Arc::new(StdMutex::new(Config::default())),
+        layers: Arc::new(StdMutex::new(ConfigLayers {
+            user: Config::default(),
+            project: ConfigLayer::default(),
+            project_path: None,
+        })),
+        catalog: Arc::new(Vec::new()),
+        run_config: snapshot(scripted(Vec::new(), 0, Duration::ZERO)),
+        restore: None,
+        persistence: harness.persistence.clone(),
+        auth: AuthStorage::new(harness._dir.path().join("auth.json")),
+        working_directory: harness._dir.path().to_path_buf(),
+    })
+    .err()
+    .expect("a blank host id is refused");
+    assert!(err.to_string().contains("empty"), "got {err}");
+    harness.host.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // 2. Two concurrent sessions
 // ---------------------------------------------------------------------------
