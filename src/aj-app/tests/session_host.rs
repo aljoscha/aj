@@ -33,6 +33,10 @@ use tempfile::TempDir;
 /// test instead of hanging CI.
 const DEADLINE: Duration = Duration::from_secs(20);
 
+/// Long enough for the host's `list` debounce to publish whatever it had
+/// coalesced, so a test can tell "nothing more is coming" from "not yet".
+const LIST_SETTLE: Duration = Duration::from_millis(600);
+
 /// A host over a temp sessions store, plus the store handles a test needs
 /// to look behind the host's back (the lock, the on-disk log).
 struct Harness {
@@ -305,6 +309,15 @@ fn events(frames: &[Frame]) -> Vec<&AgentEvent> {
             _ => None,
         })
         .collect()
+}
+
+/// One event's `type` tag, for assertion messages that name a sequence of
+/// events without dumping their payloads.
+fn event_kind(event: &AgentEvent) -> String {
+    serde_json::to_value(event)
+        .ok()
+        .and_then(|value| value["type"].as_str().map(str::to_string))
+        .unwrap_or_default()
 }
 
 /// The `(seq, entry_id)` of every durable frame, in delivery order.
@@ -985,6 +998,148 @@ async fn a_live_session_holds_its_lock_until_teardown() {
         .expect("the lock is free once the host tore the session down");
     drop(reacquired);
     rival.host.shutdown().await;
+}
+
+/// A materialization the lock refuses must not have touched the log. The
+/// build is not read-only: a resume truncates a torn trailing line and the
+/// repair walk appends synthesized tool results, so taking the lock after
+/// it would let a refused host rewrite the file the real writer owns.
+#[tokio::test]
+async fn a_refused_materialization_leaves_the_log_untouched() {
+    let harness = Harness::new(vec![finalized_text_message("on the record")]);
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+    client.pump_until_idle().await;
+    drop(client);
+    harness.host.shutdown().await;
+
+    // A torn trailing line, which is what a resume truncates away.
+    let path = harness
+        .persistence
+        .sessions_dir()
+        .join(format!("{session}.jsonl"));
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("reopen the log");
+    std::io::Write::write_all(&mut file, b"{\"id\":\"torn\"").expect("append a torn line");
+    drop(file);
+    let before = std::fs::read(&path).expect("read the log");
+
+    // Another writer holds the session, so every attempt below is refused.
+    let held = SessionLock::try_acquire(&harness.persistence, &session)
+        .expect("try_acquire")
+        .expect("the lock is free once the host tore the session down");
+
+    let rival = harness.revive(Vec::new());
+    for what in ["command", "attach"] {
+        let err = match what {
+            "command" => rival
+                .host
+                .command(&session, prompt("hi"))
+                .await
+                .expect_err("a locked session cannot be commanded")
+                .to_string(),
+            _ => rival
+                .host
+                .attach(&[AttachRequest {
+                    session: session.clone(),
+                    cursor: None,
+                }])
+                .await
+                .expect_err("a locked session cannot be attached")
+                .to_string(),
+        };
+        assert!(err.contains("held by another writer"), "{what}: {err}");
+        assert_eq!(
+            std::fs::read(&path).expect("read the log"),
+            before,
+            "the refused {what} rewrote the log",
+        );
+    }
+
+    drop(held);
+    rival.host.shutdown().await;
+}
+
+/// Every request after shutdown is refused. The session map is drained and
+/// the fan-out closed by then, so serving one would rebuild the session
+/// behind a driver nobody will ever tell to stop, and re-take its advisory
+/// lock. Reachable from a request in flight when SIGTERM lands.
+#[tokio::test]
+async fn requests_after_shutdown_are_refused() {
+    let harness = Harness::new(vec![finalized_text_message("on the record")]);
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+    client.pump_until_idle().await;
+    drop(client);
+
+    harness.host.shutdown().await;
+
+    let refusals: Vec<String> = vec![
+        harness
+            .host
+            .command(&session, prompt("hi"))
+            .await
+            .expect_err("command")
+            .to_string(),
+        harness
+            .host
+            .attach(&[AttachRequest {
+                session: session.clone(),
+                cursor: None,
+            }])
+            .await
+            .err()
+            .expect("attach")
+            .to_string(),
+        harness.host.create().await.expect_err("create").to_string(),
+        harness
+            .host
+            .sessions()
+            .await
+            .err()
+            .expect("sessions")
+            .to_string(),
+        harness
+            .host
+            .tasks(&session)
+            .await
+            .err()
+            .expect("tasks")
+            .to_string(),
+        harness
+            .host
+            .queue(&session)
+            .await
+            .err()
+            .expect("queue")
+            .to_string(),
+        harness
+            .host
+            .tree(&session)
+            .await
+            .err()
+            .expect("tree")
+            .to_string(),
+        harness
+            .host
+            .local_handles(&session)
+            .await
+            .err()
+            .expect("local handles")
+            .to_string(),
+    ];
+    for refusal in &refusals {
+        assert!(refusal.contains("shut down"), "got {refusal}");
+    }
+
+    let free = SessionLock::try_acquire(&harness.persistence, &session)
+        .expect("try_acquire")
+        .expect("no request re-took the session's lock");
+    drop(free);
 }
 
 // ---------------------------------------------------------------------------
@@ -1832,6 +1987,116 @@ async fn the_conclusion_sweep_ends_a_sub_that_finished_in_the_gap() {
     harness.host.shutdown().await;
 }
 
+/// A backfill served the instant a sub-agent's spawn root lands must not
+/// conclude it.
+///
+/// The log names a run as soon as its spawn root is appended, which is
+/// several bus emits before the host consumes the `AgentStart` that reports
+/// it running. A host that tracked the live set directly would therefore
+/// lag the log in exactly that window, and the projection would force-close
+/// a bracket the sub is still writing into: the client renders a concluded
+/// box with a fabricated report for a live sub-agent.
+///
+/// The window opens once per run and only briefly, so this attaches in a
+/// tight loop from the moment of the prompt. The oracle is stream order:
+/// the fan-out publishes to every subscriber under one lock, so a run whose
+/// real conclusion has not reached the warm client by the time a block has
+/// been written was still live when that block was written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn attaching_as_a_sub_agent_spawns_never_concludes_it() {
+    let harness =
+        Harness::with_provider(scripted(background_sub_turn(), 1, Duration::from_millis(5)));
+    let session = harness.create().await;
+    let mut warm = harness
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+    frames_until(&mut warm, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+
+    let concludes_a_sub = |frames: &[Frame]| {
+        frames.iter().any(|frame| {
+            matches!(frame, Frame::Event { event, .. }
+                if matches!(event.known(),
+                    Some(AgentEvent::AgentEnd { agent_id: AgentId::Sub(_), .. })
+                    | Some(AgentEvent::SubAgentEnd { .. })))
+        })
+    };
+
+    harness.prompt(&session, "kick it off").await;
+    let mut really_ended = false;
+    let mut attempts = 0;
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    while !really_ended {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the sub-agent run never concluded, after {attempts} attaches",
+        );
+        attempts += 1;
+        let mut joiner = harness
+            .host
+            .attach(&[AttachRequest {
+                session: session.clone(),
+                cursor: None,
+            }])
+            .await
+            .expect("attach");
+        let block = frames_until(&mut joiner, "caught_up", |frame| {
+            matches!(frame, Frame::CaughtUp { .. })
+        })
+        .await;
+        let concluded = concludes_a_sub(&block);
+        // Drained after the block, so anything the fan-out published
+        // before it is already here.
+        really_ended |= concludes_a_sub(&drained(&mut warm));
+        assert!(
+            !concluded || really_ended,
+            "attempt {attempts} concluded a sub-agent whose run was still live, \
+             block events: {:?}",
+            events(&block)
+                .into_iter()
+                .map(event_kind)
+                .collect::<Vec<_>>(),
+        );
+    }
+    harness.host.shutdown().await;
+}
+
+/// A resumed session's sub-agent boxes are still concluded: nothing runs at
+/// materialization, so every run the log names has finished, which is what
+/// the host seeds its record of finished runs with.
+#[tokio::test]
+async fn a_resumed_session_concludes_the_sub_agents_on_disk() {
+    let harness = Harness::new(sub_agent_turn());
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "delegate it").await;
+    client.pump_until_idle().await;
+    assert_ne!(
+        sub_box(&client.canonical(), 1).0,
+        aj_app::chat::SubAgentStatus::Running,
+        "the live run concluded",
+    );
+    drop(client);
+    harness.host.shutdown().await;
+
+    let revived = harness.revive(Vec::new());
+    let joiner = Client::attach(&revived.host, &session).await;
+    assert_ne!(
+        sub_box(&joiner.canonical(), 1).0,
+        aj_app::chat::SubAgentStatus::Running,
+        "a run that is only on disk is concluded, not left spinning",
+    );
+    drop(joiner);
+    revived.host.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // 14. List frames
 // ---------------------------------------------------------------------------
@@ -1864,7 +2129,7 @@ async fn list_frames_carry_the_directory_and_are_debounced() {
     harness.prompt(&session, "hi").await;
     let frames = until_idle(&mut stream).await;
     // Give the debounce tick room to publish whatever it coalesced.
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    tokio::time::sleep(LIST_SETTLE).await;
     let mut frames = frames;
     frames.extend(drained(&mut stream));
 
@@ -1896,6 +2161,83 @@ async fn list_frames_carry_the_directory_and_are_debounced() {
     assert!(!summary.working, "the turn has settled");
     assert!(summary.last_seq > 0, "it has durable entries");
     harness.host.shutdown().await;
+}
+
+/// Materializing a session publishes a `list` frame saying it is live.
+///
+/// Without one, every other client's directory keeps reporting the session
+/// as on-disk only until it happens to emit an event, and an
+/// attached-but-idle session emits none.
+#[tokio::test]
+async fn a_materialization_publishes_the_directory() {
+    let harness = Harness::new(vec![finalized_text_message("on the record")]);
+    let dormant = harness.create().await;
+    let mut client = Client::attach(&harness.host, &dormant).await;
+    harness.prompt(&dormant, "hi").await;
+    client.pump_until_idle().await;
+    drop(client);
+    harness.host.shutdown().await;
+
+    // A fresh host over the same store: `dormant` is on disk only, and
+    // `watching` carries the stream that has to learn about it.
+    let revived = harness.revive(Vec::new());
+    let watching = revived.create().await;
+    let mut stream = revived
+        .host
+        .attach(&[AttachRequest {
+            session: watching.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+    frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+    let listed = |frames: &[Frame], live: bool| {
+        frames.iter().any(|frame| match frame {
+            Frame::List { sessions } => sessions
+                .iter()
+                .any(|entry| entry.id == dormant && entry.live == live),
+            _ => false,
+        })
+    };
+    // Wait out the directory changes creating `watching` earned, so the
+    // frame asserted on below can only have come from materializing
+    // `dormant`.
+    let settled = frames_until(&mut stream, "the directory to settle", |frame| {
+        matches!(frame, Frame::List { sessions }
+            if sessions.iter().any(|entry| entry.id == dormant && !entry.live))
+    })
+    .await;
+    assert!(listed(&settled, false), "filtered above");
+    tokio::time::sleep(LIST_SETTLE).await;
+    assert!(
+        drained(&mut stream)
+            .iter()
+            .all(|frame| !matches!(frame, Frame::List { .. })),
+        "no directory change is still pending",
+    );
+
+    // Attaching it is what makes it live, and nothing about it will ever
+    // reach the stream on its own: it runs no turn.
+    let attached = revived
+        .host
+        .attach(&[AttachRequest {
+            session: dormant.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach the dormant session");
+    let frames = frames_until(&mut stream, "the directory to report it live", |frame| {
+        matches!(frame, Frame::List { sessions }
+            if sessions.iter().any(|entry| entry.id == dormant && entry.live))
+    })
+    .await;
+    assert!(listed(&frames, true), "filtered above");
+
+    drop(attached);
+    revived.host.shutdown().await;
 }
 
 // ---------------------------------------------------------------------------

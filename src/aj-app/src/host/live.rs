@@ -54,9 +54,19 @@ pub(crate) struct SessionStatus {
     /// The settings the next main turn runs against, cached off the run
     /// config so a `state` frame needs no lock of its own.
     pub(crate) settings: AgentSettings,
-    /// The sub-agents the host knows are still running. A backfill leaves
-    /// their brackets open rather than fabricating a conclusion (spec 6.5).
-    pub(crate) live_subs: BTreeSet<usize>,
+    /// The sub-agents the host has observed going idle, plus every one the
+    /// log already named when the session was materialized (nothing runs at
+    /// that point, so they are all finished).
+    ///
+    /// Monotone: it only ever grows, because a sub-agent id is minted once
+    /// per session. A backfill's `live_subs` is derived from it as "in the
+    /// log and not in here", which is what puts the lag in the safe
+    /// direction. The alternative, tracking the live set directly, lags the
+    /// log: a spawn root reaches disk several bus emits before the host
+    /// consumes the `AgentStart` that would record the run as live, and a
+    /// backfill served in that window would fabricate a conclusion for a
+    /// sub-agent that is still running (spec 6.5).
+    pub(crate) finished_subs: BTreeSet<usize>,
     pub(crate) last_activity: DateTime<Utc>,
 }
 

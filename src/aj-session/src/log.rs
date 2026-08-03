@@ -1290,6 +1290,11 @@ impl ConversationLog {
         self.core.max_agent_id()
     }
 
+    /// See [`LogSnapshot::sub_agent_ids`].
+    pub fn sub_agent_ids(&self) -> BTreeSet<usize> {
+        self.core.sub_agent_ids()
+    }
+
     /// See [`LogSnapshot::entries_in_order`].
     pub fn entries_in_order(&self) -> Vec<&ConversationEntry> {
         self.core.entries_in_order()

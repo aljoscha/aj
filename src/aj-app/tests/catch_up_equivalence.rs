@@ -93,11 +93,11 @@ impl Client {
         self.apply(caught_up_frame(epoch, log.last_seq()));
         // After `caught_up` the host concludes every sub-agent it knows to
         // be idle, which is what unwedges a box whose `SubAgentEnd` fell
-        // into the disconnected window with no durable entry behind it.
-        for child in log.sub_agent_ids() {
-            if !backfill.open_subs.contains(&child) {
-                self.apply(agent_end_frame(epoch, AgentId::Sub(child)));
-            }
+        // into the disconnected window with no durable entry behind it. It
+        // sweeps the runs the projection walked, not the log's full set,
+        // which is what keeps an abandoned branch's runs out of it.
+        for child in backfill.subs.difference(&backfill.open_subs) {
+            self.apply(agent_end_frame(epoch, AgentId::Sub(*child)));
         }
     }
 

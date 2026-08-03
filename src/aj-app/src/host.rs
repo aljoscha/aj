@@ -29,6 +29,7 @@ mod live;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -248,14 +249,26 @@ struct HostInner {
     host_id: String,
     working_directory: PathBuf,
     sessions: TokioMutex<HashMap<String, LiveEntry>>,
+    /// Set by [`SessionHost::shutdown`], and never cleared: a host is torn
+    /// down once. Every operation refuses afterwards (see
+    /// [`SessionHost::alive`]).
+    shut_down: AtomicBool,
 }
 
 impl Drop for HostInner {
     fn drop(&mut self) {
         // A host dropped without `shutdown` would otherwise leave its
         // drivers running (and its session locks held) for the life of the
-        // process. Aborting is not the graceful path, so `shutdown` stays
-        // the documented teardown; this only bounds the damage.
+        // process. Aborting is not the graceful path (no turn cancel, no
+        // task quiescing, no log flush), so `shutdown` stays the
+        // documented teardown; this only bounds the damage, loudly.
+        let abandoned: Vec<&String> = self.sessions.get_mut().keys().collect();
+        if !abandoned.is_empty() {
+            tracing::warn!(
+                "host dropped without shutdown: aborting the drivers of {abandoned:?} \
+                 without cancelling turns or flushing their logs"
+            );
+        }
         for entry in self.sessions.get_mut().values() {
             entry.driver.abort();
         }
@@ -298,6 +311,7 @@ impl SessionHost {
             host_id,
             working_directory,
             sessions: TokioMutex::new(HashMap::new()),
+            shut_down: AtomicBool::new(false),
         });
         spawn_list_publisher(&inner);
         Ok(Self { inner })
@@ -317,14 +331,13 @@ impl SessionHost {
 
     /// Create a session in the host's working directory and hold it live.
     pub async fn create(&self) -> Result<String, HostError> {
+        self.alive()?;
         let mut sessions = self.inner.sessions.lock().await;
         let session = self
             .materialize(&mut sessions, None)
             .await?
             .id()
             .to_string();
-        drop(sessions);
-        self.inner.shared.fanout.mark_list_dirty();
         Ok(session)
     }
 
@@ -339,6 +352,7 @@ impl SessionHost {
     /// either already in the backfill (and filtered against the boundary)
     /// or above it (and delivered).
     pub async fn attach(&self, requests: &[AttachRequest]) -> Result<Attachment, HostError> {
+        self.alive()?;
         // Materialize everything up front: a failure must not leave a
         // half-served stream behind.
         let mut live = Vec::with_capacity(requests.len());
@@ -377,6 +391,7 @@ impl SessionHost {
     /// as live ones. The discovery surface (spec 6.7): there is no separate
     /// on-disk listing.
     pub async fn sessions(&self) -> Result<SessionList, HostError> {
+        self.alive()?;
         // The store scan is blocking IO, so it runs before the map lock is
         // taken rather than under it.
         let on_disk = self
@@ -512,7 +527,13 @@ impl SessionHost {
     /// transcripts stay consistent), its background tasks quiesced and its
     /// log flushed, and only then is its advisory lock released, which
     /// happens when its driver task ends.
+    ///
+    /// Terminal: every later request fails rather than rebuilding a session
+    /// behind a driver nobody will ever tell to stop.
     pub async fn shutdown(&self) {
+        // Set before the map is drained, so a request that raced this
+        // cannot materialize a session between the drain and the flag.
+        self.inner.shut_down.store(true, Ordering::Release);
         let entries: Vec<LiveEntry> = {
             let mut sessions = self.inner.sessions.lock().await;
             sessions.drain().map(|(_, entry)| entry).collect()
@@ -529,13 +550,38 @@ impl SessionHost {
         self.inner.shared.fanout.close();
     }
 
+    /// Refuse a request that arrived after [`Self::shutdown`].
+    ///
+    /// Without this every path through [`Self::live`] would happily rebuild
+    /// a session the host just tore down: it would re-take the session's
+    /// advisory lock and sit behind a driver nobody will ever send
+    /// `Shutdown` to. Reachable from a request in flight when SIGTERM
+    /// lands.
+    fn alive(&self) -> Result<(), HostError> {
+        if self.inner.shut_down.load(Ordering::Acquire) {
+            return Err(HostError::Conflict {
+                reason: "the host is shut down".to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// The live session for `session`, materializing it when it is only on
     /// disk.
     async fn live(&self, session: &str) -> Result<Arc<LiveSession>, HostError> {
+        self.alive()?;
         let mut sessions = self.inner.sessions.lock().await;
         let live = self.materialize(&mut sessions, Some(session)).await?;
         drop(sessions);
         Ok(live)
+    }
+
+    /// Take a session's advisory lock, refusing when another writer holds
+    /// it.
+    fn acquire(&self, id: &str) -> Result<SessionLock, HostError> {
+        SessionLock::try_acquire(&self.inner.persistence, id)
+            .map_err(|err| HostError::Internal(Box::new(err)))?
+            .ok_or_else(|| HostError::Locked(id.to_string()))
     }
 
     /// Return the live session for `id`, creating it (when `id` is `None`)
@@ -557,6 +603,19 @@ impl SessionHost {
                 return Err(HostError::UnknownSession(id.to_string()));
             }
         }
+        // A resume's lock is taken before the build, because the build is
+        // not read-only: `ConversationLog::resume` truncates a torn tail
+        // and the repair walk appends synthesized tool results. A
+        // materialization this host refuses must have done neither (spec
+        // section 5).
+        //
+        // A create has nothing on disk to read or repair, and it mints its
+        // id by an atomic `create_new` claim on that id's lock-file path,
+        // so no other writer can be holding the lock it takes below.
+        let claimed = match id {
+            Some(id) => Some(self.acquire(id)?),
+            None => None,
+        };
         let spec = match id {
             Some(id) => SessionSpec::Resume {
                 session_id: id.to_string(),
@@ -567,10 +626,6 @@ impl SessionHost {
                 entry: SessionEntry::Startup,
             },
         };
-        // A create mints its id by claiming the lock file, so acquiring the
-        // lock after the build cannot lose a race: nobody else can hold
-        // that id.
-        //
         // NOTE: the build does blocking IO (a resume reads the whole log,
         // and the agent environment re-reads the context files and skills)
         // while this task holds the session map. Every other
@@ -593,20 +648,28 @@ impl SessionHost {
         )
         .map_err(|err| HostError::Internal(err.into()))?;
         let session_id = core.session_id.clone();
-        let lock = SessionLock::try_acquire(&self.inner.persistence, &session_id)
-            .map_err(|err| HostError::Internal(Box::new(err)))?
-            .ok_or_else(|| HostError::Locked(session_id.clone()))?;
+        let lock = match claimed {
+            Some(lock) => lock,
+            None => self.acquire(&session_id)?,
+        };
 
         let handoff = AppendHandoff::default();
         let events = core.install_persisting_forwarder(&handoff);
+        let log = core.log.lock().await;
         let status = SessionStatus {
             epoch: mint_epoch(),
-            last_seq: core.log.lock().await.last_seq(),
+            last_seq: log.last_seq(),
             working: false,
             settings: settings_of(&core.run_config),
-            live_subs: std::collections::BTreeSet::new(),
+            // Nothing runs at materialization, so every sub-agent the log
+            // names has finished. Seeding them is what keeps a backfill
+            // concluding a resumed session's boxes while leaving the
+            // brackets of runs this host starts open (see
+            // `SessionStatus::finished_subs`).
+            finished_subs: log.sub_agent_ids(),
             last_activity: Utc::now(),
         };
+        drop(log);
         let (requests_tx, requests) = unbounded_channel();
         let session = Arc::new(LiveSession::new(core, handoff, status, requests_tx));
         let driver = Driver::new(
@@ -629,6 +692,12 @@ impl SessionHost {
                 driver: handle,
             },
         );
+        // Here rather than at the callers: a session goes live through
+        // create, attach and command alike, and until a `list` frame says
+        // so every other client's directory reports it as on-disk only. An
+        // attached-but-idle session emits no events of its own, so nothing
+        // else would correct that.
+        self.inner.shared.fanout.mark_list_dirty();
         Ok(session)
     }
 
@@ -652,7 +721,7 @@ impl SessionHost {
         // The snapshot and the epoch are read under the log lock, because a
         // head switch moves both under it: reading them separately could
         // pair the old projection with the new epoch.
-        let (snapshot, epoch, working_seen, settings_seen, live_subs) = {
+        let (snapshot, epoch, working_seen, settings_seen, finished_subs) = {
             let log = session.core.log.lock().await;
             let status = session.status();
             (
@@ -660,7 +729,7 @@ impl SessionHost {
                 status.epoch.clone(),
                 status.working,
                 status.settings.clone(),
-                status.live_subs.clone(),
+                status.finished_subs.clone(),
             )
         };
         let boundary = snapshot.last_seq();
@@ -669,6 +738,18 @@ impl SessionHost {
             .as_ref()
             .filter(|cursor| cursor.epoch == epoch)
             .map(|cursor| cursor.seq);
+        // A run the log names and the host has not seen finish is live, so
+        // its bracket stays open. Deriving it this way rather than tracking
+        // the live set keeps the one unavoidable lag (a spawn root reaches
+        // disk before the host consumes the run's `AgentStart`) on the safe
+        // side: the worst case is a bracket left open a moment too long,
+        // which the live `SubAgentEnd` closes, instead of a fabricated
+        // conclusion for a running sub-agent.
+        let live_subs: std::collections::BTreeSet<usize> = snapshot
+            .sub_agent_ids()
+            .difference(&finished_subs)
+            .copied()
+            .collect();
         // Projected outside the log lock: a full backfill walks the whole
         // log, and holding the lock would stall the session's next append
         // for the length of it.
@@ -704,10 +785,13 @@ impl SessionHost {
         // backfill cannot carry the conclusion itself when no durable entry
         // follows the cursor. The reducer's `AgentEnd` arm leaves a
         // concluded box alone, so the sweep is idempotent.
-        for child in snapshot.sub_agent_ids() {
-            if backfill.open_subs.contains(&child) {
-                continue;
-            }
+        //
+        // Scoped to the runs the projection walked, and to the ones it did
+        // not leave open. Both come out of the same walk as `live_subs`
+        // above, so the sweep cannot contradict the brackets, and an
+        // abandoned branch's runs (which the log names but the projection
+        // never mentions) are left alone.
+        for child in backfill.subs.difference(&backfill.open_subs) {
             block.push(Frame::Event {
                 session: session.id().to_string(),
                 epoch: epoch.clone(),
@@ -716,7 +800,7 @@ impl SessionHost {
                 // the client's cursor invariant drop it.
                 durability: None,
                 event: aj_agent::events::AgentEvent::AgentEnd {
-                    agent_id: AgentId::Sub(child),
+                    agent_id: AgentId::Sub(*child),
                     messages: Vec::new(),
                 }
                 .into(),

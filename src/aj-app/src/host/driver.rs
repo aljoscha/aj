@@ -140,31 +140,30 @@ impl Driver {
     fn apply_lifecycle(&mut self, event: &AgentEvent) {
         match event {
             AgentEvent::AgentStart { agent_id } => self.lifecycle.mark_running(*agent_id),
-            AgentEvent::AgentEnd { agent_id, .. } => self.lifecycle.mark_idle(*agent_id),
+            AgentEvent::AgentEnd { agent_id, .. } => {
+                self.lifecycle.mark_idle(*agent_id);
+                self.note_finished(*agent_id);
+            }
             AgentEvent::CompactionStart { agent_id, .. } => {
                 self.lifecycle.mark_compacting(*agent_id);
             }
             AgentEvent::CompactionEnd { agent_id, .. } => {
                 self.lifecycle.clear_compacting(*agent_id);
             }
-            _ => return,
+            _ => {}
         }
-        self.publish_live_subs();
     }
 
-    /// Republish which sub-agents the host believes are running, which is
-    /// what a backfill consults to decide whose bracket stays open.
-    fn publish_live_subs(&self) {
-        let subs = self
-            .lifecycle
-            .running_agents()
-            .into_iter()
-            .filter_map(|agent| match agent {
-                AgentId::Sub(n) => Some(n),
-                AgentId::Main => None,
-            })
-            .collect();
-        self.session.status().live_subs = subs;
+    /// Record that `agent`'s run is over, if it is a sub-agent.
+    ///
+    /// This is the one fact a backfill's bracketing decisions derive from
+    /// (see `SessionStatus::finished_subs`), so every path that observes a
+    /// sub going idle has to come through here: the `AgentEnd` on the bus,
+    /// and the join-time reap for a sub that emitted none.
+    fn note_finished(&self, agent: AgentId) {
+        if let AgentId::Sub(n) = agent {
+            self.session.status().finished_subs.insert(n);
+        }
     }
 
     /// Handle one completed turn: reap, conclude the sub-agent boxes the
@@ -175,6 +174,7 @@ impl Driver {
             .turns
             .reap(&mut self.lifecycle, &self.session.core.task_registry, agent)
         {
+            self.note_finished(idled);
             // A sub the reap swept emitted no `AgentEnd` of its own, and a
             // remote client cannot conclude its box by reaching into the
             // model the way the local frontend does, so the conclusion
@@ -191,7 +191,6 @@ impl Driver {
                 );
             }
         }
-        self.publish_live_subs();
         let result = match outcome {
             Ok(result) => result,
             Err(err) => {
