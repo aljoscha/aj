@@ -442,27 +442,43 @@ Client application rules:
   current one. This is what keeps a stale in-flight frame from an
   abandoned branch out of the new branch's transcript.
 - **Cursor invariant**: within an epoch, a durable frame whose seq is at
-  or below the last applied seq is always dropped as a duplicate, at any
-  time, not just during a specific phase.
+  or below the last applied seq is dropped as a duplicate, at any time,
+  not just during a specific phase. This is a de-duplication
+  optimization, not the correctness mechanism. Correctness rests on
+  idempotent application, below, because the invariant cannot protect an
+  entry's trailing untagged events: a re-served entry whose durable frame
+  is dropped still applies its `UsageUpdate` and its tool bracket.
+  Adopting a different epoch resets the cursor bookkeeping, since seqs
+  from the old epoch say nothing about the new one.
 - **Re-attach reconciliation**: when a client re-attaches a session it
   already has state for (after a drop, an eviction, or a `reset`), the
   suffix will re-project things the client partially saw live. Before
-  applying the backfill the client quiesces transient-derived
-  in-flight state for that session: the unfinalized streaming
-  assistant entry, tool cells still marked running, the transient
-  activity detail on running sub-agent boxes, and any
-  compaction-in-progress indicator. A running sub-agent box itself is
-  not quiesced: its spawn root is durable and it owns the child
-  transcript, so concluding it would show a finished box for a live sub
-  and dropping it would orphan the transcript when the suffix is empty.
-  The host is authoritative for concluding sub-agent boxes (section 6.5's
-  projection rules).
-  Application must be idempotent on durable identity: a projected
-  tool start for a `call_id` the client already renders updates that
-  cell in place, a re-synthesized `SubAgentStart` for a known sub
-  reuses its box. (This is a deliberate hardening of the reducer,
-  which today appends unconditionally.) After `caught_up` the client
-  refetches the task table (section 6.7), because task events are not
+  applying the backfill the client quiesces its transient-derived
+  in-flight state for that session. Quiesce clears transient *detail*
+  and never durable identity or structure: the unfinalized streaming
+  assistant entry goes, a running tool cell keeps its `call_id`, tool
+  name and arguments but loses the partial result painted by
+  `ToolExecutionUpdate`, a running sub-agent box keeps its status and
+  child transcript but loses its activity detail, and the
+  compaction-in-progress indicator is cleared. Dropping a running tool
+  cell outright would lose its arguments for good, because a tool that
+  has not finished has no log entry and so no backfill can regenerate
+  it. Concluding or dropping a running sub-agent box would either show a
+  finished box for a live sub or orphan its child transcript. The host
+  is authoritative for concluding sub-agent boxes (the projection rules
+  above).
+
+  Application must be idempotent on durable identity, for every
+  durable-derived effect and not only the obvious ones: a projected tool
+  start for a `call_id` the client already renders updates that cell in
+  place, a re-synthesized `SubAgentStart` for a known sub reuses its box,
+  a re-served transcript row for a known message id updates in place, a
+  re-served compaction checkpoint or settings notice updates its
+  existing row rather than appending a second one. That last pair has no
+  identity on the event itself, so the client hands the frame's
+  `entry_id` to its reducer. (This is a deliberate hardening of the
+  reducer, which today appends unconditionally.) After `caught_up` the
+  client refetches the task table (section 6.7), because task events are not
   replayable. A client may instead discard the session's state and
   rebuild from a full backfill, which must produce the same result,
   and is the natural choice when it has no state yet.
