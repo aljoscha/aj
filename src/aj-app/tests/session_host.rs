@@ -392,6 +392,12 @@ impl Client {
             chat: ChatState::new(settings(), 200_000, Arc::new(Vec::new())),
             stream,
         };
+        // Armed from what the attach reports it served, which is the
+        // contract on `expect_attach`: an arm for a block that never
+        // arrives freezes the fold's cursor.
+        for served in this.stream.attached() {
+            assert_eq!(served, session, "one block, for the session asked for");
+        }
         this.client.expect_attach();
         this.apply_block().await;
         this
@@ -594,6 +600,65 @@ async fn an_unknown_session_is_refused() {
         .command("not-a-session", prompt("hi"))
         .await
         .expect_err("unknown sessions are refused");
+    assert!(matches!(err, HostError::UnknownSession(_)), "got {err:?}");
+    harness.host.shutdown().await;
+}
+
+/// An attach reports the sessions it served, and one named twice is a
+/// malformed request: the client contract is one block per named session
+/// (spec 6.5), and the second block would open a phase the client is not
+/// expecting and quiesce state it just applied.
+#[tokio::test]
+async fn an_attach_reports_what_it_served_and_refuses_a_duplicate() {
+    let harness = Harness::new(Vec::new());
+    let first = harness.create().await;
+    let second = harness.create().await;
+
+    let stream = harness
+        .host
+        .attach(&[
+            AttachRequest {
+                session: first.clone(),
+                cursor: None,
+            },
+            AttachRequest {
+                session: second.clone(),
+                cursor: None,
+            },
+        ])
+        .await
+        .expect("attach");
+    assert_eq!(stream.attached(), [first.clone(), second.clone()]);
+    drop(stream);
+
+    let err = harness
+        .host
+        .attach(&[
+            AttachRequest {
+                session: first.clone(),
+                cursor: None,
+            },
+            AttachRequest {
+                session: first.clone(),
+                cursor: None,
+            },
+        ])
+        .await
+        .err()
+        .expect("a session named twice is refused");
+    assert!(matches!(err, HostError::Invalid(_)), "got {err:?}");
+
+    // A refused attach hands back no stream, so a client has nothing to arm
+    // its fold from.
+    let err = harness
+        .host
+        .attach(&[AttachRequest {
+            session: "not-a-session".to_string(),
+            cursor: None,
+        }])
+        .await
+        .err()
+        .expect("an unknown session is refused");
     assert!(matches!(err, HostError::UnknownSession(_)), "got {err:?}");
     harness.host.shutdown().await;
 }

@@ -363,20 +363,33 @@ impl SessionHost {
     /// the session's event flow: a durable frame published in between is
     /// either already in the backfill (and filtered against the boundary)
     /// or above it (and delivered).
+    ///
+    /// Returning successfully means every named session's block will be
+    /// written, which is what [`Attachment::attached`] reports and what a
+    /// client arms its fold from.
     pub async fn attach(&self, requests: &[AttachRequest]) -> Result<Attachment, HostError> {
         self.alive()?;
+        // One block per named session is the client contract (spec 6.5), and
+        // a duplicate would be served two: the second would open a block
+        // the client is not expecting and quiesce state it just applied.
+        let mut names: Vec<String> = Vec::with_capacity(requests.len());
+        for request in requests {
+            if names.contains(&request.session) {
+                return Err(HostError::Invalid(format!(
+                    "session {} is named twice in one attach",
+                    request.session
+                )));
+            }
+            names.push(request.session.clone());
+        }
         // Materialize everything up front: a failure must not leave a
         // half-served stream behind.
         let mut live = Vec::with_capacity(requests.len());
         for request in requests {
             live.push((request, self.live(&request.session).await?));
         }
-        let names: Vec<String> = requests
-            .iter()
-            .map(|request| request.session.clone())
-            .collect();
         let (id, frames) = self.inner.shared.fanout.register(&names);
-        let attachment = Attachment::new(id, frames, Arc::clone(&self.inner.shared.fanout));
+        let attachment = Attachment::new(id, frames, names, Arc::clone(&self.inner.shared.fanout));
         for (request, session) in live {
             self.serve_block(id, request, &session).await;
         }

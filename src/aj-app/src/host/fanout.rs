@@ -162,8 +162,10 @@ impl Fanout {
         }
         let held = match subscriber.attached.remove(session) {
             Some(AttachState::Attaching { held }) => held,
-            // The caller registers a session before serving it, so this is
-            // unreachable unless the same session were served twice.
+            // Reachable only if a caller served one session two blocks,
+            // which `SessionHost::attach` refuses: the second block's held
+            // frames would have been flushed by the first, so there is
+            // nothing left to flush here.
             _ => Vec::new(),
         };
         for frame in held {
@@ -226,6 +228,7 @@ impl Fanout {
 pub struct Attachment {
     id: SubscriberId,
     frames: UnboundedReceiver<Frame>,
+    attached: Vec<String>,
     fanout: Arc<Fanout>,
 }
 
@@ -233,9 +236,25 @@ impl Attachment {
     pub(crate) fn new(
         id: SubscriberId,
         frames: UnboundedReceiver<Frame>,
+        attached: Vec<String>,
         fanout: Arc<Fanout>,
     ) -> Self {
-        Self { id, frames, fanout }
+        Self {
+            id,
+            frames,
+            attached,
+            fanout,
+        }
+    }
+
+    /// The sessions this stream was served an attach block for.
+    ///
+    /// A client arms its fold from this rather than from what it asked for:
+    /// an attach that was refused (a lock conflict, an unknown session)
+    /// returns no `Attachment` at all, so nothing here can name a session
+    /// whose block will not arrive.
+    pub fn attached(&self) -> &[String] {
+        &self.attached
     }
 
     /// The next frame, or `None` once the host closed the stream.
@@ -473,7 +492,7 @@ mod tests {
     fn dropping_an_attachment_deregisters_it() {
         let fanout = Arc::new(Fanout::default());
         let (id, rx) = fanout.register(&[SESSION.to_string()]);
-        let attachment = Attachment::new(id, rx, Arc::clone(&fanout));
+        let attachment = Attachment::new(id, rx, vec![SESSION.to_string()], Arc::clone(&fanout));
         assert_eq!(fanout.lock().len(), 1);
 
         drop(attachment);

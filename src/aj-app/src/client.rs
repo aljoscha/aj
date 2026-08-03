@@ -66,6 +66,7 @@ pub struct SessionClient {
     queue: QueueState,
     tasks: TaskTable,
     needs_task_refetch: bool,
+    needs_queue_refetch: bool,
     needs_reattach: bool,
 }
 
@@ -84,6 +85,7 @@ impl SessionClient {
             queue: QueueState::default(),
             tasks: TaskTable::default(),
             needs_task_refetch: false,
+            needs_queue_refetch: false,
             needs_reattach: false,
         }
     }
@@ -101,10 +103,17 @@ impl SessionClient {
     /// changes (spec 6.3), and an on-change re-emission must neither adopt
     /// an epoch nor quiesce.
     ///
-    /// Every session named in a stream request has to be armed. An
-    /// unarmed session's block folds as live frames instead: its
-    /// `caught_up` is ignored and its durable frames advance the cursor in
-    /// projection order, which is not seq order.
+    /// Contract: arm only once the attach has been served, from what the
+    /// server reports it attached (`Attachment::attached` in process). An
+    /// arm for a block that never arrives is what makes the next on-change
+    /// `state` frame look like one: the fold would quiesce, enter the block
+    /// phase, and stop advancing its cursor until a `caught_up` that never
+    /// comes.
+    ///
+    /// Every session the server did attach has to be armed. An unarmed
+    /// session's block folds as live frames instead: its `caught_up` is
+    /// ignored and its durable frames advance the cursor in projection
+    /// order, which is not seq order.
     ///
     /// Arming also satisfies [`Self::needs_reattach`].
     pub fn expect_attach(&mut self) {
@@ -220,9 +229,10 @@ impl SessionClient {
                 self.applied = Some(last_seq);
                 self.committed = Some(last_seq);
                 self.attach = Attach::Live;
-                // Task events are not replayable, so the table has to come
-                // from the read (spec 6.7).
+                // Neither task events nor queue updates are replayable, so
+                // both tables have to come from their reads (spec 6.7).
                 self.needs_task_refetch = true;
+                self.needs_queue_refetch = true;
                 Redraw(true)
             }
             Frame::Reset { session } => {
@@ -275,9 +285,10 @@ impl SessionClient {
 
     /// Replace the queue snapshot from the queue read (spec 6.7), which is
     /// how a mid-session joiner learns about messages queued before it
-    /// attached.
+    /// attached. Clears [`Self::needs_queue_refetch`].
     pub fn set_queue(&mut self, queue: QueueState) {
         self.queue = queue;
+        self.needs_queue_refetch = false;
     }
 
     /// The background-task table, from the tasks read.
@@ -298,6 +309,16 @@ impl SessionClient {
     /// and a backfill can carry none of them.
     pub fn needs_task_refetch(&self) -> bool {
         self.needs_task_refetch
+    }
+
+    /// Whether the queue snapshot is stale and the caller owes the queue
+    /// read.
+    ///
+    /// Set by every `caught_up`, for the same reason as the task table:
+    /// `QueueUpdate` is reliable-transient, so a backfill regenerates none
+    /// of it and a joiner would show no pending messages at all.
+    pub fn needs_queue_refetch(&self) -> bool {
+        self.needs_queue_refetch
     }
 
     /// Whether continuity was broken and the caller owes a re-attach.
@@ -331,22 +352,23 @@ impl SessionClient {
         self.seed_lifecycle(working);
     }
 
-    /// Seed the running set from the block's `working` flag.
+    /// Seed the main agent's running mark from the block's `working` flag.
     ///
     /// A client whose stream died before an `AgentEnd` would otherwise
     /// spin forever: no projected event carries a lifecycle bracket. After
     /// the block, live lifecycle events are authoritative again.
     ///
-    /// One flag cannot restore per-sub-agent marks, so a still-running
-    /// sub-agent loses its running mark here. Its box keeps its `Running`
-    /// status (the host is authoritative for concluding boxes, spec 6.5)
-    /// and its live `AgentEnd` still concludes it.
+    /// Scoped to `Main`, because `working` says nothing about sub-agents
+    /// (spec 6.3). Clearing their marks here would undercount the running
+    /// agents in the footer and stop a background sub's spinner after every
+    /// re-attach, while its box still reads `Running`. A sub whose
+    /// `AgentEnd` this client missed is cleared by the host's
+    /// post-`caught_up` conclusion sweep, which is the designed mechanism.
     fn seed_lifecycle(&mut self, working: bool) {
-        for agent in self.lifecycle.running_agents() {
-            self.lifecycle.mark_idle(agent);
-        }
         if working {
             self.lifecycle.mark_running(AgentId::Main);
+        } else {
+            self.lifecycle.mark_idle(AgentId::Main);
         }
     }
 
@@ -869,6 +891,91 @@ mod tests {
         // no filter of its own.
         assert!(!client.apply(&mut chat, live(EPOCH, task_output(9))).0);
         assert!(chat.tasks().is_empty());
+    }
+
+    /// The queue read is owed after every block too: `QueueUpdate` is
+    /// reliable-transient, so a backfill regenerates none of it and a joiner
+    /// would show no pending messages at all.
+    #[test]
+    fn caught_up_flags_a_queue_refetch_that_set_queue_clears() {
+        let (mut client, _chat) = attached();
+        assert!(client.needs_queue_refetch());
+        assert!(client.queue().queues.is_empty());
+
+        client.set_queue(QueueState {
+            queues: vec![AgentQueue {
+                agent_id: AgentId::Main,
+                steering: Vec::new(),
+                follow_up: vec![queued("from the read")],
+            }],
+        });
+
+        assert!(!client.needs_queue_refetch());
+        assert_eq!(client.queue().queues.len(), 1);
+    }
+
+    /// A re-attach seeds the main agent's mark and leaves the sub-agents'
+    /// alone: `working` says nothing about them (spec 6.3), and clearing a
+    /// running background sub's mark would stop its spinner and undercount
+    /// the footer's running agents until it ends.
+    #[test]
+    fn a_re_attach_seed_leaves_a_running_sub_agent_marked() {
+        let (mut client, mut chat) = attached();
+        for agent in [AgentId::Main, AgentId::Sub(1)] {
+            let _ = client.apply(
+                &mut chat,
+                live(EPOCH, AgentEvent::AgentStart { agent_id: agent }),
+            );
+        }
+        assert!(client.lifecycle().is_running(AgentId::Sub(1)));
+
+        // The main turn ended in the gap, so the block reports idle. The
+        // background sub is still going.
+        client.expect_attach();
+        let _ = client.apply(&mut chat, state(EPOCH, false));
+        let _ = client.apply(&mut chat, caught_up(EPOCH, 0));
+
+        assert!(!client.lifecycle().is_running(AgentId::Main));
+        assert!(
+            client.lifecycle().is_running(AgentId::Sub(1)),
+            "the sub keeps its mark until its own AgentEnd or the host's sweep",
+        );
+
+        // And the host's conclusion sweep is what clears it.
+        let _ = client.apply(
+            &mut chat,
+            live(
+                EPOCH,
+                AgentEvent::AgentEnd {
+                    agent_id: AgentId::Sub(1),
+                    messages: Vec::new(),
+                },
+            ),
+        );
+        assert!(!client.lifecycle().is_running(AgentId::Sub(1)));
+    }
+
+    /// An attach that was never served must arm nothing: the host's next
+    /// on-change `state` frame would otherwise be mistaken for a block, and
+    /// the fold would quiesce and stop advancing its cursor until a
+    /// `caught_up` that never comes.
+    #[test]
+    fn an_unarmed_client_treats_state_frames_as_live() {
+        let (mut client, mut chat) = attached();
+        let _ = client.apply(&mut chat, durable(EPOCH, 3, "entry-3", notice("one")));
+        let _ = client.apply(&mut chat, live(EPOCH, streaming_text("half a sen")));
+
+        // The attach was refused, so nothing was armed.
+        let _ = client.apply(&mut chat, state(EPOCH, true));
+
+        assert!(streaming(&chat), "no quiesce");
+        let _ = client.apply(&mut chat, durable(EPOCH, 4, "entry-4", notice("two")));
+        assert_eq!(
+            client.cursor().map(|cursor| cursor.seq),
+            Some(3),
+            "durable frames keep advancing the cursor",
+        );
+        assert_eq!(notices(&chat), vec!["one", "two"]);
     }
 
     #[test]
