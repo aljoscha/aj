@@ -26,12 +26,14 @@ use aj_models::types::{
 use aj_session::{
     AppendHandoff, ConversationLog, ConversationPersistence, TaggedEvent, persisting_forwarder,
 };
+use aj_wire::QueueState;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::chat::{ChatState, Entry, EntryId, EntryKind, NoticeLevel, SubAgentStatus, ToolStatus};
+use crate::client::SessionClient;
 use crate::footer::ContextUsage;
 use crate::session::{AgentLifecycle, SessionCore, SessionEntry, SessionSpec};
 use crate::session_setup::RunConfigSnapshot;
@@ -183,8 +185,8 @@ pub fn build_tagged_test_agent(
     (agent, log, handle, rx)
 }
 
-/// Comparable projection of a [`ChatState`] and its [`AgentLifecycle`]:
-/// the equality oracle for reducer-equivalence tests.
+/// Comparable projection of a [`ChatState`] and the client that folded
+/// into it: the equality oracle for reducer-equivalence tests.
 ///
 /// Two states that would render the same conversation project onto the
 /// same value, so `assert_eq!` on this type answers "did these two folds
@@ -206,11 +208,6 @@ pub fn build_tagged_test_agent(
 ///   which two folds of the same conversation legitimately differ on.
 /// - A sub-agent box's `latest_activity`: transient detail a re-attach
 ///   quiesce drops, so two converged states may hold different values.
-/// - Queue state. Spec 11.2 lists it, but `ChatState` holds none: the
-///   local view re-reads the live `MessageQueues` at draw time, and the
-///   client-side queue model a remote frontend needs (fed from
-///   `QueueUpdate` frames and the queue read) arrives with connect mode.
-///   Covering it belongs to whichever type owns it then, not here.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct CanonicalState {
     /// Every agent with a transcript or render bookkeeping, main first
@@ -221,6 +218,9 @@ pub struct CanonicalState {
     pub sub_boxes: BTreeMap<usize, CanonicalLocation>,
     /// The background-task table in task-id order.
     pub tasks: Vec<CanonicalTask>,
+    /// The pending messages the client is tracking, in canonical agent
+    /// order.
+    pub queue: Vec<CanonicalQueue>,
     /// Agents with an open `AgentStart`, in canonical agent order.
     pub running: Vec<AgentId>,
     /// Agents with an in-flight compaction, in canonical agent order.
@@ -284,6 +284,23 @@ pub struct CanonicalTask {
     pub cell: Option<usize>,
 }
 
+/// One agent's pending messages, as the client is tracking them.
+///
+/// Only agents with something pending appear. An agent whose queue was
+/// drained and an agent a client never heard about render the same empty
+/// box, so keeping the emptied entry would report two converged clients as
+/// different.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CanonicalQueue {
+    pub agent: AgentId,
+    /// The queued messages themselves, through `serde_json` like the other
+    /// payloads that carry no `PartialEq`. An `AgentMessage`'s id is
+    /// `#[serde(skip)]`, so this compares the text a client would show and
+    /// not the ids two folds legitimately mint differently.
+    pub steering: Vec<Value>,
+    pub follow_up: Vec<Value>,
+}
+
 /// One transcript entry, kind-tagged.
 ///
 /// Payload types that carry no `PartialEq` (`AssistantMessage`,
@@ -345,8 +362,24 @@ pub enum CanonicalEntry {
 }
 
 impl CanonicalState {
-    /// Project `chat` and `lifecycle` onto their comparable form.
-    pub fn of(chat: &ChatState, lifecycle: &AgentLifecycle) -> Self {
+    /// Project the state `client` folded into `chat`.
+    ///
+    /// The client is the one argument rather than its lifecycle plus its
+    /// queue, so a comparison of two client folds cannot omit the queue and
+    /// go blind to a divergence in it.
+    pub fn of(chat: &ChatState, client: &SessionClient) -> Self {
+        let mut this = Self::of_reduced(chat, client.lifecycle());
+        this.queue = canonical_queue(client.queue());
+        this
+    }
+
+    /// Project a fold that went straight through [`reduce`](crate::chat::reduce)
+    /// with no client around it.
+    ///
+    /// Such a fold owns no queue (`QueueUpdate` is a redraw ping to the
+    /// reducer, which drops the payload), so the queue projects empty. Use
+    /// [`Self::of`] wherever a [`SessionClient`] exists.
+    pub fn of_reduced(chat: &ChatState, lifecycle: &AgentLifecycle) -> Self {
         // The union of both maps: an agent can hold render bookkeeping
         // without a transcript, and a state the oracle skipped would be a
         // blind spot rather than a simplification.
@@ -421,6 +454,7 @@ impl CanonicalState {
             agents,
             sub_boxes,
             tasks,
+            queue: Vec::new(),
             running,
             compacting,
         }
@@ -506,6 +540,27 @@ fn agent_order(id: AgentId) -> (u8, usize) {
         AgentId::Main => (0, 0),
         AgentId::Sub(n) => (1, n),
     }
+}
+
+/// Project a client's queue snapshot: the agents with something pending,
+/// in canonical agent order.
+///
+/// Sorted rather than taken as given, because the two sources of a client's
+/// queue disagree on order: `QueueUpdate` frames arrive in mutation order
+/// and the queue read answers main first.
+fn canonical_queue(queue: &QueueState) -> Vec<CanonicalQueue> {
+    let mut queues: Vec<CanonicalQueue> = queue
+        .queues
+        .iter()
+        .filter(|agent| !agent.steering.is_empty() || !agent.follow_up.is_empty())
+        .map(|agent| CanonicalQueue {
+            agent: agent.agent_id,
+            steering: agent.steering.iter().map(json).collect(),
+            follow_up: agent.follow_up.iter().map(json).collect(),
+        })
+        .collect();
+    queues.sort_by_key(|queue| agent_order(queue.agent));
+    queues
 }
 
 /// Where `entry` sits in `agent`'s transcript, `None` when it no longer

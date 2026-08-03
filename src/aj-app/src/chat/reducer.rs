@@ -3183,7 +3183,7 @@ mod tests {
     // harness misses too.
 
     fn canon(state: &ChatState, life: &AgentLifecycle) -> CanonicalState {
-        CanonicalState::of(state, life)
+        CanonicalState::of_reduced(state, life)
     }
 
     /// The single tool cell in `id`'s transcript.

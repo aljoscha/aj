@@ -102,7 +102,7 @@ impl Client {
     }
 
     fn canonical(&self) -> CanonicalState {
-        CanonicalState::of(&self.chat, self.client.lifecycle())
+        CanonicalState::of(&self.chat, &self.client)
     }
 }
 
@@ -404,7 +404,7 @@ async fn reapplying_the_whole_projected_suffix_changes_nothing() {
         for tagged in &frames {
             fold(&mut chat, &mut life, tagged);
         }
-        let before = CanonicalState::of(&chat, &life);
+        let before = CanonicalState::of_reduced(&chat, &life);
         // The comparison is worthless if the state is empty.
         assert_eq!(
             before
@@ -426,7 +426,7 @@ async fn reapplying_the_whole_projected_suffix_changes_nothing() {
         }
 
         assert_canonical_eq(
-            &CanonicalState::of(&chat, &life),
+            &CanonicalState::of_reduced(&chat, &life),
             &before,
             "full backfill over complete state",
         );
@@ -472,8 +472,71 @@ async fn a_fold_without_durable_identity_diverges() {
     }
 
     assert_ne!(
-        CanonicalState::of(&chat, &life),
+        CanonicalState::of_reduced(&chat, &life),
         reference.canonical(),
         "an identity-blind fold has to duplicate rows",
     );
+}
+
+/// A second guard on the oracle: a pending queued message is part of the
+/// state two clients have to agree on (spec 11.2), so a client that was
+/// told about one and a client that was not must not compare equal.
+///
+/// The reducer treats `QueueUpdate` as a redraw ping and drops the payload,
+/// so nothing in the transcript records this. The client's own snapshot is
+/// the only witness, and an oracle blind to it would call a client with a
+/// queued follow-up converged with one that has none.
+#[tokio::test]
+async fn a_client_with_a_queued_message_differs_from_one_without() {
+    let (_dir, frames, _log) = scripted_tool_turn().await;
+    let mut told = uninterrupted(&frames);
+    let mut untold = uninterrupted(&frames);
+    assert_eq!(
+        told.canonical(),
+        untold.canonical(),
+        "the two folds start out identical",
+    );
+
+    told.apply(queue_update_frame(
+        EPOCH,
+        AgentId::Main,
+        "queued while busy",
+    ));
+
+    assert_ne!(
+        told.canonical(),
+        untold.canonical(),
+        "the queued follow-up is state the oracle has to see",
+    );
+
+    // And the same update lands them back on each other, so the projection
+    // reports a real difference rather than an unstable one.
+    untold.apply(queue_update_frame(
+        EPOCH,
+        AgentId::Main,
+        "queued while busy",
+    ));
+    assert_canonical_eq(
+        &told.canonical(),
+        &untold.canonical(),
+        "both clients heard the same update",
+    );
+}
+
+/// The frame the host publishes on the enqueue side: a full snapshot of one
+/// agent's queues, here a single pending follow-up.
+fn queue_update_frame(epoch: &str, agent_id: AgentId, text: &str) -> Frame {
+    Frame::Event {
+        session: SESSION.to_string(),
+        epoch: epoch.to_string(),
+        durability: None,
+        event: AgentEvent::QueueUpdate {
+            agent_id,
+            steering: Vec::new(),
+            follow_up: vec![aj_agent::message::AgentMessage::wire(
+                aj_models::types::Message::User(aj_models::types::UserMessage::text(text)),
+            )],
+        }
+        .into(),
+    }
 }

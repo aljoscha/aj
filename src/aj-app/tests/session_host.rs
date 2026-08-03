@@ -423,7 +423,7 @@ impl Client {
     }
 
     fn canonical(&self) -> CanonicalState {
-        CanonicalState::of(&self.chat, self.client.lifecycle())
+        CanonicalState::of(&self.chat, &self.client)
     }
 }
 
