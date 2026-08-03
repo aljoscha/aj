@@ -327,6 +327,89 @@ confirmation!(MainConfirm);
 confirmation!(SubConfirm);
 confirmation!(VerbosityConfirm);
 
+/// What a settings confirm amounts to for a caller that does not render a
+/// footer: whether the change applied, the entry it appended, and the text
+/// beside it.
+///
+/// One shape for every axis, because the axis-specific confirms each say
+/// "this did not apply" differently (a `None` footer, an `applied` flag, a
+/// `Failed` variant). A caller that destructured two of three fields would
+/// silently treat a refused change as an accepted one, which is what this
+/// exists to prevent.
+pub struct ConfirmOutcome {
+    /// False when nothing was staged: the target has no live handle, the
+    /// provider bundle could not be rebuilt, validation rejected the
+    /// value. `notice` says which.
+    pub applied: bool,
+    /// The confirmation line, which is also what the entry's projection
+    /// renders, or the refusal when `applied` is false.
+    pub notice: String,
+    pub notes: Vec<String>,
+    /// The settings entry the change appended, absent when the change
+    /// applied but the append failed (a note carries the reason) and when
+    /// it did not apply at all.
+    pub entry: Option<EntryRef>,
+}
+
+impl From<MainConfirm> for ConfirmOutcome {
+    fn from(confirm: MainConfirm) -> Self {
+        Self {
+            applied: confirm.footer.is_some(),
+            notice: confirm.notice,
+            notes: confirm.notes,
+            entry: confirm.entry,
+        }
+    }
+}
+
+impl From<SubConfirm> for ConfirmOutcome {
+    fn from(confirm: SubConfirm) -> Self {
+        Self {
+            applied: confirm.applied,
+            notice: confirm.notice,
+            notes: confirm.notes,
+            entry: confirm.entry,
+        }
+    }
+}
+
+impl From<VerbosityConfirm> for ConfirmOutcome {
+    fn from(confirm: VerbosityConfirm) -> Self {
+        Self {
+            // Verbosity stages a plain field: nothing to rebuild, nothing
+            // to validate, so it cannot be refused.
+            applied: true,
+            notice: confirm.notice,
+            notes: confirm.notes,
+            entry: confirm.entry,
+        }
+    }
+}
+
+impl From<SpeedConfirm> for ConfirmOutcome {
+    fn from(confirm: SpeedConfirm) -> Self {
+        match confirm {
+            SpeedConfirm::Applied {
+                notice,
+                notes,
+                entry,
+                ..
+            } => Self {
+                applied: true,
+                notice,
+                notes,
+                entry,
+            },
+            SpeedConfirm::Failed { notice, .. } => Self {
+                applied: false,
+                notice,
+                notes: Vec::new(),
+                entry: None,
+            },
+        }
+    }
+}
+
 /// Apply a confirmed thinking pick to the main agent: stage it into the
 /// run config, record it on the session log's user thread, and persist
 /// it per `persist`. Returns the new footer identity and the notice.

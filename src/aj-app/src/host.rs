@@ -83,8 +83,11 @@ const HOST_ID_FILE: &str = "host-id";
 /// Why a host request could not be served.
 ///
 /// Typed because callers branch on it: a network server maps the variants
-/// onto the status vocabulary of spec 6.1 (404 for the unknown cases, 409
-/// for a conflict or a lock, 400 for an invalid request).
+/// onto the status vocabulary of spec 6.1. 400 for [`Self::Invalid`], 404
+/// for the unknown cases, 409 for [`Self::Conflict`], [`Self::Locked`] and
+/// [`Self::Unsupported`], 500 for [`Self::Internal`]. (503 is the gateway's
+/// alone: it means an upstream host is unreachable, which a host cannot say
+/// about itself.)
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
     #[error("unknown session {0}")]
@@ -102,6 +105,15 @@ pub enum HostError {
     /// shared log.
     #[error("session {0} is held by another writer")]
     Locked(String),
+    /// The request is well formed and conflicts with nothing, but this host
+    /// cannot serve it: a model it has no credentials for, a settings
+    /// change for an agent that is not live. Deliberately not
+    /// [`Self::Invalid`], because nothing about the request is malformed and
+    /// a client retrying it verbatim against another host may well succeed.
+    #[error("{0}")]
+    Unsupported(String),
+    /// The request is malformed: an empty prompt, a session named twice in
+    /// one attach, an entry id whose role cannot be a head.
     #[error("{0}")]
     Invalid(String),
     #[error("internal host error: {0}")]

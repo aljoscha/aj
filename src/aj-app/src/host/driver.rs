@@ -34,6 +34,7 @@ use crate::host::{
     mint_epoch,
 };
 use crate::session::AgentLifecycle;
+use crate::settings::ConfirmOutcome;
 use crate::turn::{Joined, TurnStart, Turns, running_work_counts};
 
 /// How long a shutdown waits for cancelled turns to wind themselves down
@@ -496,9 +497,12 @@ impl Driver {
         Ok(CommandOutcome::Accepted)
     }
 
-    /// Apply a settings change and synthesize its frames: the projected
-    /// notice tagged with the entry the change appended, then a refreshed
-    /// `state`.
+    /// Apply a settings change and synthesize its frames: the notice tagged
+    /// with the entry the change appended, then a refreshed `state`.
+    ///
+    /// A change that did not apply is an error, never an acceptance: the
+    /// host staged nothing and has nothing to publish, and a client told
+    /// "accepted" would show settings this host never adopted.
     async fn settings(&mut self, change: SettingsChange) -> Result<CommandOutcome, HostError> {
         let SettingsChange {
             agent,
@@ -507,9 +511,9 @@ impl Driver {
         } = change;
         let core = &self.session.core;
         let shared = &self.shared;
-        let (entry, notes) = match (axis, agent) {
+        let outcome: ConfirmOutcome = match (axis, agent) {
             (SettingsAxis::Thinking(level), AgentId::Main) => {
-                let confirm = crate::settings::confirm_thinking_for_main(
+                crate::settings::confirm_thinking_for_main(
                     level,
                     persist,
                     &core.run_config,
@@ -517,58 +521,48 @@ impl Driver {
                     &shared.layers,
                     core,
                 )
-                .await;
-                (confirm.entry, confirm.notes)
+                .await
+                .into()
             }
             (SettingsAxis::Thinking(level), AgentId::Sub(n)) => {
                 let tracked = self.tracked_model();
-                let confirm =
-                    crate::settings::confirm_thinking_for_sub(level, n, tracked, core).await;
-                (confirm.entry, confirm.notes)
+                crate::settings::confirm_thinking_for_sub(level, n, tracked, core)
+                    .await
+                    .into()
             }
-            (SettingsAxis::Model(info), AgentId::Main) => {
-                let confirm = crate::settings::confirm_model_for_main(
-                    info,
-                    persist,
-                    &shared.auth,
-                    &core.run_config,
-                    &shared.config,
-                    &shared.layers,
-                    core,
-                )
-                .await;
-                (confirm.entry, confirm.notes)
-            }
+            (SettingsAxis::Model(info), AgentId::Main) => crate::settings::confirm_model_for_main(
+                info,
+                persist,
+                &shared.auth,
+                &core.run_config,
+                &shared.config,
+                &shared.layers,
+                core,
+            )
+            .await
+            .into(),
             (SettingsAxis::Model(info), AgentId::Sub(n)) => {
                 let speed = {
                     let cfg = core.run_config.lock().expect("run config mutex poisoned");
                     cfg.speed
                 };
-                let confirm =
-                    crate::settings::confirm_model_for_sub(&info, n, &shared.auth, speed, core)
-                        .await;
-                (confirm.entry, confirm.notes)
+                crate::settings::confirm_model_for_sub(&info, n, &shared.auth, speed, core)
+                    .await
+                    .into()
             }
-            (SettingsAxis::Speed(speed), AgentId::Main) => {
-                match crate::settings::confirm_speed_for_main(
-                    speed,
-                    persist,
-                    &shared.auth,
-                    &core.run_config,
-                    &shared.config,
-                    &shared.layers,
-                    core,
-                )
-                .await
-                {
-                    crate::settings::SpeedConfirm::Applied { notes, entry, .. } => (entry, notes),
-                    crate::settings::SpeedConfirm::Failed { notice, .. } => {
-                        return Err(HostError::Invalid(notice));
-                    }
-                }
-            }
+            (SettingsAxis::Speed(speed), AgentId::Main) => crate::settings::confirm_speed_for_main(
+                speed,
+                persist,
+                &shared.auth,
+                &core.run_config,
+                &shared.config,
+                &shared.layers,
+                core,
+            )
+            .await
+            .into(),
             (SettingsAxis::Verbosity(verbosity), AgentId::Main) => {
-                let confirm = crate::settings::confirm_verbosity_for_main(
+                crate::settings::confirm_verbosity_for_main(
                     verbosity,
                     persist,
                     &core.run_config,
@@ -576,24 +570,26 @@ impl Driver {
                     &shared.layers,
                     core,
                 )
-                .await;
-                (confirm.entry, confirm.notes)
+                .await
+                .into()
             }
             (SettingsAxis::Speed(_) | SettingsAxis::Verbosity(_), AgentId::Sub(n)) => {
+                // Malformed rather than unservable: these axes are
+                // session-wide, so no host could serve this request.
                 return Err(HostError::Invalid(format!(
                     "speed and verbosity are session-wide and cannot be set for agent {n}"
                 )));
             }
         };
+        if !outcome.applied {
+            return Err(HostError::Unsupported(outcome.notice));
+        }
 
-        if let Some(entry) = entry {
+        if let Some(entry) = &outcome.entry {
             // Ask the projection what a backfill would render rather than
-            // restating the wording, and publish nothing when it renders
-            // nothing: a settings entry before its thread's first message
-            // projects no notice, and a live frame no backfill regenerates
-            // would leave a joiner permanently out of step. The snapshot is
-            // taken under the log lock and projected outside it, because
-            // the projection walks the whole log.
+            // restating the wording. The snapshot is taken under the log
+            // lock and projected outside it, because the projection walks
+            // the whole log.
             let snapshot = self.session.core.log.lock().await.snapshot();
             let notice = snapshot.project_settings_entry(&entry.id);
 
@@ -621,17 +617,17 @@ impl Driver {
                         .as_ref()
                         .is_some_and(|buffered| buffered.seq > entry.seq)
                 {
-                    self.publish_notice(&entry, notice.clone());
+                    self.publish_notice(agent, entry, notice.clone(), &outcome.notice);
                     spliced = true;
                 }
                 self.on_event(tagged);
             }
             if !spliced {
-                self.publish_notice(&entry, notice);
+                self.publish_notice(agent, entry, notice, &outcome.notice);
             }
             drop(guard);
         }
-        for note in notes {
+        for note in outcome.notes {
             // A failed config write or log record is a live-only
             // diagnostic: no entry exists for a backfill to regenerate it
             // from, so it rides an untagged frame.
@@ -648,14 +644,38 @@ impl Driver {
         Ok(CommandOutcome::Accepted)
     }
 
-    /// Publish a settings entry's projected notice, or, when it projects
-    /// none, just account for the entry it appended.
-    fn publish_notice(&self, entry: &EntryRef, notice: Option<AgentEvent>) {
-        match notice {
+    /// Publish a settings entry's notice: the projected one tagged with the
+    /// entry, or `confirmation` untagged when the entry projects none.
+    ///
+    /// A settings entry that lands before its thread's first message
+    /// projects no notice, so a tagged frame would name something no
+    /// backfill can regenerate. Publishing the confirmation untagged is
+    /// what keeps the pre-first-prompt settings gesture from going silent
+    /// (spec section 5): live clients see it, and it is a transient notice
+    /// like any other. The entry's position still moves the high-water
+    /// mark, since the entry is on disk either way.
+    fn publish_notice(
+        &self,
+        agent: AgentId,
+        entry: &EntryRef,
+        projected: Option<AgentEvent>,
+        confirmation: &str,
+    ) {
+        match projected {
             Some(event) => self.publish_event(Some(entry.clone()), event),
             None => {
-                let mut status = self.session.status();
-                status.last_seq = status.last_seq.max(entry.seq);
+                {
+                    let mut status = self.session.status();
+                    status.last_seq = status.last_seq.max(entry.seq);
+                    status.last_activity = Utc::now();
+                }
+                self.publish_event(
+                    None,
+                    AgentEvent::Notice {
+                        agent_id: agent,
+                        text: confirmation.to_string(),
+                    },
+                );
             }
         }
     }

@@ -1374,11 +1374,77 @@ async fn a_settings_change_publishes_the_projected_notice() {
 }
 
 /// A settings change before the thread's first message projects no notice,
-/// so the host publishes none: a live client must never see a row a
-/// backfill cannot regenerate.
+/// so the host publishes the confirmation untagged: live clients still see
+/// the gesture, and no backfill regenerates a row for it (spec section 5).
 #[tokio::test]
-async fn a_settings_change_before_the_first_prompt_publishes_no_notice() {
+async fn a_settings_change_before_the_first_prompt_publishes_an_untagged_notice() {
     let harness = Harness::new(vec![finalized_text_message("hello back")]);
+    let session = harness.create().await;
+    let mut live = Client::attach(&harness.host, &session).await;
+
+    harness
+        .host
+        .command(
+            &session,
+            Command::Settings(SettingsChange {
+                agent: AgentId::Main,
+                persist: PersistAction::None,
+                axis: SettingsAxis::Thinking(Some(aj_models::ThinkingConfig::Low)),
+            }),
+        )
+        .await
+        .expect("thinking change");
+    let frames = frames_until(&mut live.stream, "the settings state frame", |frame| {
+        matches!(frame, Frame::State { .. })
+    })
+    .await;
+
+    let notices: Vec<&AgentEvent> = events(&frames)
+        .into_iter()
+        .filter(|event| matches!(event, AgentEvent::Notice { .. }))
+        .collect();
+    assert_eq!(
+        notices.len(),
+        1,
+        "the confirmation reaches the live client: {frames:?}",
+    );
+    assert!(
+        matches!(notices[0], AgentEvent::Notice { text, .. } if text.contains("low")),
+        "it carries the confirmation wording: {:?}",
+        notices[0],
+    );
+    assert!(
+        durable(&frames).is_empty(),
+        "a seed settings entry projects nothing, so its notice is untagged: {frames:?}",
+    );
+    assert!(
+        frames.iter().any(
+            |frame| matches!(frame, Frame::State { settings, .. } if settings.thinking == "low")
+        ),
+        "the state frame still refreshes",
+    );
+
+    // The property the untagged frame buys: a joiner's backfill regenerates
+    // no row for it, so an untagged live notice is the only way the gesture
+    // is visible at all.
+    for frame in frames {
+        let _ = live.client.apply(&mut live.chat, frame);
+    }
+    let joiner = Client::attach(&harness.host, &session).await;
+    let rendered = format!("{:?}", joiner.canonical());
+    assert!(
+        !rendered.contains("low"),
+        "the backfill regenerates nothing for a seed settings entry: {rendered}",
+    );
+    harness.host.shutdown().await;
+}
+
+/// A settings change the host cannot serve is an error, not an acceptance.
+/// It stages nothing and publishes nothing, so a client told "accepted"
+/// would render settings this host never adopted.
+#[tokio::test]
+async fn a_settings_change_that_did_not_apply_is_refused() {
+    let harness = Harness::new(Vec::new());
     let session = harness.create().await;
     let mut stream = harness
         .host
@@ -1393,34 +1459,59 @@ async fn a_settings_change_before_the_first_prompt_publishes_no_notice() {
     })
     .await;
 
-    harness
+    // A model whose api nothing in the auth store can build a provider for.
+    let mut unbuildable = scripted_model_info();
+    unbuildable.provider = "no-such-api".to_string();
+    let err = harness
         .host
         .command(
             &session,
             Command::Settings(SettingsChange {
                 agent: AgentId::Main,
                 persist: PersistAction::None,
-                axis: SettingsAxis::Thinking(Some(aj_models::ThinkingConfig::Low)),
+                axis: SettingsAxis::Model(unbuildable),
             }),
         )
         .await
-        .expect("thinking change");
-    let frames = frames_until(&mut stream, "the settings state frame", |frame| {
-        matches!(frame, Frame::State { .. })
-    })
-    .await;
+        .expect_err("a model the host cannot build is refused");
+    assert!(matches!(err, HostError::Unsupported(_)), "got {err:?}");
 
+    // A sub-agent that does not exist has no live handle to stage into.
+    let err = harness
+        .host
+        .command(
+            &session,
+            Command::Settings(SettingsChange {
+                agent: AgentId::Sub(7),
+                persist: PersistAction::None,
+                axis: SettingsAxis::Thinking(Some(aj_models::ThinkingConfig::High)),
+            }),
+        )
+        .await
+        .expect_err("a settings change for an agent that is not live is refused");
+    assert!(matches!(err, HostError::Unsupported(_)), "got {err:?}");
+
+    let handles = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session");
+    {
+        let cfg = handles
+            .run_config
+            .lock()
+            .expect("run config mutex poisoned");
+        assert_eq!(
+            cfg.model_key,
+            ("scripted".to_string(), "scripted".to_string()),
+            "the refused change staged nothing",
+        );
+    }
     assert!(
-        events(&frames)
-            .into_iter()
-            .all(|event| !matches!(event, AgentEvent::Notice { .. })),
-        "a seed settings entry projects nothing, so nothing is published: {frames:?}",
-    );
-    assert!(
-        frames.iter().any(
-            |frame| matches!(frame, Frame::State { settings, .. } if settings.thinking == "low")
-        ),
-        "the state frame still refreshes",
+        drained(&mut stream)
+            .iter()
+            .all(|frame| !matches!(frame, Frame::Event { .. })),
+        "and published no event frames",
     );
     harness.host.shutdown().await;
 }
