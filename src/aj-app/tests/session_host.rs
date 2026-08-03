@@ -1735,7 +1735,7 @@ async fn the_conclusion_sweep_ends_a_sub_that_finished_in_the_gap() {
         .host
         .attach(&[AttachRequest {
             session: session.clone(),
-            cursor: Some(aj_app::client::Cursor {
+            cursor: Some(aj_wire::Cursor {
                 epoch: cursor.epoch.clone(),
                 seq: last_seq,
             }),

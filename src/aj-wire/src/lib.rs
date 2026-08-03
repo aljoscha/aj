@@ -147,6 +147,65 @@ pub struct DurableEvent {
     pub entry_id: String,
 }
 
+/// Where a client's view of one session stands: the epoch it applied
+/// under, and the last durable seq it is willing to claim.
+///
+/// A client offers this on re-attach and a server decides whether it can
+/// serve a suffix from it (spec 6.5). It travels in a stream request as
+/// `<epoch>:<seq>`, which is what [`fmt::Display`] and [`str::parse`]
+/// implement here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cursor {
+    pub epoch: String,
+    pub seq: u64,
+}
+
+impl fmt::Display for Cursor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.epoch, self.seq)
+    }
+}
+
+impl std::str::FromStr for Cursor {
+    type Err = CursorParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // Split at the last colon: an epoch is opaque to the client that
+        // echoes it back, so it may hold one even though the tokens this
+        // host mints do not.
+        let (epoch, seq) = s
+            .rsplit_once(':')
+            .ok_or(CursorParseError::MissingSeparator)?;
+        if epoch.is_empty() {
+            return Err(CursorParseError::EmptyEpoch);
+        }
+        Ok(Self {
+            epoch: epoch.to_string(),
+            seq: seq.parse().map_err(|_| CursorParseError::InvalidSeq)?,
+        })
+    }
+}
+
+/// A cursor string does not have the `<epoch>:<seq>` shape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CursorParseError {
+    MissingSeparator,
+    EmptyEpoch,
+    InvalidSeq,
+}
+
+impl fmt::Display for CursorParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingSeparator => write!(f, "a cursor is <epoch>:<seq>"),
+            Self::EmptyEpoch => write!(f, "a cursor's epoch must not be empty"),
+            Self::InvalidSeq => write!(f, "a cursor's seq must be a non-negative integer"),
+        }
+    }
+}
+
+impl std::error::Error for CursorParseError {}
+
 /// A locally constructed frame violates a wire invariant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FrameValidationError {

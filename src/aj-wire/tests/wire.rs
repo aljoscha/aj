@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use aj_agent::events::AgentEvent;
 use aj_wire::{
-    DecodedAgentEvent, DecodedFrame, ErrorResponse, Frame, Hello, QueueState, SessionList,
+    Cursor, DecodedAgentEvent, DecodedFrame, ErrorResponse, Frame, Hello, QueueState, SessionList,
     SessionTree, TaskTable, VmList,
 };
 use serde_json::{Value, json};
@@ -488,6 +488,33 @@ fn non_event_wire_models_have_pinned_round_trip_fixtures() {
     assert_round_trip::<SessionTree>(&fixtures["tree"]);
     assert_round_trip::<VmList>(&fixtures["vms"]);
     assert_round_trip::<ErrorResponse>(&fixtures["error"]);
+}
+
+/// A cursor's `<epoch>:<seq>` encoding round-trips, and the shapes that
+/// are not one are refused rather than guessed at.
+#[test]
+fn a_cursor_round_trips_through_its_wire_encoding() {
+    let cursor = Cursor {
+        epoch: "0f1e2d3c".to_string(),
+        seq: 42,
+    };
+    assert_eq!(cursor.to_string(), "0f1e2d3c:42");
+    assert_eq!("0f1e2d3c:42".parse::<Cursor>(), Ok(cursor));
+
+    // The epoch is opaque to whoever echoes it back, so a colon inside it
+    // survives the round trip.
+    let colons = Cursor {
+        epoch: "a:b".to_string(),
+        seq: 7,
+    };
+    assert_eq!(colons.to_string().parse::<Cursor>(), Ok(colons));
+
+    for malformed in ["", "epoch", "epoch:", ":7", "epoch:-1", "epoch:x"] {
+        assert!(
+            malformed.parse::<Cursor>().is_err(),
+            "{malformed:?} is not a cursor",
+        );
+    }
 }
 
 fn assert_round_trip<T>(expected: &Value)

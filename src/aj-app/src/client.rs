@@ -21,18 +21,10 @@
 //! no operation here returns a `Result`.
 
 use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
-use aj_wire::{AgentQueue, DecodedAgentEvent, Frame, QueueState, TaskTable};
+use aj_wire::{AgentQueue, Cursor, DecodedAgentEvent, Frame, QueueState, TaskTable};
 
 use crate::chat::{ChatState, Redraw, reduce};
 use crate::session::AgentLifecycle;
-
-/// Where a client's view of one session stands: the epoch it applied
-/// under, and the last durable seq it is willing to claim.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Cursor {
-    pub epoch: String,
-    pub seq: u64,
-}
 
 /// Where the client stands relative to an attach block (spec 6.5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

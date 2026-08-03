@@ -45,8 +45,8 @@ use aj_session::{
     AppendHandoff, ConversationLog, ConversationPersistence, EntryId, SessionLock, project_suffix,
 };
 use aj_wire::{
-    AgentQueue, DurableEvent, Frame, Hello, PROTOCOL_VERSION, QueueCounts, QueueState, SessionList,
-    SessionSummary, SessionTree, TaskSummary, TaskTable, TreeSegment,
+    AgentQueue, Cursor, DurableEvent, Frame, Hello, PROTOCOL_VERSION, QueueCounts, QueueState,
+    SessionList, SessionSummary, SessionTree, TaskSummary, TaskTable, TreeSegment,
 };
 use chrono::{DateTime, Utc};
 use tokio::sync::Mutex as TokioMutex;
@@ -54,7 +54,6 @@ use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use crate::client::Cursor;
 use crate::host::driver::Driver;
 use crate::host::live::{LiveSession, Request, SessionStatus, settings_of};
 use crate::session::{SessionCore, SessionEntry, SessionSpec, SubAgentOverrides};
