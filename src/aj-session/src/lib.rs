@@ -20,6 +20,8 @@
 //!   prompt templates, and file-op extraction over log entries.
 //! - [`tree`] projects the log's branch structure onto a
 //!   segment-collapsed [`SessionTree`] for the tree-view overlay.
+//! - [`lock`] is the advisory single-writer lock a host takes while it
+//!   holds a session live.
 
 /// How many lines a blocking file scan reads between cancellation polls.
 ///
@@ -34,6 +36,7 @@ pub(crate) const SCAN_CANCEL_CHECK_LINES: usize = 1024;
 
 pub mod compaction;
 pub mod listener;
+pub mod lock;
 pub mod log;
 pub mod persistence;
 pub mod prompt_history;
@@ -47,7 +50,8 @@ pub use compaction::{
     CompactionDetails, CompactionPlan, ContextEstimate, estimate_context_tokens,
     prepare_compaction, should_compact,
 };
-pub use listener::persistence_listener;
+pub use listener::{PersistedEvent, persistence_listener, persisting_forwarder};
+pub use lock::SessionLock;
 pub use log::{
     Conversation, ConversationEntry, ConversationEntryKind, ConversationError, ConversationLog,
     EntryId, EntryRef, LogSnapshot, SessionSettings, ThreadFilter, ThreadKind,

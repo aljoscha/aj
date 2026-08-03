@@ -21,7 +21,8 @@
 //! helpers (`last_message`, `messages`, etc.) the binary uses to
 //! decide thinking efforts and resume state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{LazyLock, Mutex};
 use std::{
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Read, Write},
@@ -36,6 +37,16 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::tool_details::{compact_message, expand_message};
+
+/// Session paths this process has minted, so two [`ConversationLog::create`]
+/// calls in the same millisecond cannot pick the same one.
+///
+/// The filesystem check alone cannot see the collision: `create` is lazy,
+/// so a just-minted path has no file until the session's first punctuation
+/// append. Entries are never removed. A minted id costs a short string,
+/// and reusing one has no upside.
+static MINTED_PATHS: LazyLock<Mutex<HashSet<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 #[derive(Debug, Error)]
 pub enum ConversationError {
@@ -769,15 +780,23 @@ impl ConversationLog {
         sessions_dir: &std::path::Path,
         base: &str,
     ) -> Result<(String, PathBuf), ConversationError> {
-        let candidate = sessions_dir.join(format!("{base}.jsonl"));
-        if !candidate.exists() {
-            return Ok((base.to_string(), candidate));
+        // Hold the reservation across the existence checks so two threads
+        // minting from the same base cannot both pass them.
+        let mut reserved = MINTED_PATHS.lock().expect("minted paths mutex poisoned");
+        let mut take = |stem: &str| -> Option<(String, PathBuf)> {
+            let candidate = sessions_dir.join(format!("{stem}.jsonl"));
+            let free = !candidate.exists() && !reserved.contains(&candidate);
+            free.then(|| {
+                reserved.insert(candidate.clone());
+                (stem.to_string(), candidate)
+            })
+        };
+        if let Some(minted) = take(base) {
+            return Ok(minted);
         }
         for n in 1..1000 {
-            let stem = format!("{base}_{n}");
-            let candidate = sessions_dir.join(format!("{stem}.jsonl"));
-            if !candidate.exists() {
-                return Ok((stem, candidate));
+            if let Some(minted) = take(&format!("{base}_{n}")) {
+                return Ok(minted);
             }
         }
         // 1000 collisions in one millisecond is effectively impossible in
@@ -3253,6 +3272,37 @@ mod tests {
             ids(&snapshot.linearize(&assistant.id, ThreadFilter::USER)),
             vec![user.id.clone(), assistant.id.clone()],
         );
+    }
+
+    #[test]
+    fn create_hands_out_a_distinct_path_per_call_in_one_process() {
+        // The same-millisecond case, deterministically: two mints from one
+        // timestamp base. `create` is lazy, so neither path has a file on
+        // disk for the existence check to catch.
+        let dir = fresh_sessions_dir();
+        let (first, first_path) =
+            ConversationLog::mint_unique_path(&dir, "2026-01-01-00-00-00-000").expect("first mint");
+        let (second, second_path) =
+            ConversationLog::mint_unique_path(&dir, "2026-01-01-00-00-00-000")
+                .expect("second mint");
+        assert_ne!(first, second, "two mints from one base must differ");
+        assert_ne!(first_path, second_path);
+
+        let persistence = ConversationPersistence::new(dir);
+        let mut ids = std::collections::HashSet::new();
+        let mut logs = Vec::new();
+        for _ in 0..50 {
+            let log = ConversationLog::create(&persistence).expect("create log");
+            assert!(!log.path().exists(), "create must not touch disk");
+            assert!(
+                ids.insert(log.session_id().to_string()),
+                "create handed out a duplicate session id"
+            );
+            // Hold every log: a reservation has to outlive the call, not
+            // just the loop iteration.
+            logs.push(log);
+        }
+        assert_eq!(logs.len(), 50);
     }
 
     #[test]

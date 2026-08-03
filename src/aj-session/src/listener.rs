@@ -42,8 +42,21 @@ use aj_agent::bus::Listener;
 use aj_agent::events::{AgentEvent, AgentId};
 use aj_agent::message::AgentMessage;
 use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::mpsc::UnboundedSender;
 
-use crate::log::{ConversationLog, ConversationView, ThreadFilter};
+use crate::log::{ConversationLog, ConversationView, EntryRef, ThreadFilter};
+
+/// One event as it left the bus, paired with the log entry it appended.
+///
+/// `entry` is `Some` exactly for the durable events (spec 6.4): the
+/// `MessageEnd` that persisted a message, the `SubAgentStart` that wrote
+/// a spawn root, and the `CompactionEnd` of a compaction that recorded a
+/// checkpoint.
+#[derive(Debug, Clone)]
+pub struct PersistedEvent {
+    pub entry: Option<EntryRef>,
+    pub event: AgentEvent,
+}
 
 /// Build a [`Listener`] that writes every finalized
 /// [`AgentEvent::MessageEnd`] to the given log handle.
@@ -60,44 +73,116 @@ pub fn persistence_listener(log: Arc<TokioMutex<ConversationLog>>) -> Listener {
         let log = Arc::clone(&log);
         let event = event.clone();
         Box::pin(async move {
-            match event {
-                AgentEvent::SubAgentStart {
-                    parent,
-                    child,
-                    task,
-                    background,
-                    settings,
-                } => {
-                    let AgentId::Sub(child_n) = child else {
-                        return Err(format!("SubAgentStart with non-Sub child {child:?}").into());
-                    };
-                    let mut log_guard = log.lock().await;
-                    // Anchor the spawn root at the main thread's current
-                    // head. A sub-agent cannot spawn a sub-agent (the
-                    // `agent` tool is removed from its toolset), so the
-                    // parent is always the main thread.
-                    let parent_head = log_guard.head().cloned().ok_or_else(|| {
-                        BoxError::from(format!(
-                            "SubAgentStart: parent {parent:?} thread has no head entry to anchor child {child:?} at"
-                        ))
-                    })?;
-                    log_guard.append_subagent_spawn(
-                        child_n,
-                        parent_head,
-                        &task,
-                        background,
-                        &settings,
-                    )?;
-                }
-                AgentEvent::MessageEnd { agent_id, message } => {
-                    let mut log_guard = log.lock().await;
-                    persist(&mut log_guard, agent_id, message)?;
-                }
-                _ => {}
-            }
+            persist(&log, &event).await?;
             Ok(())
         })
     })
+}
+
+/// Build a [`Listener`] that persists exactly like
+/// [`persistence_listener`] and forwards every event to `sink`, tagged
+/// with the entry it appended.
+///
+/// The tag is taken at the append site. A consumer that instead read the
+/// log's length when it received the event would race concurrent
+/// sub-agent appends and mis-number the event (spec section 5).
+///
+/// The send is non-blocking and a closed receiver is ignored, so a slow
+/// or absent consumer can never stall or fail a turn even though the bus
+/// awaits this listener inline. That inline position is what gives the
+/// sink its guarantee: an event it receives is already on disk.
+pub fn persisting_forwarder(
+    log: Arc<TokioMutex<ConversationLog>>,
+    sink: UnboundedSender<PersistedEvent>,
+) -> Listener {
+    Arc::new(move |event: &AgentEvent| {
+        let log = Arc::clone(&log);
+        let sink = sink.clone();
+        let event = event.clone();
+        Box::pin(async move {
+            let entry = match persist(&log, &event).await? {
+                Some(entry) => Some(entry),
+                None => compaction_entry(&log, &event).await,
+            };
+            let _ = sink.send(PersistedEvent { entry, event });
+            Ok(())
+        })
+    })
+}
+
+/// Write whatever `event` persists and return the appended entry, or
+/// `None` for an event that persists nothing. Takes the log lock only in
+/// the arms that write, so the streaming events (by far the most
+/// frequent) never contend for it.
+async fn persist(
+    log: &TokioMutex<ConversationLog>,
+    event: &AgentEvent,
+) -> Result<Option<EntryRef>, BoxError> {
+    match event {
+        AgentEvent::SubAgentStart {
+            parent,
+            child,
+            task,
+            background,
+            settings,
+        } => {
+            let AgentId::Sub(child_n) = child else {
+                return Err(format!("SubAgentStart with non-Sub child {child:?}").into());
+            };
+            let mut log_guard = log.lock().await;
+            // Anchor the spawn root at the main thread's current
+            // head. A sub-agent cannot spawn a sub-agent (the
+            // `agent` tool is removed from its toolset), so the
+            // parent is always the main thread.
+            let parent_head = log_guard.head().cloned().ok_or_else(|| {
+                BoxError::from(format!(
+                    "SubAgentStart: parent {parent:?} thread has no head entry to anchor child {child:?} at"
+                ))
+            })?;
+            let appended = log_guard.append_subagent_spawn(
+                *child_n,
+                parent_head,
+                task,
+                *background,
+                settings,
+            )?;
+            Ok(Some(appended))
+        }
+        AgentEvent::MessageEnd { agent_id, message } => {
+            let mut log_guard = log.lock().await;
+            let appended = persist_message(&mut log_guard, *agent_id, message.clone())?;
+            Ok(Some(appended))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The `Compaction` entry a [`AgentEvent::CompactionEnd`] belongs to,
+/// `None` for any other event.
+///
+/// The checkpoint is appended by the compaction run rather than by this
+/// listener, so the entry is resolved by lookup instead of returned from
+/// an append. Sound because at most one compaction runs per session at a
+/// time and the bus awaits this listener inline, right after the append.
+/// A failed or canceled compaction appends nothing and carries no
+/// summary, which is what the summary match gates on.
+async fn compaction_entry(
+    log: &TokioMutex<ConversationLog>,
+    event: &AgentEvent,
+) -> Option<EntryRef> {
+    let AgentEvent::CompactionEnd {
+        agent_id,
+        summary: Some(_),
+        ..
+    } = event
+    else {
+        return None;
+    };
+    let filter = match agent_id {
+        AgentId::Main => ThreadFilter::USER,
+        AgentId::Sub(n) => ThreadFilter::subagent(*n),
+    };
+    log.lock().await.latest_compaction(filter)
 }
 
 /// Append one finalized message to the log on behalf of `agent_id`.
@@ -108,11 +193,11 @@ pub fn persistence_listener(log: Arc<TokioMutex<ConversationLog>>) -> Listener {
 /// the thread is never empty for a legitimately spawned sub-agent
 /// because [`AgentEvent::SubAgentStart`] seeds it with a
 /// `SubAgentSpawn` entry.
-fn persist(
+fn persist_message(
     log: &mut ConversationLog,
     agent_id: AgentId,
     message: AgentMessage,
-) -> Result<(), BoxError> {
+) -> Result<EntryRef, BoxError> {
     let mut view = match agent_id {
         // A `None` head is fine here: the user thread can be empty on a
         // fresh log (only the system-prompt root exists yet), and
@@ -130,8 +215,7 @@ fn persist(
         }
     };
 
-    view.add_message(message)?;
-    Ok(())
+    Ok(view.add_message(message)?)
 }
 
 #[cfg(test)]
@@ -148,7 +232,7 @@ mod tests {
     use tempfile::TempDir;
     use tokio::sync::Mutex as TokioMutex;
 
-    use super::persistence_listener;
+    use super::{PersistedEvent, persistence_listener, persisting_forwarder};
     use crate::log::{
         ConversationEntry, ConversationEntryKind, ConversationLog, ConversationView, ThreadFilter,
     };
@@ -656,5 +740,221 @@ mod tests {
         let log_guard = log.lock().await;
         // Only the system prompt root is present.
         assert_eq!(log_guard.len(), 1);
+    }
+
+    /// Drain everything the forwarder has already sent. The forwarder
+    /// sends inline while the bus awaits it, so by the time an `emit`
+    /// returns its event is in the channel.
+    fn drained(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<PersistedEvent>,
+    ) -> Vec<PersistedEvent> {
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            out.push(event);
+        }
+        out
+    }
+
+    /// Append position and id of every entry in the log, for checking
+    /// what a tag names.
+    async fn positions(log: &Arc<TokioMutex<ConversationLog>>) -> Vec<(u64, String)> {
+        log.lock()
+            .await
+            .entries_in_order()
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                (
+                    u64::try_from(index).expect("fits u64") + 1,
+                    entry.id.clone(),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn forwarder_tags_the_durable_events_and_forwards_the_rest() {
+        let (_dir, log) = fresh_log();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let bus = EventBus::new();
+        let _h = bus.subscribe(persisting_forwarder(Arc::clone(&log), tx));
+
+        let user = user_msg("hi");
+        bus.emit(AgentEvent::MessageEnd {
+            agent_id: AgentId::Main,
+            message: user.clone(),
+        })
+        .await
+        .expect("emit user message");
+        bus.emit(AgentEvent::Notice {
+            agent_id: AgentId::Main,
+            text: "nothing durable here".into(),
+        })
+        .await
+        .expect("emit notice");
+        bus.emit(sub_start(1, "do thing"))
+            .await
+            .expect("emit sub start");
+        let sub_reply = assistant_text("done");
+        bus.emit(AgentEvent::MessageEnd {
+            agent_id: AgentId::Sub(1),
+            message: sub_reply.clone(),
+        })
+        .await
+        .expect("emit sub message");
+
+        // A compaction checkpoint is written by the compaction run, not by
+        // the listener, so the forwarder has to resolve its entry.
+        let first_kept = log
+            .lock()
+            .await
+            .latest_leaf(ThreadFilter::USER)
+            .expect("user leaf");
+        log.lock()
+            .await
+            .append_compaction(ThreadFilter::USER, "summary".into(), first_kept, 100, None)
+            .expect("append the compaction checkpoint");
+        bus.emit(AgentEvent::CompactionEnd {
+            agent_id: AgentId::Main,
+            reason: aj_agent::events::CompactionReason::Manual,
+            tokens_before: 100,
+            tokens_after: 10,
+            summary: Some("summary".into()),
+            error: None,
+        })
+        .await
+        .expect("emit compaction end");
+
+        let forwarded = drained(&mut rx);
+        let kinds: Vec<(&'static str, Option<u64>)> = forwarded
+            .iter()
+            .map(|persisted| {
+                let kind = match &persisted.event {
+                    AgentEvent::MessageEnd { .. } => "message_end",
+                    AgentEvent::Notice { .. } => "notice",
+                    AgentEvent::SubAgentStart { .. } => "sub_agent_start",
+                    AgentEvent::CompactionEnd { .. } => "compaction_end",
+                    other => panic!("unexpected forwarded event {other:?}"),
+                };
+                (kind, persisted.entry.as_ref().map(|entry| entry.seq))
+            })
+            .collect();
+        // Entry 1 is the system prompt, which no event stands for.
+        assert_eq!(
+            kinds,
+            vec![
+                ("message_end", Some(2)),
+                ("notice", None),
+                ("sub_agent_start", Some(3)),
+                ("message_end", Some(4)),
+                ("compaction_end", Some(5)),
+            ],
+            "every event is forwarded, exactly the durable ones tagged"
+        );
+
+        let positions = positions(&log).await;
+        for persisted in &forwarded {
+            let Some(entry) = &persisted.entry else {
+                continue;
+            };
+            let index = usize::try_from(entry.seq).expect("fits usize") - 1;
+            assert_eq!(entry.id, positions[index].1, "tag names its own entry");
+        }
+        // A `MessageEnd`'s tag is the message's own id: that is what lets a
+        // remote client rebuild the id its reducer keys transcript entries
+        // and branch targets on.
+        assert_eq!(
+            forwarded[0].entry.as_ref().map(|e| e.id.as_str()),
+            Some(user.id())
+        );
+        assert_eq!(
+            forwarded[3].entry.as_ref().map(|e| e.id.as_str()),
+            Some(sub_reply.id())
+        );
+        // The `SubAgentStart` tag is the spawn root the listener wrote.
+        let spawn_id = forwarded[2]
+            .entry
+            .as_ref()
+            .map(|entry| entry.id.clone())
+            .expect("spawn root tagged");
+        let log_guard = log.lock().await;
+        let spawn_entry = log_guard
+            .entries_in_order()
+            .into_iter()
+            .find(|entry| entry.id == spawn_id)
+            .cloned()
+            .expect("spawn root in the log");
+        assert!(matches!(
+            spawn_entry.entry,
+            ConversationEntryKind::SubAgentSpawn { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn forwarder_leaves_a_summary_less_compaction_end_untagged() {
+        let (_dir, log) = fresh_log();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let bus = EventBus::new();
+        let _h = bus.subscribe(persisting_forwarder(Arc::clone(&log), tx));
+
+        bus.emit(AgentEvent::MessageEnd {
+            agent_id: AgentId::Main,
+            message: user_msg("hi"),
+        })
+        .await
+        .expect("emit user message");
+        // An earlier successful compaction exists, so the gate has to be
+        // the event's own summary, not the presence of a checkpoint.
+        let first_kept = log
+            .lock()
+            .await
+            .latest_leaf(ThreadFilter::USER)
+            .expect("user leaf");
+        log.lock()
+            .await
+            .append_compaction(ThreadFilter::USER, "earlier".into(), first_kept, 100, None)
+            .expect("append the compaction checkpoint");
+        let _ = drained(&mut rx);
+
+        bus.emit(AgentEvent::CompactionEnd {
+            agent_id: AgentId::Main,
+            reason: aj_agent::events::CompactionReason::Threshold,
+            tokens_before: 100,
+            tokens_after: 100,
+            summary: None,
+            error: Some("boom".into()),
+        })
+        .await
+        .expect("emit failed compaction end");
+
+        let forwarded = drained(&mut rx);
+        assert_eq!(forwarded.len(), 1);
+        assert!(
+            forwarded[0].entry.is_none(),
+            "a failed compaction appends nothing, so its event is not durable"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarder_survives_a_dropped_receiver() {
+        let (_dir, log) = fresh_log();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let bus = EventBus::new();
+        let _h = bus.subscribe(persisting_forwarder(Arc::clone(&log), tx));
+        drop(rx);
+
+        // The bus awaits listeners inline and a listener error is a fatal
+        // turn error, so an absent consumer must not surface as one.
+        bus.emit(AgentEvent::MessageEnd {
+            agent_id: AgentId::Main,
+            message: user_msg("hi"),
+        })
+        .await
+        .expect("emit must not fail on a closed sink");
+        assert_eq!(
+            log.lock().await.len(),
+            2,
+            "the message is still persisted with no consumer attached"
+        );
     }
 }

@@ -7,6 +7,7 @@ edition.workspace = true
 aj-agent = { path = "../aj-agent" }
 aj-models = { path = "../aj-models" }
 chrono = { workspace = true, features = ["serde"] }
+nix = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
