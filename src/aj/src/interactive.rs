@@ -30,7 +30,7 @@ use aj_app::session::{
 };
 use aj_app::session_setup::{RestoreContext, build_initial_run_config};
 use aj_app::settings::{
-    ConfigLayers, ConfigTarget, FooterUpdate, MainConfirm, PersistAction, SpeedConfirm, SubConfirm,
+    ConfigLayers, ConfigTarget, Confirmation, FooterUpdate, PersistAction, SpeedConfirm,
 };
 use aj_app::shutdown::{format_resume_hint, format_session_usage_header, format_usage_summary};
 use aj_app::theme::{
@@ -2291,7 +2291,7 @@ fn note_main_footer(world: &World, footer: Option<FooterUpdate>) {
 async fn confirm_thinking(world: &World, target: AgentId, level: Option<ThinkingConfig>) -> String {
     match target {
         AgentId::Main => {
-            let MainConfirm { footer, notice } = aj_app::settings::confirm_thinking_for_main(
+            let confirm = aj_app::settings::confirm_thinking_for_main(
                 level,
                 PersistAction::None,
                 &world.core.run_config,
@@ -2300,8 +2300,9 @@ async fn confirm_thinking(world: &World, target: AgentId, level: Option<Thinking
                 &world.core,
             )
             .await;
-            note_main_footer(world, footer);
-            notice
+            let message = confirm.message();
+            note_main_footer(world, confirm.footer);
+            message
         }
         AgentId::Sub(n) => confirm_thinking_sub(world, n, level).await,
     }
@@ -2324,9 +2325,10 @@ async fn confirm_thinking_sub(world: &World, n: usize, level: Option<ThinkingCon
                 .cloned()
                 .map(Arc::new)
         });
-    let SubConfirm { notice, applied } =
+    let confirm =
         aj_app::settings::confirm_thinking_for_sub(level.clone(), n, tracked, &world.core).await;
-    if applied {
+    let notice = confirm.message();
+    if confirm.applied {
         let name = aj_app::commands::thinking_level_name(&level).to_string();
         let entry = world.chat.borrow().footers().settings(target).cloned();
         if let Some(mut settings) = entry {
@@ -2351,7 +2353,7 @@ async fn confirm_thinking_sub(world: &World, n: usize, level: Option<ThinkingCon
 async fn confirm_model(world: &World, target: AgentId, info: ModelInfo) -> String {
     match target {
         AgentId::Main => {
-            let MainConfirm { footer, notice } = aj_app::settings::confirm_model_for_main(
+            let confirm = aj_app::settings::confirm_model_for_main(
                 info,
                 PersistAction::None,
                 &world.auth,
@@ -2361,8 +2363,9 @@ async fn confirm_model(world: &World, target: AgentId, info: ModelInfo) -> Strin
                 &world.core,
             )
             .await;
-            note_main_footer(world, footer);
-            notice
+            let message = confirm.message();
+            note_main_footer(world, confirm.footer);
+            message
         }
         AgentId::Sub(n) => confirm_model_sub(world, n, info).await,
     }
@@ -2389,7 +2392,7 @@ async fn confirm_model_sub(world: &World, n: usize, info: ModelInfo) -> String {
             .and_then(|s| speed_from_name(&s.speed))
             .flatten(),
     };
-    let SubConfirm { notice, applied } = aj_app::settings::confirm_model_for_sub(
+    let confirm = aj_app::settings::confirm_model_for_sub(
         &info,
         n,
         &world.auth,
@@ -2397,7 +2400,8 @@ async fn confirm_model_sub(world: &World, n: usize, info: ModelInfo) -> String {
         &world.core,
     )
     .await;
-    if applied {
+    let notice = confirm.message();
+    if confirm.applied {
         let (thinking, verbosity) = {
             let chat = world.chat.borrow();
             let settings = chat.footers().settings(target);
@@ -2446,6 +2450,17 @@ fn apply_skill_toggle(world: &World, name: &str, disable: bool) -> String {
         ),
         save,
     )
+}
+
+/// Append a settings confirm's notes (a persist failure, a failed log
+/// record) to its confirmation line, matching
+/// [`aj_app::settings::Confirmation::message`].
+fn join_notes(mut notice: String, notes: Vec<String>) -> String {
+    for note in notes {
+        notice.push(' ');
+        notice.push_str(&note);
+    }
+    notice
 }
 
 /// Append an optional follow-up note (e.g. a persist failure) to a
@@ -2503,7 +2518,7 @@ async fn apply_setting_change(
                 revert_setting_row(shell, MODEL_SETTING_ID, &active);
                 return Some(format!("Unknown model {value}."));
             };
-            let MainConfirm { footer, notice } = aj_app::settings::confirm_model_for_main(
+            let confirm = aj_app::settings::confirm_model_for_main(
                 info,
                 persist,
                 &world.auth,
@@ -2513,7 +2528,8 @@ async fn apply_setting_change(
                 &world.core,
             )
             .await;
-            note_main_footer(world, footer);
+            let notice = confirm.message();
+            note_main_footer(world, confirm.footer);
             // The core reports a rebuild failure only as notice text; compare
             // the staged key so the row reverts to the model actually active.
             let active = {
@@ -2531,7 +2547,7 @@ async fn apply_setting_change(
         }
         "thinking" => match thinking_config_from_name(value) {
             Some(level) => {
-                let MainConfirm { footer, notice } = aj_app::settings::confirm_thinking_for_main(
+                let confirm = aj_app::settings::confirm_thinking_for_main(
                     level,
                     persist,
                     &world.core.run_config,
@@ -2540,8 +2556,9 @@ async fn apply_setting_change(
                     &world.core,
                 )
                 .await;
-                note_main_footer(world, footer);
-                Some(notice)
+                let message = confirm.message();
+                note_main_footer(world, confirm.footer);
+                Some(message)
             }
             None => Some(format!("Unknown thinking level {value:?}.")),
         },
@@ -2589,9 +2606,14 @@ async fn apply_setting_change(
             )
             .await
             {
-                SpeedConfirm::Applied { footer, notice } => {
+                SpeedConfirm::Applied {
+                    footer,
+                    notice,
+                    notes,
+                    ..
+                } => {
                     note_main_footer(world, Some(footer));
-                    Some(notice)
+                    Some(join_notes(notice, notes))
                 }
                 SpeedConfirm::Failed { previous, notice } => {
                     revert_setting_row(shell, "speed", &previous);
@@ -2618,7 +2640,8 @@ async fn apply_setting_change(
                     &world.config_layers,
                     &world.core,
                 )
-                .await,
+                .await
+                .message(),
             )
         }
         "theme" => {

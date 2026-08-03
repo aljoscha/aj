@@ -25,7 +25,7 @@ use aj_models::auth::AuthStorage;
 use aj_models::registry::{ModelInfo, validate_thinking_level};
 use aj_models::types::Speed;
 use aj_models::{ThinkingConfig, speed_name, verbosity_name};
-use aj_session::ThreadFilter;
+use aj_session::{EntryRef, ThreadFilter};
 
 use crate::commands::thinking_level_name;
 use crate::model::{
@@ -235,7 +235,18 @@ pub struct FooterUpdate {
 /// apply (a provider rebuild failure) and the footer is left as-is.
 pub struct MainConfirm {
     pub footer: Option<FooterUpdate>,
+    /// The confirmation line on its own, which is also what the log
+    /// entry's projection renders.
     pub notice: String,
+    /// Problems that do not belong on the durable settings notice: a
+    /// failed config write, a failed log record. A frontend joins them
+    /// onto the confirmation with [`Confirmation::message`]; a host
+    /// publishes them separately, because a backfill regenerates the
+    /// projected notice and nothing else.
+    pub notes: Vec<String>,
+    /// The settings entry the change appended, absent when the append
+    /// failed. A host tags the projected notice with it.
+    pub entry: Option<EntryRef>,
 }
 
 /// Result of a main-agent speed confirm.
@@ -249,6 +260,8 @@ pub enum SpeedConfirm {
     Applied {
         footer: FooterUpdate,
         notice: String,
+        notes: Vec<String>,
+        entry: Option<EntryRef>,
     },
     /// The rebuild failed: nothing staged. The frontend should revert
     /// the speed row to `previous` and show `notice`.
@@ -264,8 +277,55 @@ pub enum SpeedConfirm {
 /// false and nothing was staged.
 pub struct SubConfirm {
     pub notice: String,
+    pub notes: Vec<String>,
+    /// The settings entry the change appended on the sub-agent's thread.
+    pub entry: Option<EntryRef>,
     pub applied: bool,
 }
+
+/// Result of the main-agent verbosity confirm, which neither rebuilds the
+/// provider bundle nor moves the footer.
+pub struct VerbosityConfirm {
+    pub notice: String,
+    pub notes: Vec<String>,
+    pub entry: Option<EntryRef>,
+}
+
+/// A settings confirm's user-facing text: the confirmation plus whatever
+/// went wrong beside it.
+pub trait Confirmation {
+    fn notice(&self) -> &str;
+    fn notes(&self) -> &[String];
+
+    /// The confirmation with its notes appended, space-separated. What a
+    /// frontend folding one line shows.
+    fn message(&self) -> String {
+        let mut out = self.notice().to_string();
+        for note in self.notes() {
+            out.push(' ');
+            out.push_str(note);
+        }
+        out
+    }
+}
+
+macro_rules! confirmation {
+    ($ty:ty) => {
+        impl Confirmation for $ty {
+            fn notice(&self) -> &str {
+                &self.notice
+            }
+
+            fn notes(&self) -> &[String] {
+                &self.notes
+            }
+        }
+    };
+}
+
+confirmation!(MainConfirm);
+confirmation!(SubConfirm);
+confirmation!(VerbosityConfirm);
 
 /// Apply a confirmed thinking pick to the main agent: stage it into the
 /// run config, record it on the session log's user thread, and persist
@@ -301,11 +361,9 @@ pub async fn confirm_thinking_for_main(
     let name = thinking_level_name(&level);
     // Record the change on the session log's user thread so a later
     // resume restores this level.
-    let log_note = {
+    let (entry, log_note) = {
         let mut log = core.log.lock().await;
-        log.append_thinking_change(ThreadFilter::USER, name)
-            .err()
-            .map(|err| format!("(couldn't record in session log: {err})"))
+        record(log.append_thinking_change(ThreadFilter::USER, name))
     };
     // Persist as the new default only when the change should outlive
     // this session (the settings windows). The `/thinking` overlay
@@ -319,17 +377,29 @@ pub async fn confirm_thinking_for_main(
         Some(thinking_level_name(&level)),
         |c| c.thinking = Some(config_thinking_level(level.as_ref())),
     );
-    let mut notice = format!("Thinking effort set to {name}.");
-    for note in [save_note, log_note].into_iter().flatten() {
-        notice.push(' ');
-        notice.push_str(&note);
-    }
     MainConfirm {
         footer: Some(FooterUpdate {
             settings,
             context_window,
         }),
-        notice,
+        notice: format!("Thinking effort set to {name}."),
+        notes: [save_note, log_note].into_iter().flatten().collect(),
+        entry,
+    }
+}
+
+/// Split an append result into the entry it produced and the note to show
+/// when it failed. A failed record is not fatal: the change is live for
+/// this session, it just will not survive a resume.
+fn record(
+    appended: Result<EntryRef, aj_session::ConversationError>,
+) -> (Option<EntryRef>, Option<String>) {
+    match appended {
+        Ok(entry) => (Some(entry), None),
+        Err(err) => (
+            None,
+            Some(format!("(couldn't record in session log: {err})")),
+        ),
     }
 }
 
@@ -354,6 +424,8 @@ pub async fn confirm_thinking_for_sub(
     if core.resolve_agent(target).is_none() {
         return SubConfirm {
             notice: "This agent can't be prompted.".to_string(),
+            notes: Vec::new(),
+            entry: None,
             applied: false,
         };
     }
@@ -381,6 +453,8 @@ pub async fn confirm_thinking_for_sub(
     {
         return SubConfirm {
             notice: format!("Can't set thinking level {name:?} for agent {n}: {msg}"),
+            notes: Vec::new(),
+            entry: None,
             applied: false,
         };
     }
@@ -393,19 +467,14 @@ pub async fn confirm_thinking_for_sub(
         .thinking = Some(level.clone());
     // Record the change on the sub-agent's log thread so a resumed
     // transcript reflects it.
-    let log_note = {
+    let (entry, log_note) = {
         let mut log = core.log.lock().await;
-        log.append_thinking_change(ThreadFilter::subagent(n), name)
-            .err()
-            .map(|err| format!("(couldn't record in session log: {err})"))
+        record(log.append_thinking_change(ThreadFilter::subagent(n), name))
     };
-    let mut notice = format!("Thinking effort set to {name} for agent {n}.");
-    if let Some(note) = log_note {
-        notice.push(' ');
-        notice.push_str(&note);
-    }
     SubConfirm {
-        notice,
+        notice: format!("Thinking effort set to {name} for agent {n}."),
+        notes: log_note.into_iter().collect(),
+        entry,
         applied: true,
     }
 }
@@ -473,11 +542,9 @@ pub async fn confirm_model_for_main(
             let context_window = info.context_window;
             // Record the change on the session log's user thread so a
             // later resume restores this model.
-            let log_note = {
+            let (entry, log_note) = {
                 let mut log = core.log.lock().await;
-                log.append_model_change(ThreadFilter::USER, &info.provider, &info.id)
-                    .err()
-                    .map(|err| format!("(couldn't record in session log: {err})"))
+                record(log.append_model_change(ThreadFilter::USER, &info.provider, &info.id))
             };
             // Persist the model choice (provider + id) as the new
             // default only when the change should outlive this session
@@ -506,25 +573,24 @@ pub async fn confirm_model_for_main(
                     persist_project(layers, config, &[("model_api", None), ("model_name", None)])
                 }
             };
-            let mut notice = format!(
-                "Model set to {} ({}/{}).",
-                info.name, info.provider, info.id
-            );
-            for note in [save_note, log_note].into_iter().flatten() {
-                notice.push(' ');
-                notice.push_str(&note);
-            }
             MainConfirm {
                 footer: Some(FooterUpdate {
                     settings,
                     context_window,
                 }),
-                notice,
+                notice: format!(
+                    "Model set to {} ({}/{}).",
+                    info.name, info.provider, info.id
+                ),
+                notes: [save_note, log_note].into_iter().flatten().collect(),
+                entry,
             }
         }
         Err(err) => MainConfirm {
             footer: None,
             notice: format!("Failed to switch to {}: {err}", info.name),
+            notes: Vec::new(),
+            entry: None,
         },
     }
 }
@@ -548,6 +614,8 @@ pub async fn confirm_model_for_sub(
     if core.resolve_agent(target).is_none() {
         return SubConfirm {
             notice: "This agent can't be prompted.".to_string(),
+            notes: Vec::new(),
+            entry: None,
             applied: false,
         };
     }
@@ -581,27 +649,24 @@ pub async fn confirm_model_for_sub(
             ));
             // Record the change on the sub-agent's log thread so a
             // resumed transcript reflects it.
-            let log_note = {
+            let (entry, log_note) = {
                 let mut log = core.log.lock().await;
-                log.append_model_change(ThreadFilter::subagent(n), &info.provider, &info.id)
-                    .err()
-                    .map(|err| format!("(couldn't record in session log: {err})"))
+                record(log.append_model_change(ThreadFilter::subagent(n), &info.provider, &info.id))
             };
-            let mut notice = format!(
-                "Model set to {} ({}/{}) for agent {n}.",
-                info.name, info.provider, info.id
-            );
-            if let Some(note) = log_note {
-                notice.push(' ');
-                notice.push_str(&note);
-            }
             SubConfirm {
-                notice,
+                notice: format!(
+                    "Model set to {} ({}/{}) for agent {n}.",
+                    info.name, info.provider, info.id
+                ),
+                notes: log_note.into_iter().collect(),
+                entry,
                 applied: true,
             }
         }
         Err(err) => SubConfirm {
             notice: format!("Failed to switch to {}: {err}", info.name),
+            notes: Vec::new(),
+            entry: None,
             applied: false,
         },
     }
@@ -622,7 +687,7 @@ pub async fn confirm_verbosity_for_main(
     config: &Arc<Mutex<Config>>,
     layers: &Arc<Mutex<ConfigLayers>>,
     core: &SessionCore,
-) -> String {
+) -> VerbosityConfirm {
     let unified = verbosity.map(config_verbosity_to_unified);
     let name = verbosity_name(unified);
     {
@@ -630,11 +695,9 @@ pub async fn confirm_verbosity_for_main(
         cfg.stream_options.verbosity = unified;
     }
     // Record on the user thread so a later resume restores this value.
-    let log_note = {
+    let (entry, log_note) = {
         let mut log = core.log.lock().await;
-        log.append_verbosity_change(ThreadFilter::USER, name)
-            .err()
-            .map(|err| format!("(couldn't record in session log: {err})"))
+        record(log.append_verbosity_change(ThreadFilter::USER, name))
     };
     // The verbosity name (`low`/`medium`/`high`) is the canonical
     // config value; `None` means "unset" and removes the key.
@@ -647,12 +710,11 @@ pub async fn confirm_verbosity_for_main(
         verbosity_str.as_deref(),
         |c| c.verbosity = verbosity,
     );
-    let mut notice = format!("Output verbosity set to {name}. Takes effect next turn.");
-    for note in [save_note, log_note].into_iter().flatten() {
-        notice.push(' ');
-        notice.push_str(&note);
+    VerbosityConfirm {
+        notice: format!("Output verbosity set to {name}. Takes effect next turn."),
+        notes: [save_note, log_note].into_iter().flatten().collect(),
+        entry,
     }
-    notice
 }
 
 /// Apply a speed change to the main agent: rebuild the provider bundle
@@ -710,11 +772,9 @@ pub async fn confirm_speed_for_main(
             };
             // Record the change on the session log's user thread so a
             // later resume restores this speed.
-            let log_note = {
+            let (entry, log_note) = {
                 let mut log = core.log.lock().await;
-                log.append_speed_change(ThreadFilter::USER, name)
-                    .err()
-                    .map(|err| format!("(couldn't record in session log: {err})"))
+                record(log.append_speed_change(ThreadFilter::USER, name))
             };
             // "standard" persists to the user layer as key removal:
             // it's the default, and `speed_from_name` maps it to `None`
@@ -726,17 +786,14 @@ pub async fn confirm_speed_for_main(
                     Some(Speed::Fast) => Some(ConfigSpeed::Fast),
                 };
             });
-            let mut notice = format!("Speed set to {name}. Takes effect next turn.");
-            for note in [save_note, log_note].into_iter().flatten() {
-                notice.push(' ');
-                notice.push_str(&note);
-            }
             SpeedConfirm::Applied {
                 footer: FooterUpdate {
                     settings,
                     context_window,
                 },
-                notice,
+                notice: format!("Speed set to {name}. Takes effect next turn."),
+                notes: [save_note, log_note].into_iter().flatten().collect(),
+                entry,
             }
         }
         Err(err) => SpeedConfirm::Failed {
