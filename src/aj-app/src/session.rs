@@ -20,10 +20,10 @@ use aj_agent::queue::MessageQueues;
 use aj_agent::types::UsageSummary;
 use aj_agent::{Agent, SharedAgent, SubAgentRegistry, TaskRegistry};
 use aj_conf::{AgentEnv, Config};
+use aj_models::ThinkingConfig;
 use aj_models::provider::Provider;
 use aj_models::registry::ModelInfo;
 use aj_models::types::{Speed, StreamOptions};
-use aj_models::{ThinkingConfig, speed_name, thinking_config_name, verbosity_name};
 use aj_session::{
     AppendHandoff, ConversationLog, ConversationPersistence, EntryId, TaggedEvent,
     persistence_listener, persisting_forwarder,
@@ -340,7 +340,7 @@ impl SessionCore {
         // Build a fresh agent off the run-config snapshot, which at this
         // point reflects both runtime `/model` / `/thinking` choices and
         // any settings just restored from the resumed log.
-        let (provider, model_info, stream_options, thinking, speed, verbosity, model_key) = {
+        let (provider, model_info, stream_options, thinking, speed, verbosity, model_key, settings) = {
             let cfg = run_config.lock().expect("run config mutex poisoned");
             (
                 Arc::clone(&cfg.provider),
@@ -350,6 +350,7 @@ impl SessionCore {
                 cfg.speed,
                 cfg.stream_options.verbosity,
                 cfg.model_key.clone(),
+                cfg.settings(),
             )
         };
         let BuiltAgent {
@@ -410,13 +411,7 @@ impl SessionCore {
         // it is shared: a synchronous caller can't read `model_info`
         // through the lock later.
         let seed = MainAgentSeed {
-            settings: AgentSettings {
-                provider: model_key.0.clone(),
-                model_id: model_key.1.clone(),
-                thinking: thinking_config_name(thinking.as_ref()).to_string(),
-                speed: speed_name(speed).to_string(),
-                verbosity: verbosity_name(verbosity).to_string(),
-            },
+            settings,
             context_window: agent.model_info().context_window,
         };
 

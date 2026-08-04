@@ -1,34 +1,26 @@
 //! The subscriber registry and the fan-out into it.
 //!
-//! One subscriber is one stream: a queue of frames plus the set of
-//! sessions it attached, each with the backfill boundary that tells the
-//! fan-out which live durable frames the attach block already covered.
+//! One subscriber is one stream: a producer-paced attach channel, a bounded
+//! live queue, and the backfill boundary for each attached session.
 //!
-//! Every send happens under the registry lock. That is what makes an
-//! attach block contiguous: the block's frames and the switch out of
-//! [`AttachState::Attaching`] land in one critical section, so no live
-//! frame can be spliced into the middle of it. The sends themselves are
-//! pushes onto unbounded queues and never block, so holding the lock
-//! across them is safe.
-//!
-//! **The queues are unbounded, deliberately for now.** Spec 6.9 wants a
-//! bounded queue per client with lossy coalescing and eviction on overflow,
-//! and this module is the seam that lands in: [`Subscriber::offer`] is the
-//! single place a frame is queued, and it already classifies the frame. Until
-//! a transport exists the only subscribers are in-process and read promptly,
-//! so the memory an unbounded queue can grow is bounded by the session's own
-//! activity. What must not change either way is that queueing never blocks:
-//! the publisher is the session's driver task, and a blocking send here would
-//! stall the session itself.
+//! Publishers only touch the bounded live queue and never await. The attach
+//! producer awaits its separate capacity-one channel, so HTTP backpressure
+//! paces a large backfill without ever stalling a session driver.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 
+use aj_agent::events::{AgentEvent, AgentId};
+use aj_agent::tool::TaskId;
 use aj_wire::Frame;
 use tokio::sync::Notify;
+use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::error::TryRecvError;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio_util::sync::CancellationToken;
+
+/// Enough burst room for normal clients while bounding a stalled stream.
+const DEFAULT_LIVE_CAPACITY: usize = 256;
 
 /// Identity of one attached subscriber within a host.
 pub(crate) type SubscriberId = u64;
@@ -38,14 +30,14 @@ enum AttachState {
     /// The attach block has not been written yet, so live frames are held
     /// to keep the block contiguous and ordered on this stream.
     ///
-    /// Held lossy frames are dropped rather than flushed (spec 6.5): a
+    /// Lossy frames are dropped rather than queued (spec 6.5): a
     /// cumulative snapshot delivered after the durable frame that
     /// superseded it resurrects stale transient state, and a
     /// `MessageUpdate` for a message the backfill already finalized would
     /// paint a second, unfinalized copy of it. The cost is at most one
     /// coalescing tick of streaming text, which the next live snapshot
     /// restores.
-    Attaching { held: Vec<Frame> },
+    Attaching,
     /// Live delivery. A durable frame at or below `boundary` is already in
     /// the backfill this stream was served, so it is dropped rather than
     /// re-delivered.
@@ -53,19 +45,18 @@ enum AttachState {
 }
 
 struct Subscriber {
-    frames: UnboundedSender<Frame>,
+    live: LiveSender,
     attached: HashMap<String, AttachState>,
 }
 
 impl Subscriber {
     /// Queue `frame` for this subscriber, applying the attach rules of the
     /// session it belongs to.
-    fn offer(&mut self, frame: &Frame) {
+    fn offer(&mut self, frame: &Frame) -> bool {
         let Some(session) = frame.session() else {
             // Host-level frames (`list`, `heartbeat`) belong to the
             // connection, not to a session, so no attach state gates them.
-            let _ = self.frames.send(frame.clone());
-            return;
+            return self.live.offer(frame.clone());
         };
         match self.attached.get_mut(session) {
             None => {
@@ -74,21 +65,176 @@ impl Subscriber {
                 // be suppressed, which keeps host-wide streaming churn off
                 // a client that is not watching it.
                 if !frame.is_lossy() {
-                    let _ = self.frames.send(frame.clone());
+                    return self.live.offer(frame.clone());
                 }
+                true
             }
-            Some(AttachState::Attaching { held }) => {
+            Some(AttachState::Attaching) => {
                 if !frame.is_lossy() {
-                    held.push(frame.clone());
+                    return self.live.offer(frame.clone());
                 }
+                true
             }
             Some(AttachState::Live { boundary }) => {
                 if frame.durable_seq().is_some_and(|seq| seq <= *boundary) {
-                    return;
+                    return true;
                 }
-                let _ = self.frames.send(frame.clone());
+                self.live.offer(frame.clone())
             }
         }
+    }
+}
+
+/// Identity of one cumulative snapshot in the live queue.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LossyKey {
+    Message(String, AgentId),
+    Tool(String, String),
+    Task(String, TaskId),
+    State(String),
+    List,
+    Vms,
+}
+
+fn lossy_key(frame: &Frame) -> Option<LossyKey> {
+    match frame {
+        Frame::Event { session, event, .. } => match event.known()? {
+            AgentEvent::MessageUpdate { agent_id, .. } => {
+                Some(LossyKey::Message(session.clone(), *agent_id))
+            }
+            AgentEvent::ToolExecutionUpdate { call_id, .. } => {
+                Some(LossyKey::Tool(session.clone(), call_id.clone()))
+            }
+            AgentEvent::TaskOutput { task_id, .. } => {
+                Some(LossyKey::Task(session.clone(), *task_id))
+            }
+            _ => None,
+        },
+        Frame::State { session, .. } => Some(LossyKey::State(session.clone())),
+        Frame::List { .. } => Some(LossyKey::List),
+        Frame::Vms { .. } => Some(LossyKey::Vms),
+        Frame::CaughtUp { .. } | Frame::Reset { .. } | Frame::Heartbeat => None,
+    }
+}
+
+struct LiveQueueState {
+    frames: VecDeque<Frame>,
+    closed: bool,
+}
+
+struct LiveQueue {
+    capacity: usize,
+    state: StdMutex<LiveQueueState>,
+    ready: Notify,
+    cancelled: CancellationToken,
+}
+
+#[derive(Clone)]
+struct LiveSender(Arc<LiveQueue>);
+
+pub(crate) struct LiveReceiver(Arc<LiveQueue>);
+
+fn live_channel(capacity: usize) -> (LiveSender, LiveReceiver, CancellationToken) {
+    assert!(capacity > 0, "live queue capacity must be non-zero");
+    let cancelled = CancellationToken::new();
+    let queue = Arc::new(LiveQueue {
+        capacity,
+        state: StdMutex::new(LiveQueueState {
+            frames: VecDeque::with_capacity(capacity),
+            closed: false,
+        }),
+        ready: Notify::new(),
+        cancelled: cancelled.clone(),
+    });
+    (
+        LiveSender(Arc::clone(&queue)),
+        LiveReceiver(queue),
+        cancelled,
+    )
+}
+
+impl LiveSender {
+    /// Queues a frame without blocking. Reliable overflow closes the stream.
+    fn offer(&self, frame: Frame) -> bool {
+        let key = lossy_key(&frame);
+        let mut state = self.0.state.lock().expect("live queue mutex poisoned");
+        if state.closed {
+            return false;
+        }
+        if let Some(key) = key {
+            if let Some(index) = state
+                .frames
+                .iter()
+                .position(|queued| lossy_key(queued).as_ref() == Some(&key))
+            {
+                state.frames.remove(index);
+            } else if state.frames.len() >= self.0.capacity {
+                return true;
+            }
+        } else if state.frames.len() >= self.0.capacity {
+            state.frames.clear();
+            state.closed = true;
+            drop(state);
+            self.0.cancelled.cancel();
+            self.0.ready.notify_waiters();
+            return false;
+        }
+        state.frames.push_back(frame);
+        drop(state);
+        self.0.ready.notify_one();
+        true
+    }
+
+    fn retain(&self, mut keep: impl FnMut(&Frame) -> bool) {
+        self.0
+            .state
+            .lock()
+            .expect("live queue mutex poisoned")
+            .frames
+            .retain(|frame| keep(frame));
+    }
+
+    fn close(&self) {
+        let mut state = self.0.state.lock().expect("live queue mutex poisoned");
+        state.closed = true;
+        drop(state);
+        self.0.ready.notify_waiters();
+    }
+
+    fn evict(&self) {
+        let mut state = self.0.state.lock().expect("live queue mutex poisoned");
+        state.frames.clear();
+        state.closed = true;
+        drop(state);
+        self.0.cancelled.cancel();
+        self.0.ready.notify_waiters();
+    }
+}
+
+impl LiveReceiver {
+    async fn recv(&mut self) -> Option<Frame> {
+        loop {
+            let ready = self.0.ready.notified();
+            {
+                let mut state = self.0.state.lock().expect("live queue mutex poisoned");
+                if let Some(frame) = state.frames.pop_front() {
+                    return Some(frame);
+                }
+                if state.closed {
+                    return None;
+                }
+            }
+            ready.await;
+        }
+    }
+
+    fn try_recv(&mut self) -> Option<Frame> {
+        self.0
+            .state
+            .lock()
+            .expect("live queue mutex poisoned")
+            .frames
+            .pop_front()
     }
 }
 
@@ -99,6 +245,7 @@ pub(crate) struct Fanout {
     /// Pinged whenever the session directory changed. The list publisher
     /// coalesces on it (spec 6.8).
     list_dirty: Notify,
+    live_capacity: usize,
 }
 
 impl Default for Fanout {
@@ -107,6 +254,7 @@ impl Default for Fanout {
             subscribers: StdMutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             list_dirty: Notify::new(),
+            live_capacity: DEFAULT_LIVE_CAPACITY,
         }
     }
 }
@@ -117,71 +265,43 @@ impl Fanout {
     ///
     /// Registration happens before the blocks are projected, which is what
     /// makes an attach atomic with respect to the session's event flow:
-    /// every frame published from here on is either held for the block or
+    /// every frame published from here on is either queued behind the block or
     /// filtered against its boundary, so none can be missed.
-    pub(crate) fn register(&self, sessions: &[String]) -> (SubscriberId, UnboundedReceiver<Frame>) {
+    pub(crate) fn register(
+        &self,
+        sessions: &[String],
+    ) -> (SubscriberId, LiveReceiver, CancellationToken) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = unbounded_channel();
+        let (live, receiver, cancelled) = live_channel(self.live_capacity);
         let attached = sessions
             .iter()
-            .map(|session| (session.clone(), AttachState::Attaching { held: Vec::new() }))
+            .map(|session| (session.clone(), AttachState::Attaching))
             .collect();
-        self.lock().insert(
-            id,
-            Subscriber {
-                frames: tx,
-                attached,
-            },
-        );
-        (id, rx)
+        self.lock().insert(id, Subscriber { live, attached });
+        (id, receiver, cancelled)
     }
 
     pub(crate) fn deregister(&self, id: SubscriberId) {
-        self.lock().remove(&id);
+        if let Some(subscriber) = self.lock().remove(&id) {
+            subscriber.live.evict();
+        }
     }
 
     /// Fan `frame` out to every subscriber.
     pub(crate) fn publish(&self, frame: Frame) {
-        for subscriber in self.lock().values_mut() {
-            subscriber.offer(&frame);
-        }
+        self.lock().retain(|_, subscriber| subscriber.offer(&frame));
     }
 
-    /// Write `block` to `id` and switch that session to live delivery at
-    /// `boundary`.
-    ///
-    /// One critical section, so the block stays contiguous: the held
-    /// frames are flushed behind it, and a concurrently published frame
-    /// waits for this lock and lands after.
-    pub(crate) fn deliver_block(
-        &self,
-        id: SubscriberId,
-        session: &str,
-        block: Vec<Frame>,
-        boundary: u64,
-    ) {
+    /// Switches a session to live delivery and filters duplicate durables.
+    pub(crate) fn finish_block(&self, id: SubscriberId, session: &str, boundary: u64) {
         let mut subscribers = self.lock();
         let Some(subscriber) = subscribers.get_mut(&id) else {
-            // The stream was dropped while its block was being projected.
             return;
         };
-        for frame in block {
-            let _ = subscriber.frames.send(frame);
-        }
-        let held = match subscriber.attached.remove(session) {
-            Some(AttachState::Attaching { held }) => held,
-            // Reachable only if a caller served one session two blocks,
-            // which `SessionHost::attach` refuses: the second block's held
-            // frames would have been flushed by the first, so there is
-            // nothing left to flush here.
-            _ => Vec::new(),
-        };
-        for frame in held {
-            if frame.durable_seq().is_some_and(|seq| seq <= boundary) {
-                continue;
-            }
-            let _ = subscriber.frames.send(frame);
-        }
+        subscriber.live.retain(|frame| {
+            frame.session() != Some(session)
+                || !frame.durable_seq().is_some_and(|seq| seq <= boundary)
+        });
         subscriber
             .attached
             .insert(session.to_string(), AttachState::Live { boundary });
@@ -189,7 +309,9 @@ impl Fanout {
 
     /// Drop every subscriber, closing its stream.
     pub(crate) fn close(&self) {
-        self.lock().clear();
+        for (_, subscriber) in self.lock().drain() {
+            subscriber.live.close();
+        }
     }
 
     /// Note that the session directory changed, waking the list publisher.
@@ -214,7 +336,10 @@ impl Fanout {
 /// stops costing the host anything.
 pub struct Attachment {
     id: SubscriberId,
-    frames: UnboundedReceiver<Frame>,
+    block: Receiver<Frame>,
+    block_done: bool,
+    live: LiveReceiver,
+    cancelled: CancellationToken,
     attached: Vec<String>,
     fanout: Arc<Fanout>,
 }
@@ -222,13 +347,18 @@ pub struct Attachment {
 impl Attachment {
     pub(crate) fn new(
         id: SubscriberId,
-        frames: UnboundedReceiver<Frame>,
+        block: Receiver<Frame>,
+        live: LiveReceiver,
+        cancelled: CancellationToken,
         attached: Vec<String>,
         fanout: Arc<Fanout>,
     ) -> Self {
         Self {
             id,
-            frames,
+            block,
+            block_done: false,
+            live,
+            cancelled,
             attached,
             fanout,
         }
@@ -246,17 +376,42 @@ impl Attachment {
 
     /// The next frame, or `None` once the host closed the stream.
     pub async fn recv(&mut self) -> Option<Frame> {
-        self.frames.recv().await
+        if self.cancelled.is_cancelled() {
+            return None;
+        }
+        if !self.block_done {
+            let next = tokio::select! {
+                biased;
+                _ = self.cancelled.cancelled() => return None,
+                next = self.block.recv() => next,
+            };
+            if next.is_some() {
+                return next;
+            }
+            self.block_done = true;
+        }
+        tokio::select! {
+            biased;
+            _ = self.cancelled.cancelled() => None,
+            next = self.live.recv() => next,
+        }
     }
 
     /// The next already-queued frame, without waiting. `None` both when
     /// the queue is empty and when the stream closed, which a caller
     /// draining what it has does not need to distinguish.
     pub fn try_recv(&mut self) -> Option<Frame> {
-        match self.frames.try_recv() {
-            Ok(frame) => Some(frame),
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
+        if self.cancelled.is_cancelled() {
+            return None;
         }
+        if !self.block_done {
+            match self.block.try_recv() {
+                Ok(frame) => return Some(frame),
+                Err(TryRecvError::Empty) => return None,
+                Err(TryRecvError::Disconnected) => self.block_done = true,
+            }
+        }
+        self.live.try_recv()
     }
 }
 
@@ -314,7 +469,7 @@ mod tests {
     }
 
     /// A lossy frame: a cumulative snapshot a later one supersedes.
-    fn lossy() -> Frame {
+    fn lossy(last_seq: u64) -> Frame {
         Frame::State {
             session: SESSION.to_string(),
             epoch: EPOCH.to_string(),
@@ -323,10 +478,11 @@ mod tests {
                 provider: "scripted".into(),
                 model_id: "scripted".into(),
                 thinking: "off".into(),
+                thinking_display: "default".into(),
                 speed: "standard".into(),
                 verbosity: "default".into(),
             },
-            last_seq: 0,
+            last_seq,
         }
     }
 
@@ -339,9 +495,9 @@ mod tests {
     }
 
     /// Everything queued on `rx`, rendered as a comparable summary.
-    fn drained(rx: &mut UnboundedReceiver<Frame>) -> Vec<String> {
+    fn drained(rx: &mut LiveReceiver) -> Vec<String> {
         let mut out = Vec::new();
-        while let Ok(frame) = rx.try_recv() {
+        while let Some(frame) = rx.try_recv() {
             out.push(match &frame {
                 Frame::Event {
                     durability: Some(durability),
@@ -351,7 +507,7 @@ mod tests {
                     Some(AgentEvent::Warning { text, .. }) => format!("warning {text}"),
                     other => format!("event {other:?}"),
                 },
-                Frame::State { .. } => "state".to_string(),
+                Frame::State { last_seq, .. } => format!("state {last_seq}"),
                 Frame::CaughtUp { last_seq, .. } => format!("caught_up {last_seq}"),
                 Frame::Reset { .. } => "reset".to_string(),
                 Frame::List { .. } => "list".to_string(),
@@ -361,40 +517,23 @@ mod tests {
         out
     }
 
-    /// The attach block is contiguous, the frames held while it was being
-    /// projected flush behind it, and the durable ones the backfill already
-    /// covered are dropped rather than re-delivered.
+    /// Reliable live frames collect while a block is produced. Lossy frames
+    /// are dropped, and duplicate durable frames are removed at transition.
     #[test]
-    fn an_attach_block_flushes_held_frames_against_its_boundary() {
+    fn an_attach_transition_filters_the_bounded_live_queue() {
         let fanout = Fanout::default();
-        let (id, mut rx) = fanout.register(&[SESSION.to_string()]);
+        let (id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string()]);
 
-        // Published while the block was being projected.
         fanout.publish(durable(3));
         fanout.publish(reliable("held"));
-        fanout.publish(lossy());
-        assert!(drained(&mut rx).is_empty(), "nothing escapes the block");
+        fanout.publish(lossy(1));
 
-        fanout.deliver_block(
-            id,
-            SESSION,
-            vec![lossy(), durable(1), durable(5), caught_up(5)],
-            5,
-        );
+        fanout.finish_block(id, SESSION, 5);
 
         assert_eq!(
             drained(&mut rx),
-            vec![
-                "state",
-                "durable 1",
-                "durable 5",
-                "caught_up 5",
-                // Entry 3 is in the backfill above, so its held frame is
-                // dropped. The held lossy frame is dropped too: a
-                // cumulative snapshot delivered after the durable frame
-                // that superseded it resurrects stale transient state.
-                "warning held",
-            ],
+            vec!["warning held"],
+            "entry 3 is covered by the block and the lossy frame was dropped",
         );
     }
 
@@ -404,9 +543,8 @@ mod tests {
     #[test]
     fn a_live_stream_filters_durable_frames_at_or_below_its_boundary() {
         let fanout = Fanout::default();
-        let (id, mut rx) = fanout.register(&[SESSION.to_string()]);
-        fanout.deliver_block(id, SESSION, vec![caught_up(5)], 5);
-        let _ = drained(&mut rx);
+        let (id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string()]);
+        fanout.finish_block(id, SESSION, 5);
 
         fanout.publish(durable(4));
         fanout.publish(durable(5));
@@ -421,11 +559,11 @@ mod tests {
     #[test]
     fn an_unattached_session_delivers_everything_but_its_lossy_frames() {
         let fanout = Fanout::default();
-        let (_id, mut rx) = fanout.register(&[]);
+        let (_id, mut rx, _cancelled) = fanout.register(&[]);
 
         fanout.publish(durable(1));
         fanout.publish(reliable("kept"));
-        fanout.publish(lossy());
+        fanout.publish(lossy(0));
         fanout.publish(Frame::List {
             sessions: Vec::new(),
         });
@@ -437,26 +575,95 @@ mod tests {
         );
     }
 
-    /// A `reset` published while a stream's attach block is still being
-    /// written is held and delivered behind it, like any other reliable
-    /// frame. Dropping it would leave that client attached to a session
-    /// whose continuity broke, waiting for a re-attach it was never told
-    /// to make.
+    /// A `reset` published during an attach remains in the live queue.
     #[test]
     fn a_reset_during_an_attach_is_delivered_behind_the_block() {
         let fanout = Fanout::default();
-        let (id, mut rx) = fanout.register(&[SESSION.to_string()]);
+        let (id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string()]);
         fanout.publish(reliable("held"));
         fanout.publish(Frame::Reset {
             session: SESSION.to_string(),
         });
 
-        fanout.deliver_block(id, SESSION, vec![caught_up(0)], 0);
+        fanout.finish_block(id, SESSION, 0);
+
+        assert_eq!(drained(&mut rx), vec!["warning held", "reset"]);
+    }
+
+    /// Replacing a lossy frame removes the old one and appends the new one at
+    /// the tail, so it cannot jump a reliable boundary.
+    #[test]
+    fn lossy_replacement_moves_to_the_queue_tail() {
+        let fanout = Fanout {
+            live_capacity: 3,
+            ..Fanout::default()
+        };
+        let (id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string()]);
+        fanout.finish_block(id, SESSION, 0);
+
+        fanout.publish(reliable("before"));
+        fanout.publish(lossy(1));
+        fanout.publish(reliable("after"));
+        fanout.publish(lossy(2));
 
         assert_eq!(
             drained(&mut rx),
-            vec!["caught_up 0", "warning held", "reset"]
+            vec!["warning before", "warning after", "state 2"]
         );
+    }
+
+    /// Lossy overflow drops the incoming snapshot. Reliable overflow evicts
+    /// the subscriber instead of silently losing the frame.
+    #[test]
+    fn live_overflow_drops_lossy_and_evicts_on_reliable() {
+        let fanout = Fanout {
+            live_capacity: 2,
+            ..Fanout::default()
+        };
+        let (id, mut rx, cancelled) = fanout.register(&[SESSION.to_string()]);
+        fanout.finish_block(id, SESSION, 0);
+        fanout.publish(reliable("one"));
+        fanout.publish(reliable("two"));
+        fanout.publish(Frame::List {
+            sessions: Vec::new(),
+        });
+        assert!(!cancelled.is_cancelled(), "lossy overflow is only dropped");
+
+        fanout.publish(reliable("three"));
+        assert!(cancelled.is_cancelled());
+        assert!(fanout.lock().is_empty(), "the subscriber was evicted");
+        assert!(drained(&mut rx).is_empty(), "eviction closes and clears");
+    }
+
+    /// The attach channel has capacity one and live frames remain hidden until
+    /// its sender closes.
+    #[test]
+    fn attachment_is_producer_paced_and_reads_the_block_before_live() {
+        let fanout = Arc::new(Fanout::default());
+        let (id, live, cancelled) = fanout.register(&[SESSION.to_string()]);
+        let (block_tx, block_rx) = tokio::sync::mpsc::channel(1);
+        let mut attachment = Attachment::new(
+            id,
+            block_rx,
+            live,
+            cancelled,
+            vec![SESSION.to_string()],
+            Arc::clone(&fanout),
+        );
+        block_tx.try_send(lossy(1)).expect("first block frame");
+        assert!(
+            block_tx.try_send(caught_up(1)).is_err(),
+            "the producer cannot preload a second frame",
+        );
+        fanout.publish(reliable("live"));
+
+        assert!(matches!(attachment.try_recv(), Some(Frame::State { .. })));
+        assert!(
+            attachment.try_recv().is_none(),
+            "live frames stay behind an unfinished block",
+        );
+        drop(block_tx);
+        assert!(matches!(attachment.try_recv(), Some(Frame::Event { .. })));
     }
 
     /// Dropping the stream deregisters it, so the host stops paying for a
@@ -464,8 +671,16 @@ mod tests {
     #[test]
     fn dropping_an_attachment_deregisters_it() {
         let fanout = Arc::new(Fanout::default());
-        let (id, rx) = fanout.register(&[SESSION.to_string()]);
-        let attachment = Attachment::new(id, rx, vec![SESSION.to_string()], Arc::clone(&fanout));
+        let (id, live, cancelled) = fanout.register(&[SESSION.to_string()]);
+        let (_block_tx, block_rx) = tokio::sync::mpsc::channel(1);
+        let attachment = Attachment::new(
+            id,
+            block_rx,
+            live,
+            cancelled,
+            vec![SESSION.to_string()],
+            Arc::clone(&fanout),
+        );
         assert_eq!(fanout.lock().len(), 1);
 
         drop(attachment);

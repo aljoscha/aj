@@ -523,6 +523,7 @@ mod tests {
             provider: "anthropic".into(),
             model_id: "claude".into(),
             thinking: "off".into(),
+            thinking_display: String::new(),
             speed: "standard".into(),
             verbosity: "default".into(),
         };

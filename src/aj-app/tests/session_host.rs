@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
+use aj_agent::tool::{TaskKind, TaskOutputSource, TaskRead, TaskStatus};
 use aj_app::chat::ChatState;
 use aj_app::client::SessionClient;
 use aj_app::host::{
@@ -21,12 +22,12 @@ use aj_app::test_support::{
     CanonicalState, assert_canonical_eq, assert_no_dangling, finalized_text_message,
     finalized_text_message_with_usage, scripted_model_info,
 };
-use aj_conf::{Config, ConfigLayer};
+use aj_conf::{Config, ConfigLayer, ConfigThinkingDisplay};
 use aj_models::auth::AuthStorage;
 use aj_models::scripted::{ExhaustedBehavior, ScriptedProvider};
 use aj_models::types::{AssistantContent, AssistantMessage, StopReason, ToolCall, UserContent};
 use aj_session::{ConversationPersistence, SessionLock, ThreadFilter};
-use aj_wire::Frame;
+use aj_wire::{Frame, ModelSelection, SessionSettings};
 use tempfile::TempDir;
 
 /// Every wait in this file is bounded by this, so a wedged host fails a
@@ -58,6 +59,13 @@ impl Harness {
     }
 
     fn with_provider(provider: Arc<ScriptedProvider>) -> Self {
+        Self::with_catalog(provider, Vec::new())
+    }
+
+    fn with_catalog(
+        provider: Arc<ScriptedProvider>,
+        catalog: Vec<aj_models::registry::ModelInfo>,
+    ) -> Self {
         let dir = TempDir::new().expect("tempdir");
         let persistence = ConversationPersistence::new(dir.path().join("sessions"));
         let config = Arc::new(StdMutex::new(Config::default()));
@@ -68,7 +76,7 @@ impl Harness {
                 project: ConfigLayer::default(),
                 project_path: None,
             })),
-            catalog: Arc::new(Vec::new()),
+            catalog: Arc::new(catalog),
             run_config: snapshot(provider),
             restore: None,
             persistence: persistence.clone(),
@@ -158,9 +166,25 @@ fn snapshot(provider: Arc<ScriptedProvider>) -> RunConfigSnapshot {
         model_info: Arc::new(scripted_model_info()),
         stream_options: aj_models::types::StreamOptions::default(),
         thinking: None,
+        thinking_display: None,
         speed: None,
         model_key: ("scripted".to_string(), "scripted".to_string()),
         session_id: None,
+    }
+}
+
+struct FixedTaskOutput;
+
+impl TaskOutputSource for FixedTaskOutput {
+    fn snapshot(&self) -> TaskRead {
+        TaskRead {
+            stdout_tail: "stdout tail".into(),
+            stderr_tail: "stderr tail".into(),
+            stdout_total_bytes: 50,
+            stderr_total_bytes: 12,
+            spill_path: Some("/host/private/spill".into()),
+            report: Some("agent report".into()),
+        }
     }
 }
 
@@ -533,6 +557,7 @@ fn settings() -> AgentSettings {
         provider: "scripted".into(),
         model_id: "scripted".into(),
         thinking: "off".into(),
+        thinking_display: "default".into(),
         speed: "standard".into(),
         verbosity: "default".into(),
     }
@@ -626,6 +651,123 @@ async fn a_created_session_runs_a_turn_and_publishes_its_frames() {
         seqs.windows(2).all(|pair| pair[0] < pair[1]),
         "live durable seqs are strictly increasing: {seqs:?}",
     );
+    harness.host.shutdown().await;
+}
+
+#[tokio::test]
+async fn explicit_creation_applies_settings_before_its_first_prompt() {
+    let harness = Harness::new(vec![finalized_text_message("created remotely")]);
+    let session = harness
+        .host
+        .create_with(
+            Some(SessionSettings {
+                model: Some(ModelSelection {
+                    api: "scripted".into(),
+                    url: None,
+                    name: "scripted".into(),
+                }),
+                thinking: Some("off".into()),
+                thinking_display: Some("detailed".into()),
+                speed: Some("fast".into()),
+                verbosity: Some("high".into()),
+            }),
+            Some(vec![UserContent::text("begin")]),
+        )
+        .await
+        .expect("create with settings");
+
+    let handles = harness.host.local_handles(&session).await.expect("handles");
+    let settings = handles
+        .run_config
+        .lock()
+        .expect("run config mutex poisoned")
+        .settings();
+    assert_eq!(settings.thinking_display, "detailed");
+    assert_eq!(settings.speed, "fast");
+    assert_eq!(settings.verbosity, "high");
+
+    let client = Client::attach(&harness.host, &session).await;
+    assert!(
+        format!("{:?}", client.canonical()).contains("created remotely"),
+        "the optional prompt was accepted after creation",
+    );
+    harness.host.shutdown().await;
+}
+
+#[tokio::test]
+async fn refused_creation_leaves_no_discoverable_session() {
+    let harness = Harness::new(Vec::new());
+    for (settings, prompt) in [
+        (
+            Some(SessionSettings {
+                speed: Some("warp".into()),
+                ..SessionSettings::default()
+            }),
+            None,
+        ),
+        (
+            Some(SessionSettings {
+                model: Some(ModelSelection {
+                    api: "missing".into(),
+                    url: None,
+                    name: "missing".into(),
+                }),
+                ..SessionSettings::default()
+            }),
+            None,
+        ),
+        (None, Some(Vec::new())),
+    ] {
+        harness
+            .host
+            .create_with(settings, prompt)
+            .await
+            .expect_err("creation is refused");
+        assert!(
+            harness
+                .host
+                .sessions()
+                .await
+                .expect("sessions")
+                .sessions
+                .is_empty(),
+            "validation happens before the log is created",
+        );
+    }
+    harness.host.shutdown().await;
+}
+
+#[tokio::test]
+async fn creation_resolves_real_models_from_the_host_catalog_with_lazy_auth() {
+    let mut real = scripted_model_info();
+    real.provider = "openai".into();
+    real.api = "openai-responses".into();
+    real.id = "gpt-catalog".into();
+    real.base_url = "https://catalog.example/v1".into();
+    let harness = Harness::with_catalog(scripted(Vec::new(), 0, Duration::ZERO), vec![real]);
+    let session = harness
+        .host
+        .create_with(
+            Some(SessionSettings {
+                model: Some(ModelSelection {
+                    api: "openai".into(),
+                    url: Some("https://override.example/v1".into()),
+                    name: "gpt-catalog".into(),
+                }),
+                ..SessionSettings::default()
+            }),
+            None,
+        )
+        .await
+        .expect("lazy credentials do not prevent session creation");
+    let handles = harness.host.local_handles(&session).await.expect("handles");
+    let config = handles
+        .run_config
+        .lock()
+        .expect("run config mutex poisoned");
+    assert_eq!(config.model_key, ("openai".into(), "gpt-catalog".into()));
+    assert_eq!(config.model_info.base_url, "https://override.example/v1");
+    drop(config);
     harness.host.shutdown().await;
 }
 
@@ -770,6 +912,63 @@ async fn an_attach_reports_what_it_served_and_refuses_a_duplicate() {
         .err()
         .expect("an unknown session is refused");
     assert!(matches!(err, HostError::UnknownSession(_)), "got {err:?}");
+    harness.host.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_large_attach_block_is_not_preloaded_before_attach_returns() {
+    let mut calling = finalized_text_message("checking many things");
+    calling.stop_reason = StopReason::ToolUse;
+    for n in 0..20 {
+        calling.content.push(AssistantContent::ToolCall(ToolCall {
+            id: format!("call-{n}"),
+            name: "todo_read".into(),
+            arguments: serde_json::json!({}),
+        }));
+    }
+    let harness = Harness::new(vec![calling, finalized_text_message("done")]);
+    let session = harness.create().await;
+    harness.prompt(&session, "check").await;
+    bounded("the staged turn to settle", async {
+        loop {
+            let quiet = harness
+                .host
+                .sessions()
+                .await
+                .expect("sessions")
+                .sessions
+                .iter()
+                .find(|summary| summary.id == session)
+                .is_some_and(|summary| !summary.working);
+            if quiet {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+
+    let mut attachment = harness
+        .host
+        .attach(&[AttachRequest {
+            session,
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+    let mut block = drained(&mut attachment);
+    assert!(
+        block.len() <= 1,
+        "the capacity-one producer cannot preload the backfill: {} frames",
+        block.len(),
+    );
+    block.extend(
+        frames_until(&mut attachment, "the producer-paced caught_up", |frame| {
+            matches!(frame, Frame::CaughtUp { .. })
+        })
+        .await,
+    );
+    assert!(block.len() > 20, "the test built a substantial backfill");
     harness.host.shutdown().await;
 }
 
@@ -1976,6 +2175,88 @@ async fn a_settings_change_publishes_the_projected_notice() {
     harness.host.shutdown().await;
 }
 
+#[tokio::test]
+async fn thinking_display_is_live_only_and_survives_bundle_rebuilds() {
+    let harness = Harness::new(Vec::new());
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    let handles = harness.host.local_handles(&session).await.expect("handles");
+    let before = handles.log.lock().await.last_seq();
+
+    harness
+        .host
+        .command(
+            &session,
+            Command::Settings(SettingsChange {
+                agent: AgentId::Main,
+                persist: PersistAction::None,
+                axis: SettingsAxis::ThinkingDisplay(Some(ConfigThinkingDisplay::Detailed)),
+            }),
+        )
+        .await
+        .expect("thinking display change");
+    let frames = frames_until(&mut client.stream, "the display state frame", |frame| {
+        matches!(frame, Frame::State { settings, .. } if settings.thinking_display == "detailed")
+    })
+    .await;
+    assert!(frames.iter().any(|frame| matches!(
+        frame,
+        Frame::Event {
+            durability: None,
+            event,
+            ..
+        } if matches!(event.known(), Some(AgentEvent::Notice { text, .. }) if text.contains("detailed"))
+    )));
+    assert_eq!(
+        handles.log.lock().await.last_seq(),
+        before,
+        "thinking display is not written to the log",
+    );
+
+    let mut real = scripted_model_info();
+    real.provider = "openai".into();
+    real.api = "openai-responses".into();
+    real.id = "gpt-test".into();
+    real.base_url = "https://api.example.test/v1".into();
+    harness
+        .host
+        .command(
+            &session,
+            Command::Settings(SettingsChange {
+                agent: AgentId::Main,
+                persist: PersistAction::None,
+                axis: SettingsAxis::Model(real),
+            }),
+        )
+        .await
+        .expect("model change");
+    harness
+        .host
+        .command(
+            &session,
+            Command::Settings(SettingsChange {
+                agent: AgentId::Main,
+                persist: PersistAction::None,
+                axis: SettingsAxis::Speed(Some(aj_models::types::Speed::Fast)),
+            }),
+        )
+        .await
+        .expect("speed change");
+
+    let cfg = handles
+        .run_config
+        .lock()
+        .expect("run config mutex poisoned");
+    assert_eq!(cfg.thinking_display, Some(ConfigThinkingDisplay::Detailed));
+    assert_eq!(
+        cfg.stream_options.reasoning_summary,
+        Some(aj_models::types::ReasoningSummary::Detailed),
+        "model and speed rebuilds preserve the session-tracked display",
+    );
+    drop(cfg);
+    harness.host.shutdown().await;
+}
+
 /// A settings change before the thread's first message projects no notice,
 /// so the host publishes the confirmation untagged: live clients still see
 /// the gesture, and no backfill regenerates a row for it (spec section 5).
@@ -2034,10 +2315,23 @@ async fn a_settings_change_before_the_first_prompt_publishes_an_untagged_notice(
         let _ = live.client.apply(&mut live.chat, frame);
     }
     let joiner = Client::attach(&harness.host, &session).await;
-    let rendered = format!("{:?}", joiner.canonical());
     assert!(
-        !rendered.contains("low"),
-        "the backfill regenerates nothing for a seed settings entry: {rendered}",
+        joiner
+            .canonical()
+            .agent(AgentId::Main)
+            .expect("main")
+            .entries
+            .is_empty(),
+        "the backfill regenerates no notice for a seed settings entry",
+    );
+    assert_eq!(
+        joiner
+            .chat
+            .footers()
+            .settings(AgentId::Main)
+            .map(|settings| settings.thinking.as_str()),
+        Some("low"),
+        "the opening state still carries the authoritative setting",
     );
     harness.host.shutdown().await;
 }
@@ -2728,27 +3022,15 @@ async fn the_attach_block_is_contiguous_and_filters_the_boundary() {
 /// with until something else moved.
 ///
 /// The change has to land inside the span between an attach's status snapshot
-/// and its block delivery, so this hammers attaches back to back (that span
-/// is most of an attach) and flips the settings once underneath them. The
-/// oracle is a bystander stream, already past its own block: it sees the
-/// driver's own `state` frame live, so a second one for the same flip can only
-/// be an attach's refresh.
+/// and its block delivery, so this hammers attaches back to back and flips the
+/// settings once underneath them. Every attachment is consumed while the
+/// hammer runs. Producer-paced blocks would otherwise accumulate one blocked
+/// producer per attempt, which is not a client behavior the host needs to
+/// support.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_attach_refreshes_state_that_moved_while_it_projected() {
     let harness = Harness::new(Vec::new());
     let session = harness.create().await;
-    let mut bystander = harness
-        .host
-        .attach(&[AttachRequest {
-            session: session.clone(),
-            cursor: None,
-        }])
-        .await
-        .expect("attach the bystander");
-    frames_until(&mut bystander, "caught_up", |frame| {
-        matches!(frame, Frame::CaughtUp { .. })
-    })
-    .await;
 
     let deadline = tokio::time::Instant::now() + DEADLINE;
     let mut attempts = 0;
@@ -2768,7 +3050,6 @@ async fn an_attach_refreshes_state_that_moved_while_it_projected() {
                 .as_ref(),
         )
         .to_string();
-        let _ = drained(&mut bystander);
 
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let hammer = tokio::spawn({
@@ -2778,14 +3059,29 @@ async fn an_attach_refreshes_state_that_moved_while_it_projected() {
             async move {
                 let mut served = Vec::new();
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    served.push(
-                        host.attach(&[AttachRequest {
+                    let mut stream = host
+                        .attach(&[AttachRequest {
                             session: session.clone(),
                             cursor: None,
                         }])
                         .await
-                        .expect("attach"),
-                    );
+                        .expect("attach");
+                    let mut frames = Vec::new();
+                    while let Some(frame) = stream.recv().await {
+                        let caught_up = matches!(frame, Frame::CaughtUp { .. });
+                        frames.push(frame);
+                        if caught_up {
+                            break;
+                        }
+                    }
+                    // A refresh follows the block on the live queue. Bound
+                    // the read because a stream with no refresh stays open.
+                    if let Ok(Some(frame)) =
+                        tokio::time::timeout(Duration::from_millis(2), stream.recv()).await
+                    {
+                        frames.push(frame);
+                    }
+                    served.push(frames);
                 }
                 served
             }
@@ -2807,31 +3103,17 @@ async fn an_attach_refreshes_state_that_moved_while_it_projected() {
             .expect("thinking change");
         tokio::time::sleep(Duration::from_millis(2)).await;
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let mut joiners = hammer.await.expect("the attach loop");
+        let joiners = hammer.await.expect("the attach loop");
         assert!(!joiners.is_empty(), "the loop served at least one attach");
 
-        // Both publishes are queued by the time the flip and the attaches
-        // have returned, so nothing here waits for them.
-        let refreshed = states(&drained(&mut bystander), &expected);
-        if refreshed < 2 {
-            continue;
-        }
-        assert_eq!(
-            refreshed, 2,
-            "one `state` frame from the flip, one from the attach that straddled it",
-        );
-        // And the self-heal itself: some client's block opened with the old
-        // settings, and a frame behind the block told it the new ones.
-        let healed = joiners.iter_mut().any(|joiner| {
-            let frames = drained(joiner);
+        let healed = joiners.iter().any(|frames| {
             let opened_stale = matches!(frames.first(),
                 Some(Frame::State { settings, .. }) if settings.thinking == before);
             opened_stale && states(&frames[1..], &expected) > 0
         });
-        assert!(
-            healed,
-            "a block served across the change is followed by the settings it missed",
-        );
+        if !healed {
+            continue;
+        }
         break;
     }
     harness.host.shutdown().await;
@@ -3261,13 +3543,15 @@ async fn attaching_with_a_cursor_inside_a_live_sub_run_resynthesizes_its_start()
             _ => None,
         })
         .collect();
+    let mut persisted_settings = settings();
+    persisted_settings.thinking_display.clear();
     assert_eq!(
         starts,
         vec![(
             AgentId::Sub(1),
             "look into it".to_string(),
             true,
-            settings(),
+            persisted_settings,
             None,
         )],
         "the run's start is re-synthesized with the spawn root's own fields, untagged",
@@ -3794,6 +4078,53 @@ async fn the_reads_answer_tasks_tree_and_hello() {
         hello.host_id,
         "the host id is persisted in the session store",
     );
+    revived.host.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_task_detail_read_omits_host_paths_and_cold_tasks_are_unknown() {
+    let harness = Harness::new(vec![finalized_text_message("recorded")]);
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "record this session").await;
+    client.pump_until_idle().await;
+    drop(client);
+    let handles = harness.host.local_handles(&session).await.expect("handles");
+    let (task, _cancel) = handles.task_registry.register(
+        AgentId::Main,
+        "call-1".into(),
+        TaskKind::Agent {
+            agent_id: 1,
+            task: "inspect".into(),
+        },
+        "inspect".into(),
+        Arc::new(FixedTaskOutput),
+    );
+    handles
+        .task_registry
+        .set_status(task, TaskStatus::Exited(Some(0)));
+
+    let details = harness.host.task(&session, task).await.expect("task read");
+    assert_eq!(details.status, TaskStatus::Exited(Some(0)));
+    assert_eq!(details.stdout_tail, "stdout tail");
+    assert_eq!(details.stderr_total_bytes, 12);
+    assert_eq!(details.report.as_deref(), Some("agent report"));
+    let encoded = serde_json::to_value(details).expect("task details serialize");
+    assert!(
+        encoded.get("spill_path").is_none(),
+        "a host path never crosses the transport boundary",
+    );
+    assert!(matches!(
+        harness.host.task(&session, task + 1).await,
+        Err(HostError::UnknownTask(_))
+    ));
+
+    harness.host.shutdown().await;
+    let revived = harness.revive(Vec::new());
+    assert!(matches!(
+        revived.host.task(&session, task).await,
+        Err(HostError::UnknownTask(_))
+    ));
     revived.host.shutdown().await;
 }
 

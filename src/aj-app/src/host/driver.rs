@@ -589,6 +589,7 @@ impl Driver {
         } = change;
         let core = &self.session.core;
         let shared = &self.shared;
+        let mut transient_confirmation = false;
         let outcome: ConfirmOutcome = match (axis, agent) {
             (SettingsAxis::Thinking(level), AgentId::Main) => {
                 crate::settings::confirm_thinking_for_main(
@@ -607,6 +608,16 @@ impl Driver {
                 crate::settings::confirm_thinking_for_sub(level, n, tracked, core)
                     .await
                     .into()
+            }
+            (SettingsAxis::ThinkingDisplay(display), AgentId::Main) => {
+                transient_confirmation = true;
+                crate::settings::confirm_thinking_display_for_main(
+                    display,
+                    persist,
+                    &core.run_config,
+                    &shared.config,
+                    &shared.layers,
+                )
             }
             (SettingsAxis::Model(info), AgentId::Main) => crate::settings::confirm_model_for_main(
                 info,
@@ -651,16 +662,31 @@ impl Driver {
                 .await
                 .into()
             }
-            (SettingsAxis::Speed(_) | SettingsAxis::Verbosity(_), AgentId::Sub(n)) => {
+            (
+                SettingsAxis::ThinkingDisplay(_)
+                | SettingsAxis::Speed(_)
+                | SettingsAxis::Verbosity(_),
+                AgentId::Sub(n),
+            ) => {
                 // Malformed rather than unservable: these axes are
                 // session-wide, so no host could serve this request.
                 return Err(HostError::Invalid(format!(
-                    "speed and verbosity are session-wide and cannot be set for agent {n}"
+                    "thinking display, speed, and verbosity are session-wide and cannot be set for agent {n}"
                 )));
             }
         };
         if !outcome.applied {
             return Err(HostError::Unsupported(outcome.notice));
+        }
+
+        if transient_confirmation {
+            self.publish_event(
+                None,
+                AgentEvent::Notice {
+                    agent_id: AgentId::Main,
+                    text: outcome.notice.clone(),
+                },
+            );
         }
 
         if let Some(entry) = &outcome.entry {

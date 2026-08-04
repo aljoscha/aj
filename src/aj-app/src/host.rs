@@ -45,28 +45,33 @@ use aj_agent::queue::MessageQueues;
 use aj_agent::tool::TaskId;
 use aj_agent::types::UsageSummary;
 use aj_agent::{BoxError, SubAgentRegistry, TaskRegistry};
-use aj_conf::{AgentEnv, Config};
+use aj_conf::{AgentEnv, Config, ConfigThinkingDisplay};
 use aj_models::ThinkingConfig;
 use aj_models::auth::AuthStorage;
-use aj_models::registry::ModelInfo;
+use aj_models::registry::{ModelInfo, validate_thinking_level};
 use aj_models::types::{Speed, UserContent};
+use aj_models::{speed_from_name, thinking_config_from_name, verbosity_from_name};
 use aj_session::{
     AppendHandoff, ConversationLog, ConversationPersistence, EntryId, SessionLock, project_suffix,
 };
 use aj_wire::{
-    AgentQueue, Cursor, DurableEvent, Frame, Hello, PROTOCOL_VERSION, QueueCounts, QueueState,
-    SessionList, SessionSummary, SessionTree, TaskSummary, TaskTable, TreeSegment,
+    AgentQueue, Cursor, DurableEvent, Frame, Hello, ModelSelection, PROTOCOL_VERSION, QueueCounts,
+    QueueState, SessionList, SessionSettings, SessionSummary, SessionTree, TaskDetails,
+    TaskSummary, TaskTable, TreeSegment,
 };
 use chrono::{DateTime, Utc};
 use tokio::sync::Mutex as TokioMutex;
-use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::mpsc::{Sender, channel, unbounded_channel};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::host::driver::Driver;
 use crate::host::live::{LiveSession, Request, SessionStatus, settings_of};
 use crate::session::{SessionCore, SessionEntry, SessionSpec, SubAgentOverrides};
-use crate::session_setup::{RestoreContext, RunConfigSnapshot};
+use crate::session_setup::{
+    RestoreContext, RunConfigSnapshot, thinking_display_from_name, thinking_level_for,
+};
 use crate::settings::{ConfigLayers, PersistAction};
 
 pub use fanout::Attachment;
@@ -192,6 +197,7 @@ pub enum QueueOp {
 pub enum SettingsAxis {
     Model(ModelInfo),
     Thinking(Option<ThinkingConfig>),
+    ThinkingDisplay(Option<ConfigThinkingDisplay>),
     Speed(Option<Speed>),
     Verbosity(Option<aj_conf::ConfigVerbosity>),
 }
@@ -216,6 +222,7 @@ pub enum CommandOutcome {
 }
 
 /// One session to attach, with the cursor the client offers for it.
+#[derive(Clone)]
 pub struct AttachRequest {
     pub session: String,
     /// The last durable position the client committed. A cursor from
@@ -254,12 +261,11 @@ pub struct LocalHandles {
     pub run_config: Arc<StdMutex<RunConfigSnapshot>>,
     pub sub_overrides: Arc<StdMutex<HashMap<usize, SubAgentOverrides>>>,
     pub env: AgentEnv,
-    /// What resume-time settings restoration did to this session, as
-    /// user-facing lines.
+    /// Legacy in-process restoration diagnostics.
     ///
-    /// A local frontend folds them into its transcript when it focuses the
-    /// session. Nothing regenerates them, so they are a read rather than a
-    /// frame, and a remote client does not see them.
+    /// New frontends render one local summary from
+    /// [`crate::client::SessionClient::take_first_attach_settings`]. The host
+    /// never publishes these lines, which prevents reconnect duplication.
     pub restore_notices: Vec<String>,
 }
 
@@ -396,14 +402,74 @@ impl SessionHost {
 
     /// Create a session in the host's working directory and hold it live.
     pub async fn create(&self) -> Result<String, HostError> {
+        self.create_with(None, None).await
+    }
+
+    /// Creates a session with creator-selected settings and a first prompt.
+    ///
+    /// Every setting and the prompt are validated before a log is created, so
+    /// a refused request leaves no discoverable empty session behind.
+    pub async fn create_with(
+        &self,
+        settings: Option<SessionSettings>,
+        prompt: Option<Vec<UserContent>>,
+    ) -> Result<String, HostError> {
         self.alive()?;
+        if let Some(content) = prompt.as_deref() {
+            validate_prompt(content)?;
+        }
+        let run_config = self.resolve_creator_settings(settings.as_ref())?;
         let mut sessions = self.inner.sessions.lock().await;
-        let session = self
-            .materialize(&mut sessions, None)
-            .await?
-            .id()
-            .to_string();
+        let live = self
+            .materialize(&mut sessions, None, Some(run_config))
+            .await?;
+        let session = live.id().to_string();
+        drop(sessions);
+        if let Some(content) = prompt {
+            self.command(
+                &session,
+                Command::Prompt {
+                    agent: AgentId::Main,
+                    content,
+                },
+            )
+            .await?;
+        }
         Ok(session)
+    }
+
+    /// Resolves a wire model-selection triple against this host's catalog.
+    ///
+    /// The returned row is host-owned data with an optional client URL
+    /// override. Callers pass it to [`SettingsAxis::Model`] rather than
+    /// accepting a catalog object from the wire.
+    pub fn resolve_model_selection(
+        &self,
+        selection: &ModelSelection,
+    ) -> Result<ModelInfo, HostError> {
+        validate_model_selection(selection)?;
+        let mut info = self
+            .inner
+            .shared
+            .catalog
+            .iter()
+            .find(|info| info.provider == selection.api && info.id == selection.name)
+            .cloned()
+            .or_else(|| {
+                (self.inner.base_run_config.model_key
+                    == (selection.api.clone(), selection.name.clone()))
+                    .then(|| (*self.inner.base_run_config.model_info).clone())
+            })
+            .ok_or_else(|| {
+                HostError::Unsupported(format!(
+                    "model {}/{} is not in the host catalog",
+                    selection.api, selection.name
+                ))
+            })?;
+        if let Some(url) = &selection.url {
+            info.base_url.clone_from(url);
+        }
+        Ok(info)
     }
 
     /// Open a stream and serve an attach block for every named session.
@@ -438,16 +504,32 @@ impl SessionHost {
         // half-served stream behind.
         let mut live = Vec::with_capacity(requests.len());
         for request in requests {
-            live.push((request, self.live(&request.session).await?));
+            live.push((request.clone(), self.live(&request.session).await?));
         }
-        let (id, frames) = self.inner.shared.fanout.register(&names);
-        let attachment = Attachment::new(id, frames, names, Arc::clone(&self.inner.shared.fanout));
+        let (id, live_frames, cancelled) = self.inner.shared.fanout.register(&names);
+        let (block_tx, block_rx) = channel(1);
+        let attachment = Attachment::new(
+            id,
+            block_rx,
+            live_frames,
+            cancelled.clone(),
+            names,
+            Arc::clone(&self.inner.shared.fanout),
+        );
         // Registered above before any block is projected: from here on every
-        // frame this host publishes is either held for a block or filtered
+        // frame this host publishes is either queued behind the block or filtered
         // against its boundary, which is the atomicity the doc promises.
-        for (request, session) in live {
-            self.serve_block(id, request, &session).await;
-        }
+        let host = self.clone();
+        tokio::spawn(async move {
+            for (request, session) in live {
+                if !host
+                    .serve_block(id, &request, &session, &block_tx, &cancelled)
+                    .await
+                {
+                    break;
+                }
+            }
+        });
         Ok(attachment)
     }
 
@@ -542,6 +624,30 @@ impl SessionHost {
             })
             .collect();
         Ok(TaskTable { tasks })
+    }
+
+    /// Detailed, remotely reachable output for one background task.
+    ///
+    /// Cold sessions have no task registry, so every id is unknown. The host's
+    /// spill path is intentionally omitted from the returned wire model.
+    pub async fn task(&self, session: &str, task: TaskId) -> Result<TaskDetails, HostError> {
+        let Some(live) = self.live_or_cold(session).await? else {
+            return Err(HostError::UnknownTask(task));
+        };
+        let (status, read) = live
+            .core
+            .task_registry
+            .read(task)
+            .ok_or(HostError::UnknownTask(task))?;
+        Ok(TaskDetails {
+            id: task,
+            status,
+            stdout_tail: read.stdout_tail,
+            stderr_tail: read.stderr_tail,
+            stdout_total_bytes: read.stdout_total_bytes,
+            stderr_total_bytes: read.stderr_total_bytes,
+            report: read.report,
+        })
     }
 
     /// The session's pending steering and follow-up messages. Empty, and no
@@ -677,7 +783,7 @@ impl SessionHost {
     async fn live(&self, session: &str) -> Result<Arc<LiveSession>, HostError> {
         self.alive()?;
         let mut sessions = self.inner.sessions.lock().await;
-        let live = self.materialize(&mut sessions, Some(session)).await?;
+        let live = self.materialize(&mut sessions, Some(session), None).await?;
         drop(sessions);
         Ok(live)
     }
@@ -758,6 +864,88 @@ impl SessionHost {
             .ok_or_else(|| HostError::Locked(id.to_string()))
     }
 
+    /// Resolves creator overrides into a complete per-session run config.
+    fn resolve_creator_settings(
+        &self,
+        settings: Option<&SessionSettings>,
+    ) -> Result<RunConfigSnapshot, HostError> {
+        let mut run = self.inner.base_run_config.clone();
+        let Some(settings) = settings else {
+            return Ok(run);
+        };
+
+        let speed = match settings.speed.as_deref() {
+            Some(name) => speed_from_name(name).ok_or_else(|| {
+                HostError::Invalid(format!("unknown speed {name:?}. Expected standard or fast"))
+            })?,
+            None => run.speed,
+        };
+
+        if let Some(selection) = &settings.model {
+            let info = self.resolve_model_selection(selection)?;
+            let base_bundle = self.inner.base_run_config.model_key
+                == (selection.api.clone(), selection.name.clone())
+                && self.inner.shared.catalog.iter().all(|catalog| {
+                    catalog.provider != selection.api || catalog.id != selection.name
+                });
+            if base_bundle {
+                if selection
+                    .url
+                    .as_deref()
+                    .is_some_and(|url| url != run.model_info.base_url)
+                {
+                    return Err(HostError::Unsupported(format!(
+                        "the host's injected model {}/{} cannot change its URL",
+                        selection.api, selection.name
+                    )));
+                }
+            } else {
+                let resolved = crate::model::from_model_info(&self.inner.shared.auth, info, speed)
+                    .map_err(|err| HostError::Unsupported(err.to_string()))?;
+                run.provider = resolved.provider;
+                run.model_info = resolved.model_info;
+                run.stream_options = resolved.stream_options;
+            }
+            run.model_key = (selection.api.clone(), selection.name.clone());
+        }
+
+        run.speed = speed;
+        run.stream_options.speed = speed;
+
+        if let Some(name) = settings.thinking_display.as_deref() {
+            run.thinking_display = thinking_display_from_name(name).ok_or_else(|| {
+                HostError::Invalid(format!(
+                    "unknown thinking display {name:?}. Expected default, summarized, detailed, or omitted"
+                ))
+            })?;
+        }
+        crate::model::apply_thinking_display(&mut run.stream_options, run.thinking_display);
+
+        if let Some(name) = settings.verbosity.as_deref() {
+            run.stream_options.verbosity = verbosity_from_name(name).ok_or_else(|| {
+                HostError::Invalid(format!(
+                    "unknown verbosity {name:?}. Expected default, low, medium, or high"
+                ))
+            })?;
+        }
+
+        if let Some(name) = settings.thinking.as_deref() {
+            run.thinking = thinking_config_from_name(name).ok_or_else(|| {
+                HostError::Invalid(format!(
+                    "unknown thinking level {name:?}. Expected off, minimal, low, medium, high, xhigh, or max"
+                ))
+            })?;
+            let level = run
+                .thinking
+                .as_ref()
+                .map(thinking_level_for)
+                .unwrap_or(aj_models::types::ThinkingLevel::Off);
+            validate_thinking_level(&run.model_info, &level).map_err(HostError::Unsupported)?;
+        }
+
+        Ok(run)
+    }
+
     /// Return the live session for `id`, creating it (when `id` is `None`)
     /// or resuming it from disk.
     ///
@@ -768,6 +956,7 @@ impl SessionHost {
         &self,
         sessions: &mut HashMap<String, LiveEntry>,
         id: Option<&str>,
+        create_run_config: Option<RunConfigSnapshot>,
     ) -> Result<Arc<LiveSession>, HostError> {
         if let Some(id) = id {
             if let Some(entry) = sessions.get(id) {
@@ -815,7 +1004,7 @@ impl SessionHost {
             .clone();
         let (mut core, _seed) = SessionCore::build(
             &config,
-            self.inner.base_run_config.clone(),
+            create_run_config.unwrap_or_else(|| self.inner.base_run_config.clone()),
             &self.inner.persistence,
             &spec,
             self.inner.shared.restore.as_ref(),
@@ -892,7 +1081,9 @@ impl SessionHost {
         id: fanout::SubscriberId,
         request: &AttachRequest,
         session: &Arc<LiveSession>,
-    ) {
+        block: &Sender<Frame>,
+        cancelled: &CancellationToken,
+    ) -> bool {
         // The snapshot and the epoch are read under the log lock, because a
         // head switch moves both under it: reading them separately could
         // pair the old projection with the new epoch.
@@ -933,30 +1124,53 @@ impl SessionHost {
         // for the length of it.
         let backfill = project_suffix(&snapshot, cursor, &live_subs);
 
-        let mut block = Vec::with_capacity(backfill.events.len() + 2);
-        block.push(Frame::State {
-            session: session.id().to_string(),
-            epoch: epoch.clone(),
-            working: working_seen,
-            settings: settings_seen.clone(),
-            last_seq: boundary,
-        });
-        for tagged in backfill.events {
-            block.push(Frame::Event {
+        if !send_block_frame(
+            block,
+            cancelled,
+            Frame::State {
                 session: session.id().to_string(),
                 epoch: epoch.clone(),
-                durability: tagged.entry.map(|entry| DurableEvent {
-                    seq: entry.seq,
-                    entry_id: entry.id,
-                }),
-                event: tagged.event.into(),
-            });
+                working: working_seen,
+                settings: settings_seen.clone(),
+                last_seq: boundary,
+            },
+        )
+        .await
+        {
+            return false;
         }
-        block.push(Frame::CaughtUp {
-            session: session.id().to_string(),
-            epoch: epoch.clone(),
-            last_seq: boundary,
-        });
+        for tagged in backfill.events {
+            if !send_block_frame(
+                block,
+                cancelled,
+                Frame::Event {
+                    session: session.id().to_string(),
+                    epoch: epoch.clone(),
+                    durability: tagged.entry.map(|entry| DurableEvent {
+                        seq: entry.seq,
+                        entry_id: entry.id,
+                    }),
+                    event: tagged.event.into(),
+                },
+            )
+            .await
+            {
+                return false;
+            }
+        }
+        if !send_block_frame(
+            block,
+            cancelled,
+            Frame::CaughtUp {
+                session: session.id().to_string(),
+                epoch: epoch.clone(),
+                last_seq: boundary,
+            },
+        )
+        .await
+        {
+            return false;
+        }
         // Every sub-agent the host knows to be idle is concluded after
         // `caught_up`. A sub whose `SubAgentEnd` fell into this client's
         // disconnected window would otherwise spin forever, and the
@@ -970,24 +1184,32 @@ impl SessionHost {
         // abandoned branch's runs (which the log names but the projection
         // never mentions) are left alone.
         for child in backfill.subs.difference(&backfill.open_subs) {
-            block.push(Frame::Event {
-                session: session.id().to_string(),
-                epoch: epoch.clone(),
-                // Synthesized bracketing, so untagged: its spawn root sits
-                // at or below the cursor and tagging it durable would make
-                // the client's cursor invariant drop it.
-                durability: None,
-                event: aj_agent::events::AgentEvent::AgentEnd {
-                    agent_id: AgentId::Sub(*child),
-                    messages: Vec::new(),
-                }
-                .into(),
-            });
+            if !send_block_frame(
+                block,
+                cancelled,
+                Frame::Event {
+                    session: session.id().to_string(),
+                    epoch: epoch.clone(),
+                    // Synthesized bracketing, so untagged: its spawn root sits
+                    // at or below the cursor and tagging it durable would make
+                    // the client's cursor invariant drop it.
+                    durability: None,
+                    event: aj_agent::events::AgentEvent::AgentEnd {
+                        agent_id: AgentId::Sub(*child),
+                        messages: Vec::new(),
+                    }
+                    .into(),
+                },
+            )
+            .await
+            {
+                return false;
+            }
         }
         self.inner
             .shared
             .fanout
-            .deliver_block(id, session.id(), block, boundary);
+            .finish_block(id, session.id(), boundary);
 
         // `working` and `settings` were read before the projection, and a
         // change during it was held and dropped as lossy. One more `state`
@@ -1009,7 +1231,57 @@ impl SessionHost {
         if let Some(refreshed) = refreshed {
             self.inner.shared.fanout.publish(refreshed);
         }
+        true
     }
+}
+
+/// Sends one attach-block frame under receiver backpressure.
+async fn send_block_frame(
+    sender: &Sender<Frame>,
+    cancelled: &CancellationToken,
+    frame: Frame,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = cancelled.cancelled() => false,
+        result = sender.send(frame) => result.is_ok(),
+    }
+}
+
+/// Applies the same empty-prompt rule as the session driver before creation.
+fn validate_prompt(content: &[UserContent]) -> Result<(), HostError> {
+    if content.is_empty() {
+        return Err(HostError::Invalid("the prompt is empty".to_string()));
+    }
+    let mut text = String::new();
+    for block in content {
+        let UserContent::Text(block) = block else {
+            return Ok(());
+        };
+        text.push_str(&block.text);
+    }
+    if text.is_empty() {
+        return Err(HostError::Invalid("the prompt is empty".to_string()));
+    }
+    Ok(())
+}
+
+fn validate_model_selection(selection: &ModelSelection) -> Result<(), HostError> {
+    if selection.api.is_empty() || selection.name.is_empty() {
+        return Err(HostError::Invalid(
+            "model api and name must not be empty".to_string(),
+        ));
+    }
+    if let Some(url) = selection.url.as_deref() {
+        let parsed = url::Url::parse(url)
+            .map_err(|err| HostError::Invalid(format!("invalid model url {url:?}: {err}")))?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host().is_none() {
+            return Err(HostError::Invalid(format!(
+                "model url {url:?} must be an absolute http or https URL"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Project one live session onto its directory entry.

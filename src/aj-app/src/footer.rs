@@ -237,6 +237,7 @@ impl AgentFooters {
                 provider: String::new(),
                 model_id: String::new(),
                 thinking: String::new(),
+                thinking_display: String::new(),
                 speed: String::new(),
                 verbosity: String::new(),
             },
@@ -339,6 +340,7 @@ mod tests {
             provider: "anthropic".to_string(),
             model_id: model_id.to_string(),
             thinking: thinking.to_string(),
+            thinking_display: "default".to_string(),
             speed: "standard".to_string(),
             verbosity: "default".to_string(),
         }

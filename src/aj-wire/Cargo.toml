@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 aj-agent = { path = "../aj-agent" }
+aj-models = { path = "../aj-models" }
 chrono = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }

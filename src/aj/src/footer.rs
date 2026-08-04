@@ -171,6 +171,7 @@ mod tests {
                 provider: "anthropic".into(),
                 model_id: "opus".into(),
                 thinking: "high".into(),
+                thinking_display: "default".into(),
                 speed: "standard".into(),
                 verbosity: "default".into(),
             },

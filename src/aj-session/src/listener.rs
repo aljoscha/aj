@@ -323,6 +323,7 @@ mod tests {
                 provider: "anthropic".to_string(),
                 model_id: "claude-x".to_string(),
                 thinking: "medium".to_string(),
+                thinking_display: String::new(),
                 speed: "standard".to_string(),
                 verbosity: "default".to_string(),
             },

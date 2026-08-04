@@ -581,6 +581,7 @@ fn fallback_settings() -> AgentSettings {
         provider: String::new(),
         model_id: String::new(),
         thinking: "off".to_string(),
+        thinking_display: String::new(),
         speed: "standard".to_string(),
         verbosity: "default".to_string(),
     }
@@ -2504,6 +2505,7 @@ mod tests {
             provider: "anthropic".into(),
             model_id: "claude-x".into(),
             thinking: "high".into(),
+            thinking_display: String::new(),
             speed: "fast".into(),
             verbosity: "high".into(),
         };
@@ -2584,6 +2586,7 @@ mod tests {
             provider: "anthropic".into(),
             model_id: "claude-x".into(),
             thinking: "high".into(),
+            thinking_display: String::new(),
             speed: "fast".into(),
             verbosity: "high".into(),
         };
@@ -2771,6 +2774,7 @@ mod tests {
             provider: "anthropic".into(),
             model_id: "claude-x".into(),
             thinking: "high".into(),
+            thinking_display: String::new(),
             speed: "fast".into(),
             verbosity: "default".into(),
         };
@@ -3508,6 +3512,7 @@ mod tests {
             provider: "anthropic".to_string(),
             model_id: "claude-sub".to_string(),
             thinking: "medium".to_string(),
+            thinking_display: String::new(),
             speed: "fast".to_string(),
             verbosity: "low".to_string(),
         }
@@ -3520,6 +3525,7 @@ mod tests {
             provider: "openai".to_string(),
             model_id: "gpt-sub".to_string(),
             thinking: "high".to_string(),
+            thinking_display: String::new(),
             speed: "standard".to_string(),
             verbosity: "high".to_string(),
         }

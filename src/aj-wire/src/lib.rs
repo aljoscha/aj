@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
 use aj_agent::message::AgentMessage;
 use aj_agent::tool::{TaskId, TaskKind, TaskStatus};
+use aj_models::types::UserContent;
 use chrono::{DateTime, Utc};
 use serde::de::{Error as _, MapAccess, Visitor};
 use serde::ser::{Error as _, SerializeMap};
@@ -17,6 +18,132 @@ use serde_json::value::RawValue;
 
 /// The current remote-control protocol version.
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// A creator-selected model, resolved against the receiving host's catalog.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelSelection {
+    pub api: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    pub name: String,
+}
+
+/// Optional inference-setting overrides for a session.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_display: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verbosity: Option<String>,
+}
+
+/// A prompt represented either as plain text or typed content blocks.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PromptInput {
+    Text { text: String },
+    Content { content: Vec<UserContent> },
+}
+
+impl PromptInput {
+    /// Converts the wire input into the content accepted by the session host.
+    pub fn into_content(self) -> Vec<UserContent> {
+        match self {
+            Self::Text { text } => vec![UserContent::text(text)],
+            Self::Content { content } => content,
+        }
+    }
+}
+
+/// Creates a session with optional creator settings and first prompt.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CreateSessionRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<SessionSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<PromptInput>,
+}
+
+/// Identifies a newly created session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCreated {
+    pub id: String,
+}
+
+/// Submits a prompt to an optional viewed agent.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PromptRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentId>,
+    #[serde(flatten)]
+    pub input: PromptInput,
+}
+
+/// Queues steering text for an optional viewed agent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SteerRequest {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentId>,
+}
+
+/// Cancels an optional viewed agent.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancelRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentId>,
+}
+
+/// A pending-message queue mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueOperation {
+    Remove,
+    Clear,
+}
+
+/// Withdraws one agent's pending message or clears all session queues.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueRequest {
+    pub op: QueueOperation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentId>,
+}
+
+/// The text withdrawn by a queue mutation, when one was pending.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueOutcome {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+/// Starts a manual compaction with optional instructions.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+/// Applies one or more session setting changes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettingsRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentId>,
+    #[serde(flatten)]
+    pub change: SessionSettings,
+}
+
+/// Switches a session's active branch head.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeadRequest {
+    pub entry: String,
+}
 
 /// Server identity and supported protocol features.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +200,19 @@ pub struct TaskSummary {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskTable {
     pub tasks: Vec<TaskSummary>,
+}
+
+/// Detailed status and remotely reachable output for one background task.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskDetails {
+    pub id: TaskId,
+    pub status: TaskStatus,
+    pub stdout_tail: String,
+    pub stderr_tail: String,
+    pub stdout_total_bytes: u64,
+    pub stderr_total_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<String>,
 }
 
 /// Pending messages for one agent in a session.

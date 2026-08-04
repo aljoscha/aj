@@ -1193,6 +1193,7 @@ mod tests {
             provider: "anthropic".into(),
             model_id: "claude-main".into(),
             thinking: "off".into(),
+            thinking_display: "default".into(),
             speed: "standard".into(),
             verbosity: "default".into(),
         }
@@ -1329,6 +1330,7 @@ mod tests {
             provider: provider.into(),
             model_id: model_id.into(),
             thinking: "off".into(),
+            thinking_display: "default".into(),
             speed: "standard".into(),
             verbosity: "default".into(),
         }
@@ -3287,6 +3289,7 @@ mod tests {
                 provider: "scripted".into(),
                 model_id: "scripted".into(),
                 thinking: "off".into(),
+                thinking_display: "default".into(),
                 speed: "standard".into(),
                 verbosity: "default".into(),
             },

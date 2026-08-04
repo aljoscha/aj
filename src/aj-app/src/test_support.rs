@@ -98,6 +98,7 @@ pub fn scripted_run_config(messages: Vec<AssistantMessage>) -> Arc<StdMutex<RunC
         model_info: Arc::new(scripted_model_info()),
         stream_options: StreamOptions::default(),
         thinking: None,
+        thinking_display: None,
         speed: None,
         model_key: ("scripted".to_string(), "scripted".to_string()),
         session_id: None,
@@ -121,6 +122,7 @@ pub fn scripted_run_config_with_window(
         model_info: Arc::new(model_info),
         stream_options: StreamOptions::default(),
         thinking: None,
+        thinking_display: None,
         speed: None,
         model_key: ("scripted".to_string(), "scripted".to_string()),
         session_id: None,
@@ -364,21 +366,17 @@ pub enum CanonicalEntry {
 impl CanonicalState {
     /// Project the state `client` folded into `chat`.
     ///
-    /// The client is the one argument rather than its lifecycle plus its
-    /// queue, so a comparison of two client folds cannot omit the queue and
-    /// go blind to a divergence in it.
+    /// The client supplies lifecycle state. Queue and task snapshots live in
+    /// `chat`, where a remote frontend can render them directly.
     pub fn of(chat: &ChatState, client: &SessionClient) -> Self {
-        let mut this = Self::of_reduced(chat, client.lifecycle());
-        this.queue = canonical_queue(client.queue());
-        this
+        Self::of_reduced(chat, client.lifecycle())
     }
 
     /// Project a fold that went straight through [`reduce`](crate::chat::reduce)
     /// with no client around it.
     ///
-    /// Such a fold owns no queue (`QueueUpdate` is a redraw ping to the
-    /// reducer, which drops the payload), so the queue projects empty. Use
-    /// [`Self::of`] wherever a [`SessionClient`] exists.
+    /// A direct reducer fold only changes the queue if its caller mirrors a
+    /// `QueueUpdate` into `chat`, as [`SessionClient`] does.
     pub fn of_reduced(chat: &ChatState, lifecycle: &AgentLifecycle) -> Self {
         // The union of both maps: an agent can hold render bookkeeping
         // without a transcript, and a state the oracle skipped would be a
@@ -454,10 +452,24 @@ impl CanonicalState {
             agents,
             sub_boxes,
             tasks,
-            queue: Vec::new(),
+            queue: canonical_queue(chat.queue()),
             running,
             compacting,
         }
+    }
+
+    /// Returns the convergence oracle used across a connection fault.
+    ///
+    /// Transient notice rows can be emitted entirely inside the disconnected
+    /// window and have no durable source to replay. Durable notices retain an
+    /// entry id and remain part of the comparison.
+    pub fn for_fault_comparison(mut self) -> Self {
+        for agent in &mut self.agents {
+            agent
+                .entries
+                .retain(|entry| !matches!(entry, CanonicalEntry::Notice { entry: None, .. }));
+        }
+        self
     }
 
     /// The projection of one agent, for tests that assert on a single

@@ -34,6 +34,7 @@
       "provider": "scripted",
       "model_id": "scripted-model",
       "thinking": "off",
+      "thinking_display": "default",
       "speed": "standard",
       "verbosity": "default"
     },

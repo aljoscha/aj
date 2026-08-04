@@ -261,9 +261,9 @@ async fn build_world(
         auth: auth.clone(),
         persistence: persistence.clone(),
     };
-    // The block is fully queued by the time the attach returns, so the
-    // resumed history is in the model before the first frame is drawn.
-    fold_ready_frames(&mut world);
+    // Awaited rather than drained: the block is producer-paced, and the
+    // resumed history has to be in the model before the first frame is drawn.
+    fold_attach_block(&mut world).await;
     refresh_client_reads(&mut world).await;
 
     // Startup notices, after the attach block so resumed history stays on
@@ -401,11 +401,10 @@ async fn open_stream(
 
 /// Fold every frame already queued on the focused session's stream.
 ///
-/// Called once per drive-loop iteration and after every attach, so the
-/// chrome mirrors never lag the host by a frame (a command's own frames are
-/// queued by the time it returns) and a streaming burst collapses into one
-/// redraw rather than one per chunk. Returns whether anything renderable
-/// changed.
+/// Called once per drive-loop iteration, so the chrome mirrors never lag the
+/// host by a frame (a command's own frames are queued by the time it
+/// returns) and a streaming burst collapses into one redraw rather than one
+/// per chunk. Returns whether anything renderable changed.
 fn fold_ready_frames(world: &mut World) -> bool {
     let mut redraw = false;
     while let Some(frame) = world.attachment.try_recv() {
@@ -414,24 +413,52 @@ fn fold_ready_frames(world: &mut World) -> bool {
     redraw
 }
 
+/// Fold the attach block the host is writing, up to and including its
+/// `caught_up`.
+///
+/// The block is producer-paced (spec 6.9): it is generated at the pace the
+/// client reads it rather than queued before `attach` returns, so draining
+/// only what is ready would paint the first frame against an empty
+/// transcript. Awaiting the block's end is also what makes the reads it
+/// obliges observe the state it established.
+///
+/// A stream that closes mid-block leaves what was applied in place. The
+/// caller reports the lost stream, so this stays silent about it.
+async fn fold_attach_block(world: &mut World) {
+    while let Some(frame) = world.attachment.recv().await {
+        let ends_block = matches!(
+            &frame,
+            aj_wire::Frame::CaughtUp { session, .. } if *session == world.session
+        );
+        let _ = world.client.apply(&mut world.chat.borrow_mut(), frame);
+        if ends_block {
+            return;
+        }
+    }
+}
+
 /// Discharge the reads an attach block obliges: neither the task table nor
 /// the pending-message queues are replayable, so a backfill regenerates
 /// neither (spec 6.7).
 ///
-/// The local views read the live handles instead, so nothing on screen
-/// depends on this. The client's own model does, and it is the same fold a
-/// remote client uses, so leaving it stale would leave the two paths
-/// unequal.
+/// Both reads land in the shared chat model, which is what a connect-mode
+/// client renders from, so the local and the remote path stay one path.
 async fn refresh_client_reads(world: &mut World) {
     if world.client.needs_task_refetch() {
         match world.host.tasks(&world.session).await {
-            Ok(tasks) => world.client.set_tasks(tasks),
+            Ok(tasks) => {
+                let mut chat = world.chat.borrow_mut();
+                world.client.set_tasks(&mut chat, tasks);
+            }
             Err(err) => tracing::warn!("could not read the session's task table: {err}"),
         }
     }
     if world.client.needs_queue_refetch() {
         match world.host.queue(&world.session).await {
-            Ok(queue) => world.client.set_queue(queue),
+            Ok(queue) => {
+                let mut chat = world.chat.borrow_mut();
+                world.client.set_queue(&mut chat, queue);
+            }
             Err(err) => tracing::warn!("could not read the session's message queues: {err}"),
         }
     }
@@ -580,7 +607,7 @@ async fn focus_session(
     // install-to-first-draw window.
     // Fold the attach block before the chrome reconcile below, so the first
     // frame is drawn against the session's real history and settings.
-    fold_ready_frames(world);
+    fold_attach_block(world).await;
     refresh_client_reads(world).await;
     sync_editor_chrome(world, shell);
     // Folded after the attach block so they land on top of the replayed
@@ -673,7 +700,7 @@ async fn reattach(world: &mut World, shell: &Rc<RefCell<Shell>>) -> Result<(), H
     let mut attachment = open_stream(&world.host, &world.session, &mut world.client).await?;
     std::mem::swap(&mut world.attachment, &mut attachment);
     drop(attachment);
-    fold_ready_frames(world);
+    fold_attach_block(world).await;
     refresh_client_reads(world).await;
     // Adopting an epoch resets the chat model, and both the transcript's
     // render cache and the image store are keyed by entry id, which is a
@@ -5383,6 +5410,7 @@ mod tests {
                 provider: "scripted".into(),
                 model_id: "scripted".into(),
                 thinking: "off".into(),
+                thinking_display: "default".into(),
                 speed: "standard".into(),
                 verbosity: "default".into(),
             },
@@ -5766,6 +5794,7 @@ mod tests {
                     provider: "scripted".into(),
                     model_id: "scripted".into(),
                     thinking: "off".into(),
+                    thinking_display: "default".into(),
                     speed: "standard".into(),
                     verbosity: "default".into(),
                 },
@@ -6212,6 +6241,7 @@ mod tests {
                 provider: "scripted".into(),
                 model_id: "scripted".into(),
                 thinking: "off".into(),
+                thinking_display: "default".into(),
                 speed: "standard".into(),
                 verbosity: "default".into(),
             },
@@ -9909,6 +9939,7 @@ mod tests {
                 provider: "scripted".into(),
                 model_id: "scripted".into(),
                 thinking: "off".into(),
+                thinking_display: "default".into(),
                 speed: "standard".into(),
                 verbosity: "default".into(),
             },
@@ -10960,6 +10991,7 @@ mod tests {
             provider: "scripted".into(),
             model_id: "scripted".into(),
             thinking: "off".into(),
+            thinking_display: "default".into(),
             speed: "standard".into(),
             verbosity: "default".into(),
         };
@@ -11089,6 +11121,7 @@ mod tests {
                     provider: "scripted".into(),
                     model_id: "scripted".into(),
                     thinking: "xhigh".into(),
+                    thinking_display: "default".into(),
                     speed: "standard".into(),
                     verbosity: "default".into(),
                 },
@@ -11162,6 +11195,7 @@ mod tests {
                     provider: "scripted".into(),
                     model_id: "scripted".into(),
                     thinking: "xhigh".into(),
+                    thinking_display: "default".into(),
                     speed: "standard".into(),
                     verbosity: "default".into(),
                 },
@@ -11235,6 +11269,7 @@ mod tests {
                     provider: "scripted".into(),
                     model_id: "scripted".into(),
                     thinking: "standard".into(),
+                    thinking_display: "default".into(),
                     speed: "standard".into(),
                     verbosity: "default".into(),
                 },
@@ -11296,6 +11331,7 @@ mod tests {
                     provider: "scripted".into(),
                     model_id: "scripted".into(),
                     thinking: "standard".into(),
+                    thinking_display: "default".into(),
                     speed: "standard".into(),
                     verbosity: "default".into(),
                 },
@@ -11352,6 +11388,7 @@ mod tests {
                     provider: "scripted".into(),
                     model_id: "scripted".into(),
                     thinking: "minimal".into(),
+                    thinking_display: "default".into(),
                     speed: "standard".into(),
                     verbosity: "default".into(),
                 },
@@ -11427,6 +11464,7 @@ mod tests {
                     provider: "scripted".into(),
                     model_id: "scripted".into(),
                     thinking: "xhigh".into(),
+                    thinking_display: "default".into(),
                     speed: "standard".into(),
                     verbosity: "default".into(),
                 },

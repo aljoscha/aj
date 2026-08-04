@@ -20,7 +20,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use aj_agent::events::{AgentId, AgentSettings};
-use aj_conf::{Config, ConfigLayer, ConfigSpeed, ConfigThinkingLevel, ConfigVerbosity};
+use aj_conf::{
+    Config, ConfigLayer, ConfigSpeed, ConfigThinkingDisplay, ConfigThinkingLevel, ConfigVerbosity,
+};
 use aj_models::auth::AuthStorage;
 use aj_models::registry::{ModelInfo, validate_thinking_level};
 use aj_models::types::Speed;
@@ -29,11 +31,10 @@ use aj_session::{EntryRef, ThreadFilter};
 
 use crate::commands::thinking_level_name;
 use crate::model::{
-    ResolvedModel, apply_thinking_display, apply_verbosity, config_verbosity_to_unified,
-    from_model_info,
+    ResolvedModel, apply_thinking_display, config_verbosity_to_unified, from_model_info,
 };
 use crate::session::SessionCore;
-use crate::session_setup::{RunConfigSnapshot, thinking_level_for};
+use crate::session_setup::{RunConfigSnapshot, thinking_display_name, thinking_level_for};
 
 /// The two config-file layers a frontend can edit.
 ///
@@ -430,16 +431,7 @@ pub async fn confirm_thinking_for_main(
     let (settings, context_window) = {
         let mut cfg = run_config.lock().expect("run config mutex poisoned");
         cfg.thinking = level.clone();
-        (
-            AgentSettings {
-                provider: cfg.model_key.0.clone(),
-                model_id: cfg.model_key.1.clone(),
-                thinking: thinking_level_name(&level).to_string(),
-                speed: speed_name(cfg.speed).to_string(),
-                verbosity: verbosity_name(cfg.stream_options.verbosity).to_string(),
-            },
-            cfg.model_info.context_window,
-        )
+        (cfg.settings(), cfg.model_info.context_window)
     };
     let name = thinking_level_name(&level);
     // Record the change on the session log's user thread so a later
@@ -579,9 +571,13 @@ pub async fn confirm_model_for_main(
     // Construct a fresh provider handle from the picked catalog entry,
     // carrying the active speed over so e.g. `--speed fast` survives a
     // model pick (degrading silently on providers that ignore it).
-    let speed = {
+    let (speed, display, verbosity) = {
         let cfg = run_config.lock().expect("run config mutex poisoned");
-        cfg.speed
+        (
+            cfg.speed,
+            cfg.thinking_display,
+            cfg.stream_options.verbosity,
+        )
     };
     match from_model_info(auth, info.clone(), speed) {
         Ok(ResolvedModel {
@@ -589,39 +585,27 @@ pub async fn confirm_model_for_main(
             model_info,
             mut stream_options,
         }) => {
-            // Re-apply the configured thinking-display mode and
-            // verbosity: the rebuilt baseline options would otherwise
-            // silently drop them on every model swap.
-            let (display, verbosity) = {
-                let cfg = config.lock().expect("config mutex poisoned");
-                (cfg.thinking_display, cfg.verbosity)
-            };
+            // Re-apply this session's choices. The host config is only the
+            // seed for a new session and may differ from its creator's.
             apply_thinking_display(&mut stream_options, display);
-            apply_verbosity(&mut stream_options, verbosity);
+            stream_options.verbosity = verbosity;
             // Stage the swap into the loop-side snapshot (provider +
             // model + options + the pre-select key); the next turn
             // applies it. Never locks the agent, so it's safe mid-turn —
             // the in-flight turn keeps its model and the swap takes
             // effect next turn. Thinking effort is preserved; read it
             // back for the footer entry.
-            let (current_thinking, current_verbosity) = {
+            let settings = {
                 let mut cfg = run_config.lock().expect("run config mutex poisoned");
                 cfg.provider = provider;
                 cfg.model_info = model_info;
                 cfg.stream_options = stream_options;
                 cfg.model_key = (info.provider.clone(), info.id.clone());
-                (cfg.thinking.clone(), cfg.stream_options.verbosity)
+                cfg.settings()
             };
             // Record the new settings identity so the footer's model
             // line and context-window denominator reflect the swap
             // immediately rather than waiting for the next turn.
-            let settings = AgentSettings {
-                provider: info.provider.clone(),
-                model_id: info.id.clone(),
-                thinking: thinking_level_name(&current_thinking).to_string(),
-                speed: speed_name(speed).to_string(),
-                verbosity: verbosity_name(current_verbosity).to_string(),
-            };
             let context_window = info.context_window;
             // Record the change on the session log's user thread so a
             // later resume restores this model.
@@ -800,6 +784,41 @@ pub async fn confirm_verbosity_for_main(
     }
 }
 
+/// Applies the main session's live-only reasoning-display choice.
+///
+/// The choice updates provider stream options and may become a config default,
+/// but it is never written to the session log. A resumed session therefore
+/// starts from the creator's current config unless a client changes it again.
+pub fn confirm_thinking_display_for_main(
+    display: Option<ConfigThinkingDisplay>,
+    persist: PersistAction,
+    run_config: &Arc<Mutex<RunConfigSnapshot>>,
+    config: &Arc<Mutex<Config>>,
+    layers: &Arc<Mutex<ConfigLayers>>,
+) -> ConfirmOutcome {
+    {
+        let mut cfg = run_config.lock().expect("run config mutex poisoned");
+        cfg.thinking_display = display;
+        apply_thinking_display(&mut cfg.stream_options, display);
+    }
+    let name = thinking_display_name(display);
+    let value = display.map(|value| value.to_string());
+    let save_note = persist_setting(
+        layers,
+        config,
+        persist,
+        "thinking_display",
+        value.as_deref(),
+        |config| config.thinking_display = display,
+    );
+    ConfirmOutcome {
+        applied: true,
+        notice: format!("Thinking display set to {name}. Takes effect next turn."),
+        notes: save_note.into_iter().collect(),
+        entry: None,
+    }
+}
+
 /// Apply a speed change to the main agent: rebuild the provider bundle
 /// at the current model so the speed-derived headers are re-stamped,
 /// stage it into the run config, persist per `persist`, and record on
@@ -816,9 +835,14 @@ pub async fn confirm_speed_for_main(
     core: &SessionCore,
 ) -> SpeedConfirm {
     let name = speed_name(speed);
-    let (model_info, prev_speed) = {
+    let (model_info, prev_speed, display, verbosity) = {
         let cfg = run_config.lock().expect("run config mutex poisoned");
-        ((*cfg.model_info).clone(), cfg.speed)
+        (
+            (*cfg.model_info).clone(),
+            cfg.speed,
+            cfg.thinking_display,
+            cfg.stream_options.verbosity,
+        )
     };
     match from_model_info(auth, model_info, speed) {
         Ok(ResolvedModel {
@@ -826,14 +850,10 @@ pub async fn confirm_speed_for_main(
             model_info,
             mut stream_options,
         }) => {
-            // The rebuilt baseline options would otherwise drop the
-            // configured thinking-display mode and verbosity.
-            let (display, verbosity) = {
-                let cfg = config.lock().expect("config mutex poisoned");
-                (cfg.thinking_display, cfg.verbosity)
-            };
+            // The rebuilt baseline would otherwise drop this session's
+            // creator-selected display and verbosity choices.
             apply_thinking_display(&mut stream_options, display);
-            apply_verbosity(&mut stream_options, verbosity);
+            stream_options.verbosity = verbosity;
             // Stage into the loop-side snapshot; the next turn applies
             // it. Never locks the agent, so it's safe mid-turn.
             let (settings, context_window) = {
@@ -842,16 +862,7 @@ pub async fn confirm_speed_for_main(
                 cfg.model_info = model_info;
                 cfg.stream_options = stream_options;
                 cfg.speed = speed;
-                (
-                    AgentSettings {
-                        provider: cfg.model_key.0.clone(),
-                        model_id: cfg.model_key.1.clone(),
-                        thinking: thinking_level_name(&cfg.thinking).to_string(),
-                        speed: name.to_string(),
-                        verbosity: verbosity_name(cfg.stream_options.verbosity).to_string(),
-                    },
-                    cfg.model_info.context_window,
-                )
+                (cfg.settings(), cfg.model_info.context_window)
             };
             // Record the change on the session log's user thread so a
             // later resume restores this speed.

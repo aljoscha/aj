@@ -163,8 +163,8 @@ pub enum ConversationEntryKind {
     /// "high". Stored as a string so the on-disk format stays stable;
     /// unknown values are tolerated on restore. Verbosity changes the
     /// produced answer, so it's tracked here alongside model/thinking/
-    /// speed (unlike `thinking_display`, a view-only preference that
-    /// stays in config).
+    /// speed. `thinking_display` also affects inference, but remains a
+    /// live-only session setting and is deliberately not recorded.
     VerbosityChange { verbosity: String },
     /// The structural root of a sub-agent thread, written when the
     /// sub-agent is spawned and anchored at the parent thread's head
@@ -1446,6 +1446,11 @@ impl ConversationLog {
         background: bool,
         settings: &AgentSettings,
     ) -> Result<EntryRef, ConversationError> {
+        let mut settings = settings.clone();
+        // Thinking display is session-live state. It follows the creator on
+        // creation and reseeds from config on resume, so it must not become
+        // part of a persisted sub-agent snapshot either.
+        settings.thinking_display.clear();
         self.append(
             Some(parent_head),
             ThreadKind::Subagent,
@@ -1453,7 +1458,7 @@ impl ConversationLog {
             ConversationEntryKind::SubAgentSpawn {
                 task: task.to_string(),
                 background,
-                settings: settings.clone(),
+                settings,
             },
         )
     }
@@ -2853,6 +2858,7 @@ mod tests {
             provider: "anthropic".to_string(),
             model_id: "claude-x".to_string(),
             thinking: "high".to_string(),
+            thinking_display: String::new(),
             speed: "fast".to_string(),
             verbosity: "high".to_string(),
         }

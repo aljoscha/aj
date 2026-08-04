@@ -45,14 +45,12 @@ where
     Vec::<UserContent>::deserialize(deserializer).map(Arc::from)
 }
 
-/// Snapshot of an agent's bundle identity: which model it talks to
-/// and at what thinking effort and inference speed.
+/// Snapshot of an agent's bundle identity and inference settings.
 ///
 /// `thinking` uses the "off" / "minimal" / "low" / "medium" / "high"
-/// / "xhigh" / "max" vocabulary; `speed` is "standard" or
-/// "fast". Carried on [`AgentEvent::SubAgentStart`] and persisted
-/// verbatim in the conversation log's sub-agent spawn entries, so the
-/// strings are part of the on-disk contract.
+/// / "xhigh" / "max" vocabulary. `speed` is "standard" or "fast".
+/// Sub-agent spawn entries persist the inference identity except for
+/// `thinking_display`, which is live-only session state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSettings {
     /// Provider of the model bundle (e.g. "anthropic").
@@ -62,6 +60,11 @@ pub struct AgentSettings {
     /// Thinking effort: one of "off", "minimal", "low", "medium",
     /// "high", "xhigh", "max".
     pub thinking: String,
+    /// Reasoning display mode: "default", "summarized", "detailed", or
+    /// "omitted". Empty is the backward-compatible value for snapshots
+    /// written before this field existed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub thinking_display: String,
     /// Inference speed: "standard" or "fast".
     pub speed: String,
     /// Output verbosity: "default" (server default), "low", "medium",
@@ -494,6 +497,7 @@ mod tests {
                 provider: "scripted".into(),
                 model_id: "scripted-model".into(),
                 thinking: "off".into(),
+                thinking_display: String::new(),
                 speed: "standard".into(),
                 verbosity: "default".into(),
             },
@@ -581,6 +585,7 @@ mod tests {
                 provider: "anthropic".into(),
                 model_id: "claude-x".into(),
                 thinking: "medium".into(),
+                thinking_display: String::new(),
                 speed: "fast".into(),
                 verbosity: "high".into(),
             },

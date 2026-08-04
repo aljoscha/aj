@@ -27,6 +27,7 @@ dependencies = [
  "aj-models",
  "aj-session",
  "aj-tools",
+ "aj-wire",
  "anyhow",
  "async-trait",
  "base64",
@@ -100,6 +101,7 @@ dependencies = [
  "tracing",
  "unicode-segmentation",
  "unicode-width",
+ "url",
 ]
 
 [[package]]
@@ -207,6 +209,7 @@ name = "aj-wire"
 version = "0.1.0"
 dependencies = [
  "aj-agent",
+ "aj-models",
  "chrono",
  "serde",
  "serde_json",

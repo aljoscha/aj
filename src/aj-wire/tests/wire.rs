@@ -1,9 +1,11 @@
 use std::collections::BTreeSet;
 
-use aj_agent::events::AgentEvent;
+use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
 use aj_wire::{
-    Cursor, DecodedAgentEvent, DecodedFrame, ErrorResponse, Frame, Hello, QueueState, SessionList,
-    SessionTree, TaskTable, VmList,
+    CancelRequest, CompactRequest, CreateSessionRequest, Cursor, DecodedAgentEvent, DecodedFrame,
+    ErrorResponse, Frame, HeadRequest, Hello, ModelSelection, PromptInput, PromptRequest,
+    QueueOperation, QueueOutcome, QueueRequest, QueueState, SessionCreated, SessionList,
+    SessionSettings, SessionTree, SettingsRequest, SteerRequest, TaskDetails, TaskTable, VmList,
 };
 use serde_json::{Value, json};
 
@@ -52,6 +54,186 @@ fn fixture(name: &str) -> Value {
         _ => panic!("unknown fixture {name}"),
     })
     .expect("fixture is valid JSON")
+}
+
+#[test]
+fn command_request_shapes_are_pinned() {
+    let prompt: PromptRequest = serde_json::from_value(json!({
+        "text": "hello",
+        "future_field": true
+    }))
+    .unwrap();
+    assert_eq!(prompt.agent, None);
+    assert!(matches!(prompt.input, PromptInput::Text { ref text } if text == "hello"));
+
+    let blocks: PromptRequest = serde_json::from_value(json!({
+        "agent": {"sub": 2},
+        "content": [{"type":"text","text":"structured"}]
+    }))
+    .unwrap();
+    assert_eq!(blocks.agent, Some(AgentId::Sub(2)));
+    assert!(matches!(blocks.input, PromptInput::Content { ref content } if content.len() == 1));
+
+    assert_eq!(
+        serde_json::to_value(SteerRequest {
+            text: "now".into(),
+            agent: None,
+        })
+        .unwrap(),
+        json!({"text":"now"})
+    );
+    assert_eq!(
+        serde_json::to_value(CancelRequest { agent: None }).unwrap(),
+        json!({})
+    );
+    assert_eq!(
+        serde_json::to_value(QueueRequest {
+            op: QueueOperation::Remove,
+            agent: Some(AgentId::Main),
+        })
+        .unwrap(),
+        json!({"op":"remove","agent":"main"})
+    );
+    assert_eq!(
+        serde_json::to_value(QueueOutcome {
+            text: Some("bring me back".into()),
+        })
+        .unwrap(),
+        json!({"text":"bring me back"})
+    );
+    assert_eq!(
+        serde_json::to_value(CompactRequest {
+            instructions: Some("keep protocol notes".into()),
+        })
+        .unwrap(),
+        json!({"instructions":"keep protocol notes"})
+    );
+    assert_eq!(
+        serde_json::to_value(HeadRequest {
+            entry: "entry-7".into(),
+        })
+        .unwrap(),
+        json!({"entry":"entry-7"})
+    );
+}
+
+fn selected_model() -> ModelSelection {
+    ModelSelection {
+        api: "openai".into(),
+        url: Some("https://models.example/v1".into()),
+        name: "gpt-remote".into(),
+    }
+}
+
+fn session_settings() -> SessionSettings {
+    SessionSettings {
+        model: Some(selected_model()),
+        thinking: Some("high".into()),
+        thinking_display: Some("detailed".into()),
+        speed: Some("standard".into()),
+        verbosity: Some("medium".into()),
+    }
+}
+
+#[test]
+fn settings_use_the_cli_selection_triple_and_create_round_trips() {
+    let request = SettingsRequest {
+        agent: None,
+        change: session_settings(),
+    };
+    assert_eq!(
+        serde_json::to_value(&request).unwrap(),
+        json!({
+            "model": {
+                "api":"openai",
+                "url":"https://models.example/v1",
+                "name":"gpt-remote"
+            },
+            "thinking":"high",
+            "thinking_display":"detailed",
+            "speed":"standard",
+            "verbosity":"medium"
+        })
+    );
+
+    let create = CreateSessionRequest {
+        settings: Some(session_settings()),
+        prompt: Some(PromptInput::Text {
+            text: "start here".into(),
+        }),
+    };
+    let encoded = serde_json::to_value(&create).unwrap();
+    assert_eq!(encoded["prompt"], json!({"text":"start here"}));
+    assert_eq!(
+        serde_json::from_value::<CreateSessionRequest>(encoded)
+            .unwrap()
+            .settings,
+        create.settings,
+    );
+    assert_eq!(
+        serde_json::to_value(SessionCreated {
+            id: "session-1".into()
+        })
+        .unwrap(),
+        json!({"id":"session-1"})
+    );
+}
+
+#[test]
+fn state_and_task_detail_models_pin_the_new_phase_two_fields() {
+    let settings = AgentSettings {
+        provider: "openai".into(),
+        model_id: "gpt-remote".into(),
+        thinking: "high".into(),
+        thinking_display: "detailed".into(),
+        speed: "standard".into(),
+        verbosity: "medium".into(),
+    };
+    let frame = Frame::State {
+        session: "session-1".into(),
+        epoch: "epoch-1".into(),
+        working: false,
+        settings,
+        last_seq: 4,
+    };
+    assert_eq!(
+        serde_json::to_value(frame).unwrap()["settings"]["thinking_display"],
+        "detailed"
+    );
+
+    let detail: TaskDetails = serde_json::from_value(json!({
+        "id": 3,
+        "status": "running",
+        "stdout_tail": "out",
+        "stderr_tail": "err",
+        "stdout_total_bytes": 20,
+        "stderr_total_bytes": 4,
+        "report": null,
+        "future_field": "ignored"
+    }))
+    .unwrap();
+    assert_eq!(detail.id, 3);
+    assert_eq!(detail.stdout_total_bytes + detail.stderr_total_bytes, 24);
+}
+
+#[test]
+fn agent_settings_without_thinking_display_remain_readable() {
+    let settings: AgentSettings = serde_json::from_value(json!({
+        "provider": "scripted",
+        "model_id": "scripted-model",
+        "thinking": "off",
+        "speed": "standard",
+        "verbosity": "default"
+    }))
+    .unwrap();
+    assert!(settings.thinking_display.is_empty());
+    assert!(
+        serde_json::to_value(settings)
+            .unwrap()
+            .get("thinking_display")
+            .is_none(),
+        "legacy snapshots re-serialize without fabricating a value",
+    );
 }
 
 #[test]

@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use aj_agent::events::AgentSettings;
 use aj_agent::message::AgentMessage;
 use aj_agent::{Agent, AgentSeed};
-use aj_conf::{AgentEnv, Config, ConfigSpeed};
+use aj_conf::{AgentEnv, Config, ConfigSpeed, ConfigThinkingDisplay};
 use aj_models::auth::AuthStorage;
 use aj_models::provider::Provider;
 use aj_models::registry::{ModelInfo, ModelRegistry};
@@ -82,6 +82,11 @@ pub struct RunConfigSnapshot {
     pub stream_options: StreamOptions,
     /// Default thinking effort for the next turn.
     pub thinking: Option<ThinkingConfig>,
+    /// Canonical reasoning-display choice for the next turn.
+    ///
+    /// We track the config value rather than reconstructing it from
+    /// provider-specific stream options because that mapping is lossy.
+    pub thinking_display: Option<ConfigThinkingDisplay>,
     /// Inference speed mode baked into `stream_options`' headers.
     /// Tracked explicitly so bundle rebuilds (model swap, resume
     /// restore) preserve it and so it can be recorded in the session
@@ -113,9 +118,31 @@ impl RunConfigSnapshot {
             provider: self.model_key.0.clone(),
             model_id: self.model_key.1.clone(),
             thinking: thinking_config_name(self.thinking.as_ref()).to_string(),
+            thinking_display: thinking_display_name(self.thinking_display).to_string(),
             speed: speed_name(self.speed).to_string(),
             verbosity: verbosity_name(self.stream_options.verbosity).to_string(),
         }
+    }
+}
+
+/// Returns the canonical name used in state-frame settings.
+pub fn thinking_display_name(display: Option<ConfigThinkingDisplay>) -> &'static str {
+    match display {
+        None => "default",
+        Some(ConfigThinkingDisplay::Summarized) => "summarized",
+        Some(ConfigThinkingDisplay::Detailed) => "detailed",
+        Some(ConfigThinkingDisplay::Omitted) => "omitted",
+    }
+}
+
+/// Parses the canonical state-frame thinking-display vocabulary.
+pub fn thinking_display_from_name(name: &str) -> Option<Option<ConfigThinkingDisplay>> {
+    match name {
+        "default" => Some(None),
+        "summarized" => Some(Some(ConfigThinkingDisplay::Summarized)),
+        "detailed" => Some(Some(ConfigThinkingDisplay::Detailed)),
+        "omitted" => Some(Some(ConfigThinkingDisplay::Omitted)),
+        _ => None,
     }
 }
 
@@ -147,6 +174,7 @@ fn build_run_config(
         model_info,
         stream_options,
         thinking: crate::model::default_thinking_from_config(config.thinking),
+        thinking_display: config.thinking_display,
         speed,
         model_key,
         // Filled in by `prepare_log` once the log (and thus the session
@@ -278,10 +306,8 @@ pub(crate) fn restore_session_settings(
                 cfg.provider = resolved.provider;
                 cfg.model_info = resolved.model_info;
                 cfg.stream_options = resolved.stream_options;
-                crate::model::apply_thinking_display(
-                    &mut cfg.stream_options,
-                    config.thinking_display,
-                );
+                let display = cfg.thinking_display;
+                crate::model::apply_thinking_display(&mut cfg.stream_options, display);
                 crate::model::apply_verbosity(&mut cfg.stream_options, config.verbosity);
                 cfg.model_key = (prov.clone(), id.clone());
                 notices.push(format!("Restored model {name} ({prov}/{id}) from session."));
@@ -302,10 +328,8 @@ pub(crate) fn restore_session_settings(
                 cfg.provider = resolved.provider;
                 cfg.model_info = resolved.model_info;
                 cfg.stream_options = resolved.stream_options;
-                crate::model::apply_thinking_display(
-                    &mut cfg.stream_options,
-                    config.thinking_display,
-                );
+                let display = cfg.thinking_display;
+                crate::model::apply_thinking_display(&mut cfg.stream_options, display);
                 crate::model::apply_verbosity(&mut cfg.stream_options, config.verbosity);
             }
             Err(err) => {

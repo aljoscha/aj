@@ -16,8 +16,8 @@ use aj_app::chat::{ChatState, reduce};
 use aj_app::client::SessionClient;
 use aj_app::session::AgentLifecycle;
 use aj_app::test_support::{
-    CanonicalState, assert_canonical_eq, assert_no_dangling, build_tagged_test_agent,
-    finalized_text_message, scripted_run_config,
+    CanonicalEntry, CanonicalState, assert_canonical_eq, assert_no_dangling,
+    build_tagged_test_agent, finalized_text_message, scripted_run_config,
 };
 use aj_models::types::{AssistantContent, StopReason, ToolCall};
 use aj_session::{ConversationPersistence, LogSnapshot, TaggedEvent, project_suffix};
@@ -164,6 +164,7 @@ fn scripted_settings() -> AgentSettings {
         provider: "scripted".into(),
         model_id: "scripted".into(),
         thinking: "off".into(),
+        thinking_display: "default".into(),
         speed: "standard".into(),
         verbosity: "default".into(),
     }
@@ -286,7 +287,7 @@ fn sweep(
                 client.live(frame);
             }
             assert_canonical_eq(
-                &client.canonical(),
+                &client.canonical().for_fault_comparison(),
                 expected,
                 &format!("cut {cut}, resume {resume}"),
             );
@@ -327,7 +328,7 @@ async fn every_cut_and_resume_of_a_tool_turn_converges() {
     );
     assert_no_dangling(&reference.chat);
 
-    sweep(&frames, &log, &expected, 528);
+    sweep(&frames, &log, &expected.clone().for_fault_comparison(), 528);
 }
 
 #[tokio::test]
@@ -349,7 +350,12 @@ async fn every_cut_and_resume_of_a_sub_agent_turn_converges() {
     );
     assert_no_dangling(&reference.chat);
 
-    sweep(&frames, &log, &expected, 1176);
+    sweep(
+        &frames,
+        &log,
+        &expected.clone().for_fault_comparison(),
+        1176,
+    );
 }
 
 /// A host restart mints a fresh epoch, so the cursor the client offers is
@@ -539,4 +545,46 @@ fn queue_update_frame(epoch: &str, agent_id: AgentId, text: &str) -> Frame {
         }
         .into(),
     }
+}
+
+#[test]
+fn fault_comparison_drops_only_notices_without_durable_identity() {
+    let mut client = Client::attached();
+    let _ = client.client.apply_local(
+        &mut client.chat,
+        AgentEvent::Notice {
+            agent_id: AgentId::Main,
+            text: "transient".into(),
+        },
+    );
+    client.apply(Frame::Event {
+        session: SESSION.into(),
+        epoch: EPOCH.into(),
+        durability: Some(DurableEvent {
+            seq: 1,
+            entry_id: "entry-1".into(),
+        }),
+        event: AgentEvent::Notice {
+            agent_id: AgentId::Main,
+            text: "durable".into(),
+        }
+        .into(),
+    });
+
+    let fault = client.canonical().for_fault_comparison();
+    let notices: Vec<&CanonicalEntry> = fault
+        .agent(AgentId::Main)
+        .expect("main")
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry, CanonicalEntry::Notice { .. }))
+        .collect();
+    assert!(matches!(
+        notices.as_slice(),
+        [CanonicalEntry::Notice {
+            text,
+            entry: Some(entry),
+            ..
+        }] if text == "durable" && entry == "entry-1"
+    ));
 }

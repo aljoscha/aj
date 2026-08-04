@@ -65,6 +65,8 @@ pub struct SessionClient {
     working: bool,
     queue: QueueState,
     tasks: TaskTable,
+    first_attach_settings: Option<AgentSettings>,
+    saw_first_attach: bool,
     needs_task_refetch: bool,
     needs_queue_refetch: bool,
     needs_reattach: bool,
@@ -84,6 +86,8 @@ impl SessionClient {
             working: false,
             queue: QueueState::default(),
             tasks: TaskTable::default(),
+            first_attach_settings: None,
+            saw_first_attach: false,
             needs_task_refetch: false,
             needs_queue_refetch: false,
             needs_reattach: false,
@@ -184,7 +188,7 @@ impl SessionClient {
                     // re-reads the live queues at draw time. A remote
                     // client has no such handle, so the snapshot is kept
                     // here.
-                    self.note_queue(*agent_id, steering.clone(), follow_up.clone());
+                    self.note_queue(chat, *agent_id, steering.clone(), follow_up.clone());
                 }
                 reduce(
                     chat,
@@ -203,13 +207,22 @@ impl SessionClient {
                 if !self.is_ours(&session) {
                     return Redraw(false);
                 }
+                let opens_block = self.attach == Attach::Requested;
                 if self.attach == Attach::Requested {
-                    self.open_attach_block(chat, epoch, working);
+                    self.open_attach_block(chat, epoch);
                 } else if !self.epoch_matches(&epoch) {
                     return Redraw(false);
                 }
-                // The host is authoritative for both of these, at every
+                if opens_block && !self.saw_first_attach {
+                    self.first_attach_settings = Some(settings.clone());
+                    self.saw_first_attach = true;
+                }
+                // The host is authoritative for all of these, at every
                 // emission: neither is derivable from projected events.
+                let context_window = chat.resolve_window(&settings);
+                chat.footers_mut()
+                    .note_settings(AgentId::Main, settings.clone(), context_window);
+                self.seed_lifecycle(working);
                 self.settings = Some(settings);
                 self.working = working;
                 Redraw(true)
@@ -293,6 +306,15 @@ impl SessionClient {
         self.settings.as_ref()
     }
 
+    /// Takes the settings carried by the first attach state exactly once.
+    ///
+    /// A frontend that resumed an existing session can render its local
+    /// restored-settings summary from this without the host publishing a
+    /// notice that would repeat on every reconnect.
+    pub fn take_first_attach_settings(&mut self) -> Option<AgentSettings> {
+        self.first_attach_settings.take()
+    }
+
     /// Whether the host reported a turn in flight, as of the last `state`
     /// frame. The lifecycle sets are the authority for spinners, this is
     /// the host's own flag.
@@ -309,7 +331,8 @@ impl SessionClient {
     /// Replace the queue snapshot from the queue read (spec 6.7), which is
     /// how a mid-session joiner learns about messages queued before it
     /// attached. Clears [`Self::needs_queue_refetch`].
-    pub fn set_queue(&mut self, queue: QueueState) {
+    pub fn set_queue(&mut self, chat: &mut ChatState, queue: QueueState) {
+        chat.replace_queue(queue.clone());
         self.queue = queue;
         self.needs_queue_refetch = false;
     }
@@ -321,7 +344,8 @@ impl SessionClient {
 
     /// Replace the task table from the tasks read, clearing
     /// [`Self::needs_task_refetch`].
-    pub fn set_tasks(&mut self, tasks: TaskTable) {
+    pub fn set_tasks(&mut self, chat: &mut ChatState, tasks: TaskTable) {
+        chat.replace_tasks(tasks.clone());
         self.tasks = tasks;
         self.needs_task_refetch = false;
     }
@@ -351,7 +375,7 @@ impl SessionClient {
 
     /// Adopt the epoch of the attach block this client asked for, and
     /// prepare `chat` for the backfill that follows.
-    fn open_attach_block(&mut self, chat: &mut ChatState, epoch: String, working: bool) {
+    fn open_attach_block(&mut self, chat: &mut ChatState, epoch: String) {
         match &self.epoch {
             Some(current) if *current == epoch => {
                 // A re-attach into the epoch we already applied under: the
@@ -372,14 +396,13 @@ impl SessionClient {
         }
         self.epoch = Some(epoch);
         self.attach = Attach::Applying;
-        self.seed_lifecycle(working);
     }
 
-    /// Seed the main agent's running mark from the block's `working` flag.
+    /// Reconciles the main agent's running mark from a state frame.
     ///
     /// A client whose stream died before an `AgentEnd` would otherwise
     /// spin forever: no projected event carries a lifecycle bracket. After
-    /// the block, live lifecycle events are authoritative again.
+    /// Between state frames, live lifecycle events are authoritative.
     ///
     /// Scoped to `Main`, because `working` says nothing about sub-agents
     /// (spec 6.3). Clearing their marks here would undercount the running
@@ -397,6 +420,7 @@ impl SessionClient {
 
     fn note_queue(
         &mut self,
+        chat: &mut ChatState,
         agent_id: AgentId,
         steering: Vec<aj_agent::message::AgentMessage>,
         follow_up: Vec<aj_agent::message::AgentMessage>,
@@ -406,6 +430,7 @@ impl SessionClient {
             steering,
             follow_up,
         };
+        chat.note_queue(updated.clone());
         match self
             .queue
             .queues
@@ -455,6 +480,7 @@ mod tests {
             provider: "scripted".into(),
             model_id: "scripted".into(),
             thinking: "off".into(),
+            thinking_display: "default".into(),
             speed: "standard".into(),
             verbosity: "default".into(),
         }
@@ -710,14 +736,23 @@ mod tests {
         assert_eq!(notices(&chat), vec!["one", "two"]);
         assert_eq!(client.cursor(), cursor);
         assert_eq!(client.settings(), Some(&changed));
+        assert_eq!(
+            chat.footers().settings(AgentId::Main),
+            Some(&changed),
+            "the authoritative state frame updates what the footer renders",
+        );
         assert!(client.working());
+        assert!(
+            client.lifecycle().is_running(AgentId::Main),
+            "every state frame self-heals the main lifecycle mark",
+        );
     }
 
     #[test]
     fn stale_epoch_frames_are_dropped_outside_an_attach_block() {
         let (mut client, mut chat) = attached();
         let _ = client.apply(&mut chat, durable(EPOCH, 2, "entry-2", notice("ours")));
-        client.set_tasks(TaskTable::default());
+        client.set_tasks(&mut chat, TaskTable::default());
         let cursor = client.cursor();
 
         let mut abandoned = settings();
@@ -894,6 +929,29 @@ mod tests {
     }
 
     #[test]
+    fn first_attach_settings_are_available_once_without_reconnect_duplication() {
+        let mut client = SessionClient::new(SESSION.to_string());
+        let mut chat = chat();
+        client.expect_attach();
+        let _ = client.apply(&mut chat, state(EPOCH, false));
+        assert_eq!(
+            client
+                .take_first_attach_settings()
+                .map(|settings| settings.model_id),
+            Some("scripted".to_string()),
+        );
+        assert!(client.take_first_attach_settings().is_none());
+        let _ = client.apply(&mut chat, caught_up(EPOCH, 0));
+
+        client.expect_attach();
+        let _ = client.apply(&mut chat, state(EPOCH, false));
+        assert!(
+            client.take_first_attach_settings().is_none(),
+            "a reconnect does not regenerate the local restore summary",
+        );
+    }
+
+    #[test]
     fn caught_up_flags_a_task_refetch_that_set_tasks_clears() {
         let (mut client, mut chat) = attached();
         assert!(
@@ -901,19 +959,27 @@ mod tests {
             "task events are not replayable",
         );
 
-        client.set_tasks(TaskTable {
-            tasks: vec![task_summary(7)],
-        });
+        client.set_tasks(
+            &mut chat,
+            TaskTable {
+                tasks: vec![task_summary(7)],
+            },
+        );
 
         assert!(!client.needs_task_refetch());
         assert_eq!(client.tasks().tasks.len(), 1);
+        assert_eq!(
+            chat.tasks().get(&7).map(|task| task.call_id.as_str()),
+            Some("call-1"),
+            "the read replaces the task model the reducer and footer use",
+        );
 
         // In the interim between `caught_up` and the read landing, a
         // snapshot for a task the client does not know is inert: the
         // reducer freezes output for an untracked task, so the client needs
         // no filter of its own.
         assert!(!client.apply(&mut chat, live(EPOCH, task_output(9))).0);
-        assert!(chat.tasks().is_empty());
+        assert_eq!(chat.tasks().len(), 1, "the unknown task was ignored");
     }
 
     /// The queue read is owed after every block too: `QueueUpdate` is
@@ -921,20 +987,24 @@ mod tests {
     /// would show no pending messages at all.
     #[test]
     fn caught_up_flags_a_queue_refetch_that_set_queue_clears() {
-        let (mut client, _chat) = attached();
+        let (mut client, mut chat) = attached();
         assert!(client.needs_queue_refetch());
         assert!(client.queue().queues.is_empty());
 
-        client.set_queue(QueueState {
-            queues: vec![AgentQueue {
-                agent_id: AgentId::Main,
-                steering: Vec::new(),
-                follow_up: vec![queued("from the read")],
-            }],
-        });
+        client.set_queue(
+            &mut chat,
+            QueueState {
+                queues: vec![AgentQueue {
+                    agent_id: AgentId::Main,
+                    steering: Vec::new(),
+                    follow_up: vec![queued("from the read")],
+                }],
+            },
+        );
 
         assert!(!client.needs_queue_refetch());
         assert_eq!(client.queue().queues.len(), 1);
+        assert_eq!(chat.queue().queues.len(), 1);
     }
 
     /// A re-attach seeds the main agent's mark and leaves the sub-agents'
@@ -1025,6 +1095,7 @@ mod tests {
         assert_eq!(client.queue().queues.len(), 1);
         assert_eq!(client.queue().queues[0].agent_id, AgentId::Main);
         assert_eq!(client.queue().queues[0].follow_up.len(), 1);
+        assert_eq!(chat.queue().queues.len(), 1);
 
         // Each event carries a full snapshot, so the next one replaces the
         // agent's entry rather than adding to it.
@@ -1044,8 +1115,9 @@ mod tests {
         assert_eq!(client.queue().queues[0].steering.len(), 1);
         assert!(client.queue().queues[0].follow_up.is_empty());
 
-        client.set_queue(QueueState::default());
+        client.set_queue(&mut chat, QueueState::default());
         assert!(client.queue().queues.is_empty());
+        assert!(chat.queue().queues.is_empty());
     }
 
     #[test]

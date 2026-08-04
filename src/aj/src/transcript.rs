@@ -4331,6 +4331,7 @@ mod tests {
                 provider: "scripted".into(),
                 model_id: "scripted".into(),
                 thinking: "off".into(),
+                thinking_display: "default".into(),
                 speed: "standard".into(),
                 verbosity: "default".into(),
             },
@@ -5933,6 +5934,7 @@ mod tests {
             provider: "scripted".into(),
             model_id: "scripted".into(),
             thinking: "off".into(),
+            thinking_display: "default".into(),
             speed: "standard".into(),
             verbosity: "default".into(),
         }

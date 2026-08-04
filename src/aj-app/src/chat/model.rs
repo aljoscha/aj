@@ -19,9 +19,11 @@ use std::time::{Duration, Instant};
 use aj_agent::events::{AgentId, AgentSettings, CompactionPhase};
 use aj_agent::message::{TaskNotificationKind, TaskOutcome};
 use aj_agent::tool::{TaskId, TaskKind, TaskStatus, ToolDetails};
-use aj_agent::types::TokenUsage;
+use aj_agent::types::{SubAgentUsage, TokenUsage, UsageSummary};
 use aj_models::registry::ModelInfo;
 use aj_models::types::{AssistantMessage, UserContent};
+use aj_wire::{AgentQueue, QueueState, TaskTable};
+use chrono::Utc;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -468,6 +470,8 @@ pub struct ChatState {
     /// scope can list finished tasks. Task events are transient, so a
     /// resumed session starts with an empty map.
     pub(crate) tasks: BTreeMap<TaskId, TaskInfo>,
+    /// Pending messages as reported by queue frames and reads.
+    queue: QueueState,
     /// Per-agent footer store (model line + context occupancy).
     pub(crate) footers: AgentFooters,
     /// Model catalog, for resolving a settings identity's context
@@ -516,6 +520,7 @@ impl ChatState {
             active_view: AgentId::Main,
             render: HashMap::new(),
             tasks: BTreeMap::new(),
+            queue: QueueState::default(),
             footers: AgentFooters::new(main_settings, main_context_window),
             catalog,
             sub_boxes: HashMap::new(),
@@ -578,6 +583,123 @@ impl ChatState {
     /// The tracked background tasks, in id order.
     pub fn tasks(&self) -> &BTreeMap<TaskId, TaskInfo> {
         &self.tasks
+    }
+
+    /// Replaces the background-task model from the authoritative task read.
+    pub fn replace_tasks(&mut self, table: TaskTable) {
+        let wall_now = Utc::now();
+        let now = Instant::now();
+        self.tasks = table
+            .tasks
+            .into_iter()
+            .map(|task| {
+                let age = wall_now
+                    .signed_duration_since(task.started_at)
+                    .to_std()
+                    .unwrap_or_default();
+                let started_at = now.checked_sub(age).unwrap_or(now);
+                let finished_at = task.status.is_terminal().then_some(now);
+                (
+                    task.id,
+                    TaskInfo {
+                        kind: task.kind,
+                        label: task.label,
+                        owner: task.owner,
+                        call_id: task.call_id,
+                        status: task.status,
+                        started_at,
+                        finished_at,
+                    },
+                )
+            })
+            .collect();
+    }
+
+    /// Pending steering and follow-up messages known to this client.
+    pub fn queue(&self) -> &QueueState {
+        &self.queue
+    }
+
+    /// Replaces the queue model from the authoritative queue read.
+    pub fn replace_queue(&mut self, queue: QueueState) {
+        self.queue = queue;
+    }
+
+    /// Applies one agent's full queue snapshot from a `QueueUpdate` event.
+    pub fn note_queue(&mut self, updated: AgentQueue) {
+        match self
+            .queue
+            .queues
+            .iter_mut()
+            .find(|queue| queue.agent_id == updated.agent_id)
+        {
+            Some(existing) => *existing = updated,
+            None => self.queue.queues.push(updated),
+        }
+    }
+
+    /// Builds end-of-session usage from the latest per-agent usage events.
+    pub fn usage_summary(&self) -> UsageSummary {
+        let main_agent_usage = self.usage_for(AgentId::Main);
+        let mut sub_ids: Vec<usize> = self
+            .transcripts
+            .keys()
+            .filter_map(|agent| match agent {
+                AgentId::Main => None,
+                AgentId::Sub(id) => Some(*id),
+            })
+            .collect();
+        sub_ids.sort_unstable();
+        let sub_agent_usage: Vec<SubAgentUsage> = sub_ids
+            .into_iter()
+            .map(|id| self.usage_for(AgentId::Sub(id)))
+            .collect();
+        let total_usage = sub_agent_usage.iter().fold(
+            SubAgentUsage {
+                agent_id: None,
+                input_tokens: main_agent_usage.input_tokens,
+                output_tokens: main_agent_usage.output_tokens,
+                cache_write_tokens: main_agent_usage.cache_write_tokens,
+                cache_read_tokens: main_agent_usage.cache_read_tokens,
+            },
+            |mut total, usage| {
+                total.input_tokens += usage.input_tokens;
+                total.output_tokens += usage.output_tokens;
+                total.cache_write_tokens += usage.cache_write_tokens;
+                total.cache_read_tokens += usage.cache_read_tokens;
+                total
+            },
+        );
+        UsageSummary {
+            main_agent_usage,
+            sub_agent_usage,
+            total_usage,
+        }
+    }
+
+    fn usage_for(&self, agent: AgentId) -> SubAgentUsage {
+        let usage = self.transcripts.get(&agent).and_then(|transcript| {
+            transcript.entries.iter().rev().find_map(|entry| {
+                let EntryKind::TurnUsage(usage) = &entry.kind else {
+                    return None;
+                };
+                Some(&usage.usage)
+            })
+        });
+        SubAgentUsage {
+            agent_id: match agent {
+                AgentId::Main => None,
+                AgentId::Sub(id) => Some(id),
+            },
+            input_tokens: usage.map_or(0, |usage| usage.accumulated_input + usage.turn_input),
+            output_tokens: usage.map_or(0, |usage| usage.accumulated_output + usage.turn_output),
+            cache_write_tokens: usage.map_or(0, |usage| {
+                usage.accumulated_cache_write + usage.turn_cache_write
+            }),
+            cache_read_tokens: usage.map_or(0, |usage| {
+                usage.accumulated_cache_read + usage.turn_cache_read
+            }),
+        }
     }
 
     /// Snapshot of every known agent for the agent picker: the main
@@ -841,6 +963,7 @@ impl ChatState {
         self.active_view = AgentId::Main;
         self.render.clear();
         self.tasks.clear();
+        self.queue = QueueState::default();
         self.sub_boxes.clear();
         self.compaction_phase.clear();
         self.footers.retain_main();
@@ -938,12 +1061,41 @@ mod tests {
                 provider: "scripted".into(),
                 model_id: "scripted".into(),
                 thinking: "off".into(),
+                thinking_display: "default".into(),
                 speed: "standard".into(),
                 verbosity: "default".into(),
             },
             0,
             Arc::new(Vec::new()),
         )
+    }
+
+    #[test]
+    fn usage_summary_uses_event_derived_running_totals() {
+        let mut chat = chat_state();
+        chat.transcripts
+            .get_mut(&AgentId::Main)
+            .expect("main transcript")
+            .append(EntryKind::TurnUsage(TurnUsageEntry {
+                agent_id: AgentId::Main,
+                usage: token_usage([10, 5, 2, 3], [100, 40, 20, 30]),
+                after_message_id: Some("main-message".into()),
+            }));
+        chat.transcripts
+            .entry(AgentId::Sub(2))
+            .or_default()
+            .append(EntryKind::TurnUsage(TurnUsageEntry {
+                agent_id: AgentId::Sub(2),
+                usage: token_usage([7, 4, 1, 2], [0, 0, 0, 0]),
+                after_message_id: Some("sub-message".into()),
+            }));
+
+        let usage = chat.usage_summary();
+        assert_eq!(usage.main_agent_usage.input_tokens, 110);
+        assert_eq!(usage.sub_agent_usage.len(), 1);
+        assert_eq!(usage.sub_agent_usage[0].agent_id, Some(2));
+        assert_eq!(usage.total_usage.input_tokens, 117);
+        assert_eq!(usage.total_usage.cache_read_tokens, 35);
     }
 
     #[test]

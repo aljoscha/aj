@@ -3001,6 +3001,10 @@ impl<'a> ToolContext for SessionContextWrapper<'a> {
                         model_id: self.model_info.id.clone(),
                         thinking: aj_models::thinking_config_name(self.default_thinking.as_ref())
                             .to_string(),
+                        // The agent only has provider-specific stream options.
+                        // The canonical display choice lives in the session's
+                        // run-config snapshot and cannot be recovered here.
+                        thinking_display: String::new(),
                         speed: aj_models::speed_name(self.speed).to_string(),
                         verbosity: aj_models::verbosity_name(self.stream_options.verbosity)
                             .to_string(),
