@@ -628,10 +628,10 @@ pub fn reduce(
 
         // ---- Queue snapshots ---------------------------------------------------
         AgentEvent::QueueUpdate { .. } => {
-            // Redraw ping only: the view re-reads the live
-            // `MessageQueues` snapshot rather than trusting the
-            // payload, which keeps the pending box correct even if a UI
-            // enqueue raced the drain.
+            // Redraw ping only: the payload is applied by the fold around this
+            // reducer, which is the single writer of `ChatState::queue`. The
+            // pending box renders that snapshot, so a local and a remote
+            // frontend read the same field.
             Redraw(true)
         }
     }

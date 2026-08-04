@@ -179,11 +179,10 @@ impl SessionClient {
                     follow_up,
                 } = &event
                 {
-                    // The reducer treats this event as a pure redraw ping
-                    // and drops the payload, because the local view
-                    // re-reads the live queues at draw time. A remote
-                    // client has no such handle, so the snapshot is kept
-                    // in the chat model.
+                    // The reducer treats this event as a pure redraw ping and
+                    // drops the payload, so the snapshot is kept here instead.
+                    // This is the single writer of the chat's queue model, which
+                    // is what every frontend's pending box renders.
                     chat.note_queue(AgentQueue {
                         agent_id: *agent_id,
                         steering: steering.clone(),
