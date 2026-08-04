@@ -9061,20 +9061,15 @@ mod tests {
         shut_down(&world).await;
     }
 
-    /// An in-process subscriber is evicted like any other when the shell stops
-    /// draining and the host's reliable fan-out overflows (spec 6.9), so a
-    /// closed local stream is a re-attach, not the end of the shell.
+    /// Overflow the focused session's in-process subscription until the host's
+    /// reliable fan-out evicts it, which is how a local stream ends with the
+    /// host still there (spec 6.9).
     ///
-    /// The overflow here is real: every queue command publishes a reliable
-    /// `QueueUpdate`, and nothing drains the stream while they run.
-    #[tokio::test]
-    async fn an_evicted_local_stream_is_re_attached() {
-        let dir = TempDir::new().expect("tempdir");
-        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
-        run_prompt(&mut world, "seed").await;
-        let before = user_rows(&world);
-        assert_eq!(before, vec!["seed"]);
-
+    /// The overflow is real: every queue command publishes a reliable
+    /// `QueueUpdate`, and nothing drains the stream while they run. The stream
+    /// keeps reporting `Closed` afterwards, so consuming the first one here
+    /// leaves it for the drive loop's frame arm too.
+    async fn evict_local_stream(world: &mut World) {
         // Past the fan-out's per-client bound, with nothing reading.
         for _ in 0..300 {
             world
@@ -9092,6 +9087,24 @@ mod tests {
             matches!(world.stream.recv().await, ControlFrame::Closed),
             "the overflow evicted this subscriber",
         );
+    }
+
+    /// An in-process subscriber is evicted like any other when the shell stops
+    /// draining and the host's reliable fan-out overflows (spec 6.9), so a
+    /// closed local stream is a re-attach, not the end of the shell.
+    ///
+    /// This covers the step the loop drives; that the loop routes a local
+    /// `Closed` here at all is
+    /// [`the_loop_re_attaches_an_evicted_local_stream`].
+    #[tokio::test]
+    async fn an_evicted_local_stream_is_re_attached() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        run_prompt(&mut world, "seed").await;
+        assert_eq!(user_rows(&world), vec!["seed"]);
+        let before = CanonicalState::of(&world.chat.borrow(), &world.client);
+
+        evict_local_stream(&mut world).await;
 
         // What the drive loop does with it: re-attach with the cursor, exactly
         // as a connection would.
@@ -9110,9 +9123,12 @@ mod tests {
             "the re-attach is surfaced: {:?}",
             main_notices(&world),
         );
+        // Every row the host published, not just the prompts: the backfill
+        // re-serves the durable entries above the client's cursor, and a
+        // doubled assistant row is exactly as wrong as a doubled prompt.
         assert_eq!(
-            user_rows(&world),
-            before,
+            host_entries(&CanonicalState::of(&world.chat.borrow(), &world.client)),
+            host_entries(&before),
             "the backfill rebuilt the transcript rather than doubling it",
         );
 
@@ -9155,28 +9171,396 @@ mod tests {
     fn a_failure_inside_the_attach_block_backs_off() {
         let mut state = Resume::lost();
         assert!(state.ready(), "the first attempt is due at once");
+        assert_eq!(state.retry.delay, RETRY_BACKOFF_MIN);
 
-        let mut previous = Duration::ZERO;
-        for _ in 0..4 {
+        // What the next failure holds the following attempt back by, tracked
+        // alongside the state so each iteration compares against the doubling
+        // this one owes rather than against the previous reading. The delay is
+        // the assertion's subject on purpose: a due time minus a fresh
+        // `Instant::now()` differs from the recorded delay by the microseconds
+        // between two clock reads, which is the same whether the delay grew or
+        // stood still.
+        let mut applied = RETRY_BACKOFF_MIN;
+        for attempt in 1..=4 {
             // The stream opened, then died inside the block.
             state.step = ResumeStep::CatchingUp;
+            let at = Instant::now();
             state.failed();
-            assert!(!state.ready());
-            let delay = state.due().saturating_duration_since(Instant::now());
+            assert!(!state.ready(), "attempt {attempt} left nothing holding it");
             assert!(
-                delay > previous,
-                "a repeated failure inside the block stayed at {delay:?}",
+                state.due().saturating_duration_since(at) >= applied,
+                "attempt {attempt} came due inside its own {applied:?} delay",
             );
-            previous = delay;
+            applied = (applied * 2).min(RETRY_BACKOFF_MAX);
+            assert_eq!(
+                state.retry.delay, applied,
+                "a repeated failure inside the block did not back off further",
+            );
         }
 
         for _ in 0..10 {
             state.failed();
         }
+        assert_eq!(
+            state.retry.delay, RETRY_BACKOFF_MAX,
+            "the backoff is capped",
+        );
         assert!(
             state.due().saturating_duration_since(Instant::now()) <= RETRY_BACKOFF_MAX,
             "the backoff is capped",
         );
+    }
+
+    /// Run the real drive loop over `world` until `stop` resolves, answering how
+    /// the loop exited and what `stop` observed.
+    ///
+    /// Recovery and pacing have two halves, and calling `advance_resume`,
+    /// `discharge_reattach` or `refresh_client_reads` directly reaches only one:
+    /// the other is the loop's gate on when each may run and the wake deadline
+    /// that brings the loop back for one. The tests below drive an otherwise
+    /// quiet session, so an attempt that happens at all is one the merged
+    /// deadline woke the loop for, and its timing is what the gate let through.
+    ///
+    /// `stop` is handed the loop's input pipe and ends the loop by dropping it:
+    /// the reader sees EOF, which the input arm quits on. It runs on this task
+    /// alongside the loop, so it observes through the shared chat model and must
+    /// not hold a borrow of it across an await.
+    async fn drive_until<F, Fut, T>(
+        world: &mut World,
+        shell: &Rc<RefCell<Shell>>,
+        stop: F,
+    ) -> (Result<SessionExit>, T)
+    where
+        F: FnOnce(PipeWriter) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let (mut app, writer, root) = app_over(shell).await;
+        // No watcher: nothing here writes a theme file, and an inert watch is
+        // what a bundled palette runs with anyway.
+        let mut theme_watch = ThemeWatch {
+            _guard: None,
+            rx: None,
+        };
+        let mut prompt_history_rx = None;
+        let mut autocomplete_rx = shell
+            .borrow()
+            .editor
+            .borrow_mut()
+            .take_autocomplete_rx()
+            .expect("editor hands out its autocomplete receiver exactly once");
+        tokio::join!(
+            drive(
+                &mut app,
+                &root,
+                shell,
+                world,
+                &mut theme_watch,
+                &mut prompt_history_rx,
+                &mut autocomplete_rx,
+            ),
+            stop(writer),
+        )
+    }
+
+    /// Poll `observed` until it answers `Some`, bounded by [`SETTLE_DEADLINE`] so
+    /// a loop that never gets there fails a test instead of hanging it.
+    async fn poll_for<T>(mut observed: impl FnMut() -> Option<T>) -> Option<T> {
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        while Instant::now() < deadline {
+            if let Some(value) = observed() {
+                return Some(value);
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        None
+    }
+
+    /// How many refused re-attaches a chat model was told about, one warning row
+    /// per attempt.
+    fn refusals(chat: &ChatState) -> usize {
+        notices_of(chat)
+            .iter()
+            .filter(|text| text.contains("Lost the session's event stream"))
+            .count()
+    }
+
+    /// A world that owes a re-attach no attach will ever discharge, plus a Shell
+    /// over it.
+    ///
+    /// The obligation comes from a head switch this client did not make, and the
+    /// session id is then pointed at one the host does not have, which is what a
+    /// permanently refused attach looks like from here. Nothing else is left for
+    /// the drive loop to do: the session is idle, its frames are drained and the
+    /// reads the startup attach obliged are discharged, so the loop has to wake
+    /// itself for the retry.
+    async fn a_world_owing_a_refused_re_attach(
+        dir: &TempDir,
+    ) -> (World, Rc<RefCell<Shell>>, String) {
+        let (mut world, shell) = world_and_shell(dir, "streaming-text").await;
+        run_prompt(&mut world, "seed").await;
+
+        let head = world
+            .handles()
+            .log
+            .lock()
+            .await
+            .head()
+            .cloned()
+            .expect("a persisted head");
+        world
+            .host()
+            .command(&world.session, Command::Head { entry: head })
+            .await
+            .expect("the head switch is accepted");
+        // Wait the host's `list` coalescing out (spec 6.8) before draining, so
+        // no frame of the switch is still to come.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        fold_ready_frames(&mut world);
+        refresh_client_reads(&mut world).await;
+        assert!(
+            world.client.needs_reattach(),
+            "the reset left an obligation",
+        );
+        assert!(
+            !owes_client_reads(&world),
+            "and no read is owed alongside it",
+        );
+
+        let live_session = std::mem::replace(&mut world.session, "no-such-session".to_string());
+        (world, shell, live_session)
+    }
+
+    /// The focused session's durable high-water mark, as the host reports it.
+    async fn host_mark(world: &World) -> u64 {
+        world
+            .control
+            .sessions()
+            .await
+            .expect("session list")
+            .sessions
+            .iter()
+            .find(|entry| entry.id == world.session)
+            .expect("the focused session is in the host's directory")
+            .last_seq
+    }
+
+    /// The loop routes a closed local stream into the same recovery a lost
+    /// connection takes, instead of ending the shell over it.
+    ///
+    /// The frame arm is the only place that is decided, so a test that hands
+    /// `advance_resume` a `Resume` of its own never reaches it.
+    #[tokio::test]
+    async fn the_loop_re_attaches_an_evicted_local_stream() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        run_prompt(&mut world, "seed").await;
+        let before = CanonicalState::of(&world.chat.borrow(), &world.client);
+        // The comparison below is not vacuous: the client's cursor sits under
+        // the host's durable mark, so the re-attach really re-serves an entry
+        // the fold has to recognize rather than append again.
+        let cursor = world
+            .client
+            .cursor()
+            .expect("the startup attach committed a cursor")
+            .seq;
+        let mark = host_mark(&world).await;
+        assert!(
+            cursor < mark,
+            "the cursor is already at the host's mark ({cursor} of {mark})",
+        );
+
+        evict_local_stream(&mut world).await;
+
+        let chat = Rc::clone(&world.chat);
+        let (exit, reattached) = drive_until(&mut world, &shell, |writer| async move {
+            let reattached = poll_for(|| {
+                notices_of(&chat.borrow())
+                    .iter()
+                    .any(|text| text == "Re-attached to the session.")
+                    .then_some(())
+            })
+            .await;
+            drop(writer);
+            reattached
+        })
+        .await;
+
+        match exit {
+            Ok(SessionExit::Quit) => {}
+            Ok(_) => panic!("the loop left the session over an evicted stream"),
+            Err(err) => panic!("an evicted local stream ended the shell: {err}"),
+        }
+        assert!(
+            reattached.is_some(),
+            "the loop never re-attached: {:?}",
+            main_notices(&world),
+        );
+        assert_eq!(
+            host_entries(&CanonicalState::of(&world.chat.borrow(), &world.client)),
+            host_entries(&before),
+            "the loop's re-attach rebuilt the transcript rather than doubling it",
+        );
+        shut_down(&world).await;
+    }
+
+    /// The loop comes back for a refused re-attach with nothing else going on.
+    ///
+    /// With the obligation standing and the session quiet, the loop parks on a
+    /// frame stream that will not speak again, so the retry happens only if the
+    /// due time reached the loop's wake deadline. Without it the first refusal is
+    /// also the last, and the transcript stays frozen for good (every later frame
+    /// carries an epoch the fold filters out).
+    #[tokio::test]
+    async fn the_loop_wakes_for_a_refused_re_attach() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, live_session) = a_world_owing_a_refused_re_attach(&dir).await;
+
+        let chat = Rc::clone(&world.chat);
+        let (exit, retried) = drive_until(&mut world, &shell, |writer| async move {
+            let retried = poll_for(|| (refusals(&chat.borrow()) >= 2).then_some(())).await;
+            drop(writer);
+            retried
+        })
+        .await;
+
+        assert!(
+            matches!(exit, Ok(SessionExit::Quit)),
+            "a refused local re-attach is not the shell's exit",
+        );
+        assert!(
+            retried.is_some(),
+            "the loop stopped retrying after {} attempt(s), so it never woke for \
+             the next one",
+            refusals(&world.chat.borrow()),
+        );
+        assert!(
+            world.client.needs_reattach(),
+            "the obligation still stands, so every iteration had one to discharge",
+        );
+        world.session = live_session;
+        shut_down(&world).await;
+    }
+
+    /// How many paced attempts a backoff from [`RETRY_BACKOFF_MIN`] allows inside
+    /// `window`: the first is due at once, and each failure doubles the delay up
+    /// to [`RETRY_BACKOFF_MAX`].
+    ///
+    /// An attempt due exactly at the window's end counts, so this is an upper
+    /// bound on what a correctly paced loop can get through.
+    fn allowed_attempts(window: Duration) -> usize {
+        let mut due = Duration::ZERO;
+        let mut delay = RETRY_BACKOFF_MIN;
+        let mut attempts = 0;
+        while due <= window {
+            attempts += 1;
+            due += delay;
+            delay = (delay * 2).min(RETRY_BACKOFF_MAX);
+        }
+        attempts
+    }
+
+    /// A refused re-attach stays held back while the loop is busy with other
+    /// things.
+    ///
+    /// The loop reaches the discharge block once per iteration whatever woke it,
+    /// so without the gate a peer that keeps refusing turns into one attach (and
+    /// one warning row) per keystroke. The keystrokes here are that wake source:
+    /// the pacing has to survive them.
+    ///
+    /// The bound is computed from the window that actually elapsed, so a machine
+    /// that stretches the typing out earns the attempts the backoff owes it and
+    /// nothing more.
+    #[tokio::test]
+    async fn the_loop_holds_a_refused_re_attach_back_while_it_iterates() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, live_session) = a_world_owing_a_refused_re_attach(&dir).await;
+
+        let wakes = 120;
+        let spacing = Duration::from_millis(5);
+        let started = Instant::now();
+        let (exit, ()) = drive_until(&mut world, &shell, |mut writer| async move {
+            for _ in 0..wakes {
+                writer.write_all(b"x").expect("write a key byte");
+                tokio::time::sleep(spacing).await;
+            }
+            drop(writer);
+        })
+        .await;
+        let window = started.elapsed();
+
+        assert!(matches!(exit, Ok(SessionExit::Quit)));
+        let refused = refusals(&world.chat.borrow());
+        let allowed = allowed_attempts(window);
+        assert!(
+            refused <= allowed,
+            "{refused} refused re-attaches over {wakes} wakes {spacing:?} apart, \
+             where a {window:?} window allows {allowed}: the loop re-asked on \
+             iterations rather than on the backoff",
+        );
+        assert!(
+            refused >= 1,
+            "the loop never attempted the re-attach it owed",
+        );
+        world.session = live_session;
+        shut_down(&world).await;
+    }
+
+    /// The loop's half of pacing the reads an attach block obliges: with nothing
+    /// else going on, a retry only happens if the loop wakes itself for it.
+    ///
+    /// The recorded delay is the observable: it doubles once per failed attempt,
+    /// so what it holds when the loop stops says how many attempts the loop got
+    /// around to.
+    #[tokio::test]
+    async fn the_loop_paces_the_reads_an_attach_obliged() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        run_prompt(&mut world, "seed").await;
+
+        // Attach without discharging the reads, which is the state every
+        // `caught_up` leaves the client in (spec 6.7).
+        world.stream = open_stream(&world.control, &world.session, &mut world.client)
+            .await
+            .expect("re-attach");
+        assert!(fold_attach_block(&mut world).await, "the block completed");
+        assert!(owes_client_reads(&world), "the block obliged both reads");
+        assert!(
+            !world.client.needs_reattach(),
+            "and nothing else is owed alongside them",
+        );
+        // Wait the host's `list` coalescing out (spec 6.8) and drain, so the
+        // stream the loop parks on has nothing left to say. A frame would wake
+        // the loop for free and the retry would ride along on it.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        fold_ready_frames(&mut world);
+
+        // Point the world at a session the host does not have, so every read is
+        // refused.
+        world.session = "no-such-session".to_string();
+
+        // Room for well over the first three attempts (at once, then 200ms, then
+        // a further 400ms), so a busy machine still gets through them.
+        let window = RETRY_BACKOFF_MIN * 15;
+        let (exit, ()) = drive_until(&mut world, &shell, |writer| async move {
+            tokio::time::sleep(window).await;
+            drop(writer);
+        })
+        .await;
+
+        assert!(matches!(exit, Ok(SessionExit::Quit)));
+        assert!(
+            owes_client_reads(&world),
+            "a failed read keeps the obligation",
+        );
+        // Three attempts leave `RETRY_BACKOFF_MIN << 3`. Anything less is a loop
+        // that stopped coming back for the retry.
+        assert!(
+            world.reads_retry.delay >= RETRY_BACKOFF_MIN * 8,
+            "the reads paced out to {:?} over a {window:?} window, so the loop \
+             woke for fewer than three attempts",
+            world.reads_retry.delay,
+        );
+        shut_down(&world).await;
     }
 
     /// An attach block obliges the task and queue reads (neither is
@@ -12014,10 +12398,15 @@ mod tests {
     }
 
     fn main_notices(world: &World) -> Vec<String> {
-        world
-            .chat
-            .borrow()
-            .transcript(AgentId::Main)
+        notices_of(&world.chat.borrow())
+    }
+
+    /// The notice rows of a chat model's Main transcript, in order.
+    ///
+    /// Takes the model rather than the world, so a test observing a drive loop
+    /// that holds `&mut World` can read it through its own `Rc` handle.
+    fn notices_of(chat: &ChatState) -> Vec<String> {
+        chat.transcript(AgentId::Main)
             .expect("main transcript")
             .entries()
             .iter()
