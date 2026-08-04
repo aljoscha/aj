@@ -9,10 +9,11 @@
 //! The vocabulary is the host's own: [`aj_app::host::Command`] is the one
 //! command language, and the remote arm translates it into the wire requests
 //! of spec 6.6 rather than the shell knowing two dialects. What the arms do
-//! *not* share is failure: a lost local stream means the process's own host
-//! is gone, a lost remote stream is an ordinary reconnect, which is why
+//! *not* share is how a loss reads: a remote stream reports the transport
+//! failure behind it, an in-process one just ends, which is why
 //! [`ControlFrame`] separates the two and [`ControlError`] keeps "the peer
-//! refused this" apart from "the transport failed".
+//! refused this" apart from "the transport failed". The recovery is the same
+//! either way, a re-attach with a cursor (spec 6.5).
 
 use aj_agent::events::AgentId;
 use aj_agent::tool::TaskId;
@@ -107,7 +108,8 @@ impl Control {
 
     /// Whether this frontend is a remote client, which is what decides
     /// whether a gesture with no wire equivalent is refused (spec 9.1) and
-    /// whether a lost stream is fatal.
+    /// whether a re-attach that fails can be waited out (only this process's
+    /// own host cannot be).
     pub(crate) fn is_remote(&self) -> bool {
         matches!(self, Self::Remote(_))
     }
@@ -319,6 +321,11 @@ pub(crate) enum ControlFrame {
     /// The stream failed and the client owes a re-attach.
     Lost(ControlError),
     /// The stream ended with no failure behind it.
+    ///
+    /// What an in-process stream reports for every loss, since the host does
+    /// not word them: the host going away, and reliable-frame overflow
+    /// evicting a shell that stopped draining (spec 6.9). The re-attach tells
+    /// those apart, because a host that is gone refuses it.
     Closed,
 }
 

@@ -34,8 +34,9 @@ pub(crate) const STATUS_WAKE_EVENT: &str = "aj.status.wake";
 
 /// Where this client stands with the host serving its session (spec 9.1).
 ///
-/// Always [`Connection::Connected`] for a local run, whose host cannot go
-/// away without the process going with it.
+/// A local run passes through the unsettled states only while it re-attaches
+/// a subscription the host dropped, which the shell recovers from the same way
+/// a connection does.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Connection {
     #[default]

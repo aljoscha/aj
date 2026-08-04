@@ -129,6 +129,10 @@ struct World {
     /// The fold from those frames into `chat`, and the owner of this
     /// client's agent lifecycle, cursor, and settings view.
     client: SessionClient,
+    /// Paces the retry of the reads an attach block obliges, so a peer that
+    /// fails them cannot make the loop spend every iteration in a request
+    /// (see [`refresh_client_reads`]).
+    reads_retry: Retry,
     /// Direct handles into the focused session, for the reads no frame
     /// carries: the log the tree and export walks read, the run config the
     /// startup credential check names, the task registry behind the footer's
@@ -142,9 +146,8 @@ struct World {
     /// The directory the focused session runs in: this process's own for a
     /// local run, the host's (from `hello`) for a connection.
     working_directory: PathBuf,
-    /// Where this client stands with its host. Local runs never leave
-    /// [`Connection::Connected`]. Mirrored into the status chrome by
-    /// [`sync_status`].
+    /// Where this client stands with its host. Mirrored into the status chrome
+    /// by [`sync_status`].
     connection: Connection,
     /// The chat model, shared with the [`TranscriptView`]. Only the
     /// loop mutates it (via the client fold and the arm helpers). The view
@@ -258,6 +261,7 @@ async fn build_world(
         session,
         stream,
         client,
+        reads_retry: Retry::default(),
         local: Some(handles),
         working_directory: env.working_directory.clone(),
         connection: Connection::Connected,
@@ -395,6 +399,7 @@ async fn build_connect_world(
         session,
         stream,
         client,
+        reads_retry: Retry::default(),
         local: None,
         // The host's directory, not ours: the session runs there, and its
         // `@file` completions and tool output all name paths on that machine.
@@ -590,14 +595,26 @@ async fn fold_attach_block(world: &mut World) -> bool {
 ///
 /// Both reads land in the shared chat model, which is what every frontend
 /// renders from, so the local and the remote path stay one path.
+///
+/// A failed read leaves the obligation standing and paces the retry
+/// (`world.reads_retry`): the loop calls this every iteration and each call
+/// awaits a request, so a peer that stopped answering would otherwise put a
+/// request that times out into every iteration.
 async fn refresh_client_reads(world: &mut World) {
+    if !world.reads_retry.ready() {
+        return;
+    }
+    let mut failed = false;
     if world.client.needs_task_refetch() {
         match world.control.tasks(&world.session).await {
             Ok(tasks) => {
                 let mut chat = world.chat.borrow_mut();
                 world.client.set_tasks(&mut chat, tasks);
             }
-            Err(err) => tracing::warn!("could not read the session's task table: {err}"),
+            Err(err) => {
+                failed = true;
+                tracing::warn!("could not read the session's task table: {err}");
+            }
         }
     }
     if world.client.needs_queue_refetch() {
@@ -606,9 +623,23 @@ async fn refresh_client_reads(world: &mut World) {
                 let mut chat = world.chat.borrow_mut();
                 world.client.set_queue(&mut chat, queue);
             }
-            Err(err) => tracing::warn!("could not read the session's message queues: {err}"),
+            Err(err) => {
+                failed = true;
+                tracing::warn!("could not read the session's message queues: {err}");
+            }
         }
     }
+    if failed {
+        world.reads_retry.failed();
+    } else {
+        world.reads_retry.clear();
+    }
+}
+
+/// Whether the client still owes the reads an attach block obliged, which is
+/// what decides if the loop has to wake for their paced retry.
+fn owes_client_reads(world: &World) -> bool {
+    world.client.needs_task_refetch() || world.client.needs_queue_refetch()
 }
 
 /// The notice a gesture with no connect-mode path folds, naming why (spec
@@ -884,8 +915,7 @@ async fn branch_focused_session(
 /// the outgoing stream goes away with it.
 ///
 /// Answers whether the attach block completed. A stream that dropped inside
-/// it leaves the client owing another attach, which the caller retries (a
-/// connection) or the drive loop's frame arm turns fatal (a local host).
+/// it leaves the client owing another attach, which the caller retries.
 async fn reattach(world: &mut World, shell: &Rc<RefCell<Shell>>) -> Result<bool, ControlError> {
     let mut stream = open_stream(&world.control, &world.session, &mut world.client).await?;
     std::mem::swap(&mut world.stream, &mut stream);
@@ -4899,14 +4929,6 @@ fn frame_budget_elapsed(last_render: Option<Instant>, interval: Duration) -> boo
     last_render.is_none_or(|t| t.elapsed() >= interval)
 }
 
-/// The earlier of two optional deadlines, or whichever one is set.
-fn earliest_deadline(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
-    match (a, b) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
-    }
-}
-
 /// Adds a transparent event target over `surface` without changing its paint.
 fn block_mouse(mut surface: Surface, transcript: &Rc<RefCell<TranscriptView>>) -> Surface {
     let transcript = Rc::downgrade(transcript);
@@ -4962,22 +4984,91 @@ fn push_corner_box(
     anchor_row
 }
 
-/// Where a connect-mode client stands in getting its stream back.
+/// Paces a retry the drive loop has nothing else to wake it for.
+///
+/// Every failure doubles the delay up to [`RECONNECT_BACKOFF_MAX`], so a peer
+/// that stopped answering cannot make the loop spend each iteration in a
+/// request that will fail. Nothing here is aware of what is being retried:
+/// the pacing is the same whether the failing thing is an attach, a read, or a
+/// poll.
+struct Retry {
+    /// How long the next failure waits. Doubles per failure, reset by a
+    /// success.
+    delay: Duration,
+    /// When the next attempt is allowed, `None` while one is due now. The
+    /// loop merges this into its wake deadline, which is what makes a paced
+    /// retry happen on time even when nothing else is going on.
+    due: Option<Instant>,
+}
+
+impl Default for Retry {
+    fn default() -> Self {
+        Self {
+            delay: RECONNECT_BACKOFF_MIN,
+            due: None,
+        }
+    }
+}
+
+impl Retry {
+    /// Whether the next attempt may run.
+    fn ready(&self) -> bool {
+        self.due.is_none_or(|due| Instant::now() >= due)
+    }
+
+    /// When the next attempt comes due, `None` while one is due now.
+    fn due(&self) -> Option<Instant> {
+        self.due
+    }
+
+    /// Note a failed attempt, holding the next one back.
+    fn failed(&mut self) {
+        self.due = Some(Instant::now() + self.delay);
+        self.delay = (self.delay * 2).min(RECONNECT_BACKOFF_MAX);
+    }
+
+    /// Drop the pacing: whatever comes next is due at once.
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Drop the pacing but hold the next attempt back by `delay`, for a caller
+    /// that polls on a cadence of its own.
+    fn again_in(&mut self, delay: Duration) {
+        *self = Self {
+            due: Some(Instant::now() + delay),
+            ..Self::default()
+        };
+    }
+}
+
+/// Where a client stands in getting its frame stream back.
 ///
 /// Two steps rather than one, because the "catching up" state has to be
 /// *seen*: the attach block is producer-paced, so folding it parks the loop
 /// for as long as the backfill takes, and the paint that shows the state has
 /// to happen before that. The loop therefore opens the stream in one
 /// iteration and folds the block in the next.
-enum Resume {
-    /// Waiting to re-open the stream, and the delay to apply if that fails.
-    Waiting { due: Instant, backoff: Duration },
+struct Resume {
+    step: ResumeStep,
+    /// Pacing for the whole recovery rather than for one step of it: a stream
+    /// that keeps dying inside its attach block has to back off exactly like
+    /// one that cannot be opened at all, because every attempt costs the host
+    /// a full projection and a client's cursor does not move until the block
+    /// completes (spec 6.5).
+    retry: Retry,
+}
+
+enum ResumeStep {
+    /// Waiting to re-open the stream.
+    Waiting,
     /// The stream is open and its attach block still has to be folded.
     CatchingUp,
 }
 
-/// The first re-attach is due immediately: a stream that dropped because the
-/// host restarted is usually back before a delay would have elapsed.
+/// How long the first failed re-attach waits, doubling from there. Short,
+/// because a stream that dropped because the host restarted is usually back
+/// before a longer delay would have elapsed.
 const RECONNECT_BACKOFF_MIN: Duration = Duration::from_millis(200);
 
 /// The ceiling on the re-attach delay. A client whose host is gone for good
@@ -4986,39 +5077,37 @@ const RECONNECT_BACKOFF_MIN: Duration = Duration::from_millis(200);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 impl Resume {
+    /// The state a lost stream leaves: the first attempt is due at once.
     fn lost() -> Resume {
-        Resume::Waiting {
-            due: Instant::now(),
-            backoff: RECONNECT_BACKOFF_MIN,
+        Resume {
+            step: ResumeStep::Waiting,
+            retry: Retry::default(),
         }
     }
 
-    /// When the loop next has work to do for this state. `CatchingUp` is due
-    /// at once: it only exists so the frame before it paints.
+    /// Whether the next step may run.
+    fn ready(&self) -> bool {
+        self.retry.ready()
+    }
+
+    /// When the loop next has work to do for this state. Now, unless a
+    /// failure is holding the next attempt back.
     fn due(&self) -> Instant {
-        match self {
-            Resume::Waiting { due, .. } => *due,
-            Resume::CatchingUp => Instant::now(),
-        }
+        self.retry.due().unwrap_or_else(Instant::now)
     }
 
     fn connection(&self) -> Connection {
-        match self {
-            Resume::Waiting { .. } => Connection::Reconnecting,
-            Resume::CatchingUp => Connection::CatchingUp,
+        match self.step {
+            ResumeStep::Waiting => Connection::Reconnecting,
+            ResumeStep::CatchingUp => Connection::CatchingUp,
         }
     }
 
-    /// The same state, due again after a doubled (capped) delay.
-    fn backed_off(&self) -> Resume {
-        let backoff = match self {
-            Resume::Waiting { backoff, .. } => (*backoff * 2).min(RECONNECT_BACKOFF_MAX),
-            Resume::CatchingUp => RECONNECT_BACKOFF_MIN,
-        };
-        Resume::Waiting {
-            due: Instant::now() + backoff,
-            backoff,
-        }
+    /// Note a failed step: the recovery starts over from the open, after the
+    /// backoff.
+    fn failed(&mut self) {
+        self.retry.failed();
+        self.step = ResumeStep::Waiting;
     }
 }
 
@@ -5030,14 +5119,11 @@ const TASK_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Refresh the open remote task-output viewer from the per-task read (spec
 /// 6.7), answering whether anything was pushed into it.
 ///
-/// `last` tracks the previous poll, so the read happens at most once per
-/// [`TASK_POLL_INTERVAL`] and only while such a viewer is open. A local viewer
-/// re-reads its registry at draw time and never reaches here.
-async fn poll_task_output(
-    world: &World,
-    shell: &Rc<RefCell<Shell>>,
-    last: &mut Option<Instant>,
-) -> bool {
+/// `retry` paces the read: at most one per [`TASK_POLL_INTERVAL`] while such a
+/// viewer is open, and a backed-off retry while the host is failing it, so a
+/// read that takes its full timeout cannot be re-issued the moment it returns.
+/// A local viewer re-reads its registry at draw time and never reaches here.
+async fn poll_task_output(world: &World, shell: &Rc<RefCell<Shell>>, retry: &mut Retry) -> bool {
     // The viewer's own close callback cannot reach the slot (the widget knows
     // nothing about it), so an empty overlay stack is what retires it. The
     // picker drops out before the viewer opens, so the viewer is the only
@@ -5049,22 +5135,23 @@ async fn poll_task_output(
     }
     let view = shell.borrow().task_view.borrow().clone();
     let Some(view) = view else {
-        *last = None;
+        retry.clear();
         return false;
     };
-    if last.is_some_and(|last| last.elapsed() < TASK_POLL_INTERVAL) {
+    if !retry.ready() {
         return false;
     }
-    *last = Some(Instant::now());
     let task = view.borrow().task();
     match world.control.task_details(&world.session, task).await {
         Ok(details) => {
+            retry.again_in(TASK_POLL_INTERVAL);
             view.borrow_mut().apply_details(details);
             true
         }
         Err(err) => {
             // The task may simply be gone from the host's registry. The viewer
             // keeps its last-known body, matching the local one.
+            retry.failed();
             tracing::debug!("could not read background task {task}: {err}");
             false
         }
@@ -5073,25 +5160,33 @@ async fn poll_task_output(
 
 /// Advance a pending re-attach by one step, answering the state that is left
 /// (`None` once the stream is back and caught up).
+///
+/// The one fatal case is a local run whose attach fails: this process's own
+/// host refusing to serve a session it was holding means the host is gone, and
+/// the shell cannot outlive it. Every other failure, including a connection's,
+/// is a backed-off retry.
 async fn advance_resume(
     world: &mut World,
     shell: &Rc<RefCell<Shell>>,
-    state: Resume,
-) -> Option<Resume> {
-    match state {
-        Resume::Waiting { .. } => {
+    mut state: Resume,
+) -> Result<Option<Resume>, ControlError> {
+    match state.step {
+        ResumeStep::Waiting => {
             match open_stream(&world.control, &world.session, &mut world.client).await {
                 Ok(stream) => {
                     world.stream = stream;
-                    Some(Resume::CatchingUp)
+                    state.step = ResumeStep::CatchingUp;
+                    Ok(Some(state))
                 }
+                Err(err) if !world.control.is_remote() => Err(err),
                 Err(err) => {
                     tracing::warn!("could not re-attach the session: {err}");
-                    Some(state.backed_off())
+                    state.failed();
+                    Ok(Some(state))
                 }
             }
         }
-        Resume::CatchingUp => {
+        ResumeStep::CatchingUp => {
             let complete = fold_attach_block(world).await;
             refresh_client_reads(world).await;
             // The block may have been served under a fresh epoch (a host
@@ -5102,10 +5197,53 @@ async fn advance_resume(
             if !complete {
                 // The stream died inside the block. What was applied stays,
                 // and the next attach serves the rest from our cursor.
-                return Some(state.backed_off());
+                state.failed();
+                return Ok(Some(state));
             }
-            fold_notice(world, "Reconnected to the host.");
+            fold_notice(world, reattached_notice(&world.control));
+            Ok(None)
+        }
+    }
+}
+
+/// The confirmation a completed re-attach folds: a connection came back, an
+/// in-process shell only got its subscription back.
+fn reattached_notice(control: &Control) -> &'static str {
+    if control.is_remote() {
+        "Reconnected to the host."
+    } else {
+        "Re-attached to the session."
+    }
+}
+
+/// Discharge the re-attach a broken continuity obliges, answering the resume
+/// state that is left (`None` when nothing is pending).
+///
+/// Leaving the obligation undischarged would silently freeze the transcript:
+/// every later frame carries an epoch the fold filters out. A refused attach
+/// keeps the obligation, so `retry` paces the next attempt: without it a peer
+/// that keeps refusing turns into one attach (and one warning row) per loop
+/// iteration.
+async fn discharge_reattach(
+    world: &mut World,
+    shell: &Rc<RefCell<Shell>>,
+    retry: &mut Retry,
+) -> Option<Resume> {
+    match reattach(world, shell).await {
+        // A block that did not complete leaves a dead stream, which the frame
+        // arm picks up as a loss like any other.
+        Ok(_) => {
+            retry.clear();
             None
+        }
+        Err(err) => {
+            fold_warning(world, &format!("Lost the session's event stream: {err}"));
+            retry.failed();
+            // A connection hands the obligation to the resume machinery, which
+            // paces its own attempts. An in-process host is paced by `retry`
+            // right here, because its failing attach is the shell's exit
+            // (see `advance_resume`) and must not be reached at loop speed.
+            world.control.is_remote().then(Resume::lost)
         }
     }
 }
@@ -5172,13 +5310,20 @@ async fn drive(
     // stack) because it is async and long-running, but paired with the
     // dialog overlay it pushed.
     let mut login_session: Option<LoginSession> = None;
-    // Set while the focused session's stream is down. Only a connection ever
-    // gets here: a local stream's end is fatal (see the frame arm).
+    // Set while the focused session's stream is down, in either mode: a
+    // subscription is lost for ordinary reasons even in process (see the frame
+    // arm), and the re-attach is what tells that apart from a host that is
+    // gone.
     let mut resume: Option<Resume> = None;
-    // When the open task-output overlay was last refreshed from the per-task
-    // read. `None` while no remote viewer is open, which is what bounds the
-    // poll to an overlay that can show its answer.
-    let mut task_polled: Option<Instant> = None;
+    // Paces the per-task read behind an open remote task-output overlay: the
+    // steady cadence while it answers, a backoff while it does not. Cleared
+    // while no such viewer is open, which is what bounds the poll to an
+    // overlay that can show its answer.
+    let mut task_poll = Retry::default();
+    // Paces the re-attach a broken continuity obliges, so a peer that keeps
+    // refusing it cannot turn into one attempt (and one warning row) per
+    // iteration.
+    let mut reattach_retry = Retry::default();
     // Frame pacing: cap redraws at `REDRAW_FPS_CAP`. Requests that arrive
     // within a frame budget coalesce into one paint (the redraw latch is a
     // single bool), and a request landing inside the current budget is
@@ -5243,17 +5388,31 @@ async fn drive(
         // requests the clearing repaint, so each toast vanishes exactly on
         // time even while others stay live.
         let toast_deadline = crate::toasts::earliest_toast_deadline(&shell.borrow().toasts);
-        // A pending re-attach and an open remote task viewer both have work
-        // due at a known time, and neither has an event to wake the loop.
+        // A pending re-attach, an open remote task viewer, a paced read retry
+        // and an undischarged re-attach all have work due at a known time, and
+        // none has an event to wake the loop.
         let resume_deadline = resume.as_ref().map(Resume::due);
-        let poll_deadline = task_polled.map(|last| last + TASK_POLL_INTERVAL);
-        let deadline = earliest_deadline(
-            earliest_deadline(
-                earliest_deadline(tick_deadline, frame_deadline),
-                toast_deadline,
-            ),
-            earliest_deadline(resume_deadline, poll_deadline),
-        );
+        let poll_deadline = task_poll.due();
+        let reads_deadline = owes_client_reads(world)
+            .then(|| world.reads_retry.due())
+            .flatten();
+        let reattach_deadline = world
+            .client
+            .needs_reattach()
+            .then(|| reattach_retry.due())
+            .flatten();
+        let deadline = [
+            tick_deadline,
+            frame_deadline,
+            toast_deadline,
+            resume_deadline,
+            poll_deadline,
+            reads_deadline,
+            reattach_deadline,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         tokio::select! {
             biased;
 
@@ -5591,17 +5750,14 @@ async fn drive(
                             app.request_redraw();
                         }
                     }
-                    // A local stream only ends when this process's own host is
-                    // gone, which the shell cannot outlive. A connection drops
-                    // for all the ordinary reasons, and the recovery is a
-                    // re-attach with a cursor (spec 6.5), not a teardown.
-                    lost if !world.control.is_remote() => {
-                        let reason = match lost {
-                            ControlFrame::Lost(err) => err.to_string(),
-                            _ => "the session host closed the frame stream".to_string(),
-                        };
-                        break Err(anyhow::anyhow!(reason));
-                    }
+                    // A stream ends for ordinary reasons in either mode: a
+                    // connection drops, and an in-process subscriber is evicted
+                    // when this loop stopped draining long enough for the
+                    // host's reliable fan-out to overflow (spec 6.9). Both
+                    // recover the same way, by re-attaching with a cursor
+                    // (spec 6.5). Only a local attach that then fails means
+                    // the host itself is gone, and `advance_resume` is where
+                    // that becomes the shell's exit.
                     lost => {
                         if let ControlFrame::Lost(err) = lost {
                             fold_warning(world, &format!("Lost the connection: {err}"));
@@ -5773,36 +5929,31 @@ async fn drive(
         }
         // Advance a pending re-attach, one step per iteration so the paint at
         // the top of the loop shows each connection state.
-        if resume
-            .as_ref()
-            .is_some_and(|state| Instant::now() >= state.due())
-        {
+        if resume.as_ref().is_some_and(Resume::ready) {
             let state = resume.take().expect("checked just above");
-            resume = advance_resume(world, shell, state).await;
+            match advance_resume(world, shell, state).await {
+                Ok(next) => resume = next,
+                // Only a local run reaches this: its own host refused to serve
+                // a session it was holding, so the host is gone and the shell
+                // goes with it.
+                Err(err) => break Err(anyhow::anyhow!("the session host is gone: {err}")),
+            }
             world.connection = resume
                 .as_ref()
                 .map_or(Connection::Connected, Resume::connection);
             app.request_redraw();
         }
         // Refresh the open remote task viewer from the per-task read.
-        if poll_task_output(world, shell, &mut task_polled).await {
+        if poll_task_output(world, shell, &mut task_poll).await {
             app.request_redraw();
         }
         // Continuity broke (a head switch this process did not make), so the
-        // client owes a re-attach. Leaving the obligation undischarged would
-        // silently freeze the transcript: every later frame carries an epoch
-        // the fold filters out. A pending re-attach already owes one, and its
-        // own attach discharges this.
-        if resume.is_none() && world.client.needs_reattach() {
-            if let Err(err) = reattach(world, shell).await {
-                fold_warning(world, &format!("Lost the session's event stream: {err}"));
-                // The obligation stands, so a connection hands it to the
-                // backed-off retry rather than re-attempting on every
-                // iteration for as long as the host is unreachable.
-                if world.control.is_remote() {
-                    resume = Some(Resume::lost());
-                    world.connection = Connection::Reconnecting;
-                }
+        // client owes a re-attach. A pending re-attach already owes one, and
+        // its own attach discharges this.
+        if resume.is_none() && world.client.needs_reattach() && reattach_retry.ready() {
+            resume = discharge_reattach(world, shell, &mut reattach_retry).await;
+            if resume.is_some() {
+                world.connection = Connection::Reconnecting;
             }
             app.request_redraw();
         }
@@ -8824,6 +8975,209 @@ mod tests {
              doubling it",
         );
         shut_down(&world).await;
+    }
+
+    /// A re-attach the host refuses is retried on a backoff, not once per loop
+    /// iteration.
+    ///
+    /// The obligation stands until an attach is served, and the loop reaches
+    /// this block every time around, so an unpaced retry folds a warning row
+    /// per iteration and re-asks a host that is refusing at redraw speed.
+    #[tokio::test]
+    async fn a_refused_re_attach_is_paced() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        run_prompt(&mut world, "seed").await;
+
+        let head = world
+            .handles()
+            .log
+            .lock()
+            .await
+            .head()
+            .cloned()
+            .expect("a persisted head");
+        world
+            .host()
+            .command(&world.session, Command::Head { entry: head })
+            .await
+            .expect("the head switch is accepted");
+        fold_ready_frames(&mut world);
+        assert!(
+            world.client.needs_reattach(),
+            "the reset left an obligation"
+        );
+
+        // Point the world at a session the host does not have, which is what a
+        // refused attach looks like from here.
+        let live_session = std::mem::replace(&mut world.session, "no-such-session".to_string());
+        let mut retry = Retry::default();
+
+        assert!(
+            discharge_reattach(&mut world, &shell, &mut retry)
+                .await
+                .is_none(),
+            "an in-process host's refusal stays here rather than arming a \
+             reconnect",
+        );
+        let warned = main_notices(&world)
+            .iter()
+            .filter(|text| text.contains("Lost the session's event stream"))
+            .count();
+        assert_eq!(warned, 1, "the refusal is reported once");
+        assert!(
+            world.client.needs_reattach(),
+            "and the obligation still stands",
+        );
+        assert!(!retry.ready(), "the next attempt is held back");
+        let due = retry.due().expect("a paced retry has a due time");
+
+        // The loop's next iterations find it not ready, so nothing is re-asked
+        // and no second row is folded.
+        assert!(!retry.ready());
+        assert_eq!(
+            main_notices(&world)
+                .iter()
+                .filter(|text| text.contains("Lost the session's event stream"))
+                .count(),
+            warned,
+        );
+
+        // Once the delay is out it does try again, and the delay grows.
+        tokio::time::sleep_until(due.into()).await;
+        assert!(retry.ready(), "the retry is not abandoned, only paced");
+        assert!(
+            discharge_reattach(&mut world, &shell, &mut retry)
+                .await
+                .is_none()
+        );
+        let grown = retry.due().expect("a second failure paces again");
+        assert!(
+            grown.saturating_duration_since(Instant::now())
+                > due.saturating_duration_since(Instant::now()),
+            "a repeated refusal did not back off further",
+        );
+
+        world.session = live_session;
+        shut_down(&world).await;
+    }
+
+    /// An in-process subscriber is evicted like any other when the shell stops
+    /// draining and the host's reliable fan-out overflows (spec 6.9), so a
+    /// closed local stream is a re-attach, not the end of the shell.
+    ///
+    /// The overflow here is real: every queue command publishes a reliable
+    /// `QueueUpdate`, and nothing drains the stream while they run.
+    #[tokio::test]
+    async fn an_evicted_local_stream_is_re_attached() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        run_prompt(&mut world, "seed").await;
+        let before = user_rows(&world);
+        assert_eq!(before, vec!["seed"]);
+
+        // Past the fan-out's per-client bound, with nothing reading.
+        for _ in 0..300 {
+            world
+                .control
+                .command(
+                    &world.session,
+                    Command::Queue(QueueOp::Remove {
+                        agent: AgentId::Main,
+                    }),
+                )
+                .await
+                .expect("a queue withdrawal is always accepted");
+        }
+        assert!(
+            matches!(world.stream.recv().await, ControlFrame::Closed),
+            "the overflow evicted this subscriber",
+        );
+
+        // What the drive loop does with it: re-attach with the cursor, exactly
+        // as a connection would.
+        let mut resume = Some(Resume::lost());
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        while let Some(state) = resume.take() {
+            assert!(Instant::now() < deadline, "the re-attach never settled");
+            resume = advance_resume(&mut world, &shell, state)
+                .await
+                .expect("the host is still there, so the attach is served");
+        }
+        assert!(
+            main_notices(&world)
+                .iter()
+                .any(|text| text == "Re-attached to the session."),
+            "the re-attach is surfaced: {:?}",
+            main_notices(&world),
+        );
+        assert_eq!(
+            user_rows(&world),
+            before,
+            "the backfill rebuilt the transcript rather than doubling it",
+        );
+
+        // And the shell is a live client again.
+        run_prompt(&mut world, "again").await;
+        assert_eq!(user_rows(&world), vec!["seed", "again"]);
+        shut_down(&world).await;
+    }
+
+    /// The host really being gone still ends the shell: the re-attach is what
+    /// tells that apart from an eviction, because a host that is gone refuses
+    /// it.
+    #[tokio::test]
+    async fn a_local_re_attach_after_the_host_is_gone_is_fatal() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        run_prompt(&mut world, "seed").await;
+        shut_down(&world).await;
+
+        assert!(
+            matches!(world.stream.recv().await, ControlFrame::Closed),
+            "the shutdown closed the stream",
+        );
+        assert!(
+            advance_resume(&mut world, &shell, Resume::lost())
+                .await
+                .is_err(),
+            "a local host that cannot serve its own session is gone",
+        );
+    }
+
+    /// A re-attach that keeps dying inside its attach block backs off like a
+    /// failed open does.
+    ///
+    /// Each attempt costs the host a full projection and is served the
+    /// identical suffix (a client's cursor does not move until the block
+    /// completes, spec 6.5), so a flat retry is a livelock on a busy host whose
+    /// fan-out keeps evicting a client that is still attaching.
+    #[test]
+    fn a_failure_inside_the_attach_block_backs_off() {
+        let mut state = Resume::lost();
+        assert!(state.ready(), "the first attempt is due at once");
+
+        let mut previous = Duration::ZERO;
+        for _ in 0..4 {
+            // The stream opened, then died inside the block.
+            state.step = ResumeStep::CatchingUp;
+            state.failed();
+            assert!(!state.ready());
+            let delay = state.due().saturating_duration_since(Instant::now());
+            assert!(
+                delay > previous,
+                "a repeated failure inside the block stayed at {delay:?}",
+            );
+            previous = delay;
+        }
+
+        for _ in 0..10 {
+            state.failed();
+        }
+        assert!(
+            state.due().saturating_duration_since(Instant::now()) <= RECONNECT_BACKOFF_MAX,
+            "the backoff is capped",
+        );
     }
 
     /// An attach block obliges the task and queue reads (neither is
@@ -13883,7 +14237,9 @@ mod tests {
                 state.connection(),
                 "the status line names the connection state"
             );
-            resume = advance_resume(&mut world, &shell, state).await;
+            resume = advance_resume(&mut world, &shell, state)
+                .await
+                .expect("a connection's re-attach is never fatal");
             world.connection = resume
                 .as_ref()
                 .map_or(Connection::Connected, Resume::connection);
@@ -13924,6 +14280,77 @@ mod tests {
             "and on the settings the host reported",
         );
         assert_eq!(user_rows(&world), vec!["hello"], "no duplicated prompt row");
+        remote.shutdown().await;
+    }
+
+    /// A loopback address with nothing behind it: bound to take a free port,
+    /// then released, so a client dialing it is refused rather than left
+    /// waiting.
+    async fn dead_url() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = listener.local_addr().expect("the bound address");
+        drop(listener);
+        format!("http://{addr}")
+    }
+
+    /// A read the host fails leaves the obligation standing and paces the
+    /// retry.
+    ///
+    /// The loop discharges these reads at the bottom of every iteration and
+    /// each call awaits a request, so an unpaced retry puts a request that
+    /// fails into every iteration for as long as the host stays quiet.
+    #[tokio::test]
+    async fn a_failing_client_read_is_paced() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let mut world = connect_world(&dir, &remote, &[]).await;
+
+        // Attach without discharging the reads, which is the state every
+        // `caught_up` leaves the client in (spec 6.7).
+        world.stream = open_stream(&world.control, &world.session, &mut world.client)
+            .await
+            .expect("re-attach");
+        assert!(fold_attach_block(&mut world).await, "the block completed");
+        assert!(
+            world.client.needs_task_refetch() && world.client.needs_queue_refetch(),
+            "the block obliged both reads",
+        );
+
+        // Point the client at a peer that is not there.
+        world.control =
+            Control::remote(crate::remote::RemoteClient::new(&dead_url().await).expect("a client"));
+
+        refresh_client_reads(&mut world).await;
+        assert!(
+            world.client.needs_task_refetch() && world.client.needs_queue_refetch(),
+            "a failed read keeps the obligation",
+        );
+        assert!(!world.reads_retry.ready(), "the next attempt is held back");
+        let due = world
+            .reads_retry
+            .due()
+            .expect("a paced retry has a due time");
+
+        // A call inside the delay attempts nothing: an attempt would fail and
+        // pace again, moving the due time out.
+        refresh_client_reads(&mut world).await;
+        assert_eq!(
+            world.reads_retry.due(),
+            Some(due),
+            "the read was re-issued inside its own delay",
+        );
+
+        // And once the delay is out it does try again, backing off further.
+        tokio::time::sleep_until(due.into()).await;
+        refresh_client_reads(&mut world).await;
+        let grown = world.reads_retry.due().expect("a second failure paces too");
+        assert!(
+            grown > due,
+            "the retry is not abandoned, and a repeated failure backs off",
+        );
+
         remote.shutdown().await;
     }
 
@@ -14086,7 +14513,7 @@ mod tests {
         );
 
         // The first poll fills the viewer from the read.
-        let mut polled = None;
+        let mut polled = Retry::default();
         assert!(
             poll_task_output(&world, &shell, &mut polled).await,
             "the per-task read fed the viewer"
@@ -14102,7 +14529,10 @@ mod tests {
             shell.borrow().task_view.borrow().is_none(),
             "the closed viewer was retired"
         );
-        assert!(polled.is_none(), "the poll clock resets with the viewer");
+        assert!(
+            polled.due().is_none(),
+            "the poll clock resets with the viewer"
+        );
 
         settle(&mut world).await;
         remote.shutdown().await;
