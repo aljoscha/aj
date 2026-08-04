@@ -578,9 +578,11 @@ async fn focus_session(
     // the outgoing session's baked border tint and stale `agent N` marker. This
     // mirrors the `world.status` reset above, which resets chrome for the same
     // install-to-first-draw window.
-    sync_editor_chrome(world, shell);
+    // Fold the attach block before the chrome reconcile below, so the first
+    // frame is drawn against the session's real history and settings.
     fold_ready_frames(world);
     refresh_client_reads(world).await;
+    sync_editor_chrome(world, shell);
     // Folded after the attach block so they land on top of the replayed
     // history: the confirmation, then a fresh session's env notices, then
     // whatever resume-time restoration did.
@@ -4382,13 +4384,12 @@ pub async fn run(args: Args) -> Result<()> {
         .take_autocomplete_rx()
         .expect("editor hands out its autocomplete receiver exactly once");
 
-    // Outer session loop. Each iteration drives one session to completion;
-    // a new-session or resume request exits `drive` with the matching
-    // `SessionExit`, whereupon we tear the outgoing session down and build
-    // the next one over the same Shell (see `install_next_session`). Quit
-    // and fatal errors break out. Usage of each torn-down session is
-    // snapshotted for the shutdown banner so a multi-session process
-    // itemizes every session, matching `aj`.
+    // Outer session loop. Each iteration drives one focused session; a
+    // new-session, resume or branch request exits `drive` with the matching
+    // `SessionExit`, whereupon the focus moves over the same Shell (see
+    // `focus_session`). Quit and fatal errors break out. The usage of each
+    // session the process leaves is snapshotted for the shutdown banner so a
+    // multi-session process itemizes every session, matching `aj`.
     let mut completed_sessions: Vec<(String, UsageSummary)> = Vec::new();
     let run_result: Result<()> = loop {
         // Restore the terminal even when the loop exits with a render error,
@@ -4502,13 +4503,12 @@ async fn recv_theme(rx: Option<&mut UnboundedReceiver<Theme>>) -> Option<Theme> 
     }
 }
 
-/// The host select loop for one session: turn joins, agent events,
-/// terminal input, widget timers, theme reloads, and async overlay fills.
+/// The select loop for the focused session: the host's frames, terminal
+/// input, widget timers, theme reloads, and async overlay fills.
 ///
-/// Returns the reason the session ended: `Quit` when the user quits or
-/// input ends, `New` / `Switch(id)` when a session change is requested (only
-/// ever with no turn in flight). The outer loop in [`run`] tears the session
-/// down and, for a change, builds the next one over the same Shell.
+/// Returns the reason it stopped driving this session: `Quit` when the user
+/// quits or input ends, `New` / `Switch(id)` / `Branch` when a session change
+/// is requested. The outer loop in [`run`] moves the focus and re-enters.
 /// Upper bound on interactive redraws per second. The drive loop paces
 /// `render_if_needed` to this rate so a fast redraw source (a streaming turn's
 /// `MessageUpdate`s, say) cannot drive more than one full-tree relayout and

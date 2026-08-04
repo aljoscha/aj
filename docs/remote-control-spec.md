@@ -1039,11 +1039,12 @@ before the next begins.
 ## 13. Open questions and accepted risks
 
 - Backfill cost: a full backfill projects the whole log, and sub-heavy
-  logs make that expensive (local resume defers sub-thread projection
-  for this reason, the wire has no deferred variant). v1 accepts it,
-  mitigated by cursors making steady-state re-attaches cheap and the
-  sidebar attaching lazily. A thread-scoped backfill is the follow-up
-  if it hurts.
+  logs make that expensive. The local resume used to defer sub-thread
+  projection for this reason and the wire has no deferred variant, so
+  the local frontend gave the deferral up when it became a client. v1
+  accepts it, mitigated by cursors making steady-state re-attaches cheap
+  and the sidebar attaching lazily. A thread-scoped backfill is the
+  follow-up if it hurts.
 - Suffix projection interacts with interleaved background-sub logs
   (the projection re-opens brackets with synthesized fallback starts).
   The reconciliation rules cover the client side, but this area is
