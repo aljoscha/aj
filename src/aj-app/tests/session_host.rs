@@ -66,6 +66,15 @@ impl Harness {
         provider: Arc<ScriptedProvider>,
         catalog: Vec<aj_models::registry::ModelInfo>,
     ) -> Self {
+        Self::with_run_config(snapshot(provider), catalog)
+    }
+
+    /// A host whose base run config is `run_config`, for tests about what the
+    /// host defaults a session to.
+    fn with_run_config(
+        run_config: RunConfigSnapshot,
+        catalog: Vec<aj_models::registry::ModelInfo>,
+    ) -> Self {
         let dir = TempDir::new().expect("tempdir");
         let persistence = ConversationPersistence::new(dir.path().join("sessions"));
         let config = Arc::new(StdMutex::new(Config::default()));
@@ -77,7 +86,7 @@ impl Harness {
                 project_path: None,
             })),
             catalog: Arc::new(catalog),
-            run_config: snapshot(provider),
+            run_config,
             restore: None,
             persistence: persistence.clone(),
             auth: AuthStorage::new(dir.path().join("auth.json")),
@@ -690,6 +699,51 @@ async fn explicit_creation_applies_settings_before_its_first_prompt() {
     assert!(
         format!("{:?}", client.canonical()).contains("created remotely"),
         "the optional prompt was accepted after creation",
+    );
+    harness.host.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_unstated_axis_defaults_against_the_model_the_session_runs() {
+    // A host whose configured level its own model has no word for, which is
+    // ordinary: the level comes from a config file, the model from a catalog.
+    let mut base = snapshot(scripted(Vec::new(), 0, Duration::ZERO));
+    base.thinking = Some(aj_models::ThinkingConfig::XHigh);
+    let harness = Harness::with_run_config(base, Vec::new());
+
+    // Something is stated, but not thinking, so the host defaults that axis
+    // against the model it actually runs (spec section 8).
+    let session = harness
+        .host
+        .create_with(
+            Some(SessionSettings {
+                speed: Some("fast".into()),
+                ..SessionSettings::default()
+            }),
+            None,
+        )
+        .await
+        .expect("an unstated axis is the host's to default");
+    assert!(
+        thinking(&harness.host, &session).await.is_none(),
+        "a level the model cannot serve is not what an unstated axis resolves to",
+    );
+
+    // Stated, and therefore strict: no clamping, no substitution.
+    let refused = harness
+        .host
+        .create_with(
+            Some(SessionSettings {
+                thinking: Some("xhigh".into()),
+                ..SessionSettings::default()
+            }),
+            None,
+        )
+        .await
+        .expect_err("a stated level the model cannot serve is refused");
+    assert!(
+        format!("{refused}").contains("does not support thinking level"),
+        "the refusal names what went wrong: {refused}",
     );
     harness.host.shutdown().await;
 }

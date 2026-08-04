@@ -4605,9 +4605,15 @@ pub async fn run(args: Args) -> Result<()> {
             new,
             prompt: _,
         }) => {
+            // Statedness has to come from the layers, not from the effective
+            // config: only a create sends stated axes (spec section 8), and the
+            // effective config cannot tell a written entry from a fallback.
+            let (user_layer, _) = Config::load_layer();
+            let stated = crate::connect::Stated::new(user_layer, layers.project.clone());
             let connected = crate::connect::connect(
                 &args,
                 &layers.effective(),
+                &stated,
                 ConnectTarget {
                     url,
                     session_id: session_id.as_deref(),
@@ -13608,25 +13614,36 @@ mod tests {
         (app, writer, root)
     }
 
-    /// The config a connect-mode test client runs with.
-    ///
-    /// Its thinking level is the one axis that has to be tuned: the built-in
-    /// default is `xhigh`, the scripted model the test host runs supports no
-    /// effort at all, and a creator setting the host cannot serve is refused
-    /// rather than substituted (spec section 8). That refusal is pinned by
-    /// `connect_mode_reports_a_setting_the_host_cannot_serve`; every other test
-    /// wants a client whose defaults this host can serve.
+    /// The config a stock connect-mode test client runs with: the built-in
+    /// one, untouched. Nothing in it is *stated*, so nothing travels with a
+    /// create and the host defaults every axis against its own model (spec
+    /// section 8), which is what lets these tests run against a scripted host
+    /// whose model supports no thinking effort at all.
     fn client_config() -> Config {
-        Config {
-            thinking: Some(aj_conf::ConfigThinkingLevel::Off),
-            ..Config::default()
-        }
+        Config::default()
+    }
+
+    /// A client whose user wrote nothing in any config file.
+    fn nothing_stated() -> crate::connect::Stated {
+        use aj_conf::ConfigLayer;
+        crate::connect::Stated::new(ConfigLayer::default(), ConfigLayer::default())
+    }
+
+    /// A client whose user wrote `key = value` in their config file.
+    fn stated(key: &str, value: &str) -> crate::connect::Stated {
+        use aj_conf::ConfigLayer;
+        let mut layer = ConfigLayer::default();
+        layer
+            .set_str(key, value)
+            .unwrap_or_else(|err| panic!("fixture sets {key:?}: {err}"));
+        crate::connect::Stated::new(layer, ConfigLayer::default())
     }
 
     /// Dial `remote` the way `aj connect <url> [args...]` does.
     async fn dial(
         remote: &RemoteHost,
         config: &Config,
+        stated: &crate::connect::Stated,
         argv: &[&str],
     ) -> Result<crate::connect::Connected> {
         let mut args = vec!["aj", "connect"];
@@ -13646,6 +13663,7 @@ mod tests {
         crate::connect::connect(
             &args,
             config,
+            &stated,
             ConnectTarget {
                 url,
                 session_id: session_id.as_deref(),
@@ -13663,7 +13681,9 @@ mod tests {
         args.push(&url);
         args.extend_from_slice(argv);
         let args = Args::parse_from(args);
-        let connected = dial(remote, &client_config(), argv)
+        // A stock install states nothing beyond its argv, so the host defaults
+        // every axis it is not told about.
+        let connected = dial(remote, &client_config(), &nothing_stated(), argv)
             .await
             .expect("connect to the scripted host");
         let auth = AuthStorage::new(dir.path().join("client-auth.json"));
@@ -13951,25 +13971,39 @@ mod tests {
         remote.shutdown().await;
     }
 
-    /// A creator setting the host cannot serve fails the connect with the
-    /// host's own reason, rather than quietly running at something else (spec
-    /// section 8). Reported before any terminal setup, as a plain CLI error.
+    /// Provenance decides what travels with a create (spec section 8). A level
+    /// the user actually wrote is honored strictly, so a host whose model
+    /// cannot serve it refuses in its own words, before any terminal setup. The
+    /// same level left unstated does not travel at all, and the host defaults
+    /// the axis against the model it really runs.
     #[tokio::test]
-    async fn connect_mode_reports_a_setting_the_host_cannot_serve() {
+    async fn connect_mode_sends_only_stated_settings() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
-        // The built-in default thinking level, which the scripted model the
-        // host runs does not support.
-        let refused = dial(&remote, &Config::default(), &["--new"]).await;
+
+        let refused = dial(
+            &remote,
+            &client_config(),
+            &stated("thinking", "xhigh"),
+            &["--new"],
+        )
+        .await;
         let err = match refused {
             Err(err) => err,
-            Ok(_) => panic!("the host refuses a level it cannot serve"),
+            Ok(_) => panic!("a stated level the model cannot serve is refused"),
         };
         let reported = format!("{err:#}");
         assert!(
             reported.contains("does not support thinking level"),
             "the host's reason reaches the CLI: {reported}"
         );
+
+        // Same client, same built-in fallback, nothing written: the create goes
+        // through because no opinion was ever expressed.
+        let connected = dial(&remote, &client_config(), &nothing_stated(), &["--new"])
+            .await
+            .expect("a stock client creates a session");
+        assert!(connected.created);
         remote.shutdown().await;
     }
 

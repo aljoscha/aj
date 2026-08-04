@@ -7,13 +7,13 @@
 //!
 //! Session selection is the spec's: an explicit id, else `--new` creates,
 //! else the host's most recently modified session, else create one. A create
-//! carries this client's own resolved inference settings, because per-session
-//! settings follow whoever creates the session (spec section 8).
+//! carries the settings this client's user actually stated, because
+//! per-session settings follow whoever creates the session (spec section 8).
 
 use std::path::PathBuf;
 
 use aj_app::cli::args::Args;
-use aj_conf::Config;
+use aj_conf::{Config, ConfigLayer};
 use aj_models::{speed_name, thinking_config_name, verbosity_name};
 use aj_wire::{Hello, ModelSelection, SessionSettings};
 use anyhow::{Context, Result};
@@ -52,6 +52,7 @@ pub(crate) struct Connected {
 pub(crate) async fn connect(
     args: &Args,
     config: &Config,
+    stated: &Stated,
     target: ConnectTarget<'_>,
 ) -> Result<Connected> {
     let client = RemoteClient::new(target.url)
@@ -62,7 +63,7 @@ pub(crate) async fn connect(
         .with_context(|| format!("could not reach an aj host at {}", client.base()))?;
     let working_directory = hello.working_directory.clone();
     let control = Control::remote(client);
-    let settings = creator_settings(args, config);
+    let settings = creator_settings(args, config, stated);
     let (session, created) = resolve_session(&control, &target, settings).await?;
     Ok(Connected {
         control,
@@ -77,7 +78,7 @@ pub(crate) async fn connect(
 async fn resolve_session(
     control: &Control,
     target: &ConnectTarget<'_>,
-    settings: SessionSettings,
+    settings: Option<SessionSettings>,
 ) -> Result<(String, bool)> {
     if let Some(id) = target.session_id {
         return Ok((id.to_string(), false));
@@ -104,27 +105,53 @@ async fn resolve_session(
     }
 }
 
-async fn create(control: &Control, settings: SessionSettings) -> Result<String> {
+async fn create(control: &Control, settings: Option<SessionSettings>) -> Result<String> {
     control
-        .create(Some(settings), None)
+        .create(settings, None)
         .await
         .context("could not create a session on the host")
 }
 
-/// This client's resolved inference settings, for a session it creates.
+/// Which settings a human actually stated, as opposed to what a config
+/// resolves to when nobody said anything.
 ///
-/// Resolved from the same inputs a local run's run config comes from (CLI
-/// flags over env over config), because a connect-mode client's own defaults
-/// are what its sessions should run with (spec section 8). Every axis it can
-/// name is sent, since an axis the creator omits falls back to the host's
-/// config rather than to this client's.
+/// Provenance is the line spec section 8 draws for what travels with a create,
+/// and it is only readable from the config *layers*: the effective [`Config`]
+/// a process runs with has the built-in fallbacks baked into the same `Option`
+/// fields, so a written `thinking = "xhigh"` and an absent one look identical
+/// there.
+pub(crate) struct Stated {
+    user: ConfigLayer,
+    project: ConfigLayer,
+}
+
+impl Stated {
+    pub(crate) fn new(user: ConfigLayer, project: ConfigLayer) -> Self {
+        Self { user, project }
+    }
+
+    /// Whether either layer writes `key`. Which layer wins does not matter
+    /// here, only that some file says something.
+    fn has(&self, key: &str) -> bool {
+        self.user.is_set(key) || self.project.is_set(key)
+    }
+}
+
+/// The settings this client *stated*, for a session it creates, or `None`
+/// when it stated nothing.
 ///
-/// The model is the one axis that can go unnamed: with no model pinned there
-/// is no `(api, name)` pair to send, and asking for "that provider's default"
-/// is not something the wire can express, so the host's own default model
-/// applies.
-fn creator_settings(args: &Args, config: &Config) -> SessionSettings {
+/// Spec section 8 draws the line at provenance rather than at value: an axis
+/// travels only when a human named it, through a CLI flag, an environment
+/// variable, or an entry written in this client's config. The built-in
+/// fallback a config resolves to when nothing is written is not a preference,
+/// and sending it would ask the host to honor an opinion nobody holds, which a
+/// host serving a narrow-vocabulary model would rightly refuse. What we omit
+/// the host defaults itself, against the model it actually runs.
+fn creator_settings(args: &Args, config: &Config, stated: &Stated) -> Option<SessionSettings> {
     let selection = aj_app::model::ModelSelection::merge(args, config);
+    // A model is stated by naming it, and `merge` already answers that: with
+    // none pinned anywhere there is no `(api, name)` pair to send, and "that
+    // provider's default" is not something the wire can express.
     let model = selection.name.as_ref().map(|name| ModelSelection {
         api: selection.provider_id().to_string(),
         url: selection.url.clone(),
@@ -139,19 +166,26 @@ fn creator_settings(args: &Args, config: &Config) -> SessionSettings {
             aj_conf::ConfigSpeed::Standard => aj_models::types::Speed::Standard,
             aj_conf::ConfigSpeed::Fast => aj_models::types::Speed::Fast,
         });
-    let thinking = aj_app::model::default_thinking_from_config(config.thinking);
-    let verbosity = config
-        .verbosity
-        .map(aj_app::model::config_verbosity_to_unified);
-    SessionSettings {
+    let settings = SessionSettings {
         model,
-        thinking: Some(thinking_config_name(thinking.as_ref()).to_string()),
-        thinking_display: Some(
-            aj_app::session_setup::thinking_display_name(config.thinking_display).to_string(),
-        ),
-        speed: Some(speed_name(speed).to_string()),
-        verbosity: Some(verbosity_name(verbosity).to_string()),
-    }
+        // The effective config carries the value, the layers carry whether
+        // anyone asked for it, so both are consulted per axis.
+        thinking: stated.has("thinking").then(|| {
+            let level = aj_app::model::default_thinking_from_config(config.thinking);
+            thinking_config_name(level.as_ref()).to_string()
+        }),
+        thinking_display: stated.has("thinking_display").then(|| {
+            aj_app::session_setup::thinking_display_name(config.thinking_display).to_string()
+        }),
+        speed: (args.speed.is_some() || stated.has("speed")).then(|| speed_name(speed).to_string()),
+        verbosity: stated.has("verbosity").then(|| {
+            let unified = config
+                .verbosity
+                .map(aj_app::model::config_verbosity_to_unified);
+            verbosity_name(unified).to_string()
+        }),
+    };
+    (settings != SessionSettings::default()).then_some(settings)
 }
 
 #[cfg(test)]
@@ -164,29 +198,54 @@ mod tests {
         Args::try_parse_from(argv).expect("args parse")
     }
 
-    /// With nothing pinned, every axis a client can name is still sent (the
-    /// host's config only applies to what the creator omits), and the model is
-    /// left out because there is no `(api, name)` pair to name.
+    /// A layer that writes `keys`, standing in for a config file that does.
+    /// The values only have to parse: statedness is what is under test.
+    fn wrote(keys: &[(&str, &str)]) -> ConfigLayer {
+        let mut layer = ConfigLayer::default();
+        for (key, value) in keys {
+            layer
+                .set_str(key, value)
+                .unwrap_or_else(|err| panic!("fixture sets {key:?}: {err}"));
+        }
+        layer
+    }
+
+    fn nothing_stated() -> Stated {
+        Stated::new(ConfigLayer::default(), ConfigLayer::default())
+    }
+
+    /// A stock client states nothing, so nothing travels and the host defaults
+    /// every axis itself. This is what lets a default install create a session
+    /// on a host whose model has a narrower thinking vocabulary than the
+    /// built-in fallback names (spec section 8).
     #[test]
-    fn creator_settings_send_the_resolved_defaults() {
+    fn creator_settings_are_empty_when_nothing_is_stated() {
+        // The fallback is baked into the effective config, which is exactly
+        // why value alone cannot decide this.
         let config = Config::default();
-        let settings = creator_settings(&args(&["aj"]), &config);
+        assert!(config.thinking.is_some());
+        assert_eq!(
+            creator_settings(&args(&["aj"]), &config, &nothing_stated()),
+            None
+        );
+    }
+
+    /// A written config entry is a statement, so it travels even when it names
+    /// the same value the built-in fallback would have produced.
+    #[test]
+    fn creator_settings_carry_written_config_entries() {
+        let config = Config {
+            thinking: Some(aj_conf::ConfigThinkingLevel::XHigh),
+            ..Config::default()
+        };
+        let stated = Stated::new(wrote(&[("thinking", "xhigh")]), ConfigLayer::default());
+        let settings = creator_settings(&args(&["aj"]), &config, &stated).expect("stated");
+        assert_eq!(settings.thinking.as_deref(), Some("xhigh"));
+        // Untouched axes stay unstated rather than riding along.
         assert_eq!(settings.model, None);
-        // The thinking default is the config's own, not a hard-coded "off":
-        // this client's resolved value is what the created session runs at.
-        let thinking = aj_app::model::default_thinking_from_config(config.thinking);
-        assert_eq!(
-            settings.thinking.as_deref(),
-            Some(thinking_config_name(thinking.as_ref())),
-        );
-        assert_eq!(
-            settings.thinking_display.as_deref(),
-            Some(aj_app::session_setup::thinking_display_name(
-                config.thinking_display
-            )),
-        );
-        assert_eq!(settings.speed.as_deref(), Some("standard"));
-        assert_eq!(settings.verbosity.as_deref(), Some("default"));
+        assert_eq!(settings.speed, None);
+        assert_eq!(settings.verbosity, None);
+        assert_eq!(settings.thinking_display, None);
     }
 
     /// The CLI wins over config, and a pinned model travels as the triple the
@@ -209,7 +268,12 @@ mod tests {
                 "fast",
             ]),
             &config,
-        );
+            &Stated::new(
+                ConfigLayer::default(),
+                wrote(&[("thinking", "high"), ("speed", "standard")]),
+            ),
+        )
+        .expect("stated");
         assert_eq!(
             settings.model,
             Some(ModelSelection {

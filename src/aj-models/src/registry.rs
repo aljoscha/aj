@@ -511,6 +511,40 @@ pub fn validate_thinking_level(model: &ModelInfo, level: &ThinkingLevel) -> Resu
     ))
 }
 
+/// The level to run at when nobody asked for one: `preferred` if the model
+/// offers it, otherwise the closest level it does offer that is no more
+/// expensive.
+///
+/// This is for defaulting only. A level someone actually requested goes
+/// through [`validate_thinking_level`] and fails rather than moving, because
+/// quietly running cheaper than asked would misreport what the model was told
+/// to do. A default carries no such intent, so a configured fallback this
+/// model has no word for becomes the nearest one it does.
+///
+/// We move down rather than up so a default never costs more than the
+/// configuration asked for. A model offering nothing at or below `preferred`
+/// gets its cheapest level.
+pub fn default_thinking_level(model: &ModelInfo, preferred: &ThinkingLevel) -> ThinkingLevel {
+    let supported = supported_thinking_levels(model);
+    if supported.contains(preferred) {
+        return *preferred;
+    }
+    let rank = |level: &ThinkingLevel| {
+        ALL_THINKING_LEVELS
+            .iter()
+            .position(|candidate| candidate == level)
+    };
+    let ceiling = rank(preferred);
+    supported
+        .iter()
+        .rev()
+        .find(|level| rank(level) <= ceiling)
+        .or_else(|| supported.first())
+        .copied()
+        // A model with no vocabulary at all cannot be asked to think.
+        .unwrap_or(ThinkingLevel::Off)
+}
+
 /// Every thinking level in canonical, cheapest-first order. Offered sets
 /// are returned as a subset of this, so callers get a stable order.
 const ALL_THINKING_LEVELS: [ThinkingLevel; 7] = [
@@ -1205,6 +1239,47 @@ mod tests {
         let plain = sample_model("openai", "gpt-4o");
         assert!(validate_thinking_level(&plain, &ThinkingLevel::Off).is_ok());
         assert!(validate_thinking_level(&plain, &ThinkingLevel::Max).is_err());
+    }
+
+    /// Defaulting moves to the nearest level at or below the configured one,
+    /// which is what lets a host serve a narrow-vocabulary model without the
+    /// operator's config having to know about it.
+    #[test]
+    fn defaulting_clamps_to_what_the_model_offers() {
+        let plain = sample_model("openai", "gpt-4o");
+        assert_eq!(
+            default_thinking_level(&plain, &ThinkingLevel::XHigh),
+            ThinkingLevel::Off,
+        );
+
+        let mut gpt = sample_model("openai", "gpt-5.5");
+        gpt.api = "openai-responses".into();
+        gpt.reasoning = true;
+        gpt.reasoning_options = vec![ReasoningOption::Effort {
+            values: vec![ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::High],
+        }];
+        // Supported outright, so it does not move.
+        assert_eq!(
+            default_thinking_level(&gpt, &ThinkingLevel::High),
+            ThinkingLevel::High,
+        );
+        // Unsupported, so down to the next one offered rather than up.
+        assert_eq!(
+            default_thinking_level(&gpt, &ThinkingLevel::Max),
+            ThinkingLevel::High,
+        );
+        assert_eq!(
+            default_thinking_level(&gpt, &ThinkingLevel::Medium),
+            ThinkingLevel::Low,
+        );
+        // Nothing at or below the request: its cheapest is the answer.
+        gpt.reasoning_options = vec![ReasoningOption::Effort {
+            values: vec![ThinkingLevel::High, ThinkingLevel::Max],
+        }];
+        assert_eq!(
+            default_thinking_level(&gpt, &ThinkingLevel::Low),
+            ThinkingLevel::High,
+        );
     }
 
     #[test]

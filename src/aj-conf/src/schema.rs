@@ -1097,6 +1097,34 @@ impl Config {
         }
     }
 
+    /// Load `~/.aj/config.toml` as a layer, recording the keys the file
+    /// actually sets instead of resolving the rest to their fallbacks.
+    ///
+    /// [`Self::load`] answers "what should this process run with", which bakes
+    /// the built-in fallbacks in and so cannot tell a written entry from an
+    /// absent one. A caller that has to know whether a human stated something
+    /// needs this instead (a create over the control port sends only stated
+    /// axes). Absence and unreadability degrade to an empty layer exactly as
+    /// [`Self::load_project`] does.
+    pub fn load_layer() -> (ConfigLayer, Vec<ConfigDiagnostic>) {
+        let Ok(path) = Self::config_file_path() else {
+            return (ConfigLayer::default(), Vec::new());
+        };
+        if !path.exists() {
+            return (ConfigLayer::default(), Vec::new());
+        }
+        match fs::read_to_string(&path) {
+            Ok(content) => parse_layer(&content, &path),
+            Err(e) => (
+                ConfigLayer::default(),
+                vec![ConfigDiagnostic::Unreadable {
+                    path,
+                    error: e.to_string(),
+                }],
+            ),
+        }
+    }
+
     /// Load the per-project config overlay for the current working
     /// directory's project: `<git-root>/.aj/config.toml`.
     ///
@@ -2543,6 +2571,28 @@ image_block = true
 
         let effective = layer.overlay_onto(&base);
         assert!(effective.auto_compact);
+    }
+
+    /// A layer records presence, which is what separates a written entry from
+    /// a built-in fallback. The resolved [`Config`] cannot: it holds the same
+    /// value either way.
+    #[test]
+    fn a_layer_distinguishes_a_written_entry_from_a_fallback() {
+        let path = Path::new("/p/.aj/config.toml");
+        let (written, diag) = parse_layer("thinking = \"xhigh\"\n", path);
+        assert!(diag.is_empty(), "{diag:?}");
+        assert!(written.is_set("thinking"));
+
+        let (absent, diag) = parse_layer("theme = \"light\"\n", path);
+        assert!(diag.is_empty(), "{diag:?}");
+        assert!(!absent.is_set("thinking"));
+
+        // Both resolve to the same effective value, which is exactly why the
+        // layer is the only place statedness can be read from.
+        assert_eq!(
+            written.overlay_onto(&Config::default()).thinking,
+            absent.overlay_onto(&Config::default()).thinking,
+        );
     }
 
     #[test]

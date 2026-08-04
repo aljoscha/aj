@@ -48,7 +48,7 @@ use aj_agent::{BoxError, SubAgentRegistry, TaskRegistry};
 use aj_conf::{AgentEnv, Config, ConfigThinkingDisplay};
 use aj_models::ThinkingConfig;
 use aj_models::auth::AuthStorage;
-use aj_models::registry::{ModelInfo, validate_thinking_level};
+use aj_models::registry::{ModelInfo, default_thinking_level, validate_thinking_level};
 use aj_models::types::{Speed, UserContent};
 use aj_models::{speed_from_name, thinking_config_from_name, verbosity_from_name};
 use aj_session::{
@@ -941,6 +941,22 @@ impl SessionHost {
                 .map(thinking_level_for)
                 .unwrap_or(aj_models::types::ThinkingLevel::Off);
             validate_thinking_level(&run.model_info, &level).map_err(HostError::Unsupported)?;
+        } else {
+            // Unstated, so this axis is ours to default and we default it
+            // against the model actually chosen (spec section 8). Our own
+            // configured level was resolved for our own default model, and a
+            // creator who names a model without naming a level would otherwise
+            // inherit a level that model may have no word for.
+            let configured = run
+                .thinking
+                .as_ref()
+                .map(thinking_level_for)
+                .unwrap_or(aj_models::types::ThinkingLevel::Off);
+            let level = default_thinking_level(&run.model_info, &configured);
+            if level != configured {
+                run.thinking = thinking_config_from_name(level.as_str())
+                    .expect("a canonical level name parses");
+            }
         }
 
         Ok(run)
