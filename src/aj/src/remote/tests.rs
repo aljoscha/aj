@@ -847,6 +847,47 @@ fn main_rows(state: &CanonicalState) -> usize {
         .len()
 }
 
+/// The tools the main transcript's cells name, in order.
+fn main_tools(state: &CanonicalState) -> Vec<String> {
+    state
+        .agent(AgentId::Main)
+        .expect("a main transcript")
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            CanonicalEntry::Tool { tool, .. } => Some(tool.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The text of every finalized assistant row in the main transcript, in
+/// order, with each row's content blocks joined.
+fn assistant_texts(state: &CanonicalState) -> Vec<String> {
+    state
+        .agent(AgentId::Main)
+        .expect("a main transcript")
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            CanonicalEntry::Assistant {
+                finalized: true,
+                message,
+                ..
+            } => Some(
+                message["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|block| block["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join(""),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The `(status, finished)` of sub-agent `child`'s box in its parent's
 /// transcript.
 fn sub_box(state: &CanonicalState, child: usize) -> (SubAgentStatus, bool) {
@@ -918,10 +959,10 @@ async fn creation_applies_settings_and_runs_a_first_prompt() {
         Some("fast".to_string()),
         "the creator's settings are the session's settings (spec section 8)",
     );
-    let state = remote.canonical();
-    assert!(
-        format!("{state:?}").contains("hello from the script"),
-        "the first prompt ran its turn: {state:?}",
+    assert_eq!(
+        assistant_texts(&remote.canonical()),
+        vec!["hello from the script".to_string()],
+        "the first prompt ran its turn",
     );
     let list = fixture.client.sessions().await.expect("the sessions read");
     let summary = list
@@ -1385,9 +1426,10 @@ async fn a_prompt_drives_a_turn_observed_on_the_stream() {
 
     let state = remote.canonical();
     assert_eq!(main_rows(&state), TURN_ROWS, "the whole turn: {state:?}");
-    assert!(
-        format!("{state:?}").contains("todo_read"),
-        "the tool cell is there: {state:?}",
+    assert_eq!(
+        main_tools(&state),
+        vec!["todo_read".to_string()],
+        "the tool cell is there",
     );
     assert!(
         !remote.client.working(),

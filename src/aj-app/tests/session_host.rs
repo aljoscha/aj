@@ -290,6 +290,22 @@ async fn until_idle(stream: &mut Attachment) -> Vec<Frame> {
     frames_until(stream, "the turn to settle", idle_state).await
 }
 
+/// The `(steering, follow_up)` counts a `QueueUpdate` frame carries, or
+/// `None` for any other frame.
+fn queue_counts(frame: &Frame) -> Option<(usize, usize)> {
+    let Frame::Event { event, .. } = frame else {
+        return None;
+    };
+    match event.known()? {
+        AgentEvent::QueueUpdate {
+            steering,
+            follow_up,
+            ..
+        } => Some((steering.len(), follow_up.len())),
+        _ => None,
+    }
+}
+
 /// Drain frames until the session reports itself idle with no live
 /// background task, so a run whose background sub-agent outlives the
 /// parent turn is fully covered.
@@ -542,6 +558,20 @@ fn sub_box(state: &CanonicalState, child: usize) -> (aj_app::chat::SubAgentStatu
             _ => None,
         })
         .unwrap_or_else(|| panic!("no box for sub-agent {child}"))
+}
+
+/// The tools the main transcript's cells name, in order.
+fn main_tools(state: &CanonicalState) -> Vec<String> {
+    state
+        .agent(AgentId::Main)
+        .expect("main transcript")
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            aj_app::test_support::CanonicalEntry::Tool { tool, .. } => Some(tool.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The report sub-agent `child`'s box renders, which is what a client shows
@@ -1810,20 +1840,41 @@ async fn queue_mutations_reach_every_subscriber() {
         .await
         .expect("clear");
 
-    for client in [&mut one, &mut two] {
-        client.pump_until_idle().await;
-    }
-
-    // Count the queue updates each subscriber saw across its whole stream.
-    for (label, client) in [("first", &one), ("second", &two)] {
-        let seen = client.client.queue();
+    // The pending counts each subscriber was told about, in order. Ending
+    // empty is no evidence on its own: a client the fan-out handed nothing
+    // ends empty too, which is exactly what a broken fan-out looks like.
+    let mut seen = Vec::new();
+    for (label, client) in [("first", &mut one), ("second", &mut two)] {
+        let counts: Vec<(usize, usize)> = client
+            .pump_until_idle()
+            .await
+            .iter()
+            .filter_map(queue_counts)
+            .collect();
         assert!(
-            seen.queues
+            counts.iter().any(|&(steering, _)| steering > 0),
+            "the {label} client never saw the steering message queue up: {counts:?}",
+        );
+        assert!(
+            counts.iter().any(|&(_, follow_up)| follow_up > 0),
+            "the {label} client never saw a follow-up queue up: {counts:?}",
+        );
+        assert!(
+            client
+                .chat
+                .queue()
+                .queues
                 .iter()
                 .all(|queue| queue.steering.is_empty() && queue.follow_up.is_empty()),
-            "the {label} client's queue view ends empty: {seen:?}",
+            "the {label} client's queue view ends empty: {:?}",
+            client.chat.queue(),
         );
+        seen.push(counts);
     }
+    assert_eq!(
+        seen[0], seen[1],
+        "both subscribers were told the same sequence of queue states",
+    );
     harness.host.shutdown().await;
 }
 
@@ -3229,8 +3280,9 @@ async fn attaching_mid_turn_converges_with_a_client_attached_all_along() {
         "a mid-turn joiner converges",
     );
     assert_no_dangling(&joiner.chat);
-    assert!(
-        format!("{:?}", joiner.canonical()).contains("todo_read"),
+    assert_eq!(
+        main_tools(&joiner.canonical()),
+        vec!["todo_read".to_string()],
         "the compared state is a whole turn, tool cell included",
     );
     harness.host.shutdown().await;
