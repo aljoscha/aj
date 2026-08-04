@@ -613,6 +613,30 @@ impl ChatState {
                 )
             })
             .collect();
+        self.rebadge_launch_cells();
+    }
+
+    /// Re-attach the task badges the replaced table implies to the launch
+    /// cells that carry them.
+    ///
+    /// A live client badges a cell from `TaskStart`, which is transient: a
+    /// client that attached after the launch never sees it, so without this
+    /// its launch cell would stay unbadged even though it knows the task
+    /// exists. The read is authoritative for the whole session, so a badge
+    /// naming a task the read does not list is stale and goes.
+    fn rebadge_launch_cells(&mut self) {
+        let badges: HashMap<(AgentId, &str), TaskId> = self
+            .tasks
+            .iter()
+            .map(|(&id, info)| ((info.owner, info.call_id.as_str()), id))
+            .collect();
+        for (&agent, transcript) in &mut self.transcripts {
+            for entry in &mut transcript.entries {
+                if let EntryKind::Tool(cell) = &mut entry.kind {
+                    cell.task = badges.get(&(agent, cell.call_id.as_str())).copied();
+                }
+            }
+        }
     }
 
     /// Pending steering and follow-up messages known to this client.
@@ -1068,6 +1092,79 @@ mod tests {
             0,
             Arc::new(Vec::new()),
         )
+    }
+
+    /// A launch cell for `call_id`, as a client that only ever saw the
+    /// tool bracket holds it: badgeless, because `TaskStart` is transient.
+    fn launch_cell(chat: &mut ChatState, agent: AgentId, call_id: &str) {
+        chat.transcripts
+            .entry(agent)
+            .or_default()
+            .append(EntryKind::Tool(ToolEntry {
+                call_id: call_id.to_string(),
+                tool: "bash".into(),
+                args: Value::Null,
+                status: ToolStatus::Done { is_error: false },
+                details: None,
+                content: Arc::from(Vec::new()),
+                task: None,
+                header_only: false,
+            }));
+    }
+
+    fn task_row(id: TaskId, owner: AgentId, call_id: &str) -> aj_wire::TaskSummary {
+        aj_wire::TaskSummary {
+            id,
+            owner,
+            call_id: call_id.to_string(),
+            kind: TaskKind::Bash {
+                command: "sleep 1".into(),
+            },
+            label: "sleep 1".into(),
+            status: TaskStatus::Running,
+            started_at: Utc::now(),
+        }
+    }
+
+    /// The badge a live client gets from `TaskStart` is re-derived from the
+    /// task read, so a client that attached after the launch renders the same
+    /// cell. A badge the read does not account for is stale and goes.
+    #[test]
+    fn replacing_the_task_table_rebadges_the_launch_cells() {
+        let mut chat = chat_state();
+        launch_cell(&mut chat, AgentId::Main, "call-live");
+        launch_cell(&mut chat, AgentId::Sub(1), "call-sub");
+
+        chat.replace_tasks(TaskTable {
+            tasks: vec![
+                task_row(4, AgentId::Main, "call-live"),
+                task_row(9, AgentId::Sub(1), "call-sub"),
+            ],
+        });
+
+        let badge = |chat: &ChatState, agent: AgentId| {
+            chat.transcript(agent)
+                .expect("a transcript")
+                .entries()
+                .iter()
+                .find_map(|entry| match &entry.kind {
+                    EntryKind::Tool(cell) => Some(cell.task),
+                    _ => None,
+                })
+                .expect("a launch cell")
+        };
+        assert_eq!(badge(&chat, AgentId::Main), Some(4));
+        assert_eq!(
+            badge(&chat, AgentId::Sub(1)),
+            Some(9),
+            "badges are keyed by owner as well as call, not by call alone",
+        );
+
+        // A later read that no longer lists the task clears the badge rather
+        // than leaving one that resolves to nothing.
+        chat.replace_tasks(TaskTable::default());
+        assert_eq!(badge(&chat, AgentId::Main), None);
+        assert_eq!(badge(&chat, AgentId::Sub(1)), None);
     }
 
     #[test]

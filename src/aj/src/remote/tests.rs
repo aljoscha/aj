@@ -849,33 +849,28 @@ fn assert_converged_after_fault(remote: &Attached, oracle: &Attached, context: &
 /// usage.
 const TURN_ROWS: usize = 6;
 
-/// Drop a background launch cell's live-painted state from a comparison.
+/// Drop a tracked launch cell's body from a comparison.
 ///
 /// The reducer hands a *tracked* task's cell body to its `TaskOutput`
 /// snapshots rather than to the launch result, and `TaskStart` is unordered
 /// relative to the launch's own `ToolExecutionEnd`. So a client that saw the
-/// start first shows an empty body, while one that applied the same end out
-/// of a backfill (before the tasks read gave it a table) shows the launch
-/// text. The same split leaves `entry.task` set only for the live client.
-///
-/// Neither is regenerable from the log, and the badge both clients render
-/// comes from the persisted `ToolDetails::Bash` payload, which stays in the
-/// comparison along with everything else. Keyed on that payload's task id,
-/// so an ordinary tool cell's body is still compared.
-fn without_live_task_paint(mut state: CanonicalState) -> CanonicalState {
+/// start first shows an empty body, while one that applied the same end out of
+/// a backfill shows the launch text. The two converge on the task's first
+/// output, and both readings are honest for "running, nothing yet", so the
+/// body is excluded until then. Everything else about the cell is compared,
+/// including the badge, which the tasks read repairs
+/// (`ChatState::replace_tasks`). Keyed on the persisted payload's task id, so
+/// an ordinary tool cell's body is still compared.
+fn without_live_task_body(mut state: CanonicalState) -> CanonicalState {
     for agent in &mut state.agents {
         for entry in &mut agent.entries {
             if let CanonicalEntry::Tool {
-                task,
-                details,
-                content,
-                ..
+                details, content, ..
             } = entry
                 && details
                     .as_ref()
                     .is_some_and(|details| details["task_id"].is_u64())
             {
-                *task = None;
                 *content = serde_json::Value::Null;
             }
         }
@@ -1880,8 +1875,8 @@ async fn a_joiner_refetches_the_task_table_after_caught_up() {
         "the joiner's launch cell carries its badge in the persisted details: {cell}",
     );
     assert_canonical_eq(
-        &without_live_task_paint(joiner.canonical()),
-        &without_live_task_paint(oracle.canonical()),
+        &without_live_task_body(joiner.canonical()),
+        &without_live_task_body(oracle.canonical()),
         "a joiner with a live background task",
     );
     assert_no_dangling(&joiner.chat);
