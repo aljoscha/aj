@@ -832,53 +832,10 @@ fn assert_converged(remote: &Attached, oracle: &Attached, context: &str) {
     assert_no_dangling(&oracle.chat);
 }
 
-/// The same, across a connection fault: a transient notice raised entirely
-/// inside the disconnected window has no durable source to replay, which is
-/// what the canonical form's fault projection accounts for.
-#[track_caller]
-fn assert_converged_after_fault(remote: &Attached, oracle: &Attached, context: &str) {
-    assert_canonical_eq(
-        &remote.canonical().for_fault_comparison(),
-        &oracle.canonical().for_fault_comparison(),
-        context,
-    );
-    assert_no_dangling(&remote.chat);
-    assert_no_dangling(&oracle.chat);
-}
-
 /// The transcript rows one scripted tool turn renders: the prompt, the
 /// tool-calling message and its usage, the tool cell, the answer and its
 /// usage.
 const TURN_ROWS: usize = 6;
-
-/// Drop a tracked launch cell's body from a comparison.
-///
-/// The reducer hands a *tracked* task's cell body to its `TaskOutput`
-/// snapshots rather than to the launch result, and `TaskStart` is unordered
-/// relative to the launch's own `ToolExecutionEnd`. So a client that saw the
-/// start first shows an empty body, while one that applied the same end out of
-/// a backfill shows the launch text. The two converge on the task's first
-/// output, and both readings are honest for "running, nothing yet", so the
-/// body is excluded until then. Everything else about the cell is compared,
-/// including the badge, which the tasks read repairs
-/// (`ChatState::replace_tasks`). Keyed on the persisted payload's task id, so
-/// an ordinary tool cell's body is still compared.
-fn without_live_task_body(mut state: CanonicalState) -> CanonicalState {
-    for agent in &mut state.agents {
-        for entry in &mut agent.entries {
-            if let CanonicalEntry::Tool {
-                details, content, ..
-            } = entry
-                && details
-                    .as_ref()
-                    .is_some_and(|details| details["task_id"].is_u64())
-            {
-                *content = serde_json::Value::Null;
-            }
-        }
-    }
-    state
-}
 
 /// How many rows the main transcript holds, as a guard that a comparison is
 /// comparing a whole turn rather than converging on something empty.
@@ -1839,7 +1796,14 @@ async fn an_http_client_converges_with_an_in_process_oracle() {
 
 /// The task table is not replayable, so a client owes the tasks read after
 /// every `caught_up` (spec 6.5, 6.7). A joiner that arrives after the task
-/// started has to end up with the table a client that watched it start has.
+/// started has to end up with the table a client that watched it start has,
+/// and with the same launch cell: badge, structured body and wire content.
+///
+/// The scripted task is quiet, which is what makes the whole canonical state
+/// comparable here. A task that streamed output before the joiner attached
+/// would leave the two apart on that cell's structured body: `TaskOutput` is
+/// lossy, the newest snapshot is the only carrier of a task's rolling output,
+/// and nothing re-sends it to a client that was not connected for it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_joiner_refetches_the_task_table_after_caught_up() {
     let fixture = Fixture::new(background_task_turn()).await;
@@ -1861,24 +1825,30 @@ async fn a_joiner_refetches_the_task_table_after_caught_up() {
         1,
         "the joiner's table came from the read: a backfill carries no task events",
     );
-    let cell = joiner
+    let launch = joiner
         .canonical()
         .agent(AgentId::Main)
         .expect("a main transcript")
         .entries
         .iter()
         .find_map(|entry| match entry {
-            CanonicalEntry::Tool { details, .. } => details.clone(),
+            CanonicalEntry::Tool { task, details, .. } => Some((*task, details.clone())),
             _ => None,
         })
         .expect("the launch cell");
-    assert!(
-        cell.to_string().contains(r#""task_id":1"#),
-        "the joiner's launch cell carries its badge in the persisted details: {cell}",
+    assert_eq!(
+        launch.0,
+        Some(1),
+        "the tasks read badged the joiner's launch cell",
+    );
+    assert_eq!(
+        launch.1.as_ref().map(|details| &details["task_id"]),
+        Some(&serde_json::json!(1)),
+        "and the persisted details name the task too",
     );
     assert_canonical_eq(
-        &without_live_task_body(joiner.canonical()),
-        &without_live_task_body(oracle.canonical()),
+        &joiner.canonical(),
+        &oracle.canonical(),
         "a joiner with a live background task",
     );
     assert_no_dangling(&joiner.chat);
@@ -1983,7 +1953,7 @@ async fn converges_after_a_cut(script: Vec<AssistantMessage>, cut: usize) -> boo
         TURN_ROWS,
         "the compared state is a whole turn",
     );
-    assert_converged_after_fault(&remote, &oracle, &format!("a cut after {folded} frames"));
+    assert_converged(&remote, &oracle, &format!("a cut after {folded} frames"));
     fixture.shutdown().await;
     interrupted < complete
 }
@@ -2055,7 +2025,7 @@ async fn a_cut_between_a_tool_end_and_its_durable_message_converges() {
     remote.settle().await;
 
     assert_eq!(main_rows(&oracle.canonical()), TURN_ROWS);
-    assert_converged_after_fault(&remote, &oracle, "a cut on the tool-end boundary");
+    assert_converged(&remote, &oracle, "a cut on the tool-end boundary");
     fixture.shutdown().await;
 }
 
@@ -2196,7 +2166,7 @@ async fn frames_from_a_stale_epoch_are_dropped_until_a_reattach() {
     // serve from it, and here that is everything.
     remote.reattach().await;
     remote.settle().await;
-    assert_converged_after_fault(&remote, &fresh, "a full backfill under the new epoch");
+    assert_converged(&remote, &fresh, "a full backfill under the new epoch");
     assert_eq!(
         remote.client.cursor().map(|cursor| cursor.epoch),
         fresh.client.cursor().map(|cursor| cursor.epoch),

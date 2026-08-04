@@ -458,20 +458,6 @@ impl CanonicalState {
         }
     }
 
-    /// Returns the convergence oracle used across a connection fault.
-    ///
-    /// Transient notice rows can be emitted entirely inside the disconnected
-    /// window and have no durable source to replay. Durable notices retain an
-    /// entry id and remain part of the comparison.
-    pub fn for_fault_comparison(mut self) -> Self {
-        for agent in &mut self.agents {
-            agent
-                .entries
-                .retain(|entry| !matches!(entry, CanonicalEntry::Notice { entry: None, .. }));
-        }
-        self
-    }
-
     /// The projection of one agent, for tests that assert on a single
     /// transcript.
     pub fn agent(&self, id: AgentId) -> Option<&CanonicalAgent> {

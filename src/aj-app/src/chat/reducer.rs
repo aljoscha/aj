@@ -258,15 +258,20 @@ pub fn reduce(
                     Value::Object(Default::default()),
                 ),
             };
-            // A bash result carrying a task id is a background launch,
-            // and a tracked task's cell body belongs to its `TaskOutput`
-            // snapshots, not to the launch result: the launch's own
-            // snapshot is empty, so re-projecting this bracket would
-            // blank whatever the task has streamed since (`TaskEnd` never
-            // repaints, and the next snapshot is not guaranteed either).
-            // An untracked task (a resumed cell, or a client that never
-            // saw `TaskStart`) has nobody else to paint it, so the result
-            // lands.
+            // A bash result carrying a task id is a background launch, and a
+            // tracked task's *structured* body belongs to its `TaskOutput`
+            // snapshots rather than to the launch result: the launch's own
+            // snapshot is empty, so re-projecting this bracket would blank
+            // whatever the task has streamed since (`TaskEnd` never repaints,
+            // and the next snapshot is not guaranteed either). An untracked
+            // task (a resumed cell, or a client that joined after the launch)
+            // has nobody else to paint it, so the result lands.
+            //
+            // The wire content is never contested: `TaskOutput` carries none,
+            // so no snapshot can have painted it, and it is the durable result
+            // the model saw. Freezing it too would make the cell's content
+            // depend on whether `TaskStart` won its race with this event,
+            // which is a race the launching tool documents as either-order.
             let mut frozen = false;
             if let ToolDetails::Bash {
                 task_id: Some(task_id),
@@ -277,9 +282,9 @@ pub fn reduce(
             }
             if let Some(cell) = state.tool_entry_mut(agent_id, id) {
                 cell.status = ToolStatus::Done { is_error };
+                cell.content = content;
                 if !frozen {
                     cell.details = Some(result);
-                    cell.content = content;
                 }
             }
             Redraw(true)
@@ -3912,6 +3917,46 @@ mod tests {
             }
             other => panic!("expected bash details, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_background_launch_s_wire_content_lands_whichever_order_task_start_arrives_in() {
+        // The launching tool's driver races its own return, so `TaskStart`
+        // lands on either side of the launch's `ToolExecutionEnd`. The
+        // structured body is contested (the task's snapshots own it) but the
+        // wire content is not, so the cell must read the same either way.
+        let launch = AgentEvent::ToolExecutionEnd {
+            agent_id: AgentId::Main,
+            call_id: "c1".into(),
+            tool: "bash".into(),
+            result: bash_task_details("", Some(1)),
+            content: Arc::from(vec![UserContent::text("Started background task #1")]),
+            is_error: false,
+        };
+        let start = AgentEvent::TaskStart {
+            agent_id: AgentId::Main,
+            task_id: 1,
+            call_id: "c1".into(),
+            kind: TaskKind::Bash {
+                command: "sleep 5".into(),
+            },
+            label: "sleep 5".into(),
+        };
+
+        let content_of = |events: Vec<AgentEvent>| {
+            let mut s = state();
+            let mut life = AgentLifecycle::default();
+            apply(&mut s, &mut life, tool_start(AgentId::Main, "c1", "bash"));
+            for event in events {
+                apply(&mut s, &mut life, event);
+            }
+            joined_user_text(&only_tool(&s, AgentId::Main).content)
+        };
+
+        assert_eq!(
+            content_of(vec![start.clone(), launch.clone()]),
+            content_of(vec![launch, start]),
+        );
     }
 
     #[test]
