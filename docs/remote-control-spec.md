@@ -608,7 +608,17 @@ Attention is client-relative state and stays client-side.
 
 `list` frames are lossy-coalescible (section 6.4), and the host
 debounces them: `last_seq` churn during a busy turn must not produce a
-frame per event, a short coalescing tick bounds the rate.
+frame per event, a short coalescing tick bounds the rate. Producing
+one must also be cheap, because session events are the frequent
+trigger: a refresh does no disk I/O for live sessions (the host
+already holds their `last_seq` and status in memory, reading the log
+back to recount entries is never correct), and the on-disk remainder
+is served from caches invalidated by directory change, never by
+session events. Per-file work on refresh (format sniffing, entry
+counting) caches on facts that actually change (a file's format
+never does). Violating this turns the list publisher into a
+steady-state I/O storm: a debounced refresh that rescans a large
+session directory reads hundreds of gigabytes over a working day.
 
 ### 6.9 Flow control
 
