@@ -1051,9 +1051,14 @@ before the next begins.
   logs make that expensive. The local resume used to defer sub-thread
   projection for this reason and the wire has no deferred variant, so
   the local frontend gave the deferral up when it became a client. v1
-  accepts it, mitigated by cursors making steady-state re-attaches cheap
-  and the sidebar attaching lazily. A thread-scoped backfill is the
-  follow-up if it hurts.
+  accepts that deliberately: deferral would break the "cursor =
+  applied prefix of one seq space" invariant that catch-up, dedup, and
+  re-attach reconciliation rest on, turning the cursor into per-thread
+  state and multiplying the sharp-edge cases in the protocol's riskiest
+  layer. The cost is paid once at first attach, steady-state
+  re-attaches are incremental via cursors, and the sidebar attaches
+  lazily. A thread-scoped backfill is cleanly additive later (a
+  capability) if a real session hurts.
 - Suffix projection interacts with interleaved background-sub logs
   (the projection re-opens brackets with synthesized fallback starts).
   The reconciliation rules cover the client side, but this area is
