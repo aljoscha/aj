@@ -648,7 +648,7 @@ async fn branch_focused_session(
         app.request_redraw();
         return;
     }
-    if let Err(err) = reattach(world).await {
+    if let Err(err) = reattach(world, shell).await {
         // The switch took but the stream did not reopen, so the transcript
         // on screen describes a branch the session left.
         fold_warning(world, &format!("Lost the session's event stream: {err}"));
@@ -667,12 +667,18 @@ async fn branch_focused_session(
 /// through the block's opening `state` frame, which resets the chat model
 /// before the new branch's backfill lands. A `reset` frame still queued on
 /// the outgoing stream goes away with it.
-async fn reattach(world: &mut World) -> Result<(), HostError> {
+async fn reattach(world: &mut World, shell: &Rc<RefCell<Shell>>) -> Result<(), HostError> {
     let mut attachment = open_stream(&world.host, &world.session, &mut world.client).await?;
     std::mem::swap(&mut world.attachment, &mut attachment);
     drop(attachment);
     fold_ready_frames(world);
     refresh_client_reads(world).await;
+    // Adopting an epoch resets the chat model, and both the transcript's
+    // render cache and the image store are keyed by entry id, which is a
+    // per-transcript counter that starts over with it. Dropping the view back
+    // to the tail is what clears that cache, so a row of the branch we left
+    // cannot be reused for a different entry of the one we joined.
+    shell.borrow().transcript.borrow_mut().reset_to_tail();
     Ok(())
 }
 
@@ -1361,14 +1367,19 @@ async fn handle_host_action(
 ) -> bool {
     match action {
         AjAction::CancelTurn => {
-            if cancel_viewed_turn(world).await {
-                // Don't discard what the user lined up: pull any queued
-                // message back into the editor (matching `aj`). Without
-                // this, the post-turn wake would deliver it right after
-                // the cancel.
-                return yank_pending_into_editor(world, shell).await;
+            // Nothing running: the chord falls through to the quit ladder,
+            // and a message still queued stays queued.
+            let active = world.chat.borrow().active_view();
+            if !view_busy(world, active) {
+                return false;
             }
-            false
+            // Don't discard what the user lined up: pull any queued message
+            // back into the editor (matching `aj`). Withdrawn *before* the
+            // cancel, because the host reaps the cancelled turn itself and its
+            // post-turn wake delivers whatever is still queued when it does.
+            let yanked = yank_pending_into_editor(world, shell).await;
+            cancel_viewed_turn(world).await;
+            yanked
         }
         AjAction::Steer => {
             // Steering is incoherent with an armed branch anchor: it would
@@ -5338,7 +5349,8 @@ mod tests {
     use std::io::{PipeWriter, Write};
     use std::sync::Arc;
 
-    use aj_app::chat::{EntryKind, NoticeLevel, SubAgentStatus, ToolStatus};
+    use aj_app::chat::{EntryKind, NoticeLevel, SubAgentStatus, ToolStatus, reduce};
+    use aj_app::session::AgentLifecycle;
     use clap::Parser;
     use tempfile::TempDir;
     use vaxis::gwidth;
@@ -5430,8 +5442,8 @@ mod tests {
         shell.rebind(&world);
         let expected = aj_app::session::window_title(
             APP_TITLE,
-            &world.core.session_id,
-            &world.core.env.working_directory,
+            &world.session,
+            &world.handles.env.working_directory,
         );
         assert_eq!(shell.window_title, expected);
         assert_ne!(
@@ -5449,7 +5461,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let world = scripted_world(&dir, "streaming-text").await;
         world
-            .core
+            .handles
             .task_registry
             .push_notice(aj_agent::tool::TaskNotice {
                 owner: AgentId::Main,
@@ -5902,15 +5914,106 @@ mod tests {
         assert!(has_warning, "expected a keybindings warning notice");
     }
 
+    /// Every wait on the host in these tests is bounded by this, so a wedged
+    /// session fails a test instead of hanging CI.
+    const SETTLE_DEADLINE: Duration = Duration::from_secs(20);
+
+    /// Fold frames until the focused session reports itself idle with no live
+    /// background task, which is what the drive loop's frame arm plus its
+    /// per-iteration drain do while a turn runs.
+    ///
+    /// The liveness question goes to the host rather than to the client's
+    /// lifecycle, so a demo whose background sub-agent outlives its parent
+    /// turn is covered too.
+    async fn settle(world: &mut World) {
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        loop {
+            fold_ready_frames(world);
+            let quiet = world
+                .host
+                .sessions()
+                .await
+                .expect("session list")
+                .sessions
+                .iter()
+                .find(|entry| entry.id == world.session)
+                .is_some_and(|entry| !entry.working && entry.tasks == 0);
+            if quiet {
+                // The frames of the work that just finished may have been
+                // published after the read above.
+                fold_ready_frames(world);
+                return;
+            }
+            assert!(Instant::now() < deadline, "the session never went quiet",);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// Drive one scripted turn to completion so the session's log lands on disk
     /// and can be resumed by the session-switch paths.
     async fn persist_session(world: &mut World) {
-        handle_submit(world, "persist me".to_string());
-        let joined = world.turns.join_next().await;
-        handle_turn_join(world, joined).expect("turn settles cleanly");
-        if let Ok(first) = world.event_rx.try_recv() {
-            let _ = drain_events(world, first);
-        }
+        handle_submit(world, "persist me".to_string()).await;
+        settle(world).await;
+    }
+
+    /// Point the focused session at a slowly streamed script, so a turn
+    /// started against it is still in flight while the test asserts on it.
+    ///
+    /// The scripted demos hold a fixed number of inferences and end a turn
+    /// immediately once they run out, so a test that needs a session to stay
+    /// busy installs its own script. It goes in through the live run config,
+    /// which is what the host stamps onto the agent at every turn start.
+    fn install_busy_script(world: &World) {
+        let messages = vec![aj_app::test_support::finalized_text_message(
+            "a slowly streamed answer",
+        )];
+        let mut cfg = world
+            .handles
+            .run_config
+            .lock()
+            .expect("run config mutex poisoned");
+        cfg.provider = Arc::new(aj_models::scripted::ScriptedProvider::from_messages(
+            messages,
+            1,
+            Duration::from_millis(50),
+        ));
+    }
+
+    /// Shut a world's host down, which releases the advisory locks its live
+    /// sessions hold and flushes their logs.
+    ///
+    /// A second host over the same store (what [`resumed_world`] builds)
+    /// refuses to materialize a session another host holds live, so a test
+    /// that resumes what it just wrote has to let go of it first.
+    ///
+    /// The chat model outlives it: it is a plain `Rc` the host never sees, so
+    /// a test can shut the host down and then assert on what it left behind,
+    /// which is also how it avoids holding a `RefCell` borrow across the
+    /// await.
+    async fn shut_down(world: &World) {
+        world.host.shutdown().await;
+    }
+
+    /// A resumed world plus the Shell and app the focus-change paths need.
+    async fn resumed_world_shell_app(
+        dir: &TempDir,
+        demo: &str,
+        session_id: &str,
+    ) -> (World, Rc<RefCell<Shell>>, AsyncApp, PipeWriter, WidgetRef) {
+        let world = resumed_world(dir, demo, session_id).await;
+        let shell = shell_for(&world);
+        let root: WidgetRef = to_widget_ref(Rc::clone(&shell));
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        writer.write_all(b"\x1b[?c").expect("write DA1 reply");
+        let mut app = AsyncApp::new(
+            Vaxis::new(VaxisOptions::default()),
+            Box::new(TestTty::new()),
+            reader.into(),
+        );
+        app.init(Rc::clone(&root), Options::default())
+            .await
+            .expect("init");
+        (world, shell, app, writer, root)
     }
 
     /// A world resumed from `session_id`, reusing `dir`'s persistence so the
@@ -5925,30 +6028,11 @@ mod tests {
     }
 
     /// Submit a prompt and drive a scripted demo, including its sub-agent
-    /// turns, to full completion so the persisted log holds complete
-    /// sub-agent runs.
-    ///
-    /// Loops join + drain, spawning any earned post-turn wakes, until no
-    /// turn is in flight. A single join + drain (as in [`persist_session`])
-    /// is enough for a one-turn demo, but a multi-agent demo can leave
-    /// wake turns behind, so we settle the whole join set.
+    /// turns and the wakes they earn, to full completion so the persisted log
+    /// holds complete sub-agent runs.
     async fn drive_demo_to_completion(world: &mut World) {
-        handle_submit(world, "run the demo".to_string());
-        loop {
-            if !world.turns.is_empty() {
-                let joined = world.turns.join_next().await;
-                handle_turn_join(world, joined).expect("turn settles cleanly");
-            }
-            let mut wakes = Vec::new();
-            if let Ok(first) = world.event_rx.try_recv() {
-                let (_, targets) = drain_events(world, first);
-                wakes = targets;
-            }
-            spawn_wakes(world, wakes);
-            if world.turns.is_empty() {
-                break;
-            }
-        }
+        handle_submit(world, "run the demo".to_string()).await;
+        settle(world).await;
     }
 
     /// A shell wrapping `world`'s chat and queues, for the resume/observe
@@ -5958,13 +6042,22 @@ mod tests {
         Rc::new(RefCell::new(Shell::new(
             Rc::clone(&world.chat),
             Rc::clone(&world.status),
-            world.core.message_queues.clone(),
-            world.core.task_registry.clone(),
+            world.handles.queues.clone(),
+            world.handles.task_registry.clone(),
             ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor)),
             "aj".to_string(),
             "",
             PathBuf::from("/tmp"),
         )))
+    }
+
+    /// The lowest sub-agent index the Main transcript holds a box for.
+    fn first_sub(chat: &ChatState) -> usize {
+        sub_boxes(chat)
+            .into_iter()
+            .map(|(n, ..)| n)
+            .min()
+            .expect("a sub-agent box")
     }
 
     /// The sub-agent boxes in the Main transcript, as `(child, status,
@@ -6117,7 +6210,7 @@ mod tests {
         );
         let mut life = AgentLifecycle::default();
         {
-            let log = world.core.log.lock().await;
+            let log = world.handles.log.lock().await;
             for event in aj_session::replay(&log) {
                 let _ = reduce(&mut eager, &mut life, event, None);
             }
@@ -6127,33 +6220,31 @@ mod tests {
     }
 
     /// Resume a session and confirm every sub-agent box is present, `Done`,
-    /// and reporting, while its transcript stays empty until observed: the
-    /// deferred-replay contract.
+    /// and reporting, with its transcript already projected.
+    ///
+    /// The attach block projects sub threads eagerly, so a resumed session
+    /// has nothing left to materialize on demand (spec 6.5, and section 13's
+    /// accepted backfill cost).
     #[tokio::test]
-    async fn resume_defers_subagent_transcripts() {
+    async fn a_resume_projects_every_subagent_transcript() {
         let dir = TempDir::new().expect("tempdir");
         let mut world = scripted_world(&dir, "parallel-agents").await;
         drive_demo_to_completion(&mut world).await;
-        let session_id = world.core.session_id.clone();
+        let session_id = world.session.clone();
+        shut_down(&world).await;
 
         let resumed = resumed_world(&dir, "parallel-agents", &session_id).await;
         let boxes = sub_boxes(&resumed.chat.borrow());
-
         assert!(
-            !resumed.deferred_subs.is_empty(),
-            "the demo spawns sub-agents, so the resume defers them"
-        );
-        let box_indices: HashSet<usize> = boxes.iter().map(|(n, _, _, _)| *n).collect();
-        assert_eq!(
-            resumed.deferred_subs, box_indices,
-            "deferred set is exactly the resumed sub-agent boxes"
+            !boxes.is_empty(),
+            "the demo spawns sub-agents, so the resume has boxes to project"
         );
 
         for (n, status, report, task) in &boxes {
             assert_eq!(
                 *status,
                 SubAgentStatus::Done,
-                "resumed box Sub({n}) is Done (replay closes the bracket)"
+                "resumed box Sub({n}) is Done (the projection closes the bracket)"
             );
             assert!(
                 report.as_deref().is_some_and(|r| !r.is_empty()),
@@ -6168,34 +6259,31 @@ mod tests {
                 .transcript(AgentId::Sub(*n))
                 .unwrap_or_else(|| panic!("Sub({n}) transcript slot present"));
             assert!(
-                transcript.entries().is_empty(),
-                "Sub({n}) transcript is deferred, so empty until observed"
+                !transcript.entries().is_empty(),
+                "Sub({n})'s transcript is projected, not deferred"
             );
         }
+        shut_down(&resumed).await;
     }
 
-    /// Observing a deferred sub-agent materializes its transcript on demand,
-    /// switches the view to it, and produces the same entry shape the eager
-    /// replay path builds.
+    /// Observing a resumed sub-agent switches the view to it and shows the
+    /// same entry shape the eager replay path builds.
     #[tokio::test]
-    async fn observe_materializes_a_deferred_subagent() {
+    async fn observing_a_resumed_subagent_matches_the_eager_replay() {
         let dir = TempDir::new().expect("tempdir");
         let mut world = scripted_world(&dir, "parallel-agents").await;
         drive_demo_to_completion(&mut world).await;
-        let session_id = world.core.session_id.clone();
+        let session_id = world.session.clone();
+        shut_down(&world).await;
 
         let mut resumed = resumed_world(&dir, "parallel-agents", &session_id).await;
         let shell = shell_for(&resumed);
-        let n = *resumed
-            .deferred_subs
-            .iter()
-            .min()
-            .expect("a deferred sub-agent to observe");
+        let n = first_sub(&resumed.chat.borrow());
 
         // What the eager path produces for Sub(n): full `replay` reduced into
         // a throwaway chat over the same log, with Sub(n) set active so its
         // tool cells reconcile to `header_only == false` exactly as the
-        // materialized world will once observe makes Sub(n) active. Comparing
+        // attached world will once observe makes Sub(n) active. Comparing
         // the richer shape (not just the kind) catches a divergence in tool
         // args, message text, `finalized`, or `header_only`.
         let (eager_shape, eager_report) = {
@@ -6208,8 +6296,8 @@ mod tests {
             (transcript_shape(&eager, AgentId::Sub(n)), report)
         };
 
-        // The box report the resume produced, captured before observe so we can
-        // prove observe does not touch it.
+        // The box report the attach block produced, captured before observe so
+        // we can prove observe does not touch it.
         let resume_report = sub_boxes(&resumed.chat.borrow())
             .into_iter()
             .find(|(m, _, _, _)| *m == n)
@@ -6228,23 +6316,22 @@ mod tests {
         .await;
         assert!(matches!(effect, ActionEffect::Redraw));
 
-        assert!(
-            !resumed.deferred_subs.contains(&n),
-            "Sub({n}) left the deferred set on observe"
-        );
         assert_eq!(
             resumed.chat.borrow().active_view(),
             AgentId::Sub(n),
             "observe switches the active view to the sub-agent"
         );
 
+        // Let the host go before reading the model it left behind, so no
+        // borrow spans the teardown await.
+        shut_down(&resumed).await;
         let chat = resumed.chat.borrow();
         let transcript = chat
             .transcript(AgentId::Sub(n))
             .expect("Sub(n) transcript materialized");
         assert!(
             !transcript.entries().is_empty(),
-            "materialized transcript has entries"
+            "the projected transcript has entries"
         );
         assert!(
             transcript
@@ -6262,17 +6349,16 @@ mod tests {
         );
         // Parity with the eager path: same entries and payloads, with
         // `header_only` reconciled the same way now that both views point at
-        // Sub(n). So the materialized transcript equals what a full resume
+        // Sub(n). So the backfilled transcript equals what a full replay
         // would build.
         assert_eq!(
             transcript_shape(&chat, AgentId::Sub(n)),
             eager_shape,
-            "materialized transcript matches the eager replay on kind, \
+            "the backfilled transcript matches the eager replay on kind, \
              header_only, finalized, and payload"
         );
-        // Observe is a pure read of box metadata: the report is unchanged by
-        // materializing the transcript, so it still equals both its resume-time
-        // value and the eager resume's.
+        // Observe is a pure view switch: the report is unchanged, so it still
+        // equals both its attach-time value and the eager replay's.
         let post_observe_report = sub_boxes(&chat)
             .into_iter()
             .find(|(m, _, _, _)| *m == n)
@@ -6288,22 +6374,18 @@ mod tests {
         );
     }
 
-    /// Re-observing a materialized sub-agent is a no-op: its transcript is
-    /// unchanged and it stays out of the deferred set.
+    /// Re-observing a sub-agent is a no-op: its transcript is unchanged.
     #[tokio::test]
     async fn re_observe_is_idempotent() {
         let dir = TempDir::new().expect("tempdir");
         let mut world = scripted_world(&dir, "parallel-agents").await;
         drive_demo_to_completion(&mut world).await;
-        let session_id = world.core.session_id.clone();
+        let session_id = world.session.clone();
+        shut_down(&world).await;
 
         let mut resumed = resumed_world(&dir, "parallel-agents", &session_id).await;
         let shell = shell_for(&resumed);
-        let n = *resumed
-            .deferred_subs
-            .iter()
-            .min()
-            .expect("a deferred sub-agent to observe");
+        let n = first_sub(&resumed.chat.borrow());
 
         apply_picker_outcome(
             &mut resumed,
@@ -6333,41 +6415,35 @@ mod tests {
         )
         .await;
 
-        assert!(
-            !resumed.deferred_subs.contains(&n),
-            "re-observe leaves Sub({n}) out of the deferred set"
-        );
         let count_after_second = resumed
             .chat
             .borrow()
             .transcript(AgentId::Sub(n))
-            .expect("still materialized")
+            .expect("still projected")
             .entries()
             .len();
         assert_eq!(
             count_after_first, count_after_second,
-            "re-observe does no materialize work, so the transcript is intact"
+            "re-observe touches no transcript, so it is intact"
         );
+        shut_down(&resumed).await;
     }
 
-    /// After materializing a sub-agent, switching the active view away and
-    /// back flips its tool cells' `header_only` flags exactly as the eager
-    /// path leaves them with the sub active. This pins the reconcile in
-    /// `set_active_view` for a resumed, lazily materialized transcript.
+    /// Switching the active view away from a resumed sub-agent and back flips
+    /// its tool cells' `header_only` flags exactly as the eager path leaves
+    /// them with the sub active. This pins the reconcile in
+    /// `set_active_view` for a backfilled transcript.
     #[tokio::test]
     async fn header_only_reconciles_across_view_switches() {
         let dir = TempDir::new().expect("tempdir");
         let mut world = scripted_world(&dir, "parallel-agents").await;
         drive_demo_to_completion(&mut world).await;
-        let session_id = world.core.session_id.clone();
+        let session_id = world.session.clone();
+        shut_down(&world).await;
 
         let mut resumed = resumed_world(&dir, "parallel-agents", &session_id).await;
         let shell = shell_for(&resumed);
-        let n = *resumed
-            .deferred_subs
-            .iter()
-            .min()
-            .expect("a deferred sub-agent to observe");
+        let n = first_sub(&resumed.chat.borrow());
 
         // Eager reference: Sub(n) active, so its tool cells are expanded.
         let eager_header_only = {
@@ -6379,8 +6455,7 @@ mod tests {
             "the sub-agent has tool cells to reconcile"
         );
 
-        // Observe makes Sub(n) active and materializes it, expanding its
-        // tool cells.
+        // Observe makes Sub(n) active, expanding its tool cells.
         apply_picker_outcome(
             &mut resumed,
             &shell,
@@ -6411,60 +6486,54 @@ mod tests {
             eager_header_only,
             "returning to the sub reconciles header_only to the eager result"
         );
+        shut_down(&resumed).await;
     }
 
-    /// Switching from a session with deferred sub-agents to a fresh session
-    /// replaces the deferred set, so the old indices cannot leak.
+    /// Switching from a session full of sub-agents to a fresh one replaces
+    /// the transcripts wholesale, so no box or child thread of the outgoing
+    /// session can leak into the new one's view.
     #[tokio::test]
-    async fn session_switch_replaces_deferred_subs() {
+    async fn a_session_switch_replaces_the_subagent_transcripts() {
         let dir = TempDir::new().expect("tempdir");
-        let mut world = scripted_world(&dir, "parallel-agents").await;
+        let (mut world, shell, mut app, _writer, _root) =
+            world_shell_app(&dir, "parallel-agents", default_layers()).await;
         drive_demo_to_completion(&mut world).await;
-        let previous_id = world.core.session_id.clone();
-
-        // Resume the sub-agent session so the world carries a non-empty
-        // deferred set, then switch onto a fresh session over it.
-        let mut resumed = resumed_world(&dir, "parallel-agents", &previous_id).await;
         assert!(
-            !resumed.deferred_subs.is_empty(),
-            "the resumed session has deferred sub-agents"
+            !sub_boxes(&world.chat.borrow()).is_empty(),
+            "the demo spawned sub-agents to leave behind"
         );
-        let shell = shell_for(&resumed);
 
-        let fresh = build_next_session(
-            &resumed,
-            SessionSpec::Create {
-                entry: SessionEntry::Switch,
-            },
-            &previous_id,
-            false,
-        )
-        .await
-        .expect("build fresh next session");
-        install_next_session(&mut resumed, &shell, fresh);
+        let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
+        assert!(matches!(moved, Focus::Moved));
 
+        shut_down(&world).await;
+        let chat = world.chat.borrow();
         assert!(
-            resumed.deferred_subs.is_empty(),
-            "a fresh session has no deferred subs, and the old set did not leak"
+            sub_boxes(&chat).is_empty(),
+            "a fresh session shows none of the previous session's boxes"
+        );
+        assert!(
+            chat.transcript(AgentId::Sub(1)).is_none(),
+            "and none of its child transcripts"
         );
     }
 
     /// A session aborted mid sub-agent run (a torn final line and a log cut
     /// short) still resumes: the repair drops the torn record, every box is
-    /// `Done`, and observing one materializes its flushed history without
-    /// panicking.
+    /// `Done`, and the torn sub's flushed history projects without panicking.
     #[tokio::test]
     async fn aborted_session_resume_loads_and_observes() {
         let dir = TempDir::new().expect("tempdir");
         let mut world = scripted_world(&dir, "parallel-agents").await;
         drive_demo_to_completion(&mut world).await;
-        let session_id = world.core.session_id.clone();
+        let session_id = world.session.clone();
         let log_path = {
-            let log = world.core.log.lock().await;
+            let log = world.handles.log.lock().await;
             log.path().to_path_buf()
         };
-        // Drop the world so no open handle races the on-disk rewrite.
-        drop(world);
+        // Let the host go so nothing holds the log open while it is rewritten
+        // on disk, and so the resume below can take the session's lock.
+        shut_down(&world).await;
 
         // Truncate mid sub-agent run: keep every complete line up to the last
         // sub-agent line, then tear that line in half. `ConversationLog::resume`
@@ -6515,18 +6584,16 @@ mod tests {
             );
         }
 
-        // The truncation cuts sub `torn_sub` mid run, so its box is deferred.
-        // Fail loudly rather than silently skip the materialize check if the
-        // truncation ever stops covering a sub-agent.
-        assert!(
-            !resumed.deferred_subs.is_empty(),
-            "the truncated log still holds deferred sub-agents"
-        );
-        assert!(
-            resumed.deferred_subs.contains(&torn_sub),
-            "the torn sub-agent Sub({torn_sub}) is deferred"
-        );
+        // The truncation cuts sub `torn_sub` mid run. Fail loudly rather than
+        // silently skip the parity check if the truncation ever stops
+        // covering a sub-agent.
         let n = torn_sub;
+        assert!(
+            sub_boxes(&resumed.chat.borrow())
+                .iter()
+                .any(|(m, ..)| *m == n),
+            "the truncated log still holds the torn sub-agent Sub({n})"
+        );
 
         // The eager (full-replay) resume over the SAME truncated, repaired log,
         // with Sub(n) set active. This is the reference a non-lazy resume would
@@ -6539,11 +6606,11 @@ mod tests {
             .map(|(_, _, report, _)| report)
             .expect("eager box for Sub(n)");
 
-        // Resume-time report parity: the lazy resume and the eager resume agree
-        // on the box report. Sub(n) is tool-concluding here (its last flushed
-        // entry is a tool result, its concluding assistant text was torn off),
-        // so per spec both show an empty report (a thin box). This is the "the
-        // report matches, per spec" guarantee.
+        // Report parity: the attach block's projection and the eager replay
+        // agree on the box report. Sub(n) is tool-concluding here (its last
+        // flushed entry is a tool result, its concluding assistant text was
+        // torn off), so per spec both show an empty report (a thin box). This
+        // is the "the report matches, per spec" guarantee.
         let resumed_report = sub_boxes(&resumed.chat.borrow())
             .into_iter()
             .find(|(m, _, _, _)| *m == n)
@@ -6561,22 +6628,18 @@ mod tests {
             AgentPickerOutcome::Observe(AgentId::Sub(n)),
         )
         .await;
-        assert!(
-            !resumed.deferred_subs.contains(&n),
-            "observe materialized Sub({n})"
-        );
 
-        // Observing reads the actual flushed history from the repaired log:
-        // the materialized transcript equals the eager resume's, entry for
-        // entry, including tool args and `header_only`.
+        // The backfill projected the actual flushed history from the repaired
+        // log: the transcript equals the eager resume's, entry for entry,
+        // including tool args and `header_only`.
         assert_eq!(
             transcript_shape(&resumed.chat.borrow(), AgentId::Sub(n)),
             eager_shape,
-            "the materialized transcript equals the eager resume's flushed history"
+            "the projected transcript equals the eager resume's flushed history"
         );
 
-        // Observe is a pure read of box metadata: materializing Sub(n)'s
-        // transcript does not rewrite its box report. `parallel-agents` runs
+        // Observe is a pure view switch: it does not rewrite Sub(n)'s box
+        // report. `parallel-agents` runs
         // its two subs concurrently, so their entries interleave in the log's
         // append order and replay opens/closes each bracket several times. For
         // such an interleaved sub the report set by `SubAgentEnd` (bracket
@@ -6593,6 +6656,7 @@ mod tests {
             post_observe_report, eager_report,
             "observe leaves the box report equal to the eager resume's"
         );
+        shut_down(&resumed).await;
     }
 
     /// A fresh session folds the context listing as the leading Info notice,
@@ -6657,7 +6721,9 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let mut world = scripted_world(&dir, "streaming-text").await;
         persist_session(&mut world).await;
-        let resumed = resumed_world(&dir, "streaming-text", &world.core.session_id).await;
+        let session = world.session.clone();
+        shut_down(&world).await;
+        let resumed = resumed_world(&dir, "streaming-text", &session).await;
 
         let chat = resumed.chat.borrow();
         let transcript = chat
@@ -6672,10 +6738,10 @@ mod tests {
 
     /// `fresh_env_notices` produces the fresh-session env block: a leading Info
     /// context listing followed by one warning per skill diagnostic for a
-    /// Create, and nothing for a Resume (whose prompt is fixed in its log).
-    /// This is the shared unit both the cold-start and `/new` paths fold, so a
-    /// skill problem introduced before a `/new` surfaces just as it does on a
-    /// cold start.
+    /// fresh session, and nothing for a resume (whose prompt is fixed in its
+    /// log). This is the shared unit both the cold-start and `/new` paths
+    /// fold, so a skill problem introduced before a `/new` surfaces just as it
+    /// does on a cold start.
     #[test]
     fn fresh_env_notices_carries_context_and_skill_warnings_for_create_only() {
         let env = AgentEnv {
@@ -6695,12 +6761,7 @@ mod tests {
             }],
         };
 
-        let create = fresh_env_notices(
-            &SessionSpec::Create {
-                entry: SessionEntry::Switch,
-            },
-            &env,
-        );
+        let create = fresh_env_notices(true, &env);
         assert!(
             matches!(&create[0], AgentEvent::Notice { text, .. } if text.contains("Context:")),
             "the context listing leads as an Info notice: {create:?}"
@@ -6713,109 +6774,77 @@ mod tests {
             "a skill diagnostic folds as a warning: {create:?}"
         );
 
-        let resume = fresh_env_notices(
-            &SessionSpec::Resume {
-                session_id: "s".to_string(),
-                entry: SessionEntry::Switch,
-                head: None,
-            },
-            &env,
-        );
+        let resume = fresh_env_notices(false, &env);
         assert!(
             resume.is_empty(),
             "a resume folds no env notices: {resume:?}"
         );
     }
 
-    /// A session switch folds the fresh session's context as an Info notice: a
-    /// fresh switch carries the context string in its deferred notices, a resume
-    /// (and the resume-fallback) does not, and installing a fresh switch folds
-    /// the context notice into the new session's scrollback.
+    /// A session change folds the fresh session's context as an Info notice: a
+    /// created session carries the context string into its scrollback, a
+    /// resume does not, and a refused change folds neither (it never left the
+    /// session it was in).
     #[tokio::test]
     async fn session_switch_folds_context_for_fresh_only() {
         let dir = TempDir::new().expect("tempdir");
-        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
-        let previous_id = world.core.session_id.clone();
-        let has_context =
-            |notices: &[AgentEvent]| notices.iter().any(|e| event_text(e).contains("Context:"));
-
-        let fresh = build_next_session(
-            &world,
-            SessionSpec::Create {
-                entry: SessionEntry::Switch,
-            },
-            &previous_id,
-            false,
-        )
-        .await
-        .expect("build fresh next session");
-        assert!(
-            has_context(&fresh.notices),
-            "a fresh switch carries context: {:?}",
-            fresh.notices
-        );
-
-        // Persist the session so the resume paths have a log on disk.
+        let (mut world, shell, mut app, _writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        // Persist the session so the resume path below has a log on disk.
         persist_session(&mut world).await;
-        let resumable = world.core.session_id.clone();
+        let resumable = world.session.clone();
+        let has_context =
+            |world: &World| main_notices(world).iter().any(|n| n.contains("Context:"));
 
-        let resumed = build_next_session(
-            &world,
-            SessionSpec::Resume {
-                session_id: resumable.clone(),
-                entry: SessionEntry::Switch,
-                head: None,
-            },
-            &previous_id,
-            false,
-        )
-        .await
-        .expect("build resumed next session");
+        let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
+        assert!(matches!(moved, Focus::Moved));
         assert!(
-            !has_context(&resumed.notices),
-            "a resume carries no context: {:?}",
-            resumed.notices
+            has_context(&world),
+            "a created session folds its context: {:?}",
+            main_notices(&world),
         );
 
-        // The resume-fallback path: the requested resume of a missing session
-        // fails, we fall back to resuming `previous_id`, and that build is
-        // never fresh, so it also carries no context.
-        let fallback = build_next_session(
-            &world,
-            SessionSpec::Resume {
-                session_id: "no-such-session".to_string(),
-                entry: SessionEntry::Switch,
-                head: None,
-            },
-            &resumable,
-            false,
+        // Back onto the persisted session: a resume's prompt is fixed in its
+        // log, so nothing describes the env read now.
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(resumable.clone()),
         )
-        .await
-        .expect("the fallback resumes the previous session");
+        .await;
+        assert!(matches!(moved, Focus::Moved));
+        assert_eq!(world.session, resumable);
         assert!(
-            !has_context(&fallback.notices),
-            "the resume fallback carries no context: {:?}",
-            fallback.notices
+            !has_context(&world),
+            "a resume folds no context: {:?}",
+            main_notices(&world),
         );
 
-        // Installing a fresh switch folds its context notice into the new
-        // session's scrollback.
-        let fresh = build_next_session(
-            &world,
-            SessionSpec::Create {
-                entry: SessionEntry::Switch,
-            },
-            &previous_id,
-            false,
+        // A refused change stays in the session it was in, so it folds the
+        // failure and no env block.
+        let stayed = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume("no-such-session".to_string()),
         )
-        .await
-        .expect("build fresh next session");
-        install_next_session(&mut world, &shell, fresh);
-        let folded = main_notices(&world);
+        .await;
+        assert!(matches!(stayed, Focus::Same));
+        assert_eq!(world.session, resumable, "the focus did not move");
         assert!(
-            folded.iter().any(|n| n.contains("Context:")),
-            "install folds the fresh context: {folded:?}"
+            !has_context(&world),
+            "the refusal folds no context: {:?}",
+            main_notices(&world),
         );
+        assert!(
+            main_notices(&world)
+                .iter()
+                .any(|n| n.contains("Failed to switch to session no-such-session")),
+            "the refusal says what failed: {:?}",
+            main_notices(&world),
+        );
+        shut_down(&world).await;
     }
 
     #[tokio::test]
@@ -6918,9 +6947,12 @@ mod tests {
             let event = app.next_input().await.expect("input event");
             app.handle_input(event);
             // Mirror the drive loop's submit path: record then spawn.
-            if let Some(text) = shell.borrow().take_submitted() {
+            // Bind out of the borrow first, as the drive loop does: the
+            // submit awaits on the host.
+            let submitted = shell.borrow().take_submitted();
+            if let Some(text) = submitted {
                 shell.borrow().editor.borrow_mut().add_to_history(&text);
-                handle_submit(&mut world, text);
+                handle_submit(&mut world, text).await;
                 break;
             }
         }
@@ -6938,10 +6970,10 @@ mod tests {
         );
         assert_eq!(shell.borrow().editor.borrow().text(), "recall me");
 
-        // Settle the turn so world teardown is clean.
-        cancel_viewed_turn(&world);
-        let joined = world.turns.join_next().await;
-        handle_turn_join(&mut world, joined).expect("abort is non-fatal");
+        // Settle the turn so the teardown below is clean.
+        cancel_viewed_turn(&world).await;
+        settle(&mut world).await;
+        shut_down(&world).await;
     }
 
     /// The visible-row cap bounds the editor's drawn height: with more content
@@ -7261,8 +7293,8 @@ mod tests {
 
         // Queue a pending follow-up for the viewed agent, editor left empty.
         world
-            .core
-            .message_queues
+            .handles
+            .queues
             .append_follow_up(AgentId::Main, "queued");
 
         // Plain Up (CSI A) parks Dequeue in the capture phase without touching
@@ -7274,20 +7306,21 @@ mod tests {
             (0, 0),
             "the recall chord never reached the editor",
         );
-        assert!(handle_host_action(&mut world, &shell, AjAction::Dequeue));
+        assert!(handle_host_action(&mut world, &shell, AjAction::Dequeue).await);
         assert_eq!(shell.borrow().editor.borrow().text(), "queued");
-        assert!(!world.core.message_queues.has_pending(AgentId::Main));
+        assert!(!world.handles.queues.has_pending(AgentId::Main));
 
         // Ctrl+P (0x10) does the same. Re-queue and clear the editor first.
         world
-            .core
-            .message_queues
+            .handles
+            .queues
             .append_follow_up(AgentId::Main, "again");
         shell.borrow().editor.borrow_mut().clear();
         press(&[0x10]).await;
         assert_eq!(shell.borrow().take_host_action(), Some(AjAction::Dequeue));
-        assert!(handle_host_action(&mut world, &shell, AjAction::Dequeue));
+        assert!(handle_host_action(&mut world, &shell, AjAction::Dequeue).await);
         assert_eq!(shell.borrow().editor.borrow().text(), "again");
+        shut_down(&world).await;
     }
 
     /// With a draft in the editor, plain Up does NOT recall: the stricter gate
@@ -7300,8 +7333,8 @@ mod tests {
             init_app_with_world(&dir, "streaming-text").await;
 
         world
-            .core
-            .message_queues
+            .handles
+            .queues
             .append_follow_up(AgentId::Main, "queued");
         shell.borrow().editor.borrow_mut().insert_at_cursor("draft");
 
@@ -7315,7 +7348,7 @@ mod tests {
             "the recall did not fire with a draft in the editor",
         );
         assert!(
-            world.core.message_queues.has_pending(AgentId::Main),
+            world.handles.queues.has_pending(AgentId::Main),
             "the pending message is still queued, not recalled",
         );
     }
@@ -7779,39 +7812,35 @@ mod tests {
         let mut world = scripted_world(&dir, "streaming-text").await;
         assert_eq!(quit_arm_running_work(&world), None);
 
-        handle_submit(&mut world, "go".to_string());
+        handle_submit(&mut world, "go".to_string()).await;
+        fold_ready_frames(&mut world);
         assert_eq!(
             quit_arm_running_work(&world).as_deref(),
             Some("1 agent still running")
         );
 
-        // Settle the turn so world teardown is clean.
-        cancel_viewed_turn(&world);
-        let joined = world.turns.join_next().await;
-        handle_turn_join(&mut world, joined).expect("abort is non-fatal");
+        cancel_viewed_turn(&world).await;
+        settle(&mut world).await;
+        assert_eq!(quit_arm_running_work(&world), None);
+        shut_down(&world).await;
     }
 
     /// End-to-end over the real session path: submit a prompt into a
-    /// scripted session, pump the loop arms by hand, and check the
-    /// chat model holds the user prompt plus a finalized assistant
-    /// reply. A full transcript render over the result must not panic.
+    /// scripted session, fold the frames the host publishes for it, and check
+    /// the chat model holds the user prompt plus a finalized assistant reply.
+    /// A full transcript render over the result must not panic.
     #[tokio::test]
     async fn scripted_prompt_streams_into_the_chat_model() {
         let dir = TempDir::new().expect("tempdir");
         let mut world = scripted_world(&dir, "streaming-text").await;
 
-        handle_submit(&mut world, "hi there".to_string());
-        assert!(world.turns.is_driving(AgentId::Main));
+        handle_submit(&mut world, "hi there".to_string()).await;
+        fold_ready_frames(&mut world);
+        assert!(world.client.working(), "the host accepted the prompt");
 
-        // Turn-join arm.
-        let joined = world.turns.join_next().await;
-        handle_turn_join(&mut world, joined).expect("turn settles cleanly");
-        assert!(!world.turns.is_driving(AgentId::Main));
-        assert!(world.turns.is_empty(), "no turn left in flight");
-
-        // Event arm: everything the turn emitted is buffered now.
-        let first = world.event_rx.try_recv().expect("events buffered");
-        assert!(drain_events(&mut world, first).0);
+        // The frame arm, until the turn is over.
+        settle(&mut world).await;
+        assert!(!world.client.working(), "no turn left in flight");
 
         {
             let chat = world.chat.borrow();
@@ -7863,27 +7892,39 @@ mod tests {
         };
         let surface = view.draw(&ctx);
         assert_eq!(surface.size.height, 24);
+        shut_down(&world).await;
     }
 
     fn lifecycle_running(world: &World) -> bool {
-        world.lifecycle.is_running(AgentId::Main)
+        world.client.lifecycle().is_running(AgentId::Main)
     }
 
-    /// A non-empty launch prompt spawns a Main turn, so the initial
-    /// session drives it without the user typing anything. The auto-submit
-    /// registers a cancel token for `Main`, mirroring `handle_submit`.
+    /// A non-empty launch prompt runs a Main turn, so the initial session
+    /// drives it without the user typing anything.
     #[tokio::test]
     async fn launch_prompt_spawns_a_main_turn() {
         let dir = TempDir::new().expect("tempdir");
         let mut world = scripted_world(&dir, "streaming-text").await;
 
-        auto_submit_launch(&mut world, vec![UserContent::text("launch me")]);
-        assert!(world.turns.is_driving(AgentId::Main));
+        auto_submit_launch(&mut world, vec![UserContent::text("launch me")]).await;
+        fold_ready_frames(&mut world);
+        assert!(world.client.working(), "the launch prompt started a turn");
 
-        // Settle the turn so world teardown is clean.
-        cancel_viewed_turn(&world);
-        let joined = world.turns.join_next().await;
-        handle_turn_join(&mut world, joined).expect("abort is non-fatal");
+        settle(&mut world).await;
+        let prompts: Vec<String> = world
+            .chat
+            .borrow()
+            .transcript(AgentId::Main)
+            .expect("main transcript")
+            .entries()
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntryKind::User(u) => Some(u.joined_text()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(prompts, vec!["launch me"], "and it ran as a user prompt");
+        shut_down(&world).await;
     }
 
     /// An empty launch prompt (no positionals, no `@file`) spawns nothing,
@@ -7893,102 +7934,235 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let mut world = scripted_world(&dir, "streaming-text").await;
 
-        auto_submit_launch(&mut world, Vec::new());
-        assert!(!world.turns.is_driving(AgentId::Main));
-        assert!(world.turns.is_empty());
+        auto_submit_launch(&mut world, Vec::new()).await;
+        fold_ready_frames(&mut world);
+        assert!(!world.client.working());
+        assert!(!world.chat.borrow().has_conversation());
+        shut_down(&world).await;
     }
 
-    /// `drain_events` reports the wake targets `aj` triggers on
-    /// mid-select: every `TaskEnd` unconditionally, `AgentEnd` only
-    /// when the agent has queued notices or pending messages.
-    #[tokio::test]
-    async fn drain_events_reports_wake_triggers() {
-        let dir = TempDir::new().expect("tempdir");
-        let mut world = scripted_world(&dir, "streaming-text").await;
+    // ---- The host seam ----
 
-        let task_end = AgentEvent::TaskEnd {
-            agent_id: AgentId::Main,
-            task_id: 1,
-            call_id: "tu-1".into(),
-            status: aj_agent::tool::TaskStatus::Exited(Some(0)),
-            label: "cmd".into(),
-        };
-        let (_, wake) = drain_events(&mut world, task_end);
-        assert_eq!(wake, vec![AgentId::Main], "TaskEnd wakes unconditionally");
+    /// The text blocks of a wire user message, concatenated.
+    fn user_text(message: &aj_models::types::UserMessage) -> String {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                UserContent::Text(text) => Some(text.text.as_str()),
+                UserContent::Image(_) => None,
+            })
+            .collect()
+    }
 
-        let agent_end = || AgentEvent::AgentEnd {
-            agent_id: AgentId::Main,
-            messages: Vec::new(),
-        };
-        let (_, wake) = drain_events(&mut world, agent_end());
-        assert!(wake.is_empty(), "idle AgentEnd with nothing queued");
-
+    /// The user rows of the Main transcript, in order.
+    fn user_rows(world: &World) -> Vec<String> {
         world
-            .core
-            .message_queues
-            .append_follow_up(AgentId::Main, "queued follow-up");
-        let (_, wake) = drain_events(&mut world, agent_end());
-        assert_eq!(wake, vec![AgentId::Main], "AgentEnd with pending work");
+            .chat
+            .borrow()
+            .transcript(AgentId::Main)
+            .map(|transcript| {
+                transcript
+                    .entries()
+                    .iter()
+                    .filter_map(|entry| match &entry.kind {
+                        EntryKind::User(user) => Some(user.joined_text()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
-    /// A Main turn's join sweeps a leaked sub: one still marked running
-    /// whose `AgentEnd` never arrived and that has no backing
-    /// background run.
+    /// A submit reaches the host, and the frames the host publishes for it are
+    /// what build the transcript: the submit itself renders nothing, and the
+    /// message is on the session's log before any frame is folded.
     #[tokio::test]
-    async fn main_turn_join_sweeps_leaked_sub() {
+    async fn a_prompt_reaches_the_host_and_its_frames_build_the_transcript() {
         let dir = TempDir::new().expect("tempdir");
         let mut world = scripted_world(&dir, "streaming-text").await;
 
-        handle_submit(&mut world, "go".to_string());
-        world.lifecycle.mark_running(AgentId::Sub(1));
-
-        let joined = world.turns.join_next().await;
-        handle_turn_join(&mut world, joined).expect("turn settles cleanly");
+        handle_submit(&mut world, "hi there".to_string()).await;
         assert!(
-            !world.lifecycle.is_running(AgentId::Sub(1)),
-            "leaked sub swept on the Main join"
+            user_rows(&world).is_empty(),
+            "the submit writes no row of its own: {:?}",
+            user_rows(&world),
         );
+
+        settle(&mut world).await;
+        assert_eq!(
+            user_rows(&world),
+            vec!["hi there"],
+            "the row arrived on the frame stream",
+        );
+        // And it went through the host, not around it: the session's log
+        // carries the message the turn ran.
+        let logged = {
+            let log = world.handles.log.lock().await;
+            let head = log.latest_leaf(ThreadFilter::USER).expect("a head");
+            log.linearize(&head, ThreadFilter::USER)
+                .agent_messages()
+                .iter()
+                .filter_map(|message| match message.as_stored_wire() {
+                    Some(aj_models::types::Message::User(user)) => Some(user_text(user)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            logged.iter().any(|text| text == "hi there"),
+            "the host persisted the prompt: {logged:?}",
+        );
+        shut_down(&world).await;
     }
 
-    /// A background sub-agent run (a Running `TaskKind::Agent` registry
-    /// entry) survives a Main join, and is swept once its task turns
-    /// terminal.
+    /// `/compact` while a turn runs is refused by the host, and the refusal
+    /// keeps the local wording (which names the chord that cancels the turn
+    /// first) rather than the protocol's. While idle it runs.
     #[tokio::test]
-    async fn main_turn_join_spares_background_sub_until_terminal() {
+    async fn compact_is_refused_while_busy_and_runs_when_idle() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        install_busy_script(&world);
+        handle_submit(&mut world, "go".to_string()).await;
+        fold_ready_frames(&mut world);
+        assert!(world.client.working(), "the session is busy");
+
+        apply_command(&mut world, &shell, CommandAction::Compact).await;
+        assert!(
+            main_notices(&world)
+                .iter()
+                .any(|n| *n == session_busy_notice("compact")),
+            "the busy refusal keeps its wording: {:?}",
+            main_notices(&world),
+        );
+
+        cancel_viewed_turn(&world).await;
+        settle(&mut world).await;
+        let before = main_notices(&world).len();
+        apply_command(&mut world, &shell, CommandAction::Compact).await;
+        settle(&mut world).await;
+        let folded = main_notices(&world)[before..].to_vec();
+        assert!(
+            !folded.iter().any(|n| *n == session_busy_notice("compact")),
+            "an idle compact is not refused: {folded:?}",
+        );
+        // The compaction ran as a turn and reported what it found, which is
+        // only something the host's compaction path can say.
+        assert!(
+            folded.iter().any(|n| n.starts_with("Nothing to compact")),
+            "the compaction turn ran: {folded:?}",
+        );
+        shut_down(&world).await;
+    }
+
+    /// A turn's fatal error belongs to its session, not to this client (spec
+    /// section 5): it shows up as an error row and the session stays usable,
+    /// where the pre-host drive loop ended the session on it.
+    ///
+    /// The fault is a log that cannot be opened: the first punctuating append
+    /// creates the file with `create_new`, so a path that is already taken
+    /// makes that append fail inside the inline persistence listener, which is
+    /// exactly a fatal turn error.
+    #[tokio::test]
+    async fn a_fatal_turn_error_shows_an_error_and_keeps_the_session_usable() {
         let dir = TempDir::new().expect("tempdir");
         let mut world = scripted_world(&dir, "streaming-text").await;
+        let log_path = dir
+            .path()
+            .join("sessions")
+            .join(format!("{}.jsonl", world.session));
+        std::fs::write(&log_path, "").expect("take the path the log wants");
 
-        let (task_id, _cancel) = world.core.task_registry.register(
-            AgentId::Main,
-            "test-call".to_string(),
-            aj_agent::tool::TaskKind::Agent {
-                agent_id: 1,
-                task: "explore".to_string(),
-            },
-            "explore".to_string(),
-            Arc::new(NoOutput),
-        );
-        world.lifecycle.mark_running(AgentId::Sub(1));
-
-        handle_submit(&mut world, "go".to_string());
-        let joined = world.turns.join_next().await;
-        handle_turn_join(&mut world, joined).expect("turn settles cleanly");
+        handle_submit(&mut world, "hi".to_string()).await;
+        settle(&mut world).await;
+        let errors: Vec<String> = world
+            .chat
+            .borrow()
+            .transcript(AgentId::Main)
+            .expect("main transcript")
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                EntryKind::Notice(notice) if notice.level == NoticeLevel::Error => {
+                    Some(notice.text.clone())
+                }
+                _ => None,
+            })
+            .collect();
         assert!(
-            world.lifecycle.is_running(AgentId::Sub(1)),
-            "background sub spared while its task runs"
+            errors.iter().any(|text| text.starts_with("IO error")),
+            "the failed append surfaced as an error row: {errors:?}",
         );
 
+        // Still usable: once the fault clears, the next prompt runs a turn.
+        std::fs::remove_file(&log_path).expect("clear the fault");
+        install_busy_script(&world);
+        handle_submit(&mut world, "again".to_string()).await;
+        fold_ready_frames(&mut world);
+        assert!(world.client.working(), "the session survived the error");
+        settle(&mut world).await;
+        assert!(
+            user_rows(&world).iter().any(|text| text == "again"),
+            "and the second prompt ran: {:?}",
+            user_rows(&world),
+        );
+        shut_down(&world).await;
+    }
+
+    /// An attach block obliges the task and queue reads (neither is
+    /// replayable), and the loop discharges them.
+    ///
+    /// The local views read the live handles, so nothing on screen depends on
+    /// this. The client's own model does, and it is the fold connect mode
+    /// uses, so leaving it stale would leave the two paths unequal.
+    #[tokio::test]
+    async fn an_attach_discharges_the_task_and_queue_reads() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        run_prompt(&mut world, "seed").await;
+        let task = register_bash_task(&world, "sleep 100");
         world
-            .core
-            .task_registry
-            .set_status(task_id, aj_agent::tool::TaskStatus::Exited(None));
-        handle_submit(&mut world, "again".to_string());
-        let joined = world.turns.join_next().await;
-        handle_turn_join(&mut world, joined).expect("turn settles cleanly");
+            .handles
+            .queues
+            .append_follow_up(AgentId::Main, "queued");
+
+        // Re-attach the focused session, the way the branch path does.
+        reattach(&mut world, &shell).await.expect("re-attach");
+
         assert!(
-            !world.lifecycle.is_running(AgentId::Sub(1)),
-            "swept once the background run turned terminal"
+            !world.client.needs_task_refetch(),
+            "the task read is discharged",
         );
+        assert!(
+            !world.client.needs_queue_refetch(),
+            "and the queue read too",
+        );
+        assert_eq!(
+            world
+                .client
+                .tasks()
+                .tasks
+                .iter()
+                .map(|summary| summary.id)
+                .collect::<Vec<_>>(),
+            vec![task],
+            "the task table came off the read",
+        );
+        assert_eq!(world.client.queue().queues.len(), 1);
+        assert_eq!(
+            world.client.queue().queues[0]
+                .follow_up
+                .iter()
+                .filter_map(|message| match message.as_stored_wire() {
+                    Some(aj_models::types::Message::User(user)) => Some(user_text(user)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["queued"],
+            "and so did the queue snapshot",
+        );
+        shut_down(&world).await;
     }
 
     /// End-to-end over the `background-task` demo: the launch turn
@@ -8000,33 +8174,15 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let mut world = scripted_world(&dir, "background-task").await;
 
-        handle_submit(&mut world, "run it".to_string());
-        let joined = world.turns.join_next().await;
-        handle_turn_join(&mut world, joined).expect("prompt turn settles");
-
-        // The wake turn is spawned either by the turn join above (the
-        // task finished while the turn still streamed, so its notice
-        // was already queued) or by the TaskEnd trigger while draining
-        // here. Loop until one of the two paths armed a turn.
-        while !world.turns.is_driving(AgentId::Main) {
-            let event =
-                tokio::time::timeout(std::time::Duration::from_secs(10), world.event_rx.recv())
-                    .await
-                    .expect("an event arrives before the timeout")
-                    .expect("event channel open");
-            let (_, wake_targets) = drain_events(&mut world, event);
-            spawn_wakes(&mut world, wake_targets);
-        }
-
-        let joined = world.turns.join_next().await;
-        handle_turn_join(&mut world, joined).expect("wake turn settles");
-        // Fold the buffered tail. Wake targets are ignored on purpose:
-        // the TaskEnd may sit in this tail, and re-waking the idle
-        // agent with no notices left would only spawn a no-op turn the
-        // test would have to join.
-        while let Ok(event) = world.event_rx.try_recv() {
-            let _ = drain_events(&mut world, event);
-        }
+        handle_submit(&mut world, "run it".to_string()).await;
+        // The host spawns the wake turn itself, either at the prompt turn's
+        // join (the task finished while it still streamed, so its notice was
+        // already queued) or off the `TaskEnd` it publishes. Settling covers
+        // both: it waits for the session to report no turn and no live task.
+        settle(&mut world).await;
+        // Read the model the host left behind after the teardown, so no borrow
+        // spans an await.
+        shut_down(&world).await;
 
         let chat = world.chat.borrow();
         let entries = chat
@@ -8101,8 +8257,9 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let mut world = scripted_world(&dir, "streaming-text").await;
 
-        handle_submit(&mut world, "first".to_string());
-        assert!(world.turns.is_driving(AgentId::Main));
+        handle_submit(&mut world, "first".to_string()).await;
+        fold_ready_frames(&mut world);
+        assert!(world.client.working());
 
         // Wait until the prompt's own user message landed before
         // queueing: the turn drains the follow-up queue right at its
@@ -8117,48 +8274,40 @@ mod tests {
                 .iter()
                 .any(|e| matches!(&e.kind, EntryKind::User(u) if u.joined_text() == "first"))
         };
+        let deadline = Instant::now() + SETTLE_DEADLINE;
         while !saw_prompt(&world) {
-            let event =
-                tokio::time::timeout(std::time::Duration::from_secs(10), world.event_rx.recv())
-                    .await
-                    .expect("an event arrives before the timeout")
-                    .expect("event channel open");
-            let _ = drain_events(&mut world, event);
+            assert!(Instant::now() < deadline, "the prompt never landed");
+            let frame = tokio::time::timeout(SETTLE_DEADLINE, world.attachment.recv())
+                .await
+                .expect("a frame arrives before the timeout")
+                .expect("the stream is open");
+            let _ = world.client.apply(&mut world.chat.borrow_mut(), frame);
         }
 
-        handle_submit(&mut world, "second".to_string());
-        let snapshot = world.core.message_queues.snapshot(AgentId::Main);
+        handle_submit(&mut world, "second".to_string()).await;
+        let snapshot = world.handles.queues.snapshot(AgentId::Main);
         assert_eq!(
             snapshot.kind,
             Some(aj_agent::queue::PendingKind::FollowUp),
             "busy submit queues instead of spawning",
         );
         assert_eq!(snapshot.text, "second");
-
-        // First turn settles; the join handler sees the pending
-        // follow-up and spawns the wake turn.
-        let joined = world.turns.join_next().await;
-        handle_turn_join(&mut world, joined).expect("prompt turn settles");
-        assert!(
-            world.turns.is_driving(AgentId::Main),
-            "post-turn wake spawned for the pending message",
+        fold_ready_frames(&mut world);
+        assert_eq!(
+            world.client.queue().queues.len(),
+            1,
+            "and the client learns about it from the queue frame the host \
+             publishes on the enqueue side",
         );
 
-        // The wake consumes the queue and delivers the message.
-        let joined = world.turns.join_next().await;
-        handle_turn_join(&mut world, joined).expect("wake turn settles");
+        // The host's post-turn wake consumes the queue and delivers the
+        // message.
+        settle(&mut world).await;
         assert!(
-            world
-                .core
-                .message_queues
-                .snapshot(AgentId::Main)
-                .kind
-                .is_none(),
+            world.handles.queues.snapshot(AgentId::Main).kind.is_none(),
             "queue drained by the wake",
         );
-        while let Ok(event) = world.event_rx.try_recv() {
-            let _ = drain_events(&mut world, event);
-        }
+        shut_down(&world).await;
         let chat = world.chat.borrow();
         let entries = chat
             .transcript(AgentId::Main)
@@ -8180,15 +8329,22 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let mut world = scripted_world(&dir, "streaming-text").await;
 
-        assert!(!cancel_viewed_turn(&world), "idle: fall through to quit");
+        assert!(
+            !cancel_viewed_turn(&world).await,
+            "idle: fall through to quit"
+        );
 
-        handle_submit(&mut world, "go".to_string());
-        assert!(cancel_viewed_turn(&world), "running turn is cancelled");
+        handle_submit(&mut world, "go".to_string()).await;
+        fold_ready_frames(&mut world);
+        assert!(
+            cancel_viewed_turn(&world).await,
+            "running turn is cancelled"
+        );
 
-        let joined = world.turns.join_next().await;
-        // The cancelled turn surfaces Aborted, which folds a notice
-        // and keeps the session alive.
-        handle_turn_join(&mut world, joined).expect("abort is non-fatal");
+        // The cancelled turn surfaces Aborted, which the host publishes as
+        // the same notice, and the session stays alive.
+        settle(&mut world).await;
+        shut_down(&world).await;
         let chat = world.chat.borrow();
         let entries = chat
             .transcript(AgentId::Main)
@@ -8208,8 +8364,8 @@ mod tests {
         let shell = Rc::new(RefCell::new(Shell::new(
             Rc::clone(&world.chat),
             Rc::clone(&world.status),
-            world.core.message_queues.clone(),
-            world.core.task_registry.clone(),
+            world.handles.queues.clone(),
+            world.handles.task_registry.clone(),
             ThemeHandle::new(Theme::bundled_dark_with_mode(
                 aj_app::theme::ColorMode::Truecolor,
             )),
@@ -8246,8 +8402,8 @@ mod tests {
         let shell = Rc::new(RefCell::new(Shell::new(
             Rc::clone(&world.chat),
             Rc::clone(&world.status),
-            world.core.message_queues.clone(),
-            world.core.task_registry.clone(),
+            world.handles.queues.clone(),
+            world.handles.task_registry.clone(),
             ThemeHandle::new(Theme::bundled_dark_with_mode(
                 aj_app::theme::ColorMode::Truecolor,
             )),
@@ -8275,8 +8431,9 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
 
-        handle_submit(&mut world, "first".to_string());
-        assert!(world.turns.is_driving(AgentId::Main), "busy");
+        handle_submit(&mut world, "first".to_string()).await;
+        fold_ready_frames(&mut world);
+        assert!(world.client.working(), "busy");
 
         // Busy + editor text: queue as steering, clear the editor.
         shell
@@ -8284,8 +8441,8 @@ mod tests {
             .editor
             .borrow_mut()
             .insert_at_cursor("steer this");
-        assert!(handle_host_action(&mut world, &shell, AjAction::Steer));
-        let snapshot = world.core.message_queues.snapshot(AgentId::Main);
+        assert!(handle_host_action(&mut world, &shell, AjAction::Steer).await);
+        let snapshot = world.handles.queues.snapshot(AgentId::Main);
         assert_eq!(snapshot.kind, Some(aj_agent::queue::PendingKind::Steering));
         assert_eq!(snapshot.text, "steer this");
         assert_eq!(
@@ -8295,13 +8452,13 @@ mod tests {
         );
 
         // Busy + empty editor + pending follow-up: promote to steering.
-        world.core.message_queues.clear(AgentId::Main);
+        world.handles.queues.clear(AgentId::Main);
         world
-            .core
-            .message_queues
+            .handles
+            .queues
             .append_follow_up(AgentId::Main, "follow-up");
-        assert!(handle_host_action(&mut world, &shell, AjAction::Steer));
-        let snapshot = world.core.message_queues.snapshot(AgentId::Main);
+        assert!(handle_host_action(&mut world, &shell, AjAction::Steer).await);
+        let snapshot = world.handles.queues.snapshot(AgentId::Main);
         assert_eq!(
             snapshot.kind,
             Some(aj_agent::queue::PendingKind::Steering),
@@ -8309,12 +8466,12 @@ mod tests {
         );
         assert_eq!(snapshot.text, "follow-up");
 
-        // Settle the turn so world teardown is clean. Drop the queue
-        // first so the join's wake gate has nothing to deliver.
-        world.core.message_queues.clear(AgentId::Main);
-        cancel_viewed_turn(&world);
-        let joined = world.turns.join_next().await;
-        handle_turn_join(&mut world, joined).expect("abort is non-fatal");
+        // Settle the turn so the teardown below is clean. Drop the queue
+        // first so the host's post-turn wake has nothing to deliver.
+        world.handles.queues.clear(AgentId::Main);
+        cancel_viewed_turn(&world).await;
+        settle(&mut world).await;
+        shut_down(&world).await;
     }
 
     /// Alt+Enter's steer action while idle starts a normal turn (there
@@ -8329,25 +8486,16 @@ mod tests {
             .editor
             .borrow_mut()
             .insert_at_cursor("hi there");
-        assert!(handle_host_action(&mut world, &shell, AjAction::Steer));
+        assert!(handle_host_action(&mut world, &shell, AjAction::Steer).await);
+        fold_ready_frames(&mut world);
+        assert!(world.client.working(), "idle steer spawned a prompt turn");
         assert!(
-            world.turns.is_driving(AgentId::Main),
-            "idle steer spawned a prompt turn"
-        );
-        assert!(
-            world
-                .core
-                .message_queues
-                .snapshot(AgentId::Main)
-                .kind
-                .is_none(),
+            world.handles.queues.snapshot(AgentId::Main).kind.is_none(),
             "nothing queued"
         );
 
-        let joined = world.turns.join_next().await;
-        handle_turn_join(&mut world, joined).expect("turn settles");
-        let first = world.event_rx.try_recv().expect("events buffered");
-        drain_events(&mut world, first);
+        settle(&mut world).await;
+        shut_down(&world).await;
         let chat = world.chat.borrow();
         let entries = chat
             .transcript(AgentId::Main)
@@ -8367,17 +8515,18 @@ mod tests {
         let (mut app, mut writer, mut world, shell, root) =
             init_app_with_world(&dir, "streaming-text").await;
 
-        handle_submit(&mut world, "earlier prompt".to_string());
-        let joined = world.turns.join_next().await;
-        handle_turn_join(&mut world, joined).expect("turn settles");
-        let first = world.event_rx.try_recv().expect("events buffered");
-        drain_events(&mut world, first);
+        handle_submit(&mut world, "earlier prompt".to_string()).await;
+        settle(&mut world).await;
         for i in 0..40 {
             fold_notice(&mut world, &format!("historical notice {i}"));
         }
         app.request_redraw();
         app.render(&root).expect("render populated transcript");
-        handle_submit(&mut world, "running prompt".to_string());
+        // The turn has to still be in flight when the Alt+Enter lands below.
+        install_busy_script(&world);
+        handle_submit(&mut world, "running prompt".to_string()).await;
+        fold_ready_frames(&mut world);
+        assert!(world.client.working(), "the session is busy");
 
         let transcript = Rc::clone(&shell.borrow().transcript);
         let transcript_ctx = draw_ctx(40, 8);
@@ -8397,9 +8546,9 @@ mod tests {
             .take_host_action()
             .expect("editor Alt+Enter parks a host action");
         assert_eq!(action, AjAction::Steer);
-        assert!(handle_host_action(&mut world, &shell, action));
+        assert!(handle_host_action(&mut world, &shell, action).await);
 
-        let snapshot = world.core.message_queues.snapshot(AgentId::Main);
+        let snapshot = world.handles.queues.snapshot(AgentId::Main);
         assert_eq!(snapshot.kind, Some(aj_agent::queue::PendingKind::Steering));
         assert_eq!(snapshot.text, "steer draft");
         let _ = transcript.borrow_mut().draw(&transcript_ctx);
@@ -8408,10 +8557,10 @@ mod tests {
             "accepted text follows tail"
         );
 
-        world.core.message_queues.clear(AgentId::Main);
-        cancel_viewed_turn(&world);
-        let joined = world.turns.join_next().await;
-        handle_turn_join(&mut world, joined).expect("abort is non-fatal");
+        world.handles.queues.clear(AgentId::Main);
+        cancel_viewed_turn(&world).await;
+        settle(&mut world).await;
+        shut_down(&world).await;
     }
 
     /// Alt+Enter is editor-local: with transcript focus, an idle draft is
@@ -8422,11 +8571,8 @@ mod tests {
         let (mut app, mut writer, mut world, shell, root) =
             init_app_with_world(&dir, "streaming-text").await;
 
-        handle_submit(&mut world, "earlier prompt".to_string());
-        let joined = world.turns.join_next().await;
-        handle_turn_join(&mut world, joined).expect("turn settles");
-        let first = world.event_rx.try_recv().expect("events buffered");
-        drain_events(&mut world, first);
+        handle_submit(&mut world, "earlier prompt".to_string()).await;
+        settle(&mut world).await;
         for i in 0..40 {
             fold_notice(&mut world, &format!("historical notice {i}"));
         }
@@ -8453,10 +8599,11 @@ mod tests {
 
         assert_eq!(shell.borrow().take_host_action(), None);
         assert_eq!(shell.borrow().editor.borrow().text(), "new prompt");
-        assert!(world.turns.is_empty(), "no turn was spawned");
+        assert!(!world.client.working(), "no turn was spawned");
         assert!(transcript.borrow().in_focus_mode(), "focus is preserved");
         let _ = transcript.borrow_mut().draw(&transcript_ctx);
         assert!(!transcript.borrow().is_at_bottom(), "scroll is preserved");
+        shut_down(&world).await;
     }
 
     /// Alt+Enter is also inert outside the editor while a turn is busy, so it
@@ -8467,17 +8614,18 @@ mod tests {
         let (mut app, mut writer, mut world, shell, root) =
             init_app_with_world(&dir, "streaming-text").await;
 
-        handle_submit(&mut world, "earlier prompt".to_string());
-        let joined = world.turns.join_next().await;
-        handle_turn_join(&mut world, joined).expect("turn settles");
-        let first = world.event_rx.try_recv().expect("events buffered");
-        drain_events(&mut world, first);
+        handle_submit(&mut world, "earlier prompt".to_string()).await;
+        settle(&mut world).await;
         for i in 0..40 {
             fold_notice(&mut world, &format!("historical notice {i}"));
         }
         app.request_redraw();
         app.render(&root).expect("render populated transcript");
-        handle_submit(&mut world, "running prompt".to_string());
+        // The turn has to still be in flight when the Alt+Enter lands below.
+        install_busy_script(&world);
+        handle_submit(&mut world, "running prompt".to_string()).await;
+        fold_ready_frames(&mut world);
+        assert!(world.client.working(), "the session is busy");
 
         let transcript = Rc::clone(&shell.borrow().transcript);
         let transcript_ctx = draw_ctx(40, 8);
@@ -8496,14 +8644,14 @@ mod tests {
 
         assert_eq!(shell.borrow().take_host_action(), None);
         assert_eq!(shell.borrow().editor.borrow().text(), "steer draft");
-        assert!(!world.core.message_queues.has_pending(AgentId::Main));
+        assert!(!world.handles.queues.has_pending(AgentId::Main));
         assert!(transcript.borrow().in_focus_mode(), "focus is preserved");
         let _ = transcript.borrow_mut().draw(&transcript_ctx);
         assert!(!transcript.borrow().is_at_bottom(), "scroll is preserved");
 
-        cancel_viewed_turn(&world);
-        let joined = world.turns.join_next().await;
-        handle_turn_join(&mut world, joined).expect("abort is non-fatal");
+        cancel_viewed_turn(&world).await;
+        settle(&mut world).await;
+        shut_down(&world).await;
     }
 
     /// Alt+Up's dequeue action pulls the queued message back into the
@@ -8514,27 +8662,28 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
 
-        handle_submit(&mut world, "first".to_string());
-        handle_submit(&mut world, "queued line".to_string());
+        handle_submit(&mut world, "first".to_string()).await;
+        fold_ready_frames(&mut world);
+        handle_submit(&mut world, "queued line".to_string()).await;
         assert_eq!(
-            world.core.message_queues.snapshot(AgentId::Main).text,
+            world.handles.queues.snapshot(AgentId::Main).text,
             "queued line"
         );
 
         shell.borrow().editor.borrow_mut().insert_at_cursor("draft");
-        assert!(handle_host_action(&mut world, &shell, AjAction::Dequeue));
+        assert!(handle_host_action(&mut world, &shell, AjAction::Dequeue).await);
         assert_eq!(
             shell.borrow().editor.borrow().text(),
             "queued line\n\ndraft"
         );
-        assert!(!world.core.message_queues.has_pending(AgentId::Main));
+        assert!(!world.handles.queues.has_pending(AgentId::Main));
 
-        // Nothing pending: the yank reports no change.
-        assert!(!handle_host_action(&mut world, &shell, AjAction::Dequeue));
+        // Nothing pending: the withdrawal reports no change.
+        assert!(!handle_host_action(&mut world, &shell, AjAction::Dequeue).await);
 
-        cancel_viewed_turn(&world);
-        let joined = world.turns.join_next().await;
-        handle_turn_join(&mut world, joined).expect("abort is non-fatal");
+        cancel_viewed_turn(&world).await;
+        settle(&mut world).await;
+        shut_down(&world).await;
     }
 
     /// Cancelling a turn restores the queued message into the editor
@@ -8544,24 +8693,24 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
 
-        handle_submit(&mut world, "first".to_string());
-        handle_submit(&mut world, "second".to_string());
+        handle_submit(&mut world, "first".to_string()).await;
+        fold_ready_frames(&mut world);
+        handle_submit(&mut world, "second".to_string()).await;
 
-        assert!(handle_host_action(&mut world, &shell, AjAction::CancelTurn));
+        assert!(handle_host_action(&mut world, &shell, AjAction::CancelTurn).await);
         assert_eq!(
             shell.borrow().editor.borrow().text(),
             "second",
             "the queued follow-up came back to the editor"
         );
-        assert!(!world.core.message_queues.has_pending(AgentId::Main));
+        assert!(!world.handles.queues.has_pending(AgentId::Main));
 
-        let joined = world.turns.join_next().await;
-        handle_turn_join(&mut world, joined).expect("abort is non-fatal");
+        settle(&mut world).await;
         assert!(
-            !world.turns.is_driving(AgentId::Main),
+            !world.client.working(),
             "no wake spawned, the queue was empty"
         );
-        assert!(world.turns.is_empty(), "nothing else left in flight");
+        shut_down(&world).await;
     }
 
     /// The two overlay openers park their command for the host to open the
@@ -8571,16 +8720,17 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
 
-        handle_host_action(&mut world, &shell, AjAction::HistoryOpen);
+        handle_host_action(&mut world, &shell, AjAction::HistoryOpen).await;
         assert_eq!(
             shell.borrow().take_command(),
             Some(CommandAction::OpenPromptHistory)
         );
-        handle_host_action(&mut world, &shell, AjAction::AgentPickerOpen);
+        handle_host_action(&mut world, &shell, AjAction::AgentPickerOpen).await;
         assert_eq!(
             shell.borrow().take_command(),
             Some(CommandAction::OpenAgentPicker)
         );
+        shut_down(&world).await;
     }
 
     /// The clipboard-paste insertion drops the tempfile path at the editor
@@ -9971,8 +10121,8 @@ mod tests {
         let shell = Rc::new(RefCell::new(Shell::new(
             Rc::clone(&world.chat),
             Rc::clone(&world.status),
-            world.core.message_queues.clone(),
-            world.core.task_registry.clone(),
+            world.handles.queues.clone(),
+            world.handles.task_registry.clone(),
             ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor)),
             "aj".to_string(),
             "",
@@ -10195,8 +10345,8 @@ mod tests {
         let shell = Rc::new(RefCell::new(Shell::new(
             Rc::clone(&world.chat),
             Rc::clone(&world.status),
-            world.core.message_queues.clone(),
-            world.core.task_registry.clone(),
+            world.handles.queues.clone(),
+            world.handles.task_registry.clone(),
             ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor)),
             "aj".to_string(),
             "",
@@ -10404,7 +10554,7 @@ mod tests {
         );
         // The run config staged it for the next turn.
         assert_eq!(
-            world.core.run_config.lock().unwrap().thinking,
+            world.handles.run_config.lock().unwrap().thinking,
             Some(ThinkingConfig::High)
         );
         // Session-scoped: the user config layer's default is unchanged (still
@@ -10417,7 +10567,7 @@ mod tests {
         // But the session log records it so a resume restores it.
         let recorded = {
             world
-                .core
+                .handles
                 .log
                 .lock()
                 .await
@@ -10503,7 +10653,7 @@ mod tests {
 
         // Staged into the run config for the next turn.
         assert_eq!(
-            world.core.run_config.lock().unwrap().thinking,
+            world.handles.run_config.lock().unwrap().thinking,
             Some(ThinkingConfig::High)
         );
         // Persisted to the tempdir user config.toml.
@@ -10732,7 +10882,7 @@ mod tests {
 
     /// Register a running background bash task and return its id.
     fn register_bash_task(world: &World, command: &str) -> aj_agent::tool::TaskId {
-        let (id, _cancel) = world.core.task_registry.register(
+        let (id, _cancel) = world.handles.task_registry.register(
             AgentId::Main,
             "test-call".to_string(),
             aj_agent::tool::TaskKind::Bash {
@@ -10773,12 +10923,7 @@ mod tests {
             },
         ];
         for event in events {
-            let _ = reduce(
-                &mut world.chat.borrow_mut(),
-                &mut world.lifecycle,
-                event,
-                None,
-            );
+            fold_event(world, event);
         }
     }
 
@@ -10795,17 +10940,6 @@ mod tests {
                 _ => None,
             })
             .collect()
-    }
-
-    /// The text carried by a host-side notice event, for asserting on the
-    /// deferred notices a session build produces.
-    fn event_text(event: &AgentEvent) -> &str {
-        match event {
-            AgentEvent::Notice { text, .. }
-            | AgentEvent::Warning { text, .. }
-            | AgentEvent::Error { text, .. } => text,
-            other => panic!("expected a notice event, got {other:?}"),
-        }
     }
 
     /// The picker snapshot lists the main agent, a running sub-agent, and
@@ -10885,9 +11019,8 @@ mod tests {
             }],
         )
         .await;
-        let _ = reduce(
-            &mut world.chat.borrow_mut(),
-            &mut world.lifecycle,
+        fold_event(
+            &mut world,
             AgentEvent::SubAgentStart {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
@@ -10901,7 +11034,6 @@ mod tests {
                     verbosity: "default".into(),
                 },
             },
-            None,
         );
 
         // The border rests on the main view's minimal tint before the switch.
@@ -10960,9 +11092,8 @@ mod tests {
         // Seed a sub-agent at a distinct high level, then finish it. The
         // reducer's `SubAgentEnd`/`AgentEnd` arms mark the box done but leave
         // the footer settings in place, so the sub's level must survive.
-        let _ = reduce(
-            &mut world.chat.borrow_mut(),
-            &mut world.lifecycle,
+        fold_event(
+            &mut world,
             AgentEvent::SubAgentStart {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
@@ -10976,27 +11107,22 @@ mod tests {
                     verbosity: "default".into(),
                 },
             },
-            None,
         );
-        let _ = reduce(
-            &mut world.chat.borrow_mut(),
-            &mut world.lifecycle,
+        fold_event(
+            &mut world,
             AgentEvent::SubAgentEnd {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
                 report: "done".into(),
                 conclusion: aj_agent::events::SubAgentConclusion::Completed,
             },
-            None,
         );
-        let _ = reduce(
-            &mut world.chat.borrow_mut(),
-            &mut world.lifecycle,
+        fold_event(
+            &mut world,
             AgentEvent::AgentEnd {
                 agent_id: AgentId::Sub(1),
                 messages: Vec::new(),
             },
-            None,
         );
 
         // Observe the finished sub-agent and reconcile the chrome.
@@ -11039,9 +11165,8 @@ mod tests {
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
 
         // Seed an observable sub-agent to switch the view onto.
-        let _ = reduce(
-            &mut world.chat.borrow_mut(),
-            &mut world.lifecycle,
+        fold_event(
+            &mut world,
             AgentEvent::SubAgentStart {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
@@ -11055,7 +11180,6 @@ mod tests {
                     verbosity: "default".into(),
                 },
             },
-            None,
         );
 
         // Observing the sub-agent inlays its `agent N` marker.
@@ -11102,9 +11226,8 @@ mod tests {
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
 
         // Observe a sub-agent so the editor carries an `agent 1` marker.
-        let _ = reduce(
-            &mut world.chat.borrow_mut(),
-            &mut world.lifecycle,
+        fold_event(
+            &mut world,
             AgentEvent::SubAgentStart {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
@@ -11118,7 +11241,6 @@ mod tests {
                     verbosity: "default".into(),
                 },
             },
-            None,
         );
         let _ = apply_picker_outcome(
             &mut world,
@@ -11152,16 +11274,16 @@ mod tests {
     #[tokio::test]
     async fn install_reconciles_the_editor_chrome_onto_the_new_session() {
         let dir = TempDir::new().expect("tempdir");
-        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let (mut world, shell, mut app, _writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
         let theme = Theme::bundled_dark_with_mode(ColorMode::Truecolor);
 
         // Observe a sub-agent at a level distinct from the default (a fresh
         // main view falls back to the run config's level), so the editor
         // carries both an `agent 1` marker and a border tint that visibly moves
         // across the switch.
-        let _ = reduce(
-            &mut world.chat.borrow_mut(),
-            &mut world.lifecycle,
+        fold_event(
+            &mut world,
             AgentEvent::SubAgentStart {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
@@ -11175,7 +11297,6 @@ mod tests {
                     verbosity: "default".into(),
                 },
             },
-            None,
         );
         let _ = apply_picker_outcome(
             &mut world,
@@ -11195,19 +11316,9 @@ mod tests {
             "border carries the observed sub-agent's tint before the switch"
         );
 
-        // Build and install a fresh session. Installing lands on the main view.
-        let previous_id = world.core.session_id.clone();
-        let next = build_next_session(
-            &world,
-            SessionSpec::Create {
-                entry: SessionEntry::Switch,
-            },
-            &previous_id,
-            false,
-        )
-        .await
-        .expect("build fresh next session");
-        install_next_session(&mut world, &shell, next);
+        // Focus a fresh session. Attaching one lands on the main view.
+        let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
+        assert!(matches!(moved, Focus::Moved));
 
         // No manual `sync_editor_chrome`: the install already reconciled the
         // chrome, so the first post-install paint shows the fresh main view.
@@ -11226,6 +11337,7 @@ mod tests {
             fresh_main_tint,
             "the install re-tinted the border to the fresh main view"
         );
+        shut_down(&world).await;
     }
 
     /// The drive loop reconciles the editor chrome once per iteration, so a
@@ -11245,9 +11357,8 @@ mod tests {
         // Seed a sub-agent and point the active view at it, leaving the editor
         // chrome at its resting default. Only the loop's reconcile should move
         // it.
-        let _ = reduce(
-            &mut world.chat.borrow_mut(),
-            &mut world.lifecycle,
+        fold_event(
+            &mut world,
             AgentEvent::SubAgentStart {
                 parent: AgentId::Main,
                 child: AgentId::Sub(1),
@@ -11261,7 +11372,6 @@ mod tests {
                     verbosity: "default".into(),
                 },
             },
-            None,
         );
         world.chat.borrow_mut().set_active_view(AgentId::Sub(1));
 
@@ -11344,7 +11454,7 @@ mod tests {
             shell.borrow().take_picker_outcome().is_none(),
             "stale picker did not park another outcome"
         );
-        assert!(world.core.task_registry.summary(id).is_some());
+        assert!(world.handles.task_registry.summary(id).is_some());
 
         writer.write_all(b"\x1b").expect("write esc");
         let event = app.next_input().await.expect("input event");
@@ -11389,7 +11499,7 @@ mod tests {
 
         apply_picker_outcome(&mut world, &shell, AgentPickerOutcome::Kill(id)).await;
         world
-            .core
+            .handles
             .task_registry
             .set_status(id, aj_agent::tool::TaskStatus::Killed);
         apply_picker_outcome(&mut world, &shell, AgentPickerOutcome::Kill(id)).await;
@@ -11525,21 +11635,19 @@ mod tests {
     async fn create_disk_session(dir: &TempDir, prompt: &str) -> String {
         let mut world = scripted_world(dir, "streaming-text").await;
         run_prompt(&mut world, prompt).await;
-        let id = world.core.session_id.clone();
-        aj_app::shutdown_background_tasks(&world.core.task_registry).await;
-        world.turns.shutdown().await;
+        let id = world.session.clone();
+        // The host holds the session live (and its lock) until it shuts down,
+        // so a caller that wants to resume the id has to be handed a session
+        // nobody holds.
+        shut_down(&world).await;
         id
     }
 
-    /// Submit `prompt` into `world`, settle the turn, and drain its events
-    /// into the chat model (and, via the persistence listener, to disk).
+    /// Submit `prompt` into `world` and settle the turn, so its messages
+    /// reach the chat model and the log.
     async fn run_prompt(world: &mut World, prompt: &str) {
-        handle_submit(world, prompt.to_string());
-        let joined = world.turns.join_next().await;
-        handle_turn_join(world, joined).expect("turn settles");
-        while let Ok(event) = world.event_rx.try_recv() {
-            let _ = drain_events(world, event);
-        }
+        handle_submit(world, prompt.to_string()).await;
+        settle(world).await;
     }
 
     /// The `NewSession` command parks a new-session request while idle; the
@@ -11566,8 +11674,9 @@ mod tests {
     async fn new_session_refused_mid_turn_selector_opens() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
-        handle_submit(&mut world, "go".to_string());
-        assert!(world.turns.is_driving(AgentId::Main), "busy");
+        handle_submit(&mut world, "go".to_string()).await;
+        fold_ready_frames(&mut world);
+        assert!(world.client.working(), "busy");
 
         // The selector opens read-only mid-turn.
         assert!(matches!(
@@ -11605,21 +11714,20 @@ mod tests {
         );
 
         // Settle the turn so teardown is clean.
-        cancel_viewed_turn(&world);
-        let joined = world.turns.join_next().await;
-        handle_turn_join(&mut world, joined).expect("abort is non-fatal");
+        cancel_viewed_turn(&world).await;
+        settle(&mut world).await;
+        shut_down(&world).await;
     }
 
     /// `NewSession` joins the refuse-while-busy rule for BACKGROUND work too
     /// (no turn in flight): the command refuses with a toast and parks
-    /// nothing, and the consumption-site recheck refuses a `New` request that
-    /// slipped through, then proceeds once idle.
+    /// nothing, and parks the request once the work is over.
     #[tokio::test]
     async fn new_session_refused_while_background_work_runs() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         run_prompt(&mut world, "seed").await;
-        assert!(world.turns.is_empty(), "no turn in flight");
+        assert!(!world.client.working(), "no turn in flight");
         let task = register_bash_task(&world, "sleep 100");
 
         // The command refuses up front.
@@ -11638,21 +11746,20 @@ mod tests {
             "the refusal raises the toast"
         );
 
-        // The consumption site rechecks a request that slipped through.
-        assert!(
-            consume_session_request(&world, &shell, SessionRequest::New).is_none(),
-            "a running background task refuses the parked new-session request"
-        );
-
-        // Idle (task terminal): the request proceeds to a new-session exit.
+        // Idle (task terminal): the command parks the request.
         world
-            .core
+            .handles
             .task_registry
             .set_status(task, aj_agent::tool::TaskStatus::Killed);
         assert!(matches!(
-            consume_session_request(&world, &shell, SessionRequest::New),
-            Some(SessionExit::New)
+            apply_command(&mut world, &shell, CommandAction::NewSession).await,
+            ActionEffect::Redraw
         ));
+        assert!(matches!(
+            shell.borrow().take_session_request(),
+            Some(SessionRequest::New)
+        ));
+        shut_down(&world).await;
     }
 
     /// The session tree opens read-only even mid-turn (the branch switch it
@@ -11661,8 +11768,9 @@ mod tests {
     async fn session_tree_opens_mid_turn() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
-        handle_submit(&mut world, "go".to_string());
-        assert!(world.turns.is_driving(AgentId::Main), "busy");
+        handle_submit(&mut world, "go".to_string()).await;
+        fold_ready_frames(&mut world);
+        assert!(world.client.working(), "busy");
 
         assert!(matches!(
             apply_command(&mut world, &shell, CommandAction::OpenSessionTree).await,
@@ -11681,9 +11789,9 @@ mod tests {
         );
 
         // Settle the turn so teardown is clean.
-        cancel_viewed_turn(&world);
-        let joined = world.turns.join_next().await;
-        handle_turn_join(&mut world, joined).expect("abort is non-fatal");
+        cancel_viewed_turn(&world).await;
+        settle(&mut world).await;
+        shut_down(&world).await;
     }
 
     /// While idle the session tree opens read-only, listing the current
@@ -11840,41 +11948,44 @@ mod tests {
         );
     }
 
-    /// The rebuild path: a switch tears the running session down and builds
-    /// the next over the same Shell, rebinding by content-swap so the
-    /// transcript renders the new session's model and the pending box reads
-    /// the new agent's queues. The outgoing session's usage accumulates for
-    /// the shutdown banner.
+    /// The switch path: focusing another session re-attaches over the same
+    /// Shell, rebinding by content-swap so the transcript renders the new
+    /// session's model and the pending box reads the new session's queues. The
+    /// session left behind accumulates its usage for the shutdown banner.
     #[tokio::test]
     async fn switch_rebuilds_the_session_and_accumulates_usage() {
         let dir = TempDir::new().expect("tempdir");
         let beta = create_disk_session(&dir, "beta session prompt").await;
 
-        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let (mut world, shell, mut app, _writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
         run_prompt(&mut world, "alpha session prompt").await;
-        let alpha_id = world.core.session_id.clone();
+        let alpha_id = world.session.clone();
 
         // Snapshot the outgoing usage, as the outer loop does before it
-        // rebuilds.
+        // changes focus.
         let mut completed: Vec<(String, UsageSummary)> = Vec::new();
-        completed.push((alpha_id.clone(), world.core.usage_summary().await));
+        completed.push((
+            alpha_id.clone(),
+            world
+                .host
+                .usage(&alpha_id)
+                .await
+                .expect("usage")
+                .expect("a live session"),
+        ));
 
-        // Switch to beta: build then install over the same Shell.
-        let next = build_next_session(
-            &world,
-            SessionSpec::Resume {
-                session_id: beta.clone(),
-                entry: SessionEntry::Switch,
-                head: None,
-            },
-            &alpha_id,
-            false,
+        // Switch to beta over the same Shell.
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(beta.clone()),
         )
-        .await
-        .expect("build beta");
-        install_next_session(&mut world, &shell, next);
+        .await;
+        assert!(matches!(moved, Focus::Moved));
 
-        assert_eq!(world.core.session_id, beta, "world rebuilt onto beta");
+        assert_eq!(world.session, beta, "the frontend re-attached onto beta");
         // The transcript renders beta's replayed content, not alpha's, which
         // proves every chrome widget follows the content-swapped chat cell.
         let rows = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
@@ -11891,11 +12002,11 @@ mod tests {
             shell.borrow().header.borrow().text,
             format!("aj - session {beta}")
         );
-        // The pending box reads the new agent's queues (rebound on the
-        // swap), so a message queued on the new core previews.
+        // The pending box reads the new session's queues (rebound on the
+        // swap), so a message queued there previews.
         world
-            .core
-            .message_queues
+            .handles
+            .queues
             .append_follow_up(AgentId::Main, "queued after switch");
         let pending = Rc::clone(&shell.borrow().pending);
         let pending_rows = crate::test_support::rows(
@@ -11907,28 +12018,23 @@ mod tests {
             pending_rows.join("\n").contains("queued after switch"),
             "pending box repointed to the new queues: {pending_rows:?}"
         );
-        world.core.message_queues.clear(AgentId::Main);
+        world.handles.queues.clear(AgentId::Main);
 
         // Switch again, this time to a fresh session; usage keeps
         // accumulating and the new session's transcript is empty.
         completed.push((
-            world.core.session_id.clone(),
-            world.core.usage_summary().await,
+            world.session.clone(),
+            world
+                .host
+                .usage(&world.session)
+                .await
+                .expect("usage")
+                .expect("a live session"),
         ));
-        let prev = world.core.session_id.clone();
-        let next = build_next_session(
-            &world,
-            SessionSpec::Create {
-                entry: SessionEntry::Switch,
-            },
-            &prev,
-            false,
-        )
-        .await
-        .expect("build fresh");
-        install_next_session(&mut world, &shell, next);
+        let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
+        assert!(matches!(moved, Focus::Moved));
 
-        assert_ne!(world.core.session_id, beta, "a fresh session was minted");
+        assert_ne!(world.session, beta, "a fresh session was minted");
         let fresh_rows = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
         assert!(
             !fresh_rows.contains("beta session prompt"),
@@ -11940,8 +12046,16 @@ mod tests {
         assert_eq!(completed.len(), 2);
         assert_eq!(completed[0].0, alpha_id);
         assert_eq!(completed[1].0, beta);
-        // Formatting the banner over the accumulated list must not panic.
-        print_exit_banner(&world, &completed, true).await;
+        // Collecting and formatting the banner over the accumulated list must
+        // not panic, and it itemizes the live session too.
+        let banner = ExitBanner::collect(&world, completed).await;
+        assert_eq!(banner.completed.len(), 2);
+        assert_eq!(
+            banner.live.as_ref().map(|(id, _)| id.as_str()),
+            Some(world.session.as_str()),
+        );
+        banner.print();
+        shut_down(&world).await;
     }
 
     // --- Branch flow (Phase 3) ---
@@ -12102,13 +12216,14 @@ mod tests {
             arm_branch(&sh.branch_anchor, "m1".to_string());
         }
         // Steer is refused: the editor keeps its draft and the anchor stays.
-        assert!(handle_host_action(&mut world, &shell, AjAction::Steer));
+        assert!(handle_host_action(&mut world, &shell, AjAction::Steer).await);
         assert_eq!(shell.borrow().editor.borrow().text(), "branch draft");
         assert!(shell.borrow().branch_anchor.borrow().is_some());
         // Dequeue is refused the same way.
-        assert!(handle_host_action(&mut world, &shell, AjAction::Dequeue));
+        assert!(handle_host_action(&mut world, &shell, AjAction::Dequeue).await);
         assert_eq!(shell.borrow().editor.borrow().text(), "branch draft");
         assert!(shell.borrow().branch_anchor.borrow().is_some());
+        shut_down(&world).await;
     }
 
     /// An empty (post-trim) submit while armed is refused and keeps the
@@ -12127,6 +12242,7 @@ mod tests {
             shell.borrow().branch_anchor.borrow().is_some(),
             "the anchor is kept on an empty submit"
         );
+        shut_down(&world).await;
     }
 
     /// A submit while busy (here a live turn) is refused with a toast, keeping
@@ -12136,10 +12252,10 @@ mod tests {
     async fn busy_submit_refused_toasts_keeps_anchor_and_restores_text() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
-        // Start a turn so the world is busy.
-        handle_submit(&mut world, "first".to_string());
-        assert!(!world.turns.is_empty(), "a turn is in flight");
-        let turns_before = world.turns.driven();
+        // Start a turn so the session is busy.
+        handle_submit(&mut world, "first".to_string()).await;
+        fold_ready_frames(&mut world);
+        assert!(world.client.working(), "a turn is in flight");
         {
             let sh = shell.borrow();
             arm_branch(&sh.branch_anchor, "m1".to_string());
@@ -12162,16 +12278,27 @@ mod tests {
             "the refusal raises the branch toast: {:?}",
             crate::toasts::toast_texts(&shell.borrow().toasts),
         );
+        // Settle the turn so the teardown below is clean.
+        cancel_viewed_turn(&world).await;
+        settle(&mut world).await;
+        let prompts: Vec<String> = world
+            .chat
+            .borrow()
+            .transcript(AgentId::Main)
+            .expect("main transcript")
+            .entries()
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntryKind::User(u) => Some(u.joined_text()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(
-            world.turns.driven(),
-            turns_before,
-            "no new turn spawned by the refused submit"
+            prompts,
+            vec!["first"],
+            "the refused submit never reached the host",
         );
-
-        // Settle the turn so world teardown is clean.
-        cancel_viewed_turn(&world);
-        let joined = world.turns.join_next().await;
-        handle_turn_join(&mut world, joined).expect("abort is non-fatal");
+        shut_down(&world).await;
     }
 
     /// A submit while a background bash task runs (no turn in flight) is
@@ -12183,7 +12310,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         run_prompt(&mut world, "seed").await;
-        assert!(world.turns.is_empty(), "no turn in flight");
+        assert!(!world.client.working(), "no turn in flight");
         let task = register_bash_task(&world, "sleep 100");
         {
             let sh = shell.borrow();
@@ -12203,7 +12330,7 @@ mod tests {
             "the refusal raises the branch toast"
         );
         world
-            .core
+            .handles
             .task_registry
             .set_status(task, aj_agent::tool::TaskStatus::Killed);
     }
@@ -12222,7 +12349,7 @@ mod tests {
 
         // The first user message on disk, plus its parent (a settings entry).
         let (message_id, expected_head) = {
-            let log = world.core.log.lock().await;
+            let log = world.handles.log.lock().await;
             let entry = log
                 .entries_in_order()
                 .into_iter()
@@ -12259,136 +12386,126 @@ mod tests {
         );
     }
 
-    /// A parked tree-view branch switch is refused (a toast raised, no exit)
-    /// while a turn or a background task is live, and proceeds to a branch exit
-    /// once idle. This drives the drive loop's request-consumption decision
-    /// (`consume_session_request`) directly, at the layer the harness exposes.
+    /// A branch switch is refused while a turn or a background task is live,
+    /// and proceeds once idle.
+    ///
+    /// The refusal is the host's: a mid-turn head switch would let the running
+    /// turn persist onto the branch being left. The frontend surfaces the
+    /// reason as the branch-failure notice.
     #[tokio::test]
-    async fn parked_branch_switch_refused_while_busy_and_proceeds_when_idle() {
+    async fn branch_switch_refused_while_busy_and_proceeds_when_idle() {
         let dir = TempDir::new().expect("tempdir");
-        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let (mut world, shell, mut app, _writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
         run_prompt(&mut world, "seed").await;
         let head = world
-            .core
+            .handles
             .log
             .lock()
             .await
             .head()
             .cloned()
             .expect("a persisted head");
+        let branch = || FocusRequest::Branch {
+            head: head.clone(),
+            prompt: None,
+        };
 
-        // A live turn refuses the switch and folds a notice.
-        handle_submit(&mut world, "busy".to_string());
-        assert!(!world.turns.is_empty(), "a turn is in flight");
+        // A live turn refuses the switch.
+        install_busy_script(&world);
+        handle_submit(&mut world, "busy".to_string()).await;
+        fold_ready_frames(&mut world);
+        assert!(world.client.working(), "a turn is in flight");
+        apply_focus_request(&mut app, &shell, &mut world, branch()).await;
         assert!(
-            consume_session_request(
-                &world,
-                &shell,
-                SessionRequest::Branch { head: head.clone() }
-            )
-            .is_none(),
-            "a live turn refuses the branch switch"
-        );
-        assert!(
-            crate::toasts::toast_texts(&shell.borrow().toasts)
+            main_notices(&world)
                 .iter()
-                .any(|m| m.contains("Can't switch branches while work is running")),
-            "the refusal raises the branch toast: {:?}",
-            crate::toasts::toast_texts(&shell.borrow().toasts)
+                .any(|n| n.contains("Failed to branch the conversation") && n.contains("running")),
+            "a live turn refuses the branch switch: {:?}",
+            main_notices(&world),
         );
-        cancel_viewed_turn(&world);
-        let joined = world.turns.join_next().await;
-        handle_turn_join(&mut world, joined).expect("abort is non-fatal");
+        cancel_viewed_turn(&world).await;
+        settle(&mut world).await;
 
-        // A running background task refuses the switch too, even with no turn.
+        // A running background task refuses it too, even with no turn.
         let task = register_bash_task(&world, "cargo build");
+        let before = main_notices(&world).len();
+        apply_focus_request(&mut app, &shell, &mut world, branch()).await;
         assert!(
-            consume_session_request(
-                &world,
-                &shell,
-                SessionRequest::Branch { head: head.clone() }
-            )
-            .is_none(),
-            "a running background task refuses the branch switch"
+            main_notices(&world)[before..]
+                .iter()
+                .any(|n| n.contains("Failed to branch the conversation")),
+            "a running background task refuses the branch switch: {:?}",
+            main_notices(&world),
         );
 
-        // Idle (turn settled, task terminal): the switch proceeds to a
-        // prompt-less branch exit for the selected head.
+        // Idle (turn settled, task terminal): the switch takes.
         world
-            .core
+            .handles
             .task_registry
             .set_status(task, aj_agent::tool::TaskStatus::Killed);
+        apply_focus_request(&mut app, &shell, &mut world, branch()).await;
         assert!(
-            matches!(
-                consume_session_request(
-                    &world,
-                    &shell,
-                    SessionRequest::Branch { head: head.clone() }
-                ),
-                Some(SessionExit::Branch { head: h, prompt: None }) if h == head
-            ),
-            "an idle branch request maps to a prompt-less branch exit"
+            main_notices(&world)
+                .iter()
+                .any(|n| n == "Switched to the selected branch."),
+            "an idle branch switch confirms: {:?}",
+            main_notices(&world),
         );
+        shut_down(&world).await;
     }
 
-    /// The safety-net recheck for a resume: a `SessionRequest::Resume` that
-    /// slipped through with background work live (a wake turn spawned between
-    /// the selector's confirm and this consumption) is refused with a toast and
-    /// no exit, then proceeds once idle. `consume_session_request` is the
-    /// authoritative recheck since the confirm-time `busy` snapshot is stale.
+    /// A session change leaves the outgoing session's background work
+    /// running: the host keeps every session it materialized live, so
+    /// switching away no longer tears the work down.
+    ///
+    /// The up-front refusals (the session overlays' confirms, the
+    /// `NewSession` command) are what keep a user from walking away from live
+    /// work by accident. There is no recheck at the consumption site, because
+    /// with nothing torn down there is nothing left to protect.
     #[tokio::test]
-    async fn parked_resume_refused_while_busy_and_proceeds_when_idle() {
+    async fn a_switch_leaves_the_outgoing_sessions_work_running() {
         let dir = TempDir::new().expect("tempdir");
-        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let (mut world, shell, mut app, _writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
         run_prompt(&mut world, "seed").await;
+        let outgoing = world.session.clone();
+        let task = register_bash_task(&world, "sleep 100");
 
-        // A running background task refuses the resume with a toast, no exit.
-        let task = register_bash_task(&world, "cargo build");
-        assert!(
-            consume_session_request(
-                &world,
-                &shell,
-                SessionRequest::Resume("other-session".to_string())
-            )
-            .is_none(),
-            "a running background task refuses the resume"
-        );
-        assert!(
-            crate::toasts::toast_texts(&shell.borrow().toasts)
-                .iter()
-                .any(|m| m.contains("Can't switch sessions while work is running")),
-            "the refusal raises the switch toast"
-        );
+        let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
+        assert!(matches!(moved, Focus::Moved));
+        assert_ne!(world.session, outgoing, "the focus moved");
 
-        // Idle (task terminal): the resume proceeds to a switch exit.
-        world
-            .core
-            .task_registry
-            .set_status(task, aj_agent::tool::TaskStatus::Killed);
+        let live = world
+            .host
+            .sessions()
+            .await
+            .expect("session list")
+            .sessions
+            .into_iter()
+            .find(|entry| entry.id == outgoing)
+            .expect("the outgoing session is still listed");
+        assert!(live.live, "and the host still holds it");
+        assert_eq!(live.tasks, 1, "with its background task still running");
+        // The new session has its own registry, so the task is not visible
+        // through the handles the frontend now holds.
         assert!(
-            matches!(
-                consume_session_request(
-                    &world,
-                    &shell,
-                    SessionRequest::Resume("other-session".to_string())
-                ),
-                Some(SessionExit::Switch(id)) if id == "other-session"
-            ),
-            "an idle resume request maps to a switch exit"
+            world.handles.task_registry.status(task).is_none(),
+            "the focused session's task table is its own",
         );
+        shut_down(&world).await;
     }
 
     /// End-to-end tree switch (the prompt-`None` run-loop path): a two-branch
     /// session on disk, a selector confirm parks `SessionRequest::Branch`, its
-    /// `into_exit` yields a prompt-less `SessionExit::Branch`, and the rebuild
-    /// lands on the chosen head without auto-submitting. Switching back onto
-    /// the other head shows that branch instead, the spec's round-trip check.
+    /// `into_exit` yields a prompt-less `SessionExit::Branch`, and the head
+    /// switch plus re-attach land on the chosen head without auto-submitting.
+    /// Switching back onto the other head shows that branch instead, the
+    /// spec's round-trip check.
     ///
     /// Driving the whole `run()` loop is impractical in the harness, so we
-    /// assert the chain up to `into_exit()` plus the rebuild-onto-head using
-    /// `build_next_session` / `install_next_session`, folding the run loop's
-    /// tree-switch notice via `apply_branch_switch_notice` exactly as `run()`
-    /// does.
+    /// assert the chain up to `into_exit()` plus the focus change `run()`
+    /// makes of it.
     #[tokio::test]
     async fn tree_switch_rebuilds_onto_the_selected_head_without_submitting() {
         use aj_agent::message::AgentMessage;
@@ -12448,9 +12565,8 @@ mod tests {
             (log.session_id().to_string(), branch_a, branch_b)
         };
 
-        let mut world = resumed_world(&dir, "streaming-text", &session_id).await;
-        let shell = shell_for(&world);
-        let previous_id = world.core.session_id.clone();
+        let (mut world, shell, mut app, _writer, _root) =
+            resumed_world_shell_app(&dir, "streaming-text", &session_id).await;
 
         // A tree-selector confirm parks a branch switch for branch A's head;
         // the drive loop maps it to a prompt-less branch exit.
@@ -12466,21 +12582,18 @@ mod tests {
             _ => panic!("a branch request maps to a branch exit"),
         }
 
-        // Rebuild onto branch A (the run loop's branch path with no prompt).
-        let mut next = build_next_session(
-            &world,
-            SessionSpec::Resume {
-                session_id: session_id.clone(),
-                entry: SessionEntry::Switch,
-                head: Some(branch_a.clone()),
+        // Move the head onto branch A (the run loop's branch path with no
+        // prompt).
+        apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Branch {
+                head: branch_a.clone(),
+                prompt: None,
             },
-            &previous_id,
-            true,
         )
-        .await
-        .expect("build onto branch A");
-        apply_branch_switch_notice(&mut next, true, false);
-        install_next_session(&mut world, &shell, next);
+        .await;
 
         let rows = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
         assert!(
@@ -12499,26 +12612,22 @@ mod tests {
             main_notices(&world)
         );
         assert!(
-            world.turns.is_empty(),
+            !world.client.working(),
             "a prompt-less tree switch spawns no turn"
         );
 
         // Switch back via the tree onto branch B: the transcript matches that
-        // branch instead, proving each head rebuilds faithfully.
-        let current_id = world.core.session_id.clone();
-        let next = build_next_session(
-            &world,
-            SessionSpec::Resume {
-                session_id: session_id.clone(),
-                entry: SessionEntry::Switch,
-                head: Some(branch_b.clone()),
+        // branch instead, proving each head re-attaches faithfully.
+        apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Branch {
+                head: branch_b.clone(),
+                prompt: None,
             },
-            &current_id,
-            true,
         )
-        .await
-        .expect("build onto branch B");
-        install_next_session(&mut world, &shell, next);
+        .await;
         let rows = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
         assert!(
             rows.contains("branch B prompt"),
@@ -12528,54 +12637,49 @@ mod tests {
             !rows.contains("branch A prompt"),
             "branch A content absent after switching to B: {rows}"
         );
-        assert!(world.turns.is_empty(), "still no turn spawned");
+        assert!(!world.client.working(), "still no turn spawned");
+        shut_down(&world).await;
     }
 
-    /// The transactional head override end to end: a branch rebuild onto a
-    /// stale head FAILS the build (`prepare_log` propagates the `set_head`
-    /// error), so `build_next_session` falls back to a default-head resume of
-    /// the previous session, leading with the branch-failure notice, and the
-    /// prompt handoff restores instead of submitting.
+    /// A branch onto a stale head is refused by the host, so the session stays
+    /// where it is, the failure notice names the reason, and the pending prompt
+    /// is restored into the editor rather than run against a head that did not
+    /// move.
     #[tokio::test]
-    async fn stale_head_branch_build_falls_back_with_a_failure_notice() {
+    async fn a_stale_head_keeps_the_session_and_restores_the_prompt() {
         let dir = TempDir::new().expect("tempdir");
-        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let (mut world, shell, mut app, _writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
         run_prompt(&mut world, "seed").await;
-        let previous_id = world.core.session_id.clone();
+        let session = world.session.clone();
 
-        let next = build_next_session(
-            &world,
-            SessionSpec::Resume {
-                session_id: previous_id.clone(),
-                entry: SessionEntry::Switch,
-                head: Some("does-not-exist".to_string()),
+        apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Branch {
+                head: "does-not-exist".to_string(),
+                prompt: Some("edited prompt".to_string()),
             },
-            &previous_id,
-            true,
         )
-        .await
-        .expect("the fallback build succeeds");
-        assert!(next.fell_back, "a stale head fails the requested build");
-        assert!(
-            next.notices
-                .first()
-                .map(event_text)
-                .is_some_and(|n| n.contains("Failed to branch the conversation")
-                    && n.contains("invalid conversation head")
-                    && n.contains("does-not-exist")),
-            "the fallback leads with the branch-failure notice naming the reason: {:?}",
-            next.notices
-        );
+        .await;
 
-        // The run loop's handoff gates on `fell_back` alone now: the pending
-        // prompt is restored, never submitted against the fallback head.
-        let fell_back = next.fell_back;
-        install_next_session(&mut world, &shell, next);
-        let submitted =
-            hand_off_branch_prompt(&mut world, &shell, "edited prompt".to_string(), fell_back);
-        assert!(!submitted, "the fallback restores instead of submitting");
+        assert_eq!(world.session, session, "the session is unchanged");
+        let notices = main_notices(&world);
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.contains("Failed to branch the conversation")
+                    && n.contains("does-not-exist")),
+            "the failure notice names the reason: {notices:?}",
+        );
+        assert!(
+            notices.iter().any(|n| n.contains("Branch failed")),
+            "and says the message came back: {notices:?}",
+        );
         assert_eq!(shell.borrow().editor.borrow().text(), "edited prompt");
-        assert!(world.turns.is_empty(), "no turn spawned");
+        assert!(!world.client.working(), "no turn spawned");
+        shut_down(&world).await;
     }
 
     /// Submitting with an anchor armed on the file root (a user message with no
@@ -12628,92 +12732,86 @@ mod tests {
             "edited root prompt",
             "the edited prompt is restored into the editor on a root refusal"
         );
+        shut_down(&world).await;
     }
 
-    /// A real session install (here a fresh session) clears the armed branch
-    /// anchor, so it can never resolve against a different session's log. This
-    /// drives `install_next_session` rather than calling `disarm_branch`
-    /// directly, so a regression removing the install-time clear fails here.
+    /// A real session change (here onto a fresh session) clears the armed
+    /// branch anchor, so it can never resolve against a different session's
+    /// log. This drives `focus_session` rather than calling `disarm_branch`
+    /// directly, so a regression removing the clear fails here.
     #[tokio::test]
-    async fn install_next_session_clears_the_armed_anchor() {
+    async fn focusing_a_session_clears_the_armed_anchor() {
         let dir = TempDir::new().expect("tempdir");
-        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
-        let previous_id = world.core.session_id.clone();
+        let (mut world, shell, mut app, _writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
         {
             let sh = shell.borrow();
             arm_branch(&sh.branch_anchor, "m1".to_string());
         }
         assert!(
             shell.borrow().branch_anchor.borrow().is_some(),
-            "armed before the install"
+            "armed before the change"
         );
 
-        let next = build_next_session(
-            &world,
-            SessionSpec::Create {
-                entry: SessionEntry::Switch,
-            },
-            &previous_id,
-            false,
-        )
-        .await
-        .expect("build a fresh session");
-        install_next_session(&mut world, &shell, next);
+        let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
+        assert!(matches!(moved, Focus::Moved));
 
         assert!(
             shell.borrow().branch_anchor.borrow().is_none(),
-            "install clears the armed anchor"
+            "the change clears the armed anchor"
         );
+        shut_down(&world).await;
     }
 
-    /// The post-rebuild branch handoff restores the prompt into the editor on
-    /// a build fallback, folds the failure notice, and spawns no turn. The
-    /// prompt is recorded to prompt-history at the drive-loop submit site
-    /// (before the branch breaks out), so the handoff itself only decides
-    /// submit-vs-restore. A stale requested head fails the build, so it IS
-    /// the fallback case, there is no separate stale-head path.
+    /// A branch that resolved auto-submits the prompt handed to it as the new
+    /// branch's first turn, under the confirmation that says so.
+    ///
+    /// The restore path (a head that did not move) is covered by
+    /// `a_stale_head_keeps_the_session_and_restores_the_prompt`.
     #[tokio::test]
-    async fn branch_handoff_restores_the_prompt_on_a_build_fallback() {
+    async fn a_branch_submits_the_handed_off_prompt() {
         let dir = TempDir::new().expect("tempdir");
-        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let (mut world, shell, mut app, _writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        run_prompt(&mut world, "seed").await;
+        let head = world
+            .handles
+            .log
+            .lock()
+            .await
+            .head()
+            .cloned()
+            .expect("a persisted head");
 
-        let submitted =
-            hand_off_branch_prompt(&mut world, &shell, "edited branch prompt".to_string(), true);
-        assert!(!submitted, "a build fallback must not submit");
+        // The handed-off prompt has to still be running when we look.
+        install_busy_script(&world);
+        apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Branch {
+                head,
+                prompt: Some("branch turn".to_string()),
+            },
+        )
+        .await;
+
+        fold_ready_frames(&mut world);
+        assert!(world.client.working(), "the branch prompt ran as a turn");
+        assert!(
+            main_notices(&world)
+                .iter()
+                .any(|n| n == "Branched the conversation from an earlier message."),
+            "under the branch-with-prompt confirmation: {:?}",
+            main_notices(&world),
+        );
         assert_eq!(
             shell.borrow().editor.borrow().text(),
-            "edited branch prompt",
-            "the prompt is restored verbatim into the editor"
+            "",
+            "the prompt was submitted, not restored",
         );
-        assert!(
-            world.turns.is_empty(),
-            "no turn was spawned on the restore path"
-        );
-        let restored_notice = world
-            .chat
-            .borrow()
-            .transcript(AgentId::Main)
-            .expect("main transcript")
-            .entries()
-            .iter()
-            .any(|e| matches!(&e.kind, EntryKind::Notice(n) if n.text.contains("Branch failed")));
-        assert!(restored_notice, "the failure/restore notice is folded");
-    }
 
-    /// The clean-rebuild handoff auto-submits the branch prompt as the
-    /// branch's first turn (the positive counterpart to the restore path).
-    #[tokio::test]
-    async fn branch_handoff_submits_on_a_clean_rebuild() {
-        let dir = TempDir::new().expect("tempdir");
-        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
-
-        let submitted =
-            hand_off_branch_prompt(&mut world, &shell, "branch turn".to_string(), false);
-        assert!(submitted, "a clean rebuild submits the prompt");
-        assert!(!world.turns.is_empty(), "a turn was spawned");
-
-        // Settle the spawned turn so world teardown is clean.
-        let joined = world.turns.join_next().await;
-        handle_turn_join(&mut world, joined).expect("turn settles");
+        settle(&mut world).await;
+        shut_down(&world).await;
     }
 }

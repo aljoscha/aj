@@ -2319,6 +2319,18 @@ async fn cancelling_a_foreground_sub_cascades_to_main() {
         !answers.iter().any(|text| text == "done"),
         "and the parent never ran its concluding inference: {answers:?}",
     );
+    // A sub whose run was cut short emits no `AgentEnd` of its own, so the
+    // reap at the parent turn's join sweeps it and the host publishes the
+    // conclusion as the event it stands for. Without that frame the box would
+    // spin forever, and a client cannot conclude one by reaching into its own
+    // model.
+    let (status, finished) = sub_box(&client.canonical(), 1);
+    assert_ne!(
+        status,
+        aj_app::chat::SubAgentStatus::Running,
+        "the swept sub's box is concluded",
+    );
+    assert!(finished, "and its runtime clock stopped");
     assert_no_dangling(&client.chat);
     harness.host.shutdown().await;
 }
