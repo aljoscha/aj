@@ -250,12 +250,17 @@ non-contiguity, identity-gate accept and reject paths).
 
 Then: the HTTP server over the host layer, the HTTP client, `aj
 serve`, `--listen` (flag and `AJ_LISTEN` environment variable),
-`aj connect` (single focused session), hello and capability handshake,
-heartbeats, bounded per-client queues with coalescing and eviction,
-and the connection identity gate (spec 6.11). Put the gate's peer
-lookup behind a small trait so tests can fake the whois resolver, the
-real implementation queries tailscaled's local API (the unix socket
-that `tailscale whois --json` wraps).
+`aj connect` (single focused session, with the selection rule and the
+supported-action matrix of spec 9.1: unsupported actions notice, they
+never silently no-op), session creation over the wire, the per-task
+read behind the task-output overlay, hello and capability handshake,
+heartbeats, bounded per-client queues with coalescing and eviction
+(the bound governs live fan-out only, attach blocks are
+producer-paced, spec 6.9), and the connection identity gate (spec
+6.11, flag/env names and the capability key are pinned there). Put
+the gate's peer lookup behind a small trait so tests can fake the
+whois resolver, the real implementation queries tailscaled's local
+API (the unix socket that `tailscale whois --json` wraps).
 
 Acceptance: equivalence harness green including fault injection, a
 human can run `aj serve` in one terminal and `aj connect` in another
@@ -271,10 +276,11 @@ a second client, and slow-client eviction with recovery. Sidebar tests
 with the TUI test support.
 
 Then: unified stream fan-out for many sessions, the sidebar and
-per-session `ChatState` switching, session creation over the wire,
-`aj gateway` with static host config and the `/v1/hosts` enrollment
-endpoints (with persisted enrollment state), id namespacing, control
-connections and splice forwarding, `unreachable` surfacing.
+per-session `ChatState` switching, the tree view and branching UX
+over the wire, `aj gateway` with static host config and the
+`/v1/hosts` enrollment endpoints (with persisted enrollment state),
+id namespacing, control connections and splice forwarding,
+`unreachable` surfacing.
 
 Acceptance: gateway tests green, manual: two `aj serve` hosts, one
 gateway, one client, switch between sessions on both hosts with

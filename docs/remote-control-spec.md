@@ -280,11 +280,16 @@ internally tagged with `kind`:
   is known.
 - `state`: `{kind, session, epoch, working, settings, last_seq}`.
   Structured per-session state: whether the session's **main agent** has
-  a turn in flight, the active settings (model identity, thinking, speed,
-  verbosity), and the current durable high-water mark. Sent at the start
+  a turn in flight, the active settings (model identity, thinking,
+  thinking display, speed, verbosity), and the current durable
+  high-water mark. Sent at the start
   of an attach (before backfill) and whenever any of it changes. This is
   how a mid-session joiner learns the active model and seeds its
   lifecycle spinner, neither of which is derivable from projected events.
+  It is also the authoritative carrier of restored settings: a client
+  that wants a "restored session" notice renders it locally from this
+  frame on first attach, the host publishes no restore notices, so
+  nothing can duplicate on reconnect.
   The change trigger is `working` or `settings`, not `last_seq`: every
   durable frame already carries its own position, and `list` carries it
   for sessions a client has not attached, so re-emitting `state` per
@@ -538,13 +543,22 @@ viewed agent to that parameter:
 | `.../{id}/cancel` | optional agent | Cancel the running turn, with the existing foreground-sub-agent-cancels-main cascade. |
 | `.../{id}/queue` | op: remove (optional agent) or clear | Withdraw or clear pending queued messages. Withdrawal returns the text, which is what makes the client's dequeue-into-the-editor gesture work. One agent holds at most one coalesced pending message, so there is no index to address. |
 | `.../{id}/compact` | optional instructions | Manual compaction. |
-| `.../{id}/settings` | model / thinking / speed / verbosity changes | Host applies, logs, and emits the synthesized frames. |
+| `.../{id}/settings` | model / thinking / thinking display / speed / verbosity changes | Host applies, logs, and emits the synthesized frames. |
 | `.../{id}/head` | target entry id | Switch the session head. 409 while working or tasks live. Clears queues, new epoch, `reset` frame. |
 | `.../{id}/tasks/{task_id}/kill` | — | Kill a background task. |
 
 Gateway-only additions are in section 7. Session creation through a
 gateway takes a target host parameter, because hosts are bound to
 working directories.
+
+Request bodies are the `aj-wire` types, which are the source of truth
+once landed. Two shapes the spec pins because getting them wrong is
+easy: a model change travels as the same (api, url, name) triple that
+CLI and env selection use, never as a catalog object (the host
+resolves the triple against its own catalog and credentials), and
+thinking display is a live-only axis, applied and broadcast via the
+`state` frame but not written to the log, matching the local behavior
+where it reseeds from config on resume.
 
 ### 6.7 Reads
 
@@ -563,6 +577,10 @@ needs on demand:
   model, the in-memory form uses `Instant`). Clients replace their
   task table with this after `caught_up`, and ignore `TaskOutput` for
   unknown task ids in the interim.
+- `GET /v1/sessions/{id}/tasks/{task_id}` — one task's detailed read:
+  status, output tails, byte totals, and the agent report where
+  applicable. This is what backs the task-output overlay in connect
+  mode, the spill file on the host's disk is not reachable remotely.
 - `GET /v1/sessions/{id}/queue` — pending steering and follow-up
   messages.
 - `GET /v1/sessions/{id}/tree` — the session branch tree, for the
@@ -597,7 +615,14 @@ frame per event, a short coalescing tick bounds the rate.
 The agent must never block on a slow client, and reliable frames must
 never be silently dropped for a connected client.
 
-- Per attached client, the server keeps a bounded outbound queue.
+- Per attached client, the server keeps a bounded outbound queue. The
+  bound governs **live fan-out only**: an attach block (the `state`
+  frame, backfill, `caught_up`) is producer-paced, generated and
+  written at the pace the client reads it under ordinary HTTP
+  backpressure, and is never preloaded into the bounded queue. A big
+  resumed session must not evict its own client before the first
+  frame is read. Live frames arriving during a backfill queue under
+  the bound as usual, and overflow there still evicts.
 - Lossy frames are coalesced by their key: a newer snapshot for the
   same key **replaces the queued older one's payload semantics by
   dropping the old frame and enqueueing the new one at the tail**,
@@ -699,10 +724,17 @@ layered around it:
   and every accepted connection is logged with its resolved identity.
   This is defense in depth against policy misconfiguration and gives
   every action an attributable identity. The gate has three modes,
-  configured per process (flag or environment, no config file
-  needed): `local` (default, loopback peers only), `tailscale` (the
-  whois gate), and `open` (explicit opt-out, for the host-private VM
-  bind). Serving a non-loopback address in `local` mode refuses to
+  configured per process with `--auth <local|tailscale|open>` or
+  `AJ_AUTH` (flag wins): `local` (default, loopback peers only),
+  `tailscale` (the whois gate), and `open` (explicit opt-out, for the
+  host-private VM bind). In `tailscale` mode the allowlist is given
+  with repeatable `--allow <login>` or comma-separated `AJ_ALLOW`,
+  where a login is the tailnet login name exactly as whois reports it
+  (e.g. `alice@github`). Tagged nodes have no login and are accepted
+  only via the app capability, whose key is
+  `github.com/aljoscha/aj/cap/control`. A connection passes with
+  either an allowlisted login or the capability. Serving a
+  non-loopback address in `local` mode refuses to
   start rather than silently serving unauthenticated.
 
 What this deliberately does not provide is per-connection human
@@ -869,14 +901,17 @@ govern hosts we create.
 Orthogonal to file provenance, **per-session inference settings
 follow the creator**. The host supplies the environment (workspace,
 skills, keys, catalog, tool availability), but the model, thinking
-level, speed, and verbosity of a session belong to whoever creates
-it: a connect-mode client resolves its own configured defaults and
-sends them with the create command, and explicit create settings win
-over the host's config defaults, which apply only when the creator
-sends none. A requested model must be servable by the host (present
-in its catalog, with credentials), otherwise the create fails with a
-clear error rather than silently substituting. After creation the
-settings command mutates them, from any client, as peers.
+level, thinking display, speed, and verbosity of a session belong to
+whoever creates it: a connect-mode client resolves its own configured
+defaults and sends them with the create command, and explicit create
+settings win over the host's config defaults, which apply only when
+the creator sends none. A requested model must be servable by the
+host (present in its catalog, with credentials), otherwise the create
+fails with a clear error rather than silently substituting. After
+creation the settings command mutates them, from any client, as
+peers. Thinking display sits here rather than in the UX scope because
+it changes what the provider is asked to emit, not just what is
+rendered.
 
 ## 9. Client TUI
 
@@ -892,14 +927,31 @@ re-reads a live handle at draw time, which does not exist remotely),
 and the task table must accept replacement from the tasks read
 (section 6.7). Footer settings state comes from `state` frames.
 
-Two things the in-process client still reaches around the protocol for,
-and that connect mode therefore has to grow: the thinking-display toggle
-mutates the run config directly, because no settings axis carries it and
-nothing durable records it, and the notices a resume produces when it
-restores the settings recorded in a log are returned to the caller
-rather than published, so only the process that resumed sees them. Both
-want a host-published notice and, for the toggle, either a settings axis
-or an honest client-local scope.
+Two things the in-process client used to reach around the protocol
+for are resolved by contract now: thinking display is a real settings
+axis (command, `state` frame, creator-follows rule, live-only, see
+sections 6.6 and 8), and restore notices are client-rendered from the
+attach `state` frame, the host publishes none (section 6.3).
+
+Session selection: bare `aj connect <url>` attaches the host's most
+recently modified session, and creates one when the host has none.
+`aj connect <url> --new` forces creation, and an optional session-id
+argument attaches a specific one. This is why session creation is
+part of phase 2, a fresh `aj serve` would otherwise be unreachable.
+
+Not every local action can work over the wire, and the boundary is
+explicit rather than discovered. Supported in connect mode from phase
+2: prompt, steer, cancel, queue withdraw/clear, settings including
+model switch and thinking display, compaction, task kill, and the
+task-output overlay (backed by the per-task read, section 6.7). The
+exit usage banner renders from the client's own event-derived
+accounting rather than a host read. Deferred to phase 3 alongside the
+sidebar: the session tree view and branching UX (the tree read and
+head command exist, the interaction wiring does not). Not supported
+over the wire in v1: HTML export and the session-info overlay, both
+read host-local files, run them on the host. An unsupported action in
+connect mode surfaces a clear notice, it never silently does nothing.
+
 Connection state (connected, reconnecting, catching up) is surfaced in
 the footer/status line.
 
@@ -1034,13 +1086,15 @@ before the next begins.
   existing tests keep passing.
 - **Phase 2, single-session remote**: HTTP server and client,
   `aj serve`, `aj --listen` (flag and `AJ_LISTEN` environment
-  variable), `aj connect` viewing/controlling one session, the full
-  attach/catch-up protocol, the connection identity gate (section
-  6.11), reducer-equivalence harness including fault injection.
+  variable), `aj connect` viewing/controlling one session (selection
+  rule and action matrix per section 9.1), session creation over the
+  wire, the per-task read, the full attach/catch-up protocol, the
+  connection identity gate (section 6.11), reducer-equivalence
+  harness including fault injection.
 - **Phase 3, multiplexing**: unified stream with many sessions, the
-  sidebar, session switching, session creation over the wire, the
-  gateway with aggregation over static hosts plus the `/v1/hosts`
-  enrollment endpoints and persisted enrollment state.
+  sidebar, session switching, the tree view and branching UX over the
+  wire, the gateway with aggregation over static hosts plus the
+  `/v1/hosts` enrollment endpoints and persisted enrollment state.
 - **Phase 4, provisioning**: backend trait, local-process backend
   (with the CI cycle test), profile bundle, the `/v1/vms` endpoints
   and `vms` frames, ember backend, systemd unit files and setup docs.
