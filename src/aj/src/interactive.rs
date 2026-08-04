@@ -2,41 +2,42 @@
 //!
 //! The base layout from the alt-screen UX spec: a one-line header, a
 //! flex-filling transcript, an editor, and a one-line footer, stacked
-//! in a `FlexColumn`. A real agent session backs the shell: prompts
-//! submitted from the editor spawn turns through the shared
-//! `aj_app::turn` helpers, agent events fold into the [`ChatState`]
-//! model, and the [`TranscriptView`] renders it with follow-tail.
+//! in a `FlexColumn`. A session host backs the shell: this frontend is the
+//! host's first client, attached in process (spec section 5). Prompts and
+//! every other mutation go out as host commands, the frames the host
+//! publishes fold into the [`ChatState`] model through
+//! [`SessionClient`](aj_app::client::SessionClient), and the
+//! [`TranscriptView`] renders it with follow-tail.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use aj_agent::bus::SubscriptionHandle;
-use aj_agent::events::{AgentEvent, AgentId, CompactionReason};
+use aj_agent::TaskRegistry;
+use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
 use aj_agent::queue::MessageQueues;
 use aj_agent::types::UsageSummary;
-use aj_agent::{TaskRegistry, TurnError};
 use aj_app::actions::AjAction;
-use aj_app::chat::{ChatState, reduce};
-use aj_app::cli::args::{Args, Command};
+use aj_app::chat::ChatState;
+use aj_app::cli::args::{Args, Command as CliCommand};
+use aj_app::client::SessionClient;
 use aj_app::commands::{CommandAction, load_model_catalog};
+use aj_app::host::{
+    AttachRequest, Attachment, Command, CommandOutcome, HostError, HostSetup, LocalHandles,
+    QueueOp, SessionHost, SettingsAxis, SettingsChange,
+};
 use aj_app::keybindings::fixed_keys;
-use aj_app::session::{
-    AgentLifecycle, SessionCore, SessionEntry, SessionExit, SessionRequest, SessionSpec,
-};
-use aj_app::session_setup::{RestoreContext, build_initial_run_config};
-use aj_app::settings::{
-    ConfigLayers, ConfigTarget, Confirmation, FooterUpdate, PersistAction, SpeedConfirm,
-};
+use aj_app::session::{SessionExit, SessionRequest};
+use aj_app::session_setup::build_initial_run_config;
+use aj_app::settings::{ConfigLayers, ConfigTarget, PersistAction};
 use aj_app::shutdown::{format_resume_hint, format_session_usage_header, format_usage_summary};
 use aj_app::theme::{
     ColorMode, Theme, ThemeBg, ThemeColor, ThemeHandle, ThemeWatcherGuard, watch_user_theme,
 };
-use aj_app::turn::{Joined, TurnStart, Turns, running_work_counts};
+use aj_app::turn::running_work_counts;
 use aj_conf::skills::Skill;
 use aj_conf::{
     AgentEnv, Config, ConfigDiagnostic, ConfigSpeed, ConfigThinkingDisplay, ConfigVerbosity,
@@ -46,12 +47,9 @@ use aj_models::auth::{AuthError, AuthStorage};
 use aj_models::registry::ModelInfo;
 use aj_models::types::{Speed, UserContent};
 use aj_models::usage::default_reset_sources;
-use aj_models::{ThinkingConfig, speed_from_name, speed_name, thinking_config_from_name};
-use aj_session::{
-    ConversationPersistence, PromptEntry, SessionPreview, ThreadFilter, project_thread,
-    replay_deferring_subs,
-};
-use anyhow::{Context, Result, anyhow};
+use aj_models::{ThinkingConfig, speed_from_name, thinking_config_from_name};
+use aj_session::{ConversationPersistence, PromptEntry, SessionPreview, ThreadFilter};
+use anyhow::{Context, Result};
 use base64::Engine as _;
 use chrono::Utc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -113,40 +111,39 @@ const SET_TITLE_EVENT: &str = "aj.set-title";
 /// The app name shown in the terminal window title, lowercase.
 const APP_TITLE: &str = "aj";
 
-/// Everything the select loop mutates besides the `AsyncApp`: the
-/// session core, the shared chat model, and the turn bookkeeping.
+/// Everything the select loop mutates besides the `AsyncApp`: the session
+/// host, this client's view of the focused session, and the shared chat
+/// model.
 ///
 /// Kept separate from the [`Shell`] widget so the loop's arm helpers
 /// are drivable headlessly in tests, without a terminal.
 struct World {
-    core: SessionCore,
-    /// Agent-lifecycle truth for this frontend's view of the session:
-    /// which agents are running, which are compacting. The event fold
-    /// ([`reduce`]) and the turn-join arm are its writers. It lives here
-    /// rather than on the core because a session served to several
-    /// clients has one authoritative lifecycle per owner, and this is
-    /// this frontend's.
-    lifecycle: AgentLifecycle,
-    /// Receiver side of the bus->channel forwarder feeding the drive
-    /// loop's event arm.
-    event_rx: UnboundedReceiver<AgentEvent>,
-    /// Keeps `event_rx`'s subscription alive; dropped with the world.
-    _event_handle: SubscriptionHandle,
+    /// Every live session in this process, and the only path to mutating
+    /// one. This frontend is its first client, attached in process through
+    /// direct handles and channels rather than over HTTP (spec section 5).
+    host: SessionHost,
+    /// The session this frontend renders. Changing it means re-attaching,
+    /// never rebuilding the world.
+    session: String,
+    /// The focused session's frame stream.
+    attachment: Attachment,
+    /// The fold from those frames into `chat`, and the owner of this
+    /// client's agent lifecycle, cursor, and settings view.
+    client: SessionClient,
+    /// Direct handles into the focused session, for the reads no frame
+    /// carries: the pending box's queues, the footer's task registry, the
+    /// settings UI's run-config snapshot, the log the tree and export
+    /// walks read. A read surface only, every mutation goes through
+    /// `host` (see [`LocalHandles`]).
+    handles: LocalHandles,
     /// The chat model, shared with the [`TranscriptView`]. Only the
-    /// loop mutates it (via [`reduce`] and the arm helpers). The view
+    /// loop mutates it (via the client fold and the arm helpers). The view
     /// reads it at draw time. Never borrowed across an await.
     chat: Rc<RefCell<ChatState>>,
-    /// The resumed sub-agent indices whose transcript is not yet
-    /// materialized. A sub-agent enters the set in the resume drain and
-    /// leaves it the first time it is observed. Live-spawned sub-agents
-    /// are never in it, since they build their transcript from the live
-    /// event stream.
-    deferred_subs: HashSet<usize>,
     /// Mirror of the lifecycle bits the status chrome (loader,
     /// footer) reads at draw time, shared with those widgets and
     /// refreshed by [`sync_status`] once per loop iteration. The
-    /// `AgentLifecycle` itself stays on `world`, where the reducer and
-    /// the turn-join arm mutate it.
+    /// lifecycle itself lives on `client`, whose fold is its writer.
     status: Rc<RefCell<StatusState>>,
     config: Arc<StdMutex<Config>>,
     /// The user + project config layers behind the effective `config`. The
@@ -157,29 +154,29 @@ struct World {
     /// window's model submenu. Also seeds [`ChatState`]'s context-window
     /// resolver.
     catalog: Arc<Vec<ModelInfo>>,
-    /// In-flight turns keyed by the agent running them, plus the
-    /// host's clone of each turn's cancel token.
-    turns: Turns,
     /// Credential store, shared with the async read-only overlays (auth
     /// status, usage) whose fetches run detached off the drive loop.
     auth: AuthStorage,
     /// The project's sessions store, shared with the prompt-history scan
     /// (run detached on a blocking thread off the drive loop).
     persistence: ConversationPersistence,
-    /// Resume-time settings-restoration context, resolved once at startup
-    /// and reused when a session switch rebuilds onto another session so a
-    /// resumed session's recorded model/thinking/speed are restored the
-    /// same way the process's first session's are. `None` in scripted mode.
-    restore: Option<RestoreContext>,
 }
 
-/// Build the session world: run config, session core, and the chat
-/// model seeded from the main agent and any resumed history.
+/// Which session the process opens with.
+enum StartupSession {
+    /// Mint a fresh one.
+    Create,
+    /// Resume the identified one from disk.
+    Resume(String),
+}
+
+/// Build the session world: the host, the session it opens with, and the
+/// chat model seeded from that session's attach block.
 ///
-/// Mirrors `aj`'s interactive assembly (`SessionCore::build` off the
-/// shared run-config snapshot), then folds replayed history, config
-/// diagnostics, and restore notices into the chat model so the first
-/// frame shows them.
+/// The host owns session assembly now, so what happens here is the client
+/// half: attach, fold the block the host serves (which is what replaces the
+/// startup replay), discharge the reads the block obliges, then fold the
+/// startup notices so the first frame shows them.
 async fn build_world(
     args: &Args,
     layers: ConfigLayers,
@@ -206,81 +203,73 @@ async fn build_world(
     let (run_config, restore) = build_initial_run_config(args, &config, auth, speed)?;
 
     // `aj continue` with neither an explicit id nor a latest session
-    // on disk degrades to a fresh session, matching `aj`. The session
-    // selector (interactive resume picking) is a later phase.
-    let spec = match &args.command {
-        Some(Command::Continue {
+    // on disk degrades to a fresh session, matching `aj`.
+    let startup = match &args.command {
+        Some(CliCommand::Continue {
             session_id: Some(id),
             prompt: _,
-        }) => SessionSpec::Resume {
-            session_id: id.clone(),
-            entry: SessionEntry::Startup,
-            head: None,
-        },
-        Some(Command::Continue {
+        }) => StartupSession::Resume(id.clone()),
+        Some(CliCommand::Continue {
             session_id: None,
             prompt: _,
         }) => match persistence.get_latest_session_id()? {
-            Some(latest) => SessionSpec::Resume {
-                session_id: latest,
-                entry: SessionEntry::Startup,
-                head: None,
-            },
+            Some(latest) => StartupSession::Resume(latest),
             None => {
                 eprintln!("No latest conversation to resume; starting a fresh session.");
-                SessionSpec::Create {
-                    entry: SessionEntry::Startup,
-                }
+                StartupSession::Create
             }
         },
-        _ => SessionSpec::Create {
-            entry: SessionEntry::Startup,
-        },
+        _ => StartupSession::Create,
     };
 
-    let (core, seed) =
-        SessionCore::build(&config, run_config, persistence, &spec, restore.as_ref())?;
-    let mut core = core;
-    let mut lifecycle = AgentLifecycle::default();
-    let (event_handle, event_rx) = core.subscribe_channel();
-
     let catalog = load_model_catalog();
-    let mut chat = ChatState::new(seed.settings, seed.context_window, Arc::clone(&catalog));
-    chat.show_thinking_block = config.show_thinking_block;
-    chat.show_token_usage = config.show_token_usage;
-    chat.compact_transcript = config.compact_transcript;
-    chat.show_image_in_terminal = config.show_image_in_terminal;
-    chat.syntax_highlight = config.syntax_highlighting;
+    let config = Arc::new(StdMutex::new(config));
+    let config_layers = Arc::new(StdMutex::new(layers));
+    let host = SessionHost::new(HostSetup {
+        config: Arc::clone(&config),
+        layers: Arc::clone(&config_layers),
+        catalog: Arc::clone(&catalog),
+        run_config,
+        restore,
+        persistence: persistence.clone(),
+        auth: auth.clone(),
+        working_directory: std::env::current_dir().unwrap_or_default(),
+    })?;
 
-    // Replay a resumed session's history through the same reducer the
-    // live events go through. Replay never hits the bus, so nothing is
-    // double-persisted. A fresh log replays nothing.
-    //
-    // Deferred replay withholds each sub-agent's content events but still
-    // emits its `SubAgentStart`/`SubAgentEnd`, so every sub-agent box is
-    // built (and `Done` with its report) while its transcript stays empty
-    // until observed. We record which indices were deferred so Observe
-    // can materialize them on demand.
-    let mut deferred_subs = HashSet::new();
-    {
-        let log = Arc::clone(&core.log);
-        let log = log.lock().await;
-        for event in replay_deferring_subs(&log) {
-            if let AgentEvent::SubAgentStart {
-                child: AgentId::Sub(n),
-                ..
-            } = &event
-            {
-                deferred_subs.insert(*n);
-            }
-            let _ = reduce(&mut chat, &mut lifecycle, event, None);
-        }
-    }
+    // A resume attaches, which materializes the session on the way in. A
+    // create mints one and holds it live.
+    let fresh = matches!(startup, StartupSession::Create);
+    let session = match startup {
+        StartupSession::Create => host.create().await?,
+        StartupSession::Resume(id) => id,
+    };
+    let handles = host.local_handles(&session).await?;
+    let mut client = SessionClient::new(session.clone());
+    let chat = seeded_chat(&config, &handles, &catalog);
+    let attachment = open_stream(&host, &session, &mut client).await?;
+    let mut world = World {
+        host,
+        session,
+        attachment,
+        client,
+        handles,
+        chat: Rc::new(RefCell::new(chat)),
+        status: Rc::new(RefCell::new(StatusState::default())),
+        config,
+        config_layers,
+        catalog,
+        auth: auth.clone(),
+        persistence: persistence.clone(),
+    };
+    // The block is fully queued by the time the attach returns, so the
+    // resumed history is in the model before the first frame is drawn.
+    fold_ready_frames(&mut world);
+    refresh_client_reads(&mut world).await;
 
-    // Startup notices, after replay so resumed history stays on top.
-    // Order mirrors aj: config diagnostics, then (fresh session only) the
-    // context listing followed by the skill warnings, then sandbox, auth,
-    // tmux, then the resume-restore notices.
+    // Startup notices, after the attach block so resumed history stays on
+    // top. Order mirrors aj: config diagnostics, then (fresh session only)
+    // the context listing followed by the skill warnings, then sandbox,
+    // auth, tmux, then the resume-restore notices.
     for d in diagnostics {
         let text = d.to_string();
         let event = match d.severity() {
@@ -293,38 +282,37 @@ async fn build_world(
                 text,
             },
         };
-        let _ = reduce(&mut chat, &mut lifecycle, event, None);
+        fold_event(&mut world, event);
     }
     if !keybinding_problems.is_empty() {
         let mut msg = String::from("Some keybindings in config.toml had no effect:");
         for problem in &keybinding_problems {
             msg.push_str(&format!("\n  - {problem}"));
         }
-        let _ = reduce(&mut chat, &mut lifecycle, warning_event(&msg), None);
+        fold_warning(&mut world, &msg);
     }
     // The context listing and skill warnings describe the freshly-loaded env,
     // which governs only a fresh session, so `fresh_env_notices` returns them
-    // for a Create and nothing for a resume. Folding them here, ahead of the
+    // for a create and nothing for a resume. Folding them here, ahead of the
     // sandbox/auth/tmux warnings, keeps the context leading the fresh-session
     // block. The same helper feeds the in-process new-session path, so a
     // `/new` surfaces identical env context and skill problems.
-    for event in fresh_env_notices(&spec, &core.env) {
-        let _ = reduce(&mut chat, &mut lifecycle, event, None);
+    for event in fresh_env_notices(fresh, &world.handles.env) {
+        fold_event(&mut world, event);
     }
     if aj_app::notices::sandbox_warning_enabled() {
-        let _ = reduce(
-            &mut chat,
-            &mut lifecycle,
-            warning_event(aj_app::notices::SANDBOX_WARNING),
-            None,
-        );
+        fold_warning(&mut world, aj_app::notices::SANDBOX_WARNING);
     }
     // Apply a `--api-key` runtime override to the resolved provider, then
     // nudge toward logging in when no credential is configured. Both are
     // skipped for the scripted fake provider, which needs no credentials.
     if args.scripted.is_none() {
         let provider_id = {
-            let cfg = core.run_config.lock().expect("run config mutex poisoned");
+            let cfg = world
+                .handles
+                .run_config
+                .lock()
+                .expect("run config mutex poisoned");
             cfg.model_key.0.clone()
         };
         if let Some(key) = args.api_key.clone() {
@@ -341,267 +329,248 @@ async fn build_world(
             )),
         };
         if let Some(text) = warning {
-            let event = AgentEvent::Warning {
-                agent_id: AgentId::Main,
-                text,
-            };
-            let _ = reduce(&mut chat, &mut lifecycle, event, None);
+            fold_warning(&mut world, &text);
         }
     }
     if let Some(warning) = aj_app::tmux::options().and_then(aj_app::tmux::build_warning) {
-        let _ = reduce(&mut chat, &mut lifecycle, warning_event(&warning), None);
+        fold_warning(&mut world, &warning);
     }
-    for notice in std::mem::take(&mut core.restore_notices) {
-        let _ = reduce(&mut chat, &mut lifecycle, notice_event(&notice), None);
+    for notice in world.handles.restore_notices.clone() {
+        fold_notice(&mut world, &notice);
     }
 
-    Ok(World {
-        core,
-        lifecycle,
-        event_rx,
-        _event_handle: event_handle,
-        chat: Rc::new(RefCell::new(chat)),
-        deferred_subs,
-        status: Rc::new(RefCell::new(StatusState::default())),
-        config: Arc::new(StdMutex::new(config)),
-        config_layers: Arc::new(StdMutex::new(layers)),
-        catalog,
-        turns: Turns::new(),
-        auth: auth.clone(),
-        persistence: persistence.clone(),
-        restore,
-    })
+    Ok(world)
 }
 
-/// A freshly built session ready to install over the running one: the new
-/// core, the seeded chat model, and the notices to fold after install (the
-/// switch/create confirmation, the fresh session's env notices from
-/// [`fresh_env_notices`], plus any resume-restore notices).
-struct NextSession {
-    core: SessionCore,
-    /// The lifecycle this build's replay folded into, swapped onto the
-    /// world with the chat model so the two cannot drift apart.
-    lifecycle: AgentLifecycle,
-    /// Receiver side of the new session's bus->channel forwarder, plus the
-    /// handle keeping it subscribed.
-    event_rx: UnboundedReceiver<AgentEvent>,
-    event_handle: SubscriptionHandle,
-    chat: ChatState,
-    /// The resumed sub-agent indices whose transcript is deferred, seeded
-    /// by this build's drain and swapped onto the world in
-    /// [`install_next_session`]. See [`World::deferred_subs`].
-    deferred_subs: HashSet<usize>,
-    notices: Vec<AgentEvent>,
-    /// Whether the requested build failed and this session is the
-    /// previous-session fallback. The branch flow gates the prompt handoff
-    /// on it: a successful build with a requested head override guarantees
-    /// the head applied (a stale head fails the build), so `!fell_back`
-    /// alone is the clean-rebuild signal.
-    fell_back: bool,
-}
-
-/// Build the session a new-session or resume request asks for, reusing the
-/// world's process-lifetime handles (config, run config, catalog,
-/// persistence, restore context).
+/// A fresh chat model for the session behind `handles`: the settings
+/// identity and context window its next main turn runs against, plus the
+/// config-driven display flags.
 ///
-/// If the requested build fails, falls back to resuming `previous_id` (the
-/// session that just ended, whose log is on disk and current) and reports
-/// the failure as the notice instead. Returns `Err` only when the fallback
-/// build fails too, which the outer loop treats as fatal. Touches no widget
-/// state: installing the returned session stays with the caller.
-async fn build_next_session(
-    world: &World,
-    spec: SessionSpec,
-    previous_id: &str,
-    branch: bool,
-) -> Result<NextSession> {
-    let config = world.config.lock().expect("config mutex poisoned").clone();
-    // The next session starts from the outgoing session's staged run
-    // config, so a `/model` or `/thinking` change made in this process
-    // carries across the switch. Each session then owns its clone, so a
-    // resume that restores a recorded bundle cannot reach back into the
-    // session it switched away from.
-    let staged = || {
-        world
-            .core
+/// The settings seed comes off the live run config rather than off a
+/// `state` frame, because [`ChatState::new`] needs it before any frame has
+/// been folded. The two agree: a `state` frame reports the same run config.
+fn seeded_chat(
+    config: &Arc<StdMutex<Config>>,
+    handles: &LocalHandles,
+    catalog: &Arc<Vec<ModelInfo>>,
+) -> ChatState {
+    let (settings, context_window) = {
+        let cfg = handles
             .run_config
             .lock()
-            .expect("run config mutex poisoned")
-            .clone()
+            .expect("run config mutex poisoned");
+        (cfg.settings(), cfg.model_info.context_window)
     };
-    let (mut core, seed, notice, fell_back) = match SessionCore::build(
-        &config,
-        staged(),
-        &world.persistence,
-        &spec,
-        world.restore.as_ref(),
-    ) {
-        Ok((core, seed)) => {
-            let notice = switch_notice(&spec, &core.session_id);
-            (core, seed, notice, false)
-        }
-        Err(err) => {
-            // The requested build failed. Fall back to the session that
-            // just ended so the user keeps a live world, and report why.
-            let failure = switch_failure_notice(&spec, &err, branch);
-            let fallback = SessionSpec::Resume {
-                session_id: previous_id.to_string(),
-                entry: SessionEntry::Switch,
-                head: None,
-            };
-            let (core, seed) = SessionCore::build(
-                &config,
-                staged(),
-                &world.persistence,
-                &fallback,
-                world.restore.as_ref(),
-            )?;
-            (core, seed, failure, true)
-        }
-    };
-
-    // Seed a fresh chat from the built core, replaying a resumed session's
-    // history through the same reducer the live events use. Replay never
-    // hits the bus, so nothing is double-persisted; a fresh log replays
-    // nothing.
-    let mut chat = ChatState::new(
-        seed.settings,
-        seed.context_window,
-        Arc::clone(&world.catalog),
-    );
+    let mut chat = ChatState::new(settings, context_window, Arc::clone(catalog));
+    let config = config.lock().expect("config mutex poisoned");
     chat.show_thinking_block = config.show_thinking_block;
     chat.show_token_usage = config.show_token_usage;
     chat.compact_transcript = config.compact_transcript;
     chat.show_image_in_terminal = config.show_image_in_terminal;
     chat.syntax_highlight = config.syntax_highlighting;
-    // Deferred replay withholds sub-agent content but still builds every
-    // sub-agent box, so the seeded set records which indices Observe must
-    // materialize (see `build_world`).
-    let mut deferred_subs = HashSet::new();
-    let mut lifecycle = AgentLifecycle::default();
-    {
-        let log = Arc::clone(&core.log);
-        let log = log.lock().await;
-        for event in replay_deferring_subs(&log) {
-            if let AgentEvent::SubAgentStart {
-                child: AgentId::Sub(n),
-                ..
-            } = &event
-            {
-                deferred_subs.insert(*n);
+    chat
+}
+
+/// Open a frame stream for `session` and arm `client` for the attach block
+/// the host is about to write onto it.
+///
+/// The block is served synchronously, so it is already queued when this
+/// returns: the caller folds it with [`fold_ready_frames`] rather than
+/// waiting for the drive loop's frame arm. The cursor offered is the
+/// client's own, so a re-attach after a head switch is served under the new
+/// epoch and a re-attach within one is served the suffix.
+async fn open_stream(
+    host: &SessionHost,
+    session: &str,
+    client: &mut SessionClient,
+) -> Result<Attachment, HostError> {
+    let attachment = host
+        .attach(&[AttachRequest {
+            session: session.to_string(),
+            cursor: client.cursor(),
+        }])
+        .await?;
+    // Armed from what the host reports it served, never from what we asked
+    // for: an arm for a block that never arrives would make the next
+    // on-change `state` frame look like one (see `expect_attach`).
+    if attachment.attached().iter().any(|name| name == session) {
+        client.expect_attach();
+    }
+    Ok(attachment)
+}
+
+/// Fold every frame already queued on the focused session's stream.
+///
+/// Called once per drive-loop iteration and after every attach, so the
+/// chrome mirrors never lag the host by a frame (a command's own frames are
+/// queued by the time it returns) and a streaming burst collapses into one
+/// redraw rather than one per chunk. Returns whether anything renderable
+/// changed.
+fn fold_ready_frames(world: &mut World) -> bool {
+    let mut redraw = false;
+    while let Some(frame) = world.attachment.try_recv() {
+        redraw |= world.client.apply(&mut world.chat.borrow_mut(), frame).0;
+    }
+    redraw
+}
+
+/// Discharge the reads an attach block obliges: neither the task table nor
+/// the pending-message queues are replayable, so a backfill regenerates
+/// neither (spec 6.7).
+///
+/// The local views read the live handles instead, so nothing on screen
+/// depends on this. The client's own model does, and it is the same fold a
+/// remote client uses, so leaving it stale would leave the two paths
+/// unequal.
+async fn refresh_client_reads(world: &mut World) {
+    if world.client.needs_task_refetch() {
+        match world.host.tasks(&world.session).await {
+            Ok(tasks) => world.client.set_tasks(tasks),
+            Err(err) => tracing::warn!("could not read the session's task table: {err}"),
+        }
+    }
+    if world.client.needs_queue_refetch() {
+        match world.host.queue(&world.session).await {
+            Ok(queue) => world.client.set_queue(queue),
+            Err(err) => tracing::warn!("could not read the session's message queues: {err}"),
+        }
+    }
+}
+
+/// A session change the drive loop broke out for.
+enum FocusRequest {
+    /// Mint a session and focus it.
+    Create,
+    /// Focus a session that already exists.
+    Resume(String),
+    /// Move the focused session's head, then re-attach onto the branch that
+    /// leaves, auto-submitting `prompt` as its first turn when one was
+    /// handed off.
+    Branch {
+        head: String,
+        prompt: Option<String>,
+    },
+}
+
+/// Whether a focus change moved to another session, which is what decides
+/// if the outgoing session's usage belongs in the exit banner.
+enum Focus {
+    Moved,
+    Same,
+}
+
+/// Apply a session change: point the frontend at another session, or move
+/// the focused one's head and re-attach.
+///
+/// A refused change (an unknown session, a lock held by another writer, a
+/// head switch the host refuses while work is live) folds its failure
+/// notice and stays where it is. Nothing is torn down either way: the
+/// outgoing session stays live in the host.
+async fn apply_focus_request(
+    app: &mut AsyncApp,
+    shell: &Rc<RefCell<Shell>>,
+    world: &mut World,
+    request: FocusRequest,
+) -> Focus {
+    match request {
+        FocusRequest::Create => {
+            let created = match world.host.create().await {
+                Ok(session) => {
+                    let notice = format!("Started a fresh session ({session}).");
+                    focus_session(
+                        app,
+                        shell,
+                        world,
+                        session,
+                        true,
+                        vec![notice_event(&notice)],
+                    )
+                    .await
+                }
+                Err(err) => Err(err),
+            };
+            match created {
+                Ok(()) => Focus::Moved,
+                Err(err) => {
+                    fold_notice(world, &format!("Failed to start a fresh session: {err}"));
+                    Focus::Same
+                }
             }
-            let _ = reduce(&mut chat, &mut lifecycle, event, None);
         }
-    }
-    let (event_handle, event_rx) = core.subscribe_channel();
-
-    // Order: the switch/create confirmation, then (for a fresh switch) the
-    // fresh-env notices (context listing plus any skill warnings), then any
-    // resume-restore notices. The confirmation is the switch acknowledgment,
-    // so the env notices follow it rather than lead. The caller folds these
-    // after install so they sit on top of the replayed history.
-    //
-    // A successful branch build leads with no confirmation: its wording
-    // depends on whether a prompt is handed off, which only the run loop
-    // knows, so the run loop inserts it after this build returns (see
-    // `apply_branch_switch_notice`). A build fallback still leads with its
-    // failure notice.
-    let mut notices = Vec::new();
-    if !(branch && !fell_back) {
-        notices.push(notice_event(&notice));
-    }
-    // Gate the fresh-env notices on `!fell_back`, not just the spec: on a
-    // fallback the built `core` is the resumed previous session, not the
-    // requested Create, so a Create request that fell back must not describe
-    // the fallback's env as if it were freshly started. When we did not fall
-    // back, the built session matches the requested `spec`, so passing `spec`
-    // is correct.
-    if !fell_back {
-        notices.extend(fresh_env_notices(&spec, &core.env));
-    }
-    notices.extend(
-        std::mem::take(&mut core.restore_notices)
-            .iter()
-            .map(|n| notice_event(n)),
-    );
-    Ok(NextSession {
-        core,
-        lifecycle,
-        event_rx,
-        event_handle,
-        chat,
-        deferred_subs,
-        notices,
-        fell_back,
-    })
-}
-
-/// Confirmation notice for a successful New/Switch session change, matching
-/// aj. A branch rebuild's confirmation is decided by the run loop instead (see
-/// [`apply_branch_switch_notice`]), so it never flows through here.
-fn switch_notice(spec: &SessionSpec, session_id: &str) -> String {
-    match spec {
-        SessionSpec::Create { .. } => format!("Started a fresh session ({session_id})."),
-        SessionSpec::Resume { session_id, .. } => format!("Switched to session {session_id}."),
-    }
-}
-
-/// Failure notice when a requested session change couldn't be built (the
-/// host falls back to resuming the previous session), matching aj.
-fn switch_failure_notice(spec: &SessionSpec, err: &anyhow::Error, branch: bool) -> String {
-    if branch {
-        return format!("Failed to branch the conversation: {err}");
-    }
-    match spec {
-        SessionSpec::Create { .. } => format!("Failed to start a fresh session: {err}"),
-        SessionSpec::Resume { session_id, .. } => {
-            format!("Failed to switch to session {session_id}: {err}")
+        FocusRequest::Resume(session) => {
+            let notice = format!("Switched to session {session}.");
+            match focus_session(
+                app,
+                shell,
+                world,
+                session.clone(),
+                false,
+                vec![notice_event(&notice)],
+            )
+            .await
+            {
+                Ok(()) => Focus::Moved,
+                Err(err) => {
+                    fold_notice(
+                        world,
+                        &format!("Failed to switch to session {session}: {err}"),
+                    );
+                    Focus::Same
+                }
+            }
+        }
+        FocusRequest::Branch { head, prompt } => {
+            branch_focused_session(app, shell, world, head, prompt).await;
+            // A branch stays inside its session, so the banner keeps
+            // counting it as the live one.
+            Focus::Same
         }
     }
 }
 
-/// Install a freshly built [`NextSession`] over the running world in place.
+/// Point the frontend at `session`, folding `lead` (the switch
+/// confirmation) plus that session's own startup notices on top of the
+/// history its attach block carries.
 ///
 /// Rebind by replace-contents: the `chat` and `status` cells keep their
 /// identity across the swap (every chrome widget and the keymap's dispatch
 /// closure hold clones of these Rcs, captured once at [`Shell::new`]), so
 /// overwriting their contents repoints the whole UI at the new session
 /// without rebuilding a widget or re-initializing the app. Only the handles
-/// a content swap can't reach are repointed in [`Shell::rebind`]: the
-/// pending box's message queues (the new agent owns fresh ones) and the
-/// header id.
-fn install_next_session(world: &mut World, shell: &Rc<RefCell<Shell>>, next: NextSession) {
-    *world.chat.borrow_mut() = next.chat;
-    // Swap the deferred-sub set together with the chat, so a prior
-    // session's indices can't leak into the new session's Observe path.
-    world.deferred_subs = next.deferred_subs;
-    // The lifecycle belongs to the chat model the replay folded it with,
-    // so the two are swapped together. The event stream is the new
-    // session's bus, and its handle has to outlive the swap or the
-    // subscription drops with the old one.
-    world.lifecycle = next.lifecycle;
-    world.event_rx = next.event_rx;
-    world._event_handle = next.event_handle;
-    // Status is resynced from the new core once per iteration; reset it so
+/// a content swap cannot reach are repointed in [`Shell::rebind`].
+///
+/// The world is mutated only once the new session's stream is open, so a
+/// refused attach (an unknown session, a lock another writer holds) leaves
+/// the current one running and hands the reason back for the caller to word.
+async fn focus_session(
+    app: &mut AsyncApp,
+    shell: &Rc<RefCell<Shell>>,
+    world: &mut World,
+    session: String,
+    fresh: bool,
+    lead: Vec<AgentEvent>,
+) -> Result<(), HostError> {
+    let handles = world.host.local_handles(&session).await?;
+    let mut client = SessionClient::new(session.clone());
+    let attachment = open_stream(&world.host, &session, &mut client).await?;
+
+    *world.chat.borrow_mut() = seeded_chat(&world.config, &handles, &world.catalog);
+    world.handles = handles;
+    world.client = client;
+    world.attachment = attachment;
+    world.session = session;
+    // Status is resynced from the client once per iteration; reset it so
     // the frame between install and the next sync shows idle chrome.
     *world.status.borrow_mut() = StatusState::default();
-    world.core = next.core;
     // Clear any armed branch anchor: the shell and its slots survive session
-    // rebuilds, so without this a stale anchor could resolve against the new
-    // session's log (and with legacy 8-hex ids even hit a wrong entry). Covers
-    // every install path (New, Switch, and the branch rebuild itself).
+    // changes, so without this a stale anchor could resolve against the new
+    // session's log (and with legacy 8-hex ids even hit a wrong entry).
     shell.borrow().disarm_branch();
-    // A session change is only requested with no turn in flight (the outer
-    // loop shut the outgoing turns down, and the guard refuses mid-turn
-    // requests), so this replace is normally a no-op. Dropping the old value
-    // is still the safer defensive move: it aborts any turn that slipped
-    // through rather than leaving it running against the outgoing session.
-    world.turns = Turns::default();
     // Start the switched-to session's splash box at the top: a prior session's
     // wheel scroll must not carry over.
     shell.borrow().splash.borrow_mut().reset_scroll();
     shell.borrow_mut().rebind(world);
-    // Reconcile the editor chrome onto the freshly installed session. The
+    // Reconcile the editor chrome onto the freshly focused session. The
     // per-iteration reconcile runs at the bottom of `drive`, but `drive`
     // re-enters here with no prior render and paints its first frame at the top
     // of the loop, one iteration before that reconcile. The editor widget
@@ -610,15 +579,111 @@ fn install_next_session(world: &mut World, shell: &Rc<RefCell<Shell>>, next: Nex
     // mirrors the `world.status` reset above, which resets chrome for the same
     // install-to-first-draw window.
     sync_editor_chrome(world, shell);
-    // Folded after the install so they land in the new session's chat, on
-    // top of any replayed history.
-    for event in next.notices {
-        let _ = reduce(
-            &mut world.chat.borrow_mut(),
-            &mut world.lifecycle,
-            event,
-            None,
-        );
+    fold_ready_frames(world);
+    refresh_client_reads(world).await;
+    // Folded after the attach block so they land on top of the replayed
+    // history: the confirmation, then a fresh session's env notices, then
+    // whatever resume-time restoration did.
+    for event in lead {
+        fold_event(world, event);
+    }
+    for event in fresh_env_notices(fresh, &world.handles.env) {
+        fold_event(world, event);
+    }
+    for notice in world.handles.restore_notices.clone() {
+        fold_notice(world, &notice);
+    }
+    // The outgoing session's transmitted image ids belong to its terminal
+    // graphics memory. Free them and empty the store so the new session
+    // starts clean.
+    free_session_images(app, shell);
+    // Retitle the terminal for the switched-to session, and hand focus back
+    // to the editor: `rebind` closed the overlay stack, so the widget that
+    // held focus may be gone. Both run off the loop with no event context,
+    // so they ride app events (see `REFOCUS_OVERLAY_EVENT`).
+    app.post_app_event(UserEvent {
+        name: SET_TITLE_EVENT.to_string(),
+        data: None,
+    });
+    app.post_app_event(UserEvent {
+        name: REFOCUS_OVERLAY_EVENT.to_string(),
+        data: None,
+    });
+    app.request_redraw();
+    Ok(())
+}
+
+/// Move the focused session's head and re-attach onto the branch that
+/// leaves, handing `prompt` to it under the prompt-safety invariant.
+///
+/// The head switch is the host's: it refuses while work is live, clears the
+/// abandoned branch's queues, mints a fresh epoch and publishes `reset`.
+/// Re-attaching under the client we already hold is what adopts that epoch,
+/// which is what drops the abandoned branch's transcript (spec 6.5).
+async fn branch_focused_session(
+    app: &mut AsyncApp,
+    shell: &Rc<RefCell<Shell>>,
+    world: &mut World,
+    head: String,
+    prompt: Option<String>,
+) {
+    let session = world.session.clone();
+    if let Err(err) = world
+        .host
+        .command(&session, Command::Head { entry: head })
+        .await
+    {
+        fold_notice(world, &format!("Failed to branch the conversation: {err}"));
+        // The head did not move, so the prompt would run against the branch
+        // the user meant to leave. Restore it verbatim instead; it is
+        // already in prompt history (recorded at the submit site), so it is
+        // never lost either way.
+        if let Some(prompt) = prompt {
+            shell.borrow().editor.borrow_mut().set_text(&prompt);
+            fold_notice(
+                world,
+                "Branch failed. Your message was restored to the editor.",
+            );
+        }
+        app.request_redraw();
+        return;
+    }
+    if let Err(err) = reattach(world).await {
+        // The switch took but the stream did not reopen, so the transcript
+        // on screen describes a branch the session left.
+        fold_warning(world, &format!("Lost the session's event stream: {err}"));
+    }
+    fold_notice(world, branch_switch_notice(prompt.is_some()));
+    if let Some(prompt) = prompt {
+        auto_submit_launch(world, vec![UserContent::text(prompt)]).await;
+    }
+    free_session_images(app, shell);
+    app.request_redraw();
+}
+
+/// Re-attach the focused session after its continuity broke.
+///
+/// The client is the one we already hold, so a fresh epoch is adopted
+/// through the block's opening `state` frame, which resets the chat model
+/// before the new branch's backfill lands. A `reset` frame still queued on
+/// the outgoing stream goes away with it.
+async fn reattach(world: &mut World) -> Result<(), HostError> {
+    let mut attachment = open_stream(&world.host, &world.session, &mut world.client).await?;
+    std::mem::swap(&mut world.attachment, &mut attachment);
+    drop(attachment);
+    fold_ready_frames(world);
+    refresh_client_reads(world).await;
+    Ok(())
+}
+
+/// The confirmation for a branch, chosen from whether a prompt is handed
+/// off: the `b`-submit flow (the prompt auto-submits as the branch's first
+/// turn) vs a tree-view switch that only moved the head.
+fn branch_switch_notice(prompt_present: bool) -> &'static str {
+    if prompt_present {
+        "Branched the conversation from an earlier message."
+    } else {
+        "Switched to the selected branch."
     }
 }
 
@@ -753,12 +818,12 @@ fn warning_event(text: &str) -> AgentEvent {
 /// fixed in its log and so is not governed by the env read now.
 ///
 /// Both the process-start path ([`build_world`]) and the in-process
-/// new-session path ([`build_next_session`]) fold these, so a `/new` surfaces
-/// the same context listing and skill problems a cold start does. The splash
-/// box shows warning- and error-level notices only, so the Info context
-/// listing stays in scrollback while a skill warning can surface in the box.
-fn fresh_env_notices(spec: &SessionSpec, env: &AgentEnv) -> Vec<AgentEvent> {
-    if !matches!(spec, SessionSpec::Create { .. }) {
+/// new-session path ([`focus_session`]) fold these, so a `/new` surfaces the
+/// same context listing and skill problems a cold start does. The splash box
+/// shows warning- and error-level notices only, so the Info context listing
+/// stays in scrollback while a skill warning can surface in the box.
+fn fresh_env_notices(fresh: bool, env: &AgentEnv) -> Vec<AgentEvent> {
+    if !fresh {
         return Vec::new();
     }
     let mut events = vec![notice_event(&aj_app::notices::build_context_notice(
@@ -773,28 +838,26 @@ fn fresh_env_notices(spec: &SessionSpec, env: &AgentEnv) -> Vec<AgentEvent> {
     events
 }
 
+/// Fold an event this frontend raised itself into the chat model.
+///
+/// It goes through the client rather than straight to the reducer so the
+/// client's lifecycle sets stay the only ones (see
+/// [`SessionClient::apply_local`]).
+fn fold_event(world: &mut World, event: AgentEvent) {
+    let _ = world
+        .client
+        .apply_local(&mut world.chat.borrow_mut(), event);
+}
+
 /// Fold `text` into the chat model as a Main-agent notice row.
 fn fold_notice(world: &mut World, text: &str) {
-    let _ = reduce(
-        &mut world.chat.borrow_mut(),
-        &mut world.lifecycle,
-        notice_event(text),
-        None,
-    );
+    fold_event(world, notice_event(text));
 }
 
 /// Fold `text` into the chat model as a Main-agent warning row, for
 /// failures the user should notice (e.g. a login that errored out).
 fn fold_warning(world: &mut World, text: &str) {
-    let _ = reduce(
-        &mut world.chat.borrow_mut(),
-        &mut world.lifecycle,
-        AgentEvent::Warning {
-            agent_id: AgentId::Main,
-            text: text.to_string(),
-        },
-        None,
-    );
+    fold_event(world, warning_event(text));
 }
 
 /// An in-flight OAuth login the drive loop is tracking.
@@ -983,71 +1046,43 @@ fn finish_login(
     app.request_redraw();
 }
 
-/// Fold `first` plus everything else already buffered on the event
-/// channel into the chat model.
+/// Whether the viewed agent is busy, as this client sees it.
 ///
-/// Returns whether anything changed renderable state (so the caller
-/// requests one redraw per batch, not one per streaming chunk) plus
-/// the agents that earned a post-turn wake while draining. Wake
-/// triggers, matching `aj`'s mid-select set:
+/// The host is the authority: it refuses a gesture it cannot serve, and its
+/// `working` flag on every `state` frame is what a client seeds. This mirror
+/// exists for the keymap's predicates and the overlay confirms, where the
+/// answer is needed synchronously at draw or dispatch time and where a stale
+/// one costs at most a refusal the host would have made anyway.
 ///
-/// - `TaskEnd`: the owner is woken unconditionally so the completion
-///   notice reaches the model the moment the task finishes. The gate
-///   inside `Turns::spawn_wake` skips busy owners, which pick the
-///   notice up at their next drain point instead.
-/// - `AgentEnd` with queued notices or pending messages: a sub's
-///   initial run is nested inside the parent's turn (not driven
-///   through the JoinSet), so the turn-completion trigger never sees
-///   it end. Without this, a notice arriving after that run's last
-///   drain point would rot until the next prompt. The condition is
-///   checked after the event reduced, so the owner reads as idle and
-///   the gate inside `Turns::spawn_wake` is open.
-fn drain_events(world: &mut World, first: AgentEvent) -> (bool, Vec<AgentId>) {
-    let mut redraw = false;
-    let mut wake_targets = Vec::new();
-    let mut next = Some(first);
-    while let Some(event) = next {
-        // Capture the trigger before the reducer consumes the event.
-        let trigger = match &event {
-            AgentEvent::TaskEnd { agent_id, .. } => Some((*agent_id, false)),
-            AgentEvent::AgentEnd { agent_id, .. } => Some((*agent_id, true)),
-            _ => None,
-        };
-        {
-            let mut chat = world.chat.borrow_mut();
-            redraw |= reduce(&mut chat, &mut world.lifecycle, event, None).0;
-        }
-        if let Some((id, conditional)) = trigger
-            && (!conditional
-                || world.core.task_registry.has_notices(id)
-                || world.core.message_queues.has_pending(id))
-        {
-            wake_targets.push(id);
-        }
-        next = world.event_rx.try_recv().ok();
-    }
-    (redraw, wake_targets)
+/// `working` covers the main agent only (spec 6.3), which is also the one
+/// case the lifecycle can lag: the host marks it busy the moment it spawns
+/// the turn, before the turn's `AgentStart` reaches anyone.
+fn view_busy(world: &World, view: AgentId) -> bool {
+    world.client.lifecycle().is_running(view) || (view == AgentId::Main && world.client.working())
 }
 
-/// Spawn the post-turn wakes earned while draining a batch of events.
-/// `Turns::spawn_wake` gates on busy owners, so duplicate targets in
-/// one batch are harmless.
-fn spawn_wakes(world: &mut World, targets: Vec<AgentId>) {
-    for id in targets {
-        world
-            .turns
-            .spawn_wake(id, &world.core, &world.lifecycle, &world.config);
-    }
+/// The background work the focused session is carrying, as
+/// `(agents, tasks)`.
+///
+/// The turn count is the main agent's flag rather than the host's driven-turn
+/// count, which no frame carries: the two differ only for a sub-agent
+/// continuation the host drives, and this feeds a hint line and the
+/// refuse-while-busy gestures the host re-checks anyway.
+fn running_work(world: &World) -> (usize, usize) {
+    running_work_counts(
+        usize::from(world.client.working()),
+        &world.handles.task_registry.snapshot(),
+    )
 }
 
 /// Mirror the lifecycle bits the status chrome reads into the shared
 /// [`StatusState`] cell, returning whether the animation tick should run
 /// (see [`StatusState::animating`]). Called once per loop iteration right
-/// before rendering, so every mutation path (event batch, turn join,
-/// submits) shares one sync point and the mirror can't silently drift.
+/// before rendering, so every mutation path (the frame fold, submits)
+/// shares one sync point and the mirror can't silently drift.
 fn sync_status(world: &World) -> bool {
     let active = world.chat.borrow().active_view();
-    let life = &world.lifecycle;
+    let life = world.client.lifecycle();
     let next = StatusState {
         running: life.is_running(active),
         compacting: life.is_compacting(active),
@@ -1089,42 +1124,51 @@ fn branch_armed_notice(what: &str) -> String {
     )
 }
 
-/// Handle an editor submit: spawn a prompt turn on the viewed agent
-/// if it is idle, or queue the text as a follow-up while it is busy.
+/// Handle an editor submit: hand the text to the host, which runs a prompt
+/// turn on the viewed agent if it is idle and queues it as a follow-up
+/// while it is busy.
 ///
-/// A queued message shows in the pending box (which reads the live
-/// queue snapshot at draw) and is delivered by the post-turn wake:
-/// `handle_turn_join` and the `AgentEnd` trigger in [`drain_events`]
-/// both spawn a wake when `message_queues.has_pending`. History is
-/// recorded by the callers (the drive loop and [`handle_steer`]), which
+/// A queued message shows in the pending box (which reads the live queue
+/// snapshot at draw) and is delivered by the host's post-turn wake. History
+/// is recorded by the callers (the drive loop and [`handle_steer`]), which
 /// own the editor. Returns whether the message was accepted for delivery.
-fn handle_submit(world: &mut World, text: String) -> bool {
+async fn handle_submit(world: &mut World, text: String) -> bool {
     let trimmed = text.trim().to_string();
     if trimmed.is_empty() {
         return false;
     }
     let target = world.chat.borrow().active_view();
-    if world.turns.is_busy(&world.lifecycle, target) {
-        world.core.message_queues.append_follow_up(target, &trimmed);
-        return true;
+    // The user's message row arrives back as a `MessageEnd { User }` frame,
+    // so nothing is inserted into the model here.
+    prompt_host(
+        world,
+        Command::Prompt {
+            agent: target,
+            content: vec![UserContent::text(trimmed)],
+        },
+    )
+    .await
+}
+
+/// Send a prompt command and fold the host's reason when it refuses.
+///
+/// Every refusal here is one the host alone can decide: an agent with no
+/// live handle (a resumed sub-agent), an attachment that cannot be queued
+/// behind a busy agent. Its wording is user-facing, and a remote client
+/// shows the same string.
+async fn prompt_host(world: &mut World, command: Command) -> bool {
+    match world.host.command(&world.session, command).await {
+        Ok(_) => true,
+        Err(err) => {
+            fold_notice(world, &err.to_string());
+            false
+        }
     }
-    // The user's message row arrives back over the bus as
-    // `MessageEnd { User }`, so nothing is inserted into the model here.
-    let spawned = world.turns.spawn(
-        &world.core,
-        &world.config,
-        target,
-        TurnStart::Prompt(trimmed),
-    );
-    if !spawned {
-        fold_notice(world, "This agent can't be prompted.");
-    }
-    spawned
 }
 
 /// Submit editor text and return the transcript to its live tail when accepted.
-fn handle_editor_submit(world: &mut World, shell: &Rc<RefCell<Shell>>, text: String) {
-    if handle_submit(world, text) {
+async fn handle_editor_submit(world: &mut World, shell: &Rc<RefCell<Shell>>, text: String) {
+    if handle_submit(world, text).await {
         shell.borrow().transcript.borrow_mut().resume_follow_tail();
     }
 }
@@ -1134,85 +1178,43 @@ fn handle_editor_submit(world: &mut World, shell: &Rc<RefCell<Shell>>, text: Str
 ///
 /// Kept as a standalone step called from `run` outside the outer session
 /// loop, so only the initial session submits and an in-process session
-/// switch never resubmits. The launch turn is not recorded into the
-/// editor's prompt history, matching `aj`.
-fn auto_submit_launch(world: &mut World, content: Vec<UserContent>) {
+/// switch never resubmits. The branch flow calls it too, for the prompt it
+/// hands to the branch it just opened. The launch turn is not recorded into
+/// the editor's prompt history, matching `aj`.
+async fn auto_submit_launch(world: &mut World, content: Vec<UserContent>) {
     if content.is_empty() {
         return;
     }
-    world.turns.spawn(
-        &world.core,
-        &world.config,
-        AgentId::Main,
-        TurnStart::Content(content),
-    );
+    prompt_host(
+        world,
+        Command::Prompt {
+            agent: AgentId::Main,
+            content,
+        },
+    )
+    .await;
 }
 
-/// Handle one completed turn from the join set. Returns `Err` only for
-/// fatal outcomes (turn task panic, `TurnError::Fatal`), which end the
-/// session.
-fn handle_turn_join(world: &mut World, joined: Joined) -> Result<()> {
-    let Joined { agent: id, outcome } = joined;
-    let result = outcome.map_err(|join_err| anyhow!("agent task panicked: {join_err}"))?;
-    // The spinner and footer resync from the lifecycle each frame, but a
-    // sub-agent box's status chip and runtime clock are reducer state
-    // flipped by `AgentEnd`/`SubAgentEnd`. A sub the reap sweeps emitted
-    // neither, so conclude its box directly. For the joined agent itself
-    // (and any driven sub) the buffered events carry the real conclusion
-    // and `conclude_sub_box` leaves a concluded box untouched.
-    for idled in world
-        .turns
-        .reap(&mut world.lifecycle, &world.core.task_registry, id)
-    {
-        if let AgentId::Sub(n) = idled {
-            world.chat.borrow_mut().conclude_sub_box(n);
-        }
-    }
-    // Post-turn wake: deliver queued task notices the moment the agent
-    // goes idle. `Agent::wake` is a no-op when nothing is pending.
-    // Live `TaskEnd`/`AgentEnd` events trigger the same wake mid-select
-    // (see `drain_events`), covering tasks that finish between turns.
-    if world.core.task_registry.has_notices(id) || world.core.message_queues.has_pending(id) {
-        world
-            .turns
-            .spawn_wake(id, &world.core, &world.lifecycle, &world.config);
-    }
-    match result {
-        Ok(()) => Ok(()),
-        Err(TurnError::Aborted) => {
-            // The agent already emitted the synthetic aborted
-            // `MessageEnd`s, so the transcript is consistent. A brief
-            // notice confirms Ctrl+C took effect.
-            fold_notice(world, "Turn cancelled.");
-            Ok(())
-        }
-        Err(TurnError::Recoverable(_)) => {
-            // A recoverable failure already rendered in transcript
-            // order from the turn's terminal `MessageEnd`
-            // (`AssistantMessage.error`). Re-rendering it here would
-            // float it above events still buffered in the channel, so
-            // we only keep the session alive (matches `aj`).
-            Ok(())
-        }
-        Err(TurnError::Fatal(err)) => Err(anyhow::Error::msg(err)),
-    }
-}
-
-/// Cancel the viewed agent's running turn. Returns whether anything
-/// was cancelled. Fired by the keymap's `CancelTurn` action, whose
-/// predicate keeps it off the dispatch path while nothing runs.
-fn cancel_viewed_turn(world: &World) -> bool {
+/// Cancel the viewed agent's running turn. Returns whether anything was
+/// cancelled. Fired by the keymap's `CancelTurn` action, whose predicate
+/// keeps it off the dispatch path while nothing runs.
+///
+/// The host owns the cascade: cancelling a sub-agent that runs inside its
+/// parent's turn fires the parent's token.
+async fn cancel_viewed_turn(world: &World) -> bool {
     let active = world.chat.borrow().active_view();
-    if world.turns.cancel(active) {
-        return true;
+    if !view_busy(world, active) {
+        return false;
     }
-    if world.lifecycle.is_running(active) {
-        // A sub running its initial spawn is owned by the main turn.
-        // Cancelling that token cascades to the child.
-        world.turns.cancel(AgentId::Main);
-        return true;
+    if let Err(err) = world
+        .host
+        .command(&world.session, Command::Cancel { agent: active })
+        .await
+    {
+        tracing::warn!("the host refused a cancel: {err}");
+        return false;
     }
-    false
+    true
 }
 
 /// Summarize the background work a quit would tear down, for the quit-arm
@@ -1239,53 +1241,34 @@ fn running_work_summary(agents: usize, tasks: usize) -> Option<String> {
 /// background agents and bash tasks a quit would tear down, or `None` when
 /// nothing runs.
 fn quit_arm_running_work(world: &World) -> Option<String> {
-    let (agents, tasks) =
-        running_work_counts(world.turns.driven(), &world.core.task_registry.snapshot());
+    let (agents, tasks) = running_work(world);
     running_work_summary(agents, tasks)
-}
-
-/// Decide what a parked session request does at the drive-loop consumption
-/// site: the [`SessionExit`] to break the loop with, or `None` to stay in the
-/// session.
-///
-/// Every request (a new session, a selector resume, a tree-view branch
-/// switch) rebuilds the session, which shuts its turns and background work
-/// down. We refuse any of them while a turn or background task/sub-agent is
-/// live rather than tear live work down silently. The request sites refuse
-/// while busy up front (the overlays at confirm time, the `NewSession`
-/// command in `apply_command_action`), but a request can still slip through
-/// with work live: a background sub-agent finishing between that check and
-/// this consumption spawns a parent wake turn (so `world.turns` is
-/// non-empty), and the earlier `busy` snapshot is one drive-loop iteration
-/// stale. This is the authoritative recheck.
-fn consume_session_request(
-    world: &World,
-    shell: &Rc<RefCell<Shell>>,
-    request: SessionRequest,
-) -> Option<SessionExit> {
-    let (agents, bash) =
-        running_work_counts(world.turns.driven(), &world.core.task_registry.snapshot());
-    if agents + bash > 0 {
-        // A toast, matching the request sites' up-front refuse.
-        let what = match &request {
-            SessionRequest::Branch { .. } => "switch branches",
-            SessionRequest::Resume(_) => "switch sessions",
-            SessionRequest::New => "start a new session",
-        };
-        shell.borrow().show_toast(busy_refusal(what));
-        return None;
-    }
-    Some(request.into_exit())
 }
 
 /// Pull the viewed agent's queued message back into the editor,
 /// prepending it to whatever is currently typed (blank-line joined).
-/// Returns whether anything was yanked. Ported from `aj`: used by the
-/// dequeue chord and the per-view cancel restore.
-fn yank_pending_into_editor(world: &World, shell: &Rc<RefCell<Shell>>) -> bool {
+/// Returns whether anything was yanked. Used by the dequeue chord and the
+/// per-view cancel restore.
+///
+/// The withdrawal is the host's, which is what makes the same gesture work
+/// for a client that cannot reach the queues: the command hands back the
+/// text it removed (spec 6.6).
+async fn yank_pending_into_editor(world: &World, shell: &Rc<RefCell<Shell>>) -> bool {
     let target = world.chat.borrow().active_view();
-    let Some(text) = world.core.message_queues.take_pending(target) else {
-        return false;
+    let withdrawn = world
+        .host
+        .command(
+            &world.session,
+            Command::Queue(QueueOp::Remove { agent: target }),
+        )
+        .await;
+    let text = match withdrawn {
+        Ok(CommandOutcome::Withdrawn(Some(text))) => text,
+        Ok(_) => return false,
+        Err(err) => {
+            tracing::warn!("the host refused a queue withdrawal: {err}");
+            return false;
+        }
     };
     let shell = shell.borrow();
     let mut editor = shell.editor.borrow_mut();
@@ -1327,11 +1310,16 @@ fn insert_pasted_image_path(editor: &Rc<RefCell<TextArea>>, path: &Path) -> bool
     true
 }
 
-/// The steer gesture (Alt+Enter), ported from `aj`: while the viewed
-/// agent is busy, queue the editor text as steering (or promote the
-/// pending follow-up when the editor is empty). While idle there is
-/// nothing to steer yet, so a non-empty editor starts a normal turn.
-fn handle_steer(world: &mut World, shell: &Rc<RefCell<Shell>>) {
+/// The steer gesture (Alt+Enter): while the viewed agent is busy, queue the
+/// editor text as steering (or promote the pending follow-up when the editor
+/// is empty). While idle there is nothing to steer yet, so a non-empty
+/// editor starts a normal turn.
+///
+/// Which of those three the gesture means is the host's decision (spec 6.6).
+/// The editor-side effects depend only on whether there was text: a draft
+/// that went somewhere is recorded in history and returns the transcript to
+/// its tail, an empty one promotes silently.
+async fn handle_steer(world: &mut World, shell: &Rc<RefCell<Shell>>) {
     let target = world.chat.borrow().active_view();
     // Read and clear the editor upfront: the queue and spawn branches both
     // consume the draft (matching `aj`), and the promote/no-op branches only
@@ -1343,34 +1331,42 @@ fn handle_steer(world: &mut World, shell: &Rc<RefCell<Shell>>) {
         editor.clear();
         text
     };
-    let busy = world.turns.is_busy(&world.lifecycle, target);
-    if busy {
-        if text.is_empty() {
-            world.core.message_queues.promote(target);
-        } else {
-            world.core.message_queues.append_steering(target, &text);
+    let steered = world
+        .host
+        .command(
+            &world.session,
+            Command::Steer {
+                agent: target,
+                text: text.clone(),
+            },
+        )
+        .await;
+    match steered {
+        Ok(_) if !text.is_empty() => {
             shell.borrow().editor.borrow_mut().add_to_history(&text);
             shell.borrow().transcript.borrow_mut().resume_follow_tail();
         }
-    } else if !text.is_empty() {
-        shell.borrow().editor.borrow_mut().add_to_history(&text);
-        handle_editor_submit(world, shell, text);
+        Ok(_) => {}
+        Err(err) => fold_notice(world, &err.to_string()),
     }
 }
 
 /// Execute a keymap action that needs the session world, parked by the
-/// controller's handler for the host loop (widgets can't reach the
-/// turn bookkeeping or the queues). Returns whether renderable state
-/// changed.
-fn handle_host_action(world: &mut World, shell: &Rc<RefCell<Shell>>, action: AjAction) -> bool {
+/// controller's handler for the drive loop (widgets can reach neither the
+/// host nor the queues). Returns whether renderable state changed.
+async fn handle_host_action(
+    world: &mut World,
+    shell: &Rc<RefCell<Shell>>,
+    action: AjAction,
+) -> bool {
     match action {
         AjAction::CancelTurn => {
-            if cancel_viewed_turn(world) {
+            if cancel_viewed_turn(world).await {
                 // Don't discard what the user lined up: pull any queued
                 // message back into the editor (matching `aj`). Without
                 // this, the post-turn wake would deliver it right after
                 // the cancel.
-                return yank_pending_into_editor(world, shell);
+                return yank_pending_into_editor(world, shell).await;
             }
             false
         }
@@ -1382,7 +1378,7 @@ fn handle_host_action(world: &mut World, shell: &Rc<RefCell<Shell>>, action: AjA
                 fold_notice(world, &branch_armed_notice("steer"));
                 return true;
             }
-            handle_steer(world, shell);
+            handle_steer(world, shell).await;
             true
         }
         AjAction::Dequeue => {
@@ -1393,7 +1389,7 @@ fn handle_host_action(world: &mut World, shell: &Rc<RefCell<Shell>>, action: AjA
                 fold_notice(world, &branch_armed_notice("dequeue a message"));
                 return true;
             }
-            yank_pending_into_editor(world, shell)
+            yank_pending_into_editor(world, shell).await
         }
         // Read the clipboard image to a tempfile and insert its path at the
         // editor cursor. Silent when there is no image, matching `aj`.
@@ -1452,7 +1448,7 @@ enum BranchTarget {
 /// entries for it and taking its `parent_id`. Locks the log, so call with no
 /// turn in flight.
 async fn resolve_branch_head(world: &World, message_id: &str) -> BranchTarget {
-    let log = world.core.log.lock().await;
+    let log = world.handles.log.lock().await;
     match log
         .entries_in_order()
         .into_iter()
@@ -1472,8 +1468,8 @@ enum ArmedSubmit {
     /// or the resolution failed (missing / root). The anchor and any needed
     /// notice/toast are handled inside; the caller only redraws.
     Stay,
-    /// Resolved: break the drive loop and rebuild the session onto `head`,
-    /// running `prompt` as the branch's first turn.
+    /// Resolved: break the drive loop, move the session's head to `head`,
+    /// and run `prompt` as the branch's first turn.
     Branch { head: String, prompt: String },
 }
 
@@ -1501,14 +1497,12 @@ async fn submit_with_armed_anchor(
         );
         return ArmedSubmit::Stay;
     }
-    // Busy: refuse and keep the anchor and text. A branch rebuilds the
-    // session, which tears down any in-flight turn AND background work
-    // (background sub-agents, detached bash tasks). We refuse while busy
-    // rather than kill live work, matching the session-changing overlays.
-    // Raise the toast and restore the text the submit cleared so the user
-    // keeps it.
-    let (agents, bash) =
-        running_work_counts(world.turns.driven(), &world.core.task_registry.snapshot());
+    // Busy: refuse and keep the anchor and text. A head switch mid-turn
+    // would let the running turn persist onto the branch being left, so the
+    // host refuses one while a turn or background work is live. We check the
+    // mirror here too, for the toast wording and so the editor's text is
+    // kept rather than handed to a refusal one layer down.
+    let (agents, bash) = running_work(world);
     if agents + bash > 0 {
         shell.borrow().editor.borrow_mut().set_text(&text);
         shell.borrow().show_toast(busy_refusal("branch"));
@@ -1519,7 +1513,7 @@ async fn submit_with_armed_anchor(
     let Some(message_id) = message_id else {
         // No anchor: the caller gates on `is_some`, so this is unreachable in
         // practice. Treat it as a plain submit rather than panicking.
-        handle_submit(world, text);
+        handle_submit(world, text).await;
         return ArmedSubmit::Stay;
     };
     match resolve_branch_head(world, &message_id).await {
@@ -1546,61 +1540,6 @@ async fn submit_with_armed_anchor(
             shell.borrow().disarm_branch();
             ArmedSubmit::Branch { head, prompt: text }
         }
-    }
-}
-
-/// The confirmation for a clean (non-fallback) branch rebuild, chosen from
-/// whether a prompt is handed off: the `b`-submit flow (the prompt
-/// auto-submits as the branch's first turn) vs a tree-view switch that only
-/// moved the head. A successful build guarantees the requested head applied,
-/// so there is no stale-head case to report.
-fn branch_switch_notice(prompt_present: bool) -> &'static str {
-    if prompt_present {
-        "Branched the conversation from an earlier message."
-    } else {
-        "Switched to the selected branch."
-    }
-}
-
-/// Prepend the branch rebuild's confirmation to `next.notices`, so it lands
-/// ahead of any restore notices when the run loop folds them after install. A
-/// no-op for a non-branch build and for a build fallback, which leads with
-/// its own failure notice instead (and, when a prompt was pending, the
-/// handoff folds the restore notice on top). See [`branch_switch_notice`]
-/// for the wording.
-fn apply_branch_switch_notice(next: &mut NextSession, is_branch: bool, prompt_present: bool) {
-    if is_branch && !next.fell_back {
-        next.notices
-            .insert(0, notice_event(branch_switch_notice(prompt_present)));
-    }
-}
-
-/// Hand the branch prompt to the freshly rebuilt session, under the
-/// prompt-safety invariant: auto-submit it as the branch's first turn only
-/// on a clean rebuild (`!fell_back`, and a successful build guarantees the
-/// requested head applied). On a build fallback the prompt is restored
-/// verbatim into the editor with a notice and never submitted, so it can't
-/// run against the wrong head. The prompt is already in prompt-history
-/// (recorded at the submit site), so it is never lost either way.
-///
-/// Returns whether the prompt was submitted, so callers (and tests) can
-/// distinguish the submit path from the restore path.
-fn hand_off_branch_prompt(
-    world: &mut World,
-    shell: &Rc<RefCell<Shell>>,
-    prompt: String,
-    fell_back: bool,
-) -> bool {
-    if !fell_back {
-        auto_submit_launch(world, vec![UserContent::text(prompt)]);
-        true
-    } else {
-        shell.borrow().editor.borrow_mut().set_text(&prompt);
-        fold_notice(
-            world,
-            "Branch failed. Your message was restored to the editor.",
-        );
-        false
     }
 }
 
@@ -1654,21 +1593,20 @@ async fn apply_command_action(
 ) -> ActionEffect {
     match action {
         CommandAction::Compact => {
-            // `/compact` runs as a tracked turn (it owns the turn
-            // machinery the palette confirm can't reach). Busy agents get
-            // the same notice `aj` folds rather than a silent no-op.
-            if world.turns.is_busy(&world.lifecycle, AgentId::Main) {
-                fold_notice(world, &session_busy_notice("compact"));
-            } else {
-                world.turns.spawn(
-                    &world.core,
-                    &world.config,
-                    AgentId::Main,
-                    TurnStart::Compact {
-                        reason: CompactionReason::Manual,
-                        instructions: None,
-                    },
-                );
+            // `/compact` runs as a tracked turn on the main agent, so the
+            // host refuses it while one is already running. Its own wording
+            // is the protocol's; the local notice points at the chord that
+            // cancels the turn first.
+            match world
+                .host
+                .command(&world.session, Command::Compact { instructions: None })
+                .await
+            {
+                Ok(_) => {}
+                Err(HostError::Conflict { .. }) => {
+                    fold_notice(world, &session_busy_notice("compact"));
+                }
+                Err(err) => fold_notice(world, &err.to_string()),
             }
             ActionEffect::Redraw
         }
@@ -1821,14 +1759,19 @@ async fn apply_command_action(
         // front instead, since it opens no overlay.
         CommandAction::OpenSessionSelector => {
             let handles = shell.borrow().overlay_handles();
-            open_session_selector(&handles, world.core.session_id.clone());
+            open_session_selector(&handles, world.session.clone());
             ActionEffect::OpenedOverlay
         }
         CommandAction::OpenSessionTree => {
             // Building the tree is cheap and in-memory, so lock the log, snapshot
             // the rows and the current head, and drop the lock before opening.
+            //
+            // Read off the live log rather than through the host's tree read:
+            // the row builder takes the store's own tree type, and the head is
+            // not on the read at all. A remote client goes through the read
+            // instead.
             let (rows, current_head) = {
-                let log = world.core.log.lock().await;
+                let log = world.handles.log.lock().await;
                 (
                     build_tree_rows(&log.session_tree(), Utc::now()),
                     log.head().cloned(),
@@ -1839,12 +1782,10 @@ async fn apply_command_action(
             ActionEffect::OpenedOverlay
         }
         CommandAction::NewSession => {
-            // A new session rebuilds the world, which tears down any turn AND
-            // background work, so it joins the refuse-while-busy rule of the
-            // other session-changing requests. `consume_session_request`
-            // rechecks at consumption.
-            let (agents, bash) =
-                running_work_counts(world.turns.driven(), &world.core.task_registry.snapshot());
+            // A new session takes the focus off this one, so it joins the
+            // refuse-while-busy rule of the other session-changing gestures:
+            // walking away from live work silently is worse than refusing.
+            let (agents, bash) = running_work(world);
             if agents + bash > 0 {
                 shell
                     .borrow()
@@ -2020,10 +1961,7 @@ fn fill_skills_window(list: &SkillsFill, skills: Vec<Skill>) {
 /// Apply an agent-picker outcome the widget parked. Observing an agent
 /// swaps the viewed transcript; opening a task drills into the read-only
 /// task viewer (which opens a child overlay, hence [`ActionEffect::OpenedOverlay`]);
-/// killing a task cancels it through the registry and folds a notice.
-///
-/// Async because Observe may materialize a still-deferred resumed
-/// sub-agent, which locks the log for the read.
+/// killing a task goes out as a host command and folds a notice.
 async fn apply_picker_outcome(
     world: &mut World,
     shell: &Rc<RefCell<Shell>>,
@@ -2031,30 +1969,10 @@ async fn apply_picker_outcome(
 ) -> ActionEffect {
     match outcome {
         AgentPickerOutcome::Observe(id) => {
-            // A resumed sub-agent's transcript is deferred (see
-            // `replay_deferring_subs`), so materialize it before switching
-            // the view. Doing it first lets `set_active_view` reconcile
-            // `header_only` against the now-present tool cells.
-            if let AgentId::Sub(n) = id
-                && world.deferred_subs.contains(&n)
-            {
-                // Lock only for the read. `linearize` returns an owned
-                // `Conversation`, so we drop the lock before the projection
-                // and reduce, which would otherwise stall a concurrent live
-                // turn's inline persistence on a large sub-agent.
-                let conv = {
-                    let log = world.core.log.lock().await;
-                    log.latest_leaf(ThreadFilter::subagent(n))
-                        .map(|head| log.linearize(&head, ThreadFilter::subagent(n)))
-                };
-                if let Some(conv) = conv {
-                    let mut chat = world.chat.borrow_mut();
-                    for event in project_thread(&conv, AgentId::Sub(n)) {
-                        let _ = reduce(&mut chat, &mut world.lifecycle, event, None);
-                    }
-                }
-                world.deferred_subs.remove(&n);
-            }
+            // Every sub-agent's transcript is already in the model: an attach
+            // block projects sub threads eagerly, so there is nothing to
+            // materialize on demand.
+            //
             // The transcript view reads `active_view` at draw, and the
             // per-iteration status/keymap sync picks up the new view, so
             // switching plus a redraw is all it takes.
@@ -2071,7 +1989,7 @@ async fn apply_picker_outcome(
             // line for the viewer header. A task that left the registry
             // between the snapshot and now has nothing to show.
             let command = world
-                .core
+                .handles
                 .task_registry
                 .summary(id)
                 .and_then(|s| match s.kind {
@@ -2085,7 +2003,7 @@ async fn apply_picker_outcome(
                         &handles.stack,
                         &handles.editor,
                         &handles.chrome,
-                        world.core.task_registry.clone(),
+                        world.handles.task_registry.clone(),
                         id,
                         command,
                     );
@@ -2103,9 +2021,11 @@ async fn apply_picker_outcome(
         AgentPickerOutcome::Kill(id) => {
             // The picker rows are a snapshot from open time, so consult
             // the live status: the task may have finished while the picker
-            // was up.
+            // was up. The status is what tells the three outcomes apart,
+            // which the command alone cannot (a kill of a task that already
+            // finished is accepted and does nothing).
             let live = world
-                .core
+                .handles
                 .task_registry
                 .snapshot()
                 .into_iter()
@@ -2113,8 +2033,14 @@ async fn apply_picker_outcome(
                 .map(|t| t.status);
             let notice = match live {
                 Some(aj_agent::tool::TaskStatus::Running) => {
-                    world.core.task_registry.kill(id);
-                    format!("Killing background task #{id}.")
+                    match world
+                        .host
+                        .command(&world.session, Command::KillTask { task: id })
+                        .await
+                    {
+                        Ok(_) => format!("Killing background task #{id}."),
+                        Err(err) => err.to_string(),
+                    }
                 }
                 Some(_) => format!("Background task #{id} already finished."),
                 None => format!("Background task #{id} is not in the registry (already gone?)."),
@@ -2158,43 +2084,34 @@ fn recall_into_editor(shell: &Rc<RefCell<Shell>>, text: &str) {
 }
 
 /// The viewed agent's current thinking level, from its footer entry, falling
-/// back to the run config when it has no entry.
+/// back to the session's active settings when it has no entry.
 fn viewed_thinking(world: &World, target: AgentId) -> Option<ThinkingConfig> {
     world
         .chat
         .borrow()
         .footers()
         .settings(target)
+        .or_else(|| world.client.settings())
         .and_then(|s| thinking_config_from_name(&s.thinking))
-        .unwrap_or_else(|| {
-            world
-                .core
-                .run_config
-                .lock()
-                .expect("run config mutex poisoned")
-                .thinking
-                .clone()
-        })
+        .flatten()
 }
 
 /// The viewed agent's current `(provider, id)`, from its footer entry, falling
-/// back to the run config's model key.
+/// back to the session's active settings.
 fn viewed_model(world: &World, target: AgentId) -> (String, String) {
-    world
-        .chat
-        .borrow()
-        .footers()
-        .settings(target)
+    let settings = world.chat.borrow().footers().settings(target).cloned();
+    settings
+        .as_ref()
+        .or_else(|| world.client.settings())
         .map(|s| (s.provider.clone(), s.model_id.clone()))
-        .unwrap_or_else(|| {
-            world
-                .core
-                .run_config
-                .lock()
-                .expect("run config mutex poisoned")
-                .model_key
-                .clone()
-        })
+        .unwrap_or_default()
+}
+
+/// The `provider/id` of the session's active model, as the settings window
+/// spells it in its model row.
+fn active_model(world: &World) -> String {
+    let (provider, model_id) = viewed_model(world, AgentId::Main);
+    format!("{provider}/{model_id}")
 }
 
 /// The catalog and name sets the settings window's submenus need. Rediscovered
@@ -2231,12 +2148,19 @@ async fn apply_selector_activity(
         changed = true;
         match item {
             SelectorActivity::ThinkingConfirmed { target, level } => {
-                let notice = confirm_thinking(world, target, level).await;
-                fold_notice(world, &notice);
+                // Session-scoped: the selectors leave `config.toml` alone and
+                // rely on the session log's record to survive a resume.
+                if let Some(notice) =
+                    confirm_thinking(world, target, PersistAction::None, level).await
+                {
+                    fold_notice(world, &notice);
+                }
             }
             SelectorActivity::ModelConfirmed { target, info } => {
-                let notice = confirm_model(world, target, *info).await;
-                fold_notice(world, &notice);
+                if let Some(notice) = confirm_model(world, target, PersistAction::None, *info).await
+                {
+                    fold_notice(world, &notice);
+                }
             }
             SelectorActivity::SettingChange { target, id, value } => {
                 let persist = PersistAction::set_for(target);
@@ -2269,163 +2193,144 @@ async fn apply_selector_activity(
     changed
 }
 
-/// Record a main-agent footer update into the chat model so its model line and
-/// context gauge reflect the change without waiting for the next turn.
-fn note_main_footer(world: &World, footer: Option<FooterUpdate>) {
-    if let Some(FooterUpdate {
-        settings,
-        context_window,
-    }) = footer
+/// Record the main agent's settings identity into the chat model so the
+/// footer's model line and context gauge reflect a change without waiting for
+/// the next turn.
+///
+/// Read off the focused session's run config, which is what the host just
+/// staged and what its refreshed `state` frame reports. The footer widget
+/// reads the chat model's footer table rather than the client's settings, so
+/// the change has to be noted there.
+fn note_main_footer(world: &World) {
+    let (settings, context_window) = {
+        let cfg = world
+            .handles
+            .run_config
+            .lock()
+            .expect("run config mutex poisoned");
+        (cfg.settings(), cfg.model_info.context_window)
+    };
+    world
+        .chat
+        .borrow_mut()
+        .footers_mut()
+        .note_settings(AgentId::Main, settings, context_window);
+}
+
+/// Send a settings change to the host, returning the notice to fold when it
+/// refused.
+///
+/// An accepted change folds nothing here: the host stages it, records it on
+/// the session log, and publishes the notice that record projects plus a
+/// refreshed `state` frame, so the transcript row arrives on the stream like
+/// any other. Only a refusal has no frame behind it.
+async fn command_settings(
+    world: &World,
+    agent: AgentId,
+    persist: PersistAction,
+    axis: SettingsAxis,
+) -> Option<String> {
+    let change = SettingsChange {
+        agent,
+        persist,
+        axis,
+    };
+    match world
+        .host
+        .command(&world.session, Command::Settings(change))
+        .await
     {
-        world.chat.borrow_mut().footers_mut().note_settings(
-            AgentId::Main,
-            settings,
-            context_window,
-        );
+        Ok(_) => None,
+        Err(err) => Some(err.to_string()),
     }
 }
 
-/// Apply a confirmed thinking pick (session-scoped) and reconcile the footer.
-async fn confirm_thinking(world: &World, target: AgentId, level: Option<ThinkingConfig>) -> String {
+/// Apply a confirmed thinking pick and reconcile the footer entry it moved.
+async fn confirm_thinking(
+    world: &World,
+    target: AgentId,
+    persist: PersistAction,
+    level: Option<ThinkingConfig>,
+) -> Option<String> {
+    let name = aj_app::commands::thinking_level_name(&level).to_string();
+    let refused = command_settings(world, target, persist, SettingsAxis::Thinking(level)).await;
+    if refused.is_some() {
+        return refused;
+    }
     match target {
-        AgentId::Main => {
-            let confirm = aj_app::settings::confirm_thinking_for_main(
-                level,
-                PersistAction::None,
-                &world.core.run_config,
-                &world.config,
-                &world.config_layers,
-                &world.core,
-            )
-            .await;
-            let message = confirm.message();
-            note_main_footer(world, confirm.footer);
-            message
-        }
-        AgentId::Sub(n) => confirm_thinking_sub(world, n, level).await,
+        AgentId::Main => note_main_footer(world),
+        AgentId::Sub(_) => patch_sub_footer(world, target, |settings| settings.thinking = name),
     }
+    None
 }
 
-/// Apply a confirmed thinking pick to sub-agent `n`, refreshing its footer
-/// entry on success. The validation fallback is the model the footer tracks.
-async fn confirm_thinking_sub(world: &World, n: usize, level: Option<ThinkingConfig>) -> String {
-    let target = AgentId::Sub(n);
-    let tracked = world
+/// Apply a confirmed model pick and reconcile the footer entry it moved.
+async fn confirm_model(
+    world: &World,
+    target: AgentId,
+    persist: PersistAction,
+    info: ModelInfo,
+) -> Option<String> {
+    let refused = command_settings(world, target, persist, SettingsAxis::Model(info.clone())).await;
+    if refused.is_some() {
+        return refused;
+    }
+    match target {
+        AgentId::Main => note_main_footer(world),
+        AgentId::Sub(_) => {
+            // The host rebuilds a sub's bundle at the session's speed, so
+            // that is the speed to show for it.
+            let speed = world
+                .client
+                .settings()
+                .map(|settings| settings.speed.clone());
+            let window = info.context_window;
+            patch_sub_footer_window(world, target, window, |settings| {
+                settings.provider = info.provider.clone();
+                settings.model_id = info.id.clone();
+                if let Some(speed) = speed {
+                    settings.speed = speed;
+                }
+            });
+        }
+    }
+    None
+}
+
+/// Patch the footer entry the frontend tracks for `target`, keeping its
+/// context window.
+///
+/// A sub-agent's settings live in its own override map, which no run config
+/// and no `state` frame carries, so the axis that moved is written onto the
+/// entry the footer already holds. A target with no entry yet has no footer
+/// row to correct.
+fn patch_sub_footer(world: &World, target: AgentId, patch: impl FnOnce(&mut AgentSettings)) {
+    let window = world
         .chat
         .borrow()
         .footers()
-        .settings(target)
-        .and_then(|s| {
-            world
-                .catalog
-                .iter()
-                .find(|m| m.provider == s.provider && m.id == s.model_id)
-                .cloned()
-                .map(Arc::new)
-        });
-    let confirm =
-        aj_app::settings::confirm_thinking_for_sub(level.clone(), n, tracked, &world.core).await;
-    let notice = confirm.message();
-    if confirm.applied {
-        let name = aj_app::commands::thinking_level_name(&level).to_string();
-        let entry = world.chat.borrow().footers().settings(target).cloned();
-        if let Some(mut settings) = entry {
-            let window = world
-                .chat
-                .borrow()
-                .footers()
-                .context_usage(target)
-                .context_window;
-            settings.thinking = name;
-            world
-                .chat
-                .borrow_mut()
-                .footers_mut()
-                .note_settings(target, settings, window);
-        }
-    }
-    notice
+        .context_usage(target)
+        .context_window;
+    patch_sub_footer_window(world, target, window, patch);
 }
 
-/// Apply a confirmed model pick (session-scoped) and reconcile the footer.
-async fn confirm_model(world: &World, target: AgentId, info: ModelInfo) -> String {
-    match target {
-        AgentId::Main => {
-            let confirm = aj_app::settings::confirm_model_for_main(
-                info,
-                PersistAction::None,
-                &world.auth,
-                &world.core.run_config,
-                &world.config,
-                &world.config_layers,
-                &world.core,
-            )
-            .await;
-            let message = confirm.message();
-            note_main_footer(world, confirm.footer);
-            message
-        }
-        AgentId::Sub(n) => confirm_model_sub(world, n, info).await,
-    }
-}
-
-/// Apply a confirmed model pick to sub-agent `n`, refreshing its footer entry
-/// on success at the speed the frontend tracks for it.
-async fn confirm_model_sub(world: &World, n: usize, info: ModelInfo) -> String {
-    let target = AgentId::Sub(n);
-    let staged_speed = world
-        .core
-        .sub_overrides
-        .lock()
-        .expect("sub overrides mutex poisoned")
-        .get(&n)
-        .and_then(|o| o.speed);
-    let effective_speed = match staged_speed {
-        Some(speed) => speed,
-        None => world
-            .chat
-            .borrow()
-            .footers()
-            .settings(target)
-            .and_then(|s| speed_from_name(&s.speed))
-            .flatten(),
+/// [`patch_sub_footer`] with a fresh context window, for a change that moves
+/// the model the gauge measures against.
+fn patch_sub_footer_window(
+    world: &World,
+    target: AgentId,
+    context_window: u64,
+    patch: impl FnOnce(&mut AgentSettings),
+) {
+    let Some(mut settings) = world.chat.borrow().footers().settings(target).cloned() else {
+        return;
     };
-    let confirm = aj_app::settings::confirm_model_for_sub(
-        &info,
-        n,
-        &world.auth,
-        effective_speed,
-        &world.core,
-    )
-    .await;
-    let notice = confirm.message();
-    if confirm.applied {
-        let (thinking, verbosity) = {
-            let chat = world.chat.borrow();
-            let settings = chat.footers().settings(target);
-            (
-                settings
-                    .map(|s| s.thinking.clone())
-                    .unwrap_or_else(|| "off".to_string()),
-                settings
-                    .map(|s| s.verbosity.clone())
-                    .unwrap_or_else(|| "default".to_string()),
-            )
-        };
-        let settings = aj_agent::events::AgentSettings {
-            provider: info.provider.clone(),
-            model_id: info.id.clone(),
-            thinking,
-            speed: speed_name(effective_speed).to_string(),
-            verbosity,
-        };
-        world
-            .chat
-            .borrow_mut()
-            .footers_mut()
-            .note_settings(target, settings, info.context_window);
-    }
-    notice
+    patch(&mut settings);
+    world
+        .chat
+        .borrow_mut()
+        .footers_mut()
+        .note_settings(target, settings, context_window);
 }
 
 /// Persist a skills-window toggle into `disabled_skills` (user layer). Only
@@ -2450,17 +2355,6 @@ fn apply_skill_toggle(world: &World, name: &str, disable: bool) -> String {
     )
 }
 
-/// Append a settings confirm's notes (a persist failure, a failed log
-/// record) to its confirmation line, matching
-/// [`aj_app::settings::Confirmation::message`].
-fn join_notes(mut notice: String, notes: Vec<String>) -> String {
-    for note in notes {
-        notice.push(' ');
-        notice.push_str(&note);
-    }
-    notice
-}
-
 /// Append an optional follow-up note (e.g. a persist failure) to a
 /// confirmation notice.
 fn join_notice(mut notice: String, note: Option<String>) -> String {
@@ -2481,13 +2375,16 @@ fn revert_setting_row(shell: &Rc<RefCell<Shell>>, id: &str, value: &str) {
 }
 
 /// Apply one settings-window change (or project clear) to the running session
-/// and persist it per `persist`. Returns the user-facing notice.
+/// and persist it per `persist`. Returns the user-facing notice, `None` when
+/// the change is one the host announces itself.
 ///
-/// Live-appliable settings reuse the same confirm cores as their dedicated
-/// selectors (model, thinking, speed, verbosity); the render toggles mutate
-/// the chat model; the theme row reloads the palette and re-tints live; the
-/// rest are plain config-backed values persisted with a "takes effect" note.
-/// A failed apply reverts the row's display through [`revert_setting_row`].
+/// The four session settings (model, thinking, speed, verbosity) go out as
+/// host commands, which is what makes them visible to every other client;
+/// the render toggles mutate the chat model; the theme row reloads the
+/// palette and re-tints live; the rest are plain config-backed values
+/// persisted with a "takes effect" note. A refused apply reverts the row's
+/// display through [`revert_setting_row`], so the window never shows a value
+/// that is not actually active.
 async fn apply_setting_change(
     world: &World,
     shell: &Rc<RefCell<Shell>>,
@@ -2505,59 +2402,21 @@ async fn apply_setting_change(
                     .find(|m| m.provider == provider && m.id == model_id)
                     .cloned()
             }) else {
-                let active = {
-                    let cfg = world
-                        .core
-                        .run_config
-                        .lock()
-                        .expect("run config mutex poisoned");
-                    format!("{}/{}", cfg.model_key.0, cfg.model_key.1)
-                };
-                revert_setting_row(shell, MODEL_SETTING_ID, &active);
+                revert_setting_row(shell, MODEL_SETTING_ID, &active_model(world));
                 return Some(format!("Unknown model {value}."));
             };
-            let confirm = aj_app::settings::confirm_model_for_main(
-                info,
-                persist,
-                &world.auth,
-                &world.core.run_config,
-                &world.config,
-                &world.config_layers,
-                &world.core,
-            )
-            .await;
-            let notice = confirm.message();
-            note_main_footer(world, confirm.footer);
-            // The core reports a rebuild failure only as notice text; compare
-            // the staged key so the row reverts to the model actually active.
-            let active = {
-                let cfg = world
-                    .core
-                    .run_config
-                    .lock()
-                    .expect("run config mutex poisoned");
-                format!("{}/{}", cfg.model_key.0, cfg.model_key.1)
-            };
+            let refused = confirm_model(world, AgentId::Main, persist, info).await;
+            // A refusal stages nothing, so the row is reverted to the model
+            // that is actually active. Compared rather than assumed, because
+            // the staged key is the only authority on what took.
+            let active = active_model(world);
             if active != value {
                 revert_setting_row(shell, MODEL_SETTING_ID, &active);
             }
-            Some(notice)
+            refused
         }
         "thinking" => match thinking_config_from_name(value) {
-            Some(level) => {
-                let confirm = aj_app::settings::confirm_thinking_for_main(
-                    level,
-                    persist,
-                    &world.core.run_config,
-                    &world.config,
-                    &world.config_layers,
-                    &world.core,
-                )
-                .await;
-                let message = confirm.message();
-                note_main_footer(world, confirm.footer);
-                Some(message)
-            }
+            Some(level) => confirm_thinking(world, AgentId::Main, persist, level).await,
             None => Some(format!("Unknown thinking level {value:?}.")),
         },
         "thinking_display" => {
@@ -2570,8 +2429,13 @@ async fn apply_setting_change(
                 }
             };
             {
+                // Not a host command: no settings axis carries the
+                // thinking-display mode, and nothing durable records it. It
+                // is staged straight onto the session's stream options,
+                // which is the one thing `LocalHandles` hands out that this
+                // frontend still writes.
                 let mut cfg = world
-                    .core
+                    .handles
                     .run_config
                     .lock()
                     .expect("run config mutex poisoned");
@@ -2593,31 +2457,28 @@ async fn apply_setting_change(
             ))
         }
         "speed" => match speed_from_name(value) {
-            Some(speed) => match aj_app::settings::confirm_speed_for_main(
-                speed,
-                persist,
-                &world.auth,
-                &world.core.run_config,
-                &world.config,
-                &world.config_layers,
-                &world.core,
-            )
-            .await
-            {
-                SpeedConfirm::Applied {
-                    footer,
-                    notice,
-                    notes,
-                    ..
-                } => {
-                    note_main_footer(world, Some(footer));
-                    Some(join_notes(notice, notes))
+            Some(speed) => {
+                match command_settings(world, AgentId::Main, persist, SettingsAxis::Speed(speed))
+                    .await
+                {
+                    None => {
+                        note_main_footer(world);
+                        None
+                    }
+                    // The rebuild failed, so nothing was staged: revert the
+                    // row to the speed still in force.
+                    Some(notice) => {
+                        let previous = world
+                            .client
+                            .settings()
+                            .map(|settings| settings.speed.clone());
+                        if let Some(previous) = previous {
+                            revert_setting_row(shell, "speed", &previous);
+                        }
+                        Some(notice)
+                    }
                 }
-                SpeedConfirm::Failed { previous, notice } => {
-                    revert_setting_row(shell, "speed", &previous);
-                    Some(notice)
-                }
-            },
+            }
             None => Some(format!("Unknown speed {value:?}.")),
         },
         "verbosity" => {
@@ -2629,18 +2490,13 @@ async fn apply_setting_change(
                     Err(err) => return Some(format!("Can't set verbosity: {err}")),
                 }
             };
-            Some(
-                aj_app::settings::confirm_verbosity_for_main(
-                    verbosity,
-                    persist,
-                    &world.core.run_config,
-                    &world.config,
-                    &world.config_layers,
-                    &world.core,
-                )
-                .await
-                .message(),
+            command_settings(
+                world,
+                AgentId::Main,
+                persist,
+                SettingsAxis::Verbosity(verbosity),
             )
+            .await
         }
         "theme" => {
             let mode = shell.borrow().theme.color_mode();
@@ -2861,7 +2717,7 @@ fn spawn_overlay_fetch(
             });
         }
         FetchKind::SessionInfo => {
-            let log = Arc::clone(&world.core.log);
+            let log = Arc::clone(&world.handles.log);
             tokio::spawn(async move {
                 let stats = { log.lock().await.stats() };
                 let _ = tx.send((FetchKind::SessionInfo, session_info_rows(&stats)));
@@ -2992,8 +2848,8 @@ fn spawn_skills_discovery(world: &World, tx: &UnboundedSender<Vec<Skill>>) {
 /// cloning the whole log. Only the notice string (Send) crosses back.
 fn spawn_session_export(world: &World, tx: &UnboundedSender<String>) {
     let tx = tx.clone();
-    let log = Arc::clone(&world.core.log);
-    let session_id = world.core.session_id.clone();
+    let log = Arc::clone(&world.handles.log);
+    let session_id = world.session.clone();
     tokio::task::spawn_blocking(move || {
         // `blocking_lock` is safe here: this closure runs on the blocking
         // pool, not inside an async context.
@@ -4016,28 +3872,35 @@ impl Shell {
     /// The `chat` and `status` cells are shared by identity across sessions
     /// (the outer loop overwrites their contents in place), so the chrome
     /// widgets and the keymap's dispatch closure keep pointing at the live
-    /// model with nothing to do here. Two handles do need repointing: the
-    /// pending box's message queues, because `SessionCore::build` mints
-    /// fresh queues wired into the new agent and the old clone would observe
-    /// a detached queue, and the header id. We also drop the transcript back
-    /// to follow-tail so the next session opens pinned to the bottom.
+    /// model with nothing to do here. What does need repointing is every
+    /// handle into the session itself: the pending box's message queues and
+    /// the footer's task registry belong to the session that owns them, and
+    /// the old clones would observe a session nobody is looking at. Plus the
+    /// header id and the window title. We also drop the transcript back to
+    /// follow-tail so the next session opens pinned to the bottom.
     ///
     /// NOTE: the root `Shell` instance and the `AsyncApp` are deliberately
     /// left untouched: the app's mouse/focus handlers hold the root Shell Rc
     /// captured at `init`, so rebuilding the root or re-initializing the app
     /// would strand them. We swap the Shell's innards, never the Shell.
     fn rebind(&mut self, world: &World) {
+        // Every open overlay is scoped to the session it was opened over: a
+        // task viewer holds that session's task registry, a settings window a
+        // handle this swap cannot reach. Closing the stack is what keeps one
+        // from surviving a session change pointed at the previous session.
+        self.overlays.borrow_mut().close_all();
+        *self.settings_ui.borrow_mut() = None;
         self.pending
             .borrow_mut()
-            .set_queues(world.core.message_queues.clone());
+            .set_queues(world.handles.queues.clone());
         self.footer
             .borrow_mut()
-            .set_task_registry(world.core.task_registry.clone());
-        self.header.borrow_mut().text = format!("{APP_TITLE} - session {}", world.core.session_id);
+            .set_task_registry(world.handles.task_registry.clone());
+        self.header.borrow_mut().text = format!("{APP_TITLE} - session {}", world.session);
         self.window_title = aj_app::session::window_title(
             APP_TITLE,
-            &world.core.session_id,
-            &world.core.env.working_directory,
+            &world.session,
+            &world.handles.env.working_directory,
         );
         self.transcript.borrow_mut().reset_to_tail();
     }
@@ -4319,20 +4182,20 @@ impl Widget for Shell {
 /// drive loop's per-iteration sync point, its single writer.
 fn sync_keymap_ctx(world: &World, shell: &Rc<RefCell<Shell>>) {
     let active = world.chat.borrow().active_view();
-    let busy = world.turns.is_busy(&world.lifecycle, active);
+    let busy = view_busy(world, active);
     // The global busy flag the session-overlay confirm closures read: any
     // in-flight turn OR background work (background sub-agents + bash tasks),
     // not just the viewed agent. Distinct from `turn_running` above, which is
     // per-view and gates the keymap's steer/dequeue chords.
-    let (agents, bash) =
-        running_work_counts(world.turns.driven(), &world.core.task_registry.snapshot());
+    let (agents, bash) = running_work(world);
     let shell = shell.borrow();
     shell.busy.set(agents + bash > 0);
     let mut ctx = shell.keymap_ctx.borrow_mut();
     ctx.turn_running = busy;
-    // The queue handle is swapped on session change (`world.core` is replaced),
-    // so re-clone it here rather than relying on the one captured at Shell::new.
-    ctx.message_queues = world.core.message_queues.clone();
+    // The queue handle is swapped on a session change (`world.handles` is
+    // replaced), so re-clone it here rather than relying on the one captured
+    // at Shell::new.
+    ctx.message_queues = world.handles.queues.clone();
     ctx.active_view = active;
 }
 
@@ -4403,8 +4266,8 @@ pub async fn run(args: Args) -> Result<()> {
 
     // Auto-submit the launch prompt as the initial session's first turn.
     // This sits before the outer session loop below, so an in-process
-    // session switch rebuilds the world but never resubmits, matching `aj`.
-    auto_submit_launch(&mut world, launch_content);
+    // session change never resubmits, matching `aj`.
+    auto_submit_launch(&mut world, launch_content).await;
 
     // Resolve the configured theme (default `light`, matching `aj`) and
     // load it at the env-detected color mode. `AsyncApp::init` runs the
@@ -4415,16 +4278,16 @@ pub async fn run(args: Args) -> Result<()> {
     let theme_name = resolve_theme_name(world_config_theme(&world).as_deref()).to_string();
     let env_mode = ColorMode::detect();
     let theme = ThemeHandle::new(Theme::load_with_mode(&theme_name, env_mode));
-    let header = format!("{APP_TITLE} - session {}", world.core.session_id);
-    let cwd = world.core.env.working_directory.clone();
+    let header = format!("{APP_TITLE} - session {}", world.session);
+    let cwd = world.handles.env.working_directory.clone();
     let shell = Rc::new(RefCell::new(Shell::new(
         Rc::clone(&world.chat),
         Rc::clone(&world.status),
-        world.core.message_queues.clone(),
-        world.core.task_registry.clone(),
+        world.handles.queues.clone(),
+        world.handles.task_registry.clone(),
         theme.clone(),
         header,
-        &world.core.session_id,
+        &world.session,
         cwd,
     )));
     let root: WidgetRef = to_widget_ref(Rc::clone(&shell));
@@ -4516,13 +4379,6 @@ pub async fn run(args: Args) -> Result<()> {
     // snapshotted for the shutdown banner so a multi-session process
     // itemizes every session, matching `aj`.
     let mut completed_sessions: Vec<(String, UsageSummary)> = Vec::new();
-    // Whether a live session survived the loop. A fatal build failure (both
-    // the requested build and its previous-session fallback failed) leaves
-    // `world` pointing at the already-torn-down outgoing session, whose
-    // usage was snapshotted into `completed_sessions` just above the build.
-    // The banner then prints that list alone and skips the live block, so
-    // the outgoing session isn't counted twice.
-    let mut live_survived = true;
     let run_result: Result<()> = loop {
         // Restore the terminal even when the loop exits with a render error,
         // otherwise the user is left stuck on the alt screen.
@@ -4537,117 +4393,44 @@ pub async fn run(args: Args) -> Result<()> {
         )
         .await;
 
-        // Wind down the outgoing session's work on every exit path (quit,
-        // fatal, or switch): kill the background-task tree before tearing
-        // down turns so detached process groups are killed and reaped, so
-        // an abandoned session never leaks tasks. A session change is only
-        // requested with no turn in flight, so the turn shutdown is a no-op
-        // there.
-        aj_app::shutdown_background_tasks(&world.core.task_registry).await;
-        world.turns.shutdown().await;
-
-        // A branch rebuild reuses the switch machinery but is a same-session
-        // resume with a head override plus an optional prompt to hand off. We
-        // track both across the match so the build and the post-install prompt
-        // handoff below can act on them.
-        let mut is_branch = false;
-        let mut branch_prompt: Option<String> = None;
-
-        let spec = match exit {
+        let request = match exit {
             Ok(SessionExit::Quit) => break Ok(()),
             Err(fatal) => break Err(fatal),
-            Ok(SessionExit::New) => SessionSpec::Create {
-                entry: SessionEntry::Switch,
-            },
-            Ok(SessionExit::Switch(session_id)) => SessionSpec::Resume {
-                session_id,
-                entry: SessionEntry::Switch,
-                head: None,
-            },
-            Ok(SessionExit::Branch { head, prompt }) => {
-                // Flush the abandoned branch's buffered non-punctuation entries
-                // to disk before the re-resume: they belong to that branch and
-                // must survive the resume-from-disk (but must not follow the
-                // user to the new branch). Runs here, after turn and
-                // background-task shutdown, so a racing sub-agent shutdown
-                // append is included and not stranded (spec Part 4).
-                if let Err(err) = world.core.log.lock().await.flush_pending() {
-                    tracing::warn!(
-                        "failed to flush buffered log entries before branch rebuild: {err}"
-                    );
-                }
-                is_branch = true;
-                branch_prompt = prompt;
-                SessionSpec::Resume {
-                    session_id: world.core.session_id.clone(),
-                    entry: SessionEntry::Switch,
-                    head: Some(head),
-                }
-            }
+            Ok(SessionExit::New) => FocusRequest::Create,
+            Ok(SessionExit::Switch(session_id)) => FocusRequest::Resume(session_id),
+            Ok(SessionExit::Branch { head, prompt }) => FocusRequest::Branch { head, prompt },
         };
 
-        // Snapshot the outgoing session's usage for the banner before we
-        // rebuild over it. The replacement session's usage starts at zero,
-        // so nothing is double-counted (including on the fallback path,
-        // which resumes the same session in a fresh world). A same-session
-        // branch rebuild must not push a duplicate banner entry for the id
-        // it is rebuilding onto, so we guard the push.
-        let usage = world.core.usage_summary().await;
-        if !is_branch {
-            completed_sessions.push((world.core.session_id.clone(), usage));
-        }
-        let previous_id = world.core.session_id.clone();
-
-        match build_next_session(&world, spec, &previous_id, is_branch).await {
-            Ok(mut next) => {
-                // Read the prompt-safety input before `install` consumes `next`.
-                let fell_back = next.fell_back;
-                // A successful branch build leads with no confirmation; insert
-                // the accurate one here. It depends on whether a prompt is
-                // handed off (the `b`-submit flow) or only the head moved (a
-                // tree-view switch). A build fallback inserts nothing: it leads
-                // with its own failure notice, and the prompt handoff below
-                // folds the restore notice.
-                apply_branch_switch_notice(&mut next, is_branch, branch_prompt.is_some());
-                install_next_session(&mut world, &shell, next);
-                // The outgoing session's transmitted image ids belong to its
-                // terminal graphics memory. Free them and empty the store so
-                // the new session starts clean.
-                free_session_images(&mut app, &shell);
-                // Retitle the terminal for the switched-to session. The switch
-                // ran off the loop with no event context, so we ride an app
-                // event, mirroring the refocus delegation.
-                app.post_app_event(UserEvent {
-                    name: SET_TITLE_EVENT.to_string(),
-                    data: None,
-                });
-                app.request_redraw();
-                // Branch prompt handoff, under the prompt-safety invariant:
-                // auto-submit only on a clean rebuild, otherwise restore the
-                // prompt verbatim into the editor with a notice (never
-                // submitting it against the wrong head). The prompt is already
-                // in prompt-history (recorded at the submit site), so it is
-                // never lost.
-                if let Some(prompt) = branch_prompt {
-                    hand_off_branch_prompt(&mut world, &shell, prompt, fell_back);
-                    app.request_redraw();
+        // Read the outgoing session's usage before the change and record it
+        // only once the change took: nothing is torn down here (the host
+        // keeps every session it materialized live), so a refused change
+        // leaves the same session focused and its usage still growing.
+        let previous = world.session.clone();
+        let usage = world.host.usage(&previous).await;
+        match apply_focus_request(&mut app, &shell, &mut world, request).await {
+            Focus::Moved => match usage {
+                Ok(Some(usage)) => completed_sessions.push((previous, usage)),
+                Ok(None) | Err(_) => {
+                    tracing::warn!("could not read {previous}'s usage for the exit banner");
                 }
-            }
-            // Both the requested build and the fallback failed: no session
-            // survived, so there is nothing to install. Break with the error
-            // and let the banner itemize what the completed sessions hold.
-            Err(err) => {
-                live_survived = false;
-                break Err(err);
-            }
+            },
+            // A branch stays in its session, and a refusal never left it, so
+            // the banner keeps counting this session as the live one.
+            Focus::Same => {}
         }
     };
 
+    // Read what the banner needs before the host tears its sessions down:
+    // afterwards there is no live session to ask.
+    let banner = ExitBanner::collect(&world, completed_sessions).await;
+    // Cancels every turn through the graceful path, quiesces the background
+    // tasks, flushes the logs, and releases the session locks.
+    world.host.shutdown().await;
     app.shutdown().await;
 
     // The alt screen wiped the conversation from the terminal, so the
     // normal screen gets the usage banner and the resume hint.
-    print_exit_banner(&world, &completed_sessions, live_survived).await;
+    banner.print();
     run_result
 }
 
@@ -4926,12 +4709,6 @@ async fn drive(
         tokio::select! {
             biased;
 
-            // --- Agent turn finished ---
-            joined = world.turns.join_next() => {
-                handle_turn_join(world, joined)?;
-                app.request_redraw();
-            }
-
             // --- Theme reload (fs-watcher) ---
             // Coalesced re-parses of `~/.aj/themes/<name>.json` land
             // here. Replacing the handle and re-styling rebuilds every
@@ -5076,7 +4853,7 @@ async fn drive(
                                     }
                                 }
                             } else {
-                                handle_editor_submit(world, shell, text);
+                                handle_editor_submit(world, shell, text).await;
                             }
                         }
                         // An Esc that cancelled an armed branch anchor: fold
@@ -5086,8 +4863,11 @@ async fn drive(
                             fold_notice(world, "Branch cancelled.");
                             app.request_redraw();
                         }
-                        if let Some(action) = shell.borrow().take_host_action()
-                            && handle_host_action(world, shell, action)
+                        // Bind the take out of the borrow first: the action
+                        // handlers await on the host.
+                        let host_action = shell.borrow().take_host_action();
+                        if let Some(action) = host_action
+                            && handle_host_action(world, shell, action).await
                         {
                             app.request_redraw();
                         }
@@ -5226,20 +5006,16 @@ async fn drive(
                         // the shared flag. Tear the dialog down and abort the
                         // task.
                         cancel_login(world, shell, app, &mut login_session);
-                        // A parked session change (the `NewSession` command
-                        // or a confirmed resume pick). Bind the take out of the
-                        // borrow first, so no RefCell ref is held across
-                        // `consume_session_request` (which borrows the shell to
-                        // raise its refuse toast). Any request can be parked
-                        // with background work live, so all are rechecked and
-                        // refused there rather than consumed (see
-                        // `consume_session_request`).
+                        // A parked session change (the `NewSession` command, a
+                        // confirmed resume pick, a tree-view branch switch).
+                        // The request sites refuse while work is live up front
+                        // and the host refuses a head switch it cannot serve,
+                        // so there is nothing to recheck here. Bind the take
+                        // out of the borrow first so no RefCell ref outlives
+                        // the statement.
                         let session_request = shell.borrow().take_session_request();
                         if let Some(request) = session_request {
-                            match consume_session_request(world, shell, request) {
-                                Some(exit) => break Ok(exit),
-                                None => app.request_redraw(),
-                            }
+                            break Ok(request.into_exit());
                         }
                     }
                     // The reader ended (EOF or a read error), so no
@@ -5248,23 +5024,23 @@ async fn drive(
                 }
             }
 
-            // --- Agent bus event ---
+            // --- Host frame ---
             // This arm sits BELOW the input arm on purpose. A fast streaming
-            // turn floods the agent-event stream, and under `biased` an arm
+            // turn floods the session's frame stream, and under `biased` an arm
             // above input would keep winning and starve typing until the turn
             // quiesced, so a typed follow-up or steer would render late. Below
-            // input, typed input always wins. `drain_events` still coalesces the
-            // whole channel into one batch, so a burst collapses into one redraw.
-            maybe_event = world.event_rx.recv() => {
-                // Losing the agent bus means this session can no longer
-                // observe turn progress. It is also permanently ready, so
-                // treating closure as a no-op would spin this select loop.
-                let Some(event) = maybe_event else {
-                    break Err(anyhow::anyhow!("agent event channel closed"));
+            // input, typed input always wins. The per-iteration drain at the
+            // loop's bottom still folds the rest of the batch, so a burst
+            // collapses into one redraw.
+            maybe_frame = world.attachment.recv() => {
+                // Losing the stream means this client can no longer observe
+                // its session. It is also permanently ready, so treating
+                // closure as a no-op would spin this select loop. Only a host
+                // shutdown closes it, and this loop returns before that.
+                let Some(frame) = maybe_frame else {
+                    break Err(anyhow::anyhow!("the session host closed the frame stream"));
                 };
-                let (redraw, wake_targets) = drain_events(world, event);
-                spawn_wakes(world, wake_targets);
-                if redraw {
+                if world.client.apply(&mut world.chat.borrow_mut(), frame).0 {
                     app.request_redraw();
                 }
             }
@@ -5408,6 +5184,16 @@ async fn drive(
                 }
             }
         }
+        // Fold whatever else the host published, including the frames a
+        // command this iteration issued (they are queued by the time it
+        // returns). One drain per iteration is what keeps the chrome mirrors
+        // below from lagging the host by a frame.
+        if fold_ready_frames(world) {
+            app.request_redraw();
+        }
+        // The attach block a re-attach served may have obliged the reads
+        // again.
+        refresh_client_reads(world).await;
         // One status sync per iteration, whatever the arm did. On the
         // idle-to-animating edge, post the loader wake: widgets can only
         // schedule ticks from an event handler, so the host hands the
@@ -5470,77 +5256,80 @@ async fn drive(
     exit
 }
 
-/// Print the end-of-session usage banner and resume hint to stdout,
-/// dimmed and indented like `aj`'s shutdown banner. Call after the alt
-/// screen is torn down and with no turn in flight (reading the agent's
-/// usage locks it).
+/// The end-of-run usage banner and resume hint.
 ///
-/// A single-session process prints one bare usage block. When the process
-/// spanned several sessions (new-session / resume), each torn-down
-/// session's usage was snapshotted into `completed` in order; itemize them
-/// first, each under a dim `Session: <id>` header, then the live session's
-/// block, matching `aj`.
-///
-/// `live_survived` is false only on the fatal build-failure path, where
-/// `world` still points at the already-torn-down outgoing session (itself
-/// the last entry in `completed`). We then print `completed` alone and skip
-/// the live block and the resume hint, so that session isn't counted twice.
-async fn print_exit_banner(
-    world: &World,
-    completed: &[(String, UsageSummary)],
-    live_survived: bool,
-) {
-    fn dim(s: &str) -> String {
-        format!("\x1b[2m{s}\x1b[22m")
-    }
-    fn print_block(header: Option<&str>, summary: &UsageSummary) {
-        println!();
-        if let Some(header) = header {
-            println!(" {}", dim(header));
+/// Collected while the host is still up (reading a session's usage needs its
+/// agent) and printed once the alt screen is gone, since the alt screen wiped
+/// the conversation from the terminal.
+struct ExitBanner {
+    /// Each session the process left, in the order it left them, with the
+    /// usage read at the moment it lost focus.
+    completed: Vec<(String, UsageSummary)>,
+    /// The session that was focused at the end, and its usage. `None` when
+    /// the host could not answer, which leaves the block out rather than
+    /// printing zeroes.
+    live: Option<(String, UsageSummary)>,
+    /// The `aj continue <id>` hint, present only for a session worth
+    /// resuming.
+    resume_hint: Option<String>,
+}
+
+impl ExitBanner {
+    /// Read the banner's data off the host. Call with no turn in flight
+    /// (reading a session's usage locks its agent).
+    async fn collect(world: &World, completed: Vec<(String, UsageSummary)>) -> ExitBanner {
+        let live = match world.host.usage(&world.session).await {
+            Ok(Some(usage)) => Some((world.session.clone(), usage)),
+            Ok(None) | Err(_) => None,
+        };
+        // Only sessions with at least one persisted user-thread leaf are
+        // worth resuming. A fresh session the user quit without typing
+        // anything gets no hint.
+        let resume_eligible = {
+            let log = world.handles.log.lock().await;
+            log.latest_leaf(ThreadFilter::USER).is_some()
+        };
+        ExitBanner {
+            completed,
+            live,
+            resume_hint: resume_eligible.then(|| format_resume_hint(&world.session)),
         }
-        for line in format_usage_summary(summary).lines() {
-            println!(" {}", dim(line));
-        }
-        println!();
     }
 
-    // No live world survived the loop: the outgoing session's usage is
-    // already in `completed`, so print that list and stop.
-    if !live_survived {
-        for (session_id, completed_summary) in completed {
-            print_block(
-                Some(&format_session_usage_header(session_id)),
-                completed_summary,
-            );
+    /// Print the banner to stdout, dimmed and indented like `aj`'s shutdown
+    /// banner.
+    ///
+    /// A single-session process prints one bare usage block. When the process
+    /// spanned several sessions (new-session / resume), each session it left
+    /// is itemized first, in order, under a dim `Session: <id>` header, then
+    /// the live one's block, matching `aj`.
+    fn print(&self) {
+        fn dim(s: &str) -> String {
+            format!("\x1b[2m{s}\x1b[22m")
         }
-        return;
-    }
+        fn print_block(header: Option<&str>, summary: &UsageSummary) {
+            println!();
+            if let Some(header) = header {
+                println!(" {}", dim(header));
+            }
+            for line in format_usage_summary(summary).lines() {
+                println!(" {}", dim(line));
+            }
+            println!();
+        }
 
-    let summary = world.core.usage_summary().await;
-    if completed.is_empty() {
-        print_block(None, &summary);
-    } else {
-        for (session_id, completed_summary) in completed {
-            print_block(
-                Some(&format_session_usage_header(session_id)),
-                completed_summary,
-            );
+        for (session_id, summary) in &self.completed {
+            print_block(Some(&format_session_usage_header(session_id)), summary);
         }
-        print_block(
-            Some(&format_session_usage_header(&world.core.session_id)),
-            &summary,
-        );
-    }
-    // Only sessions with at least one persisted user-thread leaf are
-    // worth resuming. A fresh session the user quit without typing
-    // anything gets no hint.
-    let resume_eligible = {
-        let log = world.core.log.lock().await;
-        log.latest_leaf(ThreadFilter::USER).is_some()
-    };
-    if resume_eligible {
-        println!(" {}", dim(&format_resume_hint(&world.core.session_id)));
-        println!();
+        if let Some((session_id, summary)) = &self.live {
+            let header =
+                (!self.completed.is_empty()).then(|| format_session_usage_header(session_id));
+            print_block(header.as_deref(), summary);
+        }
+        if let Some(hint) = &self.resume_hint {
+            println!(" {}", dim(hint));
+            println!();
+        }
     }
 }
 

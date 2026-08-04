@@ -12,7 +12,6 @@ use std::collections::BTreeSet;
 use std::sync::{Mutex as StdMutex, MutexGuard};
 
 use aj_agent::events::{AgentId, AgentSettings};
-use aj_models::{speed_name, thinking_config_name, verbosity_name};
 use aj_session::AppendHandoff;
 use chrono::{DateTime, Utc};
 use tokio::sync::mpsc::UnboundedSender;
@@ -91,14 +90,10 @@ pub(crate) struct SessionStatus {
 /// is the authority for "the active model", not the agent (whose copy lags
 /// by one turn).
 pub(crate) fn settings_of(run_config: &StdMutex<RunConfigSnapshot>) -> AgentSettings {
-    let cfg = run_config.lock().expect("run config mutex poisoned");
-    AgentSettings {
-        provider: cfg.model_key.0.clone(),
-        model_id: cfg.model_key.1.clone(),
-        thinking: thinking_config_name(cfg.thinking.as_ref()).to_string(),
-        speed: speed_name(cfg.speed).to_string(),
-        verbosity: verbosity_name(cfg.stream_options.verbosity).to_string(),
-    }
+    run_config
+        .lock()
+        .expect("run config mutex poisoned")
+        .settings()
 }
 
 /// A session the host holds live.

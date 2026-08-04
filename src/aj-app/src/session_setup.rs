@@ -13,6 +13,7 @@
 
 use std::sync::{Arc, Mutex as StdMutex};
 
+use aj_agent::events::AgentSettings;
 use aj_agent::message::AgentMessage;
 use aj_agent::{Agent, AgentSeed};
 use aj_conf::{AgentEnv, Config, ConfigSpeed};
@@ -99,6 +100,23 @@ pub struct RunConfigSnapshot {
     /// `stream_options` from registry defaults, which would otherwise
     /// drop it. `None` until the log is opened in [`prepare_log`].
     pub session_id: Option<String>,
+}
+
+impl RunConfigSnapshot {
+    /// The settings identity the next turn runs against.
+    ///
+    /// The run config is what a turn is stamped from, so this is the
+    /// authority for "the active model", not the agent, whose own copy lags
+    /// by a turn.
+    pub fn settings(&self) -> AgentSettings {
+        AgentSettings {
+            provider: self.model_key.0.clone(),
+            model_id: self.model_key.1.clone(),
+            thinking: thinking_config_name(self.thinking.as_ref()).to_string(),
+            speed: speed_name(self.speed).to_string(),
+            verbosity: verbosity_name(self.stream_options.verbosity).to_string(),
+        }
+    }
 }
 
 /// Dependencies for resume-time settings restoration: the model
