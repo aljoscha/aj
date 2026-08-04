@@ -3123,12 +3123,6 @@ async fn the_attach_block_is_contiguous_and_filters_the_boundary() {
     harness.host.shutdown().await;
 }
 
-/// An attach whose state moved while it was projecting publishes one more
-/// `state` frame behind the block, which is what self-heals the change the
-/// block dropped as lossy (spec 6.3).
-///
-/// `working` and `settings` are read before the projection, and a `state`
-/// frame published during it is held and dropped, lossy frames being
 /// A cursor at the session's high-water mark is served an empty suffix, and one
 /// past it a full backfill: it names a history this host does not have, so it
 /// counts as an epoch mismatch (spec 6.5). Serving it an empty suffix plus a
@@ -3209,104 +3203,98 @@ async fn a_cursor_past_the_high_water_mark_earns_a_full_backfill() {
     harness.host.shutdown().await;
 }
 
-/// droppable by definition. Without the refresh, a client whose block was
-/// served across the change would keep showing the settings the block opened
-/// with until something else moved.
+/// An attach whose state moved while it was projecting publishes one more
+/// `state` frame behind the block, which is what self-heals the change the
+/// block dropped as lossy (spec 6.3).
+///
+/// `working` and `settings` are read before the projection, and a `state` frame
+/// published during it is held and dropped, lossy frames being droppable by
+/// definition. Without the refresh, a client whose block was served across the
+/// change would keep showing the settings the block opened with until something
+/// else moved.
 ///
 /// The change has to land inside the span between an attach's status snapshot
-/// and its block delivery, so this hammers attaches back to back and flips the
-/// settings once underneath them. Every attachment is consumed while the
-/// hammer runs. Producer-paced blocks would otherwise accumulate one blocked
-/// producer per attempt, which is not a client behavior the host needs to
-/// support.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+/// and its block delivery, and the client decides how long that span is: the
+/// block is producer-paced over a capacity-one channel (see the fan-out's module
+/// docs), so a client that takes one frame and stops leaves the producer parked
+/// inside the block for as long as the test wants. That is why the flip below
+/// needs no timing at all, and why the rest of the block still has to arrive
+/// after it.
+#[tokio::test]
 async fn an_attach_refreshes_state_that_moved_while_it_projected() {
-    let harness = Harness::new(Vec::new());
+    let harness = Harness::new(vec![finalized_text_message("an answer")]);
     let session = harness.create().await;
+    // One turn, so the block has more frames than the channel can buffer and a
+    // client that stops reading parks its producer.
+    let mut warmup = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+    warmup.pump_until_idle().await;
+    drop(warmup);
 
-    let deadline = tokio::time::Instant::now() + DEADLINE;
-    let mut attempts = 0;
-    loop {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "no attach ever refreshed the state it snapshotted, after {attempts} attempts",
-        );
-        attempts += 1;
-        // Alternating, so every flip applies and every flip moves the
-        // settings identity a `state` frame carries.
-        let level = (attempts % 2 == 0).then_some(aj_models::ThinkingConfig::High);
-        let expected = aj_models::thinking_config_name(level.as_ref()).to_string();
-        let before = aj_models::thinking_config_name(
-            (attempts % 2 != 0)
-                .then_some(aj_models::ThinkingConfig::High)
-                .as_ref(),
+    let mut stream = harness
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+    let opened = bounded("the block's opening frame", stream.recv())
+        .await
+        .expect("the stream carries its block");
+    let Frame::State { settings, .. } = &opened else {
+        panic!("a block opens with its `state` frame, got {opened:?}");
+    };
+    let opened_with = settings.thinking.clone();
+
+    // Flip to whatever the block did not open with, so the change moves the
+    // settings identity a `state` frame carries.
+    let high = aj_models::ThinkingConfig::High;
+    let level = if opened_with == aj_models::thinking_config_name(Some(&high)) {
+        None
+    } else {
+        Some(high)
+    };
+    let expected = aj_models::thinking_config_name(level.as_ref()).to_string();
+    assert_ne!(expected, opened_with, "the flip has to move the settings");
+    harness
+        .host
+        .command(
+            &session,
+            Command::Settings(SettingsChange {
+                agent: AgentId::Main,
+                persist: PersistAction::None,
+                axis: SettingsAxis::Thinking(level),
+            }),
         )
-        .to_string();
+        .await
+        .expect("thinking change");
 
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let hammer = tokio::spawn({
-            let host = harness.host.clone();
-            let session = session.clone();
-            let stop = Arc::clone(&stop);
-            async move {
-                let mut served = Vec::new();
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    let mut stream = host
-                        .attach(&[AttachRequest {
-                            session: session.clone(),
-                            cursor: None,
-                        }])
-                        .await
-                        .expect("attach");
-                    let mut frames = Vec::new();
-                    while let Some(frame) = stream.recv().await {
-                        let caught_up = matches!(frame, Frame::CaughtUp { .. });
-                        frames.push(frame);
-                        if caught_up {
-                            break;
-                        }
-                    }
-                    // A refresh follows the block on the live queue. Bound
-                    // the read because a stream with no refresh stays open.
-                    if let Ok(Some(frame)) =
-                        tokio::time::timeout(Duration::from_millis(2), stream.recv()).await
-                    {
-                        frames.push(frame);
-                    }
-                    served.push(frames);
-                }
-                served
-            }
-        });
-        // Let the loop get going, flip underneath it, then let the attach it
-        // straddled finish.
-        tokio::time::sleep(Duration::from_millis(2)).await;
-        harness
-            .host
-            .command(
-                &session,
-                Command::Settings(SettingsChange {
-                    agent: AgentId::Main,
-                    persist: PersistAction::None,
-                    axis: SettingsAxis::Thinking(level),
-                }),
-            )
-            .await
-            .expect("thinking change");
-        tokio::time::sleep(Duration::from_millis(2)).await;
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let joiners = hammer.await.expect("the attach loop");
-        assert!(!joiners.is_empty(), "the loop served at least one attach");
+    // The producer is still inside the block, so its tail is still to come, and
+    // nothing in it can carry the change: those frames were projected before it.
+    let block = frames_until(&mut stream, "the rest of the attach block", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+    assert_eq!(
+        states(&block, &expected),
+        0,
+        "the block cannot carry a change made after its projection: {block:?}",
+    );
 
-        let healed = joiners.iter().any(|frames| {
-            let opened_stale = matches!(frames.first(),
-                Some(Frame::State { settings, .. }) if settings.thinking == before);
-            opened_stale && states(&frames[1..], &expected) > 0
-        });
-        if !healed {
-            continue;
-        }
-        break;
+    // The refresh is what carries it, behind the block.
+    let behind = frames_until(&mut stream, "the refreshed state frame", |frame| {
+        matches!(frame, Frame::State { .. })
+    })
+    .await;
+    let refreshed = behind.last().expect("the frame the wait stopped on");
+    match refreshed {
+        Frame::State { settings, .. } => assert_eq!(
+            settings.thinking, expected,
+            "the state frame behind the block reports the settings the block \
+             opened with",
+        ),
+        other => panic!("expected a `state` frame, got {other:?}"),
     }
     harness.host.shutdown().await;
 }
