@@ -84,11 +84,16 @@ pub struct Args {
     /// (`127.0.0.1:6161`), which is the only address the `local` identity
     /// mode will serve (see `--auth`).
     ///
+    /// An explicit address needs the equals form, `--listen=<addr>`: the
+    /// value is optional, and a space-separated one would swallow the first
+    /// word of `aj --listen fix the parser`.
+    ///
     /// Interactive runs embed the server alongside the TUI, so the local
     /// shell and every remote client attach to one host as peers. `aj serve`
     /// runs the same host headless.
     #[arg(
         long,
+        global = true,
         env = "AJ_LISTEN",
         num_args = 0..=1,
         require_equals = true,
@@ -104,14 +109,14 @@ pub struct Args {
     /// The control port runs arbitrary commands through the agent, so
     /// serving a non-loopback address in `local` mode refuses to start
     /// rather than serving unauthenticated.
-    #[arg(long, env = "AJ_AUTH", default_value = "local")]
+    #[arg(long, global = true, env = "AJ_AUTH", default_value = "local")]
     pub auth: String,
 
     /// Tailnet login allowed to connect in `--auth tailscale` mode,
     /// repeatable. Spelled exactly as the tailscale daemon reports it
     /// (e.g. `alice@github`). A tagged node has no login and is admitted
     /// only by the aj control capability granted in the tailnet policy.
-    #[arg(long, env = "AJ_ALLOW", value_delimiter = ',')]
+    #[arg(long, global = true, env = "AJ_ALLOW", value_delimiter = ',')]
     pub allow: Vec<String>,
 
     /// Subcommand selector for the non-conversational utilities
@@ -169,9 +174,10 @@ pub enum Command {
     /// Serve this working directory's sessions headlessly on the control
     /// port, with no terminal UI of its own.
     ///
-    /// The address comes from the top-level `--listen` / `AJ_LISTEN`, and
-    /// defaults to the loopback control port when neither is given, so a
-    /// bare `aj serve` is reachable by `aj connect` on the same machine.
+    /// The address comes from `--listen` / `AJ_LISTEN`, which are global and
+    /// so may be given on either side of the subcommand. It defaults to the
+    /// loopback control port when neither is given, so a bare `aj serve` is
+    /// reachable by `aj connect` on the same machine.
     Serve,
     /// Attach the interactive TUI to a session on a remote aj host.
     ///
@@ -221,5 +227,63 @@ mod tests {
 
         assert!(!args.print);
         assert_eq!(args.format, PrintFormat::Text);
+    }
+
+    fn parse(argv: &[&str]) -> Args {
+        Args::try_parse_from(argv).unwrap_or_else(|err| panic!("{argv:?} should parse: {err}"))
+    }
+
+    /// The control-port flags are global, so a subcommand does not hide them:
+    /// they configure the host a `serve` run is, and both placements read the
+    /// same to a user.
+    #[test]
+    fn the_control_port_flags_parse_on_either_side_of_a_subcommand() {
+        for argv in [
+            [
+                "aj",
+                "--listen=127.0.0.1:6199",
+                "--auth=tailscale",
+                "--allow=alice@github",
+                "serve",
+            ],
+            [
+                "aj",
+                "serve",
+                "--listen=127.0.0.1:6199",
+                "--auth=tailscale",
+                "--allow=alice@github",
+            ],
+        ] {
+            let args = parse(&argv);
+            assert_eq!(args.listen.as_deref(), Some("127.0.0.1:6199"), "{argv:?}");
+            assert_eq!(args.auth, "tailscale", "{argv:?}");
+            assert_eq!(args.allow, vec!["alice@github".to_string()], "{argv:?}");
+            assert!(matches!(args.command, Some(Command::Serve)), "{argv:?}");
+        }
+    }
+
+    /// A bare `--listen` takes the loopback default in either placement, and
+    /// `--auth` defaults to the mode that trusts nothing but loopback.
+    #[test]
+    fn a_bare_listen_defaults_after_a_subcommand_too() {
+        for argv in [["aj", "--listen", "serve"], ["aj", "serve", "--listen"]] {
+            let args = parse(&argv);
+            assert_eq!(
+                args.listen.as_deref(),
+                Some(DEFAULT_LISTEN_ADDRESS),
+                "{argv:?}",
+            );
+            assert_eq!(args.auth, "local", "{argv:?}");
+            assert!(args.allow.is_empty(), "{argv:?}");
+        }
+    }
+
+    /// A connect run reaches them too, which is what lets the shell say the
+    /// flag has nothing to serve rather than silently dropping it.
+    #[test]
+    fn the_control_port_flags_reach_a_connect_run() {
+        let args = parse(&["aj", "connect", "http://127.0.0.1:6161", "--listen"]);
+        assert_eq!(args.listen.as_deref(), Some(DEFAULT_LISTEN_ADDRESS));
+        assert!(matches!(args.command, Some(Command::Connect { .. })));
     }
 }
