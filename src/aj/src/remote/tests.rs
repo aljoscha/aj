@@ -450,6 +450,39 @@ fn sub_agent_turn() -> Vec<AssistantMessage> {
     ]
 }
 
+/// A turn that puts a sub-agent and a foreground tool in flight at the same
+/// time: one message spawning a background sub-agent and running a bash
+/// command that sleeps for `sleep_seconds`.
+///
+/// The two run concurrently, which is what lets a test choose which of them a
+/// re-attach lands on. `report` is what the sub streams back, and its length is
+/// how long the sub's run takes, one character every 20ms under
+/// [`cut_provider`]. The command decides how long the parent stays blocked
+/// afterwards, and while it is blocked nothing durable is appended.
+fn running_tool_and_sub_turn(report: &str, sleep_seconds: u32) -> Vec<AssistantMessage> {
+    let mut both = calling(
+        "kicking that off",
+        "call-sub",
+        "agent",
+        serde_json::json!({"task": "look into it", "run_in_background": true}),
+    );
+    both.content.push(AssistantContent::ToolCall(ToolCall {
+        id: "call-slow".to_string(),
+        name: "bash".to_string(),
+        arguments: serde_json::json!({"command": format!("sleep {sleep_seconds}"),
+                                      "description": "slow"}),
+    }));
+    vec![
+        both,
+        // Whoever asks next, which is the sub-agent.
+        finalized_text_message(report),
+        finalized_text_message("both of those are done"),
+        // The background sub's completion notice wakes the parent, which runs
+        // one more inference to acknowledge it.
+        finalized_text_message("noted, thanks"),
+    ]
+}
+
 /// A turn that starts a background command and keeps it running, so the task
 /// table has a live row in it.
 fn background_task_turn() -> Vec<AssistantMessage> {
@@ -883,6 +916,29 @@ fn assistant_texts(state: &CanonicalState) -> Vec<String> {
                     .collect::<Vec<_>>()
                     .join(""),
             ),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The arguments of every still-running cell in the main transcript that names
+/// `call_id`.
+///
+/// A list rather than a lookup, so a second cell for the same call shows up as
+/// a second element instead of hiding behind the first.
+fn running_cells(state: &CanonicalState, call_id: &str) -> Vec<serde_json::Value> {
+    state
+        .agent(AgentId::Main)
+        .expect("a main transcript")
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            CanonicalEntry::Tool {
+                call_id: id,
+                status: aj_app::chat::ToolStatus::Running,
+                args,
+                ..
+            } if id == call_id => Some(args.clone()),
             _ => None,
         })
         .collect()
@@ -2071,28 +2127,131 @@ async fn a_cut_between_a_tool_end_and_its_durable_message_converges() {
     fixture.shutdown().await;
 }
 
-/// The named sharp edge: a re-attach where zero durable entries follow the
-/// cursor, yet a sub-agent concluded in the gap. The conclusion cannot ride
-/// the backfill, so the post-`caught_up` sweep is the only thing that can
-/// deliver it (spec 6.5).
+/// The named sharp edge: the connection dies with a tool call and a sub-agent
+/// both in flight. The re-attach must not duplicate the tool cell (its
+/// arguments live nowhere else, so quiesce keeps the cell and the backfill
+/// cannot regenerate it) and must not leave either spinner stuck.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_reattach_with_no_durable_suffix_still_concludes_a_sub_agent() {
-    let fixture = Fixture::new(sub_agent_turn()).await;
+async fn a_cut_with_a_tool_and_a_sub_agent_running_converges() {
+    // A report long enough that the sub is still streaming it when the client
+    // comes back, and a command that keeps the parent blocked past that.
+    let fixture = Fixture::with_provider(cut_provider(running_tool_and_sub_turn(
+        "the sub reporting back at length, one character at a time, so that its \
+         run is still going when the client comes back",
+        3,
+    )))
+    .await;
     let session = fixture.create().await;
     let mut oracle = fixture.oracle(&session).await;
     let mut remote = fixture.remote(&session).await;
-    fixture.prompt(&session, "delegate it").await;
-    oracle.settle().await;
-    remote.settle().await;
-    assert_converged(&remote, &oracle, "the sub-agent turn");
+    fixture.prompt(&session, "do both").await;
+
+    // Cut once the slow command is under way. The sub-agent was spawned by the
+    // same message and is streaming its answer, so both are in flight.
+    remote
+        .pump_until("the slow tool call to start", |frame| {
+            matches!(frame, Frame::Event { event, .. }
+                if matches!(event.known(),
+                    Some(AgentEvent::ToolExecutionStart { call_id, .. })
+                        if call_id == "call-slow"))
+        })
+        .await;
+    remote.cut();
+    remote.reattach().await;
+
+    let state = remote.canonical();
+    let cells = running_cells(&state, "call-slow");
     assert_eq!(
-        sub_box(&remote.canonical(), 1).0,
-        SubAgentStatus::Done,
-        "the sub-agent's box is concluded",
+        cells.len(),
+        1,
+        "the re-attach neither dropped the running cell nor added a second: {state:?}",
+    );
+    assert_eq!(
+        cells[0]["command"],
+        serde_json::json!("sleep 3"),
+        "quiesce kept the cell's arguments, which no backfill can regenerate",
+    );
+    assert_eq!(
+        sub_box(&state, 1),
+        (SubAgentStatus::Running, false),
+        "the sub-agent's bracket is still open and its clock still running",
     );
 
-    // The session's high-water mark, as a client learns it: from the
-    // directory read, under the epoch the fold adopted.
+    oracle.settle().await;
+    remote.settle().await;
+
+    let state = remote.canonical();
+    assert!(
+        state.running.is_empty(),
+        "no spinner outlived the work: {:?}",
+        state.running,
+    );
+    assert_eq!(
+        sub_box(&state, 1).0,
+        SubAgentStatus::Done,
+        "the sub-agent's box concluded",
+    );
+    assert!(
+        running_cells(&state, "call-slow").is_empty(),
+        "and the slow call finished: {state:?}",
+    );
+    assert_converged(&remote, &oracle, "a cut with a tool and a sub in flight");
+    fixture.shutdown().await;
+}
+
+/// The named sharp edge: a re-attach where zero durable entries follow the
+/// cursor, yet a sub-agent concluded in the gap. Its `SubAgentEnd` is
+/// reliable-transient, so what has to conclude the client's box is the block
+/// itself (spec 6.5).
+///
+/// The gap is real here: the client's box is `Running` when it comes back. The
+/// parent stays blocked on a slow command while the sub finishes, which is what
+/// keeps a durable entry from landing behind the cursor and turning this into an
+/// ordinary incremental resume. Two mechanisms then carry the conclusion, the
+/// bracketing the projection closes for a run the host knows is finished, and
+/// the post-`caught_up` sweep, and the test pins both: the first concludes the
+/// box, the second lands on it without disturbing it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reattach_with_no_durable_suffix_still_concludes_a_sub_agent() {
+    // A short report, so the sub concludes early in the parent's long sleep.
+    let fixture =
+        Fixture::with_provider(cut_provider(running_tool_and_sub_turn("done looking", 5))).await;
+    let session = fixture.create().await;
+    let mut oracle = fixture.oracle(&session).await;
+    let mut remote = fixture.remote(&session).await;
+    fixture.prompt(&session, "do both").await;
+
+    // Up to the usage update trailing the sub-agent's assistant message, which
+    // is its last durable entry and the last event that entry projects. So the
+    // client has applied everything the log holds, and holds the entry back
+    // from its committed cursor only because a trailing event might follow it
+    // (spec 6.5).
+    remote
+        .pump_until("the sub-agent's usage update", |frame| {
+            matches!(frame, Frame::Event { event, .. }
+                if matches!(event.known(),
+                    Some(AgentEvent::UsageUpdate { agent_id: AgentId::Sub(1), .. })))
+        })
+        .await;
+    remote.cut();
+    assert_eq!(
+        sub_box(&remote.canonical(), 1).0,
+        SubAgentStatus::Running,
+        "the box is open when the connection dies",
+    );
+
+    // The sub concludes while this client is away. `SubAgentEnd` is
+    // reliable-transient, so nothing replays it.
+    oracle
+        .pump_until("the sub-agent to conclude", |frame| {
+            matches!(frame, Frame::Event { event, .. }
+                if matches!(event.known(), Some(AgentEvent::SubAgentEnd { .. })))
+        })
+        .await;
+
+    // The session's high-water mark, as a client learns it: from the directory
+    // read, under the epoch the fold adopted. The client applied every entry up
+    // to it, it only held the last one back from its committed cursor.
     let epoch = remote.client.cursor().expect("a committed cursor").epoch;
     let last_seq = fixture
         .client
@@ -2116,6 +2275,11 @@ async fn a_reattach_with_no_durable_suffix_still_concludes_a_sub_agent() {
         !block.iter().any(|frame| frame.durable_seq().is_some()),
         "the suffix at the high-water mark is empty: {block:?}",
     );
+    assert_eq!(
+        sub_box(&remote.canonical(), 1).0,
+        SubAgentStatus::Done,
+        "the block's bracketing closed the box the client came back with: {block:?}",
+    );
     let sweep = remote
         .pump_until("the conclusion sweep", |frame| {
             matches!(frame, Frame::Event { event, .. }
@@ -2127,9 +2291,15 @@ async fn a_reattach_with_no_durable_suffix_still_concludes_a_sub_agent() {
         sweep.iter().all(|frame| frame.durable_seq().is_none()),
         "the sweep is synthesized, so it carries no cursor: {sweep:?}",
     );
-    // And re-applying all of it left the client where it was: the sweep is
-    // idempotent on a box that is already concluded.
-    assert_converged(&remote, &oracle, "a sweep over concluded state");
+    assert_eq!(
+        sub_box(&remote.canonical(), 1).0,
+        SubAgentStatus::Done,
+        "and the sweep behind it is idempotent",
+    );
+
+    oracle.settle().await;
+    remote.settle().await;
+    assert_converged(&remote, &oracle, "a sweep over a box open across the gap");
     fixture.shutdown().await;
 }
 

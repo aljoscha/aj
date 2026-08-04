@@ -565,6 +565,17 @@ struct ReplayState {
     /// closed. Only the projected path contributes, which is what a caller
     /// concluding unconcluded runs needs (see [`Backfill::subs`]).
     seen_subs: BTreeSet<usize>,
+    /// The [`AgentEvent::SubAgentStart`] each sub-agent's run was opened
+    /// with, kept after the run closes.
+    ///
+    /// A background sub-agent's entries interleave with its parent's, so a
+    /// run the walk considers finished is closed at the parent's next entry
+    /// and re-opened at the sub's next one, with its spawn root well behind
+    /// us. Re-opening from the message alone would lose the task, the
+    /// background flag and the settings the root carries, and the client
+    /// would seed the child's footer from an empty settings snapshot
+    /// (spec 6.5).
+    spawned: HashMap<usize, AgentEvent>,
     /// Agents for which at least one `Message` entry has been
     /// projected. Settings entries emit a [`AgentEvent::Notice`]
     /// only for agents present here; seed entries (before any
@@ -700,19 +711,19 @@ impl ReplayState {
                 );
             }
             ConversationEntryKind::Message { .. } => {
-                // Legacy fallback: no spawn entry preceded this
-                // message, so the run's first message (the task
-                // user prompt) opens the bracket. Legacy logs carry
-                // no run mode, so the sub reads as foreground. The
-                // start stays untagged: this entry's durable frame is
-                // its own `MessageEnd`.
-                self.open_run(
-                    n,
-                    sub_start_event(n, subagent_task(entry), false, fallback_settings()),
-                    None,
-                    keep,
-                    out,
-                );
+                // The run opens at one of its own messages, so its spawn
+                // entry is behind us: either an interleaved parent entry
+                // closed the bracket in between, or the log has no spawn
+                // entry at all (legacy logs lead with the task user
+                // message). The root's own start is the truth whenever we
+                // have seen one, and the legacy fallback reads the task off
+                // the user message and defaults the rest. Either way the
+                // start stays untagged: this entry's durable frame is its
+                // own `MessageEnd`.
+                let start = self.spawned.get(&n).cloned().unwrap_or_else(|| {
+                    sub_start_event(n, subagent_task(entry), false, fallback_settings())
+                });
+                self.open_run(n, start, None, keep, out);
             }
             // Settings entries ahead of any message don't open the
             // bracket; the first `Message` entry does. A compaction
@@ -737,6 +748,7 @@ impl ReplayState {
         out: &mut VecDeque<TaggedEvent>,
     ) {
         out.push_back(durable(at, start.clone()));
+        self.spawned.insert(n, start.clone());
         let run = self.open_runs.entry(n).or_default();
         run.start = Some(start);
         run.start_delivered = keep;
@@ -3980,6 +3992,45 @@ mod tests {
             "each run keeps its spawn root's task, mode and settings"
         );
         assert_eq!(backfill.open_subs, live([1, 2]));
+    }
+
+    /// A finished background run is closed at the parent's next entry and
+    /// re-opens at its own next one. The re-opened bracket has to carry the
+    /// spawn root's task, mode and settings: a client seeds the child's footer
+    /// from them, so a default snapshot leaves it with no model line at all.
+    #[test]
+    fn a_finished_background_run_reopens_with_its_spawn_root_s_start() {
+        let (_dir, log) = log_with_two_background_subs();
+        let backfill = project_suffix(&log.snapshot(), None, &BTreeSet::new());
+
+        let starts: Vec<(usize, String, bool, AgentSettings)> = backfill
+            .events
+            .iter()
+            .filter_map(|projected| match &projected.event {
+                AgentEvent::SubAgentStart {
+                    child: AgentId::Sub(n),
+                    task,
+                    background,
+                    settings,
+                    ..
+                } => Some((*n, task.clone(), *background, settings.clone())),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            starts.len() > 2,
+            "the interleaving closes and re-opens both runs: {starts:#?}",
+        );
+        for (n, task, background, settings) in starts {
+            let (expected_task, expected_settings) = match n {
+                1 => ("first bg task", sub_settings()),
+                2 => ("second bg task", other_sub_settings()),
+                other => panic!("unexpected sub {other}"),
+            };
+            assert_eq!(task, expected_task, "sub {n} keeps its task");
+            assert!(background, "sub {n} keeps its mode");
+            assert_eq!(settings, expected_settings, "sub {n} keeps its settings");
+        }
     }
 
     /// The transition close is the only way a finished run's box gets
