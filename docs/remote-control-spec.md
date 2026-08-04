@@ -1,6 +1,6 @@
 # Remote control and VM provisioning
 
-## Status: draft, phase 1 complete
+## Status: draft, phase 2 complete
 
 Companion document: `docs/remote-control-implementation.md`, the manual
 for the implementing agent.

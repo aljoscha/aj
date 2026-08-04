@@ -155,10 +155,10 @@ Verified starting points (line references drift, re-check):
   fold lives), and the canonical form for test comparison (spec 11.2,
   note `ChatState` has no `PartialEq` and stores `Instant`s, the
   canonical form is the comparable projection). Queue state and the
-  task table need client-model paths that do not exist today: locally
-  the view re-reads live handles at draw time (`aj/src/pending.rs`),
-  remotely the model must trust `QueueUpdate` frames and accept task
-  table replacement from the tasks read.
+  task table need client-model paths: the model trusts `QueueUpdate`
+  frames and accepts task-table replacement from the tasks read, and
+  the views read that model (`aj/src/pending.rs`) rather than live
+  handles, so one path serves both modes.
 - `src/aj-app/src/cli/args.rs` — CLI args including `--scripted`.
   The scripted provider itself is `aj_models::scripted`
   (`src/aj-models/src/scripted.rs`), `src/aj-app/src/scripted.rs` is
