@@ -4407,6 +4407,117 @@ async fn reads_do_not_materialize_a_cold_session() {
     revived.host.shutdown().await;
 }
 
+/// A live session's mark comes from the host's own bookkeeping, and the cold
+/// half of the directory tracks the store rather than a snapshot of it: a log
+/// that grows behind the host's back reports its new mark, a session file that
+/// appears is listed, one that is deleted goes away, and a pre-refactor log is
+/// no session at all.
+///
+/// This is the correctness half of the list-production contract (spec 6.8).
+/// The caches it exercises are what keep a refresh from re-reading the store,
+/// and the unit tests over `ColdSessions` are the oracle for the reads they
+/// avoid.
+#[tokio::test]
+async fn the_directory_follows_the_store_it_caches() {
+    let harness = Harness::new(vec![finalized_text_message("on the record")]);
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+    client.pump_until_idle().await;
+    let logged = {
+        let handles = harness
+            .host
+            .local_handles(&session)
+            .await
+            .expect("live session");
+        handles.log.lock().await.last_seq()
+    };
+    let live_mark = harness
+        .host
+        .sessions()
+        .await
+        .expect("sessions")
+        .sessions
+        .into_iter()
+        .find(|entry| entry.id == session)
+        .expect("the live session is listed");
+    assert!(live_mark.live && logged > 0);
+    assert_eq!(
+        live_mark.last_seq, logged,
+        "a live session's mark is the one the host already holds",
+    );
+    drop(client);
+    harness.host.shutdown().await;
+
+    let revived = harness.revive(Vec::new());
+    let sessions_dir = revived.persistence.sessions_dir().to_path_buf();
+    let mark = async |id: &str| {
+        revived
+            .host
+            .sessions()
+            .await
+            .expect("sessions")
+            .sessions
+            .into_iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.last_seq)
+    };
+    assert_eq!(mark(&session).await, Some(logged), "and so is a cold one's");
+
+    // A line appended behind this host's back (a sibling process holding the
+    // session, say) moves the file's size and modification time, which is what
+    // makes the next refresh recount instead of answering from the cache.
+    let appended = serde_json::json!({
+        "id": "ffffffff",
+        "timestamp": "2024-01-01T00:00:00Z",
+        "thread": "meta",
+        "type": "system_prompt",
+        "text": "appended behind our back",
+    });
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(sessions_dir.join(format!("{session}.jsonl")))
+        .expect("reopen the log");
+    std::io::Write::write_all(&mut file, format!("{appended}\n").as_bytes())
+        .expect("append an entry");
+    drop(file);
+    assert_eq!(
+        mark(&session).await,
+        Some(logged + 1),
+        "a log that grew is counted again",
+    );
+
+    // A session file that appears is listed, and one that is deleted goes
+    // away: the enumeration is what notices either, so no cached verdict can
+    // outlive the file it was taken from.
+    let appeared = "2000-01-01-00-00-00-000";
+    let appeared_path = sessions_dir.join(format!("{appeared}.jsonl"));
+    let entry = serde_json::json!({
+        "id": "00000000",
+        "timestamp": "2024-01-01T00:00:00Z",
+        "thread": "meta",
+        "type": "system_prompt",
+        "text": "a log written behind the host's back",
+    });
+    std::fs::write(&appeared_path, format!("{entry}\n")).expect("write a session file");
+    assert_eq!(mark(appeared).await, Some(1), "the new file is listed");
+    std::fs::remove_file(&appeared_path).expect("delete it again");
+    assert_eq!(mark(appeared).await, None, "and the deleted one is gone");
+
+    let ancient = "1999-01-01-00-00-00-000";
+    std::fs::write(
+        sessions_dir.join(format!("{ancient}.jsonl")),
+        "not json at all\n",
+    )
+    .expect("write a pre-refactor file");
+    assert_eq!(
+        mark(ancient).await,
+        None,
+        "a pre-refactor log is not a session",
+    );
+    revived.host.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // 16. Shutdown
 // ---------------------------------------------------------------------------

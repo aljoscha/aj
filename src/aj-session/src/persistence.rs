@@ -40,89 +40,117 @@ impl ConversationPersistence {
     ///
     /// Files whose first line does not parse as the new
     /// [ConversationEntry] shape (e.g. pre-refactor sessions) are skipped
-    /// with a `tracing::info!` note.
+    /// with a `tracing::info!` note, and so is a file that cannot be read at
+    /// all: one bad file must not fail the listing.
     pub fn list_sessions(&self) -> Result<Vec<SessionMetadata>, ConversationError> {
+        let mut sessions = self.enumerate_sessions()?;
+        sessions.retain(|metadata| {
+            let path = self.session_path(&metadata.session_id);
+            match self.is_current_format(&metadata.session_id) {
+                Some(true) => true,
+                Some(false) => {
+                    tracing::info!(
+                        "skipping pre-refactor session file {} (old on-disk format)",
+                        path.display()
+                    );
+                    false
+                }
+                None => {
+                    tracing::warn!("skipping unreadable session file {}", path.display());
+                    false
+                }
+            }
+        });
+        Ok(sessions)
+    }
+
+    /// Every `.jsonl` file in the sessions directory, latest first, with the
+    /// facts a `stat` yields.
+    ///
+    /// No file is opened, so this says nothing about a log's format:
+    /// [`Self::is_current_format`] is that gate, applied separately. The split
+    /// is what lets a caller that refreshes a listing often cache the gate's
+    /// verdict, which is a read, while re-running the enumeration, which is
+    /// not.
+    ///
+    /// A file that vanishes or turns unreadable between the directory read and
+    /// its `stat` is skipped rather than failing the enumeration: a listing
+    /// must not break over one file, least of all one that is no longer there.
+    pub fn enumerate_sessions(&self) -> Result<Vec<SessionMetadata>, ConversationError> {
         if !self.sessions_dir.exists() {
             return Ok(Vec::new());
         }
 
-        let entries = fs::read_dir(&self.sessions_dir)?;
-        let mut session_files = Vec::new();
-
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-                if let Some(file_stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    session_files.push(file_stem.to_string());
-                }
-            }
-        }
-
-        // Sort by filename (a timestamp), latest first.
-        session_files.sort_by(|a, b| b.cmp(a));
-
         let mut sessions = Vec::new();
-
-        for session_id in session_files {
-            let path = self.session_path(&session_id);
-
-            if !Self::looks_like_new_format(&path) {
-                tracing::info!(
-                    "skipping pre-refactor session file {} (old on-disk format)",
+        for entry in fs::read_dir(&self.sessions_dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(session_id) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let metadata = match fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    // Vanished or turned unreadable since the directory read.
+                    tracing::debug!("skipping session file {}: {err}", path.display());
+                    continue;
+                }
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            let Ok(modified) = metadata.modified() else {
+                tracing::debug!(
+                    "skipping session file {}: no modification time",
                     path.display()
                 );
                 continue;
-            }
-
-            let metadata = fs::metadata(&path)?;
-            let modified = metadata.modified()?;
-            let modified_at = DateTime::<Utc>::from(modified);
-            let modified_str = modified_at.format("%Y-%m-%d %H:%M:%S UTC").to_string();
-
-            // Use file size as proxy for conversation length.
-            let file_size = metadata.len();
-            let size_display = if file_size < 1024 {
-                format!("{file_size}B")
-            } else if file_size < 1024 * 1024 {
-                format!("{}KB", file_size / 1024)
-            } else {
-                format!("{}MB", file_size / (1024 * 1024))
             };
-
-            sessions.push(SessionMetadata {
-                session_id,
-                modified: modified_str,
-                modified_at,
-                size_display,
-                size_bytes: file_size,
-            });
+            sessions.push(SessionMetadata::new(
+                session_id.to_string(),
+                modified.into(),
+                metadata.len(),
+            ));
         }
 
+        // Filenames are timestamps, so reverse-lexicographic is latest first.
+        sessions.sort_by(|left, right| right.session_id.cmp(&left.session_id));
         Ok(sessions)
     }
 
-    /// Empty files are considered new-format (they were just created and
-    /// nothing has been written yet). Otherwise the first non-empty line
-    /// must parse as a [ConversationEntry].
-    fn looks_like_new_format(path: &std::path::Path) -> bool {
-        let Ok(file) = File::open(path) else {
-            return false;
-        };
+    /// Whether `session_id`'s log is in the current on-disk format, or `None`
+    /// when the log could not be read at all.
+    ///
+    /// An empty log counts as current (it was just created and nothing has been
+    /// written yet). Otherwise its first non-empty line must parse as a
+    /// [`ConversationEntry`]. The line is read as bytes, so a log that is not
+    /// valid UTF-8 earns a verdict (it is not the current format) rather than a
+    /// read failure.
+    ///
+    /// The `None` case is separate because a caller that caches the verdict
+    /// must not cache it: the format is a durable property of the log's
+    /// content, while a failure to open the file says nothing about the log and
+    /// can clear on its own.
+    pub fn is_current_format(&self, session_id: &str) -> Option<bool> {
+        let path = self.session_path(session_id);
+        let file = File::open(&path).ok()?;
         let mut reader = BufReader::new(file);
-        let mut line = String::new();
+        let mut line = Vec::new();
         loop {
             line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) => return true, // empty file is fine
+            match reader.read_until(b'\n', &mut line) {
+                // An empty file is fine.
+                Ok(0) => return Some(true),
                 Ok(_) => {
-                    if line.trim().is_empty() {
+                    let trimmed = line.trim_ascii();
+                    if trimmed.is_empty() {
                         continue;
                     }
-                    return serde_json::from_str::<ConversationEntry>(line.trim_end()).is_ok();
+                    return Some(serde_json::from_slice::<ConversationEntry>(trimmed).is_ok());
                 }
-                Err(_) => return false,
+                Err(_) => return None,
             }
         }
     }
@@ -144,6 +172,11 @@ impl ConversationPersistence {
     /// a large log. A missing file counts zero, since a session that has
     /// not punctuated yet has nothing durable.
     ///
+    /// Lines are read as bytes, so a torn tail that cuts a multi-byte
+    /// character is a malformed line like any other rather than a read
+    /// failure. That matters because the caller caches the count against the
+    /// file and would otherwise re-read a whole log it can never count.
+    ///
     /// The one place it can disagree with a resume: a duplicated entry id,
     /// which a resume adopts once and this counts twice. Only a
     /// hand-edited log has one.
@@ -155,18 +188,18 @@ impl ConversationPersistence {
             Err(err) => return Err(err.into()),
         };
         let mut reader = BufReader::new(file);
-        let mut line = String::new();
+        let mut line = Vec::new();
         let mut entries = 0;
         loop {
             line.clear();
-            if reader.read_line(&mut line)? == 0 {
+            if reader.read_until(b'\n', &mut line)? == 0 {
                 return Ok(entries);
             }
-            let trimmed = line.trim();
+            let trimmed = line.trim_ascii();
             if trimmed.is_empty() {
                 continue;
             }
-            if serde_json::from_str::<serde::de::IgnoredAny>(trimmed).is_ok() {
+            if serde_json::from_slice::<serde::de::IgnoredAny>(trimmed).is_ok() {
                 entries += 1;
             }
         }
@@ -265,27 +298,13 @@ impl ConversationPersistence {
     /// that walk, so the progress total counts it but no row appears for
     /// it, and the counter still reaches the total.
     fn preview_candidates(&self) -> Result<Vec<(String, PathBuf)>, ConversationError> {
-        if !self.sessions_dir.exists() {
-            return Ok(Vec::new());
-        }
-
-        let entries = fs::read_dir(&self.sessions_dir)?;
-        let mut session_files: Vec<String> = Vec::new();
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    session_files.push(stem.to_string());
-                }
-            }
-        }
-        // Filenames are timestamps; reverse-lexicographic = newest-first.
-        session_files.sort_by(|a, b| b.cmp(a));
-
-        Ok(session_files
+        Ok(self
+            .enumerate_sessions()?
             .into_iter()
-            .map(|id| (id.clone(), self.session_path(&id)))
+            .map(|metadata| {
+                let path = self.session_path(&metadata.session_id);
+                (metadata.session_id, path)
+            })
             .collect())
     }
 }
@@ -323,17 +342,44 @@ fn read_preview(
 #[derive(Debug, Clone)]
 pub struct SessionMetadata {
     pub session_id: String,
-    /// Modification time, pre-formatted for the `list-sessions` output.
-    pub modified: String,
-    /// The same modification time as a value, for callers that render or
-    /// compare it themselves.
     pub modified_at: DateTime<Utc>,
-    pub size_display: String,
     /// File size in bytes. Paired with `modified_at` it fingerprints the
     /// file, which is what lets a caller cache anything it derived from
     /// the file's contents (see
     /// [`ConversationPersistence::stored_last_seq`]).
     pub size_bytes: u64,
+}
+
+impl SessionMetadata {
+    /// Assemble a row from what a `stat` of the session's log yields.
+    pub fn new(session_id: String, modified_at: DateTime<Utc>, size_bytes: u64) -> Self {
+        Self {
+            session_id,
+            modified_at,
+            size_bytes,
+        }
+    }
+
+    /// The modification time, formatted for the `list-sessions` output.
+    ///
+    /// Derived on demand rather than held: a listing that only fingerprints
+    /// files (the session host's directory refresh) enumerates the whole store
+    /// on a timer and never renders a row.
+    pub fn modified_display(&self) -> String {
+        self.modified_at.format("%Y-%m-%d %H:%M:%S UTC").to_string()
+    }
+
+    /// The file size, formatted for the `list-sessions` output. Size stands in
+    /// for conversation length.
+    pub fn size_display(&self) -> String {
+        if self.size_bytes < 1024 {
+            format!("{}B", self.size_bytes)
+        } else if self.size_bytes < 1024 * 1024 {
+            format!("{}KB", self.size_bytes / 1024)
+        } else {
+            format!("{}MB", self.size_bytes / (1024 * 1024))
+        }
+    }
 }
 
 /// Richer per-session snapshot used by the interactive session
@@ -395,7 +441,7 @@ pub struct SessionPreview {
 /// Returns `Ok(None)` when the first non-empty line does not parse as a
 /// [`ConversationEntry`], i.e. a pre-refactor file the listing should
 /// drop. This is the current-format gate applied inline so the file is
-/// opened once (the standalone [`ConversationPersistence::looks_like_new_format`]
+/// opened once (the standalone [`ConversationPersistence::is_current_format`]
 /// check stays for `list_sessions`, which doesn't otherwise read the
 /// file). A later line that fails to parse is skipped (matching the
 /// resume-time tolerance for truncated trailing lines). The walk is
@@ -659,6 +705,154 @@ mod tests {
         );
         let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume");
         assert_eq!(resumed.last_seq(), live_last_seq);
+    }
+
+    /// A torn tail that cuts a multi-byte character is a malformed line like
+    /// any other, for both readers. Neither may report it as a read failure: a
+    /// caller that caches per file would re-read the whole log on every refresh
+    /// for an answer it can never get.
+    #[test]
+    fn a_torn_multibyte_tail_is_a_malformed_line() {
+        let (_dir, persistence) = fixture();
+        let mut log = ConversationLog::create(&persistence).expect("create");
+        append_user_then_assistant(&mut log, "hello", "hi");
+        let session_id = log.session_id().to_string();
+        let path = log.path().to_path_buf();
+        let counted = persistence.stored_last_seq(&session_id).expect("count");
+        drop(log);
+
+        // The first two bytes of a three-byte character, as a crash mid-append
+        // leaves behind.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("reopen the log");
+        std::io::Write::write_all(&mut file, &[b'{', 0xe2, 0x82]).expect("append a torn line");
+        drop(file);
+
+        assert_eq!(
+            persistence.stored_last_seq(&session_id).expect("count"),
+            counted,
+            "the torn tail counts for nothing, and counting still succeeds",
+        );
+        assert_eq!(
+            persistence.is_current_format(&session_id),
+            Some(true),
+            "and the format verdict still comes off the first line",
+        );
+
+        // A whole log of invalid bytes is a verdict too, not a read failure.
+        let blob = persistence
+            .sessions_dir()
+            .join("2000-01-01-00-00-00-000.jsonl");
+        std::fs::write(&blob, [0xff, 0xfe, 0xff]).expect("write a non-utf8 log");
+        assert_eq!(
+            persistence.is_current_format("2000-01-01-00-00-00-000"),
+            Some(false),
+        );
+        assert_eq!(
+            persistence
+                .stored_last_seq("2000-01-01-00-00-00-000")
+                .expect("count"),
+            0,
+        );
+    }
+
+    /// The enumeration is the cheap half of a listing: it stats but never
+    /// opens, so a pre-refactor file is enumerated like any other and only
+    /// `list_sessions` (through the format gate) drops it.
+    #[test]
+    fn enumeration_keeps_what_the_format_gate_drops() {
+        let (_dir, persistence) = fixture();
+        let mut log = ConversationLog::create(&persistence).expect("create");
+        append_user_then_assistant(&mut log, "hello", "hi");
+        let session_id = log.session_id().to_string();
+        drop(log);
+        let old = persistence
+            .sessions_dir()
+            .join("2000-01-01-00-00-00-000.jsonl");
+        std::fs::write(&old, "not json at all\n").expect("write a pre-refactor file");
+        // Neither an unrelated extension nor a directory is a session.
+        std::fs::write(persistence.sessions_dir().join("host-id"), "id\n").expect("write");
+        std::fs::create_dir(persistence.sessions_dir().join("nested.jsonl")).expect("mkdir");
+
+        let enumerated: Vec<String> = persistence
+            .enumerate_sessions()
+            .expect("enumerate")
+            .into_iter()
+            .map(|metadata| metadata.session_id)
+            .collect();
+        assert_eq!(
+            enumerated,
+            vec![session_id.clone(), "2000-01-01-00-00-00-000".to_string()],
+            "both logs are enumerated, latest first",
+        );
+
+        let listed: Vec<String> = persistence
+            .list_sessions()
+            .expect("list")
+            .into_iter()
+            .map(|metadata| metadata.session_id)
+            .collect();
+        assert_eq!(
+            listed,
+            vec![session_id.clone()],
+            "the gate drops the old one"
+        );
+        assert_eq!(persistence.is_current_format(&session_id), Some(true));
+        assert_eq!(
+            persistence.is_current_format("2000-01-01-00-00-00-000"),
+            Some(false),
+        );
+        assert_eq!(
+            persistence.is_current_format("no-such-session"),
+            None,
+            "a log that cannot be opened has no format verdict",
+        );
+    }
+
+    /// The enumeration never opens a log, which is what a caller refreshing a
+    /// listing on a timer depends on: an unreadable log is still enumerated,
+    /// and only the gate (which does open it) has no verdict for it.
+    #[cfg(unix)]
+    #[test]
+    fn enumeration_opens_no_log() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, persistence) = fixture();
+        let mut log = ConversationLog::create(&persistence).expect("create");
+        append_user_then_assistant(&mut log, "hello", "hi");
+        let session_id = log.session_id().to_string();
+        let path = log.path().to_path_buf();
+        drop(log);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+            .expect("drop the read bit");
+        if File::open(&path).is_ok() {
+            // Root ignores the permission bits, so there is nothing to prove
+            // here. Skipping beats asserting something that cannot fail.
+            return;
+        }
+
+        let enumerated: Vec<String> = persistence
+            .enumerate_sessions()
+            .expect("enumerate")
+            .into_iter()
+            .map(|metadata| metadata.session_id)
+            .collect();
+        assert_eq!(
+            enumerated,
+            vec![session_id.clone()],
+            "a log nothing can open is still enumerated, so nothing opened it",
+        );
+        assert_eq!(persistence.is_current_format(&session_id), None);
+        assert!(persistence.list_sessions().expect("list").is_empty());
+
+        // And the verdict comes back the moment the file is readable again,
+        // with no change to its size or modification time.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("restore the read bit");
+        assert_eq!(persistence.is_current_format(&session_id), Some(true));
     }
 
     #[test]

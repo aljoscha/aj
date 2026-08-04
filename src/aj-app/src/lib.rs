@@ -89,7 +89,9 @@ pub fn handle_list_sessions() -> Result<()> {
     for session in sessions {
         println!(
             "{} (modified: {}, {})",
-            session.session_id, session.modified, session.size_display
+            session.session_id,
+            session.modified_display(),
+            session.size_display()
         );
     }
 

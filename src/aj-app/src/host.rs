@@ -28,13 +28,16 @@
 //! compile inside its spawned task, which is what keeps that rule mechanical
 //! rather than a discipline. Both are only ever held to copy a few fields or
 //! to push onto unbounded queues, so no await ever needs to happen under
-//! them.
+//! them. The cold-directory cache in [`store`] holds one more, outside this
+//! order: it is a strict leaf, taken only to read or replace a cache entry,
+//! and nothing is ever acquired while it is held.
 
 pub(crate) mod driver;
 mod fanout;
 mod live;
+mod store;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -68,6 +71,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::host::driver::Driver;
 use crate::host::live::{LiveSession, Request, SessionStatus, settings_of};
+use crate::host::store::ColdSessions;
 use crate::session::{SessionCore, SessionEntry, SessionSpec, SubAgentOverrides};
 use crate::session_setup::{
     RestoreContext, RunConfigSnapshot, thinking_display_from_name, thinking_level_for,
@@ -305,26 +309,15 @@ struct HostInner {
     /// Read once per host rather than per call, so the same task's start
     /// time does not move between two reads of the table.
     clock_anchor: (DateTime<Utc>, Instant),
-    /// Per-session durable high-water marks for sessions that are not live,
-    /// keyed by the log-file fingerprint they were counted from.
-    ///
-    /// Entries for sessions that have since been removed from the store
-    /// linger, which is bounded by the store's session count and costs a
-    /// `u64` each.
-    cold_last_seq: StdMutex<HashMap<String, CachedLastSeq>>,
+    /// The store's own sessions, with the per-file facts a directory entry
+    /// needs cached against the files they came from. A `list` refresh runs on
+    /// a coalescing tick that session events drive, so it must not rescan the
+    /// store's contents (spec 6.8).
+    cold: ColdSessions<ConversationPersistence>,
     /// Set by [`SessionHost::shutdown`], and never cleared: a host is torn
     /// down once. Every operation refuses afterwards (see
     /// [`SessionHost::alive`]).
     shut_down: AtomicBool,
-}
-
-/// One cold session's entry count, plus the file fingerprint it was counted
-/// from. A file whose modification time and size have not moved cannot have
-/// grown an entry.
-struct CachedLastSeq {
-    modified: DateTime<Utc>,
-    size: u64,
-    last_seq: u64,
 }
 
 impl Drop for HostInner {
@@ -378,13 +371,13 @@ impl SessionHost {
                 restore,
                 fanout: Arc::new(Fanout::default()),
             }),
+            cold: ColdSessions::new(persistence.clone()),
             persistence,
             base_run_config: run_config,
             host_id,
             working_directory,
             sessions: TokioMutex::new(HashMap::new()),
             clock_anchor: (Utc::now(), Instant::now()),
-            cold_last_seq: StdMutex::new(HashMap::new()),
             shut_down: AtomicBool::new(false),
         });
         spawn_list_publisher(&inner);
@@ -557,13 +550,42 @@ impl SessionHost {
     /// on-disk listing.
     pub async fn sessions(&self) -> Result<SessionList, HostError> {
         self.alive()?;
-        // The store scan is blocking IO, so it runs before the map lock is
-        // taken rather than under it.
-        let on_disk = self
+        // The live set is what excludes a live session's log from the scan
+        // below: the host holds its mark and status, and re-counting a file
+        // that grows on every append would be blocking IO on a runtime worker
+        // for a worse answer than the one we already have (spec 6.8).
+        let live_ids: HashSet<String> = self.inner.sessions.lock().await.keys().cloned().collect();
+        // The store scan is blocking IO, so it runs with the session map's lock
+        // already released.
+        let cold = self
             .inner
-            .persistence
-            .list_sessions()
+            .cold
+            .list(|id| live_ids.contains(id))
             .map_err(|err| HostError::Internal(Box::new(err)))?;
+        let mut summaries: BTreeMap<String, SessionSummary> = cold
+            .into_iter()
+            .map(|session| {
+                (
+                    session.id.clone(),
+                    SessionSummary {
+                        id: session.id,
+                        live: false,
+                        working: false,
+                        queued: QueueCounts::default(),
+                        tasks: 0,
+                        last_seq: session.last_seq,
+                        last_activity: session.last_activity,
+                        unreachable: false,
+                    },
+                )
+            })
+            .collect();
+        // The live sessions go in last, and off the map as it is now rather
+        // than off the snapshot that filtered the scan: a session materialized
+        // while the scan ran is live, and publishing it as on-disk only would
+        // be wrong rather than merely stale. A live session always wins over a
+        // cold row for the same id, since only one of those two answers can be
+        // the host's own.
         let live: Vec<Arc<LiveSession>> = self
             .inner
             .sessions
@@ -572,33 +594,8 @@ impl SessionHost {
             .values()
             .map(|entry| Arc::clone(&entry.session))
             .collect();
-
-        // The live sessions first, because a session this host holds answers
-        // every field off its own status. Counting its log's entries would be
-        // blocking IO on a runtime worker for a file that grows on every
-        // append, so the fingerprint cache would miss on every list tick.
-        let mut summaries: BTreeMap<String, SessionSummary> = live
-            .iter()
-            .map(|session| (session.id().to_string(), summarize(session)))
-            .collect();
-        for metadata in on_disk {
-            if summaries.contains_key(&metadata.session_id) {
-                continue;
-            }
-            let last_seq = self.cold_last_seq(&metadata);
-            summaries.insert(
-                metadata.session_id.clone(),
-                SessionSummary {
-                    id: metadata.session_id,
-                    live: false,
-                    working: false,
-                    queued: QueueCounts::default(),
-                    tasks: 0,
-                    last_seq,
-                    last_activity: metadata.modified_at,
-                    unreachable: false,
-                },
-            );
+        for session in &live {
+            summaries.insert(session.id().to_string(), summarize(session));
         }
         // Latest first: session ids are minted as timestamps, so their
         // descending order is chronological.
@@ -814,56 +811,6 @@ impl SessionHost {
             return Err(HostError::UnknownSession(session.to_string()));
         }
         Ok(None)
-    }
-
-    /// The durable high-water mark of a session that is not live, counted
-    /// off its log.
-    ///
-    /// Derived rather than reported as zero, because the unseen-output glyph
-    /// a client derives (spec 6.8) is about exactly the sessions it has not
-    /// attached, which is most of them. Counting is O(file) and a list tick
-    /// covers the whole store, hence the cache against the file's
-    /// fingerprint: a log whose modification time and size have not moved
-    /// cannot have grown an entry.
-    ///
-    /// A log that cannot be read counts zero: a directory listing must not
-    /// fail over one unreadable file.
-    fn cold_last_seq(&self, metadata: &aj_session::SessionMetadata) -> u64 {
-        let fingerprint = (metadata.modified_at, metadata.size_bytes);
-        {
-            let cache = self.cold_last_seq_cache();
-            if let Some(cached) = cache.get(&metadata.session_id)
-                && (cached.modified, cached.size) == fingerprint
-            {
-                return cached.last_seq;
-            }
-        }
-        let last_seq = match self.inner.persistence.stored_last_seq(&metadata.session_id) {
-            Ok(last_seq) => last_seq,
-            Err(err) => {
-                tracing::warn!(
-                    session = metadata.session_id,
-                    "could not count the log's entries: {err}"
-                );
-                return 0;
-            }
-        };
-        self.cold_last_seq_cache().insert(
-            metadata.session_id.clone(),
-            CachedLastSeq {
-                modified: fingerprint.0,
-                size: fingerprint.1,
-                last_seq,
-            },
-        );
-        last_seq
-    }
-
-    fn cold_last_seq_cache(&self) -> std::sync::MutexGuard<'_, HashMap<String, CachedLastSeq>> {
-        self.inner
-            .cold_last_seq
-            .lock()
-            .expect("cold last-seq cache mutex poisoned")
     }
 
     /// Take a session's advisory lock, refusing when another writer holds
@@ -1091,14 +1038,12 @@ impl SessionHost {
         Ok(session)
     }
 
+    /// Whether the store holds a session `id` this host could materialize.
     fn on_disk(&self, id: &str) -> Result<bool, HostError> {
-        Ok(self
-            .inner
-            .persistence
-            .list_sessions()
-            .map_err(|err| HostError::Internal(Box::new(err)))?
-            .iter()
-            .any(|metadata| metadata.session_id == id))
+        self.inner
+            .cold
+            .contains(id)
+            .map_err(|err| HostError::Internal(Box::new(err)))
     }
 
     /// Serve one session's attach block on `id`'s stream.
