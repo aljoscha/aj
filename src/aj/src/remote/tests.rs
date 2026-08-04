@@ -1481,6 +1481,38 @@ async fn a_session_another_host_holds_answers_409_locked() {
         assert_eq!(err.code(), Some("locked"), "got {err}");
     }
 
+    // The reads that do not materialize answer instead, for a session that is
+    // cold as far as this host is concerned (spec 6.7). A lock refusal here
+    // would be wrong: nothing about them takes the log.
+    assert!(
+        rival
+            .tasks(&session)
+            .await
+            .expect("the tasks read answers")
+            .tasks
+            .is_empty(),
+        "a session this host does not hold has no tasks",
+    );
+    assert!(
+        rival
+            .queue(&session)
+            .await
+            .expect("the queue read answers")
+            .queues
+            .is_empty(),
+        "and nothing queued",
+    );
+    let unknown = rival
+        .task(&session, 1)
+        .await
+        .expect_err("and no task to read");
+    assert_eq!(
+        unknown.status(),
+        Some(StatusCode::NOT_FOUND),
+        "got {unknown}"
+    );
+    assert_eq!(unknown.code(), Some("unknown_task"), "got {unknown}");
+
     // And the first host still has it: the refused materialization touched
     // neither the log nor the lock.
     fixture.prompt(&session, "again").await;
@@ -2105,6 +2137,16 @@ async fn an_http_client_converges_with_an_in_process_oracle() {
 /// would leave the two apart on that cell's structured body: `TaskOutput` is
 /// lossy, the newest snapshot is the only carrier of a task's rolling output,
 /// and nothing re-sends it to a client that was not connected for it.
+///
+/// The `details` comparison rides on that quiet a second way. Two events write
+/// the launch cell's structured body, the launch's own `ToolExecutionEnd` and
+/// the task driver's first `TaskOutput`, and `TaskStart` may land on either
+/// side of the launch result (the bash tool documents that race at its
+/// registration site). Whichever order they arrive in, the two clients agree
+/// because the driver's leading-edge snapshot of a task with no output yet is
+/// byte-identical to the launch result, `task_id` and `full_output_path`
+/// included. Whoever changes what that snapshot carries breaks this test, and
+/// the fix is here rather than in the ordering.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_joiner_refetches_the_task_table_after_caught_up() {
     let fixture = Fixture::new(background_task_turn()).await;
