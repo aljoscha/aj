@@ -5160,10 +5160,14 @@ async fn poll_task_output(world: &World, shell: &Rc<RefCell<Shell>>, retry: &mut
 /// Advance a pending re-attach by one step, answering the state that is left
 /// (`None` once the stream is back and caught up).
 ///
-/// The one fatal case is a local run whose attach fails: this process's own
-/// host refusing to serve a session it was holding means the host is gone, and
-/// the shell cannot outlive it. Every other failure, including a connection's,
-/// is a backed-off retry.
+/// This is the recovery of a stream that *ended*, and the one fatal case lives
+/// here: the shell's own host no longer serving a session it was holding means
+/// the host is gone, and the shell has nothing left to drive, since the agent,
+/// the log and the tools all live in it. Every other failure, a connection's
+/// included, is a backed-off retry.
+///
+/// A re-attach owed while the stream is still live is a different question and
+/// never fatal, see [`discharge_reattach`].
 async fn advance_resume(
     world: &mut World,
     shell: &Rc<RefCell<Shell>>,
@@ -5222,7 +5226,9 @@ fn reattached_notice(control: &Control) -> &'static str {
 /// every later frame carries an epoch the fold filters out. A refused attach
 /// keeps the obligation, so `retry` paces the next attempt: without it a peer
 /// that keeps refusing turns into one attach (and one warning row) per loop
-/// iteration.
+/// iteration. Nothing gives up, so a peer that keeps refusing keeps being asked
+/// at [`RETRY_BACKOFF_MAX`], which is what makes the shell outlast a session
+/// its host is slow to hand back.
 async fn discharge_reattach(
     world: &mut World,
     shell: &Rc<RefCell<Shell>>,
@@ -5239,9 +5245,13 @@ async fn discharge_reattach(
             fold_warning(world, &format!("Lost the session's event stream: {err}"));
             retry.failed();
             // A connection hands the obligation to the resume machinery, which
-            // paces its own attempts. An in-process host is paced by `retry`
-            // right here, because its failing attach is the shell's exit
-            // (see `advance_resume`) and must not be reached at loop speed.
+            // paces its own attempts and paints the connection state while it
+            // does. An in-process host keeps retrying right here instead,
+            // because the resume path reads a failed local open as the host
+            // being gone and ends the shell (see `advance_resume`): this
+            // obligation arrives on a stream that is still live, so a refusal
+            // says the session moved rather than that the host did, and it must
+            // not cost the user the buffer they were typing in.
             world.control.is_remote().then(Resume::lost)
         }
     }
@@ -8977,11 +8987,17 @@ mod tests {
     }
 
     /// A re-attach the host refuses is retried on a backoff, not once per loop
-    /// iteration.
+    /// iteration, and a refusal never ends the shell.
     ///
     /// The obligation stands until an attach is served, and the loop reaches
     /// this block every time around, so an unpaced retry folds a warning row
     /// per iteration and re-asks a host that is refusing at redraw speed.
+    ///
+    /// It also arrives on a stream that is still live, so an in-process refusal
+    /// says the session moved rather than that the host is gone: it stays here on
+    /// the backoff instead of arming the resume machinery, whose failed local
+    /// open is the shell's exit
+    /// ([`a_local_re_attach_after_the_host_is_gone_is_fatal`]).
     #[tokio::test]
     async fn a_refused_re_attach_is_paced() {
         let dir = TempDir::new().expect("tempdir");
@@ -9141,6 +9157,10 @@ mod tests {
     /// The host really being gone still ends the shell: the re-attach is what
     /// tells that apart from an eviction, because a host that is gone refuses
     /// it.
+    ///
+    /// This is the path a stream that *ended* takes. A re-attach owed while the
+    /// stream is still live never reaches it, see
+    /// [`a_refused_re_attach_is_paced`].
     #[tokio::test]
     async fn a_local_re_attach_after_the_host_is_gone_is_fatal() {
         let dir = TempDir::new().expect("tempdir");
