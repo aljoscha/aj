@@ -570,6 +570,37 @@ impl Fixture {
         RemoteClient::new(&self.server.url()).expect("client")
     }
 
+    /// A second host and server over the *same* session store, for the
+    /// single-writer conflict. It shares nothing else: its own config, its own
+    /// catalog, its own port.
+    async fn rival(&self) -> (SessionHost, RemoteServer, RemoteClient) {
+        let host = SessionHost::new(HostSetup {
+            config: Arc::new(StdMutex::new(Config::default())),
+            layers: Arc::new(StdMutex::new(ConfigLayers {
+                user: Config::default(),
+                project: ConfigLayer::default(),
+                project_path: None,
+            })),
+            catalog: Arc::new(vec![catalog_model()]),
+            run_config: snapshot(scripted(Vec::new(), 0, Duration::ZERO)),
+            restore: None,
+            persistence: ConversationPersistence::new(self._dir.path().join("sessions")),
+            auth: AuthStorage::new(self._dir.path().join("auth.json")),
+            working_directory: self._dir.path().to_path_buf(),
+        })
+        .expect("a second host over the same store");
+        let server = RemoteServer::bind_with(
+            host.clone(),
+            addr("127.0.0.1:0"),
+            IdentityGate::local(),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("bind a second loopback control port");
+        let client = RemoteClient::new(&server.url()).expect("client");
+        (host, server, client)
+    }
+
     /// Create a session over the wire, which is the only way a fresh host is
     /// reachable at all (spec 9.1).
     async fn create(&self) -> String {
@@ -1385,6 +1416,82 @@ async fn a_head_switch_is_refused_with_409_while_a_turn_runs() {
         .expect_err("an unknown entry is refused");
     assert_eq!(err.status(), Some(StatusCode::NOT_FOUND));
     assert_eq!(err.code(), Some("unknown_entry"));
+    fixture.shutdown().await;
+}
+
+/// A session another host holds is a 409 `locked`: materializing takes the
+/// session's advisory lock, and a second writer on one log would corrupt it
+/// (spec section 5). Every route that would materialize answers it, and the
+/// reads that do not materialize answer for a cold session instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_another_host_holds_answers_409_locked() {
+    let fixture = Fixture::new(vec![
+        finalized_text_message("answered"),
+        finalized_text_message("still mine"),
+    ])
+    .await;
+    let session = fixture.create().await;
+    let mut remote = fixture.remote(&session).await;
+    // A turn first, so the log exists on disk and the store scan finds it: the
+    // log is created lazily and a session with nothing in it is not discoverable.
+    fixture.prompt(&session, "hi").await;
+    remote.settle().await;
+    let (rival_host, rival_server, rival) = fixture.rival().await;
+
+    // The session is on disk, so the rival's directory lists it. What it
+    // cannot do is take it over.
+    assert!(
+        rival
+            .sessions()
+            .await
+            .expect("the sessions read")
+            .sessions
+            .iter()
+            .any(|entry| entry.id == session),
+        "the rival shares the store, so it discovers the session",
+    );
+
+    let mut refusals = vec![
+        rival
+            .events(&[AttachRequest {
+                session: session.clone(),
+                cursor: None,
+            }])
+            .await
+            .err(),
+        rival
+            .command(
+                &session,
+                &RemoteCommand::Prompt(PromptRequest {
+                    agent: None,
+                    input: PromptInput::Text {
+                        text: "mine now".to_string(),
+                    },
+                }),
+            )
+            .await
+            .err(),
+        rival.tree(&session).await.err(),
+    ];
+    assert_eq!(refusals.len(), 3, "every materializing route is covered");
+    for refusal in refusals.drain(..) {
+        let err = refusal.expect("the lock refuses");
+        assert_eq!(err.status(), Some(StatusCode::CONFLICT), "got {err}");
+        assert_eq!(err.code(), Some("locked"), "got {err}");
+    }
+
+    // And the first host still has it: the refused materialization touched
+    // neither the log nor the lock.
+    fixture.prompt(&session, "again").await;
+    remote.settle().await;
+    assert_eq!(
+        assistant_texts(&remote.canonical()),
+        vec!["answered".to_string(), "still mine".to_string()],
+        "the holder still drives the session",
+    );
+
+    rival_host.shutdown().await;
+    rival_server.shutdown().await;
     fixture.shutdown().await;
 }
 
