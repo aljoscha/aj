@@ -1,0 +1,413 @@
+//! The HTTP client for the remote-control protocol (spec 6.1, 6.5-6.7).
+//!
+//! One [`RemoteClient`] is one connection's worth of surface: the reads, the
+//! commands, and [`RemoteClient::events`] for the stream. It decodes the
+//! host's `{code, message}` bodies into a typed [`RemoteError`], so a caller
+//! can tell a refusal (a 409 the user should see) from a transport failure (a
+//! reconnect).
+//!
+//! The stream side is deliberately thin: [`RemoteEvents`] yields decoded
+//! [`Frame`]s and nothing else. Cursors, epochs and reconciliation are the
+//! fold's business ([`aj_app::client::SessionClient`]), which is what keeps
+//! the local and the remote client one implementation.
+
+use std::pin::Pin;
+use std::time::Duration;
+
+use aj_agent::tool::TaskId;
+use aj_app::host::{AttachRequest, CommandOutcome};
+use aj_wire::{
+    CancelRequest, CompactRequest, CreateSessionRequest, DecodedFrame, ErrorResponse, Frame,
+    HeadRequest, Hello, PROTOCOL_VERSION, PromptRequest, QueueOperation, QueueOutcome,
+    QueueRequest, QueueState, SessionCreated, SessionList, SessionTree, SettingsRequest,
+    SteerRequest, TaskDetails, TaskTable,
+};
+use eventsource_stream::{EventStreamError, Eventsource};
+use futures::{Stream, StreamExt};
+use reqwest::StatusCode;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+
+/// How long a read or a command may take before it is abandoned.
+///
+/// Never applied to the event stream, which is open for as long as the client
+/// is attached.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a stream may be silent before it counts as dead.
+///
+/// The host heartbeats every 30 seconds, so two missed heartbeats is the
+/// signal (spec 6.1). The caller reconnects with backoff.
+const SILENCE: Duration = Duration::from_secs(60);
+
+/// Why a remote call did not answer what was asked.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RemoteError {
+    #[error("invalid base url {url:?}: {reason}")]
+    InvalidUrl { url: String, reason: String },
+    #[error("could not reach the host: {0}")]
+    Transport(#[from] reqwest::Error),
+    /// The host refused. `code` is the protocol's stable token when the body
+    /// carried one, which is what a caller branches on.
+    #[error("the host answered {status}: {message}")]
+    Status {
+        status: StatusCode,
+        code: Option<String>,
+        message: String,
+    },
+    #[error("the host sent something this build cannot read: {0}")]
+    Decode(#[source] serde_json::Error),
+    #[error("could not encode the request: {0}")]
+    Encode(#[source] serde_json::Error),
+    #[error("the event stream failed: {0}")]
+    Stream(String),
+    #[error("the event stream was silent for {0:?}")]
+    Silent(Duration),
+    #[error(
+        "the host speaks protocol {found}, this build speaks {expected}: upgrade the older side"
+    )]
+    Protocol { found: u32, expected: u32 },
+}
+
+impl RemoteError {
+    /// The HTTP status behind a refusal, `None` for a transport or decode
+    /// failure.
+    pub(crate) fn status(&self) -> Option<StatusCode> {
+        match self {
+            Self::Status { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+
+    /// The protocol's error code behind a refusal, when the host sent one.
+    pub(crate) fn code(&self) -> Option<&str> {
+        match self {
+            Self::Status { code, .. } => code.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+/// One mutation, as a client names it.
+///
+/// The variants are the wire request types, so this enum only decides which
+/// route a body goes to. That keeps the client honest about the protocol:
+/// there is no client-side vocabulary that the wire does not have.
+#[derive(Clone, Debug)]
+pub(crate) enum RemoteCommand {
+    Prompt(PromptRequest),
+    Steer(SteerRequest),
+    Cancel(CancelRequest),
+    Queue(QueueRequest),
+    Compact(CompactRequest),
+    Settings(SettingsRequest),
+    Head(HeadRequest),
+    KillTask(TaskId),
+}
+
+impl RemoteCommand {
+    /// The route under `/v1/sessions/{id}/`.
+    fn route(&self) -> String {
+        match self {
+            Self::Prompt(_) => "prompt".to_string(),
+            Self::Steer(_) => "steer".to_string(),
+            Self::Cancel(_) => "cancel".to_string(),
+            Self::Queue(_) => "queue".to_string(),
+            Self::Compact(_) => "compact".to_string(),
+            Self::Settings(_) => "settings".to_string(),
+            Self::Head(_) => "head".to_string(),
+            Self::KillTask(task) => format!("tasks/{task}/kill"),
+        }
+    }
+
+    fn body(&self) -> Result<Vec<u8>, RemoteError> {
+        match self {
+            Self::Prompt(request) => encode(request),
+            Self::Steer(request) => encode(request),
+            Self::Cancel(request) => encode(request),
+            Self::Queue(request) => encode(request),
+            Self::Compact(request) => encode(request),
+            Self::Settings(request) => encode(request),
+            Self::Head(request) => encode(request),
+            Self::KillTask(_) => Ok(b"{}".to_vec()),
+        }
+    }
+
+    /// Whether this command answers with the text it withdrew (spec 6.6).
+    fn withdraws(&self) -> bool {
+        matches!(
+            self,
+            Self::Queue(QueueRequest {
+                op: QueueOperation::Remove,
+                ..
+            })
+        )
+    }
+}
+
+fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, RemoteError> {
+    serde_json::to_vec(value).map_err(RemoteError::Encode)
+}
+
+/// A client against one host or gateway.
+pub(crate) struct RemoteClient {
+    /// The base URL with no trailing slash, so every route is `{base}/v1/...`.
+    base: String,
+    http: reqwest::Client,
+    silence: Duration,
+}
+
+impl RemoteClient {
+    /// A client against `base`, which must be an absolute http(s) URL.
+    pub(crate) fn new(base: &str) -> Result<Self, RemoteError> {
+        let url = reqwest::Url::parse(base).map_err(|err| RemoteError::InvalidUrl {
+            url: base.to_string(),
+            reason: err.to_string(),
+        })?;
+        if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
+            return Err(RemoteError::InvalidUrl {
+                url: base.to_string(),
+                reason: "expected an absolute http or https URL".to_string(),
+            });
+        }
+        let http = reqwest::Client::builder()
+            .build()
+            .map_err(RemoteError::Transport)?;
+        Ok(Self {
+            base: base.trim_end_matches('/').to_string(),
+            http,
+            silence: SILENCE,
+        })
+    }
+
+    /// How long a stream this client opens may be silent before it counts as
+    /// dead. Two missed heartbeats by default.
+    pub(crate) fn with_silence(mut self, silence: Duration) -> Self {
+        self.silence = silence;
+        self
+    }
+
+    /// The base URL this client dials.
+    pub(crate) fn base(&self) -> &str {
+        &self.base
+    }
+
+    /// The reachability and identity probe, which also settles version skew.
+    ///
+    /// A protocol mismatch fails here rather than later on a frame nobody can
+    /// read: the integer only moves on a breaking change (spec 6.10).
+    pub(crate) async fn hello(&self) -> Result<Hello, RemoteError> {
+        let hello: Hello = self.get("/v1/hello").await?;
+        check_protocol(&hello)?;
+        Ok(hello)
+    }
+
+    pub(crate) async fn sessions(&self) -> Result<SessionList, RemoteError> {
+        self.get("/v1/sessions").await
+    }
+
+    /// Create a session, answering its id.
+    pub(crate) async fn create_session(
+        &self,
+        request: CreateSessionRequest,
+    ) -> Result<String, RemoteError> {
+        let response = self.post("/v1/sessions", encode(&request)?).await?;
+        let created: SessionCreated = decode(response).await?;
+        Ok(created.id)
+    }
+
+    pub(crate) async fn tasks(&self, session: &str) -> Result<TaskTable, RemoteError> {
+        self.get(&format!("/v1/sessions/{session}/tasks")).await
+    }
+
+    pub(crate) async fn task(
+        &self,
+        session: &str,
+        task: TaskId,
+    ) -> Result<TaskDetails, RemoteError> {
+        self.get(&format!("/v1/sessions/{session}/tasks/{task}"))
+            .await
+    }
+
+    pub(crate) async fn queue(&self, session: &str) -> Result<QueueState, RemoteError> {
+        self.get(&format!("/v1/sessions/{session}/queue")).await
+    }
+
+    pub(crate) async fn tree(&self, session: &str) -> Result<SessionTree, RemoteError> {
+        self.get(&format!("/v1/sessions/{session}/tree")).await
+    }
+
+    /// Apply one mutation. Every command but the queue withdrawal answers
+    /// [`CommandOutcome::Accepted`].
+    pub(crate) async fn command(
+        &self,
+        session: &str,
+        command: &RemoteCommand,
+    ) -> Result<CommandOutcome, RemoteError> {
+        let path = format!("/v1/sessions/{session}/{}", command.route());
+        let response = self.post(&path, command.body()?).await?;
+        if !command.withdraws() {
+            return Ok(CommandOutcome::Accepted);
+        }
+        let outcome: QueueOutcome = decode(response).await?;
+        Ok(CommandOutcome::Withdrawn(outcome.text))
+    }
+
+    /// Open the event stream, attaching every session in `attach` with the
+    /// cursor it offers.
+    ///
+    /// An attach the host refuses is an error here, before the stream opens,
+    /// so a caller never has to look for a failure among the frames.
+    pub(crate) async fn events(
+        &self,
+        attach: &[AttachRequest],
+    ) -> Result<RemoteEvents, RemoteError> {
+        let query: Vec<(&str, String)> = attach
+            .iter()
+            .map(|request| {
+                let value = match &request.cursor {
+                    Some(cursor) => format!("{}@{cursor}", request.session),
+                    None => request.session.clone(),
+                };
+                ("session", value)
+            })
+            .collect();
+        // No timeout: this response is open for as long as the client is
+        // attached. Silence is what a dead stream looks like, and
+        // `RemoteEvents` is where that is noticed.
+        let response = self
+            .http
+            .get(format!("{}/v1/events", self.base))
+            .query(&query)
+            .send()
+            .await?;
+        let response = refusal(response).await?;
+        Ok(RemoteEvents::new(response, self.silence))
+    }
+
+    async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, RemoteError> {
+        let response = self
+            .http
+            .get(format!("{}{path}", self.base))
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .await?;
+        decode(refusal(response).await?).await
+    }
+
+    async fn post(&self, path: &str, body: Vec<u8>) -> Result<reqwest::Response, RemoteError> {
+        let response = self
+            .http
+            .post(format!("{}{path}", self.base))
+            .timeout(REQUEST_TIMEOUT)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await?;
+        refusal(response).await
+    }
+}
+
+/// Whether `hello` names a protocol this build speaks.
+fn check_protocol(hello: &Hello) -> Result<(), RemoteError> {
+    if hello.protocol == PROTOCOL_VERSION {
+        return Ok(());
+    }
+    Err(RemoteError::Protocol {
+        found: hello.protocol,
+        expected: PROTOCOL_VERSION,
+    })
+}
+
+/// Turn a non-2xx response into a typed refusal, preserving the status and
+/// the protocol's code.
+async fn refusal(response: reqwest::Response) -> Result<reqwest::Response, RemoteError> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let body = response.text().await.unwrap_or_default();
+    // A host answers `{code, message}`. A proxy, or a status the framework
+    // answers on its own (405), may not, so the raw text stands in.
+    let (code, message) = match serde_json::from_str::<ErrorResponse>(&body) {
+        Ok(error) => (Some(error.code), error.message),
+        Err(_) if body.trim().is_empty() => (None, status.to_string()),
+        Err(_) => (None, body),
+    };
+    Err(RemoteError::Status {
+        status,
+        code,
+        message,
+    })
+}
+
+async fn decode<T: DeserializeOwned>(response: reqwest::Response) -> Result<T, RemoteError> {
+    let body = response.bytes().await?;
+    serde_json::from_slice(&body).map_err(RemoteError::Decode)
+}
+
+/// The frames of one open stream.
+///
+/// Dropping this closes the connection, which is what deregisters the
+/// subscriber on the host.
+pub(crate) struct RemoteEvents {
+    events: Pin<Box<dyn Stream<Item = Result<eventsource_stream::Event, StreamError>> + Send>>,
+    /// How long silence is tolerated before the stream counts as dead.
+    silence: Duration,
+    /// Set once the stream failed or ended, so a caller polling on cannot
+    /// read past the failure it was already told about.
+    done: bool,
+}
+
+type StreamError = EventStreamError<reqwest::Error>;
+
+impl RemoteEvents {
+    fn new(response: reqwest::Response, silence: Duration) -> Self {
+        Self {
+            events: Box::pin(response.bytes_stream().eventsource()),
+            silence,
+            done: false,
+        }
+    }
+
+    /// The next frame, `None` once the stream ended.
+    ///
+    /// An unknown frame kind is skipped: an endpoint client discards those
+    /// (spec 6.10), only a gateway forwards them. A malformed known frame is
+    /// an error and ends the stream, because a reliable frame this client
+    /// cannot apply leaves its state incomplete, and a reconnect with a
+    /// cursor is the recovery.
+    pub(crate) async fn recv(&mut self) -> Option<Result<Frame, RemoteError>> {
+        if self.done {
+            return None;
+        }
+        loop {
+            let next = match tokio::time::timeout(self.silence, self.events.next()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    let silence = self.silence;
+                    return Some(self.fail(RemoteError::Silent(silence)));
+                }
+            };
+            match next {
+                None => {
+                    self.done = true;
+                    return None;
+                }
+                Some(Err(err)) => return Some(self.fail(RemoteError::Stream(err.to_string()))),
+                Some(Ok(event)) => match serde_json::from_str::<DecodedFrame>(&event.data) {
+                    Ok(DecodedFrame::Known(frame)) => return Some(Ok(frame.into_value())),
+                    Ok(DecodedFrame::Unknown { kind, .. }) => {
+                        tracing::debug!("discarding a frame of unknown kind {kind:?}");
+                    }
+                    Err(err) => return Some(self.fail(RemoteError::Decode(err))),
+                },
+            }
+        }
+    }
+
+    fn fail(&mut self, err: RemoteError) -> Result<Frame, RemoteError> {
+        self.done = true;
+        Err(err)
+    }
+}

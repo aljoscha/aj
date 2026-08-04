@@ -67,6 +67,7 @@ mod palette;
 mod pending;
 mod prompt_history;
 mod quit_hint;
+mod remote;
 mod scroll;
 mod selection_copied;
 mod session_selector;
