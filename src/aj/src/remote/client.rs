@@ -28,11 +28,22 @@ use reqwest::StatusCode;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-/// How long a read or a command may take before it is abandoned.
+/// How long a read, a command, or the opening of the event stream may take
+/// before it is abandoned.
 ///
-/// Never applied to the event stream, which is open for as long as the client
-/// is attached.
+/// For the stream this bounds the response *head* only. The body stays open
+/// for as long as the client is attached, and silence is what a dead stream
+/// looks like once it is open (see [`RemoteEvents`]).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long establishing a connection may take, for every request this client
+/// makes.
+///
+/// A control port sits on loopback or on a tailnet, so a connect that takes
+/// longer than this is a peer that is not there. Bounding it separately is
+/// what keeps a black-holed address from burning a caller's whole request
+/// budget before the request is even sent.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a stream may be silent before it counts as dead.
 ///
@@ -155,6 +166,8 @@ pub(crate) struct RemoteClient {
     base: String,
     http: reqwest::Client,
     silence: Duration,
+    /// How long the event stream's response head may take to arrive.
+    open_timeout: Duration,
 }
 
 impl RemoteClient {
@@ -171,12 +184,14 @@ impl RemoteClient {
             });
         }
         let http = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .map_err(RemoteError::Transport)?;
         Ok(Self {
             base: base.trim_end_matches('/').to_string(),
             http,
             silence: SILENCE,
+            open_timeout: REQUEST_TIMEOUT,
         })
     }
 
@@ -184,6 +199,12 @@ impl RemoteClient {
     /// dead. Two missed heartbeats by default.
     pub(crate) fn with_silence(mut self, silence: Duration) -> Self {
         self.silence = silence;
+        self
+    }
+
+    /// How long opening a stream may take before it is abandoned.
+    pub(crate) fn with_open_timeout(mut self, open_timeout: Duration) -> Self {
+        self.open_timeout = open_timeout;
         self
     }
 
@@ -272,15 +293,25 @@ impl RemoteClient {
                 ("session", value)
             })
             .collect();
-        // No timeout: this response is open for as long as the client is
-        // attached. Silence is what a dead stream looks like, and
-        // `RemoteEvents` is where that is noticed.
-        let response = self
+        // The request-level timeout would cover the body too, and this body is
+        // open for as long as the client is attached, so the head is bounded
+        // here instead. An open that never answers is a peer this client has
+        // to give up on, silence on an open stream is what `RemoteEvents`
+        // notices.
+        let send = self
             .http
             .get(format!("{}/v1/events", self.base))
             .query(&query)
-            .send()
-            .await?;
+            .send();
+        let response = match tokio::time::timeout(self.open_timeout, send).await {
+            Ok(response) => response?,
+            Err(_) => {
+                return Err(RemoteError::Stream(format!(
+                    "the host did not answer the stream request within {:?}",
+                    self.open_timeout
+                )));
+            }
+        };
         let response = refusal(response).await?;
         Ok(RemoteEvents::new(response, self.silence))
     }
@@ -354,6 +385,14 @@ pub(crate) struct RemoteEvents {
     events: Pin<Box<dyn Stream<Item = Result<eventsource_stream::Event, StreamError>> + Send>>,
     /// How long silence is tolerated before the stream counts as dead.
     silence: Duration,
+    /// When the current silence becomes fatal.
+    ///
+    /// It moves forward on every frame received and never on a call to
+    /// [`Self::recv`], which is what makes the deadline survive that future's
+    /// cancellation: a caller polling from a `select!` arm, or dropping a
+    /// fresh `recv` future every loop iteration, still declares a wedged host
+    /// dead on time.
+    deadline: tokio::time::Instant,
     /// Set once the stream failed or ended, so a caller polling on cannot
     /// read past the failure it was already told about.
     done: bool,
@@ -366,6 +405,7 @@ impl RemoteEvents {
         Self {
             events: Box::pin(response.bytes_stream().eventsource()),
             silence,
+            deadline: tokio::time::Instant::now() + silence,
             done: false,
         }
     }
@@ -382,13 +422,16 @@ impl RemoteEvents {
             return None;
         }
         loop {
-            let next = match tokio::time::timeout(self.silence, self.events.next()).await {
+            let next = match tokio::time::timeout_at(self.deadline, self.events.next()).await {
                 Ok(next) => next,
                 Err(_) => {
                     let silence = self.silence;
                     return Some(self.fail(RemoteError::Silent(silence)));
                 }
             };
+            // Any byte the host sent is evidence it is alive, a heartbeat and
+            // a frame kind this build cannot read included.
+            self.deadline = tokio::time::Instant::now() + self.silence;
             match next {
                 None => {
                     self.done = true;

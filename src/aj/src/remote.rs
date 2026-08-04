@@ -11,11 +11,11 @@
 
 // Part of the protocol surface below has no caller above the transport: the
 // tree read (whose view is phase 3), and two diagnostics accessors (the bound
-// address and the resolver's socket path). The stream-silence override and the
-// error-code accessor are reached by this module's own tests only. All of it
-// belongs to the protocol rather than to one frontend's wiring, so the lint is
-// silenced here rather than the surface trimmed to what today's TUI happens to
-// use.
+// address and the resolver's socket path). The stream-silence and
+// stream-open-timeout overrides and the error-code accessor are reached by
+// this module's own tests only. All of it belongs to the protocol rather than
+// to one frontend's wiring, so the lint is silenced here rather than the
+// surface trimmed to what today's TUI happens to use.
 #![allow(dead_code)]
 
 mod client;

@@ -48,6 +48,7 @@ use reqwest::StatusCode;
 use tempfile::TempDir;
 
 use super::*;
+use crate::control::{Control, ControlFrame};
 use crate::remote::identity::{
     AJ_CONTROL_CAPABILITY, IdentityError, PeerIdentity, WhoisResolver, peer_identity_from_whois,
 };
@@ -1724,6 +1725,101 @@ async fn a_silent_stream_is_reported_dead() {
         "a dead stream stays dead",
     );
     fixture.shutdown().await;
+}
+
+/// The silence deadline belongs to the stream, not to a call on it.
+///
+/// The drive loop never parks on the stream alone: it drains with `try_recv`
+/// every iteration and re-creates its awaiting `recv` future whenever another
+/// `select!` arm wins. A deadline measured from the call would restart on
+/// every one of those, and a host wedged mid-turn (whose spinner keeps the
+/// loop iterating) would never be declared dead (spec 6.1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_silent_stream_is_reported_dead_to_a_polling_client() {
+    let silence = Duration::from_millis(300);
+    // A heartbeat interval far beyond the client's tolerance, so the stream is
+    // alive and silent, which is exactly the case under test.
+    let fixture = Fixture::build(
+        scripted(Vec::new(), 0, Duration::ZERO),
+        IdentityGate::local(),
+        Duration::from_secs(60),
+    )
+    .await;
+    let session = fixture.create().await;
+    let control = Control::remote(fixture.client().with_silence(silence));
+    let mut stream = control
+        .attach(&session, None)
+        .await
+        .expect("the attach is served");
+
+    // The loop's shape: drain what is ready, then go do something else. Held
+    // for well past the tolerance, so a deadline the drain restarts leaves the
+    // stream looking alive forever.
+    let polling_until = std::time::Instant::now() + silence * 3;
+    while std::time::Instant::now() < polling_until {
+        while stream.try_recv().is_some() {}
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // `try_recv` holds the failure back for `recv`, which is the one place the
+    // loop reacts to a lost stream. It has to be there already: a `recv` that
+    // has to wait out a silence window of its own is a deadline the drain
+    // above kept resetting.
+    let waited = std::time::Instant::now();
+    let frame = bounded("the silence to be reported", stream.recv()).await;
+    let waited = waited.elapsed();
+    let ControlFrame::Lost(err) = frame else {
+        panic!("a stream silent for {silence:?} is still reported live");
+    };
+    assert!(
+        err.to_string().contains("silent"),
+        "the loss names the silence: {err}",
+    );
+    assert!(
+        waited < silence,
+        "the loss was noticed only by this call, after {waited:?} of its own",
+    );
+    fixture.shutdown().await;
+}
+
+/// Opening the stream is bounded even though the body it opens is not: a host
+/// that accepts the connection and never answers must not park the caller,
+/// which for the TUI's reconnect path would freeze input and redraw with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opening_a_stream_against_a_mute_host_is_abandoned() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a loopback port");
+    let addr = listener.local_addr().expect("the bound address");
+    // Accepts and holds: the connection is established, the response head
+    // never comes.
+    let mute = tokio::spawn(async move {
+        let mut accepted = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            accepted.push(socket);
+        }
+    });
+
+    let client = RemoteClient::new(&format!("http://{addr}"))
+        .expect("client")
+        .with_open_timeout(Duration::from_millis(200));
+    let Err(err) = bounded(
+        "the open to be abandoned",
+        client.events(&[AttachRequest {
+            session: "whatever".to_string(),
+            cursor: None,
+        }]),
+    )
+    .await
+    else {
+        panic!("a mute host answered a stream request");
+    };
+
+    assert!(
+        matches!(&err, RemoteError::Stream(reason) if reason.contains("did not answer")),
+        "got {err:?}",
+    );
+    mute.abort();
 }
 
 // ---------------------------------------------------------------------------
