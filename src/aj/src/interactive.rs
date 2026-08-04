@@ -13663,7 +13663,7 @@ mod tests {
         crate::connect::connect(
             &args,
             config,
-            &stated,
+            stated,
             ConnectTarget {
                 url,
                 session_id: session_id.as_deref(),
