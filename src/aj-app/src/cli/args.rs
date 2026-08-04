@@ -177,6 +177,11 @@ pub enum Command {
     ///
     /// With no session id the host's most recently modified session is
     /// attached, and one is created when the host has none.
+    ///
+    /// Launch input follows the session id, exactly as for `continue`:
+    /// `aj connect URL ID <args...>` attaches and auto-submits the args as
+    /// the next turn. Supplying input without an id is ambiguous (the first
+    /// positional is read as the session id), so the id has to be explicit.
     Connect {
         /// Base URL of the host's control port (e.g.
         /// `http://100.64.0.2:6161`).
@@ -186,6 +191,10 @@ pub enum Command {
         /// Create a fresh session instead of attaching an existing one.
         #[arg(long)]
         new: bool,
+        /// Launch input for the attached session, interpreted exactly like
+        /// the top-level [`Args::prompt`]: a mix of `@file` attachments and
+        /// messages, auto-submitted as the next turn.
+        prompt: Vec<String>,
     },
 }
 

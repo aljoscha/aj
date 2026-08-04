@@ -58,13 +58,17 @@ impl InitialInput {
 /// relative to `cwd` (for `@file` path resolution).
 ///
 /// The positionals come from whichever slot clap populated: the
-/// top-level `aj <args...>` or `aj continue ID <args...>` (its greedy
-/// positional consumption keeps the two disjoint). `@file` arguments
-/// are resolved into `<file>` text + image attachments; a missing file
-/// is an error.
+/// top-level `aj <args...>`, `aj continue ID <args...>` or
+/// `aj connect URL ID <args...>` (its greedy positional consumption keeps
+/// them disjoint). `@file` arguments are resolved into `<file>` text +
+/// image attachments; a missing file is an error.
 pub fn initial_input(args: &Args, cwd: &Path, image_auto_resize: bool) -> Result<InitialInput> {
     let positionals: &[String] = match &args.command {
-        Some(Command::Continue { prompt, .. }) if !prompt.is_empty() => prompt,
+        Some(Command::Continue { prompt, .. } | Command::Connect { prompt, .. })
+            if !prompt.is_empty() =>
+        {
+            prompt
+        }
         _ => &args.prompt,
     };
 
@@ -156,6 +160,16 @@ mod tests {
     fn prefers_continue_slot() {
         assert_eq!(
             content_text(&["aj", "continue", "ID", "do", "thing"]).as_deref(),
+            Some("do thing")
+        );
+    }
+
+    /// Connect mode carries launch input in the same slot, after the session
+    /// id its grammar needs to disambiguate it.
+    #[test]
+    fn prefers_connect_slot() {
+        assert_eq!(
+            content_text(&["aj", "connect", "http://host:6161", "ID", "do", "thing"]).as_deref(),
             Some("do thing")
         );
     }

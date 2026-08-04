@@ -3,17 +3,19 @@
 //! Drilled into from the agent picker (Part D-3a Spec E: the picker
 //! drops out, so Esc from here returns to the editor, not the picker).
 //! It shows the task's command, a live status line, and the scrollable
-//! output. The output is re-read from the task registry on every draw,
-//! and the drive loop requests a draw whenever the task emits output or
-//! finishes, so the body tails and the status flips on their own.
+//! output. The body tails and the status flips on their own: locally the
+//! viewer re-reads the registry on every draw, remotely the drive loop
+//! polls the per-task read and pushes each snapshot in.
 //!
-//! `Ctrl+K` ([`ACTION_TASK_KILL`]) kills a still-running task in place
-//! through the registry handle the viewer holds. Esc/Enter close.
+//! `Ctrl+K` ([`ACTION_TASK_KILL`]) kills a still-running task: in place
+//! through the registry handle locally, or by parking the id for the drive
+//! loop to send as a command. Esc/Enter close.
 //!
 //! Content source: the registry's stateless [`TaskRead`] snapshot. When
 //! the task persists a spill file (background bash tasks always do) the
 //! viewer reads it for the full output; otherwise it falls back to the
-//! bounded rolling tails the model sees.
+//! bounded rolling tails the model sees. The remote read carries the tails
+//! only, since the spill file sits on the host's disk (spec 6.7).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -21,6 +23,7 @@ use std::rc::Rc;
 use aj_agent::TaskRegistry;
 use aj_agent::tool::{TaskId, TaskRead, TaskStatus};
 use aj_app::keybindings::{ACTION_TASK_KILL, action_shortcut, format_keybinding};
+use aj_wire::TaskDetails;
 use vaxis::cell::Style;
 use vaxis::key::{Key, Modifiers};
 use vaxis::vxfw::{
@@ -41,9 +44,19 @@ const PAGE_STEP: usize = 10;
 /// line, the status line, and a blank separator.
 const HEADER_ROWS: u16 = 3;
 
+/// Where the viewer's content comes from, and where a kill goes.
+pub(crate) enum TaskBacking {
+    /// A live registry: re-read at draw, killed in place.
+    Local(TaskRegistry),
+    /// The per-task read (spec 6.7): the drive loop pushes snapshots in
+    /// through [`TaskOutputView::apply_details`], and a kill is parked in the
+    /// slot for it to send as a command.
+    Remote(Rc<RefCell<Option<TaskId>>>),
+}
+
 /// A read-only, scrollable viewer that tails one background task.
 pub(crate) struct TaskOutputView {
-    registry: TaskRegistry,
+    backing: TaskBacking,
     id: TaskId,
     /// Command line, shown (truncated) in the header for context.
     command: String,
@@ -68,7 +81,7 @@ pub(crate) struct TaskOutputView {
 
 impl TaskOutputView {
     fn new(
-        registry: TaskRegistry,
+        backing: TaskBacking,
         id: TaskId,
         command: String,
         text_style: Style,
@@ -81,7 +94,7 @@ impl TaskOutputView {
         bars.borrow_mut().draw_horizontal_scrollbar = false;
         let list = Rc::clone(&bars.borrow().view);
         let mut view = TaskOutputView {
-            registry,
+            backing,
             id,
             command,
             list,
@@ -99,16 +112,41 @@ impl TaskOutputView {
     }
 
     /// Pull the live status and output from the registry and rebuild the
-    /// body rows. Following pins to the bottom; otherwise the cursor is
-    /// only clamped so a shrinking buffer can't leave it out of range.
+    /// body rows. A remote viewer has nothing to pull: the drive loop pushes
+    /// its snapshots in instead (see [`Self::apply_details`]).
     fn refresh(&mut self) {
-        let Some((status, read)) = self.registry.read(self.id) else {
+        let TaskBacking::Local(registry) = &self.backing else {
+            return;
+        };
+        let Some((status, read)) = registry.read(self.id) else {
             // A task evicted from the registry keeps its last-known body.
             return;
         };
         self.status = status;
         self.total_bytes = read.stdout_total_bytes + read.stderr_total_bytes;
-        let lines = to_lines(&task_text(&read));
+        let text = task_text(&read);
+        self.set_body(&text);
+    }
+
+    /// Apply one snapshot from the per-task read, for a viewer with no
+    /// registry to re-read.
+    pub(crate) fn apply_details(&mut self, details: TaskDetails) {
+        self.status = details.status;
+        self.total_bytes = details.stdout_total_bytes + details.stderr_total_bytes;
+        let text = joined_tails(&details.stdout_tail, &details.stderr_tail);
+        self.set_body(&text);
+    }
+
+    /// The task this viewer shows, so the drive loop knows what to poll for.
+    pub(crate) fn task(&self) -> TaskId {
+        self.id
+    }
+
+    /// Rebuild the body rows from `text`. Following pins to the bottom;
+    /// otherwise the cursor is only clamped so a shrinking buffer can't leave
+    /// it out of range.
+    fn set_body(&self, text: &str) {
+        let lines = to_lines(text);
         let count = u32::try_from(lines.len()).unwrap_or(u32::MAX);
         {
             let mut list = self.list.borrow_mut();
@@ -247,12 +285,18 @@ impl Widget for TaskOutputView {
             ctx.consume_and_redraw();
             return;
         }
-        // Overlay-local kill (Spec F): in place through the registry. The
-        // status flip arrives via the task's `TaskEnd` and repaints the
-        // header. Inert once the task is terminal.
+        // Overlay-local kill (Spec F): in place through the registry, or
+        // parked for the drive loop to send as a command. The status flip
+        // arrives via the task's `TaskEnd` and repaints the header. Inert once
+        // the task is terminal.
         if action_matches(key, ACTION_TASK_KILL) {
             if self.status == TaskStatus::Running {
-                self.registry.kill(self.id);
+                match &self.backing {
+                    TaskBacking::Local(registry) => {
+                        registry.kill(self.id);
+                    }
+                    TaskBacking::Remote(slot) => *slot.borrow_mut() = Some(self.id),
+                }
             }
             ctx.consume_and_redraw();
             return;
@@ -300,12 +344,17 @@ fn task_text(read: &TaskRead) -> String {
     {
         return String::from_utf8_lossy(&bytes).into_owned();
     }
-    let mut out = read.stdout_tail.clone();
-    if !read.stderr_tail.is_empty() {
+    joined_tails(&read.stdout_tail, &read.stderr_tail)
+}
+
+/// The two output tails as one body, stderr after stdout on its own line.
+fn joined_tails(stdout: &str, stderr: &str) -> String {
+    let mut out = stdout.to_string();
+    if !stderr.is_empty() {
         if !out.is_empty() && !out.ends_with('\n') {
             out.push('\n');
         }
-        out.push_str(&read.stderr_tail);
+        out.push_str(stderr);
     }
     out
 }
@@ -386,19 +435,19 @@ fn subtitle() -> String {
     format!("{up}/{down} scroll  \u{2022}  {kill} kill  \u{2022}  {close} to close")
 }
 
-/// Open the task-output viewer for task `id`, pushing it onto `stack`.
-/// The viewer holds a clone of `registry` so `Ctrl+K` can kill in place.
-/// Does not move focus: the caller (host) posts the refocus event.
+/// Open the task-output viewer for task `id`, pushing it onto `stack` and
+/// returning it so a caller that has to feed it snapshots can keep the
+/// handle. Does not move focus: the caller (host) posts the refocus event.
 pub(crate) fn open_task_output(
     stack: &Rc<RefCell<OverlayStack>>,
     editor: &WidgetRef,
     chrome: &OverlayChrome,
-    registry: TaskRegistry,
+    backing: TaskBacking,
     id: TaskId,
     command: String,
-) {
+) -> Rc<RefCell<TaskOutputView>> {
     let view = Rc::new(RefCell::new(TaskOutputView::new(
-        registry,
+        backing,
         id,
         command,
         chrome.select.label,
@@ -420,10 +469,11 @@ pub(crate) fn open_task_output(
         chrome,
         &format!("Task #{id}"),
         subtitle(),
-        to_widget_ref(view),
+        to_widget_ref(Rc::clone(&view)),
         focus,
         OverlayPlacement::Large,
     );
+    view
 }
 
 #[cfg(test)]
@@ -505,7 +555,7 @@ mod tests {
         let contents: String = (1..=5).map(|n| format!("line{n}\n")).collect();
         let (registry, id, _f) = task(&contents, TaskStatus::Running);
         let mut view = TaskOutputView::new(
-            registry,
+            TaskBacking::Local(registry),
             id,
             "echo hi".to_string(),
             Style::default(),
@@ -522,7 +572,7 @@ mod tests {
     fn terminal_status_shows_in_header() {
         let (registry, id, _f) = task("out\n", TaskStatus::Exited(Some(0)));
         let mut view = TaskOutputView::new(
-            registry,
+            TaskBacking::Local(registry),
             id,
             "echo hi".to_string(),
             Style::default(),
@@ -538,7 +588,7 @@ mod tests {
     fn ctrl_k_kills_a_running_task() {
         let (registry, id, _f) = task("out\n", TaskStatus::Running);
         let mut view = TaskOutputView::new(
-            registry.clone(),
+            TaskBacking::Local(registry.clone()),
             id,
             "echo hi".to_string(),
             Style::default(),
@@ -562,11 +612,67 @@ mod tests {
         assert!(ctx.consume_event, "kill consumed the chord");
     }
 
+    /// A remote viewer has no registry: it renders the pushed snapshot's
+    /// tails and parks a kill for the drive loop instead of killing in place.
+    #[test]
+    fn a_remote_viewer_renders_pushed_snapshots_and_parks_its_kill() {
+        let slot: Rc<RefCell<Option<TaskId>>> = Rc::new(RefCell::new(None));
+        let mut view = TaskOutputView::new(
+            TaskBacking::Remote(Rc::clone(&slot)),
+            7,
+            "echo hi".to_string(),
+            Style::default(),
+            Style::default(),
+            Style::default(),
+        );
+        view.apply_details(TaskDetails {
+            id: 7,
+            status: TaskStatus::Running,
+            stdout_tail: "out line\n".to_string(),
+            stderr_tail: "err line\n".to_string(),
+            stdout_total_bytes: 9,
+            stderr_total_bytes: 9,
+            report: None,
+        });
+        let rendered = flatten(&view.draw(&draw_ctx(40, 12)));
+        assert!(rendered.contains("out line"), "{rendered}");
+        assert!(rendered.contains("err line"), "{rendered}");
+        assert!(rendered.contains("running"), "{rendered}");
+        assert!(rendered.contains("18 B"), "both totals counted: {rendered}");
+
+        let ctrl_k = Event::KeyPress(Key {
+            codepoint: u32::from('k'),
+            mods: Modifiers::CTRL,
+            ..Key::default()
+        });
+        let mut ctx = EventContext::new();
+        ctx.phase = Phase::Capturing;
+        view.capture_event(&mut ctx, &ctrl_k);
+        assert_eq!(*slot.borrow(), Some(7), "the kill is parked for the loop");
+        assert!(ctx.consume_event);
+
+        // A terminal task's kill is inert, so the slot stays as it was.
+        *slot.borrow_mut() = None;
+        view.apply_details(TaskDetails {
+            id: 7,
+            status: TaskStatus::Exited(Some(0)),
+            stdout_tail: "out line\n".to_string(),
+            stderr_tail: String::new(),
+            stdout_total_bytes: 9,
+            stderr_total_bytes: 0,
+            report: None,
+        });
+        let mut ctx = EventContext::new();
+        ctx.phase = Phase::Capturing;
+        view.capture_event(&mut ctx, &ctrl_k);
+        assert_eq!(*slot.borrow(), None, "a finished task is not killed again");
+    }
+
     #[test]
     fn esc_and_enter_close() {
         let (registry, id, _f) = task("x\n", TaskStatus::Running);
         let mut view = TaskOutputView::new(
-            registry,
+            TaskBacking::Local(registry),
             id,
             "echo hi".to_string(),
             Style::default(),
@@ -634,7 +740,7 @@ mod tests {
             ..Style::default()
         };
         let mut view = TaskOutputView::new(
-            registry,
+            TaskBacking::Local(registry),
             id,
             "echo hi".to_string(),
             Style::default(),

@@ -1,10 +1,10 @@
 //! The live footer: one dim row of session facts under the editor.
 //!
 //! Reads the shared [`ChatState`] (model line, context usage, tasks),
-//! [`StatusState`] (running sub-agent count), and the session's
-//! [`TaskRegistry`] (notices queued for the viewed agent) at draw
-//! time, so it refreshes on every frame without any event-driven sync
-//! of its own.
+//! [`StatusState`] (running sub-agent count), and, for a local run, the
+//! session's [`TaskRegistry`] (notices queued for the viewed agent) at draw
+//! time, so it refreshes on every frame without any event-driven sync of its
+//! own.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -41,7 +41,11 @@ pub(crate) struct FooterLine {
     /// The session's task registry, read for the viewed agent's queued
     /// notices. Session-scoped, so a session switch replaces it
     /// through [`FooterLine::set_task_registry`].
-    task_registry: TaskRegistry,
+    ///
+    /// `None` in connect mode. The count has no protocol equivalent: it is
+    /// the host's own undelivered-notice bookkeeping, which no frame and no
+    /// read carries, so the part is simply left out rather than guessed at.
+    task_registry: Option<TaskRegistry>,
 }
 
 impl FooterLine {
@@ -50,7 +54,7 @@ impl FooterLine {
         status: Rc<RefCell<StatusState>>,
         styles: Rc<TranscriptStyles>,
         cwd: String,
-        task_registry: TaskRegistry,
+        task_registry: Option<TaskRegistry>,
     ) -> FooterLine {
         FooterLine {
             chat,
@@ -62,13 +66,16 @@ impl FooterLine {
     }
 
     /// Point the footer at another session's task registry.
-    pub(crate) fn set_task_registry(&mut self, task_registry: TaskRegistry) {
+    pub(crate) fn set_task_registry(&mut self, task_registry: Option<TaskRegistry>) {
         self.task_registry = task_registry;
     }
 
-    /// Notices queued for `owner` in the session's registry.
+    /// Notices queued for `owner` in the session's registry, zero when there
+    /// is no registry to read.
     pub(crate) fn pending_notices(&self, owner: aj_agent::events::AgentId) -> usize {
-        self.task_registry.pending_notices(owner)
+        self.task_registry
+            .as_ref()
+            .map_or(0, |registry| registry.pending_notices(owner))
     }
 
     /// Replace the palette styles, for a runtime theme swap.
@@ -128,7 +135,8 @@ impl Widget for FooterLine {
         }
         // Notices queued for the viewed agent: tasks that finished but
         // whose completion the agent has not been handed yet, because a
-        // notice can only be delivered between tool batches.
+        // notice can only be delivered between tool batches. Local-only:
+        // this is host-internal bookkeeping with no wire representation.
         if let Some(text) = format_pending_notices(self.pending_notices(active)) {
             parts.push(vec![span(text, dim)]);
         }
@@ -201,7 +209,7 @@ mod tests {
             Rc::new(RefCell::new(status)),
             styles(),
             "/home/user/proj".into(),
-            task_registry,
+            Some(task_registry),
         )
     }
 
@@ -376,6 +384,22 @@ mod tests {
     fn footer_hides_notice_part_when_nothing_is_queued() {
         let mut f = footer(chat_with_window(200_000), StatusState::default());
         let r = draw_rows(&mut f, 80);
+        assert!(!r[0].contains("pending"), "{r:?}");
+    }
+
+    /// Connect mode has no registry to read, so the part is absent rather
+    /// than reported as zero or guessed at.
+    #[test]
+    fn footer_without_a_registry_omits_the_notice_part() {
+        let mut f = FooterLine::new(
+            chat_with_window(200_000),
+            Rc::new(RefCell::new(StatusState::default())),
+            styles(),
+            "/home/user/proj".into(),
+            None,
+        );
+        assert_eq!(f.pending_notices(AgentId::Main), 0);
+        let r = draw_rows(&mut f, 100);
         assert!(!r[0].contains("pending"), "{r:?}");
     }
 

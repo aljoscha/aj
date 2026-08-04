@@ -48,7 +48,9 @@ use reqwest::StatusCode;
 use tempfile::TempDir;
 
 use super::*;
-use crate::remote::identity::peer_identity_from_whois;
+use crate::remote::identity::{
+    AJ_CONTROL_CAPABILITY, IdentityError, PeerIdentity, WhoisResolver, peer_identity_from_whois,
+};
 
 /// Every wait in this file is bounded by this.
 const DEADLINE: Duration = Duration::from_secs(20);

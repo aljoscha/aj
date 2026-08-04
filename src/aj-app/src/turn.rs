@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use aj_agent::events::{AgentEvent, AgentId, CompactionReason};
-use aj_agent::{Agent, TaskRegistry, TaskSummary, TurnError, sub_agent_session_id};
+use aj_agent::{Agent, TaskRegistry, TurnError, sub_agent_session_id};
 use aj_conf::Config;
 use aj_models::errors::is_context_overflow;
 use aj_models::types::UserContent;
@@ -493,14 +493,21 @@ impl Turns {
 /// runs, which the driven set doesn't track) make up the agent count,
 /// running bash tasks the task count. An agent-backed task counts as
 /// an agent, never as a task, matching the footer's classification.
-pub fn running_work_counts(driven_turns: usize, tasks: &[TaskSummary]) -> (usize, usize) {
+///
+/// Takes each task's kind and status rather than a registry snapshot, so a
+/// frontend can count off the client model's task table (the only form a
+/// remote client has) and the host off its live registry.
+pub fn running_work_counts<'a>(
+    driven_turns: usize,
+    tasks: impl IntoIterator<Item = (&'a aj_agent::tool::TaskKind, aj_agent::tool::TaskStatus)>,
+) -> (usize, usize) {
     let mut agents = driven_turns;
     let mut bash = 0;
-    for task in tasks {
-        if task.status != aj_agent::tool::TaskStatus::Running {
+    for (kind, status) in tasks {
+        if status != aj_agent::tool::TaskStatus::Running {
             continue;
         }
-        match task.kind {
+        match kind {
             aj_agent::tool::TaskKind::Agent { .. } => agents += 1,
             aj_agent::tool::TaskKind::Bash { .. } => bash += 1,
         }

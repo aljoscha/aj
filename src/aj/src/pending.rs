@@ -7,17 +7,20 @@
 //! or escalate it; steering and follow-up are distinguished by that
 //! hint.
 //!
-//! The widget re-reads the live [`MessageQueues`] snapshot for the
-//! active view on every draw, so it can never trust a stale event
-//! payload. `QueueUpdate` events reduce to a redraw ping, which is
-//! all the sync this needs.
+//! The queue it previews comes off the [`ChatState`], which every client
+//! keeps from `QueueUpdate` frames and the queue read (spec 6.7). Reading
+//! the model rather than a live [`aj_agent::queue::MessageQueues`] handle is
+//! what makes the box work for a remote frontend, which has no such handle.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::LazyLock;
 
-use aj_agent::queue::{MessageQueues, PendingKind};
+use aj_agent::events::AgentId;
+use aj_agent::message::{AgentMessage, AgentMessageKind};
+use aj_agent::queue::PendingKind;
 use aj_app::chat::ChatState;
+use aj_models::types::{Message, UserContent};
 use vaxis::cell::Style;
 use vaxis::vxfw::{DrawContext, Event, EventContext, Size, Surface, TextSpan, Widget};
 
@@ -58,36 +61,61 @@ static STEER_KEY_LABEL: LazyLock<String> = LazyLock::new(|| {
 /// Box above the editor previewing the viewed agent's pending message.
 pub(crate) struct PendingBox {
     chat: Rc<RefCell<ChatState>>,
-    /// Shared queue handle, cloned from the session core at
-    /// construction.
-    queues: MessageQueues,
     styles: Rc<TranscriptStyles>,
 }
 
+/// The pending message a client shows for `agent`: its kind and the
+/// coalesced text, or `None` when nothing is queued for it.
+///
+/// Steering outranks a follow-up, mirroring the queue's own precedence: an
+/// agent holds at most one pending message, and which of the two vectors
+/// carries it is what names the kind. The texts of several queued messages
+/// join with newlines the way the queue coalesces them.
+pub(crate) fn pending_message(chat: &ChatState, agent: AgentId) -> Option<(PendingKind, String)> {
+    let queue = chat
+        .queue()
+        .queues
+        .iter()
+        .find(|queue| queue.agent_id == agent)?;
+    let (kind, messages) = if !queue.steering.is_empty() {
+        (PendingKind::Steering, &queue.steering)
+    } else if !queue.follow_up.is_empty() {
+        (PendingKind::FollowUp, &queue.follow_up)
+    } else {
+        return None;
+    };
+    let text = messages
+        .iter()
+        .map(queued_text)
+        .collect::<Vec<String>>()
+        .join("\n");
+    Some((kind, text))
+}
+
+/// The text of one queued message. The queues only ever hold user text, so
+/// anything else reads as empty rather than as a preview of something the
+/// user never typed.
+fn queued_text(message: &AgentMessage) -> String {
+    let AgentMessageKind::Wire(Message::User(user)) = &message.kind else {
+        return String::new();
+    };
+    user.content
+        .iter()
+        .filter_map(|block| match block {
+            UserContent::Text(text) => Some(text.text.as_str()),
+            UserContent::Image(_) => None,
+        })
+        .collect()
+}
+
 impl PendingBox {
-    pub(crate) fn new(
-        chat: Rc<RefCell<ChatState>>,
-        queues: MessageQueues,
-        styles: Rc<TranscriptStyles>,
-    ) -> PendingBox {
-        PendingBox {
-            chat,
-            queues,
-            styles,
-        }
+    pub(crate) fn new(chat: Rc<RefCell<ChatState>>, styles: Rc<TranscriptStyles>) -> PendingBox {
+        PendingBox { chat, styles }
     }
 
     /// Replace the palette styles, for a runtime theme swap.
     pub(crate) fn set_styles(&mut self, styles: Rc<TranscriptStyles>) {
         self.styles = styles;
-    }
-
-    /// Repoint at a new session's message queues, for a session rebuild.
-    /// `SessionCore::build` mints fresh queues wired into the new agent, so
-    /// the clone taken at construction would otherwise observe a queue no
-    /// longer connected to the live agent.
-    pub(crate) fn set_queues(&mut self, queues: MessageQueues) {
-        self.queues = queues;
     }
 
     /// Hint spans describing the pending message's kind and the
@@ -126,9 +154,12 @@ impl PendingBox {
 
 impl Widget for PendingBox {
     fn draw(&mut self, ctx: &DrawContext) -> Surface {
-        let active = self.chat.borrow().active_view();
-        let snapshot = self.queues.snapshot(active);
-        let Some(kind) = snapshot.kind else {
+        let pending = {
+            let chat = self.chat.borrow();
+            let active = chat.active_view();
+            pending_message(&chat, active)
+        };
+        let Some((kind, text)) = pending else {
             // Nothing pending: no rows, the slot collapses to zero
             // height so the editor sits flush under the chat.
             return Surface::with_size(Size {
@@ -147,7 +178,7 @@ impl Widget for PendingBox {
         // sent, with the hint above it inside the same bubble.
         let mut spans = self.hint(kind);
         spans.push(span("\n\n".to_string(), self.styles.user));
-        let lines: Vec<&str> = snapshot.text.split('\n').collect();
+        let lines: Vec<&str> = text.split('\n').collect();
         // Show every line up to the cap; past it, keep
         // `MAX_BODY_LINES - 1` rows and spend the last on the
         // overflow indicator so the box height is bounded.
@@ -192,8 +223,9 @@ impl Widget for PendingBox {
 mod tests {
     use std::sync::Arc;
 
-    use aj_agent::events::{AgentId, AgentSettings};
+    use aj_agent::events::AgentSettings;
     use aj_app::theme::Theme;
+    use aj_wire::AgentQueue;
 
     use super::*;
 
@@ -219,10 +251,29 @@ mod tests {
         ))
     }
 
-    fn pending() -> (PendingBox, MessageQueues) {
-        let queues = MessageQueues::default();
-        let b = PendingBox::new(chat(), queues.clone(), styles());
-        (b, queues)
+    fn pending() -> (PendingBox, Rc<RefCell<ChatState>>) {
+        let chat = chat();
+        let b = PendingBox::new(Rc::clone(&chat), styles());
+        (b, chat)
+    }
+
+    /// Note one agent's queue the way a `QueueUpdate` frame does.
+    fn note(chat: &Rc<RefCell<ChatState>>, agent: AgentId, steering: &[&str], follow_up: &[&str]) {
+        let messages = |texts: &[&str]| {
+            texts
+                .iter()
+                .map(|text| {
+                    AgentMessage::wire(Message::User(aj_models::types::UserMessage::text(
+                        (*text).to_string(),
+                    )))
+                })
+                .collect()
+        };
+        chat.borrow_mut().note_queue(AgentQueue {
+            agent_id: agent,
+            steering: messages(steering),
+            follow_up: messages(follow_up),
+        });
     }
 
     fn draw(b: &mut PendingBox, width: u16) -> Surface {
@@ -231,14 +282,25 @@ mod tests {
 
     #[test]
     fn empty_queue_takes_zero_height() {
-        let (mut b, _q) = pending();
+        let (mut b, _chat) = pending();
+        assert_eq!(draw(&mut b, 80).size.height, 0);
+    }
+
+    /// A drained agent keeps its (now empty) queue entry, so an empty
+    /// snapshot must read as "nothing pending" rather than as a kind.
+    #[test]
+    fn a_drained_queue_takes_zero_height() {
+        let (mut b, chat) = pending();
+        note(&chat, AgentId::Main, &[], &["do the thing"]);
+        assert!(draw(&mut b, 80).size.height > 0);
+        note(&chat, AgentId::Main, &[], &[]);
         assert_eq!(draw(&mut b, 80).size.height, 0);
     }
 
     #[test]
     fn follow_up_shows_hint_above_the_tinted_body() {
-        let (mut b, q) = pending();
-        q.append_follow_up(AgentId::Main, "do the thing");
+        let (mut b, chat) = pending();
+        note(&chat, AgentId::Main, &[], &["do the thing"]);
         let surface = draw(&mut b, 80);
         let r = crate::test_support::rows(&surface);
         // Padding row, hint, blank separator, body, padding row.
@@ -266,10 +328,12 @@ mod tests {
         assert_eq!(grid[1][1].style.fg, s.accent.fg);
     }
 
+    /// Steering outranks a follow-up queued for the same agent, and its hint
+    /// omits the escalation gesture.
     #[test]
     fn steering_hint_omits_the_escalation_gesture() {
-        let (mut b, q) = pending();
-        q.append_steering(AgentId::Main, "now");
+        let (mut b, chat) = pending();
+        note(&chat, AgentId::Main, &["now"], &["later"]);
         let r = crate::test_support::rows(&draw(&mut b, 80));
         assert_eq!(
             r[1],
@@ -278,17 +342,29 @@ mod tests {
                 edit = EDIT_KEY_LABEL.as_str(),
             ),
         );
+        assert_eq!(r[3], " now", "{r:?}");
         assert!(!r.join("\n").contains(STEER_KEY_LABEL.as_str()), "{r:?}");
+    }
+
+    /// Several queued messages coalesce into one preview, newline-joined the
+    /// way the queue itself joins them.
+    #[test]
+    fn queued_messages_coalesce_into_one_body() {
+        let (mut b, chat) = pending();
+        note(&chat, AgentId::Main, &[], &["first", "second"]);
+        let r = crate::test_support::rows(&draw(&mut b, 80));
+        assert_eq!(r[3], " first", "{r:?}");
+        assert_eq!(r[4], " second", "{r:?}");
     }
 
     #[test]
     fn long_body_collapses_into_overflow_indicator() {
-        let (mut b, q) = pending();
+        let (mut b, chat) = pending();
         let text = (1..=10)
             .map(|n| format!("line {n}"))
             .collect::<Vec<_>>()
             .join("\n");
-        q.append_follow_up(AgentId::Main, &text);
+        note(&chat, AgentId::Main, &[], &[text.as_str()]);
         let r = crate::test_support::rows(&draw(&mut b, 80));
         // Padding + hint + separator + (MAX_BODY_LINES - 1) body rows
         // + overflow + padding.
@@ -301,8 +377,9 @@ mod tests {
     /// so the box height only depends on the line count.
     #[test]
     fn wide_lines_truncate_instead_of_wrapping() {
-        let (mut b, q) = pending();
-        q.append_follow_up(AgentId::Main, &"x".repeat(200));
+        let (mut b, chat) = pending();
+        let wide = "x".repeat(200);
+        note(&chat, AgentId::Main, &[], &[wide.as_str()]);
         let surface = draw(&mut b, 40);
         let r = crate::test_support::rows(&surface);
         assert_eq!(r.len(), 5, "hint + separator + one body row: {r:?}");
@@ -316,8 +393,8 @@ mod tests {
     /// The preview only shows the viewed agent's queue.
     #[test]
     fn other_agents_queues_stay_hidden() {
-        let (mut b, q) = pending();
-        q.append_follow_up(AgentId::Sub(1), "for the sub");
+        let (mut b, chat) = pending();
+        note(&chat, AgentId::Sub(1), &[], &["for the sub"]);
         assert_eq!(draw(&mut b, 80).size.height, 0);
     }
 }

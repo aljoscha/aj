@@ -32,6 +32,20 @@ pub(crate) const FRAME_INTERVAL_MS: u32 = 80;
 /// chain (widgets can only schedule ticks from an event handler).
 pub(crate) const STATUS_WAKE_EVENT: &str = "aj.status.wake";
 
+/// Where this client stands with the host serving its session (spec 9.1).
+///
+/// Always [`Connection::Connected`] for a local run, whose host cannot go
+/// away without the process going with it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Connection {
+    #[default]
+    Connected,
+    /// The stream dropped and a re-attach is pending.
+    Reconnecting,
+    /// The stream is back and its attach block is being folded.
+    CatchingUp,
+}
+
 /// Lifecycle bits the status chrome reads at draw time, mirrored from
 /// the host-owned `AgentLifecycle` once per loop iteration.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -46,12 +60,16 @@ pub(crate) struct StatusState {
     /// Count of running `Sub(_)` agents, for the footer's activity
     /// indicator.
     pub(crate) sub_agents_running: usize,
+    /// Connection state, mirrored from the world alongside the lifecycle
+    /// bits.
+    pub(crate) connection: Connection,
 }
 
 impl StatusState {
-    /// Whether the viewed agent should show the loader.
+    /// Whether the loader row is shown: the viewed agent is working, or the
+    /// connection behind it is not settled.
     pub(crate) fn busy(&self) -> bool {
-        self.running || self.compacting
+        self.running || self.compacting || self.connection != Connection::Connected
     }
 
     /// Whether the animation tick should run. Broader than [`busy`](Self::busy):
@@ -108,11 +126,19 @@ impl StatusLine {
         self.styles = styles;
     }
 
-    /// The loader message for the current activity. Compaction labels
-    /// win over the default because a compacting agent may also be
-    /// mid-turn (auto-compaction runs inside the turn ladder).
+    /// The loader message for the current activity. An unsettled
+    /// connection wins over the agent's own state: while the stream is
+    /// down what the transcript shows is stale, which the user has to
+    /// know first. Compaction labels win over the default because a
+    /// compacting agent may also be mid-turn (auto-compaction runs
+    /// inside the turn ladder).
     fn message(&self) -> String {
         let status = self.status.borrow();
+        match status.connection {
+            Connection::Reconnecting => return "Reconnecting to the host…".to_string(),
+            Connection::CatchingUp => return "Catching up…".to_string(),
+            Connection::Connected => {}
+        }
         if status.compacting {
             let chat = self.chat.borrow();
             let label = match chat.compaction_phase(chat.active_view()) {
@@ -276,6 +302,29 @@ mod tests {
         });
         let r = rows(&line);
         assert_eq!(r[0], " ⠋ Working… (Ctrl+C to cancel)", "{r:?}");
+    }
+
+    /// An unsettled connection shows its own row even while the agent is
+    /// idle, and outranks the working label while it is not (spec 9.1).
+    #[test]
+    fn connection_state_labels_the_loader() {
+        for (connection, label) in [
+            (Connection::Reconnecting, " ⠋ Reconnecting to the host…"),
+            (Connection::CatchingUp, " ⠋ Catching up…"),
+        ] {
+            let (line, _) = loader(StatusState {
+                connection,
+                ..StatusState::default()
+            });
+            assert_eq!(rows(&line)[0], label, "{connection:?}");
+
+            let (busy, _) = loader(StatusState {
+                running: true,
+                connection,
+                ..StatusState::default()
+            });
+            assert_eq!(rows(&busy)[0], label, "{connection:?} while working");
+        }
     }
 
     /// Compaction relabels the loader: the starting phase, then each

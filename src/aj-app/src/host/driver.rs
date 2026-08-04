@@ -813,9 +813,10 @@ impl Driver {
     /// the branch being left is reset, the agent is reseeded from the new
     /// branch, a fresh epoch is minted and `reset` published.
     async fn head_switch(&mut self, entry: String) -> Result<CommandOutcome, HostError> {
+        let snapshot = self.session.core.task_registry.snapshot();
         let (agents, bash) = running_work_counts(
             self.turns.driven(),
-            &self.session.core.task_registry.snapshot(),
+            snapshot.iter().map(|task| (&task.kind, task.status)),
         );
         if agents + bash > 0 {
             return Err(HostError::Conflict {

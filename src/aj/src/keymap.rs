@@ -12,8 +12,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use aj_agent::events::AgentId;
-use aj_agent::queue::MessageQueues;
 use aj_app::actions::{AjAction, ChordKey, ChordPhase, ChordSpec, global_bindings};
+use aj_app::chat::ChatState;
 use vaxis::key::{Key, Modifiers, name_map};
 use vaxis::vxfw::{Activator, BindingPhase, Entry, Keymap, TextArea};
 
@@ -49,12 +49,14 @@ pub(crate) struct HostCtx {
     /// drive loop polls, so the close-all chord must not pre-empt it.
     /// The drive loop is this field's single writer.
     pub(crate) login_active: bool,
-    /// The active view's message-queue handle, read live by the recall gesture
-    /// (plain Up / Ctrl+P) so it sees the current pending state. The drive loop
-    /// re-sets it each iteration, since the handle is swapped on session change.
-    pub(crate) message_queues: MessageQueues,
-    /// The agent whose transcript is in view, keying [`Self::message_queues`].
-    /// A mirror the drive loop refreshes at its sync point, like `turn_running`.
+    /// The chat model, read live by the recall gesture (plain Up / Ctrl+P) so
+    /// it sees the pending message the model currently holds. Shared with the
+    /// widgets and the drive loop, which is the model's single writer, so
+    /// there is no mirror to go stale.
+    pub(crate) chat: Rc<RefCell<ChatState>>,
+    /// The agent whose transcript is in view, keying the queue lookup in
+    /// [`Self::chat`]. A mirror the drive loop refreshes at its sync point,
+    /// like `turn_running`.
     pub(crate) active_view: AgentId,
 }
 
@@ -107,7 +109,9 @@ fn can_arm_quit(cx: &HostCtx) -> bool {
 /// so with any draft in the editor the key falls through to the editor's own
 /// history / cursor nav. Reading the editor here is safe for the same reason
 /// [`focus_enabled`] gives: the capture-phase match runs at the root before the
-/// event descends to the editor, so the editor is not already borrowed.
+/// event descends to the editor, so the editor is not already borrowed. The
+/// chat borrow is safe for the same reason: nothing below the root holds one
+/// during dispatch.
 ///
 /// Also gated off while the transcript is focused: there Up / Ctrl+P step
 /// through the user messages (`handle_focus_key`), and that stepping is
@@ -116,7 +120,7 @@ fn can_arm_quit(cx: &HostCtx) -> bool {
 fn can_recall_pending(cx: &HostCtx) -> bool {
     in_editor_focus(cx)
         && cx.editor.borrow().text().is_empty()
-        && cx.message_queues.has_pending(cx.active_view)
+        && crate::pending::pending_message(&cx.chat.borrow(), cx.active_view).is_some()
 }
 
 /// Close-all is inert while a login dialog is up: the dialog owns its own
@@ -275,7 +279,10 @@ pub(crate) fn build_keymap() -> Keymap<AjAction, HostCtx> {
 
 #[cfg(test)]
 mod tests {
+    use aj_agent::message::AgentMessage;
     use aj_app::actions::parse_chord;
+    use aj_models::types::{Message, UserMessage};
+    use aj_wire::AgentQueue;
     use vaxis::key::Key;
 
     use super::*;
@@ -287,9 +294,38 @@ mod tests {
             focus_mode: Rc::new(std::cell::Cell::new(false)),
             turn_running,
             login_active: false,
-            message_queues: MessageQueues::default(),
+            chat: Rc::new(RefCell::new(ChatState::new(
+                aj_agent::events::AgentSettings {
+                    provider: "scripted".into(),
+                    model_id: "scripted".into(),
+                    thinking: "off".into(),
+                    thinking_display: "default".into(),
+                    speed: "standard".into(),
+                    verbosity: "default".into(),
+                },
+                0,
+                std::sync::Arc::new(Vec::new()),
+            ))),
             active_view: AgentId::Main,
         }
+    }
+
+    /// Note a queued message for the active view, the way a `QueueUpdate`
+    /// frame does.
+    fn queue(cx: &HostCtx, steering: &[&str], follow_up: &[&str]) {
+        let messages = |texts: &[&str]| {
+            texts
+                .iter()
+                .map(|text| {
+                    AgentMessage::wire(Message::User(UserMessage::text((*text).to_string())))
+                })
+                .collect()
+        };
+        cx.chat.borrow_mut().note_queue(AgentQueue {
+            agent_id: cx.active_view,
+            steering: messages(steering),
+            follow_up: messages(follow_up),
+        });
     }
 
     /// A context for the recall gesture: an editor holding `editor_text` and,
@@ -300,7 +336,7 @@ mod tests {
             cx.editor.borrow_mut().set_text(editor_text);
         }
         if pending {
-            cx.message_queues.append_follow_up(cx.active_view, "queued");
+            queue(&cx, &[], &["queued"]);
         }
         cx
     }
@@ -799,7 +835,7 @@ mod tests {
     }
 
     /// A queued steering message (the Alt+Enter-with-text path) is recalled by
-    /// Up just like a follow-up: `has_pending` ORs both slots, so the recall
+    /// Up just like a follow-up: either vector counts as pending, so the recall
     /// gate fires for either kind. This pins the "queued/steering" case.
     #[test]
     fn up_recalls_a_queued_steering_message() {
@@ -807,11 +843,28 @@ mod tests {
         let up = key(Key::UP, Modifiers::empty());
 
         let cx = ctx(false);
-        cx.message_queues.append_steering(cx.active_view, "steered");
+        queue(&cx, &["steered"], &[]);
         assert_eq!(
             keymap.match_single(&up, BindingPhase::Capture, &cx),
             Some(&AjAction::Dequeue),
             "Up recalls a queued steering message",
+        );
+    }
+
+    /// A drained agent keeps an empty queue entry in the model, which must not
+    /// read as pending: the recall would find nothing to yank and would have
+    /// swallowed the key that history navigation wanted.
+    #[test]
+    fn a_drained_queue_does_not_recall() {
+        let keymap = build_keymap();
+        let up = key(Key::UP, Modifiers::empty());
+
+        let cx = recall_ctx("", true);
+        queue(&cx, &[], &[]);
+        assert_eq!(
+            keymap.match_single(&up, BindingPhase::Capture, &cx),
+            None,
+            "an empty queue snapshot is not a pending message",
         );
     }
 

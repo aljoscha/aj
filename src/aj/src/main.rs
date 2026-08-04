@@ -60,7 +60,9 @@ fn is_interactive(args: &Args) -> bool {
 mod agent_picker;
 mod autocomplete;
 mod bubble;
+mod connect;
 mod content_overlay;
+mod control;
 mod corner_box;
 mod footer;
 mod frame_stats_box;
@@ -287,7 +289,7 @@ mod startup_tests {
         let bare = args_of(&["aj", "connect", "http://host:6161"]);
         assert!(matches!(
             bare.command,
-            Some(Command::Connect { ref url, session_id: None, new: false })
+            Some(Command::Connect { ref url, session_id: None, new: false, .. })
                 if url == "http://host:6161"
         ));
         let picked = args_of(&["aj", "connect", "http://host:6161", "20260804-120000"]);
@@ -298,6 +300,26 @@ mod startup_tests {
         assert!(matches!(
             args_of(&["aj", "connect", "http://host:6161", "--new"]).command,
             Some(Command::Connect { new: true, .. }),
+        ));
+    }
+
+    /// Launch input for connect mode follows the session id, exactly as for
+    /// `continue`. The grammar is ambiguous without the id: the first free
+    /// positional is the session, so `aj connect URL "do this"` asks for a
+    /// session called `do this` rather than submitting a prompt.
+    #[test]
+    fn connect_takes_launch_input_after_the_session_id() {
+        let with_prompt = args_of(&["aj", "connect", "http://host:6161", "ID", "do", "this"]);
+        assert!(matches!(
+            with_prompt.command,
+            Some(Command::Connect { session_id: Some(ref id), ref prompt, .. })
+                if id == "ID" && prompt == &["do".to_string(), "this".to_string()]
+        ));
+        let ambiguous = args_of(&["aj", "connect", "http://host:6161", "do this"]);
+        assert!(matches!(
+            ambiguous.command,
+            Some(Command::Connect { session_id: Some(ref id), ref prompt, .. })
+                if id == "do this" && prompt.is_empty()
         ));
     }
 }
