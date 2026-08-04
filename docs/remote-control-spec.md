@@ -1,6 +1,6 @@
 # Remote control and VM provisioning
 
-## Status: draft, phase 0 complete
+## Status: draft, phase 1 complete
 
 Companion document: `docs/remote-control-implementation.md`, the manual
 for the implementing agent.
@@ -891,6 +891,15 @@ fed from `QueueUpdate` frames and the queue read (locally the view
 re-reads a live handle at draw time, which does not exist remotely),
 and the task table must accept replacement from the tasks read
 (section 6.7). Footer settings state comes from `state` frames.
+
+Two things the in-process client still reaches around the protocol for,
+and that connect mode therefore has to grow: the thinking-display toggle
+mutates the run config directly, because no settings axis carries it and
+nothing durable records it, and the notices a resume produces when it
+restores the settings recorded in a log are returned to the caller
+rather than published, so only the process that resumed sees them. Both
+want a host-published notice and, for the toggle, either a settings axis
+or an honest client-local scope.
 Connection state (connected, reconnecting, catching up) is surfaced in
 the footer/status line.
 
