@@ -4984,16 +4984,25 @@ fn push_corner_box(
     anchor_row
 }
 
+/// How long the first failed attempt waits, doubling from there. Short,
+/// because a stream that dropped because the host restarted is usually back
+/// before a longer delay would have elapsed.
+const RETRY_BACKOFF_MIN: Duration = Duration::from_millis(200);
+
+/// The ceiling on a paced retry. A client whose host is gone for good keeps
+/// trying at this rate, which is what makes the shell survive a host restart
+/// without the user reaching for the shell's history.
+const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
 /// Paces a retry the drive loop has nothing else to wake it for.
 ///
-/// Every failure doubles the delay up to [`RECONNECT_BACKOFF_MAX`], so a peer
-/// that stopped answering cannot make the loop spend each iteration in a
-/// request that will fail. Nothing here is aware of what is being retried:
-/// the pacing is the same whether the failing thing is an attach, a read, or a
-/// poll.
+/// Every failure doubles the delay up to [`RETRY_BACKOFF_MAX`], so a peer that
+/// stopped answering cannot make the loop spend each iteration in a request
+/// that will fail. Nothing here is aware of what is being retried: the pacing
+/// is the same whether the failing thing is an attach, a read, or a poll.
 struct Retry {
-    /// How long the next failure waits. Doubles per failure, reset by a
-    /// success.
+    /// How long the next failure waits. Doubles per failure, back to
+    /// [`RETRY_BACKOFF_MIN`] whenever the pacing is dropped.
     delay: Duration,
     /// When the next attempt is allowed, `None` while one is due now. The
     /// loop merges this into its wake deadline, which is what makes a paced
@@ -5004,7 +5013,7 @@ struct Retry {
 impl Default for Retry {
     fn default() -> Self {
         Self {
-            delay: RECONNECT_BACKOFF_MIN,
+            delay: RETRY_BACKOFF_MIN,
             due: None,
         }
     }
@@ -5024,7 +5033,7 @@ impl Retry {
     /// Note a failed attempt, holding the next one back.
     fn failed(&mut self) {
         self.due = Some(Instant::now() + self.delay);
-        self.delay = (self.delay * 2).min(RECONNECT_BACKOFF_MAX);
+        self.delay = (self.delay * 2).min(RETRY_BACKOFF_MAX);
     }
 
     /// Drop the pacing: whatever comes next is due at once.
@@ -5065,16 +5074,6 @@ enum ResumeStep {
     /// The stream is open and its attach block still has to be folded.
     CatchingUp,
 }
-
-/// How long the first failed re-attach waits, doubling from there. Short,
-/// because a stream that dropped because the host restarted is usually back
-/// before a longer delay would have elapsed.
-const RECONNECT_BACKOFF_MIN: Duration = Duration::from_millis(200);
-
-/// The ceiling on the re-attach delay. A client whose host is gone for good
-/// keeps trying at this rate, which is what makes the shell survive a host
-/// restart without the user reaching for the shell's history.
-const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 impl Resume {
     /// The state a lost stream leaves: the first attempt is due at once.
@@ -9175,7 +9174,7 @@ mod tests {
             state.failed();
         }
         assert!(
-            state.due().saturating_duration_since(Instant::now()) <= RECONNECT_BACKOFF_MAX,
+            state.due().saturating_duration_since(Instant::now()) <= RETRY_BACKOFF_MAX,
             "the backoff is capped",
         );
     }
