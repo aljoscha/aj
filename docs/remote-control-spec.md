@@ -902,16 +902,27 @@ Orthogonal to file provenance, **per-session inference settings
 follow the creator**. The host supplies the environment (workspace,
 skills, keys, catalog, tool availability), but the model, thinking
 level, thinking display, speed, and verbosity of a session belong to
-whoever creates it: a connect-mode client resolves its own configured
-defaults and sends them with the create command, and explicit create
-settings win over the host's config defaults, which apply only when
-the creator sends none. A requested model must be servable by the
-host (present in its catalog, with credentials), otherwise the create
-fails with a clear error rather than silently substituting. After
-creation the settings command mutates them, from any client, as
-peers. Thinking display sits here rather than in the UX scope because
-it changes what the provider is asked to emit, not just what is
-rendered.
+whoever creates it. "Belong" is per axis and hinges on whether the
+creator actually stated a value: a setting is stated when it comes
+from a CLI flag, an environment variable, or an entry written in the
+client's config file. The built-in fallback a config resolves to when
+nothing is written is not a preference and does not travel. The
+create command sends only stated axes, and stated axes are strict:
+a value the host's model cannot serve fails the create with a clear
+error naming the supported values, never a silent clamp or
+substitution. A stated model must likewise be servable by the host
+(present in its catalog, with credentials). Unstated axes are the
+host's to default, and its defaulting is model-aware: its own
+configured default when the chosen model supports it, otherwise a
+supported value. That is not reinterpretation, a default is the
+host's to choose precisely because nobody asked for anything. This
+split is what lets a stock client create a session on a host serving
+a narrow-vocabulary model (a scripted host supports only thinking
+`off`) while still refusing loudly when a human really asked for
+`xhigh`. After creation the settings command mutates the axes, from
+any client, as peers, under the same strictness. Thinking display
+sits here rather than in the UX scope because it changes what the
+provider is asked to emit, not just what is rendered.
 
 ## 9. Client TUI
 

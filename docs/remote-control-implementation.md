@@ -260,7 +260,11 @@ producer-paced, spec 6.9), and the connection identity gate (spec
 6.11, flag/env names and the capability key are pinned there). Put
 the gate's peer lookup behind a small trait so tests can fake the
 whois resolver, the real implementation queries tailscaled's local
-API (the unix socket that `tailscale whois --json` wraps).
+API (the unix socket that `tailscale whois --json` wraps). Session
+create sends only stated settings axes per spec section 8: the config
+schema's `Option` fields already distinguish written entries from
+built-in fallbacks, so statedness must be captured before the
+defaulting layer resolves them.
 
 Acceptance: equivalence harness green including fault injection, a
 human can run `aj serve` in one terminal and `aj connect` in another
