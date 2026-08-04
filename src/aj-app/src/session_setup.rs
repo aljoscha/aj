@@ -33,7 +33,9 @@ use anyhow::{Context, Result};
 
 use crate::SYSTEM_PROMPT;
 use crate::cli::args::Args;
+use crate::host::{HostSetup, SessionHost};
 use crate::model::{ModelSelection, ResolvedModel};
+use crate::settings::ConfigLayers;
 
 /// Loop-side snapshot of the agent's run configuration.
 ///
@@ -908,4 +910,67 @@ mod tests {
             "the synthesized result anchors at the branch tip, not the abandoned tail"
         );
     }
+}
+
+/// A composed session host plus the shared handles a frontend's settings
+/// surfaces mutate alongside it.
+///
+/// One composition path serves every mode: the interactive shell, the
+/// server it embeds for `--listen`, and headless `aj serve`. They differ in
+/// what they wrap around the host, never in how the host is built, which is
+/// what keeps a local shell and a remote client peers over one host rather
+/// than two differently-configured ones.
+pub struct ComposedHost {
+    pub host: SessionHost,
+    /// The effective config every session reads, shared so a settings
+    /// change is visible to the whole process.
+    pub config: Arc<StdMutex<Config>>,
+    /// The user and project layers behind `config`, which the settings
+    /// windows edit and persist.
+    pub layers: Arc<StdMutex<ConfigLayers>>,
+    pub catalog: Arc<Vec<ModelInfo>>,
+}
+
+/// Resolve the inference speed this run starts at: the CLI flag, else the
+/// effective config.
+pub fn resolve_speed(args: &Args, config: &Config) -> Result<Option<Speed>> {
+    let configured = match args.speed.as_deref() {
+        Some(name) => Some(name.parse::<ConfigSpeed>().map_err(anyhow::Error::msg)?),
+        None => config.speed,
+    };
+    Ok(configured.map(|speed| match speed {
+        ConfigSpeed::Standard => Speed::Standard,
+        ConfigSpeed::Fast => Speed::Fast,
+    }))
+}
+
+/// Compose the session host for `layers`' working directory.
+pub fn compose_host(
+    args: &Args,
+    layers: ConfigLayers,
+    auth: &AuthStorage,
+    persistence: &ConversationPersistence,
+) -> Result<ComposedHost> {
+    let config = layers.effective();
+    let speed = resolve_speed(args, &config)?;
+    let (run_config, restore) = build_initial_run_config(args, &config, auth, speed)?;
+    let catalog = crate::commands::load_model_catalog();
+    let config = Arc::new(StdMutex::new(config));
+    let layers = Arc::new(StdMutex::new(layers));
+    let host = SessionHost::new(HostSetup {
+        config: Arc::clone(&config),
+        layers: Arc::clone(&layers),
+        catalog: Arc::clone(&catalog),
+        run_config,
+        restore,
+        persistence: persistence.clone(),
+        auth: auth.clone(),
+        working_directory: std::env::current_dir().unwrap_or_default(),
+    })?;
+    Ok(ComposedHost {
+        host,
+        config,
+        layers,
+        catalog,
+    })
 }

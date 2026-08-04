@@ -164,11 +164,15 @@ async fn run_inner<W: Write + Send + 'static>(
     //
     // `list-sessions` and `update-models` are dispatched in `main.rs`
     // before any session setup; reaching them here would mean
-    // the dispatcher routed incorrectly.
+    // the dispatcher routed incorrectly. The remote-control modes are
+    // their own frontends and never combine with print mode.
     let resume_request: Option<Option<String>> = match &args.command {
         None => None,
         Some(Command::Continue { session_id, .. }) => Some(session_id.clone()),
-        Some(Command::ListSessions) | Some(Command::UpdateModels) => {
+        Some(Command::ListSessions)
+        | Some(Command::UpdateModels)
+        | Some(Command::Serve)
+        | Some(Command::Connect { .. }) => {
             bail!("aj --print does not accept this subcommand");
         }
     };

@@ -79,11 +79,52 @@ pub struct Args {
     #[arg(long)]
     pub scripted: Option<String>,
 
+    /// Serve this working directory's sessions on a control port, and
+    /// accept clients on it. `--listen` alone binds the loopback default
+    /// (`127.0.0.1:6161`), which is the only address the `local` identity
+    /// mode will serve (see `--auth`).
+    ///
+    /// Interactive runs embed the server alongside the TUI, so the local
+    /// shell and every remote client attach to one host as peers. `aj serve`
+    /// runs the same host headless.
+    #[arg(
+        long,
+        env = "AJ_LISTEN",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = DEFAULT_LISTEN_ADDRESS,
+    )]
+    pub listen: Option<String>,
+
+    /// Who may connect to the control port: `local` (default, loopback
+    /// peers only), `tailscale` (verify each peer against the local
+    /// tailscale daemon), or `open` (accept everyone, for a host-private
+    /// network only).
+    ///
+    /// The control port runs arbitrary commands through the agent, so
+    /// serving a non-loopback address in `local` mode refuses to start
+    /// rather than serving unauthenticated.
+    #[arg(long, env = "AJ_AUTH", default_value = "local")]
+    pub auth: String,
+
+    /// Tailnet login allowed to connect in `--auth tailscale` mode,
+    /// repeatable. Spelled exactly as the tailscale daemon reports it
+    /// (e.g. `alice@github`). A tagged node has no login and is admitted
+    /// only by the aj control capability granted in the tailnet policy.
+    #[arg(long, env = "AJ_ALLOW", value_delimiter = ',')]
+    pub allow: Vec<String>,
+
     /// Subcommand selector for the non-conversational utilities
-    /// (`list-sessions`, `continue`, `update-models`).
+    /// (`list-sessions`, `continue`, `update-models`) and the
+    /// remote-control modes (`serve`, `connect`).
     #[command(subcommand)]
     pub command: Option<Command>,
 }
+
+/// Control-port address a bare `--listen` binds: loopback, because the
+/// port is remote code execution and the identity gate's default mode
+/// trusts nothing else.
+pub const DEFAULT_LISTEN_ADDRESS: &str = "127.0.0.1:6161";
 
 /// Output formats supported by print mode.
 #[derive(ValueEnum, Copy, Clone, Eq, PartialEq, Debug, Default)]
@@ -125,6 +166,27 @@ pub enum Command {
     /// Refresh the user model catalog at `~/.aj/models.json` from
     /// `https://models.dev/api.json`.
     UpdateModels,
+    /// Serve this working directory's sessions headlessly on the control
+    /// port, with no terminal UI of its own.
+    ///
+    /// The address comes from the top-level `--listen` / `AJ_LISTEN`, and
+    /// defaults to the loopback control port when neither is given, so a
+    /// bare `aj serve` is reachable by `aj connect` on the same machine.
+    Serve,
+    /// Attach the interactive TUI to a session on a remote aj host.
+    ///
+    /// With no session id the host's most recently modified session is
+    /// attached, and one is created when the host has none.
+    Connect {
+        /// Base URL of the host's control port (e.g.
+        /// `http://100.64.0.2:6161`).
+        url: String,
+        /// Session to attach. Omit to take the host's latest.
+        session_id: Option<String>,
+        /// Create a fresh session instead of attaching an existing one.
+        #[arg(long)]
+        new: bool,
+    },
 }
 
 #[cfg(test)]

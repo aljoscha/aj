@@ -46,8 +46,15 @@ fn select_log_destination<P, W, E>(
 
 /// Whether `args` starts the interactive TUI, as opposed to print mode or a
 /// one-shot subcommand.
+///
+/// `connect` is interactive too: it runs the same shell against a remote
+/// host, so it shares the rule that logs must never share the terminal.
 fn is_interactive(args: &Args) -> bool {
-    !args.print && matches!(args.command, None | Some(Command::Continue { .. }))
+    !args.print
+        && matches!(
+            args.command,
+            None | Some(Command::Continue { .. }) | Some(Command::Connect { .. })
+        )
 }
 
 mod agent_picker;
@@ -70,6 +77,7 @@ mod quit_hint;
 mod remote;
 mod scroll;
 mod selection_copied;
+mod serve;
 mod session_selector;
 mod session_tree;
 mod settings_ui;
@@ -143,11 +151,12 @@ async fn main() -> Result<()> {
     match args.command {
         Some(Command::UpdateModels) => aj_app::handle_update_models_command().await,
         Some(Command::ListSessions) => aj_app::handle_list_sessions(),
+        Some(Command::Serve) => serve::run(args).await,
         Some(Command::Continue {
             session_id: _,
             prompt: _,
         }) => dispatch_session_mode(args).await,
-        None => dispatch_session_mode(args).await,
+        Some(Command::Connect { .. }) | None => dispatch_session_mode(args).await,
     }
 }
 
@@ -155,7 +164,7 @@ async fn main() -> Result<()> {
 mod startup_tests {
     use std::path::Path;
 
-    use aj_app::cli::args::Args;
+    use aj_app::cli::args::{Args, Command};
     use clap::Parser;
 
     use super::{LogDestination, is_interactive, select_log_destination};
@@ -212,9 +221,84 @@ mod startup_tests {
         assert!(is_interactive(&args_of(&["aj"])));
         assert!(is_interactive(&args_of(&["aj", "continue"])));
         assert!(is_interactive(&args_of(&["aj", "continue", "abc"])));
+        assert!(is_interactive(&args_of(&[
+            "aj",
+            "connect",
+            "http://host:6161"
+        ])));
         assert!(!is_interactive(&args_of(&["aj", "--print", "hello"])));
         assert!(!is_interactive(&args_of(&["aj", "list-sessions"])));
         assert!(!is_interactive(&args_of(&["aj", "update-models"])));
+        assert!(
+            !is_interactive(&args_of(&["aj", "serve"])),
+            "serve has no terminal of its own, so its logs keep stderr",
+        );
+    }
+
+    /// `--listen` takes the loopback default bare and an explicit address
+    /// with `=`. The equals form is load-bearing: a space-separated optional
+    /// value would swallow the first word of `aj --listen fix the parser`.
+    #[test]
+    fn listen_defaults_to_loopback_and_accepts_an_explicit_address() {
+        assert_eq!(
+            args_of(&["aj", "--listen"]).listen.as_deref(),
+            Some("127.0.0.1:6161"),
+        );
+        assert_eq!(
+            args_of(&["aj", "--listen=100.64.0.1:7000"])
+                .listen
+                .as_deref(),
+            Some("100.64.0.1:7000"),
+        );
+        assert_eq!(args_of(&["aj"]).listen, None, "a plain run serves nothing");
+
+        let with_prompt = args_of(&["aj", "--listen", "explain", "this"]);
+        assert_eq!(with_prompt.listen.as_deref(), Some("127.0.0.1:6161"));
+        assert_eq!(with_prompt.prompt, vec!["explain", "this"]);
+    }
+
+    /// The identity gate's inputs, whose defaults are the safe ones: no
+    /// allowlist, and the mode that serves loopback only.
+    #[test]
+    fn the_identity_gate_arguments_default_closed() {
+        let plain = args_of(&["aj"]);
+        assert_eq!(plain.auth, "local");
+        assert!(plain.allow.is_empty());
+
+        let shared = args_of(&[
+            "aj",
+            "--auth",
+            "tailscale",
+            "--allow",
+            "alice@github",
+            "--allow",
+            "bob@github,carol@github",
+        ]);
+        assert_eq!(shared.auth, "tailscale");
+        assert_eq!(
+            shared.allow,
+            vec!["alice@github", "bob@github", "carol@github"],
+            "repeated flags and comma-separated values both accumulate",
+        );
+    }
+
+    #[test]
+    fn connect_takes_an_optional_session_and_a_new_flag() {
+        let bare = args_of(&["aj", "connect", "http://host:6161"]);
+        assert!(matches!(
+            bare.command,
+            Some(Command::Connect { ref url, session_id: None, new: false })
+                if url == "http://host:6161"
+        ));
+        let picked = args_of(&["aj", "connect", "http://host:6161", "20260804-120000"]);
+        assert!(matches!(
+            picked.command,
+            Some(Command::Connect { session_id: Some(ref id), .. }) if id == "20260804-120000"
+        ));
+        assert!(matches!(
+            args_of(&["aj", "connect", "http://host:6161", "--new"]).command,
+            Some(Command::Connect { new: true, .. }),
+        ));
     }
 }
 

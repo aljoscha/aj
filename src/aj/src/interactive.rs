@@ -24,14 +24,14 @@ use aj_app::actions::AjAction;
 use aj_app::chat::ChatState;
 use aj_app::cli::args::{Args, Command as CliCommand};
 use aj_app::client::SessionClient;
-use aj_app::commands::{CommandAction, load_model_catalog};
+use aj_app::commands::CommandAction;
 use aj_app::host::{
-    AttachRequest, Attachment, Command, CommandOutcome, HostError, HostSetup, LocalHandles,
-    QueueOp, SessionHost, SettingsAxis, SettingsChange,
+    AttachRequest, Attachment, Command, CommandOutcome, HostError, LocalHandles, QueueOp,
+    SessionHost, SettingsAxis, SettingsChange,
 };
 use aj_app::keybindings::fixed_keys;
 use aj_app::session::{SessionExit, SessionRequest};
-use aj_app::session_setup::build_initial_run_config;
+use aj_app::session_setup::{ComposedHost, compose_host};
 use aj_app::settings::{ConfigLayers, ConfigTarget, PersistAction};
 use aj_app::shutdown::{format_resume_hint, format_session_usage_header, format_usage_summary};
 use aj_app::theme::{
@@ -40,12 +40,11 @@ use aj_app::theme::{
 use aj_app::turn::running_work_counts;
 use aj_conf::skills::Skill;
 use aj_conf::{
-    AgentEnv, Config, ConfigDiagnostic, ConfigSpeed, ConfigThinkingDisplay, ConfigVerbosity,
-    Severity,
+    AgentEnv, Config, ConfigDiagnostic, ConfigThinkingDisplay, ConfigVerbosity, Severity,
 };
 use aj_models::auth::{AuthError, AuthStorage};
 use aj_models::registry::ModelInfo;
-use aj_models::types::{Speed, UserContent};
+use aj_models::types::UserContent;
 use aj_models::usage::default_reset_sources;
 use aj_models::{ThinkingConfig, speed_from_name, thinking_config_from_name};
 use aj_session::{ConversationPersistence, PromptEntry, SessionPreview, ThreadFilter};
@@ -191,17 +190,6 @@ async fn build_world(
     // in the notice block below.
     let keybinding_problems = aj_app::actions::install_keybindings(config.keybindings.clone());
 
-    let speed = match args.speed.as_deref() {
-        Some(s) => Some(s.parse::<ConfigSpeed>().map_err(anyhow::Error::msg)?),
-        None => config.speed,
-    }
-    .map(|s| match s {
-        ConfigSpeed::Standard => Speed::Standard,
-        ConfigSpeed::Fast => Speed::Fast,
-    });
-
-    let (run_config, restore) = build_initial_run_config(args, &config, auth, speed)?;
-
     // `aj continue` with neither an explicit id nor a latest session
     // on disk degrades to a fresh session, matching `aj`.
     let startup = match &args.command {
@@ -222,19 +210,12 @@ async fn build_world(
         _ => StartupSession::Create,
     };
 
-    let catalog = load_model_catalog();
-    let config = Arc::new(StdMutex::new(config));
-    let config_layers = Arc::new(StdMutex::new(layers));
-    let host = SessionHost::new(HostSetup {
-        config: Arc::clone(&config),
-        layers: Arc::clone(&config_layers),
-        catalog: Arc::clone(&catalog),
-        run_config,
-        restore,
-        persistence: persistence.clone(),
-        auth: auth.clone(),
-        working_directory: std::env::current_dir().unwrap_or_default(),
-    })?;
+    let ComposedHost {
+        host,
+        config,
+        layers: config_layers,
+        catalog,
+    } = compose_host(args, layers, auth, persistence)?;
 
     // A resume attaches, which materializes the session on the way in. A
     // create mints one and holds it live.
@@ -4303,6 +4284,19 @@ pub async fn run(args: Args) -> Result<()> {
 
     let mut world = build_world(&args, layers, &diagnostics, &auth, &persistence).await?;
 
+    // The control port serves the very host this shell renders, so a remote
+    // client and this terminal are peers over one host rather than two
+    // processes contending for one session store. Started before the
+    // terminal is taken over, so a refused bind (an address the identity
+    // gate will not serve unauthenticated) reports on the normal screen.
+    let server = match crate::serve::start_server(&args, &world.host).await {
+        Ok(server) => server,
+        Err(err) => {
+            world.host.shutdown().await;
+            return Err(err);
+        }
+    };
+
     // Auto-submit the launch prompt as the initial session's first turn.
     // This sits before the outer session loop below, so an in-process
     // session change never resubmits, matching `aj`.
@@ -4461,6 +4455,11 @@ pub async fn run(args: Args) -> Result<()> {
     // Read what the banner needs before the host tears its sessions down:
     // afterwards there is no live session to ask.
     let banner = ExitBanner::collect(&world, completed_sessions).await;
+    // Remote clients lose the connection when their host departs (spec
+    // section 5), so the port closes before the sessions behind it do.
+    if let Some(server) = server {
+        server.shutdown().await;
+    }
     // Cancels every turn through the graceful path, quiesces the background
     // tasks, flushes the logs, and releases the session locks.
     world.host.shutdown().await;
