@@ -3122,6 +3122,86 @@ async fn the_attach_block_is_contiguous_and_filters_the_boundary() {
 ///
 /// `working` and `settings` are read before the projection, and a `state`
 /// frame published during it is held and dropped, lossy frames being
+/// A cursor at the session's high-water mark is served an empty suffix, and one
+/// past it a full backfill: it names a history this host does not have, so it
+/// counts as an epoch mismatch (spec 6.5). Serving it an empty suffix plus a
+/// `caught_up` would silently rewind the client's cursor instead.
+#[tokio::test]
+async fn a_cursor_past_the_high_water_mark_earns_a_full_backfill() {
+    let harness = Harness::new(vec![finalized_text_message("an answer")]);
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+    client.pump_until_idle().await;
+    let settled = client.canonical();
+    let epoch = client.client.cursor().expect("a committed cursor").epoch;
+    let mark = harness
+        .host
+        .sessions()
+        .await
+        .expect("sessions")
+        .sessions
+        .iter()
+        .find(|entry| entry.id == session)
+        .expect("the session")
+        .last_seq;
+    assert!(mark > 0, "the turn wrote log entries");
+
+    let at_mark = client
+        .reattach(
+            &harness.host,
+            aj_wire::Cursor {
+                epoch: epoch.clone(),
+                seq: mark,
+            },
+        )
+        .await;
+    assert!(
+        durable(&at_mark).is_empty(),
+        "everything is at or below the cursor: {:?}",
+        durable(&at_mark),
+    );
+
+    // Seq 0 reads as "nothing durable yet" (spec 6.4), so it is the cursor
+    // whose suffix is the whole log: the oracle for a full backfill.
+    let from_the_start = client
+        .reattach(
+            &harness.host,
+            aj_wire::Cursor {
+                epoch: epoch.clone(),
+                seq: 0,
+            },
+        )
+        .await;
+    let beyond = client
+        .reattach(
+            &harness.host,
+            aj_wire::Cursor {
+                epoch,
+                seq: mark + 1,
+            },
+        )
+        .await;
+    assert!(
+        !durable(&from_the_start).is_empty(),
+        "the turn is in the log, so a full backfill carries it",
+    );
+    assert_eq!(
+        durable(&beyond),
+        durable(&from_the_start),
+        "a cursor past the mark is served what a cursor at the start is",
+    );
+    // And re-applying the whole history left the client where it was, which is
+    // what makes serving it safe.
+    assert_canonical_eq(
+        &client.canonical(),
+        &settled,
+        "a full backfill under the same epoch",
+    );
+    assert_no_dangling(&client.chat);
+    harness.host.shutdown().await;
+}
+
 /// droppable by definition. Without the refresh, a client whose block was
 /// served across the change would keep showing the settings the block opened
 /// with until something else moved.

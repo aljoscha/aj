@@ -7,16 +7,21 @@
 //! log lock while holding `status`. `status` is a std mutex precisely so
 //! it cannot be held across an await, which is what keeps that rule
 //! mechanical rather than a discipline.
+//!
+//! `status` is also what serializes the session's `state` publishers
+//! against each other, see [`LiveSession::publish_state`].
 
 use std::collections::BTreeSet;
 use std::sync::{Mutex as StdMutex, MutexGuard};
 
 use aj_agent::events::{AgentId, AgentSettings};
 use aj_session::AppendHandoff;
+use aj_wire::Frame;
 use chrono::{DateTime, Utc};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 
+use crate::host::fanout::Fanout;
 use crate::host::{Command, CommandOutcome, HostError};
 use crate::session::SessionCore;
 use crate::session_setup::RunConfigSnapshot;
@@ -85,6 +90,19 @@ pub(crate) struct SessionStatus {
     pub(crate) last_activity: DateTime<Utc>,
 }
 
+impl SessionStatus {
+    /// The `state` frame this status describes (spec 6.3).
+    fn frame(&self, session: &str) -> Frame {
+        Frame::State {
+            session: session.to_string(),
+            epoch: self.epoch.clone(),
+            working: self.working,
+            settings: self.settings.clone(),
+            last_seq: self.last_seq,
+        }
+    }
+}
+
 /// Read the settings identity a `state` frame reports off a session's run
 /// config. The run config is what the next main turn is stamped from, so it
 /// is the authority for "the active model", not the agent (whose copy lags
@@ -130,6 +148,31 @@ impl LiveSession {
     /// take the log lock while holding it (see the module docs).
     pub(crate) fn status(&self) -> MutexGuard<'_, SessionStatus> {
         self.status.lock().expect("session status mutex poisoned")
+    }
+
+    /// Apply `update` to the published status and publish the `state` frame it
+    /// describes, unless `update` reports nothing changed.
+    ///
+    /// The status lock spans the update, the decision and the publish because
+    /// lossy coalescing is newest-wins by queue position (spec 6.9): a frame
+    /// built from an older snapshot but enqueued later drops the queued newer
+    /// one and leaves every subscriber holding the stale snapshot. Holding
+    /// `status` is what serializes the session's publishers, its driver and an
+    /// attach's post-block refresh, so the frame enqueued last is always the
+    /// one built from the newest status.
+    ///
+    /// `update` runs under the status lock, so it must take no other lock that
+    /// anything holds while reading the status (the log's above all, see the
+    /// module docs).
+    pub(crate) fn publish_state(
+        &self,
+        fanout: &Fanout,
+        update: impl FnOnce(&mut SessionStatus) -> bool,
+    ) {
+        let mut status = self.status();
+        if update(&mut status) {
+            fanout.publish(status.frame(self.id()));
+        }
     }
 
     /// Hand `request` to the session's driver. `false` when the driver has

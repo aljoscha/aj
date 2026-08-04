@@ -400,9 +400,9 @@ impl SessionClient {
 
     /// Reconciles the main agent's running mark from a state frame.
     ///
-    /// A client whose stream died before an `AgentEnd` would otherwise
-    /// spin forever: no projected event carries a lifecycle bracket. After
-    /// Between state frames, live lifecycle events are authoritative.
+    /// A client whose stream died before an `AgentEnd` would otherwise spin
+    /// forever: no projected event carries a lifecycle bracket. Between state
+    /// frames, live lifecycle events are authoritative.
     ///
     /// Scoped to `Main`, because `working` says nothing about sub-agents
     /// (spec 6.3). Clearing their marks here would undercount the running

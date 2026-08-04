@@ -321,6 +321,19 @@ impl Driver {
     // -- publishing ------------------------------------------------------
 
     fn publish_event(&self, entry: Option<EntryRef>, event: AgentEvent) {
+        // A `MessageEnd` rides the entry whose id is the message's own id: the
+        // wire codec pins the two together and refuses any other pairing
+        // (`Frame`'s serializer validates as it writes). Nothing validates on
+        // the in-process path, so a host that got this wrong would look healthy
+        // locally while every remote client's stream died and reconnected in a
+        // loop. The assert puts that where the frame is built.
+        if let AgentEvent::MessageEnd { message, .. } = &event {
+            debug_assert_eq!(
+                entry.as_ref().map(|entry| entry.id.as_str()),
+                Some(message.id()),
+                "a MessageEnd must be published with its own log entry",
+            );
+        }
         // Checked outside the guard below: a failing assert inside it would
         // poison the status mutex, and every later `status()` would panic on
         // a lock that is only there to publish frames.
@@ -369,29 +382,15 @@ impl Driver {
     /// where a `last_seq` a client is not attached to surfaces.
     fn refresh_state(&self) {
         let working = self.turns.is_busy(&self.lifecycle, AgentId::Main);
-        let changed = {
-            let mut status = self.session.status();
+        self.session.publish_state(&self.shared.fanout, |status| {
             let changed = status.working != working;
             status.working = working;
             changed
-        };
-        if changed {
-            self.publish_state();
-        }
+        });
     }
 
     fn publish_state(&self) {
-        let frame = {
-            let status = self.session.status();
-            Frame::State {
-                session: self.session.id().to_string(),
-                epoch: status.epoch.clone(),
-                working: status.working,
-                settings: status.settings.clone(),
-                last_seq: status.last_seq,
-            }
-        };
-        self.shared.fanout.publish(frame);
+        self.session.publish_state(&self.shared.fanout, |_| true);
     }
 
     /// Publish `agent`'s queue snapshot. The agent only emits this after a
@@ -743,8 +742,11 @@ impl Driver {
                 },
             );
         }
-        self.session.status().settings = settings_of(&self.session.core.run_config);
-        self.publish_state();
+        let settings = settings_of(&self.session.core.run_config);
+        self.session.publish_state(&self.shared.fanout, |status| {
+            status.settings = settings;
+            true
+        });
         Ok(CommandOutcome::Accepted)
     }
 

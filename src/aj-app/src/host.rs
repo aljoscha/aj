@@ -234,9 +234,12 @@ pub struct AttachRequest {
 /// Direct handles into one live session, for a client attached in process.
 ///
 /// Spec section 5 sanctions this: the local frontend attaches "through direct
-/// handles and channels, not through HTTP". It is a **read** surface. The
-/// pending-message box re-reads the live queues at draw time, the footer the
-/// run config and the task registry, and none of that goes through a command.
+/// handles and channels, not through HTTP". It is a **read** surface: the
+/// footer reads the run config, a task-output overlay the task registry, and
+/// none of that goes through a command. The pending-message box does not
+/// appear here, it renders the queue snapshot the fold keeps in
+/// [`ChatState::queue`](crate::chat::ChatState::queue), which is one path for
+/// a local and a remote frontend alike.
 ///
 /// Mutating through these handles is a convention this type cannot enforce,
 /// because the handles it hands out (the queues, the log, the run config) are
@@ -388,8 +391,8 @@ impl SessionHost {
         Ok(Self { inner })
     }
 
-    /// Protocol identity and capabilities (spec 6.1). Phase 1 advertises
-    /// none: there is no transport yet, so there is nothing to negotiate.
+    /// Protocol identity and capabilities (spec 6.1). The capability list is
+    /// empty: everything the protocol carries today is in its base version.
     pub fn hello(&self) -> Hello {
         Hello {
             protocol: PROTOCOL_VERSION,
@@ -570,8 +573,18 @@ impl SessionHost {
             .map(|entry| Arc::clone(&entry.session))
             .collect();
 
-        let mut summaries: BTreeMap<String, SessionSummary> = BTreeMap::new();
+        // The live sessions first, because a session this host holds answers
+        // every field off its own status. Counting its log's entries would be
+        // blocking IO on a runtime worker for a file that grows on every
+        // append, so the fingerprint cache would miss on every list tick.
+        let mut summaries: BTreeMap<String, SessionSummary> = live
+            .iter()
+            .map(|session| (session.id().to_string(), summarize(session)))
+            .collect();
         for metadata in on_disk {
+            if summaries.contains_key(&metadata.session_id) {
+                continue;
+            }
             let last_seq = self.cold_last_seq(&metadata);
             summaries.insert(
                 metadata.session_id.clone(),
@@ -586,9 +599,6 @@ impl SessionHost {
                     unreachable: false,
                 },
             );
-        }
-        for session in live {
-            summaries.insert(session.id().to_string(), summarize(&session));
         }
         // Latest first: session ids are minted as timestamps, so their
         // descending order is chronological.
@@ -1116,6 +1126,9 @@ impl SessionHost {
             )
         };
         let boundary = snapshot.last_seq();
+        // Only the epoch is checked here. A cursor past the boundary is treated
+        // as a mismatch too (spec 6.5), which `project_suffix` does: it owns
+        // the clamp because it is the layer that knows the log's own mark.
         let cursor = request
             .cursor
             .as_ref()
@@ -1232,21 +1245,9 @@ impl SessionHost {
         // frame is what self-heals that. Only when something actually
         // moved: an unconditional re-emission would make every attach look
         // like a state change to every other client on the host.
-        let refreshed = {
-            let status = session.status();
-            (status.working != working_seen || status.settings != settings_seen).then(|| {
-                Frame::State {
-                    session: session.id().to_string(),
-                    epoch: status.epoch.clone(),
-                    working: status.working,
-                    settings: status.settings.clone(),
-                    last_seq: status.last_seq,
-                }
-            })
-        };
-        if let Some(refreshed) = refreshed {
-            self.inner.shared.fanout.publish(refreshed);
-        }
+        session.publish_state(&self.inner.shared.fanout, |status| {
+            status.working != working_seen || status.settings != settings_seen
+        });
         true
     }
 }
