@@ -2122,7 +2122,7 @@ async fn a_joiner_refetches_the_task_table_after_caught_up() {
     joiner.settle().await;
 
     assert_eq!(
-        joiner.client.tasks().tasks.len(),
+        joiner.chat.tasks().len(),
         1,
         "the joiner's table came from the read: a backfill carries no task events",
     );

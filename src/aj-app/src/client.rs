@@ -3,9 +3,9 @@
 //! [`SessionClient`] is the consumer contract a session host has to
 //! satisfy. It turns the frames of one session into reducer calls and
 //! keeps the state no transcript carries: the session's epoch, the two
-//! cursor positions, the lifecycle sets, and the settings, queue and
-//! background-task snapshots a remote frontend cannot read off live
-//! handles.
+//! cursor positions, the lifecycle sets, and the settings. The queue and
+//! background-task snapshots a remote frontend cannot read off live handles
+//! go into [`ChatState`], which is what every frontend renders from.
 //!
 //! [`ChatState`] stays outside the client. A frontend can hold it behind
 //! widgets it cannot repoint, so the fold takes it as a parameter.
@@ -63,8 +63,6 @@ pub struct SessionClient {
     attach: Attach,
     settings: Option<AgentSettings>,
     working: bool,
-    queue: QueueState,
-    tasks: TaskTable,
     first_attach_settings: Option<AgentSettings>,
     saw_first_attach: bool,
     needs_task_refetch: bool,
@@ -84,8 +82,6 @@ impl SessionClient {
             attach: Attach::Live,
             settings: None,
             working: false,
-            queue: QueueState::default(),
-            tasks: TaskTable::default(),
             first_attach_settings: None,
             saw_first_attach: false,
             needs_task_refetch: false,
@@ -187,8 +183,12 @@ impl SessionClient {
                     // and drops the payload, because the local view
                     // re-reads the live queues at draw time. A remote
                     // client has no such handle, so the snapshot is kept
-                    // here.
-                    self.note_queue(chat, *agent_id, steering.clone(), follow_up.clone());
+                    // in the chat model.
+                    chat.note_queue(AgentQueue {
+                        agent_id: *agent_id,
+                        steering: steering.clone(),
+                        follow_up: follow_up.clone(),
+                    });
                 }
                 reduce(
                     chat,
@@ -322,31 +322,18 @@ impl SessionClient {
         self.working
     }
 
-    /// Pending steering and follow-up messages, from `QueueUpdate` frames
-    /// and [`Self::set_queue`].
-    pub fn queue(&self) -> &QueueState {
-        &self.queue
-    }
-
     /// Replace the queue snapshot from the queue read (spec 6.7), which is
     /// how a mid-session joiner learns about messages queued before it
     /// attached. Clears [`Self::needs_queue_refetch`].
     pub fn set_queue(&mut self, chat: &mut ChatState, queue: QueueState) {
-        chat.replace_queue(queue.clone());
-        self.queue = queue;
+        chat.replace_queue(queue);
         self.needs_queue_refetch = false;
-    }
-
-    /// The background-task table, from the tasks read.
-    pub fn tasks(&self) -> &TaskTable {
-        &self.tasks
     }
 
     /// Replace the task table from the tasks read, clearing
     /// [`Self::needs_task_refetch`].
     pub fn set_tasks(&mut self, chat: &mut ChatState, tasks: TaskTable) {
-        chat.replace_tasks(tasks.clone());
-        self.tasks = tasks;
+        chat.replace_tasks(tasks);
         self.needs_task_refetch = false;
     }
 
@@ -415,32 +402,6 @@ impl SessionClient {
             self.lifecycle.mark_running(AgentId::Main);
         } else {
             self.lifecycle.mark_idle(AgentId::Main);
-        }
-    }
-
-    fn note_queue(
-        &mut self,
-        chat: &mut ChatState,
-        agent_id: AgentId,
-        steering: Vec<aj_agent::message::AgentMessage>,
-        follow_up: Vec<aj_agent::message::AgentMessage>,
-    ) {
-        let updated = AgentQueue {
-            agent_id,
-            steering,
-            follow_up,
-        };
-        chat.note_queue(updated.clone());
-        match self
-            .queue
-            .queues
-            .iter_mut()
-            .find(|queue| queue.agent_id == agent_id)
-        {
-            // The event carries a full snapshot of both queues, so it
-            // replaces the agent's entry rather than merging into it.
-            Some(existing) => *existing = updated,
-            None => self.queue.queues.push(updated),
         }
     }
 
@@ -967,7 +928,7 @@ mod tests {
         );
 
         assert!(!client.needs_task_refetch());
-        assert_eq!(client.tasks().tasks.len(), 1);
+        assert_eq!(chat.tasks().len(), 1);
         assert_eq!(
             chat.tasks().get(&7).map(|task| task.call_id.as_str()),
             Some("call-1"),
@@ -989,7 +950,7 @@ mod tests {
     fn caught_up_flags_a_queue_refetch_that_set_queue_clears() {
         let (mut client, mut chat) = attached();
         assert!(client.needs_queue_refetch());
-        assert!(client.queue().queues.is_empty());
+        assert!(chat.queue().queues.is_empty());
 
         client.set_queue(
             &mut chat,
@@ -1003,8 +964,12 @@ mod tests {
         );
 
         assert!(!client.needs_queue_refetch());
-        assert_eq!(client.queue().queues.len(), 1);
         assert_eq!(chat.queue().queues.len(), 1);
+        assert_eq!(
+            chat.queue().queues[0].follow_up.len(),
+            1,
+            "the read replaces the queue model the pending box renders",
+        );
     }
 
     /// A re-attach seeds the main agent's mark and leaves the sub-agents'
@@ -1074,7 +1039,7 @@ mod tests {
     #[test]
     fn a_queue_update_frame_updates_the_queue_snapshot() {
         let (mut client, mut chat) = attached();
-        assert!(client.queue().queues.is_empty());
+        assert!(chat.queue().queues.is_empty());
 
         assert!(
             client
@@ -1092,10 +1057,9 @@ mod tests {
                 .0
         );
 
-        assert_eq!(client.queue().queues.len(), 1);
-        assert_eq!(client.queue().queues[0].agent_id, AgentId::Main);
-        assert_eq!(client.queue().queues[0].follow_up.len(), 1);
         assert_eq!(chat.queue().queues.len(), 1);
+        assert_eq!(chat.queue().queues[0].agent_id, AgentId::Main);
+        assert_eq!(chat.queue().queues[0].follow_up.len(), 1);
 
         // Each event carries a full snapshot, so the next one replaces the
         // agent's entry rather than adding to it.
@@ -1111,12 +1075,11 @@ mod tests {
             ),
         );
 
-        assert_eq!(client.queue().queues.len(), 1);
-        assert_eq!(client.queue().queues[0].steering.len(), 1);
-        assert!(client.queue().queues[0].follow_up.is_empty());
+        assert_eq!(chat.queue().queues.len(), 1);
+        assert_eq!(chat.queue().queues[0].steering.len(), 1);
+        assert!(chat.queue().queues[0].follow_up.is_empty());
 
         client.set_queue(&mut chat, QueueState::default());
-        assert!(client.queue().queues.is_empty());
         assert!(chat.queue().queues.is_empty());
     }
 

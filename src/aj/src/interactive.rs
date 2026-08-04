@@ -9208,30 +9208,27 @@ mod tests {
             !world.client.needs_queue_refetch(),
             "and the queue read too",
         );
-        assert_eq!(
-            world
-                .client
-                .tasks()
-                .tasks
-                .iter()
-                .map(|summary| summary.id)
-                .collect::<Vec<_>>(),
-            vec![task],
-            "the task table came off the read",
-        );
-        assert_eq!(world.client.queue().queues.len(), 1);
-        assert_eq!(
-            world.client.queue().queues[0]
-                .follow_up
-                .iter()
-                .filter_map(|message| match message.as_stored_wire() {
-                    Some(aj_models::types::Message::User(user)) => Some(user_text(user)),
-                    _ => None,
-                })
-                .collect::<Vec<_>>(),
-            vec!["queued"],
-            "and so did the queue snapshot",
-        );
+        {
+            let chat = world.chat.borrow();
+            assert_eq!(
+                chat.tasks().keys().copied().collect::<Vec<_>>(),
+                vec![task],
+                "the task table came off the read",
+            );
+            assert_eq!(chat.queue().queues.len(), 1);
+            assert_eq!(
+                chat.queue().queues[0]
+                    .follow_up
+                    .iter()
+                    .filter_map(|message| match message.as_stored_wire() {
+                        Some(aj_models::types::Message::User(user)) => Some(user_text(user)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                vec!["queued"],
+                "and so did the queue snapshot",
+            );
+        }
         shut_down(&world).await;
     }
 
@@ -9366,7 +9363,7 @@ mod tests {
         assert_eq!(snapshot.text, "second");
         fold_ready_frames(&mut world);
         assert_eq!(
-            world.client.queue().queues.len(),
+            world.chat.borrow().queue().queues.len(),
             1,
             "and the client learns about it from the queue frame the host \
              publishes on the enqueue side",

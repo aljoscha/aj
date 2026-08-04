@@ -1995,7 +1995,7 @@ fn queued(client: &Client, agent: AgentId) -> (Vec<String>, Vec<String>) {
             .collect()
     };
     client
-        .client
+        .chat
         .queue()
         .queues
         .iter()
