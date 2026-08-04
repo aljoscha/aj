@@ -161,6 +161,16 @@ impl LiveSession {
     /// attach's post-block refresh, so the frame enqueued last is always the
     /// one built from the newest status.
     ///
+    /// The enqueue is part of what the lock protects. Building the frame under
+    /// the lock and publishing after releasing it leaves the same window open,
+    /// only narrower: two publishers can still reach `Fanout::publish` out of
+    /// status order.
+    ///
+    /// NOTE: nothing observes that ordering from outside. The window is a few
+    /// instructions wide and the only publisher competing with an attach's
+    /// refresh is the session's own driver, so no test can be made to fail on
+    /// it reliably. This rule is the guard.
+    ///
     /// `update` runs under the status lock, so it must take no other lock that
     /// anything holds while reading the status (the log's above all, see the
     /// module docs).
