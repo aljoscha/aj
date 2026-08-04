@@ -3659,9 +3659,8 @@ impl Shell {
                     ctx.redraw = true;
                 }));
         }
-        // Route transcript box clicks through the picker outcome slot. The
-        // drive loop then applies the normal observe behavior, including
-        // materializing deferred transcripts from resumed sessions.
+        // Route transcript box clicks through the picker outcome slot, so the
+        // drive loop applies the normal observe behavior.
         {
             let picker_outcome = Rc::clone(&picker_outcome);
             transcript
@@ -5200,6 +5199,17 @@ async fn drive(
         // returns). One drain per iteration is what keeps the chrome mirrors
         // below from lagging the host by a frame.
         if fold_ready_frames(world) {
+            app.request_redraw();
+        }
+        // Continuity broke (a head switch this process did not make), so the
+        // client owes a re-attach. Nothing else in phase 1 publishes a
+        // `reset`, but leaving the obligation undischarged would silently
+        // freeze the transcript: every later frame carries an epoch the fold
+        // filters out.
+        if world.client.needs_reattach() {
+            if let Err(err) = reattach(world, shell).await {
+                fold_warning(world, &format!("Lost the session's event stream: {err}"));
+            }
             app.request_redraw();
         }
         // The attach block a re-attach served may have obliged the reads
@@ -8106,6 +8116,55 @@ mod tests {
             user_rows(&world).iter().any(|text| text == "again"),
             "and the second prompt ran: {:?}",
             user_rows(&world),
+        );
+        shut_down(&world).await;
+    }
+
+    /// A `reset` frame (a head switch this client did not make) leaves the
+    /// client owing a re-attach, and the re-attach rebuilds the transcript
+    /// under the new epoch without duplicating what it already had.
+    ///
+    /// The drive loop discharges the same obligation at the bottom of each
+    /// iteration. Nothing in phase 1 moves a head behind this client's back,
+    /// so the command below stands in for the second writer that will.
+    #[tokio::test]
+    async fn a_reset_is_discharged_by_a_re_attach() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        run_prompt(&mut world, "seed").await;
+        let before = user_rows(&world);
+        assert_eq!(before, vec!["seed"]);
+
+        let head = world
+            .handles
+            .log
+            .lock()
+            .await
+            .head()
+            .cloned()
+            .expect("a persisted head");
+        world
+            .host
+            .command(&world.session, Command::Head { entry: head })
+            .await
+            .expect("the head switch is accepted");
+        fold_ready_frames(&mut world);
+        assert!(
+            world.client.needs_reattach(),
+            "the reset frame left the client owing a re-attach",
+        );
+
+        reattach(&mut world, &shell).await.expect("re-attach");
+
+        assert!(
+            !world.client.needs_reattach(),
+            "asking for the attach discharged it",
+        );
+        assert_eq!(
+            user_rows(&world),
+            before,
+            "the new epoch's backfill rebuilt the transcript rather than \
+             doubling it",
         );
         shut_down(&world).await;
     }
