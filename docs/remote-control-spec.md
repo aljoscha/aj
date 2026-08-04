@@ -162,8 +162,26 @@ Responsibilities:
 
 - Session lifecycle: create, materialize on demand (attach or command
   to a known-on-disk session), keep live, tear down cleanly on
-  shutdown. Idle eviction is out of scope for v1, sessions stay live
-  until the host exits.
+  shutdown. Materialization has a symmetric release: a live session
+  that is quiescent (no turn in flight, no live background tasks, no
+  queued messages, queues are memory-only and must not be evicted
+  away) and has no attached clients is de-materialized after an idle
+  grace period: the turn driver is joined, log buffers are flushed,
+  the lock is released, and the epoch dies with the materialization
+  (section 6.5). The next attach or command re-materializes with a
+  fresh epoch and a full backfill, which the protocol absorbs by
+  design, so eviction needs no wire surface of its own. The grace
+  period is implementation taste, but long enough that switching away
+  and back does not thrash resume. Eviction serializes with
+  materialization per session id, a command arriving mid-teardown
+  waits and re-materializes. Attachment is the retention signal:
+  remote clients detach by reopening the stream without naming the
+  session, the in-process client detaches sessions it no longer
+  views, and a sidebar-era client that deliberately keeps background
+  sessions attached (section 9.2) thereby deliberately retains their
+  locks, that is use, not a leak. Without release-on-idle a
+  long-lived host monotonically accumulates every session it ever
+  touched, holding locks other processes in the same directory need.
 - Single-writer safety: materializing a session takes an advisory lock
   on the session, held in a lock file beside the log (the log itself is
   created lazily, so there is not always a file to lock), released on
@@ -171,7 +189,10 @@ Responsibilities:
   because resume truncates a torn tail and repair appends tool results,
   so a refused materialization must not have touched the file. A second process (host
   or plain interactive aj) that hits the lock refuses to materialize
-  that session (surfaced as a 409 over the wire). This is what keeps
+  that session (surfaced as a 409 over the wire). The lock file
+  records its holder (pid and host id), and the refusal carries that,
+  a user facing "session in use" needs to know which process to go
+  quit or detach. This is what keeps
   `aj --listen` and a gateway-spawned `aj serve` in the same directory
   from corrupting a shared log.
 - Per session: the `SessionCore` (agent, log, queues, task registry),
