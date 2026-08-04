@@ -845,13 +845,15 @@ async fn creation_resolves_real_models_from_the_host_catalog_with_lazy_auth() {
         .await
         .expect("lazy credentials do not prevent session creation");
     let handles = harness.host.local_handles(&session).await.expect("handles");
-    let config = handles
-        .run_config
-        .lock()
-        .expect("run config mutex poisoned");
-    assert_eq!(config.model_key, ("openai".into(), "gpt-catalog".into()));
-    assert_eq!(config.model_info.base_url, "https://override.example/v1");
-    drop(config);
+    let (model_key, base_url) = {
+        let config = handles
+            .run_config
+            .lock()
+            .expect("run config mutex poisoned");
+        (config.model_key.clone(), config.model_info.base_url.clone())
+    };
+    assert_eq!(model_key, ("openai".into(), "gpt-catalog".into()));
+    assert_eq!(base_url, "https://override.example/v1");
     harness.host.shutdown().await;
 }
 
@@ -2348,17 +2350,22 @@ async fn thinking_display_is_live_only_and_survives_bundle_rebuilds() {
         .await
         .expect("speed change");
 
-    let cfg = handles
-        .run_config
-        .lock()
-        .expect("run config mutex poisoned");
-    assert_eq!(cfg.thinking_display, Some(ConfigThinkingDisplay::Detailed));
+    let (display, reasoning_summary) = {
+        let cfg = handles
+            .run_config
+            .lock()
+            .expect("run config mutex poisoned");
+        (
+            cfg.thinking_display,
+            cfg.stream_options.reasoning_summary.clone(),
+        )
+    };
+    assert_eq!(display, Some(ConfigThinkingDisplay::Detailed));
     assert_eq!(
-        cfg.stream_options.reasoning_summary,
+        reasoning_summary,
         Some(aj_models::types::ReasoningSummary::Detailed),
         "model and speed rebuilds preserve the session-tracked display",
     );
-    drop(cfg);
     harness.host.shutdown().await;
 }
 

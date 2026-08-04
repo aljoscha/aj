@@ -211,6 +211,11 @@ impl LiveSender {
     }
 }
 
+// The queue is behind a mutex, so neither receive needs `&mut` to be sound.
+// They take it to say there is one reader: two tasks receiving concurrently
+// would interleave a session's frames, and the stream's whole contract is that
+// they arrive in order.
+#[allow(clippy::needless_pass_by_ref_mut)]
 impl LiveReceiver {
     async fn recv(&mut self) -> Option<Frame> {
         loop {
