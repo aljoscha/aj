@@ -302,6 +302,15 @@ URL path segment) and treats them as opaque in its own API. Clients
 never parse session ids. Cross-host uniqueness rests on `host_id`,
 which is why it names the session store (section 4).
 
+Opaque to clients does not mean unvalidated at the server. A host
+turns session ids into store filenames, so a wire-supplied id is
+validated syntactically at the boundary (its own id grammar, and
+categorically nothing containing a path separator or `..`) and
+rejected with 404 before it reaches any path construction or store
+lookup. Membership in an enumeration is not a substitute: it happens
+to be safe, but it couples path safety to how a lookup is
+implemented.
+
 ### 6.3 Frames
 
 `GET /v1/events` opens the SSE stream. Each frame is one JSON object,
@@ -654,8 +663,11 @@ sessions' in-memory state plus a cold-session cache and performs no
 filesystem work at all, not even stats. The cold cache is (re)built
 at enumeration points, which are rare and externally paced: host
 startup, an explicit `GET /v1/sessions`, a stream attach. The host's
-own structural changes (session create, delete, release of a
-materialized session) update the cache directly. A concurrent writer
+own structural changes reach the directory without enumeration: a
+created session appears through the live map, and a release writes
+the session's final row into the cold cache from the driver's own
+state (deletion, should it ever exist, would remove the row the same
+way). A concurrent writer
 in the same directory is a conflict the session locks exist to
 surface, not a workload to poll for, its sessions cannot be served by
 this host anyway, and its activity becomes visible at the next
@@ -663,9 +675,15 @@ enumeration point. Reading a live session's log back to recount
 entries is never correct, the host already holds its `last_seq`.
 This contract has teeth: the polling variant of this design read
 hundreds of gigabytes a day sniffing and recounting an unchanged
-400-file directory. A refresh whose payload is identical to the last
-published frame is suppressed even so, `list` is cumulative and an
-unchanged snapshot carries no information.
+400-file directory. A refresh whose payload a subscriber has already
+been sent is not sent to it again, `list` is cumulative and an
+unchanged snapshot carries no information. The comparison is per
+subscriber and against what was actually delivered: a freshly
+attached subscriber has been sent nothing, and a snapshot a client's
+bounded queue dropped was not delivered either. A single host-global
+"last published" memory could keep neither promise, it would starve
+a fresh subscriber on a quiet host and strand a client whose queue
+dropped a frame.
 
 ### 6.9 Flow control
 

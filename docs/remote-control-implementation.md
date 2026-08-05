@@ -281,10 +281,13 @@ with the TUI test support.
 
 Then: unified stream fan-out for many sessions, the sidebar and
 per-session `ChatState` switching, the tree view and branching UX
-over the wire, `aj gateway` with static host config and the
-`/v1/hosts` enrollment endpoints (with persisted enrollment state),
-id namespacing, control connections and splice forwarding,
-`unreachable` surfacing.
+over the wire, session-id validation at the wire boundary (spec 6.2,
+required before any single-id lookup may touch a path directly, and
+what unblocks `ColdSessions::contains` answering a one-id membership
+question without enumerating the store), `aj gateway` with static
+host config and the `/v1/hosts` enrollment endpoints (with persisted
+enrollment state), id namespacing, control connections and splice
+forwarding, `unreachable` surfacing.
 
 Acceptance: gateway tests green, manual: two `aj serve` hosts, one
 gateway, one client, switch between sessions on both hosts with
