@@ -640,6 +640,10 @@ counting) caches on facts that actually change (a file's format
 never does). Violating this turns the list publisher into a
 steady-state I/O storm: a debounced refresh that rescans a large
 session directory reads hundreds of gigabytes over a working day.
+A refresh whose payload is identical to the last published frame is
+suppressed, `list` is cumulative so an unchanged snapshot carries no
+information, and emitting it anyway streams identical kilobytes to
+every attached client for the length of a turn.
 
 ### 6.9 Flow control
 
