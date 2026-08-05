@@ -170,7 +170,23 @@ Responsibilities:
   the lock is released, and the epoch dies with the materialization
   (section 6.5). The next attach or command re-materializes with a
   fresh epoch and a full backfill, which the protocol absorbs by
-  design, so eviction needs no wire surface of its own. The grace
+  design, so eviction needs no wire surface of its own. Release costs
+  exactly what a process restart plus resume costs, because it is
+  one: everything scoped to a materialization dies with it, live
+  sub-agent handles (continuing a concluded sub or adjusting per-sub
+  settings is refused after re-materialization, as after any resume),
+  the background task table, and per-materialization usage
+  accounting. Only log-durable state survives, which is the same
+  contract resume has always had. One session is exempt from release:
+  a created-but-never-durable session (nothing punctuated to disk
+  yet) stays live for the host's lifetime, releasing it would orphan
+  its id (no file, nothing to re-materialize from), and force-
+  flushing it to disk would litter the store with empty sessions.
+  Local aj has the same semantics, an unprompted session is
+  process-lifetime state that vanishes on exit. The accumulation this
+  permits is bounded by deliberate client action, and its lock blocks
+  nobody (there is no file for another process to want). If it ever
+  matters, the answer is explicit deletion, not release. The grace
   period is implementation taste, but long enough that switching away
   and back does not thrash resume. Eviction serializes with
   materialization per session id, a command arriving mid-teardown
