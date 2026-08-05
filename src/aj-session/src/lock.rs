@@ -10,7 +10,9 @@
 //! [`claim_session_id`]), which is the only atomic way to reserve an id
 //! whose log file does not exist yet.
 
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use nix::errno::Errno;
@@ -39,8 +41,42 @@ use crate::persistence::ConversationPersistence;
 /// log is created lazily: a session that has not punctuated yet has no
 /// file to lock.
 pub struct SessionLock {
-    /// Dropping this releases the lock. Held for that effect only.
-    _flock: Flock<File>,
+    /// Dropping this releases the lock.
+    flock: Flock<File>,
+}
+
+impl Drop for SessionLock {
+    fn drop(&mut self) {
+        // Clear the holder record before the lock goes, while we still hold it.
+        // A record that outlived its holder would name a process that has since
+        // exited, or worse a live one that inherited its pid, so what a refusal
+        // reports would be a guess dressed up as a fact. Surviving a clean
+        // release is the one thing the record must not do: a crash leaves one
+        // behind, and a crash also releases the lock, so nobody is refused and
+        // nobody reads it.
+        let _ = self.flock.set_len(0);
+    }
+}
+
+/// Who holds a session's lock, as its lock file records it.
+///
+/// Display data, for telling a user which process to go quit or detach. It is
+/// written best-effort and read back best-effort, so a missing, empty or
+/// unparsable record is not an error, it just means the holder cannot be
+/// named. Never branch on it: the lock itself is the only authority on
+/// whether a session is held.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockHolder {
+    pub pid: u32,
+    /// The store-level id of the host that took the lock, which is what
+    /// distinguishes two hosts over one store (spec section 4).
+    pub host_id: String,
+}
+
+impl fmt::Display for LockHolder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "pid {} of host {}", self.pid, self.host_id)
+    }
 }
 
 impl SessionLock {
@@ -49,9 +85,14 @@ impl SessionLock {
     ///
     /// Takes the persistence handle rather than a bare path so the lock
     /// cannot be sited in a different store than the log it guards.
+    ///
+    /// `host_id` identifies the taker for [`Self::holder`]. Recording it is
+    /// best-effort: a lock we won but could not annotate is still a lock, so a
+    /// failed write is logged and ignored rather than dropping it.
     pub fn try_acquire(
         persistence: &ConversationPersistence,
         session_id: &str,
+        host_id: &str,
     ) -> Result<Option<Self>, ConversationError> {
         let path = lock_path(persistence.sessions_dir(), session_id);
         if let Some(dir) = path.parent() {
@@ -65,13 +106,52 @@ impl SessionLock {
             .truncate(false)
             .open(&path)?;
         match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-            Ok(flock) => Ok(Some(Self { _flock: flock })),
+            Ok(mut flock) => {
+                // Only now, with the lock won: writing before would clobber
+                // the record of whoever actually holds it.
+                if let Err(err) = record_holder(&mut flock, host_id) {
+                    tracing::debug!("could not record the holder of {}: {err}", path.display());
+                }
+                Ok(Some(Self { flock }))
+            }
             // The documented non-blocking refusal, i.e. somebody else
             // holds it. Anything else is a real failure to report.
             Err((_, Errno::EWOULDBLOCK)) => Ok(None),
             Err((_, errno)) => Err(ConversationError::Io(errno.into())),
         }
     }
+
+    /// The holder `session_id`'s lock file names, `None` when it names nobody
+    /// legible: no file, no current holder, an older build's empty one, or a
+    /// record we cannot parse.
+    ///
+    /// Ask only after an acquire of your own was refused. A record is cleared
+    /// on release, so one that is present belongs to a live holder, but this
+    /// does not check the lock itself and a holder that wrote none (an older
+    /// build) leaves the answer empty rather than wrong.
+    pub fn holder(persistence: &ConversationPersistence, session_id: &str) -> Option<LockHolder> {
+        let path = lock_path(persistence.sessions_dir(), session_id);
+        let recorded = fs::read_to_string(&path).ok()?;
+        let (pid, host_id) = recorded.trim().split_once(char::is_whitespace)?;
+        Some(LockHolder {
+            pid: pid.parse().ok()?,
+            host_id: host_id.trim().to_string(),
+        })
+    }
+}
+
+/// Stamp `pid host_id` onto a lock file we just won, replacing whatever the
+/// previous holder left there.
+fn record_holder(flock: &mut Flock<File>, host_id: &str) -> std::io::Result<()> {
+    // Truncate rather than overwrite in place: the previous holder's record
+    // can be longer than ours, and a partial overwrite would leave a hybrid
+    // of two records behind.
+    flock.set_len(0)?;
+    // One write, because the reader takes no lock: a formatted write would land
+    // in a syscall per fragment, and a read between two of them would see a pid
+    // with no host id after it.
+    flock.write_all(format!("{} {host_id}\n", std::process::id()).as_bytes())?;
+    flock.flush()
 }
 
 /// Claim `session_id` by creating its lock file, failing with
@@ -106,12 +186,20 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Acquire for a fixed host id, since these tests do not care which.
+    fn acquire(
+        persistence: &ConversationPersistence,
+        session_id: &str,
+    ) -> Result<Option<SessionLock>, ConversationError> {
+        SessionLock::try_acquire(persistence, session_id, "host-under-test")
+    }
+
     #[test]
     fn a_held_lock_refuses_a_second_acquire_until_it_is_dropped() {
         let dir = TempDir::new().expect("temp dir");
         let persistence = ConversationPersistence::new(dir.path().join("sessions"));
 
-        let held = SessionLock::try_acquire(&persistence, "s-1")
+        let held = acquire(&persistence, "s-1")
             .expect("acquire")
             .expect("nobody holds it yet");
         assert!(
@@ -125,19 +213,19 @@ mod tests {
         // what makes an in-process assertion an honest test of the
         // cross-process behaviour we are after.
         assert!(
-            SessionLock::try_acquire(&persistence, "s-1")
+            acquire(&persistence, "s-1")
                 .expect("try_acquire is not an error while held")
                 .is_none(),
             "a second acquire must refuse while the first is held"
         );
 
         // A different session is a different lock file, so it is free.
-        let other = SessionLock::try_acquire(&persistence, "s-2")
+        let other = acquire(&persistence, "s-2")
             .expect("acquire")
             .expect("a different session does not conflict");
 
         drop(held);
-        let reacquired = SessionLock::try_acquire(&persistence, "s-1")
+        let reacquired = acquire(&persistence, "s-1")
             .expect("acquire")
             .expect("the lock is free again once released");
         drop(reacquired);
@@ -156,9 +244,77 @@ mod tests {
             .expect_err("a second claim of the same id must fail");
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
 
-        let held = SessionLock::try_acquire(&persistence, "s-1")
+        let held = acquire(&persistence, "s-1")
             .expect("acquire over an existing claim")
             .expect("a claim does not hold the lock");
         drop(held);
+    }
+
+    /// The refused side learns who to go quit: the holder's record is readable
+    /// while the lock is held, and it survives the release (nothing removes a
+    /// lock file) so a caller only asks after a refusal of its own.
+    #[test]
+    fn a_taken_lock_records_a_holder_the_refused_side_can_read() {
+        let dir = TempDir::new().expect("temp dir");
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+
+        assert_eq!(
+            SessionLock::holder(&persistence, "s-1"),
+            None,
+            "a session nobody ever locked names nobody"
+        );
+
+        let held = SessionLock::try_acquire(&persistence, "s-1", "host-a")
+            .expect("acquire")
+            .expect("nobody holds it yet");
+        assert!(acquire(&persistence, "s-1").expect("try_acquire").is_none());
+        let holder = SessionLock::holder(&persistence, "s-1").expect("a recorded holder");
+        assert_eq!(
+            holder,
+            LockHolder {
+                pid: std::process::id(),
+                host_id: "host-a".to_string(),
+            },
+        );
+        assert_eq!(
+            holder.to_string(),
+            format!("pid {} of host host-a", std::process::id())
+        );
+        drop(held);
+
+        // The next holder replaces the record rather than appending to it.
+        let held = SessionLock::try_acquire(&persistence, "s-1", "b")
+            .expect("acquire")
+            .expect("free again");
+        assert_eq!(
+            SessionLock::holder(&persistence, "s-1")
+                .expect("a recorded holder")
+                .host_id,
+            "b",
+        );
+        drop(held);
+    }
+
+    /// A lock file an older build left behind carries no record. It still
+    /// locks, and the holder read reports nothing rather than failing.
+    #[test]
+    fn a_legacy_lock_file_names_nobody() {
+        let dir = TempDir::new().expect("temp dir");
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let path = lock_path(persistence.sessions_dir(), "s-1");
+        fs::create_dir_all(path.parent().expect("a locks dir")).expect("mkdir");
+
+        for content in ["", "  \n", "not-a-pid host", "12345", "\0\0"] {
+            fs::write(&path, content).expect("write a legacy lock file");
+            assert_eq!(
+                SessionLock::holder(&persistence, "s-1"),
+                None,
+                "{content:?} names nobody legible"
+            );
+            let held = acquire(&persistence, "s-1")
+                .expect("acquire over a legacy lock file")
+                .expect("an unheld legacy lock file is lockable");
+            drop(held);
+        }
     }
 }

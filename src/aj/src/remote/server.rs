@@ -677,7 +677,7 @@ impl From<HostError> for ApiError {
             HostError::UnknownTask(_) => (StatusCode::NOT_FOUND, "unknown_task"),
             HostError::UnknownEntry(_) => (StatusCode::NOT_FOUND, "unknown_entry"),
             HostError::Conflict { .. } => (StatusCode::CONFLICT, "conflict"),
-            HostError::Locked(_) => (StatusCode::CONFLICT, "locked"),
+            HostError::Locked { .. } => (StatusCode::CONFLICT, "locked"),
             HostError::Unsupported(_) => (StatusCode::CONFLICT, "unsupported"),
             HostError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         };

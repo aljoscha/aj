@@ -319,6 +319,17 @@ impl Fanout {
         }
     }
 
+    /// Whether any subscriber is attached to `session`.
+    ///
+    /// True from the moment a subscriber registers, not from when its attach
+    /// block completes, which is what lets the release path treat an attach in
+    /// flight as use (spec section 5: attachment is the retention signal).
+    pub(crate) fn attached(&self, session: &str) -> bool {
+        self.lock()
+            .values()
+            .any(|subscriber| subscriber.attached.contains_key(session))
+    }
+
     /// Note that the session directory changed, waking the list publisher.
     pub(crate) fn mark_list_dirty(&self) {
         self.list_dirty.notify_one();

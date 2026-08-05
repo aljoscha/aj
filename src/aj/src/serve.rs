@@ -118,7 +118,7 @@ pub(crate) async fn run(mut args: Args) -> Result<()> {
     let sessions_dir = Config::get_sessions_dir_path()?;
     let persistence = ConversationPersistence::new(sessions_dir);
 
-    let ComposedHost { host, .. } = compose_host(&args, layers, &auth, &persistence)?;
+    let ComposedHost { host, .. } = compose_host(&args, layers, &auth, &persistence, None)?;
     let server = match start_server(&args, &host).await {
         Ok(server) => server.expect("serve defaults its listen address above"),
         Err(err) => {

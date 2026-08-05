@@ -2449,6 +2449,16 @@ impl TaskRegistry {
         inner.notices.get(&owner).is_some_and(|q| !q.is_empty())
     }
 
+    /// Whether any agent has an undelivered task-completion notice.
+    ///
+    /// A notice lives only here until the agent it belongs to runs again, so a
+    /// caller about to drop the registry has to ask: dropping it would discard
+    /// a completion the model never saw.
+    pub fn has_any_notices(&self) -> bool {
+        let inner = self.inner.lock().expect("task registry mutex poisoned");
+        inner.notices.values().any(|queue| !queue.is_empty())
+    }
+
     /// How many notices are queued for `owner`, 0 when it has none.
     /// A frontend polls this to show that finished tasks are waiting
     /// to be delivered.

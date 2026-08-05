@@ -945,11 +945,16 @@ pub fn resolve_speed(args: &Args, config: &Config) -> Result<Option<Speed>> {
 }
 
 /// Compose the session host for `layers`' working directory.
+///
+/// `idle_grace` is how long the host holds an idle, unattached session before
+/// releasing it. `None` takes the host's own default, which is what a real run
+/// wants, and a test that cannot wait one out passes its own.
 pub fn compose_host(
     args: &Args,
     layers: ConfigLayers,
     auth: &AuthStorage,
     persistence: &ConversationPersistence,
+    idle_grace: Option<std::time::Duration>,
 ) -> Result<ComposedHost> {
     let config = layers.effective();
     let speed = resolve_speed(args, &config)?;
@@ -966,6 +971,7 @@ pub fn compose_host(
         persistence: persistence.clone(),
         auth: auth.clone(),
         working_directory: std::env::current_dir().unwrap_or_default(),
+        idle_grace,
     })?;
     Ok(ComposedHost {
         host,

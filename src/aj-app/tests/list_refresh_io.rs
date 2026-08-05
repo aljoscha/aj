@@ -115,6 +115,7 @@ fn host(dir: &TempDir, persistence: &ConversationPersistence) -> SessionHost {
         persistence: persistence.clone(),
         auth: AuthStorage::new(dir.path().join("auth.json")),
         working_directory: dir.path().to_path_buf(),
+        idle_grace: None,
     })
     .expect("host")
 }

@@ -51,7 +51,7 @@ pub use compaction::{
     prepare_compaction, should_compact,
 };
 pub use listener::{AppendHandoff, persistence_listener, persisting_forwarder};
-pub use lock::SessionLock;
+pub use lock::{LockHolder, SessionLock};
 pub use log::{
     Conversation, ConversationEntry, ConversationEntryKind, ConversationError, ConversationLog,
     EntryId, EntryRef, LogSnapshot, SessionSettings, ThreadFilter, ThreadKind,

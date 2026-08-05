@@ -1246,6 +1246,17 @@ impl ConversationLog {
         &self.path
     }
 
+    /// Whether the log has a file behind it yet.
+    ///
+    /// A created log defers its file until the first punctuating append, so
+    /// until then its entries live only here and the store does not know the
+    /// session id (see [`Self::flush_pending`], which is a no-op in that
+    /// state). A caller that would hand the session back to the store, rather
+    /// than keep it in memory, has to ask: there would be nothing to hand.
+    pub fn is_durable(&self) -> bool {
+        self.file.is_some()
+    }
+
     /// The id under which this log is listed by `aj list-sessions`.
     pub fn session_id(&self) -> &str {
         self.core.session_id()

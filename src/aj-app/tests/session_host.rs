@@ -58,6 +58,16 @@ impl Harness {
         Self::with_provider(scripted(messages, 0, Duration::ZERO))
     }
 
+    /// A host that releases an idle, unattached session after `grace`, for the
+    /// tests about what it holds and for how long.
+    fn with_idle_grace(messages: Vec<AssistantMessage>, grace: Duration) -> Self {
+        Self::with_run_config(
+            snapshot(scripted(messages, 0, Duration::ZERO)),
+            Vec::new(),
+            Some(grace),
+        )
+    }
+
     fn with_provider(provider: Arc<ScriptedProvider>) -> Self {
         Self::with_catalog(provider, Vec::new())
     }
@@ -66,7 +76,7 @@ impl Harness {
         provider: Arc<ScriptedProvider>,
         catalog: Vec<aj_models::registry::ModelInfo>,
     ) -> Self {
-        Self::with_run_config(snapshot(provider), catalog)
+        Self::with_run_config(snapshot(provider), catalog, None)
     }
 
     /// A host whose base run config is `run_config`, for tests about what the
@@ -74,6 +84,7 @@ impl Harness {
     fn with_run_config(
         run_config: RunConfigSnapshot,
         catalog: Vec<aj_models::registry::ModelInfo>,
+        idle_grace: Option<Duration>,
     ) -> Self {
         let dir = TempDir::new().expect("tempdir");
         let persistence = ConversationPersistence::new(dir.path().join("sessions"));
@@ -91,6 +102,7 @@ impl Harness {
             persistence: persistence.clone(),
             auth: AuthStorage::new(dir.path().join("auth.json")),
             working_directory: dir.path().to_path_buf(),
+            idle_grace,
         })
         .expect("host");
         Self {
@@ -121,6 +133,16 @@ impl Harness {
     /// A second host over the same session store, as a restart or a rival
     /// process would see it.
     fn revive(&self, messages: Vec<AssistantMessage>) -> Harness {
+        self.revive_with_idle_grace(messages, None)
+    }
+
+    /// A second host over the same store, releasing idle sessions after
+    /// `idle_grace`.
+    fn revive_with_idle_grace(
+        &self,
+        messages: Vec<AssistantMessage>,
+        idle_grace: Option<Duration>,
+    ) -> Harness {
         let dir = TempDir::new().expect("tempdir");
         let config = Arc::new(StdMutex::new(Config::default()));
         let host = SessionHost::new(HostSetup {
@@ -136,6 +158,7 @@ impl Harness {
             persistence: self.persistence.clone(),
             auth: AuthStorage::new(dir.path().join("auth.json")),
             working_directory: dir.path().to_path_buf(),
+            idle_grace,
         })
         .expect("host");
         Harness {
@@ -739,7 +762,7 @@ async fn an_unstated_axis_defaults_against_the_model_the_session_runs() {
     // ordinary: the level comes from a config file, the model from a catalog.
     let mut base = snapshot(scripted(Vec::new(), 0, Duration::ZERO));
     base.thinking = Some(aj_models::ThinkingConfig::XHigh);
-    let harness = Harness::with_run_config(base, Vec::new());
+    let harness = Harness::with_run_config(base, Vec::new(), None);
 
     // Something is stated, but not thinking, so the host defaults that axis
     // against the model it actually runs (spec section 8).
@@ -1097,6 +1120,7 @@ async fn the_host_id_is_claimed_not_written_over() {
         persistence: harness.persistence.clone(),
         auth: AuthStorage::new(harness._dir.path().join("auth.json")),
         working_directory: harness._dir.path().to_path_buf(),
+        idle_grace: None,
     })
     .err()
     .expect("a blank host id is refused");
@@ -1610,7 +1634,7 @@ async fn a_live_session_holds_its_lock_until_teardown() {
     drop(client);
 
     assert!(
-        SessionLock::try_acquire(&harness.persistence, &session)
+        SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
             .expect("try_acquire")
             .is_none(),
         "the host holds the session's lock while it is live",
@@ -1626,10 +1650,24 @@ async fn a_live_session_holds_its_lock_until_teardown() {
         }])
         .await
         .expect_err("a locked session cannot be materialized twice");
-    assert!(matches!(err, HostError::Locked(_)), "got {err:?}");
+    let HostError::Locked { holder, .. } = &err else {
+        panic!("got {err:?}")
+    };
+    let holder = holder.as_ref().expect("the lock file names its holder");
+    assert_eq!(holder.pid, std::process::id());
+    assert_eq!(
+        holder.host_id,
+        harness.host.hello().host_id,
+        "the refusal names the host that holds it, not the one refused",
+    );
+    assert!(
+        err.to_string()
+            .contains(&format!("pid {}", std::process::id())),
+        "and says so in the message a user reads: {err}",
+    );
 
     harness.host.shutdown().await;
-    let reacquired = SessionLock::try_acquire(&harness.persistence, &session)
+    let reacquired = SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
         .expect("try_acquire")
         .expect("the lock is free once the host tore the session down");
     drop(reacquired);
@@ -1664,7 +1702,7 @@ async fn a_refused_materialization_leaves_the_log_untouched() {
     let before = std::fs::read(&path).expect("read the log");
 
     // Another writer holds the session, so every attempt below is refused.
-    let held = SessionLock::try_acquire(&harness.persistence, &session)
+    let held = SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
         .expect("try_acquire")
         .expect("the lock is free once the host tore the session down");
 
@@ -1772,10 +1810,750 @@ async fn requests_after_shutdown_are_refused() {
         assert!(refusal.contains("shut down"), "got {refusal}");
     }
 
-    let free = SessionLock::try_acquire(&harness.persistence, &session)
+    let free = SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
         .expect("try_acquire")
         .expect("no request re-took the session's lock");
     drop(free);
+}
+
+// ---------------------------------------------------------------------------
+// 6b. Idle release
+// ---------------------------------------------------------------------------
+
+/// Short enough that a test can wait one out, long enough that the sweeper's
+/// half-grace tick and a scripted turn fit inside it without racing.
+const IDLE_GRACE: Duration = Duration::from_millis(200);
+
+/// The summary the host's directory reports for `session`, if it names it.
+async fn summary(host: &SessionHost, session: &str) -> Option<aj_wire::SessionSummary> {
+    host.sessions()
+        .await
+        .expect("sessions")
+        .sessions
+        .into_iter()
+        .find(|entry| entry.id == session)
+}
+
+/// Wait until the host reports `session` as no longer live, and answer the
+/// summary it reports for it.
+async fn until_released(host: &SessionHost, session: &str) -> aj_wire::SessionSummary {
+    bounded("the session to be released", async {
+        loop {
+            let entry = summary(host, session)
+                .await
+                .expect("a released session is still in the directory");
+            if !entry.live {
+                return entry;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+}
+
+/// Assert `session` stays live for `windows` grace periods.
+async fn stays_live(host: &SessionHost, session: &str, windows: u32) {
+    for _ in 0..windows {
+        tokio::time::sleep(IDLE_GRACE).await;
+        assert!(
+            summary(host, session).await.expect("listed").live,
+            "the session must still be live",
+        );
+    }
+}
+
+/// An idle session nobody is attached to is released once the grace is up: its
+/// driver is gone, its lock is free for another writer, and the directory
+/// reports it cold with the mark its log ended on (spec section 5).
+#[tokio::test]
+async fn an_idle_unattached_session_is_released() {
+    let harness =
+        Harness::with_idle_grace(vec![finalized_text_message("on the record")], IDLE_GRACE);
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+    client.pump_until_idle().await;
+    let logged = {
+        let handles = harness.host.local_handles(&session).await.expect("handles");
+        handles.log.lock().await.last_seq()
+    };
+    assert!(logged > 0, "the turn wrote log entries");
+
+    // Attached, so it stays however long it idles.
+    stays_live(&harness.host, &session, 2).await;
+    drop(client);
+
+    let released = until_released(&harness.host, &session).await;
+    assert_eq!(
+        released.last_seq, logged,
+        "the released session reports the mark its own driver left, not zero",
+    );
+    assert!(!released.working && released.tasks == 0);
+    let lock = SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
+        .expect("try_acquire")
+        .expect("the release freed the session's lock");
+    drop(lock);
+    harness.host.shutdown().await;
+}
+
+/// A client that stays attached keeps its session live: attachment is the
+/// retention signal (spec section 5), so a sidebar-era client that holds
+/// background sessions holds their locks, deliberately.
+#[tokio::test]
+async fn an_attached_session_is_never_released() {
+    let harness = Harness::with_idle_grace(vec![finalized_text_message("hi back")], IDLE_GRACE);
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+    client.pump_until_idle().await;
+
+    stays_live(&harness.host, &session, 5).await;
+    assert!(
+        SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
+            .expect("try_acquire")
+            .is_none(),
+        "and it still holds the session's lock",
+    );
+    drop(client);
+    until_released(&harness.host, &session).await;
+    harness.host.shutdown().await;
+}
+
+/// Work outlasting its client holds a session live, and so does a queued
+/// message: the queues are memory only, so releasing a session with one
+/// pending would discard it. Both let go once they are gone.
+#[tokio::test]
+async fn live_work_and_queued_messages_hold_a_session_live() {
+    let harness = Harness::with_idle_grace(vec![finalized_text_message("noted")], IDLE_GRACE);
+    let session = harness.create().await;
+    // Punctuate the log first: a session with nothing on disk is never
+    // released, so this test would pass for the wrong reason.
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+    client.pump_until_idle().await;
+    let handles = harness.host.local_handles(&session).await.expect("handles");
+    let (task, _cancel) = handles.task_registry.register(
+        AgentId::Main,
+        "call-1".into(),
+        TaskKind::Bash {
+            command: "sleep 100".into(),
+        },
+        "sleep 100".into(),
+        Arc::new(FixedTaskOutput),
+    );
+    // Nobody is attached from here on: the task is the only thing holding it.
+    drop(client);
+    stays_live(&harness.host, &session, 2).await;
+
+    // Queued before the task is finished, so no tick can find the session with
+    // neither of the two holding it.
+    handles.queues.append_follow_up(AgentId::Main, "later");
+    handles
+        .task_registry
+        .set_status(task, TaskStatus::Exited(Some(0)));
+    stays_live(&harness.host, &session, 2).await;
+
+    harness
+        .host
+        .command(&session, Command::Queue(QueueOp::Clear))
+        .await
+        .expect("clearing the queue");
+    let released = until_released(&harness.host, &session).await;
+    assert_eq!(released.queued.follow_up, 0);
+    harness.host.shutdown().await;
+}
+
+/// The grace runs from the last client detaching, not only from the session's
+/// own last durable work. A session idle for hours with a client attached must
+/// not go the instant that client lets go: the next attach would re-resume the
+/// whole log for nothing, which is what the grace exists to prevent.
+#[tokio::test]
+async fn a_detach_starts_the_grace_over() {
+    let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+    client.pump_until_idle().await;
+    // Attached and idle for several graces, so the session's own work clock is
+    // stale long before the client lets go.
+    stays_live(&harness.host, &session, 3).await;
+    drop(client);
+
+    // Half a grace after the detach: the release may not have happened yet.
+    tokio::time::sleep(IDLE_GRACE / 2).await;
+    assert!(
+        summary(&harness.host, &session).await.expect("listed").live,
+        "the grace must run from the detach, not from the last durable work",
+    );
+    until_released(&harness.host, &session).await;
+    harness.host.shutdown().await;
+}
+
+/// A release publishes the directory. The liveness flag flipping is the whole
+/// wire surface of a release (spec section 5), and a client watching another
+/// session has no other way to learn it: a released session emits no events.
+#[tokio::test]
+async fn a_release_publishes_the_directory() {
+    let harness = Harness::with_idle_grace(
+        vec![
+            finalized_text_message("on the record"),
+            finalized_text_message("watching"),
+        ],
+        IDLE_GRACE,
+    );
+    let going = harness.create().await;
+    let mut client = Client::attach(&harness.host, &going).await;
+    harness.prompt(&going, "hi").await;
+    client.pump_until_idle().await;
+
+    // A second session carries the stream that has to learn about the first. It
+    // stays attached, so it is never released itself.
+    let watching = harness.create().await;
+    let mut stream = harness
+        .host
+        .attach(&[AttachRequest {
+            session: watching.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+    frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+    // Quiesce the directory, so the frame asserted on below can only have come
+    // from the release.
+    loop {
+        tokio::time::sleep(LIST_SETTLE).await;
+        if drained(&mut stream)
+            .iter()
+            .all(|frame| !matches!(frame, Frame::List { .. }))
+        {
+            break;
+        }
+    }
+    // Nothing holds `going` from here on.
+    drop(client);
+
+    frames_until(
+        &mut stream,
+        "the directory to report the release",
+        |frame| {
+            matches!(frame, Frame::List { sessions }
+            if sessions.iter().any(|entry| entry.id == going && !entry.live))
+        },
+    )
+    .await;
+    drop(stream);
+    harness.host.shutdown().await;
+}
+
+/// The grace starts over from the session's own work, not from whenever the
+/// sweeper last happened to look. A sweeper that only sampled its own
+/// observations would release a session the instant a tick came due, however
+/// recently the session had been working, which is the resume thrash the grace
+/// exists to prevent.
+#[tokio::test]
+async fn work_between_two_ticks_restarts_the_grace() {
+    let harness = Harness::with_idle_grace(
+        vec![
+            finalized_text_message("punctuation"),
+            finalized_text_message("and a second answer"),
+        ],
+        IDLE_GRACE,
+    );
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "punctuate").await;
+    client.pump_until_idle().await;
+    drop(client);
+
+    // Long enough for the sweeper to have stamped this session as idle, short
+    // enough that it is not due yet.
+    tokio::time::sleep(IDLE_GRACE * 3 / 4).await;
+    assert!(
+        summary(&harness.host, &session).await.expect("listed").live,
+        "the session is not due yet, so the work below lands between two ticks",
+    );
+
+    harness.prompt(&session, "one more thing").await;
+    bounded("the second turn to finish", async {
+        while summary(&harness.host, &session)
+            .await
+            .is_some_and(|entry| entry.working)
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+
+    // Less than a grace after the work, so the session must still be here.
+    tokio::time::sleep(IDLE_GRACE * 3 / 4).await;
+    assert!(
+        summary(&harness.host, &session).await.expect("listed").live,
+        "released inside its own grace, measured from the last work",
+    );
+    until_released(&harness.host, &session).await;
+    harness.host.shutdown().await;
+}
+
+/// An undelivered task-completion notice holds a session live. The notice queue
+/// is memory only, like the message queues, so a release would discard a
+/// completion the model never saw.
+#[tokio::test]
+async fn an_undelivered_task_notice_holds_a_session_live() {
+    let harness = Harness::with_idle_grace(
+        vec![
+            finalized_text_message("punctuation"),
+            finalized_text_message("noted, thanks"),
+        ],
+        IDLE_GRACE,
+    );
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "punctuate").await;
+    client.pump_until_idle().await;
+    let handles = harness.host.local_handles(&session).await.expect("handles");
+    let (task, _cancel) = handles.task_registry.register(
+        AgentId::Main,
+        "call-1".into(),
+        TaskKind::Bash {
+            command: "true".into(),
+        },
+        "true".into(),
+        Arc::new(FixedTaskOutput),
+    );
+    // Finished, but its notice is still queued for an agent that has not run
+    // since. Nothing is attached from here on.
+    handles.task_registry.finish(
+        task,
+        TaskStatus::Exited(Some(0)),
+        aj_agent::tool::TaskNotice {
+            owner: AgentId::Main,
+            task_id: task,
+            kind: TaskKind::Bash {
+                command: "true".into(),
+            },
+            label: "true".into(),
+            status: TaskStatus::Exited(Some(0)),
+            body: "exit 0".into(),
+        },
+    );
+    drop(client);
+    stays_live(&harness.host, &session, 2).await;
+    assert_eq!(
+        summary(&harness.host, &session)
+            .await
+            .expect("listed")
+            .tasks,
+        0,
+        "the task itself is finished: the queued notice is what holds it",
+    );
+
+    // A turn drains the notice into the model, and the session can go.
+    harness.prompt(&session, "anything for me?").await;
+    until_released(&harness.host, &session).await;
+    harness.host.shutdown().await;
+}
+
+/// A client re-attaching after a release is served a fresh epoch and a full
+/// backfill, and folds to the same state as one that never lost the session.
+/// The epoch dies with the materialization (spec 6.5), so the cursor the
+/// client still holds names a history this host no longer has.
+#[tokio::test]
+async fn attaching_after_a_release_rebuilds_the_same_state() {
+    let harness =
+        Harness::with_idle_grace(vec![finalized_text_message("recorded answer")], IDLE_GRACE);
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+    client.pump_until_idle().await;
+    let before = client.canonical();
+    let cursor = client.client.cursor().expect("a committed cursor");
+    drop(client);
+
+    until_released(&harness.host, &session).await;
+
+    // Offering the dead epoch's cursor: the host must not serve it as a
+    // suffix, since the session it named is gone.
+    let mut rejoined = Client::attach(&harness.host, &session).await;
+    let block = rejoined.reattach(&harness.host, cursor.clone()).await;
+    let epoch = epoch_of(&block);
+    assert_ne!(
+        epoch, cursor.epoch,
+        "a re-materialization mints a fresh epoch",
+    );
+    assert!(
+        block
+            .iter()
+            .any(|frame| matches!(frame, Frame::Event { .. })),
+        "and the block carries a full backfill rather than an empty suffix",
+    );
+    assert_canonical_eq(
+        &rejoined.canonical(),
+        &before,
+        "a re-attach after a release rebuilds the state the release ended on",
+    );
+    drop(rejoined);
+    harness.host.shutdown().await;
+}
+
+/// A command racing the release of its own session is neither lost nor applied
+/// twice: it either reaches the driver first, and the driver then declines to
+/// go, or it waits out the teardown and re-materializes (spec section 5).
+///
+/// The commands are spaced across the sweeper's tick, so both branches are
+/// actually taken: the test asserts that at least one of them found the session
+/// already cold, which is the re-materializing half. A grace of nothing means
+/// the sweeper takes every session it finds idle.
+#[tokio::test]
+async fn a_command_racing_a_release_is_neither_lost_nor_doubled() {
+    let harness = Harness::with_idle_grace(
+        vec![
+            finalized_text_message("on the record"),
+            finalized_text_message("the one and only answer"),
+        ],
+        Duration::ZERO,
+    );
+    let session = harness.create().await;
+    // Punctuate first: a session with no log on disk is never released, so the
+    // race below would not happen at all.
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+    client.pump_until_idle().await;
+    drop(client);
+
+    let mut cold_when_issued = 0;
+    for _ in 0..20 {
+        // Long enough for the sweeper's tick to land in between, so the
+        // commands straddle releases rather than all fitting inside one tick.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let cold = summary(&harness.host, &session)
+            .await
+            .is_some_and(|entry| !entry.live);
+        match harness
+            .host
+            .command(&session, Command::Queue(QueueOp::Clear))
+            .await
+        {
+            Ok(_) => cold_when_issued += usize::from(cold),
+            Err(err) => panic!("a command racing a release must not be lost: {err}"),
+        }
+    }
+    assert!(
+        cold_when_issued > 0,
+        "no command found the session released, so the re-materializing half of \
+         the race never ran",
+    );
+
+    // And a prompt issued into the same race runs exactly once: the script holds
+    // one reply and panics if a second inference asks for one, and the turn is
+    // what holds the session live while it runs.
+    harness.prompt(&session, "hi again").await;
+    until_released(&harness.host, &session).await;
+    let client = Client::attach(&harness.host, &session).await;
+    assert_eq!(
+        assistant_rows(&client.chat, AgentId::Main)
+            .iter()
+            .filter(|text| *text == "the one and only answer")
+            .count(),
+        1,
+        "the prompt ran once, not once per materialization",
+    );
+    drop(client);
+    harness.host.shutdown().await;
+}
+
+/// A session with no log on disk is never released. Release hands a session
+/// back to the store, and the store does not know a session it has no file
+/// for, so releasing one would drop it: a client that created a session and
+/// has not prompted or attached yet would find its id gone.
+#[tokio::test]
+async fn a_session_with_nothing_on_disk_is_never_released() {
+    let harness = Harness::with_idle_grace(vec![finalized_text_message("first words")], IDLE_GRACE);
+    let session = harness.create().await;
+    // Nothing is attached and nothing is queued: only the empty log holds it.
+    stays_live(&harness.host, &session, 4).await;
+    assert!(
+        !harness
+            .persistence
+            .sessions_dir()
+            .join(format!("{session}.jsonl"))
+            .exists(),
+        "the log is still unwritten, which is the state under test",
+    );
+
+    // And it is still the session the creator was handed: the first prompt
+    // lands on it rather than on an unknown id.
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+    let frames = client.pump_until_idle().await;
+    assert_eq!(assistant_text(&frames), "first words");
+    drop(client);
+    // Punctuated now, so the grace applies from here on.
+    until_released(&harness.host, &session).await;
+    harness.host.shutdown().await;
+}
+
+/// A turn with nobody watching is not interrupted by the grace: a client that
+/// submits a prompt and closes its stream still gets its work done, and the
+/// release waits for the turn rather than cancelling it.
+#[tokio::test]
+async fn a_turn_nobody_is_attached_to_is_not_released_out_from_under() {
+    let harness = Harness::with_run_config(
+        snapshot(scripted(
+            vec![
+                finalized_text_message("punctuation"),
+                finalized_text_message("a slowly streamed answer nobody is watching"),
+            ],
+            1,
+            Duration::from_millis(10),
+        )),
+        Vec::new(),
+        Some(Duration::from_millis(30)),
+    );
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "punctuate").await;
+    client.pump_until_idle().await;
+    drop(client);
+
+    // Unattached from here on. The turn streams for far longer than the grace.
+    harness.prompt(&session, "and now the long one").await;
+    let released = until_released(&harness.host, &session).await;
+
+    // The whole answer is on disk: a release that cancelled the turn would have
+    // left the transcript short.
+    let mut rejoined = Client::attach(&harness.host, &session).await;
+    assert!(
+        assistant_rows(&rejoined.chat, AgentId::Main)
+            .iter()
+            .any(|text| text == "a slowly streamed answer nobody is watching"),
+        "the turn ran to completion: {:?}",
+        assistant_rows(&rejoined.chat, AgentId::Main),
+    );
+    assert!(
+        !rejoined
+            .drain_into_fold()
+            .iter()
+            .any(|frame| matches!(frame, Frame::Event { event, .. }
+                if matches!(event.known(), Some(AgentEvent::Notice { text, .. })
+                    if text.contains("cancelled")))),
+        "and it was not cancelled on the way out",
+    );
+    assert!(released.last_seq > 0);
+    drop(rejoined);
+    harness.host.shutdown().await;
+}
+
+/// A sub-agent's continuation holds the session live too. Only `driven_subs`
+/// records it: main is idle throughout, and a continuation is a turn the host
+/// drives rather than a background task, so nothing else in the status names it.
+#[tokio::test]
+async fn a_sub_agents_continuation_holds_its_session_live() {
+    let mut script = sub_agent_turn();
+    // A continuation slow enough to outlast several graces.
+    script.push(finalized_text_message(
+        "the sub-agent taking its time over a continuation",
+    ));
+    let harness = Harness::with_run_config(
+        snapshot(scripted(script, 1, Duration::from_millis(20))),
+        Vec::new(),
+        Some(Duration::from_millis(30)),
+    );
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "delegate it").await;
+    client.pump_until_idle().await;
+    drop(client);
+
+    harness
+        .host
+        .command(
+            &session,
+            Command::Prompt {
+                agent: AgentId::Sub(1),
+                content: vec![UserContent::text("keep going")],
+            },
+        )
+        .await
+        .expect("the retained sub-agent runs a continuation");
+    // Nobody is attached and main is idle: the sub's turn is the only thing
+    // holding the session, and the grace is up several times over before the
+    // continuation ends.
+    assert!(
+        summary(&harness.host, &session).await.expect("listed").live,
+        "the session is held while its sub-agent works",
+    );
+    until_released(&harness.host, &session).await;
+
+    // The continuation ran to the end. A release that took the session while
+    // its sub-agent was working would have cancelled the turn mid-answer.
+    let rejoined = Client::attach(&harness.host, &session).await;
+    assert!(
+        assistant_rows(&rejoined.chat, AgentId::Sub(1))
+            .iter()
+            .any(|text| text == "the sub-agent taking its time over a continuation"),
+        "the sub's continuation is in its transcript: {:?}",
+        assistant_rows(&rejoined.chat, AgentId::Sub(1)),
+    );
+    drop(rejoined);
+    harness.host.shutdown().await;
+}
+
+/// The lock a release frees is a lock another writer can take: a second host
+/// over the same store materializes the released session and agrees on its
+/// mark, which is what makes the teardown flush load-bearing rather than
+/// decorative.
+#[tokio::test]
+async fn a_released_session_can_be_taken_over_by_another_host() {
+    let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+    client.pump_until_idle().await;
+    // A settings entry buffers without punctuating, so only the teardown flush
+    // can put it on disk.
+    harness
+        .host
+        .command(
+            &session,
+            Command::Settings(SettingsChange {
+                agent: AgentId::Main,
+                persist: PersistAction::None,
+                axis: SettingsAxis::Verbosity(Some(aj_conf::ConfigVerbosity::Low)),
+            }),
+        )
+        .await
+        .expect("a settings change");
+    client.pump_until_idle().await;
+    drop(client);
+
+    let released = until_released(&harness.host, &session).await;
+    assert_eq!(
+        harness
+            .persistence
+            .stored_last_seq(&session)
+            .expect("count the log"),
+        released.last_seq,
+        "the mark the directory reports is the one on disk, so the flush landed",
+    );
+
+    let rival = harness.revive_with_idle_grace(Vec::new(), Some(IDLE_GRACE));
+    let taken = Client::attach(&rival.host, &session).await;
+    assert!(
+        summary(&rival.host, &session).await.expect("listed").live,
+        "the second host materialized the session the first one let go",
+    );
+    assert!(
+        assistant_rows(&taken.chat, AgentId::Main)
+            .iter()
+            .any(|text| text == "recorded"),
+        "and its backfill carries the first host's turn",
+    );
+    drop(taken);
+    rival.host.shutdown().await;
+    harness.host.shutdown().await;
+}
+
+/// A release never drops a session out of the directory, not even for the one
+/// refresh that races it. The refresh reads the live set, scans the store with
+/// the live logs excluded, then reads the live set again, so a session released
+/// in between is in neither half and has to be recovered from the cold cache.
+///
+/// Opportunistic: it asserts the invariant on every refresh it manages to run
+/// across the release, and a run that never lands inside the window still
+/// passes. A store with many logs widens the scan, which is what makes landing
+/// there likely.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_release_never_drops_a_session_out_of_the_directory() {
+    let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
+    let sessions_dir = harness.persistence.sessions_dir().to_path_buf();
+    std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
+    let entry = serde_json::json!({
+        "id": "00000000",
+        "timestamp": "2024-01-01T00:00:00Z",
+        "thread": "meta",
+        "type": "system_prompt",
+        "text": "x",
+    });
+    for i in 0..200 {
+        std::fs::write(
+            sessions_dir.join(format!("2020-01-01-00-00-00-{i:03}.jsonl")),
+            format!("{entry}\n"),
+        )
+        .expect("write a cold log");
+    }
+
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+    client.pump_until_idle().await;
+    drop(client);
+
+    bounded("the release to happen", async {
+        loop {
+            let entry = harness
+                .host
+                .sessions()
+                .await
+                .expect("sessions")
+                .sessions
+                .into_iter()
+                .find(|entry| entry.id == session);
+            match entry {
+                Some(entry) if !entry.live => return,
+                Some(_) => {}
+                None => panic!("the session vanished from the directory across its release"),
+            }
+        }
+    })
+    .await;
+    harness.host.shutdown().await;
+}
+
+/// A release hands the session's mark to the directory from the driver's own
+/// state, so a refresh reports a session this host closed without reading the
+/// log back (spec 6.8's no-disk-read rule for what the host already knows).
+#[tokio::test]
+async fn a_released_sessions_mark_needs_no_disk_read() {
+    let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+    client.pump_until_idle().await;
+    let logged = {
+        let handles = harness.host.local_handles(&session).await.expect("handles");
+        handles.log.lock().await.last_seq()
+    };
+    drop(client);
+    let released = until_released(&harness.host, &session).await;
+    assert_eq!(released.last_seq, logged);
+
+    // The log a released session left is unreadable from here on. Its mark
+    // still reports, which it could not if the refresh went back to the file.
+    let path = harness
+        .persistence
+        .sessions_dir()
+        .join(format!("{session}.jsonl"));
+    let mode = std::fs::metadata(&path).expect("the log").permissions();
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+        .expect("drop the read bit");
+    if std::fs::File::open(&path).is_ok() {
+        // Root ignores the permission bits, so there is nothing to prove here.
+        std::fs::set_permissions(&path, mode).expect("restore the mode");
+        harness.host.shutdown().await;
+        return;
+    }
+    let still = summary(&harness.host, &session)
+        .await
+        .expect("the session is still listed");
+    assert_eq!(
+        still.last_seq, logged,
+        "the mark came from what the release recorded, not from the log",
+    );
+    std::fs::set_permissions(&path, mode).expect("restore the mode");
+    harness.host.shutdown().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -4377,7 +5155,7 @@ async fn reads_do_not_materialize_a_cold_session() {
         "neither read materialized the session",
     );
     assert!(
-        SessionLock::try_acquire(&revived.persistence, &session)
+        SessionLock::try_acquire(&revived.persistence, &session, "a-rival-writer")
             .expect("try_acquire")
             .is_some(),
         "and neither took its advisory lock",
@@ -4615,7 +5393,7 @@ async fn shutdown_cancels_gracefully_and_flushes() {
     );
     let _ = log_path;
 
-    let reacquired = SessionLock::try_acquire(&harness.persistence, &session)
+    let reacquired = SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
         .expect("try_acquire")
         .expect("shutdown released the session lock");
     drop(reacquired);
@@ -4756,7 +5534,7 @@ async fn shutdown_releases_every_session() {
     harness.host.shutdown().await;
 
     for session in [&first, &second] {
-        let lock = SessionLock::try_acquire(&harness.persistence, session)
+        let lock = SessionLock::try_acquire(&harness.persistence, session, "a-rival-writer")
             .expect("try_acquire")
             .expect("every session's lock is released");
         drop(lock);

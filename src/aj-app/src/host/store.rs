@@ -143,6 +143,29 @@ impl<S: SessionStore> ColdSessions<S> {
         Ok(self.current_format(&metadata))
     }
 
+    /// Record what the host knows about a session it just released, so a
+    /// refresh serves it without counting a log the host itself closed.
+    ///
+    /// Touches no filesystem: `file` is the state the releasing driver read
+    /// under the session's own lock, so it is the fingerprint `last_seq` was
+    /// counted at. It is also the one the next enumeration finds, unless a rival
+    /// writer took the freed lock and appended in between, in which case the
+    /// fingerprint has moved and the entry simply misses.
+    pub(crate) fn note_released(&self, file: &SessionMetadata, last_seq: u64) {
+        let at = fingerprint(file);
+        let mut cache = self.cache();
+        cache
+            .formats
+            .insert(file.session_id.clone(), Derived { at, value: true });
+        cache.last_seqs.insert(
+            file.session_id.clone(),
+            Derived {
+                at,
+                value: last_seq,
+            },
+        );
+    }
+
     /// The format verdict for `metadata`'s log, sniffed once per fingerprint.
     ///
     /// Keyed on the fingerprint rather than on the path alone, even though a

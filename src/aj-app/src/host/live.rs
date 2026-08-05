@@ -13,9 +13,10 @@
 
 use std::collections::BTreeSet;
 use std::sync::{Mutex as StdMutex, MutexGuard};
+use std::time::Instant;
 
 use aj_agent::events::{AgentId, AgentSettings};
-use aj_session::AppendHandoff;
+use aj_session::{AppendHandoff, SessionMetadata};
 use aj_wire::Frame;
 use chrono::{DateTime, Utc};
 use tokio::sync::mpsc::UnboundedSender;
@@ -38,6 +39,39 @@ pub(crate) enum Request {
     /// quiesce background tasks, flush the log. The driver returns
     /// afterwards, which is what releases the session lock.
     Shutdown,
+    /// Wind down and return, but only if the session is [`releasable`] and has
+    /// a log on disk to be handed back to.
+    ///
+    /// The driver answers this rather than the caller deciding, because it
+    /// answers at its own position in the request queue: a command enqueued
+    /// ahead of this has already taken effect, so the session it judges is the
+    /// one the command left behind (spec section 5's serialization rule).
+    Release {
+        reply: oneshot::Sender<ReleaseOutcome>,
+    },
+}
+
+/// What a driver answers a [`Request::Release`] with.
+pub(crate) enum ReleaseOutcome {
+    /// The session was releasable. The driver has wound down and is returning,
+    /// which is what releases the session's advisory lock.
+    Released { mark: Option<ReleasedMark> },
+    /// The session was not releasable. It stays live and keeps its lock.
+    Declined,
+}
+
+/// What a released session leaves for the host's directory to report.
+///
+/// Both halves are read after the teardown flush and while the driver still
+/// holds the session's lock, so they describe the same file state and no rival
+/// writer can have moved it in between.
+pub(crate) struct ReleasedMark {
+    /// The log's own durable mark, so the directory can report the session
+    /// without counting a log the host just closed itself.
+    pub(crate) last_seq: u64,
+    /// The file the mark was read at, which is the fingerprint the directory
+    /// caches it under.
+    pub(crate) file: SessionMetadata,
 }
 
 /// The per-session state the host publishes, readable without awaiting.
@@ -88,9 +122,24 @@ pub(crate) struct SessionStatus {
     /// the new run can land while the run still reads as finished.
     pub(crate) driven_subs: BTreeSet<usize>,
     pub(crate) last_activity: DateTime<Utc>,
+    /// The same instant on the monotonic clock, for the host's own release
+    /// timer.
+    ///
+    /// Two clocks because they answer different questions. `last_activity` is
+    /// what a client renders, so it has to be wall-clock. The release timer
+    /// measures a duration this process cares about, and a wall-clock step
+    /// backwards would hold every idle session, and its lock, for the length of
+    /// the step.
+    pub(crate) last_work: Instant,
 }
 
 impl SessionStatus {
+    /// Record that the session just did something durable.
+    pub(crate) fn note_activity(&mut self) {
+        self.last_activity = Utc::now();
+        self.last_work = Instant::now();
+    }
+
     /// The `state` frame this status describes (spec 6.3).
     fn frame(&self, session: &str) -> Frame {
         Frame::State {
@@ -195,4 +244,41 @@ impl LiveSession {
     pub(crate) fn has_queued(&self, agent: AgentId) -> bool {
         self.core.message_queues.has_pending(agent)
     }
+}
+
+/// Whether `session` is releasable: nothing running, nothing queued, no
+/// undelivered task notice, nobody attached (spec section 5).
+///
+/// Queued messages and task notices hold a session live because both live in
+/// memory only: releasing a session holding one would discard something the
+/// user or a finished task handed us. Attachment is the retention signal, so a
+/// client that keeps a session attached keeps its lock, deliberately.
+///
+/// Read off the published status and the session's own registries, so the
+/// host's sweeper and the session's driver can both ask it. The driver's
+/// answer is the one that decides, not because it knows more but because of
+/// when it asks (see [`Request::Release`]). The driver also adds the one
+/// condition this cannot see, that the log has a file to come back to.
+pub(crate) fn releasable(session: &LiveSession, fanout: &Fanout) -> bool {
+    {
+        let status = session.status();
+        // `working` covers the main agent, and a sub-agent's turn is either
+        // nested in a main turn or driven on its own, which `driven_subs`
+        // records. A background sub-agent shows up in the task registry below.
+        if status.working || !status.driven_subs.is_empty() {
+            return false;
+        }
+    }
+    if session.core.message_queues.pending_counts() != (0, 0)
+        || session.core.task_registry.has_any_notices()
+    {
+        return false;
+    }
+    let running = session
+        .core
+        .task_registry
+        .snapshot()
+        .into_iter()
+        .any(|task| task.status == aj_agent::tool::TaskStatus::Running);
+    !running && !fanout.attached(session.id())
 }

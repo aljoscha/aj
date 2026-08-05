@@ -55,7 +55,8 @@ use aj_models::registry::{ModelInfo, default_thinking_level, validate_thinking_l
 use aj_models::types::{Speed, UserContent};
 use aj_models::{speed_from_name, thinking_config_from_name, verbosity_from_name};
 use aj_session::{
-    AppendHandoff, ConversationLog, ConversationPersistence, EntryId, SessionLock, project_suffix,
+    AppendHandoff, ConversationLog, ConversationPersistence, EntryId, LockHolder, SessionLock,
+    project_suffix,
 };
 use aj_wire::{
     AgentQueue, Cursor, DurableEvent, Frame, Hello, ModelSelection, PROTOCOL_VERSION, QueueCounts,
@@ -70,7 +71,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::host::driver::Driver;
-use crate::host::live::{LiveSession, Request, SessionStatus, settings_of};
+use crate::host::live::{LiveSession, ReleaseOutcome, Request, SessionStatus, settings_of};
 use crate::host::store::ColdSessions;
 use crate::session::{SessionCore, SessionEntry, SessionSpec, SubAgentOverrides};
 use crate::session_setup::{
@@ -88,6 +89,15 @@ use fanout::Fanout;
 /// frame per event would swamp every client's queue for data that is
 /// cumulative anyway (spec 6.8).
 const LIST_COALESCE: Duration = Duration::from_millis(200);
+
+/// How long a session stays live with nothing running and nobody attached
+/// before the host releases it (spec section 5).
+///
+/// The tradeoff is resume cost against lock hold time. Shorter, and switching
+/// away from a session and back re-resumes its whole log for nothing. Longer,
+/// and another process in the same directory waits that much longer for a
+/// session this one is done with, which is the failure this exists to fix.
+pub const DEFAULT_IDLE_GRACE: Duration = Duration::from_secs(30);
 
 /// File in the session store holding this store's stable host id.
 ///
@@ -120,8 +130,16 @@ pub enum HostError {
     /// Another writer holds the session's advisory lock, so this host
     /// refuses to materialize it rather than grow a sibling branch in a
     /// shared log.
-    #[error("session {0} is held by another writer")]
-    Locked(String),
+    ///
+    /// The message names the holder when its lock file recorded one, because a
+    /// user told "session in use" needs to know which process to go quit or
+    /// detach (spec section 5). `None` when the record is missing or illegible,
+    /// which an older build's lock file is.
+    #[error("session {session} is held by another writer{}", held_by(holder))]
+    Locked {
+        session: String,
+        holder: Option<LockHolder>,
+    },
     /// The request is well formed and conflicts with nothing, but this host
     /// cannot serve it: a model it has no credentials for, a settings
     /// change for an agent that is not live. Deliberately not
@@ -135,6 +153,15 @@ pub enum HostError {
     Invalid(String),
     #[error("internal host error: {0}")]
     Internal(#[source] BoxError),
+}
+
+/// The parenthetical a [`HostError::Locked`] message carries, empty when the
+/// lock file named nobody.
+fn held_by(holder: &Option<LockHolder>) -> String {
+    match holder {
+        Some(holder) => format!(" ({holder})"),
+        None => String::new(),
+    }
 }
 
 /// What a host is built from: the process-wide handles a frontend already
@@ -151,6 +178,9 @@ pub struct HostSetup {
     pub auth: AuthStorage,
     /// The one working directory this host serves (spec section 4).
     pub working_directory: PathBuf,
+    /// How long an idle, unattached session is held before it is released,
+    /// `None` for [`DEFAULT_IDLE_GRACE`].
+    pub idle_grace: Option<Duration>,
 }
 
 /// A mutation of one session.
@@ -289,11 +319,15 @@ pub(crate) struct HostShared {
     pub(crate) fanout: Arc<Fanout>,
 }
 
+/// The session map, held.
+type SessionMap<'a> = tokio::sync::MutexGuard<'a, HashMap<String, LiveEntry>>;
+
 /// One live session plus the task driving it.
 struct LiveEntry {
     session: Arc<LiveSession>,
-    /// Awaited at shutdown. The driver holds the session's advisory lock,
-    /// so joining the task is what releases it.
+    /// Awaited whenever the session is torn down, at shutdown or on release.
+    /// The driver holds the session's advisory lock, so joining the task is
+    /// what releases it.
     driver: JoinHandle<()>,
 }
 
@@ -314,6 +348,7 @@ struct HostInner {
     /// a coalescing tick that session events drive, so it must not rescan the
     /// store's contents (spec 6.8).
     cold: ColdSessions<ConversationPersistence>,
+    idle_grace: Duration,
     /// Set by [`SessionHost::shutdown`], and never cleared: a host is torn
     /// down once. Every operation refuses afterwards (see
     /// [`SessionHost::alive`]).
@@ -360,6 +395,7 @@ impl SessionHost {
             persistence,
             auth,
             working_directory,
+            idle_grace,
         } = setup;
         let host_id = resolve_host_id(persistence.sessions_dir())?;
         let inner = Arc::new(HostInner {
@@ -378,9 +414,11 @@ impl SessionHost {
             working_directory,
             sessions: TokioMutex::new(HashMap::new()),
             clock_anchor: (Utc::now(), Instant::now()),
+            idle_grace: idle_grace.unwrap_or(DEFAULT_IDLE_GRACE),
             shut_down: AtomicBool::new(false),
         });
         spawn_list_publisher(&inner);
+        spawn_idle_sweeper(&inner);
         Ok(Self { inner })
     }
 
@@ -496,13 +534,23 @@ impl SessionHost {
             }
             names.push(request.session.clone());
         }
+        // Registered before anything is materialized, so the release path sees
+        // an attach in flight as use from the first instant (spec section 5).
+        // Materializing first would leave a window where an idle session could
+        // be released out from under a block about to be served from it.
+        let (id, live_frames, cancelled) = self.inner.shared.fanout.register(&names);
         // Materialize everything up front: a failure must not leave a
         // half-served stream behind.
         let mut live = Vec::with_capacity(requests.len());
         for request in requests {
-            live.push((request.clone(), self.live(&request.session).await?));
+            match self.live(&request.session).await {
+                Ok(session) => live.push((request.clone(), session)),
+                Err(err) => {
+                    self.inner.shared.fanout.deregister(id);
+                    return Err(err);
+                }
+            }
         }
-        let (id, live_frames, cancelled) = self.inner.shared.fanout.register(&names);
         let (block_tx, block_rx) = channel(1);
         let attachment = Attachment::new(
             id,
@@ -530,15 +578,24 @@ impl SessionHost {
     }
 
     /// Apply a command to `session`, materializing it if it is only on disk.
+    ///
+    /// The session map is held from the materialization through the send, which
+    /// is what keeps a release from landing in between (spec section 5): a
+    /// command either reaches the driver ahead of the release request, and the
+    /// driver then declines to go, or it waits out the whole teardown and
+    /// re-materializes. The reply is awaited with the map released, since
+    /// requests are answered in arrival order and this one is already queued.
     pub async fn command(
         &self,
         session: &str,
         command: Command,
     ) -> Result<CommandOutcome, HostError> {
-        let live = self.live(session).await?;
         let (reply, outcome) = oneshot::channel();
-        if !live.send(Request::Command { command, reply }) {
-            return Err(HostError::Internal("session driver is gone".into()));
+        {
+            let (_sessions, live) = self.live_locked(session).await?;
+            if !live.send(Request::Command { command, reply }) {
+                return Err(HostError::Internal("session driver is gone".into()));
+            }
         }
         outcome
             .await
@@ -557,12 +614,55 @@ impl SessionHost {
         let live_ids: HashSet<String> = self.inner.sessions.lock().await.keys().cloned().collect();
         // The store scan is blocking IO, so it runs with the session map's lock
         // already released.
+        let mut summaries = self.cold_rows(|id| live_ids.contains(id))?;
+        let live: Vec<Arc<LiveSession>> = self
+            .inner
+            .sessions
+            .lock()
+            .await
+            .values()
+            .map(|entry| Arc::clone(&entry.session))
+            .collect();
+        // A session released while the scan ran is in neither set: the scan
+        // skipped its log as live, and the map no longer has it. Without this
+        // it would drop out of the directory for a refresh, which is not
+        // something a release may do (spec section 5: a client sees the
+        // liveness flag flip and nothing else).
+        let released: Vec<String> = live_ids
+            .into_iter()
+            .filter(|id| !live.iter().any(|session| session.id() == id))
+            .collect();
+        if !released.is_empty() {
+            let rows = self.cold_rows(|id| !released.iter().any(|released| released == id))?;
+            summaries.extend(rows);
+        }
+        // The live sessions go in last, and off the map as it is now rather
+        // than off the snapshot that filtered the scan: a session materialized
+        // while the scan ran is live, and publishing it as on-disk only would
+        // be wrong rather than merely stale. A live session always wins over a
+        // cold row for the same id, since only one of those two answers can be
+        // the host's own.
+        for session in &live {
+            summaries.insert(session.id().to_string(), summarize(session));
+        }
+        // Latest first: session ids are minted as timestamps, so their
+        // descending order is chronological.
+        let mut sessions: Vec<SessionSummary> = summaries.into_values().collect();
+        sessions.sort_by(|left, right| right.id.cmp(&left.id));
+        Ok(SessionList { sessions })
+    }
+
+    /// Directory rows for the store's sessions that `live` does not claim.
+    fn cold_rows(
+        &self,
+        live: impl Fn(&str) -> bool,
+    ) -> Result<BTreeMap<String, SessionSummary>, HostError> {
         let cold = self
             .inner
             .cold
-            .list(|id| live_ids.contains(id))
+            .list(live)
             .map_err(|err| HostError::Internal(Box::new(err)))?;
-        let mut summaries: BTreeMap<String, SessionSummary> = cold
+        Ok(cold
             .into_iter()
             .map(|session| {
                 (
@@ -579,29 +679,7 @@ impl SessionHost {
                     },
                 )
             })
-            .collect();
-        // The live sessions go in last, and off the map as it is now rather
-        // than off the snapshot that filtered the scan: a session materialized
-        // while the scan ran is live, and publishing it as on-disk only would
-        // be wrong rather than merely stale. A live session always wins over a
-        // cold row for the same id, since only one of those two answers can be
-        // the host's own.
-        let live: Vec<Arc<LiveSession>> = self
-            .inner
-            .sessions
-            .lock()
-            .await
-            .values()
-            .map(|entry| Arc::clone(&entry.session))
-            .collect();
-        for session in &live {
-            summaries.insert(session.id().to_string(), summarize(session));
-        }
-        // Latest first: session ids are minted as timestamps, so their
-        // descending order is chronological.
-        let mut sessions: Vec<SessionSummary> = summaries.into_values().collect();
-        sessions.sort_by(|left, right| right.id.cmp(&left.id));
-        Ok(SessionList { sessions })
+            .collect())
     }
 
     /// The session's background-task table, with wall-clock timestamps: the
@@ -713,9 +791,10 @@ impl SessionHost {
 
     /// The session's accumulated token usage, for an end-of-run report.
     ///
-    /// `None` for a session that is not live: usage is per process, so a
-    /// session this host never held spent nothing. Locks the agent, so a
-    /// turn in flight holds this up for the length of that turn.
+    /// `None` for a session that is not live: usage is per materialization, so a
+    /// session this host is not holding spent nothing that this host can still
+    /// account for. Locks the agent, so a turn in flight holds this up for the
+    /// length of that turn.
     pub async fn usage(&self, session: &str) -> Result<Option<UsageSummary>, HostError> {
         let Some(live) = self.live_or_cold(session).await? else {
             return Ok(None);
@@ -769,6 +848,63 @@ impl SessionHost {
         self.inner.shared.fanout.close();
     }
 
+    /// Release `session` if its driver reports it idle, answering whether it
+    /// went (spec section 5).
+    ///
+    /// The session map is held for the whole teardown, which is what makes
+    /// release serialize with materialization: a command or attach that arrives
+    /// meanwhile waits here and then materializes afresh, rather than building
+    /// a second core for a session whose lock the outgoing driver still holds.
+    /// The driver is joined under the same hold, because joining it is what
+    /// releases the lock. Awaiting the driver under the map cannot deadlock: a
+    /// driver never reaches back for the map (see [`HostShared`]).
+    ///
+    /// The cost is that every other session's materialization waits out this
+    /// one's teardown. Short in practice: the driver answers this at its own
+    /// queue position, so at worst we wait out one command it had already
+    /// started, and a session that is releasable has no turn to drain and no
+    /// task to quiesce, which leaves a log flush.
+    ///
+    /// The driver has the last word on releasability (see
+    /// [`Request::Release`]), so a caller may ask about a session that has
+    /// since become busy.
+    async fn release_if_idle(&self, session: &str) -> bool {
+        let mut sessions = self.inner.sessions.lock().await;
+        let Some(entry) = sessions.get(session) else {
+            return false;
+        };
+        let (reply, outcome) = oneshot::channel();
+        let answer = if entry.session.send(Request::Release { reply }) {
+            outcome.await.ok()
+        } else {
+            None
+        };
+        if matches!(answer, Some(ReleaseOutcome::Declined)) {
+            return false;
+        }
+        if answer.is_none() {
+            // No answer means the driver is gone without the host asking, which
+            // only a panicked task leaves behind. Reaping it is the recovery: a
+            // session nothing drives can serve nothing, and leaving it in the
+            // map makes every later command fail on a dead channel.
+            tracing::warn!(session, "reaping a session whose driver is gone");
+        }
+        let entry = sessions
+            .remove(session)
+            .expect("the entry is ours: the map has been held throughout");
+        // The driver returns right after answering, and its return is what
+        // drops the session's lock.
+        let _ = entry.driver.await;
+        if let Some(ReleaseOutcome::Released { mark: Some(mark) }) = answer {
+            self.inner.cold.note_released(&mark.file, mark.last_seq);
+        }
+        // The session's liveness flag is the only trace a release leaves on the
+        // wire (spec section 5), so a client watching the directory has to be
+        // told.
+        self.inner.shared.fanout.mark_list_dirty();
+        true
+    }
+
     /// Refuse a request that arrived after [`Self::shutdown`].
     ///
     /// Without this every path through [`Self::live`] would happily rebuild
@@ -788,11 +924,24 @@ impl SessionHost {
     /// The live session for `session`, materializing it when it is only on
     /// disk.
     async fn live(&self, session: &str) -> Result<Arc<LiveSession>, HostError> {
+        let (sessions, live) = self.live_locked(session).await?;
+        drop(sessions);
+        Ok(live)
+    }
+
+    /// The live session for `session`, with the session map still held.
+    ///
+    /// A caller that has to queue something on the session's driver keeps the
+    /// map until it has (see [`Self::command`]): letting go first would let a
+    /// release land in between and take the driver with it.
+    async fn live_locked(
+        &self,
+        session: &str,
+    ) -> Result<(SessionMap<'_>, Arc<LiveSession>), HostError> {
         self.alive()?;
         let mut sessions = self.inner.sessions.lock().await;
         let live = self.materialize(&mut sessions, Some(session), None).await?;
-        drop(sessions);
-        Ok(live)
+        Ok((sessions, live))
     }
 
     /// The live session for `session`, or `None` when the store knows it but
@@ -816,9 +965,14 @@ impl SessionHost {
     /// Take a session's advisory lock, refusing when another writer holds
     /// it.
     fn acquire(&self, id: &str) -> Result<SessionLock, HostError> {
-        SessionLock::try_acquire(&self.inner.persistence, id)
+        SessionLock::try_acquire(&self.inner.persistence, id, &self.inner.host_id)
             .map_err(|err| HostError::Internal(Box::new(err)))?
-            .ok_or_else(|| HostError::Locked(id.to_string()))
+            .ok_or_else(|| HostError::Locked {
+                session: id.to_string(),
+                // Read only on the refusal path, and the record is cleared on
+                // release, so what it names is a holder that has the lock now.
+                holder: SessionLock::holder(&self.inner.persistence, id),
+            })
     }
 
     /// Resolves creator overrides into a complete per-session run config.
@@ -1005,6 +1159,7 @@ impl SessionHost {
             finished_subs: log.sub_agent_ids(),
             driven_subs: std::collections::BTreeSet::new(),
             last_activity: Utc::now(),
+            last_work: Instant::now(),
         };
         drop(log);
         let (requests_tx, requests) = unbounded_channel();
@@ -1344,6 +1499,69 @@ fn read_host_id(path: &Path) -> Result<Option<String>, HostError> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(HostError::Internal(Box::new(err))),
     }
+}
+
+/// Release sessions that have been idle and unattached for the host's grace
+/// period (spec section 5).
+///
+/// Two clocks have to agree before a session goes, because neither sees the
+/// whole picture. This task's own observation covers what the session cannot
+/// report, its last client detaching, but it only samples on a tick, so work
+/// that starts and ends between two ticks is invisible to it. The session's own
+/// `last_work` covers exactly that, but it does not move when a client comes or
+/// goes. A session is due when both say a full grace has passed.
+///
+/// Holds a weak reference, so a host whose last handle is gone lets this task
+/// exit rather than keeping its sessions alive.
+fn spawn_idle_sweeper(inner: &Arc<HostInner>) {
+    let weak = Arc::downgrade(inner);
+    let grace = inner.idle_grace;
+    // Half the grace, so a session goes at most one tick later than its grace
+    // is up. Floored because a test's grace can be tiny.
+    let tick = (grace / 2).max(Duration::from_millis(1));
+    tokio::spawn(async move {
+        let mut idle_since: HashMap<String, Instant> = HashMap::new();
+        loop {
+            tokio::time::sleep(tick).await;
+            let Some(inner) = weak.upgrade() else { return };
+            let host = SessionHost { inner };
+            if host.alive().is_err() {
+                return;
+            }
+            let held: Vec<Arc<LiveSession>> = host
+                .inner
+                .sessions
+                .lock()
+                .await
+                .values()
+                .map(|entry| Arc::clone(&entry.session))
+                .collect();
+            let fanout = &host.inner.shared.fanout;
+            let now = Instant::now();
+            let mut due = Vec::new();
+            for session in &held {
+                if !live::releasable(session, fanout) {
+                    idle_since.remove(session.id());
+                    continue;
+                }
+                let observed = *idle_since.entry(session.id().to_string()).or_insert(now);
+                let worked = session.status().last_work;
+                if now.duration_since(observed) >= grace && now.duration_since(worked) >= grace {
+                    due.push(session.id().to_string());
+                }
+            }
+            // Drop what we remember about sessions this host no longer holds,
+            // so the map tracks the live set rather than its history.
+            idle_since.retain(|id, _| held.iter().any(|session| session.id() == id));
+            for session in due {
+                // A decline means the driver saw work this task did not, so the
+                // observation starts over rather than retrying every tick.
+                if !host.release_if_idle(&session).await {
+                    idle_since.remove(&session);
+                }
+            }
+        }
+    });
 }
 
 /// Publish `list` frames on a coalescing tick.

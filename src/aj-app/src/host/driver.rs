@@ -32,12 +32,13 @@ use aj_agent::TurnError;
 use aj_agent::events::{AgentEvent, AgentId};
 use aj_agent::tool::TaskId;
 use aj_models::types::UserContent;
-use aj_session::{EntryRef, TaggedEvent, ThreadFilter, repair_interrupted_tool_uses};
+use aj_session::{
+    EntryRef, SessionMetadata, TaggedEvent, ThreadFilter, repair_interrupted_tool_uses,
+};
 use aj_wire::{DurableEvent, Frame};
-use chrono::Utc;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::host::live::{LiveSession, Request, settings_of};
+use crate::host::live::{self, LiveSession, ReleaseOutcome, ReleasedMark, Request, settings_of};
 use crate::host::{
     Command, CommandOutcome, HostError, HostShared, QueueOp, SettingsAxis, SettingsChange,
     mint_epoch,
@@ -112,9 +113,42 @@ impl Driver {
                             let outcome = self.command(command).await;
                             let _ = reply.send(outcome);
                         }
+                        // Judged here, after the catch-up above, so a command
+                        // or an event that arrived before this request has
+                        // already moved the state this reads.
+                        Some(Request::Release { reply }) => {
+                            // A log with no file yet is the one condition
+                            // `releasable` cannot see. Releasing such a session
+                            // would not hand it back to the store, which does
+                            // not know its id, it would drop it.
+                            //
+                            // `try_lock`, because the host holds its session map
+                            // while it waits for this answer: the log can be
+                            // held for the length of an export render, and a
+                            // release that queued behind one would stall every
+                            // other session's materialization for as long.
+                            // Declining costs one grace. The flush below can
+                            // still meet a held log, which is a shorter wait
+                            // than an arbitrary reader's.
+                            let durable = self
+                                .session
+                                .core
+                                .log
+                                .try_lock()
+                                .is_ok_and(|log| log.is_durable());
+                            if !durable
+                                || !live::releasable(&self.session, &self.shared.fanout)
+                            {
+                                let _ = reply.send(ReleaseOutcome::Declined);
+                                continue;
+                            }
+                            let mark = self.wind_down().await;
+                            let _ = reply.send(ReleaseOutcome::Released { mark });
+                            return;
+                        }
                         // The host asked us to stop, or dropped the session.
                         Some(Request::Shutdown) | None => {
-                            self.wind_down().await;
+                            let _ = self.wind_down().await;
                             return;
                         }
                     }
@@ -353,7 +387,7 @@ impl Driver {
                 // let one out-of-order append walk the high-water mark
                 // backwards and re-serve entries a client already applied.
                 status.last_seq = status.last_seq.max(entry.seq);
-                status.last_activity = Utc::now();
+                status.note_activity();
             }
             (
                 status.epoch.clone(),
@@ -773,7 +807,7 @@ impl Driver {
                 {
                     let mut status = self.session.status();
                     status.last_seq = status.last_seq.max(entry.seq);
-                    status.last_activity = Utc::now();
+                    status.note_activity();
                 }
                 self.publish_event(
                     None,
@@ -888,7 +922,7 @@ impl Driver {
             let mut status = self.session.status();
             status.epoch = mint_epoch();
             status.last_seq = log.last_seq();
-            status.last_activity = Utc::now();
+            status.note_activity();
             // Every run the log names is finished: the refusal above
             // established that nothing is live, and the runs of the
             // abandoned branch are over by definition.
@@ -961,7 +995,14 @@ impl Driver {
     /// tool call, while a cancelled turn emits its synthetic aborted
     /// `MessageEnd`s. We keep consuming the event stream while draining so
     /// those reach attached clients before their streams close.
-    async fn wind_down(&mut self) {
+    /// Cancel the session's turns through the graceful path, quiesce its
+    /// background tasks, and flush the log.
+    ///
+    /// Answers what the session leaves behind for the host's directory, `None`
+    /// when the flush failed: the log's in-memory mark then counts entries that
+    /// did not reach the file, and a directory that reported it would be
+    /// claiming durable positions that a resume will not find.
+    async fn wind_down(&mut self) -> Option<ReleasedMark> {
         self.draining = true;
         self.turns.cancel_all();
         let grace = tokio::time::sleep(TURN_DRAIN_GRACE);
@@ -985,12 +1026,27 @@ impl Driver {
         // Buffered non-punctuation entries (the settings records, spawn
         // roots) are lost with the process otherwise: nothing else forces
         // them out.
-        if let Err(err) = self.session.core.log.lock().await.flush_pending() {
+        let mut log = self.session.core.log.lock().await;
+        if let Err(err) = log.flush_pending() {
             tracing::warn!(
                 session = self.session.id(),
                 "failed to flush the conversation log at teardown: {err}"
             );
+            return None;
         }
+        // Read under the log lock, which this task still holds along with the
+        // session's advisory lock, so the mark and the file state it was read
+        // at cannot disagree and no rival writer can be between them.
+        let last_seq = log.last_seq();
+        let file = std::fs::metadata(log.path()).ok()?;
+        Some(ReleasedMark {
+            last_seq,
+            file: SessionMetadata::new(
+                self.session.id().to_string(),
+                file.modified().ok()?.into(),
+                file.len(),
+            ),
+        })
     }
 }
 

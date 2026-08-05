@@ -196,6 +196,7 @@ async fn build_world(
     diagnostics: &[ConfigDiagnostic],
     auth: &AuthStorage,
     persistence: &ConversationPersistence,
+    idle_grace: Option<Duration>,
 ) -> Result<World> {
     let config = layers.effective();
 
@@ -229,7 +230,7 @@ async fn build_world(
         config,
         layers: config_layers,
         catalog,
-    } = compose_host(args, layers, auth, persistence)?;
+    } = compose_host(args, layers, auth, persistence, idle_grace)?;
 
     // A resume attaches, which materializes the session on the way in. A
     // create mints one and holds it live.
@@ -238,7 +239,17 @@ async fn build_world(
         StartupSession::Create => host.create().await?,
         StartupSession::Resume(id) => id,
     };
-    let handles = host.local_handles(&session).await?;
+    let control = Control::local(host);
+    let mut client = SessionClient::new(session.clone());
+    // The stream before the handles: its attachment is what stops the host from
+    // releasing the session in between (spec section 5), which would leave the
+    // world holding handles into a core nothing drives.
+    let stream = open_stream(&control, &session, &mut client).await?;
+    let handles = control
+        .host()
+        .expect("a local run holds the host")
+        .local_handles(&session)
+        .await?;
     // Read off the handles before they move into the world: the notices below
     // are folded after the attach block, and this is the local-only half of
     // startup either way.
@@ -252,10 +263,7 @@ async fn build_world(
         (cfg.settings(), cfg.model_info.context_window)
     };
     let provider_id = settings.provider.clone();
-    let control = Control::local(host);
-    let mut client = SessionClient::new(session.clone());
     let chat = seeded_chat(&config, settings, context_window, &catalog);
-    let stream = open_stream(&control, &session, &mut client).await?;
     let mut world = World {
         control,
         session,
@@ -785,9 +793,15 @@ async fn focus_session(
         .host()
         .expect("a session change is refused in connect mode")
         .clone();
-    let handles = host.local_handles(&session).await?;
     let mut client = SessionClient::new(session.clone());
+    // The stream first: its attachment is what stops the host from releasing
+    // the session between here and the handles below (spec section 5,
+    // attachment is the retention signal). Taking the handles first would leave
+    // a window where an idle session past its grace is torn down in between,
+    // and the world would hold handles into a core nothing drives while the
+    // attach materialized a second one.
     let stream = open_stream(&world.control, &session, &mut client).await?;
+    let handles = host.local_handles(&session).await?;
 
     let (settings, context_window) = local_settings_seed(&handles);
     *world.chat.borrow_mut() = seeded_chat(&world.config, settings, context_window, &world.catalog);
@@ -920,6 +934,7 @@ async fn reattach(world: &mut World, shell: &Rc<RefCell<Shell>>) -> Result<bool,
     let mut stream = open_stream(&world.control, &world.session, &mut world.client).await?;
     std::mem::swap(&mut world.stream, &mut stream);
     drop(stream);
+    refresh_local_handles(world, shell).await?;
     let complete = fold_attach_block(world).await;
     refresh_client_reads(world).await;
     // Adopting an epoch resets the chat model, and both the transcript's
@@ -929,6 +944,29 @@ async fn reattach(world: &mut World, shell: &Rc<RefCell<Shell>>) -> Result<bool,
     // cannot be reused for a different entry of the one we joined.
     shell.borrow().transcript.borrow_mut().reset_to_tail();
     Ok(complete)
+}
+
+/// Re-read the focused session's direct handles, for a local run.
+///
+/// A stream that had to be reopened can land on a fresh materialization: the
+/// host releases a session once it is idle and unattached (spec section 5), and
+/// a client whose stream died is not attached. The handles the world holds then
+/// name a core nothing drives, so the footer's task table and every overlay
+/// that reads the log would be frozen at the state the old materialization
+/// ended on. Ordered after the attach, whose registration is what keeps the
+/// session from going again underneath this.
+///
+/// A no-op in connect mode, which holds no handles.
+async fn refresh_local_handles(
+    world: &mut World,
+    shell: &Rc<RefCell<Shell>>,
+) -> Result<(), ControlError> {
+    let Some(host) = world.control.host().cloned() else {
+        return Ok(());
+    };
+    world.local = Some(host.local_handles(&world.session).await?);
+    shell.borrow().rebind_handles(world);
+    Ok(())
 }
 
 /// The confirmation for a branch, chosen from whether a prompt is handed
@@ -4260,16 +4298,27 @@ impl Shell {
         self.overlays.borrow_mut().close_all();
         *self.settings_ui.borrow_mut() = None;
         *self.task_view.borrow_mut() = None;
+        self.rebind_handles(world);
+        self.header.borrow_mut().text = format!("{APP_TITLE} - session {}", world.session);
+        self.window_title =
+            aj_app::session::window_title(APP_TITLE, &world.session, &world.working_directory);
+        self.transcript.borrow_mut().reset_to_tail();
+    }
+
+    /// Point the chrome that reads a session's own handles at the ones the
+    /// world now holds.
+    ///
+    /// Split out of [`Self::rebind`] because a re-attach can land on a fresh
+    /// materialization of the same session, which needs this and nothing else
+    /// rebind does: closing the overlay stack and dropping the view to the tail
+    /// belong to a session change.
+    fn rebind_handles(&self, world: &World) {
         self.footer.borrow_mut().set_task_registry(
             world
                 .local
                 .as_ref()
                 .map(|local| local.task_registry.clone()),
         );
-        self.header.borrow_mut().text = format!("{APP_TITLE} - session {}", world.session);
-        self.window_title =
-            aj_app::session::window_title(APP_TITLE, &world.session, &world.working_directory);
-        self.transcript.borrow_mut().reset_to_tail();
     }
 }
 
@@ -4653,7 +4702,7 @@ pub async fn run(args: Args) -> Result<()> {
             .await?;
             build_connect_world(&args, connected, layers, &diagnostics, &auth, &persistence).await?
         }
-        _ => build_world(&args, layers, &diagnostics, &auth, &persistence).await?,
+        _ => build_world(&args, layers, &diagnostics, &auth, &persistence, None).await?,
     };
 
     // The control port serves the very host this shell renders, so a remote
@@ -5178,6 +5227,9 @@ async fn advance_resume(
             match open_stream(&world.control, &world.session, &mut world.client).await {
                 Ok(stream) => {
                     world.stream = stream;
+                    // The reopened stream may name a fresh materialization, so
+                    // the handles are re-read before the block is folded.
+                    refresh_local_handles(world, shell).await?;
                     state.step = ResumeStep::CatchingUp;
                     Ok(Some(state))
                 }
@@ -6680,10 +6732,21 @@ mod tests {
     }
 
     async fn scripted_world_with_layers(dir: &TempDir, demo: &str, layers: ConfigLayers) -> World {
+        scripted_world_with(dir, demo, layers, None).await
+    }
+
+    /// A scripted world whose host releases an idle session after
+    /// `idle_grace`, for the tests about what a session switch leaves behind.
+    async fn scripted_world_with(
+        dir: &TempDir,
+        demo: &str,
+        layers: ConfigLayers,
+        idle_grace: Option<Duration>,
+    ) -> World {
         let args = Args::parse_from(["aj", "--scripted", demo]);
         let auth = AuthStorage::new(dir.path().join("auth.json"));
         let persistence = ConversationPersistence::new(dir.path().join("sessions"));
-        build_world(&args, layers, &[], &auth, &persistence)
+        build_world(&args, layers, &[], &auth, &persistence, idle_grace)
             .await
             .expect("build world")
     }
@@ -6857,7 +6920,7 @@ mod tests {
         let args = Args::parse_from(["aj", "--scripted", demo, "continue", session_id]);
         let auth = AuthStorage::new(dir.path().join("auth.json"));
         let persistence = ConversationPersistence::new(dir.path().join("sessions"));
-        build_world(&args, default_layers(), &[], &auth, &persistence)
+        build_world(&args, default_layers(), &[], &auth, &persistence, None)
             .await
             .expect("build resumed world")
     }
@@ -11600,7 +11663,18 @@ mod tests {
         demo: &str,
         layers: ConfigLayers,
     ) -> (World, Rc<RefCell<Shell>>, AsyncApp, PipeWriter, WidgetRef) {
-        let world = scripted_world_with_layers(dir, demo, layers).await;
+        world_shell_app_with_idle_grace(dir, demo, layers, None).await
+    }
+
+    /// [`world_shell_app`] over a host that releases an idle, unattached
+    /// session after `idle_grace`.
+    async fn world_shell_app_with_idle_grace(
+        dir: &TempDir,
+        demo: &str,
+        layers: ConfigLayers,
+        idle_grace: Option<Duration>,
+    ) -> (World, Rc<RefCell<Shell>>, AsyncApp, PipeWriter, WidgetRef) {
+        let world = scripted_world_with(dir, demo, layers, idle_grace).await;
         let shell = Rc::new(RefCell::new(Shell::new(
             Rc::clone(&world.chat),
             Rc::clone(&world.status),
@@ -13958,9 +14032,9 @@ mod tests {
         shut_down(&world).await;
     }
 
-    /// A session change leaves the outgoing session's background work
-    /// running: the host keeps every session it materialized live, so
-    /// switching away no longer tears the work down.
+    /// A session change leaves the outgoing session's background work running:
+    /// the switch tears nothing down, and the host holds a session with live
+    /// work whatever its idle grace says (spec section 5).
     ///
     /// The up-front refusals (the session overlays' confirms, the
     /// `NewSession` command) are what keep a user from walking away from live
@@ -13995,6 +14069,126 @@ mod tests {
         assert!(
             world.handles().task_registry.status(task).is_none(),
             "the focused session's task table is its own",
+        );
+        shut_down(&world).await;
+    }
+
+    /// A switch detaches the outgoing session, so the host is free to release
+    /// it once its grace is up: the frontend's stream is the only thing holding
+    /// it, and the switch replaces it (spec section 5, attachment is the
+    /// retention signal). Without this a long-lived TUI would accumulate a lock
+    /// on every session it ever visited.
+    #[tokio::test]
+    async fn a_switch_detaches_the_outgoing_session_so_it_releases() {
+        const GRACE: Duration = Duration::from_millis(200);
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, _writer, _root) =
+            world_shell_app_with_idle_grace(&dir, "streaming-text", default_layers(), Some(GRACE))
+                .await;
+        // Punctuate the outgoing session's log: a session with nothing on disk
+        // is deliberately never released.
+        run_prompt(&mut world, "seed").await;
+        let outgoing = world.session.clone();
+
+        let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
+        assert!(matches!(moved, Focus::Moved));
+        assert_ne!(world.session, outgoing, "the focus moved");
+
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        loop {
+            let entry = world
+                .host()
+                .sessions()
+                .await
+                .expect("session list")
+                .sessions
+                .into_iter()
+                .find(|entry| entry.id == outgoing)
+                .expect("the outgoing session is still in the directory");
+            if !entry.live {
+                assert!(entry.last_seq > 0, "and it reports what it left on disk");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the outgoing session was never released, so the switch left it attached",
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // The session the user is looking at is attached, so it stays.
+        tokio::time::sleep(GRACE * 2).await;
+        assert!(
+            world
+                .host()
+                .sessions()
+                .await
+                .expect("session list")
+                .sessions
+                .iter()
+                .any(|entry| entry.id == world.session && entry.live),
+            "the focused session is attached, so the grace does not touch it",
+        );
+        shut_down(&world).await;
+    }
+
+    /// A re-attach that lands on a fresh materialization repoints the world's
+    /// direct handles. A stream that ended leaves the session unattached, so the
+    /// host is free to release it, and the handles the world holds then name a
+    /// core nothing drives: the footer's task table, the tree and session-info
+    /// overlays and the export all read through them.
+    #[tokio::test]
+    async fn a_reattach_after_a_release_repoints_the_handles() {
+        const GRACE: Duration = Duration::from_millis(200);
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, _app, _writer, _root) =
+            world_shell_app_with_idle_grace(&dir, "streaming-text", default_layers(), Some(GRACE))
+                .await;
+        // Punctuate the log: a session with nothing on disk is never released.
+        run_prompt(&mut world, "seed").await;
+        let session = world.session.clone();
+        let stale = Arc::clone(&world.handles().log);
+
+        // The focused session's stream goes elsewhere, which is what an evicted
+        // subscriber leaves behind: nothing holds the session and the grace
+        // applies to it.
+        let elsewhere = world.host().create().await.expect("a scratch session");
+        world.stream = world
+            .control
+            .attach(&elsewhere, None)
+            .await
+            .expect("attach elsewhere");
+
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        loop {
+            let listed = world
+                .host()
+                .sessions()
+                .await
+                .expect("session list")
+                .sessions
+                .into_iter()
+                .find(|entry| entry.id == session)
+                .expect("still in the directory");
+            if !listed.live {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the session was never released");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        reattach(&mut world, &shell).await.expect("re-attach");
+        let now = world
+            .host()
+            .local_handles(&session)
+            .await
+            .expect("the host's own handles");
+        assert!(
+            !Arc::ptr_eq(&world.handles().log, &stale),
+            "the re-attach landed on a fresh materialization, which is the case under test",
+        );
+        assert!(
+            Arc::ptr_eq(&world.handles().log, &now.log),
+            "the world holds the handles of the core the host now drives",
         );
         shut_down(&world).await;
     }
@@ -14334,7 +14528,8 @@ mod tests {
             let auth = AuthStorage::new(dir.path().join("auth.json"));
             let persistence = ConversationPersistence::new(dir.path().join("sessions"));
             let ComposedHost { host, .. } =
-                compose_host(&args, default_layers(), &auth, &persistence).expect("compose a host");
+                compose_host(&args, default_layers(), &auth, &persistence, None)
+                    .expect("compose a host");
             let server = crate::remote::RemoteServer::bind(
                 host.clone(),
                 "127.0.0.1:0".parse().expect("a loopback address"),
