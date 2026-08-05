@@ -630,20 +630,26 @@ Attention is client-relative state and stays client-side.
 `list` frames are lossy-coalescible (section 6.4), and the host
 debounces them: `last_seq` churn during a busy turn must not produce a
 frame per event, a short coalescing tick bounds the rate. Producing
-one must also be cheap, because session events are the frequent
-trigger: a refresh does no disk I/O for live sessions (the host
-already holds their `last_seq` and status in memory, reading the log
-back to recount entries is never correct), and the on-disk remainder
-is served from caches invalidated by directory change, never by
-session events. Per-file work on refresh (format sniffing, entry
-counting) caches on facts that actually change (a file's format
-never does). Violating this turns the list publisher into a
-steady-state I/O storm: a debounced refresh that rescans a large
-session directory reads hundreds of gigabytes over a working day.
-A refresh whose payload is identical to the last published frame is
-suppressed, `list` is cumulative so an unchanged snapshot carries no
-information, and emitting it anyway streams identical kilobytes to
-every attached client for the length of a turn.
+one touches memory only. The host is the single writer of its working
+directory's session store (section 5), so cold sessions do not change
+behind its back and their metadata needs no continual freshness. The
+event-triggered refresh path composes the frame from the live
+sessions' in-memory state plus a cold-session cache and performs no
+filesystem work at all, not even stats. The cold cache is (re)built
+at enumeration points, which are rare and externally paced: host
+startup, an explicit `GET /v1/sessions`, a stream attach. The host's
+own structural changes (session create, delete, release of a
+materialized session) update the cache directly. A concurrent writer
+in the same directory is a conflict the session locks exist to
+surface, not a workload to poll for, its sessions cannot be served by
+this host anyway, and its activity becomes visible at the next
+enumeration point. Reading a live session's log back to recount
+entries is never correct, the host already holds its `last_seq`.
+This contract has teeth: the polling variant of this design read
+hundreds of gigabytes a day sniffing and recounting an unchanged
+400-file directory. A refresh whose payload is identical to the last
+published frame is suppressed even so, `list` is cumulative and an
+unchanged snapshot carries no information.
 
 ### 6.9 Flow control
 
