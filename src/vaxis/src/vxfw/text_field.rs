@@ -425,6 +425,10 @@ impl Widget for TextField {
     fn handle_event(&mut self, ctx: &mut EventContext, event: &Event) {
         match event {
             Event::FocusOut | Event::FocusIn => ctx.redraw = true,
+            Event::Paste(text) => {
+                self.insert_slice_at_cursor(text);
+                self.check_changed(ctx);
+            }
             Event::KeyPress(key) => {
                 if key.matches(Key::BACKSPACE, Modifiers::empty()) {
                     self.delete_before_cursor();
@@ -785,6 +789,9 @@ mod tests {
 
         text_field.handle_event(&mut ctx, &key('_', "_"));
         assert_eq!(seen.borrow().as_str(), "Hell_o");
+
+        text_field.handle_event(&mut ctx, &Event::Paste(" pasted".to_string()));
+        assert_eq!(seen.borrow().as_str(), "Hell_ pastedo");
     }
 
     #[test]

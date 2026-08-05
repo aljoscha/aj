@@ -194,7 +194,7 @@ fn url_segment(url: &str, style: Style, hyperlinks: bool) -> Segment {
 /// The login dialog overlay.
 ///
 /// This widget is the overlay's focus target (see `focus` on the pushed
-/// [`OpenOverlay`](crate::overlay::OpenOverlay)), so every key reaches it
+/// [`OpenOverlay`](crate::overlay::OpenOverlay)), so every input event reaches it
 /// at-target. It handles the dialog chords itself (Esc cancel, Ctrl+Y
 /// copy, arrows/page scroll) and forwards the rest to the inner
 /// [`TextField`] while a prompt is active. The field is never focused, so
@@ -403,6 +403,20 @@ impl Widget for LoginDialog {
     }
 
     fn handle_event(&mut self, ctx: &mut EventContext, event: &Event) {
+        if matches!(event, Event::Paste(_)) {
+            let prompting = self
+                .state
+                .lock()
+                .expect("login dialog state poisoned")
+                .input_prompt
+                .is_some();
+            if prompting {
+                self.field.handle_event(ctx, event);
+            }
+            ctx.consume_and_redraw();
+            return;
+        }
+
         let Event::KeyPress(key) = event else {
             return;
         };
@@ -466,9 +480,9 @@ impl Widget for LoginDialog {
             return;
         }
 
-        // Manual-paste editing: forward printables/backspace/submit to the
-        // field only while a prompt is active. Enter fires the field's
-        // on_submit, which delivers the value to the awaiting callback.
+        // Manual-paste editing: forward keyboard editing to the field only
+        // while a prompt is active. Enter fires the field's on_submit, which
+        // delivers the value to the awaiting callback.
         let prompting = self
             .state
             .lock()
@@ -929,6 +943,24 @@ mod tests {
         let got = fut.await.expect("join").expect("input");
         assert_eq!(got, "code123");
         // The prompt clears after delivery.
+        assert!(state.lock().unwrap().input_prompt.is_none());
+    }
+
+    #[tokio::test]
+    async fn enter_delivers_pasted_text_to_awaiting_callback() {
+        let (mut dialog, state, pending, _cancel) = make();
+        let (cb, _rx) = callbacks(&state, &pending);
+
+        let fut = tokio::spawn(async move { cb.on_prompt("paste:").await });
+        tokio::task::yield_now().await;
+        assert!(state.lock().unwrap().input_prompt.is_some(), "prompt shown");
+
+        let mut ctx = EventContext::new();
+        dialog.handle_event(&mut ctx, &Event::Paste("code123".to_string()));
+        dialog.handle_event(&mut ctx, &key_event(Key::ENTER, Modifiers::empty(), None));
+
+        let got = fut.await.expect("join").expect("input");
+        assert_eq!(got, "code123");
         assert!(state.lock().unwrap().input_prompt.is_none());
     }
 
