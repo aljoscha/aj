@@ -641,16 +641,24 @@ Per-session status in `list` frames and `GET /v1/sessions`:
   background sub-agents surface through `tasks`, not here.
 - `queued`: counts of pending steering / follow-up messages.
 - `tasks`: count of live background tasks.
-- `last_seq` and a last-activity timestamp. For a session that is not
-  live, `last_seq` is derived from the store rather than reported as
-  zero, otherwise the unseen-output glyph below could never fire for a
-  session the client has not attached, which is most of them.
+- a last-activity timestamp (host clock) on every row, and `last_seq`
+  only on live rows, where the host holds it in memory. A cold row
+  never carries a derived `last_seq`: an exact entry count is O(file
+  bytes) to compute (nothing in the log records it), the protocol
+  forbids using it as a cursor anyway (section 6.5), and seqs are not
+  even stable across materializations. Deriving it made every host
+  start read the entire store, gigabytes before first paint. The
+  activity timestamp carries the same signal for a stat: a cold row's
+  stamp is the log's mtime, a live row's is the last durable event.
 - `unreachable` (gateway only): the owning host connection is down.
 
 There is deliberately no "needs attention" bit on the server. A client
-derives it: a session that is idle and whose `last_seq` is beyond what
-the user has viewed has unseen output, that is the sidebar glyph.
-Attention is client-relative state and stays client-side.
+derives it: a session that is idle and whose activity timestamp is
+newer than the stamp the client recorded when the user last viewed it
+has unseen output, that is the sidebar glyph. Both stamps are host
+clock, the client stores and compares them without ever consulting
+its own, so skew cannot enter. Attention is client-relative state and
+stays client-side.
 
 `list` frames are lossy-coalescible (section 6.4), and the host
 debounces them: `last_seq` churn during a busy turn must not produce a
@@ -671,8 +679,12 @@ way). A concurrent writer
 in the same directory is a conflict the session locks exist to
 surface, not a workload to poll for, its sessions cannot be served by
 this host anyway, and its activity becomes visible at the next
-enumeration point. Reading a live session's log back to recount
-entries is never correct, the host already holds its `last_seq`.
+enumeration point. Reading a log to produce a directory row is never
+correct, live or cold: a live session's facts are in memory, and a
+cold row needs only enumeration metadata plus the per-path format
+sniff, the one first-line read, cached forever. Enumeration is
+therefore readdir and stats, cheap enough to run synchronously at
+startup.
 This contract has teeth: the polling variant of this design read
 hundreds of gigabytes a day sniffing and recounting an unchanged
 400-file directory. A refresh whose payload a subscriber has already
