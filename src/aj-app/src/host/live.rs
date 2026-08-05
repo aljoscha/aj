@@ -55,16 +55,18 @@ pub(crate) enum Request {
 pub(crate) enum ReleaseOutcome {
     /// The session was releasable. The driver has wound down and is returning,
     /// which is what releases the session's advisory lock.
-    Released { mark: Option<ReleasedMark> },
+    Released { mark: ReleasedMark },
     /// The session was not releasable. It stays live and keeps its lock.
     Declined,
 }
 
 /// What a released session leaves for the host's directory to report.
 ///
-/// Both halves are read after the teardown flush and while the driver still
+/// Both halves are read after the release flush and while the driver still
 /// holds the session's lock, so they describe the same file state and no rival
-/// writer can have moved it in between.
+/// writer can have moved it in between. A release the driver cannot produce one
+/// for does not happen at all: the host would have no row to serve the session
+/// with (see [`ReleaseOutcome`]).
 pub(crate) struct ReleasedMark {
     /// The log's own durable mark, so the directory can report the session
     /// without counting a log the host just closed itself.

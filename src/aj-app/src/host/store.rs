@@ -1,20 +1,33 @@
 //! The on-disk part of the host's session directory.
 //!
 //! A `list` frame is produced on a coalescing tick whose frequent trigger is
-//! session events, so producing one has to be cheap (spec 6.8). The host
-//! answers a live session off its own status and never reads its log, and this
-//! module answers the remainder from caches that only a change to the file
-//! itself invalidates. Steady state for a refresh that finds nothing changed
-//! on disk is one directory read plus one `stat` per log, and no log read.
+//! session events, so producing one may not touch the filesystem (spec 6.8). It
+//! does not: a refresh reads [`ColdSessions::rows`], which is memory. The rows
+//! are brought up to date at enumeration points, which are rare and externally
+//! paced (host startup, an explicit session listing, a stream attach), and by
+//! the host recording its own structural changes.
 //!
-//! One case falls outside that: a log the store cannot open is retried on
-//! every refresh, because nothing about the file moves when it becomes
-//! readable again. That costs the failed open and nothing more.
+//! The host is the single writer of its working directory's store (spec
+//! section 5), so this is not a staleness the design has to chase. A
+//! concurrent writer's sessions cannot be served by this host anyway, and its
+//! activity becomes visible at the next enumeration point. That cuts both ways:
+//! a row whose log another process deleted is offered until then, and an attach
+//! to it is refused, since membership is answered off the store rather than off
+//! these rows.
+//!
+//! An enumeration itself does per-file work only where a file moved: the
+//! format verdict and the entry count cache against the `(mtime, size)` they
+//! were read from. One case falls outside that, a log the store cannot open is
+//! retried at every enumeration, because nothing about the file moves when it
+//! becomes readable again. That costs the failed open and nothing more.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex as StdMutex, MutexGuard};
 
 use aj_session::{ConversationError, ConversationPersistence, SessionMetadata};
+
+use crate::host::live::ReleasedMark;
 use chrono::{DateTime, Utc};
 
 /// What a directory refresh needs from the session store.
@@ -49,17 +62,19 @@ impl SessionStore for ConversationPersistence {
 }
 
 /// One session the store holds that the host is not holding live.
+#[derive(Clone)]
 pub(crate) struct ColdSession {
     pub(crate) id: String,
     pub(crate) last_seq: u64,
     pub(crate) last_activity: DateTime<Utc>,
 }
 
-/// The store's sessions, with the per-file facts a directory entry needs
-/// cached against the file they were read from.
+/// The store's sessions as the host last saw them, with the per-file facts a
+/// directory entry needs cached against the file they were read from.
 pub(crate) struct ColdSessions<S> {
     store: S,
     cache: StdMutex<Cache>,
+    directory_reads: AtomicU64,
 }
 
 /// A log file's identity for caching: a file whose modification time and size
@@ -80,13 +95,16 @@ struct Derived<T> {
     value: T,
 }
 
-/// Both maps are keyed by session id. [`ColdSessions::list`] drops the entries
-/// of sessions that have left the store, so on a host that publishes a
-/// directory (every host does) neither map outgrows it. Entries that
-/// [`ColdSessions::contains`] adds in between are not evicted until the next
-/// `list`.
+/// Every map is keyed by session id. [`ColdSessions::enumerate`] drops the
+/// entries of sessions that have left the store, so on a host that ever
+/// enumerates (every host does, at startup) none of them outgrows it. Entries
+/// that [`ColdSessions::contains`] adds in between are not evicted until the
+/// next enumeration.
 #[derive(Default)]
 struct Cache {
+    /// The answer a refresh serves. What an enumeration point last found, plus
+    /// what the host has recorded about its own sessions since.
+    rows: HashMap<String, ColdSession>,
     formats: HashMap<String, Derived<bool>>,
     last_seqs: HashMap<String, Derived<u64>>,
 }
@@ -96,34 +114,72 @@ impl<S: SessionStore> ColdSessions<S> {
         Self {
             store,
             cache: StdMutex::new(Cache::default()),
+            directory_reads: AtomicU64::new(0),
         }
     }
 
-    /// Every current-format session in the store that `live` does not claim,
-    /// with the durable high-water mark of its log, in the store's own order.
+    /// The cold rows as they stand, in no particular order.
     ///
-    /// A live session costs nothing beyond its directory entry: the host holds
-    /// its mark in memory, and reading its log back to recount entries would
-    /// be wrong as well as expensive, since the log is mid-append (spec 6.8).
-    /// The remainder answers from the cache unless its file moved.
-    pub(crate) fn list(
-        &self,
-        live: impl Fn(&str) -> bool,
-    ) -> Result<Vec<ColdSession>, ConversationError> {
-        let enumerated = self.store.enumerate_sessions()?;
-        self.evict(&enumerated);
-        let mut cold = Vec::with_capacity(enumerated.len());
-        for metadata in enumerated {
-            if live(&metadata.session_id) || !self.current_format(&metadata) {
+    /// Touches no filesystem, which is the whole point: this is what a
+    /// refresh serves (spec 6.8).
+    pub(crate) fn rows(&self) -> Vec<ColdSession> {
+        self.cache().rows.values().cloned().collect()
+    }
+
+    /// Re-read the store and bring the rows up to date. The enumeration point
+    /// (spec 6.8), and the only path here that reads the directory.
+    ///
+    /// `live` names the sessions the host holds. Their logs are enumerated like
+    /// any other, but nothing is derived from them: the host answers a live
+    /// session off its own status, and recounting a log that is mid-append
+    /// would be wrong as well as expensive. Their rows are left as they stand
+    /// rather than dropped, so a session released while this runs keeps the row
+    /// its release recorded instead of falling out of the directory until the
+    /// next enumeration point.
+    pub(crate) fn enumerate(&self, live: impl Fn(&str) -> bool) -> Result<(), ConversationError> {
+        // What this scan is entitled to evict, taken before the directory read
+        // so that everything in it predates this scan's view of the store.
+        let known: HashSet<String> = {
+            let cache = self.cache();
+            cache
+                .rows
+                .keys()
+                .chain(cache.formats.keys())
+                .chain(cache.last_seqs.keys())
+                .cloned()
+                .collect()
+        };
+        let enumerated = self.enumerate_store()?;
+        for metadata in &enumerated {
+            if live(&metadata.session_id) {
                 continue;
             }
-            cold.push(ColdSession {
-                last_seq: self.last_seq(&metadata),
+            let row = self.current_format(metadata).then(|| ColdSession {
+                id: metadata.session_id.clone(),
+                last_seq: self.last_seq(metadata),
                 last_activity: metadata.modified_at,
-                id: metadata.session_id,
             });
+            let mut cache = self.cache();
+            match row {
+                Some(row) => cache.rows.insert(metadata.session_id.clone(), row),
+                // A log the store will not read is no session, and one that
+                // stops being readable stops being listed.
+                None => cache.rows.remove(&metadata.session_id),
+            };
         }
-        Ok(cold)
+        self.evict(&enumerated, &known);
+        Ok(())
+    }
+
+    /// How many times this has read the store's directory, whether to enumerate
+    /// or to answer a membership question.
+    ///
+    /// The refresh contract is about the filesystem work a refresh does *not*
+    /// do, which its answers cannot show, so this is the seam the tests assert
+    /// on.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn directory_reads(&self) -> u64 {
+        self.directory_reads.load(Ordering::Relaxed)
     }
 
     /// Whether the store holds a current-format log for `id`.
@@ -133,8 +189,7 @@ impl<S: SessionStore> ColdSessions<S> {
     /// them.
     pub(crate) fn contains(&self, id: &str) -> Result<bool, ConversationError> {
         let Some(metadata) = self
-            .store
-            .enumerate_sessions()?
+            .enumerate_store()?
             .into_iter()
             .find(|metadata| metadata.session_id == id)
         else {
@@ -144,16 +199,26 @@ impl<S: SessionStore> ColdSessions<S> {
     }
 
     /// Record what the host knows about a session it just released, so a
-    /// refresh serves it without counting a log the host itself closed.
+    /// refresh serves it without an enumeration and without counting a log the
+    /// host itself closed.
     ///
-    /// Touches no filesystem: `file` is the state the releasing driver read
-    /// under the session's own lock, so it is the fingerprint `last_seq` was
-    /// counted at. It is also the one the next enumeration finds, unless a rival
-    /// writer took the freed lock and appended in between, in which case the
-    /// fingerprint has moved and the entry simply misses.
-    pub(crate) fn note_released(&self, file: &SessionMetadata, last_seq: u64) {
+    /// Touches no filesystem. The mark carries its own consistency (see
+    /// [`ReleasedMark`]): the fingerprint is the file state its `last_seq` was
+    /// counted at. It is also the state the next enumeration finds, unless a
+    /// rival writer took the freed lock and appended in between, in which case
+    /// the fingerprint has moved and the derived facts simply miss.
+    pub(crate) fn note_released(&self, mark: &ReleasedMark) {
+        let ReleasedMark { last_seq, file } = mark;
         let at = fingerprint(file);
         let mut cache = self.cache();
+        cache.rows.insert(
+            file.session_id.clone(),
+            ColdSession {
+                id: file.session_id.clone(),
+                last_seq: *last_seq,
+                last_activity: file.modified_at,
+            },
+        );
         cache
             .formats
             .insert(file.session_id.clone(), Derived { at, value: true });
@@ -161,7 +226,7 @@ impl<S: SessionStore> ColdSessions<S> {
             file.session_id.clone(),
             Derived {
                 at,
-                value: last_seq,
+                value: *last_seq,
             },
         );
     }
@@ -243,18 +308,29 @@ impl<S: SessionStore> ColdSessions<S> {
         last_seq
     }
 
-    /// Drop what we derived for sessions the store no longer holds, so the
-    /// cache stays a projection of the directory rather than of its history.
-    fn evict(&self, enumerated: &[SessionMetadata]) {
+    /// Drop what we hold for sessions the store no longer holds, so the cache
+    /// stays a projection of the directory rather than of its history.
+    ///
+    /// Only ids in `known`, which this scan read the directory after taking, are
+    /// eligible. An id that arrived while the scan ran was recorded by something
+    /// that knew more about it than this scan's directory read did: a newer
+    /// enumeration, or a release handing over the state it read under the
+    /// session's own lock. Evicting one of those would undo it.
+    fn evict(&self, enumerated: &[SessionMetadata], known: &HashSet<String>) {
         let present: HashSet<&str> = enumerated
             .iter()
             .map(|metadata| metadata.session_id.as_str())
             .collect();
+        let gone = |id: &String| known.contains(id) && !present.contains(id.as_str());
         let mut cache = self.cache();
-        cache.formats.retain(|id, _| present.contains(id.as_str()));
-        cache
-            .last_seqs
-            .retain(|id, _| present.contains(id.as_str()));
+        cache.rows.retain(|id, _| !gone(id));
+        cache.formats.retain(|id, _| !gone(id));
+        cache.last_seqs.retain(|id, _| !gone(id));
+    }
+
+    fn enumerate_store(&self) -> Result<Vec<SessionMetadata>, ConversationError> {
+        self.directory_reads.fetch_add(1, Ordering::Relaxed);
+        self.store.enumerate_sessions()
     }
 
     fn cache(&self) -> MutexGuard<'_, Cache> {
@@ -282,6 +358,8 @@ fn fingerprint(metadata: &SessionMetadata) -> Fingerprint {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     /// A store whose directory the test edits and whose per-file reads it
@@ -291,6 +369,9 @@ mod tests {
     struct FakeStore {
         files: StdMutex<Vec<FakeFile>>,
         reads: StdMutex<Vec<Read>>,
+        /// Run once inside the first sniff of a scan, so a test can act while a
+        /// scan is between its directory read and its eviction.
+        during_sniff: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
     /// One log in the fake store. `modified` and `size` are independent, as
@@ -357,6 +438,9 @@ mod tests {
                 .lock()
                 .expect("reads")
                 .push(Read::Format(session_id.to_string()));
+            if let Some(interleave) = self.during_sniff.lock().expect("hook").take() {
+                interleave();
+            }
             let file = self.file(session_id)?;
             file.sniffable.then_some(file.current_format)
         }
@@ -409,6 +493,10 @@ mod tests {
             edit(file);
         }
 
+        fn during_sniff(&self, interleave: impl FnOnce() + Send + 'static) {
+            *self.during_sniff.lock().expect("hook") = Some(Box::new(interleave));
+        }
+
         fn remove(&self, id: &str) {
             self.files
                 .lock()
@@ -438,9 +526,30 @@ mod tests {
 
     /// The listed ids paired with their marks, for compact assertions.
     fn listed(cold: Vec<ColdSession>) -> Vec<(String, u64)> {
-        cold.into_iter()
+        let mut rows: Vec<(String, u64)> = cold
+            .into_iter()
             .map(|session| (session.id, session.last_seq))
-            .collect()
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// An enumeration point followed by a refresh, which is the pair every
+    /// assertion about what the store holds goes through.
+    fn refreshed(
+        cold: &ColdSessions<FakeStore>,
+        live: impl Fn(&str) -> bool,
+    ) -> Vec<(String, u64)> {
+        cold.enumerate(live).expect("enumerate");
+        listed(cold.rows())
+    }
+
+    /// A released session's mark, as its driver would hand it over.
+    fn mark(id: &str, last_seq: u64, size: u64) -> ReleasedMark {
+        ReleasedMark {
+            last_seq,
+            file: SessionMetadata::new(id.to_string(), Utc::now(), size),
+        }
     }
 
     /// The core of the performance contract: a session the host holds live is
@@ -461,7 +570,7 @@ mod tests {
                 file.entries += appended;
             });
             assert_eq!(
-                listed(cold.list(|id| id == "live").expect("list")),
+                refreshed(&cold, |id| id == "live"),
                 vec![("cold".to_string(), 3)],
                 "the live session is left to the host, the cold one is served",
             );
@@ -484,7 +593,7 @@ mod tests {
         let cold = ColdSessions::new(store);
 
         for _ in 0..10 {
-            assert_eq!(cold.list(|_| false).expect("list").len(), 3);
+            assert_eq!(refreshed(&cold, |_| false).len(), 3);
         }
         for id in ["a", "b", "c"] {
             assert_eq!(
@@ -504,10 +613,7 @@ mod tests {
         let store = FakeStore::default();
         store.put("a", 5);
         let cold = ColdSessions::new(store);
-        assert_eq!(
-            listed(cold.list(|_| false).expect("list")),
-            [("a".to_string(), 5)]
-        );
+        assert_eq!(refreshed(&cold, |_| false), [("a".to_string(), 5)]);
 
         // Same size, later modification time: a rewrite in place.
         cold.store.forget_reads();
@@ -516,7 +622,7 @@ mod tests {
             file.entries = 8;
         });
         assert_eq!(
-            listed(cold.list(|_| false).expect("list")),
+            refreshed(&cold, |_| false),
             [("a".to_string(), 8)],
             "a log rewritten to the same length is read again",
         );
@@ -529,7 +635,7 @@ mod tests {
             file.entries = 9;
         });
         assert_eq!(
-            listed(cold.list(|_| false).expect("list")),
+            refreshed(&cold, |_| false),
             [("a".to_string(), 9)],
             "a log that grew within one clock tick is read again",
         );
@@ -537,10 +643,7 @@ mod tests {
 
         // And settles again once neither half moves.
         cold.store.forget_reads();
-        assert_eq!(
-            listed(cold.list(|_| false).expect("list")),
-            [("a".to_string(), 9)]
-        );
+        assert_eq!(refreshed(&cold, |_| false), [("a".to_string(), 9)]);
         assert_eq!(cold.store.reads_of("a"), (0, 0));
     }
 
@@ -552,22 +655,16 @@ mod tests {
         let store = FakeStore::default();
         store.put("a", 2);
         let cold = ColdSessions::new(store);
-        assert_eq!(
-            listed(cold.list(|_| false).expect("list")),
-            [("a".to_string(), 2)]
-        );
+        assert_eq!(refreshed(&cold, |_| false), [("a".to_string(), 2)]);
 
         cold.store.put("b", 4);
         assert_eq!(
-            listed(cold.list(|_| false).expect("list")),
+            refreshed(&cold, |_| false),
             [("a".to_string(), 2), ("b".to_string(), 4)],
         );
 
         cold.store.remove("a");
-        assert_eq!(
-            listed(cold.list(|_| false).expect("list")),
-            [("b".to_string(), 4)]
-        );
+        assert_eq!(refreshed(&cold, |_| false), [("b".to_string(), 4)]);
 
         // Same id, same fingerprint, different file. The eviction is what
         // keeps the stale answer from surviving the file that produced it.
@@ -577,7 +674,7 @@ mod tests {
             ..FakeFile::current("a", 2)
         });
         assert_eq!(
-            listed(cold.list(|_| false).expect("list")),
+            refreshed(&cold, |_| false),
             [("a".to_string(), 7), ("b".to_string(), 4)],
         );
         assert_eq!(cold.store.reads_of("a"), (1, 1));
@@ -599,10 +696,7 @@ mod tests {
         let cold = ColdSessions::new(store);
 
         for _ in 0..5 {
-            assert_eq!(
-                listed(cold.list(|_| false).expect("list")),
-                [("current".to_string(), 3)],
-            );
+            assert_eq!(refreshed(&cold, |_| false), [("current".to_string(), 3)],);
         }
         assert_eq!(
             cold.store.reads_of("ancient"),
@@ -625,7 +719,7 @@ mod tests {
         let cold = ColdSessions::new(store);
         for _ in 0..3 {
             assert_eq!(
-                listed(cold.list(|_| false).expect("list")),
+                refreshed(&cold, |_| false),
                 [],
                 "a log that cannot be read is no session",
             );
@@ -640,7 +734,7 @@ mod tests {
         // exactly what restoring a read bit looks like.
         cold.store.edit("shy", |file| file.sniffable = true);
         assert_eq!(
-            listed(cold.list(|_| false).expect("list")),
+            refreshed(&cold, |_| false),
             [("shy".to_string(), 6)],
             "the session comes back without the file changing",
         );
@@ -660,7 +754,7 @@ mod tests {
         let cold = ColdSessions::new(store);
         for _ in 0..3 {
             assert_eq!(
-                listed(cold.list(|_| false).expect("list")),
+                refreshed(&cold, |_| false),
                 [("torn".to_string(), 0)],
                 "it is still a session, with nothing durable to report",
             );
@@ -672,9 +766,138 @@ mod tests {
         );
 
         cold.store.edit("torn", |file| file.countable = true);
+        assert_eq!(refreshed(&cold, |_| false), [("torn".to_string(), 6)],);
+    }
+
+    /// A refresh serves what the last enumeration point found and goes nowhere
+    /// near the store, so a file a sibling process leaves in the directory is
+    /// invisible until something enumerates.
+    #[test]
+    fn a_refresh_serves_the_rows_without_reading_the_directory() {
+        let store = FakeStore::default();
+        store.put("a", 2);
+        let cold = ColdSessions::new(store);
+        assert_eq!(refreshed(&cold, |_| false), [("a".to_string(), 2)]);
+        assert_eq!(cold.directory_reads(), 1);
+
+        cold.store.put("sibling", 9);
+        for _ in 0..10 {
+            assert_eq!(
+                listed(cold.rows()),
+                [("a".to_string(), 2)],
+                "the refresh reports what the enumeration found",
+            );
+        }
         assert_eq!(
-            listed(cold.list(|_| false).expect("list")),
-            [("torn".to_string(), 6)],
+            cold.directory_reads(),
+            1,
+            "and ten refreshes read the directory no times",
+        );
+
+        assert_eq!(
+            refreshed(&cold, |_| false),
+            [("a".to_string(), 2), ("sibling".to_string(), 9)],
+            "the next enumeration point picks the file up",
+        );
+    }
+
+    /// A released session is served from what the host recorded, so its row
+    /// costs neither an enumeration nor a count of the log it just closed.
+    #[test]
+    fn a_released_session_is_served_without_an_enumeration() {
+        let store = FakeStore::default();
+        store.put("held", 4);
+        let cold = ColdSessions::new(store);
+        // Held live, so the enumeration leaves it out.
+        assert_eq!(refreshed(&cold, |id| id == "held"), []);
+
+        cold.note_released(&mark("held", 4, 400));
+        assert_eq!(listed(cold.rows()), [("held".to_string(), 4)]);
+        assert_eq!(cold.directory_reads(), 1, "the release read nothing");
+        assert_eq!(cold.store.reads_of("held"), (0, 0));
+    }
+
+    /// A live session's row is left alone by an enumeration rather than
+    /// dropped. The host's live snapshot can predate a release, and the row the
+    /// release recorded must not be undone by a scan that still believes the
+    /// session is held.
+    #[test]
+    fn an_enumeration_leaves_a_live_sessions_row_alone() {
+        let store = FakeStore::default();
+        store.put("a", 2);
+        let cold = ColdSessions::new(store);
+        assert_eq!(refreshed(&cold, |_| false), [("a".to_string(), 2)]);
+
+        // Materialized, appended to, and released, all while a scan that
+        // snapshotted the live set beforehand is still running.
+        cold.store.edit("a", |file| {
+            file.entries = 5;
+            file.size += 300;
+        });
+        cold.note_released(&mark("a", 5, 800));
+        assert_eq!(refreshed(&cold, |id| id == "a"), [("a".to_string(), 5)]);
+        assert_eq!(
+            cold.store.reads_of("a"),
+            (1, 1),
+            "and the log was not re-read to produce it",
+        );
+    }
+
+    /// Eviction covers the derived facts too, not only the rows. A log with no
+    /// row still leaves a cached format verdict behind, and a verdict that
+    /// outlived its file would answer for whatever file takes the id next.
+    #[test]
+    fn a_vanished_log_leaves_no_verdict_behind() {
+        let store = FakeStore::default();
+        store.write(FakeFile {
+            current_format: false,
+            ..FakeFile::current("a", 5)
+        });
+        let cold = ColdSessions::new(store);
+        assert_eq!(
+            refreshed(&cold, |_| false),
+            [],
+            "a pre-refactor log is no row"
+        );
+
+        cold.store.remove("a");
+        assert_eq!(refreshed(&cold, |_| false), []);
+
+        // A different file, same id, and a fingerprint the old one also had,
+        // which is what a cached verdict would answer from.
+        cold.store.write(FakeFile {
+            entries: 7,
+            ..FakeFile::current("a", 5)
+        });
+        assert_eq!(
+            refreshed(&cold, |_| false),
+            [("a".to_string(), 7)],
+            "the verdict outlived the file that produced it",
+        );
+    }
+
+    /// A scan may only evict rows it could have seen. A row that arrives while
+    /// a scan runs was recorded by something that knew more about that session
+    /// than the scan's directory read did, and a release recording the state it
+    /// read under the session's own lock is exactly that.
+    #[test]
+    fn a_scan_does_not_evict_a_row_that_arrived_while_it_ran() {
+        let store = FakeStore::default();
+        store.put("a", 2);
+        let cold = Arc::new(ColdSessions::new(store));
+        let releasing = Arc::downgrade(&cold);
+        cold.store.during_sniff(move || {
+            let cold = releasing.upgrade().expect("the cache outlives the scan");
+            // A session whose log the scan's directory read never saw, because
+            // it was created after it.
+            cold.note_released(&mark("late", 7, 400));
+        });
+
+        cold.enumerate(|_| false).expect("enumerate");
+        assert_eq!(
+            listed(cold.rows()),
+            [("a".to_string(), 2), ("late".to_string(), 7)],
+            "the scan evicted a row it never had a view of",
         );
     }
 

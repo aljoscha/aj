@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 
 use aj_agent::events::{AgentEvent, AgentId};
 use aj_agent::tool::TaskId;
-use aj_wire::Frame;
+use aj_wire::{Frame, SessionSummary};
 use tokio::sync::Notify;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::error::TryRecvError;
@@ -47,12 +47,49 @@ enum AttachState {
 struct Subscriber {
     live: LiveSender,
     attached: HashMap<String, AttachState>,
+    /// The directory this subscriber was last sent, if it has been sent one.
+    ///
+    /// Per subscriber, because the claim it makes is about what this client has
+    /// seen: a subscriber that just registered has seen nothing, and one whose
+    /// queue dropped a snapshot has not seen that one.
+    sent_list: Option<Vec<SessionSummary>>,
 }
 
 impl Subscriber {
     /// Queue `frame` for this subscriber, applying the attach rules of the
     /// session it belongs to.
     fn offer(&mut self, frame: &Frame) -> bool {
+        self.deliver(frame) != Offered::Evicted
+    }
+
+    /// Queue a directory, unless this subscriber already has it.
+    ///
+    /// The frequent trigger for a refresh is a session event, and most events
+    /// move nothing a directory row shows, so the steady state during a turn is
+    /// a payload identical to the last one. `list` is cumulative and the latest
+    /// frame supersedes (spec 6.4), so an unchanged snapshot carries no
+    /// information. Compared on the payload rather than on what produced it,
+    /// because the payload is what a client sees.
+    fn offer_list(&mut self, sessions: &[SessionSummary]) -> bool {
+        if self.sent_list.as_deref() == Some(sessions) {
+            return true;
+        }
+        let frame = Frame::List {
+            sessions: sessions.to_vec(),
+        };
+        match self.deliver(&frame) {
+            Offered::Queued => {
+                self.sent_list = Some(sessions.to_vec());
+                true
+            }
+            // Not delivered, so not remembered: the next refresh offers this
+            // subscriber the directory again, unchanged or not.
+            Offered::Dropped => true,
+            Offered::Evicted => false,
+        }
+    }
+
+    fn deliver(&mut self, frame: &Frame) -> Offered {
         let Some(session) = frame.session() else {
             // Host-level frames (`list`, `heartbeat`) belong to the
             // connection, not to a session, so no attach state gates them.
@@ -67,17 +104,19 @@ impl Subscriber {
                 if !frame.is_lossy() {
                     return self.live.offer(frame.clone());
                 }
-                true
+                Offered::Dropped
             }
             Some(AttachState::Attaching) => {
                 if !frame.is_lossy() {
                     return self.live.offer(frame.clone());
                 }
-                true
+                Offered::Dropped
             }
             Some(AttachState::Live { boundary }) => {
                 if frame.durable_seq().is_some_and(|seq| seq <= *boundary) {
-                    return true;
+                    // Already in the backfill this stream was served, so the
+                    // subscriber has it.
+                    return Offered::Queued;
                 }
                 self.live.offer(frame.clone())
             }
@@ -153,13 +192,27 @@ fn live_channel(capacity: usize) -> (LiveSender, LiveReceiver, CancellationToken
     )
 }
 
+/// What became of an offered frame.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Offered {
+    /// The subscriber has it: queued, coalesced onto a queued frame of the same
+    /// lossy key, or already in the backfill it was served.
+    Queued,
+    /// Not delivered, and the subscriber stays. A lossy frame met a full queue,
+    /// or the session it belongs to is one this subscriber is not watching.
+    Dropped,
+    /// The subscriber is gone: its queue overflowed with frames that may not be
+    /// dropped, or it had already been closed.
+    Evicted,
+}
+
 impl LiveSender {
     /// Queues a frame without blocking. Reliable overflow closes the stream.
-    fn offer(&self, frame: Frame) -> bool {
+    fn offer(&self, frame: Frame) -> Offered {
         let key = lossy_key(&frame);
         let mut state = self.0.state.lock().expect("live queue mutex poisoned");
         if state.closed {
-            return false;
+            return Offered::Evicted;
         }
         if let Some(key) = key {
             if let Some(index) = state
@@ -169,7 +222,7 @@ impl LiveSender {
             {
                 state.frames.remove(index);
             } else if state.frames.len() >= self.0.capacity {
-                return true;
+                return Offered::Dropped;
             }
         } else if state.frames.len() >= self.0.capacity {
             state.frames.clear();
@@ -177,12 +230,12 @@ impl LiveSender {
             drop(state);
             self.0.cancelled.cancel();
             self.0.ready.notify_waiters();
-            return false;
+            return Offered::Evicted;
         }
         state.frames.push_back(frame);
         drop(state);
         self.0.ready.notify_one();
-        true
+        Offered::Queued
     }
 
     fn retain(&self, mut keep: impl FnMut(&Frame) -> bool) {
@@ -282,7 +335,14 @@ impl Fanout {
             .iter()
             .map(|session| (session.clone(), AttachState::Attaching))
             .collect();
-        self.lock().insert(id, Subscriber { live, attached });
+        self.lock().insert(
+            id,
+            Subscriber {
+                live,
+                attached,
+                sent_list: None,
+            },
+        );
         (id, receiver, cancelled)
     }
 
@@ -295,6 +355,13 @@ impl Fanout {
     /// Fan `frame` out to every subscriber.
     pub(crate) fn publish(&self, frame: Frame) {
         self.lock().retain(|_, subscriber| subscriber.offer(&frame));
+    }
+
+    /// Fan a directory out to every subscriber that does not already have it
+    /// (see [`Subscriber::offer_list`]).
+    pub(crate) fn publish_list(&self, sessions: Vec<SessionSummary>) {
+        self.lock()
+            .retain(|_, subscriber| subscriber.offer_list(&sessions));
     }
 
     /// Switches a session to live delivery and filters duplicate durables.
@@ -568,6 +635,94 @@ mod tests {
         fanout.publish(durable(6));
 
         assert_eq!(drained(&mut rx), vec!["warning after", "durable 6"]);
+    }
+
+    /// One directory row, enough to tell two payloads apart.
+    fn directory(last_seq: u64) -> Vec<SessionSummary> {
+        vec![SessionSummary {
+            id: SESSION.to_string(),
+            live: true,
+            working: false,
+            queued: aj_wire::QueueCounts::default(),
+            tasks: 0,
+            last_seq,
+            last_activity: chrono::DateTime::UNIX_EPOCH,
+            unreachable: false,
+        }]
+    }
+
+    /// A directory a subscriber already has is not sent again, and a changed one
+    /// is.
+    #[test]
+    fn an_unchanged_directory_is_not_offered_twice() {
+        let fanout = Fanout::default();
+        let (_id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string()]);
+
+        fanout.publish_list(directory(1));
+        fanout.publish_list(directory(1));
+        fanout.publish_list(directory(1));
+        assert_eq!(drained(&mut rx), vec!["list"], "one directory, sent once");
+
+        fanout.publish_list(directory(2));
+        assert_eq!(drained(&mut rx), vec!["list"], "a real change gets through");
+    }
+
+    /// A directory a subscriber's full queue dropped is offered again, unchanged
+    /// or not. Suppression records what was delivered, so a lossy frame the
+    /// bound turned away does not count as sent.
+    #[test]
+    fn a_dropped_directory_is_offered_again() {
+        let fanout = Fanout {
+            live_capacity: 2,
+            ..Fanout::default()
+        };
+        let (id, mut rx, cancelled) = fanout.register(&[SESSION.to_string()]);
+        fanout.finish_block(id, SESSION, 0);
+
+        // The client is not reading, so its queue fills with frames that may
+        // not be dropped.
+        fanout.publish(reliable("one"));
+        fanout.publish(reliable("two"));
+        fanout.publish_list(directory(1));
+        assert!(
+            !cancelled.is_cancelled(),
+            "a lossy frame meeting the bound drops rather than evicting",
+        );
+        assert_eq!(
+            drained(&mut rx),
+            vec!["warning one", "warning two"],
+            "the directory did not fit",
+        );
+
+        // Caught up, and the directory has not moved since.
+        fanout.publish_list(directory(1));
+        assert_eq!(
+            drained(&mut rx),
+            vec!["list"],
+            "the subscriber is offered the directory it never got",
+        );
+    }
+
+    /// A fresh subscriber is sent the directory even though every other
+    /// subscriber already has it: suppression is a claim about one client.
+    #[test]
+    fn a_fresh_subscriber_is_offered_a_directory_the_others_have() {
+        let fanout = Fanout::default();
+        let (_settled, mut settled_rx, _cancelled) = fanout.register(&[SESSION.to_string()]);
+        fanout.publish_list(directory(1));
+        assert_eq!(drained(&mut settled_rx), vec!["list"]);
+
+        let (_fresh, mut fresh_rx, _cancelled) = fanout.register(&[SESSION.to_string()]);
+        fanout.publish_list(directory(1));
+        assert_eq!(
+            drained(&mut fresh_rx),
+            vec!["list"],
+            "the new subscriber has seen no directory",
+        );
+        assert!(
+            drained(&mut settled_rx).is_empty(),
+            "and the one that has is not sent it again",
+        );
     }
 
     /// A session this stream did not attach still produces its durable and

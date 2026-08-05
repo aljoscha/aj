@@ -9,6 +9,11 @@
 //! gives are correct either way, only the reads differ, and the unit tests over
 //! the caching layer can only pin that it honours the live set it is handed,
 //! not that the host hands it one.
+//!
+//! The read counter cannot see the other half of the contract. A directory read
+//! and a `stat` transfer no bytes, so the budget below stays green over a
+//! refresh that enumerates the store on every tick, which is why the
+//! enumeration count is asserted beside it.
 
 #![cfg(target_os = "linux")]
 
@@ -121,9 +126,9 @@ fn host(dir: &TempDir, persistence: &ConversationPersistence) -> SessionHost {
 }
 
 /// A streaming turn marks the directory dirty on every event, so the publisher
-/// refreshes at its coalescing rate throughout. Once the store's cold half is
-/// cached, those refreshes must read nothing: the live session's mark comes
-/// from the host, and nothing on disk changed.
+/// refreshes at its coalescing rate throughout. Those refreshes must touch no
+/// filesystem at all: the live session's mark comes from the host, and the
+/// store's cold half is served from the cache the last enumeration point left.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_turns_worth_of_refreshes_reads_nothing() {
     let dir = TempDir::new().expect("tempdir");
@@ -140,6 +145,10 @@ async fn a_turns_worth_of_refreshes_reads_nothing() {
     host.sessions().await.expect("sessions");
 
     let before = read_bytes();
+    let enumerations = host.store_directory_reads();
+    // Every explicit listing below is an enumeration point, so the count is
+    // attributable: what must not appear in it is a refresh.
+    let mut polls = 0_u64;
     host.command(
         &session,
         Command::Prompt {
@@ -152,18 +161,23 @@ async fn a_turns_worth_of_refreshes_reads_nothing() {
     // Polling the host is itself a refresh, so the wait does not understate
     // what a turn's refreshes cost.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while host
-        .sessions()
-        .await
-        .expect("sessions")
-        .sessions
-        .iter()
-        .any(|entry| entry.id == session && entry.working)
-    {
+    loop {
+        polls += 1;
+        let working = host
+            .sessions()
+            .await
+            .expect("sessions")
+            .sessions
+            .iter()
+            .any(|entry| entry.id == session && entry.working);
+        if !working {
+            break;
+        }
         assert!(std::time::Instant::now() < deadline, "the turn never ended");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let read = read_bytes() - before;
+    let enumerated = host.store_directory_reads() - enumerations;
     host.shutdown().await;
 
     assert!(
@@ -171,5 +185,10 @@ async fn a_turns_worth_of_refreshes_reads_nothing() {
         "a turn's refreshes read {read} bytes over a store of {COLD_LOGS} logs, \
          budget {BUDGET}: the refresh is going back to the store for what the \
          host already holds",
+    );
+    assert_eq!(
+        enumerated, polls,
+        "the host read its directory {enumerated} times over {polls} explicit \
+         listings: the refresh is enumerating the store",
     );
 }

@@ -417,6 +417,12 @@ impl SessionHost {
             idle_grace: idle_grace.unwrap_or(DEFAULT_IDLE_GRACE),
             shut_down: AtomicBool::new(false),
         });
+        // Host startup is an enumeration point (spec 6.8). Nothing is live
+        // yet, and a store that cannot be read is not fatal: the next
+        // enumeration point tries again.
+        if let Err(err) = inner.cold.enumerate(|_| false) {
+            tracing::warn!("could not read the session store at startup: {err}");
+        }
         spawn_list_publisher(&inner);
         spawn_idle_sweeper(&inner);
         Ok(Self { inner })
@@ -551,6 +557,13 @@ impl SessionHost {
                 }
             }
         }
+        // A stream attach is an enumeration point (spec 6.8), placed after the
+        // materializations so their sessions are already out of the per-file
+        // work. A store that cannot be read does not fail an attach whose
+        // sessions all resolved.
+        if let Err(err) = self.enumerate().await {
+            tracing::warn!("could not re-read the session store for an attach: {err}");
+        }
         let (block_tx, block_rx) = channel(1);
         let attachment = Attachment::new(
             id,
@@ -605,64 +618,39 @@ impl SessionHost {
     /// Every session of the host's working directory, on-disk ones as well
     /// as live ones. The discovery surface (spec 6.7): there is no separate
     /// on-disk listing.
+    ///
+    /// An enumeration point (spec 6.8), so an explicit listing shows a session
+    /// a sibling process left in the directory even though no refresh would
+    /// have gone looking for it.
     pub async fn sessions(&self) -> Result<SessionList, HostError> {
         self.alive()?;
-        // The live set is what excludes a live session's log from the scan
-        // below: the host holds its mark and status, and re-counting a file
-        // that grows on every append would be blocking IO on a runtime worker
-        // for a worse answer than the one we already have (spec 6.8).
-        let live_ids: HashSet<String> = self.inner.sessions.lock().await.keys().cloned().collect();
-        // The store scan is blocking IO, so it runs with the session map's lock
-        // already released.
-        let mut summaries = self.cold_rows(|id| live_ids.contains(id))?;
-        let live: Vec<Arc<LiveSession>> = self
-            .inner
-            .sessions
-            .lock()
-            .await
+        self.enumerate().await?;
+        Ok(self.directory().await)
+    }
+
+    /// The directory as the host holds it, live sessions' own state merged with
+    /// the cold rows as they stand.
+    ///
+    /// Touches no filesystem: this is what a refresh serves (spec 6.8), and it
+    /// runs on every published frame.
+    async fn directory(&self) -> SessionList {
+        // Both halves are read under the session map, which is what makes them
+        // one observation. A release records its cold row and drops the session
+        // from the map under that same lock, so a session read here is either
+        // live or has a row, never neither. Taking the rows outside the hold
+        // would let a release land in between and drop the session out of the
+        // directory for a frame, which is not something a release may do (spec
+        // section 5: a client sees the liveness flag flip and nothing else). The
+        // cold cache is a leaf, so nesting its lock under the map cannot invert
+        // an order.
+        let sessions = self.inner.sessions.lock().await;
+        let live: Vec<Arc<LiveSession>> = sessions
             .values()
             .map(|entry| Arc::clone(&entry.session))
             .collect();
-        // A session released while the scan ran is in neither set: the scan
-        // skipped its log as live, and the map no longer has it. Without this
-        // it would drop out of the directory for a refresh, which is not
-        // something a release may do (spec section 5: a client sees the
-        // liveness flag flip and nothing else).
-        let released: Vec<String> = live_ids
-            .into_iter()
-            .filter(|id| !live.iter().any(|session| session.id() == id))
-            .collect();
-        if !released.is_empty() {
-            let rows = self.cold_rows(|id| !released.iter().any(|released| released == id))?;
-            summaries.extend(rows);
-        }
-        // The live sessions go in last, and off the map as it is now rather
-        // than off the snapshot that filtered the scan: a session materialized
-        // while the scan ran is live, and publishing it as on-disk only would
-        // be wrong rather than merely stale. A live session always wins over a
-        // cold row for the same id, since only one of those two answers can be
-        // the host's own.
-        for session in &live {
-            summaries.insert(session.id().to_string(), summarize(session));
-        }
-        // Latest first: session ids are minted as timestamps, so their
-        // descending order is chronological.
-        let mut sessions: Vec<SessionSummary> = summaries.into_values().collect();
-        sessions.sort_by(|left, right| right.id.cmp(&left.id));
-        Ok(SessionList { sessions })
-    }
-
-    /// Directory rows for the store's sessions that `live` does not claim.
-    fn cold_rows(
-        &self,
-        live: impl Fn(&str) -> bool,
-    ) -> Result<BTreeMap<String, SessionSummary>, HostError> {
-        let cold = self
-            .inner
-            .cold
-            .list(live)
-            .map_err(|err| HostError::Internal(Box::new(err)))?;
-        Ok(cold
+        let cold = self.inner.cold.rows();
+        drop(sessions);
+        let mut summaries: BTreeMap<String, SessionSummary> = cold
             .into_iter()
             .map(|session| {
                 (
@@ -679,7 +667,48 @@ impl SessionHost {
                     },
                 )
             })
-            .collect())
+            .collect();
+        // A live session always wins the id: the cold cache can still hold the
+        // row a session had before it was materialized, and of those two
+        // answers only the host's own is current.
+        for session in &live {
+            summaries.insert(session.id().to_string(), summarize(session));
+        }
+        // Latest first: session ids are minted as timestamps, so their
+        // descending order is chronological.
+        let mut sessions: Vec<SessionSummary> = summaries.into_values().collect();
+        sessions.sort_by(|left, right| right.id.cmp(&left.id));
+        SessionList { sessions }
+    }
+
+    /// How many times the host has read its session store's directory, at an
+    /// enumeration point or to answer a membership question
+    /// ([`Self::live_or_cold`]).
+    ///
+    /// The refresh contract (spec 6.8) is about the filesystem work a refresh
+    /// does *not* do, which the frames it produces cannot show, so this is the
+    /// seam the tests assert on.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn store_directory_reads(&self) -> u64 {
+        self.inner.cold.directory_reads()
+    }
+
+    /// Re-read the store into the cold cache. The enumeration point (spec 6.8).
+    async fn enumerate(&self) -> Result<(), HostError> {
+        // The live set keeps a live session's log out of the per-file work: the
+        // host holds its mark and status, and recounting a file that grows on
+        // every append would be blocking IO on a runtime worker for a worse
+        // answer than the one we already have (spec 6.8).
+        let live: HashSet<String> = self.inner.sessions.lock().await.keys().cloned().collect();
+        // The scan is blocking IO, so it runs with the session map's lock
+        // already released.
+        let scanned = self.inner.cold.enumerate(|id| live.contains(id));
+        // Marked whatever the scan found, and whether or not it succeeded. What
+        // it discovered has to reach the next published frame, and an
+        // enumeration point is also where a subscriber that has seen no
+        // directory yet gets one, which suppression leaves to the mark.
+        self.inner.shared.fanout.mark_list_dirty();
+        scanned.map_err(|err| HostError::Internal(Box::new(err)))
     }
 
     /// The session's background-task table, with wall-clock timestamps: the
@@ -882,12 +911,18 @@ impl SessionHost {
         if matches!(answer, Some(ReleaseOutcome::Declined)) {
             return false;
         }
-        if answer.is_none() {
+        let reaped = answer.is_none();
+        if reaped {
             // No answer means the driver is gone without the host asking, which
             // only a panicked task leaves behind. Reaping it is the recovery: a
             // session nothing drives can serve nothing, and leaving it in the
             // map makes every later command fail on a dead channel.
             tracing::warn!(session, "reaping a session whose driver is gone");
+        }
+        // Recorded under the same map hold that drops the session, so no
+        // directory read can observe the session as neither live nor rowed.
+        if let Some(ReleaseOutcome::Released { mark }) = &answer {
+            self.inner.cold.note_released(mark);
         }
         let entry = sessions
             .remove(session)
@@ -895,13 +930,23 @@ impl SessionHost {
         // The driver returns right after answering, and its return is what
         // drops the session's lock.
         let _ = entry.driver.await;
-        if let Some(ReleaseOutcome::Released { mark: Some(mark) }) = answer {
-            self.inner.cold.note_released(&mark.file, mark.last_seq);
+        drop(sessions);
+        if reaped {
+            // A reaped session left no mark, so what the host knows about its
+            // log is whatever it knew before the session was materialized, which
+            // can be nothing at all. Going back to the store is the only way to
+            // give it a row, and the alternative is a session that is on disk
+            // and in no directory. The scan marks the directory dirty itself,
+            // and only once it has a row to publish.
+            if let Err(err) = self.enumerate().await {
+                tracing::warn!(session, "could not re-read the store after a reap: {err}");
+            }
+        } else {
+            // The session's liveness flag is the only trace a release leaves on
+            // the wire (spec section 5), so a client watching the directory has
+            // to be told.
+            self.inner.shared.fanout.mark_list_dirty();
         }
-        // The session's liveness flag is the only trace a release leaves on the
-        // wire (spec section 5), so a client watching the directory has to be
-        // told.
-        self.inner.shared.fanout.mark_list_dirty();
         true
     }
 
@@ -1577,12 +1622,14 @@ fn spawn_list_publisher(inner: &Arc<HostInner>) {
             tokio::time::sleep(LIST_COALESCE).await;
             let Some(inner) = weak.upgrade() else { return };
             let host = SessionHost { inner };
-            match host.sessions().await {
-                Ok(list) => fanout.publish(Frame::List {
-                    sessions: list.sessions,
-                }),
-                Err(err) => tracing::warn!("failed to build the session list: {err}"),
+            // A shut-down host has drained its session map, so a directory
+            // composed from it would report every torn-down session from its
+            // cold row, walking marks backwards on the last frame a client ever
+            // sees. Nothing will mark the directory dirty again either.
+            if host.alive().is_err() {
+                return;
             }
+            fanout.publish_list(host.directory().await.sessions);
         }
     });
 }

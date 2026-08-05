@@ -117,38 +117,22 @@ impl Driver {
                         // or an event that arrived before this request has
                         // already moved the state this reads.
                         Some(Request::Release { reply }) => {
-                            // A log with no file yet is the one condition
-                            // `releasable` cannot see. Releasing such a session
-                            // would not hand it back to the store, which does
-                            // not know its id, it would drop it.
-                            //
-                            // `try_lock`, because the host holds its session map
-                            // while it waits for this answer: the log can be
-                            // held for the length of an export render, and a
-                            // release that queued behind one would stall every
-                            // other session's materialization for as long.
-                            // Declining costs one grace. The flush below can
-                            // still meet a held log, which is a shorter wait
-                            // than an arbitrary reader's.
-                            let durable = self
-                                .session
-                                .core
-                                .log
-                                .try_lock()
-                                .is_ok_and(|log| log.is_durable());
-                            if !durable
-                                || !live::releasable(&self.session, &self.shared.fanout)
-                            {
+                            let mark = if live::releasable(&self.session, &self.shared.fanout) {
+                                self.mark_for_release()
+                            } else {
+                                None
+                            };
+                            let Some(mark) = mark else {
                                 let _ = reply.send(ReleaseOutcome::Declined);
                                 continue;
-                            }
-                            let mark = self.wind_down().await;
+                            };
+                            self.wind_down().await;
                             let _ = reply.send(ReleaseOutcome::Released { mark });
                             return;
                         }
                         // The host asked us to stop, or dropped the session.
                         Some(Request::Shutdown) | None => {
-                            let _ = self.wind_down().await;
+                            self.wind_down().await;
                             return;
                         }
                     }
@@ -990,19 +974,17 @@ impl Driver {
     /// Cancel the session's turns and let them wind themselves down, then
     /// quiesce background tasks and flush the log.
     ///
-    /// The cancellation tokens rather than `JoinSet::shutdown`: an abort
-    /// leaves a transcript with an unfinished message and an unanswered
-    /// tool call, while a cancelled turn emits its synthetic aborted
-    /// `MessageEnd`s. We keep consuming the event stream while draining so
-    /// those reach attached clients before their streams close.
-    /// Cancel the session's turns through the graceful path, quiesce its
-    /// background tasks, and flush the log.
+    /// The cancellation tokens rather than `JoinSet::shutdown`: an abort leaves
+    /// a transcript with an unfinished message and an unanswered tool call,
+    /// while a cancelled turn emits its synthetic aborted `MessageEnd`s. We keep
+    /// consuming the event stream while draining so those reach attached clients
+    /// before their streams close.
     ///
-    /// Answers what the session leaves behind for the host's directory, `None`
-    /// when the flush failed: the log's in-memory mark then counts entries that
-    /// did not reach the file, and a directory that reported it would be
-    /// claiming durable positions that a resume will not find.
-    async fn wind_down(&mut self) -> Option<ReleasedMark> {
+    /// The flush is what a release has already done (see
+    /// [`Self::mark_for_release`]), so on that path this one finds nothing
+    /// pending. It still takes the log lock, which a long-running reader can
+    /// hold, and a release is waited on with the host's session map held.
+    async fn wind_down(&mut self) {
         self.draining = true;
         self.turns.cancel_all();
         let grace = tokio::time::sleep(TURN_DRAIN_GRACE);
@@ -1026,17 +1008,52 @@ impl Driver {
         // Buffered non-punctuation entries (the settings records, spawn
         // roots) are lost with the process otherwise: nothing else forces
         // them out.
-        let mut log = self.session.core.log.lock().await;
-        if let Err(err) = log.flush_pending() {
+        if let Err(err) = self.session.core.log.lock().await.flush_pending() {
             tracing::warn!(
                 session = self.session.id(),
                 "failed to flush the conversation log at teardown: {err}"
             );
+        }
+    }
+
+    /// The mark a release has to hand the store, or `None` when the session may
+    /// not go after all.
+    ///
+    /// Read under the log lock, which this task holds along with the session's
+    /// advisory lock, so the mark and the file state it was read at cannot
+    /// disagree and no rival writer can be between them. Nothing can append
+    /// between here and the teardown either: a releasable session has no turn,
+    /// no live task and nothing queued, and this task is its only appender.
+    ///
+    /// Every `None` here is a session that stays live, which is the safe
+    /// direction. A release the host cannot record a row for would leave the
+    /// session out of the directory, or leave a row that predates the
+    /// materialization, and both are worse than holding the lock for another
+    /// grace.
+    fn mark_for_release(&self) -> Option<ReleasedMark> {
+        // `try_lock`, because the host holds its session map while it waits for
+        // this answer: the log can be held for the length of an export render,
+        // and a release that queued behind one would stall every other
+        // session's materialization for as long. Declining costs one grace. The
+        // teardown flush can still meet a held log, which is the same wait one
+        // tick later.
+        let mut log = self.session.core.log.try_lock().ok()?;
+        // A log with no file yet is the one condition `releasable` cannot see.
+        // Releasing such a session would not hand it back to the store, which
+        // does not know its id, it would drop it.
+        if !log.is_durable() {
             return None;
         }
-        // Read under the log lock, which this task still holds along with the
-        // session's advisory lock, so the mark and the file state it was read
-        // at cannot disagree and no rival writer can be between them.
+        // Flushed before anything is torn down, so a log that will not flush
+        // declines with the session still intact rather than going with a mark
+        // nobody can trust.
+        if let Err(err) = log.flush_pending() {
+            tracing::warn!(
+                session = self.session.id(),
+                "not releasing a session whose log will not flush: {err}"
+            );
+            return None;
+        }
         let last_seq = log.last_seq();
         let file = std::fs::metadata(log.path()).ok()?;
         Some(ReleasedMark {

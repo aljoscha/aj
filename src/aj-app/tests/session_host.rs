@@ -27,7 +27,7 @@ use aj_models::auth::AuthStorage;
 use aj_models::scripted::{ExhaustedBehavior, ScriptedProvider};
 use aj_models::types::{AssistantContent, AssistantMessage, StopReason, ToolCall, UserContent};
 use aj_session::{ConversationPersistence, SessionLock, ThreadFilter};
-use aj_wire::{Frame, ModelSelection, SessionSettings};
+use aj_wire::{Frame, ModelSelection, SessionSettings, SessionSummary};
 use tempfile::TempDir;
 
 /// Every wait in this file is bounded by this, so a wedged host fails a
@@ -2156,6 +2156,71 @@ async fn an_undelivered_task_notice_holds_a_session_live() {
     harness.host.shutdown().await;
 }
 
+/// A release the driver cannot produce a mark for does not happen. The host has
+/// no row to serve such a session with, so releasing it would drop it out of the
+/// directory or leave a row that predates the materialization, and both are
+/// worse than holding the lock for another grace.
+#[tokio::test]
+async fn a_session_the_host_cannot_mark_is_not_released() {
+    let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "punctuate").await;
+    client.pump_until_idle().await;
+    drop(client);
+
+    // The one reachable way to make the mark unreadable while the session is
+    // otherwise perfectly releasable: the log's file is gone, so the driver
+    // cannot say what state it left behind.
+    std::fs::remove_file(
+        harness
+            .persistence
+            .sessions_dir()
+            .join(format!("{session}.jsonl")),
+    )
+    .expect("remove the log");
+
+    stays_live(&harness.host, &session, 4).await;
+    harness.host.shutdown().await;
+}
+
+/// A released session's mark never goes backwards. The mark is what a client
+/// derives unseen output from (spec 6.8), so a release publishing a row that
+/// predates the session's own work would silently erase it.
+#[tokio::test]
+async fn a_release_never_lowers_the_mark_it_publishes() {
+    let harness = Harness::with_idle_grace(
+        vec![
+            finalized_text_message("first"),
+            finalized_text_message("second"),
+        ],
+        IDLE_GRACE,
+    );
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "punctuate").await;
+    client.pump_until_idle().await;
+    // A row on disk for it, from before the work below.
+    let cold = summary(&harness.host, &session)
+        .await
+        .expect("listed")
+        .last_seq;
+    harness.prompt(&session, "more").await;
+    client.pump_until_idle().await;
+    let live = summary(&harness.host, &session)
+        .await
+        .expect("listed")
+        .last_seq;
+    assert!(live > cold, "the second turn added durable entries");
+    drop(client);
+
+    let released = until_released(&harness.host, &session).await;
+    assert_eq!(
+        released.last_seq, live,
+        "the release published the mark the session actually reached",
+    );
+}
+
 /// A client re-attaching after a release is served a fresh epoch and a full
 /// backfill, and folds to the same state as one that never lost the session.
 /// The epoch dies with the materialization (spec 6.5), so the cursor the
@@ -2522,12 +2587,56 @@ async fn a_released_sessions_mark_needs_no_disk_read() {
     let mut client = Client::attach(&harness.host, &session).await;
     harness.prompt(&session, "hi").await;
     client.pump_until_idle().await;
+    // A settings record, which is buffered rather than punctuating, so the
+    // release has something to flush and the fingerprint it records is the
+    // flushed file's. One recorded before the flush would not match what the
+    // next enumeration stats, and the log would be read again to settle it.
+    harness
+        .host
+        .command(
+            &session,
+            Command::Settings(SettingsChange {
+                agent: AgentId::Main,
+                persist: PersistAction::None,
+                axis: SettingsAxis::Thinking(Some(aj_models::ThinkingConfig::High)),
+            }),
+        )
+        .await
+        .expect("thinking change");
     let logged = {
         let handles = harness.host.local_handles(&session).await.expect("handles");
         handles.log.lock().await.last_seq()
     };
+
+    // A second session carries the stream the release is watched on. A listing
+    // would do, but it is an enumeration point, and one between the release and
+    // the unreadable log below would derive afresh what this test is asserting
+    // came from the release.
+    let watching = harness.create().await;
+    let mut stream = harness
+        .host
+        .attach(&[AttachRequest {
+            session: watching.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+    frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
     drop(client);
-    let released = until_released(&harness.host, &session).await;
+    let frames = frames_until(&mut stream, "the release to be published", |frame| {
+        matches!(frame, Frame::List { sessions }
+            if sessions.iter().any(|entry| entry.id == session && !entry.live))
+    })
+    .await;
+    let released = directories(&frames)
+        .pop()
+        .expect("the frame that reported the release")
+        .into_iter()
+        .find(|entry| entry.id == session)
+        .expect("the released session's row");
     assert_eq!(released.last_seq, logged);
 
     // The log a released session left is unreadable from here on. Its mark
@@ -2553,6 +2662,7 @@ async fn a_released_sessions_mark_needs_no_disk_read() {
         "the mark came from what the release recorded, not from the log",
     );
     std::fs::set_permissions(&path, mode).expect("restore the mode");
+    drop(stream);
     harness.host.shutdown().await;
 }
 
@@ -4777,6 +4887,422 @@ async fn list_frames_carry_the_directory_and_are_debounced() {
     assert!(summary.live);
     assert!(!summary.working, "the turn has settled");
     assert!(summary.last_seq > 0, "it has durable entries");
+    harness.host.shutdown().await;
+}
+
+/// Write a current-format log straight into the store, the way a sibling
+/// process in the same working directory would. Returns its session id.
+fn sibling_log(harness: &Harness, id: &str) -> String {
+    let sessions_dir = harness.persistence.sessions_dir().to_path_buf();
+    std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
+    let entry = serde_json::json!({
+        "id": "00000000",
+        "timestamp": "2024-01-01T00:00:00Z",
+        "thread": "meta",
+        "type": "system_prompt",
+        "text": "x",
+    });
+    std::fs::write(
+        sessions_dir.join(format!("{id}.jsonl")),
+        format!("{entry}\n"),
+    )
+    .expect("write a sibling's log");
+    id.to_string()
+}
+
+/// The directories carried by the `list` frames among `frames`.
+fn directories(frames: &[Frame]) -> Vec<Vec<SessionSummary>> {
+    frames
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::List { sessions } => Some(sessions.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The refresh path performs no filesystem work at all (spec 6.8): every
+/// directory read the host does is attributable to an enumeration point, and a
+/// streaming turn, which marks the directory dirty on every event, is not one.
+#[tokio::test]
+async fn a_turns_refreshes_never_read_the_directory() {
+    let harness = Harness::with_provider(scripted(
+        vec![finalized_text_message(
+            "a long answer streamed one character at a time so the event count is high",
+        )],
+        1,
+        Duration::from_millis(1),
+    ));
+    let session = harness.create().await;
+    let mut stream = harness
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+    frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+
+    let before = harness.host.store_directory_reads();
+    harness.prompt(&session, "hi").await;
+    let frames = until_idle(&mut stream).await;
+    tokio::time::sleep(LIST_SETTLE).await;
+    let mut frames = frames;
+    frames.extend(drained(&mut stream));
+
+    let event_count = events(&frames).len();
+    assert!(
+        event_count > 20,
+        "the turn was chatty: {event_count} events"
+    );
+    assert!(
+        !directories(&frames).is_empty(),
+        "and the directory was published while it ran",
+    );
+    assert_eq!(
+        harness.host.store_directory_reads(),
+        before,
+        "{event_count} events' worth of refreshes read the directory",
+    );
+    harness.host.shutdown().await;
+}
+
+/// A session a sibling process leaves in the store appears at the next
+/// enumeration point and not before. The host is the single writer of its
+/// working directory (spec section 5), so a sibling's session is a conflict to
+/// surface when asked, not a workload to poll for.
+#[tokio::test]
+async fn a_siblings_session_appears_at_the_next_enumeration_point() {
+    let harness = Harness::new(vec![finalized_text_message("hi back")]);
+    let session = harness.create().await;
+    let mut stream = harness
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+    frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+
+    let sibling = sibling_log(&harness, "2020-01-01-00-00-00-999");
+    // A turn's worth of refreshes, none of which may go looking.
+    harness.prompt(&session, "hi").await;
+    let frames = until_idle(&mut stream).await;
+    tokio::time::sleep(LIST_SETTLE).await;
+    let mut frames = frames;
+    frames.extend(drained(&mut stream));
+    let published = directories(&frames);
+    assert!(!published.is_empty(), "the directory was published");
+    assert!(
+        published
+            .iter()
+            .all(|directory| !directory.iter().any(|entry| entry.id == sibling)),
+        "a refresh went to the store: {published:?}",
+    );
+
+    // An explicit listing is an enumeration point, and what it finds reaches
+    // the next published frame.
+    assert!(
+        harness
+            .host
+            .sessions()
+            .await
+            .expect("listed")
+            .sessions
+            .iter()
+            .any(|entry| entry.id == sibling),
+        "the listing found the sibling's log",
+    );
+    frames_until(&mut stream, "the sibling to be published", |frame| {
+        matches!(frame, Frame::List { sessions }
+            if sessions.iter().any(|entry| entry.id == sibling))
+    })
+    .await;
+    drop(stream);
+    harness.host.shutdown().await;
+}
+
+/// A session is attachable as soon as its log is in the store, whether or not
+/// any enumeration has picked it up. Membership is answered off the store, so
+/// the rows a refresh serves never gate an attach.
+#[tokio::test]
+async fn a_siblings_session_is_attachable_before_it_is_listed() {
+    let harness = Harness::new(vec![finalized_text_message("resumed")]);
+    let sibling = sibling_log(&harness, "2020-01-01-00-00-00-997");
+    let mut stream = harness
+        .host
+        .attach(&[AttachRequest {
+            session: sibling.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("a log in the store is attachable");
+    frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+    drop(stream);
+    harness.host.shutdown().await;
+}
+
+/// A fresh stream is an enumeration point too, so a client connecting to a
+/// long-running host sees what the store holds now rather than what it held
+/// when the host started.
+#[tokio::test]
+async fn a_fresh_stream_enumerates_the_store() {
+    let harness = Harness::new(Vec::new());
+    let session = harness.create().await;
+    let sibling = sibling_log(&harness, "2020-01-01-00-00-00-998");
+    // Past the debounce of the create above, so the frame below can only have
+    // come from the attach.
+    tokio::time::sleep(LIST_SETTLE).await;
+
+    let mut stream = harness
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+    frames_until(&mut stream, "the sibling to be published", |frame| {
+        matches!(frame, Frame::List { sessions }
+            if sessions.iter().any(|entry| entry.id == sibling))
+    })
+    .await;
+    drop(stream);
+    harness.host.shutdown().await;
+}
+
+/// The host's own structural changes reach the directory without an
+/// enumeration: it knows what it just did, and the answer is already in memory.
+#[tokio::test]
+async fn the_hosts_own_changes_need_no_enumeration() {
+    let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
+    let first = harness.create().await;
+    let mut stream = harness
+        .host
+        .attach(&[AttachRequest {
+            session: first.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+    frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+
+    let before = harness.host.store_directory_reads();
+    let created = harness.host.create().await.expect("create");
+    frames_until(&mut stream, "the new session to be published", |frame| {
+        matches!(frame, Frame::List { sessions }
+            if sessions.iter().any(|entry| entry.id == created && entry.live))
+    })
+    .await;
+
+    // And the same session going the other way. Watched on the stream rather
+    // than by polling the host, since a listing is an enumeration point and
+    // would be counted below.
+    harness.prompt(&created, "hi").await;
+    let frames = frames_until(&mut stream, "the release to be published", |frame| {
+        matches!(frame, Frame::List { sessions }
+            if sessions.iter().any(|entry| entry.id == created && !entry.live))
+    })
+    .await;
+    let released = directories(&frames)
+        .pop()
+        .expect("the frame that reported the release")
+        .into_iter()
+        .find(|entry| entry.id == created)
+        .expect("the released session's row");
+    assert!(
+        released.last_seq > 0,
+        "the release published the mark the driver counted, not a zero",
+    );
+    assert_eq!(
+        harness.host.store_directory_reads(),
+        before,
+        "a create and a release read the directory",
+    );
+    drop(stream);
+    harness.host.shutdown().await;
+}
+
+/// No two `list` frames in a row carry the same directory. Dirty is marked on
+/// every session event and most events move nothing a directory row shows, so
+/// unsuppressed a streaming turn republishes one payload at the debounce rate
+/// for the length of the turn (spec 6.8).
+#[tokio::test]
+async fn an_unchanged_directory_is_not_published_again() {
+    let harness = Harness::with_provider(scripted(
+        vec![
+            // Long and slow, so the turn spans many coalescing ticks and an
+            // unsuppressed publisher has room to repeat itself.
+            finalized_text_message(&"a slowly streamed answer ".repeat(40)),
+            finalized_text_message("and a second answer"),
+        ],
+        1,
+        Duration::from_millis(2),
+    ));
+    let session = harness.create().await;
+    let mut stream = harness
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+    frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+
+    harness.prompt(&session, "hi").await;
+    let frames = until_idle(&mut stream).await;
+    tokio::time::sleep(LIST_SETTLE).await;
+    let mut frames = frames;
+    frames.extend(drained(&mut stream));
+    let published = directories(&frames);
+    assert!(
+        published.len() >= 2,
+        "the turn published {} directories, too few for the check below to mean \
+         anything",
+        published.len(),
+    );
+    for pair in published.windows(2) {
+        assert_ne!(pair[0], pair[1], "the same directory was published twice");
+    }
+
+    let settled = published.last().expect("a directory").clone();
+    let mark = settled
+        .iter()
+        .find(|entry| entry.id == session)
+        .expect("the session's row")
+        .last_seq;
+
+    // A real change still gets through, so the suppression is not just a
+    // cheaper way of publishing nothing. The mark, because a turn shorter than
+    // the coalescing window can be over before `working` is ever sampled.
+    harness.prompt(&session, "again").await;
+    frames_until(&mut stream, "the second turn to be published", |frame| {
+        matches!(frame, Frame::List { sessions }
+            if sessions.iter().any(|entry| entry.id == session && entry.last_seq > mark))
+    })
+    .await;
+    drop(stream);
+    harness.host.shutdown().await;
+}
+
+/// A host that is shutting down publishes no directory. Its session map is
+/// drained before its drivers are joined, so a frame composed in between would
+/// report every live session from whatever the store last knew about it, walking
+/// marks backwards on the last directory a client ever sees.
+#[tokio::test]
+async fn a_shutting_down_host_publishes_no_directory() {
+    let harness = Harness::with_idle_grace(
+        vec![
+            finalized_text_message("punctuation"),
+            finalized_text_message("and more of it"),
+        ],
+        IDLE_GRACE,
+    );
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "punctuate").await;
+    client.pump_until_idle().await;
+    drop(client);
+    // Released, so the store has a row for it, and then taken up again and
+    // worked past that row: the cold row is now stale by two turns.
+    let stale = until_released(&harness.host, &session).await.last_seq;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "more").await;
+    client.pump_until_idle().await;
+    let live = summary(&harness.host, &session)
+        .await
+        .expect("listed")
+        .last_seq;
+    assert!(live > stale, "the second turn moved the mark past the row");
+
+    // Holding the log stalls this session's teardown, which is what holds the
+    // window open: the map is drained by then, and the fan-out is still open.
+    let handles = harness.host.local_handles(&session).await.expect("handles");
+    let held = handles.log.lock().await;
+    // A create marks the directory dirty, so a refresh is due inside the
+    // window rather than before it.
+    let other = harness.host.create().await.expect("create");
+    let host = harness.host.clone();
+    let shutting = tokio::spawn(async move { host.shutdown().await });
+    tokio::time::sleep(LIST_SETTLE).await;
+    drop(held);
+    shutting.await.expect("shutdown");
+
+    for directory in directories(&drained(&mut client.stream)) {
+        let row = directory
+            .iter()
+            .find(|entry| entry.id == session)
+            .expect("the session is in every directory it publishes");
+        assert!(
+            row.live && row.last_seq >= live,
+            "a directory published during shutdown reported {row:?}, \
+             marks may not go backwards",
+        );
+    }
+    drop(other);
+}
+
+/// Suppression compares against what subscribers have already been sent, so a
+/// client attaching to a host whose directory has not moved in hours is still
+/// served a snapshot. Nothing else on the stream carries one.
+#[tokio::test]
+async fn a_new_subscriber_is_served_a_directory_the_others_already_have() {
+    let harness = Harness::new(vec![finalized_text_message("recorded")]);
+    let session = harness.create().await;
+    let mut settled = harness
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+    frames_until(&mut settled, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+    // Quiesce, so the directory the second client needs is one the first has
+    // already been sent and a republish would otherwise be suppressed.
+    loop {
+        tokio::time::sleep(LIST_SETTLE).await;
+        if directories(&drained(&mut settled)).is_empty() {
+            break;
+        }
+    }
+
+    let mut fresh = harness
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+    frames_until(&mut fresh, "the fresh stream's first directory", |frame| {
+        matches!(frame, Frame::List { sessions }
+            if sessions.iter().any(|entry| entry.id == session))
+    })
+    .await;
+    drop(fresh);
+    drop(settled);
     harness.host.shutdown().await;
 }
 
