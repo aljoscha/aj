@@ -231,13 +231,9 @@ async fn run_inner<W: Write + Send + 'static>(
     let source = match &resume_request {
         Some(Some(id)) => SessionSource::Resume {
             session_id: id.clone(),
-            head: None,
         },
         Some(None) => match conversation_persistence.get_latest_session_id()? {
-            Some(latest) => SessionSource::Resume {
-                session_id: latest,
-                head: None,
-            },
+            Some(latest) => SessionSource::Resume { session_id: latest },
             None => bail!(
                 "no conversation sessions to resume; invoke `aj --print \"...\"` \
                  without `continue` to start a fresh session"

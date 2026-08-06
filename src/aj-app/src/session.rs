@@ -315,7 +315,6 @@ impl SessionCore {
             SessionSpec::Create { .. } => SessionSource::Create,
             SessionSpec::Resume { session_id, .. } => SessionSource::Resume {
                 session_id: session_id.clone(),
-                head: None,
             },
         };
         // Wrapped up front because the steps below share it: `prepare_log`
