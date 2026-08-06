@@ -38,6 +38,7 @@ mod live;
 mod store;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -184,10 +185,9 @@ pub struct HostSetup {
     /// How many frames one client's live queue holds before an undroppable
     /// frame evicts it (spec 6.9), `None` for the fan-out's own default.
     ///
-    /// Tuning, not policy: eviction and its recovery behave the same at any
-    /// bound. A small one is how a test watches a slow client be evicted
-    /// without generating hundreds of frames to fill the default.
-    pub live_capacity: Option<usize>,
+    /// Tuning, not policy: the bound governs live fan-out only, and eviction
+    /// and its recovery behave the same at any value.
+    pub live_capacity: Option<NonZeroUsize>,
 }
 
 /// A mutation of one session.
@@ -697,9 +697,7 @@ impl SessionHost {
         SessionList { sessions }
     }
 
-    /// How many times the host has read its session store's directory, at an
-    /// enumeration point or to answer a membership question
-    /// ([`Self::live_or_cold`]).
+    /// How many times the host has read its session store's directory.
     ///
     /// The refresh contract (spec 6.8) is about the filesystem work a refresh
     /// does *not* do, which the frames it produces cannot show, so this is the
@@ -707,6 +705,16 @@ impl SessionHost {
     #[cfg(any(test, feature = "test-support"))]
     pub fn store_directory_reads(&self) -> u64 {
         self.inner.cold.directory_reads()
+    }
+
+    /// How many membership questions the host has put to its session store.
+    ///
+    /// The seam for spec 6.2's "before it reaches ... any store lookup": an id
+    /// the grammar turns away and one the store does not hold answer the same
+    /// 404, so only this tells them apart.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn store_membership_lookups(&self) -> u64 {
+        self.inner.cold.membership_lookups()
     }
 
     /// The activity stamp a session starts its materialization from.
@@ -1042,7 +1050,7 @@ impl SessionHost {
         if let Some(entry) = self.inner.sessions.lock().await.get(session) {
             return Ok(Some(Arc::clone(&entry.session)));
         }
-        if !self.on_disk(session) {
+        if !self.on_disk(session)? {
             return Err(HostError::UnknownSession(session.to_string()));
         }
         Ok(None)
@@ -1162,6 +1170,9 @@ impl SessionHost {
     /// Return the live session for `id`, creating it (when `id` is `None`)
     /// or resuming it from disk.
     ///
+    /// `id` must already have passed [`validate_session_id`]: this is where a
+    /// session id becomes a store path and an advisory lock.
+    ///
     /// Runs under the session-map lock, which serializes materialization
     /// against every other one: two attaches of the same on-disk session
     /// must not both build a core and fight over its lock.
@@ -1175,7 +1186,7 @@ impl SessionHost {
             if let Some(entry) = sessions.get(id) {
                 return Ok(Arc::clone(&entry.session));
             }
-            if !self.on_disk(id) {
+            if !self.on_disk(id)? {
                 return Err(HostError::UnknownSession(id.to_string()));
             }
         }
@@ -1281,10 +1292,14 @@ impl SessionHost {
 
     /// Whether the store holds a session `id` this host could materialize.
     ///
-    /// Costs one `stat`: an id that is not one this store could ever hold is
-    /// refused by its grammar before any path is built (spec 6.2).
-    fn on_disk(&self, id: &str) -> bool {
-        self.inner.cold.contains(id)
+    /// Costs one `stat`: an id that is not one this store could ever hold has
+    /// already been refused by [`validate_session_id`], so nothing here builds
+    /// a path out of an unchecked string (spec 6.2).
+    fn on_disk(&self, id: &str) -> Result<bool, HostError> {
+        self.inner
+            .cold
+            .contains(id)
+            .map_err(|err| HostError::Internal(Box::new(err)))
     }
 
     /// Serve one session's attach block on `id`'s stream.
@@ -1459,10 +1474,11 @@ async fn send_block_frame(
 /// happens to be safe, but it makes path safety depend on how a lookup is
 /// implemented, and it costs a directory read per question.
 ///
-/// [`HostError::UnknownSession`] rather than [`HostError::Invalid`], because a
-/// client cannot tell an id this host could never hold from one it merely does
-/// not have, and 404 is the honest answer to both.
-fn validate_session_id(session: &str) -> Result<(), HostError> {
+/// 404, because spec 6.2 says so. The store refuses the same ids at its own
+/// door, which is what makes the safety hold whatever route reaches it, so
+/// this gate is about *where* the refusal happens rather than whether it
+/// does.
+pub(crate) fn validate_session_id(session: &str) -> Result<(), HostError> {
     if aj_session::is_valid_session_id(session) {
         return Ok(());
     }

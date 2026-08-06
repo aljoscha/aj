@@ -1319,6 +1319,64 @@ async fn an_unknown_session_answers_404_on_every_route() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_traversal_id_is_refused_at_the_wire_boundary() {
+    let fixture = Fixture::new(Vec::new()).await;
+    // A readable log just outside the store, so a resolved traversal would
+    // find something. An empty log counts as the current format.
+    let outside = fixture._dir.path().join("elsewhere");
+    std::fs::create_dir_all(&outside).expect("a directory beside the store");
+    std::fs::write(outside.join("reachable.jsonl"), "").expect("a log outside the store");
+
+    // Ids that reach a handler as a path segment. The percent-encoded one is
+    // the interesting case: the framework decodes it back into `../` before
+    // the handler sees it.
+    for id in ["..%2Felsewhere%2Freachable", "sneaky.jsonl", "host-id."] {
+        let err = fixture
+            .client
+            .tasks(id)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{id:?} was served"));
+        assert_eq!(err.status(), Some(StatusCode::NOT_FOUND), "{id:?}: {err}");
+        assert_eq!(err.code(), Some("unknown_session"), "{id:?}: {err}");
+    }
+
+    // An id with literal separators never becomes a session route at all: the
+    // client's own URL parser resolves the `..` out of the path, so it lands
+    // on an endpoint that does not exist. Also 404, and it reaches no store.
+    let err = fixture
+        .client
+        .tasks("../elsewhere/reachable")
+        .await
+        .err()
+        .expect("a traversal path is served by nothing");
+    assert_eq!(err.status(), Some(StatusCode::NOT_FOUND), "got {err}");
+
+    // The stream route carries its id in a query parameter, where nothing
+    // normalizes it, so this is the one that really exercises the host's
+    // gate. An empty id answers the same way.
+    for id in ["../elsewhere/reachable", "..", ""] {
+        let err = fixture
+            .client
+            .events(&[AttachRequest {
+                session: id.to_string(),
+                cursor: None,
+            }])
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{id:?} opened a stream"));
+        assert_eq!(err.status(), Some(StatusCode::NOT_FOUND), "{id:?}: {err}");
+        assert_eq!(err.code(), Some("unknown_session"), "{id:?}: {err}");
+    }
+
+    assert!(
+        outside.join("reachable.jsonl").is_file(),
+        "the traversal target is still there, untouched",
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_malformed_settings_body_answers_400() {
     let fixture = Fixture::new(Vec::new()).await;
     let session = fixture.create().await;

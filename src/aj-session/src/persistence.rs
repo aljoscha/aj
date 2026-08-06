@@ -41,7 +41,9 @@ impl ConversationPersistence {
     /// Files whose first line does not parse as the new
     /// [ConversationEntry] shape (e.g. pre-refactor sessions) are skipped
     /// with a `tracing::info!` note, and so is a file that cannot be read at
-    /// all: one bad file must not fail the listing.
+    /// all: one bad file must not fail the listing. A file whose stem is not
+    /// a session id is skipped before that, by
+    /// [`Self::enumerate_sessions`].
     pub fn list_sessions(&self) -> Result<Vec<SessionMetadata>, ConversationError> {
         let mut sessions = self.enumerate_sessions()?;
         sessions.retain(|metadata| {
@@ -64,8 +66,12 @@ impl ConversationPersistence {
         Ok(sessions)
     }
 
-    /// Every `.jsonl` file in the sessions directory, latest first, with the
-    /// facts a `stat` yields.
+    /// Every `.jsonl` file in the sessions directory whose stem is a session
+    /// id, latest first, with the facts a `stat` yields.
+    ///
+    /// A stem the grammar rejects (see [`crate::id`]) is skipped: this store
+    /// refuses that id at every later lookup, so listing it would put a row in
+    /// every directory that nothing can resolve.
     ///
     /// No file is opened, so this says nothing about a log's format:
     /// [`Self::is_current_format`] is that gate, applied separately. The split
@@ -91,8 +97,8 @@ impl ConversationPersistence {
                 continue;
             };
             // A stem the grammar rejects is not a session this store can be
-            // asked about later (see [`crate::id`]), so listing it would put a
-            // row in every directory that no attach could ever resolve.
+            // asked about later, so listing it would put a row in every
+            // directory that no attach could ever resolve.
             if !crate::id::is_valid_session_id(session_id) {
                 continue;
             }
@@ -126,31 +132,44 @@ impl ConversationPersistence {
         Ok(sessions)
     }
 
-    /// The `stat` facts for one session's log, `None` when the store holds no
-    /// readable log under that id.
+    /// The `stat` facts for one session's log, `Ok(None)` when the store
+    /// holds no log under that id.
     ///
     /// The single-id form of [`Self::enumerate_sessions`], for the membership
     /// question a lookup asks. It costs one `stat` rather than a directory
     /// read, which is what keeps "is this id one of mine" off the size of the
     /// store.
     ///
-    /// An id the grammar rejects answers `None` without touching the
+    /// An id the grammar rejects answers `Ok(None)` without touching the
     /// filesystem: it cannot name a log in this store, and turning it into a
     /// path is exactly what must not happen (see [`crate::id`]).
-    pub fn session_metadata(&self, session_id: &str) -> Option<SessionMetadata> {
+    ///
+    /// Absence and failure are separate answers. A store this process cannot
+    /// read is not a store without the session in it, and a caller that
+    /// conflated the two would report a session it holds a directory row for
+    /// as gone.
+    pub fn session_metadata(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionMetadata>, ConversationError> {
         if !crate::id::is_valid_session_id(session_id) {
-            return None;
+            return Ok(None);
         }
         let path = self.session_path(session_id);
-        let metadata = fs::metadata(&path).ok()?;
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(ConversationError::Io(err)),
+        };
         if !metadata.is_file() {
-            return None;
+            return Ok(None);
         }
-        Some(SessionMetadata::new(
+        let modified = metadata.modified().map_err(ConversationError::Io)?;
+        Ok(Some(SessionMetadata::new(
             session_id.to_string(),
-            metadata.modified().ok()?.into(),
+            modified.into(),
             metadata.len(),
-        ))
+        )))
     }
 
     /// Whether `session_id`'s log is in the current on-disk format, or `None`
@@ -683,9 +702,16 @@ mod tests {
 
     /// The single-id membership primitive: one `stat`, and nothing at all for
     /// an id the grammar rejects.
+    ///
+    /// The traversal case puts a real, readable log where the id points, so
+    /// the refusal has to come from the grammar rather than from the file not
+    /// being there.
     #[test]
-    fn session_metadata_answers_one_id_without_a_directory_read() {
-        let (_dir, persistence) = fixture();
+    fn session_metadata_answers_one_id_and_refuses_a_traversal() {
+        // A store one level down, so the traversal target below still lives
+        // inside the temp dir.
+        let dir = TempDir::new().expect("temp dir");
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
         let mut log = ConversationLog::create(&persistence).expect("create");
         append_user_then_assistant(&mut log, "hello", "hi");
         let session_id = log.session_id().to_string();
@@ -694,6 +720,7 @@ mod tests {
 
         let metadata = persistence
             .session_metadata(&session_id)
+            .expect("the stat succeeded")
             .expect("the log is there");
         assert_eq!(metadata.session_id, session_id);
         assert_eq!(metadata.size_bytes, size);
@@ -701,12 +728,28 @@ mod tests {
         assert!(
             persistence
                 .session_metadata("2026-01-01-00-00-00-000")
-                .is_none()
+                .expect("a missing log is not a failure")
+                .is_none(),
         );
-        // The sessions directory itself, reached by climbing out of the store.
-        // Nothing may make this resolve, whatever is on disk.
-        assert!(persistence.session_metadata("../etc/passwd").is_none());
-        assert!(persistence.session_metadata("").is_none());
+
+        // A readable log one directory up from the store. Only the grammar
+        // stands between the id that names it and a `stat` that resolves.
+        std::fs::create_dir_all(dir.path().join("elsewhere")).expect("sibling dir");
+        std::fs::write(dir.path().join("elsewhere/reachable.jsonl"), "{}\n")
+            .expect("a log outside the store");
+        assert!(
+            dir.path().join("elsewhere/reachable.jsonl").is_file(),
+            "the traversal target is really there",
+        );
+        for id in ["../elsewhere/reachable", "..", ""] {
+            assert!(
+                persistence
+                    .session_metadata(id)
+                    .expect("a rejected id is not a failure")
+                    .is_none(),
+                "{id:?} resolved to a file",
+            );
+        }
     }
 
     /// The format sniff reads bytes, not text, so a log that is not valid

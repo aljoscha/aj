@@ -43,9 +43,12 @@ pub(crate) trait SessionStore {
     /// Every session log in the store, with its fingerprint. Opens no file.
     fn enumerate_sessions(&self) -> Result<Vec<SessionMetadata>, ConversationError>;
 
-    /// The fingerprint of one session's log, `None` when the store holds no
-    /// log under that id. One `stat`, no directory read.
-    fn session_metadata(&self, session_id: &str) -> Option<SessionMetadata>;
+    /// The fingerprint of one session's log, `Ok(None)` when the store holds
+    /// no log under that id. One `stat`, no directory read.
+    fn session_metadata(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionMetadata>, ConversationError>;
 
     /// Whether the log is in the current on-disk format, or `None` when it
     /// could not be read at all. Opens the file and reads its first line.
@@ -57,7 +60,10 @@ impl SessionStore for ConversationPersistence {
         ConversationPersistence::enumerate_sessions(self)
     }
 
-    fn session_metadata(&self, session_id: &str) -> Option<SessionMetadata> {
+    fn session_metadata(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionMetadata>, ConversationError> {
         ConversationPersistence::session_metadata(self, session_id)
     }
 
@@ -83,6 +89,7 @@ pub(crate) struct ColdSessions<S> {
     store: S,
     cache: StdMutex<Cache>,
     directory_reads: AtomicU64,
+    membership_lookups: AtomicU64,
 }
 
 /// A log file's identity for caching: a file whose modification time and size
@@ -144,6 +151,7 @@ impl<S: SessionStore> ColdSessions<S> {
             store,
             cache: StdMutex::new(Cache::default()),
             directory_reads: AtomicU64::new(0),
+            membership_lookups: AtomicU64::new(0),
         }
     }
 
@@ -240,22 +248,35 @@ impl<S: SessionStore> ColdSessions<S> {
         self.directory_reads.load(Ordering::Relaxed)
     }
 
+    /// How many membership questions reached the store.
+    ///
+    /// The other half of the same kind of contract: spec 6.2 wants an id the
+    /// grammar rejects turned away *before* a store lookup, and a refusal
+    /// leaves no other trace to assert on, since the answer is the same
+    /// either way.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn membership_lookups(&self) -> u64 {
+        self.membership_lookups.load(Ordering::Relaxed)
+    }
+
     /// Whether the store holds a current-format log for `id`.
     ///
     /// The membership test materialization gates on. It costs one `stat` plus
-    /// at most one format sniff, so it says nothing about how large the store
-    /// is: a host that holds hundreds of sessions answers this as fast as one
-    /// that holds two. That is what the id grammar buys (spec 6.2). Without a
-    /// syntactic gate the only safe way to turn a wire-supplied id into an
-    /// answer is to look for it in an enumeration, which reads the directory
-    /// on every miss.
-    pub(crate) fn contains(&self, id: &str) -> bool {
-        let Some(metadata) = self.store.session_metadata(id) else {
-            return false;
+    /// at most one format sniff, so it says nothing about how many sessions
+    /// the store holds: that is what the id grammar buys (spec 6.2, and
+    /// [`crate::host::validate_session_id`]).
+    ///
+    /// A log this store cannot stat is a failure rather than an absence, so
+    /// a store nothing can read refuses a request loudly instead of reporting
+    /// every session in it as gone. A log it can stat but not sniff is still
+    /// not a session this host could materialize, which is the one place the
+    /// answer folds a read failure into "no".
+    pub(crate) fn contains(&self, id: &str) -> Result<bool, ConversationError> {
+        self.membership_lookups.fetch_add(1, Ordering::Relaxed);
+        let Some(metadata) = self.store.session_metadata(id)? else {
+            return Ok(false);
         };
-        // An unreadable log is not a session this host can materialize, so
-        // membership answers no where the directory merely declines to move.
-        self.current_format(&metadata).unwrap_or(false)
+        Ok(self.current_format(&metadata).unwrap_or(false))
     }
 
     /// Record what the host knows about a session it just released, so a
@@ -465,11 +486,15 @@ mod tests {
             file.sniffable.then_some(file.current_format)
         }
 
-        fn session_metadata(&self, session_id: &str) -> Option<SessionMetadata> {
+        fn session_metadata(
+            &self,
+            session_id: &str,
+        ) -> Result<Option<SessionMetadata>, ConversationError> {
             // A `stat` of one path: it does not touch the directory, which is
             // what the `directory_reads` assertions rest on.
-            let file = self.file(session_id)?;
-            Some(SessionMetadata::new(file.id, at(file.modified), file.size))
+            Ok(self
+                .file(session_id)
+                .map(|file| SessionMetadata::new(file.id, at(file.modified), file.size)))
         }
     }
 
@@ -1013,9 +1038,9 @@ mod tests {
         let cold = ColdSessions::new(store);
 
         for _ in 0..5 {
-            assert!(cold.contains("a"));
-            assert!(!cold.contains("ancient"));
-            assert!(!cold.contains("nobody"));
+            assert!(cold.contains("a").expect("the store answered"));
+            assert!(!cold.contains("ancient").expect("the store answered"));
+            assert!(!cold.contains("nobody").expect("the store answered"));
         }
         assert_eq!(cold.store.sniffs_of("a"), 1);
         assert_eq!(cold.store.sniffs_of("ancient"), 1);

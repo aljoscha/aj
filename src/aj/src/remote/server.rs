@@ -462,6 +462,11 @@ fn accepted(outcome: CommandOutcome) -> Result<Response, ApiError> {
 ///
 /// Unknown parameters are ignored (spec 6.10). Attaching nothing is legal:
 /// that is the control connection a gateway opens for `list` frames alone.
+///
+/// The id itself is not judged here. It is opaque at this layer, and the
+/// host's own gate answers 404 for anything its store could not hold (spec
+/// 6.2), so an empty or malformed id reads the same on this route as on
+/// `/v1/sessions/{id}/...`.
 fn attach_requests(params: &[(String, String)]) -> Result<Vec<AttachRequest>, ApiError> {
     let mut requests = Vec::new();
     for (key, value) in params {
@@ -469,7 +474,8 @@ fn attach_requests(params: &[(String, String)]) -> Result<Vec<AttachRequest>, Ap
             continue;
         }
         // The session id comes first, so an opaque epoch carrying an `@`
-        // cannot swallow it. Session ids therefore must not contain one.
+        // cannot swallow it. Session ids therefore must not contain one,
+        // which the store's grammar guarantees.
         let (session, cursor) = match value.split_once('@') {
             Some((session, cursor)) => {
                 let cursor: Cursor = cursor.parse().map_err(|err| {
@@ -479,9 +485,6 @@ fn attach_requests(params: &[(String, String)]) -> Result<Vec<AttachRequest>, Ap
             }
             None => (value.as_str(), None),
         };
-        if session.is_empty() {
-            return Err(ApiError::invalid("a session parameter must name a session"));
-        }
         requests.push(AttachRequest {
             session: session.to_string(),
             cursor,

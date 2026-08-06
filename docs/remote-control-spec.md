@@ -1094,8 +1094,10 @@ single-session use) lists sessions:
   what makes them arrive at all, section 6.5, and it is what section 5
   counts as use), and switching is a view swap, not a rebuild. A
   session the client has not attached shows only its `list` row, which
-  is where its unseen-output glyph comes from (section 6.8). Catch-up
-  for a session happens lazily on first focus.
+  is where its unseen-output glyph comes from (section 6.8). Attaching
+  is what a first focus does, and the attach block it earns is that
+  session's catch-up, so a session the user never opens is never
+  projected.
 - Local single-session mode keeps working exactly as today, the
   sidebar simply has one entry. Creating a new session from the
   sidebar goes through the create command (choosing a host when

@@ -5,6 +5,7 @@
 //! frames asserted on are the ones a network server would serialize and
 //! the client fold ([`SessionClient`]) would receive.
 
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -77,7 +78,7 @@ impl Harness {
             snapshot(scripted(messages, 0, Duration::ZERO)),
             Vec::new(),
             None,
-            Some(capacity),
+            NonZeroUsize::new(capacity),
         )
     }
 
@@ -98,7 +99,7 @@ impl Harness {
         run_config: RunConfigSnapshot,
         catalog: Vec<aj_models::registry::ModelInfo>,
         idle_grace: Option<Duration>,
-        live_capacity: Option<usize>,
+        live_capacity: Option<NonZeroUsize>,
     ) -> Self {
         let dir = TempDir::new().expect("tempdir");
         let persistence = ConversationPersistence::new(dir.path().join("sessions"));
@@ -982,16 +983,33 @@ async fn an_unknown_session_is_refused() {
 }
 
 /// An id that could never name a log in this store is refused at every
-/// entry point, and refused off its own shape: nothing goes near the store
-/// to find that out (spec 6.2).
+/// entry point, and refused off its own shape: it does not reach the store
+/// at all (spec 6.2).
+///
+/// One of the ids points at a real, readable log just outside the store, so
+/// the refusal cannot be the file simply not being there.
 #[tokio::test]
 async fn an_id_that_is_not_a_session_id_never_reaches_the_store() {
     let harness = Harness::new(Vec::new());
-    // The one enumeration the host does at startup, so the assertion below
-    // measures what these calls added rather than what construction did.
-    let before = harness.host.store_directory_reads();
+    // An empty log counts as the current format, so this is a file the store
+    // would happily call a session if an id could name it.
+    let outside = harness._dir.path().join("elsewhere");
+    std::fs::create_dir_all(&outside).expect("a directory beside the store");
+    std::fs::write(outside.join("reachable.jsonl"), "").expect("a log outside the store");
 
-    for id in ["", "..", "../../etc/passwd", "a/b", "sneaky.jsonl", "hé"] {
+    // Taken after construction's enumeration, so the assertions below measure
+    // what these calls added.
+    let reads = harness.host.store_directory_reads();
+    let lookups = harness.host.store_membership_lookups();
+
+    for id in [
+        "",
+        "..",
+        "../elsewhere/reachable",
+        "a/b",
+        "sneaky.jsonl",
+        "hé",
+    ] {
         let err = harness
             .host
             .command(id, prompt("hi"))
@@ -1040,11 +1058,24 @@ async fn an_id_that_is_not_a_session_id_never_reaches_the_store() {
     }
 
     assert_eq!(
-        harness.host.store_directory_reads(),
-        before,
-        "a refusal off the id's own shape reads nothing, and a membership \
-         question costs a stat rather than a directory read",
+        harness.host.store_membership_lookups(),
+        lookups,
+        "a refusal off the id's own shape put no question to the store",
     );
+    assert_eq!(
+        harness.host.store_directory_reads(),
+        reads,
+        "and read no directory to reach it",
+    );
+
+    // The same store answers a well-formed id, so the refusals above are the
+    // grammar rather than a host that refuses everything.
+    let session = harness.create().await;
+    harness
+        .host
+        .tasks(&session)
+        .await
+        .expect("a well-formed id is served");
     harness.host.shutdown().await;
 }
 
@@ -5251,40 +5282,44 @@ async fn a_resumed_session_concludes_the_sub_agents_on_disk() {
 /// client that never stalled would be (spec 6.9, and spec section 11's
 /// "slow-client eviction and recovery").
 ///
-/// The bound is what makes eviction safe to test: the same rule at 256
-/// frames needs 256 frames to reach.
+/// The recovery is the interesting half, so the cursor it offers is a real
+/// one: the client applied a whole turn first, so the re-attach serves an
+/// incremental suffix onto retained state and has to quiesce and re-apply
+/// idempotently rather than rebuild.
+///
+/// The bound is what makes eviction reachable at all: the same rule at 256
+/// frames needs 256 frames to hit.
 #[tokio::test]
 async fn a_slow_client_is_evicted_and_recovers_through_its_cursor() {
     let harness = Harness::with_live_capacity(Vec::new(), 4);
     let session = harness.create().await;
     harness
-        .install_script(&session, vec![finalized_text_message("the answer")])
+        .install_script(&session, vec![finalized_text_message("the first answer")])
         .await;
 
-    // Attached, block applied, and then it stops reading. Nothing else reads
-    // this host's streams while the turn runs, so the eviction below is the
-    // bound doing its job rather than a scheduling race.
-    let mut stalled = Client::attach(&harness.host, &session).await;
-    let cursor = stalled.client.cursor();
-
+    // The first turn runs with nobody attached, so the client below picks it
+    // up through its attach block. An attach block is producer-paced, so
+    // reading one cannot trip the bound.
     harness.prompt(&session, "hi").await;
-    // Watched off the host's own directory rather than off a stream: a
-    // second reader would be racing the same bound.
-    bounded("the turn to land and settle", async {
-        loop {
-            let row = summary(&harness.host, &session).await.expect("listed");
-            if !row.working && row.last_seq.unwrap_or(0) >= 2 {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await;
+    settled(&harness, &session, 2).await;
 
-    // The turn produced more undroppable frames than the bound holds, so the
-    // stalled client's stream was closed *and cleared*: an eviction discards
-    // what it could not deliver, which is what tells it apart from an orderly
-    // close at shutdown.
+    let mut stalled = Client::attach(&harness.host, &session).await;
+    let cursor = stalled
+        .client
+        .cursor()
+        .expect("the block committed a cursor");
+    assert!(cursor.seq >= 2, "the cursor is a real position: {cursor:?}");
+
+    // From here the client reads nothing.
+    harness
+        .install_script(&session, vec![finalized_text_message("the second answer")])
+        .await;
+    harness.prompt(&session, "again").await;
+    settled(&harness, &session, cursor.seq + 2).await;
+
+    // The second turn produced more undroppable frames than the bound holds,
+    // so the stalled client's stream was closed. It hands back nothing,
+    // because an eviction cancels the stream rather than draining it.
     let leftover = bounded("the stalled stream to close", async {
         let mut seen = 0;
         while stalled.stream.recv().await.is_some() {
@@ -5293,41 +5328,44 @@ async fn a_slow_client_is_evicted_and_recovers_through_its_cursor() {
         seen
     })
     .await;
-    assert_eq!(
-        leftover, 0,
-        "an evicted stream hands back nothing it had queued",
-    );
+    assert_eq!(leftover, 0, "an evicted stream stops handing frames back");
 
-    // Recovery is the ordinary re-attach with the cursor it committed before
-    // it stalled, and it must land where a client that rebuilt from a full
-    // backfill lands.
-    let mut recovered = Client {
-        client: SessionClient::new(session.clone()),
-        chat: ChatState::new(settings(), 200_000, Arc::new(Vec::new())),
-        stream: harness
-            .host
-            .attach(&[AttachRequest {
-                session: session.clone(),
-                cursor,
-            }])
-            .await
-            .expect("re-attach after eviction"),
-    };
-    recovered.client.expect_attach();
-    recovered.apply_block().await;
+    // Recovery is the ordinary re-attach, on the client that kept its state:
+    // the suffix lands on the first turn it already applied.
+    stalled.reattach(&harness.host, cursor).await;
     let fresh = Client::attach(&harness.host, &session).await;
 
     assert_eq!(
-        assistant_rows(&recovered.chat, AgentId::Main),
-        vec!["the answer".to_string()],
-        "the suffix carried the turn the eviction cut off",
+        assistant_rows(&stalled.chat, AgentId::Main),
+        vec![
+            "the first answer".to_string(),
+            "the second answer".to_string()
+        ],
+        "the suffix carried the turn the eviction cut off, onto the one it had",
     );
     assert_canonical_eq(
-        &recovered.canonical(),
+        &stalled.canonical(),
         &fresh.canonical(),
         "an evicted client that re-attached with its cursor",
     );
     harness.host.shutdown().await;
+}
+
+/// Wait for `session` to be idle with at least `last_seq` durable entries,
+/// watched off the host's directory rather than off a stream.
+///
+/// A second reader would be racing whatever bound the test set.
+async fn settled(harness: &Harness, session: &str, last_seq: u64) {
+    bounded("the turn to land and settle", async {
+        loop {
+            let row = summary(&harness.host, session).await.expect("listed");
+            if !row.working && row.last_seq.unwrap_or(0) >= last_seq {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
 }
 
 // ---------------------------------------------------------------------------

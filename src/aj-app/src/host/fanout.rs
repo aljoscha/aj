@@ -8,6 +8,7 @@
 //! paces a large backfill without ever stalling a session driver.
 
 use std::collections::{HashMap, VecDeque};
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 
@@ -20,7 +21,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio_util::sync::CancellationToken;
 
 /// Enough burst room for normal clients while bounding a stalled stream.
-const DEFAULT_LIVE_CAPACITY: usize = 256;
+const DEFAULT_LIVE_CAPACITY: NonZeroUsize = NonZeroUsize::new(256).expect("non-zero");
 
 /// Identity of one attached subscriber within a host.
 pub(crate) type SubscriberId = u64;
@@ -161,7 +162,7 @@ struct LiveQueueState {
 }
 
 struct LiveQueue {
-    capacity: usize,
+    capacity: NonZeroUsize,
     state: StdMutex<LiveQueueState>,
     ready: Notify,
     cancelled: CancellationToken,
@@ -172,13 +173,12 @@ struct LiveSender(Arc<LiveQueue>);
 
 pub(crate) struct LiveReceiver(Arc<LiveQueue>);
 
-fn live_channel(capacity: usize) -> (LiveSender, LiveReceiver, CancellationToken) {
-    assert!(capacity > 0, "live queue capacity must be non-zero");
+fn live_channel(capacity: NonZeroUsize) -> (LiveSender, LiveReceiver, CancellationToken) {
     let cancelled = CancellationToken::new();
     let queue = Arc::new(LiveQueue {
         capacity,
         state: StdMutex::new(LiveQueueState {
-            frames: VecDeque::with_capacity(capacity),
+            frames: VecDeque::with_capacity(capacity.get()),
             closed: false,
         }),
         ready: Notify::new(),
@@ -220,10 +220,10 @@ impl LiveSender {
                 .position(|queued| lossy_key(queued).as_ref() == Some(&key))
             {
                 state.frames.remove(index);
-            } else if state.frames.len() >= self.0.capacity {
+            } else if state.frames.len() >= self.0.capacity.get() {
                 return Offered::Dropped;
             }
-        } else if state.frames.len() >= self.0.capacity {
+        } else if state.frames.len() >= self.0.capacity.get() {
             state.frames.clear();
             state.closed = true;
             drop(state);
@@ -302,7 +302,7 @@ pub(crate) struct Fanout {
     /// Pinged whenever the session directory changed. The list publisher
     /// coalesces on it (spec 6.8).
     list_dirty: Notify,
-    live_capacity: usize,
+    live_capacity: NonZeroUsize,
 }
 
 impl Default for Fanout {
@@ -314,7 +314,7 @@ impl Default for Fanout {
 impl Fanout {
     /// A registry whose per-client live queue holds `live_capacity` frames,
     /// or [`DEFAULT_LIVE_CAPACITY`] when the caller has no opinion.
-    pub(crate) fn new(live_capacity: Option<usize>) -> Self {
+    pub(crate) fn new(live_capacity: Option<NonZeroUsize>) -> Self {
         Self {
             subscribers: StdMutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
@@ -524,6 +524,8 @@ mod tests {
     use super::*;
 
     const SESSION: &str = "session-1";
+    /// The second session of the multi-session tests.
+    const OTHER: &str = "session-2";
     const EPOCH: &str = "epoch-1";
 
     fn durable(seq: u64) -> Frame {
@@ -677,10 +679,7 @@ mod tests {
     /// bound turned away does not count as sent.
     #[test]
     fn a_dropped_directory_is_offered_again() {
-        let fanout = Fanout {
-            live_capacity: 2,
-            ..Fanout::default()
-        };
+        let fanout = Fanout::new(NonZeroUsize::new(2));
         let (id, mut rx, cancelled) = fanout.register(&[SESSION.to_string()]);
         fanout.finish_block(id, SESSION, 0);
 
@@ -751,31 +750,47 @@ mod tests {
         assert_eq!(drained(&mut rx), vec!["list"]);
     }
 
-    /// One stream, two sessions: each session's frames are gated by its own
-    /// attach state, and neither leaks onto the other's boundary.
+    /// One stream, two sessions: each session's backfill boundary applies to
+    /// its own seq space only. A subscriber-wide boundary would swallow the
+    /// durable frames of whichever session's block finished with the lower
+    /// mark.
     #[test]
     fn one_stream_gates_each_attached_session_separately() {
-        const OTHER: &str = "session-2";
         let fanout = Fanout::default();
         let (id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string(), OTHER.to_string()]);
 
-        // The first session's block is served, the second's is still being
-        // written.
+        // Two live sessions with different boundaries, which is the case a
+        // shared one gets wrong.
         fanout.finish_block(id, SESSION, 5);
+        fanout.finish_block(id, OTHER, 1);
+
         fanout.publish(durable(5));
         fanout.publish(durable(6));
-        let mut other = durable(9);
-        if let Frame::Event { session, .. } = &mut other {
-            OTHER.clone_into(session);
-        }
-        fanout.publish(other);
+        // At or below the *other* session's boundary, and well below this
+        // one's: delivered, because it is not this session's seq space.
+        fanout.publish(other(durable(3)));
+        fanout.publish(other(durable(1)));
 
         assert_eq!(
             drained(&mut rx),
-            vec!["durable 6", "durable 9"],
-            "seq 5 is below the first session's boundary, and the second \
-             session's own seq space is untouched by it",
+            vec!["durable 6", "durable 3"],
+            "each session filters against its own boundary",
         );
+    }
+
+    /// Retag a session-scoped frame onto the second session of the
+    /// multi-session tests.
+    fn other(mut frame: Frame) -> Frame {
+        match &mut frame {
+            Frame::Event { session, .. }
+            | Frame::State { session, .. }
+            | Frame::CaughtUp { session, .. }
+            | Frame::Reset { session } => OTHER.clone_into(session),
+            Frame::List { .. } | Frame::Heartbeat | Frame::Vms { .. } => {
+                panic!("a host-level frame belongs to no session")
+            }
+        }
+        frame
     }
 
     /// A `reset` published during an attach remains in the live queue.
@@ -797,10 +812,7 @@ mod tests {
     /// the tail, so it cannot jump a reliable boundary.
     #[test]
     fn lossy_replacement_moves_to_the_queue_tail() {
-        let fanout = Fanout {
-            live_capacity: 3,
-            ..Fanout::default()
-        };
+        let fanout = Fanout::new(NonZeroUsize::new(3));
         let (id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string()]);
         fanout.finish_block(id, SESSION, 0);
 
@@ -819,10 +831,7 @@ mod tests {
     /// the subscriber instead of silently losing the frame.
     #[test]
     fn live_overflow_drops_lossy_and_evicts_on_reliable() {
-        let fanout = Fanout {
-            live_capacity: 2,
-            ..Fanout::default()
-        };
+        let fanout = Fanout::new(NonZeroUsize::new(2));
         let (id, mut rx, cancelled) = fanout.register(&[SESSION.to_string()]);
         fanout.finish_block(id, SESSION, 0);
         fanout.publish(reliable("one"));

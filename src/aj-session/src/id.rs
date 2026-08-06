@@ -1,15 +1,10 @@
 //! The session-id grammar the store guarantees and callers may rely on.
 //!
 //! A session id is a filename stem: [`ConversationPersistence`] turns it into
-//! `<sessions_dir>/<id>.jsonl`. An id that arrives from outside this process
-//! (the remote-control protocol treats ids as opaque strings, spec 6.2) must
-//! therefore be checked against this grammar before it reaches any path
-//! construction or store lookup, or a peer could name a file outside the
-//! store.
-//!
-//! Membership in an enumeration is not a substitute. It happens to be safe,
-//! but it makes path safety depend on how a lookup is implemented, and it
-//! forces a directory read to answer a question about one id.
+//! `<sessions_dir>/<id>.jsonl` and the advisory lock into
+//! `<sessions_dir>/locks/<id>.lock`. An id that arrives from outside this
+//! process must therefore be checked here before it reaches either, or a peer
+//! could name a file outside the store.
 //!
 //! [`ConversationPersistence`]: crate::persistence::ConversationPersistence
 
