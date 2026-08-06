@@ -192,10 +192,12 @@ Responsibilities:
   materialization per session id, a command arriving mid-teardown
   waits and re-materializes. Attachment is the retention signal:
   remote clients detach by reopening the stream without naming the
-  session, the in-process client detaches sessions it no longer
-  views, and a sidebar-era client that deliberately keeps background
-  sessions attached (section 9.2) thereby deliberately retains their
-  locks, that is use, not a leak. Without release-on-idle a
+  session, and a client keeps a small bounded working set of
+  background sessions attached (section 9.2), detaching what falls
+  out of it. Retained locks inside the working set are use, not a
+  leak. Visiting, though, is not retention: browsing fifty sessions
+  must not leave fifty live drivers and fifty held locks behind.
+  Without release-on-idle a
   long-lived host monotonically accumulates every session it ever
   touched, holding locks other processes in the same directory need.
 - Single-writer safety: materializing a session takes an advisory lock
@@ -1108,6 +1110,19 @@ single-session use) lists sessions:
   is what a first focus does, and the attach block it earns is that
   session's catch-up, so a session the user never opens is never
   projected.
+- Background attachment is a bounded working set, LRU over focus. The
+  bound is an implementation constant with its tradeoff stated: large
+  enough that juggling a handful of sessions never pays a re-attach,
+  small enough that a browse through the store does not pile up live
+  drivers and locks on the host (section 5). The focused session is
+  never detached. A session that falls out of the set is detached,
+  the host releases it after its idle grace, its lock frees, and its
+  row keeps carrying the attention signal like any unattached
+  session. Re-focusing it costs an ordinary re-attach, incremental
+  when its epoch survived, a full backfill when the host released it.
+  Detaching may keep or drop the client-side `ChatState`, dropping
+  is always safe because re-attach reconciliation absorbs a rebuild
+  (section 6.5).
 - Local single-session mode keeps working exactly as today, the
   sidebar simply has one entry. Creating a new session from the
   sidebar goes through the create command (choosing a host when
