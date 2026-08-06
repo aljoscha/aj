@@ -679,7 +679,12 @@ derives it: a session that is idle and whose activity timestamp is
 newer than the stamp the client recorded when the user last viewed it
 has unseen output, that is the sidebar glyph. Both stamps are host
 clock, the client stores and compares them without ever consulting
-its own, so skew cannot enter. Attention is client-relative state and
+its own, so skew cannot enter. A session the user has never viewed
+has no recorded stamp and reads as having nothing unseen: the glyph
+answers "did this move since I last looked", and with no last look
+the question is vacuous. The loud alternative would light every row
+of a store on first connect, drowning the signal the glyph exists to
+carry. Attention is client-relative state and
 stays client-side.
 
 `list` frames are lossy-coalescible (section 6.4), and the host
