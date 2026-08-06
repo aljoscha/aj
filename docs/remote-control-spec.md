@@ -464,13 +464,16 @@ costs at most one coalescing tick of streaming text, which the next
 live snapshot restores. A cursor beyond the session's current
 `last_seq` is treated as an epoch mismatch (full backfill).
 
-Sessions not named in the request still produce live durable and
-reliable-transient frames (it is a unified stream), just without
-backfill. Since lossy frames are droppable by definition, the server
-may suppress them for sessions a client has not attached, which keeps
-host-wide streaming churn from pressuring every client's queue.
-Changing the attach set means reopening the stream with new
-parameters, reconnection is the normal mode, not an exception.
+Sessions not named in the request produce nothing on the stream
+except their rows in `list` frames. Session-scoped frames flow only
+for attached sessions: an unattached session's events would apply to
+no client state (and their seqs must not be used as cursors, above),
+while its reliable-transient frames are undroppable by class and
+would count against the client's bounded queue, so a client could be
+evicted over traffic it never asked for. Attention for unattached
+sessions rides the list's activity stamps (section 6.8). Changing the
+attach set means reopening the stream with new parameters,
+reconnection is the normal mode, not an exception.
 
 Backfill projection rules, which differ from dead-log replay:
 
@@ -1222,3 +1225,8 @@ before the next begins.
   invariants to preserve, mechanics may adjust as branching settles.
 - Frame volume for image-heavy sessions may want compression on the
   SSE response. Deferred until measured.
+- `list` frames are cumulative over the whole store, so their size
+  grows with session count (~60 KB at 400 sessions). Per-subscriber
+  suppression and durable-event pacing bound the rate, not the size.
+  A row cap or delta encoding is the follow-up if a real store gets
+  big enough to hurt.
