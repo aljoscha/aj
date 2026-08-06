@@ -43,6 +43,10 @@ pub(crate) trait SessionStore {
     /// Every session log in the store, with its fingerprint. Opens no file.
     fn enumerate_sessions(&self) -> Result<Vec<SessionMetadata>, ConversationError>;
 
+    /// The fingerprint of one session's log, `None` when the store holds no
+    /// log under that id. One `stat`, no directory read.
+    fn session_metadata(&self, session_id: &str) -> Option<SessionMetadata>;
+
     /// Whether the log is in the current on-disk format, or `None` when it
     /// could not be read at all. Opens the file and reads its first line.
     fn is_current_format(&self, session_id: &str) -> Option<bool>;
@@ -51,6 +55,10 @@ pub(crate) trait SessionStore {
 impl SessionStore for ConversationPersistence {
     fn enumerate_sessions(&self) -> Result<Vec<SessionMetadata>, ConversationError> {
         ConversationPersistence::enumerate_sessions(self)
+    }
+
+    fn session_metadata(&self, session_id: &str) -> Option<SessionMetadata> {
+        ConversationPersistence::session_metadata(self, session_id)
     }
 
     fn is_current_format(&self, session_id: &str) -> Option<bool> {
@@ -221,12 +229,12 @@ impl<S: SessionStore> ColdSessions<S> {
         Ok(())
     }
 
-    /// How many times this has read the store's directory, whether to enumerate
-    /// or to answer a membership question.
+    /// How many times this has read the store's directory.
     ///
     /// The refresh contract is about the filesystem work a refresh does *not*
     /// do, which its answers cannot show, so this is the seam the tests assert
-    /// on.
+    /// on. Only [`Self::enumerate`] reads the directory: a membership question
+    /// is answered off a single `stat` (see [`Self::contains`]).
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn directory_reads(&self) -> u64 {
         self.directory_reads.load(Ordering::Relaxed)
@@ -234,20 +242,20 @@ impl<S: SessionStore> ColdSessions<S> {
 
     /// Whether the store holds a current-format log for `id`.
     ///
-    /// The membership test materialization gates on. It reads no more of a log
-    /// than the format sniff, so asking it about a store full of cold sessions
-    /// does not read them.
-    pub(crate) fn contains(&self, id: &str) -> Result<bool, ConversationError> {
-        let Some(metadata) = self
-            .enumerate_store()?
-            .into_iter()
-            .find(|metadata| metadata.session_id == id)
-        else {
-            return Ok(false);
+    /// The membership test materialization gates on. It costs one `stat` plus
+    /// at most one format sniff, so it says nothing about how large the store
+    /// is: a host that holds hundreds of sessions answers this as fast as one
+    /// that holds two. That is what the id grammar buys (spec 6.2). Without a
+    /// syntactic gate the only safe way to turn a wire-supplied id into an
+    /// answer is to look for it in an enumeration, which reads the directory
+    /// on every miss.
+    pub(crate) fn contains(&self, id: &str) -> bool {
+        let Some(metadata) = self.store.session_metadata(id) else {
+            return false;
         };
         // An unreadable log is not a session this host can materialize, so
         // membership answers no where the directory merely declines to move.
-        Ok(self.current_format(&metadata).unwrap_or(false))
+        self.current_format(&metadata).unwrap_or(false)
     }
 
     /// Record what the host knows about a session it just released, so a
@@ -455,6 +463,13 @@ mod tests {
             }
             let file = self.file(session_id)?;
             file.sniffable.then_some(file.current_format)
+        }
+
+        fn session_metadata(&self, session_id: &str) -> Option<SessionMetadata> {
+            // A `stat` of one path: it does not touch the directory, which is
+            // what the `directory_reads` assertions rest on.
+            let file = self.file(session_id)?;
+            Some(SessionMetadata::new(file.id, at(file.modified), file.size))
         }
     }
 
@@ -984,10 +999,11 @@ mod tests {
         );
     }
 
-    /// The membership test answers off the enumeration and the cached format
-    /// verdict, so repeating it reads no file.
+    /// The membership test answers off one `stat` and the cached format
+    /// verdict. It never reads the directory, which is what makes it
+    /// independent of how many sessions the store holds (spec 6.2).
     #[test]
-    fn membership_answers_off_one_sniff() {
+    fn membership_answers_off_one_stat_and_one_sniff() {
         let store = FakeStore::default();
         store.put("a", 3);
         store.write(FakeFile {
@@ -997,11 +1013,16 @@ mod tests {
         let cold = ColdSessions::new(store);
 
         for _ in 0..5 {
-            assert!(cold.contains("a").expect("contains"));
-            assert!(!cold.contains("ancient").expect("contains"));
-            assert!(!cold.contains("nobody").expect("contains"));
+            assert!(cold.contains("a"));
+            assert!(!cold.contains("ancient"));
+            assert!(!cold.contains("nobody"));
         }
         assert_eq!(cold.store.sniffs_of("a"), 1);
         assert_eq!(cold.store.sniffs_of("ancient"), 1);
+        assert_eq!(
+            cold.directory_reads(),
+            0,
+            "fifteen membership questions and not one directory read",
+        );
     }
 }

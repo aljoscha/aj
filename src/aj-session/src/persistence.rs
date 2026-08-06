@@ -90,6 +90,12 @@ impl ConversationPersistence {
             let Some(session_id) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
+            // A stem the grammar rejects is not a session this store can be
+            // asked about later (see [`crate::id`]), so listing it would put a
+            // row in every directory that no attach could ever resolve.
+            if !crate::id::is_valid_session_id(session_id) {
+                continue;
+            }
             let metadata = match fs::metadata(&path) {
                 Ok(metadata) => metadata,
                 Err(err) => {
@@ -118,6 +124,33 @@ impl ConversationPersistence {
         // Filenames are timestamps, so reverse-lexicographic is latest first.
         sessions.sort_by(|left, right| right.session_id.cmp(&left.session_id));
         Ok(sessions)
+    }
+
+    /// The `stat` facts for one session's log, `None` when the store holds no
+    /// readable log under that id.
+    ///
+    /// The single-id form of [`Self::enumerate_sessions`], for the membership
+    /// question a lookup asks. It costs one `stat` rather than a directory
+    /// read, which is what keeps "is this id one of mine" off the size of the
+    /// store.
+    ///
+    /// An id the grammar rejects answers `None` without touching the
+    /// filesystem: it cannot name a log in this store, and turning it into a
+    /// path is exactly what must not happen (see [`crate::id`]).
+    pub fn session_metadata(&self, session_id: &str) -> Option<SessionMetadata> {
+        if !crate::id::is_valid_session_id(session_id) {
+            return None;
+        }
+        let path = self.session_path(session_id);
+        let metadata = fs::metadata(&path).ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        Some(SessionMetadata::new(
+            session_id.to_string(),
+            metadata.modified().ok()?.into(),
+            metadata.len(),
+        ))
     }
 
     /// Whether `session_id`'s log is in the current on-disk format, or `None`
@@ -619,6 +652,61 @@ mod tests {
         assert_eq!(p.message_count, 3);
         assert_eq!(p.first_user_message.as_deref(), Some("hello world"));
         assert!(p.size_bytes > 0);
+    }
+
+    /// A file whose stem is not a session id is not a session: the store can
+    /// never be asked about it again (the grammar rejects the id at every
+    /// lookup), so a row for it would be a directory entry nothing resolves.
+    #[test]
+    fn enumeration_skips_a_stem_that_is_not_a_session_id() {
+        let (_dir, persistence) = fixture();
+        let mut log = ConversationLog::create(&persistence).expect("create");
+        append_user_then_assistant(&mut log, "hello", "hi");
+        let real = log.session_id().to_string();
+        drop(log);
+        for stem in ["not a session", "sneaky.name", "héllo"] {
+            std::fs::write(
+                persistence.sessions_dir().join(format!("{stem}.jsonl")),
+                "{}\n",
+            )
+            .expect("write a stray log");
+        }
+
+        let listed: Vec<String> = persistence
+            .enumerate_sessions()
+            .expect("enumerate")
+            .into_iter()
+            .map(|metadata| metadata.session_id)
+            .collect();
+        assert_eq!(listed, vec![real]);
+    }
+
+    /// The single-id membership primitive: one `stat`, and nothing at all for
+    /// an id the grammar rejects.
+    #[test]
+    fn session_metadata_answers_one_id_without_a_directory_read() {
+        let (_dir, persistence) = fixture();
+        let mut log = ConversationLog::create(&persistence).expect("create");
+        append_user_then_assistant(&mut log, "hello", "hi");
+        let session_id = log.session_id().to_string();
+        let size = std::fs::metadata(log.path()).expect("stat").len();
+        drop(log);
+
+        let metadata = persistence
+            .session_metadata(&session_id)
+            .expect("the log is there");
+        assert_eq!(metadata.session_id, session_id);
+        assert_eq!(metadata.size_bytes, size);
+
+        assert!(
+            persistence
+                .session_metadata("2026-01-01-00-00-00-000")
+                .is_none()
+        );
+        // The sessions directory itself, reached by climbing out of the store.
+        // Nothing may make this resolve, whatever is on disk.
+        assert!(persistence.session_metadata("../etc/passwd").is_none());
+        assert!(persistence.session_metadata("").is_none());
     }
 
     /// The format sniff reads bytes, not text, so a log that is not valid

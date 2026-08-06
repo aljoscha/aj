@@ -22,6 +22,8 @@
 //!   segment-collapsed [`SessionTree`] for the tree-view overlay.
 //! - [`lock`] is the advisory single-writer lock a host takes while it
 //!   holds a session live.
+//! - [`id`] is the session-id grammar, which is what makes an id that
+//!   arrives from off-process safe to turn into a path.
 
 /// How many lines a blocking file scan reads between cancellation polls.
 ///
@@ -35,6 +37,7 @@
 pub(crate) const SCAN_CANCEL_CHECK_LINES: usize = 1024;
 
 pub mod compaction;
+pub mod id;
 pub mod listener;
 pub mod lock;
 pub mod log;
@@ -50,6 +53,7 @@ pub use compaction::{
     CompactionDetails, CompactionPlan, ContextEstimate, estimate_context_tokens,
     prepare_compaction, should_compact,
 };
+pub use id::is_valid_session_id;
 pub use listener::{AppendHandoff, persistence_listener, persisting_forwarder};
 pub use lock::{LockHolder, SessionLock};
 pub use log::{

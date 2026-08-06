@@ -965,6 +965,73 @@ async fn an_unknown_session_is_refused() {
     harness.host.shutdown().await;
 }
 
+/// An id that could never name a log in this store is refused at every
+/// entry point, and refused off its own shape: nothing goes near the store
+/// to find that out (spec 6.2).
+#[tokio::test]
+async fn an_id_that_is_not_a_session_id_never_reaches_the_store() {
+    let harness = Harness::new(Vec::new());
+    // The one enumeration the host does at startup, so the assertion below
+    // measures what these calls added rather than what construction did.
+    let before = harness.host.store_directory_reads();
+
+    for id in ["", "..", "../../etc/passwd", "a/b", "sneaky.jsonl", "hé"] {
+        let err = harness
+            .host
+            .command(id, prompt("hi"))
+            .await
+            .expect_err("a command names no path");
+        assert!(
+            matches!(err, HostError::UnknownSession(_)),
+            "{id:?}: {err:?}"
+        );
+
+        let err = harness
+            .host
+            .attach(&[AttachRequest {
+                session: id.to_string(),
+                cursor: None,
+            }])
+            .await
+            .err()
+            .expect("an attach names no path");
+        assert!(
+            matches!(err, HostError::UnknownSession(_)),
+            "{id:?}: {err:?}"
+        );
+
+        let err = harness
+            .host
+            .tasks(id)
+            .await
+            .err()
+            .expect("a read names no path");
+        assert!(
+            matches!(err, HostError::UnknownSession(_)),
+            "{id:?}: {err:?}"
+        );
+
+        let err = harness
+            .host
+            .tree(id)
+            .await
+            .err()
+            .expect("the tree read names no path");
+        assert!(
+            matches!(err, HostError::UnknownSession(_)),
+            "{id:?}: {err:?}"
+        );
+    }
+
+    assert_eq!(
+        harness.host.store_directory_reads(),
+        before,
+        "a refusal off the id's own shape reads nothing, and a membership \
+         question costs a stat rather than a directory read",
+    );
+    harness.host.shutdown().await;
+}
+
 /// An attach reports the sessions it served, and one named twice is a
 /// malformed request: the client contract is one block per named session
 /// (spec 6.5), and the second block would open a phase the client is not
@@ -1223,6 +1290,62 @@ async fn two_sessions_on_one_host_stay_independent() {
     assert!(
         thinking(&harness.host, &second).await.is_none(),
         "and did not leak into the other session",
+    );
+    harness.host.shutdown().await;
+}
+
+/// A stream sees nothing at all from a session it did not attach, not even
+/// that session's durable and reliable-transient frames (spec 6.5). Only its
+/// row in the directory travels.
+///
+/// The rule is what keeps a busy session a client never asked for from
+/// filling that client's bounded queue and evicting it.
+#[tokio::test]
+async fn a_stream_sees_nothing_from_a_session_it_did_not_attach() {
+    let harness = Harness::new(Vec::new());
+    let watched = harness.create().await;
+    let other = harness.create().await;
+    harness
+        .install_script(&watched, vec![finalized_text_message("watched")])
+        .await;
+    harness
+        .install_script(&other, vec![finalized_text_message("unwatched")])
+        .await;
+
+    let mut client = Client::attach(&harness.host, &watched).await;
+    // Attached before the prompt, so this client can tell when the turn it
+    // is not watching has finished.
+    let mut elsewhere = Client::attach(&harness.host, &other).await;
+
+    // A whole turn on the session `client` did not attach, run to completion.
+    harness.prompt(&other, "hi").await;
+    elsewhere.pump_until_idle().await;
+    drop(elsewhere);
+
+    harness.prompt(&watched, "hi").await;
+    let frames = client.pump_until_idle().await;
+    tokio::time::sleep(LIST_SETTLE).await;
+    let frames: Vec<Frame> = frames
+        .into_iter()
+        .chain(drained(&mut client.stream))
+        .collect();
+
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| frame.session() == Some(other.as_str())),
+        "the unattached session put a frame on the stream",
+    );
+    assert_eq!(assistant_text(&only(frames.clone(), &watched)), "watched");
+    // Its row is still in the directory, which is where attention for an
+    // unattached session comes from.
+    let listed = directories(&frames)
+        .last()
+        .cloned()
+        .expect("a directory reached the stream");
+    assert!(
+        listed.iter().any(|row| row.id == other),
+        "the unattached session is missing from the directory",
     );
     harness.host.shutdown().await;
 }

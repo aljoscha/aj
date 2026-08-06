@@ -1015,6 +1015,7 @@ impl SessionHost {
         session: &str,
     ) -> Result<(SessionMap<'_>, Arc<LiveSession>), HostError> {
         self.alive()?;
+        validate_session_id(session)?;
         let mut sessions = self.inner.sessions.lock().await;
         let live = self.materialize(&mut sessions, Some(session), None).await?;
         Ok((sessions, live))
@@ -1029,10 +1030,11 @@ impl SessionHost {
     /// cold session is "nothing".
     async fn live_or_cold(&self, session: &str) -> Result<Option<Arc<LiveSession>>, HostError> {
         self.alive()?;
+        validate_session_id(session)?;
         if let Some(entry) = self.inner.sessions.lock().await.get(session) {
             return Ok(Some(Arc::clone(&entry.session)));
         }
-        if !self.on_disk(session)? {
+        if !self.on_disk(session) {
             return Err(HostError::UnknownSession(session.to_string()));
         }
         Ok(None)
@@ -1165,7 +1167,7 @@ impl SessionHost {
             if let Some(entry) = sessions.get(id) {
                 return Ok(Arc::clone(&entry.session));
             }
-            if !self.on_disk(id)? {
+            if !self.on_disk(id) {
                 return Err(HostError::UnknownSession(id.to_string()));
             }
         }
@@ -1270,11 +1272,11 @@ impl SessionHost {
     }
 
     /// Whether the store holds a session `id` this host could materialize.
-    fn on_disk(&self, id: &str) -> Result<bool, HostError> {
-        self.inner
-            .cold
-            .contains(id)
-            .map_err(|err| HostError::Internal(Box::new(err)))
+    ///
+    /// Costs one `stat`: an id that is not one this store could ever hold is
+    /// refused by its grammar before any path is built (spec 6.2).
+    fn on_disk(&self, id: &str) -> bool {
+        self.inner.cold.contains(id)
     }
 
     /// Serve one session's attach block on `id`'s stream.
@@ -1439,6 +1441,24 @@ async fn send_block_frame(
         _ = cancelled.cancelled() => false,
         result = sender.send(frame) => result.is_ok(),
     }
+}
+
+/// Refuse a session id that could never name a log in this store.
+///
+/// The wire treats session ids as opaque strings, so one arriving from a peer
+/// is checked against the store's grammar before it reaches a path or a
+/// lookup (spec 6.2). Membership in an enumeration is not a substitute: it
+/// happens to be safe, but it makes path safety depend on how a lookup is
+/// implemented, and it costs a directory read per question.
+///
+/// [`HostError::UnknownSession`] rather than [`HostError::Invalid`], because a
+/// client cannot tell an id this host could never hold from one it merely does
+/// not have, and 404 is the honest answer to both.
+fn validate_session_id(session: &str) -> Result<(), HostError> {
+    if aj_session::is_valid_session_id(session) {
+        return Ok(());
+    }
+    Err(HostError::UnknownSession(session.to_string()))
 }
 
 /// Applies the same empty-prompt rule as the session driver before creation.

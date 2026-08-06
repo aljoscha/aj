@@ -97,13 +97,12 @@ impl Subscriber {
         };
         match self.attached.get_mut(session) {
             None => {
-                // Spec 6.5: an unattached session still produces durable
-                // and reliable-transient frames, but its lossy frames may
-                // be suppressed, which keeps host-wide streaming churn off
-                // a client that is not watching it.
-                if !frame.is_lossy() {
-                    return self.live.offer(frame.clone());
-                }
+                // A session this stream did not name produces nothing but its
+                // row in `list` frames (spec 6.5). Its events would apply to
+                // no state this client holds, its seqs may not be used as
+                // cursors, and its reliable-transient frames are undroppable
+                // by class, so delivering them would let a busy session evict
+                // a client that never asked to watch it.
                 Offered::Dropped
             }
             Some(AttachState::Attaching) => {
@@ -725,24 +724,51 @@ mod tests {
         );
     }
 
-    /// A session this stream did not attach still produces its durable and
-    /// reliable-transient frames, but not its lossy ones (spec 6.5).
+    /// A session this stream did not attach produces nothing on it, not even
+    /// its durable and reliable-transient frames (spec 6.5). The host-level
+    /// `list` frame still flows: it belongs to the connection.
     #[test]
-    fn an_unattached_session_delivers_everything_but_its_lossy_frames() {
+    fn an_unattached_session_produces_nothing_but_the_list() {
         let fanout = Fanout::default();
         let (_id, mut rx, _cancelled) = fanout.register(&[]);
 
         fanout.publish(durable(1));
-        fanout.publish(reliable("kept"));
+        fanout.publish(reliable("dropped"));
         fanout.publish(lossy(0));
+        fanout.publish(Frame::Reset {
+            session: SESSION.to_string(),
+        });
         fanout.publish(Frame::List {
             sessions: Vec::new(),
         });
 
+        assert_eq!(drained(&mut rx), vec!["list"]);
+    }
+
+    /// One stream, two sessions: each session's frames are gated by its own
+    /// attach state, and neither leaks onto the other's boundary.
+    #[test]
+    fn one_stream_gates_each_attached_session_separately() {
+        const OTHER: &str = "session-2";
+        let fanout = Fanout::default();
+        let (id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string(), OTHER.to_string()]);
+
+        // The first session's block is served, the second's is still being
+        // written.
+        fanout.finish_block(id, SESSION, 5);
+        fanout.publish(durable(5));
+        fanout.publish(durable(6));
+        let mut other = durable(9);
+        if let Frame::Event { session, .. } = &mut other {
+            OTHER.clone_into(session);
+        }
+        fanout.publish(other);
+
         assert_eq!(
             drained(&mut rx),
-            vec!["durable 1", "warning kept", "list"],
-            "the host-level list frame belongs to the connection, not a session",
+            vec!["durable 6", "durable 9"],
+            "seq 5 is below the first session's boundary, and the second \
+             session's own seq space is untouched by it",
         );
     }
 
