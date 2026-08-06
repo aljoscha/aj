@@ -218,6 +218,10 @@ impl Control {
             Self::Remote(remote) => Ok(Stream::Remote {
                 events: remote.client.events(&requests).await?,
                 lost: None,
+                attached: requests
+                    .iter()
+                    .map(|request| request.session.clone())
+                    .collect(),
             }),
         }
     }
@@ -324,6 +328,11 @@ pub(crate) enum Stream {
         /// A failure `try_recv` saw. The next [`Stream::recv`] reports it, so
         /// a drain never swallows a lost stream.
         lost: Option<RemoteError>,
+        /// The sessions this stream was opened for, which is what
+        /// [`Stream::attached`] answers from. The host's attach is
+        /// all-or-nothing, so a stream that exists carries a block for every
+        /// session named in its request and for no other.
+        attached: Vec<String>,
     },
 }
 
@@ -345,13 +354,14 @@ impl Stream {
     /// Whether the peer reports it will serve `session`'s attach block, which
     /// is what a client arms its fold from.
     ///
-    /// A remote attach the host refuses fails before the stream opens, so a
-    /// stream that exists is a stream with the block on it.
+    /// False for a session this stream does not carry, so a caller holding
+    /// several streams can ask any of them about any session.
     pub(crate) fn attached(&self, session: &str) -> bool {
-        match self {
-            Self::Local(attachment) => attachment.attached().iter().any(|name| name == session),
-            Self::Remote { .. } => true,
-        }
+        let names = match self {
+            Self::Local(attachment) => attachment.attached(),
+            Self::Remote { attached, .. } => attached.as_slice(),
+        };
+        names.iter().any(|name| name == session)
     }
 
     /// The next frame, awaiting one.
@@ -361,7 +371,7 @@ impl Stream {
                 Some(frame) => ControlFrame::Frame(frame),
                 None => ControlFrame::Closed,
             },
-            Self::Remote { events, lost } => {
+            Self::Remote { events, lost, .. } => {
                 if let Some(err) = lost.take() {
                     return ControlFrame::Lost(err.into());
                 }
@@ -388,7 +398,7 @@ impl Stream {
     pub(crate) fn try_recv(&mut self) -> Option<Frame> {
         match self {
             Self::Local(attachment) => attachment.try_recv(),
-            Self::Remote { events, lost } => {
+            Self::Remote { events, lost, .. } => {
                 if lost.is_some() {
                     return None;
                 }

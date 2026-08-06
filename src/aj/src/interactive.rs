@@ -15131,6 +15131,49 @@ mod tests {
         remote.shutdown().await;
     }
 
+    /// A stream answers `attached` per session, for both a local host and a
+    /// connection: true for what it carries and false for anything else.
+    ///
+    /// A client arms its attach-block fold from this (`open_stream`), so a
+    /// stream that claimed every session would arm folds for blocks that
+    /// never arrive, and the next on-change `state` frame would be mistaken
+    /// for one. Invisible while a client holds one single-session stream,
+    /// which is why it is pinned here before the sidebar holds several.
+    #[tokio::test]
+    async fn a_stream_reports_attachment_per_session() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (world, _shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+
+        // A second session the host really has, but this stream does not
+        // carry, so "does the host know it" and "is it on this stream" cannot
+        // be confused.
+        let other = world
+            .control
+            .create(None, None)
+            .await
+            .expect("a second session");
+        assert_ne!(other, world.session);
+
+        let stream = world
+            .control
+            .attach(&world.session, None)
+            .await
+            .expect("attach");
+        assert!(
+            stream.attached(&world.session),
+            "the stream carries the session it named",
+        );
+        assert!(
+            !stream.attached(&other),
+            "a session this stream did not name is not attached on it",
+        );
+        assert!(!stream.attached("no-such-session"));
+        drop(stream);
+
+        remote.shutdown().await;
+    }
+
     /// The tree view and the branch gesture work over a connection: the tree
     /// read carries the head the overlay pre-selects, and the branch anchor
     /// travels as a `before` target the host resolves to the message's parent
