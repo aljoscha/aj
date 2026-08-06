@@ -1952,7 +1952,10 @@ async fn a_silent_stream_is_reported_dead_to_a_polling_client() {
     let session = fixture.create().await;
     let control = Control::remote(fixture.client().with_silence(silence));
     let mut stream = control
-        .attach(&session, None)
+        .attach_all(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
         .await
         .expect("the attach is served");
 

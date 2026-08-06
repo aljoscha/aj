@@ -27,7 +27,8 @@ use aj_app::client::SessionClient;
 use aj_app::commands::CommandAction;
 use aj_app::directory::SessionDirectory;
 use aj_app::host::{
-    Command, CommandOutcome, HeadTarget, LocalHandles, QueueOp, SettingsAxis, SettingsChange,
+    AttachRequest, Command, CommandOutcome, HeadTarget, LocalHandles, QueueOp, SettingsAxis,
+    SettingsChange,
 };
 use aj_app::keybindings::fixed_keys;
 use aj_app::session::{SessionExit, SessionRequest};
@@ -568,9 +569,46 @@ async fn open_stream(
     control: &Control,
     directory: &mut SessionDirectory,
 ) -> Result<Stream, ControlError> {
-    let stream = control.attach_all(&directory.attach_requests()).await?;
+    let stream = control.attach_all(&directory.attach_requests(None)).await?;
     directory.expect_attach(|session| stream.attached(session));
     Ok(stream)
+}
+
+/// Attach the working set a focus on `session` will leave, falling back to
+/// `session` alone if the whole set is refused.
+///
+/// An attach is all-or-nothing (spec 6.5), and the set is requested on every
+/// reopen, so one background session the host will not serve would otherwise
+/// refuse every reopen for every session, including the one the user is looking
+/// at. A session that cannot be attached has no business holding the client
+/// hostage, so it falls out of the working set the same way a displaced one
+/// does. The narrowed attach is the retry, not a second refusal to report: if
+/// that fails too, the reason is about the session being focused and the caller
+/// words it.
+///
+/// The sessions dropped this way are not named here. Their entries stay in the
+/// directory folding nothing, and the next reopen offers them again, so a
+/// transient refusal costs one narrowed attach rather than a permanent
+/// eviction.
+async fn attach_admitting(world: &World, session: &str) -> Result<Stream, ControlError> {
+    let requests = world.directory.attach_requests(Some(session));
+    match world.control.attach_all(&requests).await {
+        Ok(stream) => Ok(stream),
+        Err(_) if requests.len() > 1 => {
+            tracing::warn!(
+                "attaching {} session(s) was refused, narrowing to {session}",
+                requests.len(),
+            );
+            world
+                .control
+                .attach_all(&[AttachRequest {
+                    session: session.to_string(),
+                    cursor: None,
+                }])
+                .await
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Read the focused session's tree from the host and open the tree overlay
@@ -585,7 +623,7 @@ async fn open_tree_overlay(
     world: &World,
     shell: &Rc<RefCell<Shell>>,
 ) -> Result<Rc<RefCell<FilterableSelect>>, ControlError> {
-    let tree = world.control.tree(&world.session()).await?;
+    let tree = world.control.tree(world.session()).await?;
     let rows = build_tree_rows(&tree, Utc::now());
     let handles = shell.borrow().overlay_handles();
     Ok(open_session_tree(&handles, rows, tree.head))
@@ -653,7 +691,7 @@ async fn refresh_client_reads(world: &mut World) {
     }
     let mut failed = false;
     if world.client().needs_task_refetch() {
-        match world.control.tasks(&world.session()).await {
+        match world.control.tasks(world.session()).await {
             Ok(tasks) => {
                 let mut chat = world.chat.borrow_mut();
                 world.directory.client_mut().set_tasks(&mut chat, tasks);
@@ -665,7 +703,7 @@ async fn refresh_client_reads(world: &mut World) {
         }
     }
     if world.client().needs_queue_refetch() {
-        match world.control.queue(&world.session()).await {
+        match world.control.queue(world.session()).await {
             Ok(queue) => {
                 let mut chat = world.chat.borrow_mut();
                 world.directory.client_mut().set_queue(&mut chat, queue);
@@ -840,6 +878,16 @@ async fn focus_session(
     // in the background all along, so there is no stream to reopen and no
     // block to wait for (spec 9.2).
     let attaching = !world.directory.is_attached(&session);
+    // Unless it owes a re-attach. A `reset` for a background session stops its
+    // fold until one is served, so swapping onto it would paint the branch the
+    // reset abandoned. The loop discharges these set-wide, but focusing can
+    // arrive first, and the reopen is what makes the switch show the session as
+    // it now is.
+    let reopening = attaching
+        || world
+            .directory
+            .client_for(&session)
+            .is_some_and(|client| client.needs_reattach());
     // The stream first: its attachment is what stops the host from releasing
     // the session between here and the handles below (spec section 5,
     // attachment is the retention signal). Taking the handles first would leave
@@ -848,13 +896,12 @@ async fn focus_session(
     // attach materialized a second one.
     //
     // Changing the attach set means reopening the stream (spec 6.5), so a first
-    // focus re-attaches every session this client already folds alongside the
-    // new one. Each offers its own cursor, so the sessions being carried over
-    // are served their suffix rather than a fresh backfill.
-    let stream = if attaching {
-        let mut requests = world.directory.attach_requests();
-        requests.push((session.clone(), None));
-        Some(world.control.attach_all(&requests).await?)
+    // focus re-attaches every session in the working set alongside the new one.
+    // Each offers its own cursor, so the sessions carried over are served their
+    // suffix rather than a fresh backfill, and the session this one displaces
+    // from the set is detached by going unnamed here.
+    let stream = if reopening {
+        Some(attach_admitting(world, &session).await?)
     } else {
         None
     };
@@ -902,7 +949,7 @@ async fn focus_session(
     // frame is drawn against the session's real history and settings. A swap
     // onto an already-attached session has no block coming, and awaiting one
     // would hang the loop on a `caught_up` the host has no reason to send.
-    if attaching {
+    if reopening {
         fold_attach_block(world).await;
     }
     refresh_client_reads(world).await;
@@ -923,8 +970,13 @@ async fn focus_session(
     for event in fresh_env_notices(fresh, &env) {
         fold_event(world, event);
     }
-    for notice in restore_notices {
-        fold_notice(world, &notice);
+    // Only onto a transcript this focus built. A swap restores one that already
+    // shows them, and they are startup facts about the session, not about the
+    // switch, so re-folding them would stack a copy per visit.
+    if attaching {
+        for notice in restore_notices {
+            fold_notice(world, &notice);
+        }
     }
     // The outgoing session's transmitted image ids belong to its terminal
     // graphics memory. Free them and empty the store so the new session
@@ -1062,7 +1114,7 @@ async fn refresh_local_handles(
     let Some(host) = world.control.host().cloned() else {
         return Ok(());
     };
-    world.local = Some(host.local_handles(&world.session()).await?);
+    world.local = Some(host.local_handles(world.session()).await?);
     shell.borrow().rebind_handles(world);
     Ok(())
 }
@@ -1556,7 +1608,7 @@ async fn handle_submit(world: &mut World, text: String) -> bool {
 /// behind a busy agent. Its wording is user-facing, and a remote client
 /// shows the same string.
 async fn prompt_host(world: &mut World, command: Command) -> bool {
-    match world.control.command(&world.session(), command).await {
+    match world.control.command(world.session(), command).await {
         Ok(_) => true,
         Err(err) => {
             fold_notice(world, &err.to_string());
@@ -1607,7 +1659,7 @@ async fn cancel_viewed_turn(world: &World) -> bool {
     }
     if let Err(err) = world
         .control
-        .command(&world.session(), Command::Cancel { agent: active })
+        .command(world.session(), Command::Cancel { agent: active })
         .await
     {
         tracing::warn!("the host refused a cancel: {err}");
@@ -1657,7 +1709,7 @@ async fn yank_pending_into_editor(world: &World, shell: &Rc<RefCell<Shell>>) -> 
     let withdrawn = world
         .control
         .command(
-            &world.session(),
+            world.session(),
             Command::Queue(QueueOp::Remove { agent: target }),
         )
         .await;
@@ -1733,7 +1785,7 @@ async fn handle_steer(world: &mut World, shell: &Rc<RefCell<Shell>>) {
     let steered = world
         .control
         .command(
-            &world.session(),
+            world.session(),
             Command::Steer {
                 agent: target,
                 text: text.clone(),
@@ -1958,7 +2010,7 @@ async fn apply_command_action(
             // refusal reworded here.
             match world
                 .control
-                .command(&world.session(), Command::Compact { instructions: None })
+                .command(world.session(), Command::Compact { instructions: None })
                 .await
             {
                 Ok(_) => {}
@@ -1985,7 +2037,7 @@ async fn apply_command_action(
                 );
                 return ActionEffect::Redraw;
             };
-            spawn_session_export(&log, &world.session(), export_tx);
+            spawn_session_export(&log, world.session(), export_tx);
             ActionEffect::None
         }
         CommandAction::OpenThinkingSelector => {
@@ -2428,7 +2480,7 @@ async fn kill_task(world: &World, id: TaskId) -> String {
         Some(aj_agent::tool::TaskStatus::Running) => {
             match world
                 .control
-                .command(&world.session(), Command::KillTask { task: id })
+                .command(world.session(), Command::KillTask { task: id })
                 .await
             {
                 Ok(_) => format!("Killing background task #{id}."),
@@ -2629,7 +2681,7 @@ async fn command_settings(
     };
     match world
         .control
-        .command(&world.session(), Command::Settings(change))
+        .command(world.session(), Command::Settings(change))
         .await
     {
         Ok(_) => Ok(unpersisted_note(world, persisting)),
@@ -4316,7 +4368,7 @@ impl Shell {
         self.rebind_handles(world);
         self.header.borrow_mut().text = format!("{APP_TITLE} - session {}", world.session());
         self.window_title =
-            aj_app::session::window_title(APP_TITLE, &world.session(), &world.working_directory);
+            aj_app::session::window_title(APP_TITLE, world.session(), &world.working_directory);
         self.transcript.borrow_mut().reset_to_tail();
     }
 
@@ -4762,7 +4814,7 @@ pub async fn run(args: Args) -> Result<()> {
             .map(|local| local.task_registry.clone()),
         theme.clone(),
         header,
-        &world.session(),
+        world.session(),
         cwd,
     )));
     let root: WidgetRef = to_widget_ref(Rc::clone(&shell));
@@ -5204,7 +5256,7 @@ async fn poll_task_output(world: &World, shell: &Rc<RefCell<Shell>>, retry: &mut
         return false;
     }
     let task = view.borrow().task();
-    match world.control.task_details(&world.session(), task).await {
+    match world.control.task_details(world.session(), task).await {
         Ok(details) => {
             retry.again_in(TASK_POLL_INTERVAL);
             view.borrow_mut().apply_details(details);
@@ -5472,7 +5524,7 @@ async fn drive(
             .then(|| world.reads_retry.due())
             .flatten();
         let reattach_deadline = world
-            .client()
+            .directory
             .needs_reattach()
             .then(|| reattach_retry.due())
             .flatten();
@@ -6025,7 +6077,7 @@ async fn drive(
         // Continuity broke (a head switch this process did not make), so the
         // client owes a re-attach. A pending re-attach already owes one, and
         // its own attach discharges this.
-        if resume.is_none() && world.client().needs_reattach() && reattach_retry.ready() {
+        if resume.is_none() && world.directory.needs_reattach() && reattach_retry.ready() {
             resume = discharge_reattach(world, shell, &mut reattach_retry).await;
             if resume.is_some() {
                 world.connection = Connection::Reconnecting;
@@ -6152,7 +6204,7 @@ impl ExitBanner {
     /// event-derived accounting (spec 9.1), and the resume hint is left out
     /// because `aj continue` would resume a session on the *host*, not here.
     async fn collect(world: &World, completed: Vec<(String, UsageSummary)>) -> ExitBanner {
-        let live = session_usage(world, &world.session())
+        let live = session_usage(world, world.session())
             .await
             .map(|usage| (world.session().to_string(), usage));
         // Only sessions with at least one persisted user-thread leaf are
@@ -6170,7 +6222,7 @@ impl ExitBanner {
         ExitBanner {
             completed,
             live,
-            resume_hint: resume_eligible.then(|| format_resume_hint(&world.session())),
+            resume_hint: resume_eligible.then(|| format_resume_hint(world.session())),
         }
     }
 
@@ -6309,7 +6361,7 @@ mod tests {
         shell.rebind(&world);
         let expected = aj_app::session::window_title(
             APP_TITLE,
-            &world.session(),
+            world.session(),
             &world.handles().env.working_directory,
         );
         assert_eq!(shell.window_title, expected);
@@ -6839,12 +6891,12 @@ mod tests {
     async fn read_host_state(world: &mut World) {
         let tasks = world
             .control
-            .tasks(&world.session())
+            .tasks(world.session())
             .await
             .expect("the tasks read");
         let queue = world
             .control
-            .queue(&world.session())
+            .queue(world.session())
             .await
             .expect("the queue read");
         let mut chat = world.chat.borrow_mut();
@@ -9061,7 +9113,7 @@ mod tests {
         world
             .host()
             .command(
-                &world.session(),
+                world.session(),
                 Command::Head {
                     target: HeadTarget::Entry(head),
                 },
@@ -9118,7 +9170,7 @@ mod tests {
         world
             .host()
             .command(
-                &world.session(),
+                world.session(),
                 Command::Head {
                     target: HeadTarget::Entry(head),
                 },
@@ -9201,7 +9253,7 @@ mod tests {
             world
                 .control
                 .command(
-                    &world.session(),
+                    world.session(),
                     Command::Queue(QueueOp::Remove {
                         agent: AgentId::Main,
                     }),
@@ -9228,7 +9280,7 @@ mod tests {
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         run_prompt(&mut world, "seed").await;
         assert_eq!(user_rows(&world), vec!["seed"]);
-        let before = CanonicalState::of(&world.chat.borrow(), &world.client());
+        let before = CanonicalState::of(&world.chat.borrow(), world.client());
 
         evict_local_stream(&mut world).await;
 
@@ -9253,7 +9305,7 @@ mod tests {
         // re-serves the durable entries above the client's cursor, and a
         // doubled assistant row is exactly as wrong as a doubled prompt.
         assert_eq!(
-            host_entries(&CanonicalState::of(&world.chat.borrow(), &world.client())),
+            host_entries(&CanonicalState::of(&world.chat.borrow(), world.client())),
             host_entries(&before),
             "the backfill rebuilt the transcript rather than doubling it",
         );
@@ -9440,7 +9492,7 @@ mod tests {
         world
             .host()
             .command(
-                &world.session(),
+                world.session(),
                 Command::Head {
                     target: HeadTarget::Entry(head),
                 },
@@ -9496,7 +9548,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         run_prompt(&mut world, "seed").await;
-        let before = CanonicalState::of(&world.chat.borrow(), &world.client());
+        let before = CanonicalState::of(&world.chat.borrow(), world.client());
         // The comparison below is not vacuous: the client's cursor sits under
         // the host's durable mark, so the re-attach really re-serves an entry
         // the fold has to recognize rather than append again.
@@ -9538,7 +9590,7 @@ mod tests {
             main_notices(&world),
         );
         assert_eq!(
-            host_entries(&CanonicalState::of(&world.chat.borrow(), &world.client())),
+            host_entries(&CanonicalState::of(&world.chat.borrow(), world.client())),
             host_entries(&before),
             "the loop's re-attach rebuilt the transcript rather than doubling it",
         );
@@ -13675,7 +13727,7 @@ mod tests {
             world.session().to_string(),
             world
                 .host()
-                .usage(&world.session())
+                .usage(world.session())
                 .await
                 .expect("usage")
                 .expect("a live session"),
@@ -14036,7 +14088,7 @@ mod tests {
                 world
                     .host()
                     .command(
-                        &world.session(),
+                        world.session(),
                         Command::Head {
                             target: HeadTarget::Before(named),
                         },
@@ -14188,14 +14240,6 @@ mod tests {
             world_shell_app(&dir, "streaming-text", default_layers()).await;
         run_prompt(&mut world, "in the first session").await;
         let first = world.session().to_string();
-        let seq_of = |world: &World, session: &str| {
-            world
-                .directory
-                .client_for(session)
-                .map(|client| client.cursor().map_or(0, |cursor| cursor.seq))
-        };
-        let parked = seq_of(&world, &first).expect("the focused session is attached");
-
         let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
         assert!(matches!(moved, Focus::Moved));
         assert!(
@@ -14217,17 +14261,32 @@ mod tests {
             .await
             .expect("the backgrounded session accepts a prompt");
 
-        // Drain until that session's own cursor passes where it was parked.
+        // Drain until the turn shows up in that session's own parked transcript.
+        //
+        // Watching its cursor instead would not wait for anything: the switch
+        // reopened the stream, so this session is being served a re-attach block
+        // of its own, and that block advances the cursor whether or not the
+        // prompt below was ever folded. The transcript content can only come
+        // from the background fold.
+        let folded_prompt = |world: &World| {
+            world
+                .directory
+                .parked_chat(&first)
+                .and_then(|chat| chat.transcript(AgentId::Main))
+                .is_some_and(|transcript| {
+                    transcript.entries().iter().any(|entry| {
+                        matches!(&entry.kind, EntryKind::User(user)
+                            if user.joined_text() == "while in the background")
+                    })
+                })
+        };
         let deadline = Instant::now() + SETTLE_DEADLINE;
-        loop {
-            fold_ready_frames(&mut world);
-            if seq_of(&world, &first).expect("still attached") > parked {
-                break;
-            }
+        while !folded_prompt(&world) {
             assert!(
                 Instant::now() < deadline,
-                "the backgrounded session never folded a frame",
+                "the backgrounded session never folded the turn it was given",
             );
+            fold_ready_frames(&mut world);
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
@@ -14260,6 +14319,215 @@ mod tests {
         assert!(
             users.iter().any(|text| text == "while in the background"),
             "and the one folded while it was backgrounded: {users:?}",
+        );
+        shut_down(&world).await;
+    }
+
+    /// Read the stream until it goes quiet for `QUIET`, folding everything that
+    /// arrives.
+    ///
+    /// Stronger than [`settle`], which only takes what is already queued. Attach
+    /// blocks are producer-paced (spec 6.9), so a block nobody has read yet is
+    /// generated on demand and is still there to be found. Draining is what
+    /// makes "no block is coming" true rather than merely "no block is queued".
+    async fn drain_stream(world: &mut World) {
+        const QUIET: Duration = Duration::from_millis(150);
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        while Instant::now() < deadline {
+            let Ok(received) = tokio::time::timeout(QUIET, world.stream.recv()).await else {
+                return;
+            };
+            let ControlFrame::Frame(frame) = received else {
+                return;
+            };
+            let _ = world.directory.apply(&mut world.chat.borrow_mut(), frame);
+        }
+        panic!("the stream never went quiet");
+    }
+
+    /// A swap onto an already-attached session must not await an attach block.
+    /// No block is coming for it, so awaiting one parks the drive loop on a
+    /// `caught_up` the host has no reason to send and the TUI stops responding.
+    ///
+    /// Bounded explicitly, because the failure mode is a hang: without the
+    /// timeout a regression here shows up as a test suite that never finishes
+    /// rather than one that fails.
+    #[tokio::test]
+    async fn a_swap_onto_an_attached_session_does_not_await_a_block() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, _writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        persist_session(&mut world).await;
+        let first = world.session().to_string();
+
+        let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
+        assert!(matches!(moved, Focus::Moved));
+        // Drain first. The switch reopened the stream over both sessions, so
+        // `first`'s own re-attach block is still to come, and a swap that
+        // wrongly awaited a block would find that one and return without
+        // hanging.
+        drain_stream(&mut world).await;
+
+        // Back onto a session that is attached and owes nothing, which is the
+        // pure swap. Generous enough that a slow box does not trip it, short
+        // enough that a wait for a block that never comes does.
+        let swap = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(first.clone()),
+        );
+        let moved = tokio::time::timeout(Duration::from_secs(10), swap)
+            .await
+            .expect("a swap onto an attached session waits for nothing");
+        assert!(matches!(moved, Focus::Moved));
+        assert_eq!(world.session(), first);
+        shut_down(&world).await;
+    }
+
+    /// The drive loop discharges a background session's re-attach without the
+    /// user going anywhere. Its obligation has to be visible to the loop's
+    /// set-wide check, or the session sits frozen until something else happens
+    /// to reopen the stream.
+    #[tokio::test]
+    async fn the_loop_discharges_a_background_session_s_re_attach() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, _writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        run_prompt(&mut world, "on the first branch").await;
+        let first = world.session().to_string();
+        let head = world
+            .handles()
+            .log
+            .lock()
+            .await
+            .head()
+            .cloned()
+            .expect("a persisted head");
+
+        let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
+        assert!(matches!(moved, Focus::Moved));
+        world
+            .host()
+            .command(
+                &first,
+                Command::Head {
+                    target: HeadTarget::Entry(head),
+                },
+            )
+            .await
+            .expect("the head switch is accepted");
+
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        while !world.directory.needs_reattach() {
+            assert!(
+                Instant::now() < deadline,
+                "the background session's reset was never folded",
+            );
+            fold_ready_frames(&mut world);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !world.client().needs_reattach(),
+            "the obligation is the backgrounded session's, not the focused one's",
+        );
+
+        let focused = world.session().to_string();
+        // Hand it to the loop and go nowhere. The focused session is idle and
+        // drained, so this re-attach is the only work left. The wait is a plain
+        // bounded one because a successful background re-attach changes nothing
+        // the observer can see from here, and the loop holds the world. It is
+        // not a race in the direction that matters: if the loop's check only
+        // ever asked the focused client, no amount of waiting discharges this.
+        let (exit, _) = drive_until(&mut world, &shell, |writer| async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            drop(writer);
+        })
+        .await;
+        assert!(matches!(exit, Ok(SessionExit::Quit)));
+        assert!(
+            !world.directory.needs_reattach(),
+            "the loop never noticed a background session owed a re-attach",
+        );
+        assert_eq!(
+            world.session(),
+            focused,
+            "and it discharged it without moving the user",
+        );
+        shut_down(&world).await;
+    }
+
+    /// A `reset` for a *background* session is discharged too. Another peer
+    /// switching that session's head mints a fresh epoch, and until a re-attach
+    /// is served its fold filters out every later frame, so a switch onto it
+    /// would paint the branch the reset abandoned (spec 6.5).
+    #[tokio::test]
+    async fn a_background_session_reset_by_another_peer_recovers() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, _writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        run_prompt(&mut world, "on the first branch").await;
+        let first = world.session().to_string();
+        let head = world
+            .handles()
+            .log
+            .lock()
+            .await
+            .head()
+            .cloned()
+            .expect("a persisted head");
+
+        let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
+        assert!(matches!(moved, Focus::Moved));
+
+        // Another writer moves the backgrounded session's head. The host mints a
+        // fresh epoch and publishes `reset` for it.
+        world
+            .host()
+            .command(
+                &first,
+                Command::Head {
+                    target: HeadTarget::Entry(head),
+                },
+            )
+            .await
+            .expect("the head switch is accepted");
+
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        while !world.directory.needs_reattach() {
+            assert!(
+                Instant::now() < deadline,
+                "the background session's reset was never folded",
+            );
+            fold_ready_frames(&mut world);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // The obligation is a background session's, so a check that only ever
+        // asked the focused client would report nothing to do here.
+        assert!(
+            !world.client().needs_reattach(),
+            "the focused session was not the one reset",
+        );
+
+        // Switching onto it serves the re-attach, so what paints is the session
+        // as it now is rather than a fold frozen on the old epoch.
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(first.clone()),
+        )
+        .await;
+        assert!(matches!(moved, Focus::Moved));
+        assert_eq!(world.session(), first);
+        assert!(
+            !world.directory.needs_reattach(),
+            "the switch discharged the obligation",
+        );
+        assert_eq!(
+            user_messages(&world),
+            vec!["on the first branch"],
+            "and the transcript is the branch the head now names",
         );
         shut_down(&world).await;
     }
@@ -14340,7 +14608,10 @@ mod tests {
         let elsewhere = world.host().create().await.expect("a scratch session");
         world.stream = world
             .control
-            .attach(&elsewhere, None)
+            .attach_all(&[AttachRequest {
+                session: elsewhere.clone(),
+                cursor: None,
+            }])
             .await
             .expect("attach elsewhere");
 
@@ -14871,7 +15142,7 @@ mod tests {
             None,
             ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor)),
             "aj".to_string(),
-            &world.session(),
+            world.session(),
             PathBuf::from("/tmp"),
         )));
         (world, shell)
@@ -15068,7 +15339,7 @@ mod tests {
         // A client that attached fresh, after the fact, is the oracle: the
         // reconnected fold has to agree with a full backfill.
         let fresh = connect_world(&dir, &remote, &[&session]).await;
-        let mine = CanonicalState::of(&world.chat.borrow(), &world.client());
+        let mine = CanonicalState::of(&world.chat.borrow(), world.client());
         let theirs = CanonicalState::of(&fresh.chat.borrow(), fresh.client());
         assert_eq!(
             host_entries(&mine),
@@ -15280,7 +15551,7 @@ mod tests {
         // its local wording (the chord that cancels the turn first).
         let handles = remote
             .host
-            .local_handles(&world.session())
+            .local_handles(world.session())
             .await
             .expect("the host's own handles");
         install_busy_script(&handles);
@@ -15392,10 +15663,19 @@ mod tests {
 
         let mut stream = world
             .control
-            .attach_all(&[(world.session().to_string(), None), (second.clone(), None)])
+            .attach_all(&[
+                AttachRequest {
+                    session: world.session().to_string(),
+                    cursor: None,
+                },
+                AttachRequest {
+                    session: second.clone(),
+                    cursor: None,
+                },
+            ])
             .await
             .expect("one attach covering both");
-        assert!(stream.attached(&world.session()));
+        assert!(stream.attached(world.session()));
         assert!(stream.attached(&second));
 
         // Both blocks arrive on the one stream. Reading until each session
@@ -15485,11 +15765,14 @@ mod tests {
 
         let stream = world
             .control
-            .attach(&world.session(), None)
+            .attach_all(&[AttachRequest {
+                session: world.session().to_string(),
+                cursor: None,
+            }])
             .await
             .expect("attach");
         assert!(
-            stream.attached(&world.session()),
+            stream.attached(world.session()),
             "the stream carries the session it named",
         );
         assert!(
@@ -15526,7 +15809,7 @@ mod tests {
 
         let tree = world
             .control
-            .tree(&world.session())
+            .tree(world.session())
             .await
             .expect("the tree read");
         let head = tree.head.clone().expect("a session with a turn has a head");
@@ -15548,7 +15831,7 @@ mod tests {
         let parent = {
             let handles = remote
                 .host
-                .local_handles(&world.session())
+                .local_handles(world.session())
                 .await
                 .expect("the host holds the session live");
             let log = handles.log.lock().await;
@@ -15621,7 +15904,7 @@ mod tests {
         // parent the host resolved.
         let moved = world
             .control
-            .tree(&world.session())
+            .tree(world.session())
             .await
             .expect("the tree read")
             .head
@@ -15629,7 +15912,7 @@ mod tests {
         assert_ne!(moved, head, "the head moved off the branched-from message");
         assert_ne!(moved, message, "the head is not the message itself");
         assert!(
-            ancestors(&remote.host, &world.session(), &moved)
+            ancestors(&remote.host, world.session(), &moved)
                 .await
                 .contains(&parent),
             "the new branch hangs off the message's parent",

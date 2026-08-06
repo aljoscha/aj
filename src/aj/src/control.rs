@@ -25,10 +25,9 @@ use aj_app::session_setup::thinking_display_name;
 use aj_models::types::UserContent;
 use aj_models::{speed_name, thinking_config_name, verbosity_name};
 use aj_wire::{
-    CancelRequest, CompactRequest, CreateSessionRequest, Cursor, Frame, HeadRequest,
-    ModelSelection, PromptInput, PromptRequest, QueueOperation, QueueRequest, QueueState,
-    SessionList, SessionSettings, SessionTree, SettingsRequest, SteerRequest, TaskDetails,
-    TaskTable,
+    CancelRequest, CompactRequest, CreateSessionRequest, Frame, HeadRequest, ModelSelection,
+    PromptInput, PromptRequest, QueueOperation, QueueRequest, QueueState, SessionList,
+    SessionSettings, SessionTree, SettingsRequest, SteerRequest, TaskDetails, TaskTable,
 };
 use futures::FutureExt;
 use reqwest::StatusCode;
@@ -223,44 +222,24 @@ impl Control {
         }
     }
 
-    /// Open a frame stream for `session`, offering `cursor`.
+    /// Open one frame stream covering every session in `requests`, each
+    /// offering its own cursor.
     ///
-    /// The attach block follows on the stream, so the caller has to arm its
-    /// fold for it (see [`Stream::attached`]) before reading.
-    pub(crate) async fn attach(
-        &self,
-        session: &str,
-        cursor: Option<Cursor>,
-    ) -> Result<Stream, ControlError> {
-        self.attach_all(&[(session.to_string(), cursor)]).await
-    }
-
-    /// Open one frame stream covering every named session, each offering its
-    /// own cursor.
+    /// One stream per client, not one per session: the ordering guarantees are
+    /// per stream, and changing the attach set means reopening it (spec 6.5).
+    /// The attach is all-or-nothing, so a refusal for any session leaves the
+    /// caller with the stream it already had.
     ///
-    /// One stream per client rather than one per session, because the ordering
-    /// guarantees are per stream: a session's frames are FIFO with respect to
-    /// the attach block that opened them (spec 6.5). The attach is
-    /// all-or-nothing, so a refusal for any session leaves the caller with the
-    /// stream it already had.
-    ///
-    /// Every session on the stream has to be armed before reading, each
-    /// against what the peer reports it attached (see [`Stream::attached`]).
+    /// Every session on the stream has to be armed before reading, each against
+    /// what the peer reports it attached (see [`Stream::attached`]).
     pub(crate) async fn attach_all(
         &self,
-        sessions: &[(String, Option<Cursor>)],
+        requests: &[AttachRequest],
     ) -> Result<Stream, ControlError> {
-        let requests: Vec<AttachRequest> = sessions
-            .iter()
-            .map(|(session, cursor)| AttachRequest {
-                session: session.clone(),
-                cursor: cursor.clone(),
-            })
-            .collect();
         match self {
-            Self::Local(local) => Ok(Stream::Local(local.host.attach(&requests).await?)),
+            Self::Local(local) => Ok(Stream::Local(local.host.attach(requests).await?)),
             Self::Remote(remote) => Ok(Stream::Remote {
-                events: remote.client.events(&requests).await?,
+                events: remote.client.events(requests).await?,
                 lost: None,
                 attached: requests
                     .iter()
