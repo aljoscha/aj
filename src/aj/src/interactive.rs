@@ -733,11 +733,6 @@ fn remote_unsupported_notice(what: &str, why: &str) -> String {
     format!("Can't {what} over a connection: {why}.")
 }
 
-/// Why the session-changing gestures are refused over a connection: they
-/// arrive with the sidebar (spec 9.1, phase 3).
-const SIDEBAR_PHASE: &str = "session switching and creation over a \
-                             connection arrive with the sidebar";
-
 /// A session change the drive loop broke out for.
 enum FocusRequest {
     /// Mint a session and focus it.
@@ -768,29 +763,15 @@ enum Focus {
 /// notice and stays where it is. Nothing is torn down either way: the
 /// outgoing session stays live in the host.
 ///
-/// The two arms that move to another session have no connect-mode path yet
-/// (spec 9.1 defers switching to phase 3 alongside the sidebar), so a remote
-/// client is refused those with the reason. Branching stays inside the
-/// focused session and works over the wire.
+/// Every arm works in both modes. Creating and resuming go through the control
+/// surface, and the session they land on is attached the same way whether the
+/// host is in this process or across a connection.
 async fn apply_focus_request(
     app: &mut AsyncApp,
     shell: &Rc<RefCell<Shell>>,
     world: &mut World,
     request: FocusRequest,
 ) -> Focus {
-    let unsupported = match &request {
-        FocusRequest::Create => Some("start a new session"),
-        FocusRequest::Resume(_) => Some("switch sessions"),
-        // Branching stays inside the focused session, and every step of it
-        // has a wire form: the head command resolves the target, and the
-        // re-attach adopts the epoch the switch minted.
-        FocusRequest::Branch { .. } => None,
-    };
-    if let Some(what) = unsupported.filter(|_| world.control.is_remote()) {
-        fold_notice(world, &remote_unsupported_notice(what, SIDEBAR_PHASE));
-        app.request_redraw();
-        return Focus::Same;
-    }
     match request {
         FocusRequest::Create => {
             let created = match world.control.create(None, None).await {
@@ -869,11 +850,7 @@ async fn focus_session(
     fresh: bool,
     lead: Vec<AgentEvent>,
 ) -> Result<(), ControlError> {
-    let host = world
-        .control
-        .host()
-        .expect("a session change is refused in connect mode")
-        .clone();
+    let host = world.control.host().cloned();
     // A session already attached is a view swap: its frames have been folding
     // in the background all along, so there is no stream to reopen and no
     // block to wait for (spec 9.2).
@@ -905,13 +882,26 @@ async fn focus_session(
     } else {
         None
     };
-    let handles = host.local_handles(&session).await?;
+    // Direct handles are a read surface into a session in this process, so a
+    // connection has none and everything they feed has a wire form: the attach
+    // block's opening `state` frame carries the settings the footer seeds from,
+    // and the host's working directory arrived with `hello` and is the same for
+    // every session on it.
+    let handles = match &host {
+        Some(host) => Some(host.local_handles(&session).await?),
+        None => None,
+    };
 
-    let (settings, context_window) = local_settings_seed(&handles);
+    let (settings, context_window) = match &handles {
+        Some(handles) => local_settings_seed(handles),
+        None => (unknown_settings(), 0),
+    };
     let minted =
         attaching.then(|| seeded_chat(&world.config, settings, context_window, &world.catalog));
-    world.working_directory = handles.env.working_directory.clone();
-    world.local = Some(handles);
+    if let Some(handles) = &handles {
+        world.working_directory = handles.env.working_directory.clone();
+    }
+    world.local = handles;
     // Parks the outgoing session's transcript and brings the incoming one into
     // the cell the widgets read, which is what makes a switch back instant.
     world
@@ -960,22 +950,23 @@ async fn focus_session(
     for event in lead {
         fold_event(world, event);
     }
-    let (env, restore_notices) = {
-        let handles = world
-            .local
-            .as_ref()
-            .expect("a local focus change installed local handles");
-        (handles.env.clone(), handles.restore_notices.clone())
-    };
-    for event in fresh_env_notices(fresh, &env) {
-        fold_event(world, event);
-    }
-    // Only onto a transcript this focus built. A swap restores one that already
-    // shows them, and they are startup facts about the session, not about the
-    // switch, so re-folding them would stack a copy per visit.
-    if attaching {
-        for notice in restore_notices {
-            fold_notice(world, &notice);
+    // Both describe this process reading a session off its own disk, so neither
+    // has anything to say about a session running on another machine.
+    let startup = world
+        .local
+        .as_ref()
+        .map(|handles| (handles.env.clone(), handles.restore_notices.clone()));
+    if let Some((env, restore_notices)) = startup {
+        for event in fresh_env_notices(fresh, &env) {
+            fold_event(world, event);
+        }
+        // Only onto a transcript this focus built. A swap restores one that
+        // already shows them, and they are startup facts about the session, not
+        // about the switch, so re-folding them would stack a copy per visit.
+        if attaching {
+            for notice in restore_notices {
+                fold_notice(world, &notice);
+            }
         }
     }
     // The outgoing session's transmitted image ids belong to its terminal
@@ -2179,13 +2170,17 @@ async fn apply_command_action(
         // open-time busy guard here. `NewSession` below refuses while busy up
         // front instead, since it opens no overlay.
         CommandAction::OpenSessionSelector => {
-            // The previews come off this process's own session store, so over
-            // a connection the list would describe the wrong machine, and the
-            // switch it leads to is phase 3 anyway.
+            // NOTE: the previews come off this process's own session store, so
+            // over a connection this overlay describes the wrong machine. The
+            // sidebar is the surface that lists a peer's sessions (spec 9.2),
+            // and it reads the `list` rows instead.
             if world.control.is_remote() {
                 fold_notice(
                     world,
-                    &remote_unsupported_notice("switch sessions", SIDEBAR_PHASE),
+                    &remote_unsupported_notice(
+                        "browse this machine's sessions",
+                        "a connection's sessions are the ones in the sidebar",
+                    ),
                 );
                 return ActionEffect::Redraw;
             }
@@ -2201,13 +2196,6 @@ async fn apply_command_action(
             }
         },
         CommandAction::NewSession => {
-            if world.control.is_remote() {
-                fold_notice(
-                    world,
-                    &remote_unsupported_notice("start a new session", SIDEBAR_PHASE),
-                );
-                return ActionEffect::Redraw;
-            }
             // A new session takes the focus off this one, so it joins the
             // refuse-while-busy rule of the other session-changing gestures:
             // walking away from live work silently is worse than refusing.
@@ -15436,10 +15424,15 @@ mod tests {
         remote.shutdown().await;
     }
 
-    /// Every gesture connect mode has no path for folds a notice naming why,
-    /// rather than silently doing nothing (spec 9.1).
+    /// A gesture connect mode has no path for folds a notice naming why, rather
+    /// than silently doing nothing (spec 9.1).
+    ///
+    /// What is left is the two that are genuinely about this machine: an export
+    /// writes a file where the log is, and the session selector previews this
+    /// process's own store. Session switching and creation are no longer among
+    /// them, see `connect_mode_creates_and_switches_sessions`.
     #[tokio::test]
-    async fn connect_mode_refuses_the_unsupported_gestures() {
+    async fn connect_mode_refuses_the_gestures_about_this_machine() {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
         let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
@@ -15447,7 +15440,6 @@ mod tests {
         for action in [
             CommandAction::ExportHtml,
             CommandAction::OpenSessionSelector,
-            CommandAction::NewSession,
         ] {
             let before = main_notices(&world).len();
             apply_command(&mut world, &shell, action).await;
@@ -15464,27 +15456,72 @@ mod tests {
                 "{action:?} opened no overlay"
             );
         }
-        // Both session changes are refused at the focus path too, rather than
-        // tearing the world down. Each arm is driven: they are refused one by
-        // one now that branching is not, and an arm that slipped through
-        // would reach `focus_session`'s own assertion and panic.
+        remote.shutdown().await;
+    }
+
+    /// Creating and switching sessions work over a connection, which is what the
+    /// sidebar drives (spec 9.2). Both go through the control surface, so the
+    /// session they land on attaches the same way it would in process.
+    #[tokio::test]
+    async fn connect_mode_creates_and_switches_sessions() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let first = world.session().to_string();
         let (mut app, _writer, _root) = app_over(&shell).await;
-        for request in [
-            FocusRequest::Create,
-            FocusRequest::Resume(world.session().to_string()),
-        ] {
-            let before = main_notices(&world).len();
-            let focus = apply_focus_request(&mut app, &shell, &mut world, request).await;
-            assert!(matches!(focus, Focus::Same));
-            let notices = main_notices(&world);
-            assert!(
-                notices.len() > before
-                    && notices
-                        .last()
-                        .is_some_and(|n| n.contains("over a connection")),
-                "{notices:?}",
-            );
-        }
+
+        // A create over the wire mints a session on the host and focuses it.
+        let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
+        assert!(matches!(moved, Focus::Moved), "the create was refused");
+        let created = world.session().to_string();
+        assert_ne!(created, first, "a fresh session, not the one we were on");
+        assert!(
+            world.local.is_none(),
+            "a connection holds no direct handles into the session",
+        );
+
+        // It is a real session on the host, not just a local id.
+        let listed = world
+            .control
+            .sessions()
+            .await
+            .expect("the host lists its sessions")
+            .sessions;
+        assert!(
+            listed.iter().any(|row| row.id == created && row.live),
+            "the host does not have the session the create claimed: {:?}",
+            listed.iter().map(|row| &row.id).collect::<Vec<_>>(),
+        );
+
+        // Work in it, so switching back has something to come back to.
+        assert!(handle_submit(&mut world, "over the wire".to_string()).await);
+        settle(&mut world).await;
+        assert_eq!(
+            user_rows(&world),
+            vec!["over the wire"],
+            "the created session takes a turn",
+        );
+
+        // And back to the first, which is a swap onto a transcript that kept
+        // folding while we were away.
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(first.clone()),
+        )
+        .await;
+        assert!(matches!(moved, Focus::Moved), "the switch was refused");
+        assert_eq!(world.session(), first);
+        assert!(
+            !user_rows(&world).iter().any(|t| t == "over the wire"),
+            "the other session's turn is not in this transcript: {:?}",
+            user_rows(&world),
+        );
+        assert!(
+            world.directory.is_attached(&created),
+            "the session left behind stays in the working set",
+        );
         remote.shutdown().await;
     }
 
