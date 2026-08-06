@@ -63,12 +63,6 @@ pub enum SessionSpec {
     Resume {
         session_id: String,
         entry: SessionEntry,
-        /// Optional user-thread head to rebuild on, for branching and
-        /// tree-view switching. `None` means "use the log's default head"
-        /// (its `latest_leaf`), the plain-resume behavior. `None` never
-        /// means "branch to the file root": root branching is refused up
-        /// front, so every branch target here is a real entry id.
-        head: Option<EntryId>,
     },
 }
 
@@ -319,11 +313,9 @@ impl SessionCore {
     ) -> Result<(SessionCore, MainAgentSeed)> {
         let source = match spec {
             SessionSpec::Create { .. } => SessionSource::Create,
-            SessionSpec::Resume {
-                session_id, head, ..
-            } => SessionSource::Resume {
+            SessionSpec::Resume { session_id, .. } => SessionSource::Resume {
                 session_id: session_id.clone(),
-                head: head.clone(),
+                head: None,
             },
         };
         // Wrapped up front because the steps below share it: `prepare_log`

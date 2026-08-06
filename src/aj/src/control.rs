@@ -67,6 +67,29 @@ impl ControlError {
             Self::Remote(err) => err.status() == Some(StatusCode::CONFLICT),
         }
     }
+
+    /// Whether the peer does not know an entry the request named (spec 6.1's
+    /// 404 `unknown_entry`).
+    pub(crate) fn unknown_entry(&self) -> bool {
+        match self {
+            Self::Host(HostError::UnknownEntry(_)) => true,
+            Self::Host(_) => false,
+            Self::Remote(err) => err.code() == Some("unknown_entry"),
+        }
+    }
+
+    /// Whether the peer refused the request as malformed (spec 6.1's 400).
+    ///
+    /// Told apart from the other refusals because the host's message quotes
+    /// the entry id it was given, which a user has never seen. A caller that
+    /// knows what it asked for can say it in its own words.
+    pub(crate) fn invalid(&self) -> bool {
+        match self {
+            Self::Host(HostError::Invalid(_)) => true,
+            Self::Host(_) => false,
+            Self::Remote(err) => err.status() == Some(StatusCode::BAD_REQUEST),
+        }
+    }
 }
 
 /// The host this frontend drives.

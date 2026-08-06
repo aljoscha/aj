@@ -912,12 +912,13 @@ async fn branch_focused_session(
     prompt: Option<String>,
 ) {
     let session = world.session.clone();
+    let branching = matches!(target, HeadTarget::Before(_));
     if let Err(err) = world
         .control
         .command(&session, Command::Head { target })
         .await
     {
-        fold_notice(world, &format!("Failed to branch the conversation: {err}"));
+        fold_notice(world, &head_refusal(branching, &err));
         // The head did not move, so the prompt would run against the branch
         // the user meant to leave. Restore it verbatim instead; it is
         // already in prompt history (recorded at the submit site), so it is
@@ -943,6 +944,30 @@ async fn branch_focused_session(
     }
     free_session_images(app, shell);
     app.request_redraw();
+}
+
+/// What a refused head switch tells the user.
+///
+/// The host quotes the entry id it was handed, which is a hash the user has
+/// never seen. The caller knows whether it pointed at a message to branch
+/// before (`branching`) or at a branch tip to switch to, so it says that.
+/// Anything the two arms below do not recognize is reported in the peer's own
+/// words rather than guessed at.
+///
+/// NOTE: the malformed arm reads as "the first message" because the branch
+/// gesture only arms on a main-thread user message, so the root is the only
+/// entry whose parent the host can refuse. A gesture that could branch before
+/// a sub-agent entry would have to tell the two 400s apart.
+fn head_refusal(branching: bool, err: &ControlError) -> String {
+    if branching && err.unknown_entry() {
+        "Can't branch: that message is no longer in this session.".to_string()
+    } else if branching && err.invalid() {
+        "Can't branch at the first message.".to_string()
+    } else if err.unknown_entry() {
+        "Can't switch: that branch is no longer in this session.".to_string()
+    } else {
+        format!("Failed to branch the conversation: {err}")
+    }
 }
 
 /// Re-attach the focused session after its continuity broke.
@@ -7354,6 +7379,20 @@ mod tests {
     /// A session aborted mid sub-agent run (a torn final line and a log cut
     /// short) still resumes: the repair drops the torn record, every box is
     /// `Done`, and the torn sub's flushed history projects without panicking.
+    ///
+    // TODO(aljoscha): flaky under load, roughly 2 in 25 runs. Both sightings
+    // were `Sub(2)` resuming `Failed` instead of `Done`, and both were whole
+    // suite runs. It does not reproduce on its own (0 of 10) or over the
+    // binary's own suite (0 of 6), so it needs the machine busy.
+    //
+    // The suspicion is a race in this setup rather than in the resume under
+    // test: `drive_demo_to_completion` returns once the demo's observable
+    // work is done, and under contention one of `parallel-agents`'
+    // sub-agents can still record a failure before the truncation below
+    // reads the log, so the box resumes from a `Failed` record that really
+    // was written. If you hit it, dump the log bytes before truncating and
+    // check whether the failure is already on disk. If it is, the fix is in
+    // the wait, not in the repair.
     #[tokio::test]
     async fn aborted_session_resume_loads_and_observes() {
         let dir = TempDir::new().expect("tempdir");
@@ -14349,9 +14388,12 @@ mod tests {
         assert!(
             notices
                 .iter()
-                .any(|n| n.contains("Failed to branch the conversation")
-                    && n.contains("does-not-exist")),
+                .any(|n| n == "Can't switch: that branch is no longer in this session."),
             "the failure notice names the reason: {notices:?}",
+        );
+        assert!(
+            !notices.iter().any(|n| n.contains("does-not-exist")),
+            "in the gesture's words, not by quoting the host's entry id: {notices:?}",
         );
         assert!(
             notices.iter().any(|n| n.contains("Branch failed")),
@@ -14422,8 +14464,8 @@ mod tests {
         assert!(
             main_notices(&world)
                 .iter()
-                .any(|notice| notice.contains("nothing before it")),
-            "the host's own refusal is what the user reads: {:?}",
+                .any(|notice| notice == "Can't branch at the first message."),
+            "the refusal is worded for a human, not quoted from the host: {:?}",
             main_notices(&world),
         );
         assert_eq!(

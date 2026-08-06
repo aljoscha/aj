@@ -1238,7 +1238,6 @@ impl SessionHost {
             Some(id) => SessionSpec::Resume {
                 session_id: id.to_string(),
                 entry: SessionEntry::Switch,
-                head: None,
             },
             None => SessionSpec::Create {
                 entry: SessionEntry::Startup,
