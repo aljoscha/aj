@@ -181,6 +181,13 @@ pub struct HostSetup {
     /// How long an idle, unattached session is held before it is released,
     /// `None` for [`DEFAULT_IDLE_GRACE`].
     pub idle_grace: Option<Duration>,
+    /// How many frames one client's live queue holds before an undroppable
+    /// frame evicts it (spec 6.9), `None` for the fan-out's own default.
+    ///
+    /// Tuning, not policy: eviction and its recovery behave the same at any
+    /// bound. A small one is how a test watches a slow client be evicted
+    /// without generating hundreds of frames to fill the default.
+    pub live_capacity: Option<usize>,
 }
 
 /// A mutation of one session.
@@ -396,6 +403,7 @@ impl SessionHost {
             auth,
             working_directory,
             idle_grace,
+            live_capacity,
         } = setup;
         let host_id = resolve_host_id(persistence.sessions_dir())?;
         let inner = Arc::new(HostInner {
@@ -405,7 +413,7 @@ impl SessionHost {
                 catalog,
                 auth,
                 restore,
-                fanout: Arc::new(Fanout::default()),
+                fanout: Arc::new(Fanout::new(live_capacity)),
             }),
             cold: ColdSessions::new(persistence.clone()),
             persistence,

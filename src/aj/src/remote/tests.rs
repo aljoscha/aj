@@ -551,6 +551,7 @@ impl Fixture {
             auth: AuthStorage::new(dir.path().join("auth.json")),
             working_directory: dir.path().to_path_buf(),
             idle_grace: None,
+            live_capacity: None,
         })
         .expect("host");
         let server = RemoteServer::bind_with(host.clone(), addr("127.0.0.1:0"), gate, heartbeat)
@@ -590,6 +591,7 @@ impl Fixture {
             auth: AuthStorage::new(self._dir.path().join("auth.json")),
             working_directory: self._dir.path().to_path_buf(),
             idle_grace: None,
+            live_capacity: None,
         })
         .expect("a second host over the same store");
         let server = RemoteServer::bind_with(

@@ -131,6 +131,7 @@ fn setup(dir: &TempDir, persistence: &ConversationPersistence) -> HostSetup {
         auth: AuthStorage::new(dir.path().join("auth.json")),
         working_directory: dir.path().to_path_buf(),
         idle_grace: None,
+        live_capacity: None,
     }
 }
 

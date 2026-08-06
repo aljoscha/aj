@@ -307,16 +307,22 @@ pub(crate) struct Fanout {
 
 impl Default for Fanout {
     fn default() -> Self {
-        Self {
-            subscribers: StdMutex::new(HashMap::new()),
-            next_id: AtomicU64::new(1),
-            list_dirty: Notify::new(),
-            live_capacity: DEFAULT_LIVE_CAPACITY,
-        }
+        Self::new(None)
     }
 }
 
 impl Fanout {
+    /// A registry whose per-client live queue holds `live_capacity` frames,
+    /// or [`DEFAULT_LIVE_CAPACITY`] when the caller has no opinion.
+    pub(crate) fn new(live_capacity: Option<usize>) -> Self {
+        Self {
+            subscribers: StdMutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+            list_dirty: Notify::new(),
+            live_capacity: live_capacity.unwrap_or(DEFAULT_LIVE_CAPACITY),
+        }
+    }
+
     /// Register a subscriber that is about to be served attach blocks for
     /// `sessions`.
     ///

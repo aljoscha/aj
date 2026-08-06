@@ -65,6 +65,19 @@ impl Harness {
             snapshot(scripted(messages, 0, Duration::ZERO)),
             Vec::new(),
             Some(grace),
+            None,
+        )
+    }
+
+    /// A host whose clients are evicted after `capacity` undeliverable
+    /// frames, so a test can watch the flow-control rule of spec 6.9 without
+    /// generating hundreds of them.
+    fn with_live_capacity(messages: Vec<AssistantMessage>, capacity: usize) -> Self {
+        Self::with_run_config(
+            snapshot(scripted(messages, 0, Duration::ZERO)),
+            Vec::new(),
+            None,
+            Some(capacity),
         )
     }
 
@@ -76,7 +89,7 @@ impl Harness {
         provider: Arc<ScriptedProvider>,
         catalog: Vec<aj_models::registry::ModelInfo>,
     ) -> Self {
-        Self::with_run_config(snapshot(provider), catalog, None)
+        Self::with_run_config(snapshot(provider), catalog, None, None)
     }
 
     /// A host whose base run config is `run_config`, for tests about what the
@@ -85,6 +98,7 @@ impl Harness {
         run_config: RunConfigSnapshot,
         catalog: Vec<aj_models::registry::ModelInfo>,
         idle_grace: Option<Duration>,
+        live_capacity: Option<usize>,
     ) -> Self {
         let dir = TempDir::new().expect("tempdir");
         let persistence = ConversationPersistence::new(dir.path().join("sessions"));
@@ -103,6 +117,7 @@ impl Harness {
             auth: AuthStorage::new(dir.path().join("auth.json")),
             working_directory: dir.path().to_path_buf(),
             idle_grace,
+            live_capacity,
         })
         .expect("host");
         Self {
@@ -159,6 +174,7 @@ impl Harness {
             auth: AuthStorage::new(dir.path().join("auth.json")),
             working_directory: dir.path().to_path_buf(),
             idle_grace,
+            live_capacity: None,
         })
         .expect("host");
         Harness {
@@ -762,7 +778,7 @@ async fn an_unstated_axis_defaults_against_the_model_the_session_runs() {
     // ordinary: the level comes from a config file, the model from a catalog.
     let mut base = snapshot(scripted(Vec::new(), 0, Duration::ZERO));
     base.thinking = Some(aj_models::ThinkingConfig::XHigh);
-    let harness = Harness::with_run_config(base, Vec::new(), None);
+    let harness = Harness::with_run_config(base, Vec::new(), None, None);
 
     // Something is stated, but not thinking, so the host defaults that axis
     // against the model it actually runs (spec section 8).
@@ -1188,6 +1204,7 @@ async fn the_host_id_is_claimed_not_written_over() {
         auth: AuthStorage::new(harness._dir.path().join("auth.json")),
         working_directory: harness._dir.path().to_path_buf(),
         idle_grace: None,
+        live_capacity: None,
     })
     .err()
     .expect("a blank host id is refused");
@@ -2756,6 +2773,7 @@ async fn a_turn_nobody_is_attached_to_is_not_released_out_from_under() {
         )),
         Vec::new(),
         Some(Duration::from_millis(30)),
+        None,
     );
     let session = harness.create().await;
     let mut client = Client::attach(&harness.host, &session).await;
@@ -2808,6 +2826,7 @@ async fn a_sub_agents_continuation_holds_its_session_live() {
         snapshot(scripted(script, 1, Duration::from_millis(20))),
         Vec::new(),
         Some(Duration::from_millis(30)),
+        None,
     );
     let session = harness.create().await;
     let mut client = Client::attach(&harness.host, &session).await;
@@ -5225,6 +5244,90 @@ async fn a_resumed_session_concludes_the_sub_agents_on_disk() {
     );
     drop(joiner);
     revived.host.shutdown().await;
+}
+
+/// A client that stops draining is evicted rather than buffered without
+/// bound, and the ordinary re-attach with its cursor puts it back where a
+/// client that never stalled would be (spec 6.9, and spec section 11's
+/// "slow-client eviction and recovery").
+///
+/// The bound is what makes eviction safe to test: the same rule at 256
+/// frames needs 256 frames to reach.
+#[tokio::test]
+async fn a_slow_client_is_evicted_and_recovers_through_its_cursor() {
+    let harness = Harness::with_live_capacity(Vec::new(), 4);
+    let session = harness.create().await;
+    harness
+        .install_script(&session, vec![finalized_text_message("the answer")])
+        .await;
+
+    // Attached, block applied, and then it stops reading. Nothing else reads
+    // this host's streams while the turn runs, so the eviction below is the
+    // bound doing its job rather than a scheduling race.
+    let mut stalled = Client::attach(&harness.host, &session).await;
+    let cursor = stalled.client.cursor();
+
+    harness.prompt(&session, "hi").await;
+    // Watched off the host's own directory rather than off a stream: a
+    // second reader would be racing the same bound.
+    bounded("the turn to land and settle", async {
+        loop {
+            let row = summary(&harness.host, &session).await.expect("listed");
+            if !row.working && row.last_seq.unwrap_or(0) >= 2 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+
+    // The turn produced more undroppable frames than the bound holds, so the
+    // stalled client's stream was closed *and cleared*: an eviction discards
+    // what it could not deliver, which is what tells it apart from an orderly
+    // close at shutdown.
+    let leftover = bounded("the stalled stream to close", async {
+        let mut seen = 0;
+        while stalled.stream.recv().await.is_some() {
+            seen += 1;
+        }
+        seen
+    })
+    .await;
+    assert_eq!(
+        leftover, 0,
+        "an evicted stream hands back nothing it had queued",
+    );
+
+    // Recovery is the ordinary re-attach with the cursor it committed before
+    // it stalled, and it must land where a client that rebuilt from a full
+    // backfill lands.
+    let mut recovered = Client {
+        client: SessionClient::new(session.clone()),
+        chat: ChatState::new(settings(), 200_000, Arc::new(Vec::new())),
+        stream: harness
+            .host
+            .attach(&[AttachRequest {
+                session: session.clone(),
+                cursor,
+            }])
+            .await
+            .expect("re-attach after eviction"),
+    };
+    recovered.client.expect_attach();
+    recovered.apply_block().await;
+    let fresh = Client::attach(&harness.host, &session).await;
+
+    assert_eq!(
+        assistant_rows(&recovered.chat, AgentId::Main),
+        vec!["the answer".to_string()],
+        "the suffix carried the turn the eviction cut off",
+    );
+    assert_canonical_eq(
+        &recovered.canonical(),
+        &fresh.canonical(),
+        "an evicted client that re-attached with its cursor",
+    );
+    harness.host.shutdown().await;
 }
 
 // ---------------------------------------------------------------------------

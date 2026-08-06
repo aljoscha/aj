@@ -972,6 +972,7 @@ pub fn compose_host(
         auth: auth.clone(),
         working_directory: std::env::current_dir().unwrap_or_default(),
         idle_grace,
+        live_capacity: None,
     })?;
     Ok(ComposedHost {
         host,
