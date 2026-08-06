@@ -59,9 +59,9 @@ use vaxis::tty::PosixTty;
 use vaxis::vaxis::{Options as VaxisOptions, Vaxis};
 use vaxis::vxfw::{
     AsyncApp, AutocompleteDelivery, DrawContext, EditorTheme, Event, EventContext,
-    FilterableSelect, FlexColumn, FlexItem, FrameStats, KeymapController, ListView, MaxSize,
-    Options, PopupStyle, RelativePoint, Size, SubSurface, Surface, Text, TextArea, UserEvent,
-    Widget, WidgetRef, draw_widget, to_widget_ref,
+    FilterableSelect, FlexColumn, FlexItem, FlexRow, FrameStats, KeymapController, ListView,
+    MaxSize, Options, PopupStyle, RelativePoint, Size, SubSurface, Surface, Text, TextArea,
+    UserEvent, Widget, WidgetRef, draw_widget, to_widget_ref,
 };
 
 use crate::agent_picker::{AgentPickerOutcome, PickerSnapshot, open_agent_picker};
@@ -89,6 +89,9 @@ use crate::settings_ui::{
     SkillsFill, UNSET_VALUE, build_skill_rows, open_model, open_settings, open_skills,
     open_thinking, skills_placeholder_row,
 };
+#[cfg(test)]
+use crate::sidebar::SIDEBAR_COLS;
+use crate::sidebar::{RowStatus, SessionSidebar, SidebarRow, SidebarState};
 use crate::splash::{SPLASH_WAKE_EVENT, Splash};
 use crate::status::{Connection, STATUS_WAKE_EVENT, StatusLine, StatusState};
 use crate::task_output::{TaskBacking, TaskOutputView, open_task_output};
@@ -1538,6 +1541,57 @@ fn sync_status(world: &World) -> bool {
     next.animating()
 }
 
+/// The session one step from the focused row in the sidebar's order, wrapping
+/// at the ends.
+///
+/// `None` when there is nothing to move to: no rows yet, or a single row, which
+/// is the plain local case where the gesture has nowhere to go. Also `None` when
+/// no row is the focused one, which happens in the window before the first
+/// `list` frame names it, and stepping from an unknown position would jump
+/// somewhere the user did not point at.
+fn step_session(state: &SidebarState, forward: bool) -> Option<String> {
+    if state.rows.len() < 2 {
+        return None;
+    }
+    let at = state.rows.iter().position(|row| row.focused)?;
+    let len = state.rows.len();
+    let next = if forward {
+        (at + 1) % len
+    } else {
+        (at + len - 1) % len
+    };
+    Some(state.rows[next].id.clone())
+}
+
+/// Mirror the session directory into the sidebar's draw state.
+///
+/// Called once per drive-loop iteration, like [`sync_status`], because the
+/// widget cannot reach the directory and the loop is its only writer.
+///
+/// Rows come from the peer's `list` frames, so a session the client has never
+/// attached is listed too and that is where its attention glyph comes from
+/// (spec 6.8). Order is the peer's, which is activity-ordered, so the row a
+/// user wants is near the top without this having to sort.
+fn sync_sidebar(world: &World, shell: &Rc<RefCell<Shell>>) {
+    let focused = world.session();
+    let rows = world
+        .directory
+        .rows()
+        .iter()
+        .map(|row| SidebarRow {
+            status: RowStatus::of(row, world.directory.has_unseen_output(&row.id)),
+            focused: row.id == focused,
+            id: row.id.clone(),
+        })
+        .collect();
+    let sidebar = Rc::clone(&shell.borrow().sidebar);
+    let mut state = sidebar.borrow_mut();
+    // A peer that has sent no `list` frame yet leaves the strip empty rather
+    // than inventing a row for the focused session: the next frame fills it,
+    // and a fabricated row would carry no status.
+    state.rows = rows;
+}
+
 /// Arm a branch anchor: record the branched-from user message's stable id.
 /// A submit resolves it against the log to find the branch point (the
 /// message's parent), and the transcript reads it to keep the highlight box on
@@ -1867,6 +1921,10 @@ async fn handle_host_action(
         | AjAction::TranscriptFocus
         | AjAction::CopyMessage
         | AjAction::BranchMessage
+        | AjAction::SidebarToggle
+        | AjAction::SessionNext
+        | AjAction::SessionPrev
+        | AjAction::SessionNew
         | AjAction::Quit => false,
     }
 }
@@ -3604,6 +3662,15 @@ struct Shell {
     /// when `show_frame_stats` is on. Reads the `frame_stats` snapshot below.
     /// Plain `RefCell` like `quit_hint`.
     frame_stats_box: RefCell<FrameStatsBox>,
+    /// What the session sidebar draws, refreshed from the session directory by
+    /// [`sync_sidebar`] once per loop iteration and read by the strip at draw
+    /// time. Also owns whether the strip is shown at all, which the toggle
+    /// action flips.
+    sidebar: Rc<RefCell<SidebarState>>,
+    /// The strip itself, so a test can draw exactly the widget the layout holds
+    /// rather than a second one built to look like it.
+    #[cfg(test)]
+    sidebar_strip: Rc<RefCell<SessionSidebar>>,
     /// The toast-stack widget, drawn bottom-right every frame: stacked above
     /// the quit hint when no modal is open, floated over the scrim/overlay
     /// (z 3) otherwise. Reads the `toasts` stack below. Plain `RefCell` like
@@ -3879,7 +3946,7 @@ impl Shell {
         // The empty-state splash and the transcript share the chat slot. The
         // `ChatSlot` wrapper draws whichever fits the current state, so the
         // transcript's focus and scroll wiring is untouched while it is shown.
-        let splash = Splash::new(Rc::clone(&chat), styles, theme.color_mode());
+        let splash = Splash::new(Rc::clone(&chat), Rc::clone(&styles), theme.color_mode());
         let chat_slot = Rc::new(RefCell::new(ChatSlot {
             chat: Rc::clone(&chat),
             splash: Rc::clone(&splash),
@@ -3890,7 +3957,7 @@ impl Shell {
         // zero height while idle/empty, so the editor sits flush under the chat
         // between turns.
         let header_line = Rc::new(RefCell::new(Text::new(&header)));
-        let layout: WidgetRef = Rc::new(RefCell::new(FlexColumn {
+        let column: WidgetRef = Rc::new(RefCell::new(FlexColumn {
             children: vec![
                 FlexItem::init(to_widget_ref(Rc::clone(&header_line)), 0),
                 FlexItem::init(to_widget_ref(Rc::clone(&chat_slot)), 1),
@@ -3898,6 +3965,23 @@ impl Shell {
                 FlexItem::init(to_widget_ref(Rc::clone(&pending)), 0),
                 FlexItem::init(to_widget_ref(Rc::clone(&editor)), 0),
                 FlexItem::init(to_widget_ref(Rc::clone(&footer)), 0),
+            ],
+        }));
+        // The strip runs the full height beside the column, not beside the chat
+        // alone: it is about the connection rather than the transcript, and a
+        // strip that stopped at the editor would leave the session list looking
+        // like part of the conversation. `flex == 0` gives it its own fixed
+        // width and the column everything left (see `SIDEBAR_COLS`), and it
+        // draws nothing at all while hidden, so plain local use pays no width.
+        let sidebar = Rc::new(RefCell::new(SidebarState::default()));
+        let sidebar_strip = Rc::new(RefCell::new(SessionSidebar::new(
+            Rc::clone(&sidebar),
+            Rc::clone(&styles),
+        )));
+        let layout: WidgetRef = Rc::new(RefCell::new(FlexRow {
+            children: vec![
+                FlexItem::init(to_widget_ref(Rc::clone(&sidebar_strip)), 0),
+                FlexItem::init(column, 1),
             ],
         }));
 
@@ -3948,7 +4032,31 @@ impl Shell {
             let branch_anchor_for_actions = Rc::clone(&branch_anchor);
             let action_slot = Rc::clone(&host_action);
             let theme_for_actions = theme.clone();
+            let sidebar_for_actions = Rc::clone(&sidebar);
+            let session_request_for_actions = Rc::clone(&session_request);
             Box::new(move |ctx, action| match action {
+                AjAction::SidebarToggle => {
+                    let mut state = sidebar_for_actions.borrow_mut();
+                    state.visible = !state.visible;
+                    ctx.redraw = true;
+                }
+                // Stepping the sidebar's order rather than the working set's:
+                // the strip is what the user is reading, so next means the row
+                // below the one highlighted, whether or not that session has
+                // ever been attached. Parked as a session request, which is how
+                // every session change reaches the loop that owns the world.
+                AjAction::SessionNext | AjAction::SessionPrev => {
+                    let forward = matches!(action, AjAction::SessionNext);
+                    if let Some(session) = step_session(&sidebar_for_actions.borrow(), forward) {
+                        *session_request_for_actions.borrow_mut() =
+                            Some(SessionRequest::Resume(session));
+                        ctx.redraw = true;
+                    }
+                }
+                AjAction::SessionNew => {
+                    *session_request_for_actions.borrow_mut() = Some(SessionRequest::New);
+                    ctx.redraw = true;
+                }
                 AjAction::ThinkingToggle => {
                     // Matches aj's `aj.thinking.toggle` handler: flip the
                     // visibility flag, no notice (the transcript shows the new
@@ -4124,6 +4232,9 @@ impl Shell {
             keymap_ctx,
             editor,
             status_line,
+            sidebar,
+            #[cfg(test)]
+            sidebar_strip,
             quit_hint,
             quit_hint_warning,
             frame_stats_box,
@@ -6083,6 +6194,7 @@ async fn drive(
         // animating, not just busy, so a background sub-agent starting while
         // the viewed agent is idle still arms the box-spinner redraw pump.
         let animating = sync_status(world);
+        sync_sidebar(world, shell);
         // Advance the editor's autocomplete once per iteration. The delivery
         // arm above wakes the loop as streaming matches and one-shot results
         // land, but a narrowing keystroke re-scores an already-walked tree in
@@ -15191,6 +15303,325 @@ mod tests {
                 .draw(&crate::test_support::draw_ctx(120, None)),
         )
         .join("\n")
+    }
+
+    /// The sidebar's rows, as the layout's own strip draws them.
+    fn sidebar_rows(shell: &Rc<RefCell<Shell>>) -> Vec<String> {
+        let strip = Rc::clone(&shell.borrow().sidebar_strip);
+        crate::test_support::rows(
+            &strip
+                .borrow_mut()
+                .draw(&crate::test_support::draw_ctx(SIDEBAR_COLS, Some(40))),
+        )
+        .into_iter()
+        .map(|row| row.trim_end().to_string())
+        .filter(|row| !row.is_empty())
+        .collect()
+    }
+
+    /// The columns the strip actually claims when drawn, which is what it takes
+    /// from the rest of the layout.
+    fn sidebar_width(shell: &Rc<RefCell<Shell>>) -> u16 {
+        let strip = Rc::clone(&shell.borrow().sidebar_strip);
+        strip
+            .borrow_mut()
+            .draw(&crate::test_support::draw_ctx(120, Some(40)))
+            .size
+            .width
+    }
+
+    /// Press an action's own chord through the keymap, which is the path a user
+    /// takes and the one spec 9.2 requires these gestures to ride.
+    fn press_action(shell: &Rc<RefCell<Shell>>, action: AjAction) {
+        let chord = aj_app::actions::parse_chord(
+            aj_app::keybindings::effective_chord(action.action_id().expect("a bound action"))
+                .expect("a default chord"),
+        )
+        .expect("the chord parses");
+        let mut mods = vaxis::key::Modifiers::empty();
+        if chord.ctrl {
+            mods |= vaxis::key::Modifiers::CTRL;
+        }
+        if chord.alt {
+            mods |= vaxis::key::Modifiers::ALT;
+        }
+        let codepoint = match chord.key {
+            aj_app::actions::ChordKey::Char(c) => u32::from(c),
+            aj_app::actions::ChordKey::Named(name) => {
+                vaxis::key::name_map(name).expect("vaxis knows the key")
+            }
+            aj_app::actions::ChordKey::F(n) => {
+                vaxis::key::name_map(&format!("f{n}")).expect("vaxis knows the f-key")
+            }
+        };
+        // Straight at the keymap controller, which owns the action handler. The
+        // Shell's own capture phase does not route key presses to it, the
+        // framework does that by drawing it as a child.
+        let keymap = Rc::clone(&shell.borrow().keymap);
+        let mut ctx = EventContext::new();
+        keymap.borrow_mut().capture_event(
+            &mut ctx,
+            &Event::KeyPress(Key {
+                codepoint,
+                mods,
+                ..Key::default()
+            }),
+        );
+    }
+
+    /// The sidebar lists every session the peer reports, glyphs each by what it
+    /// is doing, and marks the focused one (spec 9.2). Rows come from `list`
+    /// frames, so a session this client never attached is listed too.
+    #[tokio::test]
+    async fn the_sidebar_lists_the_peer_s_sessions_with_their_status() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        run_prompt(&mut world, "seed").await;
+        press_action(&shell, AjAction::SidebarToggle);
+        let focused = world.session().to_string();
+
+        // A second session on the host that this client has never attached.
+        let other = world
+            .control
+            .create(None, None)
+            .await
+            .expect("a second session");
+
+        // Wait the host's `list` coalescing out, then mirror.
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        loop {
+            fold_ready_frames(&mut world);
+            sync_sidebar(&world, &shell);
+            if sidebar_rows(&shell).len() >= 2 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the rows never arrived");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert!(
+            !world.directory.is_attached(&other),
+            "the second session is listed without being attached",
+        );
+        let rows = sidebar_rows(&shell);
+        let label = |id: &str| SessionSidebar::label(id, usize::from(SIDEBAR_COLS) - 2);
+        assert!(
+            rows.iter().any(|row| row.contains(&label(&focused))),
+            "the focused session is listed: {rows:?}",
+        );
+        assert!(
+            rows.iter().any(|row| row.contains(&label(&other))),
+            "and so is the one never attached: {rows:?}",
+        );
+        // Both idle, so neither carries a status glyph.
+        for row in &rows {
+            assert!(
+                !row.starts_with('*') && !row.starts_with('!') && !row.starts_with('•'),
+                "an idle row wears no glyph: {row:?}",
+            );
+        }
+        shut_down(&world).await;
+    }
+
+    /// Poll until the sidebar's row for `session` satisfies `wanted`, folding
+    /// and re-mirroring each time round. The host debounces `list` frames, so a
+    /// row's status arrives a coalescing tick behind the change.
+    async fn poll_row(
+        world: &mut World,
+        shell: &Rc<RefCell<Shell>>,
+        session: &str,
+        wanted: impl Fn(&SidebarRow) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        while Instant::now() < deadline {
+            fold_ready_frames(world);
+            sync_sidebar(world, shell);
+            if shell
+                .borrow()
+                .sidebar
+                .borrow()
+                .rows
+                .iter()
+                .any(|row| row.id == session && wanted(row))
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// A session with a turn running wears the working glyph, and a session that
+    /// moved on while the user was looking elsewhere wears the unseen one (spec
+    /// 6.8, 9.2).
+    #[tokio::test]
+    async fn a_row_shows_what_its_session_is_doing() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        run_prompt(&mut world, "seed").await;
+        let first = world.session().to_string();
+
+        let other = world
+            .control
+            .create(None, None)
+            .await
+            .expect("a second session");
+        // Its row has to exist before the visit below: the viewed stamp is the
+        // one the row carried when the user left, so leaving a session the rows
+        // do not mention yet records nothing and the never-viewed rule answers
+        // for it forever after.
+        assert!(
+            poll_row(&mut world, &shell, &other, |_| true).await,
+            "the second session never appeared in the rows",
+        );
+
+        // Visit it and come back, which is what records the stamp.
+        let (mut app, _writer, _root) = app_over(&shell).await;
+        for target in [other.clone(), first.clone()] {
+            let moved =
+                apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Resume(target))
+                    .await;
+            assert!(matches!(moved, Focus::Moved));
+        }
+        assert!(
+            poll_row(&mut world, &shell, &other, |row| row.status
+                == RowStatus::Idle)
+            .await,
+            "the session starts idle",
+        );
+
+        // Work in it while the user is elsewhere.
+        world
+            .host()
+            .command(
+                &other,
+                Command::Prompt {
+                    agent: AgentId::Main,
+                    content: vec![UserContent::text("while away")],
+                },
+            )
+            .await
+            .expect("the backgrounded session accepts a prompt");
+        // What remains once it stops is that it moved since the user looked. The
+        // working glyph is not asserted here: a scripted turn can finish inside
+        // one `list` coalescing tick, so whether any frame reports it running is
+        // a race. `a_rows_status_follows_its_precedence` owns that rule.
+        assert!(
+            poll_row(&mut world, &shell, &other, |row| row.status
+                == RowStatus::Unseen)
+            .await,
+            "output the user has not seen shows as unseen: {:?}",
+            sidebar_rows(&shell),
+        );
+
+        // And the focused session, which the user is looking at, never does.
+        assert!(
+            shell
+                .borrow()
+                .sidebar
+                .borrow()
+                .rows
+                .iter()
+                .any(|row| row.id == first && row.focused && row.status == RowStatus::Idle),
+            "the focused row is idle and marked focused: {:?}",
+            sidebar_rows(&shell),
+        );
+        shut_down(&world).await;
+    }
+
+    /// The next/previous chords park a session request naming the row either
+    /// side of the focused one, wrapping at the ends, and the loop turns that
+    /// into the switch. A lone session has nowhere to step, so the gesture parks
+    /// nothing rather than re-requesting the session already focused.
+    #[tokio::test]
+    async fn the_session_chords_step_the_sidebar_s_order() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        run_prompt(&mut world, "seed").await;
+
+        // One session: nothing to step to.
+        sync_sidebar(&world, &shell);
+        press_action(&shell, AjAction::SessionNext);
+        assert!(
+            shell.borrow().take_session_request().is_none(),
+            "a lone session has nowhere to step",
+        );
+
+        let other = world
+            .control
+            .create(None, None)
+            .await
+            .expect("a second session");
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        loop {
+            fold_ready_frames(&mut world);
+            sync_sidebar(&world, &shell);
+            if shell.borrow().sidebar.borrow().rows.len() >= 2 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the rows never arrived");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Both directions land on the other row: with two rows, next and
+        // previous wrap onto the same one.
+        for action in [AjAction::SessionNext, AjAction::SessionPrev] {
+            press_action(&shell, action);
+            assert_eq!(
+                shell.borrow().take_session_request(),
+                Some(SessionRequest::Resume(other.clone())),
+                "{action:?} names the other row",
+            );
+        }
+        shut_down(&world).await;
+    }
+
+    /// The create chord parks the same request the `new` command does, so it
+    /// reaches the loop that owns the world by the one path every session change
+    /// takes.
+    #[tokio::test]
+    async fn the_new_session_chord_parks_a_create() {
+        let dir = TempDir::new().expect("tempdir");
+        let (world, shell) = world_and_shell(&dir, "streaming-text").await;
+
+        press_action(&shell, AjAction::SessionNew);
+        assert_eq!(
+            shell.borrow().take_session_request(),
+            Some(SessionRequest::New),
+        );
+        shut_down(&world).await;
+    }
+
+    /// The strip is hidden until asked for, and the toggle action shows it. A
+    /// lone local session has nothing to choose between, so the default costs no
+    /// width (spec 9.2).
+    #[tokio::test]
+    async fn the_sidebar_is_hidden_until_the_toggle_asks_for_it() {
+        let dir = TempDir::new().expect("tempdir");
+        let (world, shell) = world_and_shell(&dir, "streaming-text").await;
+        assert!(
+            !shell.borrow().sidebar.borrow().visible,
+            "hidden by default",
+        );
+        assert_eq!(
+            sidebar_width(&shell),
+            0,
+            "and takes no width from the transcript",
+        );
+
+        press_action(&shell, AjAction::SidebarToggle);
+        assert!(
+            shell.borrow().sidebar.borrow().visible,
+            "the toggle shows it"
+        );
+        assert_eq!(sidebar_width(&shell), SIDEBAR_COLS);
+
+        press_action(&shell, AjAction::SidebarToggle);
+        assert!(
+            !shell.borrow().sidebar.borrow().visible,
+            "and hides it again",
+        );
+        shut_down(&world).await;
     }
 
     /// The connect-mode smoke test (spec 11.7): a prompt submitted over the

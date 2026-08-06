@@ -238,7 +238,15 @@ pub(crate) fn build_keymap() -> Keymap<AjAction, HostCtx> {
             | AjAction::ChatPageUp
             | AjAction::ChatPageDown
             | AjAction::ChatScrollToTop
-            | AjAction::ChatScrollToBottom => no_overlay,
+            | AjAction::ChatScrollToBottom
+            // The sidebar gestures are inert under an overlay for the same
+            // reason the rest are: a modal owns the keyboard, and switching the
+            // session under an open overlay would leave it scoped to a session
+            // nobody is looking at.
+            | AjAction::SidebarToggle
+            | AjAction::SessionNext
+            | AjAction::SessionPrev
+            | AjAction::SessionNew => no_overlay,
             // Alt+Enter submits editor text, so it is inert when the transcript
             // or an overlay owns focus.
             AjAction::Steer => in_editor_focus,

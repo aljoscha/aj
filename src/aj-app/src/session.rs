@@ -95,6 +95,7 @@ pub enum SessionExit {
 /// run loop maps it onto a [`SessionExit`] so the host can tear down
 /// the current session and build the next one. Only emitted with no
 /// turn in flight.
+#[derive(Debug, PartialEq, Eq)]
 pub enum SessionRequest {
     New,
     Resume(String),

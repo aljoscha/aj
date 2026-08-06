@@ -83,6 +83,32 @@ pub const ACTION_HISTORY_OPEN: &str = "aj.history.open";
 /// Inert while a capturing overlay is already up.
 pub const ACTION_AGENT_PICKER: &str = "aj.agent.open";
 
+/// Shows or hides the session sidebar. Default binding: `alt+s`.
+///
+/// Hidden by default: a lone local session has nothing to choose between, so
+/// the strip would cost width and say nothing (spec 9.2).
+pub const ACTION_SIDEBAR_TOGGLE: &str = "aj.sidebar.toggle";
+
+/// Moves focus to the next session in the sidebar's order. Default binding:
+/// `alt+]`.
+///
+/// The order is the peer's own, which is activity-ordered, so this walks from
+/// the busiest session outward. Wraps at the end, and showing the sidebar is
+/// not a precondition: the switch is the point, the strip only says where you
+/// are.
+pub const ACTION_SESSION_NEXT: &str = "aj.session.next";
+
+/// Moves focus to the previous session in the sidebar's order. Default
+/// binding: `alt+[`.
+pub const ACTION_SESSION_PREV: &str = "aj.session.prev";
+
+/// Creates a session on whatever peer this client is driving and focuses it.
+/// Default binding: `alt+n`.
+///
+/// The same gesture as the `new` command, given a chord because creating a
+/// session is one of the sidebar's own interactions (spec 9.2).
+pub const ACTION_SESSION_NEW: &str = "aj.session.new";
+
 /// Toggles the agent picker between showing only running sub-agents
 /// and all sub-agents in the session. Default binding: `ctrl+t`.
 /// Handled inside the agent-picker overlay (contextual; only the
@@ -242,6 +268,18 @@ pub const AJ_KEYBINDINGS: &[(&str, &str, &str)] = &[
     ),
     (ACTION_HISTORY_OPEN, "ctrl+r", "Open prompt-history search"),
     (ACTION_AGENT_PICKER, "alt+a", "Open agent picker"),
+    (
+        ACTION_SIDEBAR_TOGGLE,
+        "alt+s",
+        "Show or hide the session sidebar",
+    ),
+    (ACTION_SESSION_NEXT, "alt+]", "Focus the next session"),
+    (ACTION_SESSION_PREV, "alt+[", "Focus the previous session"),
+    (
+        ACTION_SESSION_NEW,
+        "alt+n",
+        "Create and focus a new session",
+    ),
     (
         ACTION_AGENT_TOGGLE_SCOPE,
         "ctrl+t",

@@ -25,7 +25,8 @@ use crate::keybindings::{
     ACTION_AGENT_PICKER, ACTION_BRANCH_MESSAGE, ACTION_CHAT_PAGE_DOWN, ACTION_CHAT_PAGE_UP,
     ACTION_CHAT_SCROLL_BOTTOM, ACTION_CHAT_SCROLL_TOP, ACTION_CLIPBOARD_PASTE_IMAGE,
     ACTION_COPY_MESSAGE, ACTION_DEQUEUE, ACTION_HISTORY_OPEN, ACTION_OVERLAY_CLOSE_ALL,
-    ACTION_PALETTE_OPEN, ACTION_SUBMIT_STEERING, ACTION_THINKING_TOGGLE, ACTION_TOOLS_EXPAND,
+    ACTION_PALETTE_OPEN, ACTION_SESSION_NEW, ACTION_SESSION_NEXT, ACTION_SESSION_PREV,
+    ACTION_SIDEBAR_TOGGLE, ACTION_SUBMIT_STEERING, ACTION_THINKING_TOGGLE, ACTION_TOOLS_EXPAND,
     ACTION_TRANSCRIPT_FOCUS, AJ_KEYBINDINGS, default_chord, effective_chord, set_overrides,
 };
 
@@ -79,6 +80,14 @@ pub enum AjAction {
     /// Branch the conversation from the focused user message, live only in
     /// transcript-focus mode (`aj.transcript.branch_message`).
     BranchMessage,
+    /// Show or hide the session sidebar (`aj.sidebar.toggle`).
+    SidebarToggle,
+    /// Focus the next session in the sidebar's order (`aj.session.next`).
+    SessionNext,
+    /// Focus the previous session in the sidebar's order (`aj.session.prev`).
+    SessionPrev,
+    /// Create a session on this client's peer and focus it (`aj.session.new`).
+    SessionNew,
     /// Cancel the viewed agent's running turn (the Ctrl+C ladder's first
     /// rung).
     CancelTurn,
@@ -99,6 +108,10 @@ impl AjAction {
             AjAction::CloseAllOverlays => ACTION_OVERLAY_CLOSE_ALL,
             AjAction::HistoryOpen => ACTION_HISTORY_OPEN,
             AjAction::AgentPickerOpen => ACTION_AGENT_PICKER,
+            AjAction::SidebarToggle => ACTION_SIDEBAR_TOGGLE,
+            AjAction::SessionNext => ACTION_SESSION_NEXT,
+            AjAction::SessionPrev => ACTION_SESSION_PREV,
+            AjAction::SessionNew => ACTION_SESSION_NEW,
             AjAction::Steer => ACTION_SUBMIT_STEERING,
             AjAction::Dequeue => ACTION_DEQUEUE,
             AjAction::ChatPageUp => ACTION_CHAT_PAGE_UP,
@@ -294,6 +307,10 @@ pub fn global_bindings() -> Vec<GlobalBinding> {
         ),
         compiled(AjAction::HistoryOpen, ACTION_HISTORY_OPEN, Capture),
         compiled(AjAction::AgentPickerOpen, ACTION_AGENT_PICKER, Capture),
+        compiled(AjAction::SidebarToggle, ACTION_SIDEBAR_TOGGLE, Capture),
+        compiled(AjAction::SessionNext, ACTION_SESSION_NEXT, Capture),
+        compiled(AjAction::SessionPrev, ACTION_SESSION_PREV, Capture),
+        compiled(AjAction::SessionNew, ACTION_SESSION_NEW, Capture),
         compiled(AjAction::Steer, ACTION_SUBMIT_STEERING, Capture),
         compiled(AjAction::Dequeue, ACTION_DEQUEUE, Capture),
         compiled(AjAction::ChatPageUp, ACTION_CHAT_PAGE_UP, Capture),
