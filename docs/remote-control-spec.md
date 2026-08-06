@@ -1086,10 +1086,12 @@ single-session use) lists sessions:
   metadata (age, preview text if cheaply available).
 - Switching focus is instant and stateful: the client keeps one
   `ChatState` per session it has attached, live frames keep arriving
-  for background sessions over the same unified stream (durable frames
-  at minimum, so unseen-output tracking works), and switching is a
-  view swap, not a rebuild. Catch-up for a session happens lazily on
-  first focus.
+  for background sessions over the same unified stream (attachment is
+  what makes them arrive at all, section 6.5, and it is what section 5
+  counts as use), and switching is a view swap, not a rebuild. A
+  session the client has not attached shows only its `list` row, which
+  is where its unseen-output glyph comes from (section 6.8). Catch-up
+  for a session happens lazily on first focus.
 - Local single-session mode keeps working exactly as today, the
   sidebar simply has one entry. Creating a new session from the
   sidebar goes through the create command (choosing a host when
