@@ -232,10 +232,31 @@ impl Control {
         session: &str,
         cursor: Option<Cursor>,
     ) -> Result<Stream, ControlError> {
-        let requests = [AttachRequest {
-            session: session.to_string(),
-            cursor,
-        }];
+        self.attach_all(&[(session.to_string(), cursor)]).await
+    }
+
+    /// Open one frame stream covering every named session, each offering its
+    /// own cursor.
+    ///
+    /// One stream per client rather than one per session, because the ordering
+    /// guarantees are per stream: a session's frames are FIFO with respect to
+    /// the attach block that opened them (spec 6.5). The attach is
+    /// all-or-nothing, so a refusal for any session leaves the caller with the
+    /// stream it already had.
+    ///
+    /// Every session on the stream has to be armed before reading, each
+    /// against what the peer reports it attached (see [`Stream::attached`]).
+    pub(crate) async fn attach_all(
+        &self,
+        sessions: &[(String, Option<Cursor>)],
+    ) -> Result<Stream, ControlError> {
+        let requests: Vec<AttachRequest> = sessions
+            .iter()
+            .map(|(session, cursor)| AttachRequest {
+                session: session.clone(),
+                cursor: cursor.clone(),
+            })
+            .collect();
         match self {
             Self::Local(local) => Ok(Stream::Local(local.host.attach(&requests).await?)),
             Self::Remote(remote) => Ok(Stream::Remote {

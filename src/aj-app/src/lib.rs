@@ -27,6 +27,7 @@ pub mod clipboard;
 pub mod commands;
 pub mod compaction;
 pub mod diff;
+pub mod directory;
 pub mod export;
 pub mod footer;
 pub mod host;

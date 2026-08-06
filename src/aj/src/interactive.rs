@@ -15207,6 +15207,61 @@ mod tests {
         walk
     }
 
+    /// One stream serves every session it attached: both get their own
+    /// attach block, and `attached` answers for both. This is what lets the
+    /// client keep background sessions live on a single connection (spec
+    /// 6.5, 9.2).
+    #[tokio::test]
+    async fn one_stream_carries_several_sessions() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (world, _shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let second = world
+            .control
+            .create(None, None)
+            .await
+            .expect("a second session");
+
+        let mut stream = world
+            .control
+            .attach_all(&[(world.session.clone(), None), (second.clone(), None)])
+            .await
+            .expect("one attach covering both");
+        assert!(stream.attached(&world.session));
+        assert!(stream.attached(&second));
+
+        // Both blocks arrive on the one stream. Reading until each session
+        // has been caught up proves the host really served two blocks rather
+        // than one, and that the frames carry the session that owns them.
+        let mut caught_up: Vec<String> = Vec::new();
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        while caught_up.len() < 2 {
+            assert!(Instant::now() < deadline, "only saw {caught_up:?}");
+            match stream.recv().await {
+                ControlFrame::Frame(aj_wire::Frame::CaughtUp { session, .. }) => {
+                    if !caught_up.contains(&session) {
+                        caught_up.push(session);
+                    }
+                }
+                ControlFrame::Frame(_) => {}
+                other => panic!(
+                    "the stream ended early: {}",
+                    match other {
+                        ControlFrame::Lost(err) => err.to_string(),
+                        _ => "closed".to_string(),
+                    }
+                ),
+            }
+        }
+        caught_up.sort();
+        let mut expected = vec![world.session.clone(), second];
+        expected.sort();
+        assert_eq!(caught_up, expected);
+
+        drop(stream);
+        remote.shutdown().await;
+    }
+
     /// The head the tree read carries reaches the overlay, so the row the
     /// session is on opens selected and confirming it is a no-op.
     ///
