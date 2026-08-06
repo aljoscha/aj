@@ -196,18 +196,6 @@ pub(crate) fn busy_refusal(what: &str) -> ToastBody {
     }
 }
 
-/// The refusal toast for a gesture connect mode has no path for (spec 9.1).
-/// Two rows, like [`busy_refusal`]: what was refused and why, split so the box
-/// fits an 80-column terminal.
-pub(crate) fn remote_refusal(what: &str, why: &str) -> ToastBody {
-    ToastBody {
-        rows: vec![
-            vec![ToastSpan::Dim(format!("Can't {what} over a connection"))],
-            vec![ToastSpan::Dim(why.to_string())],
-        ],
-    }
-}
-
 /// The remedy row shared by every busy refusal: how to cancel the running
 /// turn and where to stop background tasks. The cancel chord is a fixed
 /// terminal convention (no keybinding entry), so it reads from `fixed_keys`;

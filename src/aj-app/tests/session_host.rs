@@ -14,8 +14,8 @@ use aj_agent::tool::{TaskKind, TaskOutputSource, TaskRead, TaskStatus};
 use aj_app::chat::ChatState;
 use aj_app::client::SessionClient;
 use aj_app::host::{
-    AttachRequest, Attachment, Command, CommandOutcome, HostError, HostSetup, QueueOp, SessionHost,
-    SettingsAxis, SettingsChange,
+    AttachRequest, Attachment, Command, CommandOutcome, HeadTarget, HostError, HostSetup, QueueOp,
+    SessionHost, SettingsAxis, SettingsChange,
 };
 use aj_app::session_setup::RunConfigSnapshot;
 use aj_app::settings::{ConfigLayers, PersistAction};
@@ -1535,7 +1535,7 @@ async fn a_head_switch_replaces_the_epoch_and_resets_the_stream() {
         .command(
             &session,
             Command::Head {
-                entry: head.clone(),
+                target: HeadTarget::Entry(head.clone()),
             },
         )
         .await
@@ -1587,7 +1587,7 @@ async fn a_head_switch_is_refused_while_work_is_live() {
         .command(
             &session,
             Command::Head {
-                entry: "whatever".to_string(),
+                target: HeadTarget::Entry("whatever".to_string()),
             },
         )
         .await
@@ -1628,7 +1628,7 @@ async fn a_head_switch_is_refused_while_work_is_live() {
         .command(
             &session,
             Command::Head {
-                entry: "whatever".to_string(),
+                target: HeadTarget::Entry("whatever".to_string()),
             },
         )
         .await
@@ -1652,7 +1652,7 @@ async fn a_head_switch_to_an_unknown_entry_is_refused() {
         .command(
             &session,
             Command::Head {
-                entry: "no-such-entry".to_string(),
+                target: HeadTarget::Entry("no-such-entry".to_string()),
             },
         )
         .await
@@ -1678,9 +1678,113 @@ async fn a_head_switch_to_an_unknown_entry_is_refused() {
     };
     let err = harness
         .host
-        .command(&session, Command::Head { entry: sub_entry })
+        .command(
+            &session,
+            Command::Head {
+                target: HeadTarget::Entry(sub_entry),
+            },
+        )
         .await
         .expect_err("a sub-agent entry cannot be a head");
+    assert!(matches!(err, HostError::Invalid(_)), "got {err:?}");
+    harness.host.shutdown().await;
+}
+
+/// A `before` target moves the head to the named entry's parent, which is
+/// what makes branching from a transcript message replace that message
+/// rather than continue after it (spec 6.6).
+///
+/// The resolution is the host's, so an unknown entry is a 404 and an entry
+/// with no parent is refused rather than silently branching from nothing.
+#[tokio::test]
+async fn a_head_switch_before_an_entry_lands_on_its_parent() {
+    let harness = Harness::new(vec![
+        finalized_text_message("the first answer"),
+        finalized_text_message("the second answer"),
+    ]);
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "first").await;
+    client.pump_until_idle().await;
+    harness.prompt(&session, "second").await;
+    client.pump_until_idle().await;
+
+    // The second user message, and the entry the head has to land on.
+    let (second_user, its_parent, root) = {
+        let handles = harness
+            .host
+            .local_handles(&session)
+            .await
+            .expect("live session");
+        let log = handles.log.lock().await;
+        let entries = log.entries_in_order();
+        let users: Vec<&aj_session::ConversationEntry> = entries
+            .iter()
+            .copied()
+            .filter(|entry| {
+                matches!(
+                    &entry.entry,
+                    aj_session::ConversationEntryKind::Message { message }
+                        if matches!(
+                            message.as_stored_wire(),
+                            Some(aj_models::types::Message::User(_))
+                        )
+                )
+            })
+            .collect();
+        let second = users.get(1).expect("two user messages");
+        let root = entries.first().expect("a first entry").id.clone();
+        (
+            second.id.clone(),
+            second.parent_id.clone().expect("a parent"),
+            root,
+        )
+    };
+
+    harness
+        .host
+        .command(
+            &session,
+            Command::Head {
+                target: HeadTarget::Before(second_user.clone()),
+            },
+        )
+        .await
+        .expect("branching before a user message is accepted");
+    let landed = harness
+        .host
+        .tree(&session)
+        .await
+        .expect("tree read")
+        .head
+        .expect("a head");
+    assert_eq!(
+        landed, its_parent,
+        "the head is the message's parent, so the branch replaces it",
+    );
+
+    let err = harness
+        .host
+        .command(
+            &session,
+            Command::Head {
+                target: HeadTarget::Before("no-such-entry".to_string()),
+            },
+        )
+        .await
+        .expect_err("an unknown entry is refused");
+    assert!(matches!(err, HostError::UnknownEntry(_)), "got {err:?}");
+
+    let err = harness
+        .host
+        .command(
+            &session,
+            Command::Head {
+                target: HeadTarget::Before(root),
+            },
+        )
+        .await
+        .expect_err("there is nothing before the first entry");
     assert!(matches!(err, HostError::Invalid(_)), "got {err:?}");
     harness.host.shutdown().await;
 }
@@ -1749,7 +1853,12 @@ async fn a_head_switch_forgets_the_abandoned_branch() {
 
     harness
         .host
-        .command(&session, Command::Head { entry: head })
+        .command(
+            &session,
+            Command::Head {
+                target: HeadTarget::Entry(head),
+            },
+        )
         .await
         .expect("head switch on an idle session");
 
@@ -6103,6 +6212,23 @@ async fn the_reads_answer_tasks_tree_and_hello() {
     assert!(
         tree.segments.iter().any(|segment| segment.on_active_path),
         "the active path is marked",
+    );
+    // The head travels with the read (spec 6.7). It is not derivable from the
+    // segments, and a client that renders the tree needs the exact entry.
+    let head = tree.head.clone().expect("a session with a turn has a head");
+    assert_eq!(
+        head,
+        harness
+            .host
+            .local_handles(&session)
+            .await
+            .expect("live")
+            .log
+            .lock()
+            .await
+            .head()
+            .cloned()
+            .expect("a persisted head"),
     );
 
     let hello = harness.host.hello();

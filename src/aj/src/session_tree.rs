@@ -21,7 +21,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use aj_app::session::SessionRequest;
-use aj_session::{EntryId, SessionTree};
+use aj_session::EntryId;
+use aj_wire::SessionTree;
 use chrono::{DateTime, Utc};
 use vaxis::vxfw::{FilterableSelect, SelectItem, to_widget_ref};
 
@@ -288,7 +289,7 @@ fn subtitle() -> String {
 
 #[cfg(test)]
 mod tests {
-    use aj_session::TreeSegment;
+    use aj_wire::TreeSegment;
     use chrono::Duration;
 
     use super::*;
@@ -317,6 +318,7 @@ mod tests {
     fn single_segment_yields_one_row() {
         let tree = SessionTree {
             segments: vec![segment("h", "only branch", None, vec![], true)],
+            head: None,
         };
         let rows = build_tree_rows(&tree, Utc::now());
         assert_eq!(rows.len(), 1);
@@ -350,6 +352,7 @@ mod tests {
         let sub_b2 = segment("b2", "sub B2", Some(1), vec![], false);
         let tree = SessionTree {
             segments: vec![prefix, branch_b, branch_a, sub_b1, sub_b2],
+            head: None,
         };
 
         let rows = build_tree_rows(&tree, Utc::now());
@@ -394,6 +397,7 @@ mod tests {
         let long = "x".repeat(200);
         let tree = SessionTree {
             segments: vec![segment("h", &long, None, vec![], true)],
+            head: None,
         };
         let rows = build_tree_rows(&tree, Utc::now());
         assert!(rows[0].display.ends_with('\u{2026}'), "{}", rows[0].display);
@@ -406,6 +410,7 @@ mod tests {
     fn multiline_label_collapses_to_one_line() {
         let tree = SessionTree {
             segments: vec![segment("h", "line one\nline two", None, vec![], true)],
+            head: None,
         };
         let rows = build_tree_rows(&tree, Utc::now());
         assert_eq!(rows.len(), 1);
@@ -447,6 +452,7 @@ mod tests {
                 segment("b", "branch B", Some(0), vec![], true),
                 segment("a", "branch A", Some(0), vec![], false),
             ],
+            head: None,
         };
         let rows = build_tree_rows(&tree, Utc::now());
         let heads = heads_map(&rows);
@@ -488,6 +494,7 @@ mod tests {
                 segment("b", "branch B", Some(0), vec![], true),
                 segment("a", "branch A", Some(0), vec![], false),
             ],
+            head: None,
         };
         let rows = build_tree_rows(&tree, Utc::now());
         let key_for_a = rows
@@ -554,6 +561,7 @@ mod tests {
     fn mid_segment_head_switches_on_any_selection() {
         let tree = SessionTree {
             segments: vec![segment("tip", "only branch", None, vec![], true)],
+            head: None,
         };
         let rows = build_tree_rows(&tree, Utc::now());
         let heads = heads_map(&rows);
@@ -569,7 +577,7 @@ mod tests {
     /// An empty tree (an unpersisted session) shows one inert placeholder row.
     #[test]
     fn empty_tree_shows_placeholder() {
-        let rows = build_tree_rows(&SessionTree { segments: vec![] }, Utc::now());
+        let rows = build_tree_rows(&SessionTree::default(), Utc::now());
         assert!(rows.is_empty());
         let items = tree_items(&rows);
         assert_eq!(items.len(), 1);

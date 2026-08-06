@@ -634,6 +634,16 @@ impl LogSnapshot {
         self.entries.contains_key(id)
     }
 
+    /// The parent of `id`, `None` both when the log does not hold `id` and
+    /// when `id` is a root. Pair with [`Self::contains`] to tell those apart.
+    ///
+    /// This is what resolves "branch before this message": the head moves to
+    /// the message's parent, so the branch replaces the message rather than
+    /// continuing after it.
+    pub fn parent_of(&self, id: &EntryId) -> Option<&EntryId> {
+        self.entries.get(id)?.parent_id.as_ref()
+    }
+
     /// The largest `agent_id` recorded on any entry in the log, or `None`
     /// if no subagent entries exist. Used on resume to seed the session's
     /// subagent counter so freshly-spawned subagents don't reuse ids from
@@ -1297,6 +1307,11 @@ impl ConversationLog {
     /// See [`LogSnapshot::contains`].
     pub fn contains(&self, id: &EntryId) -> bool {
         self.core.contains(id)
+    }
+
+    /// See [`LogSnapshot::parent_of`].
+    pub fn parent_of(&self, id: &EntryId) -> Option<&EntryId> {
+        self.core.parent_of(id)
     }
 
     pub fn is_empty(&self) -> bool {

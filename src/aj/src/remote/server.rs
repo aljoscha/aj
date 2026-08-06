@@ -20,8 +20,8 @@ use std::time::Duration;
 use aj_agent::events::AgentId;
 use aj_agent::tool::TaskId;
 use aj_app::host::{
-    AttachRequest, Attachment, Command, CommandOutcome, HostError, QueueOp, SessionHost,
-    SettingsAxis, SettingsChange,
+    AttachRequest, Attachment, Command, CommandOutcome, HeadTarget, HostError, QueueOp,
+    SessionHost, SettingsAxis, SettingsChange,
 };
 use aj_app::session_setup::thinking_display_from_name;
 use aj_app::settings::PersistAction;
@@ -403,17 +403,28 @@ async fn head(
     Path(session): Path<String>,
     Body(request): Body<HeadRequest>,
 ) -> Result<Response, ApiError> {
+    let target = head_target(request)?;
     accepted(
         state
             .host
-            .command(
-                &session,
-                Command::Head {
-                    entry: request.entry,
-                },
-            )
+            .command(&session, Command::Head { target })
             .await?,
     )
+}
+
+/// Resolve a head request into the single target the host switches to.
+///
+/// Exactly one, for the same reason a settings change names one axis: the
+/// host applies one switch, and a body naming two would leave a client
+/// guessing which one a refusal referred to.
+fn head_target(request: HeadRequest) -> Result<HeadTarget, ApiError> {
+    match (request.entry, request.before) {
+        (Some(entry), None) => Ok(HeadTarget::Entry(entry)),
+        (None, Some(entry)) => Ok(HeadTarget::Before(entry)),
+        _ => Err(ApiError::invalid(
+            "a head switch names exactly one target: entry or before",
+        )),
+    }
 }
 
 /// Open the unified event stream, attaching every named session.

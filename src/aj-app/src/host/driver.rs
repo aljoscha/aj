@@ -40,12 +40,35 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::host::live::{self, LiveSession, ReleaseOutcome, ReleasedRow, Request, settings_of};
 use crate::host::{
-    Command, CommandOutcome, HostError, HostShared, QueueOp, SettingsAxis, SettingsChange,
-    mint_epoch,
+    Command, CommandOutcome, HeadTarget, HostError, HostShared, QueueOp, SettingsAxis,
+    SettingsChange, mint_epoch,
 };
 use crate::session::AgentLifecycle;
 use crate::settings::ConfirmOutcome;
 use crate::turn::{Joined, TurnStart, Turns, running_work_counts};
+
+/// Resolve a head target against `log` to the entry the head moves to.
+///
+/// A `before` target answers its entry's parent, which is what makes a branch
+/// replace the message it was taken from rather than continue after it. An
+/// entry the log does not hold is a 404, and one with no parent is refused:
+/// branching before a root would leave the session with no history at all,
+/// and no transcript gesture can legitimately ask for it (spec 6.6).
+fn resolve_head_target(
+    log: &aj_session::ConversationLog,
+    target: HeadTarget,
+) -> Result<String, HostError> {
+    match target {
+        HeadTarget::Entry(entry) => Ok(entry),
+        HeadTarget::Before(entry) => match log.parent_of(&entry) {
+            Some(parent) => Ok(parent.clone()),
+            None if log.contains(&entry) => Err(HostError::Invalid(format!(
+                "entry {entry} starts the session, so there is nothing before it"
+            ))),
+            None => Err(HostError::UnknownEntry(entry)),
+        },
+    }
+}
 
 /// How long a shutdown waits for cancelled turns to wind themselves down
 /// before falling back to aborting them.
@@ -450,7 +473,7 @@ impl Driver {
             Command::Queue(op) => Ok(self.queue_op(op)),
             Command::Compact { instructions } => self.compact(instructions),
             Command::Settings(change) => self.settings(change).await,
-            Command::Head { entry } => self.head_switch(entry).await,
+            Command::Head { target } => self.head_switch(target).await,
             Command::KillTask { task } => self.kill_task(task),
         }
     }
@@ -825,14 +848,14 @@ impl Driver {
             .map(Arc::new)
     }
 
-    /// Switch the session's head to `entry`, in place.
+    /// Switch the session's head to `target`, in place.
     ///
     /// Refused while any turn is driven or any background task is live: a
     /// mid-turn switch would let the running turn persist onto the wrong
     /// branch. On success the queues are cleared, the state that belonged to
     /// the branch being left is reset, the agent is reseeded from the new
     /// branch, a fresh epoch is minted and `reset` published.
-    async fn head_switch(&mut self, entry: String) -> Result<CommandOutcome, HostError> {
+    async fn head_switch(&mut self, target: HeadTarget) -> Result<CommandOutcome, HostError> {
         let snapshot = self.session.core.task_registry.snapshot();
         let (agents, bash) = running_work_counts(
             self.turns.driven(),
@@ -863,6 +886,10 @@ impl Driver {
             // belong to it, so they must reach disk before the head moves
             // off them.
             log.flush_pending().map_err(internal)?;
+            // Resolved here rather than at the caller, under the same lock
+            // that moves the head: a parent read outside it could be
+            // superseded by an append before the switch lands (spec 6.6).
+            let entry = resolve_head_target(&log, target)?;
             let known = log.contains(&entry);
             log.set_head(entry.clone()).map_err(|err| match err {
                 // `set_head` refuses an id it does not know and one whose

@@ -25,7 +25,9 @@ use aj_app::chat::ChatState;
 use aj_app::cli::args::{Args, Command as CliCommand};
 use aj_app::client::SessionClient;
 use aj_app::commands::CommandAction;
-use aj_app::host::{Command, CommandOutcome, LocalHandles, QueueOp, SettingsAxis, SettingsChange};
+use aj_app::host::{
+    Command, CommandOutcome, HeadTarget, LocalHandles, QueueOp, SettingsAxis, SettingsChange,
+};
 use aj_app::keybindings::fixed_keys;
 use aj_app::session::{SessionExit, SessionRequest};
 use aj_app::session_setup::{ComposedHost, compose_host};
@@ -89,7 +91,7 @@ use crate::splash::{SPLASH_WAKE_EVENT, Splash};
 use crate::status::{Connection, STATUS_WAKE_EVENT, StatusLine, StatusState};
 use crate::task_output::{TaskBacking, TaskOutputView, open_task_output};
 use crate::terminal::TerminalCaps;
-use crate::toasts::{ToastBody, ToastStack, Toasts, busy_refusal, remote_refusal};
+use crate::toasts::{ToastBody, ToastStack, Toasts, busy_refusal};
 use crate::transcript::{TranscriptStyles, TranscriptView, vaxis_color};
 use crate::usage_overlay::open_usage_overlay;
 
@@ -656,10 +658,10 @@ fn remote_unsupported_notice(what: &str, why: &str) -> String {
     format!("Can't {what} over a connection: {why}.")
 }
 
-/// Why the session-changing and branching gestures are refused over a
-/// connection: they arrive with the sidebar (spec 9.1, phase 3).
-const SIDEBAR_PHASE: &str = "session switching and branching over a connection \
-                             arrive with the sidebar";
+/// Why the session-changing gestures are refused over a connection: they
+/// arrive with the sidebar (spec 9.1, phase 3).
+const SIDEBAR_PHASE: &str = "switching sessions over a connection arrives \
+                             with the sidebar";
 
 /// A session change the drive loop broke out for.
 enum FocusRequest {
@@ -671,7 +673,7 @@ enum FocusRequest {
     /// leaves, auto-submitting `prompt` as its first turn when one was
     /// handed off.
     Branch {
-        head: String,
+        target: HeadTarget,
         prompt: Option<String>,
     },
 }
@@ -691,21 +693,25 @@ enum Focus {
 /// notice and stays where it is. Nothing is torn down either way: the
 /// outgoing session stays live in the host.
 ///
-/// Every arm needs a session change connect mode has no path for yet (spec
-/// 9.1 defers switching and branching to phase 3 alongside the sidebar), so
-/// a remote client is refused here with the reason.
+/// The two arms that move to another session have no connect-mode path yet
+/// (spec 9.1 defers switching to phase 3 alongside the sidebar), so a remote
+/// client is refused those with the reason. Branching stays inside the
+/// focused session and works over the wire.
 async fn apply_focus_request(
     app: &mut AsyncApp,
     shell: &Rc<RefCell<Shell>>,
     world: &mut World,
     request: FocusRequest,
 ) -> Focus {
-    if world.control.is_remote() {
-        let what = match &request {
-            FocusRequest::Create => "start a new session",
-            FocusRequest::Resume(_) => "switch sessions",
-            FocusRequest::Branch { .. } => "branch the conversation",
-        };
+    let unsupported = match &request {
+        FocusRequest::Create => Some("start a new session"),
+        FocusRequest::Resume(_) => Some("switch sessions"),
+        // Branching stays inside the focused session, and every step of it
+        // has a wire form: the head command resolves the target, and the
+        // re-attach adopts the epoch the switch minted.
+        FocusRequest::Branch { .. } => None,
+    };
+    if let Some(what) = unsupported.filter(|_| world.control.is_remote()) {
         fold_notice(world, &remote_unsupported_notice(what, SIDEBAR_PHASE));
         app.request_redraw();
         return Focus::Same;
@@ -757,8 +763,8 @@ async fn apply_focus_request(
                 }
             }
         }
-        FocusRequest::Branch { head, prompt } => {
-            branch_focused_session(app, shell, world, head, prompt).await;
+        FocusRequest::Branch { target, prompt } => {
+            branch_focused_session(app, shell, world, target, prompt).await;
             // A branch stays inside its session, so the banner keeps
             // counting it as the live one.
             Focus::Same
@@ -884,13 +890,13 @@ async fn branch_focused_session(
     app: &mut AsyncApp,
     shell: &Rc<RefCell<Shell>>,
     world: &mut World,
-    head: String,
+    target: HeadTarget,
     prompt: Option<String>,
 ) {
     let session = world.session.clone();
     if let Err(err) = world
         .control
-        .command(&session, Command::Head { entry: head })
+        .command(&session, Command::Head { target })
         .await
     {
         fold_notice(world, &format!("Failed to branch the conversation: {err}"));
@@ -1737,51 +1743,15 @@ fn session_busy_notice(what: &str) -> String {
     )
 }
 
-/// Where an armed branch anchor resolves against the log.
-enum BranchTarget {
-    /// The message resolved: rebuild on this head (the message's parent).
-    Head(String),
-    /// The message id is not in the log (a stale anchor, or a wrong-session
-    /// resolve that the install-time clear should have prevented).
-    Missing,
-    /// The message is the file root: there is nothing to branch from.
-    Root,
-}
-
-/// Resolve a branch anchor's message id to the new head by scanning the log's
-/// entries for it and taking its `parent_id`. Locks the log, so call with no
-/// turn in flight.
-///
-/// Only a local run gets here: the branch gesture is refused at the arming
-/// keystroke over a connection (spec 9.1, phase 3), so a world with no log
-/// reads as a stale anchor.
-async fn resolve_branch_head(world: &World, message_id: &str) -> BranchTarget {
-    let Some(handles) = world.local.as_ref() else {
-        return BranchTarget::Missing;
-    };
-    let log = handles.log.lock().await;
-    match log
-        .entries_in_order()
-        .into_iter()
-        .find(|e| e.id == message_id)
-    {
-        None => BranchTarget::Missing,
-        Some(entry) => match &entry.parent_id {
-            None => BranchTarget::Root,
-            Some(parent) => BranchTarget::Head(parent.clone()),
-        },
-    }
-}
-
 /// The outcome of a submit made while a branch anchor is armed.
 enum ArmedSubmit {
-    /// Stay in the current session: the submit was refused (empty, or busy)
-    /// or the resolution failed (missing / root). The anchor and any needed
-    /// notice/toast are handled inside; the caller only redraws.
+    /// Stay in the current session: the submit was refused (empty, or busy).
+    /// The anchor and any needed notice or toast are handled inside, the
+    /// caller only redraws.
     Stay,
-    /// Resolved: break the drive loop, move the session's head to `head`,
+    /// Resolved: break the drive loop, move the session's head to `target`,
     /// and run `prompt` as the branch's first turn.
-    Branch { head: String, prompt: String },
+    Branch { target: HeadTarget, prompt: String },
 }
 
 /// Decide what an armed-anchor submit does. Called at the drive-loop submit
@@ -1827,30 +1797,14 @@ async fn submit_with_armed_anchor(
         handle_submit(world, text).await;
         return ArmedSubmit::Stay;
     };
-    match resolve_branch_head(world, &message_id).await {
-        // The anchor is invalid (stale id, or the first message with no
-        // parent), so we disarm rather than keep it, unlike the empty/mid-turn
-        // arms above. We still restore the editor text the submit cleared, so
-        // the user's edited prompt is not silently dropped.
-        BranchTarget::Missing => {
-            shell.borrow().editor.borrow_mut().set_text(&text);
-            shell.borrow().disarm_branch();
-            fold_notice(
-                world,
-                "Can't branch: that message is no longer in this session.",
-            );
-            ArmedSubmit::Stay
-        }
-        BranchTarget::Root => {
-            shell.borrow().editor.borrow_mut().set_text(&text);
-            shell.borrow().disarm_branch();
-            fold_notice(world, "Can't branch at the first message.");
-            ArmedSubmit::Stay
-        }
-        BranchTarget::Head(head) => {
-            shell.borrow().disarm_branch();
-            ArmedSubmit::Branch { head, prompt: text }
-        }
+    // The anchor names the message, and the host moves the head to its
+    // parent: a branch replaces the message rather than continuing after it
+    // (spec 6.6). Resolving it here would need the log, which a connection
+    // does not have, and would race an append besides.
+    shell.borrow().disarm_branch();
+    ArmedSubmit::Branch {
+        target: HeadTarget::Before(message_id),
+        prompt: text,
     }
 }
 
@@ -2095,28 +2049,18 @@ async fn apply_command_action(
             ActionEffect::OpenedOverlay
         }
         CommandAction::OpenSessionTree => {
-            // Building the tree is cheap and in-memory, so lock the log, snapshot
-            // the rows and the current head, and drop the lock before opening.
-            //
-            // Read off the live log rather than through the host's tree read:
-            // the row builder takes the store's own tree type, and the head is
-            // not on the read at all. The wire's tree read exists, but the
-            // switching gesture behind this view is phase 3, so connect mode
-            // refuses the whole view rather than open one that cannot act.
-            let Some(log) = world.local.as_ref().map(|local| Arc::clone(&local.log)) else {
-                fold_notice(
-                    world,
-                    &remote_unsupported_notice("browse the session tree", SIDEBAR_PHASE),
-                );
-                return ActionEffect::Redraw;
+            // The host's own tree read, which carries the current head
+            // alongside the segments (spec 6.7). It materializes the session,
+            // which an attached one already is.
+            let tree = match world.control.tree(&world.session).await {
+                Ok(tree) => tree,
+                Err(err) => {
+                    fold_notice(world, &format!("Could not read the session tree: {err}"));
+                    return ActionEffect::Redraw;
+                }
             };
-            let (rows, current_head) = {
-                let log = log.lock().await;
-                (
-                    build_tree_rows(&log.session_tree(), Utc::now()),
-                    log.head().cloned(),
-                )
-            };
+            let current_head = tree.head.clone();
+            let rows = build_tree_rows(&tree, Utc::now());
             let handles = shell.borrow().overlay_handles();
             open_session_tree(&handles, rows, current_head);
             ActionEffect::OpenedOverlay
@@ -3684,7 +3628,6 @@ impl Shell {
         chat: Rc<RefCell<ChatState>>,
         status: Rc<RefCell<StatusState>>,
         task_registry: Option<TaskRegistry>,
-        remote: bool,
         theme: ThemeHandle,
         header: String,
         session_id: &str,
@@ -3876,7 +3819,6 @@ impl Shell {
             let fetch_slot_for_actions = Rc::clone(&fetch_slot);
             let settings_ui_for_actions = Rc::clone(&settings_ui);
             let task_view_for_actions = Rc::clone(&task_view);
-            let toasts_for_actions: ToastStack = Rc::clone(&toasts);
             let transcript_for_actions = Rc::clone(&transcript);
             let transcript_widget: WidgetRef = to_widget_ref(Rc::clone(&transcript));
             let editor_for_actions = Rc::clone(&editor);
@@ -3967,16 +3909,6 @@ impl Shell {
                     if let Some(text) = transcript_for_actions.borrow().focused_message_text() {
                         ctx.copy_to_clipboard(text);
                     }
-                }
-                AjAction::BranchMessage if remote => {
-                    // Branching over a connection is phase 3 (spec 9.1), and
-                    // arming an anchor no submit could resolve would look like
-                    // it worked. Refused here, loudly, at the gesture.
-                    crate::toasts::show_toast(
-                        &toasts_for_actions,
-                        remote_refusal("branch the conversation", SIDEBAR_PHASE),
-                    );
-                    ctx.redraw = true;
                 }
                 AjAction::BranchMessage => {
                     // `focused_message_id` already gates on focus mode, the
@@ -4745,7 +4677,6 @@ pub async fn run(args: Args) -> Result<()> {
             .local
             .as_ref()
             .map(|local| local.task_registry.clone()),
-        world.control.is_remote(),
         theme.clone(),
         header,
         &world.session,
@@ -4858,7 +4789,7 @@ pub async fn run(args: Args) -> Result<()> {
             Err(fatal) => break Err(fatal),
             Ok(SessionExit::New) => FocusRequest::Create,
             Ok(SessionExit::Switch(session_id)) => FocusRequest::Resume(session_id),
-            Ok(SessionExit::Branch { head, prompt }) => FocusRequest::Branch { head, prompt },
+            Ok(SessionExit::Branch { target, prompt }) => FocusRequest::Branch { target, prompt },
         };
 
         // Read the outgoing session's usage before the change and record it
@@ -5613,9 +5544,9 @@ async fn drive(
                             if armed {
                                 match submit_with_armed_anchor(world, shell, text).await {
                                     ArmedSubmit::Stay => app.request_redraw(),
-                                    ArmedSubmit::Branch { head, prompt } => {
+                                    ArmedSubmit::Branch { target, prompt } => {
                                         break Ok(SessionExit::Branch {
-                                            head,
+                                            target,
                                             prompt: Some(prompt),
                                         });
                                     }
@@ -6241,7 +6172,6 @@ mod tests {
             chat,
             Rc::new(RefCell::new(StatusState::default())),
             Some(TaskRegistry::default()),
-            false,
             ThemeHandle::new(Theme::bundled_dark_with_mode(
                 aj_app::theme::ColorMode::Truecolor,
             )),
@@ -6258,7 +6188,6 @@ mod tests {
             empty_chat(),
             Rc::new(RefCell::new(StatusState::default())),
             Some(TaskRegistry::default()),
-            false,
             ThemeHandle::new(Theme::bundled_dark_with_mode(
                 aj_app::theme::ColorMode::Truecolor,
             )),
@@ -6415,7 +6344,6 @@ mod tests {
             empty_chat(),
             Rc::new(RefCell::new(StatusState::default())),
             Some(TaskRegistry::default()),
-            false,
             ThemeHandle::new(Theme::bundled_dark_with_mode(
                 aj_app::theme::ColorMode::Truecolor,
             )),
@@ -6941,7 +6869,6 @@ mod tests {
             Rc::clone(&world.chat),
             Rc::clone(&world.status),
             Some(world.handles().task_registry.clone()),
-            false,
             ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor)),
             "aj".to_string(),
             "",
@@ -9025,7 +8952,12 @@ mod tests {
             .expect("a persisted head");
         world
             .host()
-            .command(&world.session, Command::Head { entry: head })
+            .command(
+                &world.session,
+                Command::Head {
+                    target: HeadTarget::Entry(head),
+                },
+            )
             .await
             .expect("the head switch is accepted");
         fold_ready_frames(&mut world);
@@ -9077,7 +9009,12 @@ mod tests {
             .expect("a persisted head");
         world
             .host()
-            .command(&world.session, Command::Head { entry: head })
+            .command(
+                &world.session,
+                Command::Head {
+                    target: HeadTarget::Entry(head),
+                },
+            )
             .await
             .expect("the head switch is accepted");
         fold_ready_frames(&mut world);
@@ -9392,7 +9329,12 @@ mod tests {
             .expect("a persisted head");
         world
             .host()
-            .command(&world.session, Command::Head { entry: head })
+            .command(
+                &world.session,
+                Command::Head {
+                    target: HeadTarget::Entry(head),
+                },
+            )
             .await
             .expect("the head switch is accepted");
         // Wait the host's `list` coalescing out (spec 6.8) before draining, so
@@ -9910,7 +9852,6 @@ mod tests {
             Rc::clone(&world.chat),
             Rc::clone(&world.status),
             Some(world.handles().task_registry.clone()),
-            false,
             ThemeHandle::new(Theme::bundled_dark_with_mode(
                 aj_app::theme::ColorMode::Truecolor,
             )),
@@ -9948,7 +9889,6 @@ mod tests {
             Rc::clone(&world.chat),
             Rc::clone(&world.status),
             Some(world.handles().task_registry.clone()),
-            false,
             ThemeHandle::new(Theme::bundled_dark_with_mode(
                 aj_app::theme::ColorMode::Truecolor,
             )),
@@ -11414,7 +11354,6 @@ mod tests {
             chat,
             Rc::new(RefCell::new(StatusState::default())),
             Some(TaskRegistry::default()),
-            false,
             theme.clone(),
             "aj".to_string(),
             "",
@@ -11684,7 +11623,6 @@ mod tests {
             Rc::clone(&world.chat),
             Rc::clone(&world.status),
             Some(world.handles().task_registry.clone()),
-            false,
             ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor)),
             "aj".to_string(),
             "",
@@ -11908,7 +11846,6 @@ mod tests {
             Rc::clone(&world.chat),
             Rc::clone(&world.status),
             Some(world.handles().task_registry.clone()),
-            false,
             ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor)),
             "aj".to_string(),
             "",
@@ -13918,10 +13855,11 @@ mod tests {
     }
 
     /// Submitting with an anchor armed on a persisted user message resolves to
-    /// a branch exit whose head is that message's parent, carrying the edited
-    /// prompt. The anchor is disarmed on resolution.
+    /// a branch exit naming that message as the one to branch before, so the
+    /// host moves the head to its parent, carrying the edited prompt. The
+    /// anchor is disarmed on resolution.
     #[tokio::test]
-    async fn armed_submit_branches_at_the_messages_parent() {
+    async fn armed_submit_branches_before_the_anchored_message() {
         use aj_models::types::Message;
         use aj_session::ConversationEntryKind;
 
@@ -13929,7 +13867,8 @@ mod tests {
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         persist_session(&mut world).await;
 
-        // The first user message on disk, plus its parent (a settings entry).
+        // The first user message on disk, plus its parent (a settings entry),
+        // which is where the host has to land.
         let (message_id, expected_head) = {
             let log = world.handles().log.lock().await;
             let entry = log
@@ -13951,14 +13890,40 @@ mod tests {
                     .expect("the user message has a parent"),
             )
         };
+        let anchored = message_id.clone();
         {
             let sh = shell.borrow();
             arm_branch(&sh.branch_anchor, message_id);
         }
         match submit_with_armed_anchor(&mut world, &shell, "edited prompt".to_string()).await {
-            ArmedSubmit::Branch { head, prompt } => {
-                assert_eq!(head, expected_head, "branches at the message's parent");
+            ArmedSubmit::Branch { target, prompt } => {
+                let HeadTarget::Before(named) = target else {
+                    panic!("the branch gesture names the message, not a head");
+                };
+                assert_eq!(named, anchored, "the anchor's own message travels");
                 assert_eq!(prompt, "edited prompt");
+                // And the host resolves that to the message's parent.
+                world
+                    .host()
+                    .command(
+                        &world.session,
+                        Command::Head {
+                            target: HeadTarget::Before(named),
+                        },
+                    )
+                    .await
+                    .expect("the branch switch is accepted");
+                assert_eq!(
+                    world
+                        .handles()
+                        .log
+                        .lock()
+                        .await
+                        .head()
+                        .cloned()
+                        .expect("a head"),
+                    expected_head,
+                );
             }
             ArmedSubmit::Stay => panic!("expected a branch exit"),
         }
@@ -13989,7 +13954,7 @@ mod tests {
             .cloned()
             .expect("a persisted head");
         let branch = || FocusRequest::Branch {
-            head: head.clone(),
+            target: HeadTarget::Entry(head.clone()),
             prompt: None,
         };
 
@@ -14280,7 +14245,10 @@ mod tests {
         })
         .into_exit()
         {
-            SessionExit::Branch { head, prompt } => {
+            SessionExit::Branch { target, prompt } => {
+                let HeadTarget::Entry(head) = target else {
+                    panic!("a tree switch names a head directly");
+                };
                 assert_eq!(head, branch_a, "the switch targets the selected head");
                 assert!(prompt.is_none(), "a tree switch carries no prompt");
             }
@@ -14294,7 +14262,7 @@ mod tests {
             &shell,
             &mut world,
             FocusRequest::Branch {
-                head: branch_a.clone(),
+                target: HeadTarget::Entry(branch_a.clone()),
                 prompt: None,
             },
         )
@@ -14328,7 +14296,7 @@ mod tests {
             &shell,
             &mut world,
             FocusRequest::Branch {
-                head: branch_b.clone(),
+                target: HeadTarget::Entry(branch_b.clone()),
                 prompt: None,
             },
         )
@@ -14363,7 +14331,7 @@ mod tests {
             &shell,
             &mut world,
             FocusRequest::Branch {
-                head: "does-not-exist".to_string(),
+                target: HeadTarget::Entry("does-not-exist".to_string()),
                 prompt: Some("edited prompt".to_string()),
             },
         )
@@ -14424,13 +14392,32 @@ mod tests {
         }
         let outcome =
             submit_with_armed_anchor(&mut world, &shell, "edited root prompt".to_string()).await;
-        assert!(
-            matches!(outcome, ArmedSubmit::Stay),
-            "root branch is refused"
-        );
+        let ArmedSubmit::Branch { target, prompt } = outcome else {
+            panic!("the submit hands the anchor to the host");
+        };
         assert!(
             shell.borrow().branch_anchor.borrow().is_none(),
-            "the anchor is disarmed on a root refusal"
+            "the anchor is disarmed once it is handed off"
+        );
+
+        // The host owns the resolution, so the refusal comes from there.
+        let (mut app, _writer, _root) = app_over(&shell).await;
+        apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Branch {
+                target,
+                prompt: Some(prompt),
+            },
+        )
+        .await;
+        assert!(
+            main_notices(&world)
+                .iter()
+                .any(|notice| notice.contains("nothing before it")),
+            "the host's own refusal is what the user reads: {:?}",
+            main_notices(&world),
         );
         assert_eq!(
             shell.borrow().editor.borrow().text(),
@@ -14495,7 +14482,7 @@ mod tests {
             &shell,
             &mut world,
             FocusRequest::Branch {
-                head,
+                target: HeadTarget::Entry(head),
                 prompt: Some("branch turn".to_string()),
             },
         )
@@ -14666,7 +14653,6 @@ mod tests {
             Rc::clone(&world.chat),
             Rc::clone(&world.status),
             None,
-            true,
             ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor)),
             "aj".to_string(),
             &world.session,
@@ -14972,7 +14958,6 @@ mod tests {
 
         for action in [
             CommandAction::ExportHtml,
-            CommandAction::OpenSessionTree,
             CommandAction::OpenSessionSelector,
             CommandAction::NewSession,
         ] {
@@ -15141,6 +15126,80 @@ mod tests {
             polled.due().is_none(),
             "the poll clock resets with the viewer"
         );
+
+        settle(&mut world).await;
+        remote.shutdown().await;
+    }
+
+    /// The tree view and the branch gesture work over a connection: the tree
+    /// read carries the head the overlay pre-selects, and the branch anchor
+    /// travels as a `before` target the host resolves to the message's parent
+    /// (spec 6.6, 6.7).
+    #[tokio::test]
+    async fn connect_mode_browses_the_tree_and_branches() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+
+        assert!(handle_submit(&mut world, "first".to_string()).await);
+        settle(&mut world).await;
+
+        // The tree opens against the host's read rather than a local log.
+        apply_command(&mut world, &shell, CommandAction::OpenSessionTree).await;
+        assert!(
+            shell.borrow().overlays.borrow().is_open(),
+            "the tree view opened over the connection: {:?}",
+            main_notices(&world),
+        );
+        shell.borrow().overlays.borrow_mut().close_all();
+
+        let tree = world
+            .control
+            .tree(&world.session)
+            .await
+            .expect("the tree read");
+        let head = tree.head.clone().expect("a session with a turn has a head");
+
+        // Branch before the user message, which the host resolves to its
+        // parent, so the head really moves.
+        let message = world
+            .chat
+            .borrow()
+            .transcript(AgentId::Main)
+            .expect("the main transcript")
+            .entries()
+            .iter()
+            .find_map(|entry| match &entry.kind {
+                aj_app::chat::EntryKind::User(user) => user.message_id.clone(),
+                _ => None,
+            })
+            .expect("the user message carries its entry id");
+        let (mut app, _writer, _root) = app_over(&shell).await;
+        apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Branch {
+                target: HeadTarget::Before(message),
+                prompt: None,
+            },
+        )
+        .await;
+        assert!(
+            main_notices(&world)
+                .iter()
+                .any(|notice| notice.contains("Switched to the selected branch")),
+            "{:?}",
+            main_notices(&world),
+        );
+        let moved = world
+            .control
+            .tree(&world.session)
+            .await
+            .expect("the tree read")
+            .head
+            .expect("a head");
+        assert_ne!(moved, head, "the head moved off the branched-from message");
 
         settle(&mut world).await;
         remote.shutdown().await;

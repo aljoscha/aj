@@ -140,9 +140,37 @@ pub struct SettingsRequest {
 }
 
 /// Switches a session's active branch head.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Exactly one target: [`Self::entry`] names the head directly, and
+/// [`Self::before`] names an entry whose *parent* becomes the head, which is
+/// the branch-from-a-message gesture (a branch replaces the message rather
+/// than continuing after it). The parent resolution happens on the host,
+/// atomically with the switch, so no log change can land between reading the
+/// parent and moving onto it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeadRequest {
-    pub entry: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+}
+
+impl HeadRequest {
+    /// Switch the head to `entry`.
+    pub fn entry(entry: impl Into<String>) -> Self {
+        Self {
+            entry: Some(entry.into()),
+            before: None,
+        }
+    }
+
+    /// Switch the head to the parent of `entry`.
+    pub fn before(entry: impl Into<String>) -> Self {
+        Self {
+            entry: None,
+            before: Some(entry.into()),
+        }
+    }
 }
 
 /// Server identity and supported protocol features.
@@ -250,6 +278,14 @@ pub struct QueueState {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionTree {
     pub segments: Vec<TreeSegment>,
+    /// The session's current head entry, absent only for a log with no head
+    /// yet.
+    ///
+    /// Not derivable from the segments: a head can sit mid-segment, and both
+    /// the active-row pre-selection and the "switching to the current tip is
+    /// a no-op" rule need the exact entry (spec 6.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
 }
 
 /// One maximal linear segment in a session branch tree.

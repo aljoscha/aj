@@ -32,6 +32,7 @@ use anyhow::Result;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc::UnboundedReceiver;
 
+use crate::host::HeadTarget;
 use crate::session_setup::{
     BuiltAgent, PreparedLog, RestoreContext, RunConfigSnapshot, SessionSource, build_agent,
     freeze_and_seed, prepare_log,
@@ -87,12 +88,11 @@ pub enum SessionExit {
     Switch(String),
     /// New session: rebuild onto a freshly minted session.
     New,
-    /// Branch the current session at an earlier user message: rebuild the
-    /// same session onto `head` (the branched-from message's parent) and,
-    /// when set, auto-submit `prompt` as the branch's first turn. `prompt`
-    /// is `None` for a tree-view switch, which only moves the head.
+    /// Branch the current session: move its head to `target` and, when set,
+    /// auto-submit `prompt` as the branch's first turn. `prompt` is `None`
+    /// for a tree-view switch, which only moves the head.
     Branch {
-        head: EntryId,
+        target: HeadTarget,
         prompt: Option<String>,
     },
 }
@@ -117,7 +117,10 @@ impl SessionRequest {
         match self {
             SessionRequest::New => SessionExit::New,
             SessionRequest::Resume(id) => SessionExit::Switch(id),
-            SessionRequest::Branch { head } => SessionExit::Branch { head, prompt: None },
+            SessionRequest::Branch { head } => SessionExit::Branch {
+                target: HeadTarget::Entry(head),
+                prompt: None,
+            },
         }
     }
 }

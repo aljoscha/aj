@@ -18,8 +18,8 @@
 use aj_agent::events::AgentId;
 use aj_agent::tool::TaskId;
 use aj_app::host::{
-    AttachRequest, Attachment, Command, CommandOutcome, HostError, QueueOp, SessionHost,
-    SettingsAxis, SettingsChange,
+    AttachRequest, Attachment, Command, CommandOutcome, HeadTarget, HostError, QueueOp,
+    SessionHost, SettingsAxis, SettingsChange,
 };
 use aj_app::session_setup::thinking_display_name;
 use aj_models::types::UserContent;
@@ -27,7 +27,8 @@ use aj_models::{speed_name, thinking_config_name, verbosity_name};
 use aj_wire::{
     CancelRequest, CompactRequest, CreateSessionRequest, Cursor, Frame, HeadRequest,
     ModelSelection, PromptInput, PromptRequest, QueueOperation, QueueRequest, QueueState,
-    SessionList, SessionSettings, SettingsRequest, SteerRequest, TaskDetails, TaskTable,
+    SessionList, SessionSettings, SessionTree, SettingsRequest, SteerRequest, TaskDetails,
+    TaskTable,
 };
 use futures::FutureExt;
 use reqwest::StatusCode;
@@ -134,6 +135,14 @@ impl Control {
                 .client
                 .command(session, &wire_command(command))
                 .await?),
+        }
+    }
+
+    /// The session's branch tree, with its current head (spec 6.7).
+    pub(crate) async fn tree(&self, session: &str) -> Result<SessionTree, ControlError> {
+        match self {
+            Self::Local(local) => Ok(local.host.tree(session).await?),
+            Self::Remote(remote) => Ok(remote.client.tree(session).await?),
         }
     }
 
@@ -245,7 +254,10 @@ fn wire_command(command: Command) -> RemoteCommand {
             RemoteCommand::Compact(CompactRequest { instructions })
         }
         Command::Settings(change) => RemoteCommand::Settings(settings_request(change)),
-        Command::Head { entry } => RemoteCommand::Head(HeadRequest { entry }),
+        Command::Head { target } => RemoteCommand::Head(match target {
+            HeadTarget::Entry(entry) => HeadRequest::entry(entry),
+            HeadTarget::Before(entry) => HeadRequest::before(entry),
+        }),
         Command::KillTask { task } => RemoteCommand::KillTask(task),
     }
 }

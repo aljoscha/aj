@@ -1290,9 +1290,7 @@ async fn an_unknown_session_answers_404_on_every_route() {
                 ..SessionSettings::default()
             },
         }),
-        RemoteCommand::Head(HeadRequest {
-            entry: "whatever".to_string(),
-        }),
+        RemoteCommand::Head(HeadRequest::entry("whatever".to_string())),
         RemoteCommand::KillTask(1),
     ] {
         refusals.push(fixture.client.command(missing, &command).await.err());
@@ -1459,9 +1457,7 @@ async fn a_head_switch_is_refused_with_409_while_a_turn_runs() {
         .client
         .command(
             &session,
-            &RemoteCommand::Head(HeadRequest {
-                entry: "whatever".to_string(),
-            }),
+            &RemoteCommand::Head(HeadRequest::entry("whatever".to_string())),
         )
         .await
         .expect_err("a mid-turn head switch is refused");
@@ -1474,9 +1470,7 @@ async fn a_head_switch_is_refused_with_409_while_a_turn_runs() {
         .client
         .command(
             &session,
-            &RemoteCommand::Head(HeadRequest {
-                entry: "no-such-entry".to_string(),
-            }),
+            &RemoteCommand::Head(HeadRequest::entry("no-such-entry".to_string())),
         )
         .await
         .expect_err("an unknown entry is refused");
@@ -2072,9 +2066,7 @@ async fn probe_every_route(client: &RemoteClient, session: &str) -> Vec<Result<(
                 ..SessionSettings::default()
             },
         }),
-        RemoteCommand::Head(HeadRequest {
-            entry: "whatever".to_string(),
-        }),
+        RemoteCommand::Head(HeadRequest::entry("whatever".to_string())),
         RemoteCommand::KillTask(1),
     ];
 
@@ -2660,9 +2652,7 @@ async fn frames_from_a_stale_epoch_are_dropped_until_a_reattach() {
         .client
         .command(
             &session,
-            &RemoteCommand::Head(HeadRequest {
-                entry: target.clone(),
-            }),
+            &RemoteCommand::Head(HeadRequest::entry(target.clone())),
         )
         .await
         .expect("a head switch on an idle session");

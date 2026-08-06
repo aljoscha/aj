@@ -110,11 +110,19 @@ fn command_request_shapes_are_pinned() {
         json!({"instructions":"keep protocol notes"})
     );
     assert_eq!(
-        serde_json::to_value(HeadRequest {
-            entry: "entry-7".into(),
-        })
-        .unwrap(),
+        serde_json::to_value(HeadRequest::entry("entry-7")).unwrap(),
         json!({"entry":"entry-7"})
+    );
+    // The branch-from-a-message shape, which the host resolves to the
+    // entry's parent (spec 6.6).
+    assert_eq!(
+        serde_json::to_value(HeadRequest::before("entry-7")).unwrap(),
+        json!({"before":"entry-7"})
+    );
+    // Both shapes decode, and an unknown field is ignored as spec 6.10 asks.
+    assert_eq!(
+        serde_json::from_value::<HeadRequest>(json!({"before":"entry-7","junk":1})).unwrap(),
+        HeadRequest::before("entry-7"),
     );
 }
 

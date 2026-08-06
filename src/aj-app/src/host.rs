@@ -213,13 +213,25 @@ pub enum Command {
         instructions: Option<String>,
     },
     Settings(SettingsChange),
-    /// Switch the session's head to `entry`. Refused while work is live.
+    /// Switch the session's head. Refused while work is live.
     Head {
-        entry: EntryId,
+        target: HeadTarget,
     },
     KillTask {
         task: TaskId,
     },
+}
+
+/// Which entry a head switch moves to.
+///
+/// [`Self::Before`] exists because branching from a transcript message must
+/// replace that message rather than continue after it, so the head goes to
+/// its parent. The host resolves the parent under the same log lock that
+/// moves the head, which is what keeps the two from being separated by an
+/// append (spec 6.6).
+pub enum HeadTarget {
+    Entry(EntryId),
+    Before(EntryId),
 }
 
 /// A withdrawal of one agent's pending message, or a clear of the whole
@@ -853,6 +865,7 @@ impl SessionHost {
         // Cheap and in-memory, but it still walks the log, so snapshot
         // under the lock and build outside it.
         let snapshot = live.core.log.lock().await.snapshot();
+        let head = snapshot.head().cloned();
         let tree = snapshot.session_tree();
         Ok(SessionTree {
             segments: tree
@@ -869,6 +882,7 @@ impl SessionHost {
                     is_leaf: segment.is_leaf,
                 })
                 .collect(),
+            head,
         })
     }
 
