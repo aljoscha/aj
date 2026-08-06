@@ -264,6 +264,47 @@ impl SessionDirectory {
         }
     }
 
+    /// One session's fold state, mutably.
+    pub fn client_for_mut(&mut self, session: &str) -> Option<&mut SessionClient> {
+        self.sessions
+            .get_mut(session)
+            .map(|attached| &mut attached.client)
+    }
+
+    /// Arm every session the peer reports it served, for the attach blocks a
+    /// freshly opened stream carries.
+    ///
+    /// `served` is the peer's own answer, never the request we sent: an arm
+    /// for a block that never arrives strands that session's fold, and a
+    /// session the peer did attach but we left unarmed folds its block as
+    /// live frames (see [`SessionClient::expect_attach`]). Arming the whole
+    /// set in one call is what keeps those two failures out of reach of a
+    /// caller loop that covers only some of it.
+    pub fn expect_attach(&mut self, served: impl Fn(&str) -> bool) {
+        for (session, attached) in self.sessions.iter_mut() {
+            if served(session) {
+                attached.client.expect_attach();
+            }
+        }
+    }
+
+    /// Point the focused entry at `session`, keeping its fold, its transcript,
+    /// and whatever it owes.
+    ///
+    /// Staging only, for the frontend tests that need a client folding a
+    /// session the peer does not have. That is what a permanently refused
+    /// attach looks like from this side, and no honest gesture produces it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn rename_focused(&mut self, session: String) -> String {
+        let previous = std::mem::replace(&mut self.focused, session.clone());
+        let entry = self
+            .sessions
+            .remove(&previous)
+            .expect("the focused session is attached");
+        self.sessions.insert(session, entry);
+        previous
+    }
+
     /// The attach requests that re-establish every session this client folds,
     /// each offering its own cursor.
     ///
@@ -620,6 +661,56 @@ mod tests {
             !directory.has_unseen_output("session-with-no-row"),
             "and neither is a session with no row yet",
         );
+    }
+
+    /// Arming follows the peer's answer, not our request. A session the peer
+    /// did not serve must stay unarmed, or its fold waits for a block that
+    /// never comes and stops advancing its cursor.
+    #[test]
+    fn arming_covers_the_set_the_peer_served_and_no_more() {
+        let (mut directory, mut focused_chat) = two_sessions();
+        let cursor = |directory: &SessionDirectory, session: &str| {
+            directory
+                .client_for(session)
+                .expect("attached")
+                .cursor()
+                .map(|cursor| cursor.seq)
+        };
+        // Both sessions are past their first block and folding live frames.
+        let _ = directory.apply(&mut focused_chat, durable(FOCUSED, 1, "foreground"));
+        let _ = directory.apply(&mut focused_chat, durable(OTHER, 1, "background"));
+
+        // A reopened stream that served only the focused session.
+        directory.expect_attach(|session| session == FOCUSED);
+
+        // The armed fold is in the block phase, so it honours the block's
+        // `caught_up` and takes its high-water mark.
+        let _ = directory.apply(&mut focused_chat, state(FOCUSED));
+        let _ = directory.apply(&mut focused_chat, caught_up(FOCUSED, 9));
+        assert_eq!(
+            cursor(&directory, FOCUSED),
+            Some(9),
+            "the armed session took the block's high-water mark",
+        );
+
+        // The session left out was not armed, so the same shape of frames
+        // folds as live traffic and its `caught_up` is ignored. An arm that
+        // covered the whole set regardless of what the peer served would move
+        // this cursor.
+        let before = cursor(&directory, OTHER);
+        let _ = directory.apply(&mut focused_chat, state(OTHER));
+        let _ = directory.apply(&mut focused_chat, caught_up(OTHER, 5));
+        assert_eq!(
+            cursor(&directory, OTHER),
+            before,
+            "an unarmed session must not take a block's high-water mark",
+        );
+
+        // Arming the rest of the set then covers the one left out.
+        directory.expect_attach(|_| true);
+        let _ = directory.apply(&mut focused_chat, state(OTHER));
+        let _ = directory.apply(&mut focused_chat, caught_up(OTHER, 5));
+        assert_eq!(cursor(&directory, OTHER), Some(5));
     }
 
     /// A re-attach carries every session this client folds, each with its own

@@ -25,6 +25,7 @@ use aj_app::chat::ChatState;
 use aj_app::cli::args::{Args, Command as CliCommand};
 use aj_app::client::SessionClient;
 use aj_app::commands::CommandAction;
+use aj_app::directory::SessionDirectory;
 use aj_app::host::{
     Command, CommandOutcome, HeadTarget, LocalHandles, QueueOp, SettingsAxis, SettingsChange,
 };
@@ -123,14 +124,13 @@ struct World {
     /// two it is decides nothing above [`Control`] except the handful of
     /// gestures spec 9.1 leaves out of connect mode.
     control: Control,
-    /// The session this frontend renders. Changing it means re-attaching,
-    /// never rebuilding the world.
-    session: String,
-    /// The focused session's frame stream.
+    /// Every session this peer offers: the `list` rows, and a fold plus a
+    /// transcript for each session this client attached. Which one is focused
+    /// lives here too, so it cannot drift from the fold that serves it.
+    directory: SessionDirectory,
+    /// The one stream serving every attached session. Changing the attach set
+    /// means reopening it (spec 6.5), which is what a first focus does.
     stream: Stream,
-    /// The fold from those frames into `chat`, and the owner of this
-    /// client's agent lifecycle, cursor, and settings view.
-    client: SessionClient,
     /// Paces the retry of the reads an attach block obliges, so a peer that
     /// fails them cannot make the loop spend every iteration in a request
     /// (see [`refresh_client_reads`]).
@@ -242,11 +242,11 @@ async fn build_world(
         StartupSession::Resume(id) => id,
     };
     let control = Control::local(host);
-    let mut client = SessionClient::new(session.clone());
+    let mut directory = SessionDirectory::new(session.clone());
     // The stream before the handles: its attachment is what stops the host from
     // releasing the session in between (spec section 5), which would leave the
     // world holding handles into a core nothing drives.
-    let stream = open_stream(&control, &session, &mut client).await?;
+    let stream = open_stream(&control, &mut directory).await?;
     let handles = control
         .host()
         .expect("a local run holds the host")
@@ -268,9 +268,8 @@ async fn build_world(
     let chat = seeded_chat(&config, settings, context_window, &catalog);
     let mut world = World {
         control,
-        session,
+        directory,
         stream,
-        client,
         reads_retry: Retry::default(),
         local: Some(handles),
         working_directory: env.working_directory.clone(),
@@ -399,16 +398,15 @@ async fn build_connect_world(
         working_directory,
         created,
     } = connected;
-    let mut client = SessionClient::new(session.clone());
+    let mut directory = SessionDirectory::new(session.clone());
     // No run config to seed from: the block's opening `state` frame carries
     // the host's own settings and lands before the first paint.
     let chat = seeded_chat(&config, unknown_settings(), 0, &catalog);
-    let stream = open_stream(&control, &session, &mut client).await?;
+    let stream = open_stream(&control, &mut directory).await?;
     let mut world = World {
         control,
-        session,
+        directory,
         stream,
-        client,
         reads_retry: Retry::default(),
         local: None,
         // The host's directory, not ours: the session runs there, and its
@@ -435,7 +433,7 @@ async fn build_connect_world(
     }
     let dialed = format!("Connected to {}.", connect_url(&world));
     fold_notice(&mut world, &dialed);
-    if let Some(settings) = world.client.take_first_attach_settings() {
+    if let Some(settings) = world.client_mut().take_first_attach_settings() {
         let summary = format!(
             "Session settings: model {}/{}, thinking {}, thinking display {}, speed {}, \
              verbosity {}.",
@@ -447,9 +445,9 @@ async fn build_connect_world(
             settings.verbosity,
         );
         let notice = if created {
-            format!("Created session {}. {summary}", world.session)
+            format!("Created session {}. {summary}", world.session())
         } else {
-            format!("Attached session {}. {summary}", world.session)
+            format!("Attached session {}. {summary}", world.session())
         };
         fold_notice(&mut world, &notice);
     }
@@ -511,6 +509,24 @@ fn unknown_settings() -> AgentSettings {
     }
 }
 
+impl World {
+    /// The session this frontend renders.
+    fn session(&self) -> &str {
+        self.directory.focused()
+    }
+
+    /// The focused session's fold, and the owner of its agent lifecycle,
+    /// cursor, and settings view.
+    fn client(&self) -> &SessionClient {
+        self.directory.client()
+    }
+
+    /// The focused session's fold, mutably.
+    fn client_mut(&mut self) -> &mut SessionClient {
+        self.directory.client_mut()
+    }
+}
+
 #[cfg(test)]
 impl World {
     /// The focused session's direct handles, for the local-mode tests that
@@ -531,26 +547,29 @@ impl World {
     }
 }
 
-/// Open a frame stream for `session` and arm `client` for the attach block
-/// the host is about to write onto it.
+/// Open the one stream serving every session the directory folds, offering
+/// each session's own cursor, and arm every fold the peer reports it served.
 ///
-/// The caller folds the block with [`fold_attach_block`], which awaits it:
-/// the block is producer-paced (spec 6.9), so it is not necessarily queued
-/// when this returns. The cursor offered is the client's own, so a re-attach
-/// after a head switch is served under the new epoch and a re-attach within
-/// one is served the suffix.
+/// One stream per client, not one per session: the ordering guarantees are per
+/// stream, and changing the attach set means reopening it (spec 6.5). So this
+/// is both the first attach and the re-attach, and a first focus of a session
+/// is a reopen over the grown set.
+///
+/// Arming follows what the peer reports it attached, never what was asked for,
+/// and covers the whole set in one call (see
+/// [`SessionDirectory::expect_attach`]).
+///
+/// The caller folds the blocks with [`fold_attach_block`], which awaits the
+/// focused session's: blocks are producer-paced (spec 6.9), so they are not
+/// necessarily queued when this returns. The cursors offered are the clients'
+/// own, so a re-attach after a head switch is served under the new epoch and
+/// one within an epoch is served the suffix.
 async fn open_stream(
     control: &Control,
-    session: &str,
-    client: &mut SessionClient,
+    directory: &mut SessionDirectory,
 ) -> Result<Stream, ControlError> {
-    let stream = control.attach(session, client.cursor()).await?;
-    // Armed from what the peer reports it served, never from what we asked
-    // for: an arm for a block that never arrives would make the next
-    // on-change `state` frame look like one (see `expect_attach`).
-    if stream.attached(session) {
-        client.expect_attach();
-    }
+    let stream = control.attach_all(&directory.attach_requests()).await?;
+    directory.expect_attach(|session| stream.attached(session));
     Ok(stream)
 }
 
@@ -566,7 +585,7 @@ async fn open_tree_overlay(
     world: &World,
     shell: &Rc<RefCell<Shell>>,
 ) -> Result<Rc<RefCell<FilterableSelect>>, ControlError> {
-    let tree = world.control.tree(&world.session).await?;
+    let tree = world.control.tree(&world.session()).await?;
     let rows = build_tree_rows(&tree, Utc::now());
     let handles = shell.borrow().overlay_handles();
     Ok(open_session_tree(&handles, rows, tree.head))
@@ -584,7 +603,7 @@ async fn open_tree_overlay(
 fn fold_ready_frames(world: &mut World) -> bool {
     let mut redraw = false;
     while let Some(frame) = world.stream.try_recv() {
-        redraw |= world.client.apply(&mut world.chat.borrow_mut(), frame).0;
+        redraw |= world.directory.apply(&mut world.chat.borrow_mut(), frame).0;
     }
     redraw
 }
@@ -608,9 +627,9 @@ async fn fold_attach_block(world: &mut World) -> bool {
         };
         let ends_block = matches!(
             &frame,
-            aj_wire::Frame::CaughtUp { session, .. } if *session == world.session
+            aj_wire::Frame::CaughtUp { session, .. } if *session == world.session()
         );
-        let _ = world.client.apply(&mut world.chat.borrow_mut(), frame);
+        let _ = world.directory.apply(&mut world.chat.borrow_mut(), frame);
         if ends_block {
             return true;
         }
@@ -633,11 +652,11 @@ async fn refresh_client_reads(world: &mut World) {
         return;
     }
     let mut failed = false;
-    if world.client.needs_task_refetch() {
-        match world.control.tasks(&world.session).await {
+    if world.client().needs_task_refetch() {
+        match world.control.tasks(&world.session()).await {
             Ok(tasks) => {
                 let mut chat = world.chat.borrow_mut();
-                world.client.set_tasks(&mut chat, tasks);
+                world.directory.client_mut().set_tasks(&mut chat, tasks);
             }
             Err(err) => {
                 failed = true;
@@ -645,11 +664,11 @@ async fn refresh_client_reads(world: &mut World) {
             }
         }
     }
-    if world.client.needs_queue_refetch() {
-        match world.control.queue(&world.session).await {
+    if world.client().needs_queue_refetch() {
+        match world.control.queue(&world.session()).await {
             Ok(queue) => {
                 let mut chat = world.chat.borrow_mut();
-                world.client.set_queue(&mut chat, queue);
+                world.directory.client_mut().set_queue(&mut chat, queue);
             }
             Err(err) => {
                 failed = true;
@@ -667,7 +686,7 @@ async fn refresh_client_reads(world: &mut World) {
 /// Whether the client still owes the reads an attach block obliged, which is
 /// what decides if the loop has to wake for their paced retry.
 fn owes_client_reads(world: &World) -> bool {
-    world.client.needs_task_refetch() || world.client.needs_queue_refetch()
+    world.client().needs_task_refetch() || world.client().needs_queue_refetch()
 }
 
 /// The notice a gesture with no connect-mode path folds, naming why (spec
@@ -817,23 +836,49 @@ async fn focus_session(
         .host()
         .expect("a session change is refused in connect mode")
         .clone();
-    let mut client = SessionClient::new(session.clone());
+    // A session already attached is a view swap: its frames have been folding
+    // in the background all along, so there is no stream to reopen and no
+    // block to wait for (spec 9.2).
+    let attaching = !world.directory.is_attached(&session);
     // The stream first: its attachment is what stops the host from releasing
     // the session between here and the handles below (spec section 5,
     // attachment is the retention signal). Taking the handles first would leave
     // a window where an idle session past its grace is torn down in between,
     // and the world would hold handles into a core nothing drives while the
     // attach materialized a second one.
-    let stream = open_stream(&world.control, &session, &mut client).await?;
+    //
+    // Changing the attach set means reopening the stream (spec 6.5), so a first
+    // focus re-attaches every session this client already folds alongside the
+    // new one. Each offers its own cursor, so the sessions being carried over
+    // are served their suffix rather than a fresh backfill.
+    let stream = if attaching {
+        let mut requests = world.directory.attach_requests();
+        requests.push((session.clone(), None));
+        Some(world.control.attach_all(&requests).await?)
+    } else {
+        None
+    };
     let handles = host.local_handles(&session).await?;
 
     let (settings, context_window) = local_settings_seed(&handles);
-    *world.chat.borrow_mut() = seeded_chat(&world.config, settings, context_window, &world.catalog);
+    let minted =
+        attaching.then(|| seeded_chat(&world.config, settings, context_window, &world.catalog));
     world.working_directory = handles.env.working_directory.clone();
     world.local = Some(handles);
-    world.client = client;
-    world.stream = stream;
-    world.session = session;
+    // Parks the outgoing session's transcript and brings the incoming one into
+    // the cell the widgets read, which is what makes a switch back instant.
+    world
+        .directory
+        .focus(&mut world.chat.borrow_mut(), &session, || {
+            minted.expect("a session focused for the first time was minted a transcript")
+        });
+    if let Some(stream) = stream {
+        // Armed after the focus, so the session just inserted is in the set.
+        world
+            .directory
+            .expect_attach(|session| stream.attached(session));
+        world.stream = stream;
+    }
     // Status is resynced from the client once per iteration; reset it so
     // the frame between install and the next sync shows idle chrome.
     *world.status.borrow_mut() = StatusState::default();
@@ -854,8 +899,12 @@ async fn focus_session(
     // mirrors the `world.status` reset above, which resets chrome for the same
     // install-to-first-draw window.
     // Fold the attach block before the chrome reconcile below, so the first
-    // frame is drawn against the session's real history and settings.
-    fold_attach_block(world).await;
+    // frame is drawn against the session's real history and settings. A swap
+    // onto an already-attached session has no block coming, and awaiting one
+    // would hang the loop on a `caught_up` the host has no reason to send.
+    if attaching {
+        fold_attach_block(world).await;
+    }
     refresh_client_reads(world).await;
     sync_editor_chrome(world, shell);
     // Folded after the attach block so they land on top of the replayed
@@ -911,7 +960,7 @@ async fn branch_focused_session(
     target: HeadTarget,
     prompt: Option<String>,
 ) {
-    let session = world.session.clone();
+    let session = world.session().to_string();
     let branching = matches!(target, HeadTarget::Before(_));
     if let Err(err) = world
         .control
@@ -980,7 +1029,7 @@ fn head_refusal(branching: bool, err: &ControlError) -> String {
 /// Answers whether the attach block completed. A stream that dropped inside
 /// it leaves the client owing another attach, which the caller retries.
 async fn reattach(world: &mut World, shell: &Rc<RefCell<Shell>>) -> Result<bool, ControlError> {
-    let mut stream = open_stream(&world.control, &world.session, &mut world.client).await?;
+    let mut stream = open_stream(&world.control, &mut world.directory).await?;
     std::mem::swap(&mut world.stream, &mut stream);
     drop(stream);
     refresh_local_handles(world, shell).await?;
@@ -1013,7 +1062,7 @@ async fn refresh_local_handles(
     let Some(host) = world.control.host().cloned() else {
         return Ok(());
     };
-    world.local = Some(host.local_handles(&world.session).await?);
+    world.local = Some(host.local_handles(&world.session()).await?);
     shell.borrow().rebind_handles(world);
     Ok(())
 }
@@ -1187,7 +1236,8 @@ fn fresh_env_notices(fresh: bool, env: &AgentEnv) -> Vec<AgentEvent> {
 /// [`SessionClient::apply_local`]).
 fn fold_event(world: &mut World, event: AgentEvent) {
     let _ = world
-        .client
+        .directory
+        .client_mut()
         .apply_local(&mut world.chat.borrow_mut(), event);
 }
 
@@ -1400,7 +1450,8 @@ fn finish_login(
 /// case the lifecycle can lag: the host marks it busy the moment it spawns
 /// the turn, before the turn's `AgentStart` reaches anyone.
 fn view_busy(world: &World, view: AgentId) -> bool {
-    world.client.lifecycle().is_running(view) || (view == AgentId::Main && world.client.working())
+    world.client().lifecycle().is_running(view)
+        || (view == AgentId::Main && world.client().working())
 }
 
 /// The background work the focused session is carrying, as
@@ -1417,7 +1468,7 @@ fn view_busy(world: &World, view: AgentId) -> bool {
 fn running_work(world: &World) -> (usize, usize) {
     let chat = world.chat.borrow();
     running_work_counts(
-        usize::from(world.client.working()),
+        usize::from(world.client().working()),
         chat.tasks().values().map(|task| (&task.kind, task.status)),
     )
 }
@@ -1429,7 +1480,7 @@ fn running_work(world: &World) -> (usize, usize) {
 /// shares one sync point and the mirror can't silently drift.
 fn sync_status(world: &World) -> bool {
     let active = world.chat.borrow().active_view();
-    let life = world.client.lifecycle();
+    let life = world.client().lifecycle();
     let next = StatusState {
         running: life.is_running(active),
         compacting: life.is_compacting(active),
@@ -1505,7 +1556,7 @@ async fn handle_submit(world: &mut World, text: String) -> bool {
 /// behind a busy agent. Its wording is user-facing, and a remote client
 /// shows the same string.
 async fn prompt_host(world: &mut World, command: Command) -> bool {
-    match world.control.command(&world.session, command).await {
+    match world.control.command(&world.session(), command).await {
         Ok(_) => true,
         Err(err) => {
             fold_notice(world, &err.to_string());
@@ -1556,7 +1607,7 @@ async fn cancel_viewed_turn(world: &World) -> bool {
     }
     if let Err(err) = world
         .control
-        .command(&world.session, Command::Cancel { agent: active })
+        .command(&world.session(), Command::Cancel { agent: active })
         .await
     {
         tracing::warn!("the host refused a cancel: {err}");
@@ -1606,7 +1657,7 @@ async fn yank_pending_into_editor(world: &World, shell: &Rc<RefCell<Shell>>) -> 
     let withdrawn = world
         .control
         .command(
-            &world.session,
+            &world.session(),
             Command::Queue(QueueOp::Remove { agent: target }),
         )
         .await;
@@ -1682,7 +1733,7 @@ async fn handle_steer(world: &mut World, shell: &Rc<RefCell<Shell>>) {
     let steered = world
         .control
         .command(
-            &world.session,
+            &world.session(),
             Command::Steer {
                 agent: target,
                 text: text.clone(),
@@ -1907,7 +1958,7 @@ async fn apply_command_action(
             // refusal reworded here.
             match world
                 .control
-                .command(&world.session, Command::Compact { instructions: None })
+                .command(&world.session(), Command::Compact { instructions: None })
                 .await
             {
                 Ok(_) => {}
@@ -1934,7 +1985,7 @@ async fn apply_command_action(
                 );
                 return ActionEffect::Redraw;
             };
-            spawn_session_export(&log, &world.session, export_tx);
+            spawn_session_export(&log, &world.session(), export_tx);
             ActionEffect::None
         }
         CommandAction::OpenThinkingSelector => {
@@ -2087,7 +2138,7 @@ async fn apply_command_action(
                 return ActionEffect::Redraw;
             }
             let handles = shell.borrow().overlay_handles();
-            open_session_selector(&handles, world.session.clone());
+            open_session_selector(&handles, world.session().to_string());
             ActionEffect::OpenedOverlay
         }
         CommandAction::OpenSessionTree => match open_tree_overlay(world, shell).await {
@@ -2377,7 +2428,7 @@ async fn kill_task(world: &World, id: TaskId) -> String {
         Some(aj_agent::tool::TaskStatus::Running) => {
             match world
                 .control
-                .command(&world.session, Command::KillTask { task: id })
+                .command(&world.session(), Command::KillTask { task: id })
                 .await
             {
                 Ok(_) => format!("Killing background task #{id}."),
@@ -2429,7 +2480,7 @@ fn viewed_thinking(world: &World, target: AgentId) -> Option<ThinkingConfig> {
         .borrow()
         .footers()
         .settings(target)
-        .or_else(|| world.client.settings())
+        .or_else(|| world.client().settings())
         .and_then(|s| thinking_config_from_name(&s.thinking))
         .flatten()
 }
@@ -2440,7 +2491,7 @@ fn viewed_model(world: &World, target: AgentId) -> (String, String) {
     let settings = world.chat.borrow().footers().settings(target).cloned();
     settings
         .as_ref()
-        .or_else(|| world.client.settings())
+        .or_else(|| world.client().settings())
         .map(|s| (s.provider.clone(), s.model_id.clone()))
         .unwrap_or_default()
 }
@@ -2578,7 +2629,7 @@ async fn command_settings(
     };
     match world
         .control
-        .command(&world.session, Command::Settings(change))
+        .command(&world.session(), Command::Settings(change))
         .await
     {
         Ok(_) => Ok(unpersisted_note(world, persisting)),
@@ -2634,7 +2685,7 @@ async fn confirm_model(
             // The host rebuilds a sub's bundle at the session's speed, so
             // that is the speed to show for it.
             let speed = world
-                .client
+                .client()
                 .settings()
                 .map(|settings| settings.speed.clone());
             let window = info.context_window;
@@ -2807,7 +2858,7 @@ async fn apply_setting_change(
                     // row to the speed still in force.
                     Err(notice) => {
                         let previous = world
-                            .client
+                            .client()
                             .settings()
                             .map(|settings| settings.speed.clone());
                         if let Some(previous) = previous {
@@ -4263,9 +4314,9 @@ impl Shell {
         *self.settings_ui.borrow_mut() = None;
         *self.task_view.borrow_mut() = None;
         self.rebind_handles(world);
-        self.header.borrow_mut().text = format!("{APP_TITLE} - session {}", world.session);
+        self.header.borrow_mut().text = format!("{APP_TITLE} - session {}", world.session());
         self.window_title =
-            aj_app::session::window_title(APP_TITLE, &world.session, &world.working_directory);
+            aj_app::session::window_title(APP_TITLE, &world.session(), &world.working_directory);
         self.transcript.borrow_mut().reset_to_tail();
     }
 
@@ -4700,7 +4751,7 @@ pub async fn run(args: Args) -> Result<()> {
     let theme_name = resolve_theme_name(world_config_theme(&world).as_deref()).to_string();
     let env_mode = ColorMode::detect();
     let theme = ThemeHandle::new(Theme::load_with_mode(&theme_name, env_mode));
-    let header = format!("{APP_TITLE} - session {}", world.session);
+    let header = format!("{APP_TITLE} - session {}", world.session());
     let cwd = world.working_directory.clone();
     let shell = Rc::new(RefCell::new(Shell::new(
         Rc::clone(&world.chat),
@@ -4711,7 +4762,7 @@ pub async fn run(args: Args) -> Result<()> {
             .map(|local| local.task_registry.clone()),
         theme.clone(),
         header,
-        &world.session,
+        &world.session(),
         cwd,
     )));
     let root: WidgetRef = to_widget_ref(Rc::clone(&shell));
@@ -4828,7 +4879,7 @@ pub async fn run(args: Args) -> Result<()> {
         // only once the change took: nothing is torn down here (the host
         // keeps every session it materialized live), so a refused change
         // leaves the same session focused and its usage still growing.
-        let previous = world.session.clone();
+        let previous = world.session().to_string();
         let usage = session_usage(&world, &previous).await;
         match apply_focus_request(&mut app, &shell, &mut world, request).await {
             Focus::Moved => match usage {
@@ -5153,7 +5204,7 @@ async fn poll_task_output(world: &World, shell: &Rc<RefCell<Shell>>, retry: &mut
         return false;
     }
     let task = view.borrow().task();
-    match world.control.task_details(&world.session, task).await {
+    match world.control.task_details(&world.session(), task).await {
         Ok(details) => {
             retry.again_in(TASK_POLL_INTERVAL);
             view.borrow_mut().apply_details(details);
@@ -5187,7 +5238,7 @@ async fn advance_resume(
 ) -> Result<Option<Resume>, ControlError> {
     match state.step {
         ResumeStep::Waiting => {
-            match open_stream(&world.control, &world.session, &mut world.client).await {
+            match open_stream(&world.control, &mut world.directory).await {
                 Ok(stream) => {
                     world.stream = stream;
                     // The reopened stream may name a fresh materialization, so
@@ -5421,7 +5472,7 @@ async fn drive(
             .then(|| world.reads_retry.due())
             .flatten();
         let reattach_deadline = world
-            .client
+            .client()
             .needs_reattach()
             .then(|| reattach_retry.due())
             .flatten();
@@ -5770,7 +5821,7 @@ async fn drive(
             frame = world.stream.recv(), if resume.is_none() => {
                 match frame {
                     ControlFrame::Frame(frame) => {
-                        if world.client.apply(&mut world.chat.borrow_mut(), frame).0 {
+                        if world.directory.apply(&mut world.chat.borrow_mut(), frame).0 {
                             app.request_redraw();
                         }
                     }
@@ -5974,7 +6025,7 @@ async fn drive(
         // Continuity broke (a head switch this process did not make), so the
         // client owes a re-attach. A pending re-attach already owes one, and
         // its own attach discharges this.
-        if resume.is_none() && world.client.needs_reattach() && reattach_retry.ready() {
+        if resume.is_none() && world.client().needs_reattach() && reattach_retry.ready() {
             resume = discharge_reattach(world, shell, &mut reattach_retry).await;
             if resume.is_some() {
                 world.connection = Connection::Reconnecting;
@@ -6061,7 +6112,7 @@ async fn session_usage(world: &World, session: &str) -> Option<UsageSummary> {
                 None
             }
         },
-        None if session == world.session => Some(world.chat.borrow().usage_summary()),
+        None if session == world.session() => Some(world.chat.borrow().usage_summary()),
         // A connection never leaves its session, so no other one can be asked
         // for.
         None => None,
@@ -6101,9 +6152,9 @@ impl ExitBanner {
     /// event-derived accounting (spec 9.1), and the resume hint is left out
     /// because `aj continue` would resume a session on the *host*, not here.
     async fn collect(world: &World, completed: Vec<(String, UsageSummary)>) -> ExitBanner {
-        let live = session_usage(world, &world.session)
+        let live = session_usage(world, &world.session())
             .await
-            .map(|usage| (world.session.clone(), usage));
+            .map(|usage| (world.session().to_string(), usage));
         // Only sessions with at least one persisted user-thread leaf are
         // worth resuming. A fresh session the user quit without typing
         // anything gets no hint.
@@ -6119,7 +6170,7 @@ impl ExitBanner {
         ExitBanner {
             completed,
             live,
-            resume_hint: resume_eligible.then(|| format_resume_hint(&world.session)),
+            resume_hint: resume_eligible.then(|| format_resume_hint(&world.session())),
         }
     }
 
@@ -6258,7 +6309,7 @@ mod tests {
         shell.rebind(&world);
         let expected = aj_app::session::window_title(
             APP_TITLE,
-            &world.session,
+            &world.session(),
             &world.handles().env.working_directory,
         );
         assert_eq!(shell.window_title, expected);
@@ -6763,13 +6814,13 @@ mod tests {
                 .expect("session list")
                 .sessions
                 .iter()
-                .find(|entry| entry.id == world.session)
+                .find(|entry| entry.id == world.session())
                 .is_some_and(|entry| !entry.working && entry.tasks == 0);
             // The client's own view has to have caught up with the host's,
             // not just the host be idle: over a connection the frames of the
             // work that just finished can still be in flight (in process they
             // are already queued, so this converges at once).
-            if quiet && !world.client.working() {
+            if quiet && !world.client().working() {
                 fold_ready_frames(world);
                 return;
             }
@@ -6788,17 +6839,17 @@ mod tests {
     async fn read_host_state(world: &mut World) {
         let tasks = world
             .control
-            .tasks(&world.session)
+            .tasks(&world.session())
             .await
             .expect("the tasks read");
         let queue = world
             .control
-            .queue(&world.session)
+            .queue(&world.session())
             .await
             .expect("the queue read");
         let mut chat = world.chat.borrow_mut();
-        world.client.set_tasks(&mut chat, tasks);
-        world.client.set_queue(&mut chat, queue);
+        world.directory.client_mut().set_tasks(&mut chat, tasks);
+        world.directory.client_mut().set_queue(&mut chat, queue);
     }
 
     /// Queue a follow-up for `agent` on the host and let the client model see
@@ -7088,7 +7139,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let mut world = scripted_world(&dir, "parallel-agents").await;
         drive_demo_to_completion(&mut world).await;
-        let session_id = world.session.clone();
+        let session_id = world.session().to_string();
         shut_down(&world).await;
 
         let resumed = resumed_world(&dir, "parallel-agents", &session_id).await;
@@ -7131,7 +7182,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let mut world = scripted_world(&dir, "parallel-agents").await;
         drive_demo_to_completion(&mut world).await;
-        let session_id = world.session.clone();
+        let session_id = world.session().to_string();
         shut_down(&world).await;
 
         let mut resumed = resumed_world(&dir, "parallel-agents", &session_id).await;
@@ -7238,7 +7289,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let mut world = scripted_world(&dir, "parallel-agents").await;
         drive_demo_to_completion(&mut world).await;
-        let session_id = world.session.clone();
+        let session_id = world.session().to_string();
         shut_down(&world).await;
 
         let mut resumed = resumed_world(&dir, "parallel-agents", &session_id).await;
@@ -7296,7 +7347,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let mut world = scripted_world(&dir, "parallel-agents").await;
         drive_demo_to_completion(&mut world).await;
-        let session_id = world.session.clone();
+        let session_id = world.session().to_string();
         shut_down(&world).await;
 
         let mut resumed = resumed_world(&dir, "parallel-agents", &session_id).await;
@@ -7398,7 +7449,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let mut world = scripted_world(&dir, "parallel-agents").await;
         drive_demo_to_completion(&mut world).await;
-        let session_id = world.session.clone();
+        let session_id = world.session().to_string();
         let log_path = {
             let log = world.handles().log.lock().await;
             log.path().to_path_buf()
@@ -7593,7 +7644,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let mut world = scripted_world(&dir, "streaming-text").await;
         persist_session(&mut world).await;
-        let session = world.session.clone();
+        let session = world.session().to_string();
         shut_down(&world).await;
         let resumed = resumed_world(&dir, "streaming-text", &session).await;
 
@@ -7664,14 +7715,23 @@ mod tests {
             world_shell_app(&dir, "streaming-text", default_layers()).await;
         // Persist the session so the resume path below has a log on disk.
         persist_session(&mut world).await;
-        let resumable = world.session.clone();
-        let has_context =
-            |world: &World| main_notices(world).iter().any(|n| n.contains("Context:"));
+        let resumable = world.session().to_string();
+        // Counted, not merely looked for: switching back restores the parked
+        // transcript, which already carries the context this session folded at
+        // startup, so what a resume must not do is fold a second one.
+        let contexts = |world: &World| {
+            main_notices(world)
+                .iter()
+                .filter(|n| n.contains("Context:"))
+                .count()
+        };
+        assert_eq!(contexts(&world), 1, "startup folded this session's context");
 
         let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
         assert!(matches!(moved, Focus::Moved));
-        assert!(
-            has_context(&world),
+        assert_eq!(
+            contexts(&world),
+            1,
             "a created session folds its context: {:?}",
             main_notices(&world),
         );
@@ -7682,14 +7742,15 @@ mod tests {
             &mut app,
             &shell,
             &mut world,
-            FocusRequest::Resume(resumable.clone()),
+            FocusRequest::Resume(resumable.to_string()),
         )
         .await;
         assert!(matches!(moved, Focus::Moved));
-        assert_eq!(world.session, resumable);
-        assert!(
-            !has_context(&world),
-            "a resume folds no context: {:?}",
+        assert_eq!(world.session(), resumable);
+        assert_eq!(
+            contexts(&world),
+            1,
+            "a resume folded a second context onto the transcript it restored: {:?}",
             main_notices(&world),
         );
 
@@ -7703,9 +7764,10 @@ mod tests {
         )
         .await;
         assert!(matches!(stayed, Focus::Same));
-        assert_eq!(world.session, resumable, "the focus did not move");
-        assert!(
-            !has_context(&world),
+        assert_eq!(world.session(), resumable, "the focus did not move");
+        assert_eq!(
+            contexts(&world),
+            1,
             "the refusal folds no context: {:?}",
             main_notices(&world),
         );
@@ -8699,11 +8761,11 @@ mod tests {
 
         handle_submit(&mut world, "hi there".to_string()).await;
         fold_ready_frames(&mut world);
-        assert!(world.client.working(), "the host accepted the prompt");
+        assert!(world.client().working(), "the host accepted the prompt");
 
         // The frame arm, until the turn is over.
         settle(&mut world).await;
-        assert!(!world.client.working(), "no turn left in flight");
+        assert!(!world.client().working(), "no turn left in flight");
 
         {
             let chat = world.chat.borrow();
@@ -8759,7 +8821,7 @@ mod tests {
     }
 
     fn lifecycle_running(world: &World) -> bool {
-        world.client.lifecycle().is_running(AgentId::Main)
+        world.client().lifecycle().is_running(AgentId::Main)
     }
 
     /// A non-empty launch prompt runs a Main turn, so the initial session
@@ -8771,7 +8833,7 @@ mod tests {
 
         auto_submit_launch(&mut world, vec![UserContent::text("launch me")]).await;
         fold_ready_frames(&mut world);
-        assert!(world.client.working(), "the launch prompt started a turn");
+        assert!(world.client().working(), "the launch prompt started a turn");
 
         settle(&mut world).await;
         let prompts: Vec<String> = world
@@ -8799,7 +8861,7 @@ mod tests {
 
         auto_submit_launch(&mut world, Vec::new()).await;
         fold_ready_frames(&mut world);
-        assert!(!world.client.working());
+        assert!(!world.client().working());
         assert!(!world.chat.borrow().has_conversation());
         shut_down(&world).await;
     }
@@ -8889,7 +8951,7 @@ mod tests {
         install_busy_script(world.handles());
         handle_submit(&mut world, "go".to_string()).await;
         fold_ready_frames(&mut world);
-        assert!(world.client.working(), "the session is busy");
+        assert!(world.client().working(), "the session is busy");
 
         apply_command(&mut world, &shell, CommandAction::Compact).await;
         assert!(
@@ -8934,7 +8996,7 @@ mod tests {
         let log_path = dir
             .path()
             .join("sessions")
-            .join(format!("{}.jsonl", world.session));
+            .join(format!("{}.jsonl", world.session()));
         std::fs::write(&log_path, "").expect("take the path the log wants");
 
         handle_submit(&mut world, "hi".to_string()).await;
@@ -8963,7 +9025,7 @@ mod tests {
         install_busy_script(world.handles());
         handle_submit(&mut world, "again".to_string()).await;
         fold_ready_frames(&mut world);
-        assert!(world.client.working(), "the session survived the error");
+        assert!(world.client().working(), "the session survived the error");
         settle(&mut world).await;
         assert!(
             user_rows(&world).iter().any(|text| text == "again"),
@@ -8999,7 +9061,7 @@ mod tests {
         world
             .host()
             .command(
-                &world.session,
+                &world.session(),
                 Command::Head {
                     target: HeadTarget::Entry(head),
                 },
@@ -9008,14 +9070,14 @@ mod tests {
             .expect("the head switch is accepted");
         fold_ready_frames(&mut world);
         assert!(
-            world.client.needs_reattach(),
+            world.client().needs_reattach(),
             "the reset frame left the client owing a re-attach",
         );
 
         reattach(&mut world, &shell).await.expect("re-attach");
 
         assert!(
-            !world.client.needs_reattach(),
+            !world.client().needs_reattach(),
             "asking for the attach discharged it",
         );
         assert_eq!(
@@ -9056,7 +9118,7 @@ mod tests {
         world
             .host()
             .command(
-                &world.session,
+                &world.session(),
                 Command::Head {
                     target: HeadTarget::Entry(head),
                 },
@@ -9065,13 +9127,15 @@ mod tests {
             .expect("the head switch is accepted");
         fold_ready_frames(&mut world);
         assert!(
-            world.client.needs_reattach(),
+            world.client().needs_reattach(),
             "the reset left an obligation"
         );
 
         // Point the world at a session the host does not have, which is what a
         // refused attach looks like from here.
-        let live_session = std::mem::replace(&mut world.session, "no-such-session".to_string());
+        let live_session = world
+            .directory
+            .rename_focused("no-such-session".to_string());
         let mut retry = Retry::default();
 
         assert!(
@@ -9087,7 +9151,7 @@ mod tests {
             .count();
         assert_eq!(warned, 1, "the refusal is reported once");
         assert!(
-            world.client.needs_reattach(),
+            world.client().needs_reattach(),
             "and the obligation still stands",
         );
         assert!(!retry.ready(), "the next attempt is held back");
@@ -9119,7 +9183,7 @@ mod tests {
             "a repeated refusal did not back off further",
         );
 
-        world.session = live_session;
+        world.directory.rename_focused(live_session);
         shut_down(&world).await;
     }
 
@@ -9137,7 +9201,7 @@ mod tests {
             world
                 .control
                 .command(
-                    &world.session,
+                    &world.session(),
                     Command::Queue(QueueOp::Remove {
                         agent: AgentId::Main,
                     }),
@@ -9164,7 +9228,7 @@ mod tests {
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         run_prompt(&mut world, "seed").await;
         assert_eq!(user_rows(&world), vec!["seed"]);
-        let before = CanonicalState::of(&world.chat.borrow(), &world.client);
+        let before = CanonicalState::of(&world.chat.borrow(), &world.client());
 
         evict_local_stream(&mut world).await;
 
@@ -9189,7 +9253,7 @@ mod tests {
         // re-serves the durable entries above the client's cursor, and a
         // doubled assistant row is exactly as wrong as a doubled prompt.
         assert_eq!(
-            host_entries(&CanonicalState::of(&world.chat.borrow(), &world.client)),
+            host_entries(&CanonicalState::of(&world.chat.borrow(), &world.client())),
             host_entries(&before),
             "the backfill rebuilt the transcript rather than doubling it",
         );
@@ -9376,7 +9440,7 @@ mod tests {
         world
             .host()
             .command(
-                &world.session,
+                &world.session(),
                 Command::Head {
                     target: HeadTarget::Entry(head),
                 },
@@ -9389,7 +9453,7 @@ mod tests {
         fold_ready_frames(&mut world);
         refresh_client_reads(&mut world).await;
         assert!(
-            world.client.needs_reattach(),
+            world.client().needs_reattach(),
             "the reset left an obligation",
         );
         assert!(
@@ -9397,7 +9461,9 @@ mod tests {
             "and no read is owed alongside it",
         );
 
-        let live_session = std::mem::replace(&mut world.session, "no-such-session".to_string());
+        let live_session = world
+            .directory
+            .rename_focused("no-such-session".to_string());
         (world, shell, live_session)
     }
 
@@ -9414,7 +9480,7 @@ mod tests {
             .expect("session list")
             .sessions
             .iter()
-            .find(|entry| entry.id == world.session)
+            .find(|entry| entry.id == world.session())
             .expect("the focused session is in the host's directory")
             .last_seq
             .expect("a live session's row reports its position")
@@ -9430,12 +9496,12 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         run_prompt(&mut world, "seed").await;
-        let before = CanonicalState::of(&world.chat.borrow(), &world.client);
+        let before = CanonicalState::of(&world.chat.borrow(), &world.client());
         // The comparison below is not vacuous: the client's cursor sits under
         // the host's durable mark, so the re-attach really re-serves an entry
         // the fold has to recognize rather than append again.
         let cursor = world
-            .client
+            .client()
             .cursor()
             .expect("the startup attach committed a cursor")
             .seq;
@@ -9472,7 +9538,7 @@ mod tests {
             main_notices(&world),
         );
         assert_eq!(
-            host_entries(&CanonicalState::of(&world.chat.borrow(), &world.client)),
+            host_entries(&CanonicalState::of(&world.chat.borrow(), &world.client())),
             host_entries(&before),
             "the loop's re-attach rebuilt the transcript rather than doubling it",
         );
@@ -9510,10 +9576,10 @@ mod tests {
             refusals(&world.chat.borrow()),
         );
         assert!(
-            world.client.needs_reattach(),
+            world.client().needs_reattach(),
             "the obligation still stands, so every iteration had one to discharge",
         );
-        world.session = live_session;
+        world.directory.rename_focused(live_session);
         shut_down(&world).await;
     }
 
@@ -9577,7 +9643,7 @@ mod tests {
             refused >= 1,
             "the loop never attempted the re-attach it owed",
         );
-        world.session = live_session;
+        world.directory.rename_focused(live_session);
         shut_down(&world).await;
     }
 
@@ -9595,13 +9661,13 @@ mod tests {
 
         // Attach without discharging the reads, which is the state every
         // `caught_up` leaves the client in (spec 6.7).
-        world.stream = open_stream(&world.control, &world.session, &mut world.client)
+        world.stream = open_stream(&world.control, &mut world.directory)
             .await
             .expect("re-attach");
         assert!(fold_attach_block(&mut world).await, "the block completed");
         assert!(owes_client_reads(&world), "the block obliged both reads");
         assert!(
-            !world.client.needs_reattach(),
+            !world.client().needs_reattach(),
             "and nothing else is owed alongside them",
         );
         // Wait the host's `list` coalescing out (spec 6.8) and drain, so the
@@ -9612,7 +9678,9 @@ mod tests {
 
         // Point the world at a session the host does not have, so every read is
         // refused.
-        world.session = "no-such-session".to_string();
+        world
+            .directory
+            .rename_focused("no-such-session".to_string());
 
         // Room for well over the first three attempts (at once, then 200ms, then
         // a further 400ms), so a busy machine still gets through them.
@@ -9660,11 +9728,11 @@ mod tests {
         reattach(&mut world, &shell).await.expect("re-attach");
 
         assert!(
-            !world.client.needs_task_refetch(),
+            !world.client().needs_task_refetch(),
             "the task read is discharged",
         );
         assert!(
-            !world.client.needs_queue_refetch(),
+            !world.client().needs_queue_refetch(),
             "and the queue read too",
         );
         {
@@ -9785,7 +9853,7 @@ mod tests {
 
         handle_submit(&mut world, "first".to_string()).await;
         fold_ready_frames(&mut world);
-        assert!(world.client.working());
+        assert!(world.client().working());
 
         // Wait until the prompt's own user message landed before
         // queueing: the turn drains the follow-up queue right at its
@@ -9809,7 +9877,7 @@ mod tests {
             let ControlFrame::Frame(frame) = received else {
                 panic!("the stream is open");
             };
-            let _ = world.client.apply(&mut world.chat.borrow_mut(), frame);
+            let _ = world.directory.apply(&mut world.chat.borrow_mut(), frame);
         }
 
         handle_submit(&mut world, "second".to_string()).await;
@@ -9964,7 +10032,7 @@ mod tests {
 
         handle_submit(&mut world, "first".to_string()).await;
         fold_ready_frames(&mut world);
-        assert!(world.client.working(), "busy");
+        assert!(world.client().working(), "busy");
 
         // Busy + editor text: queue as steering, clear the editor.
         shell
@@ -10019,7 +10087,7 @@ mod tests {
             .insert_at_cursor("hi there");
         assert!(handle_host_action(&mut world, &shell, AjAction::Steer).await);
         fold_ready_frames(&mut world);
-        assert!(world.client.working(), "idle steer spawned a prompt turn");
+        assert!(world.client().working(), "idle steer spawned a prompt turn");
         assert!(
             world
                 .handles()
@@ -10062,7 +10130,7 @@ mod tests {
         install_busy_script(world.handles());
         handle_submit(&mut world, "running prompt".to_string()).await;
         fold_ready_frames(&mut world);
-        assert!(world.client.working(), "the session is busy");
+        assert!(world.client().working(), "the session is busy");
 
         let transcript = Rc::clone(&shell.borrow().transcript);
         let transcript_ctx = draw_ctx(40, 8);
@@ -10135,7 +10203,7 @@ mod tests {
 
         assert_eq!(shell.borrow().take_host_action(), None);
         assert_eq!(shell.borrow().editor.borrow().text(), "new prompt");
-        assert!(!world.client.working(), "no turn was spawned");
+        assert!(!world.client().working(), "no turn was spawned");
         assert!(transcript.borrow().in_focus_mode(), "focus is preserved");
         let _ = transcript.borrow_mut().draw(&transcript_ctx);
         assert!(!transcript.borrow().is_at_bottom(), "scroll is preserved");
@@ -10161,7 +10229,7 @@ mod tests {
         install_busy_script(world.handles());
         handle_submit(&mut world, "running prompt".to_string()).await;
         fold_ready_frames(&mut world);
-        assert!(world.client.working(), "the session is busy");
+        assert!(world.client().working(), "the session is busy");
 
         let transcript = Rc::clone(&shell.borrow().transcript);
         let transcript_ctx = draw_ctx(40, 8);
@@ -10243,7 +10311,7 @@ mod tests {
 
         settle(&mut world).await;
         assert!(
-            !world.client.working(),
+            !world.client().working(),
             "no wake spawned, the queue was empty"
         );
         shut_down(&world).await;
@@ -12483,6 +12551,22 @@ mod tests {
         notices_of(&world.chat.borrow())
     }
 
+    /// The user rows of the focused Main transcript, in order.
+    fn user_messages(world: &World) -> Vec<String> {
+        world
+            .chat
+            .borrow()
+            .transcript(AgentId::Main)
+            .expect("main transcript")
+            .entries()
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntryKind::User(user) => Some(user.joined_text()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The notice rows of a chat model's Main transcript, in order.
     ///
     /// Takes the model rather than the world, so a test observing a drive loop
@@ -13201,7 +13285,7 @@ mod tests {
     async fn create_disk_session(dir: &TempDir, prompt: &str) -> String {
         let mut world = scripted_world(dir, "streaming-text").await;
         run_prompt(&mut world, prompt).await;
-        let id = world.session.clone();
+        let id = world.session().to_string();
         // The host holds the session live (and its lock) until it shuts down,
         // so a caller that wants to resume the id has to be handed a session
         // nobody holds.
@@ -13242,7 +13326,7 @@ mod tests {
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         handle_submit(&mut world, "go".to_string()).await;
         fold_ready_frames(&mut world);
-        assert!(world.client.working(), "busy");
+        assert!(world.client().working(), "busy");
 
         // The selector opens read-only mid-turn.
         assert!(matches!(
@@ -13293,7 +13377,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         run_prompt(&mut world, "seed").await;
-        assert!(!world.client.working(), "no turn in flight");
+        assert!(!world.client().working(), "no turn in flight");
         let task = register_bash_task(&mut world, "sleep 100").await;
 
         // The command refuses up front.
@@ -13337,7 +13421,7 @@ mod tests {
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         handle_submit(&mut world, "go".to_string()).await;
         fold_ready_frames(&mut world);
-        assert!(world.client.working(), "busy");
+        assert!(world.client().working(), "busy");
 
         assert!(matches!(
             apply_command(&mut world, &shell, CommandAction::OpenSessionTree).await,
@@ -13527,7 +13611,7 @@ mod tests {
         let (mut world, shell, mut app, _writer, _root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
         run_prompt(&mut world, "alpha session prompt").await;
-        let alpha_id = world.session.clone();
+        let alpha_id = world.session().to_string();
 
         // Snapshot the outgoing usage, as the outer loop does before it
         // changes focus.
@@ -13552,7 +13636,7 @@ mod tests {
         .await;
         assert!(matches!(moved, Focus::Moved));
 
-        assert_eq!(world.session, beta, "the frontend re-attached onto beta");
+        assert_eq!(world.session(), beta, "the frontend re-attached onto beta");
         // The transcript renders beta's replayed content, not alpha's, which
         // proves every chrome widget follows the content-swapped chat cell.
         let rows = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
@@ -13588,10 +13672,10 @@ mod tests {
         // Switch again, this time to a fresh session; usage keeps
         // accumulating and the new session's transcript is empty.
         completed.push((
-            world.session.clone(),
+            world.session().to_string(),
             world
                 .host()
-                .usage(&world.session)
+                .usage(&world.session())
                 .await
                 .expect("usage")
                 .expect("a live session"),
@@ -13599,7 +13683,7 @@ mod tests {
         let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
         assert!(matches!(moved, Focus::Moved));
 
-        assert_ne!(world.session, beta, "a fresh session was minted");
+        assert_ne!(world.session(), beta, "a fresh session was minted");
         let fresh_rows = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
         assert!(
             !fresh_rows.contains("beta session prompt"),
@@ -13617,7 +13701,7 @@ mod tests {
         assert_eq!(banner.completed.len(), 2);
         assert_eq!(
             banner.live.as_ref().map(|(id, _)| id.as_str()),
-            Some(world.session.as_str()),
+            Some(world.session()),
         );
         banner.print();
         shut_down(&world).await;
@@ -13820,7 +13904,7 @@ mod tests {
         // Start a turn so the session is busy.
         handle_submit(&mut world, "first".to_string()).await;
         fold_ready_frames(&mut world);
-        assert!(world.client.working(), "a turn is in flight");
+        assert!(world.client().working(), "a turn is in flight");
         {
             let sh = shell.borrow();
             arm_branch(&sh.branch_anchor, "m1".to_string());
@@ -13875,7 +13959,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         run_prompt(&mut world, "seed").await;
-        assert!(!world.client.working(), "no turn in flight");
+        assert!(!world.client().working(), "no turn in flight");
         let task = register_bash_task(&mut world, "sleep 100").await;
         {
             let sh = shell.borrow();
@@ -13952,7 +14036,7 @@ mod tests {
                 world
                     .host()
                     .command(
-                        &world.session,
+                        &world.session(),
                         Command::Head {
                             target: HeadTarget::Before(named),
                         },
@@ -14008,7 +14092,7 @@ mod tests {
         install_busy_script(world.handles());
         handle_submit(&mut world, "busy".to_string()).await;
         fold_ready_frames(&mut world);
-        assert!(world.client.working(), "a turn is in flight");
+        assert!(world.client().working(), "a turn is in flight");
         apply_focus_request(&mut app, &shell, &mut world, branch()).await;
         assert!(
             main_notices(&world)
@@ -14062,12 +14146,12 @@ mod tests {
         let (mut world, shell, mut app, _writer, _root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
         run_prompt(&mut world, "seed").await;
-        let outgoing = world.session.clone();
+        let outgoing = world.session().to_string();
         let task = register_bash_task(&mut world, "sleep 100").await;
 
         let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
         assert!(matches!(moved, Focus::Moved));
-        assert_ne!(world.session, outgoing, "the focus moved");
+        assert_ne!(world.session(), outgoing, "the focus moved");
 
         let live = world
             .host()
@@ -14089,63 +14173,146 @@ mod tests {
         shut_down(&world).await;
     }
 
-    /// A switch detaches the outgoing session, so the host is free to release
-    /// it once its grace is up: the frontend's stream is the only thing holding
-    /// it, and the switch replaces it (spec section 5, attachment is the
-    /// retention signal). Without this a long-lived TUI would accumulate a lock
-    /// on every session it ever visited.
+    /// A backgrounded session keeps folding. Its frames arrive on the same
+    /// stream while another session is focused, its own transcript takes them,
+    /// and switching back is a swap onto state that is already current rather
+    /// than a rebuild off the log (spec 9.2).
+    ///
+    /// The cursor is what makes this observable: it advances only if that
+    /// session's fold ran, and a switch that dropped the outgoing client the way
+    /// a rebuild does would leave nothing there to advance.
     #[tokio::test]
-    async fn a_switch_detaches_the_outgoing_session_so_it_releases() {
+    async fn a_backgrounded_session_keeps_folding() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, _writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        run_prompt(&mut world, "in the first session").await;
+        let first = world.session().to_string();
+        let seq_of = |world: &World, session: &str| {
+            world
+                .directory
+                .client_for(session)
+                .map(|client| client.cursor().map_or(0, |cursor| cursor.seq))
+        };
+        let parked = seq_of(&world, &first).expect("the focused session is attached");
+
+        let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
+        assert!(matches!(moved, Focus::Moved));
+        assert!(
+            world.directory.is_attached(&first),
+            "the outgoing session is still folded, not dropped",
+        );
+
+        // Work in the backgrounded session, commanded straight at the host so
+        // the focused session is not the one doing it.
+        world
+            .host()
+            .command(
+                &first,
+                Command::Prompt {
+                    agent: AgentId::Main,
+                    content: vec![UserContent::text("while in the background")],
+                },
+            )
+            .await
+            .expect("the backgrounded session accepts a prompt");
+
+        // Drain until that session's own cursor passes where it was parked.
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        loop {
+            fold_ready_frames(&mut world);
+            if seq_of(&world, &first).expect("still attached") > parked {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the backgrounded session never folded a frame",
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // None of it reached the transcript on screen: that one is the created
+        // session's.
+        assert!(
+            !main_notices(&world)
+                .iter()
+                .any(|text| text.contains("while in the background")),
+            "a background fold leaked into the focused transcript: {:?}",
+            main_notices(&world),
+        );
+
+        // Switching back brings up the transcript that was folding all along,
+        // carrying both the turn from before the switch and the one from after.
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(first.clone()),
+        )
+        .await;
+        assert!(matches!(moved, Focus::Moved));
+        assert_eq!(world.session(), first);
+        let users = user_messages(&world);
+        assert!(
+            users.iter().any(|text| text == "in the first session"),
+            "the turn from before the switch: {users:?}",
+        );
+        assert!(
+            users.iter().any(|text| text == "while in the background"),
+            "and the one folded while it was backgrounded: {users:?}",
+        );
+        shut_down(&world).await;
+    }
+
+    /// A switch keeps the outgoing session attached, so the host holds it past
+    /// its idle grace and its live frames keep arriving for the transcript the
+    /// client parked (spec 9.2).
+    ///
+    /// The retained lock is the point, not an oversight: spec section 5 counts a
+    /// deliberately attached background session as use, so a client that keeps
+    /// one keeps its lock. What the user gets for it is an instant switch back
+    /// onto a transcript that stayed current while they were away.
+    #[tokio::test]
+    async fn a_switch_keeps_the_outgoing_session_attached_and_live() {
         const GRACE: Duration = Duration::from_millis(200);
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell, mut app, _writer, _root) =
             world_shell_app_with_idle_grace(&dir, "streaming-text", default_layers(), Some(GRACE))
                 .await;
         // Punctuate the outgoing session's log: a session with nothing on disk
-        // is deliberately never released.
+        // is deliberately never released, which would pass this test for the
+        // wrong reason.
         run_prompt(&mut world, "seed").await;
-        let outgoing = world.session.clone();
+        let outgoing = world.session().to_string();
 
         let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
         assert!(matches!(moved, Focus::Moved));
-        assert_ne!(world.session, outgoing, "the focus moved");
+        assert_ne!(world.session(), outgoing, "the focus moved");
 
-        let deadline = Instant::now() + SETTLE_DEADLINE;
-        loop {
-            let entry = world
-                .host()
-                .sessions()
-                .await
-                .expect("session list")
-                .sessions
-                .into_iter()
-                .find(|entry| entry.id == outgoing)
-                .expect("the outgoing session is still in the directory");
-            if !entry.live {
-                assert_eq!(
-                    entry.last_seq, None,
-                    "and its cold row carries no position (spec 6.8)",
-                );
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the outgoing session was never released, so the switch left it attached",
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        // The session the user is looking at is attached, so it stays.
-        tokio::time::sleep(GRACE * 2).await;
+        // Well past the grace that would release an unattached session.
+        tokio::time::sleep(GRACE * 4).await;
+        let rows = world
+            .host()
+            .sessions()
+            .await
+            .expect("session list")
+            .sessions;
+        let parked = rows
+            .iter()
+            .find(|entry| entry.id == outgoing)
+            .expect("the outgoing session is still in the directory");
         assert!(
-            world
-                .host()
-                .sessions()
-                .await
-                .expect("session list")
-                .sessions
-                .iter()
-                .any(|entry| entry.id == world.session && entry.live),
-            "the focused session is attached, so the grace does not touch it",
+            parked.live,
+            "the outgoing session was released, so the switch detached it",
+        );
+        assert!(
+            parked.last_seq.is_some(),
+            "a live row carries its position (spec 6.8)",
+        );
+        assert!(
+            rows.iter()
+                .any(|entry| entry.id == world.session() && entry.live),
+            "and the focused session is live too",
         );
         shut_down(&world).await;
     }
@@ -14164,7 +14331,7 @@ mod tests {
                 .await;
         // Punctuate the log: a session with nothing on disk is never released.
         run_prompt(&mut world, "seed").await;
-        let session = world.session.clone();
+        let session = world.session().to_string();
         let stale = Arc::clone(&world.handles().log);
 
         // The focused session's stream goes elsewhere, which is what an evicted
@@ -14331,7 +14498,7 @@ mod tests {
             main_notices(&world)
         );
         assert!(
-            !world.client.working(),
+            !world.client().working(),
             "a prompt-less tree switch spawns no turn"
         );
 
@@ -14356,7 +14523,7 @@ mod tests {
             !rows.contains("branch A prompt"),
             "branch A content absent after switching to B: {rows}"
         );
-        assert!(!world.client.working(), "still no turn spawned");
+        assert!(!world.client().working(), "still no turn spawned");
         shut_down(&world).await;
     }
 
@@ -14370,7 +14537,7 @@ mod tests {
         let (mut world, shell, mut app, _writer, _root) =
             world_shell_app(&dir, "streaming-text", default_layers()).await;
         run_prompt(&mut world, "seed").await;
-        let session = world.session.clone();
+        let session = world.session().to_string();
 
         apply_focus_request(
             &mut app,
@@ -14383,7 +14550,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(world.session, session, "the session is unchanged");
+        assert_eq!(world.session(), session, "the session is unchanged");
         let notices = main_notices(&world);
         assert!(
             notices
@@ -14400,7 +14567,7 @@ mod tests {
             "and says the message came back: {notices:?}",
         );
         assert_eq!(shell.borrow().editor.borrow().text(), "edited prompt");
-        assert!(!world.client.working(), "no turn spawned");
+        assert!(!world.client().working(), "no turn spawned");
         shut_down(&world).await;
     }
 
@@ -14538,7 +14705,7 @@ mod tests {
         .await;
 
         fold_ready_frames(&mut world);
-        assert!(world.client.working(), "the branch prompt ran as a turn");
+        assert!(world.client().working(), "the branch prompt ran as a turn");
         assert!(
             main_notices(&world)
                 .iter()
@@ -14704,7 +14871,7 @@ mod tests {
             None,
             ThemeHandle::new(Theme::bundled_dark_with_mode(ColorMode::Truecolor)),
             "aj".to_string(),
-            &world.session,
+            &world.session(),
             PathBuf::from("/tmp"),
         )));
         (world, shell)
@@ -14777,7 +14944,7 @@ mod tests {
         let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
 
         // A fresh host holds nothing, so bare connect created the session.
-        assert!(!world.session.is_empty());
+        assert!(!world.session().is_empty());
         // The host's scripted identity, which this client's config knows
         // nothing about, so it can only have come from a `state` frame.
         let footer = footer_row(&shell);
@@ -14814,7 +14981,7 @@ mod tests {
 
         // Create-when-empty: the host holds nothing yet.
         let created = connect_world(&dir, &remote, &[]).await;
-        let first = created.session.clone();
+        let first = created.session().to_string();
         assert!(
             remote
                 .host
@@ -14829,12 +14996,12 @@ mod tests {
 
         // Explicit id: attaches exactly that one.
         let explicit = connect_world(&dir, &remote, &[&first]).await;
-        assert_eq!(explicit.session, first);
+        assert_eq!(explicit.session(), first);
 
         // `--new`: creates another one.
         let fresh = connect_world(&dir, &remote, &["--new"]).await;
-        assert_ne!(fresh.session, first, "--new minted a second session");
-        let second = fresh.session.clone();
+        assert_ne!(fresh.session(), first, "--new minted a second session");
+        let second = fresh.session().to_string();
 
         // Bare: the host's most recently modified session, which is the one
         // that just ran a turn.
@@ -14843,7 +15010,8 @@ mod tests {
         settle(&mut working).await;
         let latest = connect_world(&dir, &remote, &[]).await;
         assert_eq!(
-            latest.session, first,
+            latest.session(),
+            first,
             "bare connect took the most recently modified session, not {second}"
         );
         remote.shutdown().await;
@@ -14856,7 +15024,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let remote = RemoteHost::start(&dir, "streaming-text").await;
         let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
-        let session = world.session.clone();
+        let session = world.session().to_string();
 
         assert!(handle_submit(&mut world, "hello".to_string()).await);
         fold_ready_frames(&mut world);
@@ -14900,8 +15068,8 @@ mod tests {
         // A client that attached fresh, after the fact, is the oracle: the
         // reconnected fold has to agree with a full backfill.
         let fresh = connect_world(&dir, &remote, &[&session]).await;
-        let mine = CanonicalState::of(&world.chat.borrow(), &world.client);
-        let theirs = CanonicalState::of(&fresh.chat.borrow(), &fresh.client);
+        let mine = CanonicalState::of(&world.chat.borrow(), &world.client());
+        let theirs = CanonicalState::of(&fresh.chat.borrow(), fresh.client());
         assert_eq!(
             host_entries(&mine),
             host_entries(&theirs),
@@ -14952,12 +15120,12 @@ mod tests {
 
         // Attach without discharging the reads, which is the state every
         // `caught_up` leaves the client in (spec 6.7).
-        world.stream = open_stream(&world.control, &world.session, &mut world.client)
+        world.stream = open_stream(&world.control, &mut world.directory)
             .await
             .expect("re-attach");
         assert!(fold_attach_block(&mut world).await, "the block completed");
         assert!(
-            world.client.needs_task_refetch() && world.client.needs_queue_refetch(),
+            world.client().needs_task_refetch() && world.client().needs_queue_refetch(),
             "the block obliged both reads",
         );
 
@@ -14967,7 +15135,7 @@ mod tests {
 
         refresh_client_reads(&mut world).await;
         assert!(
-            world.client.needs_task_refetch() && world.client.needs_queue_refetch(),
+            world.client().needs_task_refetch() && world.client().needs_queue_refetch(),
             "a failed read keeps the obligation",
         );
         assert!(!world.reads_retry.ready(), "the next attempt is held back");
@@ -15032,7 +15200,7 @@ mod tests {
         let (mut app, _writer, _root) = app_over(&shell).await;
         for request in [
             FocusRequest::Create,
-            FocusRequest::Resume(world.session.clone()),
+            FocusRequest::Resume(world.session().to_string()),
         ] {
             let before = main_notices(&world).len();
             let focus = apply_focus_request(&mut app, &shell, &mut world, request).await;
@@ -15112,7 +15280,7 @@ mod tests {
         // its local wording (the chord that cancels the turn first).
         let handles = remote
             .host
-            .local_handles(&world.session)
+            .local_handles(&world.session())
             .await
             .expect("the host's own handles");
         install_busy_script(&handles);
@@ -15224,10 +15392,10 @@ mod tests {
 
         let mut stream = world
             .control
-            .attach_all(&[(world.session.clone(), None), (second.clone(), None)])
+            .attach_all(&[(world.session().to_string(), None), (second.clone(), None)])
             .await
             .expect("one attach covering both");
-        assert!(stream.attached(&world.session));
+        assert!(stream.attached(&world.session()));
         assert!(stream.attached(&second));
 
         // Both blocks arrive on the one stream. Reading until each session
@@ -15254,7 +15422,7 @@ mod tests {
             }
         }
         caught_up.sort();
-        let mut expected = vec![world.session.clone(), second];
+        let mut expected = vec![world.session().to_string(), second];
         expected.sort();
         assert_eq!(caught_up, expected);
 
@@ -15313,15 +15481,15 @@ mod tests {
             .create(None, None)
             .await
             .expect("a second session");
-        assert_ne!(other, world.session);
+        assert_ne!(other, world.session());
 
         let stream = world
             .control
-            .attach(&world.session, None)
+            .attach(&world.session(), None)
             .await
             .expect("attach");
         assert!(
-            stream.attached(&world.session),
+            stream.attached(&world.session()),
             "the stream carries the session it named",
         );
         assert!(
@@ -15358,7 +15526,7 @@ mod tests {
 
         let tree = world
             .control
-            .tree(&world.session)
+            .tree(&world.session())
             .await
             .expect("the tree read");
         let head = tree.head.clone().expect("a session with a turn has a head");
@@ -15380,7 +15548,7 @@ mod tests {
         let parent = {
             let handles = remote
                 .host
-                .local_handles(&world.session)
+                .local_handles(&world.session())
                 .await
                 .expect("the host holds the session live");
             let log = handles.log.lock().await;
@@ -15453,7 +15621,7 @@ mod tests {
         // parent the host resolved.
         let moved = world
             .control
-            .tree(&world.session)
+            .tree(&world.session())
             .await
             .expect("the tree read")
             .head
@@ -15461,7 +15629,7 @@ mod tests {
         assert_ne!(moved, head, "the head moved off the branched-from message");
         assert_ne!(moved, message, "the head is not the message itself");
         assert!(
-            ancestors(&remote.host, &world.session, &moved)
+            ancestors(&remote.host, &world.session(), &moved)
                 .await
                 .contains(&parent),
             "the new branch hangs off the message's parent",
