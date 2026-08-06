@@ -88,6 +88,13 @@ commit secrets.
 
 - Unit tests live in the same module with `#[cfg(test)]`.
 - Integration tests go in `<crate>/tests/`.
+- Mutation-check tests that pin subtle properties: temporarily break
+  the behavior the test names (flip the rule, remove the guard,
+  reinstate the bug), verify exactly that test fails, then revert. A
+  test that stays green under the mutation is vacuous and must be
+  fixed. Assertions like `assert_ne!` on values that are almost never
+  equal, or events dispatched to a widget that does not handle them,
+  are the usual tells.
 
 ## Commit Messages
 
