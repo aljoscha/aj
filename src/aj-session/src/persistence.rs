@@ -184,8 +184,13 @@ impl ConversationPersistence {
     /// The `None` case is separate because a caller that caches the verdict
     /// must not cache it: the format is a durable property of the log's
     /// content, while a failure to open the file says nothing about the log and
-    /// can clear on its own.
+    /// can clear on its own. An id the grammar rejects reads as `None` too: it
+    /// names no log here, and it must not be turned into a path to find that
+    /// out (see [`crate::id`]).
     pub fn is_current_format(&self, session_id: &str) -> Option<bool> {
+        if !crate::id::is_valid_session_id(session_id) {
+            return None;
+        }
         let path = self.session_path(session_id);
         let file = File::open(&path).ok()?;
         let mut reader = BufReader::new(file);

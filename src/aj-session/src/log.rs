@@ -49,6 +49,10 @@ pub enum ConversationError {
     InvalidAppend(String),
     #[error("invalid conversation head: {0}")]
     InvalidHead(String),
+    /// The id does not satisfy the store's grammar ([`crate::id`]), so it
+    /// could not name a log in this store and is never turned into a path.
+    #[error("{0:?} is not a session id")]
+    InvalidSessionId(String),
 }
 
 /// A unique identifier for a [ConversationEntry] within a single
@@ -820,6 +824,9 @@ impl ConversationLog {
         persistence: &crate::persistence::ConversationPersistence,
         session_id: &str,
     ) -> Result<Self, ConversationError> {
+        if !crate::id::is_valid_session_id(session_id) {
+            return Err(ConversationError::InvalidSessionId(session_id.to_string()));
+        }
         let path = persistence.session_path(session_id);
 
         let file = File::open(&path)?;
@@ -1892,7 +1899,9 @@ mod tests {
                 "no log file until the first punctuation append"
             );
             assert!(
-                crate::lock::lock_path(&dir, log.session_id()).exists(),
+                crate::lock::lock_path(&dir, log.session_id())
+                    .expect("a minted id")
+                    .exists(),
                 "the claim is visible on the filesystem"
             );
         }

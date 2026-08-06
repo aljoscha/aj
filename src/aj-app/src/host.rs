@@ -543,8 +543,15 @@ impl SessionHost {
         // One block per named session is the client contract (spec 6.5), and
         // a duplicate would be served two: the second would open a block
         // the client is not expecting and quiesce state it just applied.
+        //
+        // The grammar runs in the same pass, ahead of the duplicate rule: an
+        // id this store could never hold is a 404 whether it appears once or
+        // twice (spec 6.2), and validating late would let an attach naming a
+        // good session and a bad one materialize and lock the good one before
+        // refusing.
         let mut names: Vec<String> = Vec::with_capacity(requests.len());
         for request in requests {
+            validate_session_id(&request.session)?;
             if names.contains(&request.session) {
                 return Err(HostError::Invalid(format!(
                     "session {} is named twice in one attach",

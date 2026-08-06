@@ -1,12 +1,21 @@
 //! The session-id grammar the store guarantees and callers may rely on.
 //!
-//! A session id is a filename stem: [`ConversationPersistence`] turns it into
-//! `<sessions_dir>/<id>.jsonl` and the advisory lock into
-//! `<sessions_dir>/locks/<id>.lock`. An id that arrives from outside this
-//! process must therefore be checked here before it reaches either, or a peer
-//! could name a file outside the store.
+//! A session id is a filename stem: it becomes
+//! `<sessions_dir>/<id>.jsonl` for the log and `<sessions_dir>/locks/<id>.lock`
+//! for the advisory lock. An id that arrives from outside this process must
+//! therefore be checked before it reaches either, or a peer could name a file
+//! outside the store, and taking a lock would create the directories to go
+//! with it.
 //!
-//! [`ConversationPersistence`]: crate::persistence::ConversationPersistence
+//! Every store entry point that accepts an id from a caller enforces this:
+//! [`ConversationPersistence::session_metadata`],
+//! [`ConversationPersistence::is_current_format`],
+//! [`ConversationLog::resume`], and the lock path itself, which is the one
+//! join whose callers do not already hold an enumerated id.
+//!
+//! [`ConversationPersistence::session_metadata`]: crate::persistence::ConversationPersistence::session_metadata
+//! [`ConversationPersistence::is_current_format`]: crate::persistence::ConversationPersistence::is_current_format
+//! [`ConversationLog::resume`]: crate::log::ConversationLog::resume
 
 /// Longest session id the store accepts.
 ///

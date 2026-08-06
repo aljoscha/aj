@@ -94,7 +94,8 @@ impl SessionLock {
         session_id: &str,
         host_id: &str,
     ) -> Result<Option<Self>, ConversationError> {
-        let path = lock_path(persistence.sessions_dir(), session_id);
+        let path = lock_path(persistence.sessions_dir(), session_id)
+            .ok_or_else(|| ConversationError::InvalidSessionId(session_id.to_string()))?;
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
         }
@@ -130,7 +131,7 @@ impl SessionLock {
     /// does not check the lock itself and a holder that wrote none (an older
     /// build) leaves the answer empty rather than wrong.
     pub fn holder(persistence: &ConversationPersistence, session_id: &str) -> Option<LockHolder> {
-        let path = lock_path(persistence.sessions_dir(), session_id);
+        let path = lock_path(persistence.sessions_dir(), session_id)?;
         let recorded = fs::read_to_string(&path).ok()?;
         let (pid, host_id) = recorded.trim().split_once(char::is_whitespace)?;
         Some(LockHolder {
@@ -162,7 +163,12 @@ fn record_holder(flock: &mut Flock<File>, host_id: &str) -> std::io::Result<()> 
 /// [`SessionLock::try_acquire`] later locks the same file for as long as
 /// the session is live.
 pub(crate) fn claim_session_id(sessions_dir: &Path, session_id: &str) -> std::io::Result<()> {
-    let path = lock_path(sessions_dir, session_id);
+    let path = lock_path(sessions_dir, session_id).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{session_id:?} is not a session id"),
+        )
+    })?;
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
@@ -174,11 +180,17 @@ pub(crate) fn claim_session_id(sessions_dir: &Path, session_id: &str) -> std::io
 }
 
 /// The lock file backing `session_id`, in a `locks/` subdirectory of the
-/// sessions store.
-pub(crate) fn lock_path(sessions_dir: &Path, session_id: &str) -> PathBuf {
-    sessions_dir
-        .join("locks")
-        .join(format!("{session_id}.lock"))
+/// sessions store, or `None` for an id the store's grammar rejects.
+///
+/// The grammar check sits here rather than at the callers because this is
+/// where an id becomes a path, and taking a lock creates directories: an id
+/// carrying `..` would make them outside the store (see [`crate::id`]).
+pub(crate) fn lock_path(sessions_dir: &Path, session_id: &str) -> Option<PathBuf> {
+    crate::id::is_valid_session_id(session_id).then(|| {
+        sessions_dir
+            .join("locks")
+            .join(format!("{session_id}.lock"))
+    })
 }
 
 #[cfg(test)]
@@ -195,6 +207,33 @@ mod tests {
     }
 
     #[test]
+    fn an_id_the_grammar_rejects_creates_nothing() {
+        let dir = TempDir::new().expect("temp dir");
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+
+        for id in ["../../escaped", "..", "", "with space"] {
+            let err = acquire(&persistence, id)
+                .err()
+                .unwrap_or_else(|| panic!("{id:?} took a lock"));
+            assert!(
+                matches!(&err, ConversationError::InvalidSessionId(named) if named == id),
+                "{id:?}: {err}",
+            );
+            assert!(SessionLock::holder(&persistence, id).is_none());
+        }
+        // Taking a lock creates the `locks/` directory it lives in, so a
+        // refused acquire is only safe if it creates nothing at all.
+        assert!(
+            !dir.path().join("sessions").exists(),
+            "a refused acquire made a directory",
+        );
+        assert!(
+            !dir.path().join("locks").exists() && !dir.path().join("../locks").exists(),
+            "a refused acquire escaped the store",
+        );
+    }
+
+    #[test]
     fn a_held_lock_refuses_a_second_acquire_until_it_is_dropped() {
         let dir = TempDir::new().expect("temp dir");
         let persistence = ConversationPersistence::new(dir.path().join("sessions"));
@@ -203,7 +242,9 @@ mod tests {
             .expect("acquire")
             .expect("nobody holds it yet");
         assert!(
-            lock_path(persistence.sessions_dir(), "s-1").exists(),
+            lock_path(persistence.sessions_dir(), "s-1")
+                .expect("a well-formed id")
+                .exists(),
             "the lock file lives in the sessions store's locks/ subdirectory"
         );
 
@@ -301,7 +342,7 @@ mod tests {
     fn a_legacy_lock_file_names_nobody() {
         let dir = TempDir::new().expect("temp dir");
         let persistence = ConversationPersistence::new(dir.path().join("sessions"));
-        let path = lock_path(persistence.sessions_dir(), "s-1");
+        let path = lock_path(persistence.sessions_dir(), "s-1").expect("a well-formed id");
         fs::create_dir_all(path.parent().expect("a locks dir")).expect("mkdir");
 
         for content in ["", "  \n", "not-a-pid host", "12345", "\0\0"] {

@@ -271,6 +271,14 @@ impl<S: SessionStore> ColdSessions<S> {
     /// every session in it as gone. A log it can stat but not sniff is still
     /// not a session this host could materialize, which is the one place the
     /// answer folds a read failure into "no".
+    ///
+    /// NOTE(aljoscha): a `stat` answers under the filesystem's own name
+    /// matching, where an enumeration answered under exact string equality.
+    /// On a case-insensitive filesystem `ABC` therefore now finds `abc.jsonl`,
+    /// and materializing under the id as spelled would put the same log in the
+    /// directory twice, once live and once cold, until the next enumeration
+    /// drops the alias. Unreachable through a client that only ever echoes ids
+    /// the directory gave it.
     pub(crate) fn contains(&self, id: &str) -> Result<bool, ConversationError> {
         self.membership_lookups.fetch_add(1, Ordering::Relaxed);
         let Some(metadata) = self.store.session_metadata(id)? else {
