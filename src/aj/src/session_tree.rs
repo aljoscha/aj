@@ -3,10 +3,10 @@
 //! A [`FilterableSelect`] over the current session's [`SessionTree`], one row
 //! per segment, with the tree art baked into each row's label (the
 //! session-selector shape, see [`crate::session_selector`]). Confirming a row
-//! parks a [`SessionRequest::Branch`] for the host, which rebuilds the session
-//! onto the chosen segment's tip through the same branch path the `b` shortcut
-//! uses. Confirming the row that is already the current tip is a no-op close,
-//! and Esc cancels.
+//! parks a branch request naming the chosen segment's tip, which the host
+//! moves the head onto through the same command the `b` shortcut uses.
+//! Confirming the row that is already the current tip is a no-op close, and
+//! Esc cancels.
 //!
 //! Rows are laid out by [`build_tree_rows`]: a DFS over the segment tree with
 //! active-path siblings sorted first (so the current branch reads as a
@@ -520,6 +520,57 @@ mod tests {
             Rc::clone(&handles.stack),
             Rc::clone(&handles.toasts),
         )
+    }
+
+    /// The head the tree read carries pre-selects its segment's row, so the
+    /// overlay opens on the branch the session is actually on rather than on
+    /// whatever sorts first. A head that sits mid-segment matches no row head
+    /// and leaves the default cursor.
+    #[test]
+    fn the_current_head_preselects_its_row() {
+        let tree = SessionTree {
+            segments: vec![
+                segment("p", "shared", None, vec![1, 2], true),
+                segment("b", "branch B", Some(0), vec![], true),
+                segment("a", "branch A", Some(0), vec![], false),
+            ],
+            head: None,
+        };
+        let now = Utc::now();
+        let rows = || build_tree_rows(&tree, now);
+        let key_for = |head: &str| {
+            rows()
+                .iter()
+                .find(|row| row.head == head)
+                .map(row_key)
+                .expect("a row for the segment")
+        };
+
+        let handles = OverlayHandles::for_tests();
+        let select = open_session_tree(&handles, rows(), Some("a".to_string()));
+        assert_eq!(
+            select.borrow().selected().map(|item| item.filter_key),
+            Some(key_for("a")),
+            "the overlay opens on the row the head names",
+        );
+
+        // Not simply the first row, which is what a dropped head would give.
+        assert_ne!(key_for("a"), key_for("p"));
+        let handles = OverlayHandles::for_tests();
+        let default = open_session_tree(&handles, rows(), None);
+        assert_eq!(
+            default.borrow().selected().map(|item| item.filter_key),
+            Some(key_for("p")),
+            "with no head the cursor stays where it started",
+        );
+
+        let handles = OverlayHandles::for_tests();
+        let midway = open_session_tree(&handles, rows(), Some("mid-segment".to_string()));
+        assert_eq!(
+            midway.borrow().selected().map(|item| item.filter_key),
+            Some(key_for("p")),
+            "a head inside a segment matches no row head",
+        );
     }
 
     /// While busy, confirming a real branch switch raises the toast and parks

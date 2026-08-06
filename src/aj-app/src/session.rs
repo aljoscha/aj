@@ -104,9 +104,9 @@ pub enum SessionExit {
 pub enum SessionRequest {
     New,
     Resume(String),
-    /// Switch the active branch of the current session: rebuild it onto
-    /// `head` with no prompt. Parked by the session-tree overlay's confirm,
-    /// this reuses the branch rebuild path (see [`SessionExit::Branch`]).
+    /// Switch the current session's head to `head`, with no prompt. Parked
+    /// by the session-tree overlay's confirm, which names a segment tip
+    /// directly rather than a message to branch before.
     Branch {
         head: EntryId,
     },

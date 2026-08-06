@@ -226,12 +226,22 @@ pub enum Command {
 ///
 /// [`Self::Before`] exists because branching from a transcript message must
 /// replace that message rather than continue after it, so the head goes to
-/// its parent. The host resolves the parent under the same log lock that
-/// moves the head, which is what keeps the two from being separated by an
-/// append (spec 6.6).
+/// its parent. The host resolves the parent, which keeps the gesture one
+/// command and keeps every client from repeating the same walk (spec 6.6).
 pub enum HeadTarget {
     Entry(EntryId),
     Before(EntryId),
+}
+
+impl HeadTarget {
+    /// The entry the request named, which is what a refusal quotes. A
+    /// [`Self::Before`] target moves the head somewhere else, so reporting
+    /// the resolved entry would name an id the client never sent.
+    pub fn named(&self) -> &str {
+        match self {
+            Self::Entry(entry) | Self::Before(entry) => entry,
+        }
+    }
 }
 
 /// A withdrawal of one agent's pending message, or a clear of the whole

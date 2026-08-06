@@ -1789,6 +1789,75 @@ async fn a_head_switch_before_an_entry_lands_on_its_parent() {
     harness.host.shutdown().await;
 }
 
+/// Every head refusal quotes the entry the request named. A `before` target
+/// moves the head somewhere else, so a refusal that quoted the entry the
+/// switch actually rejected would name an id the client never sent, which it
+/// cannot act on or even recognize.
+#[tokio::test]
+async fn a_head_refusal_names_the_entry_the_request_sent() {
+    let harness = Harness::new(sub_agent_turn());
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "delegate it").await;
+    client.pump_until_idle().await;
+
+    // A sub-agent entry cannot be a head, and its parent is a different
+    // entry, so the two ids are distinguishable in the message.
+    let (sub_entry, its_parent) = {
+        let handles = harness
+            .host
+            .local_handles(&session)
+            .await
+            .expect("live session");
+        let log = handles.log.lock().await;
+        let entries = log.entries_in_order();
+        let sub: std::collections::HashSet<&String> = entries
+            .iter()
+            .filter(|entry| entry.agent_id == Some(1))
+            .map(|entry| &entry.id)
+            .collect();
+        // A sub-agent entry whose parent is also one, so the resolved head
+        // is itself off the user thread and the switch refuses. A spawn
+        // root's parent is the assistant message that spawned it, which is
+        // a legal head, so it would be accepted.
+        let entry = entries
+            .iter()
+            .find(|entry| {
+                entry.agent_id == Some(1)
+                    && entry.parent_id.as_ref().is_some_and(|id| sub.contains(id))
+            })
+            .expect("the sub-agent run wrote more than its root");
+        (
+            entry.id.clone(),
+            entry.parent_id.clone().expect("filtered on Some"),
+        )
+    };
+    assert_ne!(sub_entry, its_parent);
+
+    let err = harness
+        .host
+        .command(
+            &session,
+            Command::Head {
+                target: HeadTarget::Before(sub_entry.clone()),
+            },
+        )
+        .await
+        .expect_err("a sub-agent entry's parent is not a legal head");
+    let HostError::Invalid(message) = &err else {
+        panic!("got {err:?}");
+    };
+    assert!(
+        message.contains(&sub_entry),
+        "the refusal names what was asked for: {message}",
+    );
+    assert!(
+        !message.contains(&its_parent),
+        "the refusal does not name an entry the client never sent: {message}",
+    );
+    harness.host.shutdown().await;
+}
+
 /// A head switch forgets what belonged to the branch it left: its
 /// sub-agents stop being promptable and its background tasks leave the
 /// table.

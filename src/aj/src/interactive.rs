@@ -554,6 +554,24 @@ async fn open_stream(
     Ok(stream)
 }
 
+/// Read the focused session's tree from the host and open the tree overlay
+/// over it, answering the built select.
+///
+/// The read carries the current head alongside the segments (spec 6.7), and
+/// the overlay needs both: the head selects the row the session is on, and
+/// makes confirming that row a no-op rather than a switch onto itself. It is
+/// the one read that materializes a session, which an attached one already
+/// is.
+async fn open_tree_overlay(
+    world: &World,
+    shell: &Rc<RefCell<Shell>>,
+) -> Result<Rc<RefCell<FilterableSelect>>, ControlError> {
+    let tree = world.control.tree(&world.session).await?;
+    let rows = build_tree_rows(&tree, Utc::now());
+    let handles = shell.borrow().overlay_handles();
+    Ok(open_session_tree(&handles, rows, tree.head))
+}
+
 /// Fold every frame already queued on the focused session's stream.
 ///
 /// Called once per drive-loop iteration, so the chrome mirrors never lag the
@@ -660,8 +678,8 @@ fn remote_unsupported_notice(what: &str, why: &str) -> String {
 
 /// Why the session-changing gestures are refused over a connection: they
 /// arrive with the sidebar (spec 9.1, phase 3).
-const SIDEBAR_PHASE: &str = "switching sessions over a connection arrives \
-                             with the sidebar";
+const SIDEBAR_PHASE: &str = "session switching and creation over a \
+                             connection arrive with the sidebar";
 
 /// A session change the drive loop broke out for.
 enum FocusRequest {
@@ -1789,7 +1807,6 @@ async fn submit_with_armed_anchor(
         shell.borrow().show_toast(busy_refusal("branch"));
         return ArmedSubmit::Stay;
     }
-    // Resolve the anchor against the log.
     let message_id = shell.borrow().branch_anchor.borrow().clone();
     let Some(message_id) = message_id else {
         // No anchor: the caller gates on `is_some`, so this is unreachable in
@@ -2048,23 +2065,13 @@ async fn apply_command_action(
             open_session_selector(&handles, world.session.clone());
             ActionEffect::OpenedOverlay
         }
-        CommandAction::OpenSessionTree => {
-            // The host's own tree read, which carries the current head
-            // alongside the segments (spec 6.7). It materializes the session,
-            // which an attached one already is.
-            let tree = match world.control.tree(&world.session).await {
-                Ok(tree) => tree,
-                Err(err) => {
-                    fold_notice(world, &format!("Could not read the session tree: {err}"));
-                    return ActionEffect::Redraw;
-                }
-            };
-            let current_head = tree.head.clone();
-            let rows = build_tree_rows(&tree, Utc::now());
-            let handles = shell.borrow().overlay_handles();
-            open_session_tree(&handles, rows, current_head);
-            ActionEffect::OpenedOverlay
-        }
+        CommandAction::OpenSessionTree => match open_tree_overlay(world, shell).await {
+            Ok(_) => ActionEffect::OpenedOverlay,
+            Err(err) => {
+                fold_notice(world, &format!("Could not read the session tree: {err}"));
+                ActionEffect::Redraw
+            }
+        },
         CommandAction::NewSession => {
             if world.control.is_remote() {
                 fold_notice(
@@ -14976,18 +14983,27 @@ mod tests {
                 "{action:?} opened no overlay"
             );
         }
-        // A session change that reached the focus path is refused there too,
-        // rather than tearing the world down.
+        // Both session changes are refused at the focus path too, rather than
+        // tearing the world down. Each arm is driven: they are refused one by
+        // one now that branching is not, and an arm that slipped through
+        // would reach `focus_session`'s own assertion and panic.
         let (mut app, _writer, _root) = app_over(&shell).await;
-        let focus = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
-        assert!(matches!(focus, Focus::Same));
-        assert!(
-            main_notices(&world)
-                .last()
-                .is_some_and(|n| n.contains("over a connection")),
-            "{:?}",
-            main_notices(&world)
-        );
+        for request in [
+            FocusRequest::Create,
+            FocusRequest::Resume(world.session.clone()),
+        ] {
+            let before = main_notices(&world).len();
+            let focus = apply_focus_request(&mut app, &shell, &mut world, request).await;
+            assert!(matches!(focus, Focus::Same));
+            let notices = main_notices(&world);
+            assert!(
+                notices.len() > before
+                    && notices
+                        .last()
+                        .is_some_and(|n| n.contains("over a connection")),
+                "{notices:?}",
+            );
+        }
         remote.shutdown().await;
     }
 
@@ -15131,6 +15147,53 @@ mod tests {
         remote.shutdown().await;
     }
 
+    /// Every entry from `entry` up to the log's root, `entry` included.
+    async fn ancestors(
+        host: &aj_app::host::SessionHost,
+        session: &str,
+        entry: &str,
+    ) -> Vec<String> {
+        let handles = host
+            .local_handles(session)
+            .await
+            .expect("the host holds the session live");
+        let log = handles.log.lock().await;
+        let mut walk = vec![entry.to_string()];
+        while let Some(parent) = log.parent_of(walk.last().expect("non-empty")) {
+            walk.push(parent.clone());
+        }
+        walk
+    }
+
+    /// The head the tree read carries reaches the overlay, so the row the
+    /// session is on opens selected and confirming it is a no-op.
+    ///
+    /// Without the head the overlay falls back to its default cursor, and
+    /// confirming that row parks a real branch request, so the user switches
+    /// to the branch they were already on (spec 6.7).
+    #[tokio::test]
+    async fn the_tree_overlay_opens_on_the_head_the_read_carries() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, _app, _writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        assert!(handle_submit(&mut world, "first".to_string()).await);
+        settle(&mut world).await;
+
+        let select = open_tree_overlay(&world, &shell)
+            .await
+            .expect("the tree read");
+        let picked = select.borrow().selected().expect("a row is selected");
+        if let Some(confirm) = select.borrow_mut().on_confirm.as_mut() {
+            let mut ctx = EventContext::new();
+            confirm(&mut ctx, &picked);
+        }
+        assert!(
+            shell.borrow().take_session_request().is_none(),
+            "confirming the row the session is already on parks no switch",
+        );
+        shut_down(&world).await;
+    }
+
     /// A stream answers `attached` per session, for both a local host and a
     /// connection: true for what it carries and false for anything else.
     ///
@@ -15217,24 +15280,80 @@ mod tests {
                 _ => None,
             })
             .expect("the user message carries its entry id");
+        let parent = {
+            let handles = remote
+                .host
+                .local_handles(&world.session)
+                .await
+                .expect("the host holds the session live");
+            let log = handles.log.lock().await;
+            log.parent_of(&message)
+                .expect("a user message has a parent")
+                .clone()
+        };
+        // Drive the real gesture: arm the anchor on the message and submit,
+        // which is the seam a connect-mode refusal would sit at.
+        {
+            let sh = shell.borrow();
+            arm_branch(&sh.branch_anchor, message.clone());
+        }
+        let outcome =
+            submit_with_armed_anchor(&mut world, &shell, "edited prompt".to_string()).await;
+        let ArmedSubmit::Branch { target, prompt } = outcome else {
+            panic!(
+                "an armed submit branches over a connection: {:?}",
+                main_notices(&world)
+            );
+        };
+        assert!(
+            matches!(&target, HeadTarget::Before(entry) if entry == &message),
+            "the anchor travels as the message to branch before",
+        );
+
         let (mut app, _writer, _root) = app_over(&shell).await;
         apply_focus_request(
             &mut app,
             &shell,
             &mut world,
             FocusRequest::Branch {
-                target: HeadTarget::Before(message),
-                prompt: None,
+                target,
+                prompt: Some(prompt),
             },
         )
         .await;
         assert!(
             main_notices(&world)
                 .iter()
-                .any(|notice| notice.contains("Switched to the selected branch")),
+                .any(|notice| notice.contains("Branched the conversation")),
             "{:?}",
             main_notices(&world),
         );
+
+        // A branch replaces the message it was taken from rather than
+        // continuing after it (spec 6.6), so the original prompt is gone from
+        // the branch's transcript and the edited one stands in its place. An
+        // `entry` target would land on the message and keep both.
+        settle(&mut world).await;
+        let prompts: Vec<String> = world
+            .chat
+            .borrow()
+            .transcript(AgentId::Main)
+            .expect("the main transcript")
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                aj_app::chat::EntryKind::User(user) => Some(user.joined_text()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            prompts,
+            vec!["edited prompt".to_string()],
+            "the branch replaced the message it was taken from",
+        );
+
+        // And the head really moved off it, onto the new branch below the
+        // parent the host resolved.
         let moved = world
             .control
             .tree(&world.session)
@@ -15243,6 +15362,13 @@ mod tests {
             .head
             .expect("a head");
         assert_ne!(moved, head, "the head moved off the branched-from message");
+        assert_ne!(moved, message, "the head is not the message itself");
+        assert!(
+            ancestors(&remote.host, &world.session, &moved)
+                .await
+                .contains(&parent),
+            "the new branch hangs off the message's parent",
+        );
 
         settle(&mut world).await;
         remote.shutdown().await;

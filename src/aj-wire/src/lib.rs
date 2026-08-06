@@ -144,9 +144,11 @@ pub struct SettingsRequest {
 /// Exactly one target: [`Self::entry`] names the head directly, and
 /// [`Self::before`] names an entry whose *parent* becomes the head, which is
 /// the branch-from-a-message gesture (a branch replaces the message rather
-/// than continuing after it). The parent resolution happens on the host,
-/// atomically with the switch, so no log change can land between reading the
-/// parent and moving onto it.
+/// than continuing after it).
+///
+/// The host resolves the parent, so the gesture is one command rather than a
+/// parent read plus a switch. A read would be an endpoint with a single
+/// consumer, and every client would have to repeat the same resolution.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeadRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]

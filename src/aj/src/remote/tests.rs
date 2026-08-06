@@ -1479,6 +1479,119 @@ async fn a_head_switch_is_refused_with_409_while_a_turn_runs() {
     fixture.shutdown().await;
 }
 
+/// A head switch names exactly one target. Both fields optional is what lets
+/// the two shapes share one body, so the rule is the wire boundary's to
+/// enforce, and a blank body decodes to a request naming neither.
+#[tokio::test]
+async fn a_head_switch_naming_no_target_or_two_answers_400() {
+    let fixture = Fixture::new(Vec::new()).await;
+    let session = fixture.create().await;
+
+    for body in [
+        serde_json::json!({}),
+        serde_json::json!({"entry": "entry-1", "before": "entry-2"}),
+        // A blank body, which the extractor reads as `{}`.
+        serde_json::json!(null),
+    ] {
+        let mut request = reqwest::Client::new().post(format!(
+            "{}/v1/sessions/{session}/head",
+            fixture.server.url()
+        ));
+        if !body.is_null() {
+            request = request.json(&body);
+        }
+        let response = request.send().await.expect("the request reaches the host");
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{body} names no single target",
+        );
+        let error: ErrorResponse = response.json().await.expect("the error shape");
+        assert_eq!(error.code, "invalid_request", "{body}");
+    }
+    fixture.shutdown().await;
+}
+
+/// The `before` shape crosses HTTP and lands on the named entry's parent,
+/// which is what makes a branch replace the message it was taken from (spec
+/// 6.6). An unknown entry is a 404 and the session's first entry is refused,
+/// so a client cannot branch a session into having no history.
+#[tokio::test]
+async fn a_head_switch_before_an_entry_resolves_over_http() {
+    let fixture = Fixture::new(vec![finalized_text_message("answered")]).await;
+    let session = fixture.create().await;
+    let mut remote = fixture.remote(&session).await;
+    fixture.prompt(&session, "hi").await;
+    remote.settle().await;
+
+    let (user_message, its_parent, root) = {
+        let handles = fixture
+            .host
+            .local_handles(&session)
+            .await
+            .expect("the host holds the session live");
+        let log = handles.log.lock().await;
+        let entries = log.entries_in_order();
+        let user = entries
+            .iter()
+            .find(|entry| {
+                matches!(
+                    &entry.entry,
+                    aj_session::ConversationEntryKind::Message { message }
+                        if matches!(
+                            message.as_stored_wire(),
+                            Some(aj_models::types::Message::User(_))
+                        )
+                )
+            })
+            .expect("the prompt was logged");
+        (
+            user.id.clone(),
+            user.parent_id.clone().expect("a user message has a parent"),
+            entries.first().expect("a first entry").id.clone(),
+        )
+    };
+
+    fixture
+        .client
+        .command(
+            &session,
+            &RemoteCommand::Head(HeadRequest::before(user_message.clone())),
+        )
+        .await
+        .expect("branching before a logged message is accepted");
+    assert_eq!(
+        fixture
+            .client
+            .tree(&session)
+            .await
+            .expect("the tree read")
+            .head,
+        Some(its_parent),
+        "the head landed on the message's parent, not on the message",
+    );
+
+    let err = fixture
+        .client
+        .command(
+            &session,
+            &RemoteCommand::Head(HeadRequest::before("no-such-entry".to_string())),
+        )
+        .await
+        .expect_err("an unknown entry is refused");
+    assert_eq!(err.status(), Some(StatusCode::NOT_FOUND));
+    assert_eq!(err.code(), Some("unknown_entry"));
+
+    let err = fixture
+        .client
+        .command(&session, &RemoteCommand::Head(HeadRequest::before(root)))
+        .await
+        .expect_err("there is nothing before the first entry");
+    assert_eq!(err.status(), Some(StatusCode::BAD_REQUEST));
+    assert_eq!(err.code(), Some("invalid_request"));
+    fixture.shutdown().await;
+}
+
 /// A session another host holds is a 409 `locked`: materializing takes the
 /// session's advisory lock, and a second writer on one log would corrupt it
 /// (spec section 5). Every route that would materialize answers it, and the

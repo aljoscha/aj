@@ -56,16 +56,21 @@ use crate::turn::{Joined, TurnStart, Turns, running_work_counts};
 /// and no transcript gesture can legitimately ask for it (spec 6.6).
 fn resolve_head_target(
     log: &aj_session::ConversationLog,
-    target: HeadTarget,
+    target: &HeadTarget,
 ) -> Result<String, HostError> {
     match target {
-        HeadTarget::Entry(entry) => Ok(entry),
-        HeadTarget::Before(entry) => match log.parent_of(&entry) {
-            Some(parent) => Ok(parent.clone()),
-            None if log.contains(&entry) => Err(HostError::Invalid(format!(
+        HeadTarget::Entry(entry) => Ok(entry.clone()),
+        HeadTarget::Before(entry) => match log.parent_of(entry) {
+            Some(parent) if log.contains(parent) => Ok(parent.clone()),
+            // The client named a real entry, so a parent id the log does not
+            // hold is a torn log rather than a bad request.
+            Some(parent) => Err(HostError::Internal(
+                format!("entry {entry} names parent {parent}, which the log does not hold").into(),
+            )),
+            None if log.contains(entry) => Err(HostError::Invalid(format!(
                 "entry {entry} starts the session, so there is nothing before it"
             ))),
-            None => Err(HostError::UnknownEntry(entry)),
+            None => Err(HostError::UnknownEntry(entry.clone())),
         },
     }
 }
@@ -889,17 +894,34 @@ impl Driver {
             // Resolved here rather than at the caller, under the same lock
             // that moves the head: a parent read outside it could be
             // superseded by an append before the switch lands (spec 6.6).
-            let entry = resolve_head_target(&log, target)?;
+            let entry = resolve_head_target(&log, &target)?;
             let known = log.contains(&entry);
-            log.set_head(entry.clone()).map_err(|err| match err {
+            log.set_head(entry).map_err(|err| match err {
                 // `set_head` refuses an id it does not know and one whose
                 // role cannot be a head (a sub-agent entry) with the same
                 // error. The first is a 404 and the second a malformed
                 // request, so the two are told apart here (spec 6.1).
-                aj_session::ConversationError::InvalidHead(_) if known => HostError::Invalid(
-                    format!("entry {entry} is not on the user thread and cannot be a head"),
-                ),
-                aj_session::ConversationError::InvalidHead(_) => HostError::UnknownEntry(entry),
+                //
+                // Both quote the entry the request named. For a `before`
+                // target that is not the entry `set_head` rejected, and
+                // naming the parent would report an id the client never sent.
+                aj_session::ConversationError::InvalidHead(_) if known => {
+                    HostError::Invalid(match &target {
+                        HeadTarget::Entry(entry) => {
+                            format!("entry {entry} is not on the user thread and cannot be a head")
+                        }
+                        HeadTarget::Before(entry) => format!(
+                            "cannot branch before entry {entry}: its parent is not on the \
+                             user thread"
+                        ),
+                    })
+                }
+                // Only a direct target reaches this: `resolve_head_target`
+                // has already established that a `before` target's parent is
+                // in the log.
+                aj_session::ConversationError::InvalidHead(_) => {
+                    HostError::UnknownEntry(target.named().to_string())
+                }
                 other => internal(other),
             })?;
             for agent in self.session.core.message_queues.queued_agents() {

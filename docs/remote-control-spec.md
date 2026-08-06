@@ -635,7 +635,7 @@ needs on demand:
   messages.
 - `GET /v1/sessions/{id}/tree` — the session branch tree, for the
   tree view and head switching. Carries the session's current head
-  entry id (absent only when the log is empty): the overlay needs it
+  entry id (absent only while the log has no head): the overlay needs it
   for active-row pre-selection and for treating a switch to the
   current tip as a no-op, and it is not derivable from the segments,
   a head can sit mid-segment.
@@ -1071,8 +1071,7 @@ model switch and thinking display, compaction, task kill, and the
 task-output overlay (backed by the per-task read, section 6.7). The
 exit usage banner renders from the client's own event-derived
 accounting rather than a host read. Deferred to phase 3 alongside the
-sidebar: the session tree view and branching UX (the tree read and
-head command exist, the interaction wiring does not). Not supported
+sidebar: switching to another session and creating one. Not supported
 over the wire in v1: HTML export and the session-info overlay, both
 read host-local files, run them on the host. An unsupported action in
 connect mode surfaces a clear notice, it never silently does nothing.
