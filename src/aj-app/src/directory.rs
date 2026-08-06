@@ -153,27 +153,6 @@ impl SessionDirectory {
         }
     }
 
-    /// Record that `session` is now attached, with `chat` as its transcript.
-    ///
-    /// Contract: the caller has already arranged for the session's frames to
-    /// arrive (a stream naming it) and armed its client, in that order. A
-    /// session recorded here whose frames never come folds nothing, which is
-    /// harmless but shows a transcript that never fills.
-    ///
-    /// Re-recording an attached session is a no-op, so a caller need not
-    /// check first. In particular it does not discard a transcript that has
-    /// already folded frames.
-    pub fn insert(&mut self, session: String, chat: ChatState) -> &mut SessionClient {
-        let attached = self.sessions.entry(session.clone()).or_insert_with(|| {
-            let client = SessionClient::new(session);
-            Attached {
-                client,
-                chat: Some(chat),
-            }
-        });
-        &mut attached.client
-    }
-
     /// Move focus to `session`, swapping its transcript into `focused_chat`.
     ///
     /// `mint` builds the transcript for a session focused for the first time,
@@ -218,19 +197,27 @@ impl SessionDirectory {
             .get_mut(&previous)
             .expect("the focused session is attached")
             .chat = Some(outgoing);
+        // Everything the session did while it was the focused one was on
+        // screen, so leaving is the moment its output counts as seen.
+        self.mark_viewed(&previous);
     }
 
-    /// Note that the user is looking at `session` now, so its output up to
+    /// Note that the user has stopped looking at `session`, so its output up to
     /// this point counts as seen.
     ///
-    /// Records the stamp the peer last reported for it, not the current time:
-    /// both sides of the [`Self::has_unseen_output`] comparison are host
-    /// clock, so this client's own clock never enters and skew cannot make a
-    /// session look either stale or fresh (spec 6.8).
+    /// Recorded as the user leaves rather than as they arrive. A session's
+    /// activity climbs while it is the focused one, and all of that was on
+    /// screen, so a stamp taken on arrival would make everything the user just
+    /// watched read as unseen the moment they switched away.
     ///
-    /// A session with no row yet records nothing, and reads as having no
-    /// unseen output until a row arrives.
-    pub fn mark_viewed(&mut self, session: &str) {
+    /// The stamp is the one the peer last reported, never the current time:
+    /// both sides of the [`Self::has_unseen_output`] comparison are host clock,
+    /// so this client's own clock never enters and skew cannot make a session
+    /// look either stale or fresh (spec 6.8).
+    ///
+    /// A session with no row yet records nothing, and reads as having no unseen
+    /// output until a row arrives.
+    fn mark_viewed(&mut self, session: &str) {
         if let Some(row) = self.rows.iter().find(|row| row.id == session) {
             self.viewed.insert(session.to_string(), row.last_activity);
         }
@@ -262,13 +249,6 @@ impl SessionDirectory {
             // light up every session in the store on connect.
             None => false,
         }
-    }
-
-    /// One session's fold state, mutably.
-    pub fn client_for_mut(&mut self, session: &str) -> Option<&mut SessionClient> {
-        self.sessions
-            .get_mut(session)
-            .map(|attached| &mut attached.client)
     }
 
     /// Arm every session the peer reports it served, for the attach blocks a
@@ -428,12 +408,16 @@ mod tests {
 
     /// A directory focused on `FOCUSED` with `OTHER` attached in the
     /// background, both caught up, plus the frontend's transcript.
+    ///
+    /// `OTHER` gets there the way a real client does: a first focus attaches it
+    /// (spec 9.2), then the user switches back.
     fn two_sessions() -> (SessionDirectory, ChatState) {
         let mut directory = SessionDirectory::new(FOCUSED.to_string());
         let mut focused_chat = chat();
 
-        directory.client_mut().expect_attach();
-        directory.insert(OTHER.to_string(), chat()).expect_attach();
+        directory.focus(&mut focused_chat, OTHER, chat);
+        directory.focus(&mut focused_chat, FOCUSED, || panic!("already attached"));
+        directory.expect_attach(|_| true);
 
         for session in [FOCUSED, OTHER] {
             let _ = directory.apply(&mut focused_chat, state(session));
@@ -580,6 +564,49 @@ mod tests {
             assert!(!directory.apply(&mut focused_chat, frame).0);
         }
         assert_eq!(directory.rows().len(), 2, "and they leave the rows alone");
+    }
+
+    /// Output produced while a session was the focused one is output the user
+    /// watched, so switching away must not leave it marked unseen. The stamp is
+    /// therefore taken as the user leaves, not as they arrive.
+    #[test]
+    fn what_the_user_watched_while_focused_is_not_unseen_afterwards() {
+        let (mut directory, mut focused_chat) = two_sessions();
+        let list = |sessions: Vec<SessionSummary>| Frame::List { sessions };
+        let quiet = |at_secs: i64| {
+            vec![
+                row(FOCUSED, false, at(at_secs)),
+                row(OTHER, false, at(at_secs)),
+            ]
+        };
+
+        // Away and back, so `FOCUSED` has a recorded stamp and the never-viewed
+        // rule cannot answer for it.
+        let _ = directory.apply(&mut focused_chat, list(quiet(10)));
+        directory.focus(&mut focused_chat, OTHER, || panic!("already attached"));
+        directory.focus(&mut focused_chat, FOCUSED, || panic!("already attached"));
+
+        // A turn runs in `FOCUSED`, on screen the whole time.
+        let _ = directory.apply(
+            &mut focused_chat,
+            list(vec![row(FOCUSED, false, at(50)), row(OTHER, false, at(10))]),
+        );
+
+        directory.focus(&mut focused_chat, OTHER, || panic!("already attached"));
+        assert!(
+            !directory.has_unseen_output(FOCUSED),
+            "the user watched that turn happen, so leaving cannot mark it unseen",
+        );
+
+        // What does count is what happens after they left.
+        let _ = directory.apply(
+            &mut focused_chat,
+            list(vec![row(FOCUSED, false, at(90)), row(OTHER, false, at(10))]),
+        );
+        assert!(
+            directory.has_unseen_output(FOCUSED),
+            "output after the switch is unseen",
+        );
     }
 
     /// Unseen output is derived by comparing two host-clock stamps, the row's
