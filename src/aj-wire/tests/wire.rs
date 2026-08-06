@@ -5,7 +5,8 @@ use aj_wire::{
     CancelRequest, CompactRequest, CreateSessionRequest, Cursor, DecodedAgentEvent, DecodedFrame,
     ErrorResponse, Frame, HeadRequest, Hello, ModelSelection, PromptInput, PromptRequest,
     QueueOperation, QueueOutcome, QueueRequest, QueueState, SessionCreated, SessionList,
-    SessionSettings, SessionTree, SettingsRequest, SteerRequest, TaskDetails, TaskTable, VmList,
+    SessionSettings, SessionSummary, SessionTree, SettingsRequest, SteerRequest, TaskDetails,
+    TaskTable, VmList,
 };
 use serde_json::{Value, json};
 
@@ -670,6 +671,38 @@ fn non_event_wire_models_have_pinned_round_trip_fixtures() {
     assert_round_trip::<SessionTree>(&fixtures["tree"]);
     assert_round_trip::<VmList>(&fixtures["vms"]);
     assert_round_trip::<ErrorResponse>(&fixtures["error"]);
+}
+
+/// A directory row carries `last_seq` only when the session is live (spec
+/// 6.8). A cold row omits the key entirely rather than reporting a zero a
+/// client would read as "nothing here", and its activity stamp, which is the
+/// signal it does carry, is required on every row.
+#[test]
+fn a_directory_row_carries_a_position_only_while_live() {
+    let list: SessionList = serde_json::from_value(fixture("models")["session_list"].clone())
+        .expect("the pinned session list decodes");
+    let [live, cold] = &list.sessions[..] else {
+        panic!("the fixture pins one live row and one cold one");
+    };
+    assert_eq!((live.live, live.last_seq), (true, Some(7)));
+    assert_eq!((cold.live, cold.last_seq), (false, None));
+
+    let encoded = serde_json::to_value(&list).expect("the list re-serializes");
+    assert!(
+        encoded["sessions"][1].get("last_seq").is_none(),
+        "a cold row omits the key: {}",
+        encoded["sessions"][1],
+    );
+
+    let mut stampless = fixture("models")["session_list"]["sessions"][1].clone();
+    stampless
+        .as_object_mut()
+        .expect("a row is an object")
+        .remove("last_activity");
+    assert!(
+        serde_json::from_value::<SessionSummary>(stampless).is_err(),
+        "the activity stamp is required on every row",
+    );
 }
 
 /// A cursor's `<epoch>:<seq>` encoding round-trips, and the shapes that

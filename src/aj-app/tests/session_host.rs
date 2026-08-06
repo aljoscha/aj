@@ -1864,7 +1864,7 @@ async fn stays_live(host: &SessionHost, session: &str, windows: u32) {
 
 /// An idle session nobody is attached to is released once the grace is up: its
 /// driver is gone, its lock is free for another writer, and the directory
-/// reports it cold with the mark its log ended on (spec section 5).
+/// reports it cold with the stamp its own work left (spec section 5).
 #[tokio::test]
 async fn an_idle_unattached_session_is_released() {
     let harness =
@@ -1873,11 +1873,11 @@ async fn an_idle_unattached_session_is_released() {
     let mut client = Client::attach(&harness.host, &session).await;
     harness.prompt(&session, "hi").await;
     client.pump_until_idle().await;
-    let logged = {
-        let handles = harness.host.local_handles(&session).await.expect("handles");
-        handles.log.lock().await.last_seq()
-    };
-    assert!(logged > 0, "the turn wrote log entries");
+    let live = summary(&harness.host, &session).await.expect("listed");
+    assert!(
+        live.live && live.last_seq.is_some_and(|seq| seq > 0),
+        "a live row reports the position the host holds (spec 6.8)",
+    );
 
     // Attached, so it stays however long it idles.
     stays_live(&harness.host, &session, 2).await;
@@ -1885,14 +1885,183 @@ async fn an_idle_unattached_session_is_released() {
 
     let released = until_released(&harness.host, &session).await;
     assert_eq!(
-        released.last_seq, logged,
-        "the released session reports the mark its own driver left, not zero",
+        released.last_seq, None,
+        "a cold row carries no position: producing one would read the log",
+    );
+    assert!(
+        released.last_activity >= live.last_activity,
+        "and the liveness flip does not walk the row's stamp backwards, \
+         {} is older than {}",
+        released.last_activity,
+        live.last_activity,
     );
     assert!(!released.working && released.tasks == 0);
     let lock = SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
         .expect("try_acquire")
         .expect("the release freed the session's lock");
     drop(lock);
+    harness.host.shutdown().await;
+}
+
+/// A live row's stamp moves on durable events and on nothing else (spec 6.8).
+/// Streaming chunks are lossy and carry no log position, so a turn's stamp
+/// steps once per durable entry rather than once per frame, which is also
+/// what keeps the `list` publisher's suppression from being defeated by a
+/// stamp that ticks on every event.
+#[tokio::test]
+async fn a_lossy_event_does_not_move_a_sessions_stamp() {
+    let harness = Harness::with_provider(scripted(
+        vec![finalized_text_message("a slowly streamed answer")],
+        1,
+        Duration::from_millis(20),
+    ));
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    let idle = summary(&harness.host, &session)
+        .await
+        .expect("listed")
+        .last_activity;
+
+    harness.prompt(&session, "hi").await;
+    // The prompt's own entry is durable, so by the first streamed chunk the
+    // stamp has already stepped once. Everything from here to the message's
+    // end is lossy.
+    let chunk = |frame: &Frame| {
+        matches!(frame, Frame::Event { event, .. }
+            if matches!(event.known(), Some(AgentEvent::MessageUpdate { .. })))
+    };
+    frames_until(&mut client.stream, "the first streamed chunk", chunk).await;
+    let streaming = summary(&harness.host, &session)
+        .await
+        .expect("listed")
+        .last_activity;
+    assert!(streaming > idle, "the prompt's own entry moved the stamp");
+
+    for nth in 0..3 {
+        frames_until(&mut client.stream, "another streamed chunk", chunk).await;
+        assert_eq!(
+            summary(&harness.host, &session)
+                .await
+                .expect("listed")
+                .last_activity,
+            streaming,
+            "chunk {nth} carries no log position, so it moves no stamp",
+        );
+    }
+
+    client.pump_until_idle().await;
+    assert!(
+        summary(&harness.host, &session)
+            .await
+            .expect("listed")
+            .last_activity
+            > streaming,
+        "and the message's durable end does move it",
+    );
+    harness.host.shutdown().await;
+}
+
+/// Materializing a session is not activity. A resume reports the stamp its
+/// log bears, so a session the user merely opens does not claim it just did
+/// something, and the row survives a round trip through liveness unchanged.
+#[tokio::test]
+async fn a_resumed_session_reports_its_logs_stamp_in_both_directions() {
+    let harness =
+        Harness::with_idle_grace(vec![finalized_text_message("on the record")], IDLE_GRACE);
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+    client.pump_until_idle().await;
+    drop(client);
+    harness.host.shutdown().await;
+
+    let modified: chrono::DateTime<chrono::Utc> = std::fs::metadata(
+        harness
+            .persistence
+            .sessions_dir()
+            .join(format!("{session}.jsonl")),
+    )
+    .expect("the log")
+    .modified()
+    .expect("a modification time")
+    .into();
+
+    let revived = harness.revive_with_idle_grace(Vec::new(), Some(IDLE_GRACE));
+    let client = Client::attach(&revived.host, &session).await;
+    let live = summary(&revived.host, &session).await.expect("listed");
+    assert!(live.live);
+    assert_eq!(
+        live.last_activity, modified,
+        "a resume reports what the log says, not the moment it was opened",
+    );
+
+    drop(client);
+    let released = until_released(&revived.host, &session).await;
+    assert_eq!(
+        released.last_activity, modified,
+        "and going cold again leaves it exactly where it was",
+    );
+    revived.host.shutdown().await;
+}
+
+/// A session's activity stamp never walks backwards, in either direction over
+/// the liveness flip (spec 6.8). The two sides read different clocks that
+/// straddle the write: a live row reports when the driver saw the append, a
+/// cold one what the file says, and the driver's is the later of the two by
+/// however long the event took to reach it. A client stores the stamp it saw
+/// at view time, so a row that goes back in time is a glyph that will not
+/// fire for output the user has not seen.
+#[tokio::test]
+async fn a_sessions_stamp_survives_a_round_trip_through_liveness() {
+    let harness = Harness::with_idle_grace(
+        vec![
+            finalized_text_message("on the record"),
+            finalized_text_message("and again"),
+        ],
+        IDLE_GRACE,
+    );
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+    client.pump_until_idle().await;
+    let live = summary(&harness.host, &session)
+        .await
+        .expect("listed")
+        .last_activity;
+    drop(client);
+
+    let released = until_released(&harness.host, &session).await;
+    assert!(
+        released.last_activity >= live,
+        "going cold walked the row back: {} < {live}",
+        released.last_activity,
+    );
+
+    // And back again, in the same host, so the row the release recorded is
+    // still in the cold cache for the materialization to start from.
+    let mut client = Client::attach(&harness.host, &session).await;
+    let relived = summary(&harness.host, &session).await.expect("listed");
+    assert!(relived.live);
+    assert!(
+        relived.last_activity >= released.last_activity,
+        "coming back live walked the row back: {} < {}",
+        relived.last_activity,
+        released.last_activity,
+    );
+
+    // A second turn moves it forward, from the stamp it kept rather than from
+    // whatever the file happened to say.
+    harness.prompt(&session, "more").await;
+    client.pump_until_idle().await;
+    assert!(
+        summary(&harness.host, &session)
+            .await
+            .expect("listed")
+            .last_activity
+            > relived.last_activity,
+        "and durable work still moves it",
+    );
+    drop(client);
     harness.host.shutdown().await;
 }
 
@@ -2184,11 +2353,12 @@ async fn a_session_the_host_cannot_mark_is_not_released() {
     harness.host.shutdown().await;
 }
 
-/// A released session's mark never goes backwards. The mark is what a client
-/// derives unseen output from (spec 6.8), so a release publishing a row that
-/// predates the session's own work would silently erase it.
+/// A released session's activity stamp never goes backwards. The stamp is
+/// what a client derives unseen output from (spec 6.8), so a release
+/// publishing a row that predates the session's own work would silently erase
+/// it.
 #[tokio::test]
-async fn a_release_never_lowers_the_mark_it_publishes() {
+async fn a_release_never_lowers_the_stamp_it_publishes() {
     let harness = Harness::with_idle_grace(
         vec![
             finalized_text_message("first"),
@@ -2200,24 +2370,26 @@ async fn a_release_never_lowers_the_mark_it_publishes() {
     let mut client = Client::attach(&harness.host, &session).await;
     harness.prompt(&session, "punctuate").await;
     client.pump_until_idle().await;
-    // A row on disk for it, from before the work below.
-    let cold = summary(&harness.host, &session)
+    // Where the row stood before the work below.
+    let before = summary(&harness.host, &session)
         .await
         .expect("listed")
-        .last_seq;
+        .last_activity;
     harness.prompt(&session, "more").await;
     client.pump_until_idle().await;
     let live = summary(&harness.host, &session)
         .await
         .expect("listed")
-        .last_seq;
-    assert!(live > cold, "the second turn added durable entries");
+        .last_activity;
+    assert!(live > before, "the second turn moved the session's stamp");
     drop(client);
 
     let released = until_released(&harness.host, &session).await;
-    assert_eq!(
-        released.last_seq, live,
-        "the release published the mark the session actually reached",
+    assert!(
+        released.last_activity >= live,
+        "the release published the stamp the session actually reached, \
+         {} is older than {live}",
+        released.last_activity,
     );
 }
 
@@ -2406,7 +2578,10 @@ async fn a_turn_nobody_is_attached_to_is_not_released_out_from_under() {
                     if text.contains("cancelled")))),
         "and it was not cancelled on the way out",
     );
-    assert!(released.last_seq > 0);
+    assert_eq!(
+        released.last_seq, None,
+        "and its cold row carries no position"
+    );
     drop(rejoined);
     harness.host.shutdown().await;
 }
@@ -2492,23 +2667,30 @@ async fn a_released_session_can_be_taken_over_by_another_host() {
         .await
         .expect("a settings change");
     client.pump_until_idle().await;
+    // What the first host's log holds, settings entry included. It is only
+    // buffered at this point, so the teardown flush is the one thing that can
+    // put it where a second host would find it.
+    let logged = {
+        let handles = harness.host.local_handles(&session).await.expect("handles");
+        handles.log.lock().await.last_seq()
+    };
     drop(client);
 
     let released = until_released(&harness.host, &session).await;
-    assert_eq!(
-        harness
-            .persistence
-            .stored_last_seq(&session)
-            .expect("count the log"),
-        released.last_seq,
-        "the mark the directory reports is the one on disk, so the flush landed",
-    );
+    assert_eq!(released.last_seq, None, "and a cold one does not");
 
     let rival = harness.revive_with_idle_grace(Vec::new(), Some(IDLE_GRACE));
     let taken = Client::attach(&rival.host, &session).await;
+    let resumed = summary(&rival.host, &session).await.expect("listed");
     assert!(
-        summary(&rival.host, &session).await.expect("listed").live,
+        resumed.live,
         "the second host materialized the session the first one let go",
+    );
+    assert_eq!(
+        resumed.last_seq,
+        Some(logged),
+        "and counted every entry the first host flushed on its way out, \
+         including the settings record that only the teardown could land",
     );
     assert!(
         assistant_rows(&taken.chat, AgentId::Main)
@@ -2577,11 +2759,11 @@ async fn a_release_never_drops_a_session_out_of_the_directory() {
     harness.host.shutdown().await;
 }
 
-/// A release hands the session's mark to the directory from the driver's own
+/// A release hands the session's row to the directory from the driver's own
 /// state, so a refresh reports a session this host closed without reading the
 /// log back (spec 6.8's no-disk-read rule for what the host already knows).
 #[tokio::test]
-async fn a_released_sessions_mark_needs_no_disk_read() {
+async fn a_released_sessions_row_needs_no_disk_read() {
     let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
     let session = harness.create().await;
     let mut client = Client::attach(&harness.host, &session).await;
@@ -2603,10 +2785,10 @@ async fn a_released_sessions_mark_needs_no_disk_read() {
         )
         .await
         .expect("thinking change");
-    let logged = {
-        let handles = harness.host.local_handles(&session).await.expect("handles");
-        handles.log.lock().await.last_seq()
-    };
+    let live = summary(&harness.host, &session)
+        .await
+        .expect("listed")
+        .last_activity;
 
     // A second session carries the stream the release is watched on. A listing
     // would do, but it is an enumeration point, and one between the release and
@@ -2637,10 +2819,17 @@ async fn a_released_sessions_mark_needs_no_disk_read() {
         .into_iter()
         .find(|entry| entry.id == session)
         .expect("the released session's row");
-    assert_eq!(released.last_seq, logged);
+    assert_eq!(released.last_seq, None, "a cold row carries no position");
+    assert!(
+        released.last_activity >= live,
+        "and the stamp it does carry did not go backwards over the release, \
+         {} is older than {live}",
+        released.last_activity,
+    );
 
-    // The log a released session left is unreadable from here on. Its mark
-    // still reports, which it could not if the refresh went back to the file.
+    // The log a released session left is unreadable from here on. The row
+    // still reports, which it could not if the refresh went back to the file:
+    // a log the store cannot open is left out of the directory entirely.
     let path = harness
         .persistence
         .sessions_dir()
@@ -2658,8 +2847,8 @@ async fn a_released_sessions_mark_needs_no_disk_read() {
         .await
         .expect("the session is still listed");
     assert_eq!(
-        still.last_seq, logged,
-        "the mark came from what the release recorded, not from the log",
+        still.last_activity, released.last_activity,
+        "the row came from what the release recorded, not from the log",
     );
     std::fs::set_permissions(&path, mode).expect("restore the mode");
     drop(stream);
@@ -4024,6 +4213,11 @@ async fn a_cursor_past_the_high_water_mark_earns_a_full_backfill() {
     client.pump_until_idle().await;
     let settled = client.canonical();
     let epoch = client.client.cursor().expect("a committed cursor").epoch;
+    // The host's own mark, not the client's cursor: a client holds its last
+    // entry back until a trailing event rules one out (spec 6.5), so its
+    // cursor sits one short of the boundary this test is about. A client may
+    // not turn a position it read in the directory into a cursor either, the
+    // test is reading ground truth to build the case.
     let mark = harness
         .host
         .sessions()
@@ -4033,7 +4227,8 @@ async fn a_cursor_past_the_high_water_mark_earns_a_full_backfill() {
         .iter()
         .find(|entry| entry.id == session)
         .expect("the session")
-        .last_seq;
+        .last_seq
+        .expect("a live session's row reports its position");
     assert!(mark > 0, "the turn wrote log entries");
 
     let at_mark = client
@@ -4886,7 +5081,10 @@ async fn list_frames_carry_the_directory_and_are_debounced() {
         .expect("the live session is listed");
     assert!(summary.live);
     assert!(!summary.working, "the turn has settled");
-    assert!(summary.last_seq > 0, "it has durable entries");
+    assert!(
+        summary.last_seq.is_some_and(|seq| seq > 0),
+        "a live row reports the position the host holds",
+    );
     harness.host.shutdown().await;
 }
 
@@ -5124,9 +5322,9 @@ async fn the_hosts_own_changes_need_no_enumeration() {
         .into_iter()
         .find(|entry| entry.id == created)
         .expect("the released session's row");
-    assert!(
-        released.last_seq > 0,
-        "the release published the mark the driver counted, not a zero",
+    assert_eq!(
+        released.last_seq, None,
+        "a cold row carries no position (spec 6.8)",
     );
     assert_eq!(
         harness.host.store_directory_reads(),
@@ -5380,7 +5578,10 @@ async fn list_frames_report_working_queued_and_live_tasks() {
         summary.last_activity >= before,
         "the turn's appends moved the last-activity stamp: {summary:?}",
     );
-    assert!(summary.last_seq > 0, "and its durable position");
+    assert!(
+        summary.last_seq.is_some_and(|seq| seq > 0),
+        "and its durable position",
+    );
 
     // Withdraw the follow-up so no wake asks the exhausted script for one
     // more inference.
@@ -5614,9 +5815,9 @@ async fn a_task_detail_read_omits_host_paths_and_cold_tasks_are_unknown() {
 }
 
 /// The task, queue and usage reads answer a session that is not live
-/// without materializing it (spec 6.7), and the directory reports its
-/// durable high-water mark from the store rather than as zero. The tree read
-/// is the one exception: it has to parse the log, so it materializes.
+/// without materializing it (spec 6.7), and the directory carries its row
+/// with the stamp its log file bears. The tree read is the one exception: it
+/// has to parse the log, so it materializes.
 #[tokio::test]
 async fn reads_do_not_materialize_a_cold_session() {
     let harness = Harness::new(vec![finalized_text_message("on the record")]);
@@ -5624,16 +5825,19 @@ async fn reads_do_not_materialize_a_cold_session() {
     let mut client = Client::attach(&harness.host, &session).await;
     harness.prompt(&session, "hi").await;
     client.pump_until_idle().await;
-    let live_last_seq = {
-        let handles = harness
-            .host
-            .local_handles(&session)
-            .await
-            .expect("live session");
-        handles.log.lock().await.last_seq()
-    };
     drop(client);
     harness.host.shutdown().await;
+
+    let log_modified: chrono::DateTime<chrono::Utc> = std::fs::metadata(
+        harness
+            .persistence
+            .sessions_dir()
+            .join(format!("{session}.jsonl")),
+    )
+    .expect("the log")
+    .modified()
+    .expect("a modification time")
+    .into();
 
     let revived = harness.revive(Vec::new());
     let is_live = async || {
@@ -5650,8 +5854,12 @@ async fn reads_do_not_materialize_a_cold_session() {
     let cold = is_live().await;
     assert!(!cold.live);
     assert_eq!(
-        cold.last_seq, live_last_seq,
-        "a cold session's high-water mark comes from the store, not from zero",
+        cold.last_seq, None,
+        "a cold row carries no position: producing one would read the log",
+    );
+    assert_eq!(
+        cold.last_activity, log_modified,
+        "and its stamp is the log file's modification time (spec 6.8)",
     );
 
     assert!(
@@ -5713,9 +5921,9 @@ async fn reads_do_not_materialize_a_cold_session() {
 
 /// A live session's mark comes from the host's own bookkeeping, and the cold
 /// half of the directory tracks the store rather than a snapshot of it: a log
-/// that grows behind the host's back reports its new mark, a session file that
-/// appears is listed, one that is deleted goes away, and a pre-refactor log is
-/// no session at all.
+/// that grows behind the host's back reports its new stamp, a session file
+/// that appears is listed, one that is deleted goes away, and a pre-refactor
+/// log is no session at all.
 ///
 /// This is the correctness half of the list-production contract (spec 6.8).
 /// The caches it exercises are what keep a refresh from re-reading the store,
@@ -5747,7 +5955,8 @@ async fn the_directory_follows_the_store_it_caches() {
         .expect("the live session is listed");
     assert!(live_mark.live && logged > 0);
     assert_eq!(
-        live_mark.last_seq, logged,
+        live_mark.last_seq,
+        Some(logged),
         "a live session's mark is the one the host already holds",
     );
     drop(client);
@@ -5755,7 +5964,9 @@ async fn the_directory_follows_the_store_it_caches() {
 
     let revived = harness.revive(Vec::new());
     let sessions_dir = revived.persistence.sessions_dir().to_path_buf();
-    let mark = async |id: &str| {
+    // The row's activity stamp, or `None` when the directory does not name
+    // the session at all.
+    let stamp = async |id: &str| {
         revived
             .host
             .sessions()
@@ -5764,13 +5975,24 @@ async fn the_directory_follows_the_store_it_caches() {
             .sessions
             .into_iter()
             .find(|entry| entry.id == id)
-            .map(|entry| entry.last_seq)
+            .map(|entry| entry.last_activity)
     };
-    assert_eq!(mark(&session).await, Some(logged), "and so is a cold one's");
+    let modified = |id: &str| -> chrono::DateTime<chrono::Utc> {
+        std::fs::metadata(sessions_dir.join(format!("{id}.jsonl")))
+            .expect("the log")
+            .modified()
+            .expect("a modification time")
+            .into()
+    };
+    assert_eq!(
+        stamp(&session).await,
+        Some(modified(&session)),
+        "a cold row's stamp is its log file's modification time",
+    );
 
     // A line appended behind this host's back (a sibling process holding the
     // session, say) moves the file's size and modification time, which is what
-    // makes the next refresh recount instead of answering from the cache.
+    // the next enumeration point picks the row up from.
     let appended = serde_json::json!({
         "id": "ffffffff",
         "timestamp": "2024-01-01T00:00:00Z",
@@ -5786,9 +6008,9 @@ async fn the_directory_follows_the_store_it_caches() {
         .expect("append an entry");
     drop(file);
     assert_eq!(
-        mark(&session).await,
-        Some(logged + 1),
-        "a log that grew is counted again",
+        stamp(&session).await,
+        Some(modified(&session)),
+        "a log that grew reports the stamp it grew to",
     );
 
     // A session file that appears is listed, and one that is deleted goes
@@ -5804,9 +6026,13 @@ async fn the_directory_follows_the_store_it_caches() {
         "text": "a log written behind the host's back",
     });
     std::fs::write(&appeared_path, format!("{entry}\n")).expect("write a session file");
-    assert_eq!(mark(appeared).await, Some(1), "the new file is listed");
+    assert_eq!(
+        stamp(appeared).await,
+        Some(modified(appeared)),
+        "the new file is listed",
+    );
     std::fs::remove_file(&appeared_path).expect("delete it again");
-    assert_eq!(mark(appeared).await, None, "and the deleted one is gone");
+    assert_eq!(stamp(appeared).await, None, "and the deleted one is gone");
 
     let ancient = "1999-01-01-00-00-00-000";
     std::fs::write(
@@ -5815,7 +6041,7 @@ async fn the_directory_follows_the_store_it_caches() {
     )
     .expect("write a pre-refactor file");
     assert_eq!(
-        mark(ancient).await,
+        stamp(ancient).await,
         None,
         "a pre-refactor log is not a session",
     );

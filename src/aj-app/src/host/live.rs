@@ -62,18 +62,23 @@ pub(crate) enum ReleaseOutcome {
 
 /// What a released session leaves for the host's directory to report.
 ///
-/// Both halves are read after the release flush and while the driver still
-/// holds the session's lock, so they describe the same file state and no rival
-/// writer can have moved it in between. A release the driver cannot produce one
-/// for does not happen at all: the host would have no row to serve the session
-/// with (see [`ReleaseOutcome`]).
+/// Read after the release flush and while the driver still holds the
+/// session's lock, so it describes the file state the release actually left
+/// and no rival writer can have moved it in between. A release the driver
+/// cannot produce one for does not happen at all: the host would have no row
+/// to serve the session with (see [`ReleaseOutcome`]).
 pub(crate) struct ReleasedMark {
-    /// The log's own durable mark, so the directory can report the session
-    /// without counting a log the host just closed itself.
-    pub(crate) last_seq: u64,
-    /// The file the mark was read at, which is the fingerprint the directory
-    /// caches it under.
+    /// The file the release left behind, which is the fingerprint the
+    /// directory caches its format verdict under.
     pub(crate) file: SessionMetadata,
+    /// The activity stamp the session's cold row carries (spec 6.8).
+    ///
+    /// The file's modification time, except that a liveness flip may not walk
+    /// a row's stamp backwards. The two clocks straddle the write: the driver
+    /// stamps a durable event when it consumes it, a moment after the append
+    /// that moved the mtime, so the mtime alone would rewind the row by that
+    /// gap. We take the later of the two.
+    pub(crate) last_activity: DateTime<Utc>,
 }
 
 /// The per-session state the host publishes, readable without awaiting.

@@ -420,6 +420,11 @@ impl SessionHost {
         // Host startup is an enumeration point (spec 6.8). Nothing is live
         // yet, and a store that cannot be read is not fatal: the next
         // enumeration point tries again.
+        //
+        // Synchronous, which it can afford to be because a row costs a
+        // `readdir` entry, a `stat` and one first-line sniff. Anything that
+        // read a log to build a row would put the whole store's bytes in front
+        // of the first frame, which on a real store is gigabytes.
         if let Err(err) = inner.cold.enumerate(|_| false) {
             tracing::warn!("could not read the session store at startup: {err}");
         }
@@ -661,7 +666,10 @@ impl SessionHost {
                         working: false,
                         queued: QueueCounts::default(),
                         tasks: 0,
-                        last_seq: session.last_seq,
+                        // A cold row carries no durable position (spec 6.8):
+                        // the count is not recorded anywhere, so producing one
+                        // would mean reading the log.
+                        last_seq: None,
                         last_activity: session.last_activity,
                         unreachable: false,
                     },
@@ -693,12 +701,33 @@ impl SessionHost {
         self.inner.cold.directory_reads()
     }
 
+    /// The activity stamp a session starts its materialization from.
+    ///
+    /// Materializing is not activity. A session resumed from a log written
+    /// last week keeps reporting last week, or every session the user merely
+    /// opens would claim it just did something and the unseen-output glyph
+    /// would read off it (spec 6.8).
+    ///
+    /// The log's modification time is the floor, and a row this host already
+    /// recorded for the session outranks it when it is later: a release
+    /// records the later of the file's time and the driver's own, because the
+    /// two clocks straddle the write (see `ReleasedMark`), and going back to
+    /// live must not undo that. A created session has neither, and being
+    /// created is the activity.
+    fn opening_stamp(&self, log: &ConversationLog, session_id: &str) -> DateTime<Utc> {
+        [log_modified_at(log), self.inner.cold.stamp(session_id)]
+            .into_iter()
+            .flatten()
+            .max()
+            .unwrap_or_else(Utc::now)
+    }
+
     /// Re-read the store into the cold cache. The enumeration point (spec 6.8).
     async fn enumerate(&self) -> Result<(), HostError> {
-        // The live set keeps a live session's log out of the per-file work: the
-        // host holds its mark and status, and recounting a file that grows on
-        // every append would be blocking IO on a runtime worker for a worse
-        // answer than the one we already have (spec 6.8).
+        // The live set keeps a live session's log out of the per-file work.
+        // The host holds its status, which is both cheaper and more current
+        // than the file, and a session mid-append is the last thing worth
+        // sniffing (spec 6.8).
         let live: HashSet<String> = self.inner.sessions.lock().await.keys().cloned().collect();
         // The scan is blocking IO, so it runs with the session map's lock
         // already released.
@@ -1203,7 +1232,7 @@ impl SessionHost {
             // `SessionStatus::finished_subs`).
             finished_subs: log.sub_agent_ids(),
             driven_subs: std::collections::BTreeSet::new(),
-            last_activity: Utc::now(),
+            last_activity: self.opening_stamp(&log, &session_id),
             last_work: Instant::now(),
         };
         drop(log);
@@ -1446,6 +1475,15 @@ fn validate_model_selection(selection: &ModelSelection) -> Result<(), HostError>
     Ok(())
 }
 
+/// The modification time of `log`'s file, or `None` for a log that has none
+/// yet (a created session defers its file to the first punctuating append).
+fn log_modified_at(log: &ConversationLog) -> Option<DateTime<Utc>> {
+    if !log.is_durable() {
+        return None;
+    }
+    Some(std::fs::metadata(log.path()).ok()?.modified().ok()?.into())
+}
+
 /// Project one live session onto its directory entry.
 fn summarize(session: &Arc<LiveSession>) -> SessionSummary {
     let (steering, follow_up) = session.core.message_queues.pending_counts();
@@ -1466,7 +1504,7 @@ fn summarize(session: &Arc<LiveSession>) -> SessionSummary {
             follow_up,
         },
         tasks,
-        last_seq: status.last_seq,
+        last_seq: Some(status.last_seq),
         last_activity: status.last_activity,
         unreachable: false,
     }

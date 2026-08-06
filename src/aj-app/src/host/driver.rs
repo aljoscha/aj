@@ -1016,11 +1016,11 @@ impl Driver {
         }
     }
 
-    /// The mark a release has to hand the store, or `None` when the session may
+    /// The row a release has to hand the store, or `None` when the session may
     /// not go after all.
     ///
     /// Read under the log lock, which this task holds along with the session's
-    /// advisory lock, so the mark and the file state it was read at cannot
+    /// advisory lock, so the row and the file state it describes cannot
     /// disagree and no rival writer can be between them. Nothing can append
     /// between here and the teardown either: a releasable session has no turn,
     /// no live task and nothing queued, and this task is its only appender.
@@ -1054,15 +1054,19 @@ impl Driver {
             );
             return None;
         }
-        let last_seq = log.last_seq();
         let file = std::fs::metadata(log.path()).ok()?;
+        let file = SessionMetadata::new(
+            self.session.id().to_string(),
+            file.modified().ok()?.into(),
+            file.len(),
+        );
+        // The status lock nests under the log lock here. That is the order the
+        // driver always takes them in, and nothing takes the log lock while
+        // holding the status.
+        let last_activity = file.modified_at.max(self.session.status().last_activity);
         Some(ReleasedMark {
-            last_seq,
-            file: SessionMetadata::new(
-                self.session.id().to_string(),
-                file.modified().ok()?.into(),
-                file.len(),
-            ),
+            file,
+            last_activity,
         })
     }
 }

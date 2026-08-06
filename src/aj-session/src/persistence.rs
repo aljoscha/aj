@@ -161,50 +161,6 @@ impl ConversationPersistence {
         Ok(sessions.first().map(|t| t.session_id.clone()))
     }
 
-    /// The durable high-water mark a resume of `session_id` would report,
-    /// read off the file rather than by building the log.
-    ///
-    /// This is what `last_seq` means for a session that is not live (spec
-    /// 6.8). It mirrors [`crate::ConversationLog::resume`]'s tolerance:
-    /// blank lines do not count and a malformed line (which for a resume
-    /// is the torn tail it truncates) is skipped. Each line's JSON is
-    /// validated but not decoded into an entry, which keeps this cheap on
-    /// a large log. A missing file counts zero, since a session that has
-    /// not punctuated yet has nothing durable.
-    ///
-    /// Lines are read as bytes, so a torn tail that cuts a multi-byte
-    /// character is a malformed line like any other rather than a read
-    /// failure. That matters because the caller caches the count against the
-    /// file and would otherwise re-read a whole log it can never count.
-    ///
-    /// The one place it can disagree with a resume: a duplicated entry id,
-    /// which a resume adopts once and this counts twice. Only a
-    /// hand-edited log has one.
-    pub fn stored_last_seq(&self, session_id: &str) -> Result<u64, ConversationError> {
-        let path = self.session_path(session_id);
-        let file = match File::open(&path) {
-            Ok(file) => file,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(err) => return Err(err.into()),
-        };
-        let mut reader = BufReader::new(file);
-        let mut line = Vec::new();
-        let mut entries = 0;
-        loop {
-            line.clear();
-            if reader.read_until(b'\n', &mut line)? == 0 {
-                return Ok(entries);
-            }
-            let trimmed = line.trim_ascii();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if serde_json::from_slice::<serde::de::IgnoredAny>(trimmed).is_ok() {
-                entries += 1;
-            }
-        }
-    }
-
     /// List sessions with rich per-session previews — first user
     /// message, message count, modified time, file size.
     ///
@@ -346,7 +302,7 @@ pub struct SessionMetadata {
     /// File size in bytes. Paired with `modified_at` it fingerprints the
     /// file, which is what lets a caller cache anything it derived from
     /// the file's contents (see
-    /// [`ConversationPersistence::stored_last_seq`]).
+    /// [`ConversationPersistence::is_current_format`]).
     pub size_bytes: u64,
 }
 
@@ -665,81 +621,29 @@ mod tests {
         assert!(p.size_bytes > 0);
     }
 
-    /// `stored_last_seq` is the count of entries a resume would adopt, read
-    /// off the file: the same number the resumed log reports, and it
-    /// tolerates the torn tail a resume truncates.
+    /// The format sniff reads bytes, not text, so a log that is not valid
+    /// UTF-8 earns a verdict rather than a read failure. That matters because
+    /// the caller caches the verdict against the file and treats a failure as
+    /// "try again next time", which for a file that will never decode is every
+    /// enumeration for the life of the host.
     #[test]
-    fn stored_last_seq_matches_what_a_resume_reports() {
-        let (_dir, persistence) = fixture();
-        let mut log = ConversationLog::create(&persistence).expect("create");
-        log.set_system_prompt("p".into()).expect("system prompt");
-        append_user_then_assistant(&mut log, "hello", "hi");
-        let session_id = log.session_id().to_string();
-        let live_last_seq = log.last_seq();
-        drop(log);
-
-        assert_eq!(
-            persistence.stored_last_seq(&session_id).expect("count"),
-            live_last_seq,
-        );
-        assert_eq!(
-            persistence
-                .stored_last_seq("no-such-session")
-                .expect("count"),
-            0,
-            "a session with nothing on disk has nothing durable",
-        );
-
-        // A torn trailing line is what a resume truncates, so it counts for
-        // neither of them.
-        let path = persistence.session_path(&session_id);
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .expect("reopen the log");
-        std::io::Write::write_all(&mut file, b"{\"id\":\"torn\"").expect("append a torn line");
-        drop(file);
-        assert_eq!(
-            persistence.stored_last_seq(&session_id).expect("count"),
-            live_last_seq,
-        );
-        let resumed = ConversationLog::resume(&persistence, &session_id).expect("resume");
-        assert_eq!(resumed.last_seq(), live_last_seq);
-    }
-
-    /// A torn tail that cuts a multi-byte character is a malformed line like
-    /// any other, for both readers. Neither may report it as a read failure: a
-    /// caller that caches per file would re-read the whole log on every refresh
-    /// for an answer it can never get.
-    #[test]
-    fn a_torn_multibyte_tail_is_a_malformed_line() {
+    fn the_format_sniff_reads_bytes_and_always_reaches_a_verdict() {
         let (_dir, persistence) = fixture();
         let mut log = ConversationLog::create(&persistence).expect("create");
         append_user_then_assistant(&mut log, "hello", "hi");
         let session_id = log.session_id().to_string();
         let path = log.path().to_path_buf();
-        let counted = persistence.stored_last_seq(&session_id).expect("count");
         drop(log);
 
         // The first two bytes of a three-byte character, as a crash mid-append
-        // leaves behind.
+        // leaves behind. The sniff reads the first line, so it is unaffected.
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
             .expect("reopen the log");
         std::io::Write::write_all(&mut file, &[b'{', 0xe2, 0x82]).expect("append a torn line");
         drop(file);
-
-        assert_eq!(
-            persistence.stored_last_seq(&session_id).expect("count"),
-            counted,
-            "the torn tail counts for nothing, and counting still succeeds",
-        );
-        assert_eq!(
-            persistence.is_current_format(&session_id),
-            Some(true),
-            "and the format verdict still comes off the first line",
-        );
+        assert_eq!(persistence.is_current_format(&session_id), Some(true));
 
         // A whole log of invalid bytes is a verdict too, not a read failure.
         let blob = persistence
@@ -749,12 +653,6 @@ mod tests {
         assert_eq!(
             persistence.is_current_format("2000-01-01-00-00-00-000"),
             Some(false),
-        );
-        assert_eq!(
-            persistence
-                .stored_last_seq("2000-01-01-00-00-00-000")
-                .expect("count"),
-            0,
         );
     }
 

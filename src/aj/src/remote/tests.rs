@@ -1061,7 +1061,10 @@ async fn creation_applies_settings_and_runs_a_first_prompt() {
         .find(|entry| entry.id == session)
         .expect("the created session is in the directory");
     assert!(summary.live, "a session this host holds is live");
-    assert!(summary.last_seq > 0, "the turn wrote log entries");
+    assert!(
+        summary.last_seq.is_some_and(|seq| seq > 0),
+        "the turn wrote log entries",
+    );
     fixture.shutdown().await;
 }
 
@@ -2496,9 +2499,12 @@ async fn a_reattach_with_no_durable_suffix_still_concludes_a_sub_agent() {
         })
         .await;
 
-    // The session's high-water mark, as a client learns it: from the directory
-    // read, under the epoch the fold adopted. The client applied every entry up
-    // to it, it only held the last one back from its committed cursor.
+    // The session's high-water mark, read off the host's own bookkeeping,
+    // under the epoch the fold adopted. The client applied every entry up to
+    // it, it only held the last one back from its committed cursor, so this is
+    // the boundary the reattach below has to be served at. A client may not
+    // turn a position it read in the directory into a cursor (spec 6.5), the
+    // test is reading ground truth to build the case.
     let epoch = remote.client.cursor().expect("a committed cursor").epoch;
     let last_seq = fixture
         .client
@@ -2509,7 +2515,8 @@ async fn a_reattach_with_no_durable_suffix_still_concludes_a_sub_agent() {
         .iter()
         .find(|entry| entry.id == session)
         .expect("the session")
-        .last_seq;
+        .last_seq
+        .expect("a live session's row reports its position");
 
     let block = remote
         .reattach_at(Some(Cursor {

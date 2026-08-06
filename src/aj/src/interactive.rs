@@ -9414,6 +9414,10 @@ mod tests {
     }
 
     /// The focused session's durable high-water mark, as the host reports it.
+    ///
+    /// The directory is the test's window onto the host's own bookkeeping. A
+    /// client may not turn a position it read there into a cursor (spec 6.5),
+    /// and nothing here does.
     async fn host_mark(world: &World) -> u64 {
         world
             .control
@@ -9425,6 +9429,7 @@ mod tests {
             .find(|entry| entry.id == world.session)
             .expect("the focused session is in the host's directory")
             .last_seq
+            .expect("a live session's row reports its position")
     }
 
     /// The loop routes a closed local stream into the same recovery a lost
@@ -14106,7 +14111,10 @@ mod tests {
                 .find(|entry| entry.id == outgoing)
                 .expect("the outgoing session is still in the directory");
             if !entry.live {
-                assert!(entry.last_seq > 0, "and it reports what it left on disk");
+                assert_eq!(
+                    entry.last_seq, None,
+                    "and its cold row carries no position (spec 6.8)",
+                );
                 break;
             }
             assert!(

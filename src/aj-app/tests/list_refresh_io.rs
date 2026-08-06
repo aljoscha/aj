@@ -4,16 +4,16 @@
 //! cumulative read counter and any other test running beside it would show up
 //! in the same number.
 //!
-//! What the budget catches is a refresh that goes back to the store for what
-//! the host already holds. It is the only test that can: the answers a refresh
-//! gives are correct either way, only the reads differ, and the unit tests over
-//! the caching layer can only pin that it honours the live set it is handed,
-//! not that the host hands it one.
+//! What the budgets catch is a directory that goes back to the store for what
+//! the host already holds, or that reads a log to produce a row. This is the
+//! only test that can: the answers are correct either way, only the reads
+//! differ, and the unit tests over the caching layer can only pin that it
+//! honours the live set it is handed, not that the host hands it one.
 //!
-//! The read counter cannot see the other half of the contract. A directory read
-//! and a `stat` transfer no bytes, so the budget below stays green over a
-//! refresh that enumerates the store on every tick, which is why the
-//! enumeration count is asserted beside it.
+//! The read counter cannot see the other half of the contract. A directory
+//! read and a `stat` transfer no bytes, so a refresh that enumerates the store
+//! on every tick stays inside a byte budget, which is why the enumeration
+//! count is asserted beside it.
 
 #![cfg(target_os = "linux")]
 
@@ -33,12 +33,12 @@ use aj_session::ConversationPersistence;
 use tempfile::TempDir;
 
 /// Cold logs in the store. Enough that re-reading them is unmistakable next to
-/// the budget below, few enough that writing them costs nothing.
+/// the budgets below, few enough that writing them costs nothing.
 const COLD_LOGS: usize = 100;
 
 /// Bytes each cold log holds. Above the 8 KiB a buffered first-line read pulls
-/// in, so re-sniffing the store would cost ~800 KB per refresh and re-counting
-/// it ~1.6 MB.
+/// in, so re-sniffing the store would cost ~800 KB per refresh and reading the
+/// logs whole ~1.6 MB.
 const LOG_BYTES: usize = 16 * 1024;
 
 /// What one streaming turn's worth of refreshes may read.
@@ -46,10 +46,20 @@ const LOG_BYTES: usize = 16 * 1024;
 /// Sized off both sides of the gap it has to separate: honouring the contract
 /// measures ~112 bytes for the whole turn (reading `/proc/self/io` itself,
 /// nothing else), while dropping just the live session from the scan filter
-/// measures ~85 KB, and dropping the caches costs megabytes. Well clear of
+/// measures ~85 KB, and reading the logs costs megabytes. Well clear of
 /// either end, so the test fails on a regression rather than on the noise a
 /// different runtime or filesystem contributes.
 const BUDGET: u64 = 16 * 1024;
+
+/// What composing a host over `COLD_LOGS` logs may read.
+///
+/// Startup enumerates, and enumerating sniffs each log's first line, which a
+/// `BufReader` pulls in 8 KiB at a time. That is the whole cost and it
+/// measures ~820 KB, so the budget is that plus room for anything incidental.
+/// Reading the logs themselves would add `COLD_LOGS * LOG_BYTES` on top, 1.6
+/// MB, which is what puts the two sides clearly apart. Sized against those two
+/// numbers, so it moves if either constant above does.
+const STARTUP_BUDGET: u64 = 1024 * 1024;
 
 /// This process's cumulative read bytes, `rchar` from `/proc/self/io`. Counts
 /// every read that reached a file descriptor, page cache or not.
@@ -86,7 +96,7 @@ fn seed_cold_logs(sessions_dir: &std::path::Path) {
     }
 }
 
-fn host(dir: &TempDir, persistence: &ConversationPersistence) -> SessionHost {
+fn setup(dir: &TempDir, persistence: &ConversationPersistence) -> HostSetup {
     let provider = Arc::new(
         ScriptedProvider::from_messages(
             // Long and slow, so the turn spans many coalescing ticks.
@@ -98,7 +108,7 @@ fn host(dir: &TempDir, persistence: &ConversationPersistence) -> SessionHost {
         )
         .on_exhausted(ExhaustedBehavior::Panic),
     );
-    SessionHost::new(HostSetup {
+    HostSetup {
         config: Arc::new(StdMutex::new(Config::default())),
         layers: Arc::new(StdMutex::new(ConfigLayers {
             user: Config::default(),
@@ -121,26 +131,59 @@ fn host(dir: &TempDir, persistence: &ConversationPersistence) -> SessionHost {
         auth: AuthStorage::new(dir.path().join("auth.json")),
         working_directory: dir.path().to_path_buf(),
         idle_grace: None,
-    })
-    .expect("host")
+    }
 }
 
-/// A streaming turn marks the directory dirty on every event, so the publisher
-/// refreshes at its coalescing rate throughout. Those refreshes must touch no
-/// filesystem at all: the live session's mark comes from the host, and the
-/// store's cold half is served from the cache the last enumeration point left.
+/// Both halves of the directory's I/O contract, in one test because the
+/// oracle is a process-wide counter and two tests would run concurrently.
+///
+/// Composing a host enumerates its store (spec 6.8), before the shell paints
+/// anything. That enumeration may read a log's first line to place it in or
+/// out of the directory, and nothing else: a row's stamp comes from the
+/// `stat`, and it carries no position at all. The failure this pins is not
+/// subtle in the wild, deriving each cold row's `last_seq` means parsing every
+/// log in the store, which on a real one is a multi-second, multi-gigabyte
+/// read before first paint.
+///
+/// Then a streaming turn, which marks the directory dirty on every event, so
+/// the publisher refreshes at its coalescing rate throughout. Those refreshes
+/// must touch no filesystem at all: the live session's state comes from the
+/// host, and the store's cold half is served from the cache the last
+/// enumeration point left.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_turns_worth_of_refreshes_reads_nothing() {
+async fn the_directory_costs_a_first_line_at_startup_and_nothing_per_refresh() {
     let dir = TempDir::new().expect("tempdir");
     let sessions_dir = dir.path().join("sessions");
     std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
     seed_cold_logs(&sessions_dir);
     let persistence = ConversationPersistence::new(sessions_dir);
-    let host = host(&dir, &persistence);
+    // Everything the composition needs is built before the window opens, so
+    // what it measures is the enumeration and nothing around it.
+    let setup = setup(&dir, &persistence);
 
-    // Materialize and warm the cache first: building a session reads context
-    // files and skills, and the first refresh counts every cold log once. Both
-    // are one-off costs the budget is not about.
+    let before = read_bytes();
+    let host = SessionHost::new(setup).expect("host");
+    let composed = read_bytes() - before;
+
+    let listed = host.sessions().await.expect("sessions").sessions;
+    assert_eq!(
+        listed.len(),
+        COLD_LOGS,
+        "the store's logs are all in the listing",
+    );
+    assert!(
+        listed.iter().all(|row| !row.live && row.last_seq.is_none()),
+        "and every one of them is a cold row with no position",
+    );
+    assert!(
+        composed < STARTUP_BUDGET,
+        "composing a host over {COLD_LOGS} logs of {LOG_BYTES} bytes read \
+         {composed} bytes, budget {STARTUP_BUDGET}: startup is reading logs, \
+         not enumerating them",
+    );
+
+    // Materialize before the second window: building a session reads context
+    // files and skills, a one-off cost the refresh budget is not about.
     let session = host.create().await.expect("create");
     host.sessions().await.expect("sessions");
 

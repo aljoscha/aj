@@ -645,7 +645,7 @@ mod tests {
             working: false,
             queued: aj_wire::QueueCounts::default(),
             tasks: 0,
-            last_seq,
+            last_seq: Some(last_seq),
             last_activity: chrono::DateTime::UNIX_EPOCH,
             unreachable: false,
         }]

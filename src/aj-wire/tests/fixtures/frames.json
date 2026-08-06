@@ -58,6 +58,15 @@
         "last_seq": 7,
         "last_activity": "2026-08-03T12:00:00Z",
         "unreachable": false
+      },
+      {
+        "id": "session-0",
+        "live": false,
+        "working": false,
+        "queued": { "steering": 0, "follow_up": 0 },
+        "tasks": 0,
+        "last_activity": "2026-08-02T09:30:00Z",
+        "unreachable": false
       }
     ]
   },

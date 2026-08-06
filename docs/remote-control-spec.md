@@ -688,9 +688,11 @@ cold row needs only enumeration metadata plus the per-path format
 sniff, the one first-line read, cached forever. Enumeration is
 therefore readdir and stats, cheap enough to run synchronously at
 startup.
-This contract has teeth: the polling variant of this design read
-hundreds of gigabytes a day sniffing and recounting an unchanged
-400-file directory. A refresh whose payload a subscriber has already
+This contract has teeth on both axes. The polling variant of this
+design read hundreds of gigabytes a day re-deriving an unchanged
+400-file directory, and deriving a cold `last_seq` once, at startup,
+still put the whole store's bytes in front of the first frame.
+A refresh whose payload a subscriber has already
 been sent is not sent to it again, `list` is cumulative and an
 unchanged snapshot carries no information. The comparison is per
 subscriber and against what was actually delivered: a freshly

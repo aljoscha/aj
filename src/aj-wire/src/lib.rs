@@ -171,7 +171,21 @@ pub struct SessionSummary {
     pub working: bool,
     pub queued: QueueCounts,
     pub tasks: usize,
-    pub last_seq: u64,
+    /// The session's durable high-water mark, present iff `live` (spec 6.8).
+    ///
+    /// A cold row has none. Nothing in a log records its entry count, so an
+    /// exact position costs a read of the whole file, and the protocol
+    /// forbids using a list-observed position as a cursor anyway (spec 6.5).
+    /// [`Self::last_activity`] is the signal a cold row carries instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seq: Option<u64>,
+    /// When the session last did something, on the host's clock: the last
+    /// durable event for a live row, the log file's modification time for a
+    /// cold one.
+    ///
+    /// A client records this at view time and compares it against later rows
+    /// to derive the unseen-output glyph (spec 6.8). Both sides of that
+    /// comparison are host clock, so the client never consults its own.
     pub last_activity: DateTime<Utc>,
     #[serde(default)]
     pub unreachable: bool,
