@@ -426,9 +426,10 @@ Per session the host maintains:
   connection that drops in between would otherwise leave the client
   claiming an entry it only partly applied. Offering an older cursor is
   always safe: the server serves one more entry and idempotent
-  application absorbs it. A `last_seq` merely observed in `list` frames
-  for a session the client never attached is glyph data, never a cursor,
-  offering it would silently skip that session's entire history.
+  application absorbs it. A `last_seq` merely observed in a `list` frame
+  is never a cursor, offering it would silently skip everything the
+  client has not applied. Only live rows carry one at all, and attention
+  for the rest rides the list's activity stamps (section 6.8).
 - **epoch**: an opaque token minted fresh every time a session is
   materialized, and replaced whenever the linearized history changes
   in a way that is not a pure append (head switch to a different
@@ -651,8 +652,22 @@ Per-session status in `list` frames and `GET /v1/sessions`:
   forbids using it as a cursor anyway (section 6.5), and seqs are not
   even stable across materializations. Deriving it made every host
   start read the entire store, gigabytes before first paint. The
-  activity timestamp carries the same signal for a stat: a cold row's
-  stamp is the log's mtime, a live row's is the last durable event.
+  activity timestamp carries the same signal for a stat. The host's
+  own answer is the authority wherever it has one: a live row's stamp
+  is the last durable event it observed, and a release hands that same
+  stamp to the cold row and pins it against the file it left behind,
+  so the row does not move over a liveness flip in either direction.
+  The log's mtime stands in only where the host has no answer, which
+  is every session on a host that just started.
+  The two are not interchangeable, which is why the host's wins. The
+  mtime answers when bytes landed: it runs a little ahead of a durable
+  event the host has not observed yet, and a long way behind one whose
+  entry was buffered, since a release's teardown flush writes those a
+  whole idle grace after the work that produced them. A row stamped
+  from that flush would announce unseen output on a session that
+  produced none. The guarantee is therefore process-local: a host that
+  restarts falls back to the mtime and can differ from what the
+  previous host published, as can two hosts listing one store.
 - `unreachable` (gateway only): the owning host connection is down.
 
 There is deliberately no "needs attention" bit on the server. A client
@@ -684,10 +699,13 @@ surface, not a workload to poll for, its sessions cannot be served by
 this host anyway, and its activity becomes visible at the next
 enumeration point. Reading a log to produce a directory row is never
 correct, live or cold: a live session's facts are in memory, and a
-cold row needs only enumeration metadata plus the per-path format
-sniff, the one first-line read, cached forever. Enumeration is
-therefore readdir and stats, cheap enough to run synchronously at
-startup.
+cold row needs only enumeration metadata plus the format sniff, the
+one first-line read, cached against the file it was taken from so a
+settled store re-sniffs nothing. Keying it on the file rather than the
+path alone is what recovers from a sniff that landed on a log another
+process was midway through writing. Enumeration is therefore readdir,
+stats and a sniff per file that moved, cheap enough to run
+synchronously at startup.
 This contract has teeth on both axes. The polling variant of this
 design read hundreds of gigabytes a day re-deriving an unchanged
 400-file directory, and deriving a cold `last_seq` once, at startup,

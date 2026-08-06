@@ -1825,13 +1825,28 @@ async fn requests_after_shutdown_are_refused() {
 const IDLE_GRACE: Duration = Duration::from_millis(200);
 
 /// The summary the host's directory reports for `session`, if it names it.
+///
+/// Every row the host produces goes through here or through
+/// [`directories`], and both check the invariant the wire type documents but
+/// does not enforce: a position is present exactly when the row is live (spec
+/// 6.8). Checking it on the way past is what makes it hold for every
+/// directory any test in this file ever looks at, rather than for the handful
+/// a dedicated test would build.
 async fn summary(host: &SessionHost, session: &str) -> Option<aj_wire::SessionSummary> {
-    host.sessions()
-        .await
-        .expect("sessions")
-        .sessions
-        .into_iter()
-        .find(|entry| entry.id == session)
+    let sessions = host.sessions().await.expect("sessions").sessions;
+    assert_rows_well_formed(&sessions);
+    sessions.into_iter().find(|entry| entry.id == session)
+}
+
+/// Panic unless every row carries a position exactly when it is live.
+fn assert_rows_well_formed(sessions: &[aj_wire::SessionSummary]) {
+    for row in sessions {
+        assert_eq!(
+            row.live,
+            row.last_seq.is_some(),
+            "a position is present iff the row is live (spec 6.8): {row:?}",
+        );
+    }
 }
 
 /// Wait until the host reports `session` as no longer live, and answer the
@@ -1990,6 +2005,12 @@ async fn a_resumed_session_reports_its_logs_stamp_in_both_directions() {
     let client = Client::attach(&revived.host, &session).await;
     let live = summary(&revived.host, &session).await.expect("listed");
     assert!(live.live);
+    // Exact, not a bound: a fresh host holds no row for the session, so the
+    // file is the only answer there is. It stays exact through the release
+    // below because a clean resume buffers nothing, so the teardown flush
+    // writes no bytes and the file does not move. A resume that starts
+    // buffering (a restore context, a repair of a torn tail) legitimately
+    // stamps the session at the repair, and this becomes a `>=`.
     assert_eq!(
         live.last_activity, modified,
         "a resume reports what the log says, not the moment it was opened",
@@ -2043,6 +2064,10 @@ async fn a_sessions_stamp_survives_a_round_trip_through_liveness() {
     let relived = summary(&harness.host, &session).await.expect("listed");
     assert!(relived.live);
     assert!(
+        relived.last_seq.is_some_and(|seq| seq > 0),
+        "and going live hands the row a position again: {relived:?}",
+    );
+    assert!(
         relived.last_activity >= released.last_activity,
         "coming back live walked the row back: {} < {}",
         relived.last_activity,
@@ -2062,6 +2087,65 @@ async fn a_sessions_stamp_survives_a_round_trip_through_liveness() {
         "and durable work still moves it",
     );
     drop(client);
+    harness.host.shutdown().await;
+}
+
+/// A release does not stamp the session with its own teardown. Buffered
+/// entries (a settings record, say) reach the file only when the release
+/// flushes them, so the log's modification time by then is the moment the
+/// host tore the session down, a whole idle grace after the work that wrote
+/// them. A row carrying that reads to a client as output it has not seen
+/// (spec 6.8), on a session that produced nothing.
+#[tokio::test]
+async fn a_release_does_not_stamp_a_session_with_its_own_flush() {
+    let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
+    let session = harness.create().await;
+    let mut client = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+    client.pump_until_idle().await;
+    // Buffered, not punctuating, so only the teardown flush can land it.
+    harness
+        .host
+        .command(
+            &session,
+            Command::Settings(SettingsChange {
+                agent: AgentId::Main,
+                persist: PersistAction::None,
+                axis: SettingsAxis::Verbosity(Some(aj_conf::ConfigVerbosity::Low)),
+            }),
+        )
+        .await
+        .expect("a settings change");
+    client.pump_until_idle().await;
+    let live = summary(&harness.host, &session).await.expect("listed");
+    drop(client);
+
+    // Idle for several graces, so a stamp taken from the flush is unmistakably
+    // later than the last thing the session did.
+    tokio::time::sleep(IDLE_GRACE * 6).await;
+    let released = until_released(&harness.host, &session).await;
+    assert_eq!(
+        released.last_activity, live.last_activity,
+        "the release reported when the session last did something, not when \
+         the host got around to writing it down",
+    );
+
+    // And the flush did land, which is what makes the stamp above a choice
+    // rather than a coincidence.
+    let flushed: chrono::DateTime<chrono::Utc> = std::fs::metadata(
+        harness
+            .persistence
+            .sessions_dir()
+            .join(format!("{session}.jsonl")),
+    )
+    .expect("the log")
+    .modified()
+    .expect("a modification time")
+    .into();
+    assert!(
+        flushed > released.last_activity,
+        "the teardown moved the file past the session's own stamp",
+    );
     harness.host.shutdown().await;
 }
 
@@ -2325,12 +2409,12 @@ async fn an_undelivered_task_notice_holds_a_session_live() {
     harness.host.shutdown().await;
 }
 
-/// A release the driver cannot produce a mark for does not happen. The host has
+/// A release the driver cannot produce a row for does not happen. The host has
 /// no row to serve such a session with, so releasing it would drop it out of the
 /// directory or leave a row that predates the materialization, and both are
 /// worse than holding the lock for another grace.
 #[tokio::test]
-async fn a_session_the_host_cannot_mark_is_not_released() {
+async fn a_session_the_host_cannot_row_is_not_released() {
     let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
     let session = harness.create().await;
     let mut client = Client::attach(&harness.host, &session).await;
@@ -2338,7 +2422,7 @@ async fn a_session_the_host_cannot_mark_is_not_released() {
     client.pump_until_idle().await;
     drop(client);
 
-    // The one reachable way to make the mark unreadable while the session is
+    // The one reachable way to make the row unreadable while the session is
     // otherwise perfectly releasable: the log's file is gone, so the driver
     // cannot say what state it left behind.
     std::fs::remove_file(
@@ -2391,6 +2475,7 @@ async fn a_release_never_lowers_the_stamp_it_publishes() {
          {} is older than {live}",
         released.last_activity,
     );
+    harness.host.shutdown().await;
 }
 
 /// A client re-attaching after a release is served a fresh epoch and a full
@@ -5108,12 +5193,16 @@ fn sibling_log(harness: &Harness, id: &str) -> String {
     id.to_string()
 }
 
-/// The directories carried by the `list` frames among `frames`.
+/// The directories carried by the `list` frames among `frames`, each checked
+/// for the present-iff-live invariant (see [`assert_rows_well_formed`]).
 fn directories(frames: &[Frame]) -> Vec<Vec<SessionSummary>> {
     frames
         .iter()
         .filter_map(|frame| match frame {
-            Frame::List { sessions } => Some(sessions.clone()),
+            Frame::List { sessions } => {
+                assert_rows_well_formed(sessions);
+                Some(sessions.clone())
+            }
             _ => None,
         })
         .collect()
@@ -5403,8 +5492,9 @@ async fn an_unchanged_directory_is_not_published_again() {
 
 /// A host that is shutting down publishes no directory. Its session map is
 /// drained before its drivers are joined, so a frame composed in between would
-/// report every live session from whatever the store last knew about it, walking
-/// marks backwards on the last directory a client ever sees.
+/// report every live session from whatever the store last knew about it,
+/// dropping its position and walking its stamp backwards on the last
+/// directory a client ever sees.
 #[tokio::test]
 async fn a_shutting_down_host_publishes_no_directory() {
     let harness = Harness::with_idle_grace(
@@ -5421,15 +5511,17 @@ async fn a_shutting_down_host_publishes_no_directory() {
     drop(client);
     // Released, so the store has a row for it, and then taken up again and
     // worked past that row: the cold row is now stale by two turns.
-    let stale = until_released(&harness.host, &session).await.last_seq;
+    let stale = until_released(&harness.host, &session).await;
+    assert_eq!(stale.last_seq, None, "a cold row carries no position");
     let mut client = Client::attach(&harness.host, &session).await;
     harness.prompt(&session, "more").await;
     client.pump_until_idle().await;
-    let live = summary(&harness.host, &session)
-        .await
-        .expect("listed")
-        .last_seq;
-    assert!(live > stale, "the second turn moved the mark past the row");
+    let live = summary(&harness.host, &session).await.expect("listed");
+    assert!(
+        live.last_activity > stale.last_activity,
+        "the second turn moved the session past the row it left behind",
+    );
+    let live_seq = live.last_seq.expect("a live row reports its position");
 
     // Holding the log stalls this session's teardown, which is what holds the
     // window open: the map is drained by then, and the fan-out is still open.
@@ -5450,9 +5542,11 @@ async fn a_shutting_down_host_publishes_no_directory() {
             .find(|entry| entry.id == session)
             .expect("the session is in every directory it publishes");
         assert!(
-            row.live && row.last_seq >= live,
+            row.live
+                && row.last_seq.is_some_and(|seq| seq >= live_seq)
+                && row.last_activity >= live.last_activity,
             "a directory published during shutdown reported {row:?}, \
-             marks may not go backwards",
+             a row may not go backwards",
         );
     }
     drop(other);

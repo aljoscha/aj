@@ -55,11 +55,11 @@ const BUDGET: u64 = 16 * 1024;
 ///
 /// Startup enumerates, and enumerating sniffs each log's first line, which a
 /// `BufReader` pulls in 8 KiB at a time. That is the whole cost and it
-/// measures ~820 KB, so the budget is that plus room for anything incidental.
-/// Reading the logs themselves would add `COLD_LOGS * LOG_BYTES` on top, 1.6
-/// MB, which is what puts the two sides clearly apart. Sized against those two
-/// numbers, so it moves if either constant above does.
-const STARTUP_BUDGET: u64 = 1024 * 1024;
+/// measures ~820 KB, so the budget is that plus a little room. Reading the
+/// logs themselves would add `COLD_LOGS * LOG_BYTES` on top, 1.6 MB, which is
+/// what puts the two sides clearly apart. Sized against those two numbers, so
+/// it moves if either constant above does.
+const STARTUP_BUDGET: u64 = 900 * 1024;
 
 /// This process's cumulative read bytes, `rchar` from `/proc/self/io`. Counts
 /// every read that reached a file descriptor, page cache or not.
@@ -164,6 +164,14 @@ async fn the_directory_costs_a_first_line_at_startup_and_nothing_per_refresh() {
     let before = read_bytes();
     let host = SessionHost::new(setup).expect("host");
     let composed = read_bytes() - before;
+    // Asserted beside the bytes because a directory read and a `stat` transfer
+    // none: a startup that enumerated once per session, rather than once, would
+    // sit inside the budget below.
+    assert_eq!(
+        host.store_directory_reads(),
+        1,
+        "composing a host is one enumeration point (spec 6.8)",
+    );
 
     let listed = host.sessions().await.expect("sessions").sessions;
     assert_eq!(

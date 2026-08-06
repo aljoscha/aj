@@ -38,7 +38,7 @@ use aj_session::{
 use aj_wire::{DurableEvent, Frame};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::host::live::{self, LiveSession, ReleaseOutcome, ReleasedMark, Request, settings_of};
+use crate::host::live::{self, LiveSession, ReleaseOutcome, ReleasedRow, Request, settings_of};
 use crate::host::{
     Command, CommandOutcome, HostError, HostShared, QueueOp, SettingsAxis, SettingsChange,
     mint_epoch,
@@ -117,17 +117,17 @@ impl Driver {
                         // or an event that arrived before this request has
                         // already moved the state this reads.
                         Some(Request::Release { reply }) => {
-                            let mark = if live::releasable(&self.session, &self.shared.fanout) {
-                                self.mark_for_release()
+                            let row = if live::releasable(&self.session, &self.shared.fanout) {
+                                self.row_for_release()
                             } else {
                                 None
                             };
-                            let Some(mark) = mark else {
+                            let Some(row) = row else {
                                 let _ = reply.send(ReleaseOutcome::Declined);
                                 continue;
                             };
                             self.wind_down().await;
-                            let _ = reply.send(ReleaseOutcome::Released { mark });
+                            let _ = reply.send(ReleaseOutcome::Released { row });
                             return;
                         }
                         // The host asked us to stop, or dropped the session.
@@ -981,7 +981,7 @@ impl Driver {
     /// before their streams close.
     ///
     /// The flush is what a release has already done (see
-    /// [`Self::mark_for_release`]), so on that path this one finds nothing
+    /// [`Self::row_for_release`]), so on that path this one finds nothing
     /// pending. It still takes the log lock, which a long-running reader can
     /// hold, and a release is waited on with the host's session map held.
     async fn wind_down(&mut self) {
@@ -1030,7 +1030,7 @@ impl Driver {
     /// session out of the directory, or leave a row that predates the
     /// materialization, and both are worse than holding the lock for another
     /// grace.
-    fn mark_for_release(&self) -> Option<ReleasedMark> {
+    fn row_for_release(&self) -> Option<ReleasedRow> {
         // `try_lock`, because the host holds its session map while it waits for
         // this answer: the log can be held for the length of an export render,
         // and a release that queued behind one would stall every other
@@ -1045,7 +1045,7 @@ impl Driver {
             return None;
         }
         // Flushed before anything is torn down, so a log that will not flush
-        // declines with the session still intact rather than going with a mark
+        // declines with the session still intact rather than going with a row
         // nobody can trust.
         if let Err(err) = log.flush_pending() {
             tracing::warn!(
@@ -1060,11 +1060,16 @@ impl Driver {
             file.modified().ok()?.into(),
             file.len(),
         );
+        // The stamp is what this driver saw, not what the file says. The flush
+        // above can land buffered entries a whole idle grace after the work
+        // that produced them, and a row stamped with its own teardown reads to
+        // a client as output it has not seen (spec 6.8).
+        //
         // The status lock nests under the log lock here. That is the order the
         // driver always takes them in, and nothing takes the log lock while
         // holding the status.
-        let last_activity = file.modified_at.max(self.session.status().last_activity);
-        Some(ReleasedMark {
+        let last_activity = self.session.status().last_activity;
+        Some(ReleasedRow {
             file,
             last_activity,
         })

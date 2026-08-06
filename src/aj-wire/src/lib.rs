@@ -171,7 +171,10 @@ pub struct SessionSummary {
     pub working: bool,
     pub queued: QueueCounts,
     pub tasks: usize,
-    /// The session's durable high-water mark, present iff `live` (spec 6.8).
+    /// The session's durable high-water mark. A host sets it exactly when
+    /// [`Self::live`] is set (spec 6.8), and a reader may rely on that only as
+    /// far as it trusts the host: nothing on this type enforces it, because
+    /// nothing reads the field without also reading `live`.
     ///
     /// A cold row has none. Nothing in a log records its entry count, so an
     /// exact position costs a read of the whole file, and the protocol

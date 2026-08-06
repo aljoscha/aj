@@ -31,7 +31,7 @@ use std::sync::{Mutex as StdMutex, MutexGuard};
 
 use aj_session::{ConversationError, ConversationPersistence, SessionMetadata};
 
-use crate::host::live::ReleasedMark;
+use crate::host::live::ReleasedRow;
 use chrono::{DateTime, Utc};
 
 /// What a directory refresh needs from the session store.
@@ -97,11 +97,21 @@ struct Sniffed {
 /// A cold row's activity stamp, plus the file state it describes.
 ///
 /// The fingerprint is what lets the host's own knowledge outrank a `stat`. A
-/// release records the stamp it settled on against the file it left behind,
-/// and an enumeration that finds that same file keeps it rather than
-/// overwriting it with the modification time, which is the same moment read
-/// from the other side of the write. Once the file moves, the `stat` is the
-/// better answer again.
+/// release records what its driver last saw the session do, against the file
+/// it left behind, and an enumeration that finds that same file keeps it. The
+/// modification time answers a different question, when the bytes landed, and
+/// the release flush can land buffered entries a whole idle grace after the
+/// work that wrote them (see [`ReleasedRow`]). Once the file moves under a
+/// writer this host is not, the `stat` is all there is.
+///
+/// NOTE(aljoscha): that last rule is what a scan whose directory read has gone
+/// stale falls foul of. A session that was cold when the scan started, then
+/// went live, was appended to and released while it ran, has a row at a newer
+/// file than the scan holds, and the scan overwrites it with its own older
+/// `stat`. [`ColdSessions::evict`] refuses the same move for the same reason
+/// and can, because it has the ids it read the directory after taking. Doing
+/// it here would need a generation per row, for a window that takes a scan
+/// outlasting the idle grace to open.
 struct Row {
     at: Fingerprint,
     last_activity: DateTime<Utc>,
@@ -179,12 +189,20 @@ impl<S: SessionStore> ColdSessions<S> {
                 continue;
             }
             // Sniffed outside the guard below: it can open a file.
-            let current_format = self.current_format(metadata);
+            let Some(current_format) = self.current_format(metadata) else {
+                // The store could not read the log at all, which says nothing
+                // about it. Dropping the row over that would take a session
+                // out of the directory on a passing EMFILE or permission blip,
+                // and a release that had just recorded its row would be the
+                // one undone. We keep what we had, and a log that never had a
+                // row still has none.
+                continue;
+            };
             let at = fingerprint(metadata);
             let mut cache = self.cache();
             if !current_format {
-                // A log the store will not read is no session, and one that
-                // stops being readable stops being listed.
+                // A pre-refactor log is no session, and one that turns into
+                // one stops being listed.
                 cache.rows.remove(&metadata.session_id);
                 continue;
             }
@@ -227,22 +245,24 @@ impl<S: SessionStore> ColdSessions<S> {
         else {
             return Ok(false);
         };
-        Ok(self.current_format(&metadata))
+        // An unreadable log is not a session this host can materialize, so
+        // membership answers no where the directory merely declines to move.
+        Ok(self.current_format(&metadata).unwrap_or(false))
     }
 
     /// Record what the host knows about a session it just released, so a
     /// refresh serves it without an enumeration.
     ///
-    /// Touches no filesystem. The mark carries its own consistency (see
-    /// [`ReleasedMark`]): the fingerprint is the file state the release left
+    /// Touches no filesystem. The row carries its own consistency (see
+    /// [`ReleasedRow`]): the fingerprint is the file state the release left
     /// behind. It is also the state the next enumeration finds, unless a rival
     /// writer took the freed lock and appended in between, in which case the
     /// fingerprint has moved and the format verdict simply misses.
-    pub(crate) fn note_released(&self, mark: &ReleasedMark) {
-        let ReleasedMark {
+    pub(crate) fn note_released(&self, released: &ReleasedRow) {
+        let ReleasedRow {
             file,
             last_activity,
-        } = mark;
+        } = released;
         let at = fingerprint(file);
         let mut cache = self.cache();
         cache.rows.insert(
@@ -274,24 +294,25 @@ impl<S: SessionStore> ColdSessions<S> {
     /// pre-refactor file, whose fingerprint never moves, is still only read
     /// once.
     ///
-    /// A log the store could not read at all earns no cache entry. Its
-    /// fingerprint does not move when it becomes readable again (dropping and
-    /// restoring a read bit leaves size and modification time alone), so
-    /// caching that verdict would hide the session from every client for the
-    /// life of the host.
-    fn current_format(&self, metadata: &SessionMetadata) -> bool {
+    /// `None` when the store could not read the log at all, which is a
+    /// different answer from "not the current format" and earns no cache
+    /// entry. Its fingerprint does not move when it becomes readable again
+    /// (dropping and restoring a read bit leaves size and modification time
+    /// alone), so caching that verdict would hide the session from every
+    /// client for the life of the host.
+    fn current_format(&self, metadata: &SessionMetadata) -> Option<bool> {
         let at = fingerprint(metadata);
         if let Some(cached) = self.sniffed(&metadata.session_id, at) {
-            return cached;
+            return Some(cached);
         }
         // Outside the guard: the sniff opens and reads a file, and every other
         // refresh would queue behind it.
         let Some(current) = self.store.is_current_format(&metadata.session_id) else {
             tracing::warn!(
                 session = metadata.session_id,
-                "leaving an unreadable log out of the session directory"
+                "could not read a session log to place it in the directory"
             );
-            return false;
+            return None;
         };
         if !current {
             // Once per fingerprint, so not the per-tick noise an uncached sniff
@@ -308,7 +329,7 @@ impl<S: SessionStore> ColdSessions<S> {
                 current_format: current,
             },
         );
-        current
+        Some(current)
     }
 
     /// The cached verdict for `id`, if it was sniffed off the file we are
@@ -521,10 +542,10 @@ mod tests {
         listed(cold.rows())
     }
 
-    /// A released session's mark, as its driver would hand it over. The file
+    /// A released session's row, as its driver would hand it over. The file
     /// the release left behind, with the stamp the driver settled on.
-    fn mark(id: &str, modified: i64, size: u64) -> ReleasedMark {
-        ReleasedMark {
+    fn released(id: &str, modified: i64, size: u64) -> ReleasedRow {
+        ReleasedRow {
             file: SessionMetadata::new(id.to_string(), at(modified), size),
             last_activity: at(modified),
         }
@@ -690,6 +711,38 @@ mod tests {
         );
     }
 
+    /// A vanished log takes its row with it, not just its format verdict.
+    ///
+    /// A row is pinned against the fingerprint it describes, so one that
+    /// outlived its file would go on answering for whatever file takes the id
+    /// next, and a recycled id landing on the same `(mtime, size)` would never
+    /// dislodge it. The stamp here is deliberately one no `stat` could produce
+    /// for either file, which is the only way to tell a surviving row from a
+    /// freshly derived one.
+    #[test]
+    fn a_vanished_log_leaves_no_row_behind() {
+        let store = FakeStore::default();
+        store.put("a", 2);
+        let cold = ColdSessions::new(store);
+        // Materialized and released, so the host recorded a row of its own.
+        cold.note_released(&ReleasedRow {
+            file: SessionMetadata::new("a".to_string(), at(2), 100),
+            last_activity: at(99),
+        });
+        assert_eq!(listed(cold.rows()), [("a".to_string(), 99)]);
+
+        cold.store.remove("a");
+        assert_eq!(refreshed(&cold, |_| false), []);
+
+        // A different file, same id, and the fingerprint the old one had.
+        cold.store.put("a", 2);
+        assert_eq!(
+            refreshed(&cold, |_| false),
+            [("a".to_string(), 2)],
+            "the row outlived the file that produced it",
+        );
+    }
+
     /// A pre-refactor log stays out of the listing, and the verdict costs one
     /// sniff however many enumerations run: the format of a log is a fact
     /// about its content, so it is cacheable.
@@ -744,6 +797,42 @@ mod tests {
         );
     }
 
+    /// A log the store cannot read for a moment does not cost the session its
+    /// row. The verdict says nothing about the log, so an enumeration that
+    /// hits one leaves the directory where it stands rather than dropping a
+    /// session out of it, which spec section 5 does not allow a release to be
+    /// followed by.
+    #[test]
+    fn a_transient_read_failure_does_not_drop_a_row() {
+        let store = FakeStore::default();
+        store.put("a", 3);
+        let cold = ColdSessions::new(store);
+        cold.note_released(&ReleasedRow {
+            file: SessionMetadata::new("a".to_string(), at(3), 100),
+            last_activity: at(9),
+        });
+        assert_eq!(listed(cold.rows()), [("a".to_string(), 9)]);
+
+        // Unreadable, at a fingerprint that does not match the release's, so
+        // the cached verdict cannot carry the row through either.
+        cold.store.edit("a", |file| {
+            file.sniffable = false;
+            file.modified = 4;
+        });
+        assert_eq!(
+            refreshed(&cold, |_| false),
+            [("a".to_string(), 9)],
+            "the row the host recorded outlives a failed sniff",
+        );
+
+        cold.store.edit("a", |file| file.sniffable = true);
+        assert_eq!(
+            refreshed(&cold, |_| false),
+            [("a".to_string(), 4)],
+            "and the file answers again once it can be read",
+        );
+    }
+
     /// A refresh serves what the last enumeration point found and goes nowhere
     /// near the store, so a file a sibling process leaves in the directory is
     /// invisible until something enumerates.
@@ -786,21 +875,16 @@ mod tests {
         // Held live, so the enumeration leaves it out.
         assert_eq!(refreshed(&cold, |id| id == "held"), []);
 
-        cold.note_released(&mark("held", 4, 400));
+        cold.note_released(&released("held", 4, 400));
         assert_eq!(listed(cold.rows()), [("held".to_string(), 4)]);
         assert_eq!(cold.directory_reads(), 1, "the release read nothing");
         assert_eq!(cold.store.sniffs_of("held"), 0);
     }
 
-    /// The row a release records carries the stamp the driver settled on, not
-    /// the file's modification time. The two differ when the driver's clock
-    /// ran on past the last append, and a liveness flip may not walk a row's
-    /// stamp backwards (see [`ReleasedMark`]).
-    ///
-    /// A later enumeration finding the same file leaves it alone. The stat
-    /// would report the same moment read from the other side of the write, so
-    /// replacing the row with it would undo the release's guarantee one tick
-    /// later.
+    /// The row a release records carries what the driver saw, not what the
+    /// file says, and a later enumeration finding the same file leaves it
+    /// alone. Replacing it with the `stat` would undo the release one tick
+    /// later, and the two answer different questions (see [`ReleasedRow`]).
     #[test]
     fn a_release_records_the_drivers_stamp_not_the_files() {
         let store = FakeStore::default();
@@ -809,7 +893,7 @@ mod tests {
             ..FakeFile::current("held", 10)
         });
         let cold = ColdSessions::new(store);
-        cold.note_released(&ReleasedMark {
+        cold.note_released(&ReleasedRow {
             file: SessionMetadata::new("held".to_string(), at(10), 400),
             last_activity: at(14),
         });
@@ -841,7 +925,7 @@ mod tests {
         // snapshotted the live set beforehand is still running. The store's
         // own view of the file is deliberately left behind at 2, so the row
         // can only read 5 if the release's record survived.
-        cold.note_released(&mark("a", 5, 800));
+        cold.note_released(&released("a", 5, 800));
         assert_eq!(refreshed(&cold, |id| id == "a"), [("a".to_string(), 5)]);
     }
 
@@ -889,7 +973,7 @@ mod tests {
             let cold = releasing.upgrade().expect("the cache outlives the scan");
             // A session whose log the scan's directory read never saw, because
             // it was created after it.
-            cold.note_released(&mark("late", 7, 400));
+            cold.note_released(&released("late", 7, 400));
         });
 
         cold.enumerate(|_| false).expect("enumerate");

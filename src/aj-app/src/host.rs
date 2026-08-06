@@ -708,17 +708,19 @@ impl SessionHost {
     /// opens would claim it just did something and the unseen-output glyph
     /// would read off it (spec 6.8).
     ///
-    /// The log's modification time is the floor, and a row this host already
-    /// recorded for the session outranks it when it is later: a release
-    /// records the later of the file's time and the driver's own, because the
-    /// two clocks straddle the write (see `ReleasedMark`), and going back to
-    /// live must not undo that. A created session has neither, and being
-    /// created is the activity.
+    /// A row this host already holds wins outright, because it is an answer
+    /// about the session and the file's modification time is an answer about
+    /// its bytes (see `ReleasedRow`). Taking the later of the two instead
+    /// would let a release's own teardown flush, which moves the mtime long
+    /// after the work it wrote, come back as activity. The file stands in when
+    /// the host has no row, which is every session on a host that just
+    /// started. A created session has neither, and being created is the
+    /// activity.
     fn opening_stamp(&self, log: &ConversationLog, session_id: &str) -> DateTime<Utc> {
-        [log_modified_at(log), self.inner.cold.stamp(session_id)]
-            .into_iter()
-            .flatten()
-            .max()
+        self.inner
+            .cold
+            .stamp(session_id)
+            .or_else(|| log_modified_at(log))
             .unwrap_or_else(Utc::now)
     }
 
@@ -950,8 +952,8 @@ impl SessionHost {
         }
         // Recorded under the same map hold that drops the session, so no
         // directory read can observe the session as neither live nor rowed.
-        if let Some(ReleaseOutcome::Released { mark }) = &answer {
-            self.inner.cold.note_released(mark);
+        if let Some(ReleaseOutcome::Released { row }) = &answer {
+            self.inner.cold.note_released(row);
         }
         let entry = sessions
             .remove(session)
@@ -961,7 +963,7 @@ impl SessionHost {
         let _ = entry.driver.await;
         drop(sessions);
         if reaped {
-            // A reaped session left no mark, so what the host knows about its
+            // A reaped session left no row, so what the host knows about its
             // log is whatever it knew before the session was materialized, which
             // can be nothing at all. Going back to the store is the only way to
             // give it a row, and the alternative is a session that is on disk
@@ -1662,8 +1664,9 @@ fn spawn_list_publisher(inner: &Arc<HostInner>) {
             let host = SessionHost { inner };
             // A shut-down host has drained its session map, so a directory
             // composed from it would report every torn-down session from its
-            // cold row, walking marks backwards on the last frame a client ever
-            // sees. Nothing will mark the directory dirty again either.
+            // cold row, dropping its position and walking its stamp backwards
+            // on the last frame a client ever sees. Nothing will mark the
+            // directory dirty again either.
             if host.alive().is_err() {
                 return;
             }

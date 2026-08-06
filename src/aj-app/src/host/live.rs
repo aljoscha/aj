@@ -55,7 +55,7 @@ pub(crate) enum Request {
 pub(crate) enum ReleaseOutcome {
     /// The session was releasable. The driver has wound down and is returning,
     /// which is what releases the session's advisory lock.
-    Released { mark: ReleasedMark },
+    Released { row: ReleasedRow },
     /// The session was not releasable. It stays live and keeps its lock.
     Declined,
 }
@@ -67,17 +67,18 @@ pub(crate) enum ReleaseOutcome {
 /// and no rival writer can have moved it in between. A release the driver
 /// cannot produce one for does not happen at all: the host would have no row
 /// to serve the session with (see [`ReleaseOutcome`]).
-pub(crate) struct ReleasedMark {
+pub(crate) struct ReleasedRow {
     /// The file the release left behind, which is the fingerprint the
     /// directory caches its format verdict under.
     pub(crate) file: SessionMetadata,
-    /// The activity stamp the session's cold row carries (spec 6.8).
+    /// The activity stamp the session's cold row carries (spec 6.8): when this
+    /// driver last saw the session do something.
     ///
-    /// The file's modification time, except that a liveness flip may not walk
-    /// a row's stamp backwards. The two clocks straddle the write: the driver
-    /// stamps a durable event when it consumes it, a moment after the append
-    /// that moved the mtime, so the mtime alone would rewind the row by that
-    /// gap. We take the later of the two.
+    /// Not [`Self::file`]'s modification time, which answers a different
+    /// question, when the bytes landed. The two disagree in both directions.
+    /// An append moves the mtime a moment before the driver observes it, and
+    /// the release flush moves it a whole idle grace after the work that
+    /// buffered the entry. The host's own answer is the one about the session.
     pub(crate) last_activity: DateTime<Utc>,
 }
 
@@ -142,8 +143,14 @@ pub(crate) struct SessionStatus {
 
 impl SessionStatus {
     /// Record that the session just did something durable.
+    ///
+    /// The stamp only ever moves forward. A wall clock can step backwards, and
+    /// this one is published: a stamp older than one a client was already
+    /// served reads as "nothing new here" for the length of the step, which
+    /// for the unseen-output glyph means real output goes unannounced (spec
+    /// 6.8).
     pub(crate) fn note_activity(&mut self) {
-        self.last_activity = Utc::now();
+        self.last_activity = Utc::now().max(self.last_activity);
         self.last_work = Instant::now();
     }
 
