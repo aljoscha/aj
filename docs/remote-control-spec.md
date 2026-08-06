@@ -594,7 +594,7 @@ viewed agent to that parameter:
 | `.../{id}/queue` | op: remove (optional agent) or clear | Withdraw or clear pending queued messages. Withdrawal returns the text, which is what makes the client's dequeue-into-the-editor gesture work. One agent holds at most one coalesced pending message, so there is no index to address. |
 | `.../{id}/compact` | optional instructions | Manual compaction. |
 | `.../{id}/settings` | model / thinking / thinking display / speed / verbosity changes | Host applies, logs, and emits the synthesized frames. |
-| `.../{id}/head` | target entry id | Switch the session head. 409 while working or tasks live. Clears queues, new epoch, `reset` frame. |
+| `.../{id}/head` | target: an entry id, or `{before: <entry_id>}` | Switch the session head. 409 while working or tasks live. Clears queues, new epoch, `reset` frame. The `before` shape resolves to the entry's parent server-side, atomically with the switch, it is the branch-from-message gesture, which replaces a message rather than appending after it. An unknown entry is 404, an entry with no parent is refused, branching before the root would orphan the session's identity and no transcript gesture can legitimately ask for it. |
 | `.../{id}/tasks/{task_id}/kill` | — | Kill a background task. |
 
 Gateway-only additions are in section 7. Session creation through a
@@ -634,7 +634,11 @@ needs on demand:
 - `GET /v1/sessions/{id}/queue` — pending steering and follow-up
   messages.
 - `GET /v1/sessions/{id}/tree` — the session branch tree, for the
-  tree view and head switching.
+  tree view and head switching. Carries the session's current head
+  entry id (absent only when the log is empty): the overlay needs it
+  for active-row pre-selection and for treating a switch to the
+  current tip as a no-op, and it is not derivable from the segments,
+  a head can sit mid-segment.
 
 ### 6.8 Status model
 
