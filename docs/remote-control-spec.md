@@ -594,7 +594,7 @@ viewed agent to that parameter:
 | `.../{id}/queue` | op: remove (optional agent) or clear | Withdraw or clear pending queued messages. Withdrawal returns the text, which is what makes the client's dequeue-into-the-editor gesture work. One agent holds at most one coalesced pending message, so there is no index to address. |
 | `.../{id}/compact` | optional instructions | Manual compaction. |
 | `.../{id}/settings` | model / thinking / thinking display / speed / verbosity changes | Host applies, logs, and emits the synthesized frames. |
-| `.../{id}/head` | target: an entry id, or `{before: <entry_id>}` | Switch the session head. 409 while working or tasks live. Clears queues, new epoch, `reset` frame. The `before` shape resolves to the entry's parent server-side, atomically with the switch, it is the branch-from-message gesture, which replaces a message rather than appending after it. An unknown entry is 404, an entry with no parent is refused, branching before the root would orphan the session's identity and no transcript gesture can legitimately ask for it. |
+| `.../{id}/head` | target: an entry id, or `{before: <entry_id>}` | Switch the session head. 409 while working or tasks live. Clears queues, new epoch, `reset` frame. The `before` shape resolves any named entry to its parent server-side, atomically with the switch. An unknown entry is 404, an entry with no parent is refused. Its consumer is the branch-from-a-message gesture (replace the message rather than append after it), but the contract is deliberately not restricted to user-thread entries: every head `before` can reach is reachable through the plain entry shape already, so a restriction would police nothing. |
 | `.../{id}/tasks/{task_id}/kill` | — | Kill a background task. |
 
 Gateway-only additions are in section 7. Session creation through a
@@ -1070,7 +1070,13 @@ explicit rather than discovered. Supported in connect mode from phase
 model switch and thinking display, compaction, task kill, and the
 task-output overlay (backed by the per-task read, section 6.7). The
 exit usage banner renders from the client's own event-derived
-accounting rather than a host read. Deferred to phase 3 alongside the
+accounting rather than a host read. One stated limitation of that
+choice: the accounting counts what the client observed under its
+current epoch, so spend on a branch abandoned by a head switch is not
+re-derivable after the reset and the banner under-reports it.
+Accepted, an exit banner does not earn host-authoritative usage on
+the wire, and such a read is the named fix if it ever matters.
+Deferred to phase 3 alongside the
 sidebar: switching to another session and creating one. Not supported
 over the wire in v1: HTML export and the session-info overlay, both
 read host-local files, run them on the host. An unsupported action in
