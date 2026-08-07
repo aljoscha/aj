@@ -813,9 +813,16 @@ enum Focus {
 /// the focused one's head and re-attach.
 ///
 /// A refused change (an unknown session, a lock held by another writer, a
-/// head switch the host refuses while work is live) folds its failure
-/// notice and stays where it is. Nothing is torn down either way: the
-/// outgoing session stays live in the host.
+/// head switch the host refuses while work is live) says so and stays where
+/// it is. Nothing is torn down either way: the outgoing session stays live in
+/// the host.
+///
+/// What a change has to say about itself, the confirmation as much as the
+/// refusal, is feedback about this client's gesture rather than anything in
+/// either session's conversation, so it goes to the toast stack. Folding it
+/// would put it in a transcript the switch is in the middle of replacing, and
+/// on a session with no conversation yet there is not even one on screen to
+/// carry it (the splash is).
 ///
 /// Every arm works in both modes. Creating and resuming go through the control
 /// surface, and the session they land on is attached the same way whether the
@@ -826,56 +833,49 @@ async fn apply_focus_request(
     world: &mut World,
     request: FocusRequest,
 ) -> Focus {
-    match request {
+    let focus = match request {
         FocusRequest::Create => {
             let created = match world.control.create(None, None, None).await {
-                Ok(session) => {
-                    let notice = format!("Started a fresh session ({session}).");
-                    focus_session(
-                        app,
-                        shell,
-                        world,
-                        session,
-                        true,
-                        vec![notice_event(&notice)],
-                    )
+                Ok(session) => focus_session(app, shell, world, session.clone(), true)
                     .await
-                }
+                    .map(|()| session),
                 Err(err) => Err(err),
             };
             match created {
-                Ok(()) => Focus::Moved,
+                Ok(session) => {
+                    shell
+                        .borrow()
+                        .show_toast(format!("Started a fresh session ({session})."));
+                    Focus::Moved
+                }
                 Err(err) => {
-                    fold_notice(world, &format!("Failed to start a fresh session: {err}"));
+                    shell
+                        .borrow()
+                        .show_toast(format!("Failed to start a fresh session: {err}"));
                     Focus::Same
                 }
             }
         }
         FocusRequest::Resume(session) if session == world.session() => {
-            // Nothing to do, and doing it anyway would show a switch notice for
-            // a switch that did not happen, discard an armed branch anchor and
-            // reset the scroll. Reachable from a stepping chord answered off a
-            // mirror that has not caught up with the last switch yet.
-            Focus::Same
+            // Nothing to do, and doing it anyway would announce a switch that
+            // did not happen, discard an armed branch anchor and reset the
+            // scroll. Reachable from a stepping chord answered off a mirror
+            // that has not caught up with the last switch yet. Returned before
+            // the repaint below, because there is nothing new to paint.
+            return Focus::Same;
         }
         FocusRequest::Resume(session) => {
-            let notice = format!("Switched to session {session}.");
-            match focus_session(
-                app,
-                shell,
-                world,
-                session.clone(),
-                false,
-                vec![notice_event(&notice)],
-            )
-            .await
-            {
-                Ok(()) => Focus::Moved,
+            match focus_session(app, shell, world, session.clone(), false).await {
+                Ok(()) => {
+                    shell
+                        .borrow()
+                        .show_toast(format!("Switched to session {session}."));
+                    Focus::Moved
+                }
                 Err(err) => {
-                    fold_notice(
-                        world,
-                        &format!("Failed to switch to session {session}: {err}"),
-                    );
+                    shell
+                        .borrow()
+                        .show_toast(format!("Failed to switch to session {session}: {err}"));
                     Focus::Same
                 }
             }
@@ -886,12 +886,17 @@ async fn apply_focus_request(
             // counting it as the live one.
             Focus::Same
         }
-    }
+    };
+    // A toast is drawn by the next frame or not at all, and a refused change
+    // touches nothing else that would ask for one, so every arm that had
+    // something to say asks here. The drive loop paints only when this latch
+    // is set, and it is about to park on the select.
+    app.request_redraw();
+    focus
 }
 
-/// Point the frontend at `session`, folding `lead` (the switch
-/// confirmation) plus that session's own startup notices on top of the
-/// history its attach block carries.
+/// Point the frontend at `session`, folding that session's own startup
+/// notices on top of the history its attach block carries.
 ///
 /// Rebind by replace-contents: the `chat` and `status` cells keep their
 /// identity across the swap (every chrome widget and the keymap's dispatch
@@ -909,7 +914,6 @@ async fn focus_session(
     world: &mut World,
     session: String,
     fresh: bool,
-    lead: Vec<AgentEvent>,
 ) -> Result<(), ControlError> {
     let host = world.control.host().cloned();
     // A session already attached is a view swap: its frames have been folding
@@ -1017,14 +1021,10 @@ async fn focus_session(
     }
     refresh_client_reads(world).await;
     sync_editor_chrome(world, shell);
-    // Folded after the attach block so they land on top of the replayed
-    // history: the confirmation, then a fresh session's env notices, then
-    // whatever resume-time restoration did.
-    for event in lead {
-        fold_event(world, event);
-    }
     // Both describe this process reading a session off its own disk, so neither
-    // has anything to say about a session running on another machine.
+    // has anything to say about a session running on another machine. Folded
+    // after the attach block so they land on top of the replayed history: a
+    // fresh session's env notices, then whatever resume-time restoration did.
     let startup = world
         .local
         .as_ref()
@@ -1069,6 +1069,13 @@ async fn focus_session(
 /// abandoned branch's queues, mints a fresh epoch and publishes `reset`.
 /// Re-attaching under the client we already hold is what adopts that epoch,
 /// which is what drops the abandoned branch's transcript (spec 6.5).
+///
+/// The gesture reports itself in toasts. A branch that took replaces the
+/// transcript wholesale, so a confirmation folded into it would be describing
+/// the switch from inside what the switch just built, and a refusal would land
+/// on the branch the user was trying to leave. What a fold is still right for
+/// here is the lost stream: that is about the conversation on screen no longer
+/// being fed, not about the gesture.
 async fn branch_focused_session(
     app: &mut AsyncApp,
     shell: &Rc<RefCell<Shell>>,
@@ -1083,17 +1090,16 @@ async fn branch_focused_session(
         .command(&session, Command::Head { target })
         .await
     {
-        fold_notice(world, &head_refusal(branching, &err));
+        shell.borrow().show_toast(head_refusal(branching, &err));
         // The head did not move, so the prompt would run against the branch
         // the user meant to leave. Restore it verbatim instead; it is
         // already in prompt history (recorded at the submit site), so it is
         // never lost either way.
         if let Some(prompt) = prompt {
             shell.borrow().editor.borrow_mut().set_text(&prompt);
-            fold_notice(
-                world,
-                "Branch failed. Your message was restored to the editor.",
-            );
+            shell
+                .borrow()
+                .show_toast("Branch failed. Your message was restored to the editor.");
         }
         app.request_redraw();
         return;
@@ -1103,7 +1109,9 @@ async fn branch_focused_session(
         // on screen describes a branch the session left.
         fold_warning(world, &format!("Lost the session's event stream: {err}"));
     }
-    fold_notice(world, branch_switch_notice(prompt.is_some()));
+    shell
+        .borrow()
+        .show_toast(branch_switch_notice(prompt.is_some()));
     if let Some(prompt) = prompt {
         auto_submit_launch(world, vec![UserContent::text(prompt)]).await;
     }
@@ -8302,8 +8310,8 @@ mod tests {
             main_notices(&world),
         );
 
-        // A refused change stays in the session it was in, so it folds the
-        // failure and no env block.
+        // A refused change stays in the session it was in, so it toasts the
+        // failure and folds no env block.
         let stayed = apply_focus_request(
             &mut app,
             &shell,
@@ -8320,13 +8328,236 @@ mod tests {
             main_notices(&world),
         );
         assert!(
-            main_notices(&world)
+            toast_lines(&shell)
                 .iter()
-                .any(|n| n.contains("Failed to switch to session no-such-session")),
+                .any(|t| t.contains("Failed to switch to session no-such-session")),
             "the refusal says what failed: {:?}",
-            main_notices(&world),
+            toast_lines(&shell),
         );
         shut_down(&world).await;
+    }
+
+    /// A session id on disk in `dir`'s store that nobody holds, for the tests
+    /// that need a session this process's host has never materialized.
+    async fn released_disk_session(dir: &TempDir) -> String {
+        let mut world = scripted_world_with_layers(dir, "streaming-text", default_layers()).await;
+        persist_session(&mut world).await;
+        let id = world.session().to_string();
+        // The host holds a live session's lock until it shuts down, so the id
+        // is only free to be locked (or resumed) once this world lets go.
+        shut_down(&world).await;
+        id
+    }
+
+    /// The store `scripted_world_with` sites its sessions in, for a test that
+    /// reaches around the host to take a lock of its own.
+    fn store_of(dir: &TempDir) -> ConversationPersistence {
+        ConversationPersistence::new(dir.path().join("sessions"))
+    }
+
+    /// A switch refused because another writer holds the session's lock says
+    /// so, and it says so on a fresh session that has never persisted a turn.
+    ///
+    /// The refusal belongs to the gesture, not to either session's
+    /// conversation, so it lands on the toast stack. That is also what makes
+    /// it survive here: a fresh session shows the splash rather than a
+    /// transcript, so a refusal folded into the chat model has nothing on
+    /// screen carrying it.
+    #[tokio::test]
+    async fn a_locked_session_refuses_the_switch_in_a_toast() {
+        let dir = TempDir::new().expect("tempdir");
+        let held = released_disk_session(&dir).await;
+        // NOTE: `flock` belongs to the open file description, so this second
+        // acquire conflicts with the host's exactly as another process would.
+        let rival = aj_session::SessionLock::try_acquire(&store_of(&dir), &held, "a-rival-writer")
+            .expect("try_acquire")
+            .expect("nobody holds the released session");
+
+        let (mut world, shell, mut app, _writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        let fresh = world.session().to_string();
+        assert!(
+            !world.chat.borrow().has_conversation(),
+            "the session we are refused from has never persisted a turn",
+        );
+
+        let stayed = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(held.clone()),
+        )
+        .await;
+        assert!(matches!(stayed, Focus::Same), "the switch was refused");
+        assert_eq!(world.session(), fresh, "and we stayed where we were");
+        assert!(
+            app.needs_redraw(),
+            "and asked for the frame that paints the toast",
+        );
+
+        let toasts = toast_lines(&shell);
+        let refusal = toasts
+            .iter()
+            .find(|t| t.contains(&held))
+            .unwrap_or_else(|| panic!("the refusal is toasted: {toasts:?}"));
+        assert!(
+            refusal.contains("held by another writer"),
+            "it says why: {refusal:?}",
+        );
+        assert!(
+            refusal.contains(&format!("pid {}", std::process::id()))
+                && refusal.contains("a-rival-writer"),
+            "and it names the holder to go quit: {refusal:?}",
+        );
+        assert!(
+            !main_notices(&world)
+                .iter()
+                .any(|n| n.contains("held by another writer")),
+            "and nothing about the gesture was folded: {:?}",
+            main_notices(&world),
+        );
+
+        drop(rival);
+        shut_down(&world).await;
+    }
+
+    /// A switch that took reports itself in a toast and leaves both
+    /// transcripts exactly as it found them: the one it left and the one it
+    /// arrived at. Neither session's conversation gained a row for a gesture
+    /// that is not part of either conversation.
+    ///
+    /// Counted rather than searched, so a confirmation folded under any
+    /// wording fails here.
+    #[tokio::test]
+    async fn a_switch_that_took_toasts_and_folds_into_neither_transcript() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, _writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        persist_session(&mut world).await;
+        let first = world.session().to_string();
+
+        let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
+        assert!(matches!(moved, Focus::Moved));
+        let second = world.session().to_string();
+        // Both sessions are attached and owe nothing, so the switch below is a
+        // pure view swap: no attach block folds, and any row either transcript
+        // gains can only have come from the gesture.
+        drain_stream(&mut world).await;
+        let left_before = main_entries(&world.chat.borrow());
+        let arrived_before = world
+            .directory
+            .parked_chat(&first)
+            .map(main_entries)
+            .expect("the session we are about to arrive at is parked");
+
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(first.clone()),
+        )
+        .await;
+        assert!(matches!(moved, Focus::Moved));
+        assert_eq!(world.session(), first);
+
+        assert!(
+            toast_lines(&shell)
+                .iter()
+                .any(|t| t == &format!("Switched to session {first}.")),
+            "the switch reports itself in a toast: {:?}",
+            toast_lines(&shell),
+        );
+        assert_eq!(
+            main_entries(&world.chat.borrow()),
+            arrived_before,
+            "the transcript arrived at gained a row: {:?}",
+            main_notices(&world),
+        );
+        assert_eq!(
+            world
+                .directory
+                .parked_chat(&second)
+                .map(main_entries)
+                .expect("the session we just left is parked"),
+            left_before,
+            "the transcript left behind gained a row",
+        );
+        shut_down(&world).await;
+    }
+
+    /// A create reports itself in a toast, and the session it left keeps the
+    /// transcript it had. The created session's own startup notices still
+    /// fold: those are facts about that session, not about the gesture.
+    #[tokio::test]
+    async fn a_create_toasts_and_leaves_the_outgoing_transcript_alone() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, _writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        persist_session(&mut world).await;
+        let first = world.session().to_string();
+        let left_before = main_entries(&world.chat.borrow());
+
+        let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
+        assert!(matches!(moved, Focus::Moved));
+        let created = world.session().to_string();
+
+        assert!(
+            toast_lines(&shell)
+                .iter()
+                .any(|t| t == &format!("Started a fresh session ({created}).")),
+            "the create reports itself in a toast: {:?}",
+            toast_lines(&shell),
+        );
+        assert!(
+            !main_notices(&world)
+                .iter()
+                .any(|n| n.contains("Started a fresh session")),
+            "and not into the transcript it just built: {:?}",
+            main_notices(&world),
+        );
+        assert_eq!(
+            world
+                .directory
+                .parked_chat(&first)
+                .map(main_entries)
+                .expect("the session we just left is parked"),
+            left_before,
+            "the transcript left behind gained a row",
+        );
+        shut_down(&world).await;
+    }
+
+    /// A create the peer cannot serve reports its failure in a toast too, so
+    /// the two outcomes of one gesture land on the same surface.
+    #[tokio::test]
+    async fn a_refused_create_toasts_its_failure() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut app, _writer, _root) = app_over(&shell).await;
+        let before = main_notices(&world).len();
+
+        // Point the client at a peer that is not there, which is the one way a
+        // create fails without the session already existing.
+        world.control =
+            Control::remote(crate::remote::RemoteClient::new(&dead_url().await).expect("a client"));
+        let stayed = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
+
+        assert!(matches!(stayed, Focus::Same), "the create was refused");
+        assert!(
+            toast_lines(&shell)
+                .iter()
+                .any(|t| t.starts_with("Failed to start a fresh session:")),
+            "the failure is toasted: {:?}",
+            toast_lines(&shell),
+        );
+        assert_eq!(
+            main_notices(&world).len(),
+            before,
+            "and nothing was folded: {:?}",
+            main_notices(&world),
+        );
+        remote.shutdown().await;
     }
 
     #[tokio::test]
@@ -13125,6 +13356,22 @@ mod tests {
         notices_of(&world.chat.borrow())
     }
 
+    /// The live toasts, each one's wrapped rows rejoined into a single line,
+    /// so an assertion names a phrase rather than where the wrap fell.
+    fn toast_lines(shell: &Rc<RefCell<Shell>>) -> Vec<String> {
+        crate::toasts::toast_texts(&shell.borrow().toasts)
+            .iter()
+            .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect()
+    }
+
+    /// How many rows a chat model's Main transcript holds, for the assertions
+    /// that a gesture folded nothing.
+    fn main_entries(chat: &ChatState) -> usize {
+        chat.transcript(AgentId::Main)
+            .map_or(0, |transcript| transcript.entries().len())
+    }
+
     /// The user rows of the focused Main transcript, in order.
     fn user_messages(world: &World) -> Vec<String> {
         world
@@ -14650,25 +14897,26 @@ mod tests {
         assert!(world.client().working(), "a turn is in flight");
         apply_focus_request(&mut app, &shell, &mut world, branch()).await;
         assert!(
-            main_notices(&world)
+            toast_lines(&shell)
                 .iter()
-                .any(|n| n.contains("Failed to branch the conversation") && n.contains("running")),
+                .any(|t| t.contains("Failed to branch the conversation") && t.contains("running")),
             "a live turn refuses the branch switch: {:?}",
-            main_notices(&world),
+            toast_lines(&shell),
         );
         cancel_viewed_turn(&world).await;
         settle(&mut world).await;
 
-        // A running background task refuses it too, even with no turn.
+        // A running background task refuses it too, even with no turn. The
+        // stack dedups an identical live toast, so this asks for the refusal
+        // to be there rather than for a second box.
         let task = register_bash_task(&mut world, "cargo build").await;
-        let before = main_notices(&world).len();
         apply_focus_request(&mut app, &shell, &mut world, branch()).await;
         assert!(
-            main_notices(&world)[before..]
+            toast_lines(&shell)
                 .iter()
-                .any(|n| n.contains("Failed to branch the conversation")),
+                .any(|t| t.contains("Failed to branch the conversation")),
             "a running background task refuses the branch switch: {:?}",
-            main_notices(&world),
+            toast_lines(&shell),
         );
 
         // Idle (turn settled, task terminal): the switch takes.
@@ -14678,10 +14926,17 @@ mod tests {
             .set_status(task, aj_agent::tool::TaskStatus::Killed);
         apply_focus_request(&mut app, &shell, &mut world, branch()).await;
         assert!(
-            main_notices(&world)
+            toast_lines(&shell)
                 .iter()
-                .any(|n| n == "Switched to the selected branch."),
+                .any(|t| t == "Switched to the selected branch."),
             "an idle branch switch confirms: {:?}",
+            toast_lines(&shell),
+        );
+        assert!(
+            !main_notices(&world)
+                .iter()
+                .any(|n| n.contains("branch") || n.contains("Branch")),
+            "and none of it was folded into the conversation: {:?}",
             main_notices(&world),
         );
         shut_down(&world).await;
@@ -15265,11 +15520,11 @@ mod tests {
             "branch B content absent after switching to A: {rows}"
         );
         assert!(
-            main_notices(&world)
+            toast_lines(&shell)
                 .iter()
-                .any(|n| n == "Switched to the selected branch."),
-            "the tree-switch notice is folded: {:?}",
-            main_notices(&world)
+                .any(|t| t == "Switched to the selected branch."),
+            "the tree switch reports itself in a toast: {:?}",
+            toast_lines(&shell),
         );
         assert!(
             !world.client().working(),
@@ -15325,20 +15580,20 @@ mod tests {
         .await;
 
         assert_eq!(world.session(), session, "the session is unchanged");
-        let notices = main_notices(&world);
+        let toasts = toast_lines(&shell);
         assert!(
-            notices
+            toasts
                 .iter()
-                .any(|n| n == "Can't switch: that branch is no longer in this session."),
-            "the failure notice names the reason: {notices:?}",
+                .any(|t| t == "Can't switch: that branch is no longer in this session."),
+            "the failure names the reason: {toasts:?}",
         );
         assert!(
-            !notices.iter().any(|n| n.contains("does-not-exist")),
-            "in the gesture's words, not by quoting the host's entry id: {notices:?}",
+            !toasts.iter().any(|t| t.contains("does-not-exist")),
+            "in the gesture's words, not by quoting the host's entry id: {toasts:?}",
         );
         assert!(
-            notices.iter().any(|n| n.contains("Branch failed")),
-            "and says the message came back: {notices:?}",
+            toasts.iter().any(|t| t.contains("Branch failed")),
+            "and says the message came back: {toasts:?}",
         );
         assert_eq!(shell.borrow().editor.borrow().text(), "edited prompt");
         assert!(!world.client().working(), "no turn spawned");
@@ -15403,11 +15658,11 @@ mod tests {
         )
         .await;
         assert!(
-            main_notices(&world)
+            toast_lines(&shell)
                 .iter()
-                .any(|notice| notice == "Can't branch at the first message."),
+                .any(|toast| toast == "Can't branch at the first message."),
             "the refusal is worded for a human, not quoted from the host: {:?}",
-            main_notices(&world),
+            toast_lines(&shell),
         );
         assert_eq!(
             shell.borrow().editor.borrow().text(),
@@ -15481,11 +15736,11 @@ mod tests {
         fold_ready_frames(&mut world);
         assert!(world.client().working(), "the branch prompt ran as a turn");
         assert!(
-            main_notices(&world)
+            toast_lines(&shell)
                 .iter()
-                .any(|n| n == "Branched the conversation from an earlier message."),
+                .any(|t| t == "Branched the conversation from an earlier message."),
             "under the branch-with-prompt confirmation: {:?}",
-            main_notices(&world),
+            toast_lines(&shell),
         );
         assert_eq!(
             shell.borrow().editor.borrow().text(),
@@ -16092,6 +16347,11 @@ mod tests {
             "no switch notice: {:?}",
             main_notices(&world),
         );
+        assert!(
+            toast_lines(&shell).is_empty(),
+            "and no switch toast either: {:?}",
+            toast_lines(&shell),
+        );
         assert_eq!(
             shell.borrow().branch_anchor.borrow().clone(),
             Some(head),
@@ -16180,6 +16440,73 @@ mod tests {
             unique.len(),
             3,
             "two steps visit two new sessions, not the same one twice: {visited:?}",
+        );
+        shut_down(&world).await;
+    }
+
+    /// The switch confirmation reaches the terminal: a real chord through the
+    /// pty, the real drive loop, the switch it breaks out for, and the box the
+    /// composed frame paints for it.
+    ///
+    /// The unit tests above prove the toast is raised. This one proves it is
+    /// wired to something the user can see, so a toast stack left out of the
+    /// layout fails here.
+    #[tokio::test]
+    async fn the_step_chord_paints_its_switch_confirmation() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        run_prompt(&mut world, "seed").await;
+        world
+            .control
+            .create(None, None, None)
+            .await
+            .expect("a second session to step onto");
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        loop {
+            fold_ready_frames(&mut world);
+            sync_sidebar(&world, &shell);
+            if shell.borrow().sidebar.borrow().rows.len() >= 2 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the rows never arrived");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let mut theme_watch = inert_theme_watch();
+        let mut prompt_history_rx: Option<UnboundedReceiver<Vec<String>>> = None;
+        let mut autocomplete_rx = shell
+            .borrow()
+            .editor
+            .borrow_mut()
+            .take_autocomplete_rx()
+            .expect("editor hands out its autocomplete receiver once");
+
+        writer
+            .write_all(&chord_bytes(AjAction::SessionNext))
+            .expect("write the step chord");
+        let exit = drive(
+            &mut app,
+            &root,
+            &shell,
+            &mut world,
+            &mut theme_watch,
+            &mut prompt_history_rx,
+            &mut autocomplete_rx,
+        )
+        .await
+        .expect("drive exits without a fatal error");
+        let SessionExit::Switch(target) = exit else {
+            panic!("the chord did not break out for a switch");
+        };
+        let moved =
+            apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Resume(target)).await;
+        assert!(matches!(moved, Focus::Moved));
+
+        let painted = painted_rows(&shell, 100, 40).join("\n");
+        assert!(
+            painted.contains(&format!("Switched to session {}.", world.session())),
+            "the confirmation is painted: {painted}",
         );
         shut_down(&world).await;
     }
@@ -18130,11 +18457,11 @@ mod tests {
         )
         .await;
         assert!(
-            main_notices(&world)
+            toast_lines(&shell)
                 .iter()
-                .any(|notice| notice.contains("Branched the conversation")),
+                .any(|toast| toast.contains("Branched the conversation")),
             "{:?}",
-            main_notices(&world),
+            toast_lines(&shell),
         );
 
         // A branch replaces the message it was taken from rather than
