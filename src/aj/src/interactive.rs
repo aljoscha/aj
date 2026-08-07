@@ -90,7 +90,7 @@ use crate::settings_ui::{
     open_thinking, skills_placeholder_row,
 };
 use crate::sidebar::{
-    MIN_COLS_WITH_SIDEBAR, SIDEBAR_COLS, SessionSidebar, SidebarState, step_session,
+    MIN_COLS_WITH_SIDEBAR, SIDEBAR_COLS, SessionSidebar, SidebarState, StripGesture, step_session,
 };
 #[cfg(test)]
 use crate::sidebar::{RowStatus, SidebarRow};
@@ -1611,6 +1611,22 @@ fn sync_sidebar(world: &World, shell: &Rc<RefCell<Shell>>) {
         state.visible = rows.len() > 1;
     }
     state.rows = rows;
+}
+
+/// Park a session change for the drive loop, which owns the world.
+///
+/// The one path the chrome's session gestures take. The stepping chords name a
+/// session by walking the strip's displayed order and a click names one by the
+/// row it landed on, but a pointer gesture is a second trigger for the action
+/// the chord dispatches rather than a second way into the switch, so both land
+/// here (spec 9.2).
+fn park_session_request(
+    slot: &Rc<RefCell<Option<SessionRequest>>>,
+    ctx: &mut EventContext,
+    request: SessionRequest,
+) {
+    *slot.borrow_mut() = Some(request);
+    ctx.redraw = true;
 }
 
 /// Arm a branch anchor: record the branched-from user message's stable id.
@@ -3987,6 +4003,10 @@ impl Shell {
         let sidebar_strip = Rc::new(RefCell::new(SessionSidebar::new(
             Rc::clone(&sidebar),
             Rc::clone(&styles),
+            // The band the pointer leaves on a row is the same one every
+            // pick list draws under its cursor, so "the pointer is here"
+            // reads the same everywhere in the app.
+            chrome.borrow().select.selected_bg,
         )));
         let layout: WidgetRef = Rc::new(RefCell::new(FlexRow {
             children: vec![
@@ -4062,14 +4082,15 @@ impl Shell {
                 AjAction::SessionNext | AjAction::SessionPrev => {
                     let forward = matches!(action, AjAction::SessionNext);
                     if let Some(session) = step_session(&sidebar_for_actions.borrow(), forward) {
-                        *session_request_for_actions.borrow_mut() =
-                            Some(SessionRequest::Resume(session));
-                        ctx.redraw = true;
+                        park_session_request(
+                            &session_request_for_actions,
+                            ctx,
+                            SessionRequest::Resume(session),
+                        );
                     }
                 }
                 AjAction::SessionNew => {
-                    *session_request_for_actions.borrow_mut() = Some(SessionRequest::New);
-                    ctx.redraw = true;
+                    park_session_request(&session_request_for_actions, ctx, SessionRequest::New);
                 }
                 AjAction::ThinkingToggle => {
                     // Matches aj's `aj.thinking.toggle` handler: flip the
@@ -4236,6 +4257,21 @@ impl Shell {
                 .borrow_mut()
                 .set_on_observe_agent(Box::new(move |id| {
                     *picker_outcome.borrow_mut() = Some(AgentPickerOutcome::Observe(id));
+                }));
+        }
+        // A pointer gesture on the strip parks the request the stepping and
+        // create chords park, through the function they both call, so a click
+        // triggers the action rather than reimplementing it (spec 9.2).
+        {
+            let session_request = Rc::clone(&session_request);
+            sidebar_strip
+                .borrow_mut()
+                .set_on_gesture(Box::new(move |ctx, gesture| {
+                    let request = match gesture {
+                        StripGesture::Focus(session) => SessionRequest::Resume(session),
+                        StripGesture::New => SessionRequest::New,
+                    };
+                    park_session_request(&session_request, ctx, request);
                 }));
         }
         let keymap =
@@ -10692,6 +10728,32 @@ mod tests {
         })
     }
 
+    fn wheel_down_at(row: i16, col: i16) -> Event {
+        Event::Mouse(vaxis::mouse::Mouse {
+            col,
+            row,
+            xoffset: 0,
+            yoffset: 0,
+            button: vaxis::mouse::Button::WheelDown,
+            mods: vaxis::mouse::Modifiers::empty(),
+            kind: vaxis::mouse::Type::Press,
+        })
+    }
+
+    /// A buttonless pointer move, which is what a terminal in any-event
+    /// tracking reports as the pointer crosses the screen.
+    fn motion_at(row: i16, col: i16) -> Event {
+        Event::Mouse(vaxis::mouse::Mouse {
+            col,
+            row,
+            xoffset: 0,
+            yoffset: 0,
+            button: vaxis::mouse::Button::None,
+            mods: vaxis::mouse::Modifiers::empty(),
+            kind: vaxis::mouse::Type::Motion,
+        })
+    }
+
     /// The Shell's draw wraps the keymap controller's surface (so the
     /// controller sits on the focus path) and appends the scrim and the
     /// top overlay above the base layout, in z order and at the ported
@@ -16075,6 +16137,280 @@ mod tests {
             Some(SessionRequest::New),
         );
         shut_down(&world).await;
+    }
+
+    /// The rows a pointer test drives, injected straight into the mirror.
+    ///
+    /// The strip's content has to be known exactly for a line index to mean
+    /// anything, and what fills the mirror from the directory is
+    /// [`sync_sidebar`]'s business, which its own tests cover.
+    fn show_sidebar(shell: &Rc<RefCell<Shell>>, rows: Vec<SidebarRow>) {
+        let sidebar = Rc::clone(&shell.borrow().sidebar);
+        let mut state = sidebar.borrow_mut();
+        state.visible = true;
+        state.toggled = true;
+        state.rows = rows;
+    }
+
+    fn sidebar_row(id: &str, host: Option<&str>, focused: bool) -> SidebarRow {
+        SidebarRow {
+            id: id.to_string(),
+            tag: None,
+            host: host.map(str::to_string),
+            status: RowStatus::Idle,
+            focused,
+            attached: focused,
+        }
+    }
+
+    /// A strip of `count` sessions, the first one focused.
+    fn sidebar_rows_named(count: usize) -> Vec<SidebarRow> {
+        (0..count)
+            .map(|at| sidebar_row(&format!("s-{at:02}"), None, at == 0))
+            .collect()
+    }
+
+    /// The strip's painted lines as the composed shell draws them at the
+    /// terminal size the pointer tests click against, so a line index here is
+    /// the row a mouse report names.
+    fn strip_lines_painted(shell: &Rc<RefCell<Shell>>) -> Vec<Vec<vaxis::cell::Cell>> {
+        let root: WidgetRef = to_widget_ref(Rc::clone(shell));
+        let surface = draw_widget(&root, &crate::test_support::draw_ctx(80, Some(40)));
+        crate::test_support::flatten(&surface)
+            .into_iter()
+            .map(|row| row.into_iter().take(usize::from(SIDEBAR_COLS)).collect())
+            .collect()
+    }
+
+    /// The text of each painted strip line: the status glyph and the label
+    /// field, without the focus marker in the first column or the rule in the
+    /// last, so a line reads as what it says.
+    fn strip_labels(shell: &Rc<RefCell<Shell>>) -> Vec<String> {
+        strip_lines_painted(shell)
+            .iter()
+            .map(|row| {
+                row[1..usize::from(SIDEBAR_COLS) - 1]
+                    .iter()
+                    .map(|cell| cell.char.grapheme())
+                    .collect::<String>()
+                    .trim()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// The strip lines the composed frame paints with the hover band.
+    fn banded_strip_lines(shell: &Rc<RefCell<Shell>>) -> Vec<usize> {
+        let band = shell.borrow().chrome.borrow().select.selected_bg;
+        assert_ne!(
+            band,
+            vaxis::cell::Color::Default,
+            "an unset band would match every plain cell",
+        );
+        strip_lines_painted(shell)
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row[3].style.bg == band)
+            .map(|(line, _)| line)
+            .collect()
+    }
+
+    /// A click on a row parks exactly what the stepping chord parks. Both go
+    /// through the one function that parks a session change, so a pointer
+    /// gesture triggers the action rather than reaching into the switch on its
+    /// own (spec 9.2).
+    ///
+    /// Driven through the composed frame: the press is hit-tested against the
+    /// surface the shell actually paints, so a strip left out of the layout,
+    /// or one that takes no events, fails here.
+    #[tokio::test]
+    async fn a_click_on_a_row_parks_what_the_chord_parks() {
+        let (mut app, mut writer, shell, root) = init_app().await;
+        show_sidebar(&shell, sidebar_rows_named(3));
+        app.render(&root).expect("render");
+        assert_eq!(
+            strip_labels(&shell)[..4],
+            ["s-00", "s-01", "s-02", "+ new"],
+            "the strip paints one line per row, then the create row",
+        );
+
+        writer
+            .write_all(&chord_bytes(AjAction::SessionNext))
+            .expect("write chord");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        let by_chord = shell.borrow().take_session_request();
+        assert_eq!(
+            by_chord,
+            Some(SessionRequest::Resume("s-01".to_string())),
+            "the chord steps to the row below the focused one",
+        );
+
+        app.handle_input(left_mouse_at(1, 2, vaxis::mouse::Type::Press));
+        assert_eq!(
+            shell.borrow().take_session_request(),
+            by_chord,
+            "and a click on that row asks for the same thing",
+        );
+    }
+
+    /// A click on the create row parks the create the chord parks.
+    #[tokio::test]
+    async fn a_click_on_the_create_row_parks_a_create() {
+        let (mut app, _writer, shell, root) = init_app().await;
+        show_sidebar(&shell, sidebar_rows_named(2));
+        app.render(&root).expect("render");
+        assert_eq!(strip_labels(&shell)[2], "+ new");
+
+        app.handle_input(left_mouse_at(2, 2, vaxis::mouse::Type::Press));
+        assert_eq!(
+            shell.borrow().take_session_request(),
+            Some(SessionRequest::New),
+        );
+    }
+
+    /// A host header and the overflow count report rather than offer, so a
+    /// click on either asks for nothing.
+    #[tokio::test]
+    async fn a_click_on_a_header_or_the_overflow_count_parks_nothing() {
+        let (mut app, _writer, shell, root) = init_app().await;
+        show_sidebar(
+            &shell,
+            vec![
+                sidebar_row("s-00", Some("laptop"), true),
+                sidebar_row("s-01", Some("builder-1"), false),
+            ],
+        );
+        app.render(&root).expect("render");
+        assert!(
+            strip_labels(&shell)[0].starts_with("~ laptop"),
+            "a header leads the strip: {:?}",
+            strip_labels(&shell),
+        );
+        app.handle_input(left_mouse_at(0, 2, vaxis::mouse::Type::Press));
+        assert!(shell.borrow().take_session_request().is_none());
+
+        // More rows than the terminal has lines, so the strip counts what it
+        // left out on the line above the create row.
+        show_sidebar(&shell, sidebar_rows_named(60));
+        app.render(&root).expect("render");
+        let labels = strip_labels(&shell);
+        assert!(
+            labels[38].ends_with("more"),
+            "the overflow count sits above the create row: {labels:?}",
+        );
+        app.handle_input(left_mouse_at(38, 2, vaxis::mouse::Type::Press));
+        assert!(shell.borrow().take_session_request().is_none());
+    }
+
+    /// An overlay floating above the strip keeps the pointer. The scrim is the
+    /// deepest hit, so it consumes the press at target while the strip only
+    /// sees it in the capturing phase, where the strip stays out of the way
+    /// and drops its band.
+    ///
+    /// NOTE: the band is read after the overlay closes. The test compositor
+    /// blits a child's whole grid, blank cells included, so a full-viewport
+    /// scrim wipes the base content there in a way a real render (which skips
+    /// an empty buffer) does not.
+    #[tokio::test]
+    async fn an_overlay_above_the_strip_keeps_the_click() {
+        let (mut app, mut writer, shell, root) = init_app().await;
+        show_sidebar(&shell, sidebar_rows_named(3));
+        app.render(&root).expect("render");
+        app.handle_input(motion_at(1, 2));
+        app.render(&root).expect("render");
+        assert_eq!(banded_strip_lines(&shell), vec![1], "the row is banded");
+
+        writer.write_all(&[0x0f]).expect("write ctrl+o");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        assert!(shell.borrow().overlays.borrow().is_open(), "the palette");
+        app.render(&root).expect("render");
+
+        app.handle_input(left_mouse_at(1, 2, vaxis::mouse::Type::Press));
+        assert!(
+            shell.borrow().take_session_request().is_none(),
+            "the press belongs to the overlay, not to the strip",
+        );
+
+        writer.write_all(b"\x1b").expect("write esc");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        assert!(!shell.borrow().overlays.borrow().is_open(), "esc closes it");
+        app.render(&root).expect("render");
+        assert!(
+            banded_strip_lines(&shell).is_empty(),
+            "and the strip comes back with no band on it: {:?}",
+            banded_strip_lines(&shell),
+        );
+    }
+
+    /// Hovering a row asks for exactly one frame, and a pointer holding still
+    /// asks for none.
+    ///
+    /// The band lives in the widget and the widget's identity is stable across
+    /// frames, so the enter/leave diffing the runtime runs against every fresh
+    /// surface finds nothing to say. A band whose surface got a new identity
+    /// each frame, or one that redrew for every pointer report, would keep the
+    /// frame loop awake for as long as the pointer rested on the strip.
+    #[tokio::test]
+    async fn hovering_a_row_settles_in_one_frame() {
+        let (mut app, _writer, shell, root) = init_app().await;
+        show_sidebar(&shell, sidebar_rows_named(3));
+        app.render(&root).expect("render");
+        assert!(!app.needs_redraw(), "the frame starts settled");
+
+        app.handle_input(motion_at(1, 2));
+        assert!(app.needs_redraw(), "the band moved onto the row");
+        app.render(&root).expect("render");
+        assert!(
+            !app.needs_redraw(),
+            "one frame settles it: the hover does not feed itself",
+        );
+        assert_eq!(banded_strip_lines(&shell), vec![1]);
+
+        app.handle_input(motion_at(1, 2));
+        assert!(
+            !app.needs_redraw(),
+            "a pointer holding still asks for nothing",
+        );
+
+        // Onto a blank line below the strip's content, which is no row at all.
+        app.handle_input(motion_at(39, 2));
+        assert!(app.needs_redraw(), "the band had to come off");
+        app.render(&root).expect("render");
+        assert!(!app.needs_redraw(), "and that settled in one frame too");
+        assert!(banded_strip_lines(&shell).is_empty());
+    }
+
+    /// The wheel over the strip scrolls it. The offset's own rules (where it
+    /// stops, what a focus change does to it) are the strip's, this is the
+    /// wiring.
+    #[tokio::test]
+    async fn the_wheel_over_the_strip_scrolls_it() {
+        let (mut app, _writer, shell, root) = init_app().await;
+        show_sidebar(&shell, sidebar_rows_named(60));
+        app.render(&root).expect("render");
+        assert_eq!(strip_labels(&shell)[0], "s-00");
+
+        app.handle_input(wheel_down_at(1, 2));
+        app.render(&root).expect("render");
+        assert_eq!(
+            strip_labels(&shell)[0],
+            "s-01",
+            "the wheel moved the run down a row",
+        );
+
+        app.handle_input(wheel_up_at(1, 2));
+        app.render(&root).expect("render");
+        assert_eq!(strip_labels(&shell)[0], "s-00", "and back up again");
+
+        // A strip whose rows all fit has nowhere to scroll.
+        show_sidebar(&shell, sidebar_rows_named(3));
+        app.render(&root).expect("render");
+        app.handle_input(wheel_down_at(1, 2));
+        app.render(&root).expect("render");
+        assert_eq!(strip_labels(&shell)[..3], ["s-00", "s-01", "s-02"]);
     }
 
     /// With one session the strip stays hidden and costs the transcript nothing,

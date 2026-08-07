@@ -35,15 +35,24 @@
 //! lines away from the rows) therefore lives in one testable place, and a
 //! pointer gesture can resolve a line by its index without deriving the layout
 //! a second time.
+//!
+//! Pointer gestures are a second trigger for actions the chords already
+//! dispatch, never a behavior of their own (spec 9.2). The strip resolves a
+//! click into a [`StripGesture`], which names a session or a create and
+//! nothing else, and the shell hands that to the same place the chord's
+//! handler hands its own answer.
 
 use std::cell::RefCell;
 use std::ops::Range;
 use std::rc::Rc;
 
 use aj_wire::SessionSummary;
-use vaxis::cell::Style;
+use vaxis::cell::{Color, Style};
 use vaxis::gwidth::{Method, gwidth};
-use vaxis::vxfw::{DrawContext, MaxSize, Overflow, RichText, Size, Surface, TextSpan, Widget};
+use vaxis::mouse::{Button, Mouse, Type};
+use vaxis::vxfw::{
+    DrawContext, Event, EventContext, MaxSize, Overflow, RichText, Size, Surface, TextSpan, Widget,
+};
 
 use crate::transcript::TranscriptStyles;
 
@@ -202,6 +211,24 @@ pub(crate) struct SidebarState {
     pub(crate) too_narrow: bool,
     /// Rows in display order, most recent activity first.
     pub(crate) rows: Vec<SidebarRow>,
+    /// Where the wheel anchored the drawn run. `None` is the resting state, in
+    /// which the run follows the focused row.
+    scroll: Option<Anchor>,
+}
+
+/// Where the wheel left the drawn run, and the session that was focused when
+/// it did.
+///
+/// The pairing is what makes a focus change drop the anchor. The layout
+/// follows the focused row, and can only do that while nothing else holds the
+/// run, so an anchor set before a switch would leave the user looking away
+/// from the session they just opened. Carried alongside the anchor rather than
+/// cleared on write so the rule holds however the mirror's rows arrive.
+struct Anchor {
+    /// Index into the display order the run starts at.
+    at: usize,
+    /// The session focused when the wheel set it.
+    focused: Option<String>,
 }
 
 impl SidebarState {
@@ -209,6 +236,56 @@ impl SidebarState {
     pub(crate) fn shown(&self) -> bool {
         self.visible && !self.too_narrow
     }
+
+    /// The wheel's anchor, if it still applies.
+    fn anchor(&self) -> Option<usize> {
+        self.scroll
+            .as_ref()
+            .filter(|anchor| anchor.focused.as_deref() == focused_id(&self.rows))
+            .map(|anchor| anchor.at)
+    }
+
+    /// The strip's lines in a strip `height` lines tall.
+    pub(crate) fn lines(&self, height: u16) -> Vec<StripLine> {
+        strip_lines(&self.rows, height, self.anchor())
+    }
+
+    /// Move the drawn run `delta` rows in a strip `height` lines tall, and say
+    /// whether it moved.
+    ///
+    /// The wheel anchors the run where it lands, because the layout otherwise
+    /// follows the focused row and would pull the view straight back on the
+    /// next frame. A wheel with nowhere to go (the rows all fit, or the run
+    /// already sits against an end) leaves the anchor alone, so scrolling a
+    /// strip that fits cannot quietly switch focus-following off.
+    pub(crate) fn scroll_by(&mut self, delta: isize, height: u16) -> bool {
+        // The create row is paid for before any run is chosen, exactly as in
+        // [`strip_lines`].
+        let budget = usize::from(height).saturating_sub(1);
+        if budget == 0 {
+            return false;
+        }
+        let layout = Layout::of(&self.rows);
+        let from = layout.visible_run(budget, self.anchor()).start;
+        let to = from
+            .saturating_add_signed(delta)
+            .min(layout.last_anchor(budget));
+        if to == from {
+            return false;
+        }
+        self.scroll = Some(Anchor {
+            at: to,
+            focused: focused_id(&self.rows).map(str::to_string),
+        });
+        true
+    }
+}
+
+/// The session the rows say is on screen, if any.
+fn focused_id(rows: &[SidebarRow]) -> Option<&str> {
+    rows.iter()
+        .find(|row| row.focused)
+        .map(|row| row.id.as_str())
 }
 
 /// Build the display rows from the peer's directory.
@@ -281,16 +358,37 @@ pub(crate) enum StripLine {
     New,
 }
 
+/// What a pointer gesture on the strip asks for.
+///
+/// A gesture names the ask and nothing more, because it is a second trigger
+/// for an action the chords already dispatch rather than a path of its own
+/// (spec 9.2): the shell hands this to the same place the chord's handler
+/// hands the session it stepped to.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum StripGesture {
+    /// Focus the session on the row that was clicked.
+    Focus(String),
+    /// Create a session.
+    New,
+}
+
 /// Lay the strip out for `rows` in `height` lines.
 ///
 /// The one place the height arithmetic lives. Host headers, the overflow row
 /// and the create row all take lines away from the rows, and the focused row
 /// has to survive that. Never returns more than `height` lines.
 ///
+/// `scroll` is where the wheel anchored the run, or `None` to follow the
+/// focused row (see [`SidebarState::scroll_by`]).
+///
 /// A height that cannot fit even the focused row and its header (two lines of
 /// strip, with hosts to group) gives up on showing a row rather than
 /// overrunning: the honest answer at that size is the overflow count.
-pub(crate) fn strip_lines(rows: &[SidebarRow], height: u16) -> Vec<StripLine> {
+pub(crate) fn strip_lines(
+    rows: &[SidebarRow],
+    height: u16,
+    scroll: Option<usize>,
+) -> Vec<StripLine> {
     let height = usize::from(height);
     if height == 0 {
         return Vec::new();
@@ -302,7 +400,7 @@ pub(crate) fn strip_lines(rows: &[SidebarRow], height: u16) -> Vec<StripLine> {
         return vec![StripLine::New];
     }
     let layout = Layout::of(rows);
-    layout.lines(layout.visible_run(budget))
+    layout.lines(layout.visible_run(budget, scroll))
 }
 
 /// A run of rows sharing a host.
@@ -394,30 +492,31 @@ impl<'a> Layout<'a> {
     }
 
     /// The run of the display order to draw in `budget` lines: the longest one
-    /// that fits with the focused row inside it.
+    /// that fits, anchored where `scroll` says or around the focused row when
+    /// it says nothing.
     ///
-    /// Scrolls by the least it can. The run stays anchored at the top until
-    /// focus would fall past its bottom edge, which keeps a step from jumping
-    /// the whole strip. With no focused row it shows the top, which is the
-    /// most recently active end.
-    fn visible_run(&self, budget: usize) -> Range<usize> {
-        let total = self.order.len();
-        // Scanned downward because cost is not monotone in the run's length:
-        // the run holding every row spends no line on the overflow row, so it
-        // can fit where a run one row shorter does not.
-        let top = (0..=total)
-            .rev()
-            .find(|&end| self.cost(0..end) <= budget)
-            .unwrap_or(0);
+    /// Following focus scrolls by the least it can. The run stays anchored at
+    /// the top until focus would fall past its bottom edge, which keeps a step
+    /// from jumping the whole strip. With no focused row it shows the top,
+    /// which is the most recently active end.
+    fn visible_run(&self, budget: usize, scroll: Option<usize>) -> Range<usize> {
+        // An anchor the user set outranks the focused row: they scrolled to
+        // look elsewhere, and following focus would undo that on the very next
+        // frame. The anchor lapses on a focus change (see [`Anchor`]), which is
+        // what hands the strip back to focus-following.
+        if let Some(start) = scroll {
+            return self.run_from(budget, start.min(self.last_anchor(budget)));
+        }
+        let top = self.run_from(budget, 0);
         let Some(focus) = self
             .order
             .iter()
             .position(|&index| self.rows[index].focused)
         else {
-            return 0..top;
+            return top;
         };
-        if focus < top {
-            return 0..top;
+        if focus < top.end {
+            return top;
         }
         // Focus fell past the bottom edge, so the run ends on it and reaches
         // back as far as the budget allows. An empty run is the answer when
@@ -425,6 +524,30 @@ impl<'a> Layout<'a> {
         (0..=focus)
             .find(|&start| self.cost(start..focus + 1) <= budget)
             .map_or(focus..focus, |start| start..focus + 1)
+    }
+
+    /// The longest run beginning at `start` that fits `budget`.
+    ///
+    /// Scanned downward because cost is not monotone in the run's length: the
+    /// run holding every row spends no line on the overflow row, so it can fit
+    /// where a run one row shorter does not.
+    fn run_from(&self, budget: usize, start: usize) -> Range<usize> {
+        (start..=self.order.len())
+            .rev()
+            .find(|&end| self.cost(start..end) <= budget)
+            .map_or(start..start, |end| start..end)
+    }
+
+    /// The furthest down the run can be anchored: the first start whose run
+    /// still reaches the last row. Anchoring past it would redraw the same
+    /// last page, so this is where the wheel stops.
+    fn last_anchor(&self, budget: usize) -> usize {
+        let total = self.order.len();
+        // An empty run costs only the overflow line, so with a budget of at
+        // least one line the scan always terminates.
+        (0..=total)
+            .find(|&start| self.cost(start..total) <= budget)
+            .unwrap_or(total)
     }
 
     /// The lines for a run, in draw order.
@@ -578,11 +701,118 @@ fn header_field(host: &str, unreachable: bool, cols: usize) -> String {
 pub(crate) struct SessionSidebar {
     state: Rc<RefCell<SidebarState>>,
     styles: Rc<TranscriptStyles>,
+    /// The band painted behind the line under the pointer.
+    hover_bg: Color,
+    /// The strip's height at the last draw, which is what the wheel scrolls
+    /// against.
+    height: u16,
+    /// The lines the last draw painted, indexed by their row inside the strip.
+    /// A pointer gesture resolves against this rather than laying the strip
+    /// out a second time, which is what keeps the gesture and the paint from
+    /// answering differently.
+    lines: Vec<StripLine>,
+    /// The line under the pointer, `None` when the pointer is elsewhere.
+    hover: Option<u16>,
+    /// Where a resolved gesture goes. Unset until the shell wires it, which
+    /// leaves the strip inert rather than half-wired.
+    on_gesture: Option<Box<dyn FnMut(&mut EventContext, StripGesture)>>,
 }
 
 impl SessionSidebar {
-    pub(crate) fn new(state: Rc<RefCell<SidebarState>>, styles: Rc<TranscriptStyles>) -> Self {
-        Self { state, styles }
+    pub(crate) fn new(
+        state: Rc<RefCell<SidebarState>>,
+        styles: Rc<TranscriptStyles>,
+        hover_bg: Color,
+    ) -> Self {
+        Self {
+            state,
+            styles,
+            hover_bg,
+            height: 0,
+            lines: Vec::new(),
+            hover: None,
+            on_gesture: None,
+        }
+    }
+
+    /// Wire where a resolved pointer gesture goes.
+    pub(crate) fn set_on_gesture(
+        &mut self,
+        on_gesture: Box<dyn FnMut(&mut EventContext, StripGesture)>,
+    ) {
+        self.on_gesture = Some(on_gesture);
+    }
+
+    /// What a click on the strip's `line`th row asks for.
+    ///
+    /// `None` on the lines that are not affordances: a host header and the
+    /// overflow count, which say something rather than offer something, and
+    /// every line below the strip's content, which the layout leaves out of
+    /// its result so those resolve to nothing by construction.
+    ///
+    /// A row that is already focused resolves like any other. Resuming the
+    /// session on screen is a no-op where the switch happens, and stating that
+    /// rule twice is how the two copies drift apart.
+    fn gesture_at(&self, line: u16) -> Option<StripGesture> {
+        match self.lines.get(usize::from(line))? {
+            StripLine::Session { index } => Some(StripGesture::Focus(
+                self.state.borrow().rows.get(*index)?.id.clone(),
+            )),
+            StripLine::New => Some(StripGesture::New),
+            StripLine::Header { .. } | StripLine::Overflow { .. } => None,
+        }
+    }
+
+    /// Point the hover band at `line`, and say whether the band moved.
+    ///
+    /// The band only marks a line a click acts on: over a header it would
+    /// offer something that is not there.
+    fn set_hover(&mut self, line: Option<u16>) -> bool {
+        let line = line.filter(|&line| {
+            matches!(
+                self.lines.get(usize::from(line)),
+                Some(StripLine::Session { .. } | StripLine::New),
+            )
+        });
+        let moved = self.hover != line;
+        self.hover = line;
+        moved
+    }
+
+    /// A pointer event at the strip's own coordinates.
+    ///
+    /// Every report moves the band, and only a left press and the wheel do
+    /// anything more. A redraw is asked for exactly when something changed,
+    /// which is what keeps a pointer resting on the strip from arming a frame
+    /// per report.
+    fn on_mouse(&mut self, ctx: &mut EventContext, mouse: Mouse) {
+        // A negative row is off the top of the strip, which is nowhere.
+        let line = u16::try_from(mouse.row).ok();
+        if self.set_hover(line) {
+            ctx.redraw = true;
+        }
+        match mouse.button {
+            Button::WheelUp => self.wheel(ctx, -1),
+            Button::WheelDown => self.wheel(ctx, 1),
+            Button::Left if mouse.kind == Type::Press => {
+                let Some(gesture) = line.and_then(|line| self.gesture_at(line)) else {
+                    return;
+                };
+                if let Some(on_gesture) = self.on_gesture.as_mut() {
+                    on_gesture(ctx, gesture);
+                }
+                // The strip acted on the press, so nothing else should.
+                ctx.consume_event();
+            }
+            _ => {}
+        }
+    }
+
+    /// Wheel the drawn run by `delta` rows, if it has anywhere to go.
+    fn wheel(&self, ctx: &mut EventContext, delta: isize) {
+        if self.state.borrow_mut().scroll_by(delta, self.height) {
+            ctx.consume_and_redraw();
+        }
     }
 
     /// The style a label is drawn in: the working-set axis, as brightness.
@@ -610,7 +840,13 @@ impl SessionSidebar {
     /// One line's spans: the focus marker, the status glyph, the label field,
     /// then the pad and the separator. Every line has this shape, so a column
     /// means the same thing on all of them.
-    fn line_spans(&self, line: &StripLine, rows: &[SidebarRow], width: u16) -> Vec<TextSpan> {
+    fn line_spans(
+        &self,
+        line: &StripLine,
+        rows: &[SidebarRow],
+        width: u16,
+        hovered: bool,
+    ) -> Vec<TextSpan> {
         let cols = label_cols(width);
         let dim = self.styles.dim;
         let (marker, glyph, glyph_style, label, label_style) = match line {
@@ -630,11 +866,24 @@ impl SessionSidebar {
             StripLine::Overflow { hidden } => (" ", " ", dim, format!("…{hidden} more"), dim),
             StripLine::New => (" ", "+", dim, "new".to_string(), dim),
         };
+        // The band reaches the pad and stops short of the separator, which
+        // belongs to the rule down the strip's edge rather than to any row.
+        let tint = |style: Style| {
+            if hovered {
+                Style {
+                    bg: self.hover_bg,
+                    ..style
+                }
+            } else {
+                style
+            }
+        };
         vec![
-            span(marker, self.styles.accent),
-            span(glyph, glyph_style),
-            span(&format!(" {}", field(&label, cols)), label_style),
-            span(&format!(" {SEPARATOR}"), dim),
+            span(marker, tint(self.styles.accent)),
+            span(glyph, tint(glyph_style)),
+            span(&format!(" {}", field(&label, cols)), tint(label_style)),
+            span(" ", tint(dim)),
+            span(SEPARATOR, dim),
         ]
     }
 
@@ -656,13 +905,6 @@ fn span(text: &str, style: Style) -> TextSpan {
 
 impl Widget for SessionSidebar {
     fn draw(&mut self, ctx: &DrawContext) -> Surface {
-        let state = self.state.borrow();
-        if !state.shown() {
-            return Surface::with_size(Size {
-                width: 0,
-                height: 0,
-            });
-        }
         // A flex row measures its inflexible children under an unbounded width,
         // so the width has to come from this widget rather than the context:
         // that measurement is exactly the question "how wide are you".
@@ -670,7 +912,9 @@ impl Widget for SessionSidebar {
             .max
             .width
             .map_or(SIDEBAR_COLS, |max| max.min(SIDEBAR_COLS));
-        if width == 0 {
+        if !self.state.borrow().shown() || width == 0 {
+            // Nothing is drawn, so nothing is there to gesture at either.
+            self.lines.clear();
             return Surface::with_size(Size {
                 width: 0,
                 height: 0,
@@ -678,15 +922,27 @@ impl Widget for SessionSidebar {
         }
         // An unbounded height is a measurement pass, which reads back only the
         // width: lay every line out and let the surface be as tall as it is.
-        let lines = strip_lines(&state.rows, ctx.max.height.unwrap_or(u16::MAX));
-        let blanks = usize::from(ctx.max.height.unwrap_or(0)).saturating_sub(lines.len());
-        let mut spans: Vec<TextSpan> = Vec::with_capacity((lines.len() + blanks) * 5);
-        for index in 0..lines.len() + blanks {
+        //
+        // Recorded before anything is painted from it, so the layout a pointer
+        // gesture resolves against is the one on screen.
+        self.height = ctx.max.height.unwrap_or(u16::MAX);
+        self.lines = self.state.borrow().lines(self.height);
+        // The rows can move under a pointer that has not, so the band is
+        // re-resolved against the fresh layout rather than left marking
+        // whatever used to be on that line.
+        self.set_hover(self.hover);
+        let state = self.state.borrow();
+        let hover = self.hover.map(usize::from);
+        let blanks = usize::from(ctx.max.height.unwrap_or(0)).saturating_sub(self.lines.len());
+        let mut spans: Vec<TextSpan> = Vec::with_capacity((self.lines.len() + blanks) * 6);
+        for index in 0..self.lines.len() + blanks {
             if index > 0 {
                 spans.push(span("\n", self.styles.text));
             }
-            match lines.get(index) {
-                Some(line) => spans.extend(self.line_spans(line, &state.rows, width)),
+            match self.lines.get(index) {
+                Some(line) => {
+                    spans.extend(self.line_spans(line, &state.rows, width, hover == Some(index)));
+                }
                 None => spans.extend(self.blank_spans(width)),
             }
         }
@@ -708,6 +964,33 @@ impl Widget for SessionSidebar {
         // the transcript beside it never starts mid-strip.
         surface.size.width = width;
         surface
+    }
+
+    fn capture_event(&mut self, ctx: &mut EventContext, event: &Event) {
+        // The strip only reaches the capturing phase when something floats
+        // above it (an open overlay's scrim, say). That gesture belongs to
+        // whatever is on top, so the strip stays out of it and drops its band
+        // rather than pointing at a row the click will not reach.
+        if matches!(event, Event::Mouse(_)) && self.set_hover(None) {
+            ctx.redraw = true;
+        }
+    }
+
+    fn handle_event(&mut self, ctx: &mut EventContext, event: &Event) {
+        match event {
+            Event::Mouse(mouse) => self.on_mouse(ctx, *mouse),
+            // The pointer left the strip, so the band goes with it.
+            Event::MouseLeave => {
+                if self.set_hover(None) {
+                    ctx.redraw = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn wants_events(&self) -> bool {
+        true
     }
 }
 
@@ -1064,7 +1347,7 @@ mod tests {
             (rows_named(&["a", "b", "c", "d"]), 3),
             (rows_named(&["a", "b", "c", "d"]), 1),
         ] {
-            let lines = strip_lines(&rows, height);
+            let lines = strip_lines(&rows, height, None);
             assert_eq!(
                 lines.last(),
                 Some(&StripLine::New),
@@ -1082,7 +1365,7 @@ mod tests {
     /// that pays for the create row.
     #[test]
     fn a_zero_height_strip_draws_nothing() {
-        assert!(strip_lines(&rows_named(&["a", "b"]), 0).is_empty());
+        assert!(strip_lines(&rows_named(&["a", "b"]), 0, None).is_empty());
     }
 
     /// One host, or none at all, is not a grouping. A plain connect has to look
@@ -1091,14 +1374,14 @@ mod tests {
     fn a_single_host_gets_no_headers() {
         let hostless = rows_named(&["a", "b", "c"]);
         assert!(
-            headers(&strip_lines(&hostless, 20)).is_empty(),
+            headers(&strip_lines(&hostless, 20, None)).is_empty(),
             "rows with no host name nothing to group under",
         );
         let one_host: Vec<SidebarRow> = ["a", "b", "c"]
             .iter()
             .map(|id| row(id).host("builder-1").build())
             .collect();
-        let lines = strip_lines(&one_host, 20);
+        let lines = strip_lines(&one_host, 20, None);
         assert!(
             headers(&lines).is_empty(),
             "one host is not a grouping: {lines:?}",
@@ -1118,7 +1401,7 @@ mod tests {
             row("laptop-old").host("laptop").build(),
             row("builder-old").host("builder-1").build(),
         ];
-        let lines = strip_lines(&rows, 20);
+        let lines = strip_lines(&rows, 20, None);
         assert_eq!(
             headers(&lines),
             vec![("laptop", false), ("builder-1", false)]
@@ -1148,12 +1431,12 @@ mod tests {
             row("here").host("builder-1").build(),
         ];
         assert_eq!(
-            headers(&strip_lines(&rows, 20)),
+            headers(&strip_lines(&rows, 20, None)),
             vec![("laptop", true), ("builder-1", false)],
         );
         rows[1].status = RowStatus::Idle;
         assert_eq!(
-            headers(&strip_lines(&rows, 20)),
+            headers(&strip_lines(&rows, 20, None)),
             vec![("laptop", false), ("builder-1", false)],
             "a host with one reachable session is reachable",
         );
@@ -1168,7 +1451,7 @@ mod tests {
             row("named").host("builder-1").build(),
             row("nameless").build(),
         ];
-        let lines = strip_lines(&rows, 20);
+        let lines = strip_lines(&rows, 20, None);
         assert_eq!(drawn(&lines, &rows), vec!["nameless", "named"]);
         assert_eq!(headers(&lines), vec![("builder-1", false)]);
         assert!(
@@ -1183,13 +1466,13 @@ mod tests {
     fn the_rows_that_do_not_fit_are_counted() {
         let rows = rows_named(&["a", "b", "c", "d", "e"]);
         // Six lines: five rows and the create row, so nothing is cut.
-        let whole = strip_lines(&rows, 6);
+        let whole = strip_lines(&rows, 6, None);
         assert_eq!(drawn(&whole, &rows), vec!["a", "b", "c", "d", "e"]);
         assert_eq!(hidden(&whole), None, "nothing was left out: {whole:?}");
 
         // One line fewer, and the overflow row costs one of its own: four
         // lines of budget hold three rows and the count of the other two.
-        let cut = strip_lines(&rows, 5);
+        let cut = strip_lines(&rows, 5, None);
         assert_eq!(drawn(&cut, &rows), vec!["a", "b", "c"]);
         assert_eq!(hidden(&cut), Some(2));
         assert_eq!(cut.len(), 5, "and it used every line it had: {cut:?}");
@@ -1206,13 +1489,13 @@ mod tests {
             row("d").host("two").build(),
         ];
         // Five lines: create row, one header, two rows, one overflow row.
-        let lines = strip_lines(&rows, 5);
+        let lines = strip_lines(&rows, 5, None);
         assert_eq!(drawn(&lines, &rows), vec!["a", "b"]);
         assert_eq!(headers(&lines), vec![("one", false)]);
         assert_eq!(hidden(&lines), Some(2));
 
         // Seven lines fit both headers, all four rows and the create row.
-        let whole = strip_lines(&rows, 7);
+        let whole = strip_lines(&rows, 7, None);
         assert_eq!(drawn(&whole, &rows), vec!["a", "b", "c", "d"]);
         assert_eq!(headers(&whole), vec![("one", false), ("two", false)]);
         assert_eq!(hidden(&whole), None);
@@ -1227,7 +1510,7 @@ mod tests {
         rows[4].focused = true;
         // Four lines: the create row, the overflow row, and two rows ending on
         // the focused one.
-        let lines = strip_lines(&rows, 4);
+        let lines = strip_lines(&rows, 4, None);
         assert_eq!(drawn(&lines, &rows), vec!["d", "e"]);
         assert_eq!(hidden(&lines), Some(4), "four rows are out of view");
     }
@@ -1241,13 +1524,13 @@ mod tests {
         let mut rows = rows_named(&["a", "b", "c", "d", "e", "f"]);
         rows[0].focused = true;
         assert_eq!(
-            drawn(&strip_lines(&rows, 4), &rows),
+            drawn(&strip_lines(&rows, 4, None), &rows),
             vec!["a", "b"],
             "the row below the focused one fills the line it left",
         );
         rows[0].focused = false;
         rows[1].focused = true;
-        assert_eq!(drawn(&strip_lines(&rows, 4), &rows), vec!["a", "b"]);
+        assert_eq!(drawn(&strip_lines(&rows, 4, None), &rows), vec!["a", "b"]);
     }
 
     /// A row shows the name the user gave it, and an over-long one keeps its
@@ -1369,14 +1652,25 @@ mod tests {
         ))
     }
 
-    /// The strip's painted cells at its own width.
-    fn painted_cells(rows: Vec<SidebarRow>, height: u16) -> Vec<Vec<vaxis::cell::Cell>> {
+    /// The tint the tests give the hover band: a color no other style in the
+    /// strip carries, so a banded cell is unmistakable.
+    const HOVER_BG: Color = Color::Rgb([9, 9, 9]);
+
+    /// A drawn strip over `rows`, ready to be asked what a pointer lands on.
+    fn strip(rows: Vec<SidebarRow>, height: u16) -> SessionSidebar {
         let state = Rc::new(RefCell::new(SidebarState {
             visible: true,
             rows,
             ..SidebarState::default()
         }));
-        let mut strip = SessionSidebar::new(state, styles());
+        let mut strip = SessionSidebar::new(state, styles(), HOVER_BG);
+        strip.draw(&crate::test_support::draw_ctx(SIDEBAR_COLS, Some(height)));
+        strip
+    }
+
+    /// The strip's painted cells at its own width.
+    fn painted_cells(rows: Vec<SidebarRow>, height: u16) -> Vec<Vec<vaxis::cell::Cell>> {
+        let mut strip = strip(rows, height);
         let surface = strip.draw(&crate::test_support::draw_ctx(SIDEBAR_COLS, Some(height)));
         crate::test_support::flatten(&surface)
     }
@@ -1472,5 +1766,382 @@ mod tests {
         assert_ne!(labels[0], labels[1], "focused and background: {labels:?}");
         assert_ne!(labels[1], labels[2], "background and listed: {labels:?}");
         assert_ne!(labels[0], labels[2], "focused and listed: {labels:?}");
+    }
+
+    /// A drawn strip that records every gesture it resolves.
+    fn wired(
+        rows: Vec<SidebarRow>,
+        height: u16,
+    ) -> (SessionSidebar, Rc<RefCell<Vec<StripGesture>>>) {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let mut strip = strip(rows, height);
+        let sink = Rc::clone(&seen);
+        strip.set_on_gesture(Box::new(move |_, gesture| sink.borrow_mut().push(gesture)));
+        (strip, seen)
+    }
+
+    fn report(line: i16, button: Button, kind: Type) -> Event {
+        Event::Mouse(Mouse {
+            col: 2,
+            row: line,
+            xoffset: 0,
+            yoffset: 0,
+            button,
+            mods: vaxis::mouse::Modifiers::empty(),
+            kind,
+        })
+    }
+
+    fn press(line: i16) -> Event {
+        report(line, Button::Left, Type::Press)
+    }
+
+    fn motion(line: i16) -> Event {
+        report(line, Button::None, Type::Motion)
+    }
+
+    fn wheel(button: Button) -> Event {
+        report(0, button, Type::Press)
+    }
+
+    /// Deliver `event` to the strip at target, returning the context so the
+    /// caller can read what the strip asked the runtime for.
+    fn deliver(strip: &mut SessionSidebar, event: &Event) -> EventContext {
+        let mut ctx = EventContext::new();
+        strip.handle_event(&mut ctx, event);
+        ctx
+    }
+
+    /// The sessions the strip's last draw painted, in painted order.
+    fn shown(strip: &SessionSidebar) -> Vec<String> {
+        let state = strip.state.borrow();
+        strip
+            .lines
+            .iter()
+            .filter_map(|line| match line {
+                StripLine::Session { index } => Some(state.rows[*index].id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn redraw(strip: &mut SessionSidebar, height: u16) {
+        strip.draw(&crate::test_support::draw_ctx(SIDEBAR_COLS, Some(height)));
+    }
+
+    fn focus_of(ids: &[&str]) -> Vec<StripGesture> {
+        ids.iter()
+            .map(|id| StripGesture::Focus((*id).to_string()))
+            .collect()
+    }
+
+    /// A click resolves by the line it landed on, and a host header takes a
+    /// line like every other: the strip's third line is the second session,
+    /// not the third.
+    #[test]
+    fn a_click_names_the_session_on_the_line_it_landed_on() {
+        // Two hosts, so the strip wears headers: `~ laptop`, its two rows,
+        // `~ builder-1`, its two rows, then the create row.
+        let rows = vec![
+            row("laptop-new").host("laptop").focused().build(),
+            row("builder-new").host("builder-1").build(),
+            row("laptop-old").host("laptop").build(),
+            row("builder-old").host("builder-1").build(),
+        ];
+        let (mut strip, seen) = wired(rows, 8);
+        for line in [1, 2, 4, 5] {
+            let ctx = deliver(&mut strip, &press(line));
+            assert!(ctx.consume_event, "line {line} was acted on");
+        }
+        assert_eq!(
+            *seen.borrow(),
+            focus_of(&["laptop-new", "laptop-old", "builder-new", "builder-old"]),
+            "the lines under the headers name the rows below them",
+        );
+
+        // Only the press acts. A drag crossing the strip belongs to whatever
+        // started it, and a release would fire the row a second time.
+        for kind in [Type::Drag, Type::Release] {
+            deliver(&mut strip, &report(1, Button::Left, kind));
+        }
+        assert_eq!(seen.borrow().len(), 4, "only the presses acted");
+    }
+
+    /// The create row asks for a session, from wherever the layout put it.
+    #[test]
+    fn a_click_on_the_create_row_asks_for_a_session() {
+        let (mut strip, seen) = wired(rows_named(&["a", "b"]), 8);
+        let ctx = deliver(&mut strip, &press(2));
+        assert_eq!(*seen.borrow(), vec![StripGesture::New]);
+        assert!(ctx.consume_event);
+    }
+
+    /// A header and the overflow count say something rather than offer
+    /// something, so a click on either does nothing at all and leaves the
+    /// press to whatever else wants it.
+    #[test]
+    fn a_header_and_the_overflow_count_are_not_affordances() {
+        let grouped = vec![row("a").host("one").build(), row("b").host("two").build()];
+        let (mut strip, seen) = wired(grouped, 8);
+        let ctx = deliver(&mut strip, &press(0));
+        assert!(seen.borrow().is_empty(), "a header click does nothing");
+        assert!(!ctx.consume_event, "and does not swallow the press");
+
+        // Five rows in five lines: three rows, the overflow count, the create
+        // row.
+        let (mut strip, seen) = wired(rows_named(&["a", "b", "c", "d", "e"]), 5);
+        let ctx = deliver(&mut strip, &press(3));
+        assert!(seen.borrow().is_empty(), "an overflow click does nothing");
+        assert!(!ctx.consume_event);
+    }
+
+    /// The lines below the strip's content are not rows. The layout leaves
+    /// them out of its result, so they resolve to nothing by construction.
+    #[test]
+    fn a_click_below_the_content_lands_on_nothing() {
+        let (mut strip, seen) = wired(rows_named(&["a", "b"]), 8);
+        for line in [3, 7, 40] {
+            deliver(&mut strip, &press(line));
+        }
+        assert!(seen.borrow().is_empty());
+    }
+
+    /// The background of each painted line's first label cell.
+    fn painted_bgs(strip: &mut SessionSidebar, height: u16) -> Vec<Color> {
+        let surface = strip.draw(&crate::test_support::draw_ctx(SIDEBAR_COLS, Some(height)));
+        crate::test_support::flatten(&surface)
+            .iter()
+            .map(|row| row[3].style.bg)
+            .collect()
+    }
+
+    fn banded(bgs: &[Color]) -> Vec<usize> {
+        bgs.iter()
+            .enumerate()
+            .filter(|(_, bg)| **bg == HOVER_BG)
+            .map(|(line, _)| line)
+            .collect()
+    }
+
+    /// The row under the pointer wears a band, and the pointer leaving takes
+    /// the band with it.
+    #[test]
+    fn the_pointer_bands_the_row_under_it() {
+        let (mut strip, _) = wired(rows_named(&["a", "b", "c"]), 6);
+        let ctx = deliver(&mut strip, &motion(1));
+        assert!(ctx.redraw, "the band moved, so the frame is dirty");
+        let bgs = painted_bgs(&mut strip, 6);
+        assert_eq!(banded(&bgs), vec![1], "exactly the hovered row: {bgs:?}");
+
+        let ctx = deliver(&mut strip, &Event::MouseLeave);
+        assert!(ctx.redraw);
+        let bgs = painted_bgs(&mut strip, 6);
+        assert!(banded(&bgs).is_empty(), "the band left with it: {bgs:?}");
+    }
+
+    /// The band marks what a click acts on and nothing else. Over a header,
+    /// the overflow count or the blank below the strip it would offer
+    /// something that is not there.
+    #[test]
+    fn the_band_only_marks_what_a_click_acts_on() {
+        // Five lines: `~ one`, a, the overflow count, the create row, and one
+        // blank below the content.
+        let rows = vec![
+            row("a").host("one").build(),
+            row("b").host("two").build(),
+            row("c").host("two").build(),
+        ];
+        let (mut strip, _) = wired(rows, 5);
+        for line in [0, 2, 4, 20] {
+            deliver(&mut strip, &motion(line));
+            let bgs = painted_bgs(&mut strip, 5);
+            assert!(
+                banded(&bgs).is_empty(),
+                "line {line} is not an affordance: {bgs:?}",
+            );
+        }
+        deliver(&mut strip, &motion(3));
+        let bgs = painted_bgs(&mut strip, 5);
+        assert_eq!(banded(&bgs), vec![3], "but the create row is: {bgs:?}");
+        deliver(&mut strip, &motion(1));
+        let bgs = painted_bgs(&mut strip, 5);
+        assert_eq!(banded(&bgs), vec![1], "and so is the row: {bgs:?}");
+    }
+
+    /// The band asks for a frame when it moves and never otherwise. A pointer
+    /// resting on the strip reports on every terminal event, and a hover that
+    /// redrew for each of them would keep the frame loop awake for nothing.
+    #[test]
+    fn a_pointer_holding_still_asks_for_no_frame() {
+        let (mut strip, _) = wired(rows_named(&["a", "b", "c"]), 6);
+        assert!(deliver(&mut strip, &motion(1)).redraw);
+        assert!(
+            !deliver(&mut strip, &motion(1)).redraw,
+            "the same row again changed nothing",
+        );
+        assert!(deliver(&mut strip, &Event::MouseLeave).redraw);
+        assert!(
+            !deliver(&mut strip, &Event::MouseLeave).redraw,
+            "and a second leave has nothing left to clear",
+        );
+    }
+
+    /// The rows can move under a pointer that has not, and the band goes by
+    /// what is on the line now, not by what was there when the pointer landed.
+    #[test]
+    fn the_band_follows_the_rows_moving_under_it() {
+        let (mut strip, _) = wired(rows_named(&["a", "b", "c"]), 6);
+        deliver(&mut strip, &motion(1));
+        assert_eq!(banded(&painted_bgs(&mut strip, 6)), vec![1]);
+
+        // A host appears on the second row, so line 1 is now its header: rows
+        // with no host sort above every header.
+        strip.state.borrow_mut().rows = vec![row("a").build(), row("b").host("builder-1").build()];
+        let bgs = painted_bgs(&mut strip, 6);
+        assert!(
+            banded(&bgs).is_empty(),
+            "the band came off a line that is no longer a row: {bgs:?}",
+        );
+    }
+
+    /// The strip reaches the capturing phase only when something floats above
+    /// it, and that gesture is not the strip's. It drops its band rather than
+    /// pointing at a row the click will never reach.
+    #[test]
+    fn a_gesture_that_belongs_to_something_above_clears_the_band() {
+        let (mut strip, seen) = wired(rows_named(&["a", "b", "c"]), 6);
+        deliver(&mut strip, &motion(1));
+        assert_eq!(banded(&painted_bgs(&mut strip, 6)), vec![1]);
+
+        let mut ctx = EventContext::new();
+        strip.capture_event(&mut ctx, &press(1));
+        assert!(ctx.redraw, "the band cleared, so the frame is dirty");
+        assert!(
+            seen.borrow().is_empty(),
+            "and the press was not the strip's"
+        );
+        assert!(banded(&painted_bgs(&mut strip, 6)).is_empty());
+    }
+
+    /// The wheel scrolls a strip that cannot show every row, and stops once
+    /// the run reaches an end rather than sliding the content off screen.
+    ///
+    /// A wheel report carries a position, so it also moves the hover band.
+    /// What says the run moved is the consume, which only a scroll that landed
+    /// somewhere new asks for.
+    #[test]
+    fn the_wheel_scrolls_a_strip_that_overflows() {
+        let ids: Vec<String> = (0..10).map(|i| format!("s-{i}")).collect();
+        let rows: Vec<SidebarRow> = ids.iter().map(|id| row(id).build()).collect();
+        // Six lines: four rows, the overflow count, the create row.
+        let (mut strip, _) = wired(rows, 6);
+        assert_eq!(shown(&strip), ["s-0", "s-1", "s-2", "s-3"]);
+
+        let ctx = deliver(&mut strip, &wheel(Button::WheelDown));
+        assert!(ctx.consume_event && ctx.redraw);
+        redraw(&mut strip, 6);
+        assert_eq!(shown(&strip), ["s-1", "s-2", "s-3", "s-4"]);
+
+        deliver(&mut strip, &wheel(Button::WheelUp));
+        redraw(&mut strip, 6);
+        assert_eq!(shown(&strip), ["s-0", "s-1", "s-2", "s-3"]);
+
+        // Off the bottom: the run stops on the last row.
+        for _ in 0..20 {
+            deliver(&mut strip, &wheel(Button::WheelDown));
+            redraw(&mut strip, 6);
+        }
+        assert_eq!(shown(&strip), ["s-6", "s-7", "s-8", "s-9"]);
+        assert!(
+            !deliver(&mut strip, &wheel(Button::WheelDown)).consume_event,
+            "and the wheel has nothing left to do",
+        );
+    }
+
+    /// A strip whose rows all fit has nowhere to scroll, and the wheel leaves
+    /// it exactly as it was rather than quietly anchoring the run where it
+    /// already sits (which would switch focus-following off for nothing).
+    #[test]
+    fn the_wheel_is_inert_while_the_rows_fit() {
+        let mut rows = rows_named(&["a", "b", "c"]);
+        rows[2].focused = true;
+        let (mut strip, _) = wired(rows, 10);
+        for button in [Button::WheelDown, Button::WheelUp] {
+            let ctx = deliver(&mut strip, &wheel(button));
+            assert!(!ctx.consume_event, "{button:?} had nowhere to go");
+        }
+        redraw(&mut strip, 10);
+        assert_eq!(shown(&strip), ["a", "b", "c"]);
+    }
+
+    /// The wheel moves the run from wherever it already sits, which is what
+    /// keeps it in step with the layout's own focus-following rather than
+    /// re-deriving a top of its own.
+    #[test]
+    fn the_wheel_scrolls_from_where_the_run_already_sits() {
+        let ids: Vec<String> = (0..10).map(|i| format!("s-{i}")).collect();
+        let mut rows: Vec<SidebarRow> = ids.iter().map(|id| row(id).build()).collect();
+        rows[9].focused = true;
+        let (mut strip, _) = wired(rows, 6);
+        assert_eq!(
+            shown(&strip),
+            ["s-6", "s-7", "s-8", "s-9"],
+            "the layout put the run at the bottom to keep focus on screen",
+        );
+        deliver(&mut strip, &wheel(Button::WheelUp));
+        redraw(&mut strip, 6);
+        assert_eq!(
+            shown(&strip),
+            ["s-5", "s-6", "s-7", "s-8"],
+            "one row up from there, not one row down from the top",
+        );
+    }
+
+    /// A focus change drops the wheel's anchor, so switching sessions always
+    /// brings the focused row back into view. A refresh that leaves focus
+    /// where it was leaves the user's scroll alone.
+    ///
+    /// The rows go straight into the mirror, the way the drive loop's refresh
+    /// puts them there: the rule is a property of the rows on hand, not of
+    /// anyone remembering to route the write through a setter.
+    #[test]
+    fn a_focus_change_pulls_the_view_back_to_the_focused_row() {
+        let ids: Vec<String> = (0..10).map(|i| format!("s-{i}")).collect();
+        let build = |focused: Option<usize>| -> Vec<SidebarRow> {
+            ids.iter()
+                .enumerate()
+                .map(|(at, id)| {
+                    let built = row(id);
+                    if Some(at) == focused {
+                        built.focused()
+                    } else {
+                        built
+                    }
+                    .build()
+                })
+                .collect()
+        };
+        let (mut strip, _) = wired(build(None), 6);
+        for _ in 0..3 {
+            deliver(&mut strip, &wheel(Button::WheelDown));
+        }
+        redraw(&mut strip, 6);
+        assert_eq!(shown(&strip), ["s-3", "s-4", "s-5", "s-6"]);
+
+        strip.state.borrow_mut().rows = build(None);
+        redraw(&mut strip, 6);
+        assert_eq!(
+            shown(&strip),
+            ["s-3", "s-4", "s-5", "s-6"],
+            "a mirror refresh that does not move focus leaves the scroll alone",
+        );
+
+        strip.state.borrow_mut().rows = build(Some(9));
+        redraw(&mut strip, 6);
+        assert_eq!(
+            shown(&strip),
+            ["s-6", "s-7", "s-8", "s-9"],
+            "and a focus change hands the strip back to focus-following",
+        );
     }
 }
