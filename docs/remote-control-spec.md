@@ -825,7 +825,11 @@ especially with long-lived VMs. Rules:
   is host-scoped and forwarded as is. This is what lets an
   older gateway sit between newer hosts and newer clients.
 - New endpoints, frame kinds, and event types arrive with a capability
-  string. Probing an endpoint (404 vs 2xx) is a valid fallback check.
+  string. New means relative to a released baseline: protocol 1
+  implies the whole section 6 surface as it stands at first release,
+  and capabilities exist for what comes after, which is why `hello`
+  advertises none today. Probing an endpoint (404 vs 2xx) is a valid
+  fallback check.
 - The pinned-shape tests in `events.rs` extend to round-trip tests:
   serialize-deserialize must be identity on the wire-visible parts,
   and decoding must survive forward-compat fixtures (extra fields,
