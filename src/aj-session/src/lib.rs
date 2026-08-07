@@ -46,6 +46,7 @@ pub mod prompt_history;
 pub mod repair;
 pub mod replay;
 pub mod stats;
+pub mod tag;
 mod tool_details;
 pub mod tree;
 

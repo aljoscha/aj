@@ -35,6 +35,115 @@ impl ConversationPersistence {
         self.sessions_dir.join(format!("{session_id}.jsonl"))
     }
 
+    /// The directory holding session sidecars, `meta/` under the store.
+    ///
+    /// The location is fixed by spec 6.8. Its payoff is that one directory read
+    /// finds every sidecar without walking the logs, which is what makes an
+    /// untagged store cost nothing and a tagged one cost one read per label
+    /// rather than a `stat` per session.
+    fn meta_dir(&self) -> PathBuf {
+        self.sessions_dir.join("meta")
+    }
+
+    /// The tag sidecar's path, or `None` for an id the grammar rejects.
+    ///
+    /// An invalid id must not become a path (see [`crate::id`]), and this is a
+    /// write path, so the check is not optional.
+    fn tag_path(&self, session_id: &str) -> Option<PathBuf> {
+        crate::id::is_valid_session_id(session_id)
+            .then(|| self.meta_dir().join(format!("{session_id}.tag")))
+    }
+
+    /// The session's tag, `Ok(None)` when it has none.
+    ///
+    /// One open and one read of a small file. Callers that list a whole store
+    /// go through [`Self::enumerate_tags`] instead, which finds the sidecars
+    /// that exist in a single directory read.
+    pub fn read_tag(&self, session_id: &str) -> Result<Option<String>, ConversationError> {
+        let Some(path) = self.tag_path(session_id) else {
+            return Ok(None);
+        };
+        match fs::read_to_string(&path) {
+            Ok(contents) => Ok(crate::tag::tag_from_sidecar(&contents)),
+            // No sidecar is the untagged case, not a failure.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Set or clear the session's tag. `None` removes the sidecar.
+    ///
+    /// The write is atomic: the body lands in a temporary file in the same
+    /// directory and is renamed over the target, so a reader sees either the
+    /// old tag or the new one and never a torn line. Callers hold the session's
+    /// lock (spec 6.6), which is what orders two writers.
+    ///
+    /// `tag` is expected to have been through [`crate::tag::normalize_tag`]
+    /// already, so this writes what it is given.
+    pub fn write_tag(&self, session_id: &str, tag: Option<&str>) -> Result<(), ConversationError> {
+        let Some(path) = self.tag_path(session_id) else {
+            return Ok(());
+        };
+        let Some(tag) = tag else {
+            match fs::remove_file(&path) {
+                Ok(()) => return Ok(()),
+                // Already untagged, which is what the caller asked for.
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(err) => return Err(err.into()),
+            }
+        };
+        fs::create_dir_all(self.meta_dir())?;
+        let mut temp = tempfile::Builder::new()
+            .prefix(".tag-")
+            .tempfile_in(self.meta_dir())?;
+        std::io::Write::write_all(&mut temp, tag.as_bytes())?;
+        std::io::Write::write_all(&mut temp, b"\n")?;
+        temp.persist(&path).map_err(|err| err.error)?;
+        Ok(())
+    }
+
+    /// Every tag sidecar in the store, with the fingerprint of the file it was
+    /// read from.
+    ///
+    /// One directory read of `meta/`, plus one small read per sidecar. An
+    /// untagged store has no `meta/` directory and costs a single failed
+    /// `read_dir`, which is what makes the untagged case free (spec 6.8): a
+    /// caller cannot ask per session without paying a `stat` per session.
+    pub fn enumerate_tags(&self) -> Result<Vec<TagMetadata>, ConversationError> {
+        let meta = self.meta_dir();
+        let entries = match fs::read_dir(&meta) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err.into()),
+        };
+        let mut tags = Vec::new();
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("tag") {
+                continue;
+            }
+            let Some(session_id) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if !crate::id::is_valid_session_id(session_id) {
+                continue;
+            }
+            let Ok(metadata) = fs::metadata(&path) else {
+                // Vanished since the directory read.
+                continue;
+            };
+            let Ok(modified) = metadata.modified() else {
+                continue;
+            };
+            tags.push(TagMetadata {
+                session_id: session_id.to_string(),
+                modified_at: modified.into(),
+                size_bytes: metadata.len(),
+            });
+        }
+        Ok(tags)
+    }
+
     /// Get metadata about all conversation sessions, sorted by creation
     /// time (latest first).
     ///
@@ -351,6 +460,17 @@ fn read_preview(
     }
 }
 
+/// A tag sidecar the store holds, with the file state it was found at.
+///
+/// The fingerprint is what lets a caller cache the tag it read: a sidecar whose
+/// modification time and size have not moved holds the same label.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TagMetadata {
+    pub session_id: String,
+    pub modified_at: DateTime<Utc>,
+    pub size_bytes: u64,
+}
+
 /// Metadata about a conversation session.
 #[derive(Debug, Clone)]
 pub struct SessionMetadata {
@@ -617,6 +737,173 @@ mod tests {
 
     use super::*;
     use crate::log::{ConversationLog, ConversationView};
+
+    /// A tag round-trips through the sidecar, and clearing removes it.
+    #[test]
+    fn a_tag_round_trips_and_clears() {
+        let (_dir, persistence) = fixture();
+        let id = "2024-01-01-00-00-00";
+
+        assert_eq!(persistence.read_tag(id).expect("read"), None, "untagged");
+
+        persistence.write_tag(id, Some("fix-auth")).expect("write");
+        assert_eq!(
+            persistence.read_tag(id).expect("read"),
+            Some("fix-auth".to_string()),
+        );
+
+        persistence.write_tag(id, Some("renamed")).expect("rewrite");
+        assert_eq!(
+            persistence.read_tag(id).expect("read"),
+            Some("renamed".to_string()),
+            "a second write replaces the first",
+        );
+
+        persistence.write_tag(id, None).expect("clear");
+        assert_eq!(persistence.read_tag(id).expect("read"), None);
+        persistence
+            .write_tag(id, None)
+            .expect("clearing an untagged session is not an error");
+    }
+
+    /// The sidecar lands where spec 6.8 puts it, `meta/<session id>.tag`, so
+    /// nothing of it appears in the store directory the logs live in and the
+    /// session enumeration cannot see it.
+    #[test]
+    fn a_sidecar_lives_under_meta() {
+        let (dir, persistence) = fixture();
+        let id = "2024-01-01-00-00-00";
+        persistence.write_tag(id, Some("fix-auth")).expect("write");
+
+        assert!(
+            dir.path().join("meta").join(format!("{id}.tag")).is_file(),
+            "the sidecar is at the path the spec names",
+        );
+        let top: Vec<std::ffi::OsString> = std::fs::read_dir(dir.path())
+            .expect("store directory")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(
+            top,
+            vec![std::ffi::OsString::from("meta")],
+            "nothing landed beside the logs",
+        );
+        assert!(
+            persistence
+                .enumerate_sessions()
+                .expect("enumerate")
+                .is_empty(),
+            "a store with only a tag holds no sessions",
+        );
+    }
+
+    /// An id the grammar rejects never becomes a path, on the write side as
+    /// much as the read side.
+    #[test]
+    fn an_invalid_id_touches_no_file() {
+        let (dir, persistence) = fixture();
+        for id in ["../escape", "with/slash", ""] {
+            persistence.write_tag(id, Some("nope")).expect("no error");
+            assert_eq!(persistence.read_tag(id).expect("read"), None);
+        }
+        assert!(
+            !dir.path().join("meta").exists(),
+            "no sidecar directory was created for a rejected id",
+        );
+    }
+
+    /// The write is atomic: the tag arrives whole or not at all. A reader
+    /// looking at the directory mid-write sees the previous tag, never a
+    /// partial line, because the body is written elsewhere and renamed in.
+    #[test]
+    fn a_tag_is_never_read_half_written() {
+        let (dir, persistence) = fixture();
+        let id = "2024-01-01-00-00-00";
+        persistence.write_tag(id, Some("before")).expect("write");
+
+        let target = dir.path().join("meta").join(format!("{id}.tag"));
+        let before = std::fs::metadata(&target).expect("the sidecar exists");
+        persistence
+            .write_tag(id, Some("after-a-much-longer-tag"))
+            .expect("rewrite");
+
+        // A rename replaces the inode rather than growing the old file, which
+        // is what makes a concurrent reader see one whole tag or the other.
+        let after = std::fs::metadata(&target).expect("still there");
+        assert_ne!(
+            inode(&before),
+            inode(&after),
+            "the rewrite landed as a rename, not an in-place write",
+        );
+        assert_eq!(
+            persistence.read_tag(id).expect("read"),
+            Some("after-a-much-longer-tag".to_string()),
+        );
+        // And nothing is left behind in the directory.
+        let strays: Vec<_> = std::fs::read_dir(dir.path().join("meta"))
+            .expect("meta")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .filter(|name| name != &std::ffi::OsString::from(format!("{id}.tag")))
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "temporary files were cleaned up: {strays:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn inode(metadata: &std::fs::Metadata) -> u64 {
+        std::os::unix::fs::MetadataExt::ino(metadata)
+    }
+
+    /// Enumerating tags is one directory read, and an untagged store does not
+    /// even have the directory.
+    #[test]
+    fn enumerating_tags_finds_the_sidecars_that_exist() {
+        let (_dir, persistence) = fixture();
+        assert!(
+            persistence.enumerate_tags().expect("enumerate").is_empty(),
+            "an untagged store has no meta directory and no tags",
+        );
+
+        persistence
+            .write_tag("2024-01-01-00-00-00", Some("first"))
+            .expect("write");
+        persistence
+            .write_tag("2024-01-02-00-00-00", Some("second"))
+            .expect("write");
+
+        let mut found: Vec<(String, u64)> = persistence
+            .enumerate_tags()
+            .expect("enumerate")
+            .into_iter()
+            .map(|tag| (tag.session_id, tag.size_bytes))
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                ("2024-01-01-00-00-00".to_string(), 6),
+                ("2024-01-02-00-00-00".to_string(), 7),
+            ],
+            "each sidecar reports its own file state",
+        );
+    }
+
+    /// A file in `meta/` that is not a tag sidecar is ignored, so a stray does
+    /// not become a row's label.
+    #[test]
+    fn enumerating_tags_ignores_what_is_not_a_sidecar() {
+        let (dir, persistence) = fixture();
+        let meta = dir.path().join("meta");
+        std::fs::create_dir_all(&meta).expect("meta");
+        std::fs::write(meta.join("notes.txt"), "not a tag").expect("write");
+        std::fs::write(meta.join("with slash.tag"), "invalid id").expect("write");
+
+        assert!(persistence.enumerate_tags().expect("enumerate").is_empty());
+    }
 
     /// Build a `ConversationPersistence` against a fresh temp dir.
     fn fixture() -> (TempDir, ConversationPersistence) {
