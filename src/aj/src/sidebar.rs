@@ -12,23 +12,50 @@
 //! sort to the top, the drawn window follows the focused row so focus is never
 //! off screen, and the stepping chords walk the order the user can see. The
 //! session selector is the browser.
+//!
+//! A row answers three independent questions, and each gets exactly one
+//! encoding so none of them has to be read out of a combination:
+//!
+//! - What is the session doing: the status glyph and its color. It says the
+//!   same thing whether or not the client holds the session open.
+//! - Does the client hold it open: the label's brightness, accent for the
+//!   focused session, plain text for one attached in the background, dim for
+//!   one the peer has merely listed. Brightness rather than a second hue,
+//!   because brightness survives a monochrome or low-contrast theme.
+//! - Which session is on screen: the [`FOCUS_MARKER`] in the leftmost column,
+//!   so focus never rests on color alone.
+//!
+//! An unattached session running a turn therefore reads as a bright glyph
+//! beside a dim label. That is the intended reading: something is happening
+//! there and you do not have it open.
+//!
+//! Layout is a pure function, [`strip_lines`], producing one [`StripLine`] per
+//! drawn line, and drawing is a dumb map over its result. The height
+//! arithmetic (host headers, the overflow row and the create row all take
+//! lines away from the rows) therefore lives in one testable place, and a
+//! pointer gesture can resolve a line by its index without deriving the layout
+//! a second time.
 
 use std::cell::RefCell;
+use std::ops::Range;
 use std::rc::Rc;
 
 use aj_wire::SessionSummary;
+use vaxis::cell::Style;
 use vaxis::gwidth::{Method, gwidth};
-use vaxis::vxfw::{DrawContext, MaxSize, RichText, Size, Surface, TextSpan, Widget};
+use vaxis::vxfw::{DrawContext, MaxSize, Overflow, RichText, Size, Surface, TextSpan, Widget};
 
 use crate::transcript::TranscriptStyles;
 
-/// Columns the sidebar occupies when shown, glyph and padding included.
+/// Columns the sidebar occupies when shown.
 ///
 /// Fixed rather than proportional: a strip that grew with the terminal would
-/// take width from the transcript for nothing. Sized for a time-of-day label
-/// plus the glyph and its separating space, with room for a slightly longer
-/// hand-named session.
-pub(crate) const SIDEBAR_COLS: u16 = 14;
+/// take width from the transcript for nothing. The columns go one to the focus
+/// marker, one to the status glyph, one to a space, the rest to the label, and
+/// the last two to a pad and the separator rule. Sized so a hand-written tag
+/// reads without eliding, which is most of what the strip is for once sessions
+/// carry names.
+pub(crate) const SIDEBAR_COLS: u16 = 24;
 
 /// Terminal width below which the strip holds itself back.
 ///
@@ -37,9 +64,20 @@ pub(crate) const SIDEBAR_COLS: u16 = 14;
 /// worth of columns.
 pub(crate) const MIN_COLS_WITH_SIDEBAR: u16 = SIDEBAR_COLS + 20;
 
-/// Columns a label may occupy: everything but the glyph and its space.
+/// The focused row's marker, in the column left of the status glyph.
+const FOCUS_MARKER: &str = "▌";
+
+/// The rule between the strip and the transcript, drawn on every line of the
+/// strip's height so the transcript's edge is one unbroken line.
+const SEPARATOR: &str = "│";
+
+/// What an unreachable host's header sets into its rule.
+const UNREACHABLE_MARK: &str = " ! ─";
+
+/// Columns a label may occupy: everything but the marker, the glyph, their
+/// separating space, and the pad and rule on the right.
 fn label_cols(width: u16) -> usize {
-    usize::from(width.saturating_sub(2))
+    usize::from(width.saturating_sub(5))
 }
 
 /// What a row's glyph says about its session, in the order a row that could
@@ -90,12 +128,64 @@ impl RowStatus {
     }
 }
 
+/// Where a row sits in the client's working set, which the strip encodes as
+/// the label's brightness (spec 9.2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Presence {
+    /// The session on screen.
+    Focused,
+    /// Attached, folding frames while the user looks elsewhere.
+    Background,
+    /// Listed by the peer and nothing more.
+    Listed,
+}
+
 /// One row of the sidebar.
 pub(crate) struct SidebarRow {
     pub(crate) id: String,
+    /// The name the user gave the session, shown in place of the id-derived
+    /// label (spec 6.8).
+    pub(crate) tag: Option<String>,
+    /// Which enrolled host the row belongs to. `None` on a plain host's rows,
+    /// which are all its own.
+    pub(crate) host: Option<String>,
     pub(crate) status: RowStatus,
     /// Whether this is the session on screen.
     pub(crate) focused: bool,
+    /// Whether the client folds frames for this session, which is what makes
+    /// the working set legible (spec 9.2).
+    pub(crate) attached: bool,
+}
+
+impl SidebarRow {
+    /// This row's place in the working set.
+    ///
+    /// An unreachable session counts as merely listed whatever the client
+    /// holds for it: the attachment carries nothing while the peer cannot
+    /// reach the host, so drawing it as open would overstate what the client
+    /// has. Focus still outranks that, because which session is on screen has
+    /// to stay legible.
+    fn presence(&self) -> Presence {
+        if self.focused {
+            Presence::Focused
+        } else if self.attached && self.status != RowStatus::Unreachable {
+            Presence::Background
+        } else {
+            Presence::Listed
+        }
+    }
+
+    /// What the row shows: the user's tag where there is one, and the
+    /// id-derived label otherwise (spec 9.2).
+    fn label(&self, cols: usize) -> String {
+        match &self.tag {
+            // A tag reads left to right, so an over-long one keeps its head
+            // and says so with an ellipsis. An id is the other way round:
+            // what distinguishes one is its tail (see [`session_label`]).
+            Some(tag) => elide_to_cols(&one_line(tag), cols),
+            None => session_label(&self.id, cols),
+        }
+    }
 }
 
 /// What the sidebar draws, mirrored from the session directory once per drive
@@ -126,11 +216,13 @@ impl SidebarState {
 /// Ordered by last activity, newest first, with ties broken by id descending so
 /// the order is total: an unstable order would reshuffle under a user stepping
 /// through it. `unseen` answers spec 6.8's "has it moved since I looked" for a
-/// row the caller already holds, which keeps this linear.
+/// row the caller already holds, and `attached` answers "do I hold it open" for
+/// a session id, which keeps this linear.
 pub(crate) fn rows_for_display(
     rows: &[SessionSummary],
     focused: &str,
     unseen: impl Fn(&SessionSummary) -> bool,
+    attached: impl Fn(&str) -> bool,
 ) -> Vec<SidebarRow> {
     let mut ordered: Vec<&SessionSummary> = rows.iter().collect();
     ordered.sort_by(|l, r| {
@@ -143,6 +235,9 @@ pub(crate) fn rows_for_display(
         .map(|row| SidebarRow {
             status: RowStatus::of(row, unseen(row)),
             focused: row.id == focused,
+            attached: attached(&row.id),
+            tag: row.tag.clone(),
+            host: row.host.clone(),
             id: row.id.clone(),
         })
         .collect()
@@ -168,66 +263,238 @@ pub(crate) fn step_session(state: &SidebarState, forward: bool) -> Option<String
     Some(state.rows[next].id.clone())
 }
 
-/// The contiguous run of rows to draw, chosen so the focused row is inside it.
+/// One drawn line of the strip.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum StripLine {
+    /// A host's group header, drawn above that host's rows.
+    Header {
+        host: String,
+        /// Whether the peer can reach none of the host's rows.
+        unreachable: bool,
+    },
+    /// A session row, named by its index into the rows the layout was built
+    /// from, so a caller resolves it without re-deriving the display order.
+    Session { index: usize },
+    /// How many rows did not fit.
+    Overflow { hidden: usize },
+    /// The create affordance, always the last line.
+    New,
+}
+
+/// Lay the strip out for `rows` in `height` lines.
 ///
-/// Scrolls by the least it can: the window only moves once focus would fall off
-/// its bottom edge, which keeps a step from jumping the whole strip. With no
-/// focused row it shows the top, which is the most recently active end.
-fn window(rows: &[SidebarRow], height: usize) -> &[SidebarRow] {
-    if height == 0 || rows.len() <= height {
-        return rows;
+/// The one place the height arithmetic lives. Host headers, the overflow row
+/// and the create row all take lines away from the rows, and the focused row
+/// has to survive that. Never returns more than `height` lines.
+///
+/// A height that cannot fit even the focused row and its header (two lines of
+/// strip, with hosts to group) gives up on showing a row rather than
+/// overrunning: the honest answer at that size is the overflow count.
+pub(crate) fn strip_lines(rows: &[SidebarRow], height: u16) -> Vec<StripLine> {
+    let height = usize::from(height);
+    if height == 0 {
+        return Vec::new();
     }
-    let focused = rows.iter().position(|row| row.focused).unwrap_or(0);
-    let start = focused.saturating_sub(height - 1);
-    &rows[start..start + height]
+    // The create row is always the last line, so it takes its line before
+    // anything else competes for one.
+    let budget = height - 1;
+    if budget == 0 {
+        return vec![StripLine::New];
+    }
+    let layout = Layout::of(rows);
+    layout.lines(layout.visible_run(budget))
 }
 
-/// The sidebar strip.
-pub(crate) struct SessionSidebar {
-    state: Rc<RefCell<SidebarState>>,
-    styles: Rc<TranscriptStyles>,
+/// A run of rows sharing a host.
+struct Group<'a> {
+    /// `None` on rows from a plain host, which are all its own.
+    host: Option<&'a str>,
+    /// Whether the peer can reach none of them, which the header says once
+    /// instead of the user reading it off every row.
+    unreachable: bool,
+    /// Where the group's rows sit in [`Layout::order`].
+    span: Range<usize>,
 }
 
-impl SessionSidebar {
-    pub(crate) fn new(state: Rc<RefCell<SidebarState>>, styles: Rc<TranscriptStyles>) -> Self {
-        Self { state, styles }
+/// The display order of the rows and the host groups over it.
+struct Layout<'a> {
+    rows: &'a [SidebarRow],
+    /// Row indices in display order: activity order, gathered into groups.
+    order: Vec<usize>,
+    /// The groups, each a contiguous span of [`Self::order`].
+    groups: Vec<Group<'a>>,
+    /// Whether groups wear headers at all. One host, or none, is not a
+    /// grouping: a plain single-host connect has to look exactly as it would
+    /// have before hosts existed.
+    headed: bool,
+}
+
+impl<'a> Layout<'a> {
+    fn of(rows: &'a [SidebarRow]) -> Self {
+        // Rows arrive activity-ordered, so gathering by first appearance
+        // orders the hosts by their most recent activity and leaves each
+        // group's own rows in activity order.
+        let mut hosts: Vec<Option<&str>> = Vec::new();
+        for row in rows {
+            let host = row.host.as_deref();
+            if !hosts.contains(&host) {
+                hosts.push(host);
+            }
+        }
+        // A group with no host name gets no header, and a headerless run under
+        // someone else's header would read as theirs, so it sorts first. Only
+        // reachable in a mixed directory, which a gateway does not produce.
+        hosts.sort_by_key(Option::is_some);
+        let mut order = Vec::with_capacity(rows.len());
+        let mut groups = Vec::with_capacity(hosts.len());
+        for host in hosts {
+            let start = order.len();
+            let mut unreachable = true;
+            for (index, row) in rows.iter().enumerate() {
+                if row.host.as_deref() != host {
+                    continue;
+                }
+                unreachable &= row.status == RowStatus::Unreachable;
+                order.push(index);
+            }
+            groups.push(Group {
+                host,
+                unreachable,
+                span: start..order.len(),
+            });
+        }
+        let headed = groups.len() > 1;
+        Self {
+            rows,
+            order,
+            groups,
+            headed,
+        }
     }
 
-    /// The visible part of a session id: its time of day.
+    /// The header a run reaching into `group` draws for it, if any.
+    fn header_of(&self, group: &Group<'a>, run: &Range<usize>) -> Option<&'a str> {
+        if !self.headed {
+            return None;
+        }
+        let host = group.host?;
+        (group.span.start < run.end && run.start < group.span.end).then_some(host)
+    }
+
+    /// Lines the run `order[run]` occupies: one per row, one per header it
+    /// reaches, and one for the overflow row when it leaves any row out. The
+    /// create row is not counted, it is paid for before a run is chosen.
+    fn cost(&self, run: Range<usize>) -> usize {
+        let headers = self
+            .groups
+            .iter()
+            .filter(|group| self.header_of(group, &run).is_some())
+            .count();
+        headers + run.len() + usize::from(run.len() < self.order.len())
+    }
+
+    /// The run of the display order to draw in `budget` lines: the longest one
+    /// that fits with the focused row inside it.
     ///
-    /// Minted ids are `YYYY-MM-DD-HH-MM-SS-mmm`, and the date is the same for
-    /// every session the user is likely to be juggling, so the leading date
-    /// earns none of the width it costs. An id in any other shape (a
-    /// hand-renamed file) is shown from its tail, where what distinguishes such
-    /// a name usually is.
-    ///
-    /// `width` is a budget in display columns, not characters, so a label of
-    /// wide graphemes cannot overflow its column and wrap. Wrapping would break
-    /// the strip's one-line-per-row correspondence and misattribute every row
-    /// below it. Control characters are dropped for the same reason: a session
-    /// file may be named anything a filesystem accepts.
-    ///
-    /// NOTE: two sessions minted in the same second share a label. The strip is
-    /// for orientation, not identification, and the header carries the focused
-    /// session's id in full.
-    pub(crate) fn label(id: &str, width: usize) -> String {
-        let cleaned: String = id.chars().filter(|c| !c.is_control()).collect();
-        let parts: Vec<&str> = cleaned.split('-').collect();
-        // The minted shape, not merely something with seven dashes: a
-        // hand-named session can have as many, and slicing its middle out would
-        // show a fragment of a word.
-        let minted = parts.len() == 7
-            && parts[0].len() == 4
-            && parts[..6]
-                .iter()
-                .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
-        let label = if minted {
-            parts[3..6].join("-")
-        } else {
-            cleaned
+    /// Scrolls by the least it can. The run stays anchored at the top until
+    /// focus would fall past its bottom edge, which keeps a step from jumping
+    /// the whole strip. With no focused row it shows the top, which is the
+    /// most recently active end.
+    fn visible_run(&self, budget: usize) -> Range<usize> {
+        let total = self.order.len();
+        // Scanned downward because cost is not monotone in the run's length:
+        // the run holding every row spends no line on the overflow row, so it
+        // can fit where a run one row shorter does not.
+        let top = (0..=total)
+            .rev()
+            .find(|&end| self.cost(0..end) <= budget)
+            .unwrap_or(0);
+        let Some(focus) = self
+            .order
+            .iter()
+            .position(|&index| self.rows[index].focused)
+        else {
+            return 0..top;
         };
-        truncate_to_cols(&label, width)
+        if focus < top {
+            return 0..top;
+        }
+        // Focus fell past the bottom edge, so the run ends on it and reaches
+        // back as far as the budget allows. An empty run is the answer when
+        // even one row and its header will not fit (see [`strip_lines`]).
+        (0..=focus)
+            .find(|&start| self.cost(start..focus + 1) <= budget)
+            .map_or(focus..focus, |start| start..focus + 1)
     }
+
+    /// The lines for a run, in draw order.
+    fn lines(&self, run: Range<usize>) -> Vec<StripLine> {
+        let mut lines = Vec::with_capacity(run.len() + self.groups.len() + 2);
+        for group in &self.groups {
+            let from = group.span.start.max(run.start);
+            let to = group.span.end.min(run.end);
+            if from >= to {
+                continue;
+            }
+            if let Some(host) = self.header_of(group, &run) {
+                lines.push(StripLine::Header {
+                    host: host.to_string(),
+                    unreachable: group.unreachable,
+                });
+            }
+            lines.extend((from..to).map(|at| StripLine::Session {
+                index: self.order[at],
+            }));
+        }
+        let hidden = self.order.len() - run.len();
+        if hidden > 0 {
+            lines.push(StripLine::Overflow { hidden });
+        }
+        lines.push(StripLine::New);
+        lines
+    }
+}
+
+/// The visible part of a session id: its time of day.
+///
+/// Minted ids are `YYYY-MM-DD-HH-MM-SS-mmm`, and the date is the same for
+/// every session the user is likely to be juggling, so the leading date earns
+/// none of the width it costs. An id in any other shape (a hand-renamed file)
+/// is shown from its tail, where what distinguishes such a name usually is.
+///
+/// `cols` is a budget in display columns, not characters, so a label of wide
+/// graphemes cannot overflow its column and wrap. Wrapping would break the
+/// strip's one-line-per-row correspondence and misattribute every row below
+/// it. Control characters are dropped for the same reason: a session file may
+/// be named anything a filesystem accepts.
+///
+/// NOTE: two sessions minted in the same second share a label. The strip is
+/// for orientation, not identification, and the header carries the focused
+/// session's id in full.
+pub(crate) fn session_label(id: &str, cols: usize) -> String {
+    let cleaned = one_line(id);
+    let parts: Vec<&str> = cleaned.split('-').collect();
+    // The minted shape, not merely something with seven dashes: a hand-named
+    // session can have as many, and slicing its middle out would show a
+    // fragment of a word.
+    let minted = parts.len() == 7
+        && parts[0].len() == 4
+        && parts[..6]
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+    let label = if minted {
+        parts[3..6].join("-")
+    } else {
+        cleaned
+    };
+    truncate_to_cols(&label, cols)
+}
+
+/// Drop control characters, which a session's name, a user's tag and a peer's
+/// host name may all contain and which would split the row's line and
+/// misattribute every row below it.
+fn one_line(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// Trim `label` from its head until it fits `cols` display columns, which keeps
@@ -253,6 +520,140 @@ fn truncate_to_cols(label: &str, cols: usize) -> String {
     out
 }
 
+/// Trim `text` to `cols` display columns from its tail, marking the cut with an
+/// ellipsis, which keeps the head where a written name says what it is.
+fn elide_to_cols(text: &str, cols: usize) -> String {
+    let Ok(budget) = u16::try_from(cols) else {
+        return text.to_string();
+    };
+    if gwidth(text, Method::Unicode) <= budget {
+        return text.to_string();
+    }
+    if budget == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    for ch in text.chars() {
+        let mut candidate = String::with_capacity(out.len() + 4);
+        candidate.push_str(&out);
+        candidate.push(ch);
+        // The ellipsis has to fit beside whatever is kept.
+        if gwidth(&candidate, Method::Unicode) + 1 > budget {
+            break;
+        }
+        out = candidate;
+    }
+    out.push('…');
+    out
+}
+
+/// `text` in a field of exactly `cols` display columns, elided if it is too
+/// wide and padded with spaces if it is too narrow.
+///
+/// Every line is built from these, which is what keeps the separator in its
+/// column whatever a tag or a host is named.
+fn field(text: &str, cols: usize) -> String {
+    let mut out = elide_to_cols(text, cols);
+    let width = usize::from(gwidth(&out, Method::Unicode));
+    out.push_str(&" ".repeat(cols.saturating_sub(width)));
+    out
+}
+
+/// A host header's label field: the name, then a rule out to the field's edge,
+/// with the unreachable mark set into the rule's tail.
+///
+/// The mark rides inside the rule rather than hanging off its end because the
+/// rule has to reach the strip's edge either way.
+fn header_field(host: &str, unreachable: bool, cols: usize) -> String {
+    let mark = if unreachable { UNREACHABLE_MARK } else { "" };
+    let mark_cols = mark.chars().count();
+    // The name, one space, one rule character, and the mark, in that order.
+    let name = elide_to_cols(&one_line(host), cols.saturating_sub(mark_cols + 2));
+    let name_cols = usize::from(gwidth(&name, Method::Unicode));
+    let rule = cols.saturating_sub(name_cols + 1 + mark_cols);
+    format!("{name} {}{mark}", "─".repeat(rule))
+}
+
+/// The sidebar strip.
+pub(crate) struct SessionSidebar {
+    state: Rc<RefCell<SidebarState>>,
+    styles: Rc<TranscriptStyles>,
+}
+
+impl SessionSidebar {
+    pub(crate) fn new(state: Rc<RefCell<SidebarState>>, styles: Rc<TranscriptStyles>) -> Self {
+        Self { state, styles }
+    }
+
+    /// The style a label is drawn in: the working-set axis, as brightness.
+    fn label_style(&self, row: &SidebarRow) -> Style {
+        match row.presence() {
+            Presence::Focused => self.styles.accent,
+            Presence::Background => self.styles.text,
+            Presence::Listed => self.styles.dim,
+        }
+    }
+
+    /// The style a status glyph is drawn in.
+    ///
+    /// It does not vary with attachment: what a session is doing is the same
+    /// fact whether or not the client holds it open.
+    fn glyph_style(&self, status: RowStatus) -> Style {
+        match status {
+            RowStatus::Unreachable => self.styles.error,
+            RowStatus::Working => self.styles.success,
+            RowStatus::Unseen => self.styles.warning,
+            RowStatus::Idle => self.styles.dim,
+        }
+    }
+
+    /// One line's spans: the focus marker, the status glyph, the label field,
+    /// then the pad and the separator. Every line has this shape, so a column
+    /// means the same thing on all of them.
+    fn line_spans(&self, line: &StripLine, rows: &[SidebarRow], width: u16) -> Vec<TextSpan> {
+        let cols = label_cols(width);
+        let dim = self.styles.dim;
+        let (marker, glyph, glyph_style, label, label_style) = match line {
+            StripLine::Header { host, unreachable } => {
+                (" ", "~", dim, header_field(host, *unreachable, cols), dim)
+            }
+            StripLine::Session { index } => {
+                let row = &rows[*index];
+                (
+                    if row.focused { FOCUS_MARKER } else { " " },
+                    row.status.glyph(),
+                    self.glyph_style(row.status),
+                    row.label(cols),
+                    self.label_style(row),
+                )
+            }
+            StripLine::Overflow { hidden } => (" ", " ", dim, format!("…{hidden} more"), dim),
+            StripLine::New => (" ", "+", dim, "new".to_string(), dim),
+        };
+        vec![
+            span(marker, self.styles.accent),
+            span(glyph, glyph_style),
+            span(&format!(" {}", field(&label, cols)), label_style),
+            span(&format!(" {SEPARATOR}"), dim),
+        ]
+    }
+
+    /// A line below the last drawn one: nothing but the separator, which runs
+    /// the strip's full height so the transcript's edge is one unbroken rule.
+    fn blank_spans(&self, width: u16) -> Vec<TextSpan> {
+        let pad = " ".repeat(usize::from(width) - 1);
+        vec![span(&format!("{pad}{SEPARATOR}"), self.styles.dim)]
+    }
+}
+
+fn span(text: &str, style: Style) -> TextSpan {
+    TextSpan {
+        text: text.to_string(),
+        style,
+        ..TextSpan::default()
+    }
+}
+
 impl Widget for SessionSidebar {
     fn draw(&mut self, ctx: &DrawContext) -> Surface {
         let state = self.state.borrow();
@@ -275,40 +676,27 @@ impl Widget for SessionSidebar {
                 height: 0,
             });
         }
-        let label_width = label_cols(width);
-        let drawn = match ctx.max.height {
-            Some(height) => window(&state.rows, usize::from(height)),
-            None => &state.rows,
-        };
-        let mut spans: Vec<TextSpan> = Vec::with_capacity(drawn.len() * 2);
-        for (index, row) in drawn.iter().enumerate() {
+        // An unbounded height is a measurement pass, which reads back only the
+        // width: lay every line out and let the surface be as tall as it is.
+        let lines = strip_lines(&state.rows, ctx.max.height.unwrap_or(u16::MAX));
+        let blanks = usize::from(ctx.max.height.unwrap_or(0)).saturating_sub(lines.len());
+        let mut spans: Vec<TextSpan> = Vec::with_capacity((lines.len() + blanks) * 5);
+        for index in 0..lines.len() + blanks {
             if index > 0 {
-                spans.push(TextSpan {
-                    text: "\n".to_string(),
-                    style: self.styles.text,
-                    ..TextSpan::default()
-                });
+                spans.push(span("\n", self.styles.text));
             }
-            let style = match (row.focused, row.status) {
-                // The focused row is the accent whatever its status: the user is
-                // looking at it, so what it is doing is on screen anyway.
-                (true, _) => self.styles.accent,
-                (false, RowStatus::Unreachable) => self.styles.error,
-                (false, RowStatus::Working) => self.styles.success,
-                (false, RowStatus::Unseen) => self.styles.warning,
-                (false, RowStatus::Idle) => self.styles.dim,
-            };
-            spans.push(TextSpan {
-                text: format!(
-                    "{} {}",
-                    row.status.glyph(),
-                    Self::label(&row.id, label_width)
-                ),
-                style,
-                ..TextSpan::default()
-            });
+            match lines.get(index) {
+                Some(line) => spans.extend(self.line_spans(line, &state.rows, width)),
+                None => spans.extend(self.blank_spans(width)),
+            }
         }
-        let mut text = RichText::new(spans);
+        // No soft wrap: one drawn row per line is the strip's contract, and a
+        // wrapped line would misattribute every line below it.
+        let mut text = RichText {
+            softwrap: false,
+            overflow: Overflow::Clip,
+            ..RichText::new(spans)
+        };
         let mut surface = text.draw(&ctx.with_constraints(
             Size { width, height: 0 },
             MaxSize {
@@ -316,7 +704,7 @@ impl Widget for SessionSidebar {
                 height: ctx.max.height,
             },
         ));
-        // The strip owns its full column width even where a row is shorter, so
+        // The strip owns its full column width even where a line is shorter, so
         // the transcript beside it never starts mid-strip.
         surface.size.width = width;
         surface
@@ -330,7 +718,7 @@ mod tests {
     #[test]
     fn a_session_id_shows_its_time_of_day() {
         assert_eq!(
-            SessionSidebar::label("2026-08-06-19-07-19-368", 12),
+            session_label("2026-08-06-19-07-19-368", 12),
             "19-07-19",
             "the date is the same for every session in a sitting, so it is dropped",
         );
@@ -340,10 +728,10 @@ mod tests {
     /// tail, which is where what distinguishes such a name usually is.
     #[test]
     fn an_unfamiliar_id_is_shown_from_its_tail() {
-        assert_eq!(SessionSidebar::label("short", 12), "short");
+        assert_eq!(session_label("short", 12), "short");
         assert_eq!(
-            SessionSidebar::label("a-very-long-hand-named-session", 8),
-            "-session",
+            session_label("a-very-long-hand-named-session", 8),
+            "-session"
         );
     }
 
@@ -352,7 +740,7 @@ mod tests {
     #[test]
     fn a_hand_named_id_with_seven_parts_is_still_shown_from_its_tail() {
         assert_eq!(
-            SessionSidebar::label("notes-on-the-rust-borrow-checker-draft", 12),
+            session_label("notes-on-the-rust-borrow-checker-draft", 12),
             "hecker-draft",
         );
     }
@@ -361,17 +749,14 @@ mod tests {
     /// as the minted shape and still shows its time of day.
     #[test]
     fn a_collision_suffix_still_reads_as_a_minted_id() {
-        assert_eq!(
-            SessionSidebar::label("2026-08-06-19-07-19-368_2", 12),
-            "19-07-19",
-        );
+        assert_eq!(session_label("2026-08-06-19-07-19-368_2", 12), "19-07-19");
     }
 
     /// A label is budgeted in display columns, so wide graphemes cannot overflow
     /// the strip and wrap onto the next row's line.
     #[test]
     fn a_wide_character_label_fits_its_columns() {
-        let label = SessionSidebar::label("会話ノート記録帳", 12);
+        let label = session_label("会話ノート記録帳", 12);
         assert!(
             gwidth(&label, Method::Unicode) <= 12,
             "{label:?} takes {} columns",
@@ -385,11 +770,21 @@ mod tests {
 
     /// A session file can be named anything the filesystem accepts, and a
     /// newline in a label would split its own row and misattribute every row
-    /// below it.
+    /// below it. A tag comes off the wire, so it gets the same treatment.
     #[test]
     fn a_control_character_cannot_split_a_row() {
-        let label = SessionSidebar::label("first\nsecond", 12);
+        let label = session_label("first\nsecond", 12);
         assert!(!label.contains('\n'), "{label:?} would break the row");
+        let tagged = row("session-1").tag("first\nsecond").build();
+        assert!(
+            !tagged.label(12).contains('\n'),
+            "{:?} would break the row",
+            tagged.label(12),
+        );
+        assert!(
+            !header_field("first\nsecond", false, 19).contains('\n'),
+            "and so would a host name",
+        );
     }
 
     fn summary(working: bool, unreachable: bool) -> SessionSummary {
@@ -477,7 +872,7 @@ mod tests {
             at("session-b", 10),
             at("session-c", 20),
         ];
-        let display = rows_for_display(&rows, "session-b", |_| false);
+        let display = rows_for_display(&rows, "session-b", |_| false, |_| false);
         assert_eq!(ids(&display), vec!["session-b", "session-c", "session-a"]);
         assert!(display[0].focused, "the focused row is marked");
         assert!(!display[1].focused);
@@ -493,23 +888,99 @@ mod tests {
         let mut b = at("session-b", 0);
         a.last_activity = now;
         b.last_activity = now;
-        let display = rows_for_display(&[a, b], "session-a", |_| false);
+        let display = rows_for_display(&[a, b], "session-a", |_| false, |_| false);
         assert_eq!(ids(&display), vec!["session-b", "session-a"]);
     }
 
-    fn row(id: &str, focused: bool) -> SidebarRow {
-        SidebarRow {
-            id: id.to_string(),
-            status: RowStatus::Idle,
-            focused,
+    /// The directory's answers ride into the row: what the peer says about the
+    /// session, and what this client holds open (spec 9.2).
+    #[test]
+    fn a_row_carries_the_tag_the_host_and_the_attachment() {
+        let mut tagged = at("session-a", 0);
+        tagged.tag = Some("fix-auth".to_string());
+        tagged.host = Some("builder-1".to_string());
+        let display = rows_for_display(
+            &[tagged, at("session-b", 1)],
+            "session-b",
+            |_| false,
+            |id| id == "session-a",
+        );
+        assert_eq!(display[0].tag.as_deref(), Some("fix-auth"));
+        assert_eq!(display[0].host.as_deref(), Some("builder-1"));
+        assert_eq!(display[0].presence(), Presence::Background);
+        assert_eq!(
+            display[1].presence(),
+            Presence::Focused,
+            "the focused row outranks its attachment",
+        );
+    }
+
+    /// A row builder: everything the layout reads, defaulted to the plain case.
+    struct Build {
+        row: SidebarRow,
+    }
+
+    fn row(id: &str) -> Build {
+        Build {
+            row: SidebarRow {
+                id: id.to_string(),
+                tag: None,
+                host: None,
+                status: RowStatus::Idle,
+                focused: false,
+                attached: false,
+            },
         }
+    }
+
+    impl Build {
+        fn tag(mut self, tag: &str) -> Self {
+            self.row.tag = Some(tag.to_string());
+            self
+        }
+
+        fn host(mut self, host: &str) -> Self {
+            self.row.host = Some(host.to_string());
+            self
+        }
+
+        fn status(mut self, status: RowStatus) -> Self {
+            self.row.status = status;
+            self
+        }
+
+        fn focused(mut self) -> Self {
+            self.row.focused = true;
+            self
+        }
+
+        fn attached(mut self) -> Self {
+            self.row.attached = true;
+            self
+        }
+
+        fn build(self) -> SidebarRow {
+            self.row
+        }
+    }
+
+    fn rows_named(ids: &[&str]) -> Vec<SidebarRow> {
+        ids.iter().map(|id| row(id).build()).collect()
     }
 
     fn state_of(focused_at: usize, len: usize) -> SidebarState {
         SidebarState {
             visible: true,
             rows: (0..len)
-                .map(|i| row(&format!("session-{i}"), i == focused_at))
+                .map(|i| {
+                    let built = row(&format!("session-{i}"));
+                    if i == focused_at {
+                        built.focused()
+                    } else {
+                        built
+                    }
+                    .build()
+                })
                 .collect(),
             ..SidebarState::default()
         }
@@ -548,42 +1019,458 @@ mod tests {
         assert_eq!(step_session(&SidebarState::default(), true), None);
         let unfocused = SidebarState {
             visible: true,
-            rows: vec![row("session-0", false), row("session-1", false)],
+            rows: rows_named(&["session-0", "session-1"]),
             ..SidebarState::default()
         };
         assert_eq!(step_session(&unfocused, true), None);
     }
 
-    /// The window follows focus, so the row the user is on is always drawn even
-    /// when the store holds more sessions than the terminal has lines.
+    /// The rows a layout draws, by id, in the order the lines come out.
+    fn drawn<'a>(lines: &[StripLine], rows: &'a [SidebarRow]) -> Vec<&'a str> {
+        lines
+            .iter()
+            .filter_map(|line| match line {
+                StripLine::Session { index } => Some(rows[*index].id.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The headers a layout draws, in order.
+    fn headers(lines: &[StripLine]) -> Vec<(&str, bool)> {
+        lines
+            .iter()
+            .filter_map(|line| match line {
+                StripLine::Header { host, unreachable } => Some((host.as_str(), *unreachable)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn hidden(lines: &[StripLine]) -> Option<usize> {
+        lines.iter().find_map(|line| match line {
+            StripLine::Overflow { hidden } => Some(*hidden),
+            _ => None,
+        })
+    }
+
+    /// The create row is the last line, always, whatever else the strip had to
+    /// leave out. It is the affordance a pointer aims at, so it cannot move.
     #[test]
-    fn the_drawn_window_keeps_the_focused_row_visible() {
-        let state = state_of(7, 10);
-        let drawn = window(&state.rows, 3);
-        assert_eq!(ids(drawn), vec!["session-5", "session-6", "session-7"]);
+    fn the_create_row_is_always_the_last_line() {
+        for (rows, height) in [
+            (rows_named(&[]), 1),
+            (rows_named(&["session-0"]), 20),
+            (rows_named(&["a", "b", "c", "d"]), 3),
+            (rows_named(&["a", "b", "c", "d"]), 1),
+        ] {
+            let lines = strip_lines(&rows, height);
+            assert_eq!(
+                lines.last(),
+                Some(&StripLine::New),
+                "{} rows in {height} lines: {lines:?}",
+                rows.len(),
+            );
+            assert!(
+                lines.len() <= usize::from(height),
+                "and the layout stayed inside its height: {lines:?}",
+            );
+        }
+    }
+
+    /// A height of nothing draws nothing, rather than panicking on the arithmetic
+    /// that pays for the create row.
+    #[test]
+    fn a_zero_height_strip_draws_nothing() {
+        assert!(strip_lines(&rows_named(&["a", "b"]), 0).is_empty());
+    }
+
+    /// One host, or none at all, is not a grouping. A plain connect has to look
+    /// exactly as it would have before hosts existed (spec 9.2).
+    #[test]
+    fn a_single_host_gets_no_headers() {
+        let hostless = rows_named(&["a", "b", "c"]);
         assert!(
-            drawn.iter().any(|row| row.focused),
-            "the focused row is inside the window",
+            headers(&strip_lines(&hostless, 20)).is_empty(),
+            "rows with no host name nothing to group under",
         );
+        let one_host: Vec<SidebarRow> = ["a", "b", "c"]
+            .iter()
+            .map(|id| row(id).host("builder-1").build())
+            .collect();
+        let lines = strip_lines(&one_host, 20);
+        assert!(
+            headers(&lines).is_empty(),
+            "one host is not a grouping: {lines:?}",
+        );
+        assert_eq!(drawn(&lines, &one_host), vec!["a", "b", "c"]);
+    }
+
+    /// Distinct hosts group, hosts in order of their most recent activity and
+    /// rows in activity order inside each group.
+    #[test]
+    fn distinct_hosts_group_by_most_recent_activity() {
+        // Activity order interleaves the hosts, so a layout that merely kept
+        // the input order, or that sorted the hosts by name, would differ.
+        let rows = vec![
+            row("laptop-new").host("laptop").build(),
+            row("builder-new").host("builder-1").build(),
+            row("laptop-old").host("laptop").build(),
+            row("builder-old").host("builder-1").build(),
+        ];
+        let lines = strip_lines(&rows, 20);
+        assert_eq!(
+            headers(&lines),
+            vec![("laptop", false), ("builder-1", false)]
+        );
+        assert_eq!(
+            drawn(&lines, &rows),
+            vec!["laptop-new", "laptop-old", "builder-new", "builder-old"],
+        );
+        // And the header sits above its own rows, not somewhere in the list.
+        assert!(matches!(lines[0], StripLine::Header { .. }));
+        assert!(matches!(lines[3], StripLine::Header { .. }));
+    }
+
+    /// A host the peer cannot reach says so once on its header. One reachable
+    /// row is enough to take the mark off: the host is answering.
+    #[test]
+    fn an_unreachable_host_marks_its_header() {
+        let mut rows = vec![
+            row("gone-1")
+                .host("laptop")
+                .status(RowStatus::Unreachable)
+                .build(),
+            row("gone-2")
+                .host("laptop")
+                .status(RowStatus::Unreachable)
+                .build(),
+            row("here").host("builder-1").build(),
+        ];
+        assert_eq!(
+            headers(&strip_lines(&rows, 20)),
+            vec![("laptop", true), ("builder-1", false)],
+        );
+        rows[1].status = RowStatus::Idle;
+        assert_eq!(
+            headers(&strip_lines(&rows, 20)),
+            vec![("laptop", false), ("builder-1", false)],
+            "a host with one reachable session is reachable",
+        );
+    }
+
+    /// A directory that names a host on some rows and not others still reads:
+    /// the nameless rows go first, so a headerless run never sits under
+    /// someone else's header and looks like theirs.
+    #[test]
+    fn rows_without_a_host_sort_above_the_headers() {
+        let rows = vec![
+            row("named").host("builder-1").build(),
+            row("nameless").build(),
+        ];
+        let lines = strip_lines(&rows, 20);
+        assert_eq!(drawn(&lines, &rows), vec!["nameless", "named"]);
+        assert_eq!(headers(&lines), vec![("builder-1", false)]);
+        assert!(
+            matches!(lines[0], StripLine::Session { .. }),
+            "the nameless row is above every header: {lines:?}",
+        );
+    }
+
+    /// Rows that do not fit are counted, not dropped in silence. What is cut is
+    /// the least recently active end, because that is how the rows are ordered.
+    #[test]
+    fn the_rows_that_do_not_fit_are_counted() {
+        let rows = rows_named(&["a", "b", "c", "d", "e"]);
+        // Six lines: five rows and the create row, so nothing is cut.
+        let whole = strip_lines(&rows, 6);
+        assert_eq!(drawn(&whole, &rows), vec!["a", "b", "c", "d", "e"]);
+        assert_eq!(hidden(&whole), None, "nothing was left out: {whole:?}");
+
+        // One line fewer, and the overflow row costs one of its own: four
+        // lines of budget hold three rows and the count of the other two.
+        let cut = strip_lines(&rows, 5);
+        assert_eq!(drawn(&cut, &rows), vec!["a", "b", "c"]);
+        assert_eq!(hidden(&cut), Some(2));
+        assert_eq!(cut.len(), 5, "and it used every line it had: {cut:?}");
+    }
+
+    /// A host header takes a line from the rows like anything else, and the
+    /// count of what is left out has to be right across that.
+    #[test]
+    fn headers_come_out_of_the_same_budget() {
+        let rows = vec![
+            row("a").host("one").build(),
+            row("b").host("one").build(),
+            row("c").host("two").build(),
+            row("d").host("two").build(),
+        ];
+        // Five lines: create row, one header, two rows, one overflow row.
+        let lines = strip_lines(&rows, 5);
+        assert_eq!(drawn(&lines, &rows), vec!["a", "b"]);
+        assert_eq!(headers(&lines), vec![("one", false)]);
+        assert_eq!(hidden(&lines), Some(2));
+
+        // Seven lines fit both headers, all four rows and the create row.
+        let whole = strip_lines(&rows, 7);
+        assert_eq!(drawn(&whole, &rows), vec!["a", "b", "c", "d"]);
+        assert_eq!(headers(&whole), vec![("one", false), ("two", false)]);
+        assert_eq!(hidden(&whole), None);
+    }
+
+    /// The focused row is drawn even when the store holds more sessions than
+    /// the terminal has lines, and the count still names every row left out,
+    /// above the run as well as below it.
+    #[test]
+    fn the_focused_row_stays_visible() {
+        let mut rows = rows_named(&["a", "b", "c", "d", "e", "f"]);
+        rows[4].focused = true;
+        // Four lines: the create row, the overflow row, and two rows ending on
+        // the focused one.
+        let lines = strip_lines(&rows, 4);
+        assert_eq!(drawn(&lines, &rows), vec!["d", "e"]);
+        assert_eq!(hidden(&lines), Some(4), "four rows are out of view");
     }
 
     /// It scrolls by the least it can: while focus still fits above the bottom
-    /// edge the window stays at the top, so a step does not jump the strip.
+    /// edge the run stays at the top, so a step does not jump the strip. The
+    /// run reaches past the focused row to fill the height, it does not stop
+    /// on it.
     #[test]
-    fn the_window_holds_still_while_focus_fits() {
-        let state = state_of(1, 10);
+    fn the_run_holds_still_while_focus_fits() {
+        let mut rows = rows_named(&["a", "b", "c", "d", "e", "f"]);
+        rows[0].focused = true;
         assert_eq!(
-            ids(window(&state.rows, 3)),
-            vec!["session-0", "session-1", "session-2"]
+            drawn(&strip_lines(&rows, 4), &rows),
+            vec!["a", "b"],
+            "the row below the focused one fills the line it left",
+        );
+        rows[0].focused = false;
+        rows[1].focused = true;
+        assert_eq!(drawn(&strip_lines(&rows, 4), &rows), vec!["a", "b"]);
+    }
+
+    /// A row shows the name the user gave it, and an over-long one keeps its
+    /// head and says it was cut.
+    #[test]
+    fn a_tag_is_shown_in_place_of_the_id() {
+        let tagged = row("2026-08-06-19-07-19-368").tag("fix-auth").build();
+        assert_eq!(tagged.label(19), "fix-auth");
+        assert_eq!(
+            row("2026-08-06-19-07-19-368").build().label(19),
+            "19-07-19",
+            "an untagged row falls back to the id-derived label",
+        );
+        let long = row("session-1")
+            .tag("rewrite-the-gateway-provisioner")
+            .build();
+        assert_eq!(long.label(19), "rewrite-the-gatewa…");
+        assert_eq!(
+            gwidth(&long.label(19), Method::Unicode),
+            19,
+            "the ellipsis is inside the budget, not beside it",
         );
     }
 
-    /// Fewer rows than lines draws them all, and a zero-height context is not a
-    /// reason to panic.
+    /// A tag of wide graphemes is budgeted in display columns, so it cannot
+    /// overflow the field and push the separator off its column.
     #[test]
-    fn a_short_list_is_drawn_whole() {
-        let state = state_of(0, 2);
-        assert_eq!(window(&state.rows, 5).len(), 2);
-        assert_eq!(window(&state.rows, 0).len(), 2);
+    fn a_wide_tag_fits_its_columns() {
+        let wide = row("session-1").tag("会話ノート記録帳の下書き").build();
+        let label = wide.label(9);
+        assert!(
+            gwidth(&label, Method::Unicode) <= 9,
+            "{label:?} takes {} columns",
+            gwidth(&label, Method::Unicode),
+        );
+        assert!(label.ends_with('…'), "and it says it was cut");
+    }
+
+    /// Whatever a field is handed, it comes out exactly as wide as it was
+    /// budgeted, which is what keeps the separator in one column.
+    #[test]
+    fn a_field_is_exactly_as_wide_as_its_budget() {
+        for text in [
+            "",
+            "short",
+            "a-much-longer-label-than-fits",
+            "会話ノート記録帳",
+        ] {
+            assert_eq!(
+                gwidth(&field(text, 19), Method::Unicode),
+                19,
+                "{text:?} did not fill its field",
+            );
+        }
+    }
+
+    /// A header's rule reaches the field's edge, and the unreachable mark is set
+    /// into the rule rather than hung off it.
+    #[test]
+    fn a_header_rules_out_to_the_field_edge() {
+        assert_eq!(
+            header_field("builder-1", false, 19),
+            "builder-1 ".to_string() + &"─".repeat(9)
+        );
+        assert_eq!(
+            header_field("laptop", true, 19),
+            format!("laptop {}{UNREACHABLE_MARK}", "─".repeat(8)),
+        );
+        for (host, unreachable) in [("builder-1", false), ("a-very-long-host-name", true)] {
+            assert_eq!(
+                gwidth(&header_field(host, unreachable, 19), Method::Unicode),
+                19,
+                "{host:?} did not rule out to the edge",
+            );
+        }
+    }
+
+    /// The working set is legible: the three states get three brightnesses, and
+    /// nothing else moves them (spec 9.2).
+    #[test]
+    fn the_working_set_shows_as_three_brightnesses() {
+        assert_eq!(row("a").focused().build().presence(), Presence::Focused);
+        assert_eq!(
+            row("a").focused().attached().build().presence(),
+            Presence::Focused,
+            "the focused session is attached too, and focus is what it shows",
+        );
+        assert_eq!(row("a").attached().build().presence(), Presence::Background,);
+        assert_eq!(row("a").build().presence(), Presence::Listed);
+        // A working turn is the glyph's business, not the label's: a session
+        // the client does not hold open stays dim while it runs.
+        assert_eq!(
+            row("a").status(RowStatus::Working).build().presence(),
+            Presence::Listed,
+        );
+        assert_eq!(
+            row("a")
+                .attached()
+                .status(RowStatus::Working)
+                .build()
+                .presence(),
+            Presence::Background,
+        );
+        // An attachment to a host the peer cannot reach is carrying nothing.
+        assert_eq!(
+            row("a")
+                .attached()
+                .status(RowStatus::Unreachable)
+                .build()
+                .presence(),
+            Presence::Listed,
+        );
+    }
+
+    fn styles() -> Rc<TranscriptStyles> {
+        Rc::new(TranscriptStyles::from_theme(
+            &aj_app::theme::Theme::bundled_dark_with_mode(aj_app::theme::ColorMode::Truecolor),
+            crate::terminal::TerminalCaps::default(),
+        ))
+    }
+
+    /// The strip's painted cells at its own width.
+    fn painted_cells(rows: Vec<SidebarRow>, height: u16) -> Vec<Vec<vaxis::cell::Cell>> {
+        let state = Rc::new(RefCell::new(SidebarState {
+            visible: true,
+            rows,
+            ..SidebarState::default()
+        }));
+        let mut strip = SessionSidebar::new(state, styles());
+        let surface = strip.draw(&crate::test_support::draw_ctx(SIDEBAR_COLS, Some(height)));
+        crate::test_support::flatten(&surface)
+    }
+
+    /// The strip's painted lines at its own width.
+    fn painted(rows: Vec<SidebarRow>, height: u16) -> Vec<String> {
+        painted_cells(rows, height)
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.char.grapheme()).collect())
+            .collect()
+    }
+
+    /// Every column of the strip, drawn: the focus marker left of the status
+    /// glyph so the two never contend for one cell, the label field, and the
+    /// separator running the strip's full height whether or not there is a line
+    /// beside it.
+    #[test]
+    fn the_strip_draws_its_columns() {
+        let rows = vec![
+            row("s-1")
+                .tag("fix-auth")
+                .host("builder-1")
+                .focused()
+                .attached()
+                .build(),
+            row("s-2")
+                .tag("eval-run")
+                .host("builder-1")
+                .status(RowStatus::Working)
+                .build(),
+            row("2026-08-06-18-40-49-001")
+                .host("laptop")
+                .status(RowStatus::Unreachable)
+                .build(),
+        ];
+        assert_eq!(
+            painted(rows, 7),
+            vec![
+                " ~ builder-1 ───────── │",
+                "▌  fix-auth            │",
+                " * eval-run            │",
+                " ~ laptop ──────── ! ─ │",
+                " ! 18-40-49            │",
+                " + new                 │",
+                "                       │",
+            ],
+        );
+    }
+
+    /// A focused row that is also working keeps both marks: the marker says
+    /// where the user is, the glyph says what the session is doing. Sharing one
+    /// column would cost whichever lost.
+    #[test]
+    fn a_focused_working_row_wears_both_marks() {
+        let rows = vec![
+            row("s-1")
+                .tag("busy")
+                .status(RowStatus::Working)
+                .focused()
+                .build(),
+        ];
+        assert_eq!(painted(rows, 2)[0], "▌* busy                │");
+    }
+
+    /// The glyph says what a session is doing and nothing else. Three rows all
+    /// running a turn wear the same glyph in the same color whatever the client
+    /// holds open, while their labels tell the three apart. Fold the two axes
+    /// into one column and an unattached session running a turn stops reading
+    /// as one.
+    #[test]
+    fn the_glyph_does_not_answer_for_the_working_set() {
+        let rows = vec![
+            row("s-1").status(RowStatus::Working).focused().build(),
+            row("s-2").status(RowStatus::Working).attached().build(),
+            row("s-3").status(RowStatus::Working).build(),
+            row("s-4").status(RowStatus::Unseen).build(),
+        ];
+        let cells = painted_cells(rows, 5);
+        let column = |col: usize| -> Vec<vaxis::cell::Style> {
+            (0..4).map(|line| cells[line][col].style).collect()
+        };
+        let glyphs = column(1);
+        assert_eq!(
+            glyphs[..3],
+            vec![glyphs[0]; 3],
+            "one status is one glyph color, whoever holds the session open",
+        );
+        assert_ne!(
+            glyphs[3], glyphs[0],
+            "and the color is the status talking, not a constant: {glyphs:?}",
+        );
+        let labels = column(3);
+        assert_ne!(labels[0], labels[1], "focused and background: {labels:?}");
+        assert_ne!(labels[1], labels[2], "background and listed: {labels:?}");
+        assert_ne!(labels[0], labels[2], "focused and listed: {labels:?}");
     }
 }

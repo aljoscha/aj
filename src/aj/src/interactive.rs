@@ -1597,9 +1597,12 @@ fn sync_sidebar(world: &World, shell: &Rc<RefCell<Shell>>) {
     // A peer that has sent no `list` frame yet leaves the strip empty rather
     // than inventing a row for the focused session: the next frame fills it,
     // and a fabricated row would carry no status.
-    let rows = crate::sidebar::rows_for_display(world.directory.rows(), world.session(), |row| {
-        world.directory.is_unseen(row)
-    });
+    let rows = crate::sidebar::rows_for_display(
+        world.directory.rows(),
+        world.session(),
+        |row| world.directory.is_unseen(row),
+        |id| world.directory.is_attached(id),
+    );
     let sidebar = Rc::clone(&shell.borrow().sidebar);
     let mut state = sidebar.borrow_mut();
     // Showing itself once the peer offers a choice is the default, and an
@@ -15366,12 +15369,16 @@ mod tests {
     /// proves the widget works while saying nothing about whether the layout
     /// still contains it, and leaving it out of the layout is exactly the defect
     /// worth catching.
+    ///
+    /// The separator column is dropped: it runs the strip's whole height, so
+    /// keeping it would make every blank line below the strip's content look
+    /// like a row.
     fn sidebar_rows(shell: &Rc<RefCell<Shell>>) -> Vec<String> {
         painted_rows(shell, 100, 40)
             .into_iter()
             .map(|row| {
                 row.chars()
-                    .take(usize::from(SIDEBAR_COLS))
+                    .take(usize::from(SIDEBAR_COLS) - 1)
                     .collect::<String>()
                     .trim_end()
                     .to_string()
@@ -15400,9 +15407,13 @@ mod tests {
         let painted = painted_rows(shell, width, 40);
         let header = painted
             .iter()
-            .find(|row| row.contains("aj"))
+            .find(|row| row.contains(APP_TITLE))
             .expect("the header is painted");
-        let indent = header.len() - header.trim_start().len();
+        // Where the header's own text starts, in columns, rather than where the
+        // line stops being blank: the strip paints a separator rule in its last
+        // column, and that rule is a multi-byte grapheme.
+        let at = header.find(APP_TITLE).expect("the header names the app");
+        let indent = header[..at].chars().count();
         u16::try_from(indent).expect("an indent within a terminal width")
     }
 
@@ -15535,8 +15546,12 @@ mod tests {
         shut_down(&world).await;
     }
 
-    /// The style of each painted sidebar row's first label cell, paired with the
-    /// row's text. Reads the composited frame, so it sees what a terminal would.
+    /// The style of each painted strip line's first label cell, paired with the
+    /// line's text. Reads the composited frame, so it sees what a terminal
+    /// would.
+    ///
+    /// One entry per painted line, the blank ones below the strip's content
+    /// included, so an index into this is the line index the layout produced.
     fn sidebar_row_styles(shell: &Rc<RefCell<Shell>>) -> Vec<(String, vaxis::cell::Style)> {
         let root: WidgetRef = to_widget_ref(Rc::clone(shell));
         let surface = draw_widget(&root, &crate::test_support::draw_ctx(100, Some(40)));
@@ -15545,12 +15560,10 @@ mod tests {
             .filter_map(|row| {
                 let strip: Vec<_> = row.iter().take(usize::from(SIDEBAR_COLS)).collect();
                 let text: String = strip.iter().map(|c| c.char.grapheme()).collect();
-                if text.trim().is_empty() {
-                    return None;
-                }
-                // Column 2 is the label's first cell: glyph, space, then label.
+                // Column 3 is the label's first cell: marker, glyph, space,
+                // then the label field.
                 strip
-                    .get(2)
+                    .get(3)
                     .map(|cell| (text.trim_end().to_string(), cell.style))
             })
             .collect()
@@ -15604,6 +15617,94 @@ mod tests {
                 "row {index} ({text:?}) is drawn the same as the focused row",
             );
         }
+        shut_down(&world).await;
+    }
+
+    /// The strip's focus and working-set axes, read off the composed frame:
+    /// the marker in the leftmost column says which session is on screen, and
+    /// the label's brightness says what the client holds open (spec 9.2).
+    ///
+    /// The three brightnesses need all three working-set states at once, which
+    /// is what the visit-and-return is for: it leaves the second session
+    /// attached in the background while the third is only listed.
+    #[tokio::test]
+    async fn the_strip_paints_focus_and_the_working_set() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        run_prompt(&mut world, "seed").await;
+        let focused = world.session().to_string();
+        let background = world
+            .control
+            .create(None, None)
+            .await
+            .expect("a second session");
+        let listed = world
+            .control
+            .create(None, None)
+            .await
+            .expect("a third session");
+        for session in [&background, &listed] {
+            assert!(
+                poll_row(&mut world, &shell, session, |_| true).await,
+                "{session} never appeared in the rows",
+            );
+        }
+
+        let (mut app, _writer, _root) = app_over(&shell).await;
+        for target in [background.clone(), focused.clone()] {
+            let moved =
+                apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Resume(target))
+                    .await;
+            assert!(matches!(moved, Focus::Moved));
+        }
+        sync_sidebar(&world, &shell);
+
+        // By line, not by label: sessions minted in the same second share a
+        // time-of-day label, so matching on text would be a coin flip. With no
+        // hosts in play the strip draws no headers, so a row's position in the
+        // mirror is its line.
+        let line_of = |session: &str| {
+            let sidebar = Rc::clone(&shell.borrow().sidebar);
+            let state = sidebar.borrow();
+            state
+                .rows
+                .iter()
+                .position(|row| row.id == session)
+                .unwrap_or_else(|| panic!("{session} has a row"))
+        };
+        let styles = TranscriptStyles::from_theme(
+            &shell.borrow().theme.read(),
+            crate::terminal::TerminalCaps::default(),
+        );
+        let painted = sidebar_row_styles(&shell);
+        assert_eq!(
+            painted[line_of(&focused)].1,
+            styles.accent,
+            "the session on screen is the accent: {painted:?}",
+        );
+        assert_eq!(
+            painted[line_of(&background)].1,
+            styles.text,
+            "one attached in the background is plain text: {painted:?}",
+        );
+        assert_eq!(
+            painted[line_of(&listed)].1,
+            styles.dim,
+            "one the client has only listed is dim: {painted:?}",
+        );
+
+        let marked: Vec<usize> = painted_rows(&shell, 100, 40)
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.starts_with('▌'))
+            .map(|(line, _)| line)
+            .collect();
+        assert_eq!(
+            marked,
+            vec![line_of(&focused)],
+            "exactly the focused line wears the marker: {:?}",
+            sidebar_rows(&shell),
+        );
         shut_down(&world).await;
     }
 
