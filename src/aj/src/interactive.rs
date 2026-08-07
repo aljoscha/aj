@@ -28,8 +28,8 @@ use aj_app::client::SessionClient;
 use aj_app::commands::CommandAction;
 use aj_app::directory::SessionDirectory;
 use aj_app::host::{
-    AttachRequest, Command, CommandOutcome, HeadTarget, LocalHandles, QueueOp, SettingsAxis,
-    SettingsChange,
+    AttachRequest, Command, CommandOutcome, CreateError, HeadTarget, LocalHandles, QueueOp,
+    SettingsAxis, SettingsChange,
 };
 use aj_app::keybindings::fixed_keys;
 use aj_app::session::{SessionExit, SessionRequest};
@@ -248,8 +248,21 @@ async fn build_world(
     // Refused before the host is asked to mint anything, so an illegal label
     // costs no session and reports on the normal screen.
     let tag = args.launch_tag().map_err(|err| anyhow!("--tag: {err}"))?;
+    // A create that minted its session and could not apply the label still
+    // gives us a session to run. Refusing to start over a label that did not
+    // stick would strand the user with a session they cannot see, and the
+    // remedy is to retag rather than to create another one.
+    let mut partial_create = None;
     let session = match startup {
-        StartupSession::Create => host.create_with(None, None, tag).await?,
+        StartupSession::Create => match host.create_with(None, None, tag).await {
+            Ok(session) => session,
+            Err(CreateError::Incomplete(partial)) => {
+                let session = partial.session.clone();
+                partial_create = Some(partial.to_string());
+                session
+            }
+            Err(err) => return Err(err.into()),
+        },
         StartupSession::Resume(id) => id,
     };
     let control = Control::local(host);
@@ -341,6 +354,9 @@ async fn build_world(
     }
     if !fresh && args.has_launch_tag() {
         fold_warning(&mut world, TAG_WITHOUT_A_CREATE);
+    }
+    if let Some(warning) = &partial_create {
+        fold_warning(&mut world, warning);
     }
     for notice in restore_notices {
         fold_notice(&mut world, &notice);
@@ -8059,6 +8075,39 @@ mod tests {
                 .read_tag(world.session())
                 .expect("read the sidecar"),
             Some("fix-auth".to_string()),
+        );
+        shut_down(&world).await;
+    }
+
+    /// A label the store cannot write does not stop the run. The session was
+    /// minted and is durable user state, so the shell opens on it and says the
+    /// label did not land, leaving the user to retag rather than re-create.
+    #[tokio::test]
+    async fn a_launch_tag_the_store_refuses_still_opens_the_session() {
+        let dir = TempDir::new().expect("tempdir");
+        // `meta/` occupied by a file is a sidecar write that cannot land.
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("the store directory");
+        std::fs::write(sessions.join("meta"), "not a directory").expect("block the sidecar");
+
+        let world = world_from_argv(
+            &dir,
+            &["aj", "--scripted", "streaming-text", "--tag", "fix-auth"],
+        )
+        .await
+        .expect("the run starts on the session it minted");
+
+        let notices = main_notices(&world);
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.contains(world.session()) && notice.contains("not applied")),
+            "the warning names the session that exists: {notices:?}",
+        );
+        assert_eq!(
+            store_in(&dir).read_tag(world.session()).ok().flatten(),
+            None,
+            "and the label really did not land",
         );
         shut_down(&world).await;
     }
