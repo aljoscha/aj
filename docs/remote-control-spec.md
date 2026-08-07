@@ -688,17 +688,27 @@ Per-session status in `list` frames and `GET /v1/sessions`:
 - `unreachable` (gateway only): the owning host connection is down.
 
 There is deliberately no "needs attention" bit on the server. A client
-derives it: a session that is idle and whose activity timestamp is
-newer than the stamp the client recorded when the user last viewed it
-has unseen output, that is the sidebar glyph. Both stamps are host
-clock, the client stores and compares them without ever consulting
-its own, so skew cannot enter. A session the user has never viewed
-has no recorded stamp and reads as having nothing unseen: the glyph
-answers "did this move since I last looked", and with no last look
-the question is vacuous. The loud alternative would light every row
-of a store on first connect, drowning the signal the glyph exists to
-carry. Attention is client-relative state and
-stays client-side.
+derives it from seqs, not stamps: a session is unseen when the last
+durable seq the client has evidence of (applied frames while
+attached, `last_seq` on live rows while not) exceeds the seq the user
+had viewed. Stamps are the wrong instrument here, a viewed stamp
+recorded from a debounced row predates output the user just watched
+and lights the glyph on it. This is also what section 6.5's "glyph
+data, never a cursor" was always pointing at: a list-observed
+`last_seq` now literally is glyph data. Unseen **latches** client-side: once
+derived from a live row it holds until the user views the session,
+so the session going cold afterwards (its row loses `last_seq` by
+design) does not clear it. The one hole is a session whose entire
+unseen window fell inside a client disconnect and that went cold
+before reconnect, it shows no glyph until opened. Accepted:
+attention is ephemeral client-relative state, it does not survive a
+client restart either, and re-deriving it from cold stores is the
+entry-count reading this design already refused. A session the user
+has never viewed reads as having nothing unseen: the glyph answers
+"did this move since I last looked", and with no last look the
+question is vacuous. The loud alternative would light every row of a
+store on first connect, drowning the signal the glyph exists to
+carry. Attention is client-relative state and stays client-side.
 
 `list` frames are lossy-coalescible (section 6.4), and the host
 debounces them: `last_seq` churn during a busy turn must not produce a
