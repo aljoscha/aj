@@ -90,7 +90,13 @@ pub const ACTION_AGENT_PICKER: &str = "aj.agent.open";
 pub const ACTION_SIDEBAR_TOGGLE: &str = "aj.sidebar.toggle";
 
 /// Moves focus to the next session in the sidebar's order. Default binding:
-/// `alt+]`.
+/// `alt+j`.
+///
+/// NOTE: down-and-up rather than a bracket pair because the sidebar is a
+/// vertical list, and because `alt+[` and `alt+]` are not typeable. Alt sends an
+/// ESC prefix, so those two arrive as `ESC [` and `ESC ]`, which are the CSI and
+/// OSC introducers every escape sequence starts with. A terminal cannot tell
+/// them from the start of a sequence, and neither can we.
 ///
 /// The order is the peer's own, which is activity-ordered, so this walks from
 /// the busiest session outward. Wraps at the end, and showing the sidebar is
@@ -99,7 +105,7 @@ pub const ACTION_SIDEBAR_TOGGLE: &str = "aj.sidebar.toggle";
 pub const ACTION_SESSION_NEXT: &str = "aj.session.next";
 
 /// Moves focus to the previous session in the sidebar's order. Default
-/// binding: `alt+[`.
+/// binding: `alt+k`.
 pub const ACTION_SESSION_PREV: &str = "aj.session.prev";
 
 /// Creates a session on whatever peer this client is driving and focuses it.
@@ -273,8 +279,8 @@ pub const AJ_KEYBINDINGS: &[(&str, &str, &str)] = &[
         "alt+s",
         "Show or hide the session sidebar",
     ),
-    (ACTION_SESSION_NEXT, "alt+]", "Focus the next session"),
-    (ACTION_SESSION_PREV, "alt+[", "Focus the previous session"),
+    (ACTION_SESSION_NEXT, "alt+j", "Focus the next session"),
+    (ACTION_SESSION_PREV, "alt+k", "Focus the previous session"),
     (
         ACTION_SESSION_NEW,
         "alt+n",

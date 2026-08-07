@@ -463,6 +463,58 @@ mod tests {
         );
     }
 
+    /// Every default chord survives a round trip through the terminal: the bytes
+    /// a terminal sends for it parse back into the key the keymap matches on.
+    ///
+    /// This is not a formality. Alt sends an ESC prefix, so an alt chord arrives
+    /// as `ESC <byte>`, and the parser reads `ESC [` as the CSI introducer and
+    /// `ESC ]` as OSC before it ever considers "alt + char". Binding `alt+[`
+    /// therefore produces an action no keystroke can reach, and nothing else in
+    /// the suite notices, because the keymap matches a `Key` the parser will
+    /// never hand it.
+    #[test]
+    fn every_default_chord_survives_the_terminal() {
+        for binding in global_bindings() {
+            let ChordKey::Char(ch) = binding.chord.key else {
+                // Named keys and F-keys arrive as escape sequences the parser
+                // decodes by table, not as a byte we can synthesize here.
+                continue;
+            };
+            if !binding.chord.alt || binding.chord.ctrl {
+                continue;
+            }
+            let bytes = [0x1b, u8::try_from(ch).expect("an ascii chord key")];
+            let parsed = vaxis::parser::Parser::new()
+                .parse(&bytes)
+                .expect("the bytes parse")
+                .event;
+            let action = binding.action.action_id().unwrap_or("<unbound>");
+            let Some(vaxis::event::Event::KeyPress(key)) = parsed else {
+                panic!(
+                    "{action}'s chord is not typeable: the terminal sends ESC {ch:?} \
+                     for it, which the parser consumes as an escape sequence",
+                );
+            };
+            assert_eq!(
+                key.codepoint,
+                u32::from(ch),
+                "{action}'s chord parses back as a different key",
+            );
+            assert!(
+                key.mods.contains(Modifiers::ALT),
+                "{action}'s chord loses its alt on the way through the terminal",
+            );
+            // And the keymap really matches what the terminal produced, not
+            // only what `key_of` reconstructs from the spec.
+            let keymap = build_keymap();
+            assert_eq!(
+                keymap.match_single(&key, BindingPhase::Capture, &ctx(false)),
+                Some(&binding.action),
+                "{action} does not fire for the key its own chord produces",
+            );
+        }
+    }
+
     /// The compiled keymap resolves the ctrl+c ambiguity by predicate:
     /// close-all under an overlay, cancel while a turn runs, the quit
     /// sequence otherwise.
