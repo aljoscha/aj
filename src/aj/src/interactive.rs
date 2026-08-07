@@ -22,7 +22,7 @@ use aj_agent::tool::TaskId;
 use aj_agent::types::UsageSummary;
 use aj_app::actions::AjAction;
 use aj_app::chat::ChatState;
-use aj_app::cli::args::{Args, Command as CliCommand};
+use aj_app::cli::args::{Args, Command as CliCommand, TAG_WITHOUT_A_CREATE};
 use aj_app::client::SessionClient;
 use aj_app::commands::CommandAction;
 use aj_app::directory::SessionDirectory;
@@ -49,7 +49,7 @@ use aj_models::types::UserContent;
 use aj_models::usage::default_reset_sources;
 use aj_models::{ThinkingConfig, speed_from_name, thinking_config_from_name};
 use aj_session::{ConversationPersistence, PromptEntry, SessionPreview, ThreadFilter};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
 use chrono::Utc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -243,8 +243,11 @@ async fn build_world(
     // A resume attaches, which materializes the session on the way in. A
     // create mints one and holds it live.
     let fresh = matches!(startup, StartupSession::Create);
+    // Refused before the host is asked to mint anything, so an illegal label
+    // costs no session and reports on the normal screen.
+    let tag = args.launch_tag().map_err(|err| anyhow!("--tag: {err}"))?;
     let session = match startup {
-        StartupSession::Create => host.create().await?,
+        StartupSession::Create => host.create_with(None, None, tag).await?,
         StartupSession::Resume(id) => id,
     };
     let control = Control::local(host);
@@ -333,6 +336,9 @@ async fn build_world(
     }
     if let Some(warning) = aj_app::tmux::options().and_then(aj_app::tmux::build_warning) {
         fold_warning(&mut world, &warning);
+    }
+    if !fresh && args.tag.is_some() {
+        fold_warning(&mut world, TAG_WITHOUT_A_CREATE);
     }
     for notice in restore_notices {
         fold_notice(&mut world, &notice);
@@ -436,6 +442,9 @@ async fn build_connect_world(
             &mut world,
             "--listen has nothing to serve in connect mode: the sessions live on the host.",
         );
+    }
+    if !created && args.tag.is_some() {
+        fold_warning(&mut world, TAG_WITHOUT_A_CREATE);
     }
     let dialed = format!("Connected to {}.", connect_url(&world));
     fold_notice(&mut world, &dialed);
@@ -801,7 +810,7 @@ async fn apply_focus_request(
 ) -> Focus {
     match request {
         FocusRequest::Create => {
-            let created = match world.control.create(None, None).await {
+            let created = match world.control.create(None, None, None).await {
                 Ok(session) => {
                     let notice = format!("Started a fresh session ({session}).");
                     focus_session(
@@ -7921,6 +7930,118 @@ mod tests {
             .iter()
             .any(|e| matches!(&e.kind, EntryKind::Notice(n) if n.text.contains("Context:")));
         assert!(!has_context, "a resumed session folds no context notice");
+    }
+
+    /// A world built from `argv`, so a launch-flag test can state the command
+    /// line it is about. The store stays inside `dir`.
+    async fn world_from_argv(dir: &TempDir, argv: &[&str]) -> Result<World> {
+        let args = Args::parse_from(argv);
+        let auth = AuthStorage::new(dir.path().join("auth.json"));
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        build_world(
+            &args,
+            layers_spilling_into(dir),
+            &[],
+            &auth,
+            &persistence,
+            None,
+        )
+        .await
+    }
+
+    /// This run's session store, for reading a sidecar back.
+    fn store_in(dir: &TempDir) -> ConversationPersistence {
+        ConversationPersistence::new(dir.path().join("sessions"))
+    }
+
+    /// `--tag` names the session a local run creates: the label lands on the
+    /// created session, through the host's own create rather than beside it.
+    #[tokio::test]
+    async fn the_tag_flag_names_the_session_a_local_run_creates() {
+        let dir = TempDir::new().expect("tempdir");
+        let world = world_from_argv(
+            &dir,
+            &["aj", "--scripted", "streaming-text", "--tag", "fix-auth"],
+        )
+        .await
+        .expect("build world");
+
+        assert_eq!(
+            store_in(&dir)
+                .read_tag(world.session())
+                .expect("read the sidecar"),
+            Some("fix-auth".to_string()),
+        );
+        shut_down(&world).await;
+    }
+
+    /// An illegal label is refused before anything is minted, so the run
+    /// reports on the normal screen and leaves no session behind.
+    #[tokio::test]
+    async fn an_illegal_launch_tag_refuses_the_run_and_creates_nothing() {
+        let dir = TempDir::new().expect("tempdir");
+        let error = match world_from_argv(
+            &dir,
+            &["aj", "--scripted", "streaming-text", "--tag", "two\nlines"],
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("an illegal tag refuses the run"),
+        };
+
+        let message = format!("{error:#}");
+        assert!(message.contains("--tag"), "names the flag: {message}");
+        assert!(
+            message.contains("single line"),
+            "and says what is wrong with it: {message}",
+        );
+        assert_eq!(
+            store_in(&dir)
+                .get_latest_session_id()
+                .expect("read the store"),
+            None,
+            "a refused run leaves no session behind",
+        );
+    }
+
+    /// A resume has no created session for `--tag` to name, so the flag is
+    /// reported rather than dropped.
+    #[tokio::test]
+    async fn a_launch_tag_on_a_resume_says_it_has_nothing_to_name() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut world = scripted_world(&dir, "streaming-text").await;
+        persist_session(&mut world).await;
+        let session = world.session().to_string();
+        shut_down(&world).await;
+
+        let resumed = world_from_argv(
+            &dir,
+            &[
+                "aj",
+                "--scripted",
+                "streaming-text",
+                "--tag",
+                "fix-auth",
+                "continue",
+                &session,
+            ],
+        )
+        .await
+        .expect("build the resumed world");
+        assert!(
+            main_notices(&resumed)
+                .iter()
+                .any(|n| n.contains("--tag has nothing to name")),
+            "{:?}",
+            main_notices(&resumed),
+        );
+        assert_eq!(
+            store_in(&dir).read_tag(&session).expect("read the sidecar"),
+            None,
+            "and the resumed session is not relabelled",
+        );
+        shut_down(&resumed).await;
     }
 
     /// `fresh_env_notices` produces the fresh-session env block: a leading Info
@@ -15542,7 +15663,7 @@ mod tests {
 
         let other = world
             .control
-            .create(None, None)
+            .create(None, None, None)
             .await
             .expect("a second session");
         // Its row has to exist before the visit below: the viewed stamp is the
@@ -15640,7 +15761,7 @@ mod tests {
         run_prompt(&mut world, "seed").await;
         world
             .control
-            .create(None, None)
+            .create(None, None, None)
             .await
             .expect("a second session");
         let deadline = Instant::now() + SETTLE_DEADLINE;
@@ -15697,12 +15818,12 @@ mod tests {
         let focused = world.session().to_string();
         let background = world
             .control
-            .create(None, None)
+            .create(None, None, None)
             .await
             .expect("a second session");
         let listed = world
             .control
-            .create(None, None)
+            .create(None, None, None)
             .await
             .expect("a third session");
         for session in [&background, &listed] {
@@ -15836,7 +15957,7 @@ mod tests {
         for _ in 0..2 {
             world
                 .control
-                .create(None, None)
+                .create(None, None, None)
                 .await
                 .expect("another session");
         }
@@ -15944,7 +16065,7 @@ mod tests {
         toggle().await;
         world
             .control
-            .create(None, None)
+            .create(None, None, None)
             .await
             .expect("a second session");
         let deadline = Instant::now() + SETTLE_DEADLINE;
@@ -16067,7 +16188,7 @@ mod tests {
         for _ in 0..2 {
             world
                 .control
-                .create(None, None)
+                .create(None, None, None)
                 .await
                 .expect("another session");
         }
@@ -16829,6 +16950,59 @@ mod tests {
         remote.shutdown().await;
     }
 
+    /// `--tag` rides the create request a `connect --new` sends, so the host's
+    /// own row carries the label. The client validates it first, which is what
+    /// makes an illegal one a CLI error rather than a round trip.
+    #[tokio::test]
+    async fn connect_new_carries_the_tag_flag_to_the_host() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+
+        let connected = dial(
+            &remote,
+            &client_config(),
+            &nothing_stated(),
+            &["--new", "--tag", "fix-auth"],
+        )
+        .await
+        .expect("create a tagged session on the host");
+        assert!(connected.created);
+
+        let listed = remote.host.sessions().await.expect("the host's rows");
+        let row = listed
+            .sessions
+            .iter()
+            .find(|row| row.id == connected.session)
+            .expect("the created session is listed");
+        assert_eq!(row.tag.as_deref(), Some("fix-auth"));
+
+        let refused = match dial(
+            &remote,
+            &client_config(),
+            &nothing_stated(),
+            &["--new", "--tag", "two\nlines"],
+        )
+        .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("an illegal tag refuses the connect"),
+        };
+        let reported = format!("{refused:#}");
+        assert!(reported.contains("--tag"), "names the flag: {reported}");
+        assert_eq!(
+            remote
+                .host
+                .sessions()
+                .await
+                .expect("the host's rows")
+                .sessions
+                .len(),
+            listed.sessions.len(),
+            "a refused tag costs the host no session",
+        );
+        remote.shutdown().await;
+    }
+
     /// A command the peer refuses folds the peer's own reason, and a refusal
     /// the peer classes as a conflict keeps its local wording.
     #[tokio::test]
@@ -16962,7 +17136,7 @@ mod tests {
         let (world, _shell) = connect_world_and_shell(&dir, &remote, &[]).await;
         let second = world
             .control
-            .create(None, None)
+            .create(None, None, None)
             .await
             .expect("a second session");
 
@@ -17063,7 +17237,7 @@ mod tests {
         // be confused.
         let other = world
             .control
-            .create(None, None)
+            .create(None, None, None)
             .await
             .expect("a second session");
         assert_ne!(other, world.session());

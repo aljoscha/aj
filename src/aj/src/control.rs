@@ -203,22 +203,26 @@ impl Control {
         }
     }
 
-    /// Create a session with the creator's settings and an optional first
-    /// prompt, answering its id (spec section 8: per-session settings follow
-    /// whoever creates the session).
+    /// Create a session with the creator's settings, an optional first prompt
+    /// and an optional tag, answering its id (spec section 8: per-session
+    /// settings follow whoever creates the session).
+    ///
+    /// `tag` is expected to have been normalized already, which is what lets
+    /// the local and the remote arm hand it on unchanged.
     pub(crate) async fn create(
         &self,
         settings: Option<SessionSettings>,
         prompt: Option<Vec<UserContent>>,
+        tag: Option<String>,
     ) -> Result<String, ControlError> {
         match self {
-            Self::Local(local) => Ok(local.host.create_with(settings, prompt, None).await?),
+            Self::Local(local) => Ok(local.host.create_with(settings, prompt, tag).await?),
             Self::Remote(remote) => Ok(remote
                 .client
                 .create_session(CreateSessionRequest {
                     settings,
                     prompt: prompt.map(|content| PromptInput::Content { content }),
-                    tag: None,
+                    tag,
                 })
                 .await?),
         }

@@ -5,6 +5,7 @@
 //! TUI. Subcommands (`list-sessions`, `continue`, `update-models`)
 //! short-circuit before mode dispatch.
 
+use aj_session::{TagError, normalize_tag};
 use clap::{Parser, Subcommand, ValueEnum};
 
 /// Top-level CLI for the `aj` binary.
@@ -119,12 +120,46 @@ pub struct Args {
     #[arg(long, global = true, env = "AJ_ALLOW", value_delimiter = ',')]
     pub allow: Vec<String>,
 
+    /// Name the session this run creates, shown in place of its id
+    /// wherever a session is listed.
+    ///
+    /// Global, so it reads the same on either side of a subcommand and
+    /// reaches the create a `connect --new` performs on the host. A run that
+    /// resumes an existing session creates nothing for the flag to name, and
+    /// says so rather than dropping it.
+    #[arg(long, global = true)]
+    pub tag: Option<String>,
+
     /// Subcommand selector for the non-conversational utilities
     /// (`list-sessions`, `continue`, `update-models`) and the
     /// remote-control modes (`serve`, `connect`).
     #[command(subcommand)]
     pub command: Option<Command>,
 }
+
+impl Args {
+    /// The validated `--tag` value for the session this run creates.
+    ///
+    /// `Ok(None)` covers both "no flag" and a flag whose value normalizes to
+    /// nothing, which is the same "no label" a blank tag means everywhere
+    /// else. Validating here is what keeps the CLI and the wire agreeing on
+    /// what a legal tag is: a label a host would refuse never reaches a
+    /// session, and the refusal reads on the normal screen.
+    pub fn launch_tag(&self) -> Result<Option<String>, TagError> {
+        match &self.tag {
+            Some(tag) => normalize_tag(tag),
+            None => Ok(None),
+        }
+    }
+}
+
+/// What a run says when `--tag` named a session it never created.
+///
+/// The flag labels the session a run mints. A resumed session already carries
+/// whatever label it was given, and relabelling it from the launch line would
+/// be a second meaning for one flag, so the run reports instead.
+pub const TAG_WITHOUT_A_CREATE: &str = "--tag has nothing to name: this run resumed a session rather than creating one. \
+     Use the session-tag command to relabel it.";
 
 /// Control-port address a bare `--listen` binds: loopback, because the
 /// port is remote code execution and the identity gate's default mode
@@ -285,5 +320,45 @@ mod tests {
         let args = parse(&["aj", "connect", "http://127.0.0.1:6161", "--listen"]);
         assert_eq!(args.listen.as_deref(), Some(DEFAULT_LISTEN_ADDRESS));
         assert!(matches!(args.command, Some(Command::Connect { .. })));
+    }
+
+    /// `--tag` is global, so a `connect --new` can name the session it asks
+    /// the host to create without a second spelling of the flag.
+    #[test]
+    fn the_tag_flag_parses_on_either_side_of_a_subcommand() {
+        for argv in [
+            ["aj", "--tag", "fix-auth", "connect", "http://host:6161"],
+            ["aj", "connect", "http://host:6161", "--tag", "fix-auth"],
+        ] {
+            let args = parse(&argv);
+            assert_eq!(args.tag.as_deref(), Some("fix-auth"), "{argv:?}");
+            assert_eq!(
+                args.launch_tag(),
+                Ok(Some("fix-auth".to_string())),
+                "{argv:?}",
+            );
+        }
+        assert_eq!(parse(&["aj"]).launch_tag(), Ok(None), "no flag, no label");
+    }
+
+    /// A tag the store would not keep is refused where the user typed it, so
+    /// the run never creates a session the flag failed to name. The trim and
+    /// the blank-clears rule are the same ones the wire applies.
+    #[test]
+    fn an_illegal_tag_is_refused_at_the_flag() {
+        assert_eq!(
+            parse(&["aj", "--tag", "two\nlines"]).launch_tag(),
+            Err(TagError::Control),
+        );
+        let long = "a".repeat(aj_session::MAX_TAG_BYTES + 1);
+        assert!(matches!(
+            parse(&["aj", "--tag", &long]).launch_tag(),
+            Err(TagError::TooLong { .. }),
+        ));
+        assert_eq!(
+            parse(&["aj", "--tag", "  spaced  "]).launch_tag(),
+            Ok(Some("spaced".to_string())),
+        );
+        assert_eq!(parse(&["aj", "--tag", "   "]).launch_tag(), Ok(None));
     }
 }

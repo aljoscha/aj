@@ -63,7 +63,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::cli::args::{Args, Command, PrintFormat};
+use crate::cli::args::{Args, Command, PrintFormat, TAG_WITHOUT_A_CREATE};
 use crate::session_setup::{
     BuiltAgent, PreparedLog, SessionSource, build_agent, build_initial_run_config, freeze_and_seed,
     prepare_log,
@@ -189,6 +189,10 @@ async fn run_inner<W: Write + Send + 'static>(
         input.into_content()
     };
 
+    // Validated before anything is minted, so a label the store would refuse
+    // costs no session.
+    let launch_tag = args.launch_tag().map_err(|err| anyhow!("--tag: {err}"))?;
+
     // Speed selection follows the same precedence as the model:
     // CLI flag > config.toml > default. `--speed` is parsed here; the
     // model bundle itself is resolved in `build_initial_run_config`
@@ -260,6 +264,19 @@ async fn run_inner<W: Write + Send + 'static>(
     )?;
     for notice in &restore_notices {
         eprintln!("aj: {notice}");
+    }
+
+    // `--tag` labels the session a run creates. The sidecar is written
+    // straight here rather than through a command: print mode owns the log it
+    // just minted and no other writer knows its id yet.
+    match (&launch_tag, &source) {
+        (Some(tag), SessionSource::Create) => conversation_persistence
+            .write_tag(log.session_id(), Some(tag))
+            .with_context(|| format!("failed to tag session {}", log.session_id()))?,
+        (Some(_), SessionSource::Resume { .. }) => {
+            eprintln!("aj: warning: {TAG_WITHOUT_A_CREATE}");
+        }
+        (None, _) => {}
     }
 
     // JSON mode: replay the persisted history through the JSON sink
@@ -726,6 +743,65 @@ mod tests {
         assert!(
             log.latest_leaf(ThreadFilter::USER).is_some(),
             "the driven turn was persisted"
+        );
+    }
+
+    /// `--tag` names the session a print run creates, so a one-shot run shows
+    /// up in a later listing under the label its command line gave it.
+    #[tokio::test(start_paused = true)]
+    async fn the_tag_flag_names_the_session_a_print_run_creates() {
+        let (_out, persistence, _sessions) = drive(&[
+            "--print",
+            "--scripted",
+            "streaming-text",
+            "--tag",
+            "fix-auth",
+            "hello",
+        ])
+        .await;
+
+        let id = persistence
+            .get_latest_session_id()
+            .expect("read latest session")
+            .expect("a session was written");
+        assert_eq!(
+            persistence.read_tag(&id).expect("read the sidecar"),
+            Some("fix-auth".to_string()),
+        );
+    }
+
+    /// An illegal label refuses the run before a log is minted.
+    #[tokio::test(start_paused = true)]
+    async fn an_illegal_tag_refuses_a_print_run_and_creates_nothing() {
+        let sessions = TempDir::new().expect("sessions tempdir");
+        let persistence = ConversationPersistence::new(sessions.path().to_path_buf());
+        let auth_dir = TempDir::new().expect("auth tempdir");
+        let cwd = TempDir::new().expect("cwd tempdir");
+
+        let error = run_inner(
+            parse(&[
+                "--print",
+                "--scripted",
+                "streaming-text",
+                "--tag",
+                "two\nlines",
+                "hello",
+            ]),
+            Config::default(),
+            AuthStorage::new(auth_dir.path().join("auth.json")),
+            persistence.clone(),
+            cwd.path().to_path_buf(),
+            Arc::new(Mutex::new(Vec::<u8>::new())),
+        )
+        .await
+        .expect_err("an illegal tag refuses the run");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("--tag"), "names the flag: {message}");
+        assert_eq!(
+            persistence.get_latest_session_id().expect("read the store"),
+            None,
+            "a refused run leaves no session behind",
         );
     }
 

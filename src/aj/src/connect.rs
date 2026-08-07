@@ -16,7 +16,7 @@ use aj_app::cli::args::Args;
 use aj_conf::{Config, ConfigLayer};
 use aj_models::{speed_name, thinking_config_name, verbosity_name};
 use aj_wire::{Hello, ModelSelection, SessionSettings};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 use crate::control::Control;
 use crate::remote::RemoteClient;
@@ -64,7 +64,11 @@ pub(crate) async fn connect(
     let working_directory = hello.working_directory.clone();
     let control = Control::remote(client);
     let settings = creator_settings(args, config, stated);
-    let (session, created) = resolve_session(&control, &target, settings).await?;
+    // Refused here rather than on the host: a create the host would reject
+    // for its label is a round trip that reports after the terminal is gone,
+    // and the flag is this client's own input to validate (spec 6.6).
+    let tag = args.launch_tag().map_err(|err| anyhow!("--tag: {err}"))?;
+    let (session, created) = resolve_session(&control, &target, settings, tag).await?;
     Ok(Connected {
         control,
         session,
@@ -79,12 +83,13 @@ async fn resolve_session(
     control: &Control,
     target: &ConnectTarget<'_>,
     settings: Option<SessionSettings>,
+    tag: Option<String>,
 ) -> Result<(String, bool)> {
     if let Some(id) = target.session_id {
         return Ok((id.to_string(), false));
     }
     if target.new {
-        return Ok((create(control, settings).await?, true));
+        return Ok((create(control, settings, tag).await?, true));
     }
     let list = control
         .sessions()
@@ -101,13 +106,17 @@ async fn resolve_session(
         Some(session) => Ok((session, false)),
         // A fresh `aj serve` holds nothing, and connect mode would otherwise
         // have nothing to attach at all.
-        None => Ok((create(control, settings).await?, true)),
+        None => Ok((create(control, settings, tag).await?, true)),
     }
 }
 
-async fn create(control: &Control, settings: Option<SessionSettings>) -> Result<String> {
+async fn create(
+    control: &Control,
+    settings: Option<SessionSettings>,
+    tag: Option<String>,
+) -> Result<String> {
     control
-        .create(settings, None)
+        .create(settings, None, tag)
         .await
         .context("could not create a session on the host")
 }
