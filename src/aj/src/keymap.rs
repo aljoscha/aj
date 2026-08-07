@@ -530,11 +530,13 @@ mod tests {
         match spec.key {
             ChordKey::Char(c) => char_bytes(c, spec),
             ChordKey::Named(name) => named_bytes(name, spec),
-            // F1..F12 have numbered CSI forms. Above that a terminal sends
-            // sequences the parser does not decode.
-            ChordKey::F(n) => [11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 23, 24]
-                .get(usize::from(n).checked_sub(1)?)
-                .map(|number| csi_numbered(*number, spec)),
+            // The numbered CSI forms, xterm's numbering, whose gaps are the
+            // numbers it spends on other keys. It runs out at F20.
+            ChordKey::F(n) => [
+                11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 23, 24, 25, 26, 28, 29, 31, 32, 33, 34,
+            ]
+            .get(usize::from(n).checked_sub(1)?)
+            .map(|number| csi_numbered(*number, spec)),
         }
     }
 

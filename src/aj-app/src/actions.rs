@@ -309,10 +309,10 @@ pub fn untypeable_reason(spec: &ChordSpec) -> Option<&'static str> {
     match spec.key {
         ChordKey::Char(c) => char_reason(c, spec),
         ChordKey::Named(name) => named_reason(name, spec),
-        // Function keys arrive as the numbered CSI form, whose decoded range
-        // stops at F12. Nothing a terminal sends above that is recognized.
-        ChordKey::F(n) => (!(1..=12).contains(&n))
-            .then_some("the terminal's encoding for function keys above f12 is not decoded"),
+        // Function keys arrive as the numbered CSI form. xterm's numbering runs
+        // out at F20, and nothing above that has an encoding to recognize.
+        ChordKey::F(n) => (!(1..=20).contains(&n))
+            .then_some("no terminal has an encoding for function keys above f20"),
     }
 }
 
@@ -1015,7 +1015,7 @@ mod tests {
             ("aj.palette.open".to_string(), "ctrl+i".to_string()),
             ("aj.agent.open".to_string(), "alt+]".to_string()),
             ("aj.tools.expand".to_string(), "alt+shift+x".to_string()),
-            ("aj.history.open".to_string(), "f13".to_string()),
+            ("aj.history.open".to_string(), "f21".to_string()),
         ]);
 
         assert_eq!(effective_chord("aj.palette.open"), Some("ctrl+o"));
@@ -1030,7 +1030,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(refused, ["ctrl+i", "alt+]", "alt+shift+x", "f13"]);
+        assert_eq!(refused, ["ctrl+i", "alt+]", "alt+shift+x", "f21"]);
         assert!(
             problems[0]
                 .to_string()

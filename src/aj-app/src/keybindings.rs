@@ -136,7 +136,12 @@ pub const ACTION_TASK_KILL: &str = "aj.task.kill";
 /// message (injected right after the next tool call), escalating any
 /// pending follow-up. While idle it starts a normal turn. Reserving
 /// `alt+enter` here costs no newline capability, since the editor keeps
-/// `shift+enter`, `ctrl+j`, and `\`+Enter for newline.
+/// `ctrl+j` and `\`+Enter for newline, plus `shift+enter` on a terminal
+/// speaking an enhanced keyboard protocol.
+///
+/// NOTE: `shift+enter` has no legacy encoding, so a plain terminal cannot
+/// tell it from `enter`. That is why the other two are the ones that always
+/// work.
 pub const ACTION_SUBMIT_STEERING: &str = "aj.message.steer";
 
 /// Action ID for the "pull a queued message back into the editor"

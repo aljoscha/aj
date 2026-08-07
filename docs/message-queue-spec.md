@@ -389,7 +389,7 @@ hint when the editor is non-empty.
 | Submit / append steering | `alt+enter` (`ACTION_SUBMIT_STEERING`) | host intercept |
 | Yank queued message (editor empty) | `up` / `ctrl+p` (`tui.editor.cursorUp`) | host intercept when editor empty + pending |
 | Yank queued message (always) | `alt+up` (`ACTION_DEQUEUE`) | host intercept, prepends to current draft |
-| Newline | `shift+enter`, `\`+Enter | editor (unchanged) |
+| Newline | `ctrl+j`, `\`+Enter, and `shift+enter` where the terminal can express it | editor (unchanged) |
 
 All overridable via `config.toml` keybindings.
 
@@ -430,11 +430,13 @@ pending message without restoring it.
 Repurposing Alt+Enter removes its newline-fallback role **in the prompt
 editor only** (the host consumes it before the editor sees it; other
 single-line inputs are unaffected, and `is_newline_event` is left
-untouched). Newline entry remains via **Shift+Enter** and the
-**`\`+Enter** workaround, and `ACTION_SUBMIT_STEERING` is rebindable for
-anyone in a terminal that can only express newline via Alt+Enter. We
-accept this because Alt+Enter is the requested gesture and Shift+Enter
-is the canonical newline. (Alternative — a different steering chord —
+untouched). Newline entry remains via **Ctrl+J** and the
+**`\`+Enter** workaround, and via **Shift+Enter** on a terminal speaking
+an enhanced keyboard protocol: it has no legacy encoding, so a plain
+terminal cannot tell it from Enter. `ACTION_SUBMIT_STEERING` is rebindable
+for anyone in a terminal that can only express newline via Alt+Enter. We
+accept this because Alt+Enter is the requested gesture and the two
+always-available newline chords remain. (Alternative — a different steering chord —
 rejected to honor the requested UX.)
 
 ---

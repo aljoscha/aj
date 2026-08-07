@@ -525,6 +525,18 @@ fn parse_csi(input: &[u8]) -> ParseResult {
                 21 => Key::F10,
                 23 => Key::F11,
                 24 => Key::F12,
+                // xterm continues the tilde family past F12 with gaps, the
+                // skipped numbers being the ones it spends on other keys.
+                // Without these arms an `f13`..`f20` binding parses as a chord
+                // and then matches nothing a terminal can send.
+                25 => Key::F13,
+                26 => Key::F14,
+                28 => Key::F15,
+                29 => Key::F16,
+                31 => Key::F17,
+                32 => Key::F18,
+                33 => Key::F19,
+                34 => Key::F20,
                 // A bracketed paste coalesces its whole content (everything up
                 // to the matching end marker) into one `Event::Paste`, so a
                 // downstream widget receives the paste as a single bulk insert.
@@ -1103,6 +1115,60 @@ mod tests {
         });
         assert_eq!(result.n, 6);
         assert_eq!(result.event, Some(expected));
+    }
+
+    /// The tilde family carries F13 through F20 on xterm's numbering, gaps
+    /// included. A binding for a key the parser cannot decode is a dead
+    /// binding, so the table has to reach as far as the names callers accept.
+    #[test]
+    fn parse_function_keys_past_f12() {
+        for (number, expected) in [
+            (25, Key::F13),
+            (26, Key::F14),
+            (28, Key::F15),
+            (29, Key::F16),
+            (31, Key::F17),
+            (32, Key::F18),
+            (33, Key::F19),
+            (34, Key::F20),
+        ] {
+            let bytes = format!("\x1b[{number}~");
+            let result = parse(bytes.as_bytes());
+            assert_eq!(
+                result.event,
+                Some(Event::KeyPress(Key {
+                    codepoint: expected,
+                    ..Default::default()
+                })),
+                "CSI {number} ~ decodes to the matching function key",
+            );
+            assert_eq!(result.n, bytes.len(), "and consumes the whole sequence");
+        }
+    }
+
+    /// The numbers xterm spends elsewhere stay unrecognized rather than being
+    /// bent into a contiguous F13 onward run.
+    #[test]
+    fn parse_skips_the_gaps_in_the_function_key_numbering() {
+        for number in [27, 30, 35] {
+            let result = parse(format!("\x1b[{number}~").as_bytes());
+            assert_eq!(result.event, None, "CSI {number} ~ is not a function key",);
+        }
+    }
+
+    /// A modified function key past F12 carries its modifiers like any other
+    /// member of the family.
+    #[test]
+    fn parse_modified_function_key_past_f12() {
+        let result = parse(b"\x1b[25;5~");
+        assert_eq!(
+            result.event,
+            Some(Event::KeyPress(Key {
+                codepoint: Key::F13,
+                mods: Modifiers::CTRL,
+                ..Default::default()
+            })),
+        );
     }
 
     #[test]

@@ -29,7 +29,7 @@
 //! the folds the peer served, and a session dropped from the working set is
 //! detached by that same reopen leaving it unnamed (spec 6.5).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use aj_wire::{Frame, SessionSummary};
 
@@ -94,6 +94,15 @@ pub struct SessionDirectory {
     /// not make what happened while the user was away seen, and a row outlives
     /// its attachment.
     viewed: HashMap<String, u64>,
+    /// Sessions derived to have output the user has not looked at.
+    ///
+    /// Latched rather than recomputed per read, because the evidence is
+    /// perishable while the attention is not (spec 6.8). A cold row carries no
+    /// `last_seq`, so a session that moved and then went cold would answer the
+    /// quiet way if each read re-derived from the row. The row was only ever
+    /// evidence, the attention is this client's own state, so it is derived
+    /// where live evidence arrives and cleared where the user looks.
+    unseen: HashSet<String>,
 }
 
 impl SessionDirectory {
@@ -111,6 +120,7 @@ impl SessionDirectory {
             }],
             rows: Vec::new(),
             viewed: HashMap::new(),
+            unseen: HashSet::new(),
         }
     }
 
@@ -192,6 +202,9 @@ impl SessionDirectory {
             // restarts the numbering below the old one, which a maximum would
             // never come back down from.
             attached.delivered = Some(seq);
+            // A frame folded into a background session is first-hand evidence
+            // that it moved, and it arrives whether or not a row follows.
+            self.latch_unseen();
         }
         // Only the focused session's transcript is on screen, so a background
         // session's fold changes nothing a redraw would show. Its row can still
@@ -206,6 +219,7 @@ impl SessionDirectory {
             Frame::List { sessions } => {
                 let changed = self.rows != sessions;
                 self.rows = sessions;
+                self.latch_unseen();
                 Redraw(changed)
             }
             // `vms` belongs to whatever renders VM state and `heartbeat` exists
@@ -311,6 +325,44 @@ impl SessionDirectory {
             // until they had visited it a second time.
             .unwrap_or(0);
         self.viewed.insert(session.to_string(), delivered);
+        // Looking at it is what discharges the mark.
+        self.unseen.remove(session);
+    }
+
+    /// Derive the unseen mark from whatever live evidence is currently in hand,
+    /// for every session the user has viewed at least once.
+    ///
+    /// Only ever sets. Clearing is [`Self::mark_viewed`]'s job, which is what
+    /// makes the mark survive its evidence going away.
+    fn latch_unseen(&mut self) {
+        let mut moved: Vec<String> = Vec::new();
+        for (session, viewed) in &self.viewed {
+            // NOTE: the focused session is not skipped here. It can pick up the
+            // mark while the user watches it, which is harmless twice over:
+            // `is_unseen` answers no for it whatever this holds, and leaving it
+            // runs `mark_viewed`, which discharges the mark on the way out.
+            //
+            // Both kinds of evidence spec 6.8 admits: frames folded while
+            // attached, and a live row's own position while not.
+            let applied = self
+                .attached
+                .iter()
+                .find(|attached| attached.session == *session)
+                .and_then(|attached| attached.delivered);
+            let listed = self
+                .rows
+                .iter()
+                .find(|row| row.id == *session)
+                .and_then(|row| row.last_seq);
+            if [applied, listed]
+                .into_iter()
+                .flatten()
+                .any(|seq| seq > *viewed)
+            {
+                moved.push(session.clone());
+            }
+        }
+        self.unseen.extend(moved);
     }
 
     /// Whether `row` has output the user has not looked at.
@@ -329,15 +381,7 @@ impl SessionDirectory {
         if row.id == self.focused() || row.working {
             return false;
         }
-        let Some(viewed) = self.viewed.get(&row.id) else {
-            // Never viewed, so there is no "since I last looked" to answer
-            // against and the question is vacuous. Reading it as unseen would
-            // light up every row of a store on first connect (spec 6.8).
-            return false;
-        };
-        // A cold row carries no durable position (spec 6.8), so there is
-        // nothing to compare and the answer falls the quiet way, as above.
-        row.last_seq.is_some_and(|last_seq| last_seq > *viewed)
+        self.unseen.contains(&row.id)
     }
 
     /// Whether any session in the working set owes a re-attach.
@@ -580,6 +624,16 @@ mod tests {
             last_seq: Some(last_seq),
             last_activity: DateTime::from_timestamp(0, 0).expect("a valid timestamp"),
             unreachable: false,
+        }
+    }
+
+    /// A released session's row: no durable position, which is what makes the
+    /// latch load-bearing (spec 6.8).
+    fn cold_row(id: &str) -> SessionSummary {
+        SessionSummary {
+            last_seq: None,
+            live: false,
+            ..row(id, false, 0)
         }
     }
 
@@ -841,18 +895,60 @@ mod tests {
         );
     }
 
-    /// The unseen mark is read off the row the caller hands over, never off a
-    /// row this looks up. The sidebar walks the whole directory asking about
-    /// each row, and a lookup here would make that walk quadratic.
+    /// The unseen mark latches: derived while the evidence was live, it holds
+    /// after the session goes cold and its row loses `last_seq` (spec 6.8). The
+    /// row was only ever evidence, the attention is this client's own state.
     #[test]
-    fn the_unseen_mark_reads_the_row_the_caller_passes() {
-        let (directory, _focused_chat) = two_sessions();
+    fn the_unseen_mark_outlives_the_row_that_proved_it() {
+        let (mut directory, mut focused_chat) = two_sessions();
+        // Leave FOCUSED, which records what the user had seen of it.
+        directory.focus(&mut focused_chat, OTHER, || panic!("already attached"));
+
+        let _ = directory.apply(
+            &mut focused_chat,
+            list(vec![row(FOCUSED, false, 5), row(OTHER, false, 0)]),
+        );
+        assert!(unseen(&directory, FOCUSED), "the live row proves it moved");
+
+        // The session is released and its row goes cold, taking the evidence
+        // with it. The mark must not go with it.
+        let _ = directory.apply(
+            &mut focused_chat,
+            list(vec![cold_row(FOCUSED), row(OTHER, false, 0)]),
+        );
         assert!(
-            directory.rows().is_empty(),
-            "no `list` frame has ever arrived",
+            unseen(&directory, FOCUSED),
+            "a cold row does not un-see what the user never looked at",
         );
 
-        assert!(directory.is_unseen(&row(OTHER, false, 7)));
+        // Looking at it is what discharges the mark.
+        directory.focus(&mut focused_chat, FOCUSED, || panic!("already attached"));
+        directory.focus(&mut focused_chat, OTHER, || panic!("already attached"));
+        assert!(
+            !unseen(&directory, FOCUSED),
+            "viewing it clears the mark, cold row or not",
+        );
+    }
+
+    /// A frame folded into a background session is evidence in its own right,
+    /// so the mark does not wait on a `list` frame to follow it.
+    #[test]
+    fn a_background_fold_is_evidence_enough() {
+        let (mut directory, mut focused_chat) = two_sessions();
+        directory.focus(&mut focused_chat, OTHER, || panic!("already attached"));
+        // A row exists, but a stale one: it says FOCUSED has moved nowhere.
+        let _ = directory.apply(
+            &mut focused_chat,
+            list(vec![cold_row(FOCUSED), row(OTHER, false, 0)]),
+        );
+        assert!(!unseen(&directory, FOCUSED), "nothing has moved yet");
+
+        // A durable frame folds into it while the user is elsewhere.
+        let _ = directory.apply(&mut focused_chat, durable(FOCUSED, 9, "while away"));
+        assert!(
+            unseen(&directory, FOCUSED),
+            "the fold is first-hand evidence, no row needed",
+        );
     }
 
     /// The rows outlive a focus change. They are the peer's directory, not the

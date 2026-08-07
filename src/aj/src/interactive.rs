@@ -15558,34 +15558,30 @@ mod tests {
             assert!(Instant::now() < deadline, "the rows never arrived");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        // Two sessions show the strip by default, so nothing has to be toggled.
-        let focused_label = {
+
+        // By row position, not by label: two sessions minted in the same second
+        // share a time-of-day label, so matching on text would be a coin flip.
+        let focused_index = {
             let sidebar = Rc::clone(&shell.borrow().sidebar);
             let state = sidebar.borrow();
-            let row = state
+            state
                 .rows
                 .iter()
-                .find(|row| row.focused)
-                .expect("a focused row");
-            crate::sidebar::SessionSidebar::label(&row.id, usize::from(SIDEBAR_COLS) - 2)
+                .position(|row| row.focused)
+                .expect("a focused row")
         };
 
+        // Two sessions show the strip by default, so nothing has to be toggled.
         let styles = sidebar_row_styles(&shell);
         assert!(styles.len() >= 2, "two rows are painted: {styles:?}");
-        let focused: Vec<_> = styles
-            .iter()
-            .filter(|(text, _)| text.contains(&focused_label))
-            .collect();
-        assert_eq!(focused.len(), 1, "one row is the focused one: {styles:?}");
-        let others: Vec<_> = styles
-            .iter()
-            .filter(|(text, _)| !text.contains(&focused_label))
-            .collect();
-        assert!(!others.is_empty(), "and there is another to compare with");
-        for (text, style) in &others {
+        let focused_style = styles[focused_index].1;
+        for (index, (text, style)) in styles.iter().enumerate() {
+            if index == focused_index {
+                continue;
+            }
             assert_ne!(
-                focused[0].1, *style,
-                "{text:?} is drawn the same as the focused row",
+                focused_style, *style,
+                "row {index} ({text:?}) is drawn the same as the focused row",
             );
         }
         shut_down(&world).await;
