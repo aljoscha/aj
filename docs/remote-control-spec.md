@@ -596,6 +596,7 @@ viewed agent to that parameter:
 | `.../{id}/queue` | op: remove (optional agent) or clear | Withdraw or clear pending queued messages. Withdrawal returns the text, which is what makes the client's dequeue-into-the-editor gesture work. One agent holds at most one coalesced pending message, so there is no index to address. |
 | `.../{id}/compact` | optional instructions | Manual compaction. |
 | `.../{id}/settings` | model / thinking / thinking display / speed / verbosity changes | Host applies, logs, and emits the synthesized frames. |
+| `.../{id}/tag` | tag string, empty clears | Set the session's tag: session-scoped display metadata (section 6.8), a single trimmed line, length-capped. Materializes like any command so the session lock covers the sidecar write. |
 | `.../{id}/head` | target: an entry id, or `{before: <entry_id>}` | Switch the session head. 409 while working or tasks live. Clears queues, new epoch, `reset` frame. The `before` shape resolves any named entry to its parent server-side, atomically with the switch. An unknown entry is 404, an entry with no parent is refused. Its consumer is the branch-from-a-message gesture (replace the message rather than append after it), but the contract is deliberately not restricted to user-thread entries: every head `before` can reach is reachable through the plain entry shape already, so a restriction would police nothing. |
 | `.../{id}/tasks/{task_id}/kill` | — | Kill a background task. |
 
@@ -674,6 +675,16 @@ Per-session status in `list` frames and `GET /v1/sessions`:
   produced none. The guarantee is therefore process-local: a host that
   restarts falls back to the mtime and can differ from what the
   previous host published, as can two hosts listing one store.
+- `tag`: optional user-set label, display metadata, never an id. A
+  tag is session-scoped, deliberately not branch-scoped, so it lives
+  beside the log rather than in it: a sidecar file
+  (`meta/<session id>.tag` in the store, single line of UTF-8,
+  written atomically) that a head switch cannot move. Untagged
+  sessions have no file. Set at create (create body / launch flag) or
+  by the tag command (section 6.6).
+- `host`: which enrolled host a row belongs to, filled by a gateway
+  and absent from a plain host's rows. Clients group by it and must
+  not derive it from the id, ids are opaque (section 6.2).
 - `unreachable` (gateway only): the owning host connection is down.
 
 There is deliberately no "needs attention" bit on the server. A client
@@ -710,11 +721,12 @@ surface, not a workload to poll for, its sessions cannot be served by
 this host anyway, and its activity becomes visible at the next
 enumeration point. Reading a log to produce a directory row is never
 correct, live or cold: a live session's facts are in memory, and a
-cold row needs only enumeration metadata plus the format sniff, the
-one first-line read, cached against the file it was taken from so a
-settled store re-sniffs nothing. Keying it on the file rather than the
-path alone is what recovers from a sniff that landed on a log another
-process was midway through writing. Enumeration is therefore readdir,
+cold row needs only enumeration metadata plus two small cached reads,
+the format sniff (first line, cached against the file it was taken
+from so a settled store re-sniffs nothing, keyed on the file rather
+than the path alone so a sniff that landed on a log another process
+was midway through writing recovers) and the tag sidecar where one
+exists (section 6.8). Enumeration is therefore readdir,
 stats and a sniff per file that moved, cheap enough to run
 synchronously at startup.
 This contract has teeth on both axes. The polling variant of this
@@ -797,7 +809,10 @@ especially with long-lived VMs. Rules:
 - Gateway handling of unknowns: forward, don't filter. The retained
   raw JSON is re-emitted unchanged except for the session-id rewrite,
   which the top-level `session` convention (section 6.3) makes
-  possible without understanding the frame. This is what lets an
+  possible without understanding the frame. Unchanged means
+  structurally: JSON key order is not significant and byte identity
+  is not required. An unknown frame with no top-level `session` field
+  is host-scoped and forwarded as is. This is what lets an
   older gateway sit between newer hosts and newer clients.
 - New endpoints, frame kinds, and event types arrive with a capability
   string. Probing an endpoint (404 vs 2xx) is a valid fallback check.
@@ -1131,9 +1146,16 @@ single-session use) lists sessions:
 Keyboard model, exact layout, and glyph choices are left to
 implementation taste within existing TUI conventions, with one
 requirement: new interactions (sidebar toggle and focus, session
-switching, remote session creation) are `AjAction`s riding the
-existing keybinding system, so they get default chords and user
-overrides like every other action.
+switching, remote session creation, session tagging) are `AjAction`s
+riding the existing keybinding system, so they get default chords and
+user overrides like every other action. Pointer gestures are a second
+trigger for the same actions, never a separate behavior: a click on a
+sidebar row dispatches the switch action that the chord dispatches.
+
+Rows show the session's tag where one is set (section 6.8), falling
+back to the id-derived label. A tag is set at launch (`--tag` on `aj`
+and on `aj connect --new`, riding the create command's tag field) or
+on the focused session through the tag action.
 
 ## 10. Crate layout
 
