@@ -6587,6 +6587,81 @@ async fn an_unreadable_sidecar_does_not_cost_a_live_session_its_label() {
     harness.host.shutdown().await;
 }
 
+/// A tag is session-scoped, deliberately not branch-scoped, so a head switch
+/// cannot move it (spec 6.8). It lives beside the log rather than in it, and
+/// the switch that rewrites the session's history leaves both the row's label
+/// and the sidecar exactly where they were.
+#[tokio::test]
+async fn a_head_switch_does_not_move_the_tag() {
+    let harness = Harness::new(vec![
+        finalized_text_message("first"),
+        finalized_text_message("second"),
+    ]);
+    let session = harness.create().await;
+    harness.prompt(&session, "one").await;
+    harness.prompt(&session, "two").await;
+    harness
+        .host
+        .command(
+            &session,
+            Command::Tag {
+                tag: Some("fix-auth".to_string()),
+            },
+        )
+        .await
+        .expect("the tag is accepted");
+    assert_eq!(
+        tag_of(&harness.host, &session).await.as_deref(),
+        Some("fix-auth"),
+    );
+
+    // Branch back to an earlier head, which mints a fresh epoch and replaces
+    // the session's projection wholesale.
+    let head = {
+        let handles = harness
+            .host
+            .local_handles(&session)
+            .await
+            .expect("live session");
+        let log = handles.log.lock().await;
+        let head = log.head().cloned().expect("a head");
+        let conversation = log.linearize(&head, ThreadFilter::USER);
+        conversation
+            .entries()
+            .iter()
+            .rev()
+            .nth(2)
+            .expect("an earlier entry")
+            .id
+            .clone()
+    };
+    harness
+        .host
+        .command(
+            &session,
+            Command::Head {
+                target: HeadTarget::Entry(head),
+            },
+        )
+        .await
+        .expect("head switch on an idle session");
+
+    assert_eq!(
+        tag_of(&harness.host, &session).await.as_deref(),
+        Some("fix-auth"),
+        "the label is the session's, not the branch's",
+    );
+    assert_eq!(
+        harness
+            .persistence
+            .read_tag(&session)
+            .expect("read the sidecar"),
+        Some("fix-auth".to_string()),
+        "and the sidecar the switch could not touch still holds it",
+    );
+    harness.host.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // 15. Reads
 // ---------------------------------------------------------------------------
