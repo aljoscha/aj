@@ -54,6 +54,7 @@ use vaxis::vxfw::{
     DrawContext, Event, EventContext, MaxSize, Overflow, RichText, Size, Surface, TextSpan, Widget,
 };
 
+use crate::text::one_line;
 use crate::transcript::TranscriptStyles;
 
 /// Columns the sidebar occupies when shown.
@@ -611,13 +612,6 @@ pub(crate) fn session_label(id: &str, cols: usize) -> String {
         cleaned
     };
     truncate_to_cols(&label, cols)
-}
-
-/// Drop control characters, which a session's name, a user's tag and a peer's
-/// host name may all contain and which would split the row's line and
-/// misattribute every row below it.
-fn one_line(text: &str) -> String {
-    text.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// Trim `label` from its head until it fits `cols` display columns, which keeps

@@ -651,8 +651,13 @@ pub(crate) fn usage_rows(statuses: &[ProviderUsageStatus], styles: &ContentStyle
 /// columns, and a blank spacer is emitted as a single-space row so it
 /// occupies a real line instead of collapsing to zero height in the
 /// [`ListView`].
+///
+/// The tag is folded to one line on the way in: it is the one value here a
+/// peer supplies, and every row is drawn as a `RichText` that a control
+/// character would either split or panic (see [`crate::text::one_line`]).
 pub(crate) fn session_info_rows(stats: &SessionStats, tag: Option<&str>) -> Vec<Row> {
-    let rows = aj_app::session_info::digest(stats, tag);
+    let tag = tag.map(crate::text::one_line);
+    let rows = aj_app::session_info::digest(stats, tag.as_deref());
     let key_width = rows
         .iter()
         .filter_map(|row| match row {
@@ -1408,6 +1413,24 @@ mod tests {
                 Style::default(),
                 "plain row default-styled: {row:?}"
             );
+        }
+    }
+
+    /// The tag is the one value on this page a peer supplies, so it is folded
+    /// before it becomes a row. A control character would split the row it
+    /// sits on, and a lone carriage return panics `RichText`'s hard-break
+    /// walk, which happens inside the draw.
+    #[test]
+    fn a_control_character_in_a_peer_tag_never_reaches_a_row() {
+        use vaxis::vxfw::{RichText, Widget};
+
+        let rows = session_info_rows(&sample_stats(), Some("ab\rcd"));
+        let blob = rows_text(&rows);
+        assert!(!blob.contains('\r'), "the label is folded: {blob:?}");
+        assert!(blob.contains("abcd"), "and it is still the label: {blob:?}");
+        for row in rows {
+            let mut text = RichText::new(row);
+            text.draw(&crate::test_support::draw_ctx(60, Some(1)));
         }
     }
 }

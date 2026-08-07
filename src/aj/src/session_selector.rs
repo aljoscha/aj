@@ -31,6 +31,7 @@ use vaxis::vxfw::{FilterableSelect, SelectItem, to_widget_ref};
 use crate::interactive::OverlayHandles;
 use crate::overlay::{OverlayPlacement, close_all, close_key_label, close_top, confirm_key_label};
 use crate::settings_ui::push_window;
+use crate::text::one_line;
 
 /// How much of the first user message a row's primary column shows before
 /// truncating with an ellipsis.
@@ -222,13 +223,16 @@ fn subtitle() -> String {
 /// The primary (left) column: the first user message, truncated, with a
 /// `(current)` suffix on the active session's row. Falls back to a
 /// placeholder when the session has no user message yet.
+///
+/// The message is a whole prompt, so only its first line is shown, and that
+/// line is folded like every other value drawn here (see [`one_line`]).
 fn format_primary(preview: &SessionPreview, is_current: bool) -> String {
     let raw = preview
         .first_user_message
         .as_deref()
         .unwrap_or("(no user message yet)");
-    let one_line = raw.lines().next().unwrap_or(raw);
-    let truncated = truncate_chars(one_line, PREVIEW_MAX_CHARS);
+    let first_line = one_line(raw.lines().next().unwrap_or(raw));
+    let truncated = truncate_chars(&first_line, PREVIEW_MAX_CHARS);
     if is_current {
         format!("{truncated} (current)")
     } else {
@@ -243,7 +247,8 @@ fn format_primary(preview: &SessionPreview, is_current: bool) -> String {
 ///
 /// The tag leads because it is the one part a user chose, and it is folded to
 /// one line for the same reason the sidebar folds it: it comes from a file
-/// that may have been hand-edited.
+/// that may have been hand-edited, or from a peer that does not normalize
+/// what it publishes (see [`one_line`]).
 fn format_secondary(preview: &SessionPreview, tag: Option<&str>, now: DateTime<Utc>) -> String {
     let count = preview.message_count;
     let msg_word = if count == 1 { "msg" } else { "msgs" };
@@ -251,7 +256,7 @@ fn format_secondary(preview: &SessionPreview, tag: Option<&str>, now: DateTime<U
     let last = format_age(now, preview.last_message_at);
     let meta = format!("{count} {msg_word} · created {created} · last {last}");
     match tag {
-        Some(tag) => format!("{} · {meta}", tag.lines().next().unwrap_or(tag)),
+        Some(tag) => format!("{} · {meta}", one_line(tag)),
         None => meta,
     }
 }
@@ -640,6 +645,28 @@ mod tests {
             "fix-auth · 42 msgs · created 13:22 · last 2h",
             "the user's label leads the column",
         );
+    }
+
+    /// A tag the peer supplies is folded before it reaches the column, and a
+    /// row built from one draws. Neither the store nor a conforming host can
+    /// produce a control character in a label, but a peer that does not
+    /// normalize can, and a lone carriage return in a drawn row is a panic in
+    /// the frame rather than a stray glyph.
+    #[test]
+    fn a_control_character_in_a_peer_tag_never_reaches_the_column() {
+        use vaxis::vxfw::{FilterableSelect, SelectStyles, Widget};
+
+        let p = preview("2025-05-09-14-30-00", Some("debug"), 42, Duration::hours(2));
+        let described = format_secondary(&p, Some("ab\rcd"), Utc::now());
+        assert!(
+            !described.contains('\r') && described.starts_with("abcd · "),
+            "the label is folded to one line: {described:?}",
+        );
+
+        let item = build_item(&p, Some("ab\rcd"), false, Utc::now());
+        let mut select = FilterableSelect::new(vec![item], SelectStyles::default());
+        let surface = select.draw(&crate::test_support::draw_ctx(60, Some(10)));
+        assert!(!surface.children.is_empty(), "the row drew");
     }
 
     #[test]

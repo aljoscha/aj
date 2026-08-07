@@ -92,6 +92,7 @@ mod task_output;
 mod terminal;
 #[cfg(test)]
 mod test_support;
+mod text;
 mod toasts;
 mod tool_cell;
 mod transcript;
