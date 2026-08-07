@@ -1154,7 +1154,10 @@ an explicit toggle wins over the default for the rest of the process.
   newest first, client-side (ties broken by id), the view windows
   around the focused row so focus is always visible, and the stepping
   chords walk the displayed order. Focusing a cold session
-  materializes it, that is what focusing means.
+  materializes it, that is what focusing means. The working set is
+  legible: rows distinguish attached sessions from merely listed
+  ones, so what the client holds open (and the locks that retention
+  implies, section 5) is visible rather than inferred.
 - Switching and creating are never refused because a turn is running:
   a background session keeps folding and its turn completes, that is
   the point of the swap model. The busy refusal that remains is the
