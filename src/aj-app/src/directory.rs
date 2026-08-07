@@ -623,6 +623,8 @@ mod tests {
             tasks: 0,
             last_seq: Some(last_seq),
             last_activity: DateTime::from_timestamp(0, 0).expect("a valid timestamp"),
+            tag: None,
+            host: None,
             unreachable: false,
         }
     }

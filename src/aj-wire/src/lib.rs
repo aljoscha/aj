@@ -220,6 +220,22 @@ pub struct SessionSummary {
     /// to derive the unseen-output glyph (spec 6.8). Both sides of that
     /// comparison are host clock, so the client never consults its own.
     pub last_activity: DateTime<Utc>,
+    /// The label the user gave the session, when it has one.
+    ///
+    /// Display metadata and never an id (spec 6.8): a client shows it in a row
+    /// instead of the id, and addresses the session by [`Self::id`] all the
+    /// same. Session-scoped rather than branch-scoped, so a head switch does
+    /// not move it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    /// Which enrolled host the row belongs to.
+    ///
+    /// A gateway fills this in as it merges its hosts' directories, and a
+    /// plain host's rows carry nothing: they are all its own. Clients group by
+    /// it and must not derive it from [`Self::id`], which is opaque (spec
+    /// 6.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     #[serde(default)]
     pub unreachable: bool,
 }

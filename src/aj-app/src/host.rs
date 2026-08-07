@@ -708,6 +708,10 @@ impl SessionHost {
                         // would mean reading the log.
                         last_seq: None,
                         last_activity: session.last_activity,
+                        tag: None,
+                        // Only a gateway names the host a row belongs to
+                        // (spec 6.8). Every row here is this host's own.
+                        host: None,
                         unreachable: false,
                     },
                 )
@@ -1582,6 +1586,8 @@ fn summarize(session: &Arc<LiveSession>) -> SessionSummary {
         tasks,
         last_seq: Some(status.last_seq),
         last_activity: status.last_activity,
+        tag: None,
+        host: None,
         unreachable: false,
     }
 }

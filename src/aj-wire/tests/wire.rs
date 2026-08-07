@@ -4,9 +4,9 @@ use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
 use aj_wire::{
     CancelRequest, CompactRequest, CreateSessionRequest, Cursor, DecodedAgentEvent, DecodedFrame,
     ErrorResponse, Frame, HeadRequest, Hello, ModelSelection, PromptInput, PromptRequest,
-    QueueOperation, QueueOutcome, QueueRequest, QueueState, SessionCreated, SessionList,
-    SessionSettings, SessionSummary, SessionTree, SettingsRequest, SteerRequest, TaskDetails,
-    TaskTable, VmList,
+    QueueCounts, QueueOperation, QueueOutcome, QueueRequest, QueueState, SessionCreated,
+    SessionList, SessionSettings, SessionSummary, SessionTree, SettingsRequest, SteerRequest,
+    TaskDetails, TaskTable, VmList,
 };
 use serde_json::{Value, json};
 
@@ -710,6 +710,59 @@ fn a_directory_row_carries_a_position_only_while_live() {
     assert!(
         serde_json::from_value::<SessionSummary>(stampless).is_err(),
         "the activity stamp is required on every row",
+    );
+}
+
+/// A row's tag and host are display metadata a row may simply not have: an
+/// untagged session, and a plain host's rows, which are all its own (spec
+/// 6.8). Absent is a key that is not there rather than an empty string, in
+/// both directions, so a client can tell "no label" from "a label that is
+/// blank" and an older peer's row still decodes.
+#[test]
+fn a_rows_tag_and_host_are_absent_rather_than_empty() {
+    let list: SessionList = serde_json::from_value(fixture("models")["session_list"].clone())
+        .expect("the pinned session list decodes");
+    let [gateway, plain] = &list.sessions[..] else {
+        panic!("the fixture pins one row with both fields and one with neither");
+    };
+    assert_eq!(gateway.tag.as_deref(), Some("fix-auth"));
+    assert_eq!(gateway.host.as_deref(), Some("workstation"));
+    assert_eq!((plain.tag.as_deref(), plain.host.as_deref()), (None, None));
+
+    let row = SessionSummary {
+        id: "session-2".to_string(),
+        live: false,
+        working: false,
+        queued: QueueCounts::default(),
+        tasks: 0,
+        last_seq: None,
+        last_activity: gateway.last_activity,
+        tag: None,
+        host: None,
+        unreachable: false,
+    };
+    let encoded = serde_json::to_value(&row).expect("the row serializes");
+    assert!(
+        encoded.get("tag").is_none() && encoded.get("host").is_none(),
+        "an untagged row on a plain host emits neither key: {encoded}",
+    );
+    assert_eq!(
+        serde_json::from_value::<SessionSummary>(encoded).expect("it decodes again"),
+        row,
+        "and a row lacking both keys reads back as carrying neither",
+    );
+
+    let labelled = SessionSummary {
+        tag: Some("fix-auth".to_string()),
+        host: Some("workstation".to_string()),
+        ..row
+    };
+    let encoded = serde_json::to_value(&labelled).expect("the row serializes");
+    assert_eq!(encoded["tag"], json!("fix-auth"));
+    assert_eq!(encoded["host"], json!("workstation"));
+    assert_eq!(
+        serde_json::from_value::<SessionSummary>(encoded).expect("it decodes again"),
+        labelled,
     );
 }
 

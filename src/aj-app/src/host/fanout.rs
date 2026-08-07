@@ -654,6 +654,8 @@ mod tests {
             tasks: 0,
             last_seq: Some(last_seq),
             last_activity: chrono::DateTime::UNIX_EPOCH,
+            tag: None,
+            host: None,
             unreachable: false,
         }]
     }

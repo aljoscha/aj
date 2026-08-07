@@ -401,6 +401,8 @@ mod tests {
             tasks: 0,
             last_seq: Some(0),
             last_activity: chrono::Utc::now(),
+            tag: None,
+            host: None,
             unreachable,
         }
     }
