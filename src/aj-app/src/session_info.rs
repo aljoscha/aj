@@ -26,12 +26,16 @@ fn kv(key: &str, value: &str) -> InfoRow {
 /// Build the session-info digest: identity, recorded settings, activity
 /// timing, message counts, aggregate usage, and the per-tool call
 /// breakdown, grouped into labelled sections separated by blank rows.
-pub fn digest(stats: &SessionStats) -> Vec<InfoRow> {
+///
+/// `tag` is the label the session carries, which lives beside the log rather
+/// than in it, so the caller supplies it.
+pub fn digest(stats: &SessionStats, tag: Option<&str>) -> Vec<InfoRow> {
     let total_messages = stats.user_messages + stats.assistant_messages + stats.tool_results;
 
     let mut rows: Vec<InfoRow> = vec![
         InfoRow::Header("Session".to_string()),
         kv("id", &stats.session_id),
+        kv("tag", tag.unwrap_or("(none)")),
         kv("file", &stats.path.display().to_string()),
         kv("project", &project_name(stats)),
         InfoRow::Blank,
@@ -198,13 +202,14 @@ mod tests {
 
     #[test]
     fn digest_sections_values_and_spacers_in_order() {
-        let rows = view(&digest(&sample_stats()));
+        let rows = view(&digest(&sample_stats(), Some("fix-auth")));
 
         // The section headers appear in order, each preceded by a blank
         // spacer once the first section is done.
         let expected = [
             RowView::Header("Session".to_string()),
             RowView::Kv("id".to_string(), "2026-06-19-14-22-03-512".to_string()),
+            RowView::Kv("tag".to_string(), "fix-auth".to_string()),
             RowView::Kv(
                 "file".to_string(),
                 "/home/u/.aj/sessions/home-u-proj/2026-06-19-14-22-03-512.jsonl".to_string(),
@@ -247,5 +252,16 @@ mod tests {
             RowView::Kv("Bash".to_string(), "8".to_string()),
         ];
         assert_eq!(rows, expected);
+    }
+
+    /// An untagged session says so rather than dropping the row, so the page's
+    /// shape does not depend on whether a label happens to be set.
+    #[test]
+    fn an_untagged_session_reads_as_none() {
+        let rows = view(&digest(&sample_stats(), None));
+        assert!(
+            rows.contains(&RowView::Kv("tag".to_string(), "(none)".to_string())),
+            "{rows:?}",
+        );
     }
 }

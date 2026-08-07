@@ -651,8 +651,8 @@ pub(crate) fn usage_rows(statuses: &[ProviderUsageStatus], styles: &ContentStyle
 /// columns, and a blank spacer is emitted as a single-space row so it
 /// occupies a real line instead of collapsing to zero height in the
 /// [`ListView`].
-pub(crate) fn session_info_rows(stats: &SessionStats) -> Vec<Row> {
-    let rows = aj_app::session_info::digest(stats);
+pub(crate) fn session_info_rows(stats: &SessionStats, tag: Option<&str>) -> Vec<Row> {
+    let rows = aj_app::session_info::digest(stats, tag);
     let key_width = rows
         .iter()
         .filter_map(|row| match row {
@@ -1189,7 +1189,7 @@ mod tests {
 
     #[test]
     fn session_info_rows_render_identity_counts_and_tools() {
-        let rows = session_info_rows(&sample_stats());
+        let rows = session_info_rows(&sample_stats(), Some("fix-auth"));
         let blob = rows_text(&rows);
         assert!(blob.contains("2026-06-19-14-22-03-512"), "{blob}");
         assert!(blob.contains("home-u-proj"), "{blob}");
@@ -1401,7 +1401,7 @@ mod tests {
     /// it draws exactly as a plain-string row would.
     #[test]
     fn plain_builder_rows_are_single_default_spans() {
-        for row in session_info_rows(&sample_stats()) {
+        for row in session_info_rows(&sample_stats(), Some("fix-auth")) {
             assert_eq!(row.len(), 1, "plain row is one span: {row:?}");
             assert_eq!(
                 row[0].style,

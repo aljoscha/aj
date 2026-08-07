@@ -10,6 +10,7 @@
 //! [`TranscriptView`] renders it with follow-tail.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2094,6 +2095,20 @@ fn focused_tag(world: &World) -> Option<String> {
         .and_then(|row| row.tag.clone())
 }
 
+/// Every label the peer reports, by session id, for the surfaces that show a
+/// list of sessions.
+///
+/// A snapshot: the selector is a view of one moment, and re-reading it per
+/// streamed batch would let rows in one list disagree about a session.
+fn session_tags(world: &World) -> HashMap<String, String> {
+    world
+        .directory
+        .rows()
+        .iter()
+        .filter_map(|row| Some((row.id.clone(), row.tag.clone()?)))
+        .collect()
+}
+
 /// Send a confirmed tag edit to the peer that owns the session.
 ///
 /// The one path for both modes: the host applies it under the session's own
@@ -2323,7 +2338,7 @@ async fn apply_command_action(
                 return ActionEffect::Redraw;
             }
             let handles = shell.borrow().overlay_handles();
-            open_session_selector(&handles, world.session().to_string());
+            open_session_selector(&handles, world.session().to_string(), session_tags(world));
             ActionEffect::OpenedOverlay
         }
         CommandAction::OpenSessionTree => match open_tree_overlay(world, shell).await {
@@ -3288,6 +3303,10 @@ fn spawn_overlay_fetch(
             });
         }
         FetchKind::SessionInfo => {
+            // The label lives beside the log, and the peer's row is where both
+            // modes can read it, so it is taken here rather than inside the
+            // spawned read.
+            let tag = focused_tag(world);
             // Not supported over the wire in v1 (spec 9.1): the stats come off
             // the host's own log. The overlay is already open, so the refusal
             // fills it rather than folding a notice behind it.
@@ -3301,7 +3320,10 @@ fn spawn_overlay_fetch(
             };
             tokio::spawn(async move {
                 let stats = { log.lock().await.stats() };
-                let _ = tx.send((FetchKind::SessionInfo, session_info_rows(&stats)));
+                let _ = tx.send((
+                    FetchKind::SessionInfo,
+                    session_info_rows(&stats, tag.as_deref()),
+                ));
             });
         }
     }
@@ -16572,6 +16594,86 @@ mod tests {
                 == Some("from-the-loop"))
             .await,
             "the loop sent the typed label to the peer",
+        );
+        shut_down(&world).await;
+    }
+
+    /// The session-info page shows the label, which it can only get from the
+    /// peer's row: the digest reads a log, and a tag is not in one.
+    #[tokio::test]
+    async fn the_session_info_page_shows_the_label() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        seed_tag(&mut world, &shell, "fix-auth").await;
+
+        let (tx, mut rx) = unbounded_channel();
+        let styles = ContentStyles::from_theme(&shell.borrow().theme.read());
+        spawn_overlay_fetch(&world, FetchKind::SessionInfo, styles, &tx);
+        let (kind, rows) = rx.recv().await.expect("the fetch delivered rows");
+        assert_eq!(kind, FetchKind::SessionInfo);
+
+        let page = rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            page.lines()
+                .any(|line| line.trim_start().starts_with("tag") && line.contains("fix-auth")),
+            "the page carries a tag row: {page}",
+        );
+        shut_down(&world).await;
+    }
+
+    /// The session selector labels its rows from the peer's directory, so a
+    /// tag typed into the filter finds the session it names.
+    #[tokio::test]
+    async fn the_session_selector_labels_and_indexes_a_tagged_row() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        seed_tag(&mut world, &shell, "fix-auth").await;
+
+        let effect = apply_command(&mut world, &shell, CommandAction::OpenSessionSelector).await;
+        assert!(matches!(effect, ActionEffect::OpenedOverlay));
+        let scan = shell
+            .borrow()
+            .take_session_scan()
+            .expect("the selector parked a scan");
+
+        // The scan's own walk is off the loop, so hand it the preview the
+        // store would have produced for the focused session.
+        let session = world.session().to_string();
+        let preview = SessionPreview {
+            session_id: session.clone(),
+            modified: Utc::now(),
+            created_at: Utc::now(),
+            last_message_at: Utc::now(),
+            size_bytes: 0,
+            message_count: 1,
+            first_user_message: Some("a prompt".to_string()),
+        };
+        extend_session_scan(&scan, &[preview], Utc::now(), true, true);
+
+        let row = scan
+            .select
+            .borrow()
+            .selected()
+            .expect("the focused session's row");
+        assert!(
+            row.description
+                .as_deref()
+                .is_some_and(|d| d.starts_with("fix-auth · ")),
+            "the label leads the metadata column: {:?}",
+            row.description,
+        );
+        assert!(
+            row.filter_key.contains("fix-auth"),
+            "and typing it finds the row: {}",
+            row.filter_key,
         );
         shut_down(&world).await;
     }

@@ -47,6 +47,10 @@ pub(crate) struct SessionScan {
     /// filter_key -> session_id, filled by [`extend_session_scan`] and read
     /// by the confirm callback (which sees only the row's filter key).
     ids: Rc<RefCell<HashMap<String, String>>>,
+    /// session_id -> user tag, snapshotted from the peer's directory when the
+    /// overlay opened. The scan reads logs, and a tag is not in one, so the
+    /// labels come from the rows the sidebar is already drawing.
+    tags: HashMap<String, String>,
 }
 
 impl SessionScan {
@@ -74,7 +78,11 @@ fn loading_items() -> Vec<SelectItem> {
 ///
 /// A switch is never refused for being busy. The session left behind stays
 /// attached and keeps folding, so its turn finishes unwatched.
-pub(crate) fn open_session_selector(handles: &OverlayHandles, current: String) {
+pub(crate) fn open_session_selector(
+    handles: &OverlayHandles,
+    current: String,
+    tags: HashMap<String, String>,
+) {
     let select = Rc::new(RefCell::new(FilterableSelect::new(
         loading_items(),
         handles.chrome.select.clone(),
@@ -126,6 +134,7 @@ pub(crate) fn open_session_selector(handles: &OverlayHandles, current: String) {
         select,
         current,
         ids,
+        tags,
     });
 }
 
@@ -152,7 +161,8 @@ pub(crate) fn extend_session_scan(
             .iter()
             .map(|preview| {
                 let is_current = preview.session_id == scan.current;
-                let item = build_item(preview, is_current, now);
+                let tag = scan.tags.get(&preview.session_id).map(String::as_str);
+                let item = build_item(preview, tag, is_current, now);
                 ids.insert(item.filter_key.clone(), preview.session_id.clone());
                 item
             })
@@ -178,19 +188,26 @@ pub(crate) fn extend_session_scan(
 }
 
 /// Build one row: the truncated first user message (tagged `(current)` for
-/// the active session) as the label, the metadata triplet as the dim
-/// description, and `"{first_user_message} {session_id}"` as the filter
-/// key so either the prompt or the id matches.
-fn build_item(preview: &SessionPreview, is_current: bool, now: DateTime<Utc>) -> SelectItem {
-    SelectItem::new(format_primary(preview, is_current), haystack(preview))
-        .with_description(format_secondary(preview, now))
+/// the active session) as the label, the user's tag plus the metadata triplet
+/// as the dim description, and `"{first_user_message} {tag} {session_id}"` as
+/// the filter key so the prompt, the label, or the id all match.
+fn build_item(
+    preview: &SessionPreview,
+    tag: Option<&str>,
+    is_current: bool,
+    now: DateTime<Utc>,
+) -> SelectItem {
+    SelectItem::new(format_primary(preview, is_current), haystack(preview, tag))
+        .with_description(format_secondary(preview, tag, now))
 }
 
-/// Searchable text for a preview: the first user message (when present)
-/// plus the session id, so a substring of either finds the row.
-fn haystack(preview: &SessionPreview) -> String {
+/// Searchable text for a preview: the first user message (when present), the
+/// user's tag, and the session id, so a substring of any of them finds the
+/// row.
+fn haystack(preview: &SessionPreview, tag: Option<&str>) -> String {
     let first = preview.first_user_message.as_deref().unwrap_or("");
-    format!("{first} {}", preview.session_id)
+    let tag = tag.unwrap_or("");
+    format!("{first} {tag} {}", preview.session_id)
 }
 
 /// The confirm/close subtitle. Enter and Esc are the widget's built-in
@@ -219,16 +236,24 @@ fn format_primary(preview: &SessionPreview, is_current: bool) -> String {
     }
 }
 
-/// The secondary (right / description) column: message count, creation
-/// date, and time since the last message, e.g.
-/// `42 msgs · created May 8 · last 5m`. The session id is omitted (it's
-/// already the row's value and would dominate the column width).
-fn format_secondary(preview: &SessionPreview, now: DateTime<Utc>) -> String {
+/// The secondary (right / description) column: the user's tag when there is
+/// one, then message count, creation date, and time since the last message,
+/// e.g. `fix-auth · 42 msgs · created May 8 · last 5m`. The session id is
+/// omitted (it's already the row's value and would dominate the column width).
+///
+/// The tag leads because it is the one part a user chose, and it is folded to
+/// one line for the same reason the sidebar folds it: it comes from a file
+/// that may have been hand-edited.
+fn format_secondary(preview: &SessionPreview, tag: Option<&str>, now: DateTime<Utc>) -> String {
     let count = preview.message_count;
     let msg_word = if count == 1 { "msg" } else { "msgs" };
     let created = format_created(now, preview.created_at);
     let last = format_age(now, preview.last_message_at);
-    format!("{count} {msg_word} · created {created} · last {last}")
+    let meta = format!("{count} {msg_word} · created {created} · last {last}");
+    match tag {
+        Some(tag) => format!("{} · {meta}", tag.lines().next().unwrap_or(tag)),
+        None => meta,
+    }
 }
 
 /// Render `then` as a coarse age relative to `now`: `now / 5m / 3h / 2d /
@@ -339,6 +364,7 @@ mod tests {
             select,
             current: current.to_string(),
             ids,
+            tags: HashMap::new(),
         };
         extend_session_scan(&scan, &previews, Utc::now(), true, true);
         (scan, request_slot)
@@ -352,15 +378,21 @@ mod tests {
             17,
             Duration::hours(3),
         );
-        let current = build_item(&p, true, Utc::now());
+        let current = build_item(&p, Some("fix-auth"), true, Utc::now());
         assert!(current.label.contains("debug the streaming protocol"));
         assert!(current.label.ends_with("(current)"), "{}", current.label);
-        // The filter key carries both the prompt and the id.
+        // The filter key carries the prompt, the label, and the id.
         assert!(current.filter_key.contains("debug the streaming protocol"));
+        assert!(current.filter_key.contains("fix-auth"));
         assert!(current.filter_key.contains("2025-05-09"));
 
-        let other = build_item(&p, false, Utc::now());
+        let other = build_item(&p, None, false, Utc::now());
         assert!(!other.label.contains("(current)"), "{}", other.label);
+        assert!(
+            !other.filter_key.contains("fix-auth"),
+            "an untagged row indexes no label: {}",
+            other.filter_key,
+        );
     }
 
     #[test]
@@ -415,7 +447,7 @@ mod tests {
         let handles = OverlayHandles::for_tests();
         handles.busy.set(busy);
 
-        open_session_selector(&handles, "current".to_string());
+        open_session_selector(&handles, "current".to_string(), HashMap::new());
         let scan = handles
             .session_scan
             .borrow_mut()
@@ -490,6 +522,7 @@ mod tests {
             select,
             current: "2025-05-08".to_string(),
             ids,
+            tags: HashMap::new(),
         };
 
         // First batch: two newer sessions, no current row. Replaces the
@@ -536,6 +569,7 @@ mod tests {
             select,
             current: "2025-05-08".to_string(),
             ids,
+            tags: HashMap::new(),
         };
 
         let batch1 = vec![
@@ -598,8 +632,13 @@ mod tests {
             first_user_message: Some("refactor".into()),
         };
         assert_eq!(
-            format_secondary(&p, now),
+            format_secondary(&p, None, now),
             "42 msgs · created 13:22 · last 2h"
+        );
+        assert_eq!(
+            format_secondary(&p, Some("fix-auth"), now),
+            "fix-auth · 42 msgs · created 13:22 · last 2h",
+            "the user's label leads the column",
         );
     }
 
