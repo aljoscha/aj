@@ -6516,6 +6516,77 @@ async fn a_label_costs_at_most_one_sidecar_read() {
     harness.host.shutdown().await;
 }
 
+/// A sidecar the host cannot read for a moment does not cost the session its
+/// label. The read says nothing about the label, so the session goes live with
+/// what the host already knew, and its release hands that on rather than
+/// clearing the cached entry.
+#[tokio::test]
+async fn an_unreadable_sidecar_does_not_cost_a_live_session_its_label() {
+    let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
+    let session = harness.create().await;
+    harness.prompt(&session, "hi").await;
+    harness
+        .host
+        .command(
+            &session,
+            Command::Tag {
+                tag: Some("fix-auth".to_string()),
+            },
+        )
+        .await
+        .expect("the tag is accepted");
+    until_released(&harness.host, &session).await;
+    assert_eq!(
+        tag_of(&harness.host, &session).await.as_deref(),
+        Some("fix-auth"),
+        "cold and labelled",
+    );
+
+    // Unreadable, as a permission blip or an EMFILE makes it. The bytes are
+    // untouched, and nothing about the file moves when it becomes readable
+    // again.
+    let sidecar = harness
+        .persistence
+        .sessions_dir()
+        .join("meta")
+        .join(format!("{session}.tag"));
+    let mode = std::fs::metadata(&sidecar)
+        .expect("the sidecar")
+        .permissions();
+    std::fs::set_permissions(
+        &sidecar,
+        std::os::unix::fs::PermissionsExt::from_mode(0o000),
+    )
+    .expect("drop the read bit");
+    if std::fs::File::open(&sidecar).is_ok() {
+        // Root ignores the permission bits, so there is nothing to prove here.
+        std::fs::set_permissions(&sidecar, mode).expect("restore the mode");
+        harness.host.shutdown().await;
+        return;
+    }
+    harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("materialize");
+    let live = summary(&harness.host, &session)
+        .await
+        .expect("the session is listed");
+    assert!(live.live, "materialized");
+    assert_eq!(
+        live.tag.as_deref(),
+        Some("fix-auth"),
+        "the label survived a read the host could not do",
+    );
+
+    // And the release hands the same label back, so the loss cannot outlive
+    // the session's live period either.
+    std::fs::set_permissions(&sidecar, mode).expect("restore the mode");
+    let released = until_released(&harness.host, &session).await;
+    assert_eq!(released.tag.as_deref(), Some("fix-auth"));
+    harness.host.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // 15. Reads
 // ---------------------------------------------------------------------------

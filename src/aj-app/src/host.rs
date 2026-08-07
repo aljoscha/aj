@@ -1315,17 +1315,22 @@ impl SessionHost {
         // here the session answers its own label out of memory, so no
         // directory refresh ever reaches the sidecar for it (spec 6.8). A
         // label we cannot read is not worth failing a materialization over.
-        let tag = self
-            .inner
-            .persistence
-            .read_tag(&session_id)
-            .unwrap_or_else(|err| {
+        let tag = match self.inner.persistence.read_tag(&session_id) {
+            Ok(tag) => tag,
+            Err(err) => {
                 tracing::warn!(
                     session = session_id,
                     "could not read the session's tag: {err}"
                 );
-                None
-            });
+                // A read that failed says nothing about the label, so the
+                // session goes live with what the host last knew rather than
+                // with "untagged". Recording the failure as untagged would
+                // outlive the blip: the row answers from memory for the whole
+                // live period, and the release then writes that answer back
+                // over the cached label.
+                self.inner.cold.label(&session_id)
+            }
+        };
         let log = core.log.lock().await;
         let status = SessionStatus {
             epoch: mint_epoch(),
