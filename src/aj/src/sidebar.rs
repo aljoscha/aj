@@ -27,7 +27,10 @@
 //!
 //! An unattached session running a turn therefore reads as a bright glyph
 //! beside a dim label. That is the intended reading: something is happening
-//! there and you do not have it open.
+//! there and you do not have it open. An attached session on a host that has
+//! gone out reads the other way round, an error glyph beside a label at
+//! attached brightness, and that is the intended reading too: you have it
+//! open and its host cannot be reached.
 //!
 //! Layout is a pure function, [`strip_lines`], producing one [`StripLine`] per
 //! drawn line, and drawing is a dumb map over its result. The height
@@ -170,15 +173,18 @@ pub(crate) struct SidebarRow {
 impl SidebarRow {
     /// This row's place in the working set.
     ///
-    /// An unreachable session counts as merely listed whatever the client
-    /// holds for it: the attachment carries nothing while the peer cannot
-    /// reach the host, so drawing it as open would overstate what the client
-    /// has. Focus still outranks that, because which session is on screen has
-    /// to stay legible.
+    /// Brightness answers one question and no other: does the client hold
+    /// this session open. Whether the peer can reach the host is the status
+    /// glyph's axis, and letting it dim the row would put two facts into one
+    /// encoding. An attached row on a host that has gone out therefore draws
+    /// at attached brightness wearing the error glyph, which is exactly the
+    /// truth of it: you have the session open and its host is not answering.
+    /// Focus outranks attachment, because which session is on screen has to
+    /// stay legible.
     fn presence(&self) -> Presence {
         if self.focused {
             Presence::Focused
-        } else if self.attached && self.status != RowStatus::Unreachable {
+        } else if self.attached {
             Presence::Background
         } else {
             Presence::Listed
@@ -1659,14 +1665,47 @@ mod tests {
                 .presence(),
             Presence::Background,
         );
-        // An attachment to a host the peer cannot reach is carrying nothing.
-        assert_eq!(
-            row("a")
+        // An attachment the client holds is an attachment whatever the peer
+        // can reach: reachability is the glyph's axis, and dimming the row
+        // for it would say the client had let the session go.
+        let out = row("a").attached().status(RowStatus::Unreachable).build();
+        assert_eq!(out.presence(), Presence::Background);
+        assert_eq!(out.status.glyph(), "!", "and the glyph is what says it");
+    }
+
+    /// A row on a host that has gone out keeps the brightness of what the
+    /// client holds and wears the error glyph, and its header still carries
+    /// the mark. Two independent axes, drawn at once.
+    #[test]
+    fn an_unreachable_row_keeps_its_working_set_brightness() {
+        let rows = vec![
+            row("s-1")
+                .host("laptop")
                 .attached()
                 .status(RowStatus::Unreachable)
-                .build()
-                .presence(),
-            Presence::Listed,
+                .build(),
+            row("s-2").host("builder-1").attached().build(),
+        ];
+        let cells = painted_cells(rows, 6);
+        let text = |line: usize| -> String {
+            cells[line]
+                .iter()
+                .map(|cell| cell.char.grapheme())
+                .collect()
+        };
+        assert_eq!(text(0), " ~ laptop ──────── ! ─ │", "the header is marked");
+        assert_eq!(text(1), " ! s-1                 │", "and so is the row");
+        assert_eq!(text(2), " ~ builder-1 ───────── │");
+        assert_eq!(text(3), "   s-2                 │");
+        let styles = styles();
+        assert_ne!(styles.text, styles.dim, "the two brightnesses differ");
+        assert_eq!(
+            cells[1][3].style, styles.text,
+            "a row the client holds open is drawn as held open",
+        );
+        assert_eq!(
+            cells[3][3].style, styles.text,
+            "the same as one whose host is answering",
         );
     }
 

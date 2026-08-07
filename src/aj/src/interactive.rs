@@ -16863,6 +16863,65 @@ mod tests {
             .collect()
     }
 
+    /// The text of a painted strip line, its whole width, so an assertion
+    /// pins where in the field each part landed.
+    fn strip_line_text(cells: &[Vec<vaxis::cell::Cell>], line: usize) -> String {
+        cells[line]
+            .iter()
+            .map(|cell| cell.char.grapheme())
+            .collect()
+    }
+
+    /// The styles the composed shell draws the strip in.
+    fn strip_styles(shell: &Rc<RefCell<Shell>>) -> TranscriptStyles {
+        TranscriptStyles::from_theme(
+            &shell.borrow().theme.read(),
+            crate::terminal::TerminalCaps::default(),
+        )
+    }
+
+    /// A row the client holds open on a host that has gone out paints at
+    /// attached brightness wearing the error glyph, and its header keeps the
+    /// mark. Brightness says what this client holds, the glyph says what the
+    /// peer can reach, and neither is allowed to answer for the other.
+    #[test]
+    fn the_composed_strip_keeps_an_unreachable_rows_brightness() {
+        let shell = test_shell_with_chat(empty_chat());
+        show_sidebar(
+            &shell,
+            vec![
+                SidebarRow {
+                    status: RowStatus::Unreachable,
+                    attached: true,
+                    ..sidebar_row("s-out", Some("laptop"), false)
+                },
+                SidebarRow {
+                    attached: true,
+                    ..sidebar_row("s-here", Some("builder-1"), false)
+                },
+            ],
+        );
+        let cells = strip_lines_painted(&shell);
+        assert_eq!(
+            strip_line_text(&cells, 0),
+            " ~ laptop ──────── ! ─ │",
+            "the unreachable host's header keeps its mark",
+        );
+        assert_eq!(strip_line_text(&cells, 1), " ! s-out               │");
+        assert_eq!(strip_line_text(&cells, 2), " ~ builder-1 ───────── │");
+        assert_eq!(strip_line_text(&cells, 3), "   s-here              │");
+        let styles = strip_styles(&shell);
+        assert_ne!(styles.text, styles.dim, "the two brightnesses differ");
+        assert_eq!(
+            cells[1][3].style, styles.text,
+            "a session the client holds open is drawn as held open",
+        );
+        assert_eq!(
+            cells[3][3].style, styles.text,
+            "the same as one whose host is answering",
+        );
+    }
+
     /// A click on a row parks exactly what the stepping chord parks. Both go
     /// through the one function that parks a session change, so a pointer
     /// gesture triggers the action rather than reaching into the switch on its
