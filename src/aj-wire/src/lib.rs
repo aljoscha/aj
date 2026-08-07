@@ -74,10 +74,19 @@ pub struct CreateSessionRequest {
     pub tag: Option<String>,
 }
 
-/// Identifies a newly created session.
+/// Identifies a newly created session, and says what the create could not
+/// apply to it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCreated {
     pub id: String,
+    /// What the create asked for after minting the session and could not do,
+    /// in the host's own words, absent when it applied everything.
+    ///
+    /// The session exists whenever this is present, which is why a create
+    /// that could not label its session still answers 200 with an id: the
+    /// client shows this and retags rather than creating a second session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete: Option<String>,
 }
 
 /// Submits a prompt to an optional viewed agent.

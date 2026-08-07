@@ -156,6 +156,66 @@ pub enum HostError {
     Internal(#[source] BoxError),
 }
 
+/// Why a create did not deliver everything that was asked of it.
+///
+/// Creating the session is the operation that either happens or does not.
+/// Applying a label and submitting a first prompt happen *after* the session
+/// exists, so their failure cannot un-create it.
+///
+/// Typed because callers branch on the distinction, and on nothing finer: a
+/// [`Self::Refused`] create did not happen, a [`Self::Incomplete`] one did.
+/// What went wrong underneath is opaque, because no caller does anything
+/// with it but show it.
+#[derive(Debug, thiserror::Error)]
+pub enum CreateError {
+    /// Nothing was minted. The request was refused before a log existed, so
+    /// it left no discoverable session behind.
+    #[error(transparent)]
+    Refused(#[from] HostError),
+    /// The session was minted. See [`PartialCreate`].
+    #[error(transparent)]
+    Incomplete(#[from] PartialCreate),
+}
+
+/// A create that minted its session and could not apply everything asked of
+/// it afterwards.
+///
+/// The session named exists, is live and is in the host's directory. The id
+/// travels as a field rather than only in the message, because that is what
+/// a caller acts on: it attaches the session and retries the step that did
+/// not land, rather than creating a second session.
+#[derive(Debug, thiserror::Error)]
+#[error("session {session} created, {step} not applied: {source}")]
+pub struct PartialCreate {
+    /// The session the create minted, which the caller acts on.
+    pub session: String,
+    /// What did not land, worded for the message ("tag", "first prompt").
+    step: &'static str,
+    #[source]
+    source: BoxError,
+}
+
+impl PartialCreate {
+    /// The label did not land, so the store still says what it said before.
+    fn tag(session: String, source: HostError) -> Self {
+        Self {
+            session,
+            step: "tag",
+            source: Box::new(source),
+        }
+    }
+
+    /// The first prompt was not taken, so the session is idle rather than
+    /// working.
+    fn prompt(session: String, source: HostError) -> Self {
+        Self {
+            session,
+            step: "first prompt",
+            source: Box::new(source),
+        }
+    }
+}
+
 /// The parenthetical a [`HostError::Locked`] message carries, empty when the
 /// lock file named nobody.
 fn held_by(holder: &Option<LockHolder>) -> String {
@@ -491,57 +551,70 @@ impl SessionHost {
 
     /// Create a session in the host's working directory and hold it live.
     pub async fn create(&self) -> Result<String, HostError> {
-        self.create_with(None, None, None).await
+        self.alive()?;
+        self.mint(None).await
     }
 
     /// Creates a session with creator-selected settings, a first prompt and a
     /// tag.
     ///
-    /// Every setting, the prompt and the tag are validated before a log is
-    /// created, so a request this host refuses leaves no discoverable empty
-    /// session behind. The tag is written once the session is live, through
-    /// the same command a later relabelling takes, so it lands under the
-    /// session's own lock.
+    /// Creation is the operation that either happens or does not. Every
+    /// setting, the prompt and the tag are validated before a log is created,
+    /// so a request this host refuses ([`CreateError::Refused`]) leaves no
+    /// discoverable empty session behind.
     ///
-    /// That ordering is also the limit of the guarantee. A tag or prompt
-    /// command that fails on its own terms, a store that will not take the
-    /// sidecar write, say, returns its error from here with the session
-    /// already minted and in the directory. Rolling that back would mean
-    /// deleting a log this host has just created, which is a decision about
-    /// what a create means rather than an accident of this ordering.
+    /// The tag and the prompt are applied once the session is live, through
+    /// the same commands a later relabelling or prompt takes, so they land
+    /// under the session's own lock. They are best-effort: a step that fails
+    /// on its own terms, a store that will not take the sidecar write, say,
+    /// is not a failed create. The answer is a [`PartialCreate`] naming the
+    /// session, which is live and in the directory, and what did not land
+    /// ("session <id> created, tag not applied: <reason>"), so the caller
+    /// retags rather than creating a second session. A minted session is
+    /// durable user state and is never deleted to make an error tidier.
     pub async fn create_with(
         &self,
         settings: Option<SessionSettings>,
         prompt: Option<Vec<UserContent>>,
         tag: Option<String>,
-    ) -> Result<String, HostError> {
+    ) -> Result<String, CreateError> {
         self.alive()?;
         if let Some(content) = prompt.as_deref() {
             validate_prompt(content)?;
         }
         let tag = normalize_tag(tag.as_deref().unwrap_or_default())
             .map_err(|err| HostError::Invalid(err.to_string()))?;
-        let run_config = self.resolve_creator_settings(settings.as_ref())?;
+        let session = self.mint(settings.as_ref()).await?;
+        if tag.is_some() {
+            if let Err(err) = self.command(&session, Command::Tag { tag }).await {
+                return Err(PartialCreate::tag(session, err).into());
+            }
+        }
+        if let Some(content) = prompt {
+            let prompt = Command::Prompt {
+                agent: AgentId::Main,
+                content,
+            };
+            if let Err(err) = self.command(&session, prompt).await {
+                return Err(PartialCreate::prompt(session, err).into());
+            }
+        }
+        Ok(session)
+    }
+
+    /// Mint a session with `settings` resolved against this host's catalog
+    /// and hold it live, answering its id.
+    ///
+    /// The half of a create that is all-or-nothing. Callers gate on
+    /// [`Self::alive`] first, so that a shut-down host refuses before it
+    /// validates anything.
+    async fn mint(&self, settings: Option<&SessionSettings>) -> Result<String, HostError> {
+        let run_config = self.resolve_creator_settings(settings)?;
         let mut sessions = self.inner.sessions.lock().await;
         let live = self
             .materialize(&mut sessions, None, Some(run_config))
             .await?;
-        let session = live.id().to_string();
-        drop(sessions);
-        if tag.is_some() {
-            self.command(&session, Command::Tag { tag }).await?;
-        }
-        if let Some(content) = prompt {
-            self.command(
-                &session,
-                Command::Prompt {
-                    agent: AgentId::Main,
-                    content,
-                },
-            )
-            .await?;
-        }
-        Ok(session)
+        Ok(live.id().to_string())
     }
 
     /// Resolves a wire model-selection triple against this host's catalog.

@@ -48,7 +48,7 @@ use reqwest::StatusCode;
 use tempfile::TempDir;
 
 use super::*;
-use crate::control::{Control, ControlFrame};
+use crate::control::{Control, ControlError, ControlFrame};
 use crate::remote::identity::{
     AJ_CONTROL_CAPABILITY, IdentityError, PeerIdentity, WhoisResolver, peer_identity_from_whois,
 };
@@ -624,6 +624,7 @@ impl Fixture {
             .create_session(CreateSessionRequest::default())
             .await
             .expect("create a session")
+            .id
     }
 
     async fn prompt(&self, session: &str, text: &str) {
@@ -1050,7 +1051,8 @@ async fn creation_applies_settings_and_runs_a_first_prompt() {
             tag: None,
         })
         .await
-        .expect("create with settings and a prompt");
+        .expect("create with settings and a prompt")
+        .id;
 
     let mut remote = fixture.remote(&session).await;
     remote.settle().await;
@@ -1382,7 +1384,8 @@ async fn a_session_is_created_with_its_label() {
             ..CreateSessionRequest::default()
         })
         .await
-        .expect("create a labelled session");
+        .expect("create a labelled session")
+        .id;
     assert_eq!(
         remote_tag(&fixture, &session).await.as_deref(),
         Some("fix-auth"),
@@ -1409,6 +1412,95 @@ async fn a_session_is_created_with_its_label() {
         1,
         "the refused creation left no session behind",
     );
+    fixture.shutdown().await;
+}
+
+/// A label the store will not write does not fail the create it was asked
+/// for: the session exists, so the route answers 200 with its id and says
+/// what did not land, and the client retags rather than creating a second
+/// session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_label_the_store_cannot_write_still_answers_a_created_session() {
+    let fixture = Fixture::new(Vec::new()).await;
+    // The sidecar directory's own path, taken by a file, so no tag write
+    // can land.
+    let meta = fixture._dir.path().join("sessions").join("meta");
+    std::fs::write(&meta, b"not a directory").expect("block the sidecar directory");
+
+    let created = fixture
+        .client
+        .create_session(CreateSessionRequest {
+            tag: Some("fix-auth".to_string()),
+            ..CreateSessionRequest::default()
+        })
+        .await
+        .expect("a create that minted a session is not a failed create");
+    let incomplete = created
+        .incomplete
+        .as_deref()
+        .expect("the response says the label did not land");
+    assert!(
+        incomplete.contains("created, tag not applied"),
+        "the host's own words for what did not stick: {incomplete}",
+    );
+    assert!(
+        fixture
+            .client
+            .sessions()
+            .await
+            .expect("the sessions read")
+            .sessions
+            .iter()
+            .any(|entry| entry.id == created.id && entry.live),
+        "the session the create minted is live and in the directory",
+    );
+    assert_eq!(
+        remote_tag(&fixture, &created.id).await,
+        None,
+        "a label the store would not take is not published as if it had",
+    );
+    fixture.shutdown().await;
+}
+
+/// Both control arms report the same thing about a create whose label did
+/// not stick: a session that exists, named by id, not a create that failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn both_control_arms_report_a_created_session_whose_label_did_not_stick() {
+    let fixture = Fixture::new(Vec::new()).await;
+    let meta = fixture._dir.path().join("sessions").join("meta");
+    std::fs::write(&meta, b"not a directory").expect("block the sidecar directory");
+
+    for control in [
+        Control::local(fixture.host.clone()),
+        Control::remote(fixture.client()),
+    ] {
+        let err = control
+            .create(None, None, Some("fix-auth".to_string()))
+            .await
+            .expect_err("the sidecar write cannot land");
+        assert!(
+            !err.conflict() && !err.invalid() && !err.unknown_entry(),
+            "a create that happened is none of the peer's refusals: {err}",
+        );
+        let ControlError::PartialCreate { session, message } = err else {
+            panic!("a created session is not a refusal: {err}");
+        };
+        assert!(
+            message.contains(&session) && message.contains("created, tag not applied"),
+            "the message names the session that exists: {message}",
+        );
+        assert!(
+            fixture
+                .client
+                .sessions()
+                .await
+                .expect("the sessions read")
+                .sessions
+                .iter()
+                .any(|entry| entry.id == session && entry.live),
+            "the session {session} the create minted is live and in the directory",
+        );
+    }
     fixture.shutdown().await;
 }
 

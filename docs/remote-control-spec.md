@@ -589,7 +589,7 @@ viewed agent to that parameter:
 
 | Command | Body | Semantics |
 |---|---|---|
-| `POST /v1/sessions` | optional settings, optional first prompt | Create a session in the host's working directory. Settings resolution per section 8. |
+| `POST /v1/sessions` | optional settings, optional first prompt, optional tag | Create a session in the host's working directory. Settings resolution per section 8. Creating the session is what either happens or does not: the settings, the prompt and the tag are validated before a log exists, so a refusal leaves nothing behind. The tag and the first prompt are applied afterwards, under the session's own lock, and are best-effort: one that does not land still answers 200 with the id, plus an `incomplete` field carrying the host's words for what did not stick, so the client retags rather than creating a second session. A minted session is never deleted to make an error tidier. |
 | `.../{id}/prompt` | text or content blocks | Exactly `handle_submit`: run a turn if idle, queue follow-up if busy. |
 | `.../{id}/steer` | text, optional agent | Queue steering (or promote pending follow-up when text is empty), as today. |
 | `.../{id}/cancel` | optional agent | Cancel the running turn, with the existing foreground-sub-agent-cancels-main cascade. |

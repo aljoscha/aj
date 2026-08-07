@@ -20,8 +20,8 @@ use std::time::Duration;
 use aj_agent::events::AgentId;
 use aj_agent::tool::TaskId;
 use aj_app::host::{
-    AttachRequest, Attachment, Command, CommandOutcome, HeadTarget, HostError, QueueOp,
-    SessionHost, SettingsAxis, SettingsChange,
+    AttachRequest, Attachment, Command, CommandOutcome, CreateError, HeadTarget, HostError,
+    QueueOp, SessionHost, SettingsAxis, SettingsChange,
 };
 use aj_app::session_setup::thinking_display_from_name;
 use aj_app::settings::PersistAction;
@@ -233,6 +233,10 @@ async fn sessions(State(state): State<Arc<ServerState>>) -> Result<Response, Api
 }
 
 /// Create a session, answering 200 with its id (spec 6.6).
+///
+/// A create that minted a session and could not apply everything asked of it
+/// is a create: it answers 200 with the id and says what did not land, so
+/// the client retags rather than creating a second session.
 async fn create_session(
     State(state): State<Arc<ServerState>>,
     Body(request): Body<CreateSessionRequest>,
@@ -242,11 +246,24 @@ async fn create_session(
         prompt,
         tag,
     } = request;
-    let id = state
+    let created = state
         .host
         .create_with(settings, prompt.map(|prompt| prompt.into_content()), tag)
-        .await?;
-    Ok(Json(SessionCreated { id }).into_response())
+        .await;
+    let created = match created {
+        Ok(id) => SessionCreated {
+            id,
+            incomplete: None,
+        },
+        Err(CreateError::Refused(err)) => return Err(err.into()),
+        // The session exists, so this is not a failed create: 200 with its
+        // id, and the host's own words for what did not land on it.
+        Err(CreateError::Incomplete(partial)) => SessionCreated {
+            id: partial.session.clone(),
+            incomplete: Some(partial.to_string()),
+        },
+    };
+    Ok(Json(created).into_response())
 }
 
 async fn tasks(

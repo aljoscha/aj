@@ -18,8 +18,8 @@
 use aj_agent::events::AgentId;
 use aj_agent::tool::TaskId;
 use aj_app::host::{
-    AttachRequest, Attachment, Command, CommandOutcome, HeadTarget, HostError, QueueOp,
-    SessionHost, SettingsAxis, SettingsChange,
+    AttachRequest, Attachment, Command, CommandOutcome, CreateError, HeadTarget, HostError,
+    QueueOp, SessionHost, SettingsAxis, SettingsChange,
 };
 use aj_app::session_setup::thinking_display_name;
 use aj_models::types::UserContent;
@@ -49,6 +49,29 @@ pub(crate) enum ControlError {
     Host(#[from] HostError),
     #[error(transparent)]
     Remote(#[from] RemoteError),
+    /// The peer created the session and could not apply everything the
+    /// create asked for afterwards (see [`aj_app::host::PartialCreate`]).
+    ///
+    /// Apart from the refusals because the session exists: a caller opens it
+    /// and says what did not stick rather than reporting a create that
+    /// failed. Both arms report it the same way, the local one off the
+    /// host's error and the remote one off the field the create response
+    /// carries, so the wording is the host's either way.
+    #[error("{message}")]
+    PartialCreate { session: String, message: String },
+}
+
+impl From<CreateError> for ControlError {
+    fn from(err: CreateError) -> Self {
+        match err {
+            // A refused create is an ordinary host refusal and reads as one.
+            CreateError::Refused(err) => Self::Host(err),
+            CreateError::Incomplete(partial) => Self::PartialCreate {
+                session: partial.session.clone(),
+                message: partial.to_string(),
+            },
+        }
+    }
 }
 
 impl ControlError {
@@ -63,7 +86,9 @@ impl ControlError {
     pub(crate) fn conflict(&self) -> bool {
         match self {
             Self::Host(HostError::Conflict { .. }) => true,
-            Self::Host(_) => false,
+            // A create that minted its session is not a refusal at all, so
+            // none of these predicates hold for it.
+            Self::Host(_) | Self::PartialCreate { .. } => false,
             Self::Remote(err) => err.status() == Some(StatusCode::CONFLICT),
         }
     }
@@ -73,7 +98,7 @@ impl ControlError {
     pub(crate) fn unknown_entry(&self) -> bool {
         match self {
             Self::Host(HostError::UnknownEntry(_)) => true,
-            Self::Host(_) => false,
+            Self::Host(_) | Self::PartialCreate { .. } => false,
             Self::Remote(err) => err.code() == Some("unknown_entry"),
         }
     }
@@ -86,7 +111,7 @@ impl ControlError {
     pub(crate) fn invalid(&self) -> bool {
         match self {
             Self::Host(HostError::Invalid(_)) => true,
-            Self::Host(_) => false,
+            Self::Host(_) | Self::PartialCreate { .. } => false,
             Self::Remote(err) => err.status() == Some(StatusCode::BAD_REQUEST),
         }
     }
@@ -209,6 +234,11 @@ impl Control {
     ///
     /// `tag` is expected to have been normalized already, which is what lets
     /// the local and the remote arm hand it on unchanged.
+    ///
+    /// A create whose session exists but whose tag or first prompt did not
+    /// land answers [`ControlError::PartialCreate`], which carries the id: it
+    /// is not a create that failed, and a caller that treats it as one
+    /// strands the session it just made.
     pub(crate) async fn create(
         &self,
         settings: Option<SessionSettings>,
@@ -217,14 +247,23 @@ impl Control {
     ) -> Result<String, ControlError> {
         match self {
             Self::Local(local) => Ok(local.host.create_with(settings, prompt, tag).await?),
-            Self::Remote(remote) => Ok(remote
-                .client
-                .create_session(CreateSessionRequest {
-                    settings,
-                    prompt: prompt.map(|content| PromptInput::Content { content }),
-                    tag,
-                })
-                .await?),
+            Self::Remote(remote) => {
+                let created = remote
+                    .client
+                    .create_session(CreateSessionRequest {
+                        settings,
+                        prompt: prompt.map(|content| PromptInput::Content { content }),
+                        tag,
+                    })
+                    .await?;
+                match created.incomplete {
+                    None => Ok(created.id),
+                    Some(message) => Err(ControlError::PartialCreate {
+                        session: created.id,
+                        message,
+                    }),
+                }
+            }
         }
     }
 

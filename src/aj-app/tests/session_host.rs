@@ -14,8 +14,8 @@ use aj_agent::tool::{TaskKind, TaskOutputSource, TaskRead, TaskStatus};
 use aj_app::chat::ChatState;
 use aj_app::client::SessionClient;
 use aj_app::host::{
-    AttachRequest, Attachment, Command, CommandOutcome, HeadTarget, HostError, HostSetup, QueueOp,
-    SessionHost, SettingsAxis, SettingsChange,
+    AttachRequest, Attachment, Command, CommandOutcome, CreateError, HeadTarget, HostError,
+    HostSetup, QueueOp, SessionHost, SettingsAxis, SettingsChange,
 };
 use aj_app::session_setup::RunConfigSnapshot;
 use aj_app::settings::{ConfigLayers, PersistAction};
@@ -833,6 +833,11 @@ async fn an_unstated_axis_defaults_against_the_model_the_session_runs() {
     harness.host.shutdown().await;
 }
 
+/// Creation is the operation that either happens or does not: everything a
+/// create can refuse is checked before a log exists, so a refusal leaves
+/// nothing discoverable behind. That is the whole of the promise. A step
+/// that fails once the session has been minted is not a refusal, which the
+/// next test pins.
 #[tokio::test]
 async fn refused_creation_leaves_no_discoverable_session() {
     let harness = Harness::new(Vec::new());
@@ -863,11 +868,15 @@ async fn refused_creation_leaves_no_discoverable_session() {
         (None, None, Some("two\nlines".to_string())),
         (None, None, Some("l".repeat(aj_session::MAX_TAG_BYTES + 1))),
     ] {
-        harness
+        let refused = harness
             .host
             .create_with(settings, prompt, tag)
             .await
             .expect_err("creation is refused");
+        assert!(
+            matches!(refused, CreateError::Refused(_)),
+            "nothing was minted, so there is no session to name: {refused}",
+        );
         assert!(
             harness
                 .host
@@ -879,6 +888,75 @@ async fn refused_creation_leaves_no_discoverable_session() {
             "validation happens before the log is created",
         );
     }
+    harness.host.shutdown().await;
+}
+
+/// A label the store will not write is not a refused creation. The session
+/// exists, is live and is in the directory, and the answer names it so the
+/// caller retags rather than creating a second session.
+#[tokio::test]
+async fn a_tag_the_store_will_not_take_leaves_the_session_created() {
+    let harness = Harness::new(Vec::new());
+    // The sidecar directory's own path, taken by a file: the store cannot
+    // create `meta/`, so no tag write can land.
+    let meta = harness.persistence.sessions_dir().join("meta");
+    std::fs::write(&meta, b"not a directory").expect("block the sidecar directory");
+
+    let err = harness
+        .host
+        .create_with(None, None, Some("fix-auth".to_string()))
+        .await
+        .expect_err("the sidecar write cannot land");
+    let CreateError::Incomplete(partial) = err else {
+        panic!("a create that minted its session is not a refusal: {err}");
+    };
+    assert!(
+        format!("{partial}").contains("created, tag not applied"),
+        "the answer reads as a create whose label did not stick: {partial}",
+    );
+
+    let listed = harness.host.sessions().await.expect("sessions");
+    let summary = listed
+        .sessions
+        .iter()
+        .find(|entry| entry.id == partial.session)
+        .expect("the session the create minted is in the directory");
+    assert!(summary.live, "the host holds the session it minted");
+    assert_eq!(
+        summary.tag, None,
+        "a label the store would not take is not published as if it had",
+    );
+    // Whether a sidecar landed is a question the store can only answer once
+    // the directory it reads is a directory again.
+    std::fs::remove_file(&meta).expect("unblock the sidecar directory");
+    assert_eq!(
+        harness
+            .persistence
+            .read_tag(&partial.session)
+            .expect("read the sidecar"),
+        None,
+        "the write that failed wrote nothing",
+    );
+
+    // The recovery the wording names: retag the session that exists.
+    harness
+        .host
+        .command(
+            &partial.session,
+            Command::Tag {
+                tag: Some("fix-auth".to_string()),
+            },
+        )
+        .await
+        .expect("the session takes the label it could not take at creation");
+    assert_eq!(
+        harness
+            .persistence
+            .read_tag(&partial.session)
+            .expect("read the sidecar")
+            .as_deref(),
+        Some("fix-auth"),
+    );
     harness.host.shutdown().await;
 }
 

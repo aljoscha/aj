@@ -182,10 +182,30 @@ fn settings_use_the_cli_selection_triple_and_create_round_trips() {
     );
     assert_eq!(
         serde_json::to_value(SessionCreated {
-            id: "session-1".into()
+            id: "session-1".into(),
+            incomplete: None,
         })
         .unwrap(),
-        json!({"id":"session-1"})
+        json!({"id":"session-1"}),
+        "a create that applied everything says only the id",
+    );
+    // The session exists either way, so the id is the answer and what did
+    // not land rides along beside it.
+    let partial = SessionCreated {
+        id: "session-1".into(),
+        incomplete: Some("session session-1 created, tag not applied: nope".into()),
+    };
+    let encoded = serde_json::to_value(&partial).unwrap();
+    assert_eq!(
+        encoded,
+        json!({
+            "id":"session-1",
+            "incomplete":"session session-1 created, tag not applied: nope"
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<SessionCreated>(encoded).unwrap(),
+        partial,
     );
 }
 

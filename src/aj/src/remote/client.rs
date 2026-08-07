@@ -230,14 +230,14 @@ impl RemoteClient {
         self.get("/v1/sessions").await
     }
 
-    /// Create a session, answering its id.
+    /// Create a session, answering its id and whatever the host could not
+    /// apply to it (see [`SessionCreated::incomplete`]).
     pub(crate) async fn create_session(
         &self,
         request: CreateSessionRequest,
-    ) -> Result<String, RemoteError> {
+    ) -> Result<SessionCreated, RemoteError> {
         let response = self.post("/v1/sessions", encode(&request)?).await?;
-        let created: SessionCreated = decode(response).await?;
-        Ok(created.id)
+        decode(response).await
     }
 
     pub(crate) async fn tasks(&self, session: &str) -> Result<TaskTable, RemoteError> {

@@ -18,7 +18,7 @@ use aj_models::{speed_name, thinking_config_name, verbosity_name};
 use aj_wire::{Hello, ModelSelection, SessionSettings};
 use anyhow::{Context, Result, anyhow};
 
-use crate::control::Control;
+use crate::control::{Control, ControlError};
 use crate::remote::RemoteClient;
 
 /// Which session `aj connect` opens with.
@@ -110,15 +110,25 @@ async fn resolve_session(
     }
 }
 
+/// Create the session connect mode opens with, per spec 9.1.
+///
+/// A create whose session exists but whose label did not land is not a
+/// failed create: connect attaches the session it just made and says what
+/// did not stick. Failing here instead would leave a session on the host
+/// that nobody asked for and nobody is looking at.
 async fn create(
     control: &Control,
     settings: Option<SessionSettings>,
     tag: Option<String>,
 ) -> Result<String> {
-    control
-        .create(settings, None, tag)
-        .await
-        .context("could not create a session on the host")
+    match control.create(settings, None, tag).await {
+        Ok(session) => Ok(session),
+        Err(ControlError::PartialCreate { session, message }) => {
+            eprintln!("aj: warning: {message}");
+            Ok(session)
+        }
+        Err(err) => Err(err).context("could not create a session on the host"),
+    }
 }
 
 /// Which settings a human actually stated, as opposed to what a config
