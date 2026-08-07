@@ -95,6 +95,12 @@ commit secrets.
   fixed. Assertions like `assert_ne!` on values that are almost never
   equal, or events dispatched to a widget that does not handle them,
   are the usual tells.
+- The strongest mutation is deleting the feature's wiring: leave the
+  widget out of the composed layout, drop the sync call from the
+  drive loop, and check the suite goes red. Tests that drive a
+  component directly through a helper prove the component, not the
+  feature. At least one test per feature must exercise the real
+  path end to end (real input bytes, the composed tree).
 
 ## Commit Messages
 

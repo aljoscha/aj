@@ -1109,8 +1109,10 @@ the footer/status line.
 
 ### 9.2 The sidebar
 
-A persistent sidebar (toggleable, hidden by default in plain local
-single-session use) lists sessions:
+A persistent sidebar lists sessions. It shows itself by default
+whenever the directory offers more than one session and stays hidden
+otherwise (a lone local session has nothing to choose between), and
+an explicit toggle wins over the default for the rest of the process.
 
 - Against a host or gateway: all sessions from the `list` frames, with
   glyphs for working / idle / unseen-output / unreachable, plus modest
@@ -1138,8 +1140,20 @@ single-session use) lists sessions:
   Detaching may keep or drop the client-side `ChatState`, dropping
   is always safe because re-attach reconciliation absorbs a rebuild
   (section 6.5).
-- Local single-session mode keeps working exactly as today, the
-  sidebar simply has one entry. Creating a new session from the
+- The strip is an orientation instrument, not a store browser, the
+  session selector is the browser. Rows order by last activity,
+  newest first, client-side (ties broken by id), the view windows
+  around the focused row so focus is always visible, and the stepping
+  chords walk the displayed order. Focusing a cold session
+  materializes it, that is what focusing means.
+- Switching and creating are never refused because a turn is running:
+  a background session keeps folding and its turn completes, that is
+  the point of the swap model. The busy refusal that remains is the
+  host's own head-switch 409 (section 6.6), which is about mutating a
+  busy session's history, not about looking elsewhere.
+- Local use keeps working exactly as today: with one session the
+  strip stays hidden and nothing changes. Creating a new session from
+  the
   sidebar goes through the create command (choosing a host when
   connected to a gateway).
 
