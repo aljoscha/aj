@@ -61,7 +61,7 @@ pub use log::{
     Conversation, ConversationEntry, ConversationEntryKind, ConversationError, ConversationLog,
     EntryId, EntryRef, LogSnapshot, SessionSettings, ThreadFilter, ThreadKind,
 };
-pub use persistence::{ConversationPersistence, SessionMetadata, SessionPreview};
+pub use persistence::{ConversationPersistence, SessionMetadata, SessionPreview, TagMetadata};
 pub use prompt_history::{
     PromptEntry, all_workspaces_history, all_workspaces_history_streaming, scan_file_user_prompts,
     workspace_history, workspace_history_streaming,
@@ -71,5 +71,6 @@ pub use replay::{
     Backfill, TaggedEvent, project_suffix, project_thread, replay, replay_deferring_subs,
 };
 pub use stats::SessionStats;
+pub use tag::{MAX_TAG_BYTES, TagError, normalize_tag};
 pub use tool_details::resolve_tool_details;
 pub use tree::{SessionTree, TreeSegment};

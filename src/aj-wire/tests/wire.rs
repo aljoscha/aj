@@ -6,7 +6,7 @@ use aj_wire::{
     ErrorResponse, Frame, HeadRequest, Hello, ModelSelection, PromptInput, PromptRequest,
     QueueCounts, QueueOperation, QueueOutcome, QueueRequest, QueueState, SessionCreated,
     SessionList, SessionSettings, SessionSummary, SessionTree, SettingsRequest, SteerRequest,
-    TaskDetails, TaskTable, VmList,
+    TagRequest, TaskDetails, TaskTable, VmList,
 };
 use serde_json::{Value, json};
 
@@ -170,6 +170,7 @@ fn settings_use_the_cli_selection_triple_and_create_round_trips() {
         prompt: Some(PromptInput::Text {
             text: "start here".into(),
         }),
+        tag: None,
     };
     let encoded = serde_json::to_value(&create).unwrap();
     assert_eq!(encoded["prompt"], json!({"text":"start here"}));
@@ -763,6 +764,45 @@ fn a_rows_tag_and_host_are_absent_rather_than_empty() {
     assert_eq!(
         serde_json::from_value::<SessionSummary>(encoded).expect("it decodes again"),
         labelled,
+    );
+}
+
+/// The tag command's body: one string, where blank means clear (spec 6.6), so
+/// a client needs no second route to remove a label. A blank body is the same
+/// request, which is what the server's `{}` default reads it as.
+#[test]
+fn a_tag_request_carries_one_string_and_defaults_to_clearing() {
+    assert_eq!(
+        serde_json::to_value(TagRequest {
+            tag: "fix-auth".to_string(),
+        })
+        .unwrap(),
+        json!({"tag": "fix-auth"}),
+    );
+    assert_eq!(
+        serde_json::from_value::<TagRequest>(json!({})).unwrap(),
+        TagRequest::default(),
+    );
+    assert_eq!(TagRequest::default().tag, "");
+
+    // A creator can name one up front, and leaving it out is untagged.
+    let create = CreateSessionRequest {
+        tag: Some("fix-auth".to_string()),
+        ..CreateSessionRequest::default()
+    };
+    let encoded = serde_json::to_value(&create).unwrap();
+    assert_eq!(encoded, json!({"tag": "fix-auth"}));
+    assert_eq!(
+        serde_json::from_value::<CreateSessionRequest>(encoded)
+            .unwrap()
+            .tag,
+        create.tag,
+    );
+    assert_eq!(
+        serde_json::from_value::<CreateSessionRequest>(json!({}))
+            .unwrap()
+            .tag,
+        None,
     );
 }
 

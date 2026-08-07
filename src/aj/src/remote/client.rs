@@ -20,7 +20,7 @@ use aj_wire::{
     CancelRequest, CompactRequest, CreateSessionRequest, DecodedFrame, ErrorResponse, Frame,
     HeadRequest, Hello, PROTOCOL_VERSION, PromptRequest, QueueOperation, QueueOutcome,
     QueueRequest, QueueState, SessionCreated, SessionList, SessionTree, SettingsRequest,
-    SteerRequest, TaskDetails, TaskTable,
+    SteerRequest, TagRequest, TaskDetails, TaskTable,
 };
 use eventsource_stream::{EventStreamError, Eventsource};
 use futures::{Stream, StreamExt};
@@ -112,6 +112,7 @@ pub(crate) enum RemoteCommand {
     Queue(QueueRequest),
     Compact(CompactRequest),
     Settings(SettingsRequest),
+    Tag(TagRequest),
     Head(HeadRequest),
     KillTask(TaskId),
 }
@@ -126,6 +127,7 @@ impl RemoteCommand {
             Self::Queue(_) => "queue".to_string(),
             Self::Compact(_) => "compact".to_string(),
             Self::Settings(_) => "settings".to_string(),
+            Self::Tag(_) => "tag".to_string(),
             Self::Head(_) => "head".to_string(),
             Self::KillTask(task) => format!("tasks/{task}/kill"),
         }
@@ -139,6 +141,7 @@ impl RemoteCommand {
             Self::Queue(request) => encode(request),
             Self::Compact(request) => encode(request),
             Self::Settings(request) => encode(request),
+            Self::Tag(request) => encode(request),
             Self::Head(request) => encode(request),
             Self::KillTask(_) => Ok(b"{}".to_vec()),
         }

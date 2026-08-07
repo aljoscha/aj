@@ -478,6 +478,7 @@ impl Driver {
             Command::Queue(op) => Ok(self.queue_op(op)),
             Command::Compact { instructions } => self.compact(instructions),
             Command::Settings(change) => self.settings(change).await,
+            Command::Tag { tag } => self.tag(tag),
             Command::Head { target } => self.head_switch(target).await,
             Command::KillTask { task } => self.kill_task(task),
         }
@@ -588,6 +589,28 @@ impl Driver {
                 instructions,
             },
         )
+    }
+
+    /// Write the session's tag sidecar and put the new label on its row.
+    ///
+    /// The write happens here rather than at the host's surface because this
+    /// task holds the session's advisory lock, which is what spec 6.6 means by
+    /// materializing like any other command: two writers of one store cannot
+    /// interleave on a session's label.
+    ///
+    /// A tag is display metadata and nothing else, so it appends no log entry
+    /// and publishes no `state` frame. The session list is where it surfaces,
+    /// which is what the dirty mark is for.
+    fn tag(&self, tag: Option<String>) -> Result<CommandOutcome, HostError> {
+        self.shared
+            .persistence
+            .write_tag(self.session.id(), tag.as_deref())
+            .map_err(internal)?;
+        // After the write, so a sidecar that would not be written leaves the
+        // row saying what the store still says.
+        self.session.status().tag = tag;
+        self.shared.fanout.mark_list_dirty();
+        Ok(CommandOutcome::Accepted)
     }
 
     fn kill_task(&self, task: TaskId) -> Result<CommandOutcome, HostError> {
@@ -1117,10 +1140,14 @@ impl Driver {
         // The status lock nests under the log lock here. That is the order the
         // driver always takes them in, and nothing takes the log lock while
         // holding the status.
-        let last_activity = self.session.status().last_activity;
+        let (last_activity, tag) = {
+            let status = self.session.status();
+            (status.last_activity, status.tag.clone())
+        };
         Some(ReleasedRow {
             file,
             last_activity,
+            tag,
         })
     }
 }

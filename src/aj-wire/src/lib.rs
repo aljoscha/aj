@@ -68,6 +68,10 @@ pub struct CreateSessionRequest {
     pub settings: Option<SessionSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<PromptInput>,
+    /// The tag the session is created with, absent for an untagged one. Same
+    /// rules as [`TagRequest`], so a blank one leaves the session untagged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
 }
 
 /// Identifies a newly created session.
@@ -173,6 +177,16 @@ impl HeadRequest {
             before: Some(entry.into()),
         }
     }
+}
+
+/// Sets or clears a session's tag (spec 6.6).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TagRequest {
+    /// The label to set. Empty or whitespace-only clears the session's tag,
+    /// so setting and clearing are one route, and an absent field reads the
+    /// same as an empty one.
+    #[serde(default)]
+    pub tag: String,
 }
 
 /// Server identity and supported protocol features.

@@ -763,6 +763,7 @@ async fn explicit_creation_applies_settings_before_its_first_prompt() {
                 verbosity: Some("high".into()),
             }),
             Some(vec![UserContent::text("begin")]),
+            None,
         )
         .await
         .expect("create with settings");
@@ -803,6 +804,7 @@ async fn an_unstated_axis_defaults_against_the_model_the_session_runs() {
                 ..SessionSettings::default()
             }),
             None,
+            None,
         )
         .await
         .expect("an unstated axis is the host's to default");
@@ -820,6 +822,7 @@ async fn an_unstated_axis_defaults_against_the_model_the_session_runs() {
                 ..SessionSettings::default()
             }),
             None,
+            None,
         )
         .await
         .expect_err("a stated level the model cannot serve is refused");
@@ -833,12 +836,13 @@ async fn an_unstated_axis_defaults_against_the_model_the_session_runs() {
 #[tokio::test]
 async fn refused_creation_leaves_no_discoverable_session() {
     let harness = Harness::new(Vec::new());
-    for (settings, prompt) in [
+    for (settings, prompt, tag) in [
         (
             Some(SessionSettings {
                 speed: Some("warp".into()),
                 ..SessionSettings::default()
             }),
+            None,
             None,
         ),
         (
@@ -851,12 +855,17 @@ async fn refused_creation_leaves_no_discoverable_session() {
                 ..SessionSettings::default()
             }),
             None,
+            None,
         ),
-        (None, Some(Vec::new())),
+        (None, Some(Vec::new()), None),
+        // A label the store would not keep, which is refused on the same
+        // terms as a setting it cannot serve (spec 6.6).
+        (None, None, Some("two\nlines".to_string())),
+        (None, None, Some("l".repeat(aj_session::MAX_TAG_BYTES + 1))),
     ] {
         harness
             .host
-            .create_with(settings, prompt)
+            .create_with(settings, prompt, tag)
             .await
             .expect_err("creation is refused");
         assert!(
@@ -892,6 +901,7 @@ async fn creation_resolves_real_models_from_the_host_catalog_with_lazy_auth() {
                 }),
                 ..SessionSettings::default()
             }),
+            None,
             None,
         )
         .await
@@ -6217,6 +6227,293 @@ async fn a_materialization_publishes_the_directory() {
 
     drop(attached);
     revived.host.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 14b. Tags
+// ---------------------------------------------------------------------------
+
+/// The label a session's row carries, or `None` when the host names no such
+/// session.
+async fn tag_of(host: &SessionHost, session: &str) -> Option<String> {
+    summary(host, session).await.and_then(|row| row.tag)
+}
+
+/// Setting a tag puts it on the session's row and on the stream, and clearing
+/// it takes it off both. It is display metadata, so this is the only place it
+/// shows: no log entry, no `state` frame (spec 6.8).
+#[tokio::test]
+async fn a_tag_reaches_the_row_and_the_directory() {
+    let harness = Harness::new(Vec::new());
+    let session = harness.create().await;
+    let mut stream = harness
+        .host
+        .attach(&[AttachRequest {
+            session: session.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+    frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+    assert_eq!(tag_of(&harness.host, &session).await, None);
+    // Past the debounce of everything above, so a directory frame from here on
+    // can only be one the tag earned.
+    tokio::time::sleep(LIST_SETTLE).await;
+    drained(&mut stream);
+
+    harness
+        .host
+        .command(
+            &session,
+            Command::Tag {
+                tag: Some("fix-auth".to_string()),
+            },
+        )
+        .await
+        .expect("the tag is accepted");
+    frames_until(&mut stream, "the label to be published", |frame| {
+        matches!(frame, Frame::List { sessions }
+        if sessions.iter().any(|entry| {
+            entry.id == session && entry.tag.as_deref() == Some("fix-auth")
+        }))
+    })
+    .await;
+    assert_eq!(
+        tag_of(&harness.host, &session).await.as_deref(),
+        Some("fix-auth"),
+        "and the row a fresh listing builds carries it too",
+    );
+    assert_eq!(
+        harness
+            .persistence
+            .read_tag(&session)
+            .expect("the sidecar reads"),
+        Some("fix-auth".to_string()),
+        "the label is in the store, where another host would find it",
+    );
+
+    tokio::time::sleep(LIST_SETTLE).await;
+    drained(&mut stream);
+    harness
+        .host
+        .command(&session, Command::Tag { tag: None })
+        .await
+        .expect("clearing is accepted");
+    frames_until(&mut stream, "the label to be dropped", |frame| {
+        matches!(frame, Frame::List { sessions }
+            if sessions.iter().any(|entry| entry.id == session && entry.tag.is_none()))
+    })
+    .await;
+    assert_eq!(tag_of(&harness.host, &session).await, None);
+    assert_eq!(
+        harness
+            .persistence
+            .read_tag(&session)
+            .expect("the sidecar reads"),
+        None,
+        "clearing removes the sidecar rather than blanking it",
+    );
+
+    drop(stream);
+    harness.host.shutdown().await;
+}
+
+/// A session created with a label wears it from its first row, so a client
+/// that creates and lists never sees the session unlabelled.
+#[tokio::test]
+async fn a_session_can_be_created_already_tagged() {
+    let harness = Harness::new(vec![finalized_text_message("hi back")]);
+    let session = harness
+        .host
+        .create_with(
+            None,
+            Some(vec![UserContent::text("hi")]),
+            // Padded, because the store keeps the trimmed label (spec 6.6).
+            Some("  spike  ".to_string()),
+        )
+        .await
+        .expect("create with a tag");
+    assert_eq!(
+        tag_of(&harness.host, &session).await.as_deref(),
+        Some("spike"),
+    );
+    harness.host.shutdown().await;
+}
+
+/// A release carries the label into the cold row, so the liveness flip does
+/// not blank it. The row is published without an enumeration (spec 6.8), so
+/// the driver's own answer is the only one available at that moment, and it is
+/// also the only current one: the label may have been set since the last scan.
+#[tokio::test]
+async fn a_released_session_keeps_its_label_without_an_enumeration() {
+    let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
+    // Attached throughout, so this one is never released and the stream stays
+    // open to watch the other one go.
+    let watching = harness.create().await;
+    let mut stream = harness
+        .host
+        .attach(&[AttachRequest {
+            session: watching.clone(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+    frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+
+    let session = harness.host.create().await.expect("create");
+    // Punctuated, so the log has a file for the release to hand back.
+    harness.prompt(&session, "hi").await;
+    harness
+        .host
+        .command(
+            &session,
+            Command::Tag {
+                tag: Some("fix-auth".to_string()),
+            },
+        )
+        .await
+        .expect("the tag is accepted");
+    let reads = harness.host.store_tag_reads();
+
+    let frames = frames_until(&mut stream, "the release to be published", |frame| {
+        matches!(frame, Frame::List { sessions }
+            if sessions.iter().any(|entry| entry.id == session && !entry.live))
+    })
+    .await;
+    let released = directories(&frames)
+        .pop()
+        .expect("the frame that reported the release")
+        .into_iter()
+        .find(|entry| entry.id == session)
+        .expect("the released session's row");
+    assert_eq!(
+        released.tag.as_deref(),
+        Some("fix-auth"),
+        "the cold row kept the label the driver held",
+    );
+    assert_eq!(
+        harness.host.store_tag_reads(),
+        reads,
+        "and it did not go to the sidecar for it",
+    );
+
+    drop(stream);
+    harness.host.shutdown().await;
+}
+
+/// A label outlives the host that set it: it is in the store, so a host that
+/// starts over the same directory finds it at its startup enumeration and
+/// keeps it when it materializes the session.
+#[tokio::test]
+async fn a_tag_survives_a_restart() {
+    let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
+    let session = harness.create().await;
+    harness.prompt(&session, "hi").await;
+    harness
+        .host
+        .command(
+            &session,
+            Command::Tag {
+                tag: Some("fix-auth".to_string()),
+            },
+        )
+        .await
+        .expect("the tag is accepted");
+    until_released(&harness.host, &session).await;
+    harness.host.shutdown().await;
+
+    let revived = harness.revive(Vec::new());
+    assert_eq!(
+        tag_of(&revived.host, &session).await.as_deref(),
+        Some("fix-auth"),
+        "a host that starts over the store finds the label on disk",
+    );
+
+    // And materializing the session keeps it: a live row answers from the
+    // host's memory, which is seeded from the sidecar (spec 6.8).
+    let row = summary(&revived.host, &session).await;
+    assert!(row.is_some_and(|row| !row.live), "cold to begin with");
+    revived
+        .host
+        .local_handles(&session)
+        .await
+        .expect("materialize the session");
+    let live = summary(&revived.host, &session)
+        .await
+        .expect("the session is listed");
+    assert!(live.live, "materialized");
+    assert_eq!(
+        live.tag.as_deref(),
+        Some("fix-auth"),
+        "and it did not lose its label on the way to being live",
+    );
+    revived.host.shutdown().await;
+}
+
+/// The label costs the directory nothing to serve. An untagged store never
+/// opens a sidecar, a live session answers from memory, and a cold one is read
+/// once and then cached against the file it came from (spec 6.8).
+#[tokio::test]
+async fn a_label_costs_at_most_one_sidecar_read() {
+    let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
+    let session = harness.create().await;
+    harness.prompt(&session, "hi").await;
+    for _ in 0..3 {
+        harness.host.sessions().await.expect("listed");
+    }
+    assert_eq!(
+        harness.host.store_tag_reads(),
+        0,
+        "an untagged store has no sidecar to read",
+    );
+
+    harness
+        .host
+        .command(
+            &session,
+            Command::Tag {
+                tag: Some("fix-auth".to_string()),
+            },
+        )
+        .await
+        .expect("the tag is accepted");
+    for _ in 0..3 {
+        assert_eq!(
+            tag_of(&harness.host, &session).await.as_deref(),
+            Some("fix-auth"),
+        );
+    }
+    assert_eq!(
+        harness.host.store_tag_reads(),
+        0,
+        "a live session's label is the host's own, not the file's",
+    );
+
+    let released = until_released(&harness.host, &session).await;
+    assert_eq!(released.tag.as_deref(), Some("fix-auth"));
+    let after_release = harness.host.store_tag_reads();
+    assert!(
+        after_release <= 1,
+        "a released label costs the one read that pins it to its file, not {after_release}",
+    );
+    for _ in 0..3 {
+        assert_eq!(
+            tag_of(&harness.host, &session).await.as_deref(),
+            Some("fix-auth"),
+        );
+    }
+    assert_eq!(
+        harness.host.store_tag_reads(),
+        after_release,
+        "and a settled sidecar is not read again",
+    );
+    harness.host.shutdown().await;
 }
 
 // ---------------------------------------------------------------------------

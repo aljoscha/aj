@@ -57,7 +57,7 @@ use aj_models::types::{Speed, UserContent};
 use aj_models::{speed_from_name, thinking_config_from_name, verbosity_from_name};
 use aj_session::{
     AppendHandoff, ConversationLog, ConversationPersistence, EntryId, LockHolder, SessionLock,
-    project_suffix,
+    normalize_tag, project_suffix,
 };
 use aj_wire::{
     AgentQueue, Cursor, DurableEvent, Frame, Hello, ModelSelection, PROTOCOL_VERSION, QueueCounts,
@@ -213,6 +213,15 @@ pub enum Command {
         instructions: Option<String>,
     },
     Settings(SettingsChange),
+    /// Set the session's label, `None` clears it (spec 6.6).
+    ///
+    /// The value is expected to have been through
+    /// [`aj_session::normalize_tag`] already: a trimmed single line, or `None`
+    /// for anything that clears. Validating at the edge is what keeps a
+    /// refused label from costing a materialization.
+    Tag {
+        tag: Option<String>,
+    },
     /// Switch the session's head. Refused while work is live.
     Head {
         target: HeadTarget,
@@ -346,6 +355,10 @@ pub(crate) struct HostShared {
     pub(crate) auth: AuthStorage,
     pub(crate) restore: Option<RestoreContext>,
     pub(crate) fanout: Arc<Fanout>,
+    /// The store the session's own files live in. A driver reaches it for the
+    /// tag sidecar, which is written under the session's advisory lock and so
+    /// belongs to the task that holds it.
+    pub(crate) persistence: ConversationPersistence,
 }
 
 /// The session map, held.
@@ -436,6 +449,7 @@ impl SessionHost {
                 auth,
                 restore,
                 fanout: Arc::new(Fanout::new(live_capacity)),
+                persistence: persistence.clone(),
             }),
             cold: ColdSessions::new(persistence.clone()),
             persistence,
@@ -477,22 +491,29 @@ impl SessionHost {
 
     /// Create a session in the host's working directory and hold it live.
     pub async fn create(&self) -> Result<String, HostError> {
-        self.create_with(None, None).await
+        self.create_with(None, None, None).await
     }
 
-    /// Creates a session with creator-selected settings and a first prompt.
+    /// Creates a session with creator-selected settings, a first prompt and a
+    /// tag.
     ///
-    /// Every setting and the prompt are validated before a log is created, so
-    /// a refused request leaves no discoverable empty session behind.
+    /// Every setting, the prompt and the tag are validated before a log is
+    /// created, so a refused request leaves no discoverable empty session
+    /// behind. The tag is written once the session is live, through the same
+    /// command a later relabelling takes, so it lands under the session's own
+    /// lock.
     pub async fn create_with(
         &self,
         settings: Option<SessionSettings>,
         prompt: Option<Vec<UserContent>>,
+        tag: Option<String>,
     ) -> Result<String, HostError> {
         self.alive()?;
         if let Some(content) = prompt.as_deref() {
             validate_prompt(content)?;
         }
+        let tag = normalize_tag(tag.as_deref().unwrap_or_default())
+            .map_err(|err| HostError::Invalid(err.to_string()))?;
         let run_config = self.resolve_creator_settings(settings.as_ref())?;
         let mut sessions = self.inner.sessions.lock().await;
         let live = self
@@ -500,6 +521,9 @@ impl SessionHost {
             .await?;
         let session = live.id().to_string();
         drop(sessions);
+        if tag.is_some() {
+            self.command(&session, Command::Tag { tag }).await?;
+        }
         if let Some(content) = prompt {
             self.command(
                 &session,
@@ -708,7 +732,7 @@ impl SessionHost {
                         // would mean reading the log.
                         last_seq: None,
                         last_activity: session.last_activity,
-                        tag: None,
+                        tag: session.tag,
                         // Only a gateway names the host a row belongs to
                         // (spec 6.8). Every row here is this host's own.
                         host: None,
@@ -748,6 +772,17 @@ impl SessionHost {
     #[cfg(any(test, feature = "test-support"))]
     pub fn store_membership_lookups(&self) -> u64 {
         self.inner.cold.membership_lookups()
+    }
+
+    /// How many tag sidecars the host has read.
+    ///
+    /// The other half of the refresh contract's per-file budget (spec 6.8): a
+    /// row carries its label whether it was cached or freshly read, so this is
+    /// the only way to tell an untagged store costing nothing from one paying
+    /// a read per row.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn store_tag_reads(&self) -> u64 {
+        self.inner.cold.tag_reads()
     }
 
     /// The activity stamp a session starts its materialization from.
@@ -1276,6 +1311,21 @@ impl SessionHost {
 
         let handoff = AppendHandoff::default();
         let events = core.install_persisting_forwarder(&handoff);
+        // One small read, on a path that has just read the whole log. From
+        // here the session answers its own label out of memory, so no
+        // directory refresh ever reaches the sidecar for it (spec 6.8). A
+        // label we cannot read is not worth failing a materialization over.
+        let tag = self
+            .inner
+            .persistence
+            .read_tag(&session_id)
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    session = session_id,
+                    "could not read the session's tag: {err}"
+                );
+                None
+            });
         let log = core.log.lock().await;
         let status = SessionStatus {
             epoch: mint_epoch(),
@@ -1290,6 +1340,7 @@ impl SessionHost {
             finished_subs: log.sub_agent_ids(),
             driven_subs: std::collections::BTreeSet::new(),
             last_activity: self.opening_stamp(&log, &session_id),
+            tag,
             last_work: Instant::now(),
         };
         drop(log);
@@ -1586,7 +1637,7 @@ fn summarize(session: &Arc<LiveSession>) -> SessionSummary {
         tasks,
         last_seq: Some(status.last_seq),
         last_activity: status.last_activity,
-        tag: None,
+        tag: status.tag.clone(),
         host: None,
         unreachable: false,
     }

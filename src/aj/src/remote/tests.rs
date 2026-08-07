@@ -41,7 +41,7 @@ use aj_session::{ConversationPersistence, ThreadFilter};
 use aj_wire::{
     CancelRequest, CompactRequest, CreateSessionRequest, Cursor, ErrorResponse, Frame, HeadRequest,
     ModelSelection, PROTOCOL_VERSION, PromptInput, PromptRequest, QueueOperation, QueueRequest,
-    QueueState, SessionSettings, SettingsRequest, SteerRequest, TaskTable,
+    QueueState, SessionSettings, SettingsRequest, SteerRequest, TagRequest, TaskTable,
 };
 use async_trait::async_trait;
 use reqwest::StatusCode;
@@ -1047,6 +1047,7 @@ async fn creation_applies_settings_and_runs_a_first_prompt() {
             prompt: Some(PromptInput::Text {
                 text: "say hello".to_string(),
             }),
+            tag: None,
         })
         .await
         .expect("create with settings and a prompt");
@@ -1259,6 +1260,155 @@ async fn a_command_with_no_body_is_accepted() {
         .expect("post with no body");
 
     assert_eq!(response.status(), StatusCode::ACCEPTED);
+    fixture.shutdown().await;
+}
+
+/// The label the host reports for `session` over the wire.
+async fn remote_tag(fixture: &Fixture, session: &str) -> Option<String> {
+    fixture
+        .client
+        .sessions()
+        .await
+        .expect("the sessions read")
+        .sessions
+        .into_iter()
+        .find(|row| row.id == session)
+        .expect("the session is listed")
+        .tag
+}
+
+/// Post a raw tag body, so a test can send shapes the typed request cannot.
+async fn post_tag(fixture: &Fixture, session: &str, body: serde_json::Value) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!(
+            "{}/v1/sessions/{session}/tag",
+            fixture.server.url()
+        ))
+        .json(&body)
+        .send()
+        .await
+        .expect("the request reaches the host")
+}
+
+/// The tag route sets a label and clears it, and the label reaches the row a
+/// client reads back (spec 6.6, 6.8). Clearing travels as the empty string,
+/// which is why there is no second route for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_tag_route_sets_and_clears_a_label() {
+    let fixture = Fixture::new(Vec::new()).await;
+    let session = fixture.create().await;
+    assert_eq!(remote_tag(&fixture, &session).await, None);
+
+    let response = post_tag(&fixture, &session, serde_json::json!({"tag": " fix-auth "})).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        remote_tag(&fixture, &session).await.as_deref(),
+        Some("fix-auth"),
+        "the stored label is the trimmed one",
+    );
+
+    for clearing in [
+        serde_json::json!({"tag": ""}),
+        serde_json::json!({"tag": "   "}),
+    ] {
+        post_tag(&fixture, &session, serde_json::json!({"tag": "again"})).await;
+        assert_eq!(
+            remote_tag(&fixture, &session).await.as_deref(),
+            Some("again")
+        );
+        let response = post_tag(&fixture, &session, clearing.clone()).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED, "{clearing}");
+        assert_eq!(
+            remote_tag(&fixture, &session).await,
+            None,
+            "{clearing} clears the label",
+        );
+    }
+
+    // An unknown session is the ordinary 404, not a tag-specific answer.
+    let response = post_tag(
+        &fixture,
+        "2020-01-01-00-00-00-000",
+        serde_json::json!({"tag": "nobody"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let error: ErrorResponse = response.json().await.expect("the error shape");
+    assert_eq!(error.code, "unknown_session");
+    fixture.shutdown().await;
+}
+
+/// A label the store would not keep is a 400 naming why, and it changes
+/// nothing: the refusal happens at the wire boundary, so the session is not
+/// even materialized for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_label_is_a_400_that_changes_nothing() {
+    let fixture = Fixture::new(Vec::new()).await;
+    let session = fixture.create().await;
+    post_tag(&fixture, &session, serde_json::json!({"tag": "keep me"})).await;
+
+    for refused in [
+        serde_json::json!({"tag": "two\nlines"}),
+        serde_json::json!({"tag": "bell\u{0007}"}),
+        serde_json::json!({"tag": "l".repeat(aj_session::MAX_TAG_BYTES + 1)}),
+    ] {
+        let response = post_tag(&fixture, &session, refused.clone()).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{refused}");
+        let error: ErrorResponse = response.json().await.expect("the error shape");
+        assert_eq!(error.code, "invalid_request", "{refused}");
+        assert!(
+            !error.message.is_empty(),
+            "the refusal says what was wrong with {refused}",
+        );
+        assert_eq!(
+            remote_tag(&fixture, &session).await.as_deref(),
+            Some("keep me"),
+            "{refused} left the label alone",
+        );
+    }
+    fixture.shutdown().await;
+}
+
+/// A session can be created already labelled, so a client that creates and
+/// lists never sees it unlabelled, and a bad label refuses the creation
+/// outright rather than leaving an unlabelled session behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_is_created_with_its_label() {
+    let fixture = Fixture::new(Vec::new()).await;
+    let session = fixture
+        .client
+        .create_session(CreateSessionRequest {
+            tag: Some("fix-auth".to_string()),
+            ..CreateSessionRequest::default()
+        })
+        .await
+        .expect("create a labelled session");
+    assert_eq!(
+        remote_tag(&fixture, &session).await.as_deref(),
+        Some("fix-auth"),
+    );
+
+    let err = fixture
+        .client
+        .create_session(CreateSessionRequest {
+            tag: Some("two\nlines".to_string()),
+            ..CreateSessionRequest::default()
+        })
+        .await
+        .expect_err("a label the store would not keep refuses the creation");
+    assert_eq!(err.status(), Some(StatusCode::BAD_REQUEST));
+    assert_eq!(err.code(), Some("invalid_request"));
+    assert_eq!(
+        fixture
+            .client
+            .sessions()
+            .await
+            .expect("the sessions read")
+            .sessions
+            .len(),
+        1,
+        "the refused creation left no session behind",
+    );
     fixture.shutdown().await;
 }
 
@@ -2193,6 +2343,9 @@ async fn probe_every_route(client: &RemoteClient, session: &str) -> Vec<Result<(
                 ..SessionSettings::default()
             },
         }),
+        RemoteCommand::Tag(TagRequest {
+            tag: "probe".to_string(),
+        }),
         RemoteCommand::Head(HeadRequest::entry("whatever".to_string())),
         RemoteCommand::KillTask(1),
     ];
@@ -2235,7 +2388,7 @@ async fn a_rejected_peer_gets_403_on_every_route() {
 
     let probes = probe_every_route(&fixture.client, &session).await;
 
-    assert_eq!(probes.len(), 16, "every route is probed");
+    assert_eq!(probes.len(), 17, "every route is probed");
     for probe in probes {
         let err = probe.expect_err("the gate refuses");
         assert_eq!(err.status(), Some(StatusCode::FORBIDDEN), "got {err}");

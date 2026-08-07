@@ -16,20 +16,21 @@
 //! these rows.
 //!
 //! An enumeration reads no log content beyond the format sniff, one first
-//! line per file, cached against the `(mtime, size)` it was read at. A row
-//! itself is built from the `stat` the enumeration already did, which is what
-//! keeps host startup off the store's bytes: deriving a cold session's
-//! `last_seq` would cost a read of every log in the directory, and the row
-//! does not carry one (spec 6.8). One case falls outside the cache, a log the
-//! store cannot open is retried at every enumeration, because nothing about
-//! the file moves when it becomes readable again. That costs the failed open
-//! and nothing more.
+//! line per file, cached against the `(mtime, size)` it was read at. The only
+//! other file it opens is a session's tag sidecar, cached the same way and
+//! only for the sessions that have one (spec 6.8). A row itself is built from
+//! the `stat` the enumeration already did, which is what keeps host startup
+//! off the store's bytes: deriving a cold session's `last_seq` would cost a
+//! read of every log in the directory, and the row does not carry one (spec
+//! 6.8). One case falls outside the cache, a log the store cannot open is
+//! retried at every enumeration, because nothing about the file moves when it
+//! becomes readable again. That costs the failed open and nothing more.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex as StdMutex, MutexGuard};
 
-use aj_session::{ConversationError, ConversationPersistence, SessionMetadata};
+use aj_session::{ConversationError, ConversationPersistence, SessionMetadata, TagMetadata};
 
 use crate::host::live::ReleasedRow;
 use chrono::{DateTime, Utc};
@@ -53,6 +54,14 @@ pub(crate) trait SessionStore {
     /// Whether the log is in the current on-disk format, or `None` when it
     /// could not be read at all. Opens the file and reads its first line.
     fn is_current_format(&self, session_id: &str) -> Option<bool>;
+
+    /// Every tag sidecar in the store, with its fingerprint. One directory
+    /// read, and none at all for a store that has no tagged session.
+    fn enumerate_tags(&self) -> Result<Vec<TagMetadata>, ConversationError>;
+
+    /// The tag in one session's sidecar, `Ok(None)` when it has none or its
+    /// sidecar says nothing usable. Opens the file and reads it.
+    fn read_tag(&self, session_id: &str) -> Result<Option<String>, ConversationError>;
 }
 
 impl SessionStore for ConversationPersistence {
@@ -70,6 +79,14 @@ impl SessionStore for ConversationPersistence {
     fn is_current_format(&self, session_id: &str) -> Option<bool> {
         ConversationPersistence::is_current_format(self, session_id)
     }
+
+    fn enumerate_tags(&self) -> Result<Vec<TagMetadata>, ConversationError> {
+        ConversationPersistence::enumerate_tags(self)
+    }
+
+    fn read_tag(&self, session_id: &str) -> Result<Option<String>, ConversationError> {
+        ConversationPersistence::read_tag(self, session_id)
+    }
 }
 
 /// One session the store holds that the host is not holding live.
@@ -80,6 +97,9 @@ impl SessionStore for ConversationPersistence {
 pub(crate) struct ColdSession {
     pub(crate) id: String,
     pub(crate) last_activity: DateTime<Utc>,
+    /// The session's label, `None` when it has no sidecar or none this host
+    /// could read (spec 6.8).
+    pub(crate) tag: Option<String>,
 }
 
 /// The store's sessions as the host last saw them. Both the row and the
@@ -90,6 +110,7 @@ pub(crate) struct ColdSessions<S> {
     cache: StdMutex<Cache>,
     directory_reads: AtomicU64,
     membership_lookups: AtomicU64,
+    tag_reads: AtomicU64,
 }
 
 /// A log file's identity for caching: a file whose modification time and size
@@ -103,10 +124,32 @@ struct Fingerprint {
     size: u64,
 }
 
+impl Fingerprint {
+    fn of(modified: DateTime<Utc>, size: u64) -> Self {
+        Self { modified, size }
+    }
+}
+
 /// A log's format verdict, plus the file state it was sniffed at.
 struct Sniffed {
     at: Fingerprint,
     current_format: bool,
+}
+
+/// A session's label, plus the sidecar state it came from.
+///
+/// `at` is `None` for a tag the host recorded itself, which a release does
+/// with what its driver held (see [`ReleasedRow`]). No fingerprint can match
+/// that, so the next enumeration reads the sidecar once and pins the entry to
+/// the file from then on.
+///
+/// `tag` is `None` for a sidecar that reads as no label at all. Caching that
+/// is what keeps a hand-mangled sidecar from being re-read at every
+/// enumeration: unlike a log the store cannot open, its content is a settled
+/// fact about the file.
+struct Tagged {
+    at: Option<Fingerprint>,
+    tag: Option<String>,
 }
 
 /// A cold row's activity stamp, plus the file state it describes.
@@ -132,9 +175,9 @@ struct Row {
     last_activity: DateTime<Utc>,
 }
 
-/// Both maps are keyed by session id. [`ColdSessions::enumerate`] drops the
+/// The maps are keyed by session id. [`ColdSessions::enumerate`] drops the
 /// entries of sessions that have left the store, so on a host that ever
-/// enumerates (every host does, at startup) neither outgrows it. Entries
+/// enumerates (every host does, at startup) none of them outgrows it. Entries
 /// that [`ColdSessions::contains`] adds in between are not evicted until the
 /// next enumeration.
 #[derive(Default)]
@@ -143,6 +186,9 @@ struct Cache {
     /// what the host has recorded about its own sessions since.
     rows: HashMap<String, Row>,
     formats: HashMap<String, Sniffed>,
+    /// One entry per session that has a label. Its absence is the untagged
+    /// answer, which is what makes an untagged store cost nothing.
+    tags: HashMap<String, Tagged>,
 }
 
 impl<S: SessionStore> ColdSessions<S> {
@@ -152,6 +198,7 @@ impl<S: SessionStore> ColdSessions<S> {
             cache: StdMutex::new(Cache::default()),
             directory_reads: AtomicU64::new(0),
             membership_lookups: AtomicU64::new(0),
+            tag_reads: AtomicU64::new(0),
         }
     }
 
@@ -160,12 +207,14 @@ impl<S: SessionStore> ColdSessions<S> {
     /// Touches no filesystem, which is the whole point: this is what a
     /// refresh serves (spec 6.8).
     pub(crate) fn rows(&self) -> Vec<ColdSession> {
-        self.cache()
+        let cache = self.cache();
+        cache
             .rows
             .iter()
             .map(|(id, row)| ColdSession {
                 id: id.clone(),
                 last_activity: row.last_activity,
+                tag: cache.tags.get(id).and_then(|tagged| tagged.tag.clone()),
             })
             .collect()
     }
@@ -196,6 +245,7 @@ impl<S: SessionStore> ColdSessions<S> {
                 .rows
                 .keys()
                 .chain(cache.formats.keys())
+                .chain(cache.tags.keys())
                 .cloned()
                 .collect()
         };
@@ -233,6 +283,30 @@ impl<S: SessionStore> ColdSessions<S> {
                 );
             }
         }
+        // The second directory read, over `meta/`. A store with no tagged
+        // session has no such directory, so this costs one failed open and
+        // reads nothing (spec 6.8).
+        //
+        // A sidecar directory we cannot read costs the labels their refresh
+        // and nothing else: a label is display metadata, and one that cannot
+        // be re-read must not take a session's row down with it. The cached
+        // labels stand until a scan gets a look at the files again, which is
+        // also why nothing is evicted on this path.
+        match self.store.enumerate_tags() {
+            Ok(sidecars) => {
+                for sidecar in &sidecars {
+                    // A live session's label is the host's own, held in memory
+                    // and handed to the cold cache by its release, so reading
+                    // the file would only offer a staler answer.
+                    if live(&sidecar.session_id) {
+                        continue;
+                    }
+                    self.tag(sidecar);
+                }
+                self.evict_tags(&sidecars, &known);
+            }
+            Err(err) => tracing::warn!("could not read the store's tag sidecars: {err}"),
+        }
         self.evict(&enumerated, &known);
         Ok(())
     }
@@ -243,9 +317,25 @@ impl<S: SessionStore> ColdSessions<S> {
     /// do, which its answers cannot show, so this is the seam the tests assert
     /// on. Only [`Self::enumerate`] reads the directory: a membership question
     /// is answered off a single `stat` (see [`Self::contains`]).
+    ///
+    /// The store's own directory, not the sidecar one an enumeration also
+    /// reads: those are counted by [`Self::tag_reads`] where they cost
+    /// anything.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn directory_reads(&self) -> u64 {
         self.directory_reads.load(Ordering::Relaxed)
+    }
+
+    /// How many tag sidecars this has opened and read.
+    ///
+    /// The same kind of contract as [`Self::directory_reads`], for the other
+    /// per-file read an enumeration is allowed (spec 6.8). A row carries its
+    /// label either way, so only this tells a cached answer from a fresh one:
+    /// an untagged store must never reach a sidecar, and a settled tagged one
+    /// must read each of them exactly once.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn tag_reads(&self) -> u64 {
+        self.tag_reads.load(Ordering::Relaxed)
     }
 
     /// How many membership questions reached the store.
@@ -299,6 +389,7 @@ impl<S: SessionStore> ColdSessions<S> {
         let ReleasedRow {
             file,
             last_activity,
+            tag,
         } = released;
         let at = fingerprint(file);
         let mut cache = self.cache();
@@ -316,6 +407,63 @@ impl<S: SessionStore> ColdSessions<S> {
                 current_format: true,
             },
         );
+        // The label the driver held, which is the only current one: it may
+        // have been set after the last enumeration read the sidecar. Recorded
+        // without a fingerprint, so the next enumeration re-reads the file
+        // once and pins the entry to it (see [`Tagged`]).
+        match tag {
+            Some(tag) => {
+                cache.tags.insert(
+                    file.session_id.clone(),
+                    Tagged {
+                        at: None,
+                        tag: Some(tag.clone()),
+                    },
+                );
+            }
+            None => {
+                cache.tags.remove(&file.session_id);
+            }
+        }
+    }
+
+    /// The label in `sidecar`, read once per fingerprint into the cache.
+    ///
+    /// The second per-file read an enumeration is allowed (spec 6.8), and as
+    /// with the format sniff the cache is what makes it affordable: a settled
+    /// store re-reads no sidecar, and one whose label was just rewritten reads
+    /// only that one.
+    ///
+    /// A sidecar the store cannot read leaves the cache alone rather than
+    /// recording "untagged". A read that failed says nothing about the label,
+    /// and the alternative would drop a session's tag off its row until the
+    /// file changed again.
+    fn tag(&self, sidecar: &TagMetadata) {
+        let at = Fingerprint::of(sidecar.modified_at, sidecar.size_bytes);
+        if self
+            .cache()
+            .tags
+            .get(&sidecar.session_id)
+            .is_some_and(|tagged| tagged.at == Some(at))
+        {
+            return;
+        }
+        // Outside the guard: this opens and reads a file, and every other
+        // refresh would queue behind it.
+        self.tag_reads.fetch_add(1, Ordering::Relaxed);
+        let tag = match self.store.read_tag(&sidecar.session_id) {
+            Ok(tag) => tag,
+            Err(err) => {
+                tracing::warn!(
+                    session = sidecar.session_id,
+                    "could not read a session's tag: {err}"
+                );
+                return;
+            }
+        };
+        self.cache()
+            .tags
+            .insert(sidecar.session_id.clone(), Tagged { at: Some(at), tag });
     }
 
     /// The format verdict for `metadata`'s log, sniffed once per fingerprint.
@@ -402,6 +550,22 @@ impl<S: SessionStore> ColdSessions<S> {
         cache.formats.retain(|id, _| !gone(id));
     }
 
+    /// Drop the labels whose sidecars are gone, under the same rule as
+    /// [`Self::evict`] and against the sidecar directory rather than the log
+    /// one.
+    ///
+    /// A label leaves with the file it describes, which is not the session's
+    /// log: clearing a tag removes only the sidecar, and the session keeps its
+    /// row having lost only its label.
+    fn evict_tags(&self, sidecars: &[TagMetadata], known: &HashSet<String>) {
+        let present: HashSet<&str> = sidecars
+            .iter()
+            .map(|sidecar| sidecar.session_id.as_str())
+            .collect();
+        let gone = |id: &String| known.contains(id) && !present.contains(id.as_str());
+        self.cache().tags.retain(|id, _| !gone(id));
+    }
+
     fn enumerate_store(&self) -> Result<Vec<SessionMetadata>, ConversationError> {
         self.directory_reads.fetch_add(1, Ordering::Relaxed);
         self.store.enumerate_sessions()
@@ -413,10 +577,7 @@ impl<S: SessionStore> ColdSessions<S> {
 }
 
 fn fingerprint(metadata: &SessionMetadata) -> Fingerprint {
-    Fingerprint {
-        modified: metadata.modified_at,
-        size: metadata.size_bytes,
-    }
+    Fingerprint::of(metadata.modified_at, metadata.size_bytes)
 }
 
 #[cfg(test)]
@@ -429,12 +590,17 @@ mod tests {
     /// counts. The counts are the point: the contract is about the reads an
     /// enumeration avoids, which its answers cannot show.
     ///
-    /// It can only serve one kind of read, because [`SessionStore`] only asks
-    /// for one. That is the contract's strongest form: producing a directory
-    /// row cannot reach a log's contents past its first line.
+    /// It can serve only the two per-file reads [`SessionStore`] asks for, a
+    /// log's first line and a tag sidecar. That is the contract's strongest
+    /// form: producing a directory row cannot reach a log's contents past its
+    /// first line.
     #[derive(Default)]
     struct FakeStore {
         files: StdMutex<Vec<FakeFile>>,
+        sidecars: StdMutex<Vec<FakeSidecar>>,
+        /// Set to fail the read of the sidecar directory, as a permission
+        /// change on `meta/` does.
+        sidecars_unreadable: StdMutex<bool>,
         sniffs: StdMutex<Vec<String>>,
         /// Run once inside the first sniff of a scan, so a test can act while a
         /// scan is between its directory read and its eviction.
@@ -455,6 +621,29 @@ mod tests {
         /// the transient failure the cache must not remember.
         sniffable: bool,
         current_format: bool,
+    }
+
+    /// One tag sidecar. Its fingerprint moves independently of the log's, as
+    /// it does on disk: relabelling a session touches this file and nothing
+    /// else.
+    #[derive(Clone)]
+    struct FakeSidecar {
+        id: String,
+        /// Epoch seconds, the sidecar's own modification time.
+        modified: i64,
+        /// What the sidecar reads as, `None` for one that says nothing usable.
+        tag: Option<String>,
+    }
+
+    impl FakeSidecar {
+        /// The size the fingerprint uses, taken from the label so that a
+        /// rewrite to a different label of the same length still has to move
+        /// the modification time to be noticed, exactly as on disk.
+        fn size(&self) -> u64 {
+            self.tag.as_ref().map_or(0, |tag| {
+                u64::try_from(tag.len()).expect("a label fits a u64")
+            })
+        }
     }
 
     impl FakeFile {
@@ -504,6 +693,26 @@ mod tests {
                 .file(session_id)
                 .map(|file| SessionMetadata::new(file.id, at(file.modified), file.size)))
         }
+
+        fn enumerate_tags(&self) -> Result<Vec<TagMetadata>, ConversationError> {
+            if *self.sidecars_unreadable.lock().expect("readable") {
+                return Err(std::io::Error::other("meta/ is not readable").into());
+            }
+            let mut sidecars = self.sidecars.lock().expect("sidecars").clone();
+            sidecars.sort_by(|left, right| left.id.cmp(&right.id));
+            Ok(sidecars
+                .iter()
+                .map(|sidecar| TagMetadata {
+                    session_id: sidecar.id.clone(),
+                    modified_at: at(sidecar.modified),
+                    size_bytes: sidecar.size(),
+                })
+                .collect())
+        }
+
+        fn read_tag(&self, session_id: &str) -> Result<Option<String>, ConversationError> {
+            Ok(self.sidecar(session_id).and_then(|sidecar| sidecar.tag))
+        }
     }
 
     impl FakeStore {
@@ -514,6 +723,43 @@ mod tests {
                 .iter()
                 .find(|file| file.id == id)
                 .cloned()
+        }
+
+        fn sidecar(&self, id: &str) -> Option<FakeSidecar> {
+            self.sidecars
+                .lock()
+                .expect("sidecars")
+                .iter()
+                .find(|sidecar| sidecar.id == id)
+                .cloned()
+        }
+
+        /// Label `id` at sidecar modification time `modified`, as a tag
+        /// command's atomic rewrite would.
+        fn tag(&self, id: &str, tag: &str, modified: i64) {
+            self.write_sidecar(FakeSidecar {
+                id: id.to_string(),
+                modified,
+                tag: Some(tag.to_string()),
+            });
+        }
+
+        fn write_sidecar(&self, sidecar: FakeSidecar) {
+            let mut sidecars = self.sidecars.lock().expect("sidecars");
+            sidecars.retain(|held| held.id != sidecar.id);
+            sidecars.push(sidecar);
+        }
+
+        fn sidecars_unreadable(&self, unreadable: bool) {
+            *self.sidecars_unreadable.lock().expect("readable") = unreadable;
+        }
+
+        /// Clear `id`'s label, which removes its sidecar.
+        fn untag(&self, id: &str) {
+            self.sidecars
+                .lock()
+                .expect("sidecars")
+                .retain(|sidecar| sidecar.id != id);
         }
 
         /// Put a current-format log last written at `modified` in the store.
@@ -596,7 +842,18 @@ mod tests {
         ReleasedRow {
             file: SessionMetadata::new(id.to_string(), at(modified), size),
             last_activity: at(modified),
+            tag: None,
         }
+    }
+
+    /// The labels the rows carry, paired with their ids.
+    fn labelled(cold: Vec<ColdSession>) -> Vec<(String, Option<String>)> {
+        let mut rows: Vec<(String, Option<String>)> = cold
+            .into_iter()
+            .map(|session| (session.id, session.tag))
+            .collect();
+        rows.sort();
+        rows
     }
 
     /// The core of the performance contract: a session the host holds live is
@@ -776,6 +1033,7 @@ mod tests {
         cold.note_released(&ReleasedRow {
             file: SessionMetadata::new("a".to_string(), at(2), 100),
             last_activity: at(99),
+            tag: None,
         });
         assert_eq!(listed(cold.rows()), [("a".to_string(), 99)]);
 
@@ -858,6 +1116,7 @@ mod tests {
         cold.note_released(&ReleasedRow {
             file: SessionMetadata::new("a".to_string(), at(3), 100),
             last_activity: at(9),
+            tag: None,
         });
         assert_eq!(listed(cold.rows()), [("a".to_string(), 9)]);
 
@@ -944,6 +1203,7 @@ mod tests {
         cold.note_released(&ReleasedRow {
             file: SessionMetadata::new("held".to_string(), at(10), 400),
             last_activity: at(14),
+            tag: None,
         });
         assert_eq!(listed(cold.rows()), [("held".to_string(), 14)]);
 
@@ -1021,7 +1281,10 @@ mod tests {
             let cold = releasing.upgrade().expect("the cache outlives the scan");
             // A session whose log the scan's directory read never saw, because
             // it was created after it.
-            cold.note_released(&released("late", 7, 400));
+            cold.note_released(&ReleasedRow {
+                tag: Some("late label".to_string()),
+                ..released("late", 7, 400)
+            });
         });
 
         cold.enumerate(|_| false).expect("enumerate");
@@ -1029,6 +1292,15 @@ mod tests {
             listed(cold.rows()),
             [("a".to_string(), 2), ("late".to_string(), 7)],
             "the scan evicted a row it never had a view of",
+        );
+        assert_eq!(
+            labelled(cold.rows()),
+            [
+                ("a".to_string(), None),
+                ("late".to_string(), Some("late label".to_string())),
+            ],
+            "and the label that came with it, which no sidecar list can \
+             account for",
         );
     }
 
@@ -1056,6 +1328,224 @@ mod tests {
             cold.directory_reads(),
             0,
             "fifteen membership questions and not one directory read",
+        );
+    }
+
+    /// A store where nothing is labelled never opens a sidecar, however often
+    /// it is enumerated. Untagged is the common case, and an implementation
+    /// that asked per session would turn it into a read per row (spec 6.8).
+    #[test]
+    fn an_untagged_store_reads_no_sidecar() {
+        let store = FakeStore::default();
+        for id in ["a", "b", "c"] {
+            store.put(id, 5);
+        }
+        let cold = ColdSessions::new(store);
+
+        for _ in 0..5 {
+            cold.enumerate(|_| false).expect("enumerate");
+            assert_eq!(
+                labelled(cold.rows()),
+                [
+                    ("a".to_string(), None),
+                    ("b".to_string(), None),
+                    ("c".to_string(), None),
+                ],
+            );
+        }
+        assert_eq!(
+            cold.tag_reads(),
+            0,
+            "five enumerations of an untagged store read a sidecar",
+        );
+    }
+
+    /// A labelled session's row carries its label, read once and then served
+    /// from the cache: a settled store re-reads no sidecar, and rewriting one
+    /// label re-reads exactly that one.
+    #[test]
+    fn a_sidecar_is_read_once_per_fingerprint() {
+        let store = FakeStore::default();
+        for id in ["a", "b"] {
+            store.put(id, 5);
+        }
+        store.tag("a", "fix-auth", 10);
+        store.tag("b", "spike", 10);
+        let cold = ColdSessions::new(store);
+
+        for _ in 0..5 {
+            cold.enumerate(|_| false).expect("enumerate");
+            assert_eq!(
+                labelled(cold.rows()),
+                [
+                    ("a".to_string(), Some("fix-auth".to_string())),
+                    ("b".to_string(), Some("spike".to_string())),
+                ],
+            );
+        }
+        assert_eq!(
+            cold.tag_reads(),
+            2,
+            "five enumerations over two settled sidecars",
+        );
+
+        // One label rewritten, which moves that sidecar and no other.
+        cold.store.tag("a", "fix-auth-again", 11);
+        cold.enumerate(|_| false).expect("enumerate");
+        assert_eq!(
+            labelled(cold.rows()),
+            [
+                ("a".to_string(), Some("fix-auth-again".to_string())),
+                ("b".to_string(), Some("spike".to_string())),
+            ],
+        );
+        assert_eq!(cold.tag_reads(), 3, "only the sidecar that moved was read");
+    }
+
+    /// A label follows its sidecar, not its log: clearing a tag removes the
+    /// file, and the row stays in the directory having lost only its label.
+    #[test]
+    fn a_cleared_label_leaves_the_row_behind() {
+        let store = FakeStore::default();
+        store.put("a", 5);
+        store.tag("a", "fix-auth", 6);
+        let cold = ColdSessions::new(store);
+        cold.enumerate(|_| false).expect("enumerate");
+        assert_eq!(
+            labelled(cold.rows()),
+            [("a".to_string(), Some("fix-auth".to_string()))],
+        );
+
+        cold.store.untag("a");
+        cold.enumerate(|_| false).expect("enumerate");
+        assert_eq!(labelled(cold.rows()), [("a".to_string(), None)]);
+        assert_eq!(
+            listed(cold.rows()),
+            [("a".to_string(), 5)],
+            "the session is still in the directory",
+        );
+
+        // And the entry is gone rather than remembered, so a sidecar that
+        // comes back at the fingerprint the old one had is read afresh.
+        let reads = cold.tag_reads();
+        cold.store.tag("a", "fix-auth", 6);
+        cold.enumerate(|_| false).expect("enumerate");
+        assert_eq!(
+            labelled(cold.rows()),
+            [("a".to_string(), Some("fix-auth".to_string()))],
+        );
+        assert_eq!(cold.tag_reads(), reads + 1);
+    }
+
+    /// A sidecar that says nothing usable reads as no label, and that verdict
+    /// is cached: its content is a settled fact about the file, unlike a log
+    /// the store could not open at all.
+    #[test]
+    fn an_unusable_sidecar_reads_as_untagged_once() {
+        let store = FakeStore::default();
+        store.put("a", 5);
+        store.write_sidecar(FakeSidecar {
+            id: "a".to_string(),
+            modified: 6,
+            tag: None,
+        });
+        let cold = ColdSessions::new(store);
+
+        for _ in 0..3 {
+            cold.enumerate(|_| false).expect("enumerate");
+            assert_eq!(labelled(cold.rows()), [("a".to_string(), None)]);
+        }
+        assert_eq!(cold.tag_reads(), 1, "the empty answer was cached too");
+    }
+
+    /// A session the host holds live answers its own label out of memory, so
+    /// an enumeration does not read its sidecar. The file can only be staler
+    /// than what the driver holds, and its release hands the label over.
+    #[test]
+    fn a_live_sessions_sidecar_is_not_read() {
+        let store = FakeStore::default();
+        store.put("live", 5);
+        store.tag("live", "on disk", 6);
+        let cold = ColdSessions::new(store);
+
+        for _ in 0..3 {
+            cold.enumerate(|id| id == "live").expect("enumerate");
+        }
+        assert_eq!(cold.tag_reads(), 0);
+
+        // Released with the label the driver held, which is what the row
+        // carries: no enumeration has read the file at all.
+        cold.note_released(&ReleasedRow {
+            file: SessionMetadata::new("live".to_string(), at(5), 100),
+            last_activity: at(9),
+            tag: Some("in memory".to_string()),
+        });
+        assert_eq!(
+            labelled(cold.rows()),
+            [("live".to_string(), Some("in memory".to_string()))],
+        );
+        assert_eq!(cold.tag_reads(), 0, "the release read nothing");
+
+        // The next enumeration pins the entry to the file, which costs the
+        // one read a released label has not had.
+        cold.enumerate(|_| false).expect("enumerate");
+        assert_eq!(
+            labelled(cold.rows()),
+            [("live".to_string(), Some("on disk".to_string()))],
+        );
+        assert_eq!(cold.tag_reads(), 1);
+        cold.enumerate(|_| false).expect("enumerate");
+        assert_eq!(cold.tag_reads(), 1, "and it settles there");
+    }
+
+    /// A release that hands over no label removes the one the cache held: the
+    /// driver's answer is the current one either way, and a cleared tag would
+    /// otherwise keep showing on the row until the next enumeration.
+    #[test]
+    fn a_release_without_a_label_clears_the_cached_one() {
+        let store = FakeStore::default();
+        store.put("a", 5);
+        store.tag("a", "fix-auth", 6);
+        let cold = ColdSessions::new(store);
+        cold.enumerate(|_| false).expect("enumerate");
+        assert_eq!(
+            labelled(cold.rows()),
+            [("a".to_string(), Some("fix-auth".to_string()))],
+        );
+
+        // Held live, cleared, and released. The sidecar is gone with the
+        // clear, as the tag command's write leaves it.
+        cold.store.untag("a");
+        cold.note_released(&released("a", 5, 100));
+        assert_eq!(labelled(cold.rows()), [("a".to_string(), None)]);
+    }
+
+    /// A sidecar directory the store cannot read costs the labels their
+    /// refresh and nothing else. The scan still produces its rows, and the
+    /// labels it already holds stand: one unreadable label may not take a
+    /// session out of the directory, and it certainly may not blank the
+    /// others.
+    #[test]
+    fn an_unreadable_sidecar_directory_does_not_fail_a_scan() {
+        let store = FakeStore::default();
+        store.put("a", 5);
+        store.put("b", 5);
+        store.tag("a", "fix-auth", 6);
+        let cold = ColdSessions::new(store);
+        cold.enumerate(|_| false).expect("enumerate");
+
+        cold.store.sidecars_unreadable(true);
+        cold.store.put("c", 7);
+        cold.enumerate(|_| false)
+            .expect("a label the scan cannot reach does not fail it");
+        assert_eq!(
+            labelled(cold.rows()),
+            [
+                ("a".to_string(), Some("fix-auth".to_string())),
+                ("b".to_string(), None),
+                ("c".to_string(), None),
+            ],
+            "the rows are all there and the label we had stands",
         );
     }
 }

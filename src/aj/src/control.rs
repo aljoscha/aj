@@ -27,7 +27,8 @@ use aj_models::{speed_name, thinking_config_name, verbosity_name};
 use aj_wire::{
     CancelRequest, CompactRequest, CreateSessionRequest, Frame, HeadRequest, ModelSelection,
     PromptInput, PromptRequest, QueueOperation, QueueRequest, QueueState, SessionList,
-    SessionSettings, SessionTree, SettingsRequest, SteerRequest, TaskDetails, TaskTable,
+    SessionSettings, SessionTree, SettingsRequest, SteerRequest, TagRequest, TaskDetails,
+    TaskTable,
 };
 use futures::FutureExt;
 use reqwest::StatusCode;
@@ -211,12 +212,13 @@ impl Control {
         prompt: Option<Vec<UserContent>>,
     ) -> Result<String, ControlError> {
         match self {
-            Self::Local(local) => Ok(local.host.create_with(settings, prompt).await?),
+            Self::Local(local) => Ok(local.host.create_with(settings, prompt, None).await?),
             Self::Remote(remote) => Ok(remote
                 .client
                 .create_session(CreateSessionRequest {
                     settings,
                     prompt: prompt.map(|content| PromptInput::Content { content }),
+                    tag: None,
                 })
                 .await?),
         }
@@ -281,6 +283,11 @@ fn wire_command(command: Command) -> RemoteCommand {
             RemoteCommand::Compact(CompactRequest { instructions })
         }
         Command::Settings(change) => RemoteCommand::Settings(settings_request(change)),
+        // A cleared tag travels as the empty string, which is what the route
+        // reads as "clear" (spec 6.6).
+        Command::Tag { tag } => RemoteCommand::Tag(TagRequest {
+            tag: tag.unwrap_or_default(),
+        }),
         Command::Head { target } => RemoteCommand::Head(match target {
             HeadTarget::Entry(entry) => HeadRequest::entry(entry),
             HeadTarget::Before(entry) => HeadRequest::before(entry),

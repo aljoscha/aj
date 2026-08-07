@@ -80,6 +80,10 @@ pub(crate) struct ReleasedRow {
     /// the release flush moves it a whole idle grace after the work that
     /// buffered the entry. The host's own answer is the one about the session.
     pub(crate) last_activity: DateTime<Utc>,
+    /// The session's label as the driver held it, so the cold row keeps it
+    /// without waiting for an enumeration. A tag set while the session was
+    /// live is newer than anything the directory cache read.
+    pub(crate) tag: Option<String>,
 }
 
 /// The per-session state the host publishes, readable without awaiting.
@@ -130,6 +134,12 @@ pub(crate) struct SessionStatus {
     /// the new run can land while the run still reads as finished.
     pub(crate) driven_subs: BTreeSet<usize>,
     pub(crate) last_activity: DateTime<Utc>,
+    /// The session's label (spec 6.8), read from its sidecar when the session
+    /// was materialized and kept current by the tag command.
+    ///
+    /// Held here so a directory refresh, which runs on a coalescing tick, can
+    /// answer for a live session without going near the filesystem.
+    pub(crate) tag: Option<String>,
     /// The same instant on the monotonic clock, for the host's own release
     /// timer.
     ///

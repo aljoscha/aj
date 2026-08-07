@@ -27,10 +27,11 @@ use aj_app::session_setup::thinking_display_from_name;
 use aj_app::settings::PersistAction;
 use aj_conf::ConfigVerbosity;
 use aj_models::{speed_from_name, thinking_config_from_name};
+use aj_session::normalize_tag;
 use aj_wire::{
     CancelRequest, CompactRequest, CreateSessionRequest, Cursor, ErrorResponse, Frame, HeadRequest,
     PromptRequest, QueueOperation, QueueOutcome, QueueRequest, SessionCreated, SessionSettings,
-    SettingsRequest, SteerRequest,
+    SettingsRequest, SteerRequest, TagRequest,
 };
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, FromRequest, Path, Query, Request, State};
@@ -195,6 +196,7 @@ fn router(state: Arc<ServerState>) -> Router {
         .route("/v1/sessions/{id}/cancel", post(cancel))
         .route("/v1/sessions/{id}/compact", post(compact))
         .route("/v1/sessions/{id}/settings", post(settings))
+        .route("/v1/sessions/{id}/tag", post(tag))
         .route("/v1/sessions/{id}/head", post(head))
         .fallback(unknown_endpoint)
         // Outside the routes rather than per handler, so an unauthorized
@@ -235,10 +237,14 @@ async fn create_session(
     State(state): State<Arc<ServerState>>,
     Body(request): Body<CreateSessionRequest>,
 ) -> Result<Response, ApiError> {
-    let CreateSessionRequest { settings, prompt } = request;
+    let CreateSessionRequest {
+        settings,
+        prompt,
+        tag,
+    } = request;
     let id = state
         .host
-        .create_with(settings, prompt.map(|prompt| prompt.into_content()))
+        .create_with(settings, prompt.map(|prompt| prompt.into_content()), tag)
         .await?;
     Ok(Json(SessionCreated { id }).into_response())
 }
@@ -410,6 +416,25 @@ async fn head(
             .command(&session, Command::Head { target })
             .await?,
     )
+}
+
+/// Set or clear the session's tag (spec 6.6).
+async fn tag(
+    State(state): State<Arc<ServerState>>,
+    Path(session): Path<String>,
+    Body(request): Body<TagRequest>,
+) -> Result<Response, ApiError> {
+    let tag = normalized_tag(&request.tag)?;
+    accepted(state.host.command(&session, Command::Tag { tag }).await?)
+}
+
+/// The label as the store keeps it, `None` for anything that clears it.
+///
+/// Resolved here rather than in the host for the same reason a head target
+/// is: a label the store would refuse is a malformed request, and refusing it
+/// at this layer costs the session neither a materialization nor its lock.
+fn normalized_tag(tag: &str) -> Result<Option<String>, ApiError> {
+    normalize_tag(tag).map_err(|err| ApiError::invalid(err.to_string()))
 }
 
 /// Resolve a head request into the single target the host switches to.
