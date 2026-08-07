@@ -1784,8 +1784,13 @@ mod tests {
             ToolDetails::Bash {
                 stdout,
                 stdout_truncation,
+                full_output_path,
                 ..
             } => {
+                // Truncating persists the spill, so this test owns the file.
+                if let Some(path) = full_output_path {
+                    std::fs::remove_file(path).ok();
+                }
                 let t = stdout_truncation
                     .as_ref()
                     .expect("partial-line case should populate truncation");

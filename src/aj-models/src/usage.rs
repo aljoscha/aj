@@ -1259,22 +1259,23 @@ pub mod codex {
 mod tests {
     use std::collections::HashMap;
 
+    use tempfile::TempDir;
+
     use super::*;
 
-    fn scratch_storage(tag: &str) -> AuthStorage {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("aj-usage-test-{tag}-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        AuthStorage::with_providers(dir.join("auth.json"), HashMap::new())
+    /// An empty credential store in a scratch directory, plus the guard that
+    /// removes it. The storage reads and writes under that directory, so the
+    /// caller has to hold the guard for as long as it uses the storage.
+    fn scratch_storage(tag: &str) -> (TempDir, AuthStorage) {
+        let dir = TempDir::with_prefix(format!("aj-usage-test-{tag}-")).expect("create temp dir");
+        let storage = AuthStorage::with_providers(dir.path().join("auth.json"), HashMap::new());
+        (dir, storage)
     }
 
     /// No credential at all → `NotConfigured`, no network involved.
     #[tokio::test]
     async fn anthropic_source_reports_not_configured() {
-        let auth = scratch_storage("not-configured");
+        let (_dir, auth) = scratch_storage("not-configured");
         let source = anthropic::AnthropicUsageSource;
         // NOTE: env vars could interfere here, but tests don't run
         // with ANTHROPIC_* keys set in CI.
@@ -1290,7 +1291,7 @@ mod tests {
     /// A plain API key → `Unsupported`, no network involved.
     #[tokio::test]
     async fn anthropic_source_reports_unsupported_for_api_key() {
-        let auth = scratch_storage("api-key");
+        let (_dir, auth) = scratch_storage("api-key");
         auth.set(
             "anthropic",
             crate::auth::AuthCredential::ApiKey {

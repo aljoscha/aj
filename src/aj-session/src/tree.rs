@@ -279,36 +279,33 @@ fn kind_placeholder(kind: &ConversationEntryKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use aj_agent::message::AgentMessage;
     use aj_models::types::{AssistantContent, AssistantMessage, Message, TextContent, UserMessage};
+
+    use tempfile::TempDir;
 
     use super::*;
     use crate::log::{ConversationLog, ConversationView, ThreadFilter};
     use crate::persistence::ConversationPersistence;
 
-    /// A unique scratch directory for one test's persistence state.
-    fn fresh_sessions_dir() -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!(
-            "aj-session-tree-test-{pid}-{tid:?}-{nanos}",
-            pid = std::process::id(),
-            tid = std::thread::current().id(),
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+    /// A scratch directory for one test's persistence state, removed when the
+    /// returned guard drops. Callers must hold the guard for as long as they
+    /// use the directory.
+    fn fresh_sessions_dir() -> TempDir {
+        TempDir::new().expect("create temp dir")
     }
 
-    fn new_log() -> ConversationLog {
-        let persistence = ConversationPersistence::new(fresh_sessions_dir());
+    /// A log on disk, plus the guard that removes its directory. The log keeps
+    /// writing to that directory, so a caller has to hold the guard for as long
+    /// as it uses the log.
+    fn new_log() -> (TempDir, ConversationLog) {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("prompt".to_string())
             .expect("set system prompt");
-        log
+        (dir, log)
     }
 
     fn user_text(text: &str) -> AgentMessage {
@@ -343,7 +340,8 @@ mod tests {
     /// An empty (unpersisted) log has no segments.
     #[test]
     fn empty_log_has_no_segments() {
-        let persistence = ConversationPersistence::new(fresh_sessions_dir());
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let log = ConversationLog::create(&persistence).expect("create log");
         assert!(log.session_tree().segments.is_empty());
     }
@@ -353,7 +351,7 @@ mod tests {
     /// active.
     #[test]
     fn linear_session_is_one_segment() {
-        let mut log = new_log();
+        let (_dir, mut log) = new_log();
         add(&mut log, user_text("first question"));
         add(&mut log, assistant_text("an answer"));
         let last = add(&mut log, user_text("second question"));
@@ -378,7 +376,7 @@ mod tests {
     /// prefix and the branch holding the head are marked active.
     #[test]
     fn fork_mid_session_splits_into_parent_and_two_children() {
-        let mut log = new_log();
+        let (_dir, mut log) = new_log();
         add(&mut log, user_text("shared question"));
         let fork = add(&mut log, assistant_text("shared answer"));
 
@@ -427,7 +425,7 @@ mod tests {
     /// anchored above at the virtual root (parent `None`).
     #[test]
     fn root_fork_yields_two_root_segments() {
-        let mut log = new_log();
+        let (_dir, mut log) = new_log();
         let root_a = add(&mut log, user_text("root A"));
 
         // Branch at the first user message: its parent is the system-prompt
@@ -451,7 +449,7 @@ mod tests {
     /// message, so its label falls back to the dim `(settings)` placeholder.
     #[test]
     fn message_free_segment_falls_back_to_settings_label() {
-        let mut log = new_log();
+        let (_dir, mut log) = new_log();
         add(&mut log, user_text("shared question"));
         let fork = add(&mut log, assistant_text("shared answer"));
 
@@ -479,7 +477,7 @@ mod tests {
     /// abandoned sibling unmarked.
     #[test]
     fn on_active_path_marks_only_the_head_chain() {
-        let mut log = new_log();
+        let (_dir, mut log) = new_log();
         add(&mut log, user_text("root"));
         let fork = add(&mut log, assistant_text("fork answer"));
 
@@ -512,7 +510,7 @@ mod tests {
     fn sub_agent_thread_does_not_fork_the_segment() {
         use aj_agent::events::AgentSettings;
 
-        let mut log = new_log();
+        let (_dir, mut log) = new_log();
         add(&mut log, user_text("first question"));
         let spawner = add(&mut log, assistant_text("spawning a sub-agent"));
 
@@ -561,7 +559,7 @@ mod tests {
     /// recursion and parent-index threading through `session_tree`).
     #[test]
     fn nested_fork_threads_parents_children_and_active_path() {
-        let mut log = new_log();
+        let (_dir, mut log) = new_log();
         add(&mut log, user_text("shared"));
         let fork1 = add(&mut log, assistant_text("shared answer"));
 
@@ -632,7 +630,7 @@ mod tests {
     /// the head (the branches under the segment's terminating fork) is marked.
     #[test]
     fn interior_head_marks_its_segment_but_nothing_below() {
-        let mut log = new_log();
+        let (_dir, mut log) = new_log();
         add(&mut log, user_text("shared"));
         let mid = add(&mut log, assistant_text("interior"));
         add(&mut log, user_text("more shared"));

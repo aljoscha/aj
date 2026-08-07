@@ -723,20 +723,21 @@ fn try_steal_stale_lock(lock_path: &Path, max_age: Duration) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::TempDir;
+
     use super::*;
     use async_trait::async_trait;
 
-    /// Build a tempdir-style scratch path so each test gets its own
-    /// `auth.json` and `.lock` to play with. Atomic counter avoids
-    /// PID collisions across cargo's parallel test runs.
-    fn scratch_path(tag: &str) -> PathBuf {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("aj-auth-test-{tag}-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join("auth.json")
+    /// An `auth.json` path in a scratch directory of its own, so each test
+    /// gets its own file and `.lock` to play with, plus the guard that removes
+    /// the directory. The guard has to outlive the test's use of the path.
+    ///
+    /// The label rides in the directory name so a leftover from a crashed run
+    /// still says which test made it.
+    fn scratch_path(tag: &str) -> (TempDir, PathBuf) {
+        let dir = TempDir::with_prefix(format!("aj-auth-test-{tag}-")).expect("create temp dir");
+        let path = dir.path().join("auth.json");
+        (dir, path)
     }
 
     /// `AuthCredential` round-trip: API-key shape stays a flat
@@ -794,7 +795,7 @@ mod tests {
     /// create the file lazily and return what we just wrote.
     #[tokio::test]
     async fn set_get_remove_persists_to_file() {
-        let path = scratch_path("crud");
+        let (_dir, path) = scratch_path("crud");
         let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
 
         assert_eq!(storage.list().await.unwrap(), Vec::<String>::new());
@@ -827,14 +828,12 @@ mod tests {
 
         storage.remove("anthropic").await.unwrap();
         assert!(!storage.has("anthropic").await.unwrap());
-
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     /// Runtime override beats env vars and stored credentials.
     #[tokio::test]
     async fn get_api_key_runtime_override_wins() {
-        let path = scratch_path("override");
+        let (_dir, path) = scratch_path("override");
         let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
 
         storage
@@ -853,8 +852,6 @@ mod tests {
 
         let key = storage.get_api_key("openai").await.unwrap();
         assert_eq!(key.as_deref(), Some("from-runtime"));
-
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     /// Stored API key is returned when no runtime override or env var
@@ -862,7 +859,7 @@ mod tests {
     /// can't accidentally satisfy the request.
     #[tokio::test]
     async fn get_api_key_falls_back_to_stored_key() {
-        let path = scratch_path("stored");
+        let (_dir, path) = scratch_path("stored");
         let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
 
         storage
@@ -877,8 +874,6 @@ mod tests {
 
         let key = storage.get_api_key("custom-provider-xyz").await.unwrap();
         assert_eq!(key.as_deref(), Some("from-file"));
-
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     /// Restores an environment variable to its prior value on drop so an
@@ -922,7 +917,7 @@ mod tests {
     #[serial_test::serial]
     async fn get_api_key_stored_credential_beats_env_var() {
         let _env = EnvVarGuard::set("OPENROUTER_API_KEY", "from-env");
-        let path = scratch_path("stored-beats-env");
+        let (_dir, path) = scratch_path("stored-beats-env");
         let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
 
         // Nothing stored yet, so the env var is the fallback.
@@ -945,8 +940,6 @@ mod tests {
             storage.get_api_key("openrouter").await.unwrap().as_deref(),
             Some("from-file"),
         );
-
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     /// OAuth refresh flow: an expired token gets refreshed via the
@@ -983,7 +976,7 @@ mod tests {
             }
         }
 
-        let path = scratch_path("refresh");
+        let (_dir, path) = scratch_path("refresh");
         let mut providers: HashMap<String, Arc<dyn OAuthProvider>> = HashMap::new();
         providers.insert("stub".into(), Arc::new(StubProvider));
         let storage = AuthStorage::with_providers(path.clone(), providers);
@@ -1009,8 +1002,6 @@ mod tests {
             }
             other => panic!("unexpected credential: {other:?}"),
         }
-
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     /// Storage should still serve a non-expired OAuth token without
@@ -1041,7 +1032,7 @@ mod tests {
             }
         }
 
-        let path = scratch_path("cached");
+        let (_dir, path) = scratch_path("cached");
         let mut providers: HashMap<String, Arc<dyn OAuthProvider>> = HashMap::new();
         providers.insert("stub".into(), Arc::new(PanickyProvider));
         let storage = AuthStorage::with_providers(path.clone(), providers);
@@ -1056,15 +1047,13 @@ mod tests {
 
         let key = storage.get_api_key("stub").await.unwrap();
         assert_eq!(key.as_deref(), Some("fresh-a"));
-
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     /// `get_api_key` returns `None` when nothing is configured at any
     /// layer — runtime, env, or file.
     #[tokio::test]
     async fn get_api_key_returns_none_when_unconfigured() {
-        let path = scratch_path("none");
+        let (_dir, path) = scratch_path("none");
         let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
 
         let key = storage
@@ -1072,8 +1061,6 @@ mod tests {
             .await
             .unwrap();
         assert!(key.is_none());
-
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     /// A failing refresh surfaces as `AuthError::OAuth` (so the host
@@ -1105,7 +1092,7 @@ mod tests {
             }
         }
 
-        let path = scratch_path("refresh-fail");
+        let (_dir, path) = scratch_path("refresh-fail");
         let mut providers: HashMap<String, Arc<dyn OAuthProvider>> = HashMap::new();
         providers.insert("stub".into(), Arc::new(FailingProvider));
         let storage = AuthStorage::with_providers(path.clone(), providers);
@@ -1131,8 +1118,6 @@ mod tests {
             }
             other => panic!("stale credential should be preserved, got {other:?}"),
         }
-
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     /// A stored OAuth credential whose provider id isn't in the
@@ -1143,7 +1128,7 @@ mod tests {
     /// turn it into a usable key.
     #[tokio::test]
     async fn get_api_key_unknown_oauth_provider_resolves_to_none() {
-        let path = scratch_path("unknown-oauth");
+        let (_dir, path) = scratch_path("unknown-oauth");
         // No providers registered, so any OAuth lookup misses.
         let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
 
@@ -1160,8 +1145,6 @@ mod tests {
             key.is_none(),
             "unknown OAuth provider should resolve to None, got {key:?}"
         );
-
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     /// `find_env_keys` mirrors the table: anthropic prefers the
@@ -1213,7 +1196,7 @@ mod tests {
     /// reads back identically (i.e. `{ provider: AuthCredential }`).
     #[tokio::test]
     async fn auth_file_format_is_provider_keyed_map() {
-        let path = scratch_path("format");
+        let (_dir, path) = scratch_path("format");
         let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
 
         storage
@@ -1234,8 +1217,6 @@ mod tests {
         assert_eq!(parsed["openai"]["key"], "sk-1");
         assert_eq!(parsed["anthropic"]["type"], "oauth");
         assert_eq!(parsed["anthropic"]["refresh"], "r");
-
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     /// Default registry includes Anthropic + OpenAI Codex so out-of-the-box
@@ -1246,7 +1227,7 @@ mod tests {
     /// which don't need a refresh flow.
     #[tokio::test]
     async fn default_registry_has_anthropic_and_openai_codex() {
-        let path = scratch_path("registry");
+        let (_dir, path) = scratch_path("registry");
         let storage = AuthStorage::new(path.clone());
 
         // Looking up by id should succeed; we verify via the
@@ -1259,8 +1240,6 @@ mod tests {
         let mut ids: Vec<&str> = providers.values().map(|p| p.id()).collect();
         ids.sort();
         assert_eq!(ids, vec!["anthropic", "openai-codex"]);
-
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     /// A legacy `openai` OAuth entry in `auth.json` is invisibly
@@ -1270,7 +1249,7 @@ mod tests {
     /// new id returns the migrated credential.
     #[tokio::test]
     async fn read_migrates_legacy_openai_oauth_to_openai_codex() {
-        let path = scratch_path("migrate");
+        let (_dir, path) = scratch_path("migrate");
         // Hand-write a pre-migration `auth.json` containing an OAuth
         // entry under the legacy `openai` key. This is exactly the
         // shape a previous-version `aj` would have produced.
@@ -1300,8 +1279,6 @@ mod tests {
             }
             other => panic!("expected migrated OAuth entry under openai-codex, got {other:?}"),
         }
-
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     /// An `api_key` entry under `openai` is *not* migrated — that's a
@@ -1310,7 +1287,7 @@ mod tests {
     /// regular OpenAI provider's auth lookup.
     #[tokio::test]
     async fn read_preserves_openai_api_key_entries() {
-        let path = scratch_path("preserve");
+        let (_dir, path) = scratch_path("preserve");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let legacy = serde_json::json!({
             "openai": {"type": "api_key", "key": "sk-keep-me"}
@@ -1324,8 +1301,6 @@ mod tests {
             other => panic!("expected untouched ApiKey under openai, got {other:?}"),
         }
         assert!(storage.get("openai-codex").await.unwrap().is_none());
-
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     /// If the user already has an `openai-codex` entry — e.g. they
@@ -1334,7 +1309,7 @@ mod tests {
     /// existing destination.
     #[tokio::test]
     async fn read_skips_migration_when_target_already_present() {
-        let path = scratch_path("collision");
+        let (_dir, path) = scratch_path("collision");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mixed = serde_json::json!({
             "openai": {
@@ -1363,8 +1338,6 @@ mod tests {
             Some(AuthCredential::OAuth(c)) => assert_eq!(c.refresh, "new-r"),
             other => panic!("expected new entry preserved, got {other:?}"),
         }
-
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     /// After the in-memory migration, the next mutating write
@@ -1373,7 +1346,7 @@ mod tests {
     /// real auth operation runs.
     #[tokio::test]
     async fn migration_persists_to_disk_on_next_write() {
-        let path = scratch_path("persist");
+        let (_dir, path) = scratch_path("persist");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let legacy = serde_json::json!({
             "openai": {
@@ -1402,15 +1375,13 @@ mod tests {
         );
         assert_eq!(on_disk["openai-codex"]["refresh"], "legacy-refresh");
         assert_eq!(on_disk["anthropic"]["type"], "api_key");
-
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     /// Concurrent writers serialize via the file lock — ten parallel
     /// `set` calls should all land without losing entries.
     #[tokio::test]
     async fn concurrent_writes_serialize_via_lock() {
-        let path = scratch_path("concurrent");
+        let (_dir, path) = scratch_path("concurrent");
         let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
 
         let mut handles = Vec::new();
@@ -1435,8 +1406,6 @@ mod tests {
         listed.sort();
         let expected: Vec<String> = (0..10u8).map(|i| format!("p{i}")).collect();
         assert_eq!(listed, expected);
-
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     /// `try_steal_stale_lock` should leave fresh locks alone but
@@ -1446,7 +1415,7 @@ mod tests {
     /// [`STALE_LOCK_AGE`] to elapse.
     #[tokio::test]
     async fn stale_lock_is_stealable() {
-        let path = scratch_path("stale");
+        let (_dir, path) = scratch_path("stale");
         let lock_path = lock_path_for(&path);
 
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1470,7 +1439,5 @@ mod tests {
             !lock_path.exists(),
             "stolen lock directory should be removed"
         );
-
-        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }

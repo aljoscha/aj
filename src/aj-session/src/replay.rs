@@ -1250,6 +1250,8 @@ fn agent_id_for(entry: &ConversationEntry) -> Option<AgentId> {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::TempDir;
+
     use super::*;
     use crate::log::{ConversationLog, ConversationView};
     use crate::persistence::ConversationPersistence;
@@ -1259,20 +1261,11 @@ mod tests {
         ToolResultMessage, UserMessage,
     };
     use serde_json::json;
-    use std::path::PathBuf;
-
-    fn fresh_sessions_dir() -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!(
-            "aj-session-replay-test-{pid}-{tid:?}-{nanos}",
-            pid = std::process::id(),
-            tid = std::thread::current().id(),
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+    /// A scratch directory for one test's persistence state, removed when the
+    /// returned guard drops. Callers must hold the guard for as long as they
+    /// use the directory.
+    fn fresh_sessions_dir() -> TempDir {
+        TempDir::new().expect("create temp dir")
     }
 
     fn user_msg(text: &str) -> AgentMessage {
@@ -1299,7 +1292,7 @@ mod tests {
 
     fn replay_events_with_raw_tool_details(details: Value) -> Vec<AgentEvent> {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("system prompt");
 
@@ -1339,7 +1332,7 @@ mod tests {
         use aj_agent::message::{TaskNotification, TaskNotificationKind, TaskOutcome};
 
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("system prompt");
         {
@@ -1396,9 +1389,9 @@ mod tests {
 
     /// Build a seeded log exercising assistant text, thinking, tool
     /// use, and tool result with structured details.
-    fn seeded_log() -> (PathBuf, ConversationLog) {
+    fn seeded_log() -> (TempDir, ConversationLog) {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.clone());
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("sys".into()).expect("system prompt");
         {
@@ -1543,7 +1536,7 @@ mod tests {
         // A log with only the system-prompt root produces zero
         // events: meta entries are structural framing.
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into())
             .expect("set system prompt");
@@ -1561,7 +1554,7 @@ mod tests {
         // todo snapshots / sub-agent reports the same way live
         // runs do.
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
@@ -1787,7 +1780,7 @@ mod tests {
     #[test]
     fn replay_routes_subagent_entries_to_sub_agent_id() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
@@ -1824,7 +1817,7 @@ mod tests {
     #[test]
     fn replay_brackets_subagent_run_with_start_and_end() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
@@ -1911,7 +1904,7 @@ mod tests {
     /// message carries `stop_reason`.
     fn subagent_log_with_stop_reason(stop_reason: StopReason) -> ConversationLog {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
@@ -2009,7 +2002,7 @@ mod tests {
     #[test]
     fn replay_reconstructs_completed_for_a_tool_using_run_ending_in_stop() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
@@ -2061,7 +2054,7 @@ mod tests {
         // build the resuming main activity by appending to the user
         // thread head captured before the sub run.
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
@@ -2137,7 +2130,7 @@ mod tests {
         // message. Replay still emits a sensible event with the
         // fallback "tool" name and an empty args object.
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         {
             let mut view = ConversationView::user(&mut log);
@@ -2197,7 +2190,7 @@ mod tests {
     #[test]
     fn replay_synthesizes_usage_update_per_assistant_message() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         {
             let mut view = ConversationView::user(&mut log);
@@ -2274,7 +2267,7 @@ mod tests {
     #[test]
     fn replay_compaction_emits_compaction_end_with_reduced_after() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
 
         let first_kept = {
@@ -2357,7 +2350,7 @@ mod tests {
     #[test]
     fn replay_keeps_main_and_subagent_usage_accumulators_separate() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
 
         let user_head = {
@@ -2428,7 +2421,7 @@ mod tests {
     #[test]
     fn replay_keeps_seed_settings_entries_silent() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
         log.append_model_change(crate::log::ThreadFilter::USER, "anthropic", "claude-x")
@@ -2456,7 +2449,7 @@ mod tests {
     #[test]
     fn replay_emits_notice_for_mid_session_settings_entries() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
         {
@@ -2498,7 +2491,7 @@ mod tests {
     #[test]
     fn replay_subagent_spawn_entry_drives_sub_agent_start() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
@@ -2585,7 +2578,7 @@ mod tests {
     #[test]
     fn replay_foreground_spawn_entry_stays_foreground() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
@@ -2636,7 +2629,7 @@ mod tests {
     #[test]
     fn replay_subagent_with_leading_settings_entries_brackets_via_legacy_path() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
@@ -2726,7 +2719,7 @@ mod tests {
     #[test]
     fn replay_subagent_legacy_log_uses_fallback_settings() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
@@ -2765,9 +2758,9 @@ mod tests {
     /// concluding report, then main resumes. The sub content is rich so
     /// the deferred/`project_thread` parity checks exercise
     /// `MessageStart`/`End`, `ToolExecution*`, and `UsageUpdate`.
-    fn log_with_foreground_sub() -> (PathBuf, ConversationLog) {
+    fn log_with_foreground_sub() -> (TempDir, ConversationLog) {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.clone());
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
@@ -2831,9 +2824,9 @@ mod tests {
     /// while it is still open, then the sub concludes and main
     /// concludes. In append order the sub's entries straddle a main
     /// entry, so full replay opens and closes the sub bracket twice.
-    fn log_with_background_sub() -> (PathBuf, ConversationLog) {
+    fn log_with_background_sub() -> (TempDir, ConversationLog) {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.clone());
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
@@ -3057,7 +3050,7 @@ mod tests {
     #[test]
     fn replay_deferring_subs_emits_start_for_legacy_log() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
@@ -3161,7 +3154,7 @@ mod tests {
         // project only the branch the head is on, not the sibling. This
         // pins the concurrent-writer interleaving fix.
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
@@ -3205,7 +3198,7 @@ mod tests {
     #[test]
     fn path_aware_replay_includes_sub_on_path_excludes_sub_on_abandoned_branch() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
@@ -3295,7 +3288,7 @@ mod tests {
         // the active branch may replay, even though the abandoned run
         // carries the same id.
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
@@ -3393,7 +3386,7 @@ mod tests {
         // SubAgentSpawn root). Anchored on the active path, it must
         // still be included.
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
@@ -3450,9 +3443,9 @@ mod tests {
     /// tool call, 5 tool result, 6 mid-session thinking change,
     /// 7 assistant, 8 compaction, 9 sub-agent spawn root, 10 sub user,
     /// 11 sub assistant.
-    fn open_sub_log() -> (PathBuf, ConversationLog) {
+    fn open_sub_log() -> (TempDir, ConversationLog) {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.clone());
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("system prompt");
         log.append_model_change(ThreadFilter::USER, "anthropic", "claude-x")
@@ -3550,9 +3543,9 @@ mod tests {
     /// 4 spawn root of sub 1, 5 spawn root of sub 2, 6 sub-1 user, 7
     /// sub-2 user, 8 sub-1 assistant, 9 parent assistant, 10 sub-2
     /// assistant, 11 sub-1 report, 12 sub-2 report.
-    fn log_with_two_background_subs() -> (PathBuf, ConversationLog) {
+    fn log_with_two_background_subs() -> (TempDir, ConversationLog) {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.clone());
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
@@ -3655,9 +3648,9 @@ mod tests {
     ///
     /// Append positions: 1 system prompt, 2 user, 3 parent assistant,
     /// 4 sub user, 5 sub assistant.
-    fn log_with_legacy_sub() -> (PathBuf, ConversationLog) {
+    fn log_with_legacy_sub() -> (TempDir, ConversationLog) {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.clone());
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
@@ -3692,9 +3685,9 @@ mod tests {
     /// 7 active assistant. Entries 4 and 5 are off the head's path, so
     /// the projection skips them and its tagged positions have a gap in
     /// the middle rather than only at the front.
-    fn log_with_abandoned_sibling_branch() -> (PathBuf, ConversationLog) {
+    fn log_with_abandoned_sibling_branch() -> (TempDir, ConversationLog) {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.clone());
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
@@ -3744,9 +3737,9 @@ mod tests {
     ///
     /// Append positions: 1 system prompt, 2 user, 3 assistant with the
     /// batch, 4/5/6 the tool results.
-    fn tool_batch_log() -> (PathBuf, ConversationLog) {
+    fn tool_batch_log() -> (TempDir, ConversationLog) {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.clone());
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
         {
@@ -3782,9 +3775,9 @@ mod tests {
     /// Append positions: 1 system prompt, 2 user, 3 parent assistant,
     /// 4 spawn root, 5 sub user, 6 sub assistant, 7 sub thinking change,
     /// 8 sub assistant.
-    fn log_with_sub_settings_change() -> (PathBuf, ConversationLog) {
+    fn log_with_sub_settings_change() -> (TempDir, ConversationLog) {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.clone());
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
 
@@ -3883,7 +3876,7 @@ mod tests {
 
     #[test]
     fn a_cursorless_suffix_with_no_live_subs_equals_replay() {
-        let fixtures: Vec<(&str, (PathBuf, ConversationLog))> = vec![
+        let fixtures: Vec<(&str, (TempDir, ConversationLog))> = vec![
             ("seeded main-thread", seeded_log()),
             ("foreground sub", log_with_foreground_sub()),
             ("background sub", log_with_background_sub()),
@@ -4162,7 +4155,7 @@ mod tests {
     #[test]
     fn an_empty_log_projects_an_empty_backfill() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let log = ConversationLog::create(&persistence).expect("create log");
         let snapshot = log.snapshot();
         for cursor in [None, Some(0), Some(1), Some(u64::MAX)] {
@@ -4340,7 +4333,7 @@ mod tests {
     #[test]
     fn a_backfill_reports_only_the_runs_on_the_projected_path() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("sp");
         let common = {

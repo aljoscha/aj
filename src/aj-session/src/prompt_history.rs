@@ -344,23 +344,16 @@ impl PromptHead {
 mod tests {
     use std::fs::File;
     use std::io::Write;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use tempfile::TempDir;
 
     use super::*;
 
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-    fn scratch_dir(label: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("aj-history-scan-{label}-{nanos}-{n}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A scratch directory for one test, removed when the returned guard
+    /// drops. The label rides in the name so a leftover directory from a
+    /// crashed run still says which test made it.
+    fn scratch_dir(label: &str) -> TempDir {
+        TempDir::with_prefix(format!("aj-history-scan-{label}-")).expect("create temp dir")
     }
 
     fn user_line(text: &str, id: &str) -> String {
@@ -407,19 +400,19 @@ mod tests {
     fn workspace_history_is_newest_first_and_deduped() {
         let dir = scratch_dir("workspace");
         write_jsonl(
-            &dir,
+            dir.path(),
             "2024-01-01-00-00-00",
             &[user_line("first", "1"), user_line("second", "2")],
         );
         write_jsonl(
-            &dir,
+            dir.path(),
             "2024-02-01-00-00-00",
             // `second` repeats. The newer occurrence wins and the older
             // one is dropped.
             &[user_line("second", "1"), user_line("third", "2")],
         );
 
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let entries = workspace_history(&persistence, 2000, &|| false);
         let texts: Vec<&str> = entries.iter().map(|e| e.text.as_str()).collect();
         // Newest file first, prompts within a file newest-first, then
@@ -432,18 +425,18 @@ mod tests {
     fn workspace_history_streaming_emits_per_file_batches_deduped() {
         let dir = scratch_dir("workspace-stream");
         write_jsonl(
-            &dir,
+            dir.path(),
             "2024-01-01-00-00-00",
             &[user_line("first", "1"), user_line("second", "2")],
         );
         write_jsonl(
-            &dir,
+            dir.path(),
             "2024-02-01-00-00-00",
             // `second` repeats. The newer file's batch drops it as seen.
             &[user_line("second", "1"), user_line("third", "2")],
         );
 
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut batches: Vec<Vec<String>> = Vec::new();
         workspace_history_streaming(&persistence, 2000, &|| false, &mut |batch| {
             batches.push(batch.into_iter().map(|e| e.text).collect());
@@ -462,8 +455,8 @@ mod tests {
         let lines: Vec<String> = (0..n)
             .map(|i| user_line(&format!("p{i}"), &i.to_string()))
             .collect();
-        write_jsonl(&dir, "2024-01-01-00-00-00", &lines);
-        let path = dir.join("2024-01-01-00-00-00.jsonl");
+        write_jsonl(dir.path(), "2024-01-01-00-00-00", &lines);
+        let path = dir.path().join("2024-01-01-00-00-00.jsonl");
 
         // Sticky predicate: false at the line-0 poll, true from the
         // line-1024 poll onward.
@@ -483,12 +476,20 @@ mod tests {
     #[test]
     fn workspace_history_streaming_stops_when_cancelled() {
         let dir = scratch_dir("workspace-cancel");
-        write_jsonl(&dir, "2024-01-01-00-00-00", &[user_line("first", "1")]);
-        write_jsonl(&dir, "2024-02-01-00-00-00", &[user_line("second", "1")]);
+        write_jsonl(
+            dir.path(),
+            "2024-01-01-00-00-00",
+            &[user_line("first", "1")],
+        );
+        write_jsonl(
+            dir.path(),
+            "2024-02-01-00-00-00",
+            &[user_line("second", "1")],
+        );
 
         // Trip the predicate after the first file's batch: the between-files
         // check must break before reading the older file.
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let seen = std::cell::Cell::new(0usize);
         let mut batches: Vec<Vec<String>> = Vec::new();
         workspace_history_streaming(&persistence, 2000, &|| seen.get() > 0, &mut |batch| {
@@ -502,7 +503,7 @@ mod tests {
     fn workspace_history_respects_the_cap() {
         let dir = scratch_dir("workspace-cap");
         write_jsonl(
-            &dir,
+            dir.path(),
             "2024-01-01-00-00-00",
             &[
                 user_line("a", "1"),
@@ -510,7 +511,7 @@ mod tests {
                 user_line("c", "3"),
             ],
         );
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let entries = workspace_history(&persistence, 2, &|| false);
         assert_eq!(entries.len(), 2, "cap honored: {entries:?}");
     }
@@ -518,8 +519,8 @@ mod tests {
     #[test]
     fn all_workspaces_history_tags_and_dedupes_across_projects() {
         let base = scratch_dir("all-base");
-        let proj_a = base.join("proj-a");
-        let proj_b = base.join("proj-b");
+        let proj_a = base.path().join("proj-a");
+        let proj_b = base.path().join("proj-b");
         std::fs::create_dir_all(&proj_a).unwrap();
         std::fs::create_dir_all(&proj_b).unwrap();
         write_jsonl(
@@ -533,7 +534,7 @@ mod tests {
             &[user_line("shared prompt", "1"), user_line("only in b", "2")],
         );
 
-        let entries = all_workspaces_history(&base, 2000);
+        let entries = all_workspaces_history(base.path(), 2000);
         let by_text: std::collections::HashMap<&str, Option<&str>> = entries
             .iter()
             .map(|e| (e.text.as_str(), e.project.as_deref()))
@@ -549,21 +550,21 @@ mod tests {
     fn all_workspaces_history_missing_base_is_empty() {
         let base = scratch_dir("missing-base");
         std::fs::remove_dir_all(&base).unwrap();
-        assert!(all_workspaces_history(&base, 2000).is_empty());
+        assert!(all_workspaces_history(base.path(), 2000).is_empty());
     }
 
     #[test]
     fn task_notifications_are_excluded() {
         let dir = scratch_dir("notices");
         write_jsonl(
-            &dir,
+            dir.path(),
             "2024-01-01-00-00-00",
             &[
                 user_line("real prompt", "1"),
                 notification_line("background task done", "2"),
             ],
         );
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let entries = workspace_history(&persistence, 2000, &|| false);
         let texts: Vec<&str> = entries.iter().map(|e| e.text.as_str()).collect();
         assert_eq!(texts, vec!["real prompt"], "harness notice excluded");

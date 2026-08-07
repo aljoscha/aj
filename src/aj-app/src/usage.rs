@@ -188,6 +188,7 @@ pub fn now_unix_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use chrono::DateTime;
+    use tempfile::TempDir;
 
     use super::*;
 
@@ -255,15 +256,13 @@ mod tests {
     /// a row per known provider so the page never comes up empty.
     #[tokio::test]
     async fn collect_covers_known_providers() {
-        let dir = std::env::temp_dir().join(format!("aj-usage-collect-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let auth = AuthStorage::with_providers(dir.join("auth.json"), Default::default());
+        let dir = TempDir::with_prefix("aj-usage-collect-").expect("create temp dir");
+        let auth = AuthStorage::with_providers(dir.path().join("auth.json"), Default::default());
         let statuses = collect_usage(&auth).await;
         let ids: Vec<&str> = statuses.iter().map(|s| s.provider_id.as_str()).collect();
         assert_eq!(
             ids,
             vec!["anthropic", "openai", "openai-codex", "openrouter"]
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

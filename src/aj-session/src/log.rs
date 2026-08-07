@@ -1598,28 +1598,19 @@ impl<'a> ConversationView<'a> {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::TempDir;
+
     use super::*;
     use crate::persistence::ConversationPersistence;
     use aj_models::types::{
         AssistantContent, AssistantMessage, TextContent, ToolCall, ToolResultMessage, UserContent,
         UserMessage,
     };
-
-    /// Allocate a unique scratch directory for one test's persistence
-    /// state. Uses the process id, the test thread id, and a nanosecond
-    /// timestamp so tests running concurrently never collide.
-    fn fresh_sessions_dir() -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!(
-            "aj-session-log-test-{pid}-{tid:?}-{nanos}",
-            pid = std::process::id(),
-            tid = std::thread::current().id(),
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+    /// A scratch directory for one test's persistence state, removed when the
+    /// returned guard drops. Callers must hold the guard for as long as they
+    /// use the directory.
+    fn fresh_sessions_dir() -> TempDir {
+        TempDir::new().expect("create temp dir")
     }
 
     fn user_text(text: &str) -> AgentMessage {
@@ -1693,8 +1684,12 @@ mod tests {
         result.details.as_ref().expect("tool details")
     }
 
-    fn resume_fixture() -> (ConversationPersistence, String, Vec<String>) {
-        let persistence = ConversationPersistence::new(fresh_sessions_dir());
+    /// A materialized log's persistence, its session id, and the records on
+    /// disk, plus the guard that removes the directory. Callers rewrite that
+    /// file, so the guard has to outlive their use of the persistence.
+    fn resume_fixture() -> (TempDir, ConversationPersistence, String, Vec<String>) {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let session_id = {
             let mut log = ConversationLog::create(&persistence).expect("create log");
             log.set_system_prompt("fixture prompt".to_string())
@@ -1710,7 +1705,7 @@ mod tests {
             .map(str::to_string)
             .collect::<Vec<_>>();
         assert_eq!(records.len(), 2);
-        (persistence, session_id, records)
+        (dir, persistence, session_id, records)
     }
 
     /// `flush_pending` drains buffered non-punctuation entries to disk so a
@@ -1718,7 +1713,8 @@ mod tests {
     /// not create a file, preserving the abandoned-empty-session property).
     #[test]
     fn flush_pending_persists_buffered_entries_and_noops_when_unmaterialized() {
-        let persistence = ConversationPersistence::new(fresh_sessions_dir());
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
 
         // Unmaterialized log: only a buffered (non-punctuation) system prompt.
         // Flushing must not create a file on disk.
@@ -1776,7 +1772,7 @@ mod tests {
 
     #[test]
     fn resume_ignores_blank_and_whitespace_lines_including_crlf() {
-        let (persistence, session_id, records) = resume_fixture();
+        let (_dir, persistence, session_id, records) = resume_fixture();
         let path = persistence.session_path(&session_id);
         let expected_ids = records
             .iter()
@@ -1800,7 +1796,7 @@ mod tests {
 
     #[test]
     fn resume_drops_malformed_trailing_record_followed_by_whitespace() {
-        let (persistence, session_id, records) = resume_fixture();
+        let (_dir, persistence, session_id, records) = resume_fixture();
         let path = persistence.session_path(&session_id);
         std::fs::write(
             &path,
@@ -1830,7 +1826,7 @@ mod tests {
 
     #[test]
     fn resume_terminates_valid_final_record_before_appending() {
-        let (persistence, session_id, records) = resume_fixture();
+        let (_dir, persistence, session_id, records) = resume_fixture();
         let path = persistence.session_path(&session_id);
         std::fs::write(&path, format!("{}\n{}", records[0], records[1]))
             .expect("remove trailing newline");
@@ -1859,7 +1855,7 @@ mod tests {
     /// the same entry id two seqs.
     #[test]
     fn resume_keeps_the_first_occurrence_of_a_duplicated_entry() {
-        let (persistence, session_id, records) = resume_fixture();
+        let (_dir, persistence, session_id, records) = resume_fixture();
         let path = persistence.session_path(&session_id);
         std::fs::write(
             &path,
@@ -1899,7 +1895,7 @@ mod tests {
     #[test]
     fn create_mints_distinct_ids_and_claims_them_on_disk() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.clone());
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
 
         let logs: Vec<ConversationLog> = (0..12)
             .map(|_| ConversationLog::create(&persistence).expect("create log"))
@@ -1914,7 +1910,7 @@ mod tests {
                 "no log file until the first punctuation append"
             );
             assert!(
-                crate::lock::lock_path(&dir, log.session_id())
+                crate::lock::lock_path(dir.path(), log.session_id())
                     .expect("a minted id")
                     .exists(),
                 "the claim is visible on the filesystem"
@@ -1930,11 +1926,11 @@ mod tests {
     #[test]
     fn create_never_reuses_a_claimed_id() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.clone());
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let first = ConversationLog::create(&persistence).expect("create log");
 
         let claimed = first.session_id().to_string();
-        let (minted, _) = ConversationLog::mint_unique_path(&dir, &claimed)
+        let (minted, _) = ConversationLog::mint_unique_path(dir.path(), &claimed)
             .expect("minting near a claimed base succeeds");
         assert_ne!(minted, claimed, "the claimed id is refused");
         assert_eq!(minted, format!("{claimed}_1"), "and the next one is taken");
@@ -1942,7 +1938,7 @@ mod tests {
 
     #[test]
     fn resume_reports_physical_line_for_malformed_non_final_record() {
-        let (persistence, session_id, records) = resume_fixture();
+        let (_dir, persistence, session_id, records) = resume_fixture();
         let path = persistence.session_path(&session_id);
         std::fs::write(
             &path,
@@ -1969,7 +1965,7 @@ mod tests {
 
     #[test]
     fn resume_surfaces_invalid_utf8_as_invalid_data_io_error() {
-        let (persistence, session_id, records) = resume_fixture();
+        let (_dir, persistence, session_id, records) = resume_fixture();
         let path = persistence.session_path(&session_id);
         let mut contents = records[0].as_bytes().to_vec();
         contents.extend_from_slice(b"\n\xff\n");
@@ -1990,7 +1986,7 @@ mod tests {
 
     #[test]
     fn resume_io_error_wins_over_earlier_non_final_corruption() {
-        let (persistence, session_id, records) = resume_fixture();
+        let (_dir, persistence, session_id, records) = resume_fixture();
         let path = persistence.session_path(&session_id);
         let mut contents = records[0].as_bytes().to_vec();
         contents.extend_from_slice(b"\n{\"id\":\n");
@@ -2020,7 +2016,7 @@ mod tests {
         // by [`set_system_prompt_alone_does_not_create_file`] and
         // [`first_punctuation_append_flushes_buffered_system_prompt`].
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
 
         let id = log
@@ -2048,7 +2044,7 @@ mod tests {
         // that prevents accumulating empty sessions when the user
         // opens the TUI and quits before submitting anything.
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir.clone());
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".to_string()).expect("set sp");
 
@@ -2068,7 +2064,7 @@ mod tests {
         // resume from disk and check both entries are present in the
         // right order.
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
 
         let session_id = {
             let mut log = ConversationLog::create(&persistence).expect("create log");
@@ -2104,7 +2100,7 @@ mod tests {
     #[test]
     fn set_system_prompt_rejects_non_empty_log() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
 
         {
@@ -2122,7 +2118,7 @@ mod tests {
     #[test]
     fn first_user_message_anchors_to_system_prompt_root() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
 
         let sp_id = log
@@ -2142,7 +2138,7 @@ mod tests {
     #[test]
     fn latest_leaf_user_skips_system_prompt() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
 
         log.set_system_prompt("p".to_string()).expect("set sp");
@@ -2160,7 +2156,7 @@ mod tests {
     #[test]
     fn linearize_user_walks_past_system_prompt() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".to_string()).expect("set sp");
 
@@ -2188,7 +2184,7 @@ mod tests {
         // panicking: we get only the entries below the break, and the
         // root above it is dropped.
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
 
         let (session_id, head_b) = {
             let mut log = ConversationLog::create(&persistence).expect("create log");
@@ -2230,7 +2226,7 @@ mod tests {
     #[test]
     fn resume_preserves_system_prompt() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
 
         let session_id = {
             let mut log = ConversationLog::create(&persistence).expect("create log");
@@ -2255,7 +2251,7 @@ mod tests {
         // it was spawned from; subagent linearization only collects
         // subagent entries.
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".to_string()).expect("set sp");
 
@@ -2278,7 +2274,7 @@ mod tests {
     #[test]
     fn direct_message_append_compacts_storage_and_expands_resume_projections() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("sys".into()).expect("set sp");
 
@@ -2368,7 +2364,7 @@ mod tests {
         use aj_agent::message::AgentMessageKind;
 
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("system prompt");
         {
@@ -2415,7 +2411,7 @@ mod tests {
         // ToolResult messages serialize with their structured details
         // preserved on disk and rehydrate equivalently on resume.
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("sys".into()).expect("set sp");
 
@@ -2462,7 +2458,7 @@ mod tests {
     #[test]
     fn message_id_is_adopted_as_entry_id_and_survives_resume() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("sys".into()).expect("set sp");
 
@@ -2503,7 +2499,8 @@ mod tests {
         // Materialize a session so a file path exists, then overwrite it
         // with a hand-built legacy fixture: 8-hex entry ids and bare wire
         // messages with no `id` field, the real shape of old files.
-        let persistence = ConversationPersistence::new(fresh_sessions_dir());
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let session_id = {
             let mut log = ConversationLog::create(&persistence).expect("create log");
             log.set_system_prompt("sys".into()).expect("set sp");
@@ -2570,7 +2567,7 @@ mod tests {
     #[test]
     fn duplicate_message_id_append_errors() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("sys".into()).expect("set sp");
 
@@ -2602,7 +2599,7 @@ mod tests {
     #[test]
     fn settings_entries_round_trip_through_resume() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let session_id = {
             let mut log = ConversationLog::create(&persistence).expect("create log");
             log.set_system_prompt("p".into()).expect("set sp");
@@ -2648,7 +2645,7 @@ mod tests {
     #[test]
     fn settings_only_log_does_not_create_file_until_punctuation() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("set sp");
         log.append_model_change(ThreadFilter::USER, "openai", "gpt-x")
@@ -2691,7 +2688,7 @@ mod tests {
     #[test]
     fn settings_entries_in_linearize_but_skipped_by_messages() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("set sp");
         log.append_model_change(ThreadFilter::USER, "anthropic", "claude-x")
@@ -2715,7 +2712,7 @@ mod tests {
     #[test]
     fn settings_last_wins_per_axis() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("set sp");
         log.append_model_change(ThreadFilter::USER, "anthropic", "claude-x")
@@ -2750,7 +2747,7 @@ mod tests {
     #[test]
     fn settings_assistant_message_fallback_for_model() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("set sp");
         {
@@ -2776,7 +2773,7 @@ mod tests {
     #[test]
     fn settings_model_change_after_assistant_message_wins() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("set sp");
         {
@@ -2799,7 +2796,7 @@ mod tests {
     #[test]
     fn settings_assistant_message_after_model_change_wins() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("set sp");
         log.append_model_change(ThreadFilter::USER, "openai", "gpt-b")
@@ -2822,7 +2819,7 @@ mod tests {
     #[test]
     fn subagent_settings_entries_excluded_from_user_linearize() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("set sp");
         let user_id = {
@@ -2864,7 +2861,7 @@ mod tests {
     #[test]
     fn append_settings_anchors_to_system_prompt_root_and_chains() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         let sp_id = log.set_system_prompt("p".into()).expect("set sp").id;
 
@@ -2902,7 +2899,7 @@ mod tests {
     #[test]
     fn subagent_spawn_round_trips_through_resume() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let session_id = {
             let mut log = ConversationLog::create(&persistence).expect("create log");
             log.set_system_prompt("p".into()).expect("set sp");
@@ -2997,7 +2994,7 @@ mod tests {
         // settings() on a sub-agent linearize picks up all three
         // axes from the spawn snapshot.
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("set sp");
         let user_id = {
@@ -3029,7 +3026,7 @@ mod tests {
     #[test]
     fn assistant_and_tool_result_count_toward_messages() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("set sp");
         {
@@ -3050,7 +3047,7 @@ mod tests {
         // materialize the file immediately and survive a resume with
         // all its fields intact.
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
 
         let (session_id, first_kept) = {
             let mut log = ConversationLog::create(&persistence).expect("create log");
@@ -3110,7 +3107,7 @@ mod tests {
     #[test]
     fn append_compaction_rejects_unknown_first_kept_id() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("set sp");
         {
@@ -3129,7 +3126,7 @@ mod tests {
         // replaced by one synthetic wrapped-summary message, and the
         // retained tail (from `first_kept_entry_id` on) is verbatim.
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("set sp");
 
@@ -3183,7 +3180,7 @@ mod tests {
     #[test]
     fn compaction_projection_expands_retained_text_details() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("set sp");
 
@@ -3252,7 +3249,8 @@ mod tests {
 
     #[test]
     fn every_append_returns_its_one_based_position() {
-        let persistence = ConversationPersistence::new(fresh_sessions_dir());
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
 
         let mut refs = vec![
@@ -3333,7 +3331,8 @@ mod tests {
 
     #[test]
     fn last_seq_starts_at_zero_and_tracks_the_last_append() {
-        let persistence = ConversationPersistence::new(fresh_sessions_dir());
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         assert_eq!(log.last_seq(), 0, "an empty log has nothing appended yet");
 
@@ -3352,7 +3351,8 @@ mod tests {
 
     #[test]
     fn snapshot_answers_reads_like_the_log_and_ignores_later_appends() {
-        let persistence = ConversationPersistence::new(fresh_sessions_dir());
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".to_string())
             .expect("system prompt");
@@ -3425,14 +3425,15 @@ mod tests {
         // disk for the existence check to catch.
         let dir = fresh_sessions_dir();
         let (first, first_path) =
-            ConversationLog::mint_unique_path(&dir, "2026-01-01-00-00-00-000").expect("first mint");
+            ConversationLog::mint_unique_path(dir.path(), "2026-01-01-00-00-00-000")
+                .expect("first mint");
         let (second, second_path) =
-            ConversationLog::mint_unique_path(&dir, "2026-01-01-00-00-00-000")
+            ConversationLog::mint_unique_path(dir.path(), "2026-01-01-00-00-00-000")
                 .expect("second mint");
         assert_ne!(first, second, "two mints from one base must differ");
         assert_ne!(first_path, second_path);
 
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut ids = std::collections::HashSet::new();
         let mut logs = Vec::new();
         for _ in 0..50 {
@@ -3454,7 +3455,7 @@ mod tests {
         // The mint-and-retry path must never hand out a duplicate id
         // within one log, even across many appends.
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".into()).expect("set sp");
 
@@ -3485,7 +3486,7 @@ mod tests {
         // id-uniqueness guarantee, not the line-tearing one (which
         // depends on real concurrent `O_APPEND` writes).
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
 
         let session_id = {
             let mut log = ConversationLog::create(&persistence).expect("create log");
@@ -3534,7 +3535,7 @@ mod tests {
     #[test]
     fn head_advances_on_user_append_and_ignores_subagent_append() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         log.set_system_prompt("p".to_string()).expect("set sp");
 
@@ -3576,7 +3577,7 @@ mod tests {
     #[test]
     fn set_head_to_earlier_entry_creates_sibling_branch() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
 
         let (session_id, u1, tail) = {
             let mut log = ConversationLog::create(&persistence).expect("create log");
@@ -3615,7 +3616,7 @@ mod tests {
     #[test]
     fn set_head_validates_entry_thread() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         let mut log = ConversationLog::create(&persistence).expect("create log");
         let sp = log.set_system_prompt("p".to_string()).expect("set sp").id;
 
@@ -3660,7 +3661,7 @@ mod tests {
     #[test]
     fn resume_initializes_head_and_set_head_shortens_linearize() {
         let dir = fresh_sessions_dir();
-        let persistence = ConversationPersistence::new(dir);
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
 
         let (session_id, u1, u2) = {
             let mut log = ConversationLog::create(&persistence).expect("create log");

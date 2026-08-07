@@ -886,10 +886,12 @@ fn new_idempotency_key() -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, OnceLock};
 
     use aj_models::usage::{ProviderUsage, UsageError, UsageWindow};
     use async_trait::async_trait;
+    use tempfile::TempDir;
     use vaxis::cell::Color;
 
     use super::*;
@@ -904,13 +906,22 @@ mod tests {
             .clone()
     }
 
+    /// An empty credential store in a scratch directory of its own.
+    ///
+    /// The directories live under one root held for the whole process rather
+    /// than behind a per-test guard. `UsageOverlay::new` spawns its fetch onto
+    /// the leaked runtime above, so a task holding a clone of the storage
+    /// outlives the test that built it, and the write path creates its parent
+    /// directory. A per-test guard would remove the directory and the late
+    /// write would put it straight back, with nothing left to clean it up.
+    /// Each store still gets its own subdirectory, so tests running
+    /// concurrently cannot see each other's credentials.
     fn scratch_auth() -> AuthStorage {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        static ROOT: OnceLock<TempDir> = OnceLock::new();
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let root = ROOT.get_or_init(|| TempDir::with_prefix("aj-usage-").expect("create temp dir"));
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("aj-usage-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        AuthStorage::with_providers(dir.join("auth.json"), HashMap::new())
+        AuthStorage::with_providers(root.path().join(format!("{n}/auth.json")), HashMap::new())
     }
 
     /// Distinct muted tint so a column left at the default fg fails the
@@ -1000,8 +1011,9 @@ mod tests {
             let closed = Rc::clone(&closed);
             Box::new(move |_ctx| *closed.borrow_mut() = true)
         };
+        let auth = scratch_auth();
         let mut overlay = UsageOverlay::new(
-            scratch_auth(),
+            auth,
             sources,
             test_styles(),
             SelectStyles::default(),
