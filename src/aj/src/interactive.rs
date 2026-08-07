@@ -16750,18 +16750,36 @@ mod tests {
         // the branch's transcript and the edited one stands in its place. An
         // `entry` target would land on the message and keep both.
         settle(&mut world).await;
-        let prompts: Vec<String> = world
-            .chat
-            .borrow()
-            .transcript(AgentId::Main)
-            .expect("the main transcript")
-            .entries()
-            .iter()
-            .filter_map(|entry| match &entry.kind {
-                aj_app::chat::EntryKind::User(user) => Some(user.joined_text()),
-                _ => None,
-            })
-            .collect();
+        // The branch's prompt reaches this client over the stream the reset
+        // obliged it to reopen, and the host can still be appending it when
+        // that attach block is generated. So wait for a prompt to land rather
+        // than assume the block carried one. Waiting for any prompt, not the
+        // expected one: a branch that wrongly kept both messages satisfies
+        // this and then fails the assertion below, which is the point.
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        let prompts = loop {
+            fold_ready_frames(&mut world);
+            let prompts: Vec<String> = world
+                .chat
+                .borrow()
+                .transcript(AgentId::Main)
+                .expect("the main transcript")
+                .entries()
+                .iter()
+                .filter_map(|entry| match &entry.kind {
+                    aj_app::chat::EntryKind::User(user) => Some(user.joined_text()),
+                    _ => None,
+                })
+                .collect();
+            if !prompts.is_empty() {
+                break prompts;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the branch's transcript never reached the client",
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
         assert_eq!(
             prompts,
             vec!["edited prompt".to_string()],
