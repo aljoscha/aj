@@ -151,6 +151,16 @@ impl Args {
             None => Ok(None),
         }
     }
+
+    /// Whether `--tag` carries a label for this run to give a session.
+    ///
+    /// The normalized answer, so a flag that names nothing reads as no flag,
+    /// which is what makes [`TAG_WITHOUT_A_CREATE`] a report about a label
+    /// that exists. An illegal one answers `false` here and is reported by
+    /// [`Self::launch_tag`], which every mode calls before anything is minted.
+    pub fn has_launch_tag(&self) -> bool {
+        matches!(self.launch_tag(), Ok(Some(_)))
+    }
 }
 
 /// What a run says when `--tag` named a session it never created.
@@ -360,5 +370,16 @@ mod tests {
             Ok(Some("spaced".to_string())),
         );
         assert_eq!(parse(&["aj", "--tag", "   "]).launch_tag(), Ok(None));
+    }
+
+    /// The report on a resume goes by the normalized label, so a flag that
+    /// names nothing has nothing to report and an illegal one is left to
+    /// `launch_tag`, which refuses the run outright.
+    #[test]
+    fn a_blank_tag_flag_names_no_session() {
+        assert!(parse(&["aj", "--tag", "fix-auth"]).has_launch_tag());
+        assert!(!parse(&["aj"]).has_launch_tag());
+        assert!(!parse(&["aj", "--tag", "   "]).has_launch_tag());
+        assert!(!parse(&["aj", "--tag", "two\nlines"]).has_launch_tag());
     }
 }

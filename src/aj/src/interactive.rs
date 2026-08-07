@@ -339,7 +339,7 @@ async fn build_world(
     if let Some(warning) = aj_app::tmux::options().and_then(aj_app::tmux::build_warning) {
         fold_warning(&mut world, &warning);
     }
-    if !fresh && args.tag.is_some() {
+    if !fresh && args.has_launch_tag() {
         fold_warning(&mut world, TAG_WITHOUT_A_CREATE);
     }
     for notice in restore_notices {
@@ -445,7 +445,7 @@ async fn build_connect_world(
             "--listen has nothing to serve in connect mode: the sessions live on the host.",
         );
     }
-    if !created && args.tag.is_some() {
+    if !created && args.has_launch_tag() {
         fold_warning(&mut world, TAG_WITHOUT_A_CREATE);
     }
     let dialed = format!("Connected to {}.", connect_url(&world));
@@ -8130,6 +8130,32 @@ mod tests {
             "and the resumed session is not relabelled",
         );
         shut_down(&resumed).await;
+
+        // A flag that normalizes to no label names nothing, so there is
+        // nothing to report about it. Print mode reads the same flag through
+        // the same rule (see `Args::has_launch_tag`).
+        let blank = world_from_argv(
+            &dir,
+            &[
+                "aj",
+                "--scripted",
+                "streaming-text",
+                "--tag",
+                "   ",
+                "continue",
+                &session,
+            ],
+        )
+        .await
+        .expect("build the resumed world");
+        assert!(
+            !main_notices(&blank)
+                .iter()
+                .any(|n| n.contains("--tag has nothing to name")),
+            "{:?}",
+            main_notices(&blank),
+        );
+        shut_down(&blank).await;
     }
 
     /// `fresh_env_notices` produces the fresh-session env block: a leading Info
@@ -17459,6 +17485,50 @@ mod tests {
                 .len(),
             listed.sessions.len(),
             "a refused tag costs the host no session",
+        );
+        remote.shutdown().await;
+    }
+
+    /// A connect that attaches an existing session has no created session for
+    /// `--tag` to name, so the flag is reported rather than dropped, exactly
+    /// as a local resume reports it. A flag that normalizes to no label names
+    /// nothing and reports nothing.
+    #[tokio::test]
+    async fn a_launch_tag_on_a_connect_resume_says_it_has_nothing_to_name() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        // A session on the host, so the connect attaches rather than creating.
+        let session = remote.host.create().await.expect("create on the host");
+
+        let world = connect_world(&dir, &remote, &["--tag", "fix-auth"]).await;
+        assert!(
+            main_notices(&world)
+                .iter()
+                .any(|n| n.contains("--tag has nothing to name")),
+            "{:?}",
+            main_notices(&world),
+        );
+        assert_eq!(
+            remote
+                .host
+                .sessions()
+                .await
+                .expect("the host's rows")
+                .sessions
+                .iter()
+                .find(|row| row.id == session)
+                .and_then(|row| row.tag.as_deref()),
+            None,
+            "and the attached session is not relabelled",
+        );
+
+        let blank = connect_world(&dir, &remote, &["--tag", "   "]).await;
+        assert!(
+            !main_notices(&blank)
+                .iter()
+                .any(|n| n.contains("--tag has nothing to name")),
+            "{:?}",
+            main_notices(&blank),
         );
         remote.shutdown().await;
     }
