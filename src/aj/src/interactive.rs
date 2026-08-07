@@ -16500,6 +16500,47 @@ mod tests {
         shut_down(&world).await;
     }
 
+    /// An empty submit clears the label the editor showed. It does not clear
+    /// one the editor never showed: with no row to prefill from, the empty
+    /// field is what the client could show rather than what the store holds,
+    /// and confirming it would delete a label the user never saw.
+    #[tokio::test]
+    async fn an_empty_submit_does_not_clear_a_label_the_editor_never_showed() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        let session = world.session().to_string();
+        seed_tag(&mut world, &shell, "fix-auth").await;
+
+        // A client holding no row for its own session, which is what an attach
+        // whose first list frame has not landed yet looks like.
+        world.directory = SessionDirectory::new(session.clone());
+
+        press(&mut app, &mut writer, &chord_bytes(AjAction::SessionTag)).await;
+        drain_parked_action(&mut world, &shell)
+            .await
+            .expect("the chord parked the tag command");
+        focus_overlay(&mut app, &root);
+        press(&mut app, &mut writer, CTRL_U).await;
+        type_text(&mut app, &mut writer, "\r").await;
+
+        assert_eq!(
+            shell.borrow().overlays.borrow().depth(),
+            0,
+            "the submit closed the editor",
+        );
+        assert!(
+            shell.borrow().take_tag_edit().is_none(),
+            "and asked the peer for nothing",
+        );
+        assert_eq!(
+            store_in(&dir).read_tag(&session).expect("read the sidecar"),
+            Some("fix-auth".to_string()),
+            "so the label the editor could not show still stands",
+        );
+        shut_down(&world).await;
+    }
+
     /// The palette command opens the same prefilled editor the chord does, so
     /// the two are one gesture with two triggers.
     #[tokio::test]

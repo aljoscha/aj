@@ -34,6 +34,11 @@ pub(crate) struct TagEdit {
 /// included) rather than popping back to it. A refusal keeps the overlay open
 /// and raises a toast: the label the store would not keep never becomes a
 /// silent no-op, and the editor is still there to fix it in.
+///
+/// `current` is what the peer's row says, so it is `None` both for a session
+/// with no label and for one the peer has published no row for. An empty
+/// submit therefore only travels as a clear when there was a label to clear
+/// (see below).
 pub(crate) fn open_session_tag(handles: &OverlayHandles, current: Option<&str>) {
     let overlay = Rc::new(RefCell::new(TextEditOverlay::new(current.unwrap_or(""))));
     let focus = overlay.borrow().focus_target();
@@ -42,11 +47,19 @@ pub(crate) fn open_session_tag(handles: &OverlayHandles, current: Option<&str>) 
         let editor = Rc::clone(&handles.editor);
         let slot = Rc::clone(&handles.tag_edit);
         let toasts = Rc::clone(&handles.toasts);
+        let showed_a_label = current.is_some();
         overlay
             .borrow()
             .set_on_submit(Box::new(move |ctx, text| match normalize_tag(text) {
                 Ok(tag) => {
-                    *slot.borrow_mut() = Some(TagEdit { tag });
+                    // A clear asks for the label on screen to be removed, so
+                    // it only travels when there was one. An editor opened on
+                    // a session whose row has not arrived shows an empty field
+                    // because that is all the client knows, and confirming it
+                    // would delete a label the user was never shown.
+                    if tag.is_some() || showed_a_label {
+                        *slot.borrow_mut() = Some(TagEdit { tag });
+                    }
                     close_all(&stack, ctx, &editor);
                 }
                 // The store's own sentence, so one refusal reads the same
