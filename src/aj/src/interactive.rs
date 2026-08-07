@@ -16493,7 +16493,9 @@ mod tests {
             "the peer republished the row under the new label",
         );
         assert!(
-            strip_labels(&shell).contains(&"ship-it".to_string()),
+            strip_labels(&shell)
+                .iter()
+                .any(|label| label.starts_with("ship-it")),
             "and the strip paints it: {:?}",
             strip_labels(&shell),
         );
@@ -16578,6 +16580,14 @@ mod tests {
             world_shell_app(&dir, "streaming-text", default_layers()).await;
         pin_sidebar_open(&shell);
         seed_tag(&mut world, &shell, "fix-auth").await;
+        // What the strip paints before the clear, so the assertion below is
+        // about the clear rather than about a label that was never there.
+        let painted = |shell: &Rc<RefCell<Shell>>| {
+            strip_labels(shell)
+                .iter()
+                .any(|label| label.contains("fix-auth"))
+        };
+        assert!(painted(&shell), "{:?}", strip_labels(&shell));
 
         press(&mut app, &mut writer, &chord_bytes(AjAction::SessionTag)).await;
         drain_parked_action(&mut world, &shell)
@@ -16600,7 +16610,7 @@ mod tests {
             "the peer republished the row without a label",
         );
         assert!(
-            !strip_labels(&shell).contains(&"fix-auth".to_string()),
+            !painted(&shell),
             "and the strip stopped painting it: {:?}",
             strip_labels(&shell),
         );
@@ -16878,6 +16888,47 @@ mod tests {
             &shell.borrow().theme.read(),
             crate::terminal::TerminalCaps::default(),
         )
+    }
+
+    /// A tagged row paints its tag and its time of day, the tag leading and
+    /// the time dim against the label field's right edge. Two sessions can
+    /// carry one tag and the time is what places a row in the sitting, so the
+    /// row shows both rather than trading one for the other.
+    ///
+    /// Read off the composed frame, so a strip left out of the layout, or one
+    /// whose field the shell lays out differently, fails here.
+    #[test]
+    fn the_composed_strip_paints_a_tag_beside_its_time() {
+        let shell = test_shell_with_chat(empty_chat());
+        show_sidebar(
+            &shell,
+            vec![
+                SidebarRow {
+                    tag: Some("fix-auth".to_string()),
+                    ..sidebar_row("2026-08-06-19-07-19-368", None, true)
+                },
+                SidebarRow {
+                    tag: Some("rewrite-the-gateway-provisioner".to_string()),
+                    ..sidebar_row("2026-08-06-18-40-49-001", None, false)
+                },
+            ],
+        );
+        let cells = strip_lines_painted(&shell);
+        assert_eq!(strip_line_text(&cells, 0), "▌  fix-auth      19-07 │");
+        assert_eq!(
+            strip_line_text(&cells, 1),
+            "   rewrite-the-… 18-40 │",
+            "an over-long tag elides and leaves the time its place",
+        );
+        let styles = strip_styles(&shell);
+        assert_eq!(
+            cells[0][3].style, styles.accent,
+            "the focused row's tag carries the working-set brightness",
+        );
+        assert_eq!(
+            cells[0][17].style, styles.dim,
+            "and the time beside it is dim on the very same line",
+        );
     }
 
     /// A row the client holds open on a host that has gone out paints at
