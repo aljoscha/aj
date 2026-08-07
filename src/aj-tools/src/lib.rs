@@ -28,6 +28,8 @@ pub mod sanitize {
 
 pub use sanitize::sanitize_terminal_output;
 
+use std::path::PathBuf;
+
 use aj_agent::tool::ErasedToolDefinition;
 
 pub use tools::agent::AgentTool;
@@ -46,10 +48,14 @@ pub struct BuiltinToolOptions {
     /// Forwarded to [`ReadFileTool::with_auto_resize`]. Default
     /// `true`; flip via `image_auto_resize` in `~/.aj/config.toml`.
     pub image_auto_resize: bool,
-    /// Forwarded to [`BashTool::with_rtk`]. Default `false`; enable
+    /// Forwarded to [`BashTool::new`]. Default `false`; enable
     /// via `bash_rtk` in `~/.aj/config.toml`. Routes eligible bash
     /// commands through `rtk` to compress their output.
     pub bash_rtk: bool,
+    /// Where bash writes the spill files carrying a command's full output.
+    /// `None` uses the ambient temp directory; set via `spill_dir` in
+    /// `~/.aj/config.toml`.
+    pub spill_dir: Option<PathBuf>,
 }
 
 impl Default for BuiltinToolOptions {
@@ -57,6 +63,7 @@ impl Default for BuiltinToolOptions {
         Self {
             image_auto_resize: true,
             bash_rtk: false,
+            spill_dir: None,
         }
     }
 }
@@ -70,7 +77,7 @@ pub fn get_builtin_tools(options: &BuiltinToolOptions) -> Vec<ErasedToolDefiniti
     vec![
         AgentTool.into(),
         ApplyPatchTool.into(),
-        BashTool::with_rtk(options.bash_rtk).into(),
+        BashTool::new(options.bash_rtk, options.spill_dir.clone()).into(),
         ReadFileTool::with_auto_resize(options.image_auto_resize).into(),
         WriteFileTool.into(),
         EditFileTool.into(),

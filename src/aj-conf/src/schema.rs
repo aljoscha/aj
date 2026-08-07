@@ -649,6 +649,13 @@ pub struct Config {
     /// `git status > out` captures rtk's compressed output in the
     /// file, not the raw form.
     pub bash_rtk: bool,
+    /// Directory for the spill files that carry a bash command's full
+    /// output: every background task's canonical output, and any
+    /// foreground run whose output was truncated for the model. Unset
+    /// uses the ambient temp directory (`TMPDIR`). Point it somewhere
+    /// with room when a small `/tmp` cannot hold what long-running
+    /// commands produce.
+    pub spill_dir: Option<String>,
     /// User keybinding overrides, `aj.*` action id to chord string (e.g.
     /// `"aj.palette.open" = "ctrl+p"`), parsed from the `[keybindings]`
     /// table. Structural only here: the value is any string, and the
@@ -685,6 +692,7 @@ impl Default for Config {
             compact_threshold: 0.85,
             compact_keep_recent: 20_000,
             bash_rtk: false,
+            spill_dir: None,
             keybindings: BTreeMap::new(),
         }
     }
@@ -967,6 +975,17 @@ impl Config {
             },
             display_fn: |c| c.bash_rtk.to_string(),
             to_toml_fn: |c| bool_item(c.bash_rtk, false),
+        },
+        ConfigOption {
+            name: "spill_dir",
+            description: "Directory for bash spill files (full output of background and truncated runs).",
+            kind: ValueKind::String,
+            apply_toml_fn: |v, c| {
+                c.spill_dir = v.try_into()?;
+                Ok(())
+            },
+            display_fn: |c| display_opt(&c.spill_dir),
+            to_toml_fn: |c| opt_value_item(&c.spill_dir),
         },
         ConfigOption {
             name: "syntax_highlighting",

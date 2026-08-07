@@ -50,6 +50,18 @@ struct Harness {
     host: SessionHost,
 }
 
+/// The config every harness session reads, with bash's spill files aimed
+/// inside `dir`.
+///
+/// A background task's spill is persisted by contract, so left at the ambient
+/// temp directory it would outlive the test that started the task.
+fn harness_config(dir: &TempDir) -> Config {
+    Config {
+        spill_dir: Some(dir.path().join("spill").to_string_lossy().into_owned()),
+        ..Config::default()
+    }
+}
+
 impl Harness {
     /// A host whose sessions run the scripted provider replaying
     /// `messages`. Every session materialized from this host shares that
@@ -103,7 +115,7 @@ impl Harness {
     ) -> Self {
         let dir = TempDir::new().expect("tempdir");
         let persistence = ConversationPersistence::new(dir.path().join("sessions"));
-        let config = Arc::new(StdMutex::new(Config::default()));
+        let config = Arc::new(StdMutex::new(harness_config(&dir)));
         let host = SessionHost::new(HostSetup {
             config: Arc::clone(&config),
             layers: Arc::new(StdMutex::new(ConfigLayers {
@@ -160,7 +172,7 @@ impl Harness {
         idle_grace: Option<Duration>,
     ) -> Harness {
         let dir = TempDir::new().expect("tempdir");
-        let config = Arc::new(StdMutex::new(Config::default()));
+        let config = Arc::new(StdMutex::new(harness_config(&dir)));
         let host = SessionHost::new(HostSetup {
             config: Arc::clone(&config),
             layers: Arc::new(StdMutex::new(ConfigLayers {

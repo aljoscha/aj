@@ -379,6 +379,17 @@ fn scripted(
     )
 }
 
+/// The config a test host reads, with bash's spill files aimed inside `dir`.
+///
+/// A background task's spill is persisted by contract, so left at the ambient
+/// temp directory it would outlive the test that started the task.
+fn harness_config(dir: &TempDir) -> Config {
+    Config {
+        spill_dir: Some(dir.path().join("spill").to_string_lossy().into_owned()),
+        ..Config::default()
+    }
+}
+
 fn snapshot(provider: Arc<ScriptedProvider>) -> RunConfigSnapshot {
     RunConfigSnapshot {
         provider,
@@ -535,7 +546,7 @@ impl Fixture {
         heartbeat: Duration,
     ) -> Self {
         let dir = TempDir::new().expect("tempdir");
-        let config = Arc::new(StdMutex::new(Config::default()));
+        let config = Arc::new(StdMutex::new(harness_config(&dir)));
         let layers = Arc::new(StdMutex::new(ConfigLayers {
             user: Config::default(),
             project: ConfigLayer::default(),
@@ -578,7 +589,7 @@ impl Fixture {
     /// catalog, its own port.
     async fn rival(&self) -> (SessionHost, RemoteServer, RemoteClient) {
         let host = SessionHost::new(HostSetup {
-            config: Arc::new(StdMutex::new(Config::default())),
+            config: Arc::new(StdMutex::new(harness_config(&self._dir))),
             layers: Arc::new(StdMutex::new(ConfigLayers {
                 user: Config::default(),
                 project: ConfigLayer::default(),

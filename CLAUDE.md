@@ -10,6 +10,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Run CLI: `cargo run -p aj -- [args]` (e.g. `list-sessions`, `continue <id>`, `continue`)
 - Format code: `cargo fmt`
 - Lint: `cargo clippy --workspace --all-targets`
+- Scratch-space guard: `./scripts/check-test-scratch.sh` (runs the suite
+  under an empty `TMPDIR` and fails on residue)
 
 The workspace enables strict custom lints (see `[workspace.lints]` in
 `Cargo.toml`), so run `cargo fmt` and `cargo check` before reporting a

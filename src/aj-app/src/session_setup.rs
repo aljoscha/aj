@@ -11,6 +11,7 @@
 //! registry, bus subscriptions, and event pump. Print mode adds the
 //! JSONL / persistence listeners and the one-shot turn.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use aj_agent::events::AgentSettings;
@@ -379,6 +380,7 @@ pub(crate) fn builtin_tool_options(config: &Config) -> BuiltinToolOptions {
     BuiltinToolOptions {
         image_auto_resize: config.image_auto_resize,
         bash_rtk: config.bash_rtk,
+        spill_dir: config.spill_dir.as_ref().map(PathBuf::from),
     }
 }
 
@@ -589,6 +591,27 @@ mod tests {
 
     fn empty_auth(dir: &TempDir) -> AuthStorage {
         AuthStorage::new(dir.path().join("auth.json"))
+    }
+
+    /// The spill directory reaches tool construction as a path, and stays
+    /// unset when the config leaves it unset so bash falls back to the ambient
+    /// temp directory.
+    #[test]
+    fn the_spill_directory_reaches_tool_construction() {
+        assert_eq!(
+            builtin_tool_options(&Config::default()).spill_dir,
+            None,
+            "unset means the ambient temp directory, not a path of our choosing",
+        );
+
+        let config = Config {
+            spill_dir: Some("/var/tmp/aj-spill".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(
+            builtin_tool_options(&config).spill_dir,
+            Some(PathBuf::from("/var/tmp/aj-spill")),
+        );
     }
 
     /// The scripted path applies the CLI > config provider-id

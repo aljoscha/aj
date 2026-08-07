@@ -52,7 +52,7 @@
 //!   runs in `Sequential` mode: a batch containing it serializes
 //!   around any other in-flight tool calls.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -135,18 +135,24 @@ pub struct BashTool {
     /// it reaches the model. See [`rtk_rewrite`] for the eligibility
     /// rules and [`rtk_available`] for the PATH probe.
     rtk: bool,
+    /// Where spill files are written. `None` uses the ambient temp
+    /// directory, which is what an unset `spill_dir` config means.
+    spill_dir: Option<PathBuf>,
 }
 
 impl BashTool {
-    /// Construct with the given rtk passthrough setting.
-    pub fn with_rtk(rtk: bool) -> Self {
-        Self { rtk }
+    /// Construct with the given rtk passthrough setting and spill directory.
+    pub fn new(rtk: bool, spill_dir: Option<PathBuf>) -> Self {
+        Self { rtk, spill_dir }
     }
 }
 
 impl Default for BashTool {
     fn default() -> Self {
-        Self { rtk: false }
+        Self {
+            rtk: false,
+            spill_dir: None,
+        }
     }
 }
 
@@ -353,7 +359,7 @@ impl ToolDefinition for BashTool {
         // happens we drop the `NamedTempFile` at the end and the file
         // gets unlinked; if truncation does happen we `keep()` it and
         // surface the path through the structured payload.
-        let spill = Arc::new(Mutex::new(SpillState::new()?));
+        let spill = Arc::new(Mutex::new(SpillState::new(self.spill_dir.as_deref())?));
 
         let stdout_state = Arc::new(Mutex::new(StreamState::new()));
         let stderr_state = Arc::new(Mutex::new(StreamState::new()));
@@ -694,11 +700,21 @@ enum SpillFile {
 }
 
 impl SpillState {
-    fn new() -> std::io::Result<Self> {
-        let file = tempfile::Builder::new()
-            .prefix("aj-bash-")
-            .suffix(".log")
-            .tempfile()?;
+    /// A fresh spill file in `dir`, or in the ambient temp directory when
+    /// `dir` is `None`.
+    ///
+    /// The directory is created if missing, so a configured path does not have
+    /// to exist before the first command runs.
+    fn new(dir: Option<&Path>) -> std::io::Result<Self> {
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("aj-bash-").suffix(".log");
+        let file = match dir {
+            Some(dir) => {
+                std::fs::create_dir_all(dir)?;
+                builder.tempfile_in(dir)?
+            }
+            None => builder.tempfile()?,
+        };
         Ok(Self {
             file: Some(SpillFile::Temp(file)),
         })
@@ -1344,6 +1360,7 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Mutex as StdMutex;
     use std::task::{Context, Poll};
+    use tempfile::TempDir;
     use tokio::io::{AsyncRead, ReadBuf};
     use tokio_util::sync::CancellationToken;
 
@@ -1365,7 +1382,7 @@ mod tests {
     #[tokio::test]
     async fn read_stream_surfaces_pipe_read_failure() {
         let state = Arc::new(Mutex::new(StreamState::new()));
-        let spill = Arc::new(Mutex::new(SpillState::new().expect("spill")));
+        let spill = Arc::new(Mutex::new(SpillState::new(None).expect("spill")));
         let error = Arc::new(Mutex::new(None));
 
         read_stream(FailingReader, state, spill, Arc::clone(&error), "stdout").await;
@@ -1379,7 +1396,7 @@ mod tests {
     #[tokio::test]
     async fn read_stream_surfaces_spill_write_failure() {
         let state = Arc::new(Mutex::new(StreamState::new()));
-        let mut unavailable_spill = SpillState::new().expect("spill");
+        let mut unavailable_spill = SpillState::new(None).expect("spill");
         unavailable_spill.file = None;
         let spill = Arc::new(Mutex::new(unavailable_spill));
         let error = Arc::new(Mutex::new(None));
@@ -1461,7 +1478,7 @@ mod tests {
         // With passthrough off the method short-circuits before
         // touching the PATH cache or spawning rtk, so no rtk
         // installation is needed for this test.
-        let tool = BashTool::with_rtk(false);
+        let tool = BashTool::new(false, None);
         assert_eq!(tool.rtk_rewrite("git status").await, None);
     }
 
@@ -1762,10 +1779,13 @@ mod tests {
     #[tokio::test]
     async fn single_huge_line_emits_last_line_partial_marker() {
         let mut ctx = DummyToolContext::default();
+        // Truncating persists the spill, so the tool writes into a directory
+        // this test owns.
+        let spill_dir = TempDir::new().expect("create temp dir");
         // One ~120 KB line with no internal newlines, no trailing
         // newline. Exceeds the 50 KB byte cap; line cap is irrelevant
         // (one line total).
-        let outcome = BashTool::default()
+        let outcome = BashTool::new(false, Some(spill_dir.path().to_path_buf()))
             .execute(
                 &mut ctx,
                 BashInput {
@@ -1787,10 +1807,11 @@ mod tests {
                 full_output_path,
                 ..
             } => {
-                // Truncating persists the spill, so this test owns the file.
-                if let Some(path) = full_output_path {
-                    std::fs::remove_file(path).ok();
-                }
+                let path = full_output_path.as_ref().expect("a truncated run spills");
+                assert!(
+                    path.starts_with(spill_dir.path()),
+                    "the spill honours the configured directory: {path:?}",
+                );
                 let t = stdout_truncation
                     .as_ref()
                     .expect("partial-line case should populate truncation");
@@ -2112,14 +2133,19 @@ mod tests {
 
     // ---- Background mode --------------------------------------------------
 
-    /// Execute `command` as a background task on `ctx`, returning the
-    /// minted task id and the spill path from the started result.
+    /// Execute `command` as a background task on `ctx`, returning the minted
+    /// task id, the spill path from the started result, and the guard that
+    /// removes the directory holding it.
+    ///
+    /// A background task's spill is persisted by contract, so pointing the tool
+    /// at an owned directory is what keeps the file from outliving the test.
     async fn start_background(
         ctx: &mut DummyToolContext,
         command: &str,
         timeout: u64,
-    ) -> (aj_agent::tool::TaskId, PathBuf) {
-        let outcome = BashTool::default()
+    ) -> (aj_agent::tool::TaskId, PathBuf, TempDir) {
+        let spill_dir = TempDir::new().expect("create temp dir");
+        let outcome = BashTool::new(false, Some(spill_dir.path().to_path_buf()))
             .execute(
                 ctx,
                 BashInput {
@@ -2138,7 +2164,7 @@ mod tests {
                 full_output_path: Some(path),
                 exit_code: None,
                 ..
-            } => (*id, path.clone()),
+            } => (*id, path.clone(), spill_dir),
             other => panic!("expected started Bash details with task id + spill path: {other:?}"),
         }
     }
@@ -2173,7 +2199,8 @@ mod tests {
     #[tokio::test]
     async fn background_started_result_carries_id_and_spill_path() {
         let mut ctx = DummyToolContext::default();
-        let outcome = BashTool::default()
+        let spill_dir = TempDir::new().expect("create temp dir");
+        let outcome = BashTool::new(false, Some(spill_dir.path().to_path_buf()))
             .execute(
                 &mut ctx,
                 BashInput {
@@ -2235,8 +2262,6 @@ mod tests {
             body.contains(&format!("Full output: {}", spill_path.display())),
             "notice body: {body:?}"
         );
-
-        std::fs::remove_file(&spill_path).ok();
     }
 
     /// The detached driver announces the task on the bus as its
@@ -2261,7 +2286,7 @@ mod tests {
             },
         ));
 
-        let (id, spill_path) = start_background(&mut ctx, "true", 30).await;
+        let (id, _spill_path, _spill_dir) = start_background(&mut ctx, "true", 30).await;
         // The registry flips terminal before the `TaskEnd` emit, so
         // wait for the emit itself.
         wait_for(
@@ -2274,8 +2299,6 @@ mod tests {
             vec![("start", id), ("end", id)],
             "TaskStart precedes TaskEnd"
         );
-
-        std::fs::remove_file(&spill_path).ok();
     }
 
     /// `timeout` is ignored in background mode: a command outliving
@@ -2286,15 +2309,14 @@ mod tests {
         // A zero-second timeout would kill the foreground path
         // immediately; the background task must run to its natural
         // exit anyway.
-        let (id, spill_path) = start_background(&mut ctx, "sleep 0.3; echo done", 0).await;
+        let (id, spill_path, _spill_dir) =
+            start_background(&mut ctx, "sleep 0.3; echo done", 0).await;
 
         let registry = ctx.task_registry();
         let status = await_terminal(&registry, id).await;
         assert_eq!(status, aj_agent::tool::TaskStatus::Exited(Some(0)));
         let on_disk = std::fs::read_to_string(&spill_path).expect("spill readable");
         assert_eq!(on_disk, "done\n");
-
-        std::fs::remove_file(&spill_path).ok();
     }
 
     /// The spill file is live: it can be read (e.g. via `read_file`
@@ -2302,7 +2324,8 @@ mod tests {
     #[tokio::test]
     async fn background_spill_file_readable_while_running() {
         let mut ctx = DummyToolContext::default();
-        let (id, spill_path) = start_background(&mut ctx, "echo first; sleep 30", 30).await;
+        let (id, spill_path, _spill_dir) =
+            start_background(&mut ctx, "echo first; sleep 30", 30).await;
 
         let registry = ctx.task_registry();
         let path = spill_path.clone();
@@ -2326,7 +2349,5 @@ mod tests {
         assert!(registry.kill(id));
         let status = await_terminal(&registry, id).await;
         assert_eq!(status, aj_agent::tool::TaskStatus::Killed);
-
-        std::fs::remove_file(&spill_path).ok();
     }
 }

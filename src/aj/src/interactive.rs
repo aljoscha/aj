@@ -6937,6 +6937,25 @@ mod tests {
         scripted_world_with_layers(dir, demo, default_layers()).await
     }
 
+    /// Where a test's bash spill files belong: inside the caller's temp dir, so
+    /// its guard takes them. A background task's spill is persisted by
+    /// contract, so left at the ambient temp directory it would outlive the
+    /// test that started the task.
+    fn spill_dir_in(dir: &TempDir) -> Option<String> {
+        Some(dir.path().join("spill").to_string_lossy().into_owned())
+    }
+
+    /// [`default_layers`] with the spill directory aimed inside `dir`.
+    fn layers_spilling_into(dir: &TempDir) -> ConfigLayers {
+        ConfigLayers {
+            user: Config {
+                spill_dir: spill_dir_in(dir),
+                ..Config::default()
+            },
+            ..default_layers()
+        }
+    }
+
     /// Empty config layers with no project path, for tests that don't
     /// exercise persistence.
     fn default_layers() -> ConfigLayers {
@@ -6956,9 +6975,10 @@ mod tests {
     async fn scripted_world_with(
         dir: &TempDir,
         demo: &str,
-        layers: ConfigLayers,
+        mut layers: ConfigLayers,
         idle_grace: Option<Duration>,
     ) -> World {
+        layers.user.spill_dir = spill_dir_in(dir);
         let args = Args::parse_from(["aj", "--scripted", demo]);
         let auth = AuthStorage::new(dir.path().join("auth.json"));
         let persistence = ConversationPersistence::new(dir.path().join("sessions"));
@@ -15144,7 +15164,7 @@ mod tests {
             let auth = AuthStorage::new(dir.path().join("auth.json"));
             let persistence = ConversationPersistence::new(dir.path().join("sessions"));
             let ComposedHost { host, .. } =
-                compose_host(&args, default_layers(), &auth, &persistence, None)
+                compose_host(&args, layers_spilling_into(dir), &auth, &persistence, None)
                     .expect("compose a host");
             let server = crate::remote::RemoteServer::bind(
                 host.clone(),

@@ -1246,6 +1246,7 @@ async fn execute_tool(input: ToolWorkerInput) -> ToolOutcomeWire {
         &BuiltinToolOptions {
             image_auto_resize: true,
             bash_rtk: false,
+            spill_dir: None,
         },
         &["agent".into()],
         Some("gpt"),

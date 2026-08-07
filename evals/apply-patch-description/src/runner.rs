@@ -2197,6 +2197,7 @@ fn expected_tools(variant: DescriptionVariant, family: Option<&str>) -> Vec<Tool
         &BuiltinToolOptions {
             image_auto_resize: true,
             bash_rtk: false,
+            spill_dir: None,
         },
         &disabled,
         family,
