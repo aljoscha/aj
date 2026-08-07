@@ -240,39 +240,42 @@ impl SoftwrapIterator {
         self.line = Vec::new();
     }
 
-    /// Returns the next hard line as an owned cell vector, splitting on `\n` and
-    /// `\r\n`.
+    /// Returns the next hard line as an owned cell vector, splitting on `\n`,
+    /// `\r`, and `\r\n`.
     ///
-    /// NOTE: The `\r` handling mirrors upstream exactly, including the latent
-    /// bug where a lone or leading carriage return takes the "back up one"
-    /// branch on the same iteration it is seen and underflows. None of the
-    /// ported tests exercise `\r`, and we reproduce the behavior rather than
-    /// quietly fixing it (D8).
+    /// A lone carriage return breaks a line like a newline does. It is not a
+    /// character anyone means to see in a cell, and this widget draws content
+    /// that reached us from somewhere else (a peer's session tag, a message),
+    /// so the byte has to have a defined meaning here rather than panicking a
+    /// draw. Upstream backs up on the iteration it first sees the return, which
+    /// underflows `hard_index` on any return not preceded by a full line, and
+    /// we deliberately do not reproduce that.
     fn next_hard_break(&mut self) -> Option<Vec<Cell>> {
         if self.hard_index >= self.text.len() {
             return None;
         }
         let start = self.hard_index;
-        let mut saw_cr = false;
         while self.hard_index < self.text.len() {
             let grapheme = self.text[self.hard_index].char.grapheme();
-            let is_cr = grapheme == "\r";
-            let is_lf = grapheme == "\n";
-            if is_cr {
-                saw_cr = true;
-            }
-            if is_lf {
+            // Grapheme segmentation keeps a `\r\n` pair together (Unicode
+            // GB3), so the pair arrives as one cluster and is one break.
+            if !matches!(grapheme, "\n" | "\r" | "\r\n") {
                 self.hard_index += 1;
-                if saw_cr {
-                    return Some(self.text[start..self.hard_index - 2].to_vec());
-                }
-                return Some(self.text[start..self.hard_index - 1].to_vec());
+                continue;
             }
-            if saw_cr {
-                self.hard_index -= 1;
-                return Some(self.text[start..self.hard_index - 1].to_vec());
-            }
+            let end = self.hard_index;
             self.hard_index += 1;
+            // A `\r` and `\n` that reached us as separate clusters are still
+            // one break, which is the case segmentation did not fold.
+            if grapheme == "\r"
+                && self
+                    .text
+                    .get(self.hard_index)
+                    .is_some_and(|cell| cell.char.grapheme() == "\n")
+            {
+                self.hard_index += 1;
+            }
+            return Some(self.text[start..end].to_vec());
         }
         Some(self.text[start..].to_vec())
     }
@@ -420,6 +423,111 @@ mod tests {
                 height: 20,
             },
             width_method: gwidth::Method::Unicode,
+        }
+    }
+
+    /// The lines a `RichText` breaks `text` into, read off the drawn surface.
+    fn drawn_lines(text: &str, softwrap: bool) -> Vec<String> {
+        let mut rich_text = RichText {
+            softwrap,
+            ..RichText::new(vec![Segment {
+                text: text.to_string(),
+                ..Segment::default()
+            }])
+        };
+        let c = ctx(MaxSize {
+            width: Some(20),
+            height: Some(8),
+        });
+        let surface = rich_text.draw(&c);
+        let mut lines = vec![String::new(); usize::from(surface.size.height)];
+        for (index, cell) in surface.buffer.iter().enumerate() {
+            let row = index / usize::from(surface.size.width);
+            if let Some(line) = lines.get_mut(row) {
+                line.push_str(cell.char.grapheme());
+            }
+        }
+        // Trailing spaces only. A `\r` left in a line by a broken walk is
+        // whitespace, and trimming it would hide exactly that.
+        lines
+            .iter()
+            .map(|line| line.trim_end_matches(' ').to_string())
+            .collect()
+    }
+
+    /// The lines a `RichText` built from several spans breaks into.
+    fn drawn_lines_of_spans(texts: &[&str]) -> Vec<String> {
+        let mut rich_text = RichText {
+            softwrap: false,
+            ..RichText::new(
+                texts
+                    .iter()
+                    .map(|text| Segment {
+                        text: (*text).to_string(),
+                        ..Segment::default()
+                    })
+                    .collect(),
+            )
+        };
+        let c = ctx(MaxSize {
+            width: Some(20),
+            height: Some(8),
+        });
+        let surface = rich_text.draw(&c);
+        let mut lines = vec![String::new(); usize::from(surface.size.height)];
+        for (index, cell) in surface.buffer.iter().enumerate() {
+            let row = index / usize::from(surface.size.width);
+            if let Some(line) = lines.get_mut(row) {
+                line.push_str(cell.char.grapheme());
+            }
+        }
+        lines
+            .iter()
+            .map(|line| line.trim_end_matches(' ').to_string())
+            .collect()
+    }
+
+    /// Segmentation folds `\r\n` into one cluster, but it runs per span, so a
+    /// return ending one span and a newline opening the next arrive separately.
+    /// They are still one break.
+    #[test]
+    fn a_return_and_newline_split_across_spans_are_one_break() {
+        assert_eq!(drawn_lines_of_spans(&["a\r", "\nb"]), ["a", "b"]);
+        assert_eq!(
+            drawn_lines_of_spans(&["a\r", "b"]),
+            ["a", "b"],
+            "a return ending a span still breaks on its own",
+        );
+    }
+
+    /// A carriage return breaks a line like a newline does, whether or not a
+    /// newline follows it, and a `\r\n` pair is one break rather than two.
+    ///
+    /// Peer-supplied content reaches this widget (a session tag, a message),
+    /// so a byte nobody normalized must not be able to panic a draw.
+    #[test]
+    fn a_carriage_return_breaks_a_line() {
+        for softwrap in [false, true] {
+            assert_eq!(drawn_lines("a\nb", softwrap), ["a", "b"], "{softwrap}");
+            assert_eq!(drawn_lines("a\rb", softwrap), ["a", "b"], "{softwrap}");
+            assert_eq!(drawn_lines("a\r\nb", softwrap), ["a", "b"], "{softwrap}");
+            assert_eq!(drawn_lines("ab\rcd", softwrap), ["ab", "cd"], "{softwrap}");
+            assert_eq!(
+                drawn_lines("a\r\rb", softwrap),
+                ["a", "", "b"],
+                "two returns are two breaks ({softwrap})",
+            );
+        }
+    }
+
+    /// A return with nothing either side of it draws rather than panicking.
+    /// These are the shapes that underflowed the hard-break walk.
+    #[test]
+    fn a_lone_carriage_return_draws() {
+        for softwrap in [false, true] {
+            assert_eq!(drawn_lines("\r", softwrap), [""], "{softwrap}");
+            assert_eq!(drawn_lines("\r\n", softwrap), [""], "{softwrap}");
+            assert_eq!(drawn_lines("\rx", softwrap), ["", "x"], "{softwrap}");
         }
     }
 
