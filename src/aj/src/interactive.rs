@@ -83,6 +83,7 @@ use crate::prompt_history::{HistoryFetch, HistoryScope, MAX_ENTRIES, open_prompt
 use crate::quit_hint::QuitHint;
 use crate::selection_copied::SelectionCopied;
 use crate::session_selector::{SessionScan, extend_session_scan, open_session_selector};
+use crate::session_tag::{TagEdit, open_session_tag};
 use crate::session_tree::{build_tree_rows, open_session_tree};
 use crate::settings_ui::{
     MODEL_SETTING_ID, SelectorActivity, SettingsCatalogs, SettingsUi, SettingsValues, SkillRow,
@@ -1941,17 +1942,20 @@ async fn handle_host_action(
         // Read the clipboard image to a tempfile and insert its path at the
         // editor cursor. Silent when there is no image, matching `aj`.
         AjAction::PasteImage => paste_clipboard_image(shell),
-        // The direct chords (ctrl+r, alt+a) open the same overlays as the
-        // palette commands. Park the matching command so the host's
-        // `apply_command_action` opens it on the next drive-loop step
-        // (which owns the refocus move). Nothing renders here yet, so no
-        // redraw.
+        // The direct chords open the same overlays as their palette commands.
+        // Park the matching command so the host's `apply_command_action` opens
+        // it on the next drive-loop step (which owns the refocus move).
+        // Nothing renders here yet, so no redraw.
         AjAction::HistoryOpen => {
             *shell.borrow().command_slot.borrow_mut() = Some(CommandAction::OpenPromptHistory);
             false
         }
         AjAction::AgentPickerOpen => {
             *shell.borrow().command_slot.borrow_mut() = Some(CommandAction::OpenAgentPicker);
+            false
+        }
+        AjAction::SessionTag => {
+            *shell.borrow().command_slot.borrow_mut() = Some(CommandAction::OpenSessionTag);
             false
         }
         // Handled inside the controller's dispatch-side handler (see
@@ -2073,6 +2077,36 @@ enum ActionEffect {
     Redraw,
     /// An overlay was opened from the host loop; focus it and redraw.
     OpenedOverlay,
+}
+
+/// The tag the peer reports for the focused session, `None` when it has none
+/// or the peer has not published a row for it yet.
+///
+/// Read off the directory rather than the store: the directory is the one
+/// answer both modes have, and it is the same row the sidebar draws, so the
+/// editor opens on the label the user is looking at.
+fn focused_tag(world: &World) -> Option<String> {
+    world
+        .directory
+        .rows()
+        .iter()
+        .find(|row| row.id == world.session())
+        .and_then(|row| row.tag.clone())
+}
+
+/// Send a confirmed tag edit to the peer that owns the session.
+///
+/// The one path for both modes: the host applies it under the session's own
+/// lock and republishes the row, so the sidebar shows the new label without
+/// this loop touching a sidecar. A refusal is folded in the peer's words.
+async fn apply_tag_edit(world: &mut World, edit: TagEdit) {
+    if let Err(err) = world
+        .control
+        .command(world.session(), Command::Tag { tag: edit.tag })
+        .await
+    {
+        fold_notice(world, &format!("Could not set the session tag: {err}"));
+    }
 }
 
 /// Apply a [`CommandAction`] the palette parked for the host loop.
@@ -2299,6 +2333,16 @@ async fn apply_command_action(
                 ActionEffect::Redraw
             }
         },
+        // Read-only to open and safe mid-work: relabelling a session touches
+        // nothing a turn is using. The peer's own row is what the editor is
+        // prefilled from, so a local and a connected session start from the
+        // label the sidebar is showing.
+        CommandAction::OpenSessionTag => {
+            let current = focused_tag(world);
+            let handles = shell.borrow().overlay_handles();
+            open_session_tag(&handles, current.as_deref());
+            ActionEffect::OpenedOverlay
+        }
         CommandAction::NewSession => {
             // Live work is no reason to refuse. The session we leave stays
             // attached and keeps folding, so its turn finishes whether or not
@@ -3600,6 +3644,8 @@ pub(crate) struct OverlayHandles {
     pub(crate) session_request: Rc<RefCell<Option<SessionRequest>>>,
     /// Where the login/logout picker parks a confirmed provider action.
     pub(crate) auth_request: Rc<RefCell<Option<AuthPickerRequest>>>,
+    /// Where the session-tag editor parks a confirmed label.
+    pub(crate) tag_edit: Rc<RefCell<Option<TagEdit>>>,
     /// The shared work-in-flight flag the session-changing overlays read at
     /// confirm time to refuse a switch mid-work.
     pub(crate) busy: Rc<Cell<bool>>,
@@ -3628,6 +3674,7 @@ impl OverlayHandles {
             session_scan: Rc::new(RefCell::new(None)),
             session_request: Rc::new(RefCell::new(None)),
             auth_request: Rc::new(RefCell::new(None)),
+            tag_edit: Rc::new(RefCell::new(None)),
             busy: Rc::new(Cell::new(false)),
             toasts: Rc::new(RefCell::new(Vec::new())),
         }
@@ -3823,6 +3870,9 @@ struct Shell {
     /// drained by the drive loop (which owns the credential store and the
     /// login task machinery).
     auth_request: Rc<RefCell<Option<AuthPickerRequest>>>,
+    /// Where the session-tag editor parks a confirmed label, read by the drive
+    /// loop, which owns the control surface the tag command travels over.
+    tag_edit: Rc<RefCell<Option<TagEdit>>>,
     /// The armed branch anchor: the branched-from user message's stable id,
     /// `Some` while the user is composing a branch (after `b`). The
     /// `on_action` handler arms it, the drive loop resolves it on submit, the
@@ -4041,6 +4091,7 @@ impl Shell {
         let session_scan: Rc<RefCell<Option<SessionScan>>> = Rc::new(RefCell::new(None));
         let session_request: Rc<RefCell<Option<SessionRequest>>> = Rc::new(RefCell::new(None));
         let auth_request: Rc<RefCell<Option<AuthPickerRequest>>> = Rc::new(RefCell::new(None));
+        let tag_edit: Rc<RefCell<Option<TagEdit>>> = Rc::new(RefCell::new(None));
         let keymap_ctx = Rc::new(RefCell::new(HostCtx {
             overlays: Rc::clone(&overlays),
             editor: Rc::clone(&editor),
@@ -4215,7 +4266,8 @@ impl Shell {
                 | AjAction::Dequeue
                 | AjAction::PasteImage
                 | AjAction::HistoryOpen
-                | AjAction::AgentPickerOpen => {
+                | AjAction::AgentPickerOpen
+                | AjAction::SessionTag => {
                     *action_slot.borrow_mut() = Some(*action);
                 }
             })
@@ -4326,6 +4378,7 @@ impl Shell {
             session_scan,
             session_request,
             auth_request,
+            tag_edit,
             branch_anchor,
             branch_cancelled,
             image_store,
@@ -4417,6 +4470,11 @@ impl Shell {
         self.auth_request.borrow_mut().take()
     }
 
+    /// Collect a confirmed tag edit parked by the session-tag editor, if any.
+    fn take_tag_edit(&self) -> Option<TagEdit> {
+        self.tag_edit.borrow_mut().take()
+    }
+
     /// The shared handles the drive loop needs to open an overlay: the stack
     /// it pushes onto, the editor (focus fallback), a live chrome snapshot,
     /// the parked-request slots, and the busy flag plus toast stack the
@@ -4456,6 +4514,7 @@ impl Shell {
             session_scan: Rc::clone(&self.session_scan),
             session_request: Rc::clone(&self.session_request),
             auth_request: Rc::clone(&self.auth_request),
+            tag_edit: Rc::clone(&self.tag_edit),
             busy: Rc::clone(&self.busy),
             toasts: Rc::clone(&self.toasts),
         }
@@ -6033,6 +6092,13 @@ async fn drive(
                         // the shared flag. Tear the dialog down and abort the
                         // task.
                         cancel_login(world, shell, app, &mut login_session);
+                        // A confirmed session-tag edit. Bound out of the borrow
+                        // first: the command awaits on the peer.
+                        let tag_edit = shell.borrow().take_tag_edit();
+                        if let Some(edit) = tag_edit {
+                            apply_tag_edit(world, edit).await;
+                            app.request_redraw();
+                        }
                         // A parked session change (the `NewSession` command, a
                         // confirmed resume pick, a tree-view branch switch).
                         // The request sites refuse while work is live up front
@@ -16260,6 +16326,298 @@ mod tests {
         shut_down(&world).await;
     }
 
+    // ---- Session tag (spec 6.8) ----
+
+    /// Run the two production steps the drive loop takes between a parked
+    /// global action and an open overlay: the host handler, then whatever
+    /// command it parked. `None` when nothing was parked.
+    async fn drain_parked_action(
+        world: &mut World,
+        shell: &Rc<RefCell<Shell>>,
+    ) -> Option<ActionEffect> {
+        let action = shell.borrow().take_host_action()?;
+        handle_host_action(world, shell, action).await;
+        let command = shell.borrow().take_command()?;
+        Some(apply_command(world, shell, command).await)
+    }
+
+    /// Send `bytes` as one keystroke and dispatch the event it decodes into.
+    async fn press(app: &mut AsyncApp, writer: &mut PipeWriter, bytes: &[u8]) {
+        writer.write_all(bytes).expect("write a chord");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+    }
+
+    /// Type `text` one byte at a time, dispatching each keystroke.
+    async fn type_text(app: &mut AsyncApp, writer: &mut PipeWriter, text: &str) {
+        writer.write_all(text.as_bytes()).expect("write text");
+        for _ in 0..text.len() {
+            let event = app.next_input().await.expect("input event");
+            app.handle_input(event);
+        }
+    }
+
+    /// Ctrl+U, which the one-line editor reads as "delete to start", so a test
+    /// can replace a prefilled label rather than append to it.
+    const CTRL_U: &[u8] = &[0x15];
+
+    /// Pin the strip open so a test can read the label it paints. The mirror is
+    /// still filled from the directory by [`sync_sidebar`].
+    fn pin_sidebar_open(shell: &Rc<RefCell<Shell>>) {
+        let sidebar = Rc::clone(&shell.borrow().sidebar);
+        let mut state = sidebar.borrow_mut();
+        state.visible = true;
+        state.toggled = true;
+    }
+
+    /// Set the focused session's tag through the peer and wait for the row to
+    /// come back carrying it, which is what the editor prefills from.
+    async fn seed_tag(world: &mut World, shell: &Rc<RefCell<Shell>>, tag: &str) {
+        let session = world.session().to_string();
+        world
+            .control
+            .command(
+                &session,
+                Command::Tag {
+                    tag: Some(tag.to_string()),
+                },
+            )
+            .await
+            .expect("the peer accepts the tag");
+        assert!(
+            poll_row(world, shell, &session, |row| row.tag.as_deref()
+                == Some(tag))
+            .await,
+            "the peer republished the row with its label",
+        );
+    }
+
+    /// The full gesture from real key bytes: the chord opens the editor
+    /// prefilled with the label the session carries, and a submit relabels the
+    /// row the strip paints.
+    ///
+    /// Nothing here calls the open function or the tag command directly. The
+    /// keystroke goes through the composed tree, the action through the host
+    /// handler and the command slot, and the submitted label through the same
+    /// control surface a connection uses, so dropping any link fails this.
+    #[tokio::test]
+    async fn the_tag_chord_opens_the_prefilled_editor_and_a_submit_relabels_the_row() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        seed_tag(&mut world, &shell, "fix-auth").await;
+
+        press(&mut app, &mut writer, &chord_bytes(AjAction::SessionTag)).await;
+        let effect = drain_parked_action(&mut world, &shell)
+            .await
+            .expect("the chord parked the tag command");
+        assert!(matches!(effect, ActionEffect::OpenedOverlay));
+        focus_overlay(&mut app, &root);
+
+        // The strip is still hidden here, so the only thing that can be
+        // painting the label is the editor itself.
+        let painted = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+        assert!(
+            painted.contains("Session tag"),
+            "the editor is titled: {painted}"
+        );
+        assert!(
+            painted.contains("fix-auth"),
+            "and prefilled with the current label: {painted}",
+        );
+
+        press(&mut app, &mut writer, CTRL_U).await;
+        type_text(&mut app, &mut writer, "ship-it\r").await;
+        assert_eq!(shell.borrow().overlays.borrow().depth(), 0, "editor closed");
+        let edit = shell
+            .borrow()
+            .take_tag_edit()
+            .expect("the submit parked a tag edit");
+        assert_eq!(edit.tag.as_deref(), Some("ship-it"));
+        apply_tag_edit(&mut world, edit).await;
+
+        pin_sidebar_open(&shell);
+        let session = world.session().to_string();
+        assert!(
+            poll_row(&mut world, &shell, &session, |row| row.tag.as_deref()
+                == Some("ship-it"))
+            .await,
+            "the peer republished the row under the new label",
+        );
+        assert!(
+            strip_labels(&shell).contains(&"ship-it".to_string()),
+            "and the strip paints it: {:?}",
+            strip_labels(&shell),
+        );
+        shut_down(&world).await;
+    }
+
+    /// The palette command opens the same prefilled editor the chord does, so
+    /// the two are one gesture with two triggers.
+    #[tokio::test]
+    async fn the_tag_palette_command_opens_the_same_prefilled_editor() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        seed_tag(&mut world, &shell, "fix-auth").await;
+
+        // Ctrl+O opens the palette; `tag` filters to the one row and Enter
+        // confirms it, which parks the command for the loop.
+        press(&mut app, &mut writer, &[0x0f]).await;
+        app.render(&root).expect("render");
+        type_text(&mut app, &mut writer, "tag\r").await;
+        let command = shell.borrow().take_command();
+        assert_eq!(command, Some(CommandAction::OpenSessionTag));
+        let effect = apply_command(&mut world, &shell, command.expect("a command")).await;
+        assert!(matches!(effect, ActionEffect::OpenedOverlay));
+        focus_overlay(&mut app, &root);
+
+        let painted = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+        assert!(
+            painted.contains("Session tag") && painted.contains("fix-auth"),
+            "the palette opens the prefilled editor: {painted}",
+        );
+        shut_down(&world).await;
+    }
+
+    /// An empty submission clears the label, which is the same "blank clears"
+    /// rule the wire and the launch flag follow.
+    #[tokio::test]
+    async fn an_empty_tag_submission_clears_the_label() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        pin_sidebar_open(&shell);
+        seed_tag(&mut world, &shell, "fix-auth").await;
+
+        press(&mut app, &mut writer, &chord_bytes(AjAction::SessionTag)).await;
+        drain_parked_action(&mut world, &shell)
+            .await
+            .expect("the chord parked the tag command");
+        focus_overlay(&mut app, &root);
+
+        press(&mut app, &mut writer, CTRL_U).await;
+        type_text(&mut app, &mut writer, "\r").await;
+        let edit = shell
+            .borrow()
+            .take_tag_edit()
+            .expect("an empty submit still parks an edit");
+        assert_eq!(edit.tag, None, "blank asks for the label to be removed");
+        apply_tag_edit(&mut world, edit).await;
+
+        let session = world.session().to_string();
+        assert!(
+            poll_row(&mut world, &shell, &session, |row| row.tag.is_none()).await,
+            "the peer republished the row without a label",
+        );
+        assert!(
+            !strip_labels(&shell).contains(&"fix-auth".to_string()),
+            "and the strip stopped painting it: {:?}",
+            strip_labels(&shell),
+        );
+        shut_down(&world).await;
+    }
+
+    /// The real drive loop carries the whole gesture: the chord opens the
+    /// editor, the typed label submits, and the loop's own drain sends it to
+    /// the peer. Every byte goes into the input buffer before the loop reads
+    /// any of them, exactly as a fast typist leaves them.
+    ///
+    /// This is the wiring test. Nothing here reaches into the shell between
+    /// keystrokes, so a missing drain, a chord that parks nothing, or an
+    /// overlay that never takes focus leaves the label unset and fails here.
+    /// The trailing create chord is only how the loop is made to return.
+    #[tokio::test]
+    async fn the_drive_loop_carries_a_tag_edit_from_the_keystroke_to_the_peer() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        let session = world.session().to_string();
+
+        let mut theme_watch = inert_theme_watch();
+        let mut prompt_history_rx: Option<UnboundedReceiver<Vec<String>>> = None;
+        let mut autocomplete_rx = shell
+            .borrow()
+            .editor
+            .borrow_mut()
+            .take_autocomplete_rx()
+            .expect("editor hands out its autocomplete receiver once");
+
+        writer
+            .write_all(&chord_bytes(AjAction::SessionTag))
+            .expect("the tag chord");
+        writer.write_all(b"from-the-loop\r").expect("the label");
+        writer
+            .write_all(&chord_bytes(AjAction::SessionNew))
+            .expect("the chord that ends the loop");
+
+        let exit = drive(
+            &mut app,
+            &root,
+            &shell,
+            &mut world,
+            &mut theme_watch,
+            &mut prompt_history_rx,
+            &mut autocomplete_rx,
+        )
+        .await
+        .expect("drive exits without a fatal error");
+        assert!(
+            matches!(exit, SessionExit::New),
+            "the create chord is what ends the loop",
+        );
+
+        assert!(
+            poll_row(&mut world, &shell, &session, |row| row.tag.as_deref()
+                == Some("from-the-loop"))
+            .await,
+            "the loop sent the typed label to the peer",
+        );
+        shut_down(&world).await;
+    }
+
+    /// A label the store would not keep is reported in a toast and changes
+    /// nothing. The editor stays open, so the refusal is not a dead end.
+    #[tokio::test]
+    async fn a_refused_tag_toasts_and_leaves_the_label_alone() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        seed_tag(&mut world, &shell, "fix-auth").await;
+
+        press(&mut app, &mut writer, &chord_bytes(AjAction::SessionTag)).await;
+        drain_parked_action(&mut world, &shell)
+            .await
+            .expect("the chord parked the tag command");
+        focus_overlay(&mut app, &root);
+
+        press(&mut app, &mut writer, CTRL_U).await;
+        let overlong = "a".repeat(aj_session::MAX_TAG_BYTES + 1);
+        type_text(&mut app, &mut writer, &format!("{overlong}\r")).await;
+
+        assert!(
+            shell.borrow().take_tag_edit().is_none(),
+            "a refused label parks nothing for the loop",
+        );
+        let toasts = crate::toasts::toast_texts(&shell.borrow().toasts);
+        assert!(
+            toasts.iter().any(|t| t.starts_with("Tag not set:")
+                && t.contains(&format!("at most {} bytes", aj_session::MAX_TAG_BYTES))),
+            "the refusal is toasted in the store's own words: {toasts:?}",
+        );
+        assert_eq!(
+            shell.borrow().overlays.borrow().depth(),
+            1,
+            "the editor stays open so the label can be fixed",
+        );
+        assert_eq!(
+            focused_tag(&world).as_deref(),
+            Some("fix-auth"),
+            "and the session keeps the label it had",
+        );
+        shut_down(&world).await;
+    }
+
     /// The rows a pointer test drives, injected straight into the mirror.
     ///
     /// The strip's content has to be known exactly for a line index to mean
@@ -16999,6 +17357,57 @@ mod tests {
                 .len(),
             listed.sessions.len(),
             "a refused tag costs the host no session",
+        );
+        remote.shutdown().await;
+    }
+
+    /// The tag gesture is the same one over a connection: the chord opens the
+    /// editor prefilled from the peer's row, and the submit travels as the
+    /// wire's tag request, so the host's own store ends up carrying the label.
+    #[tokio::test]
+    async fn the_tag_gesture_relabels_a_connected_session() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &["--new"]).await;
+        let (mut app, mut writer, root) = app_over(&shell).await;
+        seed_tag(&mut world, &shell, "over-the-wire").await;
+
+        press(&mut app, &mut writer, &chord_bytes(AjAction::SessionTag)).await;
+        let effect = drain_parked_action(&mut world, &shell)
+            .await
+            .expect("the chord parked the tag command");
+        assert!(matches!(effect, ActionEffect::OpenedOverlay));
+        focus_overlay(&mut app, &root);
+        let painted = flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n");
+        assert!(
+            painted.contains("over-the-wire"),
+            "the editor prefills from the peer's row: {painted}",
+        );
+
+        press(&mut app, &mut writer, CTRL_U).await;
+        type_text(&mut app, &mut writer, "renamed\r").await;
+        let edit = shell
+            .borrow()
+            .take_tag_edit()
+            .expect("the submit parked a tag edit");
+        apply_tag_edit(&mut world, edit).await;
+
+        let session = world.session().to_string();
+        assert!(
+            poll_row(&mut world, &shell, &session, |row| row.tag.as_deref()
+                == Some("renamed"))
+            .await,
+            "the host republished the row under the new label",
+        );
+        let listed = remote.host.sessions().await.expect("the host's rows");
+        assert_eq!(
+            listed
+                .sessions
+                .iter()
+                .find(|row| row.id == session)
+                .and_then(|row| row.tag.as_deref()),
+            Some("renamed"),
+            "and the label landed on the host, not on this client",
         );
         remote.shutdown().await;
     }

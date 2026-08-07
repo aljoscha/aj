@@ -115,6 +115,18 @@ pub const ACTION_SESSION_PREV: &str = "aj.session.prev";
 /// session is one of the sidebar's own interactions (spec 9.2).
 pub const ACTION_SESSION_NEW: &str = "aj.session.new";
 
+/// Opens the editor for the focused session's tag, the label a client shows in
+/// place of its id (spec 6.8). Default binding: `alt+r`.
+///
+/// NOTE: `r` for rename rather than `t` for tag, because `alt+t` is the
+/// thinking toggle. It joins the sidebar's `alt` cluster (`alt+s`, `alt+j`,
+/// `alt+k`, `alt+n`), which is where the rest of the strip's interactions live.
+///
+/// Submitting an empty label clears the tag, which is the same "blank clears"
+/// rule the wire and the launch flag follow, so there is no second gesture for
+/// removing one.
+pub const ACTION_SESSION_TAG: &str = "aj.session.tag";
+
 /// Toggles the agent picker between showing only running sub-agents
 /// and all sub-agents in the session. Default binding: `ctrl+t`.
 /// Handled inside the agent-picker overlay (contextual; only the
@@ -291,6 +303,7 @@ pub const AJ_KEYBINDINGS: &[(&str, &str, &str)] = &[
         "alt+n",
         "Create and focus a new session",
     ),
+    (ACTION_SESSION_TAG, "alt+r", "Tag the focused session"),
     (
         ACTION_AGENT_TOGGLE_SCOPE,
         "ctrl+t",

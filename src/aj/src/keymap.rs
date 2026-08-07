@@ -246,7 +246,8 @@ pub(crate) fn build_keymap() -> Keymap<AjAction, HostCtx> {
             | AjAction::SidebarToggle
             | AjAction::SessionNext
             | AjAction::SessionPrev
-            | AjAction::SessionNew => no_overlay,
+            | AjAction::SessionNew
+            | AjAction::SessionTag => no_overlay,
             // Alt+Enter submits editor text, so it is inert when the transcript
             // or an overlay owns focus.
             AjAction::Steer => in_editor_focus,

@@ -81,6 +81,7 @@ mod scroll;
 mod selection_copied;
 mod serve;
 mod session_selector;
+mod session_tag;
 mod session_tree;
 mod settings_ui;
 mod sidebar;

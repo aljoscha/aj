@@ -26,8 +26,9 @@ use crate::keybindings::{
     ACTION_CHAT_SCROLL_BOTTOM, ACTION_CHAT_SCROLL_TOP, ACTION_CLIPBOARD_PASTE_IMAGE,
     ACTION_COPY_MESSAGE, ACTION_DEQUEUE, ACTION_HISTORY_OPEN, ACTION_OVERLAY_CLOSE_ALL,
     ACTION_PALETTE_OPEN, ACTION_SESSION_NEW, ACTION_SESSION_NEXT, ACTION_SESSION_PREV,
-    ACTION_SIDEBAR_TOGGLE, ACTION_SUBMIT_STEERING, ACTION_THINKING_TOGGLE, ACTION_TOOLS_EXPAND,
-    ACTION_TRANSCRIPT_FOCUS, AJ_KEYBINDINGS, default_chord, effective_chord, set_overrides,
+    ACTION_SESSION_TAG, ACTION_SIDEBAR_TOGGLE, ACTION_SUBMIT_STEERING, ACTION_THINKING_TOGGLE,
+    ACTION_TOOLS_EXPAND, ACTION_TRANSCRIPT_FOCUS, AJ_KEYBINDINGS, default_chord, effective_chord,
+    set_overrides,
 };
 
 /// A global keymap action, the typed counterpart of the `aj.*` action-ID
@@ -88,6 +89,8 @@ pub enum AjAction {
     SessionPrev,
     /// Create a session on this client's peer and focus it (`aj.session.new`).
     SessionNew,
+    /// Edit the focused session's tag (`aj.session.tag`).
+    SessionTag,
     /// Cancel the viewed agent's running turn (the Ctrl+C ladder's first
     /// rung).
     CancelTurn,
@@ -112,6 +115,7 @@ impl AjAction {
             AjAction::SessionNext => ACTION_SESSION_NEXT,
             AjAction::SessionPrev => ACTION_SESSION_PREV,
             AjAction::SessionNew => ACTION_SESSION_NEW,
+            AjAction::SessionTag => ACTION_SESSION_TAG,
             AjAction::Steer => ACTION_SUBMIT_STEERING,
             AjAction::Dequeue => ACTION_DEQUEUE,
             AjAction::ChatPageUp => ACTION_CHAT_PAGE_UP,
@@ -445,6 +449,7 @@ pub fn global_bindings() -> Vec<GlobalBinding> {
         compiled(AjAction::SessionNext, ACTION_SESSION_NEXT, Capture),
         compiled(AjAction::SessionPrev, ACTION_SESSION_PREV, Capture),
         compiled(AjAction::SessionNew, ACTION_SESSION_NEW, Capture),
+        compiled(AjAction::SessionTag, ACTION_SESSION_TAG, Capture),
         compiled(AjAction::Steer, ACTION_SUBMIT_STEERING, Capture),
         compiled(AjAction::Dequeue, ACTION_DEQUEUE, Capture),
         compiled(AjAction::ChatPageUp, ACTION_CHAT_PAGE_UP, Capture),
