@@ -13,7 +13,9 @@
 //! The read counter cannot see the other half of the contract. A directory
 //! read and a `stat` transfer no bytes, so a refresh that enumerates the store
 //! on every tick stays inside a byte budget, which is why the enumeration
-//! count is asserted beside it.
+//! counts are asserted beside it. Both of them: an enumeration point reads the
+//! store's directory and the `meta/` one holding the tag sidecars, and a
+//! refresh that went looking for labels would transfer no bytes either.
 
 #![cfg(target_os = "linux")]
 
@@ -173,6 +175,11 @@ async fn the_directory_costs_a_first_line_at_startup_and_nothing_per_refresh() {
         1,
         "composing a host is one enumeration point (spec 6.8)",
     );
+    assert_eq!(
+        host.store_sidecar_directory_reads(),
+        1,
+        "which reads the sidecar directory exactly once as well",
+    );
 
     let listed = host.sessions().await.expect("sessions").sessions;
     assert_eq!(
@@ -198,6 +205,7 @@ async fn the_directory_costs_a_first_line_at_startup_and_nothing_per_refresh() {
 
     let before = read_bytes();
     let enumerations = host.store_directory_reads();
+    let sidecar_enumerations = host.store_sidecar_directory_reads();
     // Every explicit listing below is an enumeration point, so the count is
     // attributable: what must not appear in it is a refresh.
     let mut polls = 0_u64;
@@ -230,6 +238,7 @@ async fn the_directory_costs_a_first_line_at_startup_and_nothing_per_refresh() {
     }
     let read = read_bytes() - before;
     let enumerated = host.store_directory_reads() - enumerations;
+    let sidecars_enumerated = host.store_sidecar_directory_reads() - sidecar_enumerations;
     host.shutdown().await;
 
     assert!(
@@ -242,5 +251,10 @@ async fn the_directory_costs_a_first_line_at_startup_and_nothing_per_refresh() {
         enumerated, polls,
         "the host read its directory {enumerated} times over {polls} explicit \
          listings: the refresh is enumerating the store",
+    );
+    assert_eq!(
+        sidecars_enumerated, polls,
+        "the host listed the sidecar directory {sidecars_enumerated} times over \
+         {polls} explicit listings: the refresh is going after the labels",
     );
 }

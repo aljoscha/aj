@@ -109,6 +109,7 @@ pub(crate) struct ColdSessions<S> {
     store: S,
     cache: StdMutex<Cache>,
     directory_reads: AtomicU64,
+    sidecar_directory_reads: AtomicU64,
     membership_lookups: AtomicU64,
     tag_reads: AtomicU64,
 }
@@ -202,6 +203,7 @@ impl<S: SessionStore> ColdSessions<S> {
             store,
             cache: StdMutex::new(Cache::default()),
             directory_reads: AtomicU64::new(0),
+            sidecar_directory_reads: AtomicU64::new(0),
             membership_lookups: AtomicU64::new(0),
             tag_reads: AtomicU64::new(0),
         }
@@ -318,7 +320,7 @@ impl<S: SessionStore> ColdSessions<S> {
         // be re-read must not take a session's row down with it. The cached
         // labels stand until a scan gets a look at the files again, which is
         // also why nothing is evicted on this path.
-        match self.store.enumerate_tags() {
+        match self.enumerate_sidecars() {
             Ok(sidecars) => {
                 for sidecar in &sidecars {
                     // A live session's label is the host's own, held in memory
@@ -344,12 +346,24 @@ impl<S: SessionStore> ColdSessions<S> {
     /// on. Only [`Self::enumerate`] reads the directory: a membership question
     /// is answered off a single `stat` (see [`Self::contains`]).
     ///
-    /// The store's own directory, not the sidecar one an enumeration also
-    /// reads: those are counted by [`Self::tag_reads`] where they cost
-    /// anything.
+    /// The store's own directory. The sidecar one an enumeration also reads
+    /// has its own counter, [`Self::sidecar_directory_reads`].
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn directory_reads(&self) -> u64 {
         self.directory_reads.load(Ordering::Relaxed)
+    }
+
+    /// How many times this has read the store's `meta/` directory.
+    ///
+    /// The same contract as [`Self::directory_reads`], for the second
+    /// directory an enumeration reads. It needs its own counter because
+    /// neither of the other seams can see it: a readdir and a `stat` transfer
+    /// no bytes, and [`Self::tag_reads`] counts sidecar contents, which this
+    /// reads none of. A refresh that listed the sidecars would be invisible
+    /// without it (spec 6.8).
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn sidecar_directory_reads(&self) -> u64 {
+        self.sidecar_directory_reads.load(Ordering::Relaxed)
     }
 
     /// How many tag sidecars this has opened and read.
@@ -359,6 +373,10 @@ impl<S: SessionStore> ColdSessions<S> {
     /// label either way, so only this tells a cached answer from a fresh one:
     /// an untagged store must never reach a sidecar, and a settled tagged one
     /// must read each of them exactly once.
+    ///
+    /// The refresh path's reads, which is where the budget lives. A
+    /// materialization reads the sidecar of the one session it is opening,
+    /// through the store directly, and that read is not counted here.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn tag_reads(&self) -> u64 {
         self.tag_reads.load(Ordering::Relaxed)
@@ -611,6 +629,11 @@ impl<S: SessionStore> ColdSessions<S> {
     fn enumerate_store(&self) -> Result<Vec<SessionMetadata>, ConversationError> {
         self.directory_reads.fetch_add(1, Ordering::Relaxed);
         self.store.enumerate_sessions()
+    }
+
+    fn enumerate_sidecars(&self) -> Result<Vec<TagMetadata>, ConversationError> {
+        self.sidecar_directory_reads.fetch_add(1, Ordering::Relaxed);
+        self.store.enumerate_tags()
     }
 
     fn cache(&self) -> MutexGuard<'_, Cache> {
@@ -1757,6 +1780,40 @@ mod tests {
             labelled(cold.rows()),
             [("a".to_string(), Some("relabelled".to_string()))],
             "and the file answers again once it can be read",
+        );
+    }
+
+    /// A refresh reads neither directory, the sidecar one included. Both are
+    /// enumeration work, and neither transfers bytes a read budget could see,
+    /// so the counts are the only seam that catches a refresh going looking.
+    #[test]
+    fn a_refresh_reads_neither_directory() {
+        let store = FakeStore::default();
+        store.put("a", 2);
+        store.tag("a", "fix-auth", 3);
+        let cold = ColdSessions::new(store);
+        cold.enumerate(|_| false).expect("enumerate");
+        assert_eq!(cold.directory_reads(), 1);
+        assert_eq!(cold.sidecar_directory_reads(), 1);
+
+        for _ in 0..10 {
+            assert_eq!(
+                labelled(cold.rows()),
+                [("a".to_string(), Some("fix-auth".to_string()))],
+            );
+        }
+        assert_eq!(cold.directory_reads(), 1, "ten refreshes read no directory");
+        assert_eq!(
+            cold.sidecar_directory_reads(),
+            1,
+            "and listed no sidecars either",
+        );
+
+        cold.enumerate(|_| false).expect("enumerate");
+        assert_eq!(
+            (cold.directory_reads(), cold.sidecar_directory_reads()),
+            (2, 2),
+            "an enumeration point reads each directory exactly once",
         );
     }
 

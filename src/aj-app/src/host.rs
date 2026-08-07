@@ -764,6 +764,17 @@ impl SessionHost {
         self.inner.cold.directory_reads()
     }
 
+    /// How many times the host has read its session store's `meta/` directory.
+    ///
+    /// The other half of the enumeration's directory cost (spec 6.8). A
+    /// sidecar listing transfers no bytes and reads no sidecar, so neither a
+    /// byte budget nor [`Self::store_tag_reads`] can see it: this is the only
+    /// seam that catches a refresh that went looking for labels.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn store_sidecar_directory_reads(&self) -> u64 {
+        self.inner.cold.sidecar_directory_reads()
+    }
+
     /// How many membership questions the host has put to its session store.
     ///
     /// The seam for spec 6.2's "before it reaches ... any store lookup": an id
@@ -774,12 +785,13 @@ impl SessionHost {
         self.inner.cold.membership_lookups()
     }
 
-    /// How many tag sidecars the host has read.
+    /// How many tag sidecars the host has read to refresh its directory.
     ///
-    /// The other half of the refresh contract's per-file budget (spec 6.8): a
-    /// row carries its label whether it was cached or freshly read, so this is
-    /// the only way to tell an untagged store costing nothing from one paying
-    /// a read per row.
+    /// The per-file half of the refresh contract's budget (spec 6.8): a row
+    /// carries its label whether it was cached or freshly read, so this is the
+    /// only way to tell an untagged store costing nothing from one paying a
+    /// read per row. A materialization's own read of the session it opens goes
+    /// straight to the store and is not counted here.
     #[cfg(any(test, feature = "test-support"))]
     pub fn store_tag_reads(&self) -> u64 {
         self.inner.cold.tag_reads()
