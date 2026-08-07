@@ -32,15 +32,15 @@
 //! Layout is a pure function, [`strip_lines`], producing one [`StripLine`] per
 //! drawn line, and drawing is a dumb map over its result. The height
 //! arithmetic (host headers, the overflow row and the create row all take
-//! lines away from the rows) therefore lives in one testable place, and a
-//! pointer gesture can resolve a line by its index without deriving the layout
-//! a second time.
+//! lines away from the rows) therefore lives in one testable place.
 //!
 //! Pointer gestures are a second trigger for actions the chords already
 //! dispatch, never a behavior of their own (spec 9.2). The strip resolves a
 //! click into a [`StripGesture`], which names a session or a create and
 //! nothing else, and the shell hands that to the same place the chord's
-//! handler hands its own answer.
+//! handler hands its own answer. A draw records what each line it paints
+//! resolves to, so a click answers with the session the user is looking at
+//! even when the mirror has moved since (see [`SessionSidebar::gestures`]).
 
 use std::cell::RefCell;
 use std::ops::Range;
@@ -700,11 +700,15 @@ pub(crate) struct SessionSidebar {
     /// The strip's height at the last draw, which is what the wheel scrolls
     /// against.
     height: u16,
-    /// The lines the last draw painted, indexed by their row inside the strip.
-    /// A pointer gesture resolves against this rather than laying the strip
-    /// out a second time, which is what keeps the gesture and the paint from
-    /// answering differently.
-    lines: Vec<StripLine>,
+    /// What a click on each line the last draw painted asks for, `None` for a
+    /// line that offers nothing.
+    ///
+    /// Recorded by the draw that painted it, rather than resolved when the
+    /// press arrives: the drive loop refreshes the mirror at the top of every
+    /// iteration and paints only once the frame budget has elapsed, so a
+    /// press handled in between would resolve a line against rows that are
+    /// not the ones on screen.
+    gestures: Vec<Option<StripGesture>>,
     /// The line under the pointer, `None` when the pointer is elsewhere.
     hover: Option<u16>,
     /// Where a resolved gesture goes. Unset until the shell wires it, which
@@ -723,7 +727,7 @@ impl SessionSidebar {
             styles,
             hover_bg,
             height: 0,
-            lines: Vec::new(),
+            gestures: Vec::new(),
             hover: None,
             on_gesture: None,
         }
@@ -748,13 +752,7 @@ impl SessionSidebar {
     /// session on screen is a no-op where the switch happens, and stating that
     /// rule twice is how the two copies drift apart.
     fn gesture_at(&self, line: u16) -> Option<StripGesture> {
-        match self.lines.get(usize::from(line))? {
-            StripLine::Session { index } => Some(StripGesture::Focus(
-                self.state.borrow().rows.get(*index)?.id.clone(),
-            )),
-            StripLine::New => Some(StripGesture::New),
-            StripLine::Header { .. } | StripLine::Overflow { .. } => None,
-        }
+        self.gestures.get(usize::from(line))?.clone()
     }
 
     /// Point the hover band at `line`, and say whether the band moved.
@@ -763,10 +761,9 @@ impl SessionSidebar {
     /// offer something that is not there.
     fn set_hover(&mut self, line: Option<u16>) -> bool {
         let line = line.filter(|&line| {
-            matches!(
-                self.lines.get(usize::from(line)),
-                Some(StripLine::Session { .. } | StripLine::New),
-            )
+            self.gestures
+                .get(usize::from(line))
+                .is_some_and(Option::is_some)
         });
         let moved = self.hover != line;
         self.hover = line;
@@ -889,6 +886,16 @@ impl SessionSidebar {
     }
 }
 
+/// What a click on `line` asks for, resolved against the rows the layout that
+/// produced it was built from.
+fn gesture_for(line: &StripLine, rows: &[SidebarRow]) -> Option<StripGesture> {
+    match line {
+        StripLine::Session { index } => Some(StripGesture::Focus(rows.get(*index)?.id.clone())),
+        StripLine::New => Some(StripGesture::New),
+        StripLine::Header { .. } | StripLine::Overflow { .. } => None,
+    }
+}
+
 fn span(text: &str, style: Style) -> TextSpan {
     TextSpan {
         text: text.to_string(),
@@ -908,7 +915,7 @@ impl Widget for SessionSidebar {
             .map_or(SIDEBAR_COLS, |max| max.min(SIDEBAR_COLS));
         if !self.state.borrow().shown() || width == 0 {
             // Nothing is drawn, so nothing is there to gesture at either.
-            self.lines.clear();
+            self.gestures.clear();
             return Surface::with_size(Size {
                 width: 0,
                 height: 0,
@@ -916,24 +923,32 @@ impl Widget for SessionSidebar {
         }
         // An unbounded height is a measurement pass, which reads back only the
         // width: lay every line out and let the surface be as tall as it is.
-        //
-        // Recorded before anything is painted from it, so the layout a pointer
-        // gesture resolves against is the one on screen.
         self.height = ctx.max.height.unwrap_or(u16::MAX);
-        self.lines = self.state.borrow().lines(self.height);
+        let lines = {
+            let state = self.state.borrow();
+            let lines = state.lines(self.height);
+            // Resolved here, against the rows this paint draws from, so a
+            // press that arrives before the next paint answers with what is
+            // on screen (see [`Self::gestures`]).
+            self.gestures = lines
+                .iter()
+                .map(|line| gesture_for(line, &state.rows))
+                .collect();
+            lines
+        };
         // The rows can move under a pointer that has not, so the band is
         // re-resolved against the fresh layout rather than left marking
         // whatever used to be on that line.
         self.set_hover(self.hover);
         let state = self.state.borrow();
         let hover = self.hover.map(usize::from);
-        let blanks = usize::from(ctx.max.height.unwrap_or(0)).saturating_sub(self.lines.len());
-        let mut spans: Vec<TextSpan> = Vec::with_capacity((self.lines.len() + blanks) * 6);
-        for index in 0..self.lines.len() + blanks {
+        let blanks = usize::from(ctx.max.height.unwrap_or(0)).saturating_sub(lines.len());
+        let mut spans: Vec<TextSpan> = Vec::with_capacity((lines.len() + blanks) * 6);
+        for index in 0..lines.len() + blanks {
             if index > 0 {
                 spans.push(span("\n", self.styles.text));
             }
-            match self.lines.get(index) {
+            match lines.get(index) {
                 Some(line) => {
                     spans.extend(self.line_spans(line, &state.rows, width, hover == Some(index)));
                 }
@@ -1808,12 +1823,11 @@ mod tests {
 
     /// The sessions the strip's last draw painted, in painted order.
     fn shown(strip: &SessionSidebar) -> Vec<String> {
-        let state = strip.state.borrow();
         strip
-            .lines
+            .gestures
             .iter()
-            .filter_map(|line| match line {
-                StripLine::Session { index } => Some(state.rows[*index].id.clone()),
+            .filter_map(|gesture| match gesture {
+                Some(StripGesture::Focus(id)) => Some(id.clone()),
                 _ => None,
             })
             .collect()
@@ -1859,6 +1873,43 @@ mod tests {
             deliver(&mut strip, &report(1, Button::Left, kind));
         }
         assert_eq!(seen.borrow().len(), 4, "only the presses acted");
+    }
+
+    /// A click answers with the session that was painted on the line, not with
+    /// whatever the mirror holds by the time the press arrives.
+    ///
+    /// The drive loop refreshes the mirror at the top of every iteration and
+    /// paints only once the frame budget has elapsed, so a press handled in
+    /// between sees rows that have already moved. A background session going
+    /// active reorders them, and a new row at the top shifts every index by
+    /// one.
+    #[test]
+    fn a_click_names_the_session_that_was_painted_on_the_line() {
+        let (mut strip, seen) = wired(rows_named(&["a", "b", "c"]), 8);
+        assert_eq!(shown(&strip), ["a", "b", "c"], "painted in this order");
+
+        // Refreshed with a newly active session at the top. No paint follows,
+        // so the screen still shows `a` on the first line.
+        strip.state.borrow_mut().rows = rows_named(&["new", "a", "b", "c"]);
+        deliver(&mut strip, &press(0));
+        assert_eq!(*seen.borrow(), focus_of(&["a"]));
+
+        // And the next paint moves the answer along with the rows.
+        redraw(&mut strip, 8);
+        deliver(&mut strip, &press(0));
+        assert_eq!(*seen.borrow(), focus_of(&["a", "new"]));
+    }
+
+    /// The same holds when the rows shrink under the strip: the line still
+    /// names the session that was drawn on it, rather than resolving its
+    /// index against a shorter list or falling off the end of one.
+    #[test]
+    fn a_click_after_the_rows_shrink_still_names_what_was_painted() {
+        let (mut strip, seen) = wired(rows_named(&["a", "b", "c"]), 8);
+        strip.state.borrow_mut().rows = rows_named(&["a"]);
+        let ctx = deliver(&mut strip, &press(2));
+        assert_eq!(*seen.borrow(), focus_of(&["c"]));
+        assert!(ctx.consume_event, "and the strip acted on the press");
     }
 
     /// The create row asks for a session, from wherever the layout put it.
