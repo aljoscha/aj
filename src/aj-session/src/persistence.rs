@@ -80,9 +80,15 @@ impl ConversationPersistence {
     ///
     /// `tag` is expected to have been through [`crate::tag::normalize_tag`]
     /// already, so this writes what it is given.
+    ///
+    /// An id the grammar rejects is an error rather than a quiet no-op. It
+    /// cannot name a sidecar in this store, and a caller that took the `Ok`
+    /// for a write would go on to publish a label the store does not hold:
+    /// the tag command sets the session's row on the strength of this
+    /// returning.
     pub fn write_tag(&self, session_id: &str, tag: Option<&str>) -> Result<(), ConversationError> {
         let Some(path) = self.tag_path(session_id) else {
-            return Ok(());
+            return Err(ConversationError::InvalidSessionId(session_id.to_string()));
         };
         let Some(tag) = tag else {
             match fs::remove_file(&path) {
@@ -105,10 +111,12 @@ impl ConversationPersistence {
     /// Every tag sidecar in the store, with the fingerprint of the file it was
     /// read from.
     ///
-    /// One directory read of `meta/`, plus one small read per sidecar. An
-    /// untagged store has no `meta/` directory and costs a single failed
-    /// `read_dir`, which is what makes the untagged case free (spec 6.8): a
-    /// caller cannot ask per session without paying a `stat` per session.
+    /// One directory read of `meta/` plus one `stat` per sidecar, and no
+    /// sidecar contents at all: the label itself is read by
+    /// [`Self::read_tag`], once per fingerprint this reports. An untagged
+    /// store has no `meta/` directory and costs a single failed `read_dir`,
+    /// which is what makes the untagged case free (spec 6.8): a caller cannot
+    /// ask per session without paying a `stat` per session.
     pub fn enumerate_tags(&self) -> Result<Vec<TagMetadata>, ConversationError> {
         let meta = self.meta_dir();
         let entries = match fs::read_dir(&meta) {
@@ -132,6 +140,13 @@ impl ConversationPersistence {
                 // Vanished since the directory read.
                 continue;
             };
+            // A directory named like a sidecar is not one, and offering it
+            // would cost a failed open at every enumeration for the life of
+            // the store: the read fails, so nothing is cached, so it is tried
+            // again next time.
+            if !metadata.is_file() {
+                continue;
+            }
             let Ok(modified) = metadata.modified() else {
                 continue;
             };
@@ -799,12 +814,22 @@ mod tests {
     }
 
     /// An id the grammar rejects never becomes a path, on the write side as
-    /// much as the read side.
+    /// much as the read side. The write says so rather than reporting a
+    /// success it did not have: a caller that believed it would put a label on
+    /// a row the store cannot carry.
     #[test]
     fn an_invalid_id_touches_no_file() {
         let (dir, persistence) = fixture();
         for id in ["../escape", "with/slash", ""] {
-            persistence.write_tag(id, Some("nope")).expect("no error");
+            assert!(
+                matches!(
+                    persistence.write_tag(id, Some("nope")),
+                    Err(ConversationError::InvalidSessionId(named)) if named == id,
+                ),
+                "{id:?} is refused rather than silently dropped",
+            );
+            // Clearing is refused on the same terms: it is a write too.
+            assert!(persistence.write_tag(id, None).is_err());
             assert_eq!(persistence.read_tag(id).expect("read"), None);
         }
         assert!(
@@ -893,7 +918,10 @@ mod tests {
     }
 
     /// A file in `meta/` that is not a tag sidecar is ignored, so a stray does
-    /// not become a row's label.
+    /// not become a row's label. A directory named like one is not a sidecar
+    /// either: offering it would cost a failed open at every enumeration for
+    /// the life of the store, since a read that fails is deliberately not
+    /// cached.
     #[test]
     fn enumerating_tags_ignores_what_is_not_a_sidecar() {
         let (dir, persistence) = fixture();
@@ -901,8 +929,13 @@ mod tests {
         std::fs::create_dir_all(&meta).expect("meta");
         std::fs::write(meta.join("notes.txt"), "not a tag").expect("write");
         std::fs::write(meta.join("with slash.tag"), "invalid id").expect("write");
+        std::fs::create_dir_all(meta.join("2024-01-01-00-00-00.tag")).expect("a directory");
 
         assert!(persistence.enumerate_tags().expect("enumerate").is_empty());
+        assert!(
+            persistence.read_tag("2024-01-01-00-00-00").is_err(),
+            "and reading it is the failure the listing spares the caller",
+        );
     }
 
     /// Build a `ConversationPersistence` against a fresh temp dir.
