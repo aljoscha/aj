@@ -498,10 +498,17 @@ impl SessionHost {
     /// tag.
     ///
     /// Every setting, the prompt and the tag are validated before a log is
-    /// created, so a refused request leaves no discoverable empty session
-    /// behind. The tag is written once the session is live, through the same
-    /// command a later relabelling takes, so it lands under the session's own
-    /// lock.
+    /// created, so a request this host refuses leaves no discoverable empty
+    /// session behind. The tag is written once the session is live, through
+    /// the same command a later relabelling takes, so it lands under the
+    /// session's own lock.
+    ///
+    /// That ordering is also the limit of the guarantee. A tag or prompt
+    /// command that fails on its own terms, a store that will not take the
+    /// sidecar write, say, returns its error from here with the session
+    /// already minted and in the directory. Rolling that back would mean
+    /// deleting a log this host has just created, which is a decision about
+    /// what a create means rather than an accident of this ordering.
     pub async fn create_with(
         &self,
         settings: Option<SessionSettings>,

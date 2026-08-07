@@ -734,6 +734,22 @@ impl SessionSidebar {
     }
 
     /// Wire where a resolved pointer gesture goes.
+    ///
+    /// The gesture reaches the same sink the stepping and create chords
+    /// reach, rather than being dispatched as the action they dispatch, so it
+    /// does not pass the keymap predicate that makes those chords inert under
+    /// an overlay. Two things make that sound rather than accidental.
+    ///
+    /// A click cannot reach the strip while an overlay is up. The shell draws
+    /// a full-viewport scrim above the base layout for as long as the stack is
+    /// non-empty, and the scrim is then the deepest hit everywhere and
+    /// consumes the press at target, which is before the strip's turn in the
+    /// bubbling phase. The strip sees the press in the capturing phase only,
+    /// where it deliberately does nothing but drop its band.
+    ///
+    /// And a gesture names a session, which no action carries: a chord steps
+    /// the order, a click points at a row. The two can only meet at the
+    /// request they park, which is where the switch actually happens.
     pub(crate) fn set_on_gesture(
         &mut self,
         on_gesture: Box<dyn FnMut(&mut EventContext, StripGesture)>,
