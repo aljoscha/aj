@@ -1,6 +1,6 @@
 # Remote control and VM provisioning
 
-## Status: draft, phase 2 complete
+## Status: draft, phase 3 in progress
 
 Companion document: `docs/remote-control-implementation.md`, the manual
 for the implementing agent.
@@ -1098,8 +1098,7 @@ current epoch, so spend on a branch abandoned by a head switch is not
 re-derivable after the reset and the banner under-reports it.
 Accepted, an exit banner does not earn host-authoritative usage on
 the wire, and such a read is the named fix if it ever matters.
-Deferred to phase 3 alongside the
-sidebar: switching to another session and creating one. Not supported
+Not supported
 over the wire in v1: HTML export and the session-info overlay, both
 read host-local files, run them on the host. An unsupported action in
 connect mode surfaces a clear notice, it never silently does nothing.
@@ -1153,8 +1152,7 @@ an explicit toggle wins over the default for the rest of the process.
   busy session's history, not about looking elsewhere.
 - Local use keeps working exactly as today: with one session the
   strip stays hidden and nothing changes. Creating a new session from
-  the
-  sidebar goes through the create command (choosing a host when
+  the sidebar goes through the create command (choosing a host when
   connected to a gateway).
 
 Keyboard model, exact layout, and glyph choices are left to

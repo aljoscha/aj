@@ -32,7 +32,6 @@
 use std::collections::HashMap;
 
 use aj_wire::{Frame, SessionSummary};
-use chrono::{DateTime, Utc};
 
 use crate::chat::{ChatState, Redraw};
 use crate::client::SessionClient;
@@ -58,6 +57,19 @@ struct Attached {
     /// The transcript while this session sits in the background. `None` for
     /// the focused session, whose transcript the frontend holds.
     chat: Option<ChatState>,
+    /// The durable position the stream has carried this session to: the seq
+    /// of the last durable frame routed into its transcript, `None` until one
+    /// arrives.
+    ///
+    /// This is what the user has had on screen while the session was focused,
+    /// which is the position [`SessionDirectory::mark_viewed`] records.
+    ///
+    /// NOTE: deliberately not [`SessionClient::cursor`], which lags by one
+    /// durable frame so a re-attach never claims an entry whose trailing
+    /// untagged events it may have missed. That conservatism is right for
+    /// resumption and wrong here: the last entry of every turn the user
+    /// watched would read back as unseen.
+    delivered: Option<u64>,
 }
 
 /// Every session a peer offers, plus the fold state for the working set.
@@ -73,14 +85,15 @@ pub struct SessionDirectory {
     attached: Vec<Attached>,
     /// The last `list` frame's rows, in the order the peer sent them.
     rows: Vec<SessionSummary>,
-    /// Each session's activity stamp as of when the user last looked at it, on
-    /// the host's clock. Compared against the row's current stamp to derive
-    /// unseen output, so this client never consults its own clock (spec 6.8).
+    /// Each session's durable position as of when the user last looked at it,
+    /// compared against a row's `last_seq` to derive unseen output (spec 6.8).
+    /// Both sides are the host's own sequence numbers, so neither clock enters
+    /// and skew cannot make a session look either stale or fresh.
     ///
     /// Kept for sessions dropped from the working set too: being detached does
     /// not make what happened while the user was away seen, and a row outlives
     /// its attachment.
-    viewed: HashMap<String, DateTime<Utc>>,
+    viewed: HashMap<String, u64>,
 }
 
 impl SessionDirectory {
@@ -94,6 +107,7 @@ impl SessionDirectory {
                 client: SessionClient::new(session.clone()),
                 session,
                 chat: None,
+                delivered: None,
             }],
             rows: Vec::new(),
             viewed: HashMap::new(),
@@ -165,10 +179,20 @@ impl SessionDirectory {
             return Redraw(false);
         };
         let attached = &mut self.attached[index];
+        // Read off the envelope before the fold consumes the frame.
+        let delivered = delivered_seq(&frame);
         let redraw = match &mut attached.chat {
             Some(chat) => attached.client.apply(chat, frame),
             None => attached.client.apply(focused_chat, frame),
         };
+        if let Some(seq) = delivered {
+            // Last write wins rather than a maximum. A block re-delivers
+            // entries at or below the position already reached and commits the
+            // true one in its `caught_up`, and a block under a new epoch
+            // restarts the numbering below the old one, which a maximum would
+            // never come back down from.
+            attached.delivered = Some(seq);
+        }
         // Only the focused session's transcript is on screen, so a background
         // session's fold changes nothing a redraw would show. Its row can still
         // change, but that arrives as a `list` frame of its own.
@@ -240,6 +264,7 @@ impl SessionDirectory {
                         client: SessionClient::new(session.to_string()),
                         session: session.to_string(),
                         chat: None,
+                        delivered: None,
                     },
                 );
                 chat
@@ -265,48 +290,54 @@ impl SessionDirectory {
     /// this point counts as seen.
     ///
     /// Recorded as the user leaves rather than as they arrive. A session's
-    /// activity climbs while it is the focused one, and all of that was on
-    /// screen, so a stamp taken on arrival would make everything the user just
-    /// watched read as unseen the moment they switched away.
+    /// output climbs while it is the focused one, and all of that was on
+    /// screen, so a position taken on arrival would make everything the user
+    /// just watched read as unseen the moment they switched away.
     ///
-    /// The stamp is the one the peer last reported, never the current time:
-    /// both sides of the [`Self::has_unseen_output`] comparison are host clock,
-    /// so this client's own clock never enters and skew cannot make a session
-    /// look either stale or fresh (spec 6.8).
-    ///
-    /// A session with no row yet records nothing, and reads as having no unseen
-    /// output until a row arrives.
+    /// What is recorded is this client's own fold position, never the one the
+    /// row reports. `list` frames are coalesced on a tick (spec 6.8), so the
+    /// row in hand at this moment predates output the user watched arrive, and
+    /// recording it would announce that output as unseen.
     fn mark_viewed(&mut self, session: &str) {
-        if let Some(row) = self.rows.iter().find(|row| row.id == session) {
-            self.viewed.insert(session.to_string(), row.last_activity);
-        }
+        let delivered = self
+            .attached
+            .iter()
+            .find(|attached| attached.session == session)
+            .and_then(|attached| attached.delivered)
+            // A session left before its stream delivered anything showed the
+            // user nothing, and position zero is exactly that. Recording
+            // nothing instead would leave the never-viewed rule answering for
+            // a session the user did view, so it could never report unseen
+            // until they had visited it a second time.
+            .unwrap_or(0);
+        self.viewed.insert(session.to_string(), delivered);
     }
 
-    /// Whether `session` has produced output the user has not looked at.
+    /// Whether `row` has output the user has not looked at.
     ///
-    /// True when the session is idle and its activity stamp is newer than the
-    /// one recorded at the last view. A working session is excluded because its
+    /// True when the session is idle and its durable position is past the one
+    /// recorded at the last view. A working session is excluded because its
     /// glyph says it is working, which is the more useful fact, and the unseen
     /// mark is what remains once it stops (spec 6.8).
     ///
     /// The focused session is never unseen: the user is looking at it.
-    pub fn has_unseen_output(&self, session: &str) -> bool {
-        if session == self.focused() {
+    ///
+    /// The caller passes the row rather than a session id because the one
+    /// caller walks the whole directory asking about each row, and recovering
+    /// a row it already holds would make that walk quadratic.
+    pub fn is_unseen(&self, row: &SessionSummary) -> bool {
+        if row.id == self.focused() || row.working {
             return false;
         }
-        let Some(row) = self.rows.iter().find(|row| row.id == session) else {
-            return false;
-        };
-        if row.working {
-            return false;
-        }
-        match self.viewed.get(session) {
-            Some(seen) => row.last_activity > *seen,
+        let Some(viewed) = self.viewed.get(&row.id) else {
             // Never viewed, so there is no "since I last looked" to answer
             // against and the question is vacuous. Reading it as unseen would
             // light up every row of a store on first connect (spec 6.8).
-            None => false,
-        }
+            return false;
+        };
+        // A cold row carries no durable position (spec 6.8), so there is
+        // nothing to compare and the answer falls the quiet way, as above.
+        row.last_seq.is_some_and(|last_seq| last_seq > *viewed)
     }
 
     /// Whether any session in the working set owes a re-attach.
@@ -352,18 +383,26 @@ impl SessionDirectory {
     /// that focus will leave: the new session first, and the session it
     /// displaces from the working set absent, which is how the reopen detaches
     /// it. Pass `None` to re-attach the set as it stands.
+    ///
+    /// An admitted session leads whether or not it is already attached, and is
+    /// named exactly once. A reset on a background session reopens the stream
+    /// admitting a session the set already holds, and the consumer waits for
+    /// the admitted session's catch-up before it paints the switch.
     pub fn attach_requests(&self, admitting: Option<&str>) -> Vec<AttachRequest> {
         let mut requests = Vec::with_capacity(WORKING_SET);
-        if let Some(session) = admitting.filter(|session| !self.is_attached(session)) {
+        if let Some(session) = admitting {
             requests.push(AttachRequest {
                 session: session.to_string(),
-                cursor: None,
+                // A session already in the set offers what it folded, so the
+                // reopen serves it a suffix rather than a whole history.
+                cursor: self.client_for(session).and_then(|client| client.cursor()),
             });
         }
         let room = WORKING_SET - requests.len();
         requests.extend(
             self.attached
                 .iter()
+                .filter(|attached| Some(attached.session.as_str()) != admitting)
                 .take(room)
                 .map(|attached| AttachRequest {
                     session: attached.session.clone(),
@@ -371,6 +410,34 @@ impl SessionDirectory {
                 }),
         );
         requests
+    }
+
+    /// Drop every attached session except `keep`, which is what a narrowed
+    /// re-attach leaves behind on the peer, and answer the ids dropped.
+    ///
+    /// A dropped session stops being folded here, so a later focus onto it
+    /// takes the full attach path and re-attaches it rather than swapping to a
+    /// transcript the stream no longer feeds. Its `list` row and its viewed
+    /// stamp both stay: the session is still one the user is meant to be aware
+    /// of, and being detached does not make the output it produced while they
+    /// were away seen.
+    ///
+    /// The focused session is never dropped, `keep` or not. Its transcript is
+    /// the one on loan to the frontend and this type cannot repoint that cell,
+    /// so dropping it would leave the frontend rendering a session nothing
+    /// folds. In practice `keep` is the focused session, and a caller that
+    /// narrows onto another one gets both back.
+    pub fn drop_all_but(&mut self, keep: &str) -> Vec<String> {
+        let focused = self.focused().to_string();
+        let mut dropped = Vec::new();
+        self.attached.retain(|attached| {
+            if attached.session == keep || attached.session == focused {
+                return true;
+            }
+            dropped.push(attached.session.clone());
+            false
+        });
+        dropped
     }
 
     /// A background session's parked transcript, `None` for the focused session
@@ -403,12 +470,27 @@ impl SessionDirectory {
     }
 }
 
+/// The durable position a frame carries into a transcript, `None` for a frame
+/// that carries none.
+///
+/// A `state` frame reports one too, but it names where the host stood when it
+/// was emitted, which is ahead of anything the client has folded: the block
+/// that frame opens is what delivers the entries up to it.
+fn delivered_seq(frame: &Frame) -> Option<u64> {
+    match frame {
+        Frame::Event { durability, .. } => durability.as_ref().map(|durable| durable.seq),
+        Frame::CaughtUp { last_seq, .. } => Some(*last_seq),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
     use aj_wire::QueueCounts;
+    use chrono::DateTime;
 
     use super::*;
     use crate::chat::EntryKind;
@@ -483,21 +565,48 @@ mod tests {
         }
     }
 
-    fn row(id: &str, working: bool, last_activity: DateTime<Utc>) -> SessionSummary {
+    /// A live row at durable position `last_seq`.
+    ///
+    /// `last_activity` is fixed, and far enough in the past that any answer
+    /// reaching for the local clock would read it as ancient: the unseen mark
+    /// is derived from positions, so no test here may turn on the stamp.
+    fn row(id: &str, working: bool, last_seq: u64) -> SessionSummary {
         SessionSummary {
             id: id.to_string(),
             live: true,
             working,
             queued: QueueCounts::default(),
             tasks: 0,
-            last_seq: Some(0),
-            last_activity,
+            last_seq: Some(last_seq),
+            last_activity: DateTime::from_timestamp(0, 0).expect("a valid timestamp"),
             unreachable: false,
         }
     }
 
-    fn at(secs: i64) -> DateTime<Utc> {
-        DateTime::from_timestamp(secs, 0).expect("a valid timestamp")
+    fn list(sessions: Vec<SessionSummary>) -> Frame {
+        Frame::List { sessions }
+    }
+
+    /// What the sidebar asks: the unseen mark for the row the directory holds
+    /// under `id`, `false` when there is no such row.
+    fn unseen(directory: &SessionDirectory, id: &str) -> bool {
+        directory
+            .rows()
+            .iter()
+            .find(|row| row.id == id)
+            .is_some_and(|row| directory.is_unseen(row))
+    }
+
+    /// Exactly the focused entry's transcript is on loan to the frontend.
+    fn transcripts_are_on_loan_once(directory: &SessionDirectory) {
+        for (index, attached) in directory.attached.iter().enumerate() {
+            assert_eq!(
+                attached.chat.is_none(),
+                index == 0,
+                "{} holds the wrong side of the transcript loan",
+                attached.session,
+            );
+        }
     }
 
     /// A directory focused on `FOCUSED` with `OTHER` attached in the
@@ -649,17 +758,12 @@ mod tests {
         let (mut directory, mut focused_chat) = two_sessions();
         assert!(directory.rows().is_empty());
 
-        let sessions = vec![row(FOCUSED, false, at(10)), row(OTHER, true, at(20))];
-        let redraw = directory.apply(
-            &mut focused_chat,
-            Frame::List {
-                sessions: sessions.clone(),
-            },
-        );
+        let sessions = vec![row(FOCUSED, false, 10), row(OTHER, true, 20)];
+        let redraw = directory.apply(&mut focused_chat, list(sessions.clone()));
         assert!(redraw.0, "the first rows are news");
         assert_eq!(directory.rows().len(), 2);
 
-        let redraw = directory.apply(&mut focused_chat, Frame::List { sessions });
+        let redraw = directory.apply(&mut focused_chat, list(sessions));
         assert!(!redraw.0, "the same rows again are not");
 
         // The other host-level kinds are nobody's business here.
@@ -670,46 +774,85 @@ mod tests {
     }
 
     /// Output produced while a session was the focused one is output the user
-    /// watched, so switching away must not leave it marked unseen. The stamp is
-    /// therefore taken as the user leaves, not as they arrive.
+    /// watched, so switching away must not leave it marked unseen.
+    ///
+    /// The row in hand when the user leaves predates that output: `list` frames
+    /// are coalesced on a tick (spec 6.8), so the frame reporting the turn
+    /// lands after the switch. What the client records is therefore its own
+    /// fold position, which is exactly what was on screen.
     #[test]
     fn what_the_user_watched_while_focused_is_not_unseen_afterwards() {
         let (mut directory, mut focused_chat) = two_sessions();
-        let list = |sessions: Vec<SessionSummary>| Frame::List { sessions };
-        let quiet = |at_secs: i64| {
-            vec![
-                row(FOCUSED, false, at(at_secs)),
-                row(OTHER, false, at(at_secs)),
-            ]
-        };
 
-        // Away and back, so `FOCUSED` has a recorded stamp and the never-viewed
-        // rule cannot answer for it.
-        let _ = directory.apply(&mut focused_chat, list(quiet(10)));
+        // Away and back, so `FOCUSED` has a recorded position and the
+        // never-viewed rule cannot answer for it.
+        let _ = directory.apply(
+            &mut focused_chat,
+            list(vec![row(FOCUSED, false, 10), row(OTHER, false, 10)]),
+        );
         directory.focus(&mut focused_chat, OTHER, || panic!("already attached"));
         directory.focus(&mut focused_chat, FOCUSED, || panic!("already attached"));
 
-        // A turn runs in `FOCUSED`, on screen the whole time.
-        let _ = directory.apply(
-            &mut focused_chat,
-            list(vec![row(FOCUSED, false, at(50)), row(OTHER, false, at(10))]),
-        );
+        // A turn runs in `FOCUSED`, on screen the whole time. No `list` frame
+        // reports it yet: the coalescing tick has not fired.
+        let _ = directory.apply(&mut focused_chat, durable(FOCUSED, 50, "watched"));
 
         directory.focus(&mut focused_chat, OTHER, || panic!("already attached"));
+        let _ = directory.apply(
+            &mut focused_chat,
+            list(vec![row(FOCUSED, false, 50), row(OTHER, false, 10)]),
+        );
         assert!(
-            !directory.has_unseen_output(FOCUSED),
+            !unseen(&directory, FOCUSED),
             "the user watched that turn happen, so leaving cannot mark it unseen",
         );
 
         // What does count is what happens after they left.
         let _ = directory.apply(
             &mut focused_chat,
-            list(vec![row(FOCUSED, false, at(90)), row(OTHER, false, at(10))]),
+            list(vec![row(FOCUSED, false, 90), row(OTHER, false, 10)]),
         );
         assert!(
-            directory.has_unseen_output(FOCUSED),
+            unseen(&directory, FOCUSED),
             "output after the switch is unseen",
         );
+    }
+
+    /// A session the user left before its first row still records what they
+    /// saw. The client's own fold position is known whether or not a row has
+    /// arrived, so the never-viewed rule cannot go on answering for a session
+    /// the user did view (spec 6.8).
+    #[test]
+    fn a_session_left_before_its_first_row_still_reports_later_output() {
+        let mut directory = SessionDirectory::new(FOCUSED.to_string());
+        let mut focused_chat = chat();
+
+        // Left inside the window before any `list` frame, which is where every
+        // freshly created session and every connect starts.
+        directory.focus(&mut focused_chat, OTHER, chat);
+
+        let _ = directory.apply(
+            &mut focused_chat,
+            list(vec![row(FOCUSED, false, 5), row(OTHER, false, 0)]),
+        );
+        assert!(
+            unseen(&directory, FOCUSED),
+            "the user did view it, so a row past what they saw is unseen",
+        );
+    }
+
+    /// The unseen mark is read off the row the caller hands over, never off a
+    /// row this looks up. The sidebar walks the whole directory asking about
+    /// each row, and a lookup here would make that walk quadratic.
+    #[test]
+    fn the_unseen_mark_reads_the_row_the_caller_passes() {
+        let (directory, _focused_chat) = two_sessions();
+        assert!(
+            directory.rows().is_empty(),
+            "no `list` frame has ever arrived",
+        );
+
+        assert!(directory.is_unseen(&row(OTHER, false, 7)));
     }
 
     /// The rows outlive a focus change. They are the peer's directory, not the
@@ -718,13 +861,8 @@ mod tests {
     #[test]
     fn the_rows_survive_a_focus_change() {
         let (mut directory, mut focused_chat) = two_sessions();
-        let sessions = vec![row(FOCUSED, false, at(10)), row(OTHER, true, at(20))];
-        let _ = directory.apply(
-            &mut focused_chat,
-            Frame::List {
-                sessions: sessions.clone(),
-            },
-        );
+        let sessions = vec![row(FOCUSED, false, 10), row(OTHER, true, 20)];
+        let _ = directory.apply(&mut focused_chat, list(sessions.clone()));
 
         directory.focus(&mut focused_chat, OTHER, || panic!("already attached"));
         assert_eq!(directory.rows(), sessions.as_slice());
@@ -736,39 +874,40 @@ mod tests {
         );
     }
 
-    /// Unseen output is derived by comparing two host-clock stamps, the row's
-    /// current one against the one recorded when the user last looked. This
-    /// client's own clock never enters, so skew between it and the host
-    /// cannot invent or hide the glyph (spec 6.8).
+    /// Unseen output is derived by comparing two of the host's own durable
+    /// positions, the row's current one against the one the client had folded
+    /// when the user last looked. Neither side is a clock, so no skew and no
+    /// stale stamp can invent or hide the glyph (spec 6.8).
     #[test]
-    fn unseen_output_compares_host_stamps_only() {
+    fn unseen_output_compares_durable_positions() {
         let (mut directory, mut focused_chat) = two_sessions();
-        let list = |sessions: Vec<SessionSummary>| Frame::List { sessions };
 
-        // Stamps far in the past on any real clock. A comparison that reached
-        // for `Utc::now()` on either side would read these as ancient.
+        // `OTHER` folds up to the position its row reports, which is what the
+        // user watching it would have had on screen.
+        let _ = directory.apply(&mut focused_chat, durable(OTHER, 10, "watched"));
         let _ = directory.apply(
             &mut focused_chat,
-            list(vec![row(FOCUSED, false, at(10)), row(OTHER, false, at(10))]),
+            list(vec![row(FOCUSED, false, 10), row(OTHER, false, 10)]),
         );
         directory.mark_viewed(OTHER);
         assert!(
-            !directory.has_unseen_output(OTHER),
+            !unseen(&directory, OTHER),
             "nothing has happened since the user looked",
         );
 
         let _ = directory.apply(
             &mut focused_chat,
-            list(vec![row(FOCUSED, false, at(10)), row(OTHER, false, at(20))]),
+            list(vec![row(FOCUSED, false, 10), row(OTHER, false, 20)]),
         );
         assert!(
-            directory.has_unseen_output(OTHER),
+            unseen(&directory, OTHER),
             "the session moved on after the user looked away",
         );
 
-        // Looking again clears it, at the stamp the host reported.
+        // Folding that output and looking again clears it.
+        let _ = directory.apply(&mut focused_chat, durable(OTHER, 20, "caught up on"));
         directory.mark_viewed(OTHER);
-        assert!(!directory.has_unseen_output(OTHER));
+        assert!(!unseen(&directory, OTHER));
     }
 
     /// A working session's glyph is that it is working, and the focused
@@ -778,46 +917,34 @@ mod tests {
     #[test]
     fn working_focused_and_never_viewed_sessions_are_not_unseen() {
         let (mut directory, mut focused_chat) = two_sessions();
-        let _ = directory.apply(
-            &mut focused_chat,
-            Frame::List {
-                sessions: vec![row(FOCUSED, false, at(10)), row(OTHER, true, at(10))],
-            },
-        );
 
-        // Away and back, which records a stamp for both. Without one, the
+        // Away and back, which records a position for both. Without one, the
         // never-viewed arm would answer for them and the two rules below would
         // never be reached.
         directory.focus(&mut focused_chat, OTHER, || panic!("already attached"));
         directory.focus(&mut focused_chat, FOCUSED, || panic!("already attached"));
         let _ = directory.apply(
             &mut focused_chat,
-            Frame::List {
-                sessions: vec![
-                    row(FOCUSED, false, at(99)),
-                    row(OTHER, true, at(99)),
-                    // Idle, moving, and never viewed: it reaches the
-                    // never-viewed arm rather than being turned away for
-                    // having no row at all.
-                    row("session-never-opened", false, at(99)),
-                ],
-            },
+            list(vec![
+                row(FOCUSED, false, 99),
+                row(OTHER, true, 99),
+                // Idle, moved on, and never viewed: it reaches the
+                // never-viewed arm rather than being turned away for working
+                // or for being the focused one.
+                row("session-never-opened", false, 99),
+            ]),
         );
         assert!(
-            !directory.has_unseen_output(OTHER),
+            !unseen(&directory, OTHER),
             "a working session reports working, not unseen",
         );
         assert!(
-            !directory.has_unseen_output(FOCUSED),
+            !unseen(&directory, FOCUSED),
             "the focused session is being looked at right now",
         );
         assert!(
-            !directory.has_unseen_output("session-never-opened"),
+            !unseen(&directory, "session-never-opened"),
             "a row the user never opened is not unseen output",
-        );
-        assert!(
-            !directory.has_unseen_output("session-with-no-row"),
-            "and neither is a session with no row yet",
         );
     }
 
@@ -956,6 +1083,59 @@ mod tests {
         );
     }
 
+    /// A session already in the working set leads the attach set just the same
+    /// when it is the one being admitted, and is named once. A `reset` on a
+    /// background session drives exactly this: the reopen admits a session the
+    /// set already holds, and the consumer waits for that session's catch-up
+    /// before it paints the switch, so leading with another session gates the
+    /// first paint behind an unrelated backfill.
+    #[test]
+    fn the_attach_set_leads_with_an_admitted_session_already_attached() {
+        let (mut directory, mut focused_chat) = two_sessions();
+        // A position to offer, so leading with `OTHER` cannot be confused with
+        // the fresh-admission path, which offers none.
+        for seq in [3, 4] {
+            let _ = directory.apply(&mut focused_chat, durable(OTHER, seq, "background"));
+        }
+        // A third session, so "leads with the admitted one" cannot pass by
+        // luck: with two entries an arbitrary order is right half the time.
+        directory.focus(&mut focused_chat, "session-third", chat);
+        directory.focus(&mut focused_chat, FOCUSED, || panic!("already attached"));
+
+        let requests = directory.attach_requests(Some(OTHER));
+        let named: Vec<String> = requests.iter().map(|r| r.session.clone()).collect();
+        assert_eq!(
+            named,
+            vec![
+                OTHER.to_string(),
+                FOCUSED.to_string(),
+                "session-third".to_string(),
+            ],
+            "the admitted session leads and is named once",
+        );
+        assert_eq!(
+            requests[0].cursor.as_ref().map(|c| c.seq),
+            Some(3),
+            "an admitted session already folding offers the position it reached",
+        );
+
+        // And the answer agrees, as a set, with what the focus leaves.
+        let displaced = directory.focus(&mut focused_chat, OTHER, || panic!("already attached"));
+        assert_eq!(displaced, None, "an attached session displaces nothing");
+        let mut left: Vec<String> = directory
+            .attach_requests(None)
+            .into_iter()
+            .map(|r| r.session)
+            .collect();
+        let mut predicted = named;
+        left.sort();
+        predicted.sort();
+        assert_eq!(
+            left, predicted,
+            "the set predicted for the focus is the set the focus left",
+        );
+    }
+
     /// A re-attach carries every session this client folds, each with its own
     /// cursor, focused first. One stream serves the whole set, so offering a
     /// single session's cursor would silently drop the rest.
@@ -991,5 +1171,77 @@ mod tests {
             Some(3),
             "the background session offers its own position, not the focused one's",
         );
+    }
+
+    /// A narrowed re-attach leaves the peer holding one session, so the rest
+    /// have to leave the working set: a later focus onto one of them must take
+    /// the attach path rather than swapping onto a transcript nothing feeds.
+    /// Their rows and their viewed positions both survive, because a detached
+    /// session is still one the user is meant to be aware of.
+    #[test]
+    fn dropping_all_but_one_detaches_the_rest_and_keeps_what_they_owe() {
+        let (mut directory, mut focused_chat) = two_sessions();
+        directory.focus(&mut focused_chat, "session-third", chat);
+        directory.focus(&mut focused_chat, FOCUSED, || panic!("already attached"));
+        let _ = directory.apply(
+            &mut focused_chat,
+            list(vec![
+                row(FOCUSED, false, 0),
+                row(OTHER, false, 7),
+                row("session-third", false, 0),
+            ]),
+        );
+        assert!(
+            unseen(&directory, OTHER),
+            "`OTHER` moved on after the user left it",
+        );
+
+        let dropped = directory.drop_all_but(FOCUSED);
+
+        assert_eq!(
+            dropped,
+            vec!["session-third".to_string(), OTHER.to_string()],
+            "dropped in the order they were held, most recently focused first",
+        );
+        assert!(!directory.is_attached(OTHER));
+        assert!(!directory.is_attached("session-third"));
+        assert!(directory.is_attached(FOCUSED));
+        transcripts_are_on_loan_once(&directory);
+        assert_eq!(
+            directory.rows().len(),
+            3,
+            "a detached session is still one the peer lists",
+        );
+        assert!(
+            unseen(&directory, OTHER),
+            "being detached does not make what happened while away seen",
+        );
+
+        // A later focus onto a dropped session takes the attach path.
+        let mut minted = false;
+        directory.focus(&mut focused_chat, OTHER, || {
+            minted = true;
+            chat()
+        });
+        assert!(minted, "the dropped session is attached afresh");
+        transcripts_are_on_loan_once(&directory);
+    }
+
+    /// The focused session survives a drop that does not name it. Its
+    /// transcript is the one on loan to the frontend, and this type cannot
+    /// repoint that cell, so dropping it would leave the frontend rendering a
+    /// session nothing folds.
+    #[test]
+    fn dropping_all_but_a_background_session_spares_the_focused_one() {
+        let (mut directory, mut focused_chat) = two_sessions();
+        directory.focus(&mut focused_chat, "session-third", chat);
+        directory.focus(&mut focused_chat, FOCUSED, || panic!("already attached"));
+
+        let dropped = directory.drop_all_but(OTHER);
+
+        assert_eq!(dropped, vec!["session-third".to_string()]);
+        assert!(directory.is_attached(FOCUSED));
+        assert!(directory.is_attached(OTHER));
+        transcripts_are_on_loan_once(&directory);
     }
 }

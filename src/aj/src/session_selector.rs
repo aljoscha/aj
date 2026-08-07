@@ -31,7 +31,6 @@ use vaxis::vxfw::{FilterableSelect, SelectItem, to_widget_ref};
 use crate::interactive::OverlayHandles;
 use crate::overlay::{OverlayPlacement, close_all, close_key_label, close_top, confirm_key_label};
 use crate::settings_ui::push_window;
-use crate::toasts::{busy_refusal, show_toast};
 
 /// How much of the first user message a row's primary column shows before
 /// truncating with an ellipsis.
@@ -73,11 +72,8 @@ fn loading_items() -> Vec<SelectItem> {
 /// current row (or Esc) just closes. Does not move focus: the caller posts
 /// the refocus event.
 ///
-/// The overlay opens read-only at any time. A real switch (a different
-/// session) is refused at confirm time while `handles.busy` (an in-flight
-/// turn or background work): it raises a toast into `handles.toasts` and
-/// keeps the overlay open rather than parking a request that would tear live
-/// work down.
+/// A switch is never refused for being busy. The session left behind stays
+/// attached and keeps folding, so its turn finishes unwatched.
 pub(crate) fn open_session_selector(handles: &OverlayHandles, current: String) {
     let select = Rc::new(RefCell::new(FilterableSelect::new(
         loading_items(),
@@ -92,8 +88,6 @@ pub(crate) fn open_session_selector(handles: &OverlayHandles, current: String) {
         let ids_c = Rc::clone(&ids);
         let current_c = current.clone();
         let request_c = Rc::clone(&handles.session_request);
-        let busy_c = Rc::clone(&handles.busy);
-        let toasts_c = Rc::clone(&handles.toasts);
         let stack_c = Rc::clone(&handles.stack);
         let editor_c = Rc::clone(&handles.editor);
         sel.on_confirm = Some(Box::new(move |ctx, item| {
@@ -105,14 +99,6 @@ pub(crate) fn open_session_selector(handles: &OverlayHandles, current: String) {
             // Choosing the active session changes nothing, so just close.
             if session_id == current_c {
                 close_all(&stack_c, ctx, &editor_c);
-                return;
-            }
-            // A real switch mid-work would tear live turns and background work
-            // down, so refuse it: raise the toast and keep the overlay open
-            // (the user can Esc or wait for the work to finish).
-            if busy_c.get() {
-                show_toast(&toasts_c, busy_refusal("switch sessions"));
-                ctx.redraw = true;
                 return;
             }
             *request_c.borrow_mut() = Some(SessionRequest::Resume(session_id));
@@ -457,21 +443,21 @@ mod tests {
         )
     }
 
-    /// While busy, confirming a non-current row raises the toast and parks NO
-    /// request, leaving the overlay open so the user can Esc or wait.
+    /// Live work does not hold the user in a session: the one they leave keeps
+    /// folding in the background, so a busy switch parks and closes exactly
+    /// like an idle one and raises no refusal.
     #[test]
-    fn confirm_switch_while_busy_toasts_and_stays_open() {
+    fn confirm_switch_while_busy_parks_and_closes() {
         let (request, stack, toasts) = confirm_switch_over(true);
-        assert!(request.borrow().is_none(), "no request parked while busy");
         assert!(
-            stack.borrow().is_open(),
-            "the overlay stays open while busy"
+            matches!(request.borrow().as_ref(), Some(SessionRequest::Resume(id)) if id == "other"),
+            "a busy switch parks a resume for the picked id",
         );
+        assert!(!stack.borrow().is_open(), "the confirm closed the overlay");
         assert!(
-            crate::toasts::toast_texts(&toasts)
-                .iter()
-                .any(|m| m.contains("Can't switch sessions while work is running")),
-            "the refusal raises the switch toast"
+            crate::toasts::toast_texts(&toasts).is_empty(),
+            "and said nothing about being busy: {:?}",
+            crate::toasts::toast_texts(&toasts),
         );
     }
 

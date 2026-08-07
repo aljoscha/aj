@@ -407,6 +407,205 @@ mod tests {
         key(codepoint, mods)
     }
 
+    /// The control code a terminal sends for `ctrl+<c>`, in the conventional
+    /// caret mapping. `None` where the mapping has no entry, and ctrl then
+    /// never reaches the application at all.
+    fn control_code(c: char) -> Option<u8> {
+        Some(match c {
+            // Ctrl+Space and Ctrl+@ are the same keystroke to a terminal.
+            '@' | ' ' => 0x00,
+            'a'..='z' => u8::try_from(u32::from(c) - 0x60).expect("an ascii letter"),
+            '[' => 0x1b,
+            '\\' => 0x1c,
+            ']' => 0x1d,
+            '^' => 0x1e,
+            '_' => 0x1f,
+            '?' => 0x7f,
+            _ => return None,
+        })
+    }
+
+    /// The control code a terminal sends for a named key that has one, rather
+    /// than an escape sequence.
+    fn control_code_key(name: &str) -> Option<u8> {
+        match name {
+            "enter" => Some(0x0d),
+            "escape" => Some(0x1b),
+            "tab" => Some(0x09),
+            "backspace" => Some(0x7f),
+            _ => None,
+        }
+    }
+
+    /// The modifier parameter a CSI sequence carries: one plus the bitmask of
+    /// shift, alt, ctrl, and super in that bit order. `None` when no modifier is
+    /// held, where a terminal leaves the parameter out entirely.
+    fn modifier_param(spec: &ChordSpec) -> Option<u8> {
+        let mask = u8::from(spec.shift)
+            | u8::from(spec.alt) << 1
+            | u8::from(spec.ctrl) << 2
+            | u8::from(spec.super_mod) << 3;
+        (mask != 0).then_some(mask + 1)
+    }
+
+    /// The `CSI 1 ; <mods> <final>` form of a cursor key.
+    fn csi_final(final_byte: u8, spec: &ChordSpec) -> Vec<u8> {
+        let final_byte = char::from(final_byte);
+        match modifier_param(spec) {
+            Some(param) => format!("\x1b[1;{param}{final_byte}").into_bytes(),
+            None => format!("\x1b[{final_byte}").into_bytes(),
+        }
+    }
+
+    /// The `CSI <number> ; <mods> ~` form of an editing or function key.
+    fn csi_numbered(number: u8, spec: &ChordSpec) -> Vec<u8> {
+        match modifier_param(spec) {
+            Some(param) => format!("\x1b[{number};{param}~").into_bytes(),
+            None => format!("\x1b[{number}~").into_bytes(),
+        }
+    }
+
+    fn char_bytes(c: char, spec: &ChordSpec) -> Option<Vec<u8>> {
+        // A bare control byte is how a ctrl chord or a named key is
+        // transmitted, no key sends one on its own.
+        if c.is_control() {
+            return None;
+        }
+        let mut buf = [0u8; 4];
+        let utf8 = c.encode_utf8(&mut buf).as_bytes();
+        // (ctrl, alt, shift, super)
+        match (spec.ctrl, spec.alt, spec.shift, spec.super_mod) {
+            (false, false, false, false) => Some(utf8.to_vec()),
+            // Shift arrives as the shifted glyph, which we can only synthesize
+            // for a letter. Every other one depends on the keyboard layout.
+            (false, false, true, false) => c
+                .is_ascii_alphabetic()
+                .then(|| vec![u8::try_from(c.to_ascii_uppercase()).expect("an ascii letter")]),
+            (true, false, false, false) => control_code(c).map(|code| vec![code]),
+            (false, true, false, false) => {
+                let mut bytes = vec![0x1b];
+                bytes.extend_from_slice(utf8);
+                Some(bytes)
+            }
+            // A character key is its own bytes with at most an ESC prefix for
+            // alt, so there is nowhere to put a second modifier.
+            _ => None,
+        }
+    }
+
+    fn named_bytes(name: &str, spec: &ChordSpec) -> Option<Vec<u8>> {
+        if let Some(code) = control_code_key(name) {
+            // (ctrl, alt, shift, super)
+            return match (spec.ctrl, spec.alt, spec.shift, spec.super_mod) {
+                (false, false, false, false) => Some(vec![code]),
+                (false, true, false, false) => Some(vec![0x1b, code]),
+                // `CSI Z` is the only modified control-code key terminals send.
+                (false, false, true, false) if name == "tab" => Some(b"\x1b[Z".to_vec()),
+                _ => None,
+            };
+        }
+        Some(match name {
+            "up" => csi_final(b'A', spec),
+            "down" => csi_final(b'B', spec),
+            "right" => csi_final(b'C', spec),
+            "left" => csi_final(b'D', spec),
+            "end" => csi_final(b'F', spec),
+            "home" => csi_final(b'H', spec),
+            "insert" => csi_numbered(2, spec),
+            "delete" => csi_numbered(3, spec),
+            "page_up" => csi_numbered(5, spec),
+            "page_down" => csi_numbered(6, spec),
+            _ => panic!("the chord grammar's key names are a closed set, got {name:?}"),
+        })
+    }
+
+    /// The bytes a terminal sends when the user types `spec`, or `None` when no
+    /// keystroke sends it at all.
+    ///
+    /// This is the encoding every terminal speaks. One that has negotiated the
+    /// kitty keyboard protocol sends `CSI <codepoint> ; <mods> u` for everything
+    /// instead, which would carry far more chords, but the protocol is
+    /// opportunistic and `aj` cannot require it.
+    fn terminal_bytes(spec: &ChordSpec) -> Option<Vec<u8>> {
+        match spec.key {
+            ChordKey::Char(c) => char_bytes(c, spec),
+            ChordKey::Named(name) => named_bytes(name, spec),
+            // F1..F12 have numbered CSI forms. Above that a terminal sends
+            // sequences the parser does not decode.
+            ChordKey::F(n) => [11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 23, 24]
+                .get(usize::from(n).checked_sub(1)?)
+                .map(|number| csi_numbered(*number, spec)),
+        }
+    }
+
+    /// The key press a terminal's bytes for `spec` decode to, or `None` when no
+    /// keystroke produces one.
+    fn terminal_key(spec: &ChordSpec) -> Option<Key> {
+        let bytes = terminal_bytes(spec)?;
+        let parsed = vaxis::parser::Parser::new().parse(&bytes).ok()?;
+        // A short read means the parser took the bytes for the prefix of a
+        // longer sequence, which is the `alt+[` hazard exactly: a terminal
+        // cannot tell them from the start of one either.
+        if parsed.n != bytes.len() {
+            return None;
+        }
+        match parsed.event {
+            Some(vaxis::event::Event::KeyPress(key)) => Some(key),
+            _ => None,
+        }
+    }
+
+    /// The named keys [`parse_chord`] emits.
+    const CHORD_KEY_NAMES: &[&str] = &[
+        "enter",
+        "escape",
+        "tab",
+        "backspace",
+        "delete",
+        "insert",
+        "up",
+        "down",
+        "left",
+        "right",
+        "home",
+        "end",
+        "page_up",
+        "page_down",
+    ];
+
+    /// Every chord shape the grammar can build: each key class crossed with all
+    /// sixteen modifier combinations. The characters span printable ASCII plus a
+    /// control character and two multi-byte ones, which a config file can spell
+    /// even though no keyboard has such a key.
+    fn every_chord_spec() -> impl Iterator<Item = ChordSpec> {
+        let chars = (0x20u8..=0x7e)
+            .map(|b| ChordKey::Char(char::from(b)))
+            .chain(['\t', 'ä', '€'].into_iter().map(ChordKey::Char));
+        let named = CHORD_KEY_NAMES.iter().copied().map(ChordKey::Named);
+        let fkeys = (1u8..=35).map(ChordKey::F);
+        chars.chain(named).chain(fkeys).flat_map(|key| {
+            (0u8..16).map(move |bits| ChordSpec {
+                key,
+                ctrl: bits & 1 != 0,
+                alt: bits & 2 != 0,
+                shift: bits & 4 != 0,
+                super_mod: bits & 8 != 0,
+            })
+        })
+    }
+
+    /// A context in which `action`'s predicate holds, so a keymap match tests
+    /// the chord rather than the gate.
+    fn ctx_where_enabled(action: AjAction) -> HostCtx {
+        let cx = ctx(false);
+        match action {
+            AjAction::CloseAllOverlays => push_scrim(&cx),
+            AjAction::CopyMessage | AjAction::BranchMessage => cx.focus_mode.set(true),
+            _ => {}
+        }
+        cx
+    }
+
     #[test]
     fn activator_translates_chars_named_keys_and_fkeys() {
         let alt_up = activator(&parse_chord("alt+up").unwrap());
@@ -464,53 +663,70 @@ mod tests {
     }
 
     /// Every default chord survives a round trip through the terminal: the bytes
-    /// a terminal sends for it parse back into the key the keymap matches on.
+    /// a terminal sends for it parse back into the key its binding matches on,
+    /// and that key reaches this binding's own action and no other.
     ///
-    /// This is not a formality. Alt sends an ESC prefix, so an alt chord arrives
-    /// as `ESC <byte>`, and the parser reads `ESC [` as the CSI introducer and
-    /// `ESC ]` as OSC before it ever considers "alt + char". Binding `alt+[`
-    /// therefore produces an action no keystroke can reach, and nothing else in
-    /// the suite notices, because the keymap matches a `Key` the parser will
-    /// never hand it.
+    /// This is not a formality. A terminal has far fewer encodings than the
+    /// chord grammar has spellings, so a well-formed chord can still be
+    /// unreachable, and the failure is silent. Alt is sent as an ESC prefix, so
+    /// `alt+[` arrives as the CSI introducer every escape sequence starts with.
+    /// Ctrl+i is sent as the tab control code, so it fires the Tab binding
+    /// instead. Nothing else in the suite notices, because the keymap is
+    /// otherwise only ever fed a `Key` reconstructed from the chord rather than
+    /// one the parser produced.
     #[test]
     fn every_default_chord_survives_the_terminal() {
-        for binding in global_bindings() {
-            let ChordKey::Char(ch) = binding.chord.key else {
-                // Named keys and F-keys arrive as escape sequences the parser
-                // decodes by table, not as a byte we can synthesize here.
-                continue;
-            };
-            if !binding.chord.alt || binding.chord.ctrl {
-                continue;
-            }
-            let bytes = [0x1b, u8::try_from(ch).expect("an ascii chord key")];
-            let parsed = vaxis::parser::Parser::new()
-                .parse(&bytes)
-                .expect("the bytes parse")
-                .event;
-            let action = binding.action.action_id().unwrap_or("<unbound>");
-            let Some(vaxis::event::Event::KeyPress(key)) = parsed else {
+        let keymap = build_keymap();
+        let globals = global_bindings();
+        for (action_id, chord, _) in aj_app::keybindings::AJ_KEYBINDINGS {
+            let spec = parse_chord(chord).expect("the default chords parse");
+            let key = terminal_key(&spec).unwrap_or_else(|| {
                 panic!(
-                    "{action}'s chord is not typeable: the terminal sends ESC {ch:?} \
-                     for it, which the parser consumes as an escape sequence",
-                );
-            };
-            assert_eq!(
-                key.codepoint,
-                u32::from(ch),
-                "{action}'s chord parses back as a different key",
-            );
+                    "{action_id}'s chord {chord:?} is not typeable: the bytes a terminal \
+                     sends for it are not a key press",
+                )
+            });
             assert!(
-                key.mods.contains(Modifiers::ALT),
-                "{action}'s chord loses its alt on the way through the terminal",
+                activator(&spec).accepts(&key),
+                "{action_id}'s chord {chord:?} arrives from the terminal as a different \
+                 key: {key:?}",
             );
-            // And the keymap really matches what the terminal produced, not
-            // only what `key_of` reconstructs from the spec.
-            let keymap = build_keymap();
+
+            match globals
+                .iter()
+                .find(|b| b.action.action_id() == Some(*action_id))
+            {
+                Some(binding) => assert_eq!(
+                    keymap.match_single(
+                        &key,
+                        BindingPhase::Capture,
+                        &ctx_where_enabled(binding.action)
+                    ),
+                    Some(&binding.action),
+                    "{action_id} does not fire for the key its own chord produces",
+                ),
+                // Overlay-local rows never enter the global keymap. The focused
+                // widget matches them at target through `action_matches`.
+                None => assert!(
+                    action_matches(&key, action_id),
+                    "{action_id} does not match the key its own chord produces",
+                ),
+            }
+        }
+    }
+
+    /// [`aj_app::actions::untypeable_reason`] is a hand-written restatement of
+    /// what the input parser does, since `aj-app` may not depend on this crate.
+    /// This sweeps the whole chord space through the real parser and asserts the
+    /// two agree, so the restatement cannot drift from the parser it describes.
+    #[test]
+    fn untypeable_reason_agrees_with_the_parser() {
+        for spec in every_chord_spec() {
+            let round_trips = terminal_key(&spec).is_some_and(|key| activator(&spec).accepts(&key));
             assert_eq!(
-                keymap.match_single(&key, BindingPhase::Capture, &ctx(false)),
-                Some(&binding.action),
-                "{action} does not fire for the key its own chord produces",
+                round_trips,
+                aj_app::actions::untypeable_reason(&spec).is_none(),
+                "the predicate and the parser disagree about {spec:?}",
             );
         }
     }

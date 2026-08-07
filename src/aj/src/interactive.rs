@@ -89,9 +89,11 @@ use crate::settings_ui::{
     SkillsFill, UNSET_VALUE, build_skill_rows, open_model, open_settings, open_skills,
     open_thinking, skills_placeholder_row,
 };
+use crate::sidebar::{
+    MIN_COLS_WITH_SIDEBAR, SIDEBAR_COLS, SessionSidebar, SidebarState, step_session,
+};
 #[cfg(test)]
-use crate::sidebar::SIDEBAR_COLS;
-use crate::sidebar::{RowStatus, SessionSidebar, SidebarRow, SidebarState};
+use crate::sidebar::{RowStatus, SidebarRow};
 use crate::splash::{SPLASH_WAKE_EVENT, Splash};
 use crate::status::{Connection, STATUS_WAKE_EVENT, StatusLine, StatusState};
 use crate::task_output::{TaskBacking, TaskOutputView, open_task_output};
@@ -593,25 +595,47 @@ async fn open_stream(
 /// directory folding nothing, and the next reopen offers them again, so a
 /// transient refusal costs one narrowed attach rather than a permanent
 /// eviction.
-async fn attach_admitting(world: &World, session: &str) -> Result<Stream, ControlError> {
+async fn attach_admitting(world: &World, session: &str) -> Result<Attachment, ControlError> {
     let requests = world.directory.attach_requests(Some(session));
     match world.control.attach_all(&requests).await {
-        Ok(stream) => Ok(stream),
+        Ok(stream) => Ok(Attachment {
+            stream,
+            narrowed: false,
+        }),
         Err(_) if requests.len() > 1 => {
             tracing::warn!(
                 "attaching {} session(s) was refused, narrowing to {session}",
                 requests.len(),
             );
-            world
-                .control
-                .attach_all(&[AttachRequest {
+            // Keep the cursor the wide attach would have offered, so the
+            // narrowed one still resumes incrementally rather than replaying
+            // the session from its start.
+            let narrowed = requests
+                .into_iter()
+                .find(|request| request.session == session)
+                .unwrap_or_else(|| AttachRequest {
                     session: session.to_string(),
                     cursor: None,
-                }])
-                .await
+                });
+            let stream = world.control.attach_all(&[narrowed]).await?;
+            Ok(Attachment {
+                stream,
+                narrowed: true,
+            })
         }
         Err(err) => Err(err),
     }
+}
+
+/// A freshly opened stream, and whether the peer refused to serve the whole
+/// working set so the attach had to narrow to the one session being focused.
+///
+/// The flag is load-bearing: a narrowed attach leaves every other member
+/// detached on the peer, and the client has to be told so it re-attaches them
+/// later rather than swapping onto a view nothing feeds.
+struct Attachment {
+    stream: Stream,
+    narrowed: bool,
 }
 
 /// Read the focused session's tree from the host and open the tree overlay
@@ -800,6 +824,13 @@ async fn apply_focus_request(
                 }
             }
         }
+        FocusRequest::Resume(session) if session == world.session() => {
+            // Nothing to do, and doing it anyway would show a switch notice for
+            // a switch that did not happen, discard an armed branch anchor and
+            // reset the scroll. Reachable from a stepping chord answered off a
+            // mirror that has not caught up with the last switch yet.
+            Focus::Same
+        }
         FocusRequest::Resume(session) => {
             let notice = format!("Switched to session {session}.");
             match focus_session(
@@ -880,7 +911,7 @@ async fn focus_session(
     // Each offers its own cursor, so the sessions carried over are served their
     // suffix rather than a fresh backfill, and the session this one displaces
     // from the set is detached by going unnamed here.
-    let stream = if reopening {
+    let attachment = if reopening {
         Some(attach_admitting(world, &session).await?)
     } else {
         None
@@ -912,12 +943,24 @@ async fn focus_session(
         .focus(&mut world.chat.borrow_mut(), &session, || {
             minted.expect("a session focused for the first time was minted a transcript")
         });
-    if let Some(stream) = stream {
+    if let Some(Attachment { stream, narrowed }) = attachment {
         // Armed after the focus, so the session just inserted is in the set.
         world
             .directory
             .expect_attach(|session| stream.attached(session));
         world.stream = stream;
+        if narrowed {
+            // The peer serves one session now, so every other member of the
+            // working set is detached in fact. Dropping them says so, and a
+            // later focus re-attaches instead of swapping onto a view no stream
+            // feeds. Their rows stay, which is how the user keeps seeing them.
+            // Safe here and not before the focus: the session being kept is the
+            // focused one, so the parked-transcript invariant holds.
+            let dropped = world.directory.drop_all_but(&session);
+            if !dropped.is_empty() {
+                tracing::warn!("detached by the narrowed attach: {}", dropped.join(", "));
+            }
+        }
     }
     // Status is resynced from the client once per iteration; reset it so
     // the frame between install and the next sync shows idle chrome.
@@ -1541,28 +1584,6 @@ fn sync_status(world: &World) -> bool {
     next.animating()
 }
 
-/// The session one step from the focused row in the sidebar's order, wrapping
-/// at the ends.
-///
-/// `None` when there is nothing to move to: no rows yet, or a single row, which
-/// is the plain local case where the gesture has nowhere to go. Also `None` when
-/// no row is the focused one, which happens in the window before the first
-/// `list` frame names it, and stepping from an unknown position would jump
-/// somewhere the user did not point at.
-fn step_session(state: &SidebarState, forward: bool) -> Option<String> {
-    if state.rows.len() < 2 {
-        return None;
-    }
-    let at = state.rows.iter().position(|row| row.focused)?;
-    let len = state.rows.len();
-    let next = if forward {
-        (at + 1) % len
-    } else {
-        (at + len - 1) % len
-    };
-    Some(state.rows[next].id.clone())
-}
-
 /// Mirror the session directory into the sidebar's draw state.
 ///
 /// Called once per drive-loop iteration, like [`sync_status`], because the
@@ -1573,22 +1594,19 @@ fn step_session(state: &SidebarState, forward: bool) -> Option<String> {
 /// (spec 6.8). Order is the peer's, which is activity-ordered, so the row a
 /// user wants is near the top without this having to sort.
 fn sync_sidebar(world: &World, shell: &Rc<RefCell<Shell>>) {
-    let focused = world.session();
-    let rows = world
-        .directory
-        .rows()
-        .iter()
-        .map(|row| SidebarRow {
-            status: RowStatus::of(row, world.directory.has_unseen_output(&row.id)),
-            focused: row.id == focused,
-            id: row.id.clone(),
-        })
-        .collect();
-    let sidebar = Rc::clone(&shell.borrow().sidebar);
-    let mut state = sidebar.borrow_mut();
     // A peer that has sent no `list` frame yet leaves the strip empty rather
     // than inventing a row for the focused session: the next frame fills it,
     // and a fabricated row would carry no status.
+    let rows = crate::sidebar::rows_for_display(world.directory.rows(), world.session(), |row| {
+        world.directory.is_unseen(row)
+    });
+    let sidebar = Rc::clone(&shell.borrow().sidebar);
+    let mut state = sidebar.borrow_mut();
+    // Showing itself once the peer offers a choice is the default, and an
+    // explicit toggle outranks it for the rest of the process (spec 9.2).
+    if !state.toggled {
+        state.visible = rows.len() > 1;
+    }
     state.rows = rows;
 }
 
@@ -2254,19 +2272,12 @@ async fn apply_command_action(
             }
         },
         CommandAction::NewSession => {
-            // A new session takes the focus off this one, so it joins the
-            // refuse-while-busy rule of the other session-changing gestures:
-            // walking away from live work silently is worse than refusing.
-            let (agents, bash) = running_work(world);
-            if agents + bash > 0 {
-                shell
-                    .borrow()
-                    .show_toast(busy_refusal("start a new session"));
-            } else {
-                // No overlay: park the request straight away. The drive
-                // loop's post-input check turns it into `SessionExit::New`.
-                *shell.borrow().session_request.borrow_mut() = Some(SessionRequest::New);
-            }
+            // Live work is no reason to refuse. The session we leave stays
+            // attached and keeps folding, so its turn finishes whether or not
+            // anyone is looking at it. No overlay to close either, so the
+            // request parks straight away and the drive loop's post-input
+            // check turns it into `SessionExit::New`.
+            *shell.borrow().session_request.borrow_mut() = Some(SessionRequest::New);
             ActionEffect::Redraw
         }
         CommandAction::OpenPromptHistory => {
@@ -3667,10 +3678,6 @@ struct Shell {
     /// time. Also owns whether the strip is shown at all, which the toggle
     /// action flips.
     sidebar: Rc<RefCell<SidebarState>>,
-    /// The strip itself, so a test can draw exactly the widget the layout holds
-    /// rather than a second one built to look like it.
-    #[cfg(test)]
-    sidebar_strip: Rc<RefCell<SessionSidebar>>,
     /// The toast-stack widget, drawn bottom-right every frame: stacked above
     /// the quit hint when no modal is open, floated over the scrim/overlay
     /// (z 3) otherwise. Reads the `toasts` stack below. Plain `RefCell` like
@@ -4038,6 +4045,10 @@ impl Shell {
                 AjAction::SidebarToggle => {
                     let mut state = sidebar_for_actions.borrow_mut();
                     state.visible = !state.visible;
+                    // An explicit ask outranks the row-count default for the
+                    // rest of the process, in both directions: a user who hid
+                    // the strip does not want it back when a session appears.
+                    state.toggled = true;
                     ctx.redraw = true;
                 }
                 // Stepping the sidebar's order rather than the working set's:
@@ -4233,8 +4244,6 @@ impl Shell {
             editor,
             status_line,
             sidebar,
-            #[cfg(test)]
-            sidebar_strip,
             quit_hint,
             quit_hint_warning,
             frame_stats_box,
@@ -4364,6 +4373,26 @@ impl Shell {
     /// it pushes onto, the editor (focus fallback), a live chrome snapshot,
     /// the parked-request slots, and the busy flag plus toast stack the
     /// session-changing confirms read and raise into.
+    /// Columns the sidebar takes from the left of the base column, which
+    /// anything floated over that column has to clear.
+    fn sidebar_cols(&self) -> u16 {
+        if self.sidebar.borrow().shown() {
+            SIDEBAR_COLS
+        } else {
+            0
+        }
+    }
+
+    /// Hold the strip back on a terminal with no width to spare.
+    ///
+    /// The strip is inflexible, so on a narrow terminal it would take its full
+    /// width off a transcript that has none to give and leave the column
+    /// nothing. Kept apart from `visible` so the user's ask survives a resize
+    /// and comes back when the width does.
+    fn suppress_sidebar_if_too_narrow(&self, terminal_cols: u16) {
+        self.sidebar.borrow_mut().too_narrow = terminal_cols < MIN_COLS_WITH_SIDEBAR;
+    }
+
     fn overlay_handles(&self) -> OverlayHandles {
         OverlayHandles {
             stack: Rc::clone(&self.overlays),
@@ -4503,6 +4532,9 @@ impl Widget for Shell {
         // means the editor grows against the current frame, and the first
         // painted frame is already correct.
         self.set_editor_row_cap(usize::from(ctx.max.size().height));
+        // Same reason, for the sidebar: only the Shell learns the terminal
+        // width, because a flex row measures the strip under an unbounded one.
+        self.suppress_sidebar_if_too_narrow(ctx.max.size().width);
 
         let mut inner = draw_widget(&to_widget_ref(Rc::clone(&self.keymap)), ctx);
 
@@ -4531,14 +4563,20 @@ impl Widget for Shell {
                 .saturating_sub(editor.drawn_height());
             // Rows available above the editor, keeping the header on screen.
             let max_rows = usize::from(editor_top.saturating_sub(HEADER_ROWS));
-            if let Some(popup) = editor.draw_autocomplete_popup_surface(term.width, max_rows) {
+            // The popup belongs to the editor, so it starts where the editor
+            // does. The sidebar indents the whole base column, and a popup left
+            // at column zero would sit over the strip instead of under the text
+            // it completes.
+            let indent = self.sidebar_cols();
+            let popup_width = term.width.saturating_sub(indent);
+            if let Some(popup) = editor.draw_autocomplete_popup_surface(popup_width, max_rows) {
                 let popup = block_mouse(popup, &self.transcript);
                 // Anchor so the popup's bottom edge abuts the editor's top.
                 let anchor = editor_top.saturating_sub(popup.size.height);
                 inner.children.push(SubSurface {
                     origin: RelativePoint {
                         row: i32::from(anchor),
-                        col: 0,
+                        col: i32::from(indent),
                     },
                     surface: popup,
                     // z 1 draws over the base `FlexColumn` (z 0), like the scrim.
@@ -5032,7 +5070,8 @@ pub async fn run(args: Args) -> Result<()> {
         // leaves the same session focused and its usage still growing.
         let previous = world.session().to_string();
         let usage = session_usage(&world, &previous).await;
-        match apply_focus_request(&mut app, &shell, &mut world, request).await {
+        let moved = apply_focus_request(&mut app, &shell, &mut world, request).await;
+        match moved {
             Focus::Moved => match usage {
                 Some(usage) => completed_sessions.push((previous, usage)),
                 None => {
@@ -5570,6 +5609,13 @@ async fn drive(
         data: None,
     });
     let exit = loop {
+        // The sidebar mirror leads the iteration, ahead of both the paint and
+        // the input read. A session request breaks out of the input arm below,
+        // so a mirror refreshed at the foot of the iteration would leave a key
+        // already buffered when the loop is re-entered to be answered from rows
+        // that predate the switch, and a stepping chord would name the session
+        // just landed on.
+        sync_sidebar(world, shell);
         // Paint current state before blocking on the next event, subject to
         // the frame cap: whenever the loop is about to wait, the screen must
         // already reflect current state. This flushes redraws requested while
@@ -6194,7 +6240,6 @@ async fn drive(
         // animating, not just busy, so a background sub-agent starting while
         // the viewed agent is idle still arms the box-spinner redraw pump.
         let animating = sync_status(world);
-        sync_sidebar(world, shell);
         // Advance the editor's autocomplete once per iteration. The delivery
         // arm above wakes the loop as streaming matches and one-shot results
         // land, but a narrowing keystroke re-scores an already-walked tree in
@@ -6256,18 +6301,26 @@ async fn drive(
 /// own fold derived from the event stream (spec 9.1), which covers exactly
 /// the frames this client saw.
 async fn session_usage(world: &World, session: &str) -> Option<UsageSummary> {
+    // Asking the host locks the session's agent, and a turn holds that lock
+    // for its whole duration, so a busy session would park this loop until the
+    // turn ended: no paint, no input, not even a cancel. Fall back to the
+    // client's own event-derived accounting, which is what a connection uses
+    // for the same banner (spec 9.1). A session with work in flight has no
+    // final usage to report anyway.
+    let (agents, bash) = running_work(world);
+    let busy = agents + bash > 0;
     match world.control.host() {
-        Some(host) => match host.usage(session).await {
+        Some(host) if !busy => match host.usage(session).await {
             Ok(usage) => usage,
             Err(err) => {
                 tracing::warn!("could not read {session}'s usage for the exit banner: {err}");
                 None
             }
         },
-        None if session == world.session() => Some(world.chat.borrow().usage_summary()),
-        // A connection never leaves its session, so no other one can be asked
-        // for.
-        None => None,
+        // `running_work` answers for the focused session, so the fallback is
+        // only sound for that one. Both callers ask about it.
+        _ if session == world.session() => Some(world.chat.borrow().usage_summary()),
+        _ => None,
     }
 }
 
@@ -13468,12 +13521,11 @@ mod tests {
         ));
     }
 
-    /// The session selector opens read-only even mid-turn (the switch is
-    /// refused at confirm time, not by refusing to open). `NewSession` still
-    /// refuses mid-turn (it starts a fresh session with no overlay to gate
-    /// the switch), raising a toast and parking nothing.
+    /// Neither gesture is gated on live work: the selector opens mid-turn and
+    /// `NewSession` parks its request, because the session left behind keeps
+    /// folding and finishes its turn unwatched (spec 9.2).
     #[tokio::test]
-    async fn new_session_refused_mid_turn_selector_opens() {
+    async fn new_session_and_the_selector_are_open_mid_turn() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         handle_submit(&mut world, "go".to_string()).await;
@@ -13498,20 +13550,19 @@ mod tests {
         );
         shell.borrow().overlays.borrow_mut().close_all();
 
-        // NewSession is still refused mid-turn.
+        // NewSession parks mid-turn rather than refusing.
         assert!(matches!(
             apply_command(&mut world, &shell, CommandAction::NewSession).await,
             ActionEffect::Redraw
         ));
-        assert!(
-            shell.borrow().take_session_request().is_none(),
-            "no new-session parked mid-turn"
+        assert_eq!(
+            shell.borrow().take_session_request(),
+            Some(SessionRequest::New),
+            "a new session is parked mid-turn",
         );
         assert!(
-            crate::toasts::toast_texts(&shell.borrow().toasts)
-                .iter()
-                .any(|m| m.contains("Can't start a new session while work is running")),
-            "{:?}",
+            crate::toasts::toast_texts(&shell.borrow().toasts).is_empty(),
+            "and nothing was refused: {:?}",
             crate::toasts::toast_texts(&shell.borrow().toasts)
         );
 
@@ -13521,47 +13572,30 @@ mod tests {
         shut_down(&world).await;
     }
 
-    /// `NewSession` joins the refuse-while-busy rule for BACKGROUND work too
-    /// (no turn in flight): the command refuses with a toast and parks
-    /// nothing, and parks the request once the work is over.
+    /// A running background task does not hold the user in a session either: it
+    /// keeps running behind the switch, exactly as a turn does.
     #[tokio::test]
-    async fn new_session_refused_while_background_work_runs() {
+    async fn new_session_is_allowed_while_background_work_runs() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         run_prompt(&mut world, "seed").await;
         assert!(!world.client().working(), "no turn in flight");
-        let task = register_bash_task(&mut world, "sleep 100").await;
+        let _task = register_bash_task(&mut world, "sleep 100").await;
 
-        // The command refuses up front.
         assert!(matches!(
             apply_command(&mut world, &shell, CommandAction::NewSession).await,
             ActionEffect::Redraw
         ));
-        assert!(
-            shell.borrow().take_session_request().is_none(),
-            "no new-session parked while background work runs"
-        );
-        assert!(
-            crate::toasts::toast_texts(&shell.borrow().toasts)
-                .iter()
-                .any(|m| m.contains("Can't start a new session while work is running")),
-            "the refusal raises the toast"
-        );
-
-        // Idle (task terminal): the command parks the request.
-        world
-            .handles()
-            .task_registry
-            .set_status(task, aj_agent::tool::TaskStatus::Killed);
-        read_host_state(&mut world).await;
-        assert!(matches!(
-            apply_command(&mut world, &shell, CommandAction::NewSession).await,
-            ActionEffect::Redraw
-        ));
-        assert!(matches!(
+        assert_eq!(
             shell.borrow().take_session_request(),
-            Some(SessionRequest::New)
-        ));
+            Some(SessionRequest::New),
+            "a live task does not refuse a new session",
+        );
+        assert!(
+            crate::toasts::toast_texts(&shell.borrow().toasts).is_empty(),
+            "and nothing was refused: {:?}",
+            crate::toasts::toast_texts(&shell.borrow().toasts)
+        );
         shut_down(&world).await;
     }
 
@@ -15305,122 +15339,74 @@ mod tests {
         .join("\n")
     }
 
-    /// The sidebar's rows, as the layout's own strip draws them.
+    /// The sidebar's rows as the composed shell paints them, read out of the
+    /// root surface's leftmost columns.
+    ///
+    /// Drawn through the root on purpose. Asking the strip widget to draw itself
+    /// proves the widget works while saying nothing about whether the layout
+    /// still contains it, and leaving it out of the layout is exactly the defect
+    /// worth catching.
     fn sidebar_rows(shell: &Rc<RefCell<Shell>>) -> Vec<String> {
-        let strip = Rc::clone(&shell.borrow().sidebar_strip);
-        crate::test_support::rows(
-            &strip
-                .borrow_mut()
-                .draw(&crate::test_support::draw_ctx(SIDEBAR_COLS, Some(40))),
-        )
-        .into_iter()
-        .map(|row| row.trim_end().to_string())
-        .filter(|row| !row.is_empty())
-        .collect()
+        painted_rows(shell, 100, 40)
+            .into_iter()
+            .map(|row| {
+                row.chars()
+                    .take(usize::from(SIDEBAR_COLS))
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .filter(|row| !row.is_empty())
+            .collect()
     }
 
-    /// The columns the strip actually claims when drawn, which is what it takes
-    /// from the rest of the layout.
+    /// Every painted line of the composed shell, at the given terminal size.
+    fn painted_rows(shell: &Rc<RefCell<Shell>>, width: u16, height: u16) -> Vec<String> {
+        let root: WidgetRef = to_widget_ref(Rc::clone(shell));
+        crate::test_support::rows(&draw_widget(
+            &root,
+            &crate::test_support::draw_ctx(width, Some(height)),
+        ))
+    }
+
+    /// The columns the strip takes off the transcript, measured by where the
+    /// header lands in the painted frame rather than by asking the widget.
     fn sidebar_width(shell: &Rc<RefCell<Shell>>) -> u16 {
-        let strip = Rc::clone(&shell.borrow().sidebar_strip);
-        strip
-            .borrow_mut()
-            .draw(&crate::test_support::draw_ctx(120, Some(40)))
-            .size
-            .width
+        sidebar_width_at(shell, 100)
     }
 
-    /// Press an action's own chord through the keymap, which is the path a user
-    /// takes and the one spec 9.2 requires these gestures to ride.
-    fn press_action(shell: &Rc<RefCell<Shell>>, action: AjAction) {
+    /// The strip's drawn width at a given terminal width.
+    fn sidebar_width_at(shell: &Rc<RefCell<Shell>>, width: u16) -> u16 {
+        let painted = painted_rows(shell, width, 40);
+        let header = painted
+            .iter()
+            .find(|row| row.contains("aj"))
+            .expect("the header is painted");
+        let indent = header.len() - header.trim_start().len();
+        u16::try_from(indent).expect("an indent within a terminal width")
+    }
+
+    /// The bytes a terminal sends for an action's own default chord.
+    ///
+    /// Only the alt+char and plain-char classes, which is all the sidebar
+    /// gestures use. `every_default_chord_survives_the_terminal` is what proves
+    /// a chord is typeable at all.
+    fn chord_bytes(action: AjAction) -> Vec<u8> {
         let chord = aj_app::actions::parse_chord(
             aj_app::keybindings::effective_chord(action.action_id().expect("a bound action"))
                 .expect("a default chord"),
         )
         .expect("the chord parses");
-        let mut mods = vaxis::key::Modifiers::empty();
-        if chord.ctrl {
-            mods |= vaxis::key::Modifiers::CTRL;
-        }
-        if chord.alt {
-            mods |= vaxis::key::Modifiers::ALT;
-        }
-        let codepoint = match chord.key {
-            aj_app::actions::ChordKey::Char(c) => u32::from(c),
-            aj_app::actions::ChordKey::Named(name) => {
-                vaxis::key::name_map(name).expect("vaxis knows the key")
-            }
-            aj_app::actions::ChordKey::F(n) => {
-                vaxis::key::name_map(&format!("f{n}")).expect("vaxis knows the f-key")
-            }
+        let aj_app::actions::ChordKey::Char(c) = chord.key else {
+            panic!("{action:?} is not a plain-character chord");
         };
-        // Straight at the keymap controller, which owns the action handler. The
-        // Shell's own capture phase does not route key presses to it, the
-        // framework does that by drawing it as a child.
-        let keymap = Rc::clone(&shell.borrow().keymap);
-        let mut ctx = EventContext::new();
-        keymap.borrow_mut().capture_event(
-            &mut ctx,
-            &Event::KeyPress(Key {
-                codepoint,
-                mods,
-                ..Key::default()
-            }),
-        );
-    }
-
-    /// The sidebar lists every session the peer reports, glyphs each by what it
-    /// is doing, and marks the focused one (spec 9.2). Rows come from `list`
-    /// frames, so a session this client never attached is listed too.
-    #[tokio::test]
-    async fn the_sidebar_lists_the_peer_s_sessions_with_their_status() {
-        let dir = TempDir::new().expect("tempdir");
-        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
-        run_prompt(&mut world, "seed").await;
-        press_action(&shell, AjAction::SidebarToggle);
-        let focused = world.session().to_string();
-
-        // A second session on the host that this client has never attached.
-        let other = world
-            .control
-            .create(None, None)
-            .await
-            .expect("a second session");
-
-        // Wait the host's `list` coalescing out, then mirror.
-        let deadline = Instant::now() + SETTLE_DEADLINE;
-        loop {
-            fold_ready_frames(&mut world);
-            sync_sidebar(&world, &shell);
-            if sidebar_rows(&shell).len() >= 2 {
-                break;
-            }
-            assert!(Instant::now() < deadline, "the rows never arrived");
-            tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!chord.ctrl, "{action:?} is not a ctrl chord");
+        let mut bytes = Vec::new();
+        if chord.alt {
+            bytes.push(0x1b);
         }
-
-        assert!(
-            !world.directory.is_attached(&other),
-            "the second session is listed without being attached",
-        );
-        let rows = sidebar_rows(&shell);
-        let label = |id: &str| SessionSidebar::label(id, usize::from(SIDEBAR_COLS) - 2);
-        assert!(
-            rows.iter().any(|row| row.contains(&label(&focused))),
-            "the focused session is listed: {rows:?}",
-        );
-        assert!(
-            rows.iter().any(|row| row.contains(&label(&other))),
-            "and so is the one never attached: {rows:?}",
-        );
-        // Both idle, so neither carries a status glyph.
-        for row in &rows {
-            assert!(
-                !row.starts_with('*') && !row.starts_with('!') && !row.starts_with('•'),
-                "an idle row wears no glyph: {row:?}",
-            );
-        }
-        shut_down(&world).await;
+        bytes.push(u8::try_from(c).expect("an ascii chord key"));
+        bytes
     }
 
     /// Poll until the sidebar's row for `session` satisfies `wanted`, folding
@@ -15529,25 +15515,35 @@ mod tests {
         shut_down(&world).await;
     }
 
-    /// The next/previous chords park a session request naming the row either
-    /// side of the focused one, wrapping at the ends, and the loop turns that
-    /// into the switch. A lone session has nowhere to step, so the gesture parks
-    /// nothing rather than re-requesting the session already focused.
+    /// The style of each painted sidebar row's first label cell, paired with the
+    /// row's text. Reads the composited frame, so it sees what a terminal would.
+    fn sidebar_row_styles(shell: &Rc<RefCell<Shell>>) -> Vec<(String, vaxis::cell::Style)> {
+        let root: WidgetRef = to_widget_ref(Rc::clone(shell));
+        let surface = draw_widget(&root, &crate::test_support::draw_ctx(100, Some(40)));
+        crate::test_support::flatten(&surface)
+            .iter()
+            .filter_map(|row| {
+                let strip: Vec<_> = row.iter().take(usize::from(SIDEBAR_COLS)).collect();
+                let text: String = strip.iter().map(|c| c.char.grapheme()).collect();
+                if text.trim().is_empty() {
+                    return None;
+                }
+                // Column 2 is the label's first cell: glyph, space, then label.
+                strip
+                    .get(2)
+                    .map(|cell| (text.trim_end().to_string(), cell.style))
+            })
+            .collect()
+    }
+
+    /// The focused row is drawn differently from the rest, so the user can see
+    /// which session they are in without reading the header.
     #[tokio::test]
-    async fn the_session_chords_step_the_sidebar_s_order() {
+    async fn the_focused_row_is_marked_apart_from_the_others() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         run_prompt(&mut world, "seed").await;
-
-        // One session: nothing to step to.
-        sync_sidebar(&world, &shell);
-        press_action(&shell, AjAction::SessionNext);
-        assert!(
-            shell.borrow().take_session_request().is_none(),
-            "a lone session has nowhere to step",
-        );
-
-        let other = world
+        world
             .control
             .create(None, None)
             .await
@@ -15562,17 +15558,384 @@ mod tests {
             assert!(Instant::now() < deadline, "the rows never arrived");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        // Two sessions show the strip by default, so nothing has to be toggled.
+        let focused_label = {
+            let sidebar = Rc::clone(&shell.borrow().sidebar);
+            let state = sidebar.borrow();
+            let row = state
+                .rows
+                .iter()
+                .find(|row| row.focused)
+                .expect("a focused row");
+            crate::sidebar::SessionSidebar::label(&row.id, usize::from(SIDEBAR_COLS) - 2)
+        };
 
-        // Both directions land on the other row: with two rows, next and
-        // previous wrap onto the same one.
-        for action in [AjAction::SessionNext, AjAction::SessionPrev] {
-            press_action(&shell, action);
-            assert_eq!(
-                shell.borrow().take_session_request(),
-                Some(SessionRequest::Resume(other.clone())),
-                "{action:?} names the other row",
+        let styles = sidebar_row_styles(&shell);
+        assert!(styles.len() >= 2, "two rows are painted: {styles:?}");
+        let focused: Vec<_> = styles
+            .iter()
+            .filter(|(text, _)| text.contains(&focused_label))
+            .collect();
+        assert_eq!(focused.len(), 1, "one row is the focused one: {styles:?}");
+        let others: Vec<_> = styles
+            .iter()
+            .filter(|(text, _)| !text.contains(&focused_label))
+            .collect();
+        assert!(!others.is_empty(), "and there is another to compare with");
+        for (text, style) in &others {
+            assert_ne!(
+                focused[0].1, *style,
+                "{text:?} is drawn the same as the focused row",
             );
         }
+        shut_down(&world).await;
+    }
+
+    /// Resuming the session already focused does nothing at all.
+    ///
+    /// Not merely "moves nowhere": running the switch body would fold a notice
+    /// for a switch that did not happen, discard an armed branch anchor, reset
+    /// the scroll, and count the session twice in the exit banner.
+    #[tokio::test]
+    async fn resuming_the_focused_session_changes_nothing() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, _writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        run_prompt(&mut world, "seed").await;
+        let session = world.session().to_string();
+        let head = world
+            .handles()
+            .log
+            .lock()
+            .await
+            .latest_leaf(ThreadFilter::USER)
+            .expect("a persisted user message");
+        arm_branch(&shell.borrow().branch_anchor, head.clone());
+        let before = main_notices(&world).len();
+
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(session.clone()),
+        )
+        .await;
+
+        assert!(matches!(moved, Focus::Same), "the focus did not move");
+        assert_eq!(world.session(), session, "and the session is untouched");
+        assert_eq!(
+            main_notices(&world).len(),
+            before,
+            "no switch notice: {:?}",
+            main_notices(&world),
+        );
+        assert_eq!(
+            shell.borrow().branch_anchor.borrow().clone(),
+            Some(head),
+            "an armed branch survives a switch that did not happen",
+        );
+        shut_down(&world).await;
+    }
+
+    /// Two stepping chords in a row walk two sessions.
+    ///
+    /// The second keystroke is the one that bites. A session request breaks out
+    /// of the input arm, which sits above the per-iteration mirror refresh, so a
+    /// key already buffered when the loop is re-entered is handled before the
+    /// rows have caught up with the switch. Answered off the stale mirror, the
+    /// step names the session just landed on, and the user holding the chord
+    /// walks exactly one session and jams there.
+    ///
+    /// Driven through the real loop, because what is under test is where the
+    /// refresh sits relative to the input arm.
+    #[tokio::test]
+    async fn holding_the_step_chord_keeps_walking() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        run_prompt(&mut world, "seed").await;
+        for _ in 0..2 {
+            world
+                .control
+                .create(None, None)
+                .await
+                .expect("another session");
+        }
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        loop {
+            fold_ready_frames(&mut world);
+            sync_sidebar(&world, &shell);
+            if shell.borrow().sidebar.borrow().rows.len() >= 3 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the rows never arrived");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let mut theme_watch = inert_theme_watch();
+        let mut prompt_history_rx: Option<UnboundedReceiver<Vec<String>>> = None;
+        let mut autocomplete_rx = shell
+            .borrow()
+            .editor
+            .borrow_mut()
+            .take_autocomplete_rx()
+            .expect("editor hands out its autocomplete receiver once");
+
+        // Both chords are in the buffer before the loop reads either, which is
+        // what a held key does.
+        let chord = chord_bytes(AjAction::SessionNext);
+        writer.write_all(&chord).expect("first chord");
+        writer.write_all(&chord).expect("second chord");
+
+        let mut visited = vec![world.session().to_string()];
+        for step in 0..2 {
+            let exit = drive(
+                &mut app,
+                &root,
+                &shell,
+                &mut world,
+                &mut theme_watch,
+                &mut prompt_history_rx,
+                &mut autocomplete_rx,
+            )
+            .await
+            .expect("drive exits without a fatal error");
+            let SessionExit::Switch(target) = exit else {
+                panic!("step {step} did not break out for a switch");
+            };
+            let moved =
+                apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Resume(target))
+                    .await;
+            assert!(matches!(moved, Focus::Moved), "step {step} moved");
+            // No mirror refresh here on purpose: the loop's own is what has to
+            // be in the right place.
+            visited.push(world.session().to_string());
+        }
+
+        let unique: std::collections::BTreeSet<&String> = visited.iter().collect();
+        assert_eq!(
+            unique.len(),
+            3,
+            "two steps visit two new sessions, not the same one twice: {visited:?}",
+        );
+        shut_down(&world).await;
+    }
+
+    /// An explicit toggle outranks the row-count default for the rest of the
+    /// process, in both directions (spec 9.2).
+    ///
+    /// The mirror runs every drive-loop iteration and is what applies the
+    /// default, so the claim is only worth anything across a re-sync.
+    #[tokio::test]
+    async fn an_explicit_toggle_survives_the_mirror() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, mut writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        let mut toggle = async || {
+            writer
+                .write_all(&chord_bytes(AjAction::SidebarToggle))
+                .expect("write chord");
+            let event = app.next_input().await.expect("input event");
+            app.handle_input(event);
+        };
+
+        // The rows arrive with the first `list` frame, and the default only has
+        // something to say once they do.
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        loop {
+            fold_ready_frames(&mut world);
+            sync_sidebar(&world, &shell);
+            if !shell.borrow().sidebar.borrow().rows.is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the first row never arrived");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Asked for, with one session, which the default would hide.
+        toggle().await;
+        sync_sidebar(&world, &shell);
+        assert_eq!(shell.borrow().sidebar.borrow().rows.len(), 1, "one session");
+        assert!(
+            shell.borrow().sidebar.borrow().shown(),
+            "the ask outlives the mirror that would hide it",
+        );
+
+        // Dismissed, with two sessions, which the default would show.
+        toggle().await;
+        world
+            .control
+            .create(None, None)
+            .await
+            .expect("a second session");
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        loop {
+            fold_ready_frames(&mut world);
+            sync_sidebar(&world, &shell);
+            if shell.borrow().sidebar.borrow().rows.len() >= 2 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the rows never arrived");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !shell.borrow().sidebar.borrow().shown(),
+            "a user who dismissed the strip does not get it back when a session appears",
+        );
+        shut_down(&world).await;
+    }
+
+    /// On a terminal with no width to spare the strip holds itself back, rather
+    /// than taking its fixed width off a transcript that has none to give.
+    ///
+    /// The user's ask survives: it is the drawn width that yields, not
+    /// `visible`, so widening the terminal brings the strip back.
+    #[tokio::test]
+    async fn a_narrow_terminal_holds_the_strip_back() {
+        let dir = TempDir::new().expect("tempdir");
+        let (world, shell) = world_and_shell(&dir, "streaming-text").await;
+        shell.borrow().sidebar.borrow_mut().visible = true;
+        shell.borrow().sidebar.borrow_mut().toggled = true;
+
+        let narrow = painted_rows(&shell, MIN_COLS_WITH_SIDEBAR - 1, 20);
+        let header = narrow
+            .iter()
+            .find(|row| row.contains("aj"))
+            .expect("the header is painted even when narrow");
+        assert_eq!(
+            header.len() - header.trim_start().len(),
+            0,
+            "the transcript keeps the full width: {header:?}",
+        );
+        assert!(
+            narrow
+                .iter()
+                .all(|row| row.chars().count() <= usize::from(MIN_COLS_WITH_SIDEBAR - 1)),
+            "and nothing painted past the screen",
+        );
+        assert!(
+            shell.borrow().sidebar.borrow().visible,
+            "the user's ask is untouched",
+        );
+
+        // One more column than the minimum, and it comes back.
+        assert_eq!(
+            sidebar_width_at(&shell, MIN_COLS_WITH_SIDEBAR),
+            SIDEBAR_COLS,
+            "the strip returns once the width is there",
+        );
+        shut_down(&world).await;
+    }
+
+    /// The completion popup belongs to the editor, so it starts where the editor
+    /// does. Left at column zero it would cover the strip and sit adrift of the
+    /// text it completes.
+    #[tokio::test]
+    async fn the_completion_popup_clears_the_strip() {
+        let tmp = TempDir::new().expect("tempdir");
+        for n in 0..4 {
+            std::fs::write(tmp.path().join(format!("file{n}.rs")), "x").expect("write file");
+        }
+        let (mut app, mut writer, shell, _root) = init_app_in_dir(tmp.path().to_path_buf()).await;
+        shell.borrow().sidebar.borrow_mut().visible = true;
+        shell.borrow().sidebar.borrow_mut().toggled = true;
+
+        for byte in b"@file" {
+            type_and_settle_autocomplete(&mut app, &mut writer, &shell, *byte).await;
+        }
+        assert!(
+            shell.borrow().editor.borrow().is_showing_autocomplete(),
+            "the completion popup is open",
+        );
+        let composed = shell.borrow_mut().draw(&draw_ctx(100, 30));
+        let popup = popup_overlay(&composed).expect("a popup floats above the layout");
+        assert_eq!(
+            popup.origin.col,
+            i32::from(SIDEBAR_COLS),
+            "the popup starts where the editor does, clear of the strip",
+        );
+        assert!(
+            popup.origin.col + i32::from(popup.surface.size.width) <= 100,
+            "and still fits the terminal",
+        );
+    }
+
+    /// The next/previous chords step the displayed order, and they do it from
+    /// real key bytes through the input path a user's keystroke takes.
+    ///
+    /// Three rows is the smallest set that can tell the two directions apart:
+    /// with two, next and previous both wrap onto the same row.
+    #[tokio::test]
+    async fn the_session_chords_step_the_sidebar_s_order() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, mut writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        run_prompt(&mut world, "seed").await;
+        let mut press = async |bytes: Vec<u8>| {
+            writer.write_all(&bytes).expect("write chord");
+            let event = app.next_input().await.expect("input event");
+            app.handle_input(event);
+        };
+
+        // One session: nothing to step to.
+        sync_sidebar(&world, &shell);
+        press(chord_bytes(AjAction::SessionNext)).await;
+        assert!(
+            shell.borrow().take_session_request().is_none(),
+            "a lone session has nowhere to step",
+        );
+
+        for _ in 0..2 {
+            world
+                .control
+                .create(None, None)
+                .await
+                .expect("another session");
+        }
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        loop {
+            fold_ready_frames(&mut world);
+            sync_sidebar(&world, &shell);
+            if shell.borrow().sidebar.borrow().rows.len() >= 3 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the rows never arrived");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Read the order off the mirror and derive what each direction must
+        // name, so the assertion cannot agree with a reversed implementation.
+        let (order, at) = {
+            let sidebar = Rc::clone(&shell.borrow().sidebar);
+            let state = sidebar.borrow();
+            let order: Vec<String> = state.rows.iter().map(|row| row.id.clone()).collect();
+            let at = state
+                .rows
+                .iter()
+                .position(|row| row.focused)
+                .expect("a focused row");
+            (order, at)
+        };
+        let len = order.len();
+        let expected_next = order[(at + 1) % len].clone();
+        let expected_prev = order[(at + len - 1) % len].clone();
+        assert_ne!(
+            expected_next, expected_prev,
+            "three rows must distinguish the directions",
+        );
+
+        press(chord_bytes(AjAction::SessionNext)).await;
+        assert_eq!(
+            shell.borrow().take_session_request(),
+            Some(SessionRequest::Resume(expected_next)),
+            "next names the row below the focused one",
+        );
+        press(chord_bytes(AjAction::SessionPrev)).await;
+        assert_eq!(
+            shell.borrow().take_session_request(),
+            Some(SessionRequest::Resume(expected_prev)),
+            "previous names the row above it",
+        );
         shut_down(&world).await;
     }
 
@@ -15582,9 +15945,14 @@ mod tests {
     #[tokio::test]
     async fn the_new_session_chord_parks_a_create() {
         let dir = TempDir::new().expect("tempdir");
-        let (world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let (world, shell, mut app, mut writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
 
-        press_action(&shell, AjAction::SessionNew);
+        writer
+            .write_all(&chord_bytes(AjAction::SessionNew))
+            .expect("write chord");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
         assert_eq!(
             shell.borrow().take_session_request(),
             Some(SessionRequest::New),
@@ -15592,16 +15960,25 @@ mod tests {
         shut_down(&world).await;
     }
 
-    /// The strip is hidden until asked for, and the toggle action shows it. A
-    /// lone local session has nothing to choose between, so the default costs no
-    /// width (spec 9.2).
+    /// With one session the strip stays hidden and costs the transcript nothing,
+    /// and the toggle chord shows it (spec 9.2). Measured through the composed
+    /// frame, so a strip missing from the layout fails here.
     #[tokio::test]
-    async fn the_sidebar_is_hidden_until_the_toggle_asks_for_it() {
+    async fn the_sidebar_is_hidden_for_a_lone_session_until_the_toggle_asks() {
         let dir = TempDir::new().expect("tempdir");
-        let (world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let (world, shell, mut app, mut writer, _root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        let mut toggle = async || {
+            writer
+                .write_all(&chord_bytes(AjAction::SidebarToggle))
+                .expect("write chord");
+            let event = app.next_input().await.expect("input event");
+            app.handle_input(event);
+        };
+
         assert!(
-            !shell.borrow().sidebar.borrow().visible,
-            "hidden by default",
+            !shell.borrow().sidebar.borrow().shown(),
+            "hidden for a lone session",
         );
         assert_eq!(
             sidebar_width(&shell),
@@ -15609,18 +15986,19 @@ mod tests {
             "and takes no width from the transcript",
         );
 
-        press_action(&shell, AjAction::SidebarToggle);
+        toggle().await;
         assert!(
-            shell.borrow().sidebar.borrow().visible,
+            shell.borrow().sidebar.borrow().shown(),
             "the toggle shows it"
         );
         assert_eq!(sidebar_width(&shell), SIDEBAR_COLS);
 
-        press_action(&shell, AjAction::SidebarToggle);
+        toggle().await;
         assert!(
-            !shell.borrow().sidebar.borrow().visible,
+            !shell.borrow().sidebar.borrow().shown(),
             "and hides it again",
         );
+        assert_eq!(sidebar_width(&shell), 0);
         shut_down(&world).await;
     }
 
@@ -15868,9 +16246,15 @@ mod tests {
         let remote = RemoteHost::start(&dir, "streaming-text").await;
         let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
 
-        for action in [
-            CommandAction::ExportHtml,
-            CommandAction::OpenSessionSelector,
+        // The reason is pinned, not just the fact of a refusal: each names the
+        // host-local thing it cannot reach, and the selector points at what the
+        // user should reach for instead.
+        for (action, reason) in [
+            (CommandAction::ExportHtml, "run the export there"),
+            (
+                CommandAction::OpenSessionSelector,
+                "a connection's sessions are the ones in the sidebar",
+            ),
         ] {
             let before = main_notices(&world).len();
             apply_command(&mut world, &shell, action).await;
@@ -15879,8 +16263,8 @@ mod tests {
                 notices.len() > before
                     && notices
                         .last()
-                        .is_some_and(|n| n.contains("over a connection")),
-                "{action:?} folds a refusal: {notices:?}"
+                        .is_some_and(|n| n.contains("over a connection") && n.contains(reason)),
+                "{action:?} folds a refusal explaining {reason:?}: {notices:?}"
             );
             assert!(
                 !shell.borrow().overlays.borrow().is_open(),

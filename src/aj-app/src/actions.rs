@@ -254,6 +254,140 @@ pub fn parse_chord(input: &str) -> Option<ChordSpec> {
     })
 }
 
+/// Characters that follow an `ESC` as the introducer of an escape sequence
+/// (`SS3`, `DCS`, `SOS`, `CSI`, `OSC`, `PM`, `APC`).
+const ESCAPE_INTRODUCERS: &[char] = &['O', 'P', 'X', '[', ']', '^', '_'];
+
+/// The control codes `0x1C..=0x1F` name no key, so the input parser decodes
+/// them as text rather than as a ctrl chord.
+const CTRL_ARRIVES_AS_TEXT: &str =
+    "the control code the terminal sends for it arrives as text, not as a ctrl chord";
+
+/// Ctrl chords whose control code belongs to another key. The reason names the
+/// key the keystroke arrives as, which is what the user observes.
+const CTRL_ALIASES: &[(char, &str)] = &[
+    ('h', "the terminal sends the backspace code for it"),
+    ('i', "the terminal sends the tab code for it"),
+    ('m', "the terminal sends the enter code for it"),
+    ('[', "the terminal sends the escape code for it"),
+    ('?', "the terminal sends the backspace code for it"),
+    (' ', "the terminal sends the ctrl+@ code for it"),
+    ('\\', CTRL_ARRIVES_AS_TEXT),
+    (']', CTRL_ARRIVES_AS_TEXT),
+    ('^', CTRL_ARRIVES_AS_TEXT),
+    ('_', CTRL_ARRIVES_AS_TEXT),
+];
+
+/// Named keys a terminal sends as a single control code instead of an escape
+/// sequence.
+const CONTROL_CODE_KEYS: &[&str] = &["enter", "escape", "tab", "backspace"];
+
+/// Why no keystroke can produce `spec`, or `None` when a terminal can send it.
+///
+/// A chord only works if the bytes a terminal transmits for it decode back into
+/// the key the keymap matches on, and the terminal has far fewer encodings than
+/// the chord grammar has spellings. Two shapes exist. A cursor, editing, or
+/// function key arrives as a CSI sequence carrying a modifier parameter, which
+/// encodes shift, alt, ctrl, and super exactly, so every combination survives.
+/// A character or a control-code key arrives as its own bytes with at most an
+/// `ESC` prefix for alt, which has nowhere to put a modifier, so most
+/// combinations on those either collide with another key or are simply not sent.
+///
+/// The kitty keyboard protocol's `CSI u` form does encode every key and modifier
+/// exactly, but a terminal only speaks it after negotiating the capability. A
+/// chord that needs it would work on some terminals and fire the wrong action on
+/// the rest, so it does not count as typeable here.
+///
+/// The returned reason completes the sentence "ignored keybinding X for Y:
+/// `<reason>`".
+///
+/// These rules restate what the terminal input parser does. That parser lives in
+/// the TUI crate, which this crate may not depend on, so the frontend carries a
+/// test sweeping the whole chord space through the real parser and asserting it
+/// agrees with this function.
+pub fn untypeable_reason(spec: &ChordSpec) -> Option<&'static str> {
+    match spec.key {
+        ChordKey::Char(c) => char_reason(c, spec),
+        ChordKey::Named(name) => named_reason(name, spec),
+        // Function keys arrive as the numbered CSI form, whose decoded range
+        // stops at F12. Nothing a terminal sends above that is recognized.
+        ChordKey::F(n) => (!(1..=12).contains(&n))
+            .then_some("the terminal's encoding for function keys above f12 is not decoded"),
+    }
+}
+
+fn char_reason(c: char, spec: &ChordSpec) -> Option<&'static str> {
+    if c.is_control() {
+        return Some(
+            "a bare control character is not a key, it is how a ctrl chord or a named key is sent",
+        );
+    }
+    // (ctrl, alt, shift, super)
+    match (spec.ctrl, spec.alt, spec.shift, spec.super_mod) {
+        (false, false, false, false) => None,
+        // Shift is not transmitted next to a character, the terminal sends the
+        // shifted glyph on its own. Only a letter's shifted glyph reads back as
+        // a shift chord, every other one depends on the keyboard layout.
+        (false, false, true, false) => (!c.is_ascii_alphabetic()).then_some(
+            "a terminal sends the shifted glyph rather than shift plus the key, which only \
+             reads back as a shift chord for a letter",
+        ),
+        (true, false, false, false) => ctrl_reason(c),
+        (false, true, false, false) => alt_reason(c),
+        _ => Some(
+            "a terminal sends a character key as its own bytes, optionally ESC-prefixed for \
+             alt, which carries no second modifier and never super",
+        ),
+    }
+}
+
+fn ctrl_reason(c: char) -> Option<&'static str> {
+    if let Some((_, reason)) = CTRL_ALIASES.iter().find(|(key, _)| *key == c) {
+        return Some(reason);
+    }
+    // The conventional control codes are the lowercase letters plus `@`, and
+    // `CTRL_ALIASES` has already taken the ones another key owns.
+    if c.is_ascii_lowercase() || c == '@' {
+        return None;
+    }
+    Some("a terminal has no control code for this key, so ctrl never reaches the application")
+}
+
+fn alt_reason(c: char) -> Option<&'static str> {
+    if ESCAPE_INTRODUCERS.contains(&c) {
+        return Some(
+            "alt is sent as an ESC prefix and this character introduces an escape sequence, \
+             so a terminal cannot tell the two apart",
+        );
+    }
+    if !c.is_ascii() {
+        return Some(
+            "alt is sent as an ESC prefix, which carries only the first byte of a multi-byte \
+             character",
+        );
+    }
+    None
+}
+
+fn named_reason(name: &str, spec: &ChordSpec) -> Option<&'static str> {
+    // Everything else is a cursor or editing key, which arrives as a CSI
+    // sequence whose modifier parameter carries every combination.
+    if !CONTROL_CODE_KEYS.contains(&name) {
+        return None;
+    }
+    // (ctrl, alt, shift, super)
+    match (spec.ctrl, spec.alt, spec.shift, spec.super_mod) {
+        (false, false, false, false) | (false, true, false, false) => None,
+        // `CSI Z` is the one modified form of a control-code key that terminals
+        // send, and it exists for shift+tab alone.
+        (false, false, true, false) if name == "tab" => None,
+        _ => Some(
+            "a terminal sends this key as a bare control code, which carries no modifier \
+             beyond the ESC prefix that means alt",
+        ),
+    }
+}
+
 /// The dispatch phase a global binding wants, mirrored by the frontend
 /// onto its keymap engine.
 ///
@@ -335,6 +469,13 @@ pub enum KeybindingProblem {
     UnknownAction { action: String },
     /// The chord string does not parse (see [`parse_chord`]).
     InvalidChord { action: String, chord: String },
+    /// The chord parses but no keystroke produces it, so the binding would be
+    /// dead or would fire on a different key (see [`untypeable_reason`]).
+    Untypeable {
+        action: String,
+        chord: String,
+        reason: &'static str,
+    },
     /// The chord clashes with a reserved key or another global binding, so the
     /// action keeps its default. `with` names what it clashed with.
     Conflict {
@@ -353,6 +494,14 @@ impl fmt::Display for KeybindingProblem {
             KeybindingProblem::InvalidChord { action, chord } => write!(
                 f,
                 "ignored keybinding {chord:?} for {action:?}: not a valid chord"
+            ),
+            KeybindingProblem::Untypeable {
+                action,
+                chord,
+                reason,
+            } => write!(
+                f,
+                "ignored keybinding {chord:?} for {action:?}: no keystroke produces it, {reason}"
             ),
             KeybindingProblem::Conflict {
                 action,
@@ -415,8 +564,9 @@ fn blame_of(
 ///
 /// Each entry is `(action_id, chord)`. An entry is rejected, and reported as a
 /// [`KeybindingProblem`], when its action is unknown, its chord does not parse,
-/// or its chord is reserved. Beyond that, the accepted set must leave the final
-/// bindings collision-free: the global chords stay mutually distinct, and an
+/// no keystroke can produce its chord (see [`untypeable_reason`]), or its chord
+/// is reserved. Beyond that, the accepted set must leave the final bindings
+/// collision-free: the global chords stay mutually distinct, and an
 /// overlay-local chord may not equal an always-on global chord (those fire even
 /// while an overlay is up, so they would shadow it). An override that breaks
 /// that is dropped with a [`KeybindingProblem::Conflict`] and its action keeps
@@ -466,6 +616,17 @@ where
         // reserved/collision checks, which would otherwise flag the one default
         // that is a reserved chord (close-all's ctrl+c).
         if default_chord(action_id).and_then(parse_chord) == Some(spec) {
+            continue;
+        }
+        // A chord no terminal can send is worse than no override at all: the
+        // action goes dead, and the keystroke the user pressed often reaches a
+        // different binding instead.
+        if let Some(reason) = untypeable_reason(&spec) {
+            problems.push(KeybindingProblem::Untypeable {
+                action: key,
+                chord,
+                reason,
+            });
             continue;
         }
         if reserved.contains(&spec) {
@@ -743,7 +904,7 @@ mod tests {
     fn install_keybindings_accepts_valid_and_reports_bad() {
         let _guard = STORE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let problems = install_keybindings([
-            ("aj.palette.open".to_string(), "ctrl+shift+p".to_string()),
+            ("aj.palette.open".to_string(), "alt+p".to_string()),
             ("aj.not.a.thing".to_string(), "ctrl+z".to_string()),
             ("aj.tools.expand".to_string(), "bogus".to_string()),
             ("aj.thinking.toggle".to_string(), "ctrl+c".to_string()),
@@ -751,7 +912,7 @@ mod tests {
 
         assert_eq!(
             effective_chord("aj.palette.open"),
-            Some("ctrl+shift+p"),
+            Some("alt+p"),
             "the valid override took effect"
         );
         assert_eq!(effective_chord("aj.tools.expand"), Some("alt+o"));
@@ -820,14 +981,14 @@ mod tests {
     #[test]
     fn install_keybindings_rejects_a_clash_with_an_earlier_override() {
         let _guard = STORE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        // Both target ctrl+shift+p (no default uses it). `aj.agent.open` sorts
+        // Both target alt+p (no default uses it). `aj.agent.open` sorts
         // before `aj.palette.open`, so palette is the later id and gets dropped.
         let problems = install_keybindings([
-            ("aj.agent.open".to_string(), "ctrl+shift+p".to_string()),
-            ("aj.palette.open".to_string(), "ctrl+shift+p".to_string()),
+            ("aj.agent.open".to_string(), "alt+p".to_string()),
+            ("aj.palette.open".to_string(), "alt+p".to_string()),
         ]);
 
-        assert_eq!(effective_chord("aj.agent.open"), Some("ctrl+shift+p"));
+        assert_eq!(effective_chord("aj.agent.open"), Some("alt+p"));
         assert_eq!(
             effective_chord("aj.palette.open"),
             Some("ctrl+o"),
@@ -839,6 +1000,61 @@ mod tests {
         )));
 
         set_overrides(BTreeMap::new());
+    }
+
+    /// A user override that no keystroke can produce is refused, so the action
+    /// keeps a chord that works instead of going silently dead. Each case here
+    /// is a different hazard: a ctrl chord whose control code belongs to Tab, an
+    /// alt chord whose character introduces an escape sequence, a modifier
+    /// combination a character key cannot carry, and a function key above the
+    /// decoded range.
+    #[test]
+    fn install_keybindings_refuses_untypeable_chords() {
+        let _guard = STORE_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let problems = install_keybindings([
+            ("aj.palette.open".to_string(), "ctrl+i".to_string()),
+            ("aj.agent.open".to_string(), "alt+]".to_string()),
+            ("aj.tools.expand".to_string(), "alt+shift+x".to_string()),
+            ("aj.history.open".to_string(), "f13".to_string()),
+        ]);
+
+        assert_eq!(effective_chord("aj.palette.open"), Some("ctrl+o"));
+        assert_eq!(effective_chord("aj.agent.open"), Some("alt+a"));
+        assert_eq!(effective_chord("aj.tools.expand"), Some("alt+o"));
+        assert_eq!(effective_chord("aj.history.open"), Some("ctrl+r"));
+
+        let refused: Vec<&str> = problems
+            .iter()
+            .filter_map(|p| match p {
+                KeybindingProblem::Untypeable { chord, .. } => Some(chord.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refused, ["ctrl+i", "alt+]", "alt+shift+x", "f13"]);
+        assert!(
+            problems[0]
+                .to_string()
+                .contains("the terminal sends the tab code"),
+            "the message names the key the keystroke arrives as: {}",
+            problems[0]
+        );
+
+        set_overrides(BTreeMap::new());
+    }
+
+    /// Every default chord is typeable. The frontend proves this against the
+    /// real input parser as well, but keeping it here means a table edit fails
+    /// in the crate that owns the table.
+    #[test]
+    fn every_default_chord_is_typeable() {
+        for (action_id, chord, _) in AJ_KEYBINDINGS {
+            let spec = parse_chord(chord).expect("default chords parse");
+            assert_eq!(
+                untypeable_reason(&spec),
+                None,
+                "default chord {chord:?} for {action_id} cannot be typed"
+            );
+        }
     }
 
     /// Both reserved chords (the Ctrl+C ladder and the login Ctrl+Y copy) are
