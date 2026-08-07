@@ -15,6 +15,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use aj_app::keybindings::{ACTION_AGENT_PICKER, action_shortcut, fixed_keys};
+use vaxis::gwidth;
 use vaxis::vxfw::{DrawContext, Size, Surface};
 
 use crate::corner_box::{CornerBoxBody, corner_box, span};
@@ -29,6 +30,16 @@ const COPY_TOAST_DURATION: Duration = Duration::from_millis(2000);
 /// busy refusal carries a remedy row the user should get to read.
 const NOTICE_TOAST_DURATION: Duration = Duration::from_millis(4000);
 
+/// The column budget a message wraps to.
+///
+/// A box is sized to its content and declines to draw at all when it would
+/// not fit (see [`corner_box`]), so a message of unbounded length, a peer's
+/// own refusal for instance, would silently show nothing rather than
+/// overflowing. Wrapping to this keeps a toast inside a classic 80-column
+/// terminal with the four columns its frame takes, and leaves a little room
+/// besides for a terminal that measures a grapheme wider than we do.
+const WRAP_COLS: usize = 72;
+
 /// A styled toast fragment. Semantic kinds rather than resolved `Style`s so a
 /// runtime theme swap re-tints a live toast through the widget's current
 /// styles.
@@ -40,9 +51,9 @@ pub(crate) enum ToastSpan {
     Dim(String),
 }
 
-/// A toast's body: one or more rows of styled spans. Most toasts are a
-/// single row; the busy refusal splits its message and remedy across two so
-/// the box stays narrow enough for an 80-column terminal.
+/// A toast's body: one or more rows of styled spans. A plain message wraps
+/// into as many rows as it needs (see [`wrap_rows`]); the busy refusal builds
+/// its own two, splitting the message from the remedy.
 pub(crate) struct ToastBody {
     rows: Vec<Vec<ToastSpan>>,
 }
@@ -50,7 +61,7 @@ pub(crate) struct ToastBody {
 impl From<String> for ToastBody {
     fn from(message: String) -> ToastBody {
         ToastBody {
-            rows: vec![vec![ToastSpan::Dim(message)]],
+            rows: wrap_rows(&message),
         }
     }
 }
@@ -59,6 +70,37 @@ impl From<&str> for ToastBody {
     fn from(message: &str) -> ToastBody {
         ToastBody::from(message.to_string())
     }
+}
+
+/// Fold `message` into dim rows no wider than [`WRAP_COLS`] cells.
+///
+/// Greedy over whitespace-separated words, so an embedded newline reads as a
+/// space. A word wider than the budget takes a row of its own rather than
+/// being cut: the message stays whole, and an unbreakable run that long is
+/// then what makes the box decline. An empty message keeps one empty row, so
+/// a toast always has a body to frame.
+fn wrap_rows(message: &str) -> Vec<Vec<ToastSpan>> {
+    let mut rows: Vec<String> = Vec::new();
+    for word in message.split_whitespace() {
+        match rows.last_mut() {
+            Some(row) if cells(row) + 1 + cells(word) <= WRAP_COLS => {
+                row.push(' ');
+                row.push_str(word);
+            }
+            _ => rows.push(word.to_string()),
+        }
+    }
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    rows.into_iter()
+        .map(|row| vec![ToastSpan::Dim(row)])
+        .collect()
+}
+
+/// The terminal-cell width of `s`, for the wrap budget.
+fn cells(s: &str) -> usize {
+    usize::from(gwidth::gwidth(s, gwidth::Method::Unicode))
 }
 
 /// One raised toast: its styled body rows, when it was raised, and how long
@@ -577,5 +619,89 @@ mod tests {
             );
             assert!(body.contains("stops tasks"), "{body:?}");
         }
+    }
+
+    /// A message wider than the budget folds onto further rows at word
+    /// boundaries, and a message that already fits stays on one.
+    #[test]
+    fn a_long_message_wraps_at_word_boundaries() {
+        let long = "one two three four five six seven eight nine ten eleven twelve \
+                    thirteen fourteen fifteen";
+        let stack = empty_stack();
+        show_toast(&stack, long);
+        let rows: Vec<String> = stack.borrow()[0].rows.iter().map(|r| row_text(r)).collect();
+        assert!(rows.len() > 1, "the message wrapped onto one row: {rows:?}");
+        for text in &rows {
+            assert!(
+                cells(text) <= WRAP_COLS,
+                "{text:?} is {} cells",
+                cells(text)
+            );
+            assert!(!text.starts_with(' ') && !text.ends_with(' '), "{text:?}");
+        }
+        // No word was cut and none was dropped: rejoining the rows gives the
+        // message back.
+        assert_eq!(
+            rows.join(" "),
+            long.split_whitespace().collect::<Vec<_>>().join(" "),
+        );
+
+        let short = empty_stack();
+        show_toast(&short, "short enough");
+        assert_eq!(
+            short.borrow()[0].rows.len(),
+            1,
+            "a short message stays whole"
+        );
+    }
+
+    /// The refusal a locked session produces is the longest thing a toast
+    /// carries: the gesture's own words plus the peer's, naming a session id
+    /// twice and the holder besides. It has to draw on 80 columns, because a
+    /// box that does not fit draws nothing at all.
+    #[test]
+    fn a_lock_holder_refusal_fits_an_80_column_terminal() {
+        let session = "2026-08-06-19-07-19-368";
+        let message = format!(
+            "Failed to switch to session {session}: session {session} is held by \
+             another writer (pid 483927 of host builder-1)"
+        );
+        let stack = empty_stack();
+        show_toast(&stack, message);
+        let toasts = widget_over(&stack);
+        let surfs = toasts.draw_stack(
+            &draw_ctx(80, Some(24)),
+            Size {
+                width: 80,
+                height: 24,
+            },
+        );
+        assert_eq!(surfs.len(), 1, "the refusal fits 80 columns");
+        // The frame's own glyphs out, then whitespace normalized, so the
+        // assertion names the message rather than where the wrap fell.
+        let flat = rows(&surfs[0])
+            .join(" ")
+            .replace(['\u{2502}', '\u{2500}'], " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            flat.contains("is held by another writer (pid 483927 of host builder-1)"),
+            "and it still names the holder to go quit: {flat:?}",
+        );
+    }
+
+    /// An empty message keeps a body to frame rather than collapsing to a
+    /// zero-row box.
+    #[test]
+    fn an_empty_message_still_has_a_row() {
+        let stack = empty_stack();
+        show_toast(&stack, "");
+        assert_eq!(stack.borrow()[0].rows.len(), 1);
+        let toasts = widget_over(&stack);
+        assert_eq!(
+            toasts.draw_stack(&draw_ctx(200, Some(50)), roomy()).len(),
+            1,
+        );
     }
 }
