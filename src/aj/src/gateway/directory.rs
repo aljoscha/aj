@@ -178,12 +178,24 @@ impl Directory {
     /// address is one enrollment, and one host id is one namespace. The second
     /// matters more than it looks: two enrollments of one store would give every
     /// session of it two ids that both route, and a client would see it twice.
+    ///
+    /// A third refuses a `host_id` outside the grammar, checked here where it
+    /// arrives and not only where it is adopted ([`Self::adopt`]): an id this
+    /// gateway cannot namespace with can never connect, so recording one would
+    /// leave an enrollment that is broken for as long as it is kept, in the set
+    /// and in the state file, reporting itself only as a host that never answers.
     pub(crate) fn enroll(
         &self,
         address: HostAddress,
         source: HostSource,
         host_id: Option<String>,
     ) -> Result<(), DirectoryError> {
+        if let Some(host_id) = &host_id {
+            validate_host_id(host_id).map_err(|source| DirectoryError::UnusableHostId {
+                host_id: host_id.clone(),
+                source,
+            })?;
+        }
         let mut hosts = self.lock();
         if hosts.contains_key(&address) {
             return Err(DirectoryError::AddressEnrolled { address });

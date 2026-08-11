@@ -1163,6 +1163,48 @@ async fn enrolling_something_that_is_not_a_host_is_refused() {
     fixture.shutdown().await;
 }
 
+/// A host reporting an id this gateway cannot namespace with is refused where it
+/// arrives.
+///
+/// The grammar is checked at the boundary, exactly as a session id's is (spec
+/// 6.2), and enrollment is a boundary: the id comes off the wire. Recording one
+/// the rest of the module forbids would enroll a host that can never connect,
+/// because adopting the id refuses it on every dial, and it would keep making
+/// every create that names no host ambiguous, across restarts, reported as
+/// nothing but a host that never answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_id_this_gateway_cannot_namespace_with_is_refused_at_enrollment() {
+    let (url, serving) = canned_server(
+        serde_json::json!({"protocol": PROTOCOL_VERSION, "capabilities": [],
+                           "app_version": "0", "host_id": "with:colon"}),
+        Vec::new(),
+    )
+    .await;
+    let fixture = Fixture::new(&[]).await;
+
+    let response = fixture.enroll(&url).await;
+
+    // Read what the gateway kept before what it answered: an enrollment that
+    // stuck is the lasting half of this, in the set a create resolves against
+    // and in the file a restart reads.
+    assert!(
+        fixture.hosts().await.hosts.is_empty(),
+        "an id this gateway can never namespace with was enrolled anyway",
+    );
+    let recorded =
+        std::fs::read_to_string(fixture.state.path().join("hosts.json")).unwrap_or_default();
+    assert!(
+        !recorded.contains("with:colon"),
+        "and written down, so it comes back after a restart: {recorded}",
+    );
+    let (status, code, _) = refusal(response).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(code, "unusable_host_id");
+
+    fixture.shutdown().await;
+    serving.abort();
+}
+
 /// An enrollment the gateway cannot write down does not stand, in either
 /// direction: it would otherwise come back, or disappear, at the next restart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
