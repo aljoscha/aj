@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use aj_app::host::AttachRequest;
 use aj_wire::{DirectoryHost, HostList, HostSource, HostSummary, MergedDirectory, RawObject};
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 use crate::gateway::config::HostAddress;
 use crate::gateway::enrollment::EnrolledHost;
@@ -62,6 +63,14 @@ struct Enrollment {
     connected: bool,
     /// Why the last connection attempt did not stick, for `GET /v1/hosts`.
     error: Option<String>,
+    /// Cancelled when this enrollment is withdrawn, which is what ends the
+    /// streams spliced onto this host (spec 7.1).
+    ///
+    /// Held here so that the set a withdrawal mutates and the signal it sends
+    /// are the same thing under the same lock: a splice opened from a snapshot
+    /// of this map holds a clone, and one opened after the withdrawal cannot
+    /// resolve the host at all.
+    serving: CancellationToken,
 }
 
 impl Enrollment {
@@ -133,6 +142,33 @@ fn own(
     row.set(UNREACHABLE_FIELD, &!connected)
 }
 
+/// An enrollment removed from the directory, and what a withdrawal still owes it
+/// (spec 7.1).
+///
+/// Removing it is only the first of three steps: its rows are out of the merged
+/// directory, and then the streams spliced onto it end and its link stops.
+/// Carried rather than done at once because a withdrawal the gateway cannot
+/// write down does not stand, and [`Directory::restore`] can only put back what
+/// nothing has torn down yet.
+pub(crate) struct Withdrawn {
+    /// The address whose link is now to be stopped.
+    pub(crate) address: HostAddress,
+    enrollment: Enrollment,
+}
+
+impl Withdrawn {
+    /// End the streams spliced onto this host.
+    ///
+    /// Deliberately not a `reset`: that asks the client to attach again, and
+    /// these ids no longer resolve here, so the re-attach would be refused and
+    /// take down the client's sessions on every other host with it (spec 6.5,
+    /// 7.1). What the client is told instead is the directory, where the host's
+    /// rows and its group are gone.
+    pub(crate) fn end_splices(&self) {
+        self.enrollment.serving.cancel();
+    }
+}
+
 /// Where a proxied request goes: which host, and what that host calls the
 /// session.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -156,6 +192,8 @@ struct Owner<'a> {
     address: &'a HostAddress,
     /// Whether this gateway's control connection to the host is up.
     connected: bool,
+    /// The enrollment's own token, cancelled when it is withdrawn.
+    serving: CancellationToken,
 }
 
 /// Resolve a namespaced session id against the enrolled hosts.
@@ -182,6 +220,7 @@ fn owner<'a>(
         session: named.session,
         address,
         connected: enrollment.connected,
+        serving: enrollment.serving.clone(),
     })
 }
 
@@ -211,6 +250,9 @@ pub(crate) struct AttachGroup {
     /// The attach set as the owning host names it: de-namespaced ids, the
     /// client's cursors untouched.
     pub(crate) attach: Vec<AttachRequest>,
+    /// Cancelled when this host's enrollment is withdrawn, which is what ends
+    /// the upstream opened from this group (spec 7.1).
+    pub(crate) serving: CancellationToken,
 }
 
 impl AttachGroup {
@@ -281,19 +323,26 @@ impl Directory {
                 rows: Vec::new(),
                 connected: false,
                 error: None,
+                serving: CancellationToken::new(),
             },
         );
         self.publish(&hosts);
         Ok(())
     }
 
-    /// Remove the enrollment of `host_id`, answering the address whose link is
-    /// now to be stopped.
+    /// Remove the enrollment of `host_id`, answering what remains to be torn
+    /// down for it.
+    ///
+    /// The host's rows leave the merged directory here, in the same publish that
+    /// removes it from the enrolled set, so nothing ever serves a directory that
+    /// contradicts that set. What this does *not* do is end anything: a
+    /// withdrawal the gateway cannot write down does not stand, and a torn-down
+    /// stream cannot be put back. See [`Withdrawn`].
     ///
     /// A configured host is refused: it would come straight back from the
     /// configuration file on the next start, so removing it here would be a
     /// promise the gateway cannot keep.
-    pub(crate) fn withdraw(&self, host_id: &str) -> Result<HostAddress, DirectoryError> {
+    pub(crate) fn withdraw(&self, host_id: &str) -> Result<Withdrawn, DirectoryError> {
         let mut hosts = self.lock();
         let (address, enrollment) = hosts
             .iter()
@@ -307,9 +356,24 @@ impl Directory {
             });
         }
         let address = address.clone();
-        hosts.remove(&address);
+        let enrollment = hosts.remove(&address).expect("the enrollment just found");
         self.publish(&hosts);
-        Ok(address)
+        Ok(Withdrawn {
+            address,
+            enrollment,
+        })
+    }
+
+    /// Put a withdrawal back exactly as it was.
+    ///
+    /// The rollback of a withdrawal the gateway could not record. Exact matters
+    /// twice over: the rows return with it, so a client's directory does not go
+    /// empty until the host next says something, and so does its token, so the
+    /// streams it is serving stay the ones a later withdrawal ends.
+    pub(crate) fn restore(&self, withdrawn: Withdrawn) {
+        let mut hosts = self.lock();
+        hosts.insert(withdrawn.address, withdrawn.enrollment);
+        self.publish(&hosts);
     }
 
     /// Settle the id of the host at `address` against what it just reported.
@@ -454,6 +518,7 @@ impl Directory {
                 session,
                 address,
                 connected,
+                serving,
             } = owner(&hosts, &request.session)?;
             let group = groups
                 .entry(host_id.clone())
@@ -461,6 +526,7 @@ impl Directory {
                     host_id,
                     dial: connected.then(|| address.clone()),
                     attach: Vec::new(),
+                    serving,
                 });
             group.attach.push(AttachRequest {
                 session,
@@ -1195,13 +1261,51 @@ mod tests {
             directory.withdraw("absent"),
             Err(DirectoryError::UnknownHost { .. }),
         ));
-        assert_eq!(
-            directory.withdraw("dynamic").expect("withdraw"),
-            address("127.0.0.1:1"),
+        // The token a splice onto that host holds, taken before the withdrawal
+        // the way a client stream takes it.
+        let watching = directory
+            .group(&[attaching("dynamic:s-1", None)])
+            .expect("a group")
+            .swap_remove(0)
+            .serving;
+        let withdrawn = directory.withdraw("dynamic").expect("withdraw");
+        assert_eq!(withdrawn.address, address("127.0.0.1:1"));
+        assert!(
+            !watching.is_cancelled(),
+            "removing an enrollment from the set does not end anything by itself",
         );
         assert!(
             directory.sessions().sessions.is_empty(),
             "and its rows go with it",
+        );
+        assert_eq!(
+            directory
+                .sessions()
+                .hosts
+                .iter()
+                .map(|host| host.id.clone())
+                .collect::<Vec<_>>(),
+            vec!["static".to_string()],
+            "and so does its group, while the host that stayed keeps its own",
+        );
+
+        // A withdrawal the gateway could not record puts everything back, rows
+        // and token alike, so a later one still reaches the streams this one
+        // left running.
+        directory.restore(withdrawn);
+        assert_eq!(
+            merged(&directory)[0].0.id,
+            "dynamic:s-1",
+            "the rows come back with it, not empty until the host speaks again",
+        );
+        directory
+            .withdraw("dynamic")
+            .expect("withdraw")
+            .end_splices();
+        assert!(
+            watching.is_cancelled(),
+            "a restore that minted a fresh token would leave this stream running \
+             for a host that is gone",
         );
     }
 

@@ -345,32 +345,36 @@ impl Gateway {
             })
     }
 
-    /// Remove the enrollment of `host_id` and stop following it.
+    /// Remove the enrollment of `host_id` and tear down what this gateway was
+    /// doing for it (spec 7.1).
     ///
-    /// NOTE: the client streams that already spliced that host's sessions keep
-    /// running. Each holds a stream of its own onto the host, which a withdrawal
-    /// does not reach into: its rows leave the directory and its route stops
-    /// resolving, so a command for one of those sessions is a 404 while its
-    /// frames still arrive. Whether a withdrawal should `reset` those sessions is
-    /// not settled: the re-attach a `reset` asks for would be refused, because
-    /// the namespace is gone, and on this protocol a refused attach fails the
-    /// client's whole stream rather than one session of it.
+    /// Active teardown rather than bookkeeping, in this order:
+    ///
+    /// 1. the enrollment and its rows leave the directory, in one publish, so
+    ///    nothing serves a directory that contradicts the enrolled set;
+    /// 2. the withdrawal is written down, and a write that fails puts step 1
+    ///    back exactly as it was, which is only possible while nothing has been
+    ///    torn down;
+    /// 3. the streams spliced onto that host end, without a `reset`: the
+    ///    re-attach a `reset` asks for would be refused now that the namespace
+    ///    is gone, and a refused attach fails the client's *whole* stream, so it
+    ///    would cost that client the sessions it holds on every other host;
+    /// 4. the control link stops, awaited, so a withdrawal that has answered has
+    ///    nothing left dialing that host.
+    ///
+    /// Steps 3 and 4 both close connections to the host and could be either way
+    /// round. The client-visible half goes first.
     pub(crate) async fn withdraw(&self, host_id: &str) -> Result<(), GatewayError> {
         let _writing = self.inner.writing.lock().await;
-        let address = self.inner.directory.withdraw(host_id)?;
+        let withdrawn = self.inner.directory.withdraw(host_id)?;
         if let Err(err) = self.remember() {
             // A withdrawal the gateway cannot write down would come back as a
-            // surprise after a restart, so it does not stand. The enrollment goes
-            // back, its link was never stopped, and its rows return with that
-            // host's next directory.
-            let _ = self.inner.directory.enroll(
-                address,
-                HostSource::Dynamic,
-                Some(host_id.to_string()),
-            );
+            // surprise after a restart, so it does not stand.
+            self.inner.directory.restore(withdrawn);
             return Err(err);
         }
-        self.undial(&address).await;
+        withdrawn.end_splices();
+        self.undial(&withdrawn.address).await;
         Ok(())
     }
 

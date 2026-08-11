@@ -20,6 +20,12 @@
 //! opens an upstream. Resume is then incremental when the host's epoch survived
 //! and full when it did not, inherited from the host protocol with no gateway
 //! involvement.
+//!
+//! The one end that is not a drop is a withdrawal: the host stops being this
+//! gateway's, so its upstream ends and its sessions are *not* reset, because the
+//! re-attach a `reset` asks for would be refused and would take the client's
+//! sessions on every other host down with it (spec 6.5, 7.1). The client learns
+//! it from the directory, where that host's rows and its group are gone.
 
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
@@ -111,6 +117,7 @@ impl Splice {
                         .iter()
                         .map(|request| request.session.clone())
                         .collect(),
+                    serving: group.serving,
                 },
                 events,
             ));
@@ -205,6 +212,8 @@ struct Upstream {
     address: HostAddress,
     /// The sessions this stream attached, in the host's own vocabulary.
     sessions: Vec<String>,
+    /// Cancelled when this host's enrollment is withdrawn (spec 7.1).
+    serving: CancellationToken,
 }
 
 /// Open one host's upstream stream with the client's own attach set.
@@ -258,37 +267,72 @@ fn unreachable(address: &HostAddress, source: RemoteError) -> GatewayError {
 }
 
 /// Forward one host's frames to one client until the stream ends.
+///
+/// A withdrawal ends this without a `reset`, which is the one way this stream
+/// stops that is not a break in continuity: the host is not this gateway's any
+/// more, its rows are out of the merged directory, and the ids a `reset` would
+/// have the client offer back no longer resolve here. A refused attach fails a
+/// client's whole stream (spec 6.5), so that `reset` would cost it the sessions
+/// it holds on every other host.
+///
+/// The whole loop races the withdrawal, not just the read: a pump pacing an
+/// attach block is parked on the client's queue, and a signal it only saw
+/// between frames would never reach it.
 async fn pump(
     upstream: Upstream,
     mut events: RemoteEvents,
     queue: Sender,
     cancel: CancellationToken,
 ) {
-    // The sessions whose attach block is still being written. Their frames are
-    // paced rather than measured against the client's bound, see
-    // [`Sender::send_paced`].
-    let mut attaching: HashSet<String> = upstream.sessions.iter().cloned().collect();
-    let ended = loop {
-        let next = tokio::select! {
-            _ = cancel.cancelled() => return,
-            next = events.recv_decoded() => next,
-        };
-        let frame = match next {
-            None => break "the host closed the stream".to_string(),
-            Some(Err(err)) => break err.to_string(),
-            Some(Ok(frame)) => frame,
-        };
-        if !forward(&upstream.host_id, frame, &mut attaching, &queue).await {
-            return;
-        }
+    let ended = tokio::select! {
+        _ = upstream.serving.cancelled() => return,
+        ended = carry(&upstream, &mut events, &queue, &cancel) => ended,
+    };
+    let Some(ended) = ended else {
+        return;
     };
     tracing::info!("the spliced stream to {} ended: {ended}", upstream.address);
+    // A withdrawal that landed as this stream ended anyway: both are ready at
+    // once and the select above picked this arm, which says nothing about which
+    // happened first. The enrollment is gone either way, so there is nobody left
+    // to re-attach to.
+    if upstream.serving.is_cancelled() {
+        return;
+    }
     // Continuity is broken for exactly the sessions this stream carried, and
     // this gateway does not resume them itself (see the module docs).
     for session in &upstream.sessions {
         let namespaced = SessionAddress::new(&upstream.host_id, session).to_string();
         if queue.offer(reset(&namespaced)) == Offered::Evicted {
             return;
+        }
+    }
+}
+
+/// Forward frames until the upstream ends, answering why it did, or `None` once
+/// the client this was for is gone.
+async fn carry(
+    upstream: &Upstream,
+    events: &mut RemoteEvents,
+    queue: &Sender,
+    cancel: &CancellationToken,
+) -> Option<String> {
+    // The sessions whose attach block is still being written. Their frames are
+    // paced rather than measured against the client's bound, see
+    // [`Sender::send_paced`].
+    let mut attaching: HashSet<String> = upstream.sessions.iter().cloned().collect();
+    loop {
+        let next = tokio::select! {
+            _ = cancel.cancelled() => return None,
+            next = events.recv_decoded() => next,
+        };
+        let frame = match next {
+            None => return Some("the host closed the stream".to_string()),
+            Some(Err(err)) => return Some(err.to_string()),
+            Some(Ok(frame)) => frame,
+        };
+        if !forward(&upstream.host_id, frame, &mut attaching, queue).await {
+            return None;
         }
     }
 }

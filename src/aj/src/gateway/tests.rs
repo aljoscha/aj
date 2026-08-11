@@ -3017,6 +3017,264 @@ async fn a_reattach_after_a_restart_resumes_fully_when_the_epoch_changed() {
 }
 
 // ---------------------------------------------------------------------------
+// Withdrawing an enrollment (spec 7.1's active teardown)
+// ---------------------------------------------------------------------------
+
+/// Removing an enrollment is active teardown, not bookkeeping (spec 7.1): the
+/// host's rows leave the merged list, its upstream connections close, and its
+/// splices end. Leaving them running would serve a directory that contradicts
+/// the enrollment set.
+///
+/// Two hosts on one client stream, because a client's attach set spans hosts and
+/// on this protocol a refused attach fails the client's **whole** stream. So
+/// ending one host's splice must not cost that client the sessions it holds on
+/// the others, and must not ask it to re-attach ids that no longer resolve,
+/// which is the same loss by another route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_withdrawal_ends_that_hosts_splices_and_leaves_the_others_alone() {
+    let cue = Arc::new(tokio::sync::Notify::new());
+    let leaving = FakeHost::start("leaving", Script::Frames(block("s-1", "epoch-1", 0))).await;
+    let staying = FakeHost::start(
+        "staying",
+        Script::Cued {
+            first: block("s-9", "epoch-9", 0),
+            cue: Arc::clone(&cue),
+            then: vec![warning_frame("s-9", "epoch-9", "still watching this one")],
+        },
+    )
+    .await;
+    // Enrolled over the wire: a configured host is the file's to remove, and
+    // refusing to withdraw one is its own test.
+    let fixture = Fixture::new(&[]).await;
+    for host in [&leaving, &staying] {
+        assert_eq!(
+            fixture.enroll(&host.address.to_string()).await.status(),
+            StatusCode::OK,
+        );
+    }
+    // An enrollment answers before its link has dialed, and a host this gateway
+    // holds no link to contributes no upstream at all (spec 7.1).
+    fixture.until_connected("leaving").await;
+    fixture.until_connected("staying").await;
+    let mut events = fixture
+        .attach(&[attach("leaving:s-1"), attach("staying:s-9")])
+        .await;
+    let opened = carried_until(&mut events, "both attach blocks", |carried| {
+        carried.caught_up.len() == 2
+    })
+    .await;
+    assert_eq!(
+        leaving.spliced_attaches().len(),
+        1,
+        "the upstream this withdrawal has to end was never opened, so nothing \
+         here is torn down: {opened:?}",
+    );
+    assert_eq!(
+        (leaving.released(), staying.released()),
+        (0, 0),
+        "and both are still open going in",
+    );
+
+    assert_eq!(
+        fixture.withdraw("leaving").await.status(),
+        StatusCode::NO_CONTENT,
+    );
+
+    bounded("the withdrawn host's upstream to close", async {
+        while leaving.released() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert_eq!(
+        staying.released(),
+        0,
+        "the other host's stream went down with it, which is the collateral a \
+         client's attach set spanning hosts cannot afford",
+    );
+
+    // The client is still there and still served: a live frame from the host
+    // that stayed, which also bounds the window a `reset` would have arrived in,
+    // since the pump queues one the moment its upstream ends.
+    cue.notify_one();
+    let carried = carried_until(
+        &mut events,
+        "a frame from the host that stayed",
+        |carried| carried.events("staying:s-9") > 0,
+    )
+    .await;
+    assert!(
+        !carried.ended,
+        "the client's whole stream ended over one host's withdrawal: {carried:?}",
+    );
+    assert!(
+        carried.resets.is_empty(),
+        "a withdrawal asked the client to attach ids this gateway no longer \
+         resolves, which would fail its whole stream: {carried:?}",
+    );
+
+    // And the directory says the same thing the teardown did.
+    fixture
+        .until("the withdrawn host's rows to go", |list| {
+            (!list
+                .sessions
+                .iter()
+                .any(|row| row.host.as_deref() == Some("leaving"))
+                && list
+                    .sessions
+                    .iter()
+                    .any(|row| row.host.as_deref() == Some("staying")))
+            .then_some(())
+        })
+        .await;
+    assert!(
+        !fixture
+            .client
+            .sessions()
+            .await
+            .expect("the merged directory")
+            .hosts
+            .iter()
+            .any(|host| host.id == "leaving"),
+        "a host that is not enrolled is not a group either",
+    );
+    let err = fixture
+        .client
+        .command("leaving:s-1", &prompt("go"))
+        .await
+        .expect_err("a session on a withdrawn host names nothing here");
+    assert_eq!(err.status(), Some(StatusCode::NOT_FOUND), "got {err:?}");
+    assert_eq!(err.code(), Some("unknown_session"));
+
+    fixture.shutdown().await;
+    leaving.stop();
+    staying.stop();
+}
+
+/// A withdrawal reaches a client that has stopped reading, whose upstream is
+/// parked mid-block waiting for room in that client's queue (spec 6.9's pacing).
+///
+/// That is the one place a teardown signal delivered only where frames are read
+/// would never arrive, and it is exactly the client whose upstream costs a host
+/// a subscriber it can do nothing about.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_withdrawal_ends_the_upstream_of_a_client_that_stopped_reading() {
+    let resuming = deep_block("s-1", "epoch-1", 800);
+    let deep = resuming.len();
+    let fake = FakeHost::start("fake", Script::Frames(resuming)).await;
+    let fixture = Fixture::new(&[]).await;
+    assert_eq!(
+        fixture.enroll(&fake.address.to_string()).await.status(),
+        StatusCode::OK,
+    );
+    fixture.until_connected("fake").await;
+
+    // Attached and then never read from, so every buffer behind the client fills
+    // and the task pumping its upstream parks.
+    let events = fixture.attach(&[attach("fake:s-1")]).await;
+    let stalled = fake.until_stalled().await;
+    assert!(
+        stalled < deep,
+        "the client absorbed {stalled} of {deep} block frames, so it is not \
+         stalled at all and this test measures nothing",
+    );
+    assert_eq!(fake.released(), 0, "and its upstream is open");
+
+    assert_eq!(
+        fixture.withdraw("fake").await.status(),
+        StatusCode::NO_CONTENT,
+    );
+
+    bounded("the withdrawn host's upstream to close", async {
+        while fake.released() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+
+    drop(events);
+    fixture.shutdown().await;
+    fake.stop();
+}
+
+/// A withdrawal the gateway cannot write down does not stand, and neither does
+/// any part of its teardown: the enrollment is back with the rows it had, and
+/// the client watching that host is still being served.
+///
+/// The order this pins is the reason it holds: nothing is torn down until the
+/// withdrawal is recorded, because a teardown is not a thing a rollback can
+/// undo.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_withdrawal_that_was_not_recorded_leaves_the_splices_alone() {
+    let cue = Arc::new(tokio::sync::Notify::new());
+    let fake = FakeHost::start(
+        "fake",
+        Script::Cued {
+            first: block("s-1", "epoch-1", 0),
+            cue: Arc::clone(&cue),
+            then: vec![warning_frame("s-1", "epoch-1", "still watching")],
+        },
+    )
+    .await;
+    let fixture = Fixture::new(&[]).await;
+    assert_eq!(
+        fixture.enroll(&fake.address.to_string()).await.status(),
+        StatusCode::OK,
+    );
+    fixture.until_connected("fake").await;
+    let mut events = fixture.attach(&[attach("fake:s-1")]).await;
+    carried_until(&mut events, "the attach block", |carried| {
+        !carried.caught_up.is_empty()
+    })
+    .await;
+    fixture.row("fake:s-1").await;
+
+    // A directory where the state file goes, so the write that records the
+    // withdrawal cannot land.
+    let state = fixture.state.path().join("hosts.json");
+    std::fs::remove_file(&state).expect("the recorded enrollment");
+    std::fs::create_dir(&state).expect("stage an unwritable state file");
+    let (status, _, _) = refusal(fixture.withdraw("fake").await).await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        fixture.hosts().await.hosts.len(),
+        1,
+        "a withdrawal that was not recorded did not happen",
+    );
+    assert_eq!(
+        fixture
+            .client
+            .sessions()
+            .await
+            .expect("the merged directory")
+            .sessions
+            .iter()
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>(),
+        vec!["fake:s-1".to_string()],
+        "with the rows it had: this host says nothing further, so a directory \
+         put back empty would stay empty",
+    );
+
+    cue.notify_one();
+    let carried = carried_until(&mut events, "a frame after the refusal", |carried| {
+        carried.events("fake:s-1") > 0
+    })
+    .await;
+    assert_eq!(
+        fake.released(),
+        0,
+        "the splice was torn down for a withdrawal that did not happen: {carried:?}",
+    );
+    assert!(!carried.ended && carried.resets.is_empty(), "{carried:?}");
+
+    std::fs::remove_dir(&state).expect("unstage");
+    fixture.shutdown().await;
+    fake.stop();
+}
+
+// ---------------------------------------------------------------------------
 // Flow control (spec 6.9)
 // ---------------------------------------------------------------------------
 
