@@ -960,6 +960,39 @@ incrementally when the host's epochs survived and fully when they did
 not. The same mechanism covers the case where a host evicts a slow
 gateway.
 
+The gateway does not re-open that upstream itself. Resuming one needs a
+*current* cursor, and the client's cursor advances as it applies the
+frames the gateway forwarded, so tracking one would give the gateway
+per-session cursor state this section denies it, and put a second,
+subtly different cursor authority in the system. `reset` plus the
+client's own re-attach is the whole mechanism, which is why `reset` is
+emitted on two edges: the host was lost, and the host came back. The
+control connection is the reachability oracle for the second, since it
+redials on its own and its return is what makes an upstream attach
+succeed again.
+
+A client that attaches sessions on a host the gateway currently cannot
+reach is **not** refused: those sessions contribute no upstream and
+stay `unreachable` in the list, which is the signal that they carry
+nothing, while the sessions of every other host on that stream are
+served normally. Failing the whole stream would punish those. Nor does
+the gateway spin on `reset` for them, it waits for the host's return
+edge. A host the gateway believes is reachable and which then does not
+answer the attach is the ordinary 503 instead: nothing has told the
+client those sessions are unreachable, so a stream that carried them
+silently would leave it watching frames that never come.
+
+Flow control on a client stream is section 6.9's, with the gateway as
+the server: a bounded queue per client, lossy frames coalesced by key
+and dropped at the bound, durable and reliable-transient frames never
+dropped, and a client the gateway cannot keep up with evicted. One
+difference in mechanism, none in rule: on a host the attach block is
+paced by its own producer, on a gateway the block arrives over the
+upstream connection, so pacing it means not reading that connection
+until the client reads. Measuring a block against the bound instead
+would evict the very client that asked for it, and the re-attach would
+do the same again.
+
 Enrollment: static host addresses from the gateway config file, plus
 dynamic enrollment (VMs it provisions, or explicit
 `POST /v1/hosts {address}`). `GET /v1/hosts` lists, `DELETE
