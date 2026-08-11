@@ -1251,6 +1251,10 @@ async fn wedged_host() -> (String, tokio::task::JoinHandle<()>) {
 /// A host that hangs up as soon as its stream opens is backed off like any other
 /// failure. Resetting the delay on every connection that *opened* would redial a
 /// host in that state at the floor rate for as long as it stayed there.
+///
+/// The signal is a rate, so the two tunings are set far apart: a floor of 5ms
+/// against a ceiling of 200ms means an unbacked-off link dials some tens of times
+/// in the window and a backed-off one about a dozen.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_that_hangs_up_at_once_is_not_redialed_at_the_floor_rate() {
     let dials = Arc::new(AtomicUsize::new(0));
@@ -1259,23 +1263,21 @@ async fn a_host_that_hangs_up_at_once_is_not_redialed_at_the_floor_rate() {
         TempDir::new().expect("tempdir"),
         Vec::new(),
         Tuning {
-            reconnect_delay: Duration::from_millis(20),
-            max_reconnect_delay: Duration::from_millis(100),
+            reconnect_delay: Duration::from_millis(5),
+            max_reconnect_delay: Duration::from_millis(200),
             ..tuning()
         },
     )
     .await;
     assert_eq!(fixture.enroll(&url).await.status(), StatusCode::OK);
 
-    // Long enough that the floor rate would be unmistakable: 20ms between
-    // dials is 50 of them, where a doubling delay capped at 100ms is a dozen.
-    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    tokio::time::sleep(Duration::from_millis(2_000)).await;
     let dialled = dials.load(Ordering::Relaxed);
 
     assert!(dialled > 1, "the link did keep trying, {dialled} times");
     assert!(
-        dialled < 30,
-        "the link redialled {dialled} times in a second, which is the floor rate",
+        dialled < 20,
+        "the link redialled {dialled} times in two seconds, which is the floor rate",
     );
 
     fixture.shutdown().await;
