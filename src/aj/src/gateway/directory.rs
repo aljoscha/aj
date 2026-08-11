@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use aj_app::host::AttachRequest;
-use aj_wire::{HostList, HostSource, HostSummary, MergedDirectory, RawObject};
+use aj_wire::{DirectoryHost, HostList, HostSource, HostSummary, MergedDirectory, RawObject};
 use tokio::sync::watch;
 
 use crate::gateway::config::HostAddress;
@@ -618,31 +618,45 @@ impl Directory {
     }
 }
 
-/// Namespace every host's rows into one directory.
+/// Namespace every host's rows into one directory, and name the hosts it was
+/// composed from.
 ///
 /// Ordered latest first by the session's own id, which is how a host orders its
 /// own rows (ids are minted as timestamps), with the host id breaking ties so
 /// the order is total. Clients re-sort by activity anyway (spec 9.2), so this is
 /// about being deterministic rather than about presentation.
+///
+/// A host is named whether or not it has rows here, because it may have none for
+/// two different reasons: it is quiet, or this gateway cannot reach it and never
+/// stored what it last said. A client renders the second as an empty group
+/// rather than as nothing, which is the whole point of naming the hosts
+/// (spec 7.1).
 fn merge(hosts: &BTreeMap<HostAddress, Enrollment>) -> MergedDirectory {
     let mut rows: Vec<(&str, &Row, bool)> = Vec::new();
+    let mut enrolled: Vec<DirectoryHost> = Vec::new();
     for enrollment in hosts.values() {
         // A host that has never answered has no id to namespace with, and
-        // therefore no rows either.
+        // therefore no rows either, and no group for a client to put under a
+        // name it does not have (spec 7.1).
         let Some(host_id) = enrollment.host_id.as_deref() else {
             continue;
         };
+        enrolled.push(DirectoryHost {
+            id: host_id.to_string(),
+            unreachable: !enrollment.connected,
+        });
         for row in &enrollment.rows {
             rows.push((host_id, row, enrollment.connected));
         }
     }
     rows.sort_by(|left, right| right.1.id.cmp(&left.1.id).then_with(|| left.0.cmp(right.0)));
+    enrolled.sort_by(|left, right| left.id.cmp(&right.id));
     MergedDirectory {
         sessions: rows
             .into_iter()
             .map(|(host_id, row, connected)| row.namespaced(host_id, connected))
             .collect(),
-        hosts: Vec::new(),
+        hosts: enrolled,
     }
 }
 
@@ -868,6 +882,11 @@ mod tests {
         directory.set_rows(&address, vec![row("s-1")]);
 
         assert!(directory.sessions().sessions.is_empty());
+        assert!(
+            directory.sessions().hosts.is_empty(),
+            "and no group either: a client has no name to put one under, and an \
+             address is not one (spec 7.1)",
+        );
         assert_eq!(directory.hosts().hosts.len(), 1);
         assert_eq!(directory.hosts().hosts[0].id, None);
         assert!(
@@ -880,6 +899,14 @@ mod tests {
             merged(&directory)[0].0.id,
             "learned:s-1",
             "its rows join the directory as soon as it names itself",
+        );
+        assert_eq!(
+            directory.sessions().hosts,
+            vec![DirectoryHost {
+                id: "learned".to_string(),
+                unreachable: true,
+            }],
+            "and so does its group, which it is not connected to fill yet",
         );
     }
 

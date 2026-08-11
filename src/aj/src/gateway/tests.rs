@@ -25,9 +25,9 @@ use aj_app::host::{AttachRequest, Command, SessionHost};
 use aj_app::test_support::finalized_text_message;
 use aj_models::types::AssistantContent;
 use aj_wire::{
-    CreateSessionRequest, Cursor, DecodedFrame, EnrollHostRequest, ErrorResponse, Frame, HostList,
-    HostSource, HostSummary, PROTOCOL_VERSION, PromptInput, PromptRequest, SessionCreated,
-    SessionList, SessionSummary,
+    CreateSessionRequest, Cursor, DecodedFrame, DirectoryHost, EnrollHostRequest, ErrorResponse,
+    Frame, HostList, HostSource, HostSummary, PROTOCOL_VERSION, PromptInput, PromptRequest,
+    SessionCreated, SessionList, SessionSummary,
 };
 use clap::Parser;
 use reqwest::StatusCode;
@@ -757,13 +757,13 @@ async fn a_newer_hosts_row_reaches_a_client_whole() {
 
     let mut events = fixture.attach(&[]).await;
     let seen = decoded_until(&mut events, "the merged directory", |frame| {
-        list_rows(frame).is_some_and(|rows| rows.len() == 2)
+        list_frame(frame).is_some_and(|(rows, _)| rows.len() == 2)
     })
     .await;
-    let carried = seen
+    let (carried, _) = seen
         .iter()
         .rev()
-        .find_map(list_rows)
+        .find_map(list_frame)
         .expect("a list frame with both rows");
 
     // The rows first: what a lost row costs is the whole session, and a preview
@@ -818,11 +818,113 @@ fn newer_row(row: &SessionSummary, extra: &str) -> String {
     format!("{},{extra}}}", &known[..known.len() - 1])
 }
 
-/// The typed rows of a `list` frame, `None` for every other frame.
-fn list_rows(frame: &DecodedFrame) -> Option<&Vec<SessionSummary>> {
+/// A gateway marks a host's sessions unreachable while it still has their rows,
+/// and after a restart it has none: it stores no rows, deliberately (spec 7.1).
+/// The signal survives because its `list` frames name the enrolled hosts with
+/// their reachability, so a client that holds no rows for a host still knows the
+/// host is there and cannot be reached.
+///
+/// Two hosts, one of them up, because the harm this is about is a host reading
+/// as absent rather than as unreachable: with one host a client cannot tell an
+/// empty directory from a directory that has not arrived, and the reachable
+/// host's rows are what say the merge ran at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unreachable_host_survives_a_restart_as_a_group_with_no_rows() {
+    let mut down = Upstream::start().await;
+    let mut up = Upstream::start().await;
+    let session = down.create().await;
+    let kept = up.create().await;
+    // A turn on the session that is about to go away, so its host has a log to
+    // enumerate when it comes back: the point here is a directory the *gateway*
+    // no longer holds, not one the host lost.
+    down.prompt(&session, "first").await;
+    settled(&down, &session, 1).await;
+    // Enrolled over the wire, which is the enrollment a gateway remembers: the
+    // id it namespaces that host by is what it writes down (spec 7.1).
+    let fixture = Fixture::new(&[]).await;
+    assert_eq!(
+        fixture.enroll(&down.address()).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(fixture.enroll(&up.address()).await.status(), StatusCode::OK);
+    let (lost, kept) = (down.namespaced(&session), up.namespaced(&kept));
+    fixture.row(&lost).await;
+    fixture.row(&kept).await;
+
+    down.stop().await;
+    let fixture = fixture.restart().await;
+
+    let mut events = fixture.attach(&[]).await;
+    let seen = decoded_until(&mut events, "the directory after the restart", |frame| {
+        list_frame(frame)
+            .is_some_and(|(rows, hosts)| rows.iter().any(|row| row.id == kept) && hosts.len() == 2)
+    })
+    .await;
+    let (rows, hosts) = seen
+        .iter()
+        .rev()
+        .find_map(list_frame)
+        .expect("a list frame naming both hosts");
+
+    // The rows first, because this measures nothing unless the gateway really
+    // came back without them: with the downed host's rows still here, this is
+    // the ordinary unreachable-row case and says nothing about a restart.
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.host.as_deref() == Some(&down.host_id())),
+        "the gateway persisted the downed host's rows, so nothing here is about \
+         a directory it no longer holds: {rows:?}",
+    );
+    let mut named = vec![
+        DirectoryHost {
+            id: down.host_id(),
+            unreachable: true,
+        },
+        DirectoryHost {
+            id: up.host_id(),
+            unreachable: false,
+        },
+    ];
+    // A host id is minted at random, so which of these two sorts first is not
+    // the fixture's to say.
+    named.sort_by(|left, right| left.id.cmp(&right.id));
+    assert_eq!(
+        hosts, &named,
+        "a host with no rows here is still named, which is the empty group a \
+         client renders instead of nothing: {hosts:?}",
+    );
+    assert!(
+        rows.iter().any(|row| row.id == kept && !row.unreachable),
+        "and the host that is there is served as usual: {rows:?}",
+    );
+
+    // It comes back on its own, and the group fills in.
+    down.restart().await;
+    let seen = decoded_until(&mut events, "the returned host's rows", |frame| {
+        list_frame(frame).is_some_and(|(rows, _)| rows.iter().any(|row| row.id == lost))
+    })
+    .await;
+    let (_, hosts) = seen
+        .iter()
+        .rev()
+        .find_map(list_frame)
+        .expect("a list frame with the returned host's rows");
+    assert!(
+        hosts.iter().all(|host| !host.unreachable),
+        "the host answered again, so nothing is unreachable: {hosts:?}",
+    );
+
+    fixture.shutdown().await;
+    down.stop().await;
+    up.stop().await;
+}
+
+/// The rows and the hosts of a `list` frame, `None` for every other frame.
+fn list_frame(frame: &DecodedFrame) -> Option<(&Vec<SessionSummary>, &Vec<DirectoryHost>)> {
     match frame {
         DecodedFrame::Known(known) => match known.value() {
-            Frame::List { sessions, .. } => Some(sessions),
+            Frame::List { sessions, hosts } => Some((sessions, hosts)),
             _ => None,
         },
         DecodedFrame::Unknown { .. } => None,
