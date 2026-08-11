@@ -708,6 +708,137 @@ async fn a_client_only_ever_sees_namespaced_ids() {
     right.stop().await;
 }
 
+/// A row travels as the host that owns it wrote it (spec 6.10): the gateway
+/// rewrites the three fields it owns and passes everything else through, a field
+/// this build has no type for and a number literal no float survives included.
+///
+/// Two hosts, because the merge is where two hosts' rows meet and is the one
+/// place a re-encode would be tempting. The `preview` this carries is the field
+/// spec section 13 banks as future work, which is exactly the version ceiling
+/// spec 6.10 exists to prevent: a gateway must forward it years before it has a
+/// type for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_newer_hosts_row_reaches_a_client_whole() {
+    let left = FakeHost::with_rows(
+        "left",
+        Script::Frames(Vec::new()),
+        vec![newer_row(
+            &fake_row("s-2"),
+            r#""preview":{"text":"auth","weight":18446744073709551616}"#,
+        )],
+    )
+    .await;
+    // A row that already names a host and calls itself unreachable: those are
+    // this gateway's fields to answer for, whoever wrote them last.
+    let right = FakeHost::with_rows(
+        "right",
+        Script::Frames(Vec::new()),
+        vec![newer_row(
+            &SessionSummary {
+                host: Some("stale".to_string()),
+                unreachable: true,
+                ..fake_row("s-1")
+            },
+            r#""preview":"1e400 is a number too""#,
+        )],
+    )
+    .await;
+    let fixture = Fixture::tuned(
+        TempDir::new().expect("tempdir"),
+        vec![left.address.clone(), right.address.clone()],
+        tuning(),
+    )
+    .await;
+    fixture
+        .until("both hosts' rows", |list| {
+            (list.sessions.len() == 2).then_some(())
+        })
+        .await;
+
+    let mut events = fixture.attach(&[]).await;
+    let seen = decoded_until(&mut events, "the merged directory", |frame| {
+        list_rows(frame).is_some_and(|rows| rows.len() == 2)
+    })
+    .await;
+    let carried = seen
+        .iter()
+        .rev()
+        .find_map(list_rows)
+        .expect("a list frame with both rows");
+
+    // The rows first: what a lost row costs is the whole session, and a preview
+    // assertion on a directory of one would name the wrong harm.
+    assert_eq!(
+        carried
+            .iter()
+            .map(|row| (row.id.as_str(), row.host.as_deref(), row.unreachable))
+            .collect::<Vec<_>>(),
+        vec![
+            ("left:s-2", Some("left"), false),
+            ("right:s-1", Some("right"), false),
+        ],
+        "the three fields this gateway owns, and nobody else's answer for them",
+    );
+    let json = raw_json(&seen);
+    assert!(
+        json.contains(r#""preview":{"text":"auth","weight":18446744073709551616}"#),
+        "a field this gateway has no type for reaches the client whole, literals \
+         included: {json}",
+    );
+    assert!(
+        json.contains(r#""preview":"1e400 is a number too""#),
+        "and so does the other host's, which the merge saw in the same frame: {json}",
+    );
+
+    // The sessions read is the same composition, so it carries the same rows.
+    let read = fixture
+        .http
+        .get(format!("{}/v1/sessions", fixture.server.url()))
+        .send()
+        .await
+        .expect("the sessions read")
+        .text()
+        .await
+        .expect("a body");
+    assert!(
+        read.contains(r#""preview":{"text":"auth","weight":18446744073709551616}"#)
+            && read.contains(r#""id":"left:s-2""#),
+        "a client that reads the directory sees what a client watching it sees: {read}",
+    );
+
+    fixture.shutdown().await;
+    left.stop();
+    right.stop();
+}
+
+/// A directory row as a host a version ahead writes it: everything this build
+/// knows, plus `extra` spliced in as the text that host wrote.
+fn newer_row(row: &SessionSummary, extra: &str) -> String {
+    let known = serde_json::to_string(row).expect("a row");
+    format!("{},{extra}}}", &known[..known.len() - 1])
+}
+
+/// The typed rows of a `list` frame, `None` for every other frame.
+fn list_rows(frame: &DecodedFrame) -> Option<&Vec<SessionSummary>> {
+    match frame {
+        DecodedFrame::Known(known) => match known.value() {
+            Frame::List { sessions, .. } => Some(sessions),
+            _ => None,
+        },
+        DecodedFrame::Unknown { .. } => None,
+    }
+}
+
+/// Every frame as it arrived on the wire, which is where a field this build has
+/// no type for is still visible.
+fn raw_json(frames: &[DecodedFrame]) -> String {
+    frames
+        .iter()
+        .map(|frame| serde_json::to_string(frame).expect("a frame re-serializes"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_second_hosts_sessions_join_the_directory_on_enrollment() {
     let mut left = Upstream::start().await;
@@ -3527,6 +3658,21 @@ struct FakeHost {
 
 impl FakeHost {
     async fn start(host_id: &str, script: Script) -> Self {
+        Self::with_rows(
+            host_id,
+            script,
+            vec![serde_json::to_string(&fake_row("s-1")).expect("a row")],
+        )
+        .await
+    }
+
+    /// The same, with the directory this host publishes on its control
+    /// connection written out as JSON.
+    ///
+    /// Raw rather than typed, because what a gateway must not reshape is the
+    /// bytes a host wrote: a row from a host a version ahead carries fields this
+    /// build has no type for, and number literals a re-encode would round.
+    async fn with_rows(host_id: &str, script: Script, rows: Vec<String>) -> Self {
         use axum::extract::Query;
         use axum::response::IntoResponse;
         use axum::response::sse::{Event, Sse};
@@ -3541,6 +3687,7 @@ impl FakeHost {
             "app_version": "0",
             "host_id": host_id,
         });
+        let directory = format!(r#"{{"kind":"list","sessions":[{}]}}"#, rows.join(","));
         let app = axum::Router::new()
             .route(
                 "/v1/hello",
@@ -3560,6 +3707,7 @@ impl FakeHost {
                         let released = Arc::clone(&released);
                         let written = Arc::clone(&written);
                         let script = script.clone();
+                        let directory = directory.clone();
                         async move {
                             let attached: Vec<String> = params
                                 .iter()
@@ -3603,12 +3751,7 @@ impl FakeHost {
                             // and then stays open, which is what keeps the
                             // gateway's link to it up.
                             let (frames, tail, guard) = if control {
-                                let list = serde_json::to_string(&Frame::List {
-                                    sessions: vec![fake_row("s-1")],
-                                    hosts: Vec::new(),
-                                })
-                                .expect("a list frame");
-                                (vec![list], Tail::Held, None)
+                                (vec![directory], Tail::Held, None)
                             } else {
                                 let guard = Some(Released(Arc::clone(&released)));
                                 match &script {

@@ -225,7 +225,7 @@ async fn hello(State(state): State<Arc<ServerState>>) -> Response {
 
 /// The merged directory (spec 7.1), which is the payload the `list` frames carry.
 async fn sessions(State(state): State<Arc<ServerState>>) -> Response {
-    Json(state.gateway.sessions()).into_response()
+    Json(state.gateway.sessions().as_ref().clone()).into_response()
 }
 
 async fn hosts(State(state): State<Arc<ServerState>>) -> Response {
@@ -441,8 +441,10 @@ fn client_stream(
             let json = match &frame {
                 // A frame from a host is re-serialized from the JSON it arrived
                 // as, so a payload this build does not understand travels
-                // verbatim (spec 6.10).
+                // verbatim (spec 6.10). The merged directory is this gateway's
+                // own composition and keeps its rows the same way.
                 Outgoing::Spliced(frame) => serde_json::to_string(frame),
+                Outgoing::Directory(directory) => serde_json::to_string(&directory.as_frame()),
                 Outgoing::Own(frame) => serde_json::to_string(frame),
             };
             match json {

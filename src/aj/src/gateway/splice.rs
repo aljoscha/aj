@@ -25,7 +25,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use aj_wire::{DecodedFrame, Frame, SessionSummary};
+use aj_wire::{DecodedFrame, Frame, MergedDirectory};
 use tokio::sync::watch;
 use tokio_util::sync::{CancellationToken, DropGuard};
 
@@ -38,7 +38,10 @@ use crate::remote::{RemoteClient, RemoteError, RemoteEvents};
 
 /// What one client stream writes next.
 pub(crate) enum Outgoing {
-    /// A frame this gateway composed itself: the merged directory, a heartbeat.
+    /// The merged directory, which this gateway composes from its hosts' rows
+    /// and writes as a `list` frame (spec 7.1).
+    Directory(Arc<MergedDirectory>),
+    /// A frame this gateway composed itself: a heartbeat.
     Own(Frame),
     /// A frame spliced from the host that owns the session it names, forwarded
     /// as it arrived apart from that id.
@@ -50,7 +53,7 @@ pub(crate) struct Splice {
     /// The spliced frames of the sessions this client attached.
     frames: outbound::Receiver,
     /// The merged directory, which every client stream carries.
-    directory: watch::Receiver<Arc<Vec<SessionSummary>>>,
+    directory: watch::Receiver<Arc<MergedDirectory>>,
     /// Whether the opening directory has been written.
     opened: bool,
     /// Cancelled when this is dropped, which is what ends the upstream streams
@@ -75,7 +78,7 @@ impl Splice {
     pub(crate) async fn open(
         groups: Vec<AttachGroup>,
         reachable: watch::Receiver<Arc<BTreeSet<String>>>,
-        directory: watch::Receiver<Arc<Vec<SessionSummary>>>,
+        directory: watch::Receiver<Arc<MergedDirectory>>,
         tuning: Tuning,
         shutdown: &CancellationToken,
     ) -> Result<Self, GatewayError> {
@@ -154,7 +157,7 @@ impl Splice {
         // to learn what is there.
         if !self.opened {
             self.opened = true;
-            return Some(Outgoing::Own(self.list()));
+            return Some(self.list());
         }
         let woken = tokio::select! {
             _ = shutdown.cancelled() => Woken::Over,
@@ -173,19 +176,16 @@ impl Splice {
         };
         match woken {
             Woken::Spliced(frame) => Some(Outgoing::Spliced(frame)),
-            Woken::Directory => Some(Outgoing::Own(self.list())),
+            Woken::Directory => Some(self.list()),
             Woken::Idle => Some(Outgoing::Own(Frame::Heartbeat)),
             Woken::Over => None,
         }
     }
 
-    /// The merged directory as a frame, marked as seen so the next change is one
-    /// this client has not been sent.
-    fn list(&mut self) -> Frame {
-        Frame::List {
-            sessions: self.directory.borrow_and_update().as_ref().clone(),
-            hosts: Vec::new(),
-        }
+    /// The merged directory as this client's next frame, marked as seen so the
+    /// next change is one this client has not been sent.
+    fn list(&mut self) -> Outgoing {
+        Outgoing::Directory(Arc::clone(&self.directory.borrow_and_update()))
     }
 }
 

@@ -136,9 +136,21 @@ async fn attempt(address: &HostAddress, directory: &Directory) -> Attempt {
             Some(Err(err)) => return Attempt::Ended(err.to_string()),
             Some(Ok(frame)) => frame,
         };
-        match frame {
-            DecodedFrame::Known(frame) => match frame.value() {
-                Frame::List { sessions, .. } => directory.set_rows(address, sessions.clone()),
+        match &frame {
+            DecodedFrame::Known(known) => match known.value() {
+                // The rows travel as their host wrote them: this gateway owns
+                // three of their fields and passes the rest through, so a typed
+                // re-encode here would strip a newer host's (spec 6.10).
+                Frame::List { .. } => match frame.rows() {
+                    // `Ok(None)` cannot come back for a `list` frame: the read
+                    // decides on the same kind this arm matched on.
+                    Ok(Some(rows)) => directory.set_rows(address, rows),
+                    outcome => {
+                        tracing::warn!(
+                            "{address} sent a directory this gateway cannot read: {outcome:?}"
+                        );
+                    }
+                },
                 // A control connection names no session, so a host publishes it
                 // none of these (spec 6.5). The ones a client asked for reach it
                 // on that client's own spliced stream instead.

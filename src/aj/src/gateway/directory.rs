@@ -7,14 +7,16 @@
 //! and a client watching cannot disagree.
 //!
 //! The gateway holds no session state of its own beyond these rows. A row is
-//! whatever its host last said, with three fields the gateway owns: the
-//! namespaced id, the `host` it belongs to, and `unreachable`.
+//! whatever its host last said, kept as the JSON that host wrote, with three
+//! fields the gateway owns: the namespaced id, the `host` it belongs to, and
+//! `unreachable`. Everything else on it passes through unread, which is what
+//! keeps a newer host's row a newer host's row (spec 6.10).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use aj_app::host::AttachRequest;
-use aj_wire::{HostList, HostSource, HostSummary, SessionList, SessionSummary};
+use aj_wire::{HostList, HostSource, HostSummary, MergedDirectory, RawObject};
 use tokio::sync::watch;
 
 use crate::gateway::config::HostAddress;
@@ -27,14 +29,14 @@ pub(crate) struct Directory {
     /// what a link dials. The host id is learned, and a configured host that
     /// has never answered does not have one yet.
     hosts: StdMutex<BTreeMap<HostAddress, Enrollment>>,
-    /// The merged rows, republished whenever they actually change.
+    /// The merged directory, republished whenever it actually changes.
     ///
     /// A watch rather than a queue per subscriber, because every frame this
     /// carries is a cumulative `list` snapshot: the newest supersedes and a
     /// slow reader wants only the latest (spec 6.4). Session frames are
     /// undroppable, so they travel a client's bounded queue instead
     /// ([`crate::gateway::outbound`]).
-    merged: watch::Sender<Arc<Vec<SessionSummary>>>,
+    merged: watch::Sender<Arc<MergedDirectory>>,
     /// The ids of the hosts whose control connection is up, republished
     /// whenever that set changes.
     ///
@@ -56,7 +58,7 @@ struct Enrollment {
     /// (see [`Directory::adopt`]).
     host_id: Option<String>,
     /// The rows of this host's own last `list` frame, with its own ids.
-    rows: Vec<SessionSummary>,
+    rows: Vec<Row>,
     connected: bool,
     /// Why the last connection attempt did not stick, for `GET /v1/hosts`.
     error: Option<String>,
@@ -68,6 +70,67 @@ impl Enrollment {
     fn name(&self, address: &HostAddress) -> String {
         self.host_id.clone().unwrap_or_else(|| address.to_string())
     }
+}
+
+/// The fields of a directory row a gateway owns, spelled as
+/// [`aj_wire::SessionSummary`] spells them (spec 6.8). Every other field on a
+/// row belongs to the host that wrote it.
+const ID_FIELD: &str = "id";
+const HOST_FIELD: &str = "host";
+const UNREACHABLE_FIELD: &str = "unreachable";
+
+/// One row as its host wrote it, with the id this gateway routes and orders on
+/// read out of it once.
+///
+/// The id comes off the row's own JSON rather than off a typed decode, so what
+/// this gateway sorts and namespaces by is the very field it rewrites, and the
+/// two cannot drift.
+struct Row {
+    id: String,
+    raw: RawObject,
+}
+
+impl Row {
+    /// One row of a host's directory, `None` for a row this gateway cannot read
+    /// an id from.
+    ///
+    /// Such a row has no namespace to appear under and nothing to route on, and
+    /// re-emitting it under the host's own id would put an id no client here can
+    /// address on the wire. A host's `list` frame is refused at decode long
+    /// before this, so it takes a directory composed some other way to get here.
+    fn read(raw: RawObject) -> Option<Self> {
+        match raw.get::<String>(ID_FIELD) {
+            Ok(Some(id)) => Some(Self { id, raw }),
+            outcome => {
+                tracing::warn!("dropping a directory row this gateway cannot name: {outcome:?}");
+                None
+            }
+        }
+    }
+
+    /// This row as a client of this gateway sees it: the three fields a gateway
+    /// owns rewritten, everything else the host's own JSON (spec 6.10).
+    fn namespaced(&self, host_id: &str, connected: bool) -> RawObject {
+        let mut raw = self.raw.clone();
+        // A string and a bool always encode, so a failure here would be a
+        // serializer bug rather than anything a host could send.
+        own(&mut raw, host_id, &self.id, connected).expect("a string and a bool encode as JSON");
+        raw
+    }
+}
+
+/// Write the three fields a gateway owns onto a row it re-emits.
+fn own(
+    row: &mut RawObject,
+    host_id: &str,
+    session: &str,
+    connected: bool,
+) -> Result<(), serde_json::Error> {
+    row.set(ID_FIELD, &SessionAddress::new(host_id, session).to_string())?;
+    // Clients group by this rather than parsing the id, which is opaque
+    // (spec 6.2, 6.8).
+    row.set(HOST_FIELD, host_id)?;
+    row.set(UNREACHABLE_FIELD, &!connected)
 }
 
 /// Where a proxied request goes: which host, and what that host calls the
@@ -163,7 +226,7 @@ impl AttachGroup {
 
 impl Directory {
     pub(crate) fn new() -> Self {
-        let (merged, _) = watch::channel(Arc::new(Vec::new()));
+        let (merged, _) = watch::channel(Arc::new(MergedDirectory::default()));
         let (reachable, _) = watch::channel(Arc::new(BTreeSet::new()));
         Self {
             hosts: StdMutex::new(BTreeMap::new()),
@@ -329,7 +392,12 @@ impl Directory {
     }
 
     /// Replace what the host at `address` last said about its sessions.
-    pub(crate) fn set_rows(&self, address: &HostAddress, rows: Vec<SessionSummary>) {
+    ///
+    /// The rows arrive as that host wrote them and are kept that way: only the
+    /// id is read out, because it is what this gateway routes and orders on and
+    /// the field it rewrites (spec 6.10).
+    pub(crate) fn set_rows(&self, address: &HostAddress, rows: Vec<RawObject>) {
+        let rows = rows.into_iter().filter_map(Row::read).collect();
         let mut hosts = self.lock();
         let Some(enrollment) = hosts.get_mut(address) else {
             return;
@@ -453,17 +521,15 @@ impl Directory {
         }
     }
 
-    /// The merged directory as it stands.
-    pub(crate) fn sessions(&self) -> SessionList {
-        SessionList {
-            sessions: (*self.merged.borrow()).as_ref().clone(),
-            hosts: Vec::new(),
-        }
+    /// The merged directory as it stands, which is the payload the sessions
+    /// read answers with and the `list` frames carry.
+    pub(crate) fn sessions(&self) -> Arc<MergedDirectory> {
+        Arc::clone(&self.merged.borrow())
     }
 
     /// A receiver for the merged directory. The current value counts as seen,
     /// so a caller sends [`Self::sessions`] itself before waiting for changes.
-    pub(crate) fn subscribe(&self) -> watch::Receiver<Arc<Vec<SessionSummary>>> {
+    pub(crate) fn subscribe(&self) -> watch::Receiver<Arc<MergedDirectory>> {
         self.merged.subscribe()
     }
 
@@ -558,8 +624,8 @@ impl Directory {
 /// own rows (ids are minted as timestamps), with the host id breaking ties so
 /// the order is total. Clients re-sort by activity anyway (spec 9.2), so this is
 /// about being deterministic rather than about presentation.
-fn merge(hosts: &BTreeMap<HostAddress, Enrollment>) -> Vec<SessionSummary> {
-    let mut rows: Vec<(&str, &SessionSummary, bool)> = Vec::new();
+fn merge(hosts: &BTreeMap<HostAddress, Enrollment>) -> MergedDirectory {
+    let mut rows: Vec<(&str, &Row, bool)> = Vec::new();
     for enrollment in hosts.values() {
         // A host that has never answered has no id to namespace with, and
         // therefore no rows either.
@@ -571,16 +637,13 @@ fn merge(hosts: &BTreeMap<HostAddress, Enrollment>) -> Vec<SessionSummary> {
         }
     }
     rows.sort_by(|left, right| right.1.id.cmp(&left.1.id).then_with(|| left.0.cmp(right.0)));
-    rows.into_iter()
-        .map(|(host_id, row, connected)| SessionSummary {
-            id: SessionAddress::new(host_id, &row.id).to_string(),
-            // A gateway fills this in as it merges, and clients group by it
-            // rather than parsing the id (spec 6.8).
-            host: Some(host_id.to_string()),
-            unreachable: !connected,
-            ..row.clone()
-        })
-        .collect()
+    MergedDirectory {
+        sessions: rows
+            .into_iter()
+            .map(|(host_id, row, connected)| row.namespaced(host_id, connected))
+            .collect(),
+        hosts: Vec::new(),
+    }
 }
 
 /// Why a directory operation did not do what was asked.
@@ -649,6 +712,7 @@ pub(crate) enum DirectoryError {
 
 #[cfg(test)]
 mod tests {
+    use aj_wire::SessionSummary;
     use chrono::{TimeZone, Utc};
 
     use super::*;
@@ -657,8 +721,11 @@ mod tests {
         HostAddress::parse(raw).expect("an address")
     }
 
-    fn row(id: &str) -> SessionSummary {
-        SessionSummary {
+    /// One row as a host writes it, plus a field this build has no type for, so
+    /// that every assertion about the merge is also an assertion about what
+    /// travels (spec 6.10).
+    fn row(id: &str) -> RawObject {
+        let mut raw = RawObject::encode(&SessionSummary {
             id: id.to_string(),
             live: true,
             working: false,
@@ -672,7 +739,28 @@ mod tests {
             tag: None,
             host: None,
             unreachable: false,
-        }
+        })
+        .expect("a row is an object");
+        raw.set("preview", &format!("what {id} was doing"))
+            .expect("a string encodes");
+        raw
+    }
+
+    /// The merged rows decoded back into what a client reads, plus the text each
+    /// one would arrive as.
+    fn merged(directory: &Directory) -> Vec<(SessionSummary, String)> {
+        directory
+            .sessions()
+            .sessions
+            .iter()
+            .map(|raw| {
+                let json = serde_json::to_string(raw).expect("a row re-serializes");
+                (
+                    serde_json::from_str(&json).expect("a merged row is a row"),
+                    json,
+                )
+            })
+            .collect()
     }
 
     /// A host with `id` at `raw`, connected, holding `rows`.
@@ -692,23 +780,54 @@ mod tests {
         connected(&directory, "127.0.0.1:1", "left", &["s-2"]);
         connected(&directory, "127.0.0.1:2", "right", &["s-1"]);
 
-        let sessions = directory.sessions().sessions;
+        let sessions = merged(&directory);
 
         assert_eq!(
             sessions
                 .iter()
-                .map(|row| row.id.as_str())
+                .map(|(row, _)| row.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["left:s-2", "right:s-1"],
             "latest session first, across hosts",
         );
-        assert_eq!(sessions[0].host.as_deref(), Some("left"));
-        assert_eq!(sessions[1].host.as_deref(), Some("right"));
-        assert!(sessions.iter().all(|row| !row.unreachable));
+        assert_eq!(sessions[0].0.host.as_deref(), Some("left"));
+        assert_eq!(sessions[1].0.host.as_deref(), Some("right"));
+        assert!(sessions.iter().all(|(row, _)| !row.unreachable));
         assert_eq!(
-            sessions[0].last_seq,
+            sessions[0].0.last_seq,
             Some(2),
             "everything else is the host's own answer, forwarded",
+        );
+        assert!(
+            sessions[0].1.contains(r#""preview":"what s-2 was doing""#),
+            "a field this gateway has no type for included: {}",
+            sessions[0].1,
+        );
+    }
+
+    /// A row this gateway cannot read an id from has no namespace to appear
+    /// under and nothing to route on, so it does not travel. Its neighbours do:
+    /// one unreadable row is not the host's whole directory.
+    #[test]
+    fn a_row_with_no_readable_id_is_dropped() {
+        let directory = Directory::new();
+        let address = connected(&directory, "127.0.0.1:1", "left", &["s-1"]);
+
+        directory.set_rows(
+            &address,
+            vec![
+                serde_json::from_str(r#"{"live":true}"#).expect("a row with no id"),
+                serde_json::from_str(r#"{"id":42}"#).expect("a row whose id is no string"),
+                row("s-2"),
+            ],
+        );
+
+        assert_eq!(
+            merged(&directory)
+                .iter()
+                .map(|(row, _)| row.id.clone())
+                .collect::<Vec<_>>(),
+            vec!["left:s-2".to_string()],
         );
     }
 
@@ -720,10 +839,10 @@ mod tests {
 
         directory.disconnected(&left, "connection refused".to_string());
 
-        let sessions = directory.sessions().sessions;
+        let sessions = merged(&directory);
         assert_eq!(sessions.len(), 2, "nothing is dropped: {sessions:?}");
-        assert!(sessions[0].unreachable, "left's row: {:?}", sessions[0]);
-        assert!(!sessions[1].unreachable, "right is unaffected");
+        assert!(sessions[0].0.unreachable, "left's row: {:?}", sessions[0]);
+        assert!(!sessions[1].0.unreachable, "right is unaffected");
         assert_eq!(
             directory.hosts().hosts[0].error.as_deref(),
             Some("connection refused"),
@@ -731,11 +850,7 @@ mod tests {
 
         directory.connected(&left);
         assert!(
-            directory
-                .sessions()
-                .sessions
-                .iter()
-                .all(|row| !row.unreachable),
+            merged(&directory).iter().all(|(row, _)| !row.unreachable),
             "and the mark clears when it answers again",
         );
         assert_eq!(directory.hosts().hosts[0].error, None);
@@ -762,7 +877,7 @@ mod tests {
 
         directory.adopt(&address, "learned").expect("adopt");
         assert_eq!(
-            directory.sessions().sessions[0].id,
+            merged(&directory)[0].0.id,
             "learned:s-1",
             "its rows join the directory as soon as it names itself",
         );
@@ -810,7 +925,7 @@ mod tests {
             directory.adopt(&address, "other"),
             Err(DirectoryError::IdChanged { .. }),
         ));
-        assert_eq!(directory.sessions().sessions[0].id, "left:s-1");
+        assert_eq!(merged(&directory)[0].0.id, "left:s-1");
 
         // An id the gateway could not namespace with is refused before it is
         // ever recorded.
@@ -1080,6 +1195,6 @@ mod tests {
 
         directory.set_rows(&address, vec![row("s-1"), row("s-2")]);
         assert!(watcher.has_changed().expect("alive"), "a new row is news");
-        assert_eq!(watcher.borrow_and_update().len(), 2);
+        assert_eq!(watcher.borrow_and_update().sessions.len(), 2);
     }
 }

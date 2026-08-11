@@ -41,7 +41,7 @@ use tokio_util::sync::CancellationToken;
 
 use aj_app::cli::args::{Args, Command, DEFAULT_LISTEN_ADDRESS};
 use aj_app::host::AttachRequest;
-use aj_wire::{Hello, HostList, HostSource, HostSummary, PROTOCOL_VERSION, SessionList};
+use aj_wire::{Hello, HostList, HostSource, HostSummary, MergedDirectory, PROTOCOL_VERSION};
 use anyhow::{Context, Result, bail};
 use reqwest::StatusCode;
 
@@ -283,7 +283,7 @@ impl Gateway {
     }
 
     /// The merged session directory (spec 7.1).
-    pub(crate) fn sessions(&self) -> SessionList {
+    pub(crate) fn sessions(&self) -> Arc<MergedDirectory> {
         self.inner.directory.sessions()
     }
 
