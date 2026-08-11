@@ -2580,7 +2580,7 @@ async fn a_client_that_stops_reading_is_evicted_and_recovers() {
 /// survive.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_block_bigger_than_the_bound_does_not_evict_its_own_client() {
-    let backfilled = 300;
+    let backfilled: u64 = 300;
     let mut script = vec![state_frame("s-1", "epoch-1", backfilled)];
     for entry in 1..=backfilled {
         script.push(warning_frame(
@@ -2609,8 +2609,8 @@ async fn a_block_bigger_than_the_bound_does_not_evict_its_own_client() {
         block
             .iter()
             .filter(|frame| matches!(frame, Frame::Event { .. }))
-            .count() as u64,
-        backfilled,
+            .count(),
+        usize::try_from(backfilled).expect("a count that fits"),
         "every frame of a block hundreds deep arrived against a bound of two",
     );
     assert_eq!(caught_up_at(&block), backfilled);
