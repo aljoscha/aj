@@ -136,7 +136,7 @@ pub enum HostError {
     /// user told "session in use" needs to know which process to go quit or
     /// detach (spec section 5). `None` when the record is missing or illegible,
     /// which an older build's lock file is.
-    #[error("session {session} is held by another writer{}", held_by(holder))]
+    #[error("session {session} is held by {}", holder_name(holder))]
     Locked {
         session: String,
         holder: Option<LockHolder>,
@@ -216,12 +216,17 @@ impl PartialCreate {
     }
 }
 
-/// The parenthetical a [`HostError::Locked`] message carries, empty when the
-/// lock file named nobody.
-fn held_by(holder: &Option<LockHolder>) -> String {
+/// Who a [`HostError::Locked`] message names as the holder: what the lock
+/// file recorded, or a generic writer where it recorded nothing.
+///
+/// The specific name replaces the generic one rather than qualifying it, so
+/// the refusal names its cause once. A user told a session is in use is being
+/// pointed at a process to go quit, and "another writer (pid 5 of host h)"
+/// spends two clauses getting there.
+fn holder_name(holder: &Option<LockHolder>) -> String {
     match holder {
-        Some(holder) => format!(" ({holder})"),
-        None => String::new(),
+        Some(holder) => holder.to_string(),
+        None => "another writer".to_string(),
     }
 }
 

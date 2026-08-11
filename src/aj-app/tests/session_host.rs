@@ -2174,7 +2174,8 @@ async fn a_refused_materialization_leaves_the_log_untouched() {
                 .expect_err("a locked session cannot be attached")
                 .to_string(),
         };
-        assert!(err.contains("held by another writer"), "{what}: {err}");
+        assert!(err.contains("is held by pid"), "{what}: {err}");
+        assert!(err.contains("a-rival-writer"), "{what}: {err}");
         assert_eq!(
             std::fs::read(&path).expect("read the log"),
             before,

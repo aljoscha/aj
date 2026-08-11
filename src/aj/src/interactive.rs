@@ -81,6 +81,7 @@ use crate::palette::{FetchKind, PendingFetch, open_palette};
 use crate::pending::PendingBox;
 use crate::prompt_history::{HistoryFetch, HistoryScope, MAX_ENTRIES, open_prompt_history};
 use crate::quit_hint::QuitHint;
+use crate::remote::RemoteError;
 use crate::selection_copied::SelectionCopied;
 use crate::session_selector::{SessionScan, extend_session_scan, open_session_selector};
 use crate::session_tag::{TagEdit, open_session_tag};
@@ -786,6 +787,65 @@ fn remote_unsupported_notice(what: &str, why: &str) -> String {
     format!("Can't {what} over a connection: {why}.")
 }
 
+/// The label the peer's directory carries for `session`, `None` for an
+/// untagged session or one the peer has not listed.
+fn directory_tag(world: &World, session: &str) -> Option<String> {
+    world
+        .directory
+        .rows()
+        .iter()
+        .find(|row| row.id == session)?
+        .tag
+        .clone()
+}
+
+/// How a message names the session it is about: the label the user gave it
+/// and the id, or the id alone.
+///
+/// Both, where there is a tag. The tag is how the user knows the session and
+/// the id is what they act on afterwards (`aj continue <id>`), so a refusal
+/// that dropped the id would leave nothing to recover with. An untagged
+/// session's only name is its id, and showing it twice would be naming the
+/// subject twice.
+fn session_subject(session: &str, tag: Option<&str>) -> String {
+    match tag {
+        Some(tag) => format!("{tag} ({session})"),
+        None => session.to_string(),
+    }
+}
+
+/// What a refused session switch tells the user: one subject, named the way
+/// the user knows the session, one cause, and the attempted action carried by
+/// the verb.
+///
+/// The peer words a refusal as a whole sentence about the session, so
+/// composing one with a "failed to switch to <id>" of our own would name the
+/// session twice. Where the peer's sentence opens with the session we asked
+/// about, its subject comes off and ours goes in front. Where it does not,
+/// the peer's sentence stands as it is: it names its own subject, and
+/// re-subjecting a sentence we did not recognize would be a guess.
+fn switch_refusal(session: &str, tag: Option<&str>, err: &ControlError) -> String {
+    let message = peer_refusal(err);
+    match message.strip_prefix(&format!("session {session} ")) {
+        Some(cause) => format!("Can't switch: {} {cause}.", session_subject(session, tag)),
+        None => format!("Can't switch: {message}."),
+    }
+}
+
+/// The peer's own words for a refusal, without the transport wrapper a
+/// connection puts around them.
+///
+/// A remote refusal also reports the status it arrived under, which is for a
+/// log rather than for a user: the message inside says the same thing in the
+/// user's terms, and it is the very sentence the in-process host would have
+/// produced, so a refusal reads the same in both modes.
+fn peer_refusal(err: &ControlError) -> String {
+    match err {
+        ControlError::Remote(RemoteError::Status { message, .. }) => message.clone(),
+        _ => err.to_string(),
+    }
+}
+
 /// A session change the drive loop broke out for.
 enum FocusRequest {
     /// Mint a session and focus it.
@@ -866,15 +926,16 @@ async fn apply_focus_request(
         FocusRequest::Resume(session) => {
             match focus_session(app, shell, world, session.clone(), false).await {
                 Ok(()) => {
-                    shell
-                        .borrow()
-                        .show_toast(format!("Switched to session {session}."));
+                    let subject =
+                        session_subject(&session, directory_tag(world, &session).as_deref());
+                    shell.borrow().show_toast(format!("Switched to {subject}."));
                     Focus::Moved
                 }
                 Err(err) => {
+                    let tag = directory_tag(world, &session);
                     shell
                         .borrow()
-                        .show_toast(format!("Failed to switch to session {session}: {err}"));
+                        .show_toast(switch_refusal(&session, tag.as_deref(), &err));
                     Focus::Same
                 }
             }
@@ -8315,7 +8376,7 @@ mod tests {
         assert!(
             toast_lines(&shell)
                 .iter()
-                .any(|t| t.contains("Failed to switch to session no-such-session")),
+                .any(|t| t == "Can't switch: unknown session no-such-session."),
             "the refusal says what failed: {:?}",
             toast_lines(&shell),
         );
@@ -8324,9 +8385,18 @@ mod tests {
 
     /// A session id on disk in `dir`'s store that nobody holds, for the tests
     /// that need a session this process's host has never materialized.
-    async fn released_disk_session(dir: &TempDir) -> String {
+    async fn released_disk_session(dir: &TempDir, tag: Option<&str>) -> String {
         let mut world = scripted_world_with_layers(dir, "streaming-text", default_layers()).await;
         persist_session(&mut world).await;
+        if let Some(tag) = tag {
+            apply_tag_edit(
+                &mut world,
+                TagEdit {
+                    tag: Some(tag.to_string()),
+                },
+            )
+            .await;
+        }
         let id = world.session().to_string();
         // The host holds a live session's lock until it shuts down, so the id
         // is only free to be locked (or resumed) once this world lets go.
@@ -8348,10 +8418,14 @@ mod tests {
     /// it survive here: a fresh session shows the splash rather than a
     /// transcript, so a refusal folded into the chat model has nothing on
     /// screen carrying it.
+    ///
+    /// The held session carries a tag, because the toast names the session
+    /// the way the user knows it and the label has to come off the live
+    /// directory to get there.
     #[tokio::test]
     async fn a_locked_session_refuses_the_switch_in_a_toast() {
         let dir = TempDir::new().expect("tempdir");
-        let held = released_disk_session(&dir).await;
+        let held = released_disk_session(&dir, Some("fix-auth")).await;
         // NOTE: `flock` belongs to the open file description, so this second
         // acquire conflicts with the host's exactly as another process would.
         let rival = aj_session::SessionLock::try_acquire(&store_of(&dir), &held, "a-rival-writer")
@@ -8364,6 +8438,12 @@ mod tests {
         assert!(
             !world.chat.borrow().has_conversation(),
             "the session we are refused from has never persisted a turn",
+        );
+        assert!(
+            poll_row(&mut world, &shell, &held, |row| row.tag.as_deref()
+                == Some("fix-auth"))
+            .await,
+            "the peer lists the held session under its label",
         );
 
         let stayed = apply_focus_request(
@@ -8385,25 +8465,94 @@ mod tests {
             .iter()
             .find(|t| t.contains(&held))
             .unwrap_or_else(|| panic!("the refusal is toasted: {toasts:?}"));
-        assert!(
-            refusal.contains("held by another writer"),
-            "it says why: {refusal:?}",
-        );
-        assert!(
-            refusal.contains(&format!("pid {}", std::process::id()))
-                && refusal.contains("a-rival-writer"),
-            "and it names the holder to go quit: {refusal:?}",
+        assert_eq!(
+            *refusal,
+            format!(
+                "Can't switch: fix-auth ({held}) is held by pid {} of host a-rival-writer.",
+                std::process::id(),
+            ),
+            "the label, the id in full, and the holder to go quit, each once",
         );
         assert!(
             !main_notices(&world)
                 .iter()
-                .any(|n| n.contains("held by another writer")),
+                .any(|n| n.contains("is held by")),
             "and nothing about the gesture was folded: {:?}",
             main_notices(&world),
         );
 
         drop(rival);
         shut_down(&world).await;
+    }
+
+    /// A lock-holder refusal for a tagged session: the subject is named once,
+    /// the way the user knows it, and the id they act on afterwards (`aj
+    /// continue <id>`) rides along in full rather than abbreviated. The cause
+    /// is named once too, by the holder there is to go quit.
+    #[test]
+    fn a_lock_refusal_names_the_session_once() {
+        let session = "2026-08-07-20-00-10-561";
+        let err = locked(session, Some(("a1b2c3", 3231223)));
+        let tagged = switch_refusal(session, Some("fix-auth"), &err);
+        assert_eq!(
+            tagged,
+            "Can't switch: fix-auth (2026-08-07-20-00-10-561) \
+             is held by pid 3231223 of host a1b2c3.",
+        );
+        assert_eq!(
+            tagged.matches(session).count(),
+            1,
+            "the id is in it once: {tagged:?}",
+        );
+        assert_eq!(
+            switch_refusal(session, None, &err),
+            "Can't switch: 2026-08-07-20-00-10-561 is held by pid 3231223 of host a1b2c3.",
+            "an untagged session's only name is its id, so it appears alone",
+        );
+    }
+
+    /// The same refusal over a connection reads the same as in process. The
+    /// status the transport reports belongs in a log, and what reaches the
+    /// user is the host's own sentence under our verb.
+    #[test]
+    fn a_wire_refusal_reads_like_a_local_one() {
+        let session = "2026-08-07-20-00-10-561";
+        let local = locked(session, Some(("a1b2c3", 3231223)));
+        let wire = ControlError::Remote(RemoteError::Status {
+            status: reqwest::StatusCode::CONFLICT,
+            code: Some("locked".to_string()),
+            message: local.to_string(),
+        });
+        assert_eq!(
+            switch_refusal(session, Some("fix-auth"), &wire),
+            switch_refusal(session, Some("fix-auth"), &local),
+        );
+    }
+
+    /// A refusal worded some other way keeps the peer's own subject rather
+    /// than being handed ours: the peer named the session itself, and putting
+    /// a second subject in front of a sentence we did not recognize would
+    /// name it twice again.
+    #[test]
+    fn an_unrecognized_refusal_keeps_the_peers_words() {
+        let err = ControlError::Host(aj_app::host::HostError::UnknownSession(
+            "no-such-session".to_string(),
+        ));
+        assert_eq!(
+            switch_refusal("no-such-session", Some("fix-auth"), &err),
+            "Can't switch: unknown session no-such-session.",
+        );
+    }
+
+    /// A lock refusal from the host, holder and all.
+    fn locked(session: &str, holder: Option<(&str, u32)>) -> ControlError {
+        ControlError::Host(aj_app::host::HostError::Locked {
+            session: session.to_string(),
+            holder: holder.map(|(host_id, pid)| aj_session::LockHolder {
+                pid,
+                host_id: host_id.to_string(),
+            }),
+        })
     }
 
     /// A switch that took reports itself in a toast and leaves both
@@ -8448,7 +8597,7 @@ mod tests {
         assert!(
             toast_lines(&shell)
                 .iter()
-                .any(|t| t == &format!("Switched to session {first}.")),
+                .any(|t| t == &format!("Switched to {first}.")),
             "the switch reports itself in a toast: {:?}",
             toast_lines(&shell),
         );
@@ -16490,7 +16639,7 @@ mod tests {
 
         let painted = painted_rows(&shell, 100, 40).join("\n");
         assert!(
-            painted.contains(&format!("Switched to session {}.", world.session())),
+            painted.contains(&format!("Switched to {}.", world.session())),
             "the confirmation is painted: {painted}",
         );
         shut_down(&world).await;

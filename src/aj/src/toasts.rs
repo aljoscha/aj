@@ -656,16 +656,14 @@ mod tests {
     }
 
     /// The refusal a locked session produces is the longest thing a toast
-    /// carries: the gesture's own words plus the peer's, naming a session id
-    /// twice and the holder besides. It has to draw on 80 columns, because a
-    /// box that does not fit draws nothing at all.
+    /// carries: the gesture's verb, the session named the way the user knows
+    /// it, the id they act on afterwards, and the holder besides. It has to
+    /// draw on 80 columns, because a box that does not fit draws nothing at
+    /// all.
     #[test]
     fn a_lock_holder_refusal_fits_an_80_column_terminal() {
-        let session = "2026-08-06-19-07-19-368";
-        let message = format!(
-            "Failed to switch to session {session}: session {session} is held by \
-             another writer (pid 483927 of host builder-1)"
-        );
+        let message = "Can't switch: rewrite-the-gateway (2026-08-06-19-07-19-368) \
+                       is held by pid 483927 of host builder-1.";
         let stack = empty_stack();
         show_toast(&stack, message);
         let toasts = widget_over(&stack);
@@ -686,7 +684,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert!(
-            flat.contains("is held by another writer (pid 483927 of host builder-1)"),
+            flat.contains("is held by pid 483927 of host builder-1"),
             "and it still names the holder to go quit: {flat:?}",
         );
     }
