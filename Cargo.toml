@@ -149,3 +149,11 @@ mod_module_files = "warn"
 needless_pass_by_ref_mut = "warn"
 borrow_interior_mutable_const = "warn"
 or_fun_call = "warn"
+
+[profile.dev]
+# Debug builds are the ones agents and humans iterate on, and full debuginfo is
+# the single biggest contributor to target dir size. Line tables keep file and
+# line in backtraces, which is what we actually read. For a debugger session
+# that needs variable inspection, override per build with
+# CARGO_PROFILE_DEV_DEBUG=2.
+debug = "line-tables-only"
