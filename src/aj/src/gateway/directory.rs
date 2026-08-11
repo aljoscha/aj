@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::gateway::config::HostAddress;
 use crate::gateway::enrollment::EnrolledHost;
-use crate::gateway::naming::{HostIdError, SessionAddress, validate_host_id};
+use crate::gateway::naming::{HostIdError, SessionAddress, addressable_session, validate_host_id};
 
 /// The enrolled hosts and the one directory they merge into.
 pub(crate) struct Directory {
@@ -104,20 +104,33 @@ struct Row {
 
 impl Row {
     /// One row of a host's directory, `None` for a row this gateway cannot read
-    /// an id from.
+    /// an id from, or could not route the id it reads.
     ///
-    /// Such a row has no namespace to appear under and nothing to route on, and
-    /// re-emitting it under the host's own id would put an id no client here can
-    /// address on the wire. A host's `list` frame is refused at decode long
-    /// before this, so it takes a directory composed some other way to get here.
+    /// A row with no readable id has no namespace to appear under and nothing to
+    /// route on, and re-emitting it under the host's own id would put an id no
+    /// client here can address on the wire. An id [`addressable_session`]
+    /// refuses is the same thing one step later: this gateway would publish it
+    /// and then refuse the attach for it, and a refused attach fails a client's
+    /// whole stream (spec 6.5), so one such row would cost that client the
+    /// sessions it holds on every other host.
+    ///
+    /// A host's `list` frame is refused at decode long before this, so it takes
+    /// a directory composed some other way to get here.
     fn read(raw: RawObject) -> Option<Self> {
-        match raw.get::<String>(ID_FIELD) {
-            Ok(Some(id)) => Some(Self { id, raw }),
+        let id = match raw.get::<String>(ID_FIELD) {
+            Ok(Some(id)) => id,
             outcome => {
                 tracing::warn!("dropping a directory row this gateway cannot name: {outcome:?}");
-                None
+                return None;
             }
+        };
+        if let Err(err) = addressable_session(&id) {
+            tracing::warn!(
+                "dropping the directory row {id:?}, which this gateway could not route: {err}"
+            );
+            return None;
         }
+        Some(Self { id, raw })
     }
 
     /// This row as a client of this gateway sees it: the three fields a gateway
@@ -916,6 +929,39 @@ mod tests {
                 .map(|(row, _)| row.id.clone())
                 .collect::<Vec<_>>(),
             vec!["left:s-2".to_string()],
+        );
+    }
+
+    /// A row this gateway would publish and then refuse to route is dropped
+    /// where a row with no readable id is. `SessionAddress::parse` refuses an
+    /// empty session half and a dot segment, and a refused attach fails a
+    /// client's whole stream (spec 6.5), so one such row on one host would cost
+    /// a client every session on every other one.
+    #[test]
+    fn a_row_this_gateway_would_refuse_to_route_is_dropped() {
+        let directory = Directory::new();
+        let left = connected(&directory, "127.0.0.1:1", "left", &[]);
+        connected(&directory, "127.0.0.1:2", "right", &["s-1"]);
+
+        directory.set_rows(
+            &left,
+            ["", ".", "..", "s-2"].iter().map(|id| row(id)).collect(),
+        );
+
+        let published: Vec<String> = merged(&directory)
+            .iter()
+            .map(|(row, _)| row.id.clone())
+            .collect();
+        let attach: Vec<AttachRequest> = published.iter().map(|id| attaching(id, None)).collect();
+        assert!(
+            directory.group(&attach).is_ok(),
+            "this gateway published ids it will not resolve, which fails the whole \
+             stream of any client that attaches them: {published:?}",
+        );
+        assert_eq!(
+            published,
+            vec!["left:s-2".to_string(), "right:s-1".to_string()],
+            "and the rows those ids arrived beside still travel",
         );
     }
 

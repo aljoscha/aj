@@ -41,28 +41,40 @@ impl SessionAddress {
     /// ever one. Splitting at the last would differ only for input neither side
     /// can produce, and would mis-route it silently instead of refusing it.
     ///
-    /// The session half is deliberately not checked against the store's
-    /// grammar. It belongs to the host, which validates its own ids and answers
-    /// 404 for one it could never hold (spec 6.2), and a gateway that judged it
-    /// too would have to be upgraded whenever a host's grammar grew. Two
-    /// exceptions, both about the half staying a path segment of its own when a
-    /// proxied URL is built from it: an empty one, and a dot segment. `.` and
-    /// `..` disappear from a URL path, so forwarding one would send the host a
-    /// request for a *different route* than the client named, which is how a
-    /// request about one session would become a create.
+    /// The session half is judged by [`addressable_session`] and by nothing
+    /// else here.
     pub(crate) fn parse(raw: &str) -> Result<Self, AddressError> {
         let (host, session) = raw
             .split_once(SEPARATOR)
             .ok_or(AddressError::NotNamespaced)?;
         validate_host_id(host).map_err(AddressError::Host)?;
-        if session.is_empty() {
-            return Err(AddressError::EmptySession);
-        }
-        if session == "." || session == ".." {
-            return Err(AddressError::DotSession);
-        }
+        addressable_session(session)?;
         Ok(Self::new(host, session))
     }
+}
+
+/// Whether `session` can be the session half of an id addressed here.
+///
+/// Deliberately not the store's grammar. The half belongs to the host, which
+/// validates its own ids and answers 404 for one it could never hold (spec
+/// 6.2), and a gateway that judged it too would have to be upgraded whenever a
+/// host's grammar grew. Two exceptions, both about the half staying a path
+/// segment of its own when a proxied URL is built from it: an empty one, and a
+/// dot segment. `.` and `..` disappear from a URL path, so forwarding one would
+/// send the host a request for a *different route* than the client named, which
+/// is how a request about one session would become a create.
+///
+/// Read by whatever puts a session id on this gateway's wire as well as by
+/// [`SessionAddress::parse`], so what a gateway publishes and what it resolves
+/// cannot drift.
+pub(crate) fn addressable_session(session: &str) -> Result<(), AddressError> {
+    if session.is_empty() {
+        return Err(AddressError::EmptySession);
+    }
+    if session == "." || session == ".." {
+        return Err(AddressError::DotSession);
+    }
+    Ok(())
 }
 
 impl fmt::Display for SessionAddress {
