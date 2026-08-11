@@ -340,6 +340,15 @@ impl Gateway {
     }
 
     /// Remove the enrollment of `host_id` and stop following it.
+    ///
+    /// NOTE: the client streams that already spliced that host's sessions keep
+    /// running. Each holds a stream of its own onto the host, which a withdrawal
+    /// does not reach into: its rows leave the directory and its route stops
+    /// resolving, so a command for one of those sessions is a 404 while its
+    /// frames still arrive. Whether a withdrawal should `reset` those sessions is
+    /// not settled: the re-attach a `reset` asks for would be refused, because
+    /// the namespace is gone, and on this protocol a refused attach fails the
+    /// client's whole stream rather than one session of it.
     pub(crate) async fn withdraw(&self, host_id: &str) -> Result<(), GatewayError> {
         let _writing = self.inner.writing.lock().await;
         let address = self.inner.directory.withdraw(host_id)?;

@@ -125,6 +125,11 @@ impl Splice {
     /// `idle` (spec 6.1). The directory is a watch rather than a queued frame
     /// because `list` is a cumulative snapshot the newest supersedes, so a
     /// client that fell behind wants only the latest (spec 6.4).
+    ///
+    /// A `list` or a heartbeat can land in the middle of an attach block, which a
+    /// host's own stream never does (it drains a block before its live queue).
+    /// That is harmless: the ordering spec 6.5 asks for is within one session's
+    /// frames, and neither of these belongs to a session.
     pub(crate) async fn next_frame(
         &mut self,
         idle: Duration,
