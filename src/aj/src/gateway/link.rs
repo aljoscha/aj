@@ -11,6 +11,7 @@
 //! `unreachable` flag, and the sessions of the other hosts are untouched.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use aj_wire::{DecodedFrame, Frame};
 use tokio::task::JoinHandle;
@@ -64,6 +65,7 @@ async fn run(
 ) {
     let mut delay = tuning.reconnect_delay;
     loop {
+        let started = Instant::now();
         let outcome = tokio::select! {
             _ = cancel.cancelled() => return,
             outcome = attempt(&address, &directory) => outcome,
@@ -72,9 +74,14 @@ async fn run(
             Attempt::Ended(reason) => {
                 tracing::info!("the control connection to {address} ended: {reason}");
                 directory.disconnected(&address, reason);
-                // The host was there, so the next attempt starts patient again
-                // rather than inheriting the backoff of an earlier outage.
-                delay = tuning.reconnect_delay;
+                // A connection that stood for a while was a real one, so the
+                // next attempt starts patient again rather than inheriting the
+                // backoff of an earlier outage. One that ended as soon as it
+                // opened keeps backing off: a host that hangs up immediately
+                // would otherwise be redialed at the floor rate forever.
+                if started.elapsed() >= tuning.max_reconnect_delay {
+                    delay = tuning.reconnect_delay;
+                }
             }
             Attempt::Failed(reason) => {
                 tracing::debug!("could not reach {address}: {reason}");

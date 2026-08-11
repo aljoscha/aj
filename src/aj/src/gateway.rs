@@ -436,9 +436,9 @@ fn resolve_gateway_id(state_dir: &Path) -> Result<String, GatewayError> {
     if let Some(id) = read(&path)? {
         return Ok(id);
     }
-    std::fs::create_dir_all(state_dir).map_err(|source| EnrollmentError::Read {
+    std::fs::create_dir_all(state_dir).map_err(|err| EnrollmentError::Write {
         path: state_dir.to_path_buf(),
-        source,
+        reason: err.to_string(),
     })?;
     let minted = format!("{:032x}", rand::random::<u128>());
     match std::fs::OpenOptions::new()
@@ -448,25 +448,28 @@ fn resolve_gateway_id(state_dir: &Path) -> Result<String, GatewayError> {
     {
         Ok(mut file) => {
             std::io::Write::write_all(&mut file, format!("{minted}\n").as_bytes()).map_err(
-                |source| EnrollmentError::Read {
+                |err| EnrollmentError::Write {
                     path: path.clone(),
-                    source,
+                    reason: err.to_string(),
                 },
             )?;
             Ok(minted)
         }
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
             read(&path)?.ok_or_else(|| {
-                EnrollmentError::Write {
+                // Blank, which only a crash between the create and the write
+                // leaves behind. Overwriting it would reopen the race the claim
+                // exists to close.
+                EnrollmentError::Unusable {
                     path: path.clone(),
                     reason: "the id file is empty: remove it to mint a fresh id".to_string(),
                 }
                 .into()
             })
         }
-        Err(source) => Err(EnrollmentError::Read {
+        Err(err) => Err(EnrollmentError::Write {
             path: path.clone(),
-            source,
+            reason: err.to_string(),
         }
         .into()),
     }

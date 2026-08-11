@@ -13,6 +13,8 @@
 //! instead of hanging CI.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use aj_app::cli::args::Args;
@@ -1236,6 +1238,78 @@ async fn wedged_host() -> (String, tokio::task::JoinHandle<()>) {
             std::future::pending::<()>().await;
             StatusCode::IM_A_TEAPOT
         });
+    let listener = tokio::net::TcpListener::bind(addr("127.0.0.1:0"))
+        .await
+        .expect("bind");
+    let bound = listener.local_addr().expect("local addr");
+    let serving = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{bound}"), serving)
+}
+
+/// A host that hangs up as soon as its stream opens is backed off like any other
+/// failure. Resetting the delay on every connection that *opened* would redial a
+/// host in that state at the floor rate for as long as it stayed there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_hangs_up_at_once_is_not_redialed_at_the_floor_rate() {
+    let dials = Arc::new(AtomicUsize::new(0));
+    let (url, serving) = hanging_up_host(Arc::clone(&dials)).await;
+    let fixture = Fixture::tuned(
+        TempDir::new().expect("tempdir"),
+        Vec::new(),
+        Tuning {
+            reconnect_delay: Duration::from_millis(20),
+            max_reconnect_delay: Duration::from_millis(100),
+            ..tuning()
+        },
+    )
+    .await;
+    assert_eq!(fixture.enroll(&url).await.status(), StatusCode::OK);
+
+    // Long enough that the floor rate would be unmistakable: 20ms between
+    // dials is 50 of them, where a doubling delay capped at 100ms is a dozen.
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    let dialled = dials.load(Ordering::Relaxed);
+
+    assert!(dialled > 1, "the link did keep trying, {dialled} times");
+    assert!(
+        dialled < 30,
+        "the link redialled {dialled} times in a second, which is the floor rate",
+    );
+
+    fixture.shutdown().await;
+    serving.abort();
+}
+
+/// A host that answers the handshake, opens the stream and closes it at once,
+/// counting the handshakes it was asked for.
+async fn hanging_up_host(dials: Arc<AtomicUsize>) -> (String, tokio::task::JoinHandle<()>) {
+    use axum::response::sse::{Event, Sse};
+    use axum::routing::get;
+
+    let hello = serde_json::json!({"protocol": PROTOCOL_VERSION, "capabilities": [],
+                                   "app_version": "0", "host_id": "flapping"});
+    let app = axum::Router::new()
+        .route(
+            "/v1/hello",
+            get(move || {
+                let hello = hello.clone();
+                let dials = Arc::clone(&dials);
+                async move {
+                    dials.fetch_add(1, Ordering::Relaxed);
+                    axum::Json(hello)
+                }
+            }),
+        )
+        .route(
+            "/v1/events",
+            get(|| async move {
+                Sse::new(futures::stream::empty::<
+                    Result<Event, std::convert::Infallible>,
+                >())
+            }),
+        );
     let listener = tokio::net::TcpListener::bind(addr("127.0.0.1:0"))
         .await
         .expect("bind");

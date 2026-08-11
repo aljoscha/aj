@@ -229,6 +229,12 @@ impl Directory {
     /// cannot be expected to tell the difference and nothing it could fix is
     /// being reported. A host that is down is 503, which is the one status a
     /// gateway has that a host does not (spec 6.1).
+    ///
+    /// Down means "this gateway's control connection to it is down", the same
+    /// thing the row's `unreachable` flag says, and a host whose port would in
+    /// fact answer is refused all the same. That is deliberate: what a client is
+    /// told about a session and what happens when it acts on one have to agree,
+    /// and the window is bounded by the link's redial.
     pub(crate) fn route(&self, id: &str) -> Result<Route, DirectoryError> {
         let unknown = |reason: String| DirectoryError::UnknownSession {
             id: id.to_string(),

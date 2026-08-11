@@ -89,16 +89,16 @@ impl EnrollmentFile {
             path: self.path.clone(),
             reason: "the state file has no parent directory".to_string(),
         })?;
-        std::fs::create_dir_all(parent).map_err(|source| EnrollmentError::Read {
+        std::fs::create_dir_all(parent).map_err(|err| EnrollmentError::Write {
             path: parent.to_path_buf(),
-            source,
+            reason: err.to_string(),
         })?;
         let body = serde_json::to_vec_pretty(&Persisted {
             hosts: hosts.to_vec(),
         })
-        .map_err(|source| EnrollmentError::Parse {
+        .map_err(|err| EnrollmentError::Write {
             path: self.path.clone(),
-            source,
+            reason: err.to_string(),
         })?;
         let write = || -> Result<(), String> {
             let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
@@ -131,6 +131,11 @@ pub(crate) enum EnrollmentError {
     },
     #[error("could not write the gateway state at {path}: {reason}")]
     Write { path: PathBuf, reason: String },
+    /// A file in the state directory that exists and cannot be used as it is.
+    /// Left for the operator, because the alternative is overwriting state whose
+    /// meaning is unclear.
+    #[error("{path} is not usable gateway state: {reason}")]
+    Unusable { path: PathBuf, reason: String },
 }
 
 /// Where an enrollment came from, which decides whether it can be withdrawn
