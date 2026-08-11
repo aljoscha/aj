@@ -10,7 +10,6 @@
 //! [`TranscriptView`] renders it with follow-tail.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2119,20 +2118,6 @@ fn focused_tag(world: &World) -> Option<String> {
         .and_then(|row| row.tag.clone())
 }
 
-/// Every label the peer reports, by session id, for the surfaces that show a
-/// list of sessions.
-///
-/// A snapshot: the selector is a view of one moment, and re-reading it per
-/// streamed batch would let rows in one list disagree about a session.
-fn session_tags(world: &World) -> HashMap<String, String> {
-    world
-        .directory
-        .rows()
-        .iter()
-        .filter_map(|row| Some((row.id.clone(), row.tag.clone()?)))
-        .collect()
-}
-
 /// Send a confirmed tag edit to the peer that owns the session.
 ///
 /// The one path for both modes: the host applies it under the session's own
@@ -2362,7 +2347,7 @@ async fn apply_command_action(
                 return ActionEffect::Redraw;
             }
             let handles = shell.borrow().overlay_handles();
-            open_session_selector(&handles, world.session().to_string(), session_tags(world));
+            open_session_selector(&handles, world.session().to_string());
             ActionEffect::OpenedOverlay
         }
         CommandAction::OpenSessionTree => match open_tree_overlay(world, shell).await {
@@ -17082,12 +17067,14 @@ mod tests {
         shut_down(&world).await;
     }
 
-    /// The session selector labels its rows from the peer's directory, so a
-    /// tag typed into the filter finds the session it names.
+    /// The selector labels its rows from the same scan it lists them from, so
+    /// a tag set through the peer reaches the picker off the store, and typing
+    /// it finds the session it names.
     #[tokio::test]
     async fn the_session_selector_labels_and_indexes_a_tagged_row() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        run_prompt(&mut world, "a prompt").await;
         seed_tag(&mut world, &shell, "fix-auth").await;
 
         let effect = apply_command(&mut world, &shell, CommandAction::OpenSessionSelector).await;
@@ -17097,31 +17084,23 @@ mod tests {
             .take_session_scan()
             .expect("the selector parked a scan");
 
-        // The scan's own walk is off the loop, so hand it the preview the
-        // store would have produced for the focused session.
-        let session = world.session().to_string();
-        let preview = SessionPreview {
-            session_id: session.clone(),
-            modified: Utc::now(),
-            created_at: Utc::now(),
-            last_message_at: Utc::now(),
-            size_bytes: 0,
-            message_count: 1,
-            first_user_message: Some("a prompt".to_string()),
-        };
-        extend_session_scan(&scan, &[preview], Utc::now(), true, true);
+        // The scan's own walk is off the loop, so run it here as the drive
+        // loop's fill arm would, over the same store.
+        let mut previews = Vec::new();
+        world
+            .persistence
+            .list_session_previews_streaming(&|| false, &mut |batch| previews.extend(batch));
+        extend_session_scan(&scan, &previews, Utc::now(), true, true);
 
         let row = scan
             .select
             .borrow()
             .selected()
             .expect("the focused session's row");
-        assert!(
-            row.description
-                .as_deref()
-                .is_some_and(|d| d.starts_with("fix-auth · ")),
-            "the label leads the metadata column: {:?}",
-            row.description,
+        assert_eq!(
+            row.prefix.as_deref(),
+            Some("fix-auth"),
+            "the label has a column of its own beside the preview",
         );
         assert!(
             row.filter_key.contains("fix-auth"),

@@ -12,12 +12,12 @@
 //! blocking on the whole walk. Rows are newest-first, the active session
 //! pre-selected and tagged `(current)`.
 //!
-//! A row's filter key is `"{first_user_message} {session_id}"` so typing
-//! either the prompt or the id finds it, matching aj's selector. The
-//! confirmed value is the session id, recovered through a shared
-//! filter-key -> id map (the same indirection the command palette uses for
-//! its actions), since the widget hands the confirm callback only the row's
-//! filter key.
+//! A row's filter key is `"{first_user_message} {tag} {session_id}"` so typing
+//! the prompt, the label, or the id finds it, and a `#`-prefixed query narrows
+//! to the labels alone. The confirmed value is the session id, recovered
+//! through a shared filter-key -> id map (the same indirection the command
+//! palette uses for its actions), since the widget hands the confirm callback
+//! only the row's filter key.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -37,6 +37,16 @@ use crate::text::one_line;
 /// truncating with an ellipsis.
 const PREVIEW_MAX_CHARS: usize = 60;
 
+/// How wide the tag column may get before truncating with an ellipsis. A tag
+/// can be 80 bytes, and the column is sized to the widest one on show, so
+/// without a cap a single long label would push the preview off the overlay.
+const TAG_COLUMN_MAX_CHARS: usize = 16;
+
+/// Typed as the query's first character, this narrows the filter to the tags
+/// (see [`FilterableSelect::set_scope_sigil`]). Anywhere else it is ordinary
+/// text.
+const TAG_SCOPE_SIGIL: char = '#';
+
 /// A parked request for the host to scan session previews and fill the
 /// selector's list. The select handle is `!Send`, so it stays on the host
 /// side; the spawned scan produces only the (Send) previews.
@@ -48,10 +58,6 @@ pub(crate) struct SessionScan {
     /// filter_key -> session_id, filled by [`extend_session_scan`] and read
     /// by the confirm callback (which sees only the row's filter key).
     ids: Rc<RefCell<HashMap<String, String>>>,
-    /// session_id -> user tag, snapshotted from the peer's directory when the
-    /// overlay opened. The scan reads logs, and a tag is not in one, so the
-    /// labels come from the rows the sidebar is already drawing.
-    tags: HashMap<String, String>,
 }
 
 impl SessionScan {
@@ -79,11 +85,7 @@ fn loading_items() -> Vec<SelectItem> {
 ///
 /// A switch is never refused for being busy. The session left behind stays
 /// attached and keeps folding, so its turn finishes unwatched.
-pub(crate) fn open_session_selector(
-    handles: &OverlayHandles,
-    current: String,
-    tags: HashMap<String, String>,
-) {
+pub(crate) fn open_session_selector(handles: &OverlayHandles, current: String) {
     let select = Rc::new(RefCell::new(FilterableSelect::new(
         loading_items(),
         handles.chrome.select.clone(),
@@ -94,6 +96,7 @@ pub(crate) fn open_session_selector(
         let mut sel = select.borrow_mut();
         // A project can hold many sessions, so show the vertical scroll bar.
         sel.set_show_scrollbar(true);
+        sel.set_scope_sigil(TAG_SCOPE_SIGIL);
         let ids_c = Rc::clone(&ids);
         let current_c = current.clone();
         let request_c = Rc::clone(&handles.session_request);
@@ -135,7 +138,6 @@ pub(crate) fn open_session_selector(
         select,
         current,
         ids,
-        tags,
     });
 }
 
@@ -162,8 +164,7 @@ pub(crate) fn extend_session_scan(
             .iter()
             .map(|preview| {
                 let is_current = preview.session_id == scan.current;
-                let tag = scan.tags.get(&preview.session_id).map(String::as_str);
-                let item = build_item(preview, tag, is_current, now);
+                let item = build_item(preview, is_current, now);
                 ids.insert(item.filter_key.clone(), preview.session_id.clone());
                 item
             })
@@ -189,17 +190,29 @@ pub(crate) fn extend_session_scan(
 }
 
 /// Build one row: the truncated first user message (tagged `(current)` for
-/// the active session) as the label, the user's tag plus the metadata triplet
-/// as the dim description, and `"{first_user_message} {tag} {session_id}"` as
-/// the filter key so the prompt, the label, or the id all match.
-fn build_item(
-    preview: &SessionPreview,
-    tag: Option<&str>,
-    is_current: bool,
-    now: DateTime<Utc>,
-) -> SelectItem {
-    SelectItem::new(format_primary(preview, is_current), haystack(preview, tag))
-        .with_description(format_secondary(preview, tag, now))
+/// the active session) as the label, the session's own label as a column
+/// beside it, the metadata triplet as the dim description, and
+/// `"{first_user_message} {tag} {session_id}"` as the filter key so the
+/// prompt, the label, or the id all match.
+///
+/// The tag is the row's scope key too, so a `#`-prefixed query matches labels
+/// and nothing else. It is folded to one line before any of that: it comes
+/// from a file that may have been hand-edited, and a lone carriage return in a
+/// drawn row is a panic in the frame (see [`one_line`]). Folding once here is
+/// what keeps the drawn column and the text the filter matches identical.
+fn build_item(preview: &SessionPreview, is_current: bool, now: DateTime<Utc>) -> SelectItem {
+    let tag = preview.tag.as_deref().map(one_line);
+    let item = SelectItem::new(
+        format_primary(preview, is_current),
+        haystack(preview, tag.as_deref()),
+    )
+    .with_description(format_secondary(preview, now));
+    match tag {
+        Some(tag) => item
+            .with_prefix(truncate_chars(&tag, TAG_COLUMN_MAX_CHARS))
+            .with_scope_key(tag),
+        None => item,
+    }
 }
 
 /// Searchable text for a preview: the first user message (when present), the
@@ -240,25 +253,16 @@ fn format_primary(preview: &SessionPreview, is_current: bool) -> String {
     }
 }
 
-/// The secondary (right / description) column: the user's tag when there is
-/// one, then message count, creation date, and time since the last message,
-/// e.g. `fix-auth · 42 msgs · created May 8 · last 5m`. The session id is
-/// omitted (it's already the row's value and would dominate the column width).
-///
-/// The tag leads because it is the one part a user chose, and it is folded to
-/// one line for the same reason the sidebar folds it: it comes from a file
-/// that may have been hand-edited, or from a peer that does not normalize
-/// what it publishes (see [`one_line`]).
-fn format_secondary(preview: &SessionPreview, tag: Option<&str>, now: DateTime<Utc>) -> String {
+/// The secondary (right / description) column: message count, creation date,
+/// and time since the last message, e.g. `42 msgs · created May 8 · last 5m`.
+/// The session id is omitted (it's already the row's value and would dominate
+/// the column width), and the tag has a column of its own.
+fn format_secondary(preview: &SessionPreview, now: DateTime<Utc>) -> String {
     let count = preview.message_count;
     let msg_word = if count == 1 { "msg" } else { "msgs" };
     let created = format_created(now, preview.created_at);
     let last = format_age(now, preview.last_message_at);
-    let meta = format!("{count} {msg_word} · created {created} · last {last}");
-    match tag {
-        Some(tag) => format!("{} · {meta}", one_line(tag)),
-        None => meta,
-    }
+    format!("{count} {msg_word} · created {created} · last {last}")
 }
 
 /// Render `then` as a coarse age relative to `now`: `now / 5m / 3h / 2d /
@@ -338,6 +342,16 @@ mod tests {
             size_bytes: 1024,
             message_count: count,
             first_user_message: first_user.map(|s| s.to_string()),
+            tag: None,
+        }
+    }
+
+    /// The same preview, labelled: what the scan produces for a session whose
+    /// sidecar holds a tag.
+    fn tagged(preview: SessionPreview, tag: &str) -> SessionPreview {
+        SessionPreview {
+            tag: Some(tag.to_string()),
+            ..preview
         }
     }
 
@@ -369,7 +383,6 @@ mod tests {
             select,
             current: current.to_string(),
             ids,
-            tags: HashMap::new(),
         };
         extend_session_scan(&scan, &previews, Utc::now(), true, true);
         (scan, request_slot)
@@ -383,7 +396,7 @@ mod tests {
             17,
             Duration::hours(3),
         );
-        let current = build_item(&p, Some("fix-auth"), true, Utc::now());
+        let current = build_item(&tagged(p.clone(), "fix-auth"), true, Utc::now());
         assert!(current.label.contains("debug the streaming protocol"));
         assert!(current.label.ends_with("(current)"), "{}", current.label);
         // The filter key carries the prompt, the label, and the id.
@@ -391,13 +404,60 @@ mod tests {
         assert!(current.filter_key.contains("fix-auth"));
         assert!(current.filter_key.contains("2025-05-09"));
 
-        let other = build_item(&p, None, false, Utc::now());
+        let other = build_item(&p, false, Utc::now());
         assert!(!other.label.contains("(current)"), "{}", other.label);
         assert!(
             !other.filter_key.contains("fix-auth"),
             "an untagged row indexes no label: {}",
             other.filter_key,
         );
+    }
+
+    /// The tag supplements the row rather than displacing anything: it takes a
+    /// column of its own, the preview keeps the label, and the metadata column
+    /// is the metadata alone. An untagged row carries no column at all, so an
+    /// untagged project's list is unchanged.
+    #[test]
+    fn the_tag_is_a_column_of_its_own_beside_the_preview() {
+        let p = preview(
+            "2025-05-09",
+            Some("debug the protocol"),
+            42,
+            Duration::hours(2),
+        );
+        let item = build_item(&tagged(p.clone(), "fix-auth"), false, Utc::now());
+        assert_eq!(item.prefix.as_deref(), Some("fix-auth"));
+        assert_eq!(item.label, "debug the protocol");
+        assert_eq!(item.scope_key.as_deref(), Some("fix-auth"));
+        assert!(
+            item.description
+                .as_deref()
+                .is_some_and(|d| d.starts_with("42 msgs · created ")),
+            "the metadata column is the metadata: {:?}",
+            item.description,
+        );
+
+        let untagged = build_item(&p, false, Utc::now());
+        assert_eq!(untagged.prefix, None);
+        assert_eq!(untagged.scope_key, None);
+        assert_eq!(untagged.description, item.description);
+    }
+
+    /// A tag can be 80 bytes, so the column truncates. The filter still sees
+    /// the whole label, so a query for the part that was cut off finds the row.
+    #[test]
+    fn a_long_tag_truncates_in_its_column_but_not_in_the_filter() {
+        let long = "release-candidate-verification";
+        let p = tagged(
+            preview("2025-05-09", Some("prompt"), 1, Duration::hours(1)),
+            long,
+        );
+        let item = build_item(&p, false, Utc::now());
+        let column = item.prefix.expect("a tagged row has the column");
+        assert_eq!(column.chars().count(), TAG_COLUMN_MAX_CHARS);
+        assert!(column.ends_with('\u{2026}'), "{column}");
+        assert_eq!(item.scope_key.as_deref(), Some(long));
+        assert!(item.filter_key.contains(long));
     }
 
     #[test]
@@ -452,7 +512,7 @@ mod tests {
         let handles = OverlayHandles::for_tests();
         handles.busy.set(busy);
 
-        open_session_selector(&handles, "current".to_string(), HashMap::new());
+        open_session_selector(&handles, "current".to_string());
         let scan = handles
             .session_scan
             .borrow_mut()
@@ -527,7 +587,6 @@ mod tests {
             select,
             current: "2025-05-08".to_string(),
             ids,
-            tags: HashMap::new(),
         };
 
         // First batch: two newer sessions, no current row. Replaces the
@@ -574,7 +633,6 @@ mod tests {
             select,
             current: "2025-05-08".to_string(),
             ids,
-            tags: HashMap::new(),
         };
 
         let batch1 = vec![
@@ -635,35 +693,37 @@ mod tests {
             size_bytes: 0,
             message_count: 42,
             first_user_message: Some("refactor".into()),
+            tag: None,
         };
         assert_eq!(
-            format_secondary(&p, None, now),
+            format_secondary(&p, now),
             "42 msgs · created 13:22 · last 2h"
         );
         assert_eq!(
-            format_secondary(&p, Some("fix-auth"), now),
-            "fix-auth · 42 msgs · created 13:22 · last 2h",
-            "the user's label leads the column",
+            format_secondary(&tagged(p, "fix-auth"), now),
+            "42 msgs · created 13:22 · last 2h",
+            "the label has a column of its own and does not lead this one",
         );
     }
 
-    /// A tag the peer supplies is folded before it reaches the column, and a
-    /// row built from one draws. Neither the store nor a conforming host can
-    /// produce a control character in a label, but a peer that does not
-    /// normalize can, and a lone carriage return in a drawn row is a panic in
-    /// the frame rather than a stray glyph.
+    /// A tag from a hand-edited sidecar is folded before it reaches the
+    /// column, and a row built from one draws. The store's own write path
+    /// rejects a control character, but the file it writes can be edited
+    /// afterwards, and a lone carriage return in a drawn row is a panic in the
+    /// frame rather than a stray glyph.
     #[test]
-    fn a_control_character_in_a_peer_tag_never_reaches_the_column() {
+    fn a_control_character_in_a_stored_tag_never_reaches_the_column() {
         use vaxis::vxfw::{FilterableSelect, SelectStyles, Widget};
 
-        let p = preview("2025-05-09-14-30-00", Some("debug"), 42, Duration::hours(2));
-        let described = format_secondary(&p, Some("ab\rcd"), Utc::now());
-        assert!(
-            !described.contains('\r') && described.starts_with("abcd · "),
-            "the label is folded to one line: {described:?}",
+        let p = tagged(
+            preview("2025-05-09-14-30-00", Some("debug"), 42, Duration::hours(2)),
+            "ab\rcd",
         );
+        let item = build_item(&p, false, Utc::now());
+        assert_eq!(item.prefix.as_deref(), Some("abcd"));
+        assert_eq!(item.scope_key.as_deref(), Some("abcd"));
+        assert!(!item.filter_key.contains('\r'), "{}", item.filter_key);
 
-        let item = build_item(&p, Some("ab\rcd"), false, Utc::now());
         let mut select = FilterableSelect::new(vec![item], SelectStyles::default());
         let surface = select.draw(&crate::test_support::draw_ctx(60, Some(10)));
         assert!(!surface.children.is_empty(), "the row drew");
@@ -676,6 +736,247 @@ mod tests {
         let primary = format_primary(&p, false);
         assert!(primary.ends_with('\u{2026}'), "{primary}");
         assert_eq!(primary.chars().count(), PREVIEW_MAX_CHARS);
+    }
+
+    /// A store holding one tagged session: an empty log under a valid id, the
+    /// state a session is in before its first prompt, plus its tag sidecar.
+    /// The `TempDir` guard is returned so the store outlives the caller's use
+    /// of it.
+    fn tagged_store(
+        tag: &str,
+    ) -> (
+        tempfile::TempDir,
+        aj_session::ConversationPersistence,
+        String,
+    ) {
+        let dir = tempfile::TempDir::with_prefix("aj-selector-tag-").expect("temp dir");
+        let persistence = aj_session::ConversationPersistence::new(dir.path().to_path_buf());
+        let id = "2025-05-09-14-30-00-000".to_string();
+        std::fs::write(dir.path().join(format!("{id}.jsonl")), "").expect("session log");
+        persistence.write_tag(&id, Some(tag)).expect("tag sidecar");
+        (dir, persistence, id)
+    }
+
+    /// The selector's rows carry the labels its own scan read, so a tagged
+    /// session shows its tag even though nothing has enumerated it into the
+    /// directory the sidebar draws.
+    #[test]
+    fn a_tag_the_directory_never_saw_still_reaches_the_selector() {
+        let (_dir, persistence, id) = tagged_store("held-elsewhere");
+        let mut previews = Vec::new();
+        persistence.list_session_previews_streaming(&|| false, &mut |batch| {
+            previews.extend(batch);
+        });
+        assert_eq!(previews.len(), 1, "the store scan found the session");
+        assert_eq!(previews[0].session_id, id);
+
+        let handles = OverlayHandles::for_tests();
+        open_session_selector(&handles, "another-session".to_string());
+        let scan = handles
+            .session_scan
+            .borrow_mut()
+            .take()
+            .expect("open parked a scan");
+        extend_session_scan(&scan, &previews, Utc::now(), true, true);
+
+        let drawn = drawn_rows(&handles).join("\n");
+        assert!(
+            drawn.contains("held-elsewhere"),
+            "the drawn row carries the label the scan read: {drawn}",
+        );
+    }
+
+    /// The composed overlay's drawn rows: the window the stack holds, drawn
+    /// and composited the way a frame paints it.
+    fn drawn_rows(handles: &OverlayHandles) -> Vec<String> {
+        let stack = handles.stack.borrow();
+        let window = &stack.top().expect("the selector is open").widget;
+        let surface = window
+            .borrow_mut()
+            .draw(&crate::test_support::draw_ctx(90, Some(20)));
+        crate::test_support::rows(&surface)
+    }
+
+    /// Three rows the filter can tell apart: two labelled, one not, with
+    /// `fix` reachable through a prompt as well as through a label.
+    fn filter_previews() -> Vec<SessionPreview> {
+        vec![
+            tagged(
+                preview(
+                    "2025-05-10-00-00-00",
+                    Some("refactor the parser"),
+                    3,
+                    Duration::minutes(1),
+                ),
+                "fix-auth",
+            ),
+            preview(
+                "2025-05-09-00-00-00",
+                Some("fix the streaming bug"),
+                2,
+                Duration::hours(1),
+            ),
+            tagged(
+                preview(
+                    "2025-05-08-00-00-00",
+                    Some("write the docs"),
+                    1,
+                    Duration::hours(4),
+                ),
+                "eval-run",
+            ),
+        ]
+    }
+
+    /// Open the real selector over `previews` and type `query` into it one
+    /// key at a time, through the widget the overlay stack hands focus to.
+    /// Nothing here reaches past the composed overlay, so dropping the scope
+    /// wiring or the tag column shows up in the drawn rows.
+    fn selector_over(previews: &[SessionPreview], query: &str) -> (OverlayHandles, SessionScan) {
+        use vaxis::key::Key;
+        use vaxis::vxfw::{Event, EventContext, Phase};
+
+        let handles = OverlayHandles::for_tests();
+        open_session_selector(&handles, "current".to_string());
+        let scan = handles
+            .session_scan
+            .borrow_mut()
+            .take()
+            .expect("open parked a scan");
+        extend_session_scan(&scan, previews, Utc::now(), true, true);
+
+        let focus = Rc::clone(&handles.stack.borrow().top().expect("open").focus);
+        for c in query.chars() {
+            let event = Event::KeyPress(Key {
+                codepoint: u32::from(c),
+                text: Some(c.to_string().into()),
+                ..Key::default()
+            });
+            let mut ctx = EventContext::new();
+            ctx.phase = Phase::AtTarget;
+            focus.borrow_mut().handle_event(&mut ctx, &event);
+        }
+        (handles, scan)
+    }
+
+    /// The labels of the rows a query left visible, in rank order.
+    fn matched(previews: &[SessionPreview], query: &str) -> Vec<String> {
+        let (_handles, scan) = selector_over(previews, query);
+        // Bound to a name so the `Ref` is released before `scan` drops.
+        let labels = scan.select.borrow().visible_labels();
+        labels
+    }
+
+    /// The tag joins the corpus the plain query already searched, so an id, a
+    /// prompt and a label all find their row with no syntax to learn.
+    #[test]
+    fn a_plain_query_matches_ids_previews_and_tags_alike() {
+        let previews = filter_previews();
+        assert_eq!(matched(&previews, "refactor"), ["refactor the parser"]);
+        assert_eq!(matched(&previews, "2025-05-08"), ["write the docs"]);
+        assert_eq!(matched(&previews, "eval-run"), ["write the docs"]);
+        assert_eq!(
+            matched(&previews, "fix"),
+            ["refactor the parser", "fix the streaming bug"],
+            "unscoped, a label and a prompt are equally good matches",
+        );
+    }
+
+    /// The `#` prefix narrows to the labels: the row whose only `fix` is in
+    /// its prompt drops out, and so does every unlabelled row.
+    #[test]
+    fn a_hash_prefixed_query_matches_tags_only() {
+        let previews = filter_previews();
+        assert_eq!(matched(&previews, "#fix"), ["refactor the parser"]);
+        assert_eq!(
+            matched(&previews, "#refactor"),
+            Vec::<String>::new(),
+            "the prompt is out of scope under the sigil",
+        );
+    }
+
+    /// A bare `#` is the empty scoped query, so it lists the labelled
+    /// sessions and nothing else.
+    #[test]
+    fn a_bare_hash_lists_the_labelled_sessions() {
+        assert_eq!(
+            matched(&filter_previews(), "#"),
+            ["refactor the parser", "write the docs"],
+        );
+    }
+
+    /// A project where nothing is labelled has nothing in scope, so a `#`
+    /// query comes up empty instead of falling back to the corpus.
+    #[test]
+    fn a_hash_query_over_an_unlabelled_project_matches_nothing() {
+        let previews = vec![
+            preview(
+                "2025-05-10-00-00-00",
+                Some("refactor"),
+                1,
+                Duration::hours(1),
+            ),
+            preview("2025-05-09-00-00-00", Some("debug"), 1, Duration::hours(2)),
+        ];
+        assert_eq!(matched(&previews, "#"), Vec::<String>::new());
+        assert_eq!(matched(&previews, "#refactor"), Vec::<String>::new());
+    }
+
+    /// Only the leading `#` is a sigil. Anywhere else it is a character like
+    /// any other, matched against the corpus, so a prompt that quotes an
+    /// issue number is still findable.
+    #[test]
+    fn a_hash_inside_a_query_is_literal() {
+        let previews = vec![
+            preview(
+                "2025-05-10-00-00-00",
+                Some("close issue #42"),
+                1,
+                Duration::hours(1),
+            ),
+            tagged(
+                preview(
+                    "2025-05-09-00-00-00",
+                    Some("unrelated"),
+                    1,
+                    Duration::hours(2),
+                ),
+                "issue-42",
+            ),
+        ];
+        assert_eq!(matched(&previews, "issue #4"), ["close issue #42"]);
+    }
+
+    /// The tag column is drawn, and drawn beside the preview rather than in
+    /// place of it. This goes through `open_session_selector` and the window
+    /// it pushes, so the column surviving in `build_item` alone is not enough
+    /// to pass.
+    #[test]
+    fn the_tag_column_draws_beside_the_preview() {
+        let (handles, _scan) = selector_over(&filter_previews(), "");
+        let rows = drawn_rows(&handles);
+        let row = rows
+            .iter()
+            .find(|row| row.contains("refactor the parser"))
+            .expect("the labelled row drew");
+        let tag_at = row.find("fix-auth").expect("the tag column drew");
+        let preview_at = row.find("refactor the parser").expect("checked above");
+        assert!(tag_at < preview_at, "tag column left of the preview: {row}");
+        assert!(
+            row.contains("3 msgs · created "),
+            "and the metadata column is still there: {row}",
+        );
+
+        // The unlabelled row keeps its preview, indented into the same column.
+        let plain = rows
+            .iter()
+            .find(|row| row.contains("fix the streaming bug"))
+            .expect("the unlabelled row drew");
+        assert_eq!(
+            plain.find("fix the streaming bug"),
+            Some(preview_at),
+            "every row's preview starts in the same column: {plain}",
+        );
     }
 
     /// The confirm/close subtitle resolves its key labels from the

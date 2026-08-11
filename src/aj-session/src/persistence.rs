@@ -7,6 +7,7 @@
 
 use aj_models::types::{Message, UserContent};
 use chrono::{DateTime, NaiveDateTime, Utc};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -157,6 +158,37 @@ impl ConversationPersistence {
             });
         }
         Ok(tags)
+    }
+
+    /// The label of every tagged session in the store, keyed by session id.
+    ///
+    /// Driven by [`Self::enumerate_tags`], so the cost is one directory read
+    /// plus one small read per sidecar that exists. An untagged store has no
+    /// `meta/` directory and pays a single failed `read_dir` with no
+    /// per-session read at all (spec 6.8), which is why this cannot be a loop
+    /// over the sessions asking each for its tag.
+    ///
+    /// A label that cannot be read is dropped rather than raised: a listing
+    /// carries labels as display metadata, and one unreadable sidecar must not
+    /// cost the caller its rows.
+    fn tags_by_session(&self) -> HashMap<String, String> {
+        let sidecars = match self.enumerate_tags() {
+            Ok(sidecars) => sidecars,
+            Err(err) => {
+                tracing::debug!(
+                    "could not enumerate tag sidecars in {}: {err}",
+                    self.meta_dir().display()
+                );
+                return HashMap::new();
+            }
+        };
+        sidecars
+            .into_iter()
+            .filter_map(|sidecar| {
+                let tag = self.read_tag(&sidecar.session_id).ok().flatten()?;
+                Some((sidecar.session_id, tag))
+            })
+            .collect()
     }
 
     /// Get metadata about all conversation sessions, sorted by creation
@@ -365,10 +397,12 @@ impl ConversationPersistence {
         mut on_progress: impl FnMut(usize, usize),
     ) -> Result<Vec<SessionPreview>, ConversationError> {
         let candidates = self.preview_candidates()?;
+        let mut tags = self.tags_by_session();
         let total = candidates.len();
         let mut previews = Vec::with_capacity(total);
         for (i, (session_id, path)) in candidates.into_iter().enumerate() {
-            if let Some(preview) = read_preview(session_id, &path, &|| false) {
+            if let Some(mut preview) = read_preview(session_id, &path, &|| false) {
+                preview.tag = tags.remove(&preview.session_id);
                 previews.push(preview);
             }
             // Tick progress for every file, including the pre-refactor
@@ -409,11 +443,15 @@ impl ConversationPersistence {
                 return;
             }
         };
+        // Read once up front rather than per file: the labels are a single
+        // directory read of `meta/` (see [`Self::tags_by_session`]), and the
+        // walk they annotate is the same snapshot of the store.
+        let mut tags = self.tags_by_session();
         for (session_id, path) in candidates {
             if cancel() {
                 break;
             }
-            if let Some(preview) = read_preview(session_id, &path, cancel) {
+            if let Some(mut preview) = read_preview(session_id, &path, cancel) {
                 // A mid-file cancel leaves `read_preview` with a partial
                 // count, so re-check before emitting: a sticky `cancel` is
                 // true here and we drop the partial rather than show a row
@@ -421,6 +459,7 @@ impl ConversationPersistence {
                 if cancel() {
                     break;
                 }
+                preview.tag = tags.remove(&preview.session_id);
                 emit(vec![preview]);
             }
         }
@@ -581,6 +620,13 @@ pub struct SessionPreview {
     /// user prompt. The string carries the verbatim text — the
     /// renderer applies its own truncation policy.
     pub first_user_message: Option<String>,
+    /// The label the session carries, `None` when it has none.
+    ///
+    /// It lives in a tag sidecar rather than in the log, so the listing
+    /// fills it from one read of the sidecar directory (see
+    /// [`ConversationPersistence::list_session_previews_streaming`]) and the
+    /// per-file walk leaves it unset.
+    pub tag: Option<String>,
 }
 
 /// Open `path`, walk every JSONL line, and assemble a
@@ -688,6 +734,8 @@ fn read_session_preview_file(
         size_bytes,
         message_count,
         first_user_message,
+        // Not in the log: the listing fills it from the tag sidecars.
+        tag: None,
     }))
 }
 
@@ -1259,6 +1307,92 @@ mod tests {
             .map(|p| p.session_id)
             .collect();
         assert_eq!(streamed, batched);
+    }
+
+    /// A preview carries the label its session's sidecar holds, and only that
+    /// session's: the listing is one source for both the row and its label.
+    #[test]
+    fn previews_carry_the_labels_the_sidecars_hold() {
+        let (_dir, persistence) = fixture();
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let mut log = ConversationLog::create(&persistence).expect("create");
+            append_user_then_assistant(&mut log, &format!("prompt {i}"), &format!("reply {i}"));
+            ids.push(log.session_id().to_string());
+            // Tiny sleep so the millisecond-resolution mint sees a fresh
+            // timestamp for each file.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        persistence
+            .write_tag(&ids[1], Some("fix-auth"))
+            .expect("write");
+
+        let labelled = |previews: Vec<SessionPreview>| -> Vec<(String, Option<String>)> {
+            let mut rows: Vec<(String, Option<String>)> = previews
+                .into_iter()
+                .map(|preview| (preview.session_id, preview.tag))
+                .collect();
+            rows.sort();
+            rows
+        };
+        let expected = vec![
+            (ids[0].clone(), None),
+            (ids[1].clone(), Some("fix-auth".to_string())),
+            (ids[2].clone(), None),
+        ];
+        assert_eq!(
+            labelled(persistence.list_session_previews(|_, _| {}).expect("list")),
+            expected,
+        );
+
+        let mut streamed = Vec::new();
+        persistence.list_session_previews_streaming(&|| false, &mut |batch| {
+            streamed.extend(batch);
+        });
+        assert_eq!(
+            labelled(streamed),
+            expected,
+            "the streaming listing labels its rows the same way",
+        );
+    }
+
+    /// The labels come off one read of the sidecar directory, not off a
+    /// per-session question. A sidecar whose session has no log is therefore
+    /// still found, which a listing that asked each session for its tag could
+    /// not do, and which is what keeps an untagged store free (spec 6.8).
+    #[test]
+    fn the_label_map_is_driven_by_the_sidecar_directory() {
+        let (_dir, persistence) = fixture();
+        assert!(
+            persistence.tags_by_session().is_empty(),
+            "an untagged store has no sidecar directory to read",
+        );
+
+        persistence
+            .write_tag("2024-01-01-00-00-00", Some("no-log-here"))
+            .expect("write");
+        assert_eq!(
+            persistence.tags_by_session().get("2024-01-01-00-00-00"),
+            Some(&"no-log-here".to_string()),
+        );
+    }
+
+    /// A sidecar body that reads as no label at all leaves the session
+    /// unlabelled rather than failing the listing, matching how the sidecar
+    /// read tolerates a hand-edited file.
+    #[test]
+    fn an_unusable_sidecar_leaves_the_session_unlabelled() {
+        let (dir, persistence) = fixture();
+        let mut log = ConversationLog::create(&persistence).expect("create");
+        append_user_then_assistant(&mut log, "prompt", "reply");
+        let id = log.session_id().to_string();
+        let meta = dir.path().join("meta");
+        std::fs::create_dir_all(&meta).expect("meta");
+        std::fs::write(meta.join(format!("{id}.tag")), "\n").expect("write");
+
+        let previews = persistence.list_session_previews(|_, _| {}).expect("list");
+        assert_eq!(previews.len(), 1);
+        assert_eq!(previews[0].tag, None);
     }
 
     #[test]

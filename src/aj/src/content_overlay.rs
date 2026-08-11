@@ -1192,6 +1192,35 @@ mod tests {
         }
     }
 
+    /// The tag supplements the id rather than standing in for it: both rows
+    /// are on the page, adjacent, and the id row still carries the id. An
+    /// untagged session keeps the same shape and says so.
+    #[test]
+    fn the_tag_row_sits_beside_the_id_row_without_replacing_it() {
+        let rows = session_info_rows(&sample_stats(), Some("fix-auth"));
+        let texts: Vec<String> = rows.iter().map(row_text).collect();
+        let id_at = texts
+            .iter()
+            .position(|t| t.starts_with("  id ") && t.contains("2026-06-19-14-22-03-512"))
+            .unwrap_or_else(|| panic!("an id row: {texts:?}"));
+        let tag_at = texts
+            .iter()
+            .position(|t| t.starts_with("  tag ") && t.contains("fix-auth"))
+            .unwrap_or_else(|| panic!("a tag row: {texts:?}"));
+        assert_eq!(tag_at, id_at + 1, "the tag row follows the id: {texts:?}");
+
+        let untagged: Vec<String> = session_info_rows(&sample_stats(), None)
+            .iter()
+            .map(row_text)
+            .collect();
+        assert_eq!(untagged.len(), texts.len(), "same shape when untagged");
+        assert!(
+            untagged[tag_at].starts_with("  tag ") && untagged[tag_at].contains("(none)"),
+            "the row stays and says so: {:?}",
+            untagged[tag_at],
+        );
+    }
+
     #[test]
     fn session_info_rows_render_identity_counts_and_tools() {
         let rows = session_info_rows(&sample_stats(), Some("fix-auth"));
