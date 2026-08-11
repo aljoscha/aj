@@ -1743,11 +1743,31 @@ fn prefill_branch_editor(editor: &Rc<RefCell<TextArea>>, message: &str) {
     editor.set_text(message);
 }
 
-/// The notice folded when a gesture incoherent with an armed branch anchor
-/// (steer, dequeue) is attempted: it points the user at Esc to cancel.
-fn branch_armed_notice(what: &str) -> String {
+/// The editor's top-bar label while a branch anchor is armed: the mode, what
+/// it wants, and how to leave it.
+///
+/// Arming is a mode the user stays in until they submit or cancel, not an
+/// event, so what it has to say stands in the chrome for exactly as long as
+/// the mode does. A toast would expire under a user still deciding what to
+/// type, and a transcript fold would put a fact about this client's editor
+/// into a conversation that has nothing to do with it.
+fn branch_armed_hint() -> String {
     format!(
-        "Can't {what} while branching \u{2014} press {} to cancel the branch first.",
+        "branching \u{00b7} type a message \u{00b7} {} cancels",
+        close_key_label()
+    )
+}
+
+/// The refusal toast for a gesture incoherent with an armed branch anchor
+/// (steer, dequeue): it points the user at Esc to cancel.
+///
+/// A refused gesture is a completed client action with nothing left pending,
+/// so it toasts rather than folding: the gesture never reached the
+/// conversation, and the mode it collided with is already named in the
+/// editor's chrome.
+fn branch_armed_refusal(what: &str) -> String {
+    format!(
+        "Can't {what} while branching. Press {} to cancel the branch first.",
         close_key_label()
     )
 }
@@ -2008,7 +2028,7 @@ async fn handle_host_action(
             // consume the branch prompt as steering for the branch being
             // abandoned. Refuse and keep the anchor and editor text intact.
             if shell.borrow().branch_anchor.borrow().is_some() {
-                fold_notice(world, &branch_armed_notice("steer"));
+                shell.borrow().show_toast(branch_armed_refusal("steer"));
                 return true;
             }
             handle_steer(world, shell).await;
@@ -2019,7 +2039,9 @@ async fn handle_host_action(
             // splice queued text into the prefilled branch prompt. Refuse and
             // keep the anchor and editor text intact.
             if shell.borrow().branch_anchor.borrow().is_some() {
-                fold_notice(world, &branch_armed_notice("dequeue a message"));
+                shell
+                    .borrow()
+                    .show_toast(branch_armed_refusal("dequeue a message"));
                 return true;
             }
             yank_pending_into_editor(world, shell).await
@@ -2096,16 +2118,11 @@ async fn submit_with_armed_anchor(
     text: String,
 ) -> ArmedSubmit {
     // Empty (post-trim): refuse and keep the anchor. The head must not move
-    // for a prompt that would be dropped. The editor is already empty, so
-    // there is nothing to restore.
+    // for a prompt that would be dropped. Nothing is said about it: the mode
+    // is still armed, and the standing hint in the editor's chrome is already
+    // asking for the message this submit did not carry (see
+    // [`branch_armed_hint`]).
     if text.trim().is_empty() {
-        fold_notice(
-            world,
-            &format!(
-                "Type a message to branch, or press {} to cancel.",
-                close_key_label()
-            ),
-        );
         return ArmedSubmit::Stay;
     }
     // Busy: refuse and keep the anchor and text. A head switch mid-turn
@@ -3972,10 +3989,6 @@ struct Shell {
     /// session install clears it so a stale anchor can't resolve against a
     /// different session's log.
     branch_anchor: Rc<RefCell<Option<String>>>,
-    /// Set by the Esc handler when it cancels an armed anchor, so the drive
-    /// loop folds the cancel notice (the Shell can't reach the chat model's
-    /// lifecycle). A plain flag, drained once per input event.
-    branch_cancelled: Rc<Cell<bool>>,
     /// The per-session image store, shared with the [`TranscriptView`]'s entry
     /// builder (which records pending images and reads transmitted ids) and
     /// the host loop (which transmits after each frame and frees on a session
@@ -4054,11 +4067,9 @@ impl Shell {
         // Branch-anchor slot, following the parked-slot pattern: `on_action`
         // arms it on `b`, the drive loop resolves it on submit, the transcript
         // reads it to keep the highlight box on the branched-from message, and
-        // the Esc handler flips `branch_cancelled` so the drive loop folds the
-        // cancel notice. Created here so the closures and the transcript all
-        // share the same cell.
+        // the Esc handler clears it on a cancel. Created here so the closures
+        // and the transcript all share the same cell.
         let branch_anchor: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-        let branch_cancelled: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         // The per-session image store, shared between the transcript builder
         // (which records pending images and reads transmitted ids) and the
         // host loop (which transmits and frees). Created here so both share
@@ -4472,7 +4483,6 @@ impl Shell {
             auth_request,
             tag_edit,
             branch_anchor,
-            branch_cancelled,
             image_store,
             terminal_caps: Cell::new(TerminalCaps::default()),
         }
@@ -4493,12 +4503,6 @@ impl Shell {
     /// drive loop schedules the clearing repaint at the toast's deadline).
     fn show_toast(&self, body: impl Into<ToastBody>) {
         crate::toasts::show_toast(&self.toasts, body);
-    }
-
-    /// Take the "an Esc cancelled the armed anchor" flag, so the drive loop
-    /// folds the cancel notice exactly once.
-    fn take_branch_cancelled(&self) -> bool {
-        self.branch_cancelled.replace(false)
     }
 
     /// Collect a keymap action parked for the host loop, if any.
@@ -4980,7 +4984,10 @@ impl Widget for Shell {
         {
             if self.branch_anchor.borrow().is_some() {
                 self.disarm_branch();
-                self.branch_cancelled.set(true);
+                // A cancel is a client action that has completed: the mode is
+                // gone, nothing is pending, and the conversation was never
+                // part of it. That is a toast, not a fold.
+                self.show_toast("Branch cancelled.");
                 ctx.consume_and_redraw();
                 return;
             }
@@ -5016,7 +5023,7 @@ fn sync_keymap_ctx(world: &World, shell: &Rc<RefCell<Shell>>) {
 
 /// Reconcile the editor's border tint and top-bar label from the active view
 /// and branch state. The border follows the viewed agent's thinking level
-/// (aj's color-bar parity). The label reads `branching` while a branch is
+/// (aj's color-bar parity). The label reads the branch hint while a branch is
 /// armed (the salient mode), else `agent N` for a sub-agent, cleared for the
 /// main agent. This is the single writer: the drive loop calls it once per
 /// iteration and once before the first paint, so no view-switch, arm, or
@@ -5029,7 +5036,7 @@ fn sync_editor_chrome(world: &World, shell: &Rc<RefCell<Shell>>) {
     // A pending branch overrides the agent marker: while composing the branch
     // prompt the mode matters more than which view is behind it.
     let label = if shell.branch_anchor.borrow().is_some() {
-        Some("branching".to_string())
+        Some(branch_armed_hint())
     } else {
         match active {
             AgentId::Main => None,
@@ -6033,13 +6040,6 @@ async fn drive(
                             } else {
                                 handle_editor_submit(world, shell, text).await;
                             }
-                        }
-                        // An Esc that cancelled an armed branch anchor: fold
-                        // the cancel notice (the Shell can't reach the chat
-                        // lifecycle) and redraw so it shows.
-                        if shell.borrow().take_branch_cancelled() {
-                            fold_notice(world, "Branch cancelled.");
-                            app.request_redraw();
                         }
                         // Bind the take out of the borrow first: the action
                         // handlers await on the host.
@@ -12526,7 +12526,7 @@ mod tests {
         app.handle_input(event);
         let _ = shell.borrow_mut().draw(&full_draw_ctx());
         assert!(shell.borrow().branch_anchor.borrow().is_none());
-        assert!(shell.borrow().take_branch_cancelled());
+        assert_eq!(toast_lines(&shell), vec!["Branch cancelled."]);
         assert!(
             !transcript.borrow().is_following_tail(),
             "branch cancellation preserves detached follow state"
@@ -14015,6 +14015,109 @@ mod tests {
         );
     }
 
+    /// The branch hint reaches the screen through the loop and the composed
+    /// layout: with an anchor armed, one real drive iteration reconciles the
+    /// editor chrome and the painted frame carries the hint. Read off the
+    /// paint rather than the widget, so a hint the layout does not draw fails
+    /// here too.
+    #[tokio::test]
+    async fn the_drive_loop_paints_the_branch_hint() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        arm_branch(&shell.borrow().branch_anchor, "m1".to_string());
+
+        let mut theme_watch = inert_theme_watch();
+        let mut prompt_history_rx: Option<UnboundedReceiver<Vec<String>>> = None;
+        let mut autocomplete_rx = shell
+            .borrow()
+            .editor
+            .borrow_mut()
+            .take_autocomplete_rx()
+            .expect("editor hands out its autocomplete receiver once");
+
+        // One benign key forces a full loop iteration, whose reconcile lays
+        // the hint into the editor's chrome, then EOF quits.
+        writer.write_all(b"x").expect("benign key");
+        drop(writer);
+        let exit = drive(
+            &mut app,
+            &root,
+            &shell,
+            &mut world,
+            &mut theme_watch,
+            &mut prompt_history_rx,
+            &mut autocomplete_rx,
+        )
+        .await
+        .expect("drive exits without a fatal error");
+        assert!(matches!(exit, SessionExit::Quit), "EOF quit the loop");
+
+        let painted = painted_rows(&shell, 100, 40).join("\n");
+        for part in ["branching", "type a message", "cancels"] {
+            assert!(
+                painted.contains(part),
+                "the painted frame says {part:?}: {painted}",
+            );
+        }
+    }
+
+    /// Esc typed at the real terminal, through the real loop: the branch is
+    /// disarmed, the cancel toast is painted, the standing hint is gone from
+    /// the chrome, and the conversation gained nothing. Every wire in the
+    /// path is live here, from the key bytes to the composed frame.
+    #[tokio::test]
+    async fn a_typed_escape_cancels_the_branch_and_toasts_it() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        let folded = main_notices(&world);
+        arm_branch(&shell.borrow().branch_anchor, "m1".to_string());
+
+        let mut theme_watch = inert_theme_watch();
+        let mut prompt_history_rx: Option<UnboundedReceiver<Vec<String>>> = None;
+        let mut autocomplete_rx = shell
+            .borrow()
+            .editor
+            .borrow_mut()
+            .take_autocomplete_rx()
+            .expect("editor hands out its autocomplete receiver once");
+
+        writer.write_all(b"\x1b").expect("write an escape");
+        drop(writer);
+        let exit = drive(
+            &mut app,
+            &root,
+            &shell,
+            &mut world,
+            &mut theme_watch,
+            &mut prompt_history_rx,
+            &mut autocomplete_rx,
+        )
+        .await
+        .expect("drive exits without a fatal error");
+        assert!(matches!(exit, SessionExit::Quit), "EOF quit the loop");
+
+        assert!(
+            shell.borrow().branch_anchor.borrow().is_none(),
+            "the typed Esc disarmed the branch",
+        );
+        let painted = painted_rows(&shell, 100, 40).join("\n");
+        assert!(
+            painted.contains("Branch cancelled."),
+            "the cancel is toasted onto the frame: {painted}",
+        );
+        assert!(
+            !painted.contains("branching"),
+            "and the standing hint is gone with the mode: {painted}",
+        );
+        assert_eq!(
+            main_notices(&world),
+            folded,
+            "and neither the arm nor the cancel folded",
+        );
+    }
+
     /// A confirmed task pick opens and refocuses its viewer before another
     /// queued key can dispatch through the closed picker path.
     #[tokio::test]
@@ -14686,32 +14789,43 @@ mod tests {
         assert!(shell.borrow().branch_anchor.borrow().is_none());
     }
 
-    /// While a branch is armed the editor chrome reads `branching`; disarming
+    /// While a branch is armed the editor chrome carries the standing hint:
+    /// the mode, what it wants, and how to leave it. Arming is a mode the
+    /// user stays in, so the hint stands for as long as the mode does rather
+    /// than expiring like a toast or settling into the transcript. Disarming
     /// restores the agent marker (empty on the main view).
     #[tokio::test]
-    async fn editor_chrome_shows_branching_while_armed() {
+    async fn editor_chrome_shows_the_branch_hint_while_armed() {
         let dir = TempDir::new().expect("tempdir");
         let (world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let folded = main_notices(&world);
 
         sync_editor_chrome(&world, &shell);
         assert!(
             !editor_top_bar_text(&shell).contains("branching"),
-            "no marker before arming"
+            "no hint before arming"
         );
 
         arm_branch(&shell.borrow().branch_anchor, "m1".to_string());
         sync_editor_chrome(&world, &shell);
-        assert!(
-            editor_top_bar_text(&shell).contains("branching"),
-            "armed: chrome shows the branching marker: {}",
-            editor_top_bar_text(&shell),
+        let armed = editor_top_bar_text(&shell);
+        for part in ["branching", "type a message", "cancels"] {
+            assert!(
+                armed.contains(part),
+                "armed: the chrome says {part:?}: {armed}",
+            );
+        }
+        assert_eq!(
+            main_notices(&world),
+            folded,
+            "and arming folds nothing of its own",
         );
 
         shell.borrow().disarm_branch();
         sync_editor_chrome(&world, &shell);
         assert!(
             !editor_top_bar_text(&shell).contains("branching"),
-            "disarming clears the marker"
+            "disarming clears the hint"
         );
     }
 
@@ -14748,16 +14862,16 @@ mod tests {
     }
 
     /// Esc cancels an armed anchor: it clears the anchor (dropping the
-    /// transcript's highlight box), flags
-    /// the drive loop to fold the cancel notice, and consumes the key. The
-    /// editor text is left untouched (the user's to keep). The popup-first
-    /// priority is structural: the editor consumes Esc at the target phase
-    /// when its autocomplete popup is open, so this bubble-phase handler only
-    /// runs with the popup closed.
+    /// transcript's highlight box), toasts the cancel, and consumes the key.
+    /// The editor text is left untouched (the user's to keep). The
+    /// popup-first priority is structural: the editor consumes Esc at the
+    /// target phase when its autocomplete popup is open, so this bubble-phase
+    /// handler only runs with the popup closed.
     #[tokio::test]
     async fn esc_cancels_the_armed_anchor() {
         let dir = TempDir::new().expect("tempdir");
-        let (_world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let (world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let folded = main_notices(&world);
         shell.borrow().editor.borrow_mut().set_text("kept draft");
         {
             let sh = shell.borrow();
@@ -14777,9 +14891,15 @@ mod tests {
             shell.borrow().branch_anchor.borrow().is_none(),
             "anchor cleared"
         );
-        assert!(
-            shell.borrow().take_branch_cancelled(),
-            "cancel flag set for the drive loop's notice"
+        assert_eq!(
+            toast_lines(&shell),
+            vec!["Branch cancelled."],
+            "the cancel is a completed client action, so it toasts",
+        );
+        assert_eq!(
+            main_notices(&world),
+            folded,
+            "and folds nothing into the conversation",
         );
         assert_eq!(
             shell.borrow().editor.borrow().text(),
@@ -14790,11 +14910,13 @@ mod tests {
 
     /// Steer and dequeue are refused while a branch anchor is armed, keeping
     /// the anchor and the editor draft intact (both are incoherent with a
-    /// pending branch).
+    /// pending branch). The refusal is a completed client gesture, so it
+    /// toasts rather than folding into a conversation it never reached.
     #[tokio::test]
     async fn steer_and_dequeue_refused_while_branch_armed() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let folded = main_notices(&world);
         shell.borrow().editor.borrow_mut().set_text("branch draft");
         {
             let sh = shell.borrow();
@@ -14808,15 +14930,29 @@ mod tests {
         assert!(handle_host_action(&mut world, &shell, AjAction::Dequeue).await);
         assert_eq!(shell.borrow().editor.borrow().text(), "branch draft");
         assert!(shell.borrow().branch_anchor.borrow().is_some());
+
+        let toasts = toast_lines(&shell);
+        for what in ["steer", "dequeue a message"] {
+            assert!(
+                toasts
+                    .iter()
+                    .any(|t| t.contains(&format!("Can't {what} while branching"))),
+                "the {what} refusal toasts: {toasts:?}",
+            );
+        }
+        assert_eq!(main_notices(&world), folded, "and neither folds");
         shut_down(&world).await;
     }
 
     /// An empty (post-trim) submit while armed is refused and keeps the
     /// anchor: the head must not move for a prompt that would be dropped.
+    /// It says nothing of its own, because the mode it stays in is already
+    /// asking for the message in the editor's chrome.
     #[tokio::test]
     async fn empty_submit_refused_keeps_anchor() {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let folded = main_notices(&world);
         {
             let sh = shell.borrow();
             arm_branch(&sh.branch_anchor, "m1".to_string());
@@ -14826,6 +14962,17 @@ mod tests {
         assert!(
             shell.borrow().branch_anchor.borrow().is_some(),
             "the anchor is kept on an empty submit"
+        );
+        assert_eq!(
+            main_notices(&world),
+            folded,
+            "and nothing is folded about it",
+        );
+        sync_editor_chrome(&world, &shell);
+        assert!(
+            editor_top_bar_text(&shell).contains("type a message"),
+            "the standing hint is what asks for one: {}",
+            editor_top_bar_text(&shell),
         );
         shut_down(&world).await;
     }
@@ -15777,6 +15924,12 @@ mod tests {
         assert!(
             shell.borrow().branch_anchor.borrow().is_none(),
             "the anchor is disarmed once it is handed off"
+        );
+        sync_editor_chrome(&world, &shell);
+        assert!(
+            !editor_top_bar_text(&shell).contains("branching"),
+            "and the mode's standing hint goes with it: {}",
+            editor_top_bar_text(&shell),
         );
 
         // The host owns the resolution, so the refusal comes from there.
