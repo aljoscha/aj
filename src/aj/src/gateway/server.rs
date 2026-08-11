@@ -12,12 +12,14 @@
 //! and it means a route a host gains needs no change here. What gets validated is
 //! the namespace, never the route.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aj_wire::{EnrollHostRequest, ErrorResponse, Frame, SessionSummary};
+use aj_app::host::AttachRequest;
+use aj_wire::{Cursor, EnrollHostRequest, ErrorResponse};
 use axum::body::{Body as AxumBody, Bytes};
 use axum::extract::{ConnectInfo, FromRequest, Path, Query, Request, State};
 use axum::http::{Method, StatusCode, header};
@@ -30,13 +32,13 @@ use futures::Stream;
 use serde::de::DeserializeOwned;
 use serde_json::value::RawValue;
 use tokio::net::TcpListener;
-use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::gateway::config::HostAddress;
 use crate::gateway::directory::{DirectoryError, HostTarget, Route};
 use crate::gateway::naming::SessionAddress;
+use crate::gateway::splice::{Outgoing, Splice};
 use crate::gateway::{Gateway, GatewayError};
 use crate::remote::{IdentityError, IdentityGate};
 
@@ -247,7 +249,7 @@ async fn create_session(
     let url = sessions_url(&target.address).ok_or_else(|| not_a_base_url(&target.address))?;
     let body = serde_json::to_vec(&body).map_err(|err| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
-        code: "internal",
+        code: Cow::Borrowed("internal"),
         message: format!(
             "could not re-encode the create for {}: {err}",
             target.address
@@ -278,7 +280,7 @@ fn namespace_created(answer: Answer, target: &HostTarget) -> Result<Response, Ap
     }
     let unreadable = |reason: String| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
-        code: "internal",
+        code: Cow::Borrowed("internal"),
         message: format!(
             "the host at {} answered a create this gateway cannot namespace, so the session \
              it created is not addressable here: {reason}",
@@ -303,98 +305,96 @@ fn namespace_created(answer: Answer, target: &HostTarget) -> Result<Response, Ap
     .into_response())
 }
 
-/// Open the gateway's event stream.
+/// Open the gateway's event stream (spec 6.5, 7.1).
 ///
-/// A client that attaches nothing gets the merged directory and heartbeats,
-/// which is what a session list and a sidebar need. A client that attaches a
-/// session is refused: forwarding a session's frames means splicing the owning
-/// host's stream, and this build does not, so the alternative to refusing is a
-/// stream that silently carries nothing for the session it was asked for.
+/// Every session the request names is attached on the host that owns it, with
+/// the client's own cursor, and its frames travel back with their ids namespaced
+/// ([`crate::gateway::splice`]). A client that attaches nothing gets the merged
+/// directory and heartbeats, which is what a session list and a sidebar need.
 async fn events(
     State(state): State<Arc<ServerState>>,
     Query(params): Query<Vec<(String, String)>>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, aj_agent::BoxError>>>, ApiError> {
-    let attached = params.iter().filter(|(key, _)| key == "session").count();
-    if attached > 0 {
-        return Err(ApiError::unsupported(format!(
-            "this gateway cannot attach a session yet ({attached} named): attach it on the \
-             host that owns it, which every row of `GET /v1/sessions` names"
-        )));
-    }
-    Ok(Sse::new(list_stream(
-        state.gateway.subscribe(),
+    let attach = attach_requests(&params)?;
+    let splice = state.gateway.splice(&attach).await?;
+    Ok(Sse::new(client_stream(
+        splice,
         state.heartbeat,
         state.shutdown.clone(),
     )))
 }
 
+/// Parse the stream's repeatable `session=<id>[@<epoch>:<seq>]` parameters
+/// (spec 6.5).
+///
+/// The cursor is split off at the **first** `@`, exactly as a host does, so a
+/// namespaced id and the cursor behind it read the same on both sides of a
+/// gateway. Unknown parameters are ignored (spec 6.10), and attaching nothing is
+/// legal.
+///
+/// The id itself is judged where it is resolved
+/// ([`crate::gateway::directory::Directory::group`]): it is one namespace plus
+/// one opaque half, and only the enrolled hosts say whether the namespace names
+/// anything.
+fn attach_requests(params: &[(String, String)]) -> Result<Vec<AttachRequest>, ApiError> {
+    let mut requests = Vec::new();
+    for (key, value) in params {
+        if key != "session" {
+            continue;
+        }
+        let (session, cursor) = match value.split_once('@') {
+            Some((session, cursor)) => {
+                let cursor: Cursor = cursor.parse().map_err(|err| {
+                    ApiError::invalid(format!("invalid cursor in session={value:?}: {err}"))
+                })?;
+                (session, Some(cursor))
+            }
+            None => (value.as_str(), None),
+        };
+        requests.push(AttachRequest {
+            session: session.to_string(),
+            cursor,
+        });
+    }
+    Ok(requests)
+}
+
 async fn unknown_endpoint() -> ApiError {
     ApiError {
         status: StatusCode::NOT_FOUND,
-        code: "unknown_endpoint",
+        code: Cow::Borrowed("unknown_endpoint"),
         message: "no such endpoint on this gateway".to_string(),
     }
 }
 
-/// One `list` frame per change of the merged directory, plus a heartbeat
-/// whenever the writer has been idle for `idle`.
-struct ListWriter {
-    directory: watch::Receiver<Arc<Vec<SessionSummary>>>,
-    /// Whether the opening frame has been written.
-    opened: bool,
-}
-
-impl ListWriter {
-    /// The current directory, marked as seen so the next
-    /// [`watch::Receiver::changed`] waits for one this stream has not been sent.
-    fn snapshot(&mut self) -> Vec<SessionSummary> {
-        self.directory.borrow_and_update().as_ref().clone()
-    }
-}
-
-/// The stream of frames one attached client receives.
+/// One SSE `data:` line per frame this client is owed (spec 6.1).
 ///
-/// The current directory opens it, because a client that has just attached has
-/// been sent nothing and would otherwise wait for a change to learn what is
-/// there. After that only changes are written: `list` is cumulative, so a
-/// snapshot identical to the last one carries no information (spec 6.8).
-fn list_stream(
-    directory: watch::Receiver<Arc<Vec<SessionSummary>>>,
+/// Which frames those are, and where they come from, is
+/// [`Splice::next_frame`]'s: this only writes them. Dropping the response drops
+/// the splice, which closes the upstream streams it opened.
+fn client_stream(
+    splice: Splice,
     idle: Duration,
     shutdown: CancellationToken,
 ) -> impl Stream<Item = Result<Event, aj_agent::BoxError>> {
-    let writer = ListWriter {
-        directory,
-        opened: false,
-    };
-    futures::stream::unfold(Some(writer), move |state| {
+    futures::stream::unfold(Some(splice), move |state| {
         let shutdown = shutdown.clone();
         async move {
-            let mut writer = state?;
-            let frame = if writer.opened {
-                let change = tokio::select! {
-                    _ = shutdown.cancelled() => return None,
-                    change = tokio::time::timeout(idle, writer.directory.changed()) => change,
-                };
-                match change {
-                    Ok(Ok(())) => Frame::List {
-                        sessions: writer.snapshot(),
-                    },
-                    // The gateway is gone, so there is nothing left to say.
-                    Ok(Err(_)) => return None,
-                    Err(_) => Frame::Heartbeat,
-                }
-            } else {
-                writer.opened = true;
-                Frame::List {
-                    sessions: writer.snapshot(),
-                }
+            let mut splice = state?;
+            let frame = splice.next_frame(idle, &shutdown).await?;
+            let json = match &frame {
+                // A frame from a host is re-serialized from the JSON it arrived
+                // as, so a payload this build does not understand travels
+                // verbatim (spec 6.10).
+                Outgoing::Spliced(frame) => serde_json::to_string(frame),
+                Outgoing::Own(frame) => serde_json::to_string(frame),
             };
-            match serde_json::to_string(&frame) {
-                Ok(json) => Some((Ok(Event::default().data(json)), Some(writer))),
-                // A frame this gateway built that will not serialize is a bug in it.
-                // Ending the stream makes the client reconnect, which is the only
-                // honest answer.
+            match json {
+                Ok(json) => Some((Ok(Event::default().data(json)), Some(splice))),
+                // A frame that will not serialize is a bug in this gateway, or a
+                // host that sent JSON this one cannot write back. Ending the
+                // stream makes the client reconnect, which is the only honest
+                // answer: skipping the frame would silently drop a reliable one.
                 Err(err) => Some((Err(err.into()), None)),
             }
         }
@@ -480,7 +480,7 @@ async fn read_body(request: Request) -> Result<Bytes, ApiError> {
 fn not_a_base_url(address: &HostAddress) -> ApiError {
     ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
-        code: "internal",
+        code: Cow::Borrowed("internal"),
         message: format!("{address} is not a base URL"),
     }
 }
@@ -679,8 +679,9 @@ where
 struct ApiError {
     status: StatusCode,
     /// A stable snake_case token, so a client can branch on the reason without
-    /// parsing prose.
-    code: &'static str,
+    /// parsing prose. Owned when it is the owning host's own token, travelling
+    /// back through this gateway unchanged.
+    code: Cow<'static, str>,
     message: String,
 }
 
@@ -688,18 +689,7 @@ impl ApiError {
     fn invalid(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
-            code: "invalid_request",
-            message: message.into(),
-        }
-    }
-
-    /// A well-formed request this gateway cannot serve, which is 409 in the
-    /// protocol's vocabulary (spec 6.1) rather than 404: the endpoint is there,
-    /// and the same request against a host may well succeed.
-    fn unsupported(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::CONFLICT,
-            code: "unsupported",
+            code: Cow::Borrowed("invalid_request"),
             message: message.into(),
         }
     }
@@ -708,7 +698,7 @@ impl ApiError {
     fn unreachable(host: &str, cause: impl std::fmt::Display) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
-            code: "host_unreachable",
+            code: Cow::Borrowed("host_unreachable"),
             message: format!("could not reach the host at {host}: {cause}"),
         }
     }
@@ -719,7 +709,7 @@ impl IntoResponse for ApiError {
         (
             self.status,
             Json(ErrorResponse {
-                code: self.code.to_string(),
+                code: self.code.into_owned(),
                 message: self.message,
             }),
         )
@@ -735,6 +725,24 @@ impl From<GatewayError> for ApiError {
                 (StatusCode::SERVICE_UNAVAILABLE, "host_unreachable")
             }
             GatewayError::Directory(err) => directory_status(err),
+            // The owning host's own refusal, code and all (spec 6.10). A host
+            // that sent no code is not one this protocol describes, so this
+            // gateway names the refusal itself rather than inventing the host's
+            // word for it.
+            GatewayError::AttachRefused {
+                status,
+                code,
+                message,
+            } => {
+                return Self {
+                    status: *status,
+                    code: match code {
+                        Some(code) => Cow::Owned(code.clone()),
+                        None => Cow::Borrowed("host_refused"),
+                    },
+                    message: message.clone(),
+                };
+            }
             // A gateway that cannot write down what it was told is not a client's
             // fault, and the enrollment did not stick.
             GatewayError::State(_) | GatewayError::Http(_) => {
@@ -746,7 +754,7 @@ impl From<GatewayError> for ApiError {
         }
         Self {
             status,
-            code,
+            code: Cow::Borrowed(code),
             message: err.to_string(),
         }
     }
@@ -791,7 +799,7 @@ impl From<IdentityError> for ApiError {
         };
         Self {
             status,
-            code,
+            code: Cow::Borrowed(code),
             // A rejected peer learns that it was rejected, not why.
             message: match status {
                 StatusCode::FORBIDDEN => "this peer is not authorized".to_string(),

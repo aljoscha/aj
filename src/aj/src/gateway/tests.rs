@@ -13,17 +13,20 @@
 //! instead of hanging CI.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
+use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
 use aj_app::cli::args::Args;
-use aj_app::host::{AttachRequest, SessionHost};
+use aj_app::host::{AttachRequest, Command, SessionHost};
 use aj_app::test_support::finalized_text_message;
+use aj_models::types::AssistantContent;
 use aj_wire::{
-    CreateSessionRequest, EnrollHostRequest, ErrorResponse, Frame, HostList, HostSource,
-    HostSummary, PROTOCOL_VERSION, PromptInput, PromptRequest, SessionCreated, SessionList,
-    SessionSummary,
+    CreateSessionRequest, Cursor, DecodedFrame, EnrollHostRequest, ErrorResponse, Frame, HostList,
+    HostSource, HostSummary, PROTOCOL_VERSION, PromptInput, PromptRequest, SessionCreated,
+    SessionList, SessionSummary,
 };
 use clap::Parser;
 use reqwest::StatusCode;
@@ -34,7 +37,7 @@ use crate::gateway::naming::SessionAddress;
 use crate::remote::tests::{
     FakeWhois, HostHandles, addr, bounded, canned_server, scripted, scripted_host,
 };
-use crate::remote::{IdentityGate, RemoteClient, RemoteCommand, RemoteServer};
+use crate::remote::{IdentityGate, RemoteClient, RemoteCommand, RemoteEvents, RemoteServer};
 
 /// How long a settled directory has to prove it is not settled after all.
 ///
@@ -158,11 +161,119 @@ impl Upstream {
     /// The address is reused deliberately: a gateway redials the address it was
     /// enrolled with, so a fresh port would test enrollment instead of
     /// reconnection. The store carries the `host-id` file, so the host returns
-    /// under the same id and its sessions keep their namespace.
+    /// under the same id and its sessions keep their namespace. Their epochs do
+    /// not: an epoch is minted per materialization and never persisted (spec
+    /// 6.5), so a restart is what makes a cursor stale.
     async fn restart(&mut self) {
         let (host, server) = Self::serve(&self.dir, Some(self.addr)).await;
         self.host = host;
         self.server = Some(server);
+    }
+
+    /// Run a turn with no gateway in the way.
+    ///
+    /// What a test needs while the gateway's connection to this host is cut: the
+    /// host is up and its sessions keep running, which is exactly the state an
+    /// incremental resume is about.
+    async fn prompt(&self, session: &str, text: &str) {
+        self.host
+            .command(
+                session,
+                Command::Prompt {
+                    agent: AgentId::Main,
+                    content: PromptInput::Text {
+                        text: text.to_string(),
+                    }
+                    .into_content(),
+                },
+            )
+            .await
+            .expect("the host accepts the prompt");
+    }
+}
+
+/// A loopback relay in front of a host, whose connections a test can cut.
+///
+/// The gateway is enrolled at the relay's address, so a cut breaks every
+/// connection this gateway holds to that host, control link and spliced streams
+/// alike, while the host itself keeps running. That is the flap spec 7.1
+/// describes: "a gateway-to-host connection drops ... even though client
+/// connections stayed up", and the one where the host's epochs survive, so a
+/// resume through it is incremental.
+struct Bridge {
+    address: HostAddress,
+    /// Whether a new connection is piped through or closed at once.
+    open: Arc<AtomicBool>,
+    /// The pipes in flight, so a cut can break them.
+    piping: Arc<StdMutex<Vec<tokio::task::AbortHandle>>>,
+    accepting: tokio::task::JoinHandle<()>,
+}
+
+impl Bridge {
+    async fn to(upstream: &Upstream) -> Self {
+        let listener = tokio::net::TcpListener::bind(addr("127.0.0.1:0"))
+            .await
+            .expect("bind a bridge port");
+        let bound = listener.local_addr().expect("local addr");
+        let target = upstream.addr;
+        let open = Arc::new(AtomicBool::new(true));
+        let piping: Arc<StdMutex<Vec<tokio::task::AbortHandle>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let accepting = tokio::spawn({
+            let open = Arc::clone(&open);
+            let piping = Arc::clone(&piping);
+            async move {
+                loop {
+                    let Ok((mut inbound, _)) = listener.accept().await else {
+                        return;
+                    };
+                    // Accepted and closed at once while cut, so a dial fails
+                    // rather than hanging on a connection nothing answers.
+                    if !open.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    let pipe = tokio::spawn(async move {
+                        let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await else {
+                            return;
+                        };
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    });
+                    piping
+                        .lock()
+                        .expect("the bridge mutex is poisoned")
+                        .push(pipe.abort_handle());
+                }
+            }
+        });
+        Self {
+            address: HostAddress::parse(&format!("http://{bound}")).expect("an address"),
+            open,
+            piping,
+            accepting,
+        }
+    }
+
+    /// Break every connection through the bridge, and refuse new ones.
+    fn cut(&self) {
+        self.open.store(false, Ordering::Relaxed);
+        for pipe in self
+            .piping
+            .lock()
+            .expect("the bridge mutex is poisoned")
+            .drain(..)
+        {
+            pipe.abort();
+        }
+    }
+
+    /// Let connections through again.
+    fn heal(&self) {
+        self.open.store(true, Ordering::Relaxed);
+    }
+
+    fn stop(self) {
+        self.cut();
+        self.accepting.abort();
     }
 }
 
@@ -322,11 +433,156 @@ impl Fixture {
             .expect("the withdrawal request")
     }
 
+    /// Open a client stream attaching `sessions`, by their namespaced ids.
+    async fn attach(&self, sessions: &[AttachRequest]) -> RemoteEvents {
+        self.client
+            .events(sessions)
+            .await
+            .expect("a client stream onto the gateway")
+    }
+
     async fn shutdown(self) {
         self.server.shutdown().await;
         self.gateway.shutdown().await;
         drop(self.state);
     }
+}
+
+/// One session to attach, with no cursor.
+fn attach(session: &str) -> AttachRequest {
+    AttachRequest {
+        session: session.to_string(),
+        cursor: None,
+    }
+}
+
+/// One session to attach, offering `cursor`.
+fn attach_at(session: &str, cursor: Cursor) -> AttachRequest {
+    AttachRequest {
+        session: session.to_string(),
+        cursor: Some(cursor),
+    }
+}
+
+/// Read frames until `done` accepts one, answering everything read, that frame
+/// included.
+async fn frames_until(
+    events: &mut RemoteEvents,
+    what: &str,
+    mut done: impl FnMut(&Frame) -> bool,
+) -> Vec<Frame> {
+    let mut seen = Vec::new();
+    bounded(what, async {
+        loop {
+            let Some(frame) = events.recv().await else {
+                panic!("the stream ended before {what}, having carried {seen:?}");
+            };
+            let frame = frame.unwrap_or_else(|err| panic!("a good frame: {err}"));
+            let stop = done(&frame);
+            seen.push(frame);
+            if stop {
+                return;
+            }
+        }
+    })
+    .await;
+    seen
+}
+
+/// Every frame that arrives inside `window`, which is how a test asserts that
+/// something does *not*.
+async fn frames_within(events: &mut RemoteEvents, window: Duration) -> Vec<Frame> {
+    let mut seen = Vec::new();
+    let collecting = async {
+        while let Some(frame) = events.recv().await {
+            seen.push(frame.expect("a good frame"));
+        }
+    };
+    let _ = tokio::time::timeout(window, collecting).await;
+    seen
+}
+
+/// The sessions the `reset` frames among `frames` name (spec 6.3).
+fn resets(frames: &[Frame]) -> Vec<String> {
+    frames
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::Reset { session } => Some(session.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The concatenated text of every finalized assistant message among `frames`.
+fn assistant_text(frames: &[Frame]) -> Vec<String> {
+    frames
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::Event { event, .. } => event.known(),
+            _ => None,
+        })
+        .filter_map(|event| match event {
+            AgentEvent::MessageEnd { message, .. } => message.as_stored_wire(),
+            _ => None,
+        })
+        .filter_map(|message| match message {
+            aj_models::types::Message::Assistant(assistant) => Some(assistant),
+            _ => None,
+        })
+        .map(|assistant| {
+            assistant
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    AssistantContent::Text(text) => Some(text.text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .collect()
+}
+
+/// The durable positions among `frames`, in delivery order (spec 6.4).
+fn durable_seqs(frames: &[Frame]) -> Vec<u64> {
+    frames
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::Event {
+                durability: Some(durability),
+                ..
+            } => Some(durability.seq),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The epoch of the `state` frame that opens an attach block (spec 6.5).
+fn epoch_of(frames: &[Frame]) -> String {
+    frames
+        .iter()
+        .find_map(|frame| match frame {
+            Frame::State { epoch, .. } => Some(epoch.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("an attach block opens with a state frame: {frames:?}"))
+}
+
+/// The `caught_up` position of an attach block, and the cursor a client would
+/// commit from it.
+fn caught_up_at(frames: &[Frame]) -> u64 {
+    frames
+        .iter()
+        .find_map(|frame| match frame {
+            Frame::CaughtUp { last_seq, .. } => Some(*last_seq),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("an attach block ends with caught_up: {frames:?}"))
+}
+
+/// Every session id the session-scoped frames among `frames` name.
+fn named_sessions(frames: &[Frame]) -> Vec<&str> {
+    frames.iter().filter_map(Frame::session).collect()
 }
 
 /// The `{code, message}` body behind a refusal.
@@ -1573,34 +1829,1156 @@ impl Recorder {
 }
 
 // ---------------------------------------------------------------------------
-// The deliberate refusals of this stage
+// Splicing a client's sessions (spec 7.1, 6.5, 6.10)
 // ---------------------------------------------------------------------------
 
+/// A real turn on a real host, watched through a gateway.
+///
+/// The whole composed path: the client's attach travels upstream, the host's
+/// block and the turn it drives come back, and every session-scoped frame names
+/// the id the client asked for rather than the one the host knows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn attaching_a_session_is_refused_rather_than_silently_empty() {
+async fn a_spliced_turn_reaches_a_client_with_its_ids_namespaced() {
     let mut host = Upstream::start().await;
     let session = host.create().await;
     let fixture = Fixture::new(&[&host]).await;
     let id = host.namespaced(&session);
     fixture.row(&id).await;
 
-    let refused = fixture
-        .client
-        .events(&[AttachRequest {
-            session: id,
-            cursor: None,
-        }])
-        .await;
-    let Err(err) = refused else {
-        panic!("a gateway cannot splice a session stream in this stage");
-    };
+    let mut events = fixture.attach(&[attach(&id)]).await;
 
-    assert_eq!(err.status(), Some(StatusCode::CONFLICT), "got {err:?}");
-    assert_eq!(err.code(), Some("unsupported"));
+    let block = frames_until(&mut events, "the attach block", is_caught_up).await;
+    assert!(
+        block
+            .iter()
+            .any(|frame| matches!(frame, Frame::State { .. })),
+        "an attach block opens with the session's state (spec 6.5): {block:?}",
+    );
+    assert!(
+        named_sessions(&block).iter().all(|named| *named == id),
+        "a spliced frame names the session the client attached, not the host's own \
+         id ({session}): {:?}",
+        named_sessions(&block),
+    );
+
+    fixture
+        .client
+        .command(&id, &prompt("go"))
+        .await
+        .expect("the prompt is accepted");
+    let turn = frames_until(&mut events, "the assistant's answer", |frame| {
+        !assistant_text(std::slice::from_ref(frame)).is_empty()
+    })
+    .await;
+
+    assert_eq!(
+        assistant_text(&turn),
+        vec!["done".to_string()],
+        "the turn the client drove came back on the stream it was watching",
+    );
+    assert!(
+        named_sessions(&turn).iter().all(|named| *named == id),
+        "and its frames are namespaced too: {:?}",
+        named_sessions(&turn),
+    );
+    assert!(
+        !durable_seqs(&turn).is_empty(),
+        "the durable envelope travels with them, which is what advances a cursor: {turn:?}",
+    );
 
     fixture.shutdown().await;
     host.stop().await;
 }
+
+/// One client stream, two hosts: each session's frames arrive under its own
+/// host's namespace, and neither host's stream carries the other's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_hosts_ride_one_client_stream() {
+    let mut left = Upstream::start().await;
+    let mut right = Upstream::start().await;
+    let here = left.create().await;
+    let there = right.create().await;
+    let fixture = Fixture::new(&[&left, &right]).await;
+    let (here, there) = (left.namespaced(&here), right.namespaced(&there));
+    fixture.row(&here).await;
+    fixture.row(&there).await;
+
+    let mut events = fixture.attach(&[attach(&here), attach(&there)]).await;
+
+    let mut blocks = 0;
+    let opened = frames_until(&mut events, "both attach blocks", |frame| {
+        if is_caught_up(frame) {
+            blocks += 1;
+        }
+        blocks == 2
+    })
+    .await;
+    let mut named: Vec<&str> = named_sessions(&opened);
+    named.sort_unstable();
+    named.dedup();
+    assert_eq!(
+        named,
+        {
+            let mut both = vec![here.as_str(), there.as_str()];
+            both.sort_unstable();
+            both
+        },
+        "one block per session, each under its own host: {opened:?}",
+    );
+
+    for (id, text) in [(&here, "done"), (&there, "done")] {
+        fixture
+            .client
+            .command(id, &prompt("go"))
+            .await
+            .expect("the prompt is accepted");
+        let turn = frames_until(&mut events, "the answer", |frame| {
+            !assistant_text(std::slice::from_ref(frame)).is_empty()
+        })
+        .await;
+        assert_eq!(assistant_text(&turn), vec![text.to_string()]);
+        assert!(
+            turn.iter()
+                .filter_map(Frame::session)
+                .any(|named| named == id),
+            "the turn arrived under {id}: {turn:?}",
+        );
+    }
+
+    fixture.shutdown().await;
+    left.stop().await;
+    right.stop().await;
+}
+
+/// What travels upstream is the host's own ids with the client's own cursors,
+/// one stream per host (spec 7.1).
+///
+/// A real host would answer an attach either way, so only a host that keeps what
+/// it was asked can show the difference: a gateway that forwarded namespaced ids,
+/// or dropped the cursors, or opened a stream per session, would be invisible
+/// otherwise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_upstream_attach_carries_host_ids_and_the_clients_cursors() {
+    let fake = FakeHost::start("fake", Script::Frames(block("s-1", "epoch-1", 3))).await;
+    let fixture = Fixture::over(TempDir::new().expect("tempdir"), vec![fake.address.clone()]).await;
+    fixture.until_connected("fake").await;
+
+    let mut events = fixture
+        .attach(&[
+            attach_at(
+                "fake:s-1",
+                Cursor {
+                    epoch: "epoch-1".to_string(),
+                    seq: 3,
+                },
+            ),
+            attach("fake:s-2"),
+        ])
+        .await;
+    frames_until(&mut events, "the host's block", is_caught_up).await;
+
+    let attaches = fake.attaches();
+    assert_eq!(
+        attaches
+            .iter()
+            .filter(|attached| !attached.is_empty())
+            .collect::<Vec<_>>(),
+        vec![&vec!["s-1@epoch-1:3".to_string(), "s-2".to_string()]],
+        "one upstream for the host, carrying its own ids and the client's own \
+         cursors: {attaches:?}",
+    );
+    assert!(
+        attaches.iter().any(|attached| attached.is_empty()),
+        "and the control connection attaches nothing at all (spec 7.1): {attaches:?}",
+    );
+
+    fixture.shutdown().await;
+    fake.stop();
+}
+
+/// An id this gateway cannot resolve is refused before any host is asked about
+/// it, which is the same 404 a proxied request to it answers (spec 6.2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn attaching_an_id_this_gateway_cannot_name_reaches_no_host() {
+    let fake = FakeHost::start("fake", Script::Frames(block("s-1", "epoch-1", 0))).await;
+    let fixture = Fixture::over(TempDir::new().expect("tempdir"), vec![fake.address.clone()]).await;
+    fixture.until_connected("fake").await;
+
+    for id in [
+        // A bare host-local id: what a host answers to, and meaningless here.
+        "s-1",
+        // A host this gateway does not have.
+        "0123456789abcdef:whatever",
+        ":whatever",
+        "fake:",
+        // A session half a URL would swallow.
+        "fake:..",
+    ] {
+        let refused = fixture.client.events(&[attach(id)]).await;
+
+        // The host is read before the answer is unwrapped, so an attach that got
+        // through fails on having reached a host rather than on the shape of what
+        // came back.
+        assert_eq!(
+            fake.spliced_attaches(),
+            Vec::<Vec<String>>::new(),
+            "attaching {id:?} reached a host this gateway cannot address it on",
+        );
+        let Err(err) = refused else {
+            panic!("{id:?} names no session on this gateway");
+        };
+        assert_eq!(err.status(), Some(StatusCode::NOT_FOUND), "{id:?}: {err:?}");
+        assert_eq!(err.code(), Some("unknown_session"), "{id:?}");
+    }
+
+    fixture.shutdown().await;
+    fake.stop();
+}
+
+/// The owning host's refusal of an attach travels back, code and all: the client
+/// asked the question and the host answered it (spec 6.10).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hosts_own_attach_refusal_travels_back() {
+    let fake = FakeHost::start("fake", Script::Refuse).await;
+    let fixture = Fixture::over(TempDir::new().expect("tempdir"), vec![fake.address.clone()]).await;
+    fixture.until_connected("fake").await;
+
+    let Err(err) = fixture.client.events(&[attach("fake:s-1")]).await else {
+        panic!("the host refuses this attach");
+    };
+
+    assert_eq!(err.status(), Some(StatusCode::CONFLICT), "got {err:?}");
+    assert_eq!(
+        err.code(),
+        Some("locked"),
+        "the host's own code, which this gateway has no vocabulary of its own for",
+    );
+    assert!(
+        err.to_string().contains("another writer"),
+        "and the host's own words: {err}",
+    );
+
+    fixture.shutdown().await;
+    fake.stop();
+}
+
+/// A frame kind this build does not know is forwarded with its session id
+/// rewritten and nothing else touched (spec 6.10's forward-don't-filter).
+///
+/// The two frames that do not travel are in the same script: a host's own `list`
+/// would put ids no client of this gateway can address on the stream, and a
+/// heartbeat belongs to the connection it was written on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unknown_frame_kind_is_forwarded_with_its_session_rewritten() {
+    let mut script = block("s-1", "epoch-1", 0);
+    script.push(serde_json::to_string(&Frame::Heartbeat).expect("a heartbeat"));
+    script.push(
+        serde_json::to_string(&Frame::List {
+            sessions: vec![fake_row("s-1")],
+        })
+        .expect("a list frame"),
+    );
+    script.push(
+        r#"{"kind":"something_newer","session":"s-1","payload":{"n":18446744073709551616}}"#
+            .to_string(),
+    );
+    script.push(warning_frame("s-1", "epoch-1", "the frame after it"));
+    let fake = FakeHost::start("fake", Script::Frames(script)).await;
+    let fixture = Fixture::over(TempDir::new().expect("tempdir"), vec![fake.address.clone()]).await;
+    fixture.until_connected("fake").await;
+
+    let mut events = fixture.attach(&[attach("fake:s-1")]).await;
+    let seen = decoded_until(&mut events, "the frame behind the unknown one", |frame| {
+        matches!(frame, DecodedFrame::Known(known)
+            if matches!(known.value(), Frame::Event { .. }))
+    })
+    .await;
+
+    let unknown: Vec<&DecodedFrame> = seen
+        .iter()
+        .filter(|frame| matches!(frame, DecodedFrame::Unknown { .. }))
+        .collect();
+    let [forwarded] = unknown[..] else {
+        panic!("the unknown kind was filtered out rather than forwarded: {seen:?}");
+    };
+    let DecodedFrame::Unknown { kind, raw } = forwarded else {
+        unreachable!("filtered on the variant");
+    };
+    assert_eq!(kind, "something_newer");
+    assert_eq!(
+        forwarded
+            .session()
+            .expect("a readable session id")
+            .as_deref(),
+        Some("fake:s-1"),
+        "a kind this gateway cannot read still gets its id namespaced: {}",
+        raw.get(),
+    );
+    assert!(
+        raw.get().contains("18446744073709551616"),
+        "and its payload travels verbatim, number literals included: {}",
+        raw.get(),
+    );
+
+    let known: Vec<&Frame> = seen
+        .iter()
+        .filter_map(|frame| match frame {
+            DecodedFrame::Known(known) => Some(known.value()),
+            DecodedFrame::Unknown { .. } => None,
+        })
+        .collect();
+    assert!(
+        !known.iter().any(|frame| matches!(frame, Frame::Heartbeat)),
+        "a host's heartbeat is not a client's: {known:?}",
+    );
+    for frame in &known {
+        if let Frame::List { sessions } = frame {
+            for row in sessions {
+                SessionAddress::parse(&row.id).unwrap_or_else(|err| {
+                    panic!(
+                        "a host's own list reached the client, so {:?} is not addressable \
+                         here: {err}",
+                        row.id
+                    )
+                });
+            }
+        }
+    }
+
+    fixture.shutdown().await;
+    fake.stop();
+}
+
+// ---------------------------------------------------------------------------
+// A host that flaps (spec 7.1's `reset`)
+// ---------------------------------------------------------------------------
+
+/// A host that goes away resets exactly its own sessions, and the sessions of
+/// the host that stayed keep working on the very same stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_host_resets_its_own_sessions_and_leaves_the_others_alone() {
+    let mut left = Upstream::start().await;
+    let mut right = Upstream::start().await;
+    let doomed = left.create().await;
+    let alive = right.create().await;
+    let fixture = Fixture::new(&[&left, &right]).await;
+    let (doomed, alive) = (left.namespaced(&doomed), right.namespaced(&alive));
+    fixture.row(&doomed).await;
+    fixture.row(&alive).await;
+    let mut events = fixture.attach(&[attach(&doomed), attach(&alive)]).await;
+    let mut blocks = 0;
+    frames_until(&mut events, "both attach blocks", |frame| {
+        if is_caught_up(frame) {
+            blocks += 1;
+        }
+        blocks == 2
+    })
+    .await;
+
+    left.stop().await;
+
+    let lost = frames_until(&mut events, "a reset for the lost host", |frame| {
+        matches!(frame, Frame::Reset { .. })
+    })
+    .await;
+    assert_eq!(
+        resets(&lost),
+        vec![doomed.clone()],
+        "the sessions of the host that went away, and no others: {lost:?}",
+    );
+
+    // The other host's session is untouched: it is watched over a stream of its
+    // own, which the flap next door never touched.
+    fixture
+        .client
+        .command(&alive, &prompt("go"))
+        .await
+        .expect("the prompt is accepted");
+    let turn = frames_until(&mut events, "the healthy host's answer", |frame| {
+        !assistant_text(std::slice::from_ref(frame)).is_empty()
+    })
+    .await;
+    assert_eq!(assistant_text(&turn), vec!["done".to_string()]);
+    assert!(
+        !resets(&turn).contains(&alive),
+        "the healthy host's session was reset over another host's flap: {turn:?}",
+    );
+
+    fixture.shutdown().await;
+    right.stop().await;
+}
+
+/// A gateway does not reopen an upstream it lost. It says `reset` and waits for
+/// the client to attach again (spec 7.1).
+///
+/// Resuming one itself would need a *current* cursor, and the client's cursor
+/// advances as it applies what this gateway forwarded, so the gateway would have
+/// to keep per-session cursor state that spec 7.1 forbids it. A host that hangs a
+/// spliced stream up while its control connection stays open is that case with
+/// nothing else moving: exactly one upstream was ever opened, and exactly one
+/// `reset` came back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gateway_does_not_reopen_an_upstream_it_lost() {
+    let fake = FakeHost::start("fake", Script::Ends(block("s-1", "epoch-1", 0))).await;
+    let fixture = Fixture::over(TempDir::new().expect("tempdir"), vec![fake.address.clone()]).await;
+    fixture.until_connected("fake").await;
+
+    let mut events = fixture.attach(&[attach("fake:s-1")]).await;
+    let lost = frames_until(&mut events, "the reset for the ended stream", |frame| {
+        matches!(frame, Frame::Reset { .. })
+    })
+    .await;
+    assert_eq!(resets(&lost), vec!["fake:s-1".to_string()]);
+
+    let quiet = frames_within(&mut events, QUIET).await;
+
+    assert_eq!(
+        fake.spliced_attaches().len(),
+        1,
+        "the gateway attached again by itself, which it has no cursor to do \
+         honestly: {:?}",
+        fake.spliced_attaches(),
+    );
+    assert!(
+        resets(&quiet).is_empty(),
+        "and it does not repeat itself while it waits: {quiet:?}",
+    );
+
+    fixture.shutdown().await;
+    fake.stop();
+}
+
+/// A re-attach while the host is still down does not fail the stream, does not
+/// spin on `reset`, and is told when the host comes back (spec 7.1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reattach_while_a_host_is_down_waits_for_it_to_return() {
+    let mut down = Upstream::start().await;
+    let mut up = Upstream::start().await;
+    let waiting = down.create().await;
+    let watched = up.create().await;
+    let fixture = Fixture::new(&[&down, &up]).await;
+    let (waiting, watched) = (down.namespaced(&waiting), up.namespaced(&watched));
+    fixture.row(&waiting).await;
+    fixture.row(&watched).await;
+    down.stop().await;
+    fixture
+        .until("the downed host's row to be marked", |list| {
+            list.sessions
+                .iter()
+                .find(|row| row.id == waiting && row.unreachable)
+                .map(|_| ())
+        })
+        .await;
+
+    let mut events = fixture.attach(&[attach(&waiting), attach(&watched)]).await;
+
+    // The healthy host's session is served, which is what failing the whole
+    // stream over its neighbour would have cost.
+    let opened = frames_until(&mut events, "the healthy session's block", is_caught_up).await;
+    assert!(
+        named_sessions(&opened).contains(&watched.as_str()),
+        "the session on the host that is there was served: {opened:?}",
+    );
+    let quiet = frames_within(&mut events, QUIET).await;
+    assert!(
+        resets(&quiet).is_empty(),
+        "a session whose host is known to be down waits rather than being reset \
+         over and over: {quiet:?}",
+    );
+
+    down.restart().await;
+
+    let returned = frames_until(&mut events, "a reset for the returned host", |frame| {
+        matches!(frame, Frame::Reset { .. })
+    })
+    .await;
+    assert_eq!(
+        resets(&returned),
+        vec![waiting.clone()],
+        "the host came back, so its sessions are asked to attach again: {returned:?}",
+    );
+
+    fixture.shutdown().await;
+    down.stop().await;
+    up.stop().await;
+}
+
+/// A flap the host itself survived resumes **incrementally**: the client's
+/// cursor still means what it meant, so the host serves the suffix after it
+/// (spec 7.1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reattach_after_a_reset_resumes_incrementally_when_the_epoch_survived() {
+    let mut host = Upstream::start().await;
+    let session = host.create().await;
+    let bridge = Bridge::to(&host).await;
+    let fixture = Fixture::over(
+        TempDir::new().expect("tempdir"),
+        vec![bridge.address.clone()],
+    )
+    .await;
+    let id = host.namespaced(&session);
+    fixture.row(&id).await;
+    // A turn before the attach, so the block carries durable frames a resume
+    // could wrongly serve again.
+    let before = host.durable_seq(&session).await;
+    fixture
+        .client
+        .command(&id, &prompt("first"))
+        .await
+        .expect("the prompt is accepted");
+    settled(&host, &session, before + 1).await;
+
+    let mut events = fixture.attach(&[attach(&id)]).await;
+    let block = frames_until(&mut events, "the first attach block", is_caught_up).await;
+    let epoch = epoch_of(&block);
+    let cursor = Cursor {
+        epoch: epoch.clone(),
+        seq: caught_up_at(&block),
+    };
+    assert_eq!(
+        assistant_text(&block),
+        vec!["done".to_string()],
+        "the first turn is in the block, so re-serving it would show: {block:?}",
+    );
+
+    bridge.cut();
+    let lost = frames_until(&mut events, "the reset for the broken link", |frame| {
+        matches!(frame, Frame::Reset { .. })
+    })
+    .await;
+    assert_eq!(resets(&lost), vec![id.clone()]);
+
+    // The host never went anywhere: its session runs on while this gateway
+    // cannot see it, which is what makes the resume incremental rather than
+    // empty.
+    host.prompt(&session, "second").await;
+    settled(&host, &session, cursor.seq + 1).await;
+    let reached = host.durable_seq(&session).await;
+    bridge.heal();
+    fixture.until_connected(&host.host_id()).await;
+
+    drop(events);
+    let mut events = fixture.attach(&[attach_at(&id, cursor.clone())]).await;
+    let resumed = frames_until(&mut events, "the resumed attach block", is_caught_up).await;
+
+    assert_eq!(
+        epoch_of(&resumed),
+        epoch,
+        "the host's epoch survived the flap, so the client's cursor still means \
+         something: {resumed:?}",
+    );
+    assert!(
+        durable_seqs(&resumed).iter().all(|seq| *seq > cursor.seq),
+        "the suffix after the cursor and nothing below it, which is what forwarding \
+         the client's own cursor buys: {:?} against a cursor at {}",
+        durable_seqs(&resumed),
+        cursor.seq,
+    );
+    assert_eq!(
+        assistant_text(&resumed),
+        vec!["done".to_string()],
+        "the turn it missed, once, rather than both turns again: {resumed:?}",
+    );
+    assert_eq!(caught_up_at(&resumed), reached);
+
+    fixture.shutdown().await;
+    bridge.stop();
+    host.stop().await;
+}
+
+/// A host that restarted mints fresh epochs, so the same re-attach resumes
+/// **fully**: the cursor describes a history the session no longer has
+/// (spec 6.5, 7.1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reattach_after_a_restart_resumes_fully_when_the_epoch_changed() {
+    let mut host = Upstream::start().await;
+    let session = host.create().await;
+    let fixture = Fixture::new(&[&host]).await;
+    let id = host.namespaced(&session);
+    fixture.row(&id).await;
+    let before = host.durable_seq(&session).await;
+    fixture
+        .client
+        .command(&id, &prompt("first"))
+        .await
+        .expect("the prompt is accepted");
+    settled(&host, &session, before + 1).await;
+
+    let mut events = fixture.attach(&[attach(&id)]).await;
+    let block = frames_until(&mut events, "the first attach block", is_caught_up).await;
+    let epoch = epoch_of(&block);
+    let cursor = Cursor {
+        epoch: epoch.clone(),
+        seq: caught_up_at(&block),
+    };
+    assert!(
+        durable_seqs(&block).iter().any(|seq| *seq <= cursor.seq),
+        "the log has durable entries at or below the cursor: {block:?}",
+    );
+
+    host.stop().await;
+    frames_until(&mut events, "the reset for the lost host", |frame| {
+        matches!(frame, Frame::Reset { .. })
+    })
+    .await;
+    host.restart().await;
+    fixture.until_connected(&host.host_id()).await;
+
+    drop(events);
+    let mut events = fixture.attach(&[attach_at(&id, cursor.clone())]).await;
+    let resumed = frames_until(&mut events, "the resumed attach block", is_caught_up).await;
+
+    assert_ne!(
+        epoch_of(&resumed),
+        epoch,
+        "a restart materializes the session afresh, so its epoch is new: {resumed:?}",
+    );
+    assert!(
+        durable_seqs(&resumed).iter().any(|seq| *seq <= cursor.seq),
+        "a cursor from an epoch that is gone earns the whole log back: {:?} against a \
+         cursor at {}",
+        durable_seqs(&resumed),
+        cursor.seq,
+    );
+    assert_eq!(
+        assistant_text(&resumed),
+        vec!["done".to_string()],
+        "the turn from before the restart is served again: {resumed:?}",
+    );
+
+    fixture.shutdown().await;
+    host.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Flow control (spec 6.9)
+// ---------------------------------------------------------------------------
+
+/// A client the gateway cannot keep up with is evicted rather than buffered
+/// without bound, and the ordinary re-attach puts it back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_that_stops_reading_is_evicted_and_recovers() {
+    let fake = FakeHost::start(
+        "fake",
+        Script::Flood {
+            session: "s-1".to_string(),
+        },
+    )
+    .await;
+    let fixture = Fixture::tuned(
+        TempDir::new().expect("tempdir"),
+        vec![fake.address.clone()],
+        Tuning {
+            outbound_queue: NonZeroUsize::new(2).expect("non-zero"),
+            ..tuning()
+        },
+    )
+    .await;
+    fixture.until_connected("fake").await;
+
+    // From here the client reads nothing at all, while the host writes without
+    // end.
+    let mut events = fixture.attach(&[attach("fake:s-1")]).await;
+    bounded("the stalled client to be evicted", async {
+        while fake.released() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        fake.written() > 2,
+        "the host wrote more than the client's queue holds, {} frames",
+        fake.written(),
+    );
+
+    // An evicted stream ends rather than handing back everything it was owed:
+    // what the client missed comes back from the backfill of its re-attach.
+    let mut carried = 0;
+    bounded("the evicted stream to end", async {
+        while (events.recv().await).is_some() {
+            carried += 1;
+        }
+    })
+    .await;
+    assert!(
+        carried < fake.written(),
+        "the client was served every frame the host wrote, so nothing bounded it: \
+         {carried} of {}",
+        fake.written(),
+    );
+
+    // Recovery is the ordinary re-attach.
+    let mut events = fixture.attach(&[attach("fake:s-1")]).await;
+    let block = frames_until(&mut events, "the block of the re-attach", is_caught_up).await;
+    assert!(
+        named_sessions(&block).contains(&"fake:s-1"),
+        "an evicted client attaches again and is served: {block:?}",
+    );
+
+    drop(events);
+    fixture.shutdown().await;
+    fake.stop();
+}
+
+/// An attach block bigger than the client's bound does not evict the client that
+/// asked for it (spec 6.9).
+///
+/// The bound governs live fan-out. A block measured against it would evict on
+/// the first big backfill, and the re-attach that followed would do the same
+/// again, so a client with a real session could never catch up at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_block_bigger_than_the_bound_does_not_evict_its_own_client() {
+    let mut host = Upstream::start().await;
+    let session = host.create().await;
+    let fixture = Fixture::tuned(
+        TempDir::new().expect("tempdir"),
+        vec![HostAddress::parse(&host.address()).expect("an address")],
+        Tuning {
+            outbound_queue: NonZeroUsize::new(1).expect("non-zero"),
+            ..tuning()
+        },
+    )
+    .await;
+    let id = host.namespaced(&session);
+    fixture.row(&id).await;
+    let before = host.durable_seq(&session).await;
+    fixture
+        .client
+        .command(&id, &prompt("go"))
+        .await
+        .expect("the prompt is accepted");
+    settled(&host, &session, before + 1).await;
+
+    let mut events = fixture.attach(&[attach(&id)]).await;
+    let block = frames_until(&mut events, "the whole attach block", is_caught_up).await;
+
+    assert!(
+        block.len() > 2,
+        "the block was bigger than the bound of 1 frame, which is the point: {block:?}",
+    );
+    assert_eq!(
+        assistant_text(&block),
+        vec!["done".to_string()],
+        "and it arrived whole: {block:?}",
+    );
+
+    fixture.shutdown().await;
+    host.stop().await;
+}
+
+/// A client that goes away releases the upstream streams opened for it, so a
+/// host stops paying for a subscriber nobody reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_stream_that_ends_releases_its_upstreams() {
+    let fake = FakeHost::start("fake", Script::Frames(block("s-1", "epoch-1", 0))).await;
+    let fixture = Fixture::over(TempDir::new().expect("tempdir"), vec![fake.address.clone()]).await;
+    fixture.until_connected("fake").await;
+    let mut events = fixture.attach(&[attach("fake:s-1")]).await;
+    frames_until(&mut events, "the attach block", is_caught_up).await;
+    assert_eq!(fake.released(), 0, "the client is still reading");
+
+    drop(events);
+
+    bounded("the upstream to be released", async {
+        while fake.released() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+
+    fixture.shutdown().await;
+    fake.stop();
+}
+
+/// A shutdown ends a spliced client's stream rather than waiting for it, and
+/// releases the upstreams behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shutdown_ends_a_spliced_stream_and_its_upstreams() {
+    let fake = FakeHost::start("fake", Script::Frames(block("s-1", "epoch-1", 0))).await;
+    let fixture = Fixture::over(TempDir::new().expect("tempdir"), vec![fake.address.clone()]).await;
+    fixture.until_connected("fake").await;
+    let mut events = fixture.attach(&[attach("fake:s-1")]).await;
+    frames_until(&mut events, "the attach block", is_caught_up).await;
+
+    let started = std::time::Instant::now();
+    fixture.shutdown().await;
+    let took = started.elapsed();
+
+    assert!(
+        took < Duration::from_secs(2),
+        "the shutdown waited {took:?} on a client it could have closed",
+    );
+    assert!(
+        bounded("the end of the stream", events.recv())
+            .await
+            .is_none(),
+        "the client is told rather than left holding a stream nothing writes to",
+    );
+    bounded("the upstream to be released", async {
+        while fake.released() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+
+    fake.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Test support for the splice
+// ---------------------------------------------------------------------------
+
+/// Wait until `session` is idle with at least `last_seq` durable entries, read
+/// off the host itself rather than off the stream under test.
+async fn settled(host: &Upstream, session: &str, last_seq: u64) {
+    bounded("the turn to land and settle", async {
+        loop {
+            let list = host.host.sessions().await.expect("the host's directory");
+            let row = list
+                .sessions
+                .iter()
+                .find(|row| row.id == session)
+                .expect("the session is this host's");
+            if !row.working && row.last_seq.unwrap_or(0) >= last_seq {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+}
+
+fn is_caught_up(frame: &Frame) -> bool {
+    matches!(frame, Frame::CaughtUp { .. })
+}
+
+/// Read frames in decoded form until `done` accepts one, which is how a test
+/// sees a kind this build does not know (spec 6.10).
+async fn decoded_until(
+    events: &mut RemoteEvents,
+    what: &str,
+    mut done: impl FnMut(&DecodedFrame) -> bool,
+) -> Vec<DecodedFrame> {
+    let mut seen = Vec::new();
+    bounded(what, async {
+        loop {
+            let Some(frame) = events.recv_decoded().await else {
+                panic!("the stream ended before {what}, having carried {seen:?}");
+            };
+            let frame = frame.unwrap_or_else(|err| panic!("a good frame: {err}"));
+            let stop = done(&frame);
+            seen.push(frame);
+            if stop {
+                return;
+            }
+        }
+    })
+    .await;
+    seen
+}
+
+/// The settings a fake host reports, which no test reads: only its presence in
+/// a `state` frame matters here.
+fn fake_settings() -> AgentSettings {
+    AgentSettings {
+        provider: "scripted".into(),
+        model_id: "scripted".into(),
+        thinking: "off".into(),
+        thinking_display: "default".into(),
+        speed: "standard".into(),
+        verbosity: "default".into(),
+    }
+}
+
+/// One directory row, as a fake host writes it about its own session.
+fn fake_row(id: &str) -> SessionSummary {
+    SessionSummary {
+        id: id.to_string(),
+        live: true,
+        working: false,
+        queued: aj_wire::QueueCounts::default(),
+        tasks: 0,
+        last_seq: Some(1),
+        last_activity: chrono::DateTime::UNIX_EPOCH,
+        tag: None,
+        host: None,
+        unreachable: false,
+    }
+}
+
+/// The frames of one attach block, as a host writes them (spec 6.5).
+fn block(session: &str, epoch: &str, last_seq: u64) -> Vec<String> {
+    vec![
+        serde_json::to_string(&Frame::State {
+            session: session.to_string(),
+            epoch: epoch.to_string(),
+            working: false,
+            settings: fake_settings(),
+            last_seq,
+        })
+        .expect("a state frame"),
+        serde_json::to_string(&Frame::CaughtUp {
+            session: session.to_string(),
+            epoch: epoch.to_string(),
+            last_seq,
+        })
+        .expect("a caught_up frame"),
+    ]
+}
+
+/// A reliable-transient event frame, which is what a client that stops reading
+/// is measured against: it may be neither coalesced nor dropped (spec 6.4).
+fn warning_frame(session: &str, epoch: &str, text: &str) -> String {
+    serde_json::to_string(&Frame::Event {
+        session: session.to_string(),
+        epoch: epoch.to_string(),
+        durability: None,
+        event: AgentEvent::Warning {
+            agent_id: AgentId::Main,
+            text: text.to_string(),
+        }
+        .into(),
+    })
+    .expect("a warning frame")
+}
+
+/// What a [`FakeHost`] writes on a stream that attaches something.
+#[derive(Clone)]
+enum Script {
+    /// These frames, then silence with the stream held open.
+    Frames(Vec<String>),
+    /// These frames, then the host hangs the stream up. The flap a gateway must
+    /// not paper over by dialing again on its own.
+    Ends(Vec<String>),
+    /// An attach block, then reliable frames without end.
+    Flood { session: String },
+    /// Not a stream at all: the host's own refusal of the attach.
+    Refuse,
+}
+
+/// A stand-in host with a scripted event stream.
+///
+/// For the three things a real host cannot be made to do on demand: send a frame
+/// kind from the future, write faster than a client reads, and refuse an attach
+/// with a code this gateway has no vocabulary of its own for. It answers `hello`
+/// under its id, holds its control connection open with one `list` frame on it,
+/// and records the attach parameters of every stream it is asked for.
+struct FakeHost {
+    address: HostAddress,
+    /// The `session` parameters of every stream, in the order they arrived. A
+    /// control connection names none, and is recorded as an empty row.
+    attaches: Arc<StdMutex<Vec<Vec<String>>>>,
+    /// How many spliced streams have been released, which is how a test sees an
+    /// upstream connection being closed from the gateway's side.
+    released: Arc<AtomicUsize>,
+    /// How many frames a flooding stream has written.
+    written: Arc<AtomicUsize>,
+    serving: tokio::task::JoinHandle<()>,
+}
+
+impl FakeHost {
+    async fn start(host_id: &str, script: Script) -> Self {
+        use axum::extract::Query;
+        use axum::response::IntoResponse;
+        use axum::response::sse::{Event, Sse};
+        use axum::routing::get;
+
+        let attaches: Arc<StdMutex<Vec<Vec<String>>>> = Arc::new(StdMutex::new(Vec::new()));
+        let released = Arc::new(AtomicUsize::new(0));
+        let written = Arc::new(AtomicUsize::new(0));
+        let hello = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "capabilities": [],
+            "app_version": "0",
+            "host_id": host_id,
+        });
+        let app = axum::Router::new()
+            .route(
+                "/v1/hello",
+                get(move || {
+                    let hello = hello.clone();
+                    async move { axum::Json(hello) }
+                }),
+            )
+            .route(
+                "/v1/events",
+                get({
+                    let attaches = Arc::clone(&attaches);
+                    let released = Arc::clone(&released);
+                    let written = Arc::clone(&written);
+                    move |Query(params): Query<Vec<(String, String)>>| {
+                        let attaches = Arc::clone(&attaches);
+                        let released = Arc::clone(&released);
+                        let written = Arc::clone(&written);
+                        let script = script.clone();
+                        async move {
+                            let attached: Vec<String> = params
+                                .iter()
+                                .filter(|(key, _)| key == "session")
+                                .map(|(_, value)| value.clone())
+                                .collect();
+                            let control = attached.is_empty();
+                            attaches
+                                .lock()
+                                .expect("the attaches mutex is poisoned")
+                                .push(attached);
+                            if !control && matches!(script, Script::Refuse) {
+                                return (
+                                    StatusCode::CONFLICT,
+                                    axum::Json(serde_json::json!({
+                                        "code": "locked",
+                                        "message": "the session is held by another writer",
+                                    })),
+                                )
+                                    .into_response();
+                            }
+                            // A control connection carries this host's directory
+                            // and then stays open, which is what keeps the
+                            // gateway's link to it up.
+                            let (frames, tail, guard) = if control {
+                                let list = serde_json::to_string(&Frame::List {
+                                    sessions: vec![fake_row("s-1")],
+                                })
+                                .expect("a list frame");
+                                (vec![list], Tail::Held, None)
+                            } else {
+                                let guard = Some(Released(Arc::clone(&released)));
+                                match &script {
+                                    Script::Frames(frames) => (frames.clone(), Tail::Held, guard),
+                                    Script::Ends(frames) => (frames.clone(), Tail::Ended, guard),
+                                    Script::Flood { session } => (
+                                        block(session, "epoch-1", 0),
+                                        Tail::Flood(session.clone()),
+                                        guard,
+                                    ),
+                                    Script::Refuse => unreachable!("answered above"),
+                                }
+                            };
+                            let opening = futures::stream::iter(frames.into_iter().map(|data| {
+                                Ok::<_, std::convert::Infallible>(Event::default().data(data))
+                            }));
+                            let tail: Pin<
+                                Box<
+                                    dyn futures::Stream<
+                                            Item = Result<Event, std::convert::Infallible>,
+                                        > + Send,
+                                >,
+                            > = match tail {
+                                Tail::Flood(session) => Box::pin(flood(session, written, guard)),
+                                Tail::Held => Box::pin(held(guard)),
+                                Tail::Ended => {
+                                    drop(guard);
+                                    Box::pin(futures::stream::empty())
+                                }
+                            };
+                            Sse::new(futures::StreamExt::chain(opening, tail)).into_response()
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind(addr("127.0.0.1:0"))
+            .await
+            .expect("bind");
+        let bound = listener.local_addr().expect("local addr");
+        let serving = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Self {
+            address: HostAddress::parse(&format!("http://{bound}")).expect("an address"),
+            attaches,
+            released,
+            written,
+            serving,
+        }
+    }
+
+    /// Every stream this host was asked for, control connections included.
+    fn attaches(&self) -> Vec<Vec<String>> {
+        self.attaches
+            .lock()
+            .expect("the attaches mutex is poisoned")
+            .clone()
+    }
+
+    /// Every stream that named a session, which is what a splice opens.
+    fn spliced_attaches(&self) -> Vec<Vec<String>> {
+        self.attaches()
+            .into_iter()
+            .filter(|attached| !attached.is_empty())
+            .collect()
+    }
+
+    fn released(&self) -> usize {
+        self.released.load(Ordering::Relaxed)
+    }
+
+    fn written(&self) -> usize {
+        self.written.load(Ordering::Relaxed)
+    }
+
+    fn stop(self) {
+        self.serving.abort();
+    }
+}
+
+/// Counts one released stream when it is dropped, which happens when the
+/// response is.
+struct Released(Arc<AtomicUsize>);
+
+impl Drop for Released {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// What a fake host's stream does once its scripted frames are written.
+enum Tail {
+    /// Held open and silent, which is what keeps a gateway's link to it up.
+    Held,
+    /// Ended, which is what a host hanging up looks like.
+    Ended,
+    /// Reliable frames without end, for the session named.
+    Flood(String),
+}
+
+/// A stream that never yields and holds `guard` until it is dropped.
+fn held(
+    guard: Option<Released>,
+) -> impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>> {
+    futures::stream::unfold(guard, |guard| async move {
+        std::future::pending::<()>().await;
+        Some((Ok(axum::response::sse::Event::default()), guard))
+    })
+}
+
+/// Reliable frames without end, counted as they are written.
+///
+/// Chunky on purpose: what a stalled client is measured against is bytes in
+/// flight, so frames big enough to fill a socket buffer make the bound bite in
+/// hundreds of frames rather than in millions.
+fn flood(
+    session: String,
+    written: Arc<AtomicUsize>,
+    guard: Option<Released>,
+) -> impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>> {
+    let payload = "x".repeat(4096);
+    futures::stream::unfold((0usize, guard), move |(count, guard)| {
+        let frame = warning_frame(&session, "epoch-1", &format!("{count}:{payload}"));
+        let written = Arc::clone(&written);
+        async move {
+            written.fetch_add(1, Ordering::Relaxed);
+            tokio::task::yield_now().await;
+            Some((
+                Ok(axum::response::sse::Event::default().data(frame)),
+                (count + 1, guard),
+            ))
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// The deliberate refusals of this stage
+// ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unknown_endpoint_answers_404() {

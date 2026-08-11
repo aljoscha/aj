@@ -1,13 +1,16 @@
 //! One enrolled host's control connection (spec 7.1).
 //!
 //! Per host: its `/v1/events` stream with no session attachments, which is what
-//! the gateway learns that host's directory from. Nothing else rides it in this
-//! stage. Splicing a client's attached sessions opens further upstream streams
-//! alongside this one, so this is the link's floor rather than its ceiling.
+//! the gateway learns that host's directory from. A client that attaches
+//! sessions gets a stream of its own onto the same host
+//! ([`crate::gateway::splice`]), so this connection carries `list` frames and
+//! heartbeats and nothing else.
 //!
 //! A drop is ordinary, not exceptional: the link marks its host unreachable,
 //! waits out a backoff and dials again. A client sees the flap in the list's
-//! `unreachable` flag, and the sessions of the other hosts are untouched.
+//! `unreachable` flag, and the sessions of the other hosts are untouched. This
+//! link is also the reachability oracle a splice waits on: a host it reaches
+//! again is what earns that client's sessions a `reset`.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -137,8 +140,8 @@ async fn attempt(address: &HostAddress, directory: &Directory) -> Attempt {
             DecodedFrame::Known(frame) => match frame.value() {
                 Frame::List { sessions } => directory.set_rows(address, sessions.clone()),
                 // A control connection names no session, so a host publishes it
-                // none of these (spec 6.5). Forwarding them to the clients that
-                // did ask is stage 3's splice.
+                // none of these (spec 6.5). The ones a client asked for reach it
+                // on that client's own spliced stream instead.
                 Frame::Event { .. }
                 | Frame::State { .. }
                 | Frame::CaughtUp { .. }

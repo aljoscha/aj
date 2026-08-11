@@ -13,23 +13,25 @@
 //!   gateway's own record of what it was told to keep.
 //! - [`directory`] holds the enrolled hosts and composes the merged list.
 //! - [`link`] is one host's control connection, dialing until told to stop.
+//! - [`splice`] is one client stream: the upstreams of the sessions it
+//!   attached, and the `reset` frames a flapping host earns them.
+//! - [`outbound`] is that stream's bounded queue (spec 6.9).
 //! - [`server`] is the HTTP surface, including the proxy.
-//!
-//! The one thing this stage deliberately does not do, refused in one place
-//! rather than half-built: splicing a client's session attachments, which is
-//! what the control connection grows into.
 
 mod config;
 mod directory;
 mod enrollment;
 mod link;
 mod naming;
+mod outbound;
 mod server;
+mod splice;
 
 #[cfg(test)]
 mod tests;
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -37,17 +39,17 @@ use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
 
 use aj_app::cli::args::{Args, Command, DEFAULT_LISTEN_ADDRESS};
-use aj_wire::{
-    Hello, HostList, HostSource, HostSummary, PROTOCOL_VERSION, SessionList, SessionSummary,
-};
+use aj_app::host::AttachRequest;
+use aj_wire::{Hello, HostList, HostSource, HostSummary, PROTOCOL_VERSION, SessionList};
 use anyhow::{Context, Result, bail};
-use tokio::sync::watch;
+use reqwest::StatusCode;
 
 use crate::gateway::config::{AddressError, GatewayConfig, HostAddress};
 use crate::gateway::directory::{Directory, DirectoryError, HostTarget, Route};
 use crate::gateway::enrollment::{EnrollmentError, EnrollmentFile};
 use crate::gateway::link::Link;
 use crate::gateway::server::GatewayServer;
+use crate::gateway::splice::Splice;
 use crate::remote::{RemoteClient, RemoteError};
 
 /// File under the gateway's state directory holding its own stable id.
@@ -71,6 +73,13 @@ const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(15);
 /// How long a client's stream may be idle before a heartbeat frame (spec 6.1).
 const HEARTBEAT: Duration = Duration::from_secs(30);
 
+/// How much slack one client's outbound queue holds (spec 6.9).
+///
+/// The same bound a host applies to its own clients, for the same reason: enough
+/// burst room for a client that reads normally, little enough that a client this
+/// gateway cannot keep up with is evicted rather than buffered without bound.
+const OUTBOUND_QUEUE: NonZeroUsize = NonZeroUsize::new(256).expect("non-zero");
+
 /// How long a proxied request may take before the owning host counts as not
 /// answering, and how long establishing that connection may take.
 ///
@@ -82,8 +91,9 @@ const HEARTBEAT: Duration = Duration::from_secs(30);
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The timings a gateway runs on. Tuning, not policy: every value here changes
-/// how quickly something is noticed, never what is true.
+/// The timings and bounds a gateway runs on. Tuning, not policy: every value
+/// here changes how quickly something is noticed, or how much slack a slow
+/// client gets, never what is true.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Tuning {
     pub(crate) reconnect_delay: Duration,
@@ -91,6 +101,8 @@ pub(crate) struct Tuning {
     pub(crate) heartbeat: Duration,
     /// How long a proxied request waits on the owning host.
     pub(crate) upstream_timeout: Duration,
+    /// How many frames one client's stream may fall behind by (spec 6.9).
+    pub(crate) outbound_queue: NonZeroUsize,
 }
 
 impl Default for Tuning {
@@ -100,6 +112,7 @@ impl Default for Tuning {
             max_reconnect_delay: MAX_RECONNECT_DELAY,
             heartbeat: HEARTBEAT,
             upstream_timeout: UPSTREAM_TIMEOUT,
+            outbound_queue: OUTBOUND_QUEUE,
         }
     }
 }
@@ -133,6 +146,17 @@ pub(crate) enum GatewayError {
     },
     #[error(transparent)]
     Directory(#[from] DirectoryError),
+    /// The host that owns an attached session refused it, in its own words: a
+    /// session it does not hold, a lock conflict. Carried rather than
+    /// interpreted, so a client of a gateway reads a host's refusal exactly as a
+    /// client of that host would (spec 6.10).
+    #[error("the host answered {status}: {message}")]
+    AttachRefused {
+        status: StatusCode,
+        /// The protocol's stable token, when the host sent one (spec 6.1).
+        code: Option<String>,
+        message: String,
+    },
     #[error(transparent)]
     State(#[from] EnrollmentError),
     /// The gateway's own HTTP stack would not start, which only happens before
@@ -345,9 +369,21 @@ impl Gateway {
         Ok(self.inner.directory.create_target(named)?)
     }
 
-    /// A receiver for the merged directory, for one attached client.
-    pub(crate) fn subscribe(&self) -> watch::Receiver<Arc<Vec<SessionSummary>>> {
-        self.inner.directory.subscribe()
+    /// Open one client's event stream, splicing every session it attached
+    /// (spec 7.1).
+    pub(crate) async fn splice(&self, attach: &[AttachRequest]) -> Result<Splice, GatewayError> {
+        // Subscribed before the grouping, so a host that comes up in between is
+        // still a change this stream is woken for: the groups are the state the
+        // splice compares against, and they are the newer of the two.
+        let reachable = self.inner.directory.reachable();
+        let groups = self.inner.directory.group(attach)?;
+        Splice::open(
+            groups,
+            reachable,
+            self.inner.directory.subscribe(),
+            self.inner.tuning.outbound_queue,
+        )
+        .await
     }
 
     /// The client the proxy forwards with.

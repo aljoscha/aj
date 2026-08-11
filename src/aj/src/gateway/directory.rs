@@ -10,9 +10,10 @@
 //! whatever its host last said, with three fields the gateway owns: the
 //! namespaced id, the `host` it belongs to, and `unreachable`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex as StdMutex};
 
+use aj_app::host::AttachRequest;
 use aj_wire::{HostList, HostSource, HostSummary, SessionList, SessionSummary};
 use tokio::sync::watch;
 
@@ -30,9 +31,19 @@ pub(crate) struct Directory {
     ///
     /// A watch rather than a queue per subscriber, because every frame this
     /// carries is a cumulative `list` snapshot: the newest supersedes and a
-    /// slow reader wants only the latest (spec 6.4). Session frames, which are
-    /// undroppable and need a bounded queue with eviction, are stage 3's.
+    /// slow reader wants only the latest (spec 6.4). Session frames are
+    /// undroppable, so they travel a client's bounded queue instead
+    /// ([`crate::gateway::outbound`]).
     merged: watch::Sender<Arc<Vec<SessionSummary>>>,
+    /// The ids of the hosts whose control connection is up, republished
+    /// whenever that set changes.
+    ///
+    /// Not derivable from [`Self::merged`]: a host contributes rows only once
+    /// it has sent a directory, and a client can hold sessions of one that
+    /// currently contributes none. A splice watches this because a host
+    /// *returning* is what makes an upstream attach possible again, and
+    /// `reset` is how a client is asked to make one (spec 7.1).
+    reachable: watch::Sender<Arc<BTreeSet<String>>>,
 }
 
 /// One host as the gateway holds it.
@@ -67,6 +78,47 @@ pub(crate) struct Route {
     pub(crate) session: String,
 }
 
+/// The enrollment a namespaced session id resolves to.
+struct Owner<'a> {
+    /// The id the host answers to, which is the namespace the session id
+    /// carried.
+    host_id: String,
+    /// What that host calls the session.
+    session: String,
+    /// The address the host is enrolled at, which is what a link or an upstream
+    /// dials.
+    address: &'a HostAddress,
+    /// Whether this gateway's control connection to the host is up.
+    connected: bool,
+}
+
+/// Resolve a namespaced session id against the enrolled hosts.
+///
+/// In one place so that a proxied request and a spliced attach cannot disagree
+/// about which ids name a session here. Reachability is reported rather than
+/// judged: a command refuses on it ([`Directory::route`]) and a stream does not
+/// ([`Directory::group`]).
+fn owner<'a>(
+    hosts: &'a BTreeMap<HostAddress, Enrollment>,
+    id: &str,
+) -> Result<Owner<'a>, DirectoryError> {
+    let unknown = |reason: String| DirectoryError::UnknownSession {
+        id: id.to_string(),
+        reason,
+    };
+    let named = SessionAddress::parse(id).map_err(|err| unknown(err.to_string()))?;
+    let (address, enrollment) = hosts
+        .iter()
+        .find(|(_, enrolled)| enrolled.host_id.as_deref() == Some(named.host.as_str()))
+        .ok_or_else(|| unknown(format!("no host {} is enrolled here", named.host)))?;
+    Ok(Owner {
+        host_id: named.host,
+        session: named.session,
+        address,
+        connected: enrollment.connected,
+    })
+}
+
 /// Which host a create lands on: the host to forward it to, and the id its
 /// sessions are namespaced under.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,12 +127,45 @@ pub(crate) struct HostTarget {
     pub(crate) host_id: String,
 }
 
+/// The sessions one client attached on one host (spec 7.1).
+///
+/// One group is one upstream stream: the host's own ids with the client's own
+/// cursors, ready to travel as they arrived.
+pub(crate) struct AttachGroup {
+    pub(crate) host_id: String,
+    /// The address to open the upstream at, `None` when this gateway's control
+    /// connection to the host is down.
+    ///
+    /// A host that is not there contributes no upstream rather than failing the
+    /// client's whole stream, which would punish the sessions of every other
+    /// host on it. Those sessions read `unreachable` in the list, which is what
+    /// tells the client they carry nothing, and the host's return prompts the
+    /// `reset` that makes it attach them again (spec 7.1).
+    pub(crate) dial: Option<HostAddress>,
+    /// The attach set as the owning host names it: de-namespaced ids, the
+    /// client's cursors untouched.
+    pub(crate) attach: Vec<AttachRequest>,
+}
+
+impl AttachGroup {
+    /// The namespaced ids of this group's sessions, as a client of this gateway
+    /// addresses them.
+    pub(crate) fn namespaced(&self) -> Vec<String> {
+        self.attach
+            .iter()
+            .map(|request| SessionAddress::new(&self.host_id, &request.session).to_string())
+            .collect()
+    }
+}
+
 impl Directory {
     pub(crate) fn new() -> Self {
         let (merged, _) = watch::channel(Arc::new(Vec::new()));
+        let (reachable, _) = watch::channel(Arc::new(BTreeSet::new()));
         Self {
             hosts: StdMutex::new(BTreeMap::new()),
             merged,
+            reachable,
         }
     }
 
@@ -252,25 +337,53 @@ impl Directory {
     /// told about a session and what happens when it acts on one have to agree,
     /// and the window is bounded by the link's redial.
     pub(crate) fn route(&self, id: &str) -> Result<Route, DirectoryError> {
-        let unknown = |reason: String| DirectoryError::UnknownSession {
-            id: id.to_string(),
-            reason,
-        };
-        let address = SessionAddress::parse(id).map_err(|err| unknown(err.to_string()))?;
         let hosts = self.lock();
-        let (dial, enrollment) = hosts
-            .iter()
-            .find(|(_, enrolled)| enrolled.host_id.as_deref() == Some(address.host.as_str()))
-            .ok_or_else(|| unknown(format!("no host {} is enrolled here", address.host)))?;
-        if !enrollment.connected {
+        let owner = owner(&hosts, id)?;
+        if !owner.connected {
             return Err(DirectoryError::Unreachable {
-                host: address.host.clone(),
+                host: owner.host_id,
             });
         }
         Ok(Route {
-            address: dial.clone(),
-            session: address.session,
+            address: owner.address.clone(),
+            session: owner.session,
         })
+    }
+
+    /// Group a client's attach set by the host that owns each session
+    /// (spec 7.1).
+    ///
+    /// The refusal is [`Self::route`]'s: an id this gateway cannot resolve to an
+    /// enrolled host names no session here, and refusing the whole stream for it
+    /// is what a host does with an attach it cannot serve (spec 6.5). A host
+    /// that is enrolled and not reachable is *not* a refusal, see
+    /// [`AttachGroup::dial`].
+    pub(crate) fn group(
+        &self,
+        requests: &[AttachRequest],
+    ) -> Result<Vec<AttachGroup>, DirectoryError> {
+        let hosts = self.lock();
+        let mut groups: BTreeMap<String, AttachGroup> = BTreeMap::new();
+        for request in requests {
+            let Owner {
+                host_id,
+                session,
+                address,
+                connected,
+            } = owner(&hosts, &request.session)?;
+            let group = groups
+                .entry(host_id.clone())
+                .or_insert_with(|| AttachGroup {
+                    host_id,
+                    dial: connected.then(|| address.clone()),
+                    attach: Vec::new(),
+                });
+            group.attach.push(AttachRequest {
+                session,
+                cursor: request.cursor.clone(),
+            });
+        }
+        Ok(groups.into_values().collect())
     }
 
     /// Which host a create is for (spec 6.6).
@@ -337,6 +450,16 @@ impl Directory {
         self.merged.subscribe()
     }
 
+    /// A receiver for the ids of the hosts this gateway can reach.
+    ///
+    /// The current value counts as seen, so a caller that wants to act on an
+    /// edge takes the state it compares against from elsewhere. A splice takes
+    /// it from the groups it opened, which is what keeps a host that came up
+    /// between the two an edge rather than a state this stream has to guess at.
+    pub(crate) fn reachable(&self) -> watch::Receiver<Arc<BTreeSet<String>>> {
+        self.reachable.subscribe()
+    }
+
     /// The enrolled hosts, for `GET /v1/hosts`.
     pub(crate) fn hosts(&self) -> HostList {
         let hosts = self.lock();
@@ -385,7 +508,9 @@ impl Directory {
     /// Called with the map held, so what is published is what the map says: two
     /// mutations cannot interleave into a snapshot neither of them produced. An
     /// unchanged payload is not published at all, because `list` is cumulative
-    /// and an identical snapshot carries no information (spec 6.8).
+    /// and an identical snapshot carries no information (spec 6.8), and because
+    /// every attached client watches both of these: a host's ordinary directory
+    /// refresh must not wake one of them per client per frame.
     fn publish(&self, hosts: &BTreeMap<HostAddress, Enrollment>) {
         let merged = merge(hosts);
         self.merged.send_if_modified(|current| {
@@ -393,6 +518,18 @@ impl Directory {
                 return false;
             }
             *current = Arc::new(merged);
+            true
+        });
+        let reachable: BTreeSet<String> = hosts
+            .values()
+            .filter(|enrollment| enrollment.connected)
+            .filter_map(|enrollment| enrollment.host_id.clone())
+            .collect();
+        self.reachable.send_if_modified(|current| {
+            if **current == reachable {
+                return false;
+            }
+            *current = Arc::new(reachable);
             true
         });
     }
@@ -714,6 +851,88 @@ mod tests {
             directory.route("left:s-1"),
             Err(DirectoryError::Unreachable { .. }),
         ));
+    }
+
+    /// A client's attach set groups by the host that owns each session, in that
+    /// host's own vocabulary and with the client's own cursors (spec 7.1).
+    ///
+    /// A host that is not reachable still gets a group, with nothing to dial: its
+    /// sessions contribute no upstream rather than failing the client's whole
+    /// stream, and the group is what tells this gateway whose `reset` to emit
+    /// when that host returns.
+    #[test]
+    fn an_attach_set_groups_by_the_host_that_owns_each_session() {
+        let directory = Directory::new();
+        let left = connected(&directory, "127.0.0.1:1", "left", &["s-1", "s-2"]);
+        connected(&directory, "127.0.0.1:2", "right", &["s-9"]);
+
+        let groups = directory
+            .group(&[
+                attaching("left:s-1", Some("epoch-1:3")),
+                attaching("right:s-9", None),
+                attaching("left:s-2", None),
+            ])
+            .expect("every id names an enrolled host");
+
+        assert_eq!(
+            rendered(&groups),
+            vec![
+                "left@http://127.0.0.1:1: s-1@epoch-1:3, s-2".to_string(),
+                "right@http://127.0.0.1:2: s-9".to_string(),
+            ],
+            "one group per host, in the client's own order within it",
+        );
+        assert_eq!(
+            groups[0].namespaced(),
+            vec!["left:s-1".to_string(), "left:s-2".to_string()],
+            "and the group knows what a client of this gateway calls them",
+        );
+
+        directory.disconnected(&left, "gone".to_string());
+        let groups = directory
+            .group(&[attaching("left:s-1", None)])
+            .expect("a host that is not there is not a refusal");
+        assert_eq!(rendered(&groups), vec!["left@-: s-1".to_string()]);
+
+        for id in ["s-1", "absent:s-1", ":s-1", "left:", "left:.."] {
+            assert!(
+                matches!(
+                    directory.group(&[attaching(id, None)]),
+                    Err(DirectoryError::UnknownSession { .. }),
+                ),
+                "{id:?} names no session here, so the stream is refused",
+            );
+        }
+    }
+
+    fn attaching(session: &str, cursor: Option<&str>) -> AttachRequest {
+        AttachRequest {
+            session: session.to_string(),
+            cursor: cursor.map(|cursor| cursor.parse().expect("a cursor")),
+        }
+    }
+
+    /// Each group as `<host>@<address or -> : <attach set>`, which is everything
+    /// one upstream is opened from.
+    fn rendered(groups: &[AttachGroup]) -> Vec<String> {
+        groups
+            .iter()
+            .map(|group| {
+                let attach: Vec<String> = group
+                    .attach
+                    .iter()
+                    .map(|request| match &request.cursor {
+                        Some(cursor) => format!("{}@{cursor}", request.session),
+                        None => request.session.clone(),
+                    })
+                    .collect();
+                let dial = match &group.dial {
+                    Some(address) => address.to_string(),
+                    None => "-".to_string(),
+                };
+                format!("{}@{dial}: {}", group.host_id, attach.join(", "))
+            })
+            .collect()
     }
 
     /// Which host a create lands on (spec 6.6): the one it names, the only one
