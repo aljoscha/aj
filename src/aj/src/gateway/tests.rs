@@ -2381,6 +2381,19 @@ async fn a_reattach_after_a_reset_resumes_incrementally_when_the_epoch_survived(
     );
     assert_eq!(caught_up_at(&resumed), reached);
 
+    // A second flap, now that this stream was opened with a cursor: what the
+    // `reset` names is the session, not the session with the cursor stuck to it.
+    bridge.cut();
+    let again = frames_until(&mut events, "the reset for the second flap", |frame| {
+        matches!(frame, Frame::Reset { .. })
+    })
+    .await;
+    assert_eq!(
+        resets(&again),
+        vec![id.clone()],
+        "a client matches a reset against the id it attached: {again:?}",
+    );
+
     fixture.shutdown().await;
     bridge.stop();
     host.stop().await;
