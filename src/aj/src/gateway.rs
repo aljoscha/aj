@@ -35,6 +35,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
+use tokio::sync::Mutex as TokioMutex;
+
 use aj_app::cli::args::{Args, Command, DEFAULT_LISTEN_ADDRESS};
 use aj_wire::{Hello, PROTOCOL_VERSION, SessionList, SessionSummary};
 use anyhow::{Context, Result, bail};
@@ -128,6 +130,14 @@ struct GatewayInner {
     /// The enrollment state file, which the dynamic set is written to after
     /// every change to it.
     state: EnrollmentFile,
+    /// Held across a change to the enrolled set and the write that records it.
+    ///
+    /// The directory has its own lock, but it does not cover the file: two
+    /// enrollments arriving together would each take a consistent snapshot and
+    /// could still write them in the other order, leaving the file one host short
+    /// of the directory. That divergence only shows up as a host missing after a
+    /// restart, which is the hardest kind of bug to trace back to here.
+    writing: TokioMutex<()>,
     /// One per enrolled host. Keyed by address for the same reason the directory
     /// is: the address is what a link dials, and a host that has never answered
     /// has no id to key on.
@@ -194,6 +204,7 @@ impl Gateway {
             id: resolve_gateway_id(&state_dir)?,
             directory,
             state,
+            writing: TokioMutex::new(()),
             links: StdMutex::new(HashMap::new()),
             http: reqwest::Client::new(),
             tuning,
@@ -255,16 +266,21 @@ impl Gateway {
                 address: address.clone(),
                 source,
             })?;
-        self.inner.directory.enroll(
-            address.clone(),
-            HostSource::Dynamic,
-            Some(hello.host_id.clone()),
-        )?;
-        if let Err(err) = self.remember() {
-            // An enrollment the gateway cannot write down would come back as a
-            // surprise absence after a restart, so it does not stand.
-            let _ = self.inner.directory.withdraw(&hello.host_id);
-            return Err(err);
+        {
+            // Held across both, so the file cannot end up describing a set that
+            // was never enrolled.
+            let _writing = self.inner.writing.lock().await;
+            self.inner.directory.enroll(
+                address.clone(),
+                HostSource::Dynamic,
+                Some(hello.host_id.clone()),
+            )?;
+            if let Err(err) = self.remember() {
+                // An enrollment the gateway cannot write down would come back as
+                // a surprise absence after a restart, so it does not stand.
+                let _ = self.inner.directory.withdraw(&hello.host_id);
+                return Err(err);
+            }
         }
         self.dial(address.clone());
         let hosts = self.hosts();
@@ -282,19 +298,23 @@ impl Gateway {
 
     /// Remove the enrollment of `host_id` and stop following it.
     pub(crate) async fn withdraw(&self, host_id: &str) -> Result<(), GatewayError> {
-        let address = self.inner.directory.withdraw(host_id)?;
-        if let Err(err) = self.remember() {
-            // A withdrawal the gateway cannot write down would come back as a
-            // surprise after a restart, so it does not stand. The enrollment goes
-            // back, its link was never stopped, and its rows return with that
-            // host's next directory.
-            let _ = self.inner.directory.enroll(
-                address,
-                HostSource::Dynamic,
-                Some(host_id.to_string()),
-            );
-            return Err(err);
-        }
+        let address = {
+            let _writing = self.inner.writing.lock().await;
+            let address = self.inner.directory.withdraw(host_id)?;
+            if let Err(err) = self.remember() {
+                // A withdrawal the gateway cannot write down would come back as a
+                // surprise after a restart, so it does not stand. The enrollment
+                // goes back, its link was never stopped, and its rows return with
+                // that host's next directory.
+                let _ = self.inner.directory.enroll(
+                    address,
+                    HostSource::Dynamic,
+                    Some(host_id.to_string()),
+                );
+                return Err(err);
+            }
+            address
+        };
         self.undial(&address).await;
         Ok(())
     }

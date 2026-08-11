@@ -802,6 +802,37 @@ async fn an_enrollment_the_gateway_cannot_record_does_not_stand() {
     host.stop().await;
 }
 
+/// Two enrollments in flight at once both stick, in the directory and in the
+/// file: the record of what was enrolled is written under the same lock as the
+/// enrolling, so one cannot overwrite the other's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_enrollments_at_once_are_both_recorded() {
+    let mut left = Upstream::start().await;
+    let mut right = Upstream::start().await;
+    let fixture = Fixture::new(&[]).await;
+
+    let (left_address, right_address) = (left.address(), right.address());
+    let (first, second) = tokio::join!(
+        fixture.enroll(&left_address),
+        fixture.enroll(&right_address),
+    );
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(fixture.hosts().await.hosts.len(), 2);
+
+    let fixture = fixture.restart().await;
+    let recovered = fixture.hosts().await;
+    assert_eq!(
+        recovered.hosts.len(),
+        2,
+        "both were written down, not just the one that finished last: {recovered:?}",
+    );
+
+    fixture.shutdown().await;
+    left.stop().await;
+    right.stop().await;
+}
+
 /// A remembered host the configuration now also names is one host, and the
 /// configuration is its record from then on (spec 7.1).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
