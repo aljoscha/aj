@@ -251,6 +251,9 @@ impl Control {
                 let created = remote
                     .client
                     .create_session(CreateSessionRequest {
+                        // The create is for the server this client is attached
+                        // to, which is what an absent host means (spec 6.6).
+                        host: None,
                         settings,
                         prompt: prompt.map(|content| PromptInput::Content { content }),
                         tag,

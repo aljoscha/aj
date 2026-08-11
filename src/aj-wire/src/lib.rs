@@ -64,6 +64,16 @@ impl PromptInput {
 /// Creates a session with optional creator settings and first prompt.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CreateSessionRequest {
+    /// Which host the session is created on, named in the same vocabulary
+    /// [`SessionSummary::host`] and [`HostSummary::id`] use (spec 6.6).
+    ///
+    /// A gateway needs it unless exactly one host is enrolled, and refuses an
+    /// ambiguous create rather than guessing. A plain host accepts its own id
+    /// and nothing else, because it serves one working directory. Absent
+    /// leaves the choice to the server that answers, which is what keeps a
+    /// client that never names a host working.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings: Option<SessionSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

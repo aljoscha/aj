@@ -49,7 +49,7 @@ impl SessionAddress {
     /// proxied URL is built from it: an empty one, and a dot segment. `.` and
     /// `..` disappear from a URL path, so forwarding one would send the host a
     /// request for a *different route* than the client named, which is how a
-    /// refusal on this gateway would get walked around.
+    /// request about one session would become a create.
     pub(crate) fn parse(raw: &str) -> Result<Self, AddressError> {
         let (host, session) = raw
             .split_once(SEPARATOR)
@@ -226,7 +226,7 @@ mod tests {
 
     /// A dot segment is the one shape that would not stay put: a URL path drops
     /// it, so `host:..` plus no route would address `/v1/sessions` on the host,
-    /// which is the create this gateway refuses.
+    /// which is its create route rather than anything about a session.
     #[test]
     fn a_dot_segment_is_not_a_session() {
         for session in [".", ".."] {

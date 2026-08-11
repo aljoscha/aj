@@ -1070,6 +1070,7 @@ async fn creation_applies_settings_and_runs_a_first_prompt() {
                 text: "say hello".to_string(),
             }),
             tag: None,
+            host: None,
         })
         .await
         .expect("create with settings and a prompt")
@@ -1102,6 +1103,72 @@ async fn creation_applies_settings_and_runs_a_first_prompt() {
         summary.last_seq.is_some_and(|seq| seq > 0),
         "the turn wrote log entries",
     );
+    fixture.shutdown().await;
+}
+
+/// A create may name the host it is for, and a host serves exactly one
+/// working directory (spec 6.6): an absent field and this host's own id are
+/// both a create for here, and any other host's id is refused rather than
+/// served on its behalf.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_create_naming_another_host_is_refused() {
+    let fixture = Fixture::new(Vec::new()).await;
+    let own = fixture.host.hello().host_id;
+
+    let anywhere = fixture
+        .client
+        .create_session(CreateSessionRequest::default())
+        .await
+        .expect("a create naming no host is a create for here");
+    let here = fixture
+        .client
+        .create_session(CreateSessionRequest {
+            host: Some(own.clone()),
+            ..CreateSessionRequest::default()
+        })
+        .await
+        .expect("and so is one naming this host");
+    let elsewhere = fixture
+        .client
+        .create_session(CreateSessionRequest {
+            host: Some("0123456789abcdef".to_string()),
+            ..CreateSessionRequest::default()
+        })
+        .await;
+
+    // The store is where the harm would land, so it is read first: a host that
+    // served the create would have minted a third session in its own working
+    // directory on another host's behalf.
+    let mut minted = fixture
+        .host
+        .sessions()
+        .await
+        .expect("the host's directory")
+        .sessions
+        .into_iter()
+        .map(|row| row.id)
+        .collect::<Vec<_>>();
+    minted.sort();
+    let mut expected = vec![anywhere.id, here.id];
+    expected.sort();
+    assert_eq!(
+        minted, expected,
+        "only the creates for this host minted a session",
+    );
+
+    let err = elsewhere.expect_err("a host cannot create in another host's working directory");
+    assert_eq!(err.status(), Some(StatusCode::CONFLICT), "got {err:?}");
+    assert_eq!(
+        err.code(),
+        Some("unsupported"),
+        "a well-formed request this host cannot serve, which the same request \
+         against the named host could (spec 6.1)",
+    );
+    assert!(
+        err.to_string().contains(&own),
+        "the refusal names the host that answered: {err}",
+    );
+
     fixture.shutdown().await;
 }
 

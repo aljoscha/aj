@@ -242,10 +242,12 @@ async fn create_session(
     Body(request): Body<CreateSessionRequest>,
 ) -> Result<Response, ApiError> {
     let CreateSessionRequest {
+        host,
         settings,
         prompt,
         tag,
     } = request;
+    creates_here(&state.host, host.as_deref())?;
     let created = state
         .host
         .create_with(settings, prompt.map(|prompt| prompt.into_content()), tag)
@@ -264,6 +266,27 @@ async fn create_session(
         },
     };
     Ok(Json(created).into_response())
+}
+
+/// Refuse a create meant for another host (spec 6.6).
+///
+/// A host serves exactly one working directory, so the only session it can
+/// create is its own: an absent field and this host's own id are the same
+/// request, and any other id is a create for a store this process does not
+/// hold. [`HostError::Unsupported`], so 409 rather than 400: nothing about the
+/// body is malformed, and the very same body against the host it names may
+/// well succeed.
+fn creates_here(host: &SessionHost, named: Option<&str>) -> Result<(), ApiError> {
+    let own = host.hello().host_id;
+    match named {
+        None => Ok(()),
+        Some(named) if named == own => Ok(()),
+        Some(named) => Err(HostError::Unsupported(format!(
+            "this host is {own}, not {named:?}: a host creates sessions only in its own \
+             working directory"
+        ))
+        .into()),
+    }
 }
 
 async fn tasks(

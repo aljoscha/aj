@@ -13,8 +13,8 @@
 //! instead of hanging CI.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use aj_app::cli::args::Args;
@@ -22,7 +22,8 @@ use aj_app::host::{AttachRequest, SessionHost};
 use aj_app::test_support::finalized_text_message;
 use aj_wire::{
     CreateSessionRequest, EnrollHostRequest, ErrorResponse, Frame, HostList, HostSource,
-    HostSummary, PROTOCOL_VERSION, PromptInput, PromptRequest, SessionList, SessionSummary,
+    HostSummary, PROTOCOL_VERSION, PromptInput, PromptRequest, SessionCreated, SessionList,
+    SessionSummary,
 };
 use clap::Parser;
 use reqwest::StatusCode;
@@ -117,6 +118,16 @@ impl Upstream {
 
     async fn create(&self) -> String {
         self.host.create().await.expect("create a session")
+    }
+
+    /// The sessions this host itself reports, which is where a create either
+    /// landed or did not.
+    ///
+    /// Read from the host rather than through the gateway, for the same reason
+    /// [`Self::durable_seq`] is.
+    async fn session_ids(&self) -> Vec<String> {
+        let list = self.host.sessions().await.expect("the host's directory");
+        list.sessions.into_iter().map(|row| row.id).collect()
     }
 
     /// How far `session`'s log has got, as this host itself reports it.
@@ -261,6 +272,34 @@ impl Fixture {
             }
         })
         .await
+    }
+
+    /// Wait until the control connection to `id` is up.
+    ///
+    /// What a create waits for: a target this gateway cannot reach is refused
+    /// rather than held, so a create raced against the first dial would be a
+    /// 503 about nothing.
+    async fn until_connected(&self, id: &str) {
+        self.until_hosts(&format!("the host {id} to answer"), |hosts| {
+            hosts
+                .hosts
+                .iter()
+                .find(|host| host.id.as_deref() == Some(id) && host.connected)
+                .map(|_| ())
+        })
+        .await;
+    }
+
+    /// Create a session, sending `body` verbatim, so a test can send a field
+    /// this build does not know and a number no float holds.
+    async fn create(&self, body: &str) -> reqwest::Response {
+        self.http
+            .post(format!("{}/v1/sessions", self.server.url()))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .expect("the create request")
     }
 
     /// Enroll `address`, answering whatever the gateway replied.
@@ -1059,6 +1098,450 @@ async fn an_unchanged_directory_publishes_nothing() {
 }
 
 // ---------------------------------------------------------------------------
+// Creating a session (spec 6.6)
+// ---------------------------------------------------------------------------
+
+/// One enrolled host needs no naming: a create that names none defaults to it.
+///
+/// The id that comes back is this gateway's vocabulary, which a read on it
+/// proves rather than its spelling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_defaults_to_the_one_enrolled_host() {
+    let mut host = Upstream::start().await;
+    let fixture = Fixture::new(&[&host]).await;
+    fixture.until_connected(&host.host_id()).await;
+
+    let created = fixture
+        .client
+        .create_session(CreateSessionRequest::default())
+        .await
+        .expect("a create on the one host enrolled here");
+
+    let address = SessionAddress::parse(&created.id)
+        .unwrap_or_else(|err| panic!("a namespaced id, got {:?}: {err}", created.id));
+    assert_eq!(
+        host.session_ids().await,
+        vec![address.session.clone()],
+        "the create minted its session on the enrolled host",
+    );
+    assert_eq!(
+        address.host,
+        host.host_id(),
+        "and the id names that host, which is what a client groups the row by",
+    );
+    fixture
+        .client
+        .tree(&created.id)
+        .await
+        .expect("the id a create answers with addresses the session");
+
+    fixture.shutdown().await;
+    host.stop().await;
+}
+
+/// Two enrolled hosts and a create naming neither is ambiguous, and ambiguity
+/// is refused with a clear error rather than guessed at.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_naming_no_host_is_refused_when_two_are_enrolled() {
+    let mut left = Upstream::start().await;
+    let mut right = Upstream::start().await;
+    let fixture = Fixture::new(&[&left, &right]).await;
+    fixture.until_connected(&left.host_id()).await;
+    fixture.until_connected(&right.host_id()).await;
+
+    let response = fixture.create("{}").await;
+
+    // The stores are where a guess would land, so they are read before the
+    // response: whichever host was picked would hold a session nobody asked
+    // for.
+    let status = response.status();
+    assert_eq!(
+        (left.session_ids().await, right.session_ids().await),
+        (Vec::new(), Vec::new()),
+        "a host was guessed at and minted a session (answered {status})",
+    );
+
+    let (_, code, message) = refusal(response).await;
+    assert_eq!(status, StatusCode::CONFLICT, "code {code}");
+    assert_eq!(code, "ambiguous_host");
+    assert!(
+        message.contains(&left.host_id()) && message.contains(&right.host_id()),
+        "the refusal names the hosts to choose between: {message}",
+    );
+
+    fixture.shutdown().await;
+    left.stop().await;
+    right.stop().await;
+}
+
+/// A create that names one of several hosts lands there and nowhere else, and
+/// the id it answers with resolves as an address on this gateway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_lands_on_the_host_it_names() {
+    let mut left = Upstream::start().await;
+    let mut right = Upstream::start().await;
+    let fixture = Fixture::new(&[&left, &right]).await;
+    fixture.until_connected(&left.host_id()).await;
+    fixture.until_connected(&right.host_id()).await;
+
+    let created = fixture
+        .client
+        .create_session(CreateSessionRequest {
+            host: Some(right.host_id()),
+            ..CreateSessionRequest::default()
+        })
+        .await
+        .expect("a create on the host it names");
+
+    let address = SessionAddress::parse(&created.id)
+        .unwrap_or_else(|err| panic!("a namespaced id, got {:?}: {err}", created.id));
+    assert_eq!(
+        right.session_ids().await,
+        vec![address.session.clone()],
+        "the named host minted the session",
+    );
+    assert!(
+        left.session_ids().await.is_empty(),
+        "and the host that was not named was left alone",
+    );
+    assert_eq!(address.host, right.host_id());
+
+    // The id resolves, which a turn on it proves: the prompt is accepted here
+    // and becomes durable there. A returned id in the wrong vocabulary would
+    // not route at all.
+    let before = right.durable_seq(&address.session).await;
+    fixture
+        .client
+        .command(&created.id, &prompt("go"))
+        .await
+        .expect("the id a create answers with addresses the session");
+    bounded("the turn to become durable on the named host", async {
+        while right.durable_seq(&address.session).await <= before {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+
+    fixture.shutdown().await;
+    left.stop().await;
+    right.stop().await;
+}
+
+/// A named target that is not there is the same 503 a proxied command to it
+/// answers (spec 6.1): a create is not held for a host that may come back, and
+/// it certainly does not land somewhere else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_naming_a_host_that_is_not_there_answers_503() {
+    let mut left = Upstream::start().await;
+    let mut right = Upstream::start().await;
+    let fixture = Fixture::new(&[&left, &right]).await;
+    fixture.until_connected(&left.host_id()).await;
+    fixture.until_connected(&right.host_id()).await;
+    let downed = left.host_id();
+    left.stop().await;
+    fixture
+        .until_hosts("the downed host to be marked", |hosts| {
+            hosts
+                .hosts
+                .iter()
+                .find(|host| host.id.as_deref() == Some(&downed) && !host.connected)
+                .map(|_| ())
+        })
+        .await;
+
+    let response = fixture.create(&format!(r#"{{"host":"{downed}"}}"#)).await;
+
+    let status = response.status();
+    assert!(
+        right.session_ids().await.is_empty(),
+        "the create landed on the host that was not named (answered {status})",
+    );
+    let (_, code, _) = refusal(response).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "code {code}");
+    assert_eq!(code, "host_unreachable");
+
+    fixture.shutdown().await;
+    right.stop().await;
+}
+
+/// A gateway with nothing enrolled has nowhere to create a session, and says
+/// so rather than answering as if it had tried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_create_is_refused_when_nothing_is_enrolled() {
+    let fixture = Fixture::new(&[]).await;
+
+    let (status, code, message) = refusal(fixture.create("{}").await).await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "code {code}");
+    assert_eq!(code, "no_host_enrolled");
+    assert!(
+        message.contains("enrolled"),
+        "the refusal says what is missing: {message}",
+    );
+
+    fixture.shutdown().await;
+}
+
+/// A name no enrollment answers to names no host, and the create goes nowhere
+/// else for it: a mistyped target must not land a session on whichever host
+/// this gateway happens to hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_naming_a_host_that_is_not_enrolled_is_a_404() {
+    let mut left = Upstream::start().await;
+    let mut right = Upstream::start().await;
+    let fixture = Fixture::new(&[&left, &right]).await;
+    fixture.until_connected(&left.host_id()).await;
+    fixture.until_connected(&right.host_id()).await;
+
+    let response = fixture.create(r#"{"host":"0123456789abcdef"}"#).await;
+
+    let status = response.status();
+    assert_eq!(
+        (left.session_ids().await, right.session_ids().await),
+        (Vec::new(), Vec::new()),
+        "the create fell back to an enrolled host (answered {status})",
+    );
+    let (_, code, _) = refusal(response).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "code {code}");
+    assert_eq!(code, "unknown_host");
+
+    fixture.shutdown().await;
+    left.stop().await;
+    right.stop().await;
+}
+
+/// What goes upstream is the client's own create body with one field changed:
+/// `host`, set to the id of the host that answers it, because the create names
+/// its target in that host's own vocabulary (spec 6.6).
+///
+/// A real host accepts an absent field as readily as its own id, so only a
+/// server that keeps what it was sent can show the difference. The same
+/// recording shows that everything else travels untouched, a field this build
+/// does not know included (spec 6.10).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_forwarded_create_names_the_target_in_its_own_vocabulary() {
+    let recorder = Recorder::start("recorder").await;
+    let fixture = Fixture::over(
+        TempDir::new().expect("tempdir"),
+        vec![recorder.address.clone()],
+    )
+    .await;
+    fixture.until_connected("recorder").await;
+
+    let response = fixture
+        .create(r#"{"tag":"fix-auth","added_later":{"n":18446744073709551616}}"#)
+        .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let created: SessionCreated = response.json().await.expect("a created body");
+    let sent = recorder.recorded();
+    let body: serde_json::Value =
+        serde_json::from_str(&sent).expect("the forwarded create is JSON");
+    assert_eq!(
+        body["host"],
+        serde_json::json!("recorder"),
+        "the create names the host that answers it: {sent}",
+    );
+    assert_eq!(
+        body["tag"],
+        serde_json::json!("fix-auth"),
+        "and carries the rest of the client's body: {sent}",
+    );
+    assert!(
+        sent.contains("18446744073709551616"),
+        "a number no float holds travels as it was written: {sent}",
+    );
+    assert_eq!(
+        created.id, "recorder:recorded-1",
+        "and the answer namespaces the id the host minted",
+    );
+
+    fixture.shutdown().await;
+    recorder.stop();
+}
+
+/// A create for a host whose control connection is down is refused even though
+/// that host's port would answer it: what a client is told about a host (an
+/// unreachable row) and what a create on it does have to agree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_is_refused_for_a_host_the_gateway_has_no_link_to() {
+    let recorder = Recorder::unlinked("recorder").await;
+    let fixture = Fixture::over(
+        TempDir::new().expect("tempdir"),
+        vec![recorder.address.clone()],
+    )
+    .await;
+    // It answers `hello`, so the gateway learns its id, and its stream never
+    // opens, so the gateway never has a connection to it.
+    fixture
+        .until_hosts("the host to be named and not connected", |hosts| {
+            hosts
+                .hosts
+                .iter()
+                .find(|host| host.id.as_deref() == Some("recorder") && !host.connected)
+                .map(|_| ())
+        })
+        .await;
+
+    let response = fixture.create(r#"{"host":"recorder"}"#).await;
+
+    let status = response.status();
+    assert!(
+        recorder.creates().is_empty(),
+        "a create reached a host this gateway has no link to (answered {status})",
+    );
+    let (_, code, _) = refusal(response).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "code {code}");
+    assert_eq!(code, "host_unreachable");
+
+    fixture.shutdown().await;
+    recorder.stop();
+}
+
+/// A create the host itself refuses comes back as the host's own refusal.
+///
+/// The gateway reads the body for its `host` field and judges nothing else, so
+/// a thinking level only the host has a vocabulary for is the host's call to
+/// make (spec 6.10, and spec 8's strictness about stated settings).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hosts_own_create_refusal_travels_back() {
+    let mut host = Upstream::start().await;
+    let fixture = Fixture::new(&[&host]).await;
+    fixture.until_connected(&host.host_id()).await;
+
+    let response = fixture
+        .create(r#"{"settings":{"thinking":"ludicrous"}}"#)
+        .await;
+
+    let status = response.status();
+    assert!(
+        host.session_ids().await.is_empty(),
+        "a refused create minted nothing (answered {status})",
+    );
+    let (_, code, message) = refusal(response).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "code {code}");
+    assert_eq!(
+        code, "invalid_request",
+        "the host's own code, not this gateway's reading of the body",
+    );
+    assert!(
+        message.contains("ludicrous"),
+        "and the host's own words: {message}",
+    );
+
+    fixture.shutdown().await;
+    host.stop().await;
+}
+
+/// A stand-in host that keeps the create bodies it is sent.
+struct Recorder {
+    address: HostAddress,
+    creates: Arc<StdMutex<Vec<String>>>,
+    serving: tokio::task::JoinHandle<()>,
+}
+
+impl Recorder {
+    /// A recorder the gateway can link to.
+    async fn start(host_id: &str) -> Self {
+        Self::serve(host_id, true).await
+    }
+
+    /// A recorder that answers everything except an event stream, so the
+    /// gateway learns its id from `hello` and never has a control connection to
+    /// it. Its create route works perfectly well, which is what makes "the
+    /// gateway will not use a host it is not linked to" observable.
+    async fn unlinked(host_id: &str) -> Self {
+        Self::serve(host_id, false).await
+    }
+
+    async fn serve(host_id: &str, stream: bool) -> Self {
+        use axum::response::sse::{Event, Sse};
+        use axum::routing::{get, post};
+
+        let creates: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let hello = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "capabilities": [],
+            "app_version": "0",
+            "host_id": host_id,
+        });
+        let mut app = axum::Router::new().route(
+            "/v1/hello",
+            get(move || {
+                let hello = hello.clone();
+                async move { axum::Json(hello) }
+            }),
+        );
+        if stream {
+            app = app.route(
+                "/v1/events",
+                get(|| async {
+                    // One frame and then silence: the frame gets the response
+                    // head out, and the stream staying open is what keeps the
+                    // gateway's link connected. A stream that ended would mark
+                    // this host unreachable, and a create would then be refused
+                    // before it was ever forwarded.
+                    let opening = futures::stream::iter([Ok::<_, std::convert::Infallible>(
+                        Event::default().data(r#"{"kind":"heartbeat"}"#),
+                    )]);
+                    Sse::new(futures::StreamExt::chain(
+                        opening,
+                        futures::stream::pending(),
+                    ))
+                }),
+            );
+        }
+        let app = app.route(
+            "/v1/sessions",
+            post({
+                let creates = Arc::clone(&creates);
+                move |body: String| {
+                    let creates = Arc::clone(&creates);
+                    async move {
+                        let mut held = creates.lock().expect("the creates mutex is poisoned");
+                        held.push(body);
+                        axum::Json(serde_json::json!({"id": format!("recorded-{}", held.len())}))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(addr("127.0.0.1:0"))
+            .await
+            .expect("bind");
+        let bound = listener.local_addr().expect("local addr");
+        let serving = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Self {
+            address: HostAddress::parse(&format!("http://{bound}")).expect("an address"),
+            creates,
+            serving,
+        }
+    }
+
+    /// Every create body this recorder was sent.
+    fn creates(&self) -> Vec<String> {
+        self.creates
+            .lock()
+            .expect("the creates mutex is poisoned")
+            .clone()
+    }
+
+    /// The one create body this recorder was sent.
+    fn recorded(&self) -> String {
+        let creates = self.creates();
+        let [body] = &creates[..] else {
+            panic!("expected exactly one forwarded create, got {creates:?}");
+        };
+        body.clone()
+    }
+
+    fn stop(self) {
+        self.serving.abort();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The deliberate refusals of this stage
 // ---------------------------------------------------------------------------
 
@@ -1086,26 +1569,6 @@ async fn attaching_a_session_is_refused_rather_than_silently_empty() {
 
     fixture.shutdown().await;
     host.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn creating_a_session_through_a_gateway_is_refused() {
-    let fixture = Fixture::new(&[]).await;
-
-    let err = fixture
-        .client
-        .create_session(CreateSessionRequest::default())
-        .await
-        .expect_err("a gateway has no rule for which host to create on");
-
-    assert_eq!(err.status(), Some(StatusCode::CONFLICT), "got {err:?}");
-    assert_eq!(err.code(), Some("unsupported"));
-    assert!(
-        err.to_string().contains("host"),
-        "the refusal names what is missing: {err}",
-    );
-
-    fixture.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

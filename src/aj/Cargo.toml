@@ -29,7 +29,7 @@ nucleo = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

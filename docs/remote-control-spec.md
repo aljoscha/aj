@@ -314,9 +314,9 @@ store lookup. Membership in an enumeration is not a substitute: it
 happens to be safe, but it couples path safety to how a lookup is
 implemented. Nor is a URL builder: one measured builder silently
 drops `.` and `..` segments instead of escaping them, which turned a
-crafted id into a different upstream *route* (a create, walking
-around the gateway's create refusal) rather than a bad session
-lookup. Validation happens before construction, on both roles.
+crafted id into a different upstream *route* (the create route,
+minting a session instead of answering about one) rather than a bad
+session lookup. Validation happens before construction, on both roles.
 
 ### 6.3 Frames
 

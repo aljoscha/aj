@@ -15,10 +15,9 @@
 //! - [`link`] is one host's control connection, dialing until told to stop.
 //! - [`server`] is the HTTP surface, including the proxy.
 //!
-//! Two things this stage deliberately does not do, each refused in one place
-//! rather than half-built: splicing a client's session attachments (which is
-//! what the control connection grows into) and creating a session, which has no
-//! rule yet for which host to create it on.
+//! The one thing this stage deliberately does not do, refused in one place
+//! rather than half-built: splicing a client's session attachments, which is
+//! what the control connection grows into.
 
 mod config;
 mod directory;
@@ -45,7 +44,7 @@ use anyhow::{Context, Result, bail};
 use tokio::sync::watch;
 
 use crate::gateway::config::{AddressError, GatewayConfig, HostAddress};
-use crate::gateway::directory::{Directory, DirectoryError, Route};
+use crate::gateway::directory::{Directory, DirectoryError, HostTarget, Route};
 use crate::gateway::enrollment::{EnrollmentError, EnrollmentFile};
 use crate::gateway::link::Link;
 use crate::gateway::server::GatewayServer;
@@ -339,6 +338,11 @@ impl Gateway {
     /// Where a namespaced session id points, or why it does not.
     pub(crate) fn route(&self, id: &str) -> Result<Route, GatewayError> {
         Ok(self.inner.directory.route(id)?)
+    }
+
+    /// Which host a create is for, or why none is (spec 6.6).
+    pub(crate) fn create_target(&self, named: Option<&str>) -> Result<HostTarget, GatewayError> {
+        Ok(self.inner.directory.create_target(named)?)
     }
 
     /// A receiver for the merged directory, for one attached client.

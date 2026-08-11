@@ -12,6 +12,7 @@
 //! and it means a route a host gains needs no change here. What gets validated is
 //! the namespace, never the route.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,12 +28,15 @@ use axum::routing::{any, delete, get};
 use axum::{Json, Router, middleware};
 use futures::Stream;
 use serde::de::DeserializeOwned;
+use serde_json::value::RawValue;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::gateway::directory::{DirectoryError, Route};
+use crate::gateway::config::HostAddress;
+use crate::gateway::directory::{DirectoryError, HostTarget, Route};
+use crate::gateway::naming::SessionAddress;
 use crate::gateway::{Gateway, GatewayError};
 use crate::remote::{IdentityError, IdentityGate};
 
@@ -223,18 +227,80 @@ async fn withdraw(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-/// Creating a session through a gateway, which this build does not do.
+/// Create a session on the host it is for (spec 6.6).
 ///
-/// TODO(aljoscha): a create has to name the host to create on, because a host
-/// serves one working directory (spec 6.6 says so in passing). That parameter is
-/// in neither section 7's gateway surface nor `CreateSessionRequest`, and
-/// choosing a host here would be inventing a selection rule. Until the ruling
-/// lands, the route refuses, deliberately and in one place.
-async fn create_session() -> ApiError {
-    ApiError::unsupported(
-        "a gateway cannot create a session yet: a create has to name the host to create it \
-         on, since a host serves one working directory. Create it on that host instead.",
+/// The target is resolved here and nowhere else: the host the body names, or
+/// the sole enrolled one when it names none. What travels upstream is the
+/// client's own body with `host` set to that host's own id, because a create
+/// names its target in the vocabulary of the server that answers it, and what
+/// comes back has its session id namespaced for the same reason. Everything
+/// else in both directions is carried unread, a field this build does not know
+/// included (spec 6.10).
+async fn create_session(
+    State(state): State<Arc<ServerState>>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let content_type = forwarded_content_type(&request);
+    let mut body = create_body(read_body(request).await?)?;
+    let target = state.gateway.create_target(named_host(&body)?.as_deref())?;
+    set_string_field(&mut body, HOST_FIELD, &target.host_id);
+    let url = sessions_url(&target.address).ok_or_else(|| not_a_base_url(&target.address))?;
+    let body = serde_json::to_vec(&body).map_err(|err| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        code: "internal",
+        message: format!(
+            "could not re-encode the create for {}: {err}",
+            target.address
+        ),
+    })?;
+    let answer = send(
+        state.gateway.http(),
+        Upstream {
+            method: Method::POST,
+            url,
+            content_type,
+            body: Bytes::from(body),
+        },
+        &target.address,
     )
+    .await?;
+    namespace_created(answer, &target)
+}
+
+/// Namespace the session id a host just minted (spec 6.2, 6.6).
+///
+/// Only a create that happened names a session. Anything else is the host's own
+/// answer travelling back untouched, code and all: a refused create minted
+/// nothing, and there is no id to rewrite.
+fn namespace_created(answer: Answer, target: &HostTarget) -> Result<Response, ApiError> {
+    if !answer.status.is_success() {
+        return Ok(answer.into_response());
+    }
+    let unreadable = |reason: String| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        code: "internal",
+        message: format!(
+            "the host at {} answered a create this gateway cannot namespace, so the session \
+             it created is not addressable here: {reason}",
+            target.address
+        ),
+    };
+    let mut created: JsonObject =
+        serde_json::from_slice(&answer.body).map_err(|err| unreadable(err.to_string()))?;
+    let id = string_field(&created, CREATED_ID_FIELD)
+        .map_err(|err| unreadable(err.to_string()))?
+        .ok_or_else(|| unreadable(format!("it names no {CREATED_ID_FIELD}")))?;
+    set_string_field(
+        &mut created,
+        CREATED_ID_FIELD,
+        &SessionAddress::new(&target.host_id, &id).to_string(),
+    );
+    let body = serde_json::to_vec(&created).map_err(|err| unreadable(err.to_string()))?;
+    Ok(Answer {
+        body: Bytes::from(body),
+        ..answer
+    }
+    .into_response())
 }
 
 /// Open the gateway's event stream.
@@ -360,27 +426,14 @@ async fn forward(
     request: Request,
 ) -> Result<Response, ApiError> {
     let route = state.gateway.route(id)?;
-    let mut url = upstream_url(&route, rest).ok_or_else(|| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        code: "internal",
-        message: format!("{} is not a base URL", route.address),
-    })?;
+    let mut url = upstream_url(&route, rest).ok_or_else(|| not_a_base_url(&route.address))?;
     // Forwarded as it arrived: a parameter this build does not know is not this
     // gateway's to drop (spec 6.10).
     url.set_query(request.uri().query());
     let method = request.method().clone();
-    // The only header with meaning in this protocol. Blanket forwarding would
-    // drag hop-by-hop headers (`connection`, `transfer-encoding`) along, which
-    // belong to the connection the gateway terminated rather than to the request.
-    let content_type = request
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let body = axum::body::to_bytes(request.into_body(), PROXY_BODY_LIMIT)
-        .await
-        .map_err(|err| ApiError::invalid(format!("could not read the request body: {err}")))?;
-    relay(
+    let content_type = forwarded_content_type(&request);
+    let body = read_body(request).await?;
+    let answer = send(
         state.gateway.http(),
         Upstream {
             method,
@@ -388,9 +441,10 @@ async fn forward(
             content_type,
             body,
         },
-        &route,
+        &route.address,
     )
-    .await
+    .await?;
+    Ok(answer.into_response())
 }
 
 /// One request as it goes upstream.
@@ -399,6 +453,36 @@ struct Upstream {
     url: reqwest::Url,
     content_type: Option<String>,
     body: Bytes,
+}
+
+/// The one request header with meaning in this protocol.
+///
+/// Blanket forwarding would drag hop-by-hop headers (`connection`,
+/// `transfer-encoding`) along, which belong to the connection the gateway
+/// terminated rather than to the request.
+fn forwarded_content_type(request: &Request) -> Option<String> {
+    request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
+/// The request body, bounded by [`PROXY_BODY_LIMIT`].
+async fn read_body(request: Request) -> Result<Bytes, ApiError> {
+    axum::body::to_bytes(request.into_body(), PROXY_BODY_LIMIT)
+        .await
+        .map_err(|err| ApiError::invalid(format!("could not read the request body: {err}")))
+}
+
+/// An enrolled address that will not parse back into a URL, which only a
+/// corrupt state file can produce: every address is parsed on the way in.
+fn not_a_base_url(address: &HostAddress) -> ApiError {
+    ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        code: "internal",
+        message: format!("{address} is not a base URL"),
+    }
 }
 
 /// The upstream URL for a proxied request.
@@ -415,11 +499,10 @@ struct Upstream {
 /// session's own subtree, which names a route the client could have named
 /// outright.
 fn upstream_url(route: &Route, rest: Option<&str>) -> Option<reqwest::Url> {
-    let mut url = reqwest::Url::parse(route.address.url()).ok()?;
+    let mut url = sessions_url(&route.address)?;
     {
         let mut path = url.path_segments_mut().ok()?;
-        path.pop_if_empty();
-        path.push("v1").push("sessions").push(&route.session);
+        path.push(&route.session);
         for segment in rest.unwrap_or_default().split('/') {
             if !segment.is_empty() {
                 path.push(segment);
@@ -429,17 +512,52 @@ fn upstream_url(route: &Route, rest: Option<&str>) -> Option<reqwest::Url> {
     Some(url)
 }
 
-/// Send `upstream` and answer with what came back.
+/// The `/v1/sessions` route on a host: the create, and the root every session
+/// URL extends.
+fn sessions_url(address: &HostAddress) -> Option<reqwest::Url> {
+    let mut url = reqwest::Url::parse(address.url()).ok()?;
+    {
+        let mut path = url.path_segments_mut().ok()?;
+        path.pop_if_empty();
+        path.push("v1").push("sessions");
+    }
+    Some(url)
+}
+
+/// What a host answered, before it becomes this gateway's response.
 ///
-/// The status and the body travel unchanged, which is the whole contract: a
-/// client of a gateway has to be able to read a host's own refusal, code and all.
+/// A step rather than a response, because the create route reads the body it
+/// gets back and every other route does not.
+struct Answer {
+    status: StatusCode,
+    content_type: Option<header::HeaderValue>,
+    body: Bytes,
+}
+
+impl IntoResponse for Answer {
+    /// The host's status and body, unchanged: a client of a gateway has to be
+    /// able to read a host's own refusal, code and all.
+    fn into_response(self) -> Response {
+        let mut response = Response::new(AxumBody::from(self.body));
+        *response.status_mut() = self.status;
+        if let Some(content_type) = self.content_type {
+            response
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, content_type);
+        }
+        response
+    }
+}
+
+/// Send `upstream` to the host at `address` and read its whole answer.
+///
 /// A transport failure becomes the gateway's own 503, because from the client's
 /// side the host is simply not there.
-async fn relay(
+async fn send(
     http: &reqwest::Client,
     upstream: Upstream,
-    route: &Route,
-) -> Result<Response, ApiError> {
+    address: &HostAddress,
+) -> Result<Answer, ApiError> {
     let Upstream {
         method,
         url,
@@ -452,7 +570,7 @@ async fn relay(
     }
     let response = match request.body(body).send().await {
         Ok(response) => response,
-        Err(err) => return Err(ApiError::unreachable(&route.address.to_string(), err)),
+        Err(err) => return Err(ApiError::unreachable(&address.to_string(), err)),
     };
     let status = response.status();
     let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
@@ -460,16 +578,70 @@ async fn relay(
         Ok(body) => body,
         // The head arrived and the body did not, so the answer is as lost as if
         // nothing had arrived at all.
-        Err(err) => return Err(ApiError::unreachable(&route.address.to_string(), err)),
+        Err(err) => return Err(ApiError::unreachable(&address.to_string(), err)),
     };
-    let mut response = Response::new(AxumBody::from(body));
-    *response.status_mut() = status;
-    if let Some(content_type) = content_type {
-        response
-            .headers_mut()
-            .insert(header::CONTENT_TYPE, content_type);
+    Ok(Answer {
+        status,
+        content_type,
+        body,
+    })
+}
+
+/// The create body's target-host field, [`aj_wire::CreateSessionRequest::host`].
+const HOST_FIELD: &str = "host";
+
+/// The created answer's session id, [`aj_wire::SessionCreated::id`].
+const CREATED_ID_FIELD: &str = "id";
+
+/// A JSON object held as its top-level fields, every value left unparsed.
+///
+/// The create is the one route where a gateway edits a body rather than
+/// carrying it: it sets the target `host` on the way up and namespaces the
+/// minted `id` on the way back. Keeping every other value as text is what makes
+/// those two the *only* changes, so a field this build does not know travels
+/// with its number literals intact (spec 6.10's forward-don't-filter).
+type JsonObject = BTreeMap<String, Box<RawValue>>;
+
+/// A create body as its top-level fields, with a blank one reading as `{}`.
+///
+/// The same tolerance the host's own extractor applies, so a create sent with
+/// no body at all reads the same through a gateway as it does against a host. A
+/// body that is not a JSON object is malformed, and saying so here rather than
+/// forwarding it keeps the refusal in one place.
+fn create_body(bytes: Bytes) -> Result<JsonObject, ApiError> {
+    if bytes.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Ok(JsonObject::new());
     }
-    Ok(response)
+    serde_json::from_slice(&bytes)
+        .map_err(|err| ApiError::invalid(format!("malformed request body: {err}")))
+}
+
+/// The host a create names, `None` when it names none (spec 6.6).
+///
+/// A `null` reads as naming none, which is how the typed body decodes it. A
+/// value that is not a string is a malformed request rather than a host nobody
+/// has: inventing an id from it would refuse the create for the wrong reason.
+fn named_host(body: &JsonObject) -> Result<Option<String>, ApiError> {
+    string_field(body, HOST_FIELD).map_err(|err| {
+        ApiError::invalid(format!(
+            "the create's {HOST_FIELD} field names an enrolled host: {err}"
+        ))
+    })
+}
+
+/// The value of `key` as a string, `None` when the key is absent or `null`.
+fn string_field(object: &JsonObject, key: &str) -> Result<Option<String>, serde_json::Error> {
+    match object.get(key) {
+        None => Ok(None),
+        Some(raw) => serde_json::from_str(raw.get()),
+    }
+}
+
+/// Set `key` to a string, replacing whatever was there.
+fn set_string_field(object: &mut JsonObject, key: &str, value: &str) {
+    // A string always encodes, so the only way this fails is a serializer bug.
+    let value = serde_json::value::to_raw_value(value).expect("a string encodes as JSON");
+    object.insert(key.to_string(), value);
 }
 
 /// A JSON request body with the protocol's error shape for a malformed one.
@@ -503,6 +675,7 @@ where
 
 /// An unsuccessful response: the status plus the stable `{code, message}` body
 /// of spec 6.1.
+#[derive(Debug)]
 struct ApiError {
     status: StatusCode,
     /// A stable snake_case token, so a client can branch on the reason without
@@ -592,6 +765,11 @@ fn directory_status(err: &DirectoryError) -> (StatusCode, &'static str) {
         DirectoryError::UnknownSession { .. } => (StatusCode::NOT_FOUND, "unknown_session"),
         DirectoryError::Unreachable { .. } => (StatusCode::SERVICE_UNAVAILABLE, "host_unreachable"),
         DirectoryError::UnusableHostId { .. } => (StatusCode::CONFLICT, "unusable_host_id"),
+        // Both are well-formed creates this gateway cannot serve as it stands,
+        // which is 409 rather than 400: the client's body is fine, and naming
+        // an enrolled host (or enrolling one) makes the same request work.
+        DirectoryError::AmbiguousHost { .. } => (StatusCode::CONFLICT, "ambiguous_host"),
+        DirectoryError::NoHostEnrolled => (StatusCode::CONFLICT, "no_host_enrolled"),
         // Neither of these can reach a request: only a link sees a host change
         // its id or an enrollment vanish under it. Mapping them anyway keeps this
         // total without inventing a status for a case a client cannot provoke.
@@ -702,5 +880,114 @@ mod tests {
             SessionAddress::parse("host:.."),
             Err(crate::gateway::naming::AddressError::DotSession),
         );
+    }
+
+    /// A create body is read for its `host` and for nothing else, and what goes
+    /// upstream is the client's own body with that one field set (spec 6.6).
+    #[test]
+    fn a_create_body_is_read_for_its_host_alone() {
+        for (raw, named) in [
+            // A blank body is `{}`, as it is on a host.
+            ("", None),
+            ("  ", None),
+            ("{}", None),
+            (r#"{"host":null}"#, None),
+            (r#"{"tag":"fix-auth"}"#, None),
+            (r#"{"host":"left"}"#, Some("left")),
+        ] {
+            let body = create_body(Bytes::from_static(raw.as_bytes()))
+                .unwrap_or_else(|err| panic!("{raw:?} is a create body: {}", err.message));
+            assert_eq!(
+                named_host(&body).expect("a host or none").as_deref(),
+                named,
+                "{raw:?}",
+            );
+        }
+
+        // A host that is not a string is a malformed request rather than a host
+        // nobody has: refusing it as unknown would name the wrong problem.
+        let body = create_body(Bytes::from_static(br#"{"host":5}"#)).expect("an object");
+        assert_eq!(
+            named_host(&body).expect_err("5 names no host").status,
+            StatusCode::BAD_REQUEST,
+        );
+        assert_eq!(
+            create_body(Bytes::from_static(b"[1]"))
+                .expect_err("a create body is an object")
+                .status,
+            StatusCode::BAD_REQUEST,
+        );
+
+        let mut body = create_body(Bytes::from_static(
+            br#"{"tag":"fix-auth","added_later":{"n":18446744073709551616}}"#,
+        ))
+        .expect("an object");
+        set_string_field(&mut body, HOST_FIELD, "left");
+        let forwarded = serde_json::to_string(&body).expect("it re-encodes");
+        assert!(forwarded.contains(r#""host":"left""#), "{forwarded}");
+        assert!(
+            forwarded.contains("18446744073709551616"),
+            "a field this gateway does not know keeps its own number literal: {forwarded}",
+        );
+    }
+
+    /// The id a host minted is namespaced on the way out, and anything that is
+    /// not a created session travels back as the host wrote it (spec 6.6).
+    #[tokio::test]
+    async fn a_created_answer_is_namespaced_and_a_refusal_is_forwarded() {
+        let target = HostTarget {
+            address: HostAddress::parse("127.0.0.1:6161").expect("an address"),
+            host_id: "left".to_string(),
+        };
+        let answer = |status: StatusCode, body: &'static str| Answer {
+            status,
+            content_type: None,
+            body: Bytes::from_static(body.as_bytes()),
+        };
+
+        let created = namespace_created(
+            answer(
+                StatusCode::OK,
+                r#"{"id":"s-1","incomplete":"tag not applied"}"#,
+            ),
+            &target,
+        )
+        .expect("a created session");
+        assert_eq!(created.status(), StatusCode::OK);
+        let body = body_json(created).await;
+        assert_eq!(body["id"], serde_json::json!("left:s-1"));
+        assert_eq!(
+            body["incomplete"],
+            serde_json::json!("tag not applied"),
+            "and the rest of the host's answer is untouched",
+        );
+
+        let refused = namespace_created(
+            answer(
+                StatusCode::CONFLICT,
+                r#"{"code":"unsupported","message":"no"}"#,
+            ),
+            &target,
+        )
+        .expect("a refusal is an answer too");
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            body_json(refused).await["code"],
+            serde_json::json!("unsupported"),
+            "a create that minted nothing names no session to rewrite",
+        );
+
+        // A success this gateway cannot namespace is reported, never guessed
+        // at: the session may exist on the host and is not addressable here.
+        let err = namespace_created(answer(StatusCode::OK, r#"{"session":"s-1"}"#), &target)
+            .expect_err("a created answer with no id");
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    async fn body_json(response: Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(response.into_body(), PROXY_BODY_LIMIT)
+            .await
+            .expect("a response body");
+        serde_json::from_slice(&body).expect("a JSON body")
     }
 }

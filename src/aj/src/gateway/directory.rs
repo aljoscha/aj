@@ -51,12 +51,28 @@ struct Enrollment {
     error: Option<String>,
 }
 
+impl Enrollment {
+    /// What this gateway knows the host by: its id, or the address it was
+    /// enrolled at while it has never answered and so has no id.
+    fn name(&self, address: &HostAddress) -> String {
+        self.host_id.clone().unwrap_or_else(|| address.to_string())
+    }
+}
+
 /// Where a proxied request goes: which host, and what that host calls the
 /// session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Route {
     pub(crate) address: HostAddress,
     pub(crate) session: String,
+}
+
+/// Which host a create lands on: the host to forward it to, and the id its
+/// sessions are namespaced under.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HostTarget {
+    pub(crate) address: HostAddress,
+    pub(crate) host_id: String,
 }
 
 impl Directory {
@@ -248,13 +264,64 @@ impl Directory {
             .ok_or_else(|| unknown(format!("no host {} is enrolled here", address.host)))?;
         if !enrollment.connected {
             return Err(DirectoryError::Unreachable {
-                host_id: address.host.clone(),
+                host: address.host.clone(),
             });
         }
         Ok(Route {
             address: dial.clone(),
             session: address.session,
         })
+    }
+
+    /// Which host a create is for (spec 6.6).
+    ///
+    /// `named` is the create body's `host` field, in the vocabulary the
+    /// directory rows' `host` field uses. Naming none defaults to the sole
+    /// enrolled host and to nothing else: with none enrolled there is nowhere
+    /// to create, and with several the request is ambiguous, which is refused
+    /// rather than guessed at, because a session created on the wrong host is
+    /// in the wrong working directory and cannot be moved.
+    ///
+    /// A target whose control connection is down is unreachable, which is the
+    /// same answer a proxied command to it gets and for the same reason
+    /// ([`Self::route`]): what a client is told about a host and what happens
+    /// when it acts on one have to agree.
+    pub(crate) fn create_target(&self, named: Option<&str>) -> Result<HostTarget, DirectoryError> {
+        let hosts = self.lock();
+        let (address, enrollment) = match named {
+            Some(named) => hosts
+                .iter()
+                .find(|(_, enrolled)| enrolled.host_id.as_deref() == Some(named))
+                .ok_or_else(|| DirectoryError::UnknownHost {
+                    host_id: named.to_string(),
+                })?,
+            None => {
+                let mut enrollments = hosts.iter();
+                let sole = enrollments.next().ok_or(DirectoryError::NoHostEnrolled)?;
+                if enrollments.next().is_some() {
+                    return Err(DirectoryError::AmbiguousHost {
+                        hosts: hosts
+                            .iter()
+                            .map(|(address, enrollment)| enrollment.name(address))
+                            .collect(),
+                    });
+                }
+                sole
+            }
+        };
+        // A host that has never answered has no id, and so is not connected
+        // either: a link adopts an id before it reports a connection. Both read
+        // as unreachable, which is what a gateway can honestly say about a host
+        // it has not spoken to.
+        match (&enrollment.host_id, enrollment.connected) {
+            (Some(host_id), true) => Ok(HostTarget {
+                address: address.clone(),
+                host_id: host_id.clone(),
+            }),
+            _ => Err(DirectoryError::Unreachable {
+                host: enrollment.name(address),
+            }),
+        }
     }
 
     /// The merged directory as it stands.
@@ -384,8 +451,25 @@ pub(crate) enum DirectoryError {
     StaticHost { address: HostAddress },
     #[error("{id} names no session here: {reason}")]
     UnknownSession { id: String, reason: String },
-    #[error("host {host_id} is not reachable from this gateway")]
-    Unreachable { host_id: String },
+    /// The gateway's control connection to the host is down, so it will not
+    /// serve a request for it.
+    #[error("host {host} is not reachable from this gateway")]
+    Unreachable {
+        /// What this gateway knows the host by: its id, or its address when it
+        /// has never answered and so has no id.
+        host: String,
+    },
+    /// A create named no host and there is more than one to choose from. Never
+    /// guessed at (spec 6.6).
+    #[error(
+        "this gateway has {} hosts enrolled, so a create has to name one of them: {}",
+        hosts.len(),
+        hosts.join(", ")
+    )]
+    AmbiguousHost { hosts: Vec<String> },
+    /// A create arrived at a gateway that has no host to create on.
+    #[error("no host is enrolled on this gateway, so there is nowhere to create a session")]
+    NoHostEnrolled,
     #[error("a host reports the id {host_id:?}, which cannot be used here: {source}")]
     UnusableHostId {
         host_id: String,
@@ -630,6 +714,80 @@ mod tests {
             directory.route("left:s-1"),
             Err(DirectoryError::Unreachable { .. }),
         ));
+    }
+
+    /// Which host a create lands on (spec 6.6): the one it names, the only one
+    /// enrolled when it names none, and nothing guessed at in between.
+    #[test]
+    fn a_create_target_is_the_host_it_names_or_the_only_one_enrolled() {
+        let directory = Directory::new();
+        assert!(matches!(
+            directory.create_target(None),
+            Err(DirectoryError::NoHostEnrolled),
+        ));
+
+        let left = connected(&directory, "127.0.0.1:1", "left", &["s-1"]);
+        let target = HostTarget {
+            address: left.clone(),
+            host_id: "left".to_string(),
+        };
+        assert_eq!(
+            directory.create_target(None).expect("the only host"),
+            target,
+            "one enrolled host needs no naming",
+        );
+        assert_eq!(
+            directory.create_target(Some("left")).expect("named"),
+            target
+        );
+        assert!(
+            matches!(
+                directory.create_target(Some("absent")),
+                Err(DirectoryError::UnknownHost { .. }),
+            ),
+            "a name no enrollment answers to is not a host to fall back from",
+        );
+
+        connected(&directory, "127.0.0.1:2", "right", &[]);
+        let Err(DirectoryError::AmbiguousHost { hosts }) = directory.create_target(None) else {
+            panic!("two enrolled hosts and no name is ambiguous");
+        };
+        assert_eq!(
+            hosts,
+            vec!["left".to_string(), "right".to_string()],
+            "and the refusal names the hosts to choose between",
+        );
+        assert_eq!(
+            directory
+                .create_target(Some("right"))
+                .expect("named")
+                .host_id,
+            "right",
+        );
+
+        directory.disconnected(&left, "gone".to_string());
+        assert!(matches!(
+            directory.create_target(Some("left")),
+            Err(DirectoryError::Unreachable { .. }),
+        ));
+    }
+
+    /// A configured host that has never answered is enrolled, so it counts
+    /// towards a create having to name one, and it can never be the target
+    /// itself: the session would have no namespace to appear under.
+    #[test]
+    fn a_host_with_no_id_yet_is_not_a_create_target() {
+        let directory = Directory::new();
+        let fresh = enrolled_without_id(&directory);
+
+        let Err(DirectoryError::Unreachable { host }) = directory.create_target(None) else {
+            panic!("a host this gateway has never spoken to cannot take a create");
+        };
+        assert_eq!(
+            host,
+            fresh.to_string(),
+            "named by its address, which is all this gateway knows it by",
+        );
     }
 
     #[test]

@@ -189,6 +189,7 @@ fn settings_use_the_cli_selection_triple_and_create_round_trips() {
             text: "start here".into(),
         }),
         tag: None,
+        host: None,
     };
     let encoded = serde_json::to_value(&create).unwrap();
     assert_eq!(encoded["prompt"], json!({"text":"start here"}));
@@ -225,6 +226,44 @@ fn settings_use_the_cli_selection_triple_and_create_round_trips() {
         serde_json::from_value::<SessionCreated>(encoded).unwrap(),
         partial,
     );
+}
+
+/// A create may name the host it is for (spec 6.6), in the same vocabulary a
+/// directory row's `host` field and an enrolled host's id use. The field is
+/// optional and additive: a client that names none sends no key at all, which
+/// is what leaves the choice of host to the server that answers.
+#[test]
+fn a_create_names_the_host_it_is_for_or_leaves_the_choice_to_the_server() {
+    let targeted = CreateSessionRequest {
+        host: Some("workstation".to_string()),
+        ..CreateSessionRequest::default()
+    };
+    assert_eq!(
+        serde_json::to_value(&targeted).unwrap(),
+        json!({"host": "workstation"}),
+    );
+    assert_eq!(
+        serde_json::to_value(CreateSessionRequest::default()).unwrap(),
+        json!({}),
+        "a create that names no host emits no key",
+    );
+    // A null reads as no host named, so a client that spells the absence out
+    // is not refused for it.
+    for body in [
+        json!({"host": "workstation"}),
+        json!({"tag": "fix-auth"}),
+        json!({"host": null}),
+    ] {
+        let expected = body.get("host").and_then(Value::as_str);
+        assert_eq!(
+            serde_json::from_value::<CreateSessionRequest>(body.clone())
+                .unwrap_or_else(|err| panic!("{body} decodes: {err}"))
+                .host
+                .as_deref(),
+            expected,
+            "{body}",
+        );
+    }
 }
 
 #[test]
