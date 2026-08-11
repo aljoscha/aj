@@ -327,6 +327,9 @@ impl Gateway {
             if let Err(err) = self.remember() {
                 // An enrollment the gateway cannot write down would come back as
                 // a surprise absence after a restart, so it does not stand.
+                // Nothing to tear down with it: no link was dialed yet, so it
+                // was never reachable and no client stream could have spliced
+                // onto it.
                 let _ = self.inner.directory.withdraw(&hello.host_id);
                 return Err(err);
             }
