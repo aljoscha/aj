@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
 use aj_wire::{
@@ -8,6 +8,7 @@ use aj_wire::{
     SessionList, SessionSettings, SessionSummary, SessionTree, SettingsRequest, SteerRequest,
     TagRequest, TaskDetails, TaskTable, VmList,
 };
+use serde_json::value::RawValue;
 use serde_json::{Value, json};
 
 const EVENT_TYPES: &[&str] = &[
@@ -518,23 +519,289 @@ fn decoded_frame_forwards_unknown_numbers_exactly() {
 #[test]
 fn decoded_frame_rewrites_known_session_without_losing_additions() {
     let input = r#"{"kind":"state","session":"old","epoch":"e","working":false,"settings":{"provider":"p","model_id":"m","thinking":"off","speed":"standard","verbosity":"default","future_setting":{"huge":1e400}},"last_seq":7,"future_number":18446744073709551616}"#;
-    let expected = r#"{"kind":"state","session":"gateway:old","epoch":"e","working":false,"settings":{"provider":"p","model_id":"m","thinking":"off","speed":"standard","verbosity":"default","future_setting":{"huge":1e400}},"last_seq":7,"future_number":18446744073709551616}"#;
-    let mut frame: DecodedFrame = serde_json::from_str(input).unwrap();
+    let before: DecodedFrame = serde_json::from_str(input).unwrap();
+    let mut after = before.clone();
 
-    assert!(frame.rewrite_session("gateway:old").unwrap());
+    assert!(after.rewrite_session("gateway:old").unwrap());
 
-    assert_eq!(serde_json::to_string(&frame).unwrap(), expected);
+    assert_rewrote_session(&before, &after, "gateway:old");
+    assert_eq!(known_session(&after), Some("gateway:old"));
+    // The number literals are the one place byte preservation is the property
+    // rather than a coincidence: re-parsing would round 2^64 to a float and
+    // reject 1e400 outright.
+    let json = serde_json::to_string(&after).unwrap();
+    assert!(json.contains("1e400"), "{json}");
+    assert!(json.contains("18446744073709551616"), "{json}");
 }
 
 #[test]
 fn decoded_frame_rewrites_unknown_session_without_parsing_payloads() {
     let input = r#"{"kind":"future_frame","session":"old","future_number":1e400}"#;
-    let expected = r#"{"kind":"future_frame","session":"gateway:old","future_number":1e400}"#;
+    let before: DecodedFrame = serde_json::from_str(input).unwrap();
+    let mut after = before.clone();
+
+    assert!(after.rewrite_session("gateway:old").unwrap());
+
+    assert_rewrote_session(&before, &after, "gateway:old");
+    let DecodedFrame::Unknown { kind, .. } = &after else {
+        panic!("a rewritten unknown frame stays unknown");
+    };
+    assert_eq!(kind, "future_frame");
+    assert!(
+        serde_json::to_string(&after).unwrap().contains("1e400"),
+        "an unparsed payload keeps its number literals",
+    );
+}
+
+/// Every frame kind either carries a top-level `session` a gateway rewrites,
+/// or is host-scoped and forwarded as is (spec 6.10). The partition lives in
+/// [`frame_carries_session`], whose match is exhaustive, so a new frame
+/// variant does not compile until it says which side it is on.
+///
+/// The fixtures are fed in pretty-printed so that "left untouched" is a
+/// statement with teeth: a frame that went through a re-serialization would
+/// come back compacted.
+#[test]
+fn every_frame_kind_says_whether_its_session_can_be_rewritten() {
+    let mut covered = BTreeSet::new();
+
+    for fixture in fixture("frames").as_array().expect("frames are an array") {
+        let input = serde_json::to_string_pretty(fixture).unwrap();
+        let before: DecodedFrame = serde_json::from_str(&input).unwrap();
+        let DecodedFrame::Known(known) = &before else {
+            panic!("the pinned fixtures are all known kinds");
+        };
+        let carries = frame_carries_session(known.value());
+        covered.insert(frame_kind(known.value()));
+        assert_eq!(
+            known.value().session().is_some(),
+            carries,
+            "Frame::session agrees on the partition: {input}",
+        );
+
+        let mut after = before.clone();
+        assert_eq!(
+            after.rewrite_session("gateway:session-1").unwrap(),
+            carries,
+            "{input}",
+        );
+        if carries {
+            assert_rewrote_session(&before, &after, "gateway:session-1");
+            assert_eq!(known_session(&after), Some("gateway:session-1"));
+        } else {
+            // A host-scoped frame is not re-serialized at all, so a `list`
+            // frame's rows keep the ids a gateway rewrites for itself.
+            assert_eq!(serde_json::to_string(&after).unwrap(), input);
+        }
+    }
+
+    assert_eq!(
+        covered,
+        FRAME_KINDS.iter().copied().collect::<BTreeSet<_>>(),
+        "one fixture per frame kind",
+    );
+}
+
+/// A frame built in process retains no JSON, so the rewrite goes through its
+/// typed value instead. Both paths answer for the same partition, and a
+/// host-scoped frame comes back untouched here too.
+#[test]
+fn a_locally_built_frame_rewrites_through_its_typed_value() {
+    let mut covered = BTreeSet::new();
+
+    for frame in local_frames() {
+        let before = DecodedFrame::try_from(frame).expect("a local frame is valid");
+        let DecodedFrame::Known(known) = &before else {
+            panic!("a local frame is known");
+        };
+        assert!(known.raw_json().is_none(), "a local frame retains no JSON");
+        let carries = frame_carries_session(known.value());
+        covered.insert(frame_kind(known.value()));
+        assert_eq!(known.value().session().is_some(), carries);
+
+        let mut after = before.clone();
+        let kind = frame_kind(known.value());
+        assert_eq!(
+            after.rewrite_session("gateway:old").unwrap(),
+            carries,
+            "{kind}"
+        );
+        if carries {
+            assert_rewrote_session(&before, &after, "gateway:old");
+            assert_eq!(known_session(&after), Some("gateway:old"));
+        } else {
+            assert_eq!(
+                serde_json::to_string(&after).unwrap(),
+                serde_json::to_string(&before).unwrap(),
+                "{kind}",
+            );
+        }
+    }
+
+    assert_eq!(
+        covered,
+        FRAME_KINDS.iter().copied().collect::<BTreeSet<_>>(),
+        "one locally built frame per frame kind",
+    );
+}
+
+/// An unknown frame with no top-level `session` is host-scoped and forwarded
+/// as is (spec 6.10). A `session` down in a payload is not the frame's
+/// session, and finding one there must not turn the frame into a
+/// session-scoped one.
+#[test]
+fn an_unknown_frame_without_a_top_level_session_is_forwarded_as_is() {
+    let input = r#"{
+  "kind": "future_frame",
+  "host_scoped": true,
+  "payload": {"session": "nested", "huge": 1e400}
+}"#;
+    let mut frame: DecodedFrame = serde_json::from_str(input).unwrap();
+
+    assert!(!frame.rewrite_session("gateway:whatever").unwrap());
+
+    assert_eq!(
+        serde_json::to_string(&frame).unwrap(),
+        input,
+        "a declined frame is handed on exactly as it arrived",
+    );
+}
+
+/// The rewrite reaches the top-level `session` and nothing else. This is what
+/// makes it safe on a frame the forwarder does not understand: an event
+/// payload may plausibly carry a `session` field of its own, and it has to
+/// arrive as the host wrote it.
+#[test]
+fn the_rewrite_reaches_only_the_top_level_session() {
+    let event = r#"{"type":"notice","agent_id":"main","text":"hi","session":"payload-session"}"#;
+    let input = format!(r#"{{"kind":"event","session":"old","epoch":"e","event":{event}}}"#);
+    let before: DecodedFrame = serde_json::from_str(&input).unwrap();
+    let mut after = before.clone();
+
+    assert!(after.rewrite_session("gateway:old").unwrap());
+
+    assert_rewrote_session(&before, &after, "gateway:old");
+    assert_eq!(top_level_fields(&after)["event"], event);
+
+    let payload = r#"{"nested":{"session":"deep","huge":1e400}}"#;
+    let input = format!(r#"{{"kind":"future_frame","session":"old","payload":{payload}}}"#);
+    let before: DecodedFrame = serde_json::from_str(&input).unwrap();
+    let mut after = before.clone();
+
+    assert!(after.rewrite_session("gateway:old").unwrap());
+
+    assert_rewrote_session(&before, &after, "gateway:old");
+    assert_eq!(top_level_fields(&after)["payload"], payload);
+}
+
+/// A duplicate `session` is malformed and refused for a known kind, but an
+/// unknown frame is forwarded as it arrived, duplicates included, and a reader
+/// downstream may take either occurrence. So every occurrence is rewritten.
+#[test]
+fn every_top_level_session_occurrence_is_rewritten() {
+    let input = r#"{"kind":"future_frame","session":"old","session":"older"}"#;
     let mut frame: DecodedFrame = serde_json::from_str(input).unwrap();
 
     assert!(frame.rewrite_session("gateway:old").unwrap());
 
-    assert_eq!(serde_json::to_string(&frame).unwrap(), expected);
+    // Counted in the text rather than looked up by key, which is the whole
+    // point: a map keyed by name would hide the second occurrence.
+    let json = serde_json::to_string(&frame).unwrap();
+    assert_eq!(
+        json.matches(r#""session":"gateway:old""#).count(),
+        2,
+        "{json}"
+    );
+    assert!(!json.contains("older"), "{json}");
+}
+
+/// A gateway mints `<host_id>:<session_id>` from two opaque halves (spec 6.2),
+/// so the replacement goes in as JSON rather than spliced in as text. A
+/// control character in an id would otherwise break the line-oriented framing
+/// the frame travels in.
+#[test]
+fn a_session_id_needing_escapes_survives_the_rewrite() {
+    let replacement = "h\"o\\st\u{1}\n:sitzplatz\u{2013}1";
+
+    for input in [
+        r#"{"kind":"reset","session":"old"}"#,
+        r#"{"kind":"future_frame","session":"old"}"#,
+    ] {
+        let mut frame: DecodedFrame = serde_json::from_str(input).unwrap();
+
+        assert!(frame.rewrite_session(replacement).unwrap());
+
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(!json.contains('\n'), "{json}");
+        let value: Value = serde_json::from_str(&json).expect("the rewrite emits valid JSON");
+        assert_eq!(value["session"], json!(replacement), "{json}");
+        if matches!(frame, DecodedFrame::Known(_)) {
+            assert_eq!(known_session(&frame), Some(replacement));
+        }
+    }
+}
+
+/// The key is matched after JSON unescaping, not by looking for `"session"` in
+/// the frame's bytes. Pinned because that scan looks like a cheap
+/// optimization and is not one.
+#[test]
+fn the_session_key_is_matched_after_json_unescaping() {
+    let input = r#"{"kind":"future_frame","\u0073ession":"old"}"#;
+    let mut frame: DecodedFrame = serde_json::from_str(input).unwrap();
+
+    assert!(frame.rewrite_session("gateway:old").unwrap());
+
+    assert_eq!(top_level_fields(&frame)["session"], r#""gateway:old""#);
+}
+
+/// A gateway rewrites a frame it has already rewritten whenever its own view
+/// of the id moves, and it routes on the typed value while forwarding the
+/// retained JSON, so the two must not drift apart.
+#[test]
+fn a_rewritten_frame_can_be_rewritten_again() {
+    let input =
+        r#"{"kind":"caught_up","session":"old","epoch":"e","last_seq":3,"added_later":true}"#;
+    let mut frame: DecodedFrame = serde_json::from_str(input).unwrap();
+
+    assert!(frame.rewrite_session("first:old").unwrap());
+    assert_eq!(known_session(&frame), Some("first:old"));
+    let once = frame.clone();
+    assert!(frame.rewrite_session("second:old").unwrap());
+
+    assert_rewrote_session(&once, &frame, "second:old");
+    assert_eq!(known_session(&frame), Some("second:old"));
+    assert_eq!(top_level_fields(&frame)["added_later"], "true");
+
+    let mut local = DecodedFrame::try_from(Frame::Reset {
+        session: "old".to_string(),
+    })
+    .unwrap();
+    assert!(local.rewrite_session("first:old").unwrap());
+    assert!(local.rewrite_session("second:old").unwrap());
+    assert_eq!(known_session(&local), Some("second:old"));
+}
+
+/// Rewriting to the id a frame already carries changes nothing that matters.
+/// It may still change bytes, because the id is re-emitted the way serde
+/// writes a string rather than the way the host spelled it, and spec 6.10 asks
+/// only for structural equality.
+#[test]
+fn rewriting_to_the_same_id_changes_nothing_that_matters() {
+    let input = r#"{"kind":"future_frame","session":"a\u0062c","huge":1e400}"#;
+    let before: DecodedFrame = serde_json::from_str(input).unwrap();
+    let mut after = before.clone();
+
+    assert!(after.rewrite_session("abc").unwrap());
+
+    assert_rewrote_session(&before, &after, "abc");
+    let spelled = top_level_fields(&before).remove("session").unwrap();
+    let rewritten = top_level_fields(&after).remove("session").unwrap();
+    assert_eq!(
+        serde_json::from_str::<String>(&spelled).unwrap(),
+        serde_json::from_str::<String>(&rewritten).unwrap(),
+        "the id is the one the frame already carried",
+    );
+    assert_ne!(spelled, rewritten, "byte identity is not the promise");
 }
 
 #[test]
@@ -912,4 +1179,105 @@ fn frame_kind(frame: &Frame) -> &'static str {
         Frame::Heartbeat => "heartbeat",
         Frame::Vms { .. } => "vms",
     }
+}
+
+/// Whether a frame kind carries the top-level `session` a gateway rewrites
+/// (spec 6.3), stated here rather than read off the library so that the two
+/// can be held against each other.
+///
+/// The match is exhaustive on purpose. A new frame variant does not compile
+/// until it declares which side of the rewrite it is on.
+fn frame_carries_session(frame: &Frame) -> bool {
+    match frame {
+        Frame::Event { .. }
+        | Frame::State { .. }
+        | Frame::CaughtUp { .. }
+        | Frame::Reset { .. } => true,
+        Frame::List { .. } | Frame::Heartbeat | Frame::Vms { .. } => false,
+    }
+}
+
+/// One frame per variant, built in process, so none of them retains any JSON.
+fn local_frames() -> Vec<Frame> {
+    let notice: AgentEvent = serde_json::from_value(json!({
+        "type": "notice",
+        "agent_id": "main",
+        "text": "hello"
+    }))
+    .expect("the notice event decodes");
+    vec![
+        Frame::Event {
+            session: "old".to_string(),
+            epoch: "epoch-1".to_string(),
+            durability: None,
+            event: DecodedAgentEvent::from(notice),
+        },
+        Frame::State {
+            session: "old".to_string(),
+            epoch: "epoch-1".to_string(),
+            working: true,
+            settings: AgentSettings {
+                provider: "scripted".to_string(),
+                model_id: "scripted-model".to_string(),
+                thinking: "off".to_string(),
+                thinking_display: "default".to_string(),
+                speed: "standard".to_string(),
+                verbosity: "default".to_string(),
+            },
+            last_seq: 7,
+        },
+        Frame::CaughtUp {
+            session: "old".to_string(),
+            epoch: "epoch-1".to_string(),
+            last_seq: 7,
+        },
+        Frame::List {
+            sessions: Vec::new(),
+        },
+        Frame::Reset {
+            session: "old".to_string(),
+        },
+        Frame::Heartbeat,
+        Frame::Vms { vms: Vec::new() },
+    ]
+}
+
+/// The session a known frame's typed value reports, which is what a gateway
+/// routes on while the retained JSON is what it forwards.
+fn known_session(frame: &DecodedFrame) -> Option<&str> {
+    let DecodedFrame::Known(known) = frame else {
+        panic!("expected a known frame");
+    };
+    known.value().session()
+}
+
+/// The top-level fields of the JSON a frame forwards, keyed by name, each
+/// value kept as the exact text that was emitted.
+///
+/// This is the comparison spec 6.10 calls for: top-level key order is not
+/// significant, and everything below the top level travels verbatim, which is
+/// what re-emitting a frame unchanged means for a forwarder that does not
+/// understand it. Decoding into [`Value`] would be weaker, it rounds a number
+/// literal an unknown payload may carry and refuses `1e400` outright. It also
+/// keeps only one of a duplicated key, so a test about duplicates works on the
+/// text instead.
+fn top_level_fields(frame: &DecodedFrame) -> BTreeMap<String, String> {
+    let json = serde_json::to_string(frame).expect("a frame serializes");
+    serde_json::from_str::<BTreeMap<String, Box<RawValue>>>(&json)
+        .expect("a frame is a JSON object")
+        .into_iter()
+        .map(|(key, value)| (key, value.get().to_string()))
+        .collect()
+}
+
+/// Asserts a rewrite moved the top-level `session` to `replacement` and left
+/// every other top-level field exactly as it was.
+fn assert_rewrote_session(before: &DecodedFrame, after: &DecodedFrame, replacement: &str) {
+    let mut expected = top_level_fields(before);
+    let previous = expected.insert(
+        "session".to_string(),
+        serde_json::to_string(replacement).expect("a session id is a JSON string"),
+    );
+    assert!(previous.is_some(), "the frame carried a top-level session");
+    assert_eq!(top_level_fields(after), expected);
 }

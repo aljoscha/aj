@@ -986,9 +986,22 @@ pub enum DecodedFrame {
 }
 
 impl DecodedFrame {
-    /// Rewrites a top-level session id without parsing or dropping other fields.
+    /// Rewrites the frame's top-level session id, reporting whether it had
+    /// one.
     ///
-    /// Returns `false` for host-level frames that have no top-level `session`.
+    /// A gateway calls this on every frame it forwards, kinds this build does
+    /// not know included (spec 6.10). What comes back out is the frame the
+    /// host wrote, structurally unchanged apart from the id: top-level key
+    /// order is not significant and byte identity is not promised, but nothing
+    /// below the top level is parsed, so payloads and their number literals
+    /// travel verbatim. A `session` nested in a payload is not the frame's
+    /// session and is left alone.
+    ///
+    /// `false` says the frame has no top-level `session`, which makes it
+    /// host-scoped (`list`, `heartbeat`, `vms`, and any unknown kind that
+    /// carries no id). Such a frame is handed back untouched rather than
+    /// re-serialized. A frame decoded from the wire decides on the JSON it
+    /// will forward, a locally built one on its variant.
     pub fn rewrite_session(&mut self, replacement: &str) -> Result<bool, serde_json::Error> {
         let raw = match &*self {
             Self::Known(frame) => frame.raw_json(),
@@ -1058,14 +1071,25 @@ struct FrameTag {
     kind: String,
 }
 
+/// A JSON object held as its top-level fields, every value left unparsed.
+///
+/// Flat by design. A gateway rewrites the top-level `session` and must disturb
+/// nothing else, and keeping nested values as text is what puts a payload's own
+/// `session` out of reach.
 struct RawObject(Vec<(String, Box<RawValue>)>);
 
 impl RawObject {
+    /// Replaces every top-level `session` value, reporting whether it found
+    /// one.
     fn rewrite_session(&mut self, replacement: &str) -> Result<bool, serde_json::Error> {
         let replacement = serde_json::value::to_raw_value(replacement)?;
         let mut rewritten = false;
         for (key, value) in &mut self.0 {
             if key == "session" {
+                // No early exit: a duplicate key is malformed for a known kind
+                // and refused at decode, but an unknown frame is forwarded as
+                // it arrived, and a reader downstream may take either
+                // occurrence.
                 replacement.clone_into(value);
                 rewritten = true;
             }
