@@ -176,10 +176,14 @@ impl Fixture {
     }
 
     async fn over(state: TempDir, static_hosts: Vec<HostAddress>) -> Self {
+        Self::tuned(state, static_hosts, tuning()).await
+    }
+
+    async fn tuned(state: TempDir, static_hosts: Vec<HostAddress>, tuning: Tuning) -> Self {
         let gateway = Gateway::new(GatewaySetup {
             state_dir: state.path().to_path_buf(),
             static_hosts,
-            tuning: tuning(),
+            tuning,
         })
         .expect("a gateway over a fresh state directory");
         let server =
@@ -1152,6 +1156,94 @@ async fn a_frame_kind_the_gateway_does_not_know_does_not_break_its_link() {
 
     fixture.shutdown().await;
     serving.abort();
+}
+
+/// A host that takes a request and never answers it is unreachable, not a hang:
+/// a client of a gateway must not be held open for as long as a host cares to
+/// stay silent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_answers_nothing_becomes_a_503() {
+    let (url, serving) = wedged_host().await;
+    let state = TempDir::new().expect("tempdir");
+    let fixture = Fixture::tuned(
+        state,
+        Vec::new(),
+        Tuning {
+            upstream_timeout: Duration::from_millis(300),
+            ..tuning()
+        },
+    )
+    .await;
+    assert_eq!(fixture.enroll(&url).await.status(), StatusCode::OK);
+    fixture.row("wedged:2026-01-01-00-00-00-000").await;
+
+    let started = std::time::Instant::now();
+    let err = fixture
+        .client
+        .tree("wedged:2026-01-01-00-00-00-000")
+        .await
+        .expect_err("the host never answers");
+
+    assert_eq!(
+        err.status(),
+        Some(StatusCode::SERVICE_UNAVAILABLE),
+        "got {err:?}",
+    );
+    assert_eq!(err.code(), Some("host_unreachable"));
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(5),
+        "the proxy waited {took:?} on a host it had bounded",
+    );
+
+    fixture.shutdown().await;
+    serving.abort();
+}
+
+/// A host that answers the handshake and the control stream, and then nothing
+/// at all: every other route hangs for as long as the connection lasts.
+async fn wedged_host() -> (String, tokio::task::JoinHandle<()>) {
+    use axum::response::sse::{Event, Sse};
+    use axum::routing::get;
+    use futures::StreamExt;
+
+    let hello = serde_json::json!({"protocol": PROTOCOL_VERSION, "capabilities": [],
+                                   "app_version": "0", "host_id": "wedged"});
+    let list = r#"{"kind":"list","sessions":[{"id":"2026-01-01-00-00-00-000","live":true,
+        "working":false,"queued":{"steering":0,"follow_up":0},"tasks":0,
+        "last_activity":"2026-01-01T00:00:00Z"}]}"#;
+    let app = axum::Router::new()
+        .route(
+            "/v1/hello",
+            get(move || {
+                let hello = hello.clone();
+                async move { axum::Json(hello) }
+            }),
+        )
+        .route(
+            "/v1/events",
+            get(move || async move {
+                // One directory, then the stream stays open and silent, which is
+                // what keeps the gateway thinking this host is there.
+                let frames = futures::stream::iter([Ok::<_, std::convert::Infallible>(
+                    Event::default().data(list),
+                )])
+                .chain(futures::stream::pending());
+                Sse::new(frames)
+            }),
+        )
+        .fallback(|| async {
+            std::future::pending::<()>().await;
+            StatusCode::IM_A_TEAPOT
+        });
+    let listener = tokio::net::TcpListener::bind(addr("127.0.0.1:0"))
+        .await
+        .expect("bind");
+    let bound = listener.local_addr().expect("local addr");
+    let serving = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{bound}"), serving)
 }
 
 // ---------------------------------------------------------------------------

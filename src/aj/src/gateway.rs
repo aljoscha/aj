@@ -72,6 +72,17 @@ const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(15);
 /// How long a client's stream may be idle before a heartbeat frame (spec 6.1).
 const HEARTBEAT: Duration = Duration::from_secs(30);
 
+/// How long a proxied request may take before the owning host counts as not
+/// answering, and how long establishing that connection may take.
+///
+/// The same bounds the typed client applies to the same requests: a control port
+/// sits on loopback or a tailnet, and every route the proxy carries answers
+/// promptly by contract (a command is accepted, not awaited). Without them a host
+/// that accepts a connection and then says nothing would hold a client of this
+/// gateway open for as long as it cared to.
+const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The timings a gateway runs on. Tuning, not policy: every value here changes
 /// how quickly something is noticed, never what is true.
 #[derive(Clone, Copy, Debug)]
@@ -79,6 +90,8 @@ pub(crate) struct Tuning {
     pub(crate) reconnect_delay: Duration,
     pub(crate) max_reconnect_delay: Duration,
     pub(crate) heartbeat: Duration,
+    /// How long a proxied request waits on the owning host.
+    pub(crate) upstream_timeout: Duration,
 }
 
 impl Default for Tuning {
@@ -87,6 +100,7 @@ impl Default for Tuning {
             reconnect_delay: RECONNECT_DELAY,
             max_reconnect_delay: MAX_RECONNECT_DELAY,
             heartbeat: HEARTBEAT,
+            upstream_timeout: UPSTREAM_TIMEOUT,
         }
     }
 }
@@ -122,6 +136,10 @@ pub(crate) enum GatewayError {
     Directory(#[from] DirectoryError),
     #[error(transparent)]
     State(#[from] EnrollmentError),
+    /// The gateway's own HTTP stack would not start, which only happens before
+    /// it serves anything.
+    #[error("could not build the gateway's HTTP client: {0}")]
+    Http(#[source] reqwest::Error),
 }
 
 struct GatewayInner {
@@ -206,7 +224,7 @@ impl Gateway {
             state,
             writing: TokioMutex::new(()),
             links: StdMutex::new(HashMap::new()),
-            http: reqwest::Client::new(),
+            http: proxy_client(tuning.upstream_timeout)?,
             tuning,
         });
         let gateway = Self { inner };
@@ -382,6 +400,19 @@ impl Gateway {
     fn links(&self) -> std::sync::MutexGuard<'_, HashMap<HostAddress, Link>> {
         self.inner.links.lock().expect("the link mutex is poisoned")
     }
+}
+
+/// The client the proxy forwards with.
+///
+/// Bounded in both directions, because a request this gateway forwards is a
+/// client of this gateway waiting: an unbounded one turns a wedged host into a
+/// wedged gateway connection, one per request, until something gives up.
+fn proxy_client(timeout: Duration) -> Result<reqwest::Client, GatewayError> {
+    reqwest::Client::builder()
+        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+        .timeout(timeout)
+        .build()
+        .map_err(GatewayError::Http)
 }
 
 /// The gateway's own id, minted on first use.

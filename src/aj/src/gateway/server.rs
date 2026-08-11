@@ -565,7 +565,9 @@ impl From<GatewayError> for ApiError {
             GatewayError::Directory(err) => directory_status(err),
             // A gateway that cannot write down what it was told is not a client's
             // fault, and the enrollment did not stick.
-            GatewayError::State(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+            GatewayError::State(_) | GatewayError::Http(_) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal")
+            }
         };
         if status == StatusCode::INTERNAL_SERVER_ERROR {
             tracing::warn!("the gateway failed internally: {err}");
