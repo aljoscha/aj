@@ -309,6 +309,26 @@ and a setup document for building the golden image.
 Acceptance: CI cycle test green, manual ember run on the target
 machine documented in the report (what was run, what happened).
 
+## Banked polish
+
+Small items with rulings already made, batched into a polish round
+whenever one next happens, not worth interrupting structural work:
+
+- "Branch failed. Your message was restored to the editor." stacks
+  under the head-switch refusal toast and names the action twice.
+  Ruling: collapse the two toasts into one sentence, do not suppress
+  either.
+- "Tag not set: a tag is at most 80 bytes…" says "tag" twice because
+  the store's sentence is shared across the TUI, the wire, and the
+  launch flag. Ruling: reword the sentence at its source in
+  `aj-session` so composition reads well everywhere, same principle
+  as the `HostError::Locked` wording (fix wording where it is
+  produced).
+
+Two larger banked features (remote previews, cross-host prompt
+history) are recorded with their design constraints in spec
+section 13.
+
 ## Reporting
 
 At the end of each phase, produce a short report: what landed, test

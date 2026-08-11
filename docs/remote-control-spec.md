@@ -1334,3 +1334,21 @@ before the next begins.
   suppression and durable-event pacing bound the rate, not the size.
   A row cap or delta encoding is the follow-up if a real store gets
   big enough to hurt.
+- Banked, wanted: previews in connect mode. Rows deliberately carry
+  no preview text (section 9.2's "if cheaply available" resolved to
+  "not over the wire"), but the selector is poorer for it remotely.
+  The enumeration contract (section 6.8) forbids content reads per
+  row, so the design is one of two shapes, decided when picked up:
+  fold preview capture into the same fingerprint-cached head read
+  that sniffs the format (enumeration-paced, amortized free), or an
+  on-demand per-session preview read issued by the selector for
+  visible rows (user-paced, no standing cost).
+- Banked, wanted: prompt history across hosts. The overlay scans
+  only the local store's logs, so prompts typed into remote sessions
+  are invisible locally, and the client trends toward a disposable
+  terminal (eventually a web UI), so user-scoped state cannot live
+  only client-side, which also rules out a client journal as the
+  fix. Candidate shape: a capped, user-paced history read on the
+  host (the same scan the local overlay runs, behind an endpoint,
+  with a capability string per section 6.10), the client merges
+  sources and dedupes, a gateway merges per-host reads naturally.
