@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aj_wire::{ErrorResponse, Frame, SessionSummary};
+use aj_wire::{EnrollHostRequest, ErrorResponse, Frame, SessionSummary};
 use axum::body::{Body as AxumBody, Bytes};
 use axum::extract::{ConnectInfo, FromRequest, Path, Query, Request, State};
 use axum::http::{Method, StatusCode, header};
@@ -33,7 +33,6 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::gateway::directory::{DirectoryError, Route};
-use crate::gateway::enrollment::EnrollHostRequest;
 use crate::gateway::{Gateway, GatewayError};
 use crate::remote::{IdentityError, IdentityGate};
 

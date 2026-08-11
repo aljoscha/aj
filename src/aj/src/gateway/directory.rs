@@ -13,11 +13,11 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex as StdMutex};
 
-use aj_wire::{SessionList, SessionSummary};
+use aj_wire::{HostList, HostSource, HostSummary, SessionList, SessionSummary};
 use tokio::sync::watch;
 
 use crate::gateway::config::HostAddress;
-use crate::gateway::enrollment::{EnrolledHost, HostList, HostSource, HostSummary};
+use crate::gateway::enrollment::EnrolledHost;
 use crate::gateway::naming::{HostIdError, SessionAddress, validate_host_id};
 
 /// The enrolled hosts and the one directory they merge into.

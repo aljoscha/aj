@@ -342,6 +342,57 @@ pub struct TreeSegment {
     pub is_leaf: bool,
 }
 
+/// Where an enrollment came from, which decides whether it can be withdrawn
+/// over the wire (spec 7.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostSource {
+    /// Named by the gateway's configuration file, and so the file's to remove.
+    Config,
+    /// Enrolled over the wire, and so the gateway's to remember.
+    Dynamic,
+}
+
+/// The address of a host to enroll on a gateway (spec 7.1).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnrollHostRequest {
+    /// `<host>:<port>` or a full `http(s)://` URL.
+    ///
+    /// A plain string rather than a parsed address, because it is what a peer
+    /// of any age can produce. The gateway normalizes and refuses it.
+    pub address: String,
+}
+
+/// One enrolled host in a gateway's host table (spec 7.1).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostSummary {
+    /// The id the host reports for itself, which is the namespace its sessions
+    /// appear under and the vocabulary a directory row's `host` field and a
+    /// create's `host` field use (spec 6.6, 6.8).
+    ///
+    /// Absent only for a configured host that has never answered: a gateway
+    /// cannot invent an id for a store it has not spoken to, and a dynamic
+    /// enrollment always has one, because reaching the host is what enrolling
+    /// it means.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub address: String,
+    pub source: HostSource,
+    /// Whether the gateway's control connection to this host is up.
+    pub connected: bool,
+    /// How many of this host's sessions are in the merged directory.
+    pub sessions: usize,
+    /// Why the last connection attempt did not succeed, when one did not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// The complete enrolled-host table returned by a gateway.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostList {
+    pub hosts: Vec<HostSummary>,
+}
+
 /// Current provisioning state of a VM.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]

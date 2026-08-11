@@ -74,6 +74,24 @@
     ],
     "head": "entry-6"
   },
+  "hosts": {
+    "hosts": [
+      {
+        "id": "workstation",
+        "address": "http://100.64.0.2:6161",
+        "source": "dynamic",
+        "connected": true,
+        "sessions": 2
+      },
+      {
+        "address": "http://100.64.0.9:6161",
+        "source": "config",
+        "connected": false,
+        "sessions": 0,
+        "error": "connection refused"
+      }
+    ]
+  },
   "vms": {
     "vms": [
       {

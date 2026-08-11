@@ -1,18 +1,13 @@
-//! Enrollment: what a gateway remembers about its hosts, and what it answers
-//! about them (spec 7.1).
+//! Enrollment: what a gateway remembers about its hosts (spec 7.1).
 //!
-//! Two halves, deliberately different in kind. The state file is the gateway's
-//! own memory of the hosts it was told to keep, so it is typed: an address it
-//! cannot parse back is a corrupt file, not a request to tolerate. The wire
-//! bodies are what a client sends and reads, so they are plain strings that a
-//! peer of any age can produce.
+//! The state file is the gateway's own memory of the hosts it was told to keep,
+//! so it is typed: an address it cannot parse back is a corrupt file, not a
+//! request to tolerate. What a client sends and reads about those hosts is the
+//! protocol's own ([`aj_wire::EnrollHostRequest`], [`aj_wire::HostList`]).
 //!
 //! Only dynamic enrollments are written down. A static one comes back from the
 //! configuration file on every start (see [`super::config`]), and persisting it
 //! too would resurrect a host the operator deleted from that file.
-//!
-//! TODO(aljoscha): the three wire bodies here belong in `aj-wire`, which owns
-//! the protocol's models. They are the only ones defined outside it.
 
 use std::path::{Path, PathBuf};
 
@@ -136,53 +131,6 @@ pub(crate) enum EnrollmentError {
     /// meaning is unclear.
     #[error("{path} is not usable gateway state: {reason}")]
     Unusable { path: PathBuf, reason: String },
-}
-
-/// Where an enrollment came from, which decides whether it can be withdrawn
-/// over the wire and whether it is written down.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum HostSource {
-    /// Named by the configuration file, and so the file's to remove.
-    Config,
-    /// Enrolled over the wire, and so the gateway's to remember.
-    Dynamic,
-}
-
-/// `POST /v1/hosts`: the address of a host to enroll.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct EnrollHostRequest {
-    /// `<host>:<port>` or a full `http(s)://` URL.
-    pub(crate) address: String,
-}
-
-/// One enrolled host in `GET /v1/hosts`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct HostSummary {
-    /// The id the host reports for itself, which is the namespace its sessions
-    /// appear under.
-    ///
-    /// Absent only for a configured host that has never answered: a gateway
-    /// cannot invent an id for a store it has not spoken to, and a dynamic
-    /// enrollment always has one, because reaching the host is what enrolling
-    /// it means.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) id: Option<String>,
-    pub(crate) address: String,
-    pub(crate) source: HostSource,
-    /// Whether the gateway's control connection to this host is up.
-    pub(crate) connected: bool,
-    /// How many of this host's sessions are in the merged directory.
-    pub(crate) sessions: usize,
-    /// Why the last connection attempt did not succeed, when one did not.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) error: Option<String>,
-}
-
-/// The complete enrolled-host table.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct HostList {
-    pub(crate) hosts: Vec<HostSummary>,
 }
 
 #[cfg(test)]

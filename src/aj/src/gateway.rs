@@ -38,15 +38,15 @@ use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
 
 use aj_app::cli::args::{Args, Command, DEFAULT_LISTEN_ADDRESS};
-use aj_wire::{Hello, PROTOCOL_VERSION, SessionList, SessionSummary};
+use aj_wire::{
+    Hello, HostList, HostSource, HostSummary, PROTOCOL_VERSION, SessionList, SessionSummary,
+};
 use anyhow::{Context, Result, bail};
 use tokio::sync::watch;
 
 use crate::gateway::config::{AddressError, GatewayConfig, HostAddress};
 use crate::gateway::directory::{Directory, DirectoryError, Route};
-use crate::gateway::enrollment::{
-    EnrollmentError, EnrollmentFile, HostList, HostSource, HostSummary,
-};
+use crate::gateway::enrollment::{EnrollmentError, EnrollmentFile};
 use crate::gateway::link::Link;
 use crate::gateway::server::GatewayServer;
 use crate::remote::{RemoteClient, RemoteError};

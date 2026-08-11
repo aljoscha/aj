@@ -3,10 +3,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
 use aj_wire::{
     CancelRequest, CompactRequest, CreateSessionRequest, Cursor, DecodedAgentEvent, DecodedFrame,
-    ErrorResponse, Frame, HeadRequest, Hello, ModelSelection, PromptInput, PromptRequest,
-    QueueCounts, QueueOperation, QueueOutcome, QueueRequest, QueueState, SessionCreated,
-    SessionList, SessionSettings, SessionSummary, SessionTree, SettingsRequest, SteerRequest,
-    TagRequest, TaskDetails, TaskTable, VmList,
+    EnrollHostRequest, ErrorResponse, Frame, HeadRequest, Hello, HostList, HostSource, HostSummary,
+    ModelSelection, PromptInput, PromptRequest, QueueCounts, QueueOperation, QueueOutcome,
+    QueueRequest, QueueState, SessionCreated, SessionList, SessionSettings, SessionSummary,
+    SessionTree, SettingsRequest, SteerRequest, TagRequest, TaskDetails, TaskTable, VmList,
 };
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
@@ -1221,6 +1221,7 @@ fn non_event_wire_models_have_pinned_round_trip_fixtures() {
     assert_round_trip::<TaskTable>(&fixtures["tasks"]);
     assert_round_trip::<QueueState>(&fixtures["queue"]);
     assert_round_trip::<SessionTree>(&fixtures["tree"]);
+    assert_round_trip::<HostList>(&fixtures["hosts"]);
     assert_round_trip::<VmList>(&fixtures["vms"]);
     assert_round_trip::<ErrorResponse>(&fixtures["error"]);
 }
@@ -1307,6 +1308,117 @@ fn a_rows_tag_and_host_are_absent_rather_than_empty() {
     assert_eq!(
         serde_json::from_value::<SessionSummary>(encoded).expect("it decodes again"),
         labelled,
+    );
+}
+
+/// The enrollment request: one address and nothing else, which is all an
+/// operator hands a gateway (spec 7.1). An address is required, because a
+/// gateway cannot dial what it was not told, and a field a newer client sends
+/// alongside it is ignored (spec 6.10).
+#[test]
+fn an_enrollment_request_carries_one_address() {
+    assert_eq!(
+        serde_json::to_value(EnrollHostRequest {
+            address: "100.64.0.2:6161".to_string(),
+        })
+        .unwrap(),
+        json!({"address": "100.64.0.2:6161"}),
+    );
+    assert_eq!(
+        serde_json::from_value::<EnrollHostRequest>(json!({
+            "address": "http://100.64.0.2:6161",
+            "added_later": {"resources": 2}
+        }))
+        .expect("an addition a newer client sends is ignored")
+        .address,
+        "http://100.64.0.2:6161",
+    );
+    assert!(
+        serde_json::from_value::<EnrollHostRequest>(json!({})).is_err(),
+        "a gateway cannot dial an address it was never given",
+    );
+}
+
+/// An enrolled-host row says only what the gateway knows: a host that has
+/// never answered has no id to report, and one whose connection is up has no
+/// failure to report (spec 7.1). Both are absent keys rather than empty
+/// strings, in both directions, so a client can tell "not known" from "known
+/// to be blank" and an older gateway's row still decodes.
+#[test]
+fn an_enrolled_host_row_reports_an_id_and_an_error_only_when_it_has_one() {
+    let hosts: HostList = serde_json::from_value(fixture("models")["hosts"].clone())
+        .expect("the pinned host list decodes");
+    let [dynamic, configured] = &hosts.hosts[..] else {
+        panic!("the fixture pins one dynamic row and one configured one");
+    };
+    assert_eq!(
+        (dynamic.id.as_deref(), dynamic.source, dynamic.connected),
+        (Some("workstation"), HostSource::Dynamic, true),
+    );
+    assert_eq!(dynamic.error, None, "a host that is up reports no failure");
+    assert_eq!(
+        (
+            configured.id.as_deref(),
+            configured.source,
+            configured.connected,
+        ),
+        (None, HostSource::Config, false),
+        "a configured host that has never answered cannot be given an id",
+    );
+    assert_eq!(configured.error.as_deref(), Some("connection refused"));
+
+    let encoded = serde_json::to_value(&hosts).expect("the list re-serializes");
+    assert!(
+        encoded["hosts"][1].get("id").is_none(),
+        "an unanswered host omits the key: {}",
+        encoded["hosts"][1],
+    );
+    assert!(
+        encoded["hosts"][0].get("error").is_none(),
+        "a connected host omits the key: {}",
+        encoded["hosts"][0],
+    );
+    assert_eq!(
+        (
+            &encoded["hosts"][0]["source"],
+            &encoded["hosts"][1]["source"],
+        ),
+        (&json!("dynamic"), &json!("config")),
+        "where an enrollment came from is one snake_case token",
+    );
+
+    let row = HostSummary {
+        id: None,
+        address: "http://100.64.0.9:6161".to_string(),
+        source: HostSource::Config,
+        connected: false,
+        sessions: 0,
+        error: None,
+    };
+    let encoded = serde_json::to_value(&row).expect("the row serializes");
+    assert!(
+        encoded.get("id").is_none() && encoded.get("error").is_none(),
+        "a host nothing is known about yet emits neither key: {encoded}",
+    );
+    assert_eq!(
+        serde_json::from_value::<HostSummary>(encoded).expect("it decodes again"),
+        row,
+        "and a row lacking both keys reads back as carrying neither",
+    );
+
+    let known = HostSummary {
+        id: Some("workstation".to_string()),
+        error: Some("connection refused".to_string()),
+        ..row
+    };
+    let mut encoded = serde_json::to_value(&known).expect("the row serializes");
+    assert_eq!(encoded["id"], json!("workstation"));
+    assert_eq!(encoded["error"], json!("connection refused"));
+    encoded["added_later"] = json!(true);
+    assert_eq!(
+        serde_json::from_value::<HostSummary>(encoded)
+            .expect("a newer gateway's row decodes (spec 6.10)"),
+        known,
     );
 }
 

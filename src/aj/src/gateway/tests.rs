@@ -21,15 +21,14 @@ use aj_app::cli::args::Args;
 use aj_app::host::{AttachRequest, SessionHost};
 use aj_app::test_support::finalized_text_message;
 use aj_wire::{
-    CreateSessionRequest, ErrorResponse, Frame, PROTOCOL_VERSION, PromptInput, PromptRequest,
-    SessionList, SessionSummary,
+    CreateSessionRequest, EnrollHostRequest, ErrorResponse, Frame, HostList, HostSource,
+    HostSummary, PROTOCOL_VERSION, PromptInput, PromptRequest, SessionList, SessionSummary,
 };
 use clap::Parser;
 use reqwest::StatusCode;
 use tempfile::TempDir;
 
 use super::*;
-use crate::gateway::enrollment::{EnrollHostRequest, HostList, HostSource, HostSummary};
 use crate::gateway::naming::SessionAddress;
 use crate::remote::tests::{
     FakeWhois, HostHandles, addr, bounded, canned_server, scripted, scripted_host,
