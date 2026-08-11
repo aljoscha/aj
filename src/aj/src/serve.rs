@@ -1,5 +1,10 @@
 //! Headless and embedded operation of the control port (spec section 4).
 //!
+//! The listen-address resolution, the identity gate's construction and the
+//! shutdown signal are shared with `aj gateway`: a gateway binds a control port
+//! under the same rules, because it is the same remote code execution behind it
+//! (spec 6.11).
+//!
 //! `aj serve` composes the same session host the interactive shell does and
 //! serves it with no terminal of its own. An interactive run given
 //! `--listen` serves the very host it is rendering, so the local shell and
@@ -27,7 +32,7 @@ use crate::remote::{IdentityGate, IdentityMode, RemoteServer, TailscaleWhois};
 /// binds is usually reached by name, but exactly one address is bound: an
 /// ambiguous name is the operator's to disambiguate, since which of two
 /// interfaces carries the control port is a security decision.
-fn resolve_listen(listen: &str) -> Result<SocketAddr> {
+pub(crate) fn resolve_listen(listen: &str) -> Result<SocketAddr> {
     let mut resolved = listen
         .to_socket_addrs()
         .with_context(|| format!("could not resolve the listen address {listen:?}"))?;
@@ -49,7 +54,7 @@ fn resolve_listen(listen: &str) -> Result<SocketAddr> {
 /// constructing it fails when that daemon is unreachable: refusing to start
 /// is the honest outcome for a mode whose whole purpose is to reject
 /// unidentified peers.
-fn build_gate(args: &Args) -> Result<IdentityGate> {
+pub(crate) fn build_gate(args: &Args) -> Result<IdentityGate> {
     let mode: IdentityMode = args
         .auth
         .parse()
@@ -139,7 +144,7 @@ pub(crate) async fn run(mut args: Args) -> Result<()> {
 
 /// Resolve when the process is asked to stop: Ctrl+C, or SIGTERM from a
 /// service manager (the reference unit runs `aj serve` under systemd).
-async fn wait_for_shutdown() {
+pub(crate) async fn wait_for_shutdown() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};

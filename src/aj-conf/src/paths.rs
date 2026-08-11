@@ -213,6 +213,29 @@ impl Config {
     pub fn get_sessions_base_dir_path() -> Result<PathBuf, ConfigError> {
         Ok(Self::get_config_dir()?.join("sessions"))
     }
+
+    /// Path to `~/.aj/gateway.toml`, the gateway's static configuration.
+    ///
+    /// Creates the `~/.aj` directory but not the file: a gateway with no
+    /// configuration file is a gateway with no statically configured hosts,
+    /// which is a legitimate way to run one.
+    pub fn gateway_config_file_path() -> Result<PathBuf, ConfigError> {
+        Ok(Self::get_config_dir()?.join("gateway.toml"))
+    }
+
+    /// Path to `~/.aj/gateway/`, where a gateway keeps its own runtime state:
+    /// its id and its dynamic enrollments.
+    ///
+    /// Separate from the configuration file by design. That file is the
+    /// operator's, this directory is the gateway's, and a host the operator
+    /// removed from the file must not come back out of here.
+    pub fn gateway_state_dir_path() -> Result<PathBuf, ConfigError> {
+        let dir = Self::get_config_dir()?.join("gateway");
+        if !dir.exists() {
+            fs::create_dir_all(&dir)?;
+        }
+        Ok(dir)
+    }
 }
 
 #[cfg(test)]

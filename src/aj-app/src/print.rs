@@ -172,6 +172,7 @@ async fn run_inner<W: Write + Send + 'static>(
         Some(Command::ListSessions)
         | Some(Command::UpdateModels)
         | Some(Command::Serve)
+        | Some(Command::Gateway { .. })
         | Some(Command::Connect { .. }) => {
             bail!("aj --print does not accept this subcommand");
         }

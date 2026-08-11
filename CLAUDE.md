@@ -72,6 +72,9 @@ Persistent state lives under `~/.aj/`:
 - `themes/<name>.json` — optional user themes layered on top of the
   bundled `dark` / `light` palettes. Hot-reloads on file changes.
 - `sessions/<project>/` — JSONL conversation logs, one file per session.
+- `gateway.toml` — `aj gateway`'s static host addresses (`--config` names
+  another file), and `gateway/` its own runtime state: its id and the
+  hosts enrolled over the wire.
 
 Model selection precedence (highest to lowest): CLI flags
 (`--model-api`, `--model-url`, `--model-name`) → env vars (`MODEL_API`,

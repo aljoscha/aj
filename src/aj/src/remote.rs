@@ -23,8 +23,8 @@ mod identity;
 mod server;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub(crate) use client::{RemoteClient, RemoteCommand, RemoteError, RemoteEvents};
-pub(crate) use identity::{IdentityGate, IdentityMode, TailscaleWhois};
+pub(crate) use identity::{IdentityError, IdentityGate, IdentityMode, TailscaleWhois};
 pub(crate) use server::RemoteServer;

@@ -5,6 +5,8 @@
 //! TUI. Subcommands (`list-sessions`, `continue`, `update-models`)
 //! short-circuit before mode dispatch.
 
+use std::path::PathBuf;
+
 use aj_session::{TagError, normalize_tag};
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -247,6 +249,24 @@ pub enum Command {
         /// messages, auto-submitted as the next turn.
         prompt: Vec<String>,
     },
+    /// Aggregate many session hosts behind one address.
+    ///
+    /// A gateway serves the session-facing API of a host, forwarding every
+    /// request to the host that owns the session, and adds the host-management
+    /// endpoints. It holds no sessions of its own.
+    ///
+    /// The address comes from `--listen` / `AJ_LISTEN`, which are global and so
+    /// may be given on either side of the subcommand, and defaults to the
+    /// loopback control port.
+    Gateway {
+        /// Read static host addresses from this file instead of
+        /// `~/.aj/gateway.toml`.
+        ///
+        /// A file named here has to exist. The default one need not: a gateway
+        /// told about its hosts over the wire needs no configuration file.
+        #[arg(long, value_name = "FILE")]
+        config: Option<PathBuf>,
+    },
 }
 
 #[cfg(test)]
@@ -330,6 +350,36 @@ mod tests {
         let args = parse(&["aj", "connect", "http://127.0.0.1:6161", "--listen"]);
         assert_eq!(args.listen.as_deref(), Some(DEFAULT_LISTEN_ADDRESS));
         assert!(matches!(args.command, Some(Command::Connect { .. })));
+    }
+
+    /// A gateway takes its address from the same global flag a host does, and
+    /// its configuration file from a flag of its own.
+    #[test]
+    fn the_gateway_subcommand_takes_a_listen_address_and_a_config_file() {
+        let args = parse(&[
+            "aj",
+            "--listen=127.0.0.1:6000",
+            "gateway",
+            "--config",
+            "/etc/aj/gateway.toml",
+        ]);
+        assert_eq!(args.listen.as_deref(), Some("127.0.0.1:6000"));
+        assert!(matches!(
+            args.command,
+            Some(Command::Gateway { config: Some(ref path) })
+                if path == std::path::Path::new("/etc/aj/gateway.toml")
+        ));
+
+        let bare = parse(&["aj", "gateway"]);
+        assert!(matches!(
+            bare.command,
+            Some(Command::Gateway { config: None })
+        ));
+        assert_eq!(
+            bare.listen, None,
+            "the address is resolved by the mode, which defaults it",
+        );
+        assert_eq!(bare.auth, "local", "and the gate defaults closed here too");
     }
 
     /// `--tag` is global, so a `connect --new` can name the session it asks

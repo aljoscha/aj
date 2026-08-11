@@ -958,8 +958,11 @@ Gateway configuration is a TOML file (`--config <file>`, defaulting to
 provisioner section selecting the backend with its backend-specific
 settings (for local-process: the workspace root to create session dirs
 under and optionally the `aj` binary to spawn, for ember: the golden
-VM name, default resources, and the VM user). Runtime state (dynamic
-enrollments, VM records) lives under `~/.aj/gateway/`. A session host
+VM name, default resources, and the VM user). Runtime state (the
+gateway's own id, dynamic enrollments, VM records) lives under
+`~/.aj/gateway/`. The id is there because `hello` carries one for a
+gateway as much as for a host (section 6.1) and a gateway has no
+session store to name it. A session host
 needs no configuration file of its own: the listen address and the
 identity-gate settings (section 6.11), given as flags or environment,
 plus its auto-minted per-working-directory `host_id`, is all there

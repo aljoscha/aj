@@ -64,14 +64,14 @@ const DEADLINE: Duration = Duration::from_secs(20);
 const QUIET: Duration = Duration::from_millis(300);
 
 /// Await `future`, failing the test rather than hanging.
-async fn bounded<T>(what: &str, future: impl Future<Output = T>) -> T {
+pub(crate) async fn bounded<T>(what: &str, future: impl Future<Output = T>) -> T {
     match tokio::time::timeout(DEADLINE, future).await {
         Ok(value) => value,
         Err(_) => panic!("timed out waiting for {what}"),
     }
 }
 
-fn addr(text: &str) -> SocketAddr {
+pub(crate) fn addr(text: &str) -> SocketAddr {
     text.parse().expect("a socket address")
 }
 
@@ -369,7 +369,7 @@ fn settings() -> AgentSettings {
     }
 }
 
-fn scripted(
+pub(crate) fn scripted(
     messages: Vec<AssistantMessage>,
     chunk_size: usize,
     chunk_delay: Duration,
@@ -389,6 +389,55 @@ fn harness_config(dir: &TempDir) -> Config {
         spill_dir: Some(dir.path().join("spill").to_string_lossy().into_owned()),
         ..Config::default()
     }
+}
+
+/// The process-wide handles a test host is built over: the config its sessions
+/// read, and the layers a persisting settings change would write.
+///
+/// Held by the caller as well as the host, so a test can assert that a remote
+/// change touched neither.
+#[derive(Clone)]
+pub(crate) struct HostHandles {
+    pub(crate) config: Arc<StdMutex<Config>>,
+    pub(crate) layers: Arc<StdMutex<ConfigLayers>>,
+}
+
+impl HostHandles {
+    pub(crate) fn new(dir: &TempDir) -> Self {
+        Self {
+            config: Arc::new(StdMutex::new(harness_config(dir))),
+            layers: Arc::new(StdMutex::new(ConfigLayers {
+                user: Config::default(),
+                project: ConfigLayer::default(),
+                project_path: None,
+            })),
+        }
+    }
+}
+
+/// A host over `dir`'s session store, running `provider`.
+///
+/// The one recipe for a test host in this crate: the transport fixture, the
+/// second host of a lock conflict and the gateway's upstreams all come from
+/// here, so what "a test host" is stays in one place.
+pub(crate) fn scripted_host(
+    dir: &TempDir,
+    provider: Arc<ScriptedProvider>,
+    handles: HostHandles,
+) -> SessionHost {
+    SessionHost::new(HostSetup {
+        config: handles.config,
+        layers: handles.layers,
+        catalog: Arc::new(vec![catalog_model()]),
+        run_config: snapshot(provider),
+        restore: None,
+        persistence: ConversationPersistence::new(dir.path().join("sessions")),
+        auth: AuthStorage::new(dir.path().join("auth.json")),
+        working_directory: dir.path().to_path_buf(),
+        idle_grace: None,
+        live_capacity: None,
+    })
+    .expect("a host over the temp store")
 }
 
 fn snapshot(provider: Arc<ScriptedProvider>) -> RunConfigSnapshot {
@@ -547,25 +596,8 @@ impl Fixture {
         heartbeat: Duration,
     ) -> Self {
         let dir = TempDir::new().expect("tempdir");
-        let config = Arc::new(StdMutex::new(harness_config(&dir)));
-        let layers = Arc::new(StdMutex::new(ConfigLayers {
-            user: Config::default(),
-            project: ConfigLayer::default(),
-            project_path: None,
-        }));
-        let host = SessionHost::new(HostSetup {
-            config: Arc::clone(&config),
-            layers: Arc::clone(&layers),
-            catalog: Arc::new(vec![catalog_model()]),
-            run_config: snapshot(provider),
-            restore: None,
-            persistence: ConversationPersistence::new(dir.path().join("sessions")),
-            auth: AuthStorage::new(dir.path().join("auth.json")),
-            working_directory: dir.path().to_path_buf(),
-            idle_grace: None,
-            live_capacity: None,
-        })
-        .expect("host");
+        let handles = HostHandles::new(&dir);
+        let host = scripted_host(&dir, provider, handles.clone());
         let server = RemoteServer::bind_with(host.clone(), addr("127.0.0.1:0"), gate, heartbeat)
             .await
             .expect("bind a loopback control port");
@@ -575,8 +607,8 @@ impl Fixture {
             host,
             server,
             client,
-            config,
-            layers,
+            config: handles.config,
+            layers: handles.layers,
         }
     }
 
@@ -589,23 +621,11 @@ impl Fixture {
     /// single-writer conflict. It shares nothing else: its own config, its own
     /// catalog, its own port.
     async fn rival(&self) -> (SessionHost, RemoteServer, RemoteClient) {
-        let host = SessionHost::new(HostSetup {
-            config: Arc::new(StdMutex::new(harness_config(&self._dir))),
-            layers: Arc::new(StdMutex::new(ConfigLayers {
-                user: Config::default(),
-                project: ConfigLayer::default(),
-                project_path: None,
-            })),
-            catalog: Arc::new(vec![catalog_model()]),
-            run_config: snapshot(scripted(Vec::new(), 0, Duration::ZERO)),
-            restore: None,
-            persistence: ConversationPersistence::new(self._dir.path().join("sessions")),
-            auth: AuthStorage::new(self._dir.path().join("auth.json")),
-            working_directory: self._dir.path().to_path_buf(),
-            idle_grace: None,
-            live_capacity: None,
-        })
-        .expect("a second host over the same store");
+        let host = scripted_host(
+            &self._dir,
+            scripted(Vec::new(), 0, Duration::ZERO),
+            HostHandles::new(&self._dir),
+        );
         let server = RemoteServer::bind_with(
             host.clone(),
             addr("127.0.0.1:0"),
@@ -2289,7 +2309,7 @@ async fn opening_a_stream_against_a_mute_host_is_abandoned() {
 
 /// A stand-in server that answers canned bodies: a frame kind this build
 /// does not know, a malformed known frame, a protocol from the future.
-async fn canned_server(
+pub(crate) async fn canned_server(
     hello: serde_json::Value,
     frames: Vec<String>,
 ) -> (String, tokio::task::JoinHandle<()>) {

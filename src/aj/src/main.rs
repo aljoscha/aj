@@ -66,6 +66,7 @@ mod control;
 mod corner_box;
 mod footer;
 mod frame_stats_box;
+mod gateway;
 mod image_store;
 mod interactive;
 mod keymap;
@@ -157,6 +158,7 @@ async fn main() -> Result<()> {
         Some(Command::UpdateModels) => aj_app::handle_update_models_command().await,
         Some(Command::ListSessions) => aj_app::handle_list_sessions(),
         Some(Command::Serve) => serve::run(args).await,
+        Some(Command::Gateway { .. }) => gateway::run(args).await,
         Some(Command::Continue {
             session_id: _,
             prompt: _,
@@ -237,6 +239,10 @@ mod startup_tests {
         assert!(
             !is_interactive(&args_of(&["aj", "serve"])),
             "serve has no terminal of its own, so its logs keep stderr",
+        );
+        assert!(
+            !is_interactive(&args_of(&["aj", "gateway"])),
+            "nor does a gateway, which renders nothing at all",
         );
     }
 
