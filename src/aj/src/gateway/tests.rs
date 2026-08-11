@@ -2538,45 +2538,49 @@ async fn a_client_that_stops_reading_is_evicted_and_recovers() {
 ///
 /// The bound governs live fan-out. A block measured against it would evict on
 /// the first big backfill, and the re-attach that followed would do the same
-/// again, so a client with a real session could never catch up at all.
+/// again, so a client with a real session could never catch up at all. The block
+/// here is written in one burst, hundreds of frames deep against a bound of two,
+/// which is what a resumed session looks like and what a queued block cannot
+/// survive.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_block_bigger_than_the_bound_does_not_evict_its_own_client() {
-    let mut host = Upstream::start().await;
-    let session = host.create().await;
+    let backfilled = 300;
+    let mut script = vec![state_frame("s-1", "epoch-1", backfilled)];
+    for entry in 1..=backfilled {
+        script.push(warning_frame(
+            "s-1",
+            "epoch-1",
+            &format!("{entry}:{}", "x".repeat(4096)),
+        ));
+    }
+    script.push(caught_up_frame("s-1", "epoch-1", backfilled));
+    let fake = FakeHost::start("fake", Script::Frames(script)).await;
     let fixture = Fixture::tuned(
         TempDir::new().expect("tempdir"),
-        vec![HostAddress::parse(&host.address()).expect("an address")],
+        vec![fake.address.clone()],
         Tuning {
-            outbound_queue: NonZeroUsize::new(1).expect("non-zero"),
+            outbound_queue: NonZeroUsize::new(2).expect("non-zero"),
             ..tuning()
         },
     )
     .await;
-    let id = host.namespaced(&session);
-    fixture.row(&id).await;
-    let before = host.durable_seq(&session).await;
-    fixture
-        .client
-        .command(&id, &prompt("go"))
-        .await
-        .expect("the prompt is accepted");
-    settled(&host, &session, before + 1).await;
+    fixture.until_connected("fake").await;
 
-    let mut events = fixture.attach(&[attach(&id)]).await;
+    let mut events = fixture.attach(&[attach("fake:s-1")]).await;
     let block = frames_until(&mut events, "the whole attach block", is_caught_up).await;
 
-    assert!(
-        block.len() > 2,
-        "the block was bigger than the bound of 1 frame, which is the point: {block:?}",
-    );
     assert_eq!(
-        assistant_text(&block),
-        vec!["done".to_string()],
-        "and it arrived whole: {block:?}",
+        block
+            .iter()
+            .filter(|frame| matches!(frame, Frame::Event { .. }))
+            .count() as u64,
+        backfilled,
+        "every frame of a block hundreds deep arrived against a bound of two",
     );
+    assert_eq!(caught_up_at(&block), backfilled);
 
     fixture.shutdown().await;
-    host.stop().await;
+    fake.stop();
 }
 
 /// A client that goes away releases the upstream streams opened for it, so a
@@ -2722,21 +2726,31 @@ fn fake_row(id: &str) -> SessionSummary {
 /// The frames of one attach block, as a host writes them (spec 6.5).
 fn block(session: &str, epoch: &str, last_seq: u64) -> Vec<String> {
     vec![
-        serde_json::to_string(&Frame::State {
-            session: session.to_string(),
-            epoch: epoch.to_string(),
-            working: false,
-            settings: fake_settings(),
-            last_seq,
-        })
-        .expect("a state frame"),
-        serde_json::to_string(&Frame::CaughtUp {
-            session: session.to_string(),
-            epoch: epoch.to_string(),
-            last_seq,
-        })
-        .expect("a caught_up frame"),
+        state_frame(session, epoch, last_seq),
+        caught_up_frame(session, epoch, last_seq),
     ]
+}
+
+/// The `state` frame an attach block opens with.
+fn state_frame(session: &str, epoch: &str, last_seq: u64) -> String {
+    serde_json::to_string(&Frame::State {
+        session: session.to_string(),
+        epoch: epoch.to_string(),
+        working: false,
+        settings: fake_settings(),
+        last_seq,
+    })
+    .expect("a state frame")
+}
+
+/// The `caught_up` frame an attach block ends with.
+fn caught_up_frame(session: &str, epoch: &str, last_seq: u64) -> String {
+    serde_json::to_string(&Frame::CaughtUp {
+        session: session.to_string(),
+        epoch: epoch.to_string(),
+        last_seq,
+    })
+    .expect("a caught_up frame")
 }
 
 /// A reliable-transient event frame, which is what a client that stops reading
