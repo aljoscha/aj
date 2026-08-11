@@ -12,6 +12,7 @@
 //! moment, and every wait goes through [`bounded`] so a wedged link fails a test
 //! instead of hanging CI.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -500,6 +501,57 @@ async fn frames_within(events: &mut RemoteEvents, window: Duration) -> Vec<Frame
     };
     let _ = tokio::time::timeout(window, collecting).await;
     seen
+}
+
+/// What a stream carried, as counts and names rather than frames.
+///
+/// For the tests that read an attach block deep enough to fill the sockets
+/// between a host and a client ([`deep_block`]): tens of megabytes, which a test
+/// that kept the frames would print back at a failed assertion. This keeps what
+/// those tests assert on, the eviction they are about included, because an
+/// evicted stream ends.
+#[derive(Debug, Default)]
+struct Carried {
+    /// How many `event` frames arrived, by session.
+    events: BTreeMap<String, usize>,
+    /// The sessions whose `caught_up` arrived, in order.
+    caught_up: Vec<String>,
+    /// The sessions a `reset` named, in order.
+    resets: Vec<String>,
+    /// Whether the stream ended, which for a client of a gateway means it was
+    /// evicted or the gateway went away (spec 6.9).
+    ended: bool,
+}
+
+impl Carried {
+    fn events(&self, session: &str) -> usize {
+        self.events.get(session).copied().unwrap_or_default()
+    }
+}
+
+/// Read frames into a tally until `done` accepts it, or the stream ends.
+async fn carried_until(
+    events: &mut RemoteEvents,
+    what: &str,
+    mut done: impl FnMut(&Carried) -> bool,
+) -> Carried {
+    let mut carried = Carried::default();
+    bounded(what, async {
+        while !done(&carried) {
+            let Some(frame) = events.recv().await else {
+                carried.ended = true;
+                return;
+            };
+            match frame.unwrap_or_else(|err| panic!("a good frame: {err}")) {
+                Frame::Event { session, .. } => *carried.events.entry(session).or_default() += 1,
+                Frame::CaughtUp { session, .. } => carried.caught_up.push(session),
+                Frame::Reset { session } => carried.resets.push(session),
+                _ => {}
+            }
+        }
+    })
+    .await;
+    carried
 }
 
 /// The sessions the `reset` frames among `frames` name (spec 6.3).
@@ -2574,23 +2626,21 @@ async fn a_client_that_stops_reading_is_evicted_and_recovers() {
 ///
 /// The bound governs live fan-out. A block measured against it would evict on
 /// the first big backfill, and the re-attach that followed would do the same
-/// again, so a client with a real session could never catch up at all. The block
-/// here is written in one burst, hundreds of frames deep against a bound of two,
-/// which is what a resumed session looks like and what a queued block cannot
-/// survive.
+/// again, so a client with a real session could never catch up at all.
+///
+/// The block has to *reach* the bound for that to be measured at all, and one
+/// that fits in the sockets between the host and the client never does: the
+/// writer never stalls, the queue never fills, and the test passes with pacing
+/// removed. So the client here waits until the host's writes stop with the block
+/// unfinished, which is the state where the queue is full of paced frames and the
+/// task pumping them is parked. How much fits is the machine's business, so it is
+/// checked rather than assumed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_block_bigger_than_the_bound_does_not_evict_its_own_client() {
-    let backfilled: u64 = 300;
-    let mut script = vec![state_frame("s-1", "epoch-1", backfilled)];
-    for entry in 1..=backfilled {
-        script.push(warning_frame(
-            "s-1",
-            "epoch-1",
-            &format!("{entry}:{}", "x".repeat(4096)),
-        ));
-    }
-    script.push(caught_up_frame("s-1", "epoch-1", backfilled));
-    let fake = FakeHost::start("fake", Script::Frames(script)).await;
+    let backfilled: u64 = 800;
+    let resuming = deep_block("s-1", "epoch-1", backfilled);
+    let deep = resuming.len();
+    let fake = FakeHost::start("fake", Script::Frames(resuming)).await;
     let fixture = Fixture::tuned(
         TempDir::new().expect("tempdir"),
         vec![fake.address.clone()],
@@ -2603,17 +2653,32 @@ async fn a_block_bigger_than_the_bound_does_not_evict_its_own_client() {
     fixture.until_connected("fake").await;
 
     let mut events = fixture.attach(&[attach("fake:s-1")]).await;
-    let block = frames_until(&mut events, "the whole attach block", is_caught_up).await;
+    let stalled = fake.until_stalled().await;
+    assert!(
+        stalled < deep,
+        "the client absorbed {stalled} of {deep} block frames, so its queue never \
+         reached the bound and this test measures nothing",
+    );
+    // An eviction cancels the splice, so the upstream carrying the block goes
+    // with it: the loss lands on the host before the client can read a frame of
+    // it.
+    assert_eq!(
+        fake.released(),
+        0,
+        "the block evicted the client that asked for it, {stalled} frames in",
+    );
+
+    let carried = carried_until(&mut events, "the whole attach block", |carried| {
+        !carried.caught_up.is_empty()
+    })
+    .await;
 
     assert_eq!(
-        block
-            .iter()
-            .filter(|frame| matches!(frame, Frame::Event { .. }))
-            .count(),
+        carried.events("fake:s-1"),
         usize::try_from(backfilled).expect("a count that fits"),
-        "every frame of a block hundreds deep arrived against a bound of two",
+        "every frame of a block hundreds deep arrived against a bound of two: {carried:?}",
     );
-    assert_eq!(caught_up_at(&block), backfilled);
+    assert_eq!(carried.caught_up, vec!["fake:s-1".to_string()]);
 
     fixture.shutdown().await;
     fake.stop();
@@ -2663,11 +2728,9 @@ async fn a_live_frame_from_another_host_does_not_evict_a_client_mid_block() {
     let mut events = fixture
         .attach(&[attach("left:s-1"), attach("right:s-9")])
         .await;
-    let mut seen = frames_until(
-        &mut events,
-        "the other host's block",
-        |frame| matches!(frame, Frame::CaughtUp { session, .. } if session == "right:s-9"),
-    )
+    let opened = carried_until(&mut events, "the other host's block", |carried| {
+        carried.caught_up.contains(&"right:s-9".to_string())
+    })
     .await;
 
     // From here the client reads nothing, so the queue fills with the paced
@@ -2697,24 +2760,18 @@ async fn a_live_frame_from_another_host_does_not_evict_a_client_mid_block() {
          {stalled} of {deep} frames of the block it had asked for",
     );
 
-    seen.extend(
-        frames_until(
-            &mut events,
-            "the rest of the block",
-            |frame| matches!(frame, Frame::CaughtUp { session, .. } if session == "left:s-1"),
-        )
-        .await,
+    let carried = carried_until(&mut events, "the rest of the block", |carried| {
+        carried.caught_up.contains(&"left:s-1".to_string())
+    })
+    .await;
+    assert_eq!(
+        opened.events("left:s-1") + carried.events("left:s-1"),
+        usize::try_from(backfilled).expect("a count that fits"),
+        "the whole block reached the client: {carried:?}",
     );
     assert_eq!(
-        seen.iter()
-            .filter(|frame| matches!(frame, Frame::Event { session, .. } if session == "left:s-1"))
-            .count(),
-        usize::try_from(backfilled).expect("a count that fits"),
-        "the whole block reached the client",
-    );
-    assert!(
-        seen.iter()
-            .any(|frame| matches!(frame, Frame::Event { session, .. } if session == "right:s-9")),
+        opened.events("right:s-9") + carried.events("right:s-9"),
+        1,
         "and so did the live frame, queued behind the block rather than into it",
     );
 
