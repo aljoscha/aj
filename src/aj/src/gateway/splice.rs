@@ -227,17 +227,19 @@ async fn dial(
         .map_err(|err| unreachable(address, err))?;
     client.events(&group.attach).await.map_err(|err| match err {
         // The host's own answer to a client's attach: a session it does not
-        // hold, a lock conflict. It travels back with its status and its code,
+        // hold, a lock conflict. It travels back with its status and its body,
         // exactly as a proxied refusal does, because the client asked this
         // question and the owning host answered it.
         RemoteError::Status {
             status,
-            code,
             message,
+            body,
+            ..
         } => GatewayError::AttachRefused {
             status,
-            code,
+            host_id: group.host_id.clone(),
             message,
+            body,
         },
         // Not a refusal: a host this gateway believed was there did not answer.
         // Carrying its sessions silently would leave a client watching frames

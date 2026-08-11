@@ -327,14 +327,45 @@ fn namespace_created(answer: Answer, target: &HostTarget) -> Result<Response, Ap
 async fn events(
     State(state): State<Arc<ServerState>>,
     Query(params): Query<Vec<(String, String)>>,
-) -> Result<Sse<impl Stream<Item = Result<Event, aj_agent::BoxError>>>, ApiError> {
-    let attach = attach_requests(&params)?;
-    let splice = state.gateway.splice(&attach, &state.shutdown).await?;
+) -> Result<Sse<impl Stream<Item = Result<Event, aj_agent::BoxError>>>, Response> {
+    let attach = attach_requests(&params).map_err(IntoResponse::into_response)?;
+    let splice = state
+        .gateway
+        .splice(&attach, &state.shutdown)
+        .await
+        .map_err(refused)?;
     Ok(Sse::new(client_stream(
         splice,
         state.heartbeat,
         state.shutdown.clone(),
     )))
+}
+
+/// Why a client's stream could not be opened.
+///
+/// A refusal the owning host wrote travels back as that host wrote it, with the
+/// session ids in it namespaced and nothing else touched, which is the path a
+/// proxied refusal takes: the client asked this question and the host answered
+/// it, so its own fields are what a capable client composes its wording from
+/// (spec 6.6). A body this gateway cannot read that way, and everything that is
+/// the gateway's own answer, goes through [`ApiError`].
+fn refused(err: GatewayError) -> Response {
+    if let GatewayError::AttachRefused {
+        status,
+        host_id,
+        body,
+        ..
+    } = &err
+        && let Some(body) = namespaced_error(body.as_bytes(), host_id)
+    {
+        return Answer {
+            status: *status,
+            content_type: Some(header::HeaderValue::from_static("application/json")),
+            body,
+        }
+        .into_response();
+    }
+    ApiError::from(err).into_response()
 }
 
 /// Parse the stream's repeatable `session=<id>[@<epoch>:<seq>]` parameters
@@ -446,7 +477,7 @@ async fn forward(
     let method = request.method().clone();
     let content_type = forwarded_content_type(&request);
     let body = read_body(request).await?;
-    let answer = send(
+    let mut answer = send(
         state.gateway.http(),
         Upstream {
             method,
@@ -457,7 +488,39 @@ async fn forward(
         &route.address,
     )
     .await?;
+    // A refusal the host wrote names its session in the host's own vocabulary,
+    // which no client of this gateway can address (spec 6.6).
+    if !answer.status.is_success()
+        && let Some(body) = namespaced_error(&answer.body, &route.host_id)
+    {
+        answer.body = body;
+    }
     Ok(answer.into_response())
+}
+
+/// A host's error body under this gateway's own vocabulary, `None` when the body
+/// is no JSON object at all (spec 6.6).
+///
+/// An error that references a session names it in a top-level `session` field,
+/// and that is the one field of an error body a gateway owes anything to: the id
+/// the host used is one no client here can address. Everything else travels as it
+/// arrived, a field this build does not know included, which is the discipline
+/// the create route follows in the other direction (spec 6.10).
+///
+/// The `None` is what separates a refusal this gateway can carry from one it can
+/// only summarize: a proxy's HTML page, an empty body.
+fn namespaced_error(body: &[u8], host_id: &str) -> Option<Bytes> {
+    let mut object: JsonObject = serde_json::from_slice(body).ok()?;
+    let Some(session) = string_field(&object, SESSION_FIELD).ok().flatten() else {
+        // An envelope naming no session is already in every vocabulary.
+        return Some(Bytes::copy_from_slice(body));
+    };
+    set_string_field(
+        &mut object,
+        SESSION_FIELD,
+        &SessionAddress::new(host_id, &session).to_string(),
+    );
+    serde_json::to_vec(&object).ok().map(Bytes::from)
 }
 
 /// One request as it goes upstream.
@@ -606,6 +669,10 @@ const HOST_FIELD: &str = "host";
 /// The created answer's session id, [`aj_wire::SessionCreated::id`].
 const CREATED_ID_FIELD: &str = "id";
 
+/// The field an error body names a session in (spec 6.6), the same convention
+/// frames use (spec 6.3).
+const SESSION_FIELD: &str = "session";
+
 /// A JSON object held as its top-level fields, every value left unparsed.
 ///
 /// The create is the one route where a gateway edits a body rather than
@@ -738,21 +805,18 @@ impl From<GatewayError> for ApiError {
                 (StatusCode::SERVICE_UNAVAILABLE, "host_unreachable")
             }
             GatewayError::Directory(err) => directory_status(err),
-            // The owning host's own refusal, code and all (spec 6.10). A host
-            // that sent no code is not one this protocol describes, so this
-            // gateway names the refusal itself rather than inventing the host's
-            // word for it.
+            // A refusal whose body is not an envelope at all: an HTML page from
+            // something in front of the host, nothing. The gateway names it
+            // itself, because the host named nothing, and carries the host's own
+            // words. A body that *is* an envelope never reaches here (see
+            // [`refused`]), because every field of one is the host's to keep
+            // (spec 6.6).
             GatewayError::AttachRefused {
-                status,
-                code,
-                message,
+                status, message, ..
             } => {
                 return Self {
                     status: *status,
-                    code: match code {
-                        Some(code) => Cow::Owned(code.clone()),
-                        None => Cow::Borrowed("host_refused"),
-                    },
+                    code: Cow::Borrowed("host_refused"),
                     message: message.clone(),
                 };
             }
@@ -831,6 +895,7 @@ mod tests {
     fn route(address: &str, session: &str) -> Route {
         Route {
             address: HostAddress::parse(address).expect("an address"),
+            host_id: "left".to_string(),
             session: session.to_string(),
         }
     }

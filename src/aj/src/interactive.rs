@@ -8522,6 +8522,7 @@ mod tests {
             status: reqwest::StatusCode::CONFLICT,
             code: Some("locked".to_string()),
             message: local.to_string(),
+            body: serde_json::json!({"code": "locked", "message": local.to_string()}).to_string(),
         });
         assert_eq!(
             switch_refusal(session, Some("fix-auth"), &wire),

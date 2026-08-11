@@ -843,6 +843,53 @@ async fn an_id_no_namespace_can_hold_is_a_404() {
     host.stop().await;
 }
 
+/// An error body a host wrote crosses the proxy with its session named in this
+/// gateway's own vocabulary, and nothing else touched (spec 6.6).
+///
+/// The host names the session as the host knows it, which is an id no client of
+/// this gateway can address: the rewrite is the same one the create answer gets,
+/// and everything around it travels as the host wrote it, the fields this build
+/// has no name for included (spec 6.10).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_proxied_error_body_names_the_session_this_gateways_way() {
+    let recorder = Recorder::start("recorder").await;
+    let fixture = Fixture::over(
+        TempDir::new().expect("tempdir"),
+        vec![recorder.address.clone()],
+    )
+    .await;
+    fixture.until_connected("recorder").await;
+
+    let response = fixture
+        .http
+        .get(format!(
+            "{}/v1/sessions/recorder:s-1/{REFUSED_ROUTE}",
+            fixture.server.url()
+        ))
+        .send()
+        .await
+        .expect("the proxied request");
+
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.expect("a JSON body");
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(
+        body["session"], "recorder:s-1",
+        "the host's own id for it is one no client here can address: {body}",
+    );
+    assert_eq!(
+        body["code"], "unknown_session",
+        "and the host's own code travels: {body}",
+    );
+    assert_eq!(
+        body["hint"], "look it up",
+        "as does a field this gateway has no name for: {body}",
+    );
+
+    fixture.shutdown().await;
+    recorder.stop();
+}
+
 // ---------------------------------------------------------------------------
 // A host that is not there (spec 6.8's `unreachable`, 6.1's 503)
 // ---------------------------------------------------------------------------
@@ -1741,6 +1788,10 @@ async fn a_hosts_own_create_refusal_travels_back() {
     host.stop().await;
 }
 
+/// The one route a [`Recorder`] refuses, so a test can watch an error body cross
+/// the proxy.
+const REFUSED_ROUTE: &str = "refuse";
+
 /// A stand-in host that keeps the create bodies it is sent.
 struct Recorder {
     address: HostAddress,
@@ -1825,12 +1876,29 @@ impl Recorder {
                     move |path: axum::extract::Path<(String, String)>| {
                         let proxied = Arc::clone(&proxied);
                         async move {
+                            use axum::response::IntoResponse;
+
                             let axum::extract::Path((id, rest)) = path;
                             proxied
                                 .lock()
                                 .expect("the proxied mutex is poisoned")
                                 .push(format!("{id}/{rest}"));
-                            axum::Json(serde_json::json!({}))
+                            // One route refuses, in the shape spec 6.6 gives an
+                            // error about a session: the id in the host's own
+                            // vocabulary, plus a field of its own.
+                            if rest == REFUSED_ROUTE {
+                                return (
+                                    StatusCode::NOT_FOUND,
+                                    axum::Json(serde_json::json!({
+                                        "code": "unknown_session",
+                                        "message": format!("no session {id} here"),
+                                        "session": id,
+                                        "hint": "look it up",
+                                    })),
+                                )
+                                    .into_response();
+                            }
+                            axum::Json(serde_json::json!({})).into_response()
                         }
                     }
                 }),
@@ -2108,6 +2176,57 @@ async fn a_hosts_own_attach_refusal_travels_back() {
     assert!(
         err.to_string().contains("another writer"),
         "and the host's own words: {err}",
+    );
+
+    fixture.shutdown().await;
+    fake.stop();
+}
+
+/// A refusal an owning host wrote reaches the client whole (spec 6.6).
+///
+/// Three things about the same body: an envelope carrying only a `message` is a
+/// complete error, so the message is the host's sentence and not the JSON it
+/// arrived in; the session it names is named in the one vocabulary a client of
+/// this gateway has; and a field this build has no name for is still there for a
+/// client that does. The proxy carries a host's error bodies whole, and this is
+/// the same rule on the path that does not go through it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hosts_own_attach_refusal_travels_back_whole() {
+    let fake = FakeHost::start(
+        "fake",
+        Script::RefuseRaw(
+            r#"{"message":"the session is held by another writer","session":"s-1","holder":"pid 42"}"#,
+        ),
+    )
+    .await;
+    let fixture = Fixture::over(TempDir::new().expect("tempdir"), vec![fake.address.clone()]).await;
+    fixture.until_connected("fake").await;
+
+    let response = fixture
+        .http
+        .get(format!(
+            "{}/v1/events?session=fake:s-1",
+            fixture.server.url()
+        ))
+        .send()
+        .await
+        .expect("the stream request");
+
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.expect("a JSON body");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body["message"], "the session is held by another writer",
+        "the host's own sentence rather than the body it arrived in: {body}",
+    );
+    assert_eq!(
+        body["session"], "fake:s-1",
+        "named in the only vocabulary a client of this gateway has: {body}",
+    );
+    assert_eq!(
+        body["holder"], "pid 42",
+        "and a field this gateway has no name for is still there for a client \
+         that has: {body}",
     );
 
     fixture.shutdown().await;
@@ -3262,6 +3381,10 @@ enum Script {
     },
     /// Not a stream at all: the host's own refusal of the attach.
     Refuse,
+    /// A refusal whose body the test writes, for the shapes spec 6.6 admits and
+    /// this build has no type for: an envelope carrying only a `message`, fields
+    /// a newer host adds to one.
+    RefuseRaw(&'static str),
     /// Nothing at all, not even a response head: the host took the request and
     /// went quiet.
     Mute,
@@ -3347,6 +3470,14 @@ impl FakeHost {
                                 )
                                     .into_response();
                             }
+                            if !control && let Script::RefuseRaw(body) = &script {
+                                return (
+                                    StatusCode::CONFLICT,
+                                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                                    *body,
+                                )
+                                    .into_response();
+                            }
                             if !control && matches!(script, Script::Mute) {
                                 std::future::pending::<()>().await;
                             }
@@ -3382,7 +3513,7 @@ impl FakeHost {
                                         },
                                         guard,
                                     ),
-                                    Script::Refuse | Script::Mute => {
+                                    Script::Refuse | Script::RefuseRaw(_) | Script::Mute => {
                                         unreachable!("answered above")
                                     }
                                     Script::Cued { first, cue, then } => (

@@ -154,9 +154,14 @@ pub(crate) enum GatewayError {
     #[error("the host answered {status}: {message}")]
     AttachRefused {
         status: StatusCode,
-        /// The protocol's stable token, when the host sent one (spec 6.1).
-        code: Option<String>,
+        /// The host whose refusal this is, which is the namespace the session ids
+        /// in its body appear under downstream.
+        host_id: String,
+        /// The host's own sentence, for this gateway's own log and for the
+        /// envelope it mints when the host sent none (spec 6.6).
         message: String,
+        /// The refusal body as the host wrote it, which is what travels back.
+        body: String,
     },
     #[error(transparent)]
     State(#[from] EnrollmentError),

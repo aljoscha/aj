@@ -75,6 +75,9 @@ impl Enrollment {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Route {
     pub(crate) address: HostAddress,
+    /// The id the host answers to, which is the namespace this gateway's clients
+    /// address its sessions under.
+    pub(crate) host_id: String,
     pub(crate) session: String,
 }
 
@@ -346,6 +349,7 @@ impl Directory {
         }
         Ok(Route {
             address: owner.address.clone(),
+            host_id: owner.host_id,
             session: owner.session,
         })
     }
@@ -826,6 +830,7 @@ mod tests {
             directory.route("left:s-1").expect("a route"),
             Route {
                 address: left.clone(),
+                host_id: "left".to_string(),
                 session: "s-1".to_string(),
             },
             "the de-namespaced id is what the owning host calls it",

@@ -19,10 +19,10 @@ use std::time::Duration;
 use aj_agent::tool::TaskId;
 use aj_app::host::{AttachRequest, CommandOutcome};
 use aj_wire::{
-    CancelRequest, CompactRequest, CreateSessionRequest, DecodedFrame, ErrorResponse, Frame,
-    HeadRequest, Hello, PROTOCOL_VERSION, PromptRequest, QueueOperation, QueueOutcome,
-    QueueRequest, QueueState, SessionCreated, SessionList, SessionTree, SettingsRequest,
-    SteerRequest, TagRequest, TaskDetails, TaskTable,
+    CancelRequest, CompactRequest, CreateSessionRequest, DecodedFrame, Frame, HeadRequest, Hello,
+    PROTOCOL_VERSION, PromptRequest, QueueOperation, QueueOutcome, QueueRequest, QueueState,
+    SessionCreated, SessionList, SessionTree, SettingsRequest, SteerRequest, TagRequest,
+    TaskDetails, TaskTable,
 };
 use eventsource_stream::{EventStreamError, Eventsource};
 use futures::{Stream, StreamExt};
@@ -62,11 +62,19 @@ pub(crate) enum RemoteError {
     Transport(#[from] reqwest::Error),
     /// The host refused. `code` is the protocol's stable token when the body
     /// carried one, which is what a caller branches on.
+    ///
+    /// `body` is that body as it arrived, because a gateway re-emits a refusal it
+    /// did not author and every field of it is the host's to keep (spec 6.6,
+    /// 6.10). `code` and `message` are the two fields this protocol names inside
+    /// it, read out for callers that branch or display.
     #[error("the host answered {status}: {message}")]
     Status {
         status: StatusCode,
         code: Option<String>,
+        /// The host's own sentence: its envelope's `message`, or the whole body
+        /// when the body was no envelope at all.
         message: String,
+        body: String,
     },
     #[error("the host sent something this build cannot read: {0}")]
     Decode(#[source] serde_json::Error),
@@ -355,26 +363,45 @@ fn check_protocol(hello: &Hello) -> Result<(), RemoteError> {
     })
 }
 
-/// Turn a non-2xx response into a typed refusal, preserving the status and
-/// the protocol's code.
+/// Turn a non-2xx response into a typed refusal, preserving the status, the
+/// protocol's code and the body it all arrived in.
 async fn refusal(response: reqwest::Response) -> Result<reqwest::Response, RemoteError> {
     let status = response.status();
     if status.is_success() {
         return Ok(response);
     }
     let body = response.text().await.unwrap_or_default();
-    // A host answers `{code, message}`. A proxy, or a status the framework
-    // answers on its own (405), may not, so the raw text stands in.
-    let (code, message) = match serde_json::from_str::<ErrorResponse>(&body) {
-        Ok(error) => (Some(error.code), error.message),
-        Err(_) if body.trim().is_empty() => (None, status.to_string()),
-        Err(_) => (None, body),
-    };
+    // Both fields are read on their own, because spec 6.6 calls an envelope
+    // carrying only a `message` a complete error and an unknown `code` renders as
+    // its message verbatim. A proxy, or a status the framework answers itself
+    // (405), sends no envelope at all, and then the raw text stands in: pasting a
+    // whole JSON body into `message` would show a user a blob instead of the
+    // sentence the peer wrote.
+    let envelope = serde_json::from_str::<Envelope>(&body).ok();
+    let code = envelope.as_ref().and_then(|envelope| envelope.code.clone());
+    let message = envelope
+        .and_then(|envelope| envelope.message)
+        .unwrap_or_else(|| {
+            if body.trim().is_empty() {
+                status.to_string()
+            } else {
+                body.clone()
+            }
+        });
     Err(RemoteError::Status {
         status,
         code,
         message,
+        body,
     })
+}
+
+/// A refusal's body read for the two fields this protocol names, each optional
+/// (spec 6.6).
+#[derive(serde::Deserialize)]
+struct Envelope {
+    code: Option<String>,
+    message: Option<String>,
 }
 
 async fn decode<T: DeserializeOwned>(response: reqwest::Response) -> Result<T, RemoteError> {
@@ -472,5 +499,69 @@ impl RemoteEvents {
     fn fail<T>(&mut self, err: RemoteError) -> Result<T, RemoteError> {
         self.done = true;
         Err(err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Spec 6.6: codes arrive error by error, an envelope with only a `message`
+    /// is a complete error, and an unknown code renders as its message verbatim.
+    /// So both fields are read on their own, and a body that is no envelope at
+    /// all is the only case where the raw text is the best there is.
+    #[tokio::test]
+    async fn a_refusal_is_read_for_each_field_it_has() {
+        for (body, expected_code, expected_message) in [
+            (
+                r#"{"code":"locked","message":"held by another writer"}"#,
+                Some("locked"),
+                "held by another writer",
+            ),
+            // The shape that reached a user as a JSON blob: the sentence is
+            // there, and the envelope is complete without a code.
+            (
+                r#"{"message":"held by another writer","session":"s-1"}"#,
+                None,
+                "held by another writer",
+            ),
+            (
+                r#"{"code":"locked"}"#,
+                Some("locked"),
+                r#"{"code":"locked"}"#,
+            ),
+            // Not an envelope: something in front of the host, or nothing at all.
+            ("<html>bad gateway</html>", None, "<html>bad gateway</html>"),
+            ("", None, "409 Conflict"),
+        ] {
+            let response = reqwest::Response::from(
+                axum::http::Response::builder()
+                    .status(StatusCode::CONFLICT)
+                    .body(body.to_string())
+                    .expect("a response"),
+            );
+
+            let err = refusal(response)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{body:?} is a refusal"));
+
+            let RemoteError::Status {
+                code,
+                message,
+                body: carried,
+                ..
+            } = &err
+            else {
+                panic!("{body:?} became {err:?}");
+            };
+            assert_eq!(code.as_deref(), expected_code, "{body:?}");
+            assert_eq!(message, expected_message, "{body:?}");
+            assert_eq!(
+                carried, body,
+                "the body travels whole, because a gateway re-emits a refusal it \
+                 did not author",
+            );
+        }
     }
 }
