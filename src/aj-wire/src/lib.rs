@@ -11,7 +11,7 @@ use aj_agent::message::AgentMessage;
 use aj_agent::tool::{TaskId, TaskKind, TaskStatus};
 use aj_models::types::UserContent;
 use chrono::{DateTime, Utc};
-use serde::de::{Error as _, MapAccess, Visitor};
+use serde::de::{Error as _, IgnoredAny, MapAccess, Visitor};
 use serde::ser::{Error as _, SerializeMap};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::value::RawValue;
@@ -986,6 +986,48 @@ pub enum DecodedFrame {
 }
 
 impl DecodedFrame {
+    /// The frame's top-level session id, `None` for a host-scoped frame.
+    ///
+    /// The read side of [`Self::rewrite_session`], answering for the same
+    /// field on the same terms, which is what lets a gateway namespace every
+    /// frame the rewrite would touch, kinds this build does not know included
+    /// (spec 6.10). A frame decoded from the wire answers from the JSON it will
+    /// forward, a locally built one from its variant. A `session` nested in a
+    /// payload is not the frame's session and is not read. `None` comes back
+    /// exactly where the rewrite returns `false`.
+    ///
+    /// A top-level `session` no id can be read from is an error rather than
+    /// `None`: a value that is not a string, `null`, or a string token whose
+    /// escapes do not decode. Spec 6.3 mints ids as strings, so such a frame is
+    /// malformed, and only an unknown kind can carry one this far, a known kind
+    /// is refused at decode. Both other answers would be worse. `None` would
+    /// call the frame host-scoped while the rewrite still replaces the field, so
+    /// a gateway would forward a session-scoped frame carrying the host's own
+    /// id. Handing back the field's literal text would invent an id no host ever
+    /// minted.
+    ///
+    /// The id comes back owned. A caller builds the replacement from it and
+    /// hands that straight back to the rewrite, which borrows the frame
+    /// mutably.
+    pub fn session(&self) -> Result<Option<String>, serde_json::Error> {
+        let raw = match self {
+            // NOTE: For a known kind the typed value would answer too, and
+            // identically, because its strict decode refuses a `session` that is
+            // anything but one string. Reading the JSON anyway keeps the answer
+            // tied to the bytes the rewrite writes into, so the two cannot drift
+            // if that strictness ever loosens.
+            Self::Known(frame) => match frame.raw_json() {
+                Some(raw) => raw,
+                // A locally built frame retains no JSON, so its variant is the
+                // only source there is. The rewrite falls back the same way.
+                None => return Ok(frame.value().session().map(str::to_string)),
+            },
+            Self::Unknown { raw, .. } => raw,
+        };
+        let TopLevelSession(session) = serde_json::from_str(raw.get())?;
+        Ok(session)
+    }
+
     /// Rewrites the frame's top-level session id, reporting whether it had
     /// one.
     ///
@@ -1138,6 +1180,91 @@ impl Serialize for RawObject {
             map.serialize_entry(key, value)?;
         }
         map.end()
+    }
+}
+
+/// The top-level `session` of a frame's JSON, with every other field skipped.
+///
+/// A gateway reads this for every frame it forwards, so nothing else is
+/// materialized: no other key is allocated and no value is copied out. The
+/// document is still walked once, which is what finding a top-level key costs
+/// in JSON, and walking it rather than searching its text is what keeps a
+/// payload's own `session` out of reach.
+struct TopLevelSession(Option<String>);
+
+impl<'de> Deserialize<'de> for TopLevelSession {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct TopLevelSessionVisitor;
+
+        impl<'de> Visitor<'de> for TopLevelSessionVisitor {
+            type Value = TopLevelSession;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a JSON object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut session = None;
+                while let Some(key) = map.next_key::<TopLevelKey>()? {
+                    match key {
+                        // Read as a string, so a `session` that is not one is
+                        // an error rather than an id this invented. The last
+                        // occurrence wins if a duplicate key gets this far,
+                        // which is the one a reader that parses the frame into
+                        // a map takes.
+                        TopLevelKey::Session => session = Some(map.next_value::<String>()?),
+                        TopLevelKey::Other => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(TopLevelSession(session))
+            }
+        }
+
+        deserializer.deserialize_map(TopLevelSessionVisitor)
+    }
+}
+
+/// Whether a top-level key is `session`, decided after JSON unescaping and
+/// without allocating the key.
+enum TopLevelKey {
+    Session,
+    Other,
+}
+
+impl<'de> Deserialize<'de> for TopLevelKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct TopLevelKeyVisitor;
+
+        impl<'de> Visitor<'de> for TopLevelKeyVisitor {
+            type Value = TopLevelKey;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a JSON object key")
+            }
+
+            fn visit_str<E>(self, key: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(match key {
+                    "session" => TopLevelKey::Session,
+                    _ => TopLevelKey::Other,
+                })
+            }
+        }
+
+        deserializer.deserialize_str(TopLevelKeyVisitor)
     }
 }
 
