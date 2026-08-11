@@ -968,14 +968,24 @@ alongside the rows (additive, gateway-only), and a client renders an
 unreachable host it holds no rows for as an empty group rather than
 as nothing. Honest absence beats a cached directory: persisted rows
 could name sessions that no longer exist, and a stale "maybe" is
-worse than a clear "unreachable, contents unknown".
+worse than a clear "unreachable, contents unknown". `GET /v1/sessions`
+answers the same payload, hosts included, because the read and the
+frames are one composition: a client that reads the directory and a
+client that watches it must not disagree about which hosts there are.
+A host the gateway has never spoken to is not among them, since it has
+no id yet and there is nothing for a client to group under.
 Clients re-attach with their cursors as usual, which resumes
 incrementally when the host's epochs survived and fully when they did
 not. The same mechanism covers the case where a host evicts a slow
 gateway. Removing an enrollment is active teardown, not bookkeeping:
 the upstream connections close, the host's sessions leave the merged
 list, and its splices end. Leaving them would serve a directory that
-contradicts the enrollment set.
+contradicts the enrollment set. Those splices end **without** a
+`reset`: it would ask the client to attach ids the gateway no longer
+resolves, and a refused attach fails a client's whole stream (section
+6.5), so it would cost that client the sessions it holds on every
+other host. The directory is what tells it, the withdrawn host's rows
+and its entry are gone from it.
 
 The gateway does not re-open that upstream itself. Resuming one needs a
 *current* cursor, and the client's cursor advances as it applies the
