@@ -614,7 +614,22 @@ protocol-1 baseline (section 6.10). The response names the session in
 the answering server's id vocabulary, namespaced through a gateway.
 
 Request bodies are the `aj-wire` types, which are the source of truth
-once landed. Two shapes the spec pins because getting them wrong is
+once landed. Errors cross the wire as a small envelope, not bare
+prose: `{code, message, ...fields}`. The `message` is the human
+sentence, produced where the facts live and always sufficient on its
+own. An unknown `code` renders as its `message` verbatim, so codes
+are additive (section 6.10), and a capable client composes its own
+wording from the code's fields and can act on the kind, the same
+division the rest of the protocol uses, the wire carries structure
+and rendering happens where the human is. An error that references a
+session carries it in a top-level `session` field, the same
+convention frames use (section 6.3), so a gateway rewrites error
+bodies with the machinery it already has, without understanding the
+code. Codes arrive error-by-error, when a client needs to
+distinguish or re-render one, there is no big-bang migration, an
+envelope with only a `message` is a complete error.
+
+Two shapes the spec pins because getting them wrong is
 easy: a model change travels as the same (api, url, name) triple that
 CLI and env selection use, never as a catalog object (the host
 resolves the triple against its own catalog and credentials), and
