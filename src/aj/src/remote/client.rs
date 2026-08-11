@@ -6,10 +6,12 @@
 //! can tell a refusal (a 409 the user should see) from a transport failure (a
 //! reconnect).
 //!
-//! The stream side is deliberately thin: [`RemoteEvents`] yields decoded
-//! [`Frame`]s and nothing else. Cursors, epochs and reconciliation are the
-//! fold's business ([`aj_app::client::SessionClient`]), which is what keeps
-//! the local and the remote client one implementation.
+//! The stream side is deliberately thin: [`RemoteEvents`] yields frames and
+//! nothing else, either decoded to [`Frame`] for an endpoint client or as
+//! [`aj_wire::DecodedFrame`] for a gateway, which has to forward the kinds it
+//! does not know. Cursors, epochs and reconciliation are the fold's business
+//! ([`aj_app::client::SessionClient`]), which is what keeps the local and the
+//! remote client one implementation.
 
 use std::pin::Pin;
 use std::time::Duration;
@@ -416,43 +418,58 @@ impl RemoteEvents {
     /// The next frame, `None` once the stream ended.
     ///
     /// An unknown frame kind is skipped: an endpoint client discards those
-    /// (spec 6.10), only a gateway forwards them. A malformed known frame is
-    /// an error and ends the stream, because a reliable frame this client
-    /// cannot apply leaves its state incomplete, and a reconnect with a
-    /// cursor is the recovery.
+    /// (spec 6.10). A gateway, which forwards them, reads
+    /// [`Self::recv_decoded`] instead. A malformed known frame is an error and
+    /// ends the stream, because a reliable frame this client cannot apply
+    /// leaves its state incomplete, and a reconnect with a cursor is the
+    /// recovery.
     pub(crate) async fn recv(&mut self) -> Option<Result<Frame, RemoteError>> {
-        if self.done {
-            return None;
-        }
         loop {
-            let next = match tokio::time::timeout_at(self.deadline, self.events.next()).await {
-                Ok(next) => next,
-                Err(_) => {
-                    let silence = self.silence;
-                    return Some(self.fail(RemoteError::Silent(silence)));
+            match self.recv_decoded().await? {
+                Ok(DecodedFrame::Known(frame)) => return Some(Ok(frame.into_value())),
+                Ok(DecodedFrame::Unknown { kind, .. }) => {
+                    tracing::debug!("discarding a frame of unknown kind {kind:?}");
                 }
-            };
-            // Any byte the host sent is evidence it is alive, a heartbeat and
-            // a frame kind this build cannot read included.
-            self.deadline = tokio::time::Instant::now() + self.silence;
-            match next {
-                None => {
-                    self.done = true;
-                    return None;
-                }
-                Some(Err(err)) => return Some(self.fail(RemoteError::Stream(err.to_string()))),
-                Some(Ok(event)) => match serde_json::from_str::<DecodedFrame>(&event.data) {
-                    Ok(DecodedFrame::Known(frame)) => return Some(Ok(frame.into_value())),
-                    Ok(DecodedFrame::Unknown { kind, .. }) => {
-                        tracing::debug!("discarding a frame of unknown kind {kind:?}");
-                    }
-                    Err(err) => return Some(self.fail(RemoteError::Decode(err))),
-                },
+                Err(err) => return Some(Err(err)),
             }
         }
     }
 
-    fn fail(&mut self, err: RemoteError) -> Result<Frame, RemoteError> {
+    /// The next frame in decoded form, `None` once the stream ended.
+    ///
+    /// A kind this build does not know arrives as [`DecodedFrame::Unknown`]
+    /// with its JSON retained, which is what a gateway forwards (spec 6.10). A
+    /// malformed *known* frame is still an error: a frame whose kind we
+    /// recognize and whose payload we cannot read is a peer we have stopped
+    /// understanding, not an additive change.
+    pub(crate) async fn recv_decoded(&mut self) -> Option<Result<DecodedFrame, RemoteError>> {
+        if self.done {
+            return None;
+        }
+        let next = match tokio::time::timeout_at(self.deadline, self.events.next()).await {
+            Ok(next) => next,
+            Err(_) => {
+                let silence = self.silence;
+                return Some(self.fail(RemoteError::Silent(silence)));
+            }
+        };
+        // Any byte the host sent is evidence it is alive, a heartbeat and a
+        // frame kind this build cannot read included.
+        self.deadline = tokio::time::Instant::now() + self.silence;
+        match next {
+            None => {
+                self.done = true;
+                None
+            }
+            Some(Err(err)) => Some(self.fail(RemoteError::Stream(err.to_string()))),
+            Some(Ok(event)) => Some(match serde_json::from_str::<DecodedFrame>(&event.data) {
+                Ok(frame) => Ok(frame),
+                Err(err) => self.fail(RemoteError::Decode(err)),
+            }),
+        }
+    }
+
+    fn fail<T>(&mut self, err: RemoteError) -> Result<T, RemoteError> {
         self.done = true;
         Err(err)
     }

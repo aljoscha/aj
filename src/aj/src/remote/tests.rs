@@ -39,9 +39,10 @@ use aj_models::scripted::{ExhaustedBehavior, ScriptedProvider};
 use aj_models::types::{AssistantContent, AssistantMessage, StopReason, ToolCall};
 use aj_session::{ConversationPersistence, ThreadFilter};
 use aj_wire::{
-    CancelRequest, CompactRequest, CreateSessionRequest, Cursor, ErrorResponse, Frame, HeadRequest,
-    ModelSelection, PROTOCOL_VERSION, PromptInput, PromptRequest, QueueOperation, QueueRequest,
-    QueueState, SessionSettings, SettingsRequest, SteerRequest, TagRequest, TaskTable,
+    CancelRequest, CompactRequest, CreateSessionRequest, Cursor, DecodedFrame, ErrorResponse,
+    Frame, HeadRequest, ModelSelection, PROTOCOL_VERSION, PromptInput, PromptRequest,
+    QueueOperation, QueueRequest, QueueState, SessionSettings, SettingsRequest, SteerRequest,
+    TagRequest, TaskTable,
 };
 use async_trait::async_trait;
 use reqwest::StatusCode;
@@ -2382,6 +2383,63 @@ async fn an_unknown_frame_kind_is_skipped_and_a_malformed_known_one_errors() {
     assert!(matches!(err, RemoteError::Decode(_)), "got {err:?}");
     assert!(
         bounded("the end of the stream", events.recv())
+            .await
+            .is_none(),
+        "a failed stream ends",
+    );
+    serving.abort();
+}
+
+/// The same stream read as decoded frames keeps the unknown kind, with its
+/// JSON intact. That is the form a gateway forwards from (spec 6.10), so the
+/// discarding an endpoint client does must not be the only way to read a
+/// stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_decoded_stream_keeps_an_unknown_frame_whole() {
+    let (url, serving) = canned_server(
+        serde_json::json!({"protocol": PROTOCOL_VERSION, "capabilities": [],
+                           "app_version": "0", "host_id": "canned"}),
+        vec![
+            r#"{"kind":"something_newer","session":"s","payload":{"a":1}}"#.to_string(),
+            r#"{"kind":"heartbeat"}"#.to_string(),
+            r#"{"kind":"caught_up","session":"s"}"#.to_string(),
+        ],
+    )
+    .await;
+    let client = RemoteClient::new(&url).expect("client");
+    let mut events = client.events(&[]).await.expect("open the canned stream");
+
+    let frame = bounded("the unknown frame", events.recv_decoded())
+        .await
+        .expect("an item")
+        .expect("an unknown kind is not an error");
+    let DecodedFrame::Unknown { kind, raw } = frame else {
+        panic!("the unknown kind decoded as known");
+    };
+    assert_eq!(kind, "something_newer");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(raw.get()).expect("the retained JSON"),
+        serde_json::json!({"kind":"something_newer","session":"s","payload":{"a":1}}),
+        "the whole frame is retained, not just the fields this build knows",
+    );
+
+    let frame = bounded("the heartbeat", events.recv_decoded())
+        .await
+        .expect("an item")
+        .expect("a known kind");
+    assert!(
+        matches!(frame, DecodedFrame::Known(known) if matches!(known.value(), Frame::Heartbeat)),
+        "a known kind still decodes",
+    );
+    // A malformed known frame is an error on this form too: it is the same
+    // reliable frame nobody can apply.
+    let err = bounded("the malformed frame", events.recv_decoded())
+        .await
+        .expect("an item")
+        .expect_err("a malformed known frame is an error");
+    assert!(matches!(err, RemoteError::Decode(_)), "got {err:?}");
+    assert!(
+        bounded("the end of the stream", events.recv_decoded())
             .await
             .is_none(),
         "a failed stream ends",
