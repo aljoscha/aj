@@ -6,11 +6,19 @@
 //!
 //! The proxy is **one wildcard route, not a handler per command**. Everything
 //! under `/v1/sessions/{id}/` travels to the owning host unread: the method, the
-//! query, the body, and back the status and the response body. Only the id is
-//! touched, and only to strip the namespace. That is what lets an older gateway
-//! sit between a newer host and a newer client (spec 6.10's forward-don't-filter)
-//! and it means a route a host gains needs no change here. What gets validated is
-//! the namespace, never the route.
+//! query, the body, and back the status and the response body. What is touched is
+//! the id, to strip the namespace, and the `session` an error body names, to put
+//! it back (spec 6.6). That is what lets an older gateway sit between a newer host
+//! and a newer client (spec 6.10's forward-don't-filter) and it means a
+//! request/response route a host gains needs no change here. What gets validated
+//! is the namespace, never the route.
+//!
+//! Request and response, and not a stream: a proxied request is bounded end to
+//! end by `UPSTREAM_TIMEOUT` and its answer is read whole before any of it is
+//! written back. That is right for the routes this carries, which answer promptly
+//! by contract (a command is accepted, not awaited), and it is why the one route
+//! that stays open is spliced rather than proxied
+//! ([`crate::gateway::splice`]).
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;

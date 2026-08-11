@@ -378,11 +378,14 @@ struct HostReturn {
 /// open would spin a client whose host is down (attach, reset, re-attach, reset),
 /// and a host that was up all along has broken nothing for this stream.
 ///
-/// The edge can still be one more `reset` than continuity strictly needed: a
-/// control link that flapped while the spliced stream survived earns one, and so
-/// does a host whose return follows a drop the pump already reported. Both are
-/// deliberate. A `reset` costs a re-attach that resumes incrementally, while
-/// missing one leaves a client waiting on a host nothing will tell it about.
+/// The edge can be one `reset` more than continuity strictly needed: a host whose
+/// return follows a drop the pump already reported earns one, and so does a
+/// control link that flapped while the spliced stream survived, when the watcher
+/// saw both sides of the flap. It can also be none of those, because `watch`
+/// coalesces: a flap that lands entirely between two wakes presents as no change
+/// at all. Both are deliberate. A `reset` costs a re-attach that resumes
+/// incrementally, and a flap this misses is one where the stream was open, so a
+/// stream that broke with it is reported by its own pump.
 async fn returns(
     mut hosts: Vec<HostReturn>,
     mut reachable: watch::Receiver<Arc<BTreeSet<String>>>,
