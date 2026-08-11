@@ -2,9 +2,10 @@
 //!
 //! One entry per enrolled host, each holding the last directory that host sent
 //! and whether its control connection is up. From those the gateway composes
-//! one namespaced list: the payload `GET /v1/sessions` answers and the `list`
-//! frames its clients receive. There is one composition, so a client reading
-//! and a client watching cannot disagree.
+//! one namespaced list, and the hosts it was composed from: the payload
+//! `GET /v1/sessions` answers and the `list` frames its clients receive. There
+//! is one composition, so a client reading and a client watching cannot
+//! disagree.
 //!
 //! The gateway holds no session state of its own beyond these rows. A row is
 //! whatever its host last said, kept as the JSON that host wrote, with three
@@ -41,11 +42,13 @@ pub(crate) struct Directory {
     /// The ids of the hosts whose control connection is up, republished
     /// whenever that set changes.
     ///
-    /// Not derivable from [`Self::merged`]: a host contributes rows only once
-    /// it has sent a directory, and a client can hold sessions of one that
-    /// currently contributes none. A splice watches this because a host
-    /// *returning* is what makes an upstream attach possible again, and
-    /// `reset` is how a client is asked to make one (spec 7.1).
+    /// The same facts [`Self::merged`] now names, on a channel of their own
+    /// because they move at a different rate: the merged directory is
+    /// republished for every row a busy host touches, and a splice watching it
+    /// for reachability alone would wake once per client per refresh. A splice
+    /// watches this because a host *returning* is what makes an upstream attach
+    /// possible again, and `reset` is how a client is asked to make one
+    /// (spec 7.1).
     reachable: watch::Sender<Arc<BTreeSet<String>>>,
 }
 
@@ -370,6 +373,11 @@ impl Directory {
     /// twice over: the rows return with it, so a client's directory does not go
     /// empty until the host next says something, and so does its token, so the
     /// streams it is serving stay the ones a later withdrawal ends.
+    ///
+    /// NOTE: what the enrollment was told while it was out is lost, because the
+    /// link's own updates find no entry to write into. That is one file write
+    /// wide and self-correcting: the link is still running and reports its next
+    /// connect or failure into the entry that is back.
     pub(crate) fn restore(&self, withdrawn: Withdrawn) {
         let mut hosts = self.lock();
         hosts.insert(withdrawn.address, withdrawn.enrollment);

@@ -3127,16 +3127,19 @@ async fn a_withdrawal_ends_that_hosts_splices_and_leaves_the_others_alone() {
             .then_some(())
         })
         .await;
-    assert!(
-        !fixture
+    assert_eq!(
+        fixture
             .client
             .sessions()
             .await
             .expect("the merged directory")
-            .hosts
-            .iter()
-            .any(|host| host.id == "leaving"),
-        "a host that is not enrolled is not a group either",
+            .hosts,
+        vec![DirectoryHost {
+            id: "staying".to_string(),
+            unreachable: false,
+        }],
+        "a host that is not enrolled is not a group either, and the one that is \
+         still names itself",
     );
     let err = fixture
         .client
