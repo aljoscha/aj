@@ -29,7 +29,9 @@ use tempfile::TempDir;
 use super::*;
 use crate::gateway::enrollment::{EnrollHostRequest, HostList, HostSource, HostSummary};
 use crate::gateway::naming::SessionAddress;
-use crate::remote::tests::{HostHandles, addr, bounded, canned_server, scripted, scripted_host};
+use crate::remote::tests::{
+    FakeWhois, HostHandles, addr, bounded, canned_server, scripted, scripted_host,
+};
 use crate::remote::{IdentityGate, RemoteClient, RemoteCommand, RemoteServer};
 
 /// How long a settled directory has to prove it is not settled after all.
@@ -1230,6 +1232,53 @@ fn the_config_flag_names_a_file_that_has_to_exist() {
         config_path(None, default.clone()).expect("the default file"),
         Some(default),
     );
+}
+
+/// The gate sits outside the routes, so a peer it refuses cannot even learn
+/// which endpoints a gateway has (spec 6.11).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rejected_peer_reaches_nothing_on_a_gateway() {
+    let state = TempDir::new().expect("tempdir");
+    let gateway = Gateway::new(GatewaySetup {
+        state_dir: state.path().to_path_buf(),
+        static_hosts: Vec::new(),
+        tuning: tuning(),
+    })
+    .expect("a gateway");
+    // A gate whose lookups fail refuses every peer, loopback included, which is
+    // the only way to be refused from this side of a test.
+    let server = GatewayServer::bind(
+        gateway.clone(),
+        addr("127.0.0.1:0"),
+        IdentityGate::tailscale([], FakeWhois::failing()),
+    )
+    .await
+    .expect("bind");
+    let http = reqwest::Client::new();
+
+    for route in [
+        "/v1/hello",
+        "/v1/sessions",
+        "/v1/hosts",
+        "/v1/events",
+        "/v1/nope",
+    ] {
+        let response = http
+            .get(format!("{}{route}", server.url()))
+            .send()
+            .await
+            .expect("the request");
+        let (status, code, message) = refusal(response).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{route}");
+        assert_eq!(code, "forbidden", "{route}");
+        assert_eq!(
+            message, "this peer is not authorized",
+            "a refused peer learns that it was refused, not why",
+        );
+    }
+
+    server.shutdown().await;
+    gateway.shutdown().await;
 }
 
 /// A gateway is remote code execution exactly as a host is, so the identity

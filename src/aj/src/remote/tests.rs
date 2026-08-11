@@ -80,7 +80,7 @@ pub(crate) fn addr(text: &str) -> SocketAddr {
 // ---------------------------------------------------------------------------
 
 /// A resolver with a fixed answer, recording the peers it was asked about.
-struct FakeWhois {
+pub(crate) struct FakeWhois {
     answer: Result<PeerIdentity, String>,
     asked: StdMutex<Vec<SocketAddr>>,
 }
@@ -93,7 +93,7 @@ impl FakeWhois {
         })
     }
 
-    fn failing() -> Arc<Self> {
+    pub(crate) fn failing() -> Arc<Self> {
         Arc::new(Self {
             answer: Err("tailscaled is not running".to_string()),
             asked: StdMutex::new(Vec::new()),
