@@ -1215,6 +1215,38 @@ async fn a_host_id_this_gateway_cannot_namespace_with_is_refused_at_enrollment()
     serving.abort();
 }
 
+/// A remembered host id the grammar refuses is dropped when the file is read,
+/// and the file stops naming it.
+///
+/// The state file is the gateway's own memory and a person can edit it, so it is
+/// read with the same suspicion as the wire (spec 6.2): an id nothing can route
+/// would otherwise sit in the enrolled set forever, connecting no host and
+/// counting against every create that names none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_remembered_host_id_the_grammar_refuses_is_dropped_at_startup() {
+    let state = TempDir::new().expect("tempdir");
+    std::fs::write(
+        state.path().join("hosts.json"),
+        r#"{"hosts":[{"address":"http://127.0.0.1:1","host_id":"with:colon"}]}"#,
+    )
+    .expect("a state file this gateway will read");
+
+    let fixture = Fixture::over(state, Vec::new()).await;
+
+    assert!(
+        fixture.hosts().await.hosts.is_empty(),
+        "an id this gateway can never namespace with came back from the file",
+    );
+    let recorded =
+        std::fs::read_to_string(fixture.state.path().join("hosts.json")).expect("the state file");
+    assert!(
+        !recorded.contains("with:colon"),
+        "and stayed in it, so it comes back at the next restart too: {recorded}",
+    );
+
+    fixture.shutdown().await;
+}
+
 /// An enrollment the gateway cannot write down does not stand, in either
 /// direction: it would otherwise come back, or disappear, at the next restart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
