@@ -1471,3 +1471,65 @@ async fn a_local_gateway_refuses_to_serve_a_public_address() {
 
     gateway.shutdown().await;
 }
+
+/// A dot segment in the session half never reaches a host as a path.
+///
+/// `<host>:..` names no session, and a URL path drops a `..` segment rather
+/// than escaping it, so a proxy that passed one through would address
+/// `/v1/sessions` on the host. A POST there is a create, which is the one
+/// request this gateway refuses, so the walk would route around the refusal
+/// and mint a session.
+///
+/// `SessionAddress::parse` refuses the shape and a unit test covers that. This
+/// test exists because a correct parser proves nothing about the parser being
+/// on the request path: it drives the real router over a real socket and reads
+/// the outcome off the host's own store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dot_segment_never_reaches_a_host_as_a_path() {
+    let mut upstream = Upstream::start().await;
+    let fixture = Fixture::new(&[&upstream]).await;
+    fixture
+        .until("the host's rows", |list| Some(list.sessions.clone()))
+        .await;
+
+    let before = upstream
+        .host
+        .sessions()
+        .await
+        .expect("the host's directory")
+        .sessions
+        .len();
+
+    let response = fixture
+        .http
+        .post(format!(
+            "{}/v1/sessions/{}:..",
+            fixture.server.url(),
+            upstream.host_id()
+        ))
+        .send()
+        .await
+        .expect("the traversal request");
+    // The store is read before the response is decoded, so a walk that got
+    // through fails on the harm it did rather than on the shape of a body the
+    // gateway never meant to send.
+    let status = response.status();
+    let after = upstream
+        .host
+        .sessions()
+        .await
+        .expect("the host's directory")
+        .sessions
+        .len();
+    assert_eq!(
+        before, after,
+        "a dot segment reached the host's create route and minted a session",
+    );
+
+    let (_, code, _) = refusal(response).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "code {code}");
+    assert_eq!(code, "unknown_session");
+
+    fixture.shutdown().await;
+    upstream.stop().await;
+}
