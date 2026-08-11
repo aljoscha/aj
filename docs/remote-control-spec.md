@@ -601,8 +601,17 @@ viewed agent to that parameter:
 | `.../{id}/tasks/{task_id}/kill` | — | Kill a background task. |
 
 Gateway-only additions are in section 7. Session creation through a
-gateway takes a target host parameter, because hosts are bound to
-working directories.
+gateway takes a target host, because hosts are bound to working
+directories: the create body carries an optional `host` field naming
+an enrolled host, in the same vocabulary the directory rows' `host`
+field uses (section 6.8), which is how the sidebar can fill it. On a
+gateway the field is required unless exactly one host is enrolled,
+then it defaults to that host, ambiguity is refused with a clear
+error, never guessed. On a plain host the field is absent or equals
+the host's own id, anything else is refused, a host cannot create
+elsewhere. No capability string, the field ships inside the
+protocol-1 baseline (section 6.10). The response names the session in
+the answering server's id vocabulary, namespaced through a gateway.
 
 Request bodies are the `aj-wire` types, which are the source of truth
 once landed. Two shapes the spec pins because getting them wrong is
