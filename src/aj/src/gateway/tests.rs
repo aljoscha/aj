@@ -2619,6 +2619,110 @@ async fn a_block_bigger_than_the_bound_does_not_evict_its_own_client() {
     fake.stop();
 }
 
+/// A live frame from another host does not evict a client mid-block (spec 6.9:
+/// "the bound governs live fan-out only"; spec 7.1: a block measured against the
+/// bound would evict the very client that asked for it, and the re-attach would
+/// do the same again).
+///
+/// It takes two hosts, which is what a gateway is for: one host's frames are
+/// forwarded by one task in order, so a live frame of its own can never arrive
+/// while its own block is still in flight. In production this is a client
+/// watching a big session resume on one host while a turn runs on another.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_frame_from_another_host_does_not_evict_a_client_mid_block() {
+    let backfilled: u64 = 800;
+    let resuming = deep_block("s-1", "epoch-1", backfilled);
+    let deep = resuming.len();
+    let left = FakeHost::start("left", Script::Frames(resuming)).await;
+    let cue = Arc::new(tokio::sync::Notify::new());
+    let opening = block("s-9", "epoch-9", 0);
+    let cued_at = opening.len() + 1;
+    let right = FakeHost::start(
+        "right",
+        Script::Cued {
+            first: opening,
+            cue: Arc::clone(&cue),
+            then: vec![warning_frame("s-9", "epoch-9", "a turn on the other host")],
+        },
+    )
+    .await;
+    let fixture = Fixture::tuned(
+        TempDir::new().expect("tempdir"),
+        vec![left.address.clone(), right.address.clone()],
+        Tuning {
+            outbound_queue: NonZeroUsize::new(2).expect("non-zero"),
+            ..tuning()
+        },
+    )
+    .await;
+    fixture.until_connected("left").await;
+    fixture.until_connected("right").await;
+
+    // Read until the second session is caught up, so that what arrives for it
+    // from here on is live rather than part of its own block.
+    let mut events = fixture
+        .attach(&[attach("left:s-1"), attach("right:s-9")])
+        .await;
+    let mut seen = frames_until(
+        &mut events,
+        "the other host's block",
+        |frame| matches!(frame, Frame::CaughtUp { session, .. } if session == "right:s-9"),
+    )
+    .await;
+
+    // From here the client reads nothing, so the queue fills with the paced
+    // frames of the block and the task pumping it parks.
+    let stalled = left.until_stalled().await;
+    assert!(
+        stalled < deep,
+        "the client absorbed {stalled} of {deep} block frames, so its queue never \
+         reached the bound and this test measures nothing",
+    );
+    cue.notify_one();
+    bounded("the live frame to leave the other host", async {
+        while right.written() < cued_at {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    tokio::time::sleep(QUIET).await;
+
+    // Read on the far side of the eviction rather than through it: an eviction
+    // cancels the whole splice, so the upstream carrying the block is gone with
+    // it, and that is where a client's loss lands.
+    assert_eq!(
+        left.released(),
+        0,
+        "one live frame from another host evicted the client mid-block, after \
+         {stalled} of {deep} frames of the block it had asked for",
+    );
+
+    seen.extend(
+        frames_until(
+            &mut events,
+            "the rest of the block",
+            |frame| matches!(frame, Frame::CaughtUp { session, .. } if session == "left:s-1"),
+        )
+        .await,
+    );
+    assert_eq!(
+        seen.iter()
+            .filter(|frame| matches!(frame, Frame::Event { session, .. } if session == "left:s-1"))
+            .count(),
+        usize::try_from(backfilled).expect("a count that fits"),
+        "the whole block reached the client",
+    );
+    assert!(
+        seen.iter()
+            .any(|frame| matches!(frame, Frame::Event { session, .. } if session == "right:s-9")),
+        "and so did the live frame, queued behind the block rather than into it",
+    );
+
+    fixture.shutdown().await;
+    left.stop();
+    right.stop();
+}
+
 /// A host that takes a stream request and never answers it is a 503, not a hang:
 /// a client of a gateway must not be held open for as long as a host cares to
 /// stay silent.
@@ -2808,6 +2912,25 @@ fn block(session: &str, epoch: &str, last_seq: u64) -> Vec<String> {
     ]
 }
 
+/// An attach block with `backfilled` frames between its `state` and its
+/// `caught_up`: what a resumed session looks like.
+///
+/// Chunky frames for the same reason [`flood`]'s are: what a client that is not
+/// reading is measured against is bytes in flight, so big frames fill the
+/// sockets between a host and that client in hundreds of frames rather than in
+/// millions. A test that wants the client's queue at its bound waits for the
+/// host's writes to stall ([`FakeHost::until_stalled`]) and checks that this
+/// block did not fit.
+fn deep_block(session: &str, epoch: &str, backfilled: u64) -> Vec<String> {
+    let payload = "x".repeat(32768);
+    let mut frames = vec![state_frame(session, epoch, backfilled)];
+    frames.extend(
+        (1..=backfilled).map(|entry| warning_frame(session, epoch, &format!("{entry}:{payload}"))),
+    );
+    frames.push(caught_up_frame(session, epoch, backfilled));
+    frames
+}
+
 /// The `state` frame an attach block opens with.
 fn state_frame(session: &str, epoch: &str, last_seq: u64) -> String {
     serde_json::to_string(&Frame::State {
@@ -2856,6 +2979,15 @@ enum Script {
     Ends(Vec<String>),
     /// An attach block, then reliable frames without end.
     Flood { session: String },
+    /// These frames, then the ones after `cue` is notified, then silence with
+    /// the stream held open. For a live frame that has to arrive at a moment the
+    /// test chooses: after another host's block has provably filled the client's
+    /// queue.
+    Cued {
+        first: Vec<String>,
+        cue: Arc<tokio::sync::Notify>,
+        then: Vec<String>,
+    },
     /// Not a stream at all: the host's own refusal of the attach.
     Refuse,
     /// Nothing at all, not even a response head: the host took the request and
@@ -2878,7 +3010,9 @@ struct FakeHost {
     /// How many spliced streams have been released, which is how a test sees an
     /// upstream connection being closed from the gateway's side.
     released: Arc<AtomicUsize>,
-    /// How many frames a flooding stream has written.
+    /// How many frames this host's spliced streams have written, scripted and
+    /// flooded alike. A count that stops moving is how a test sees the whole
+    /// pipeline behind it stall (see [`Self::until_stalled`]).
     written: Arc<AtomicUsize>,
     serving: tokio::task::JoinHandle<()>,
 }
@@ -2974,11 +3108,28 @@ impl FakeHost {
                                     Script::Refuse | Script::Mute => {
                                         unreachable!("answered above")
                                     }
+                                    Script::Cued { first, cue, then } => (
+                                        first.clone(),
+                                        Tail::Cued(Arc::clone(cue), then.clone()),
+                                        guard,
+                                    ),
                                 }
                             };
-                            let opening = futures::stream::iter(frames.into_iter().map(|data| {
-                                Ok::<_, std::convert::Infallible>(Event::default().data(data))
-                            }));
+                            // Counted as they go out rather than as they were
+                            // scripted, so a test can watch this host's writes
+                            // stop moving. A control connection's own `list` is
+                            // not one of them: what a test measures is the
+                            // stream a client is waiting on.
+                            let counted = Arc::clone(&written);
+                            let opening = futures::StreamExt::map(
+                                futures::stream::iter(frames),
+                                move |data| {
+                                    if !control {
+                                        counted.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    Ok::<_, std::convert::Infallible>(Event::default().data(data))
+                                },
+                            );
                             let tail: Pin<
                                 Box<
                                     dyn futures::Stream<
@@ -2987,6 +3138,9 @@ impl FakeHost {
                                 >,
                             > = match tail {
                                 Tail::Flood(session) => Box::pin(flood(session, written, guard)),
+                                Tail::Cued(cue, frames) => {
+                                    Box::pin(cued(cue, frames, written, guard))
+                                }
                                 Tail::Held => Box::pin(held(guard)),
                                 Tail::Ended => {
                                     drop(guard);
@@ -3038,6 +3192,29 @@ impl FakeHost {
         self.written.load(Ordering::Relaxed)
     }
 
+    /// Wait until this host stops writing, answering how many frames got out.
+    ///
+    /// A host whose writes have stopped is one every buffer behind which is
+    /// full: the client is not reading, the gateway's queue is at its bound, and
+    /// the task pumping this stream is parked. Callers compare the answer with
+    /// the script they wrote, because a host that got its whole script out
+    /// reached no bound at all and the test that assumed it did would be
+    /// measuring the machine's socket buffers.
+    async fn until_stalled(&self) -> usize {
+        bounded("this host's writes to stall", async {
+            let mut last = 0;
+            loop {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let now = self.written();
+                if now > 0 && now == last {
+                    return now;
+                }
+                last = now;
+            }
+        })
+        .await
+    }
+
     fn stop(self) {
         self.serving.abort();
     }
@@ -3061,6 +3238,25 @@ enum Tail {
     Ended,
     /// Reliable frames without end, for the session named.
     Flood(String),
+    /// A wait for the cue, then these frames, then held open.
+    Cued(Arc<tokio::sync::Notify>, Vec<String>),
+}
+
+/// A wait for `cue`, then `frames`, then silence with the stream held open.
+fn cued(
+    cue: Arc<tokio::sync::Notify>,
+    frames: Vec<String>,
+    written: Arc<AtomicUsize>,
+    guard: Option<Released>,
+) -> impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>> {
+    let cued = futures::StreamExt::flatten(futures::stream::once(async move {
+        cue.notified().await;
+        futures::stream::iter(frames.into_iter().map(move |data| {
+            written.fetch_add(1, Ordering::Relaxed);
+            Ok(axum::response::sse::Event::default().data(data))
+        }))
+    }));
+    futures::StreamExt::chain(cued, held(guard))
 }
 
 /// A stream that never yields and holds `guard` until it is dropped.

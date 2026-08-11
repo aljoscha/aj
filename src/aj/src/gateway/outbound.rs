@@ -14,6 +14,12 @@
 //! Pacing a block means the upstream connection stalls until the client reads,
 //! which is ordinary HTTP backpressure with the host's own producer at the far
 //! end of it.
+//!
+//! The bound governs live fan-out only (spec 6.9), so a queued block occupies
+//! the queue without occupying the bound: a client mid-backfill keeps its full
+//! slack for the live frames of every other session on its stream, and overflow
+//! there still evicts it. One difference in mechanism from a host, which travels
+//! a block on a channel of its own, none in rule.
 
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
@@ -34,6 +40,7 @@ pub(crate) fn channel(capacity: NonZeroUsize, cancelled: CancellationToken) -> (
         capacity,
         state: StdMutex::new(State {
             frames: VecDeque::new(),
+            live: 0,
             closed: false,
         }),
         ready: Notify::new(),
@@ -55,6 +62,13 @@ struct Queue {
 
 struct State {
     frames: VecDeque<Queued>,
+    /// How many of `frames` are live, which is what an overflow is measured
+    /// against: the bound governs live fan-out only (spec 6.9).
+    ///
+    /// Kept as a count rather than recomputed because every live frame pays for
+    /// it. The invariant is `live == frames.iter().filter(coalescible).count()`,
+    /// so every path that adds, takes or clears a frame maintains it.
+    live: usize,
     /// Set by an eviction, which also clears the frames: what a client did not
     /// get, it will get again from the backfill of its re-attach.
     closed: bool,
@@ -63,7 +77,10 @@ struct State {
 /// One frame waiting for the client.
 struct Queued {
     frame: DecodedFrame,
-    /// Whether a newer snapshot of the same lossy key may take this one's place.
+    /// Whether this frame arrived through [`Sender::offer`], which is to say
+    /// whether it is live. Two things follow from it, and they are the same
+    /// question: a newer snapshot of the same lossy key may take a live frame's
+    /// place, and a live frame is what the bound counts.
     ///
     /// False for the frames of an attach block. They have to reach the client in
     /// the order the host wrote them: the block opens with the `state` frame the
@@ -113,11 +130,13 @@ impl Sender {
                 // place: in-place substitution would reorder content across a
                 // queued durable boundary (spec 6.9).
                 state.frames.remove(index);
-            } else if state.frames.len() >= self.0.capacity.get() {
+                state.live -= 1;
+            } else if state.live >= self.0.capacity.get() {
                 return Offered::Dropped;
             }
-        } else if state.frames.len() >= self.0.capacity.get() {
+        } else if state.live >= self.0.capacity.get() {
             state.frames.clear();
+            state.live = 0;
             state.closed = true;
             drop(state);
             self.0.cancelled.cancel();
@@ -128,6 +147,7 @@ impl Sender {
             frame,
             coalescible: true,
         });
+        state.live += 1;
         drop(state);
         self.0.ready.notify_one();
         Offered::Queued
@@ -138,6 +158,11 @@ impl Sender {
     /// For the frames of an attach block (see the module docs). They are queued
     /// in the order they arrived and never coalesced, in either direction: the
     /// block is a sequence the client applies as one.
+    ///
+    /// Room is the whole queue rather than the live bound, which is what keeps
+    /// the two together bounded by twice the capacity: a block gets the queue's
+    /// slack when nothing live is using it, and gives it back as live frames
+    /// arrive.
     ///
     /// Answers whether the client is still there: `false` once it left or its
     /// stream was cancelled, with the frame undelivered.
@@ -186,6 +211,9 @@ impl Receiver {
             {
                 let mut state = self.0.lock();
                 if let Some(queued) = state.frames.pop_front() {
+                    if queued.coalescible {
+                        state.live -= 1;
+                    }
                     drop(state);
                     self.0.room.notify_waiters();
                     return Some(queued.frame);
@@ -412,6 +440,65 @@ mod tests {
             drained(&mut receiver),
             vec!["state 1", "warning backfill", "state 2"],
             "the block arrived in the order the host wrote it",
+        );
+    }
+
+    /// A queued attach block occupies the queue without occupying the bound
+    /// (spec 6.9: "the bound governs live fan-out only"). A block that filled
+    /// the queue would otherwise leave zero live headroom, so the next reliable
+    /// frame of any other session on the stream would evict the client the block
+    /// is for, and its re-attach would reach the same state again.
+    #[tokio::test]
+    async fn a_queued_block_leaves_the_live_bound_alone() {
+        let (sender, mut receiver, cancelled) = queue(2);
+
+        assert!(sender.send_paced(lossy(1)).await, "the block's state frame");
+        assert!(sender.send_paced(reliable("backfill")).await);
+
+        assert_eq!(
+            sender.offer(reliable("live")),
+            Offered::Queued,
+            "a live frame during a block met a queue with no room for it",
+        );
+        assert!(!cancelled.is_cancelled(), "so the client stayed");
+        assert_eq!(
+            drained(&mut receiver),
+            vec!["state 1", "warning backfill", "warning live"],
+            "and the live frame queued behind the block rather than into it",
+        );
+    }
+
+    /// The live count is what the bound is measured against, so it has to come
+    /// back to zero: a frame the client read gives its slot back, a superseded
+    /// snapshot leaves the count where it found it, and a block frame never took
+    /// one.
+    ///
+    /// A drifting count is invisible until the queue is full, and then it evicts
+    /// a client that is keeping up.
+    #[tokio::test]
+    async fn a_drained_queue_holds_no_live_slack() {
+        let (sender, mut receiver, cancelled) = queue(2);
+
+        assert!(sender.send_paced(lossy(1)).await, "a block frame");
+        assert_eq!(sender.offer(lossy(2)), Offered::Queued);
+        assert_eq!(
+            sender.offer(lossy(3)),
+            Offered::Queued,
+            "which supersedes the queued snapshot",
+        );
+        assert_eq!(drained(&mut receiver), vec!["state 1", "state 3"]);
+
+        assert_eq!(sender.offer(reliable("one")), Offered::Queued);
+        assert_eq!(
+            sender.offer(reliable("two")),
+            Offered::Queued,
+            "the whole bound is available again to a client that read what it was sent",
+        );
+        assert!(!cancelled.is_cancelled());
+        assert_eq!(
+            sender.offer(reliable("three")),
+            Offered::Evicted,
+            "and the bound still bites at the same place",
         );
     }
 
