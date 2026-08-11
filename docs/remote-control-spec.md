@@ -853,6 +853,14 @@ especially with long-lived VMs. Rules:
   is not required. An unknown frame with no top-level `session` field
   is host-scoped and forwarded as is. This is what lets an
   older gateway sit between newer hosts and newer clients.
+- The same discipline governs a gateway editing a request or response
+  body (create's `host` field going up, the session id coming back):
+  parse only the top level, keep every other value as raw JSON, edit
+  the named fields, re-emit structurally unchanged. A typed decode
+  and re-encode would silently drop a newer client's fields or refuse
+  a body an older gateway cannot parse, reintroducing exactly the
+  version ceiling this section exists to prevent. This applies to
+  every body-editing route, present and future.
 - New endpoints, frame kinds, and event types arrive with a capability
   string. New means relative to a released baseline: protocol 1
   implies the whole section 6 surface as it stands at first release,
