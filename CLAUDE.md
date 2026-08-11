@@ -112,6 +112,13 @@ commit secrets.
   decoding artifact of the very bug it caught, and a test that
   catches the right bug for the wrong stated reason will be misread
   under pressure.
+- A test that needs its fixture to reach a state (a full queue, a
+  stalled client, an armed mode) asserts that the state was reached,
+  with a message saying the test otherwise measures nothing, e.g.
+  "absorbed {stalled} of {deep} frames, the queue never hit the
+  bound". Environment differences (bigger socket buffers, faster
+  disks) must fail that assertion loudly, never pass the test
+  quietly.
 - A mutation that survives is a finding, not a formality. Expect the
   check to change the work: the usual outcome is a test rewritten to
   reach the real path, or a property nothing was pinning. Report every
