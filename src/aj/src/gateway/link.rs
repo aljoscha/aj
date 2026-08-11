@@ -1,10 +1,9 @@
 //! One enrolled host's control connection (spec 7.1).
 //!
-//! Per host: its `/v1/events` stream with no session attachments, which is
-//! where the gateway learns that host's directory from. Nothing else rides it
-//! in this stage. Splicing a client's attached sessions opens further upstream
-//! streams alongside this one, so this is the link's floor rather than its
-//! ceiling.
+//! Per host: its `/v1/events` stream with no session attachments, which is what
+//! the gateway learns that host's directory from. Nothing else rides it in this
+//! stage. Splicing a client's attached sessions opens further upstream streams
+//! alongside this one, so this is the link's floor rather than its ceiling.
 //!
 //! A drop is ordinary, not exceptional: the link marks its host unreachable,
 //! waits out a backoff and dials again. A client sees the flap in the list's

@@ -46,7 +46,8 @@ const QUIET: Duration = Duration::from_millis(400);
 ///
 /// The production delays are seconds, which is right for a tailnet and far too
 /// slow to watch. The stream-silence timeout is left at the client's default:
-/// nothing here wedges a host, and a test finishes long before 60 seconds.
+/// the one host here that goes quiet on an open stream is only up for a moment,
+/// and every test finishes long before sixty seconds of silence.
 fn tuning() -> Tuning {
     Tuning {
         reconnect_delay: Duration::from_millis(20),
