@@ -54,10 +54,23 @@ struct Queue {
 }
 
 struct State {
-    frames: VecDeque<DecodedFrame>,
+    frames: VecDeque<Queued>,
     /// Set by an eviction, which also clears the frames: what a client did not
     /// get, it will get again from the backfill of its re-attach.
     closed: bool,
+}
+
+/// One frame waiting for the client.
+struct Queued {
+    frame: DecodedFrame,
+    /// Whether a newer snapshot of the same lossy key may take this one's place.
+    ///
+    /// False for the frames of an attach block. They have to reach the client in
+    /// the order the host wrote them: the block opens with the `state` frame the
+    /// client adopts the session's epoch from (spec 6.5), so a live snapshot that
+    /// coalesced it away would leave the client applying a block under no epoch
+    /// at all. A newer snapshot queues behind the block instead.
+    coalescible: bool,
 }
 
 /// The producing half, held by every task feeding one client stream.
@@ -92,11 +105,10 @@ impl Sender {
             return Offered::Evicted;
         }
         if let Some(key) = key {
-            if let Some(index) = state
-                .frames
-                .iter()
-                .position(|queued| lossy_key(queued).as_ref() == Some(&key))
-            {
+            let superseded = state.frames.iter().position(|queued| {
+                queued.coalescible && lossy_key(&queued.frame).as_ref() == Some(&key)
+            });
+            if let Some(index) = superseded {
                 // Dropped and re-enqueued at the tail rather than substituted in
                 // place: in-place substitution would reorder content across a
                 // queued durable boundary (spec 6.9).
@@ -112,7 +124,10 @@ impl Sender {
             self.0.ready.notify_waiters();
             return Offered::Evicted;
         }
-        state.frames.push_back(frame);
+        state.frames.push_back(Queued {
+            frame,
+            coalescible: true,
+        });
         drop(state);
         self.0.ready.notify_one();
         Offered::Queued
@@ -120,11 +135,13 @@ impl Sender {
 
     /// Queue `frame`, waiting for room rather than evicting.
     ///
-    /// For the frames of an attach block (see the module docs). Answers whether
-    /// the client is still there: `false` once it left or its stream was
-    /// cancelled, with the frame undelivered.
+    /// For the frames of an attach block (see the module docs). They are queued
+    /// in the order they arrived and never coalesced, in either direction: the
+    /// block is a sequence the client applies as one.
+    ///
+    /// Answers whether the client is still there: `false` once it left or its
+    /// stream was cancelled, with the frame undelivered.
     pub(crate) async fn send_paced(&self, frame: DecodedFrame) -> bool {
-        let key = lossy_key(&frame);
         loop {
             // Interest is registered before the queue is inspected, so a frame
             // taken in between wakes this rather than being missed.
@@ -134,18 +151,11 @@ impl Sender {
                 if state.closed {
                     return false;
                 }
-                let queued = match &key {
-                    Some(key) => state
-                        .frames
-                        .iter()
-                        .position(|queued| lossy_key(queued).as_ref() == Some(key)),
-                    None => None,
-                };
-                if let Some(index) = queued {
-                    state.frames.remove(index);
-                }
-                if queued.is_some() || state.frames.len() < self.0.capacity.get() {
-                    state.frames.push_back(frame);
+                if state.frames.len() < self.0.capacity.get() {
+                    state.frames.push_back(Queued {
+                        frame,
+                        coalescible: false,
+                    });
                     drop(state);
                     self.0.ready.notify_one();
                     return true;
@@ -175,10 +185,10 @@ impl Receiver {
             let ready = self.0.ready.notified();
             {
                 let mut state = self.0.lock();
-                if let Some(frame) = state.frames.pop_front() {
+                if let Some(queued) = state.frames.pop_front() {
                     drop(state);
                     self.0.room.notify_waiters();
-                    return Some(frame);
+                    return Some(queued.frame);
                 }
                 if state.closed {
                     return None;
@@ -384,6 +394,25 @@ mod tests {
         sender.offer(lossy(2));
 
         assert_eq!(drained(&mut receiver), vec!["warning after", "state 2"]);
+    }
+
+    /// A queued attach block is never coalesced into: its opening `state` frame
+    /// is what the client adopts the session's epoch from (spec 6.5), so a live
+    /// snapshot that took its place would leave the client applying a block under
+    /// no epoch at all. The newer snapshot queues behind the block.
+    #[tokio::test]
+    async fn a_live_snapshot_does_not_take_a_queued_blocks_place() {
+        let (sender, mut receiver, _cancelled) = queue(4);
+
+        assert!(sender.send_paced(lossy(1)).await, "the block's state frame");
+        assert!(sender.send_paced(reliable("backfill")).await);
+        assert_eq!(sender.offer(lossy(2)), Offered::Queued);
+
+        assert_eq!(
+            drained(&mut receiver),
+            vec!["state 1", "warning backfill", "state 2"],
+            "the block arrived in the order the host wrote it",
+        );
     }
 
     /// A paced frame waits for room instead of evicting, which is what keeps an

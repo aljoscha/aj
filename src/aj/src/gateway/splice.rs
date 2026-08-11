@@ -308,12 +308,16 @@ async fn forward(
         return queue.offer(frame) != Offered::Evicted;
     };
     let namespaced = SessionAddress::new(host_id, &session).to_string();
-    if let Err(err) = frame.rewrite_session(&namespaced) {
-        // The read answered from the same field the rewrite writes, so this
-        // cannot happen. Dropping the frame is the honest fallback: forwarding
-        // it would carry the host's own id downstream.
-        tracing::warn!("dropping a frame that will not take a namespaced id: {err}");
-        return true;
+    // `false` would say the frame has no top-level `session`, which the read
+    // above already answered for: the two decide on the same field, so neither
+    // that nor an error can happen here. Dropping the frame is the honest
+    // fallback, because forwarding it would carry the host's own id downstream.
+    match frame.rewrite_session(&namespaced) {
+        Ok(true) => {}
+        outcome => {
+            tracing::warn!("dropping a frame that will not take a namespaced id: {outcome:?}");
+            return true;
+        }
     }
     let paced = attaching.contains(&session);
     if paced && ends_a_block(&frame) {
