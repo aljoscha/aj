@@ -2742,7 +2742,7 @@ async fn a_release_publishes_the_directory() {
         &mut stream,
         "the directory to report the release",
         |frame| {
-            matches!(frame, Frame::List { sessions }
+            matches!(frame, Frame::List { sessions, .. }
             if sessions.iter().any(|entry| entry.id == going && !entry.live))
         },
     )
@@ -3346,7 +3346,7 @@ async fn a_released_sessions_row_needs_no_disk_read() {
     .await;
     drop(client);
     let frames = frames_until(&mut stream, "the release to be published", |frame| {
-        matches!(frame, Frame::List { sessions }
+        matches!(frame, Frame::List { sessions, .. }
             if sessions.iter().any(|entry| entry.id == session && !entry.live))
     })
     .await;
@@ -5700,7 +5700,7 @@ async fn list_frames_carry_the_directory_and_are_debounced() {
     );
 
     let last = lists.last().expect("a list frame");
-    let Frame::List { sessions } = last else {
+    let Frame::List { sessions, .. } = last else {
         unreachable!("filtered above")
     };
     let summary = sessions
@@ -5742,7 +5742,7 @@ fn directories(frames: &[Frame]) -> Vec<Vec<SessionSummary>> {
     frames
         .iter()
         .filter_map(|frame| match frame {
-            Frame::List { sessions } => {
+            Frame::List { sessions, .. } => {
                 assert_rows_well_formed(sessions);
                 Some(sessions.clone())
             }
@@ -5852,7 +5852,7 @@ async fn a_siblings_session_appears_at_the_next_enumeration_point() {
         "the listing found the sibling's log",
     );
     frames_until(&mut stream, "the sibling to be published", |frame| {
-        matches!(frame, Frame::List { sessions }
+        matches!(frame, Frame::List { sessions, .. }
             if sessions.iter().any(|entry| entry.id == sibling))
     })
     .await;
@@ -5904,7 +5904,7 @@ async fn a_fresh_stream_enumerates_the_store() {
         .await
         .expect("attach");
     frames_until(&mut stream, "the sibling to be published", |frame| {
-        matches!(frame, Frame::List { sessions }
+        matches!(frame, Frame::List { sessions, .. }
             if sessions.iter().any(|entry| entry.id == sibling))
     })
     .await;
@@ -5934,7 +5934,7 @@ async fn the_hosts_own_changes_need_no_enumeration() {
     let before = harness.host.store_directory_reads();
     let created = harness.host.create().await.expect("create");
     frames_until(&mut stream, "the new session to be published", |frame| {
-        matches!(frame, Frame::List { sessions }
+        matches!(frame, Frame::List { sessions, .. }
             if sessions.iter().any(|entry| entry.id == created && entry.live))
     })
     .await;
@@ -5944,7 +5944,7 @@ async fn the_hosts_own_changes_need_no_enumeration() {
     // would be counted below.
     harness.prompt(&created, "hi").await;
     let frames = frames_until(&mut stream, "the release to be published", |frame| {
-        matches!(frame, Frame::List { sessions }
+        matches!(frame, Frame::List { sessions, .. }
             if sessions.iter().any(|entry| entry.id == created && !entry.live))
     })
     .await;
@@ -6025,7 +6025,7 @@ async fn an_unchanged_directory_is_not_published_again() {
     // the coalescing window can be over before `working` is ever sampled.
     harness.prompt(&session, "again").await;
     frames_until(&mut stream, "the second turn to be published", |frame| {
-        matches!(frame, Frame::List { sessions }
+        matches!(frame, Frame::List { sessions, .. }
             if sessions.iter().any(|entry| entry.id == session && entry.last_seq > mark))
     })
     .await;
@@ -6132,7 +6132,7 @@ async fn a_new_subscriber_is_served_a_directory_the_others_already_have() {
         .await
         .expect("attach");
     frames_until(&mut fresh, "the fresh stream's first directory", |frame| {
-        matches!(frame, Frame::List { sessions }
+        matches!(frame, Frame::List { sessions, .. }
             if sessions.iter().any(|entry| entry.id == session))
     })
     .await;
@@ -6191,7 +6191,7 @@ async fn list_frames_report_working_queued_and_live_tasks() {
     // The turn keeps events flowing, so the directory tick keeps publishing
     // while all three conditions hold at once.
     let frames = frames_until(&mut stream, "a list frame for the busy session", |frame| {
-        matches!(frame, Frame::List { sessions }
+        matches!(frame, Frame::List { sessions, .. }
             if sessions.iter().any(|entry| entry.id == session
                 && entry.live
                 && entry.working
@@ -6203,7 +6203,9 @@ async fn list_frames_report_working_queued_and_live_tasks() {
         .iter()
         .rev()
         .find_map(|frame| match frame {
-            Frame::List { sessions } => sessions.iter().find(|entry| entry.id == session).cloned(),
+            Frame::List { sessions, .. } => {
+                sessions.iter().find(|entry| entry.id == session).cloned()
+            }
             _ => None,
         })
         .expect("filtered above");
@@ -6264,7 +6266,7 @@ async fn a_materialization_publishes_the_directory() {
     .await;
     let listed = |frames: &[Frame], live: bool| {
         frames.iter().any(|frame| match frame {
-            Frame::List { sessions } => sessions
+            Frame::List { sessions, .. } => sessions
                 .iter()
                 .any(|entry| entry.id == dormant && entry.live == live),
             _ => false,
@@ -6274,7 +6276,7 @@ async fn a_materialization_publishes_the_directory() {
     // frame asserted on below can only have come from materializing
     // `dormant`.
     let settled = frames_until(&mut stream, "the directory to settle", |frame| {
-        matches!(frame, Frame::List { sessions }
+        matches!(frame, Frame::List { sessions, .. }
             if sessions.iter().any(|entry| entry.id == dormant && !entry.live))
     })
     .await;
@@ -6298,7 +6300,7 @@ async fn a_materialization_publishes_the_directory() {
         .await
         .expect("attach the dormant session");
     let frames = frames_until(&mut stream, "the directory to report it live", |frame| {
-        matches!(frame, Frame::List { sessions }
+        matches!(frame, Frame::List { sessions, .. }
             if sessions.iter().any(|entry| entry.id == dormant && entry.live))
     })
     .await;
@@ -6354,7 +6356,7 @@ async fn a_tag_reaches_the_row_and_the_directory() {
         .await
         .expect("the tag is accepted");
     frames_until(&mut stream, "the label to be published", |frame| {
-        matches!(frame, Frame::List { sessions }
+        matches!(frame, Frame::List { sessions, .. }
         if sessions.iter().any(|entry| {
             entry.id == session && entry.tag.as_deref() == Some("fix-auth")
         }))
@@ -6382,7 +6384,7 @@ async fn a_tag_reaches_the_row_and_the_directory() {
         .await
         .expect("clearing is accepted");
     frames_until(&mut stream, "the label to be dropped", |frame| {
-        matches!(frame, Frame::List { sessions }
+        matches!(frame, Frame::List { sessions, .. }
             if sessions.iter().any(|entry| entry.id == session && entry.tag.is_none()))
     })
     .await;
@@ -6461,7 +6463,7 @@ async fn a_released_session_keeps_its_label_without_an_enumeration() {
     let reads = harness.host.store_tag_reads();
 
     let frames = frames_until(&mut stream, "the release to be published", |frame| {
-        matches!(frame, Frame::List { sessions }
+        matches!(frame, Frame::List { sessions, .. }
             if sessions.iter().any(|entry| entry.id == session && !entry.live))
     })
     .await;

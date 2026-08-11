@@ -77,6 +77,9 @@ impl Subscriber {
         }
         let frame = Frame::List {
             sessions: sessions.to_vec(),
+            // A plain host's rows are all its own, so it names no hosts
+            // (spec 7.1).
+            hosts: Vec::new(),
         };
         match self.deliver(&frame) {
             Offered::Queued => {
@@ -747,6 +750,7 @@ mod tests {
         });
         fanout.publish(Frame::List {
             sessions: Vec::new(),
+            hosts: Vec::new(),
         });
 
         assert_eq!(drained(&mut rx), vec!["list"]);
@@ -840,6 +844,7 @@ mod tests {
         fanout.publish(reliable("two"));
         fanout.publish(Frame::List {
             sessions: Vec::new(),
+            hosts: Vec::new(),
         });
         assert!(!cancelled.is_cancelled(), "lossy overflow is only dropped");
 

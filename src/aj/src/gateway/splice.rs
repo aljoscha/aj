@@ -184,6 +184,7 @@ impl Splice {
     fn list(&mut self) -> Frame {
         Frame::List {
             sessions: self.directory.borrow_and_update().as_ref().clone(),
+            hosts: Vec::new(),
         }
     }
 }

@@ -836,7 +836,12 @@ impl SessionHost {
         // descending order is chronological.
         let mut sessions: Vec<SessionSummary> = summaries.into_values().collect();
         sessions.sort_by(|left, right| right.id.cmp(&left.id));
-        SessionList { sessions }
+        // No hosts: a plain host serves one working directory, and the field
+        // is a gateway's (spec 7.1).
+        SessionList {
+            sessions,
+            hosts: Vec::new(),
+        }
     }
 
     /// How many times the host has read its session store's directory.

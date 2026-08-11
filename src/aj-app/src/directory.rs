@@ -216,7 +216,9 @@ impl SessionDirectory {
     /// this type has no use for.
     fn apply_host_frame(&mut self, frame: Frame) -> Redraw {
         match frame {
-            Frame::List { sessions } => {
+            // A gateway's frame also names its enrolled hosts, which the
+            // sidebar's grouping reads rather than this reducer (spec 7.1).
+            Frame::List { sessions, .. } => {
                 let changed = self.rows != sessions;
                 self.rows = sessions;
                 self.latch_unseen();
@@ -640,7 +642,10 @@ mod tests {
     }
 
     fn list(sessions: Vec<SessionSummary>) -> Frame {
-        Frame::List { sessions }
+        Frame::List {
+            sessions,
+            hosts: Vec::new(),
+        }
     }
 
     /// What the sidebar asks: the unseen mark for the row the directory holds

@@ -277,6 +277,76 @@ pub struct SessionSummary {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionList {
     pub sessions: Vec<SessionSummary>,
+    /// The hosts a gateway has enrolled, empty from a plain host (spec 7.1).
+    ///
+    /// The same field a gateway's `list` frames carry, because the read and the
+    /// frames are one payload: a client that reads the directory and a client
+    /// that watches it must not disagree about which hosts there are.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<DirectoryHost>,
+}
+
+/// One enrolled host in a gateway's directory (spec 7.1).
+///
+/// Carried alongside the rows rather than derived from them, because a gateway
+/// holds a host's rows only for as long as that host has sent them: across a
+/// restart it holds none for a host it cannot reach, and it stores none
+/// deliberately. A client renders such a host as an empty group rather than as
+/// nothing, which is what keeps "unreachable, contents unknown" tellable from
+/// "no such host".
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryHost {
+    /// The id this host's sessions are namespaced under, in the vocabulary
+    /// [`SessionSummary::host`] and [`HostSummary::id`] use.
+    ///
+    /// A host a gateway has never spoken to has no id and appears here not at
+    /// all: there is no namespace for a client to group anything under, and a
+    /// gateway does not invent one (spec 7.1).
+    pub id: String,
+    /// The gateway's control connection to this host is down, which is what
+    /// [`SessionSummary::unreachable`] says about each of its rows.
+    #[serde(default)]
+    pub unreachable: bool,
+}
+
+/// The directory a gateway composes from its hosts (spec 7.1): their rows as
+/// they wrote them, and the hosts themselves.
+///
+/// The writer's view of what [`SessionList`] reads. The rows stay unparsed
+/// because a gateway owns three of their fields and passes the rest through, so
+/// a typed re-encode here would drop a newer host's (spec 6.10). One value
+/// serves both places the directory appears, the sessions read and the `list`
+/// frames, so the two cannot drift.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergedDirectory {
+    pub sessions: Vec<RawObject>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<DirectoryHost>,
+}
+
+impl MergedDirectory {
+    /// This directory as the `list` frame a client of a gateway receives.
+    pub fn as_frame(&self) -> DirectoryFrame<'_> {
+        DirectoryFrame {
+            sessions: &self.sessions,
+            hosts: &self.hosts,
+        }
+    }
+}
+
+/// A [`MergedDirectory`] written as a `list` frame (spec 6.3).
+#[derive(Serialize)]
+#[serde(tag = "kind", rename = "list")]
+pub struct DirectoryFrame<'a> {
+    sessions: &'a [RawObject],
+    #[serde(skip_serializing_if = "no_hosts")]
+    hosts: &'a [DirectoryHost],
+}
+
+/// Empty reads as absent, so a gateway with nothing enrolled writes the same
+/// `list` frame a plain host does.
+fn no_hosts(hosts: &&[DirectoryHost]) -> bool {
+    hosts.is_empty()
 }
 
 /// Wall-clock summary of one background task.
@@ -663,6 +733,9 @@ pub enum Frame {
     },
     List {
         sessions: Vec<SessionSummary>,
+        /// The hosts a gateway has enrolled, empty on a plain host's own frames
+        /// (spec 7.1).
+        hosts: Vec<DirectoryHost>,
     },
     Reset {
         session: String,
@@ -812,6 +885,8 @@ enum FrameRef<'a> {
     },
     List {
         sessions: &'a [SessionSummary],
+        #[serde(skip_serializing_if = "no_hosts")]
+        hosts: &'a [DirectoryHost],
     },
     Reset {
         session: &'a str,
@@ -862,7 +937,7 @@ impl Serialize for Frame {
                 epoch,
                 last_seq: *last_seq,
             },
-            Self::List { sessions } => FrameRef::List { sessions },
+            Self::List { sessions, hosts } => FrameRef::List { sessions, hosts },
             Self::Reset { session } => FrameRef::Reset { session },
             Self::Heartbeat => FrameRef::Heartbeat,
             Self::Vms { vms } => FrameRef::Vms { vms },
@@ -954,9 +1029,9 @@ impl<'de> Deserialize<'de> for Frame {
                 })
             }
             "list" => {
-                let ListFrameFields { sessions } =
+                let ListFrameFields { sessions, hosts } =
                     serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
-                Ok(Self::List { sessions })
+                Ok(Self::List { sessions, hosts })
             }
             "reset" => {
                 let ResetFrameFields { session } =
@@ -1004,6 +1079,8 @@ struct CaughtUpFrameFields {
 #[derive(Deserialize)]
 struct ListFrameFields {
     sessions: Vec<SessionSummary>,
+    #[serde(default)]
+    hosts: Vec<DirectoryHost>,
 }
 
 #[derive(Deserialize)]

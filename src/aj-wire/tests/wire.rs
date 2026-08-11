@@ -3,11 +3,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
 use aj_wire::{
     CancelRequest, CompactRequest, CreateSessionRequest, Cursor, DecodedAgentEvent, DecodedFrame,
-    EnrollHostRequest, ErrorResponse, Frame, HeadRequest, Hello, HostList, HostSource, HostSummary,
-    ModelSelection, PromptInput, PromptRequest, QueueCounts, QueueOperation, QueueOutcome,
-    QueueRequest, QueueState, RawObject, SessionCreated, SessionList, SessionSettings,
-    SessionSummary, SessionTree, SettingsRequest, SteerRequest, TagRequest, TaskDetails, TaskTable,
-    VmList,
+    DirectoryHost, EnrollHostRequest, ErrorResponse, Frame, HeadRequest, Hello, HostList,
+    HostSource, HostSummary, MergedDirectory, ModelSelection, PromptInput, PromptRequest,
+    QueueCounts, QueueOperation, QueueOutcome, QueueRequest, QueueState, RawObject, SessionCreated,
+    SessionList, SessionSettings, SessionSummary, SessionTree, SettingsRequest, SteerRequest,
+    TagRequest, TaskDetails, TaskTable, VmList,
 };
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
@@ -1164,6 +1164,7 @@ fn a_row_takes_the_fields_a_gateway_owns_and_keeps_the_rest() {
 fn only_a_list_frame_has_rows() {
     let local = DecodedFrame::try_from(Frame::List {
         sessions: vec![pinned_row()],
+        hosts: Vec::new(),
     })
     .expect("a local list frame is valid");
     let rows = local.rows().expect("readable").expect("a list frame");
@@ -1286,6 +1287,120 @@ fn raw_objects_compare_on_the_text_they_would_emit() {
         "key order is what a re-emitted row keeps, so it counts as a difference",
     );
     assert_ne!(row(r#"{"id":"s-1"}"#), row(r#"{"id":"s-1","live":true}"#));
+}
+
+/// A gateway's `list` frame names the hosts it has enrolled alongside the rows
+/// (spec 7.1). Additive: a plain host's frame carries no such key, and an older
+/// peer's frame reads as naming none.
+#[test]
+fn a_list_frame_names_the_hosts_a_gateway_enrolled() {
+    let frame: DecodedFrame = serde_json::from_value(fixture("frames")[5].clone())
+        .expect("the pinned gateway list frame decodes");
+    let DecodedFrame::Known(known) = &frame else {
+        panic!("a list frame is a known kind");
+    };
+    let Frame::List { sessions, hosts } = known.value() else {
+        panic!("the fixture at that index is the gateway's list frame");
+    };
+    assert_eq!(sessions[0].host.as_deref(), Some("workstation"));
+    assert_eq!(
+        hosts,
+        &vec![
+            DirectoryHost {
+                id: "workstation".to_string(),
+                unreachable: false,
+            },
+            DirectoryHost {
+                id: "laptop".to_string(),
+                unreachable: true,
+            },
+        ],
+        "a host with no rows here is still named, which is what a client renders \
+         an empty group from",
+    );
+
+    let plain = serde_json::to_value(
+        DecodedFrame::try_from(Frame::List {
+            sessions: Vec::new(),
+            hosts: Vec::new(),
+        })
+        .expect("a local list frame is valid"),
+    )
+    .expect("it serializes");
+    assert_eq!(
+        plain,
+        json!({"kind": "list", "sessions": []}),
+        "a plain host names no hosts and writes no key",
+    );
+    let older: Frame = serde_json::from_value(json!({"kind": "list", "sessions": []}))
+        .expect("a frame with no hosts key decodes");
+    assert!(matches!(older, Frame::List { hosts, .. } if hosts.is_empty()));
+}
+
+/// The directory a gateway composes is one value serving two places: the
+/// sessions read and the `list` frames, which is what keeps a client that reads
+/// and a client that watches from disagreeing (spec 7.1). Its rows travel as
+/// their hosts wrote them, and what comes out the other side is what a typed
+/// client decodes.
+#[test]
+fn a_merged_directory_writes_the_read_and_the_frame_from_one_value() {
+    let rows: DecodedFrame = serde_json::from_str(GATEWAY_ROWS).expect("a list frame decodes");
+    let mut sessions = rows.rows().expect("readable").expect("rows");
+    for (index, row) in sessions.iter_mut().enumerate() {
+        row.set("id", &format!("left:s-{index}"))
+            .expect("a string encodes");
+        row.set("host", "left").expect("a string encodes");
+    }
+    let directory = MergedDirectory {
+        sessions,
+        hosts: vec![
+            DirectoryHost {
+                id: "left".to_string(),
+                unreachable: false,
+            },
+            DirectoryHost {
+                id: "right".to_string(),
+                unreachable: true,
+            },
+        ],
+    };
+
+    let read = serde_json::to_string(&directory).expect("the read body serializes");
+    let frame = serde_json::to_string(&directory.as_frame()).expect("the frame serializes");
+
+    assert_eq!(
+        frame,
+        format!(r#"{{"kind":"list",{}}}"#, &read[1..read.len() - 1]),
+        "the frame is the read body under a kind: {frame}",
+    );
+    assert!(
+        frame.contains(r#""preview":{"text":"hello","weight":18446744073709551616}"#),
+        "a field this build has no type for reaches the client whole: {frame}",
+    );
+
+    let decoded: DecodedFrame = serde_json::from_str(&frame).expect("a client decodes it");
+    let DecodedFrame::Known(known) = &decoded else {
+        panic!("it is a list frame");
+    };
+    let Frame::List { sessions, hosts } = known.value() else {
+        panic!("it is a list frame");
+    };
+    assert_eq!(
+        sessions
+            .iter()
+            .map(|row| (row.id.as_str(), row.host.as_deref()))
+            .collect::<Vec<_>>(),
+        vec![("left:s-0", Some("left")), ("left:s-1", Some("left"))],
+    );
+    assert_eq!(hosts, &directory.hosts);
+    assert_eq!(
+        serde_json::from_str::<SessionList>(&read).expect("the read decodes"),
+        SessionList {
+            sessions: sessions.clone(),
+            hosts: hosts.clone(),
+        },
+        "and the sessions read decodes into the same rows and hosts",
+    );
 }
 
 /// A `list` frame with two rows: one from a host a version ahead, carrying a
@@ -1839,6 +1954,7 @@ fn local_frames() -> Vec<Frame> {
         },
         Frame::List {
             sessions: Vec::new(),
+            hosts: Vec::new(),
         },
         Frame::Reset {
             session: "old".to_string(),

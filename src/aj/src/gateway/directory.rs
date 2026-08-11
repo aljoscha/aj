@@ -457,6 +457,7 @@ impl Directory {
     pub(crate) fn sessions(&self) -> SessionList {
         SessionList {
             sessions: (*self.merged.borrow()).as_ref().clone(),
+            hosts: Vec::new(),
         }
     }
 

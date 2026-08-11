@@ -1400,7 +1400,7 @@ async fn a_stream_that_attaches_nothing_carries_the_merged_directory() {
     let rows = bounded("a list frame", async {
         loop {
             match events.recv().await.expect("a frame").expect("a good frame") {
-                Frame::List { sessions } => return sessions,
+                Frame::List { sessions, .. } => return sessions,
                 Frame::Heartbeat => continue,
                 other => panic!("a gateway stream carries no {other:?} in this stage"),
             }
@@ -1417,7 +1417,7 @@ async fn a_stream_that_attaches_nothing_carries_the_merged_directory() {
     let rows = bounded("the directory after a create", async {
         loop {
             match events.recv().await.expect("a frame").expect("a good frame") {
-                Frame::List { sessions }
+                Frame::List { sessions, .. }
                     if sessions
                         .iter()
                         .any(|row| row.id == right.namespaced(&fresh)) =>
@@ -1459,7 +1459,7 @@ async fn an_idle_gateway_stream_heartbeats() {
         while heartbeats < 2 {
             match events.recv().await.expect("a frame").expect("a good frame") {
                 Frame::Heartbeat => heartbeats += 1,
-                Frame::List { sessions } => assert!(sessions.is_empty(), "{sessions:?}"),
+                Frame::List { sessions, .. } => assert!(sessions.is_empty(), "{sessions:?}"),
                 other => panic!("unexpected {other:?}"),
             }
         }
@@ -1516,7 +1516,7 @@ async fn an_unchanged_directory_publishes_nothing() {
     let mut events = fixture.client.events(&[]).await.expect("a stream");
     let first = bounded("the opening directory", async {
         loop {
-            if let Frame::List { sessions } =
+            if let Frame::List { sessions, .. } =
                 events.recv().await.expect("a frame").expect("a good frame")
             {
                 return sessions;
@@ -2358,6 +2358,7 @@ async fn an_unknown_frame_kind_is_forwarded_with_its_session_rewritten() {
     script.push(
         serde_json::to_string(&Frame::List {
             sessions: vec![fake_row("s-1")],
+            hosts: Vec::new(),
         })
         .expect("a list frame"),
     );
@@ -2451,7 +2452,7 @@ async fn an_unknown_frame_kind_is_forwarded_with_its_session_rewritten() {
         "a host's own reset travels too, namespaced: {known:?}",
     );
     for frame in &known {
-        if let Frame::List { sessions } = frame {
+        if let Frame::List { sessions, .. } = frame {
             for row in sessions {
                 SessionAddress::parse(&row.id).unwrap_or_else(|err| {
                     panic!(
@@ -3604,6 +3605,7 @@ impl FakeHost {
                             let (frames, tail, guard) = if control {
                                 let list = serde_json::to_string(&Frame::List {
                                     sessions: vec![fake_row("s-1")],
+                                    hosts: Vec::new(),
                                 })
                                 .expect("a list frame");
                                 (vec![list], Tail::Held, None)

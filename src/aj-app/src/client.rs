@@ -632,6 +632,7 @@ mod tests {
             Frame::Heartbeat,
             Frame::List {
                 sessions: Vec::new(),
+                hosts: Vec::new(),
             },
             Frame::Vms { vms: Vec::new() },
         ] {
