@@ -854,12 +854,17 @@ especially with long-lived VMs. Rules:
   is host-scoped and forwarded as is. This is what lets an
   older gateway sit between newer hosts and newer clients.
 - The same discipline governs a gateway editing a request or response
-  body (create's `host` field going up, the session id coming back):
-  parse only the top level, keep every other value as raw JSON, edit
+  body (create's `host` field going up, the session id coming back)
+  **and any wire object a gateway re-emits under its own name, the
+  merged directory's rows included**: parse only the top level, keep
+  every other value as raw JSON, edit
   the named fields, re-emit structurally unchanged. A typed decode
   and re-encode would silently drop a newer client's fields or refuse
   a body an older gateway cannot parse, reintroducing exactly the
-  version ceiling this section exists to prevent. This applies to
+  version ceiling this section exists to prevent. A row merge is not
+  exempt because it is a merge: the gateway reads the fields it
+  routes on and rewrites the ones it owns (id, `host`,
+  `unreachable`), everything else passes through raw. This applies to
   every body-editing route, present and future.
 - New endpoints, frame kinds, and event types arrive with a capability
   string. New means relative to a released baseline: protocol 1
@@ -954,11 +959,23 @@ unreachable).
 When a gateway-to-host connection drops, downstream continuity for
 that host's sessions is broken even though client connections stayed
 up. The gateway must emit `reset` frames for the affected sessions
-(and mark them unreachable in the list until the host returns).
+and mark them unreachable in the list while it still has their rows.
+Across a gateway restart it does not: the gateway stores no rows,
+deliberately, so a host that is down when the gateway comes back has
+no sessions to mark. The signal survives anyway because a gateway's
+`list` frames carry the enrolled hosts with their reachability
+alongside the rows (additive, gateway-only), and a client renders an
+unreachable host it holds no rows for as an empty group rather than
+as nothing. Honest absence beats a cached directory: persisted rows
+could name sessions that no longer exist, and a stale "maybe" is
+worse than a clear "unreachable, contents unknown".
 Clients re-attach with their cursors as usual, which resumes
 incrementally when the host's epochs survived and fully when they did
 not. The same mechanism covers the case where a host evicts a slow
-gateway.
+gateway. Removing an enrollment is active teardown, not bookkeeping:
+the upstream connections close, the host's sessions leave the merged
+list, and its splices end. Leaving them would serve a directory that
+contradicts the enrollment set.
 
 The gateway does not re-open that upstream itself. Resuming one needs a
 *current* cursor, and the client's cursor advances as it applies the

@@ -72,7 +72,11 @@ survived adversarial review. After the phase's work is committed:
    report, for this project the natural split is one on correctness,
    concurrency, and protocol edge cases (catch-up, epochs, flow
    control, races), the other on spec conformance, interface
-   contracts, and test coverage.
+   contracts, and test coverage. If the change under review edited
+   the spec or the manual, both prompts must name those paragraphs
+   as targets: prose written by the same hands as the code inherits
+   the code's blind spots, and self-written spec deltas have been
+   the falsified paragraphs more than once.
 2. Run a **fix pass** that takes both reports, triages them,
    integrates the valid findings, and amends the phase's commits.
    Adversarial review produces false positives, rejecting a finding
