@@ -20,7 +20,6 @@
 //! that stays open is spliced rather than proxied
 //! ([`crate::gateway::splice`]).
 
-use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -270,7 +269,7 @@ async fn create_session(
     let url = sessions_url(&target.address).ok_or_else(|| not_a_base_url(&target.address))?;
     let body = serde_json::to_vec(&body).map_err(|err| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
-        code: Cow::Borrowed("internal"),
+        code: "internal",
         message: format!(
             "could not re-encode the create for {}: {err}",
             target.address
@@ -301,7 +300,7 @@ fn namespace_created(answer: Answer, target: &HostTarget) -> Result<Response, Ap
     }
     let unreadable = |reason: String| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
-        code: Cow::Borrowed("internal"),
+        code: "internal",
         message: format!(
             "the host at {} answered a create this gateway cannot namespace, so the session \
              it created is not addressable here: {reason}",
@@ -414,7 +413,7 @@ fn attach_requests(params: &[(String, String)]) -> Result<Vec<AttachRequest>, Ap
 async fn unknown_endpoint() -> ApiError {
     ApiError {
         status: StatusCode::NOT_FOUND,
-        code: Cow::Borrowed("unknown_endpoint"),
+        code: "unknown_endpoint",
         message: "no such endpoint on this gateway".to_string(),
     }
 }
@@ -564,7 +563,7 @@ async fn read_body(request: Request) -> Result<Bytes, ApiError> {
 fn not_a_base_url(address: &HostAddress) -> ApiError {
     ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
-        code: Cow::Borrowed("internal"),
+        code: "internal",
         message: format!("{address} is not a base URL"),
     }
 }
@@ -767,9 +766,10 @@ where
 struct ApiError {
     status: StatusCode,
     /// A stable snake_case token, so a client can branch on the reason without
-    /// parsing prose. Owned when it is the owning host's own token, travelling
-    /// back through this gateway unchanged.
-    code: Cow<'static, str>,
+    /// parsing prose. This gateway's own vocabulary, always: a token an owning
+    /// host coined travels inside that host's own body (see [`refused`]) rather
+    /// than through here.
+    code: &'static str,
     message: String,
 }
 
@@ -777,7 +777,7 @@ impl ApiError {
     fn invalid(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
-            code: Cow::Borrowed("invalid_request"),
+            code: "invalid_request",
             message: message.into(),
         }
     }
@@ -786,7 +786,7 @@ impl ApiError {
     fn unreachable(host: &str, cause: impl std::fmt::Display) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
-            code: Cow::Borrowed("host_unreachable"),
+            code: "host_unreachable",
             message: format!("could not reach the host at {host}: {cause}"),
         }
     }
@@ -797,7 +797,7 @@ impl IntoResponse for ApiError {
         (
             self.status,
             Json(ErrorResponse {
-                code: self.code.into_owned(),
+                code: self.code.to_string(),
                 message: self.message,
             }),
         )
@@ -824,7 +824,7 @@ impl From<GatewayError> for ApiError {
             } => {
                 return Self {
                     status: *status,
-                    code: Cow::Borrowed("host_refused"),
+                    code: "host_refused",
                     message: message.clone(),
                 };
             }
@@ -839,7 +839,7 @@ impl From<GatewayError> for ApiError {
         }
         Self {
             status,
-            code: Cow::Borrowed(code),
+            code,
             message: err.to_string(),
         }
     }
@@ -884,7 +884,7 @@ impl From<IdentityError> for ApiError {
         };
         Self {
             status,
-            code: Cow::Borrowed(code),
+            code,
             // A rejected peer learns that it was rejected, not why.
             message: match status {
                 StatusCode::FORBIDDEN => "this peer is not authorized".to_string(),
