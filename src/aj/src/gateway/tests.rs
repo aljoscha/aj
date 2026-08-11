@@ -1437,6 +1437,7 @@ async fn a_hosts_own_create_refusal_travels_back() {
 struct Recorder {
     address: HostAddress,
     creates: Arc<StdMutex<Vec<String>>>,
+    proxied: Arc<StdMutex<Vec<String>>>,
     serving: tokio::task::JoinHandle<()>,
 }
 
@@ -1459,6 +1460,7 @@ impl Recorder {
         use axum::routing::{get, post};
 
         let creates: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let proxied: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
         let hello = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
             "capabilities": [],
@@ -1491,20 +1493,40 @@ impl Recorder {
                 }),
             );
         }
-        let app = app.route(
-            "/v1/sessions",
-            post({
-                let creates = Arc::clone(&creates);
-                move |body: String| {
+        let app = app
+            .route(
+                "/v1/sessions",
+                post({
                     let creates = Arc::clone(&creates);
-                    async move {
-                        let mut held = creates.lock().expect("the creates mutex is poisoned");
-                        held.push(body);
-                        axum::Json(serde_json::json!({"id": format!("recorded-{}", held.len())}))
+                    move |body: String| {
+                        let creates = Arc::clone(&creates);
+                        async move {
+                            let mut held = creates.lock().expect("the creates mutex is poisoned");
+                            held.push(body);
+                            axum::Json(
+                                serde_json::json!({"id": format!("recorded-{}", held.len())}),
+                            )
+                        }
                     }
-                }
-            }),
-        );
+                }),
+            )
+            .route(
+                "/v1/sessions/{id}/{*rest}",
+                axum::routing::any({
+                    let proxied = Arc::clone(&proxied);
+                    move |path: axum::extract::Path<(String, String)>| {
+                        let proxied = Arc::clone(&proxied);
+                        async move {
+                            let axum::extract::Path((id, rest)) = path;
+                            proxied
+                                .lock()
+                                .expect("the proxied mutex is poisoned")
+                                .push(format!("{id}/{rest}"));
+                            axum::Json(serde_json::json!({}))
+                        }
+                    }
+                }),
+            );
         let listener = tokio::net::TcpListener::bind(addr("127.0.0.1:0"))
             .await
             .expect("bind");
@@ -1515,8 +1537,17 @@ impl Recorder {
         Self {
             address: HostAddress::parse(&format!("http://{bound}")).expect("an address"),
             creates,
+            proxied,
             serving,
         }
+    }
+
+    /// Every proxied session route this recorder was sent, as `id/rest`.
+    fn proxied(&self) -> Vec<String> {
+        self.proxied
+            .lock()
+            .expect("the proxied mutex is poisoned")
+            .clone()
     }
 
     /// Every create body this recorder was sent.
@@ -1994,4 +2025,52 @@ async fn a_dot_segment_never_reaches_a_host_as_a_path() {
 
     fixture.shutdown().await;
     upstream.stop().await;
+}
+
+/// A command for a host the gateway holds no link to is refused before it is
+/// forwarded.
+///
+/// Stopping a host proves less than it looks. Its port closes, so the dial
+/// fails and the same `503 host_unreachable` comes back whether or not the
+/// gateway consulted its link first, which makes the obvious test vacuous for
+/// the check it means to pin. This host answers every route, so the only thing
+/// that can refuse the command is the check, and the only thing that can prove
+/// the refusal came first is the host having been sent nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_command_is_refused_before_reaching_a_host_with_no_link() {
+    let recorder = Recorder::unlinked("recorder").await;
+    let fixture = Fixture::over(
+        TempDir::new().expect("tempdir"),
+        vec![recorder.address.clone()],
+    )
+    .await;
+    fixture
+        .until_hosts("the host to be named and not connected", |hosts| {
+            hosts
+                .hosts
+                .iter()
+                .find(|host| host.id.as_deref() == Some("recorder") && !host.connected)
+                .map(|_| ())
+        })
+        .await;
+
+    let outcome = fixture
+        .client
+        .command("recorder:2026-01-01-00-00-00-000", &prompt("go"))
+        .await;
+
+    // The recorder is read before the outcome is unwrapped, so a command that
+    // got through fails on having reached the host rather than on the shape of
+    // the answer it came back with.
+    assert!(
+        recorder.proxied().is_empty(),
+        "a command reached a host this gateway has no link to: {:?}",
+        recorder.proxied(),
+    );
+    let err = outcome.expect_err("a command for a host with no link is refused");
+    assert_eq!(err.status(), Some(StatusCode::SERVICE_UNAVAILABLE));
+    assert_eq!(err.code(), Some("host_unreachable"));
+
+    fixture.shutdown().await;
+    recorder.stop();
 }
