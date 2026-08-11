@@ -79,6 +79,7 @@ impl Splice {
         let guard = cancel.clone().drop_guard();
         let (sender, frames) = outbound::channel(tuning.outbound_queue, cancel.clone());
         let mut watched = Vec::new();
+        let mut opened = Vec::new();
         for group in groups {
             watched.push(HostReturn {
                 sessions: group.namespaced(),
@@ -92,7 +93,7 @@ impl Splice {
                 continue;
             };
             let events = dial(&address, &group, tuning.upstream_timeout).await?;
-            tokio::spawn(pump(
+            opened.push((
                 Upstream {
                     host_id: group.host_id,
                     address,
@@ -103,9 +104,16 @@ impl Splice {
                         .collect(),
                 },
                 events,
-                sender.clone(),
-                cancel.clone(),
             ));
+        }
+        // Pumped only once every dial is done. The dials are sequential and each
+        // one is bounded by `upstream_timeout`, so a pump started inside that
+        // loop would forward one host's frames into a queue for a client that
+        // has not been handed its response head yet, and a busy session would
+        // evict a client that never saw a frame. Until then the frames wait in
+        // the upstream connection, which is where backpressure belongs.
+        for (upstream, events) in opened {
+            tokio::spawn(pump(upstream, events, sender.clone(), cancel.clone()));
         }
         if !watched.is_empty() {
             tokio::spawn(returns(watched, reachable, sender, cancel.clone()));

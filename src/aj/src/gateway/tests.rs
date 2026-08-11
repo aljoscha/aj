@@ -2723,6 +2723,90 @@ async fn a_live_frame_from_another_host_does_not_evict_a_client_mid_block() {
     right.stop();
 }
 
+/// No upstream is pumped before every dial is done (spec 7.1: "returning means
+/// every upstream that could be opened is open").
+///
+/// The dials are sequential and each is bounded by `upstream_timeout`, so a pump
+/// started inside that loop forwards one host's frames for as long as the
+/// remaining dials take, into a queue for a client that has not been handed its
+/// response head yet. A busy session there evicts a client that never saw a
+/// frame, and its re-attach reproduces the state exactly.
+///
+/// The queue here is deliberately big enough for the whole block, so what the
+/// assertion measures is what the gateway pulled out of the first host and not
+/// where a bound bit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_upstream_is_pumped_before_every_dial_is_done() {
+    let backfilled: u64 = 800;
+    let talking = deep_block("s-1", "epoch-1", backfilled);
+    let deep = talking.len();
+    let first = FakeHost::start("aaa", Script::Frames(talking)).await;
+    let cue = Arc::new(tokio::sync::Notify::new());
+    let slow = FakeHost::start(
+        "zzz",
+        Script::CuedHead {
+            cue: Arc::clone(&cue),
+            frames: block("s-9", "epoch-9", 0),
+        },
+    )
+    .await;
+    let fixture = Fixture::tuned(
+        TempDir::new().expect("tempdir"),
+        vec![first.address.clone(), slow.address.clone()],
+        Tuning {
+            outbound_queue: NonZeroUsize::new(deep * 2).expect("non-zero"),
+            ..tuning()
+        },
+    )
+    .await;
+    fixture.until_connected("aaa").await;
+    fixture.until_connected("zzz").await;
+
+    // The stream request cannot come back until the second host answers its
+    // head, and that wait is the window under test.
+    let client = RemoteClient::new(&fixture.server.url()).expect("client");
+    let opening = tokio::spawn(async move {
+        client
+            .events(&[attach("aaa:s-1"), attach("zzz:s-9")])
+            .await
+            .expect("a client stream onto the gateway")
+    });
+    let stalled = first.until_stalled().await;
+
+    assert!(
+        stalled < deep,
+        "the gateway drained {stalled} of {deep} frames out of the first host \
+         while the second was still being dialed, into a queue for a client that \
+         had not been handed its response head",
+    );
+
+    // And once the second host answers, the client is served both blocks whole.
+    cue.notify_one();
+    let mut events = bounded("the stream to open", opening)
+        .await
+        .expect("the task");
+    let mut blocks = 0;
+    let served = frames_until(&mut events, "both blocks", |frame| {
+        if is_caught_up(frame) {
+            blocks += 1;
+        }
+        blocks == 2
+    })
+    .await;
+    assert_eq!(
+        served
+            .iter()
+            .filter(|frame| matches!(frame, Frame::Event { session, .. } if session == "aaa:s-1"))
+            .count(),
+        usize::try_from(backfilled).expect("a count that fits"),
+        "and the first host's block arrived whole behind the wait",
+    );
+
+    fixture.shutdown().await;
+    first.stop();
+    slow.stop();
+}
+
 /// A host that takes a stream request and never answers it is a 503, not a hang:
 /// a client of a gateway must not be held open for as long as a host cares to
 /// stay silent.
@@ -2988,6 +3072,13 @@ enum Script {
         cue: Arc<tokio::sync::Notify>,
         then: Vec<String>,
     },
+    /// A response head that waits for `cue`, then these frames. A host on a slow
+    /// link, which is what a splice is waiting on while the upstreams it already
+    /// opened are open.
+    CuedHead {
+        cue: Arc<tokio::sync::Notify>,
+        frames: Vec<String>,
+    },
     /// Not a stream at all: the host's own refusal of the attach.
     Refuse,
     /// Nothing at all, not even a response head: the host took the request and
@@ -3078,6 +3169,11 @@ impl FakeHost {
                             if !control && matches!(script, Script::Mute) {
                                 std::future::pending::<()>().await;
                             }
+                            // Awaited before the response is composed, so the
+                            // head itself is what waits.
+                            if !control && let Script::CuedHead { cue, .. } = &script {
+                                cue.notified().await;
+                            }
                             // A control connection carries this host's directory
                             // and then stays open, which is what keeps the
                             // gateway's link to it up.
@@ -3113,6 +3209,9 @@ impl FakeHost {
                                         Tail::Cued(Arc::clone(cue), then.clone()),
                                         guard,
                                     ),
+                                    Script::CuedHead { frames, .. } => {
+                                        (frames.clone(), Tail::Held, guard)
+                                    }
                                 }
                             };
                             // Counted as they go out rather than as they were
