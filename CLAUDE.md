@@ -106,6 +106,12 @@ commit secrets.
   component directly through a helper prove the component, not the
   feature. At least one test per feature must exercise the real
   path end to end (real input bytes, the composed tree).
+- Assert at the boundary where the harm lands, and order assertions
+  so a failure names the harm. A traversal test reads the store, not
+  the response body: reading the response first can fail on a
+  decoding artifact of the very bug it caught, and a test that
+  catches the right bug for the wrong stated reason will be misread
+  under pressure.
 - A mutation that survives is a finding, not a formality. Expect the
   check to change the work: the usual outcome is a test rewritten to
   reach the real path, or a property nothing was pinning. Report every

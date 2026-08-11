@@ -305,13 +305,18 @@ never parse session ids. Cross-host uniqueness rests on `host_id`,
 which is why it names the session store (section 4).
 
 Opaque to clients does not mean unvalidated at the server. A host
-turns session ids into store filenames, so a wire-supplied id is
+turns session ids into store filenames and a gateway turns them into
+upstream URLs, so a wire-supplied id is
 validated syntactically at the boundary (its own id grammar, and
 categorically nothing containing a path separator or `..`) and
-rejected with 404 before it reaches any path construction or store
-lookup. Membership in an enumeration is not a substitute: it happens
-to be safe, but it couples path safety to how a lookup is
-implemented.
+rejected with 404 before it reaches any path or URL construction or
+store lookup. Membership in an enumeration is not a substitute: it
+happens to be safe, but it couples path safety to how a lookup is
+implemented. Nor is a URL builder: one measured builder silently
+drops `.` and `..` segments instead of escaping them, which turned a
+crafted id into a different upstream *route* (a create, walking
+around the gateway's create refusal) rather than a bad session
+lookup. Validation happens before construction, on both roles.
 
 ### 6.3 Frames
 
