@@ -216,8 +216,11 @@ impl SessionDirectory {
     /// this type has no use for.
     fn apply_host_frame(&mut self, frame: Frame) -> Redraw {
         match frame {
-            // A gateway's frame also names its enrolled hosts, which the
-            // sidebar's grouping reads rather than this reducer (spec 7.1).
+            // A gateway's frame also names its enrolled hosts, which this
+            // reducer drops. The sidebar groups by each row's own `host`, so a
+            // host a gateway holds no rows for renders as nothing rather than
+            // as the empty group spec 7.1 asks for. Holding these names is what
+            // that grouping would read.
             Frame::List { sessions, .. } => {
                 let changed = self.rows != sessions;
                 self.rows = sessions;

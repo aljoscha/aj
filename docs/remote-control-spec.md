@@ -972,8 +972,9 @@ worse than a clear "unreachable, contents unknown". `GET /v1/sessions`
 answers the same payload, hosts included, because the read and the
 frames are one composition: a client that reads the directory and a
 client that watches it must not disagree about which hosts there are.
-A host the gateway has never spoken to is not among them, since it has
-no id yet and there is nothing for a client to group under.
+A host the gateway has no id for is not among them: an id is learned by
+speaking to the host and never configured, and until there is one
+there is nothing for a client to group under.
 Clients re-attach with their cursors as usual, which resumes
 incrementally when the host's epochs survived and fully when they did
 not. The same mechanism covers the case where a host evicts a slow
