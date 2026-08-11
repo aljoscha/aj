@@ -39,9 +39,8 @@ use crate::remote::{IdentityError, IdentityGate};
 
 /// How long [`GatewayServer::shutdown`] waits for in-flight streams.
 ///
-/// A gateway stream ends when its client goes away or the directory channel
-/// closes, so this bound only exists so an attached client cannot wedge the
-/// process.
+/// Shutdown ends the streams itself, so this is the bound on a connection that
+/// does not go away even once nothing is being written to it.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// The largest request body the proxy will carry.
@@ -73,6 +72,13 @@ struct ServerState {
     /// rather than read at the write site so a test can watch the behavior
     /// without a thirty-second wait.
     heartbeat: Duration,
+    /// Cancelled by [`GatewayServer::shutdown`].
+    ///
+    /// A client's stream ends on it, which is what makes teardown prompt: unlike
+    /// a host, a gateway has nothing else that would close an attached stream, so
+    /// without this every shutdown would wait out [`SHUTDOWN_GRACE`] for a
+    /// perfectly healthy client.
+    shutdown: CancellationToken,
 }
 
 /// One bound gateway port.
@@ -101,13 +107,14 @@ impl GatewayServer {
         let local = listener
             .local_addr()
             .map_err(|source| ServerError::Bind { addr, source })?;
+        let shutdown = CancellationToken::new();
         let state = Arc::new(ServerState {
             heartbeat: gateway.tuning().heartbeat,
             gateway,
             gate,
+            shutdown: shutdown.clone(),
         });
         let app = router(Arc::clone(&state));
-        let shutdown = CancellationToken::new();
         let serving = tokio::spawn({
             let shutdown = shutdown.clone();
             async move {
@@ -252,6 +259,7 @@ async fn events(
     Ok(Sse::new(list_stream(
         state.gateway.subscribe(),
         state.heartbeat,
+        state.shutdown.clone(),
     )))
 }
 
@@ -288,34 +296,42 @@ impl ListWriter {
 fn list_stream(
     directory: watch::Receiver<Arc<Vec<SessionSummary>>>,
     idle: Duration,
+    shutdown: CancellationToken,
 ) -> impl Stream<Item = Result<Event, aj_agent::BoxError>> {
     let writer = ListWriter {
         directory,
         opened: false,
     };
-    futures::stream::unfold(Some(writer), move |state| async move {
-        let mut writer = state?;
-        let frame = if writer.opened {
-            match tokio::time::timeout(idle, writer.directory.changed()).await {
-                Ok(Ok(())) => Frame::List {
+    futures::stream::unfold(Some(writer), move |state| {
+        let shutdown = shutdown.clone();
+        async move {
+            let mut writer = state?;
+            let frame = if writer.opened {
+                let change = tokio::select! {
+                    _ = shutdown.cancelled() => return None,
+                    change = tokio::time::timeout(idle, writer.directory.changed()) => change,
+                };
+                match change {
+                    Ok(Ok(())) => Frame::List {
+                        sessions: writer.snapshot(),
+                    },
+                    // The gateway is gone, so there is nothing left to say.
+                    Ok(Err(_)) => return None,
+                    Err(_) => Frame::Heartbeat,
+                }
+            } else {
+                writer.opened = true;
+                Frame::List {
                     sessions: writer.snapshot(),
-                },
-                // The gateway is gone, so there is nothing left to say.
-                Ok(Err(_)) => return None,
-                Err(_) => Frame::Heartbeat,
+                }
+            };
+            match serde_json::to_string(&frame) {
+                Ok(json) => Some((Ok(Event::default().data(json)), Some(writer))),
+                // A frame this gateway built that will not serialize is a bug in it.
+                // Ending the stream makes the client reconnect, which is the only
+                // honest answer.
+                Err(err) => Some((Err(err.into()), None)),
             }
-        } else {
-            writer.opened = true;
-            Frame::List {
-                sessions: writer.snapshot(),
-            }
-        };
-        match serde_json::to_string(&frame) {
-            Ok(json) => Some((Ok(Event::default().data(json)), Some(writer))),
-            // A frame this gateway built that will not serialize is a bug in it.
-            // Ending the stream makes the client reconnect, which is the only
-            // honest answer.
-            Err(err) => Some((Err(err.into()), None)),
         }
     })
 }

@@ -266,9 +266,11 @@ impl Gateway {
                 address: address.clone(),
                 source,
             })?;
+        // Held across all three, so an enrollment is one step: the file cannot
+        // end up describing a set that was never enrolled, and a withdrawal
+        // cannot land between the enrolling and the dialing and leave a link
+        // behind that nothing will ever stop.
         {
-            // Held across both, so the file cannot end up describing a set that
-            // was never enrolled.
             let _writing = self.inner.writing.lock().await;
             self.inner.directory.enroll(
                 address.clone(),
@@ -281,8 +283,8 @@ impl Gateway {
                 let _ = self.inner.directory.withdraw(&hello.host_id);
                 return Err(err);
             }
+            self.dial(address.clone());
         }
-        self.dial(address.clone());
         let hosts = self.hosts();
         hosts
             .hosts
@@ -298,23 +300,20 @@ impl Gateway {
 
     /// Remove the enrollment of `host_id` and stop following it.
     pub(crate) async fn withdraw(&self, host_id: &str) -> Result<(), GatewayError> {
-        let address = {
-            let _writing = self.inner.writing.lock().await;
-            let address = self.inner.directory.withdraw(host_id)?;
-            if let Err(err) = self.remember() {
-                // A withdrawal the gateway cannot write down would come back as a
-                // surprise after a restart, so it does not stand. The enrollment
-                // goes back, its link was never stopped, and its rows return with
-                // that host's next directory.
-                let _ = self.inner.directory.enroll(
-                    address,
-                    HostSource::Dynamic,
-                    Some(host_id.to_string()),
-                );
-                return Err(err);
-            }
-            address
-        };
+        let _writing = self.inner.writing.lock().await;
+        let address = self.inner.directory.withdraw(host_id)?;
+        if let Err(err) = self.remember() {
+            // A withdrawal the gateway cannot write down would come back as a
+            // surprise after a restart, so it does not stand. The enrollment goes
+            // back, its link was never stopped, and its rows return with that
+            // host's next directory.
+            let _ = self.inner.directory.enroll(
+                address,
+                HostSource::Dynamic,
+                Some(host_id.to_string()),
+            );
+            return Err(err);
+        }
         self.undial(&address).await;
         Ok(())
     }

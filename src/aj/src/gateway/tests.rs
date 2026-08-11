@@ -985,6 +985,38 @@ async fn an_idle_gateway_stream_heartbeats() {
     gateway.shutdown().await;
 }
 
+/// A shutdown ends its clients' streams rather than waiting for them to leave.
+///
+/// A host's streams end because the host closes its attachments. A gateway has
+/// nothing that would, so without ending them on shutdown every teardown with a
+/// perfectly healthy client attached would sit out the server's whole grace
+/// period.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shutdown_does_not_wait_out_an_attached_client() {
+    let fixture = Fixture::new(&[]).await;
+    let mut events = fixture.client.events(&[]).await.expect("a stream");
+    bounded("the opening directory", async {
+        events.recv().await.expect("a frame").expect("a good frame")
+    })
+    .await;
+
+    let started = std::time::Instant::now();
+    fixture.shutdown().await;
+    let took = started.elapsed();
+
+    assert!(
+        took < Duration::from_secs(2),
+        "the shutdown waited {took:?} on a client it could have closed",
+    );
+    // And the client is told, rather than left holding a stream nothing writes to.
+    assert!(
+        bounded("the end of the stream", events.recv())
+            .await
+            .is_none(),
+        "the stream ended",
+    );
+}
+
 /// A settled gateway stops talking: its link stays up rather than reconnecting,
 /// and a directory that has not changed is not republished, because `list` is
 /// cumulative and an identical snapshot carries no information (spec 6.8).
