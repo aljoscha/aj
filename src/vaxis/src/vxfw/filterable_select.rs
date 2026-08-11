@@ -107,6 +107,10 @@ pub struct SelectItem {
     pub label: String,
     /// Text the fuzzy filter matches and ranks against.
     pub filter_key: String,
+    /// Narrower text a scoped query matches instead of `filter_key`, for a
+    /// select that offers one (see [`FilterableSelect::set_scope_sigil`]). A
+    /// row without one never matches a scoped query.
+    pub scope_key: Option<String>,
     /// Optional right-aligned metadata column drawn to the left of the label
     /// (a command category, say), styled with [`SelectStyles::prefix`].
     pub prefix: Option<String>,
@@ -125,10 +129,18 @@ impl SelectItem {
         SelectItem {
             label: label.into(),
             filter_key: filter_key.into(),
+            scope_key: None,
             prefix: None,
             shortcut: None,
             description: None,
         }
+    }
+
+    /// Adds the text a scoped query matches against, for a select with a
+    /// scope sigil ([`FilterableSelect::set_scope_sigil`]).
+    pub fn with_scope_key(mut self, scope_key: impl Into<String>) -> SelectItem {
+        self.scope_key = Some(scope_key.into());
+        self
     }
 
     /// Adds a right-aligned metadata column drawn to the left of the label.
@@ -164,6 +176,8 @@ struct SelectState {
     visible: Vec<(usize, u32)>,
     /// The current filter text, mirrored from the filter field on change.
     query: String,
+    /// The optional narrowing sigil ([`FilterableSelect::set_scope_sigil`]).
+    scope_sigil: Option<char>,
     matcher: FuzzyMatcher,
     /// Widest `prefix` across all items (0 when none set), the width of the
     /// right-aligned metadata column.
@@ -335,24 +349,52 @@ fn build_row(
 ///
 /// Used by `set_items` and by `on_change` on any non-append query change.
 fn full_filter(state: &mut SelectState, list: &mut ListView) {
+    let all = (0..state.items.len()).collect();
+    state.visible = rank(state, all);
+    list.item_count = Some(u32::try_from(state.visible.len()).expect("row count fits u32"));
+    list.jump_to_item(0);
+}
+
+/// Rank `candidates`, indices into `items` in ascending order, against the
+/// live query. Best-first, ties broken by index.
+///
+/// Ascending order is the caller's part of the bargain: `filter_scored`
+/// breaks score ties by its own enumeration position, so handing it the
+/// indices in order makes that an original-index tiebreak. That is what lets
+/// a partial rescore (a narrowing query, a streamed batch) reproduce the
+/// order a full rescore would have produced.
+///
+/// A scoped query (see [`FilterableSelect::set_scope_sigil`]) is matched
+/// without its sigil against each row's `scope_key`, and a row carrying none
+/// is dropped before it reaches the matcher rather than matched against an
+/// empty key. Dropping it is what makes the bare sigil mean "every row that
+/// has a scope key" instead of "every row".
+fn rank(state: &mut SelectState, candidates: Vec<usize>) -> Vec<(usize, u32)> {
     let SelectState {
         items,
-        visible,
         query,
         matcher,
+        scope_sigil,
         ..
     } = state;
-    // Enumerate all items in order, so `filter_scored`'s positional tiebreak
-    // is the original index.
-    *visible = matcher
-        .filter_scored(items.iter().enumerate(), query, |(_, item)| {
-            item.filter_key.as_str()
+    let stripped = scope_sigil.and_then(|sigil| query.trim_start().strip_prefix(sigil));
+    let scoped = stripped.is_some();
+    let query = stripped.unwrap_or(query.as_str());
+    let entries = candidates
+        .into_iter()
+        .filter(|&i| !scoped || items[i].scope_key.is_some())
+        .map(|i| (i, &items[i]));
+    matcher
+        .filter_scored(entries, query, |(_, item)| {
+            if scoped {
+                item.scope_key.as_deref().unwrap_or("")
+            } else {
+                item.filter_key.as_str()
+            }
         })
         .into_iter()
         .map(|((i, _), score)| (i, score))
-        .collect();
-    list.item_count = Some(u32::try_from(visible.len()).expect("row count fits u32"));
-    list.jump_to_item(0);
+        .collect()
 }
 
 /// Recomputes `visible` by rescoring only the current visible subset, for a
@@ -368,31 +410,16 @@ fn full_filter(state: &mut SelectState, list: &mut ListView) {
 /// harder (a longer needle that still requires the old prefix as a
 /// subsequence), and adding a token adds a requirement. Either way an item can
 /// only drop out, never enter. So it is sound to rescore just the survivors.
+///
+/// A scope sigil does not weaken this. An append leaves the query's first
+/// character alone unless the old query was empty, so the scope either stays
+/// as it was or turns on from the unfiltered set, where every item is a
+/// survivor already.
 fn narrow_filter(state: &mut SelectState, list: &mut ListView) {
-    let SelectState {
-        items,
-        visible,
-        query,
-        matcher,
-        ..
-    } = state;
-    // Sort the candidate indices ascending before rescoring so that
-    // `filter_scored`'s positional tiebreak (its internal enumeration order)
-    // equals the original-index tiebreak. That makes the narrowed order
-    // byte-identical to a full rescore's order over the same survivors: the
-    // scores are per-item and identical either way, and ties break the same.
-    let mut indices: Vec<usize> = visible.iter().map(|&(i, _)| i).collect();
-    indices.sort_unstable();
-    *visible = matcher
-        .filter_scored(
-            indices.into_iter().map(|i| (i, &items[i])),
-            query,
-            |(_, item)| item.filter_key.as_str(),
-        )
-        .into_iter()
-        .map(|((i, _), score)| (i, score))
-        .collect();
-    list.item_count = Some(u32::try_from(visible.len()).expect("row count fits u32"));
+    let mut candidates: Vec<usize> = state.visible.iter().map(|&(i, _)| i).collect();
+    candidates.sort_unstable();
+    state.visible = rank(state, candidates);
+    list.item_count = Some(u32::try_from(state.visible.len()).expect("row count fits u32"));
     list.jump_to_item(0);
 }
 
@@ -401,29 +428,14 @@ fn narrow_filter(state: &mut SelectState, list: &mut ListView) {
 /// avoiding a full rescore of the accumulated set. Leaves the cursor to the
 /// caller (`extend_items` restores it); only the item count is updated here.
 fn merge_extend(state: &mut SelectState, list: &mut ListView, old_len: usize) {
-    let SelectState {
-        items,
-        visible,
-        query,
-        matcher,
-        ..
-    } = state;
-    // Score just the new tail. `filter_scored` enumerates the tail from 0, so
-    // its positional tiebreak matches ascending real index (`old_len + pos`),
-    // keeping the batch's own ranking correct.
-    let new_ranked: Vec<(usize, u32)> = matcher
-        .filter_scored(items[old_len..].iter().enumerate(), query, |(_, item)| {
-            item.filter_key.as_str()
-        })
-        .into_iter()
-        .map(|((pos, _), score)| (old_len + pos, score))
-        .collect();
+    let tail = (old_len..state.items.len()).collect();
+    let new_ranked = rank(state, tail);
     // Both lists are already in rank order (score desc, index asc), so a
     // linear two-way merge reproduces a full rescore's order. New indices all
     // exceed old ones, so a score tie between an old and a new item keeps the
     // old (lower index) first, matching the stable tiebreak.
-    *visible = merge_ranked(std::mem::take(visible), new_ranked);
-    list.item_count = Some(u32::try_from(visible.len()).expect("row count fits u32"));
+    state.visible = merge_ranked(std::mem::take(&mut state.visible), new_ranked);
+    list.item_count = Some(u32::try_from(state.visible.len()).expect("row count fits u32"));
 }
 
 /// Merge two rank-ordered lists (score descending, then index ascending) into
@@ -502,6 +514,7 @@ impl FilterableSelect {
             visible: Vec::new(),
             items,
             query: String::new(),
+            scope_sigil: None,
             matcher: FuzzyMatcher::new(),
             prefix_width: 0,
             label_width: 0,
@@ -574,6 +587,18 @@ impl FilterableSelect {
     /// content overlays.
     pub fn set_show_scrollbar(&mut self, show: bool) {
         self.show_scrollbar = show;
+    }
+
+    /// Offer a one-character query scope: a query whose first character is
+    /// `sigil` matches rows' [`SelectItem::scope_key`] with the sigil
+    /// stripped, and rows that carry no scope key drop out entirely. So the
+    /// bare sigil lists every row that has one.
+    ///
+    /// Off by default, and the sigil anywhere but the front of the query is
+    /// ordinary text matched against `filter_key` like any other character.
+    /// Takes effect on the next filter, so set it before the select is used.
+    pub fn set_scope_sigil(&mut self, sigil: char) {
+        self.state.borrow_mut().scope_sigil = Some(sigil);
     }
 
     /// The widget the host should focus while this select is active: the
@@ -1608,6 +1633,144 @@ mod tests {
             full_rescore_indices(&item_vec, "ab")
         );
         assert_eq!(visible_indices(&select), vec![0, 1, 2, 3]);
+    }
+
+    // --- The optional query scope. ---
+
+    /// Three rows whose scope keys are a strict subset of their filter keys,
+    /// plus one row with no scope key at all whose filter key carries a
+    /// literal `#`.
+    fn scoped_items() -> Vec<SelectItem> {
+        vec![
+            SelectItem::new("alpha", "alpha fix-auth").with_scope_key("fix-auth"),
+            SelectItem::new("bravo", "bravo fixture").with_scope_key("fixture"),
+            SelectItem::new("charlie", "charlie fix the prompt"),
+            SelectItem::new("delta", "delta issue #42"),
+        ]
+    }
+
+    /// A select over [`scoped_items`] with `#` as its scope sigil, with
+    /// `query` typed in one key at a time through the real filter field.
+    fn scoped_select(query: &str) -> FilterableSelect {
+        let mut select = FilterableSelect::new(scoped_items(), SelectStyles::default());
+        select.set_scope_sigil('#');
+        type_str(&mut select, query);
+        select
+    }
+
+    /// The sigil narrows the query to the scope keys: an unscoped query sees
+    /// the whole corpus, a scoped one sees only rows that have a scope key,
+    /// and only their key.
+    #[test]
+    fn the_scope_sigil_restricts_matching_to_the_scope_key() {
+        assert_eq!(
+            scoped_select("fix").visible_labels(),
+            ["alpha", "bravo", "charlie"],
+            "unscoped, the corpus answers"
+        );
+        assert_eq!(
+            scoped_select("#fix").visible_labels(),
+            ["alpha", "bravo"],
+            "scoped, the row whose match was in the prompt drops out"
+        );
+        assert_eq!(
+            scoped_select("#auth").visible_labels(),
+            ["alpha"],
+            "and the match has to be in the key, not the label"
+        );
+        assert_eq!(
+            scoped_select("#alpha").visible_labels(),
+            Vec::<String>::new(),
+            "a row that has a key is still matched only on that key",
+        );
+    }
+
+    /// The scope folds case exactly the way the corpus does, which is the
+    /// matcher's rule and not this widget's: the text is folded, the query is
+    /// taken as typed, so a lowercase query finds a label of any case.
+    #[test]
+    fn a_scoped_query_folds_case_the_way_the_corpus_does() {
+        let item = SelectItem::new("echo", "echo Fix-Auth").with_scope_key("Fix-Auth");
+        let mut select = FilterableSelect::new(vec![item], SelectStyles::default());
+        select.set_scope_sigil('#');
+        type_str(&mut select, "fix");
+        assert_eq!(select.visible_labels(), ["echo"], "unscoped");
+        for _ in 0..3 {
+            send(&mut select, &key(Key::BACKSPACE, Modifiers::empty()));
+        }
+        type_str(&mut select, "#fix");
+        assert_eq!(select.visible_labels(), ["echo"], "and scoped");
+    }
+
+    /// The bare sigil is the empty scoped query, which every scope key
+    /// matches and no missing one does, so it lists exactly the rows that
+    /// have a key.
+    #[test]
+    fn a_bare_scope_sigil_lists_the_rows_that_have_a_key() {
+        assert_eq!(scoped_select("#").visible_labels(), ["alpha", "bravo"]);
+    }
+
+    /// Nothing at all carries a scope key: the sigil then matches nothing
+    /// rather than falling back to the corpus.
+    #[test]
+    fn a_scoped_query_over_rows_without_keys_matches_nothing() {
+        let mut select = FilterableSelect::new(items(&["alpha", "bravo"]), SelectStyles::default());
+        select.set_scope_sigil('#');
+        type_str(&mut select, "#");
+        assert!(select.visible_labels().is_empty(), "the bare sigil");
+        type_str(&mut select, "al");
+        assert!(select.visible_labels().is_empty(), "and a scoped query");
+    }
+
+    /// The sigil is only a sigil at the front of the query. Elsewhere it is
+    /// ordinary text matched against the corpus, so a row with no scope key
+    /// at all is still findable by a `#` in its filter key.
+    #[test]
+    fn the_scope_sigil_is_literal_anywhere_but_the_front() {
+        assert_eq!(
+            scoped_select("issue #42").visible_labels(),
+            ["delta"],
+            "a mid-query # matched the corpus literally"
+        );
+    }
+
+    /// Without a sigil configured the character is plain text, so a select
+    /// that never opted in keeps matching exactly as it did.
+    #[test]
+    fn without_a_sigil_the_character_is_plain_text() {
+        let mut select = FilterableSelect::new(scoped_items(), SelectStyles::default());
+        type_str(&mut select, "#4");
+        assert_eq!(select.visible_labels(), ["delta"]);
+    }
+
+    /// Editing across the scope boundary keeps the incremental paths honest:
+    /// typing the sigil narrows (append) and deleting it rescores in full,
+    /// and both land on the set a fresh select at that query would show.
+    #[test]
+    fn editing_across_the_scope_boundary_matches_a_fresh_filter() {
+        let mut select = scoped_select("#fix");
+        assert_eq!(select.visible_labels(), ["alpha", "bravo"]);
+        for _ in 0..3 {
+            send(&mut select, &key(Key::BACKSPACE, Modifiers::empty()));
+        }
+        assert_eq!(select.visible_labels(), scoped_select("#").visible_labels());
+        send(&mut select, &key(Key::BACKSPACE, Modifiers::empty()));
+        assert_eq!(
+            select.visible_labels(),
+            ["alpha", "bravo", "charlie", "delta"],
+            "deleting the sigil restored the whole corpus"
+        );
+    }
+
+    /// A streamed batch is ranked under the live scope, so rows arriving
+    /// while a scoped query is up are filtered by it like the rest.
+    #[test]
+    fn a_batch_streamed_under_a_scoped_query_is_scoped_too() {
+        let mut select = FilterableSelect::new(Vec::new(), SelectStyles::default());
+        select.set_scope_sigil('#');
+        type_str(&mut select, "#fix");
+        select.extend_items(scoped_items());
+        assert_eq!(select.visible_labels(), ["alpha", "bravo"]);
     }
 }
 
