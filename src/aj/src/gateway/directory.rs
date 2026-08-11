@@ -1382,4 +1382,33 @@ mod tests {
         assert!(watcher.has_changed().expect("alive"), "a new row is news");
         assert_eq!(watcher.borrow_and_update().sessions.len(), 2);
     }
+
+    /// Reachability is a channel of its own because it moves at a different
+    /// rate: the merged directory is republished for every row a busy host
+    /// touches, and a splice watching that for reachability alone would wake
+    /// once per client per refresh (spec 7.1).
+    #[tokio::test]
+    async fn a_row_change_does_not_republish_reachability() {
+        let directory = Directory::new();
+        let address = connected(&directory, "127.0.0.1:1", "left", &["s-1"]);
+        let reachable = directory.reachable();
+        let merged = directory.subscribe();
+
+        directory.set_rows(&address, vec![row("s-1"), row("s-2")]);
+
+        assert!(
+            merged.has_changed().expect("the directory is alive"),
+            "the row was news to the directory, and this measures nothing unless it was",
+        );
+        assert!(
+            !reachable.has_changed().expect("alive"),
+            "one host's row churn woke every splice waiting for a host to return",
+        );
+
+        directory.disconnected(&address, "gone".to_string());
+        assert!(
+            reachable.has_changed().expect("alive"),
+            "and a host that went away is what this channel is for",
+        );
+    }
 }
