@@ -5,8 +5,9 @@ use aj_wire::{
     CancelRequest, CompactRequest, CreateSessionRequest, Cursor, DecodedAgentEvent, DecodedFrame,
     EnrollHostRequest, ErrorResponse, Frame, HeadRequest, Hello, HostList, HostSource, HostSummary,
     ModelSelection, PromptInput, PromptRequest, QueueCounts, QueueOperation, QueueOutcome,
-    QueueRequest, QueueState, SessionCreated, SessionList, SessionSettings, SessionSummary,
-    SessionTree, SettingsRequest, SteerRequest, TagRequest, TaskDetails, TaskTable, VmList,
+    QueueRequest, QueueState, RawObject, SessionCreated, SessionList, SessionSettings,
+    SessionSummary, SessionTree, SettingsRequest, SteerRequest, TagRequest, TaskDetails, TaskTable,
+    VmList,
 };
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
@@ -1097,6 +1098,204 @@ fn the_session_reader_and_the_rewrite_agree_on_every_frame() {
     for input in FORWARDED_FRAMES {
         assert_reads_what_the_rewrite_writes(&serde_json::from_str(input).unwrap());
     }
+}
+
+/// A `list` frame's rows come back as their host wrote them (spec 6.10): a
+/// gateway re-emits them under its own name, so a field this build has no type
+/// for, and a number literal no float survives, have to travel through the read
+/// and back out again.
+#[test]
+fn a_list_frames_rows_are_read_as_their_host_wrote_them() {
+    let frame: DecodedFrame = serde_json::from_str(GATEWAY_ROWS).expect("a list frame decodes");
+
+    let rows = frame
+        .rows()
+        .expect("the rows are readable")
+        .expect("a list frame has rows");
+
+    let [live, cold] = &rows[..] else {
+        panic!("the fixture carries two rows: {rows:?}");
+    };
+    assert_eq!(live.get::<String>("id").expect("an id"), Some("s-1".into()));
+    assert_eq!(
+        serde_json::to_string(live).expect("a row re-serializes"),
+        r#"{"id":"s-1","live":true,"working":false,"queued":{"steering":0,"follow_up":0},"tasks":0,"last_seq":7,"last_activity":"2026-08-03T12:00:00Z","unreachable":false,"preview":{"text":"hello","weight":18446744073709551616}}"#,
+        "a row is re-emitted as it arrived, `preview` and its literal included",
+    );
+    assert_eq!(cold.get::<String>("id").expect("an id"), Some("s-0".into()));
+}
+
+/// The three fields a gateway owns on a row it re-emits (spec 6.10), edited
+/// through the same primitive that rewrites a frame's session: `id` and
+/// `unreachable` are replaced where they sit, `host` is added to a plain host's
+/// row that has none, and nothing else moves.
+#[test]
+fn a_row_takes_the_fields_a_gateway_owns_and_keeps_the_rest() {
+    let frame: DecodedFrame = serde_json::from_str(GATEWAY_ROWS).expect("a list frame decodes");
+    let mut rows = frame.rows().expect("readable").expect("rows");
+    let row = &mut rows[0];
+
+    row.set("id", "left:s-1").expect("a string encodes");
+    row.set("host", "left").expect("a string encodes");
+    row.set("unreachable", &true).expect("a bool encodes");
+
+    assert_eq!(
+        serde_json::to_string(row).expect("a row re-serializes"),
+        r#"{"id":"left:s-1","live":true,"working":false,"queued":{"steering":0,"follow_up":0},"tasks":0,"last_seq":7,"last_activity":"2026-08-03T12:00:00Z","unreachable":true,"preview":{"text":"hello","weight":18446744073709551616},"host":"left"}"#,
+        "`id` and `unreachable` replaced where they sat, `host` appended, and a \
+         payload the gateway never parsed",
+    );
+    assert_eq!(
+        serde_json::from_str::<SessionSummary>(
+            &serde_json::to_string(row).expect("a row re-serializes")
+        )
+        .expect("an edited row still decodes")
+        .host
+        .as_deref(),
+        Some("left"),
+    );
+}
+
+/// A locally built `list` frame retains no JSON, so its rows come from its typed
+/// values, which is the fallback the session reader makes for the same reason.
+/// Every other kind has no rows at all, unknown kinds included: a gateway
+/// forwards those whole rather than merging them.
+#[test]
+fn only_a_list_frame_has_rows() {
+    let local = DecodedFrame::try_from(Frame::List {
+        sessions: vec![pinned_row()],
+    })
+    .expect("a local list frame is valid");
+    let rows = local.rows().expect("readable").expect("a list frame");
+    assert_eq!(
+        rows[0].get::<String>("id").expect("an id"),
+        Some("session-0".to_string()),
+        "a frame with no retained JSON answers from its typed rows",
+    );
+    assert_eq!(
+        serde_json::from_str::<SessionSummary>(
+            &serde_json::to_string(&rows[0]).expect("a row re-serializes")
+        )
+        .expect("it decodes"),
+        pinned_row(),
+    );
+
+    for frame in local_frames() {
+        let carries_rows = matches!(frame, Frame::List { .. });
+        let frame = DecodedFrame::try_from(frame).expect("a local frame is valid");
+        assert_eq!(
+            frame.rows().expect("readable").is_some(),
+            carries_rows,
+            "{frame:?}",
+        );
+    }
+    for input in FORWARDED_FRAMES {
+        let frame: DecodedFrame = serde_json::from_str(input).expect("a frame decodes");
+        assert!(
+            frame.rows().expect("readable").is_none(),
+            "no kind but `list` has rows: {input}",
+        );
+    }
+}
+
+/// The primitive under the row edit and the session rewrite: it names one
+/// top-level field and touches nothing else, keys keep the order they arrived
+/// in, and a value below the top level is never parsed, so a nested `id` is not
+/// a field a gateway owns.
+#[test]
+fn a_raw_object_edits_the_one_field_it_names() {
+    let mut object: RawObject = serde_json::from_str(
+        r#"{"id":"s-1","nested":{"id":"inner","huge":1e400},"tag":"fix-auth"}"#,
+    )
+    .expect("an object");
+
+    assert_eq!(
+        object.get::<String>("id").expect("a string"),
+        Some("s-1".into())
+    );
+    assert_eq!(object.get::<String>("absent").expect("no key"), None);
+    assert!(
+        object.get::<String>("nested").is_err(),
+        "a field that is not a string says so rather than reading as absent",
+    );
+
+    object.set("id", "left:s-1").expect("a string encodes");
+    object.set("unreachable", &false).expect("a bool encodes");
+    assert_eq!(
+        serde_json::to_string(&object).expect("it re-serializes"),
+        r#"{"id":"left:s-1","nested":{"id":"inner","huge":1e400},"tag":"fix-auth","unreachable":false}"#,
+        "the named field is replaced where it sat, a new one is appended",
+    );
+}
+
+/// A duplicated key is malformed and a gateway forwards it all the same, so the
+/// read takes the occurrence a reader that parses the object into a map would,
+/// and the edit leaves no other occurrence behind for anyone to disagree over.
+#[test]
+fn a_raw_object_reads_the_last_duplicate_and_replaces_every_one() {
+    let mut object: RawObject =
+        serde_json::from_str(r#"{"id":"first","live":true,"id":"last"}"#).expect("an object");
+
+    assert_eq!(
+        object.get::<String>("id").expect("a string"),
+        Some("last".to_string()),
+    );
+
+    object.set("id", "left:s-1").expect("a string encodes");
+    assert_eq!(
+        serde_json::to_string(&object).expect("it re-serializes"),
+        r#"{"id":"left:s-1","live":true,"id":"left:s-1"}"#,
+    );
+}
+
+/// A value built in process has no wire JSON to keep, so it is encoded once and
+/// edited from there.
+#[test]
+fn a_raw_object_can_be_encoded_from_a_typed_value() {
+    let mut object = RawObject::encode(&pinned_row()).expect("a row is an object");
+    object.set("host", "left").expect("a string encodes");
+
+    let row: SessionSummary =
+        serde_json::from_str(&serde_json::to_string(&object).expect("it re-serializes"))
+            .expect("it decodes");
+    assert_eq!(row.host.as_deref(), Some("left"));
+    assert!(
+        RawObject::encode(&[1, 2, 3]).is_err(),
+        "an array is not an object to edit",
+    );
+}
+
+/// Two rows are the same when they carry the same fields in the same order with
+/// the same text, which is what lets a gateway ask whether its merged directory
+/// moved without parsing every row back.
+#[test]
+fn raw_objects_compare_on_the_text_they_would_emit() {
+    let row = |raw: &str| serde_json::from_str::<RawObject>(raw).expect("an object");
+
+    assert_eq!(
+        row(r#"{"id":"s-1","live":true}"#),
+        row(r#"{"id":"s-1","live":true}"#)
+    );
+    assert_ne!(
+        row(r#"{"id":"s-1","live":true}"#),
+        row(r#"{"id":"s-1","live":false}"#)
+    );
+    assert_ne!(
+        row(r#"{"id":"s-1","live":true}"#),
+        row(r#"{"live":true,"id":"s-1"}"#),
+        "key order is what a re-emitted row keeps, so it counts as a difference",
+    );
+    assert_ne!(row(r#"{"id":"s-1"}"#), row(r#"{"id":"s-1","live":true}"#));
+}
+
+/// A `list` frame with two rows: one from a host a version ahead, carrying a
+/// field this build has no type for and a number literal no float survives.
+const GATEWAY_ROWS: &str = r#"{"kind":"list","sessions":[{"id":"s-1","live":true,"working":false,"queued":{"steering":0,"follow_up":0},"tasks":0,"last_seq":7,"last_activity":"2026-08-03T12:00:00Z","unreachable":false,"preview":{"text":"hello","weight":18446744073709551616}},{"id":"s-0","live":false,"working":false,"queued":{"steering":0,"follow_up":0},"tasks":0,"last_activity":"2026-08-03T11:00:00Z","unreachable":false}]}"#;
+
+/// One typed row, for the paths that have no wire JSON to start from.
+fn pinned_row() -> SessionSummary {
+    serde_json::from_value(fixture("models")["session_list"]["sessions"][1].clone())
+        .expect("the pinned cold row decodes")
 }
 
 #[test]

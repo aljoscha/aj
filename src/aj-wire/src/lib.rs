@@ -11,7 +11,7 @@ use aj_agent::message::AgentMessage;
 use aj_agent::tool::{TaskId, TaskKind, TaskStatus};
 use aj_models::types::UserContent;
 use chrono::{DateTime, Utc};
-use serde::de::{Error as _, IgnoredAny, MapAccess, Visitor};
+use serde::de::{DeserializeOwned, Error as _, IgnoredAny, MapAccess, Visitor};
 use serde::ser::{Error as _, SerializeMap};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::value::RawValue;
@@ -1119,13 +1119,55 @@ impl DecodedFrame {
         };
 
         let mut object: RawObject = serde_json::from_str(&raw)?;
-        if !object.rewrite_session(replacement)? {
+        if !object.replace(
+            SESSION_FIELD,
+            &serde_json::value::to_raw_value(replacement)?,
+        ) {
             return Ok(false);
         }
         let rewritten = serde_json::to_string(&object)?;
         *self = serde_json::from_str(&rewritten)?;
         Ok(true)
     }
+
+    /// The rows of a `list` frame as their host wrote them, `None` for every
+    /// other kind.
+    ///
+    /// The read a gateway needs to re-emit a directory under its own name: it
+    /// owns `id`, `host` and `unreachable` on a row and passes everything else
+    /// through, so it takes the rows unparsed rather than through
+    /// [`SessionSummary`], which a re-encode would drop a newer host's fields
+    /// from (spec 6.10). A row's own nested values stay text for the same
+    /// reason the rewrite leaves a payload alone.
+    ///
+    /// A frame decoded from the wire answers from the JSON it arrived as, a
+    /// locally built one by encoding its typed rows, which is the same fallback
+    /// [`Self::session`] makes.
+    pub fn rows(&self) -> Result<Option<Vec<RawObject>>, serde_json::Error> {
+        // An unknown kind is not `list`: a gateway forwards it whole rather than
+        // merging it.
+        let Self::Known(frame) = self else {
+            return Ok(None);
+        };
+        let Frame::List { sessions, .. } = frame.value() else {
+            return Ok(None);
+        };
+        let Some(raw) = frame.raw_json() else {
+            return sessions
+                .iter()
+                .map(RawObject::encode)
+                .collect::<Result<Vec<_>, _>>()
+                .map(Some);
+        };
+        let ListRows { sessions } = serde_json::from_str(raw.get())?;
+        Ok(Some(sessions))
+    }
+}
+
+/// The rows of a `list` frame, unparsed, with every other field skipped.
+#[derive(Deserialize)]
+struct ListRows {
+    sessions: Vec<RawObject>,
 }
 
 impl TryFrom<Frame> for DecodedFrame {
@@ -1176,30 +1218,97 @@ struct FrameTag {
 
 /// A JSON object held as its top-level fields, every value left unparsed.
 ///
-/// Flat by design. A gateway rewrites the top-level `session` and must disturb
-/// nothing else, and keeping nested values as text is what puts a payload's own
-/// `session` out of reach.
-struct RawObject(Vec<(String, Box<RawValue>)>);
+/// Flat by design. What edits an object here owns a named field or two of it and
+/// must disturb nothing else, and keeping nested values as text is what puts a
+/// payload's own `session`, or a row's own nested `id`, out of reach. It is also
+/// what carries a peer's number literals through unrounded (spec 6.10).
+///
+/// Key order is the order the object arrived in, and a duplicate key is kept as
+/// two fields: an object edited here is re-emitted, not normalized.
+#[derive(Clone, Debug)]
+pub struct RawObject(Vec<(String, Box<RawValue>)>);
 
 impl RawObject {
-    /// Replaces every top-level `session` value, reporting whether it found
-    /// one.
-    fn rewrite_session(&mut self, replacement: &str) -> Result<bool, serde_json::Error> {
-        let replacement = serde_json::value::to_raw_value(replacement)?;
-        let mut rewritten = false;
-        for (key, value) in &mut self.0 {
-            if key == "session" {
+    /// The top-level fields of `value` as it serializes, with every nested value
+    /// left as the JSON it produced.
+    ///
+    /// For a value built in process, which has no wire JSON of its own to keep.
+    /// Fails when `value` does not serialize as a JSON object.
+    pub fn encode<T>(value: &T) -> Result<Self, serde_json::Error>
+    where
+        T: ?Sized + Serialize,
+    {
+        serde_json::from_str(&serde_json::to_string(value)?)
+    }
+
+    /// The value of `key` decoded as `T`, `None` when the object has no such
+    /// key.
+    ///
+    /// The last occurrence wins for a duplicate key, which is the one a reader
+    /// that parses the object into a map takes. A value that is not a `T`,
+    /// `null` included, is an error rather than a missing field: the field is
+    /// there and says something this cannot read.
+    pub fn get<T>(&self, key: &str) -> Result<Option<T>, serde_json::Error>
+    where
+        T: DeserializeOwned,
+    {
+        self.0
+            .iter()
+            .rev()
+            .find(|(field, _)| field == key)
+            .map(|(_, value)| serde_json::from_str(value.get()))
+            .transpose()
+    }
+
+    /// Names `value` for `key`, so the object carries it afterwards either way:
+    /// every occurrence of an existing key is replaced, and a key that is not
+    /// there is appended.
+    pub fn set<T>(&mut self, key: &str, value: &T) -> Result<(), serde_json::Error>
+    where
+        T: ?Sized + Serialize,
+    {
+        let value = serde_json::value::to_raw_value(value)?;
+        if !self.replace(key, &value) {
+            self.0.push((key.to_string(), value));
+        }
+        Ok(())
+    }
+
+    /// Replaces every occurrence of `key`, reporting whether it found one. A key
+    /// that is not there is not added: this edits an object, it does not extend
+    /// it.
+    fn replace(&mut self, key: &str, replacement: &RawValue) -> bool {
+        let mut replaced = false;
+        for (field, value) in &mut self.0 {
+            if field == key {
                 // No early exit: a duplicate key is malformed for a known kind
                 // and refused at decode, but an unknown frame is forwarded as
                 // it arrived, and a reader downstream may take either
                 // occurrence.
                 replacement.clone_into(value);
-                rewritten = true;
+                replaced = true;
             }
         }
-        Ok(rewritten)
+        replaced
     }
 }
+
+/// Text equality field by field, in order.
+///
+/// What a gateway compares is what it would send, and a peer serializes an
+/// unchanged row the same way twice, so this answers "has anything moved" without
+/// parsing values back. Two structurally equal objects spelled differently do
+/// compare unequal, which costs a republished snapshot and never a wrong one.
+impl PartialEq for RawObject {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len()
+            && std::iter::zip(&self.0, &other.0).all(|((key, value), (other_key, other_value))| {
+                key == other_key && value.get() == other_value.get()
+            })
+    }
+}
+
+impl Eq for RawObject {}
 
 impl<'de> Deserialize<'de> for RawObject {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -1243,6 +1352,10 @@ impl Serialize for RawObject {
         map.end()
     }
 }
+
+/// The field a session-scoped frame names its session in (spec 6.3), and the one
+/// field of a frame a gateway rewrites.
+const SESSION_FIELD: &str = "session";
 
 /// The top-level `session` of a frame's JSON, with every other field skipped.
 ///
@@ -1319,7 +1432,7 @@ impl<'de> Deserialize<'de> for TopLevelKey {
                 E: serde::de::Error,
             {
                 Ok(match key {
-                    "session" => TopLevelKey::Session,
+                    SESSION_FIELD => TopLevelKey::Session,
                     _ => TopLevelKey::Other,
                 })
             }
