@@ -67,13 +67,19 @@ impl Splice {
     /// than a failure a client would have to look for among the frames (spec
     /// 6.5). A host this gateway holds no link to contributes no upstream at all
     /// (see [`AttachGroup::dial`]).
+    ///
+    /// `shutdown` is the serving gateway's own token, and this splice's is a
+    /// child of it: a client that stopped reading never observes a shutdown,
+    /// because its stream is only polled when there is room to write to it, and
+    /// its upstreams have to end anyway.
     pub(crate) async fn open(
         groups: Vec<AttachGroup>,
         reachable: watch::Receiver<Arc<BTreeSet<String>>>,
         directory: watch::Receiver<Arc<Vec<SessionSummary>>>,
         tuning: Tuning,
+        shutdown: &CancellationToken,
     ) -> Result<Self, GatewayError> {
-        let cancel = CancellationToken::new();
+        let cancel = shutdown.child_token();
         // Taken before anything is spawned, so an upstream that will not open
         // takes the ones that already did down with it on the way out.
         let guard = cancel.clone().drop_guard();

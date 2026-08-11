@@ -42,10 +42,7 @@ use crate::gateway::splice::{Outgoing, Splice};
 use crate::gateway::{Gateway, GatewayError};
 use crate::remote::{IdentityError, IdentityGate};
 
-/// How long [`GatewayServer::shutdown`] waits for in-flight streams.
-///
-/// Shutdown ends the streams itself, so this is the bound on a connection that
-/// does not go away even once nothing is being written to it.
+/// How long [`GatewayServer::shutdown`] waits for in-flight connections.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// The largest request body the proxy will carry.
@@ -83,6 +80,12 @@ struct ServerState {
     /// a host, a gateway has nothing else that would close an attached stream, so
     /// without this every shutdown would wait out [`SHUTDOWN_GRACE`] for a
     /// perfectly healthy client.
+    ///
+    /// A client that stopped reading is not told at all: its stream is polled
+    /// only when hyper can write to it, so it observes nothing and its
+    /// connection outlives the grace. What the token still reaches is the splice
+    /// behind it, whose own token is a child of this one, so the upstream streams
+    /// and the subscribers they hold on hosts end either way.
     shutdown: CancellationToken,
 }
 
@@ -146,6 +149,13 @@ impl GatewayServer {
     }
 
     /// Stop accepting and let in-flight streams finish.
+    ///
+    /// The grace is a bound on a connection that does not go away even once
+    /// nothing is being written to it, which is the shape of a client that
+    /// stopped reading: it cannot be told, and the abort ends the accept loop
+    /// rather than the connections it spawned, so it lasts as long as the
+    /// process. Its upstreams are gone before the grace begins (see
+    /// [`ServerState::shutdown`]), which is what the wait was protecting.
     pub(crate) async fn shutdown(self) {
         self.shutdown.cancel();
         let abort = self.serving.abort_handle();
@@ -153,7 +163,10 @@ impl GatewayServer {
             .await
             .is_err()
         {
-            tracing::warn!("giving up on gateway streams still open after {SHUTDOWN_GRACE:?}");
+            tracing::warn!(
+                "giving up on gateway connections still open after {SHUTDOWN_GRACE:?}: \
+                 the upstreams behind them are already released"
+            );
             abort.abort();
         }
     }
@@ -316,7 +329,7 @@ async fn events(
     Query(params): Query<Vec<(String, String)>>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, aj_agent::BoxError>>>, ApiError> {
     let attach = attach_requests(&params)?;
-    let splice = state.gateway.splice(&attach).await?;
+    let splice = state.gateway.splice(&attach, &state.shutdown).await?;
     Ok(Sse::new(client_stream(
         splice,
         state.heartbeat,

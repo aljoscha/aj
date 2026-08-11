@@ -2906,6 +2906,59 @@ async fn a_shutdown_ends_a_spliced_stream_and_its_upstreams() {
     fake.stop();
 }
 
+/// A shutdown releases the upstreams of a client that stopped reading, which is
+/// the client that cannot be told.
+///
+/// Its stream is polled only when there is room to write to it, so it never
+/// observes the shutdown token at all. What ends its upstreams is the token
+/// behind them: the splice's own, a child of the serving port's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shutdown_releases_a_stalled_clients_upstreams() {
+    let resuming = deep_block("s-1", "epoch-1", 800);
+    let deep = resuming.len();
+    let fake = FakeHost::start("fake", Script::Frames(resuming)).await;
+    let fixture = Fixture::over(TempDir::new().expect("tempdir"), vec![fake.address.clone()]).await;
+    fixture.until_connected("fake").await;
+
+    // Attached and then never read from, so every buffer behind the client fills
+    // and the task pumping its upstream parks.
+    let events = fixture.attach(&[attach("fake:s-1")]).await;
+    let stalled = fake.until_stalled().await;
+    assert!(
+        stalled < deep,
+        "the client absorbed {stalled} of {deep} block frames, so it is not stalled \
+         at all and this test measures nothing",
+    );
+
+    // Shut down alongside the wait, because a stalled client's connection costs
+    // the whole grace period and the release must not.
+    let shutting = tokio::spawn(fixture.shutdown());
+    let released = bounded(
+        "the shutdown to release the stalled client's upstream",
+        async {
+            for _ in 0..100 {
+                if fake.released() > 0 {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            false
+        },
+    )
+    .await;
+
+    assert!(
+        released,
+        "the gateway shut down and the host still holds a subscriber for a client \
+         that stopped reading",
+    );
+    bounded("the shutdown to finish", shutting)
+        .await
+        .expect("the shutdown task");
+    drop(events);
+    fake.stop();
+}
+
 // ---------------------------------------------------------------------------
 // Test support for the splice
 // ---------------------------------------------------------------------------

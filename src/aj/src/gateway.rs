@@ -37,6 +37,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use tokio::sync::Mutex as TokioMutex;
+use tokio_util::sync::CancellationToken;
 
 use aj_app::cli::args::{Args, Command, DEFAULT_LISTEN_ADDRESS};
 use aj_app::host::AttachRequest;
@@ -380,7 +381,14 @@ impl Gateway {
 
     /// Open one client's event stream, splicing every session it attached
     /// (spec 7.1).
-    pub(crate) async fn splice(&self, attach: &[AttachRequest]) -> Result<Splice, GatewayError> {
+    ///
+    /// `shutdown` is the serving port's own token: it ends the splice's upstreams
+    /// whether or not the client is still reading (see [`Splice::open`]).
+    pub(crate) async fn splice(
+        &self,
+        attach: &[AttachRequest],
+        shutdown: &CancellationToken,
+    ) -> Result<Splice, GatewayError> {
         // Subscribed before the grouping, so a host that comes up in between is
         // still a change this stream is woken for: the groups are the state the
         // splice compares against, and they are the newer of the two.
@@ -391,6 +399,7 @@ impl Gateway {
             reachable,
             self.inner.directory.subscribe(),
             self.inner.tuning,
+            shutdown,
         )
         .await
     }
@@ -406,8 +415,10 @@ impl Gateway {
 
     /// Stop following every host.
     ///
-    /// Nothing else has to be wound down: a gateway owns no sessions, no locks
-    /// and no logs, which is the whole point of it holding none.
+    /// A gateway owns no sessions, no locks and no logs, which is the whole point
+    /// of it holding none. The client streams it is serving are the serving
+    /// port's: they end, and release the upstreams behind them, on the token
+    /// [`GatewayServer::shutdown`] cancels.
     pub(crate) async fn shutdown(&self) {
         let links: Vec<Link> = {
             let mut held = self.links();
