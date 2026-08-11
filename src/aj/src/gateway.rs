@@ -381,7 +381,7 @@ impl Gateway {
             groups,
             reachable,
             self.inner.directory.subscribe(),
-            self.inner.tuning.outbound_queue,
+            self.inner.tuning,
         )
         .await
     }

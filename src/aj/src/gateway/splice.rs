@@ -22,7 +22,6 @@
 //! involvement.
 
 use std::collections::{BTreeSet, HashSet};
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,11 +29,11 @@ use aj_wire::{DecodedFrame, Frame, SessionSummary};
 use tokio::sync::watch;
 use tokio_util::sync::{CancellationToken, DropGuard};
 
-use crate::gateway::GatewayError;
 use crate::gateway::config::HostAddress;
 use crate::gateway::directory::AttachGroup;
 use crate::gateway::naming::SessionAddress;
 use crate::gateway::outbound::{self, Offered, Sender};
+use crate::gateway::{GatewayError, Tuning};
 use crate::remote::{RemoteClient, RemoteError, RemoteEvents};
 
 /// What one client stream writes next.
@@ -72,13 +71,13 @@ impl Splice {
         groups: Vec<AttachGroup>,
         reachable: watch::Receiver<Arc<BTreeSet<String>>>,
         directory: watch::Receiver<Arc<Vec<SessionSummary>>>,
-        capacity: NonZeroUsize,
+        tuning: Tuning,
     ) -> Result<Self, GatewayError> {
         let cancel = CancellationToken::new();
         // Taken before anything is spawned, so an upstream that will not open
         // takes the ones that already did down with it on the way out.
         let guard = cancel.clone().drop_guard();
-        let (sender, frames) = outbound::channel(capacity, cancel.clone());
+        let (sender, frames) = outbound::channel(tuning.outbound_queue, cancel.clone());
         let mut watched = Vec::new();
         for group in groups {
             watched.push(HostReturn {
@@ -92,7 +91,7 @@ impl Splice {
             let Some(address) = group.dial.clone() else {
                 continue;
             };
-            let events = dial(&address, &group).await?;
+            let events = dial(&address, &group, tuning.upstream_timeout).await?;
             tokio::spawn(pump(
                 Upstream {
                     host_id: group.host_id,
@@ -193,8 +192,20 @@ struct Upstream {
 /// The ids that travel are the host's own and the cursors are the client's,
 /// untouched: the gateway holds no cursors, so what it offers upstream is what
 /// the client offered it (spec 7.1).
-async fn dial(address: &HostAddress, group: &AttachGroup) -> Result<RemoteEvents, GatewayError> {
-    let client = RemoteClient::new(address.url()).map_err(|err| unreachable(address, err))?;
+///
+/// `answer_within` bounds the response head only. The body stays open for as
+/// long as the client is attached, and silence on an open stream is what the
+/// client notices (two missed heartbeats). Without the bound a host that took
+/// the request and said nothing would hold a client of this gateway waiting on
+/// its own stream request for as long as it cared to.
+async fn dial(
+    address: &HostAddress,
+    group: &AttachGroup,
+    answer_within: Duration,
+) -> Result<RemoteEvents, GatewayError> {
+    let client = RemoteClient::new(address.url())
+        .map(|client| client.with_open_timeout(answer_within))
+        .map_err(|err| unreachable(address, err))?;
     client.events(&group.attach).await.map_err(|err| match err {
         // The host's own answer to a client's attach: a session it does not
         // hold, a lock conflict. It travels back with its status and its code,

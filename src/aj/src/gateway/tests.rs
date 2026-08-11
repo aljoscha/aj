@@ -2583,6 +2583,47 @@ async fn a_block_bigger_than_the_bound_does_not_evict_its_own_client() {
     fake.stop();
 }
 
+/// A host that takes a stream request and never answers it is a 503, not a hang:
+/// a client of a gateway must not be held open for as long as a host cares to
+/// stay silent.
+///
+/// This bounds the response *head* only. Once the stream is open, silence is the
+/// client's own business (two missed heartbeats, spec 6.1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_never_answers_an_attach_becomes_a_503() {
+    let fake = FakeHost::start("fake", Script::Mute).await;
+    let fixture = Fixture::tuned(
+        TempDir::new().expect("tempdir"),
+        vec![fake.address.clone()],
+        Tuning {
+            upstream_timeout: Duration::from_millis(300),
+            ..tuning()
+        },
+    )
+    .await;
+    fixture.until_connected("fake").await;
+
+    let started = std::time::Instant::now();
+    let Err(err) = fixture.client.events(&[attach("fake:s-1")]).await else {
+        panic!("a host that answers nothing cannot serve an attach");
+    };
+
+    assert_eq!(
+        err.status(),
+        Some(StatusCode::SERVICE_UNAVAILABLE),
+        "got {err:?}",
+    );
+    assert_eq!(err.code(), Some("host_unreachable"));
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(5),
+        "the splice waited {took:?} on a host it had bounded",
+    );
+
+    fixture.shutdown().await;
+    fake.stop();
+}
+
 /// A client that goes away releases the upstream streams opened for it, so a
 /// host stops paying for a subscriber nobody reads.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2781,6 +2822,9 @@ enum Script {
     Flood { session: String },
     /// Not a stream at all: the host's own refusal of the attach.
     Refuse,
+    /// Nothing at all, not even a response head: the host took the request and
+    /// went quiet.
+    Mute,
 }
 
 /// A stand-in host with a scripted event stream.
@@ -2861,6 +2905,9 @@ impl FakeHost {
                                 )
                                     .into_response();
                             }
+                            if !control && matches!(script, Script::Mute) {
+                                std::future::pending::<()>().await;
+                            }
                             // A control connection carries this host's directory
                             // and then stays open, which is what keeps the
                             // gateway's link to it up.
@@ -2888,7 +2935,9 @@ impl FakeHost {
                                         },
                                         guard,
                                     ),
-                                    Script::Refuse => unreachable!("answered above"),
+                                    Script::Refuse | Script::Mute => {
+                                        unreachable!("answered above")
+                                    }
                                 }
                             };
                             let opening = futures::stream::iter(frames.into_iter().map(|data| {
