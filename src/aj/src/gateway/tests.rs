@@ -2780,6 +2780,77 @@ async fn a_live_frame_from_another_host_does_not_evict_a_client_mid_block() {
     right.stop();
 }
 
+/// Two sessions on one host share one upstream: both blocks are paced, and a
+/// stream that breaks resets both of them (spec 6.5, 6.3).
+///
+/// One pump carries every session a client attached on one host, and two pieces
+/// of its state are per session: the set still being backfilled, and the `reset`
+/// a broken stream owes. Treating either as one session's is invisible with one
+/// session attached, which is all any other test here does. The second block is
+/// deep, because a session dropped out of the paced set is not evicted until its
+/// block meets the live bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_sessions_on_one_host_are_both_paced_and_both_reset() {
+    let backfilled: u64 = 800;
+    let mut script = block("s-1", "epoch-1", 0);
+    script.extend(deep_block("s-2", "epoch-2", backfilled));
+    let deep = script.len();
+    let fake = FakeHost::start("fake", Script::Ends(script)).await;
+    let fixture = Fixture::tuned(
+        TempDir::new().expect("tempdir"),
+        vec![fake.address.clone()],
+        Tuning {
+            outbound_queue: NonZeroUsize::new(2).expect("non-zero"),
+            ..tuning()
+        },
+    )
+    .await;
+    fixture.until_connected("fake").await;
+
+    let mut events = fixture
+        .attach(&[attach("fake:s-1"), attach("fake:s-2")])
+        .await;
+    let stalled = fake.until_stalled().await;
+    assert!(
+        stalled < deep,
+        "the client absorbed {stalled} of {deep} frames, so its queue never reached \
+         the bound and this test measures nothing",
+    );
+
+    let carried = carried_until(&mut events, "both blocks", |carried| {
+        carried.caught_up.len() == 2
+    })
+    .await;
+    assert!(
+        !carried.ended,
+        "the client was evicted mid-block, which is what measuring the second \
+         session's block against the live bound does: {carried:?}",
+    );
+    assert_eq!(
+        carried.caught_up,
+        vec!["fake:s-1".to_string(), "fake:s-2".to_string()],
+    );
+    assert_eq!(
+        carried.events("fake:s-2"),
+        usize::try_from(backfilled).expect("a count that fits"),
+        "and the second session's block arrived whole: {carried:?}",
+    );
+
+    // The host hangs up once its script runs out, which it can only reach after
+    // the client has drained it. Continuity broke for both sessions the stream
+    // carried, so both are told.
+    let mut named = resets(&frames_within(&mut events, QUIET).await);
+    named.sort();
+    assert_eq!(
+        named,
+        vec!["fake:s-1".to_string(), "fake:s-2".to_string()],
+        "a lost upstream resets every session it carried",
+    );
+
+    fixture.shutdown().await;
+    fake.stop();
+}
+
 /// No upstream is pumped before every dial is done (spec 7.1: "returning means
 /// every upstream that could be opened is open").
 ///
