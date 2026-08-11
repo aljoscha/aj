@@ -103,6 +103,11 @@ commit secrets.
   component directly through a helper prove the component, not the
   feature. At least one test per feature must exercise the real
   path end to end (real input bytes, the composed tree).
+- A mutation that survives is a finding, not a formality. Expect the
+  check to change the work: the usual outcome is a test rewritten to
+  reach the real path, or a property nothing was pinning. Report every
+  mutation and its result, including the ones that survived and what
+  you did about them.
 - Test helpers return owning guards (`TempDir`), never bare paths, so
   scratch-space lifetime is compiler-checked. State that must outlive
   a test (leaked runtimes, async reaps) lives in a per-test
