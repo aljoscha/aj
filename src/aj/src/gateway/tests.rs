@@ -2831,10 +2831,12 @@ impl FakeHost {
                                 .map(|(_, value)| value.clone())
                                 .collect();
                             let control = attached.is_empty();
-                            attaches
-                                .lock()
-                                .expect("the attaches mutex is poisoned")
-                                .push(attached);
+                            let spliced = {
+                                let mut held =
+                                    attaches.lock().expect("the attaches mutex is poisoned");
+                                held.push(attached);
+                                held.iter().filter(|attached| !attached.is_empty()).count()
+                            };
                             if !control && matches!(script, Script::Refuse) {
                                 return (
                                     StatusCode::CONFLICT,
@@ -2861,7 +2863,15 @@ impl FakeHost {
                                     Script::Ends(frames) => (frames.clone(), Tail::Ended, guard),
                                     Script::Flood { session } => (
                                         block(session, "epoch-1", 0),
-                                        Tail::Flood(session.clone()),
+                                        // Only the first stream floods. A client
+                                        // that re-attached into an unending one
+                                        // would simply be evicted again, which is
+                                        // not what recovery means.
+                                        if spliced == 1 {
+                                            Tail::Flood(session.clone())
+                                        } else {
+                                            Tail::Held
+                                        },
                                         guard,
                                     ),
                                     Script::Refuse => unreachable!("answered above"),
