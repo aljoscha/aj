@@ -468,3 +468,107 @@ fn reset(session: &str) -> DecodedFrame {
     })
     .expect("a reset frame carries nothing that could fail validation")
 }
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroUsize;
+
+    use futures::FutureExt;
+
+    use super::*;
+    use crate::remote::RemoteClient;
+    use crate::remote::tests::{addr, bounded};
+
+    /// How many times the tie is played out.
+    ///
+    /// Both arms of [`pump`]'s `select!` are ready on its first poll here, and
+    /// `select!` resolves that at random, so the round in which the upstream arm
+    /// wins is the one the guard after the loop exists for. Enough rounds that
+    /// missing it is 2^-64.
+    const ROUNDS: usize = 64;
+
+    /// An upstream that ended in the very poll its host was withdrawn in sends
+    /// no `reset` (spec 7.1).
+    ///
+    /// Both are true at once here, which is a state the enrollment reaches for
+    /// real: the pump is spawned only after every dial, so a withdrawal during
+    /// the dials plus a host that has already closed the stream presents `pump`
+    /// with both on its first poll. Whichever arm wins, the enrollment is gone,
+    /// so a `reset` would ask the client to attach an id this gateway no longer
+    /// resolves, and a refused attach would cost it the sessions it holds on
+    /// every other host (spec 6.5).
+    ///
+    /// The fixture leaves `select!` as the only decider: the stream is driven to
+    /// its end first, so `carry` completes on its first poll without yielding,
+    /// and the token is cancelled before `pump` is polled at all.
+    #[tokio::test]
+    async fn an_upstream_that_ended_as_it_was_withdrawn_sends_no_reset() {
+        let (address, host) = host_with_no_frames().await;
+        let client = RemoteClient::new(address.url()).expect("a client");
+        bounded("the withdrawal to race the end of the stream", async {
+            for round in 0..ROUNDS {
+                let mut events = client.events(&[]).await.expect("a stream");
+                assert!(
+                    events.recv_decoded().await.is_none(),
+                    "round {round}: the stream has to be over before the pump runs, \
+                     or this measures an ordinary read instead of the tie",
+                );
+                let serving = CancellationToken::new();
+                serving.cancel();
+                let cancel = CancellationToken::new();
+                let (queue, mut frames) =
+                    outbound::channel(NonZeroUsize::new(8).expect("non-zero"), cancel.clone());
+
+                pump(
+                    Upstream {
+                        host_id: "left".to_string(),
+                        address: address.clone(),
+                        sessions: vec!["s-1".to_string()],
+                        serving,
+                    },
+                    events,
+                    queue,
+                    cancel,
+                )
+                .await;
+
+                let carried = frames.recv().now_or_never().flatten();
+                assert!(
+                    carried.is_none(),
+                    "round {round}: a withdrawn host's splice asked the client to \
+                     re-attach an id this gateway no longer resolves: {carried:?}",
+                );
+            }
+        })
+        .await;
+        host.abort();
+    }
+
+    /// A host whose event stream is over as soon as it opens.
+    ///
+    /// What makes `carry` complete without yielding: [`RemoteEvents`] marks
+    /// itself done at the end of the stream, so every read after that answers on
+    /// the spot.
+    async fn host_with_no_frames() -> (HostAddress, tokio::task::JoinHandle<()>) {
+        use axum::response::sse::{Event, Sse};
+        use axum::routing::get;
+
+        let app = axum::Router::new().route(
+            "/v1/events",
+            get(|| async {
+                Sse::new(futures::stream::empty::<
+                    Result<Event, std::convert::Infallible>,
+                >())
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(addr("127.0.0.1:0"))
+            .await
+            .expect("bind a loopback port");
+        let bound = listener.local_addr().expect("local addr");
+        let serving = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let address = HostAddress::parse(&format!("http://{bound}")).expect("an address");
+        (address, serving)
+    }
+}
