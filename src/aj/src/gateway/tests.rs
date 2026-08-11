@@ -2085,6 +2085,14 @@ async fn an_unknown_frame_kind_is_forwarded_with_its_session_rewritten() {
     // No `session` at all, which makes it host-scoped: forwarded as it arrived
     // (spec 6.10).
     script.push(r#"{"kind":"something_global","note":"host wide"}"#.to_string());
+    // A host's own `reset`, which a head switch produces (spec 6.3): the gateway
+    // has its own reasons to emit one, and that is no reason to swallow this.
+    script.push(
+        serde_json::to_string(&Frame::Reset {
+            session: "s-1".to_string(),
+        })
+        .expect("a reset frame"),
+    );
     script.push(warning_frame("s-1", "epoch-1", "the frame after it"));
     let fake = FakeHost::start("fake", Script::Frames(script)).await;
     let fixture = Fixture::over(TempDir::new().expect("tempdir"), vec![fake.address.clone()]).await;
@@ -2147,6 +2155,17 @@ async fn an_unknown_frame_kind_is_forwarded_with_its_session_rewritten() {
     assert!(
         !known.iter().any(|frame| matches!(frame, Frame::Heartbeat)),
         "a host's heartbeat is not a client's: {known:?}",
+    );
+    assert_eq!(
+        known
+            .iter()
+            .filter_map(|frame| match frame {
+                Frame::Reset { session } => Some(session.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec!["fake:s-1"],
+        "a host's own reset travels too, namespaced: {known:?}",
     );
     for frame in &known {
         if let Frame::List { sessions } = frame {
