@@ -20,13 +20,12 @@
 //! that stays open is spliced rather than proxied
 //! ([`crate::gateway::splice`]).
 
-use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use aj_app::host::AttachRequest;
-use aj_wire::{Cursor, EnrollHostRequest, ErrorResponse};
+use aj_wire::{Cursor, EnrollHostRequest, ErrorResponse, RawObject};
 use axum::body::{Body as AxumBody, Bytes};
 use axum::extract::{ConnectInfo, FromRequest, Path, Query, Request, State};
 use axum::http::{Method, StatusCode, header};
@@ -37,7 +36,6 @@ use axum::routing::{any, delete, get};
 use axum::{Json, Router, middleware};
 use futures::Stream;
 use serde::de::DeserializeOwned;
-use serde_json::value::RawValue;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -269,7 +267,8 @@ async fn create_session(
     let query = request.uri().query().map(str::to_string);
     let mut body = create_body(read_body(request).await?)?;
     let target = state.gateway.create_target(named_host(&body)?.as_deref())?;
-    set_string_field(&mut body, HOST_FIELD, &target.host_id);
+    body.set(HOST_FIELD, &target.host_id)
+        .expect("a string encodes as JSON");
     let mut url = sessions_url(&target.address).ok_or_else(|| not_a_base_url(&target.address))?;
     url.set_query(query.as_deref());
     let body = serde_json::to_vec(&body).map_err(|err| ApiError {
@@ -312,16 +311,18 @@ fn namespace_created(answer: Answer, target: &HostTarget) -> Result<Response, Ap
             target.address
         ),
     };
-    let mut created: JsonObject =
+    let mut created: RawObject =
         serde_json::from_slice(&answer.body).map_err(|err| unreadable(err.to_string()))?;
-    let id = string_field(&created, CREATED_ID_FIELD)
+    let id = created
+        .get::<String>(CREATED_ID_FIELD)
         .map_err(|err| unreadable(err.to_string()))?
         .ok_or_else(|| unreadable(format!("it names no {CREATED_ID_FIELD}")))?;
-    set_string_field(
-        &mut created,
-        CREATED_ID_FIELD,
-        &SessionAddress::new(&target.host_id, &id).to_string(),
-    );
+    created
+        .set(
+            CREATED_ID_FIELD,
+            &SessionAddress::new(&target.host_id, &id).to_string(),
+        )
+        .expect("a string encodes as JSON");
     let body = serde_json::to_vec(&created).map_err(|err| unreadable(err.to_string()))?;
     Ok(Answer {
         body: Bytes::from(body),
@@ -524,16 +525,17 @@ async fn forward(
 /// The `None` is what separates a refusal this gateway can carry from one it can
 /// only summarize: a proxy's HTML page, an empty body.
 fn namespaced_error(body: &[u8], host_id: &str) -> Option<Bytes> {
-    let mut object: JsonObject = serde_json::from_slice(body).ok()?;
-    let Some(session) = string_field(&object, SESSION_FIELD).ok().flatten() else {
+    let mut object: RawObject = serde_json::from_slice(body).ok()?;
+    let Some(session) = object.get::<String>(SESSION_FIELD).ok().flatten() else {
         // An envelope naming no session is already in every vocabulary.
         return Some(Bytes::copy_from_slice(body));
     };
-    set_string_field(
-        &mut object,
-        SESSION_FIELD,
-        &SessionAddress::new(host_id, &session).to_string(),
-    );
+    object
+        .set(
+            SESSION_FIELD,
+            &SessionAddress::new(host_id, &session).to_string(),
+        )
+        .expect("a string encodes as JSON");
     serde_json::to_vec(&object).ok().map(Bytes::from)
 }
 
@@ -687,55 +689,44 @@ const CREATED_ID_FIELD: &str = "id";
 /// frames use (spec 6.3).
 const SESSION_FIELD: &str = "session";
 
-/// A JSON object held as its top-level fields, every value left unparsed.
-///
-/// The create is the one route where a gateway edits a body rather than
-/// carrying it: it sets the target `host` on the way up and namespaces the
-/// minted `id` on the way back. Keeping every other value as text is what makes
-/// those two the *only* changes, so a field this build does not know travels
-/// with its number literals intact (spec 6.10's forward-don't-filter).
-type JsonObject = BTreeMap<String, Box<RawValue>>;
-
 /// A create body as its top-level fields, with a blank one reading as `{}`.
 ///
 /// The same tolerance the host's own extractor applies, so a create sent with
 /// no body at all reads the same through a gateway as it does against a host. A
 /// body that is not a JSON object is malformed, and saying so here rather than
 /// forwarding it keeps the refusal in one place.
-fn create_body(bytes: Bytes) -> Result<JsonObject, ApiError> {
-    if bytes.iter().all(|byte| byte.is_ascii_whitespace()) {
-        return Ok(JsonObject::new());
-    }
+///
+/// [`RawObject`] is what every body this gateway edits is held as: it owns a
+/// named field or two and keeps everything else as the text it arrived in, so a
+/// field this build does not know travels with its number literals intact, and
+/// a body a host would refuse stays one (spec 6.10's forward-don't-filter).
+fn create_body(bytes: Bytes) -> Result<RawObject, ApiError> {
+    let bytes = if bytes.iter().all(|byte| byte.is_ascii_whitespace()) {
+        Bytes::from_static(b"{}")
+    } else {
+        bytes
+    };
     serde_json::from_slice(&bytes)
         .map_err(|err| ApiError::invalid(format!("malformed request body: {err}")))
 }
 
 /// The host a create names, `None` when it names none (spec 6.6).
 ///
-/// A `null` reads as naming none, which is how the typed body decodes it. A
-/// value that is not a string is a malformed request rather than a host nobody
-/// has: inventing an id from it would refuse the create for the wrong reason.
-fn named_host(body: &JsonObject) -> Result<Option<String>, ApiError> {
-    string_field(body, HOST_FIELD).map_err(|err| {
-        ApiError::invalid(format!(
-            "the create's {HOST_FIELD} field names an enrolled host: {err}"
-        ))
-    })
-}
-
-/// The value of `key` as a string, `None` when the key is absent or `null`.
-fn string_field(object: &JsonObject, key: &str) -> Result<Option<String>, serde_json::Error> {
-    match object.get(key) {
-        None => Ok(None),
-        Some(raw) => serde_json::from_str(raw.get()),
-    }
-}
-
-/// Set `key` to a string, replacing whatever was there.
-fn set_string_field(object: &mut JsonObject, key: &str, value: &str) {
-    // A string always encodes, so the only way this fails is a serializer bug.
-    let value = serde_json::value::to_raw_value(value).expect("a string encodes as JSON");
-    object.insert(key.to_string(), value);
+/// Read as the type [`aj_wire::CreateSessionRequest::host`] has, so a `null`
+/// reads as naming none exactly as the typed body decodes it. A value that is
+/// neither is a malformed request rather than a host nobody has: inventing an
+/// id from it would refuse the create for the wrong reason. A body that names
+/// the field twice reads as the last occurrence, which is the one a reader
+/// parsing it into a map takes, and travels upstream with both: whether a body
+/// like that is a create at all is the host's answer to give.
+fn named_host(body: &RawObject) -> Result<Option<String>, ApiError> {
+    body.get::<Option<String>>(HOST_FIELD)
+        .map(Option::flatten)
+        .map_err(|err| {
+            ApiError::invalid(format!(
+                "the create's {HOST_FIELD} field names an enrolled host: {err}"
+            ))
+        })
 }
 
 /// A JSON request body with the protocol's error shape for a malformed one.
@@ -1023,12 +1014,29 @@ mod tests {
             br#"{"tag":"fix-auth","added_later":{"n":18446744073709551616}}"#,
         ))
         .expect("an object");
-        set_string_field(&mut body, HOST_FIELD, "left");
+        body.set(HOST_FIELD, "left").expect("a string encodes");
         let forwarded = serde_json::to_string(&body).expect("it re-encodes");
         assert!(forwarded.contains(r#""host":"left""#), "{forwarded}");
         assert!(
             forwarded.contains("18446744073709551616"),
             "a field this gateway does not know keeps its own number literal: {forwarded}",
+        );
+
+        // A key the body repeats is the host's to refuse, so it travels with
+        // both occurrences and the gateway's own field written over each of
+        // them. Collapsing them here would make a body the host refuses into
+        // one it accepts.
+        let mut body = create_body(Bytes::from_static(br#"{"host":"a","host":"b"}"#))
+            .expect("a duplicate key is still an object");
+        assert_eq!(
+            named_host(&body).expect("a host").as_deref(),
+            Some("b"),
+            "the occurrence a reader parsing this into a map would take",
+        );
+        body.set(HOST_FIELD, "left").expect("a string encodes");
+        assert_eq!(
+            serde_json::to_string(&body).expect("it re-encodes"),
+            r#"{"host":"left","host":"left"}"#,
         );
     }
 

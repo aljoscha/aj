@@ -2113,6 +2113,51 @@ async fn a_hosts_own_create_refusal_travels_back() {
     host.stop().await;
 }
 
+/// A create body a host refuses is refused through a gateway too (spec 6.10,
+/// 7.1).
+///
+/// A gateway edits the body for the one field it owns and normalizes nothing
+/// else, so a duplicate key reaches the host that judges it. Collapsing the two
+/// occurrences would launder a body the host refuses into one it accepts, which
+/// is a client getting a different answer for having a gateway in the path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_body_that_repeats_a_key_is_the_hosts_to_refuse() {
+    let mut host = Upstream::start().await;
+    let fixture = Fixture::new(&[&host]).await;
+    fixture.until_connected(&host.host_id()).await;
+    let body = format!(r#"{{"host":"{id}","host":"{id}"}}"#, id = host.host_id());
+
+    let direct = fixture
+        .http
+        .post(format!("{}/v1/sessions", host.address()))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body.clone())
+        .send()
+        .await
+        .expect("the create request");
+    let refused = direct.status();
+    assert_eq!(
+        refused,
+        StatusCode::BAD_REQUEST,
+        "the host refuses this body, and this measures nothing unless it does",
+    );
+
+    let response = fixture.create(&body).await;
+
+    let status = response.status();
+    assert!(
+        host.session_ids().await.is_empty(),
+        "the gateway created a session from a body this host refuses (answered {status})",
+    );
+    assert_eq!(
+        status, refused,
+        "the same body: {refused} against the host, {status} through the gateway",
+    );
+
+    fixture.shutdown().await;
+    host.stop().await;
+}
+
 /// The one route a [`Recorder`] refuses, so a test can watch an error body cross
 /// the proxy.
 const REFUSED_ROUTE: &str = "refuse";
