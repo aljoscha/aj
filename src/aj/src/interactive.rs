@@ -16856,8 +16856,8 @@ mod tests {
         assert!(
             strip_labels(&shell)
                 .iter()
-                .any(|label| label.starts_with("ship-it")),
-            "and the strip paints it: {:?}",
+                .any(|label| label.ends_with(" ship-it")),
+            "and the strip paints it beside the time: {:?}",
             strip_labels(&shell),
         );
         shut_down(&world).await;
@@ -17245,10 +17245,10 @@ mod tests {
         )
     }
 
-    /// A tagged row paints its tag and its time of day, the tag leading and
-    /// the time dim against the label field's right edge. Two sessions can
-    /// carry one tag and the time is what places a row in the sitting, so the
-    /// row shows both rather than trading one for the other.
+    /// A tagged row paints its time of day in the leading column and its tag
+    /// beside it. Two sessions can carry one tag and the time is what places a
+    /// row in the sitting, so the row shows both, and the time keeps the
+    /// column whatever the tag is.
     ///
     /// Read off the composed frame, so a strip left out of the layout, or one
     /// whose field the shell lays out differently, fails here.
@@ -17269,20 +17269,20 @@ mod tests {
             ],
         );
         let cells = strip_lines_painted(&shell);
-        assert_eq!(strip_line_text(&cells, 0), "▌  fix-auth      19-07 │");
+        assert_eq!(strip_line_text(&cells, 0), "▌  19-07-19 fix-auth   │");
         assert_eq!(
             strip_line_text(&cells, 1),
-            "   rewrite-the-… 18-40 │",
-            "an over-long tag elides and leaves the time its place",
+            "   18-40-49 rewrite-t… │",
+            "an over-long tag elides inside its own column",
         );
         let styles = strip_styles(&shell);
         assert_eq!(
             cells[0][3].style, styles.accent,
-            "the focused row's tag carries the working-set brightness",
+            "the focused row's time carries the working-set brightness",
         );
         assert_eq!(
-            cells[0][17].style, styles.dim,
-            "and the time beside it is dim on the very same line",
+            cells[0][12].style, styles.accent,
+            "and so does its tag, on the very same line",
         );
     }
 

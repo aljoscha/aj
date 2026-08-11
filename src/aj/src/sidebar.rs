@@ -32,9 +32,9 @@
 //! attached brightness, and that is the intended reading too: you have it
 //! open and its host cannot be reached.
 //!
-//! The label field itself carries two things where a session is tagged. The
-//! tag leads, and the time of day drops to the field's right edge in dim (see
-//! [`SidebarRow::label`]).
+//! The label field itself is two columns. The id-derived label leads (a
+//! minted id's time of day), and the tag the user gave the session
+//! supplements it to the right (see [`SidebarRow::label`]).
 //!
 //! Layout is a pure function, [`strip_lines`], producing one [`StripLine`] per
 //! drawn line, and drawing is a dumb map over its result. The height
@@ -69,9 +69,9 @@ use crate::transcript::TranscriptStyles;
 /// Fixed rather than proportional: a strip that grew with the terminal would
 /// take width from the transcript for nothing. The columns go one to the focus
 /// marker, one to the status glyph, one to a space, the rest to the label, and
-/// the last two to a pad and the separator rule. Sized so a hand-written tag
-/// reads without eliding, which is most of what the strip is for once sessions
-/// carry names, and still leaves the time of day its place beside one.
+/// the last two to a pad and the separator rule. Sized so the time of day
+/// keeps its column and a hand-written tag still reads without eliding beside
+/// it, which is most of what the strip is for once sessions carry names.
 pub(crate) const SIDEBAR_COLS: u16 = 24;
 
 /// Terminal width below which the strip holds itself back.
@@ -97,9 +97,14 @@ fn label_cols(width: u16) -> usize {
     usize::from(width.saturating_sub(5))
 }
 
-/// Columns between a tag and the time of day beside it, so the two never run
+/// Columns the id-derived label takes where a tag shares the field: the width
+/// of a minted id's `HH-MM-SS` time of day, which is what the column carries
+/// on every session the app itself named.
+const ID_COLS: usize = 8;
+
+/// Columns between the id label and a tag beside it, so the two never run
 /// together into one word.
-const TAG_TIME_GAP: usize = 1;
+const ID_TAG_GAP: usize = 1;
 
 /// What a row's glyph says about its session, in the order a row that could
 /// claim several of these should claim one (spec 6.8, 9.2).
@@ -199,63 +204,35 @@ impl SidebarRow {
         }
     }
 
-    /// What the row shows in a label field of `cols` columns.
+    /// What the row shows in a label field of `cols` columns: the id-derived
+    /// label in a fixed leading column, then the tag.
     ///
-    /// A tag leads, and the time of day drops to the field's right edge
-    /// rather than off the row. Both are wanted: the time is the strip's
-    /// temporal anchor, and a tag does not identify a session (two sessions
-    /// can carry the same one), so neither has a claim to evict the other.
-    fn label(&self, cols: usize) -> RowLabel {
+    /// The id column is what the strip is scanned down, so it holds one width
+    /// and one place on every row and a tag supplements it rather than
+    /// displacing it. A tag does not identify a session either (two can carry
+    /// the same one), which is the other half of why it cannot have the
+    /// column.
+    ///
+    /// A row with no tag has nothing to its right to hold the column against,
+    /// so its label spreads over the whole field. That is what keeps a
+    /// hand-named session, whose label is a filename rather than a time of
+    /// day, readable.
+    fn label(&self, cols: usize) -> String {
         let Some(tag) = &self.tag else {
-            return RowLabel::plain(&session_label(&self.id, cols), cols);
+            return field(&session_label(&self.id, cols), cols);
         };
-        // Only a minted id carries a time to show, and the seconds go with
-        // it: minute precision is enough to place a row in the sitting, which
-        // is all the time is doing here, and the columns it saves go to the
-        // tag.
-        //
-        // The time rides along only where the field can hold it and still
-        // leave the tag something. A strip squeezed narrower than that keeps
-        // the tag, which is what the user named the session for.
-        let time = minted_time(&self.id)
-            .map(|[hour, minute, _]| format!("{hour}-{minute}"))
-            .filter(|time| width_of(time) + TAG_TIME_GAP < cols);
-        let (time_cols, gap) = time
-            .as_deref()
-            .map_or((0, 0), |time| (width_of(time), TAG_TIME_GAP));
+        let id_cols = cols.min(ID_COLS);
+        let id = session_label(&self.id, id_cols);
+        if cols <= id_cols + ID_TAG_GAP {
+            // Too narrow to hold a tag column at all. The tag is what drops:
+            // half a time of day would leave every row's anchor unreadable,
+            // and the strip is orientation before it is names.
+            return field(&id, cols);
+        }
         // A tag reads left to right, so an over-long one keeps its head and
-        // says so with an ellipsis. An id is the other way round: what
-        // distinguishes one is its tail (see [`session_label`]).
-        //
-        // The gap comes out of the tag rather than out of the field's
-        // padding, so a tag long enough to fill its room still does not run
-        // into the time.
-        let tag = elide_to_cols(&one_line(tag), cols - time_cols - gap);
-        RowLabel {
-            lead: field(&tag, cols - time_cols),
-            time,
-        }
-    }
-}
-
-/// What a line writes into its label field, laid out and ready to draw. The
-/// parts together occupy exactly the field's columns, which is what keeps the
-/// separator in its own column whatever a session is named.
-struct RowLabel {
-    /// The text the field leads with, padded out to what the time leaves it.
-    lead: String,
-    /// The time of day at the field's right edge, drawn dim. `None` where the
-    /// lead has the whole field.
-    time: Option<String>,
-}
-
-impl RowLabel {
-    /// A label whose lead fills the field on its own.
-    fn plain(text: &str, cols: usize) -> Self {
-        Self {
-            lead: field(text, cols),
-            time: None,
-        }
+        // says so with an ellipsis (`field` elides). An id is the other way
+        // round: what distinguishes one is its tail (see [`session_label`]).
+        field(&format!("{} {}", field(&id, id_cols), one_line(tag)), cols)
     }
 }
 
@@ -928,7 +905,7 @@ impl SessionSidebar {
                 " ",
                 "~",
                 dim,
-                RowLabel::plain(&header_field(host, *unreachable, cols), cols),
+                field(&header_field(host, *unreachable, cols), cols),
                 dim,
             ),
             StripLine::Session { index } => {
@@ -941,14 +918,10 @@ impl SessionSidebar {
                     self.label_style(row),
                 )
             }
-            StripLine::Overflow { hidden } => (
-                " ",
-                " ",
-                dim,
-                RowLabel::plain(&format!("…{hidden} more"), cols),
-                dim,
-            ),
-            StripLine::New => (" ", "+", dim, RowLabel::plain("new", cols), dim),
+            StripLine::Overflow { hidden } => {
+                (" ", " ", dim, field(&format!("…{hidden} more"), cols), dim)
+            }
+            StripLine::New => (" ", "+", dim, field("new", cols), dim),
         };
         // The band reaches the pad and stops short of the separator, which
         // belongs to the rule down the strip's edge rather than to any row.
@@ -962,21 +935,17 @@ impl SessionSidebar {
                 style
             }
         };
-        let mut spans = vec![
+        // The whole label field carries one brightness, the tag included:
+        // brightness answers where the row sits in the working set, and a
+        // part of the field that did not move with it would look like a
+        // second answer to the same question.
+        vec![
             span(marker, tint(self.styles.accent)),
             span(glyph, tint(glyph_style)),
-            span(&format!(" {}", label.lead), tint(label_style)),
-        ];
-        // The time is dim on every row, whatever brightness the lead carries.
-        // The working-set axis is read by comparing one row's lead against
-        // another's, and a time that brightened with its row would put a
-        // second thing in the field claiming to answer the same question.
-        if let Some(time) = &label.time {
-            spans.push(span(time, tint(dim)));
-        }
-        spans.push(span(" ", tint(dim)));
-        spans.push(span(SEPARATOR, dim));
-        spans
+            span(&format!(" {label}"), tint(label_style)),
+            span(" ", tint(dim)),
+            span(SEPARATOR, dim),
+        ]
     }
 
     /// A line below the last drawn one: nothing but the separator, which runs
@@ -1168,7 +1137,7 @@ mod tests {
     fn a_control_character_cannot_split_a_row() {
         let label = session_label("first\nsecond", 12);
         assert!(!label.contains('\n'), "{label:?} would break the row");
-        let tagged = field_text(&row("session-1").tag("first\nsecond").build(), 12);
+        let tagged = row("session-1").tag("first\nsecond").build().label(12);
         assert!(!tagged.contains('\n'), "{tagged:?} would break the row");
         assert!(
             !header_field("first\nsecond", false, 19).contains('\n'),
@@ -1639,89 +1608,72 @@ mod tests {
         assert_eq!(drawn(&strip_lines(&rows, 4, None), &rows), vec!["a", "b"]);
     }
 
-    /// A row's label field as it is drawn, the two parts run together, which
-    /// is what a reader sees on the line.
-    fn field_text(row: &SidebarRow, cols: usize) -> String {
-        let label = row.label(cols);
-        format!("{}{}", label.lead, label.time.unwrap_or_default())
+    /// The minted id every layout test reads its time of day out of.
+    const MINTED: &str = "2026-08-06-19-07-19-368";
+
+    /// The time column holds one width and one place on every row: a tag
+    /// supplements it to the right and never displaces it. That is what makes
+    /// the column scannable, and it is why the tag is the part that elides.
+    #[test]
+    fn the_time_column_is_the_same_on_a_tagged_and_an_untagged_row() {
+        let untagged = row(MINTED).build().label(19);
+        assert_eq!(untagged, field("19-07-19", 19));
+        for tag in ["", "fix-auth", "rewrite-the-gateway-provisioner", "会話"] {
+            let tagged = row(MINTED).tag(tag).build().label(19);
+            assert!(
+                tagged.starts_with("19-07-19 "),
+                "{tag:?} moved the time column: {tagged:?}",
+            );
+            assert_eq!(width_of(&tagged), 19, "{tag:?} overran the field");
+        }
     }
 
-    /// A row shows the name the user gave it, and an over-long one keeps its
-    /// head and says it was cut.
+    /// An untagged row lays out exactly as it did before tags existed: with
+    /// nothing to its right holding the column, the id label has the whole
+    /// field, which is what keeps a hand-named session readable.
     #[test]
-    fn a_tag_is_shown_in_place_of_the_id() {
-        let tagged = row("2026-08-06-19-07-19-368").tag("fix-auth").build();
-        assert_eq!(tagged.label(19).lead.trim_end(), "fix-auth");
+    fn an_untagged_row_has_the_whole_field() {
+        for id in [MINTED, "notes-on-the-rust-borrow-checker-draft"] {
+            assert_eq!(
+                row(id).build().label(19),
+                field(&session_label(id, 19), 19),
+                "{id:?} did not lay out as a plain label",
+            );
+        }
+    }
+
+    /// A row shows the name the user gave it in the column beside the time,
+    /// and an over-long one keeps its head and says it was cut.
+    #[test]
+    fn a_tag_takes_the_column_beside_the_time() {
         assert_eq!(
-            row("2026-08-06-19-07-19-368").build().label(19).lead,
-            field("19-07-19", 19),
-            "an untagged row falls back to the id-derived label",
+            row(MINTED).tag("fix-auth").build().label(19),
+            "19-07-19 fix-auth  "
         );
-        let long = row("session-1")
-            .tag("rewrite-the-gateway-provisioner")
-            .build();
-        assert_eq!(long.label(19).lead, "rewrite-the-gatewa…");
+        // Ten columns is what the field leaves a tag, and a tag that fills
+        // them exactly is not cut.
         assert_eq!(
-            width_of(&long.label(19).lead),
+            row(MINTED).tag("ten-column").build().label(19),
+            "19-07-19 ten-column"
+        );
+        let long = row(MINTED).tag("rewrite-the-gateway-provisioner").build();
+        assert_eq!(long.label(19), "19-07-19 rewrite-t\u{2026}");
+        assert_eq!(
+            width_of(&long.label(19)),
             19,
-            "the ellipsis is inside the budget, not beside it",
+            "the ellipsis is inside the tag's column, not beside it",
         );
     }
 
-    /// A tag does not evict the time of day, it moves it: the tag leads and
-    /// the time takes the field's right edge, so a row still says when its
-    /// session was minted. Two sessions can carry one tag, and the time is
-    /// what places a row in the sitting, so neither can have the other's
-    /// columns.
+    /// A hand-renamed session has no time of day to show, so its id label
+    /// takes the column the time would have had. The column means "which
+    /// session" on every row, and a tag never moves it.
     #[test]
-    fn a_tag_shows_beside_the_time_rather_than_instead_of_it() {
-        let tagged = row("2026-08-06-19-07-19-368").tag("fix-auth").build();
-        let label = tagged.label(19);
-        assert_eq!(label.time.as_deref(), Some("19-07"));
-        assert_eq!(
-            field_text(&tagged, 19),
-            "fix-auth      19-07",
-            "the tag leads and the time is against the right edge",
-        );
-        assert_eq!(
-            width_of(&field_text(&tagged, 19)),
-            19,
-            "and the two together are exactly the field",
-        );
-
-        assert_eq!(
-            row("2026-08-06-19-07-19-368").build().label(19).time,
-            None,
-            "an untagged row's lead already is the time",
-        );
-    }
-
-    /// The tag has first claim on the columns: it elides at the room it is
-    /// left, and the time keeps its own place rather than being pushed off by
-    /// a long name.
-    #[test]
-    fn an_over_long_tag_elides_and_the_time_survives_it() {
-        let long = row("2026-08-06-19-07-19-368")
-            .tag("rewrite-the-gateway-provisioner")
-            .build();
-        assert_eq!(field_text(&long, 19), "rewrite-the-… 19-07");
-        assert_eq!(width_of(&field_text(&long, 19)), 19);
-
-        // A tag long enough to fill its room still does not touch the time.
-        let exact = row("2026-08-06-19-07-19-368").tag("thirteen-cols").build();
-        assert_eq!(field_text(&exact, 19), "thirteen-cols 19-07");
-    }
-
-    /// A hand-renamed session has no time of day in its id, so a tag on one
-    /// takes the whole field rather than sitting beside a fragment of a
-    /// filename.
-    #[test]
-    fn a_tag_on_a_hand_named_session_has_the_field_to_itself() {
+    fn a_hand_named_session_keeps_the_id_column() {
         let named = row("notes-on-the-rust-borrow-checker-draft")
             .tag("fix-auth")
             .build();
-        assert_eq!(named.label(19).time, None);
-        assert_eq!(field_text(&named, 19), field("fix-auth", 19));
+        assert_eq!(named.label(19), "er-draft fix-auth  ");
     }
 
     /// A tag of wide graphemes is budgeted in display columns, so it cannot
@@ -1736,39 +1688,48 @@ mod tests {
             "🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀",
             "🚀-会話-e\u{301}-🚀-会話",
         ] {
-            for cols in [9, 19] {
-                let wide = row("2026-08-06-19-07-19-368").tag(tag).build();
-                let drawn = field_text(&wide, cols);
+            for cols in [9, 12, 19] {
+                let drawn = row(MINTED).tag(tag).build().label(cols);
                 assert_eq!(
                     width_of(&drawn),
                     cols,
                     "{tag:?} in {cols} columns drew {drawn:?}",
                 );
                 assert!(
-                    drawn.ends_with("19-07"),
-                    "and the time kept the right edge: {drawn:?}",
+                    drawn.starts_with("19-07-19"),
+                    "and the time kept its column: {drawn:?}",
                 );
             }
         }
-        let wide = row("session-1").tag("会話ノート記録帳の下書き").build();
-        let lead = wide.label(9).lead;
-        assert!(lead.ends_with('…'), "and it says it was cut: {lead:?}");
+        let cut = row(MINTED).tag("会話ノート記録").build().label(19);
+        assert!(
+            cut.trim_end().ends_with('\u{2026}'),
+            "and it says it was cut: {cut:?}",
+        );
     }
 
-    /// A field too narrow to hold both keeps the tag. The tag is what the
-    /// user named the session for, and half a time of day says nothing.
+    /// A field with no room for a tag column keeps the time. The time is the
+    /// column the rest of the strip is read against, and a tag that pushed it
+    /// out of one row would cost every row its anchor.
     #[test]
-    fn a_field_too_narrow_for_both_keeps_the_tag() {
-        let tagged = row("2026-08-06-19-07-19-368").tag("fix-auth").build();
-        assert_eq!(tagged.label(6).time, None, "five columns and a gap is six");
-        assert_eq!(field_text(&tagged, 6), "fix-a…");
+    fn a_field_too_narrow_for_a_tag_keeps_the_time() {
+        let tagged = row(MINTED).tag("fix-auth").build();
         assert_eq!(
-            tagged.label(7).time.as_deref(),
-            Some("19-07"),
-            "one more column and the time fits beside a tag",
+            tagged.label(9),
+            "19-07-19 ",
+            "eight columns and the gap leave a tag nothing",
         );
-        assert_eq!(field_text(&tagged, 7), "… 19-07");
-        assert_eq!(field_text(&tagged, 0), "", "and nothing fits in nothing");
+        assert_eq!(
+            tagged.label(10),
+            "19-07-19 \u{2026}",
+            "one more column and the tag says it is there",
+        );
+        assert_eq!(
+            tagged.label(4),
+            row(MINTED).build().label(4),
+            "and a field too narrow for the time itself cuts it the same way",
+        );
+        assert_eq!(tagged.label(0), "", "and nothing fits in nothing");
     }
 
     /// Whatever a field is handed, it comes out exactly as wide as it was
@@ -1919,8 +1880,8 @@ mod tests {
     }
 
     /// Every column of the strip, drawn: the focus marker left of the status
-    /// glyph so the two never contend for one cell, the label field with a
-    /// tag leading and the time of day against its right edge, and the
+    /// glyph so the two never contend for one cell, the label field with the
+    /// time of day in its leading column and a tag beside it, and the
     /// separator running the strip's full height whether or not there is a
     /// line beside it.
     #[test]
@@ -1946,8 +1907,8 @@ mod tests {
             painted(rows, 7),
             vec![
                 " ~ builder-1 ───────── │",
-                "▌  fix-auth      19-07 │",
-                " * eval-run            │",
+                "▌  19-07-19 fix-auth   │",
+                " * s-2      eval-run   │",
                 " ~ laptop ──────── ! ─ │",
                 " ! 18-40-49            │",
                 " + new                 │",
@@ -1968,7 +1929,7 @@ mod tests {
                 .focused()
                 .build(),
         ];
-        assert_eq!(painted(rows, 2)[0], "▌* busy                │");
+        assert_eq!(painted(rows, 2)[0], "▌* s-1      busy       │");
     }
 
     /// The glyph says what a session is doing and nothing else. Three rows all
@@ -2004,11 +1965,15 @@ mod tests {
         assert_ne!(labels[0], labels[2], "focused and listed: {labels:?}");
     }
 
-    /// The dim time does not join the working-set axis. Rows of different
-    /// brightness carry the same dim time, so what the client holds open is
-    /// still read off the leads alone.
+    /// The label field answers the working-set question with one brightness
+    /// across both its columns: the time and the tag alike take the row's own.
+    /// A part of the field pinned to a style of its own would read as a second
+    /// answer to a question the field already answers.
+    ///
+    /// The drawn cells also pin where the time column sits, which is the same
+    /// eight columns on every row.
     #[test]
-    fn the_time_beside_a_tag_is_dim_whatever_the_row_is() {
+    fn the_label_field_carries_one_brightness() {
         let rows = vec![
             row("2026-08-06-19-07-19-368")
                 .tag("on-screen")
@@ -2018,19 +1983,18 @@ mod tests {
         ];
         let cells = painted_cells(rows, 4);
         let styles = styles();
-        assert_eq!(cells[0][3].style, styles.accent, "the focused row's tag");
-        assert_eq!(cells[1][3].style, styles.dim, "and the listed row's");
-        // Columns 17 to 21 are the field's last five: the time's own place.
-        for (line, expected) in [(0, "19-07"), (1, "18-40")] {
-            let time: String = cells[line][17..22]
+        // The field starts at column 3: marker, glyph, space. Its time takes
+        // columns 3 to 10, the gap column 11, and the tag starts at 12.
+        for (line, style, what) in [(0, styles.accent, "focused"), (1, styles.dim, "listed")] {
+            assert_eq!(cells[line][3].style, style, "the {what} row's time");
+            assert_eq!(cells[line][12].style, style, "and its tag");
+        }
+        for (line, expected) in [(0, "19-07-19"), (1, "18-40-49")] {
+            let time: String = cells[line][3..11]
                 .iter()
                 .map(|cell| cell.char.grapheme())
                 .collect();
-            assert_eq!(time, expected, "line {line} drew the wrong five columns");
-            assert_eq!(
-                cells[line][17].style, styles.dim,
-                "line {line} drew {time:?} in the lead's brightness",
-            );
+            assert_eq!(time, expected, "line {line} drew the wrong eight columns");
         }
     }
 
