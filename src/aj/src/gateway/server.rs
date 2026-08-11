@@ -263,10 +263,15 @@ async fn create_session(
     request: Request,
 ) -> Result<Response, ApiError> {
     let content_type = forwarded_content_type(&request);
+    // Read before the body, which consumes the request. Carried for the same
+    // reason the proxy carries one: a parameter this build does not know is not
+    // this gateway's to drop (spec 6.10).
+    let query = request.uri().query().map(str::to_string);
     let mut body = create_body(read_body(request).await?)?;
     let target = state.gateway.create_target(named_host(&body)?.as_deref())?;
     set_string_field(&mut body, HOST_FIELD, &target.host_id);
-    let url = sessions_url(&target.address).ok_or_else(|| not_a_base_url(&target.address))?;
+    let mut url = sessions_url(&target.address).ok_or_else(|| not_a_base_url(&target.address))?;
+    url.set_query(query.as_deref());
     let body = serde_json::to_vec(&body).map_err(|err| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         code: "internal",

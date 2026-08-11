@@ -405,8 +405,18 @@ impl Fixture {
     /// Create a session, sending `body` verbatim, so a test can send a field
     /// this build does not know and a number no float holds.
     async fn create(&self, body: &str) -> reqwest::Response {
+        self.create_with_query("", body).await
+    }
+
+    /// The same with `query` (no `?`) on the request: a create's parameters are
+    /// as much the client's as its body (spec 6.10).
+    async fn create_with_query(&self, query: &str, body: &str) -> reqwest::Response {
+        let separator = if query.is_empty() { "" } else { "?" };
         self.http
-            .post(format!("{}/v1/sessions", self.server.url()))
+            .post(format!(
+                "{}/v1/sessions{separator}{query}",
+                self.server.url()
+            ))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body.to_string())
             .send()
@@ -1726,10 +1736,18 @@ async fn the_forwarded_create_names_the_target_in_its_own_vocabulary() {
     fixture.until_connected("recorder").await;
 
     let response = fixture
-        .create(r#"{"tag":"fix-auth","added_later":{"n":18446744073709551616}}"#)
+        .create_with_query(
+            "newer=1",
+            r#"{"tag":"fix-auth","added_later":{"n":18446744073709551616}}"#,
+        )
         .await;
 
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        recorder.create_queries(),
+        vec![Some("newer=1".to_string())],
+        "a parameter this build does not know is not this gateway's to drop",
+    );
     let created: SessionCreated = response.json().await.expect("a created body");
     let sent = recorder.recorded();
     let body: serde_json::Value =
@@ -1838,6 +1856,9 @@ const REFUSED_ROUTE: &str = "refuse";
 struct Recorder {
     address: HostAddress,
     creates: Arc<StdMutex<Vec<String>>>,
+    /// The query string of every create it was sent, `None` for one that carried
+    /// none.
+    create_queries: Arc<StdMutex<Vec<Option<String>>>>,
     proxied: Arc<StdMutex<Vec<String>>>,
     serving: tokio::task::JoinHandle<()>,
 }
@@ -1861,6 +1882,8 @@ impl Recorder {
         use axum::routing::{get, post};
 
         let creates: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let create_queries: Arc<StdMutex<Vec<Option<String>>>> =
+            Arc::new(StdMutex::new(Vec::new()));
         let proxied: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
         let hello = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
@@ -1899,9 +1922,15 @@ impl Recorder {
                 "/v1/sessions",
                 post({
                     let creates = Arc::clone(&creates);
-                    move |body: String| {
+                    let create_queries = Arc::clone(&create_queries);
+                    move |uri: axum::http::Uri, body: String| {
                         let creates = Arc::clone(&creates);
+                        let create_queries = Arc::clone(&create_queries);
                         async move {
+                            create_queries
+                                .lock()
+                                .expect("the queries mutex is poisoned")
+                                .push(uri.query().map(str::to_string));
                             let mut held = creates.lock().expect("the creates mutex is poisoned");
                             held.push(body);
                             axum::Json(
@@ -1955,6 +1984,7 @@ impl Recorder {
         Self {
             address: HostAddress::parse(&format!("http://{bound}")).expect("an address"),
             creates,
+            create_queries,
             proxied,
             serving,
         }
@@ -1965,6 +1995,14 @@ impl Recorder {
         self.proxied
             .lock()
             .expect("the proxied mutex is poisoned")
+            .clone()
+    }
+
+    /// The query string of every create this recorder was sent.
+    fn create_queries(&self) -> Vec<Option<String>> {
+        self.create_queries
+            .lock()
+            .expect("the queries mutex is poisoned")
             .clone()
     }
 
