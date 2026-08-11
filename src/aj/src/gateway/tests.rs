@@ -2082,6 +2082,9 @@ async fn an_unknown_frame_kind_is_forwarded_with_its_session_rewritten() {
         r#"{"kind":"something_newer","session":"s-1","payload":{"n":18446744073709551616}}"#
             .to_string(),
     );
+    // No `session` at all, which makes it host-scoped: forwarded as it arrived
+    // (spec 6.10).
+    script.push(r#"{"kind":"something_global","note":"host wide"}"#.to_string());
     script.push(warning_frame("s-1", "epoch-1", "the frame after it"));
     let fake = FakeHost::start("fake", Script::Frames(script)).await;
     let fixture = Fixture::over(TempDir::new().expect("tempdir"), vec![fake.address.clone()]).await;
@@ -2098,8 +2101,8 @@ async fn an_unknown_frame_kind_is_forwarded_with_its_session_rewritten() {
         .iter()
         .filter(|frame| matches!(frame, DecodedFrame::Unknown { .. }))
         .collect();
-    let [forwarded] = unknown[..] else {
-        panic!("the unknown kind was filtered out rather than forwarded: {seen:?}");
+    let [forwarded, host_scoped] = unknown[..] else {
+        panic!("an unknown kind was filtered out rather than forwarded: {seen:?}");
     };
     let DecodedFrame::Unknown { kind, raw } = forwarded else {
         unreachable!("filtered on the variant");
@@ -2118,6 +2121,20 @@ async fn an_unknown_frame_kind_is_forwarded_with_its_session_rewritten() {
         raw.get().contains("18446744073709551616"),
         "and its payload travels verbatim, number literals included: {}",
         raw.get(),
+    );
+    let DecodedFrame::Unknown {
+        kind: host_kind,
+        raw: host_raw,
+    } = host_scoped
+    else {
+        unreachable!("filtered on the variant");
+    };
+    assert_eq!(host_kind, "something_global");
+    assert!(
+        host_raw.get().contains("host wide"),
+        "an unknown kind that names no session is host-scoped, and travels as it \
+         arrived: {}",
+        host_raw.get(),
     );
 
     let known: Vec<&Frame> = seen
