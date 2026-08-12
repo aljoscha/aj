@@ -7,7 +7,7 @@
 
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
 use aj_agent::tool::{TaskKind, TaskOutputSource, TaskRead, TaskStatus};
@@ -38,6 +38,13 @@ const DEADLINE: Duration = Duration::from_secs(20);
 /// Long enough for the host's `list` debounce to publish whatever it had
 /// coalesced, so a test can tell "nothing more is coming" from "not yet".
 const LIST_SETTLE: Duration = Duration::from_millis(600);
+
+/// The host's `list` coalescing window, which is private to the host.
+///
+/// Only used to turn a measured burst duration into how many frames that
+/// burst is allowed to produce, so a host that lengthens its window still
+/// passes and one that shortens it has to move this too.
+const LIST_WINDOW: Duration = Duration::from_millis(200);
 
 /// A host over a temp sessions store, plus the store handles a test needs
 /// to look behind the host's back (the lock, the on-disk log).
@@ -5889,8 +5896,14 @@ async fn settled(harness: &Harness, session: &str, last_seq: u64) {
 
 /// `list` frames carry the whole directory with per-session status, and a
 /// busy turn does not produce one frame per event.
+///
+/// The frame count says nothing about the coalescing tick. A streaming turn's
+/// events leave the directory payload untouched between durable appends, so
+/// what holds the count down here is the unchanged-payload rule. The tick's
+/// own contract is
+/// [`distinct_directories_inside_one_window_reach_a_client_as_one_frame`].
 #[tokio::test]
-async fn list_frames_carry_the_directory_and_are_debounced() {
+async fn list_frames_carry_the_directory_and_not_one_per_event() {
     let harness = Harness::with_provider(scripted(
         vec![finalized_text_message(
             "a long answer streamed one character at a time so the event count is high",
@@ -5948,6 +5961,135 @@ async fn list_frames_carry_the_directory_and_are_debounced() {
     assert!(
         summary.last_seq.is_some_and(|seq| seq > 0),
         "a live row reports the position the host holds",
+    );
+    harness.host.shutdown().await;
+}
+
+/// How many labels [`distinct_directories_inside_one_window_reach_a_client_as_one_frame`]
+/// sets, one directory change each.
+///
+/// Enough that a publisher chasing every change could not stay under the
+/// frame bound, few enough that the paced burst still fits inside one window.
+const RELABELS: usize = 24;
+
+/// How long the burst waits between labels.
+///
+/// A directory does not change faster than the work that changes it, so the
+/// burst is paced rather than tight. The pace is also what makes the tick
+/// visible at all: a publisher without one needs a moment per change to run,
+/// and a tight loop starves it into coalescing by accident.
+const RELABEL_STEP: Duration = Duration::from_millis(5);
+
+/// Directory states that differ from one another, arriving inside one
+/// coalescing window, reach a reading client as a single `list` frame
+/// carrying the last of them (spec 6.8).
+///
+/// This is the coalescing tick's own contract and nothing else's. Every label
+/// below is distinct, so every directory the publisher composes is a payload
+/// this client has not seen and the unchanged-payload rule turns none of them
+/// away. Relabelling is the cheapest change that moves a row: it appends no
+/// log entry and publishes no `state` frame, so the burst costs two syscalls
+/// and a channel round trip per label rather than a model.
+///
+/// The client has to be reading while the burst runs, which is why the burst
+/// is on a task of its own. A queued `list` frame is superseded in place by
+/// the next one, so a client that only drains at the end sees one frame
+/// whatever the publisher did, and the tick would be unobservable.
+///
+/// The timing assumption is that the burst spans far fewer coalescing windows
+/// than it has labels. Wall clock enters only through that ratio, which the
+/// guard below asserts rather than assumes: a machine loaded enough to
+/// stretch the burst past it fails loudly instead of passing on a bound it
+/// would meet with or without the tick.
+#[tokio::test]
+async fn distinct_directories_inside_one_window_reach_a_client_as_one_frame() {
+    let harness = Harness::new(Vec::new());
+    let session = harness.create().await;
+    let mut stream = harness
+        .host
+        .attach(&[attach_request(&session)])
+        .await
+        .expect("attach");
+    frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+    // Creating and attaching marked the directory dirty. Let the publisher
+    // finish with that and park, so the burst opens a window of its own
+    // instead of landing in the tail of one already running.
+    tokio::time::sleep(LIST_SETTLE).await;
+    drained(&mut stream);
+
+    let host = harness.host.clone();
+    let id = session.clone();
+    let burst = tokio::spawn(async move {
+        let start = Instant::now();
+        for index in 0..RELABELS {
+            host.command(
+                &id,
+                Command::Tag {
+                    tag: Some(format!("label-{index}")),
+                },
+            )
+            .await
+            .expect("the label is accepted");
+            tokio::time::sleep(RELABEL_STEP).await;
+        }
+        start.elapsed()
+    });
+
+    let last = format!("label-{}", RELABELS - 1);
+    let mut frames = frames_until(&mut stream, "the last label to be published", |frame| {
+        matches!(frame, Frame::List { sessions, .. }
+            if sessions
+                .iter()
+                .any(|row| row.id == session && row.tag.as_deref() == Some(last.as_str())))
+    })
+    .await;
+    let burst = bounded("the relabelling to finish", burst)
+        .await
+        .expect("the relabelling task");
+    // Whatever the tick was still holding when the last label landed.
+    tokio::time::sleep(LIST_SETTLE).await;
+    frames.extend(drained(&mut stream));
+
+    let labels: Vec<Option<String>> = directories(&frames)
+        .iter()
+        .map(|rows| {
+            rows.iter()
+                .find(|row| row.id == session)
+                .and_then(|row| row.tag.clone())
+        })
+        .collect();
+
+    let windows = usize::try_from(burst.as_millis() / LIST_WINDOW.as_millis())
+        .expect("a burst of at most a few hundred windows");
+    // One frame per window the burst spanned, one for the window that carries
+    // its tail, and one for a boundary landing between two labels.
+    let allowed = windows + 2;
+    // A stretched burst spans windows of its own, and one frame per window is
+    // what a publisher produces with or without the tick, so past this ratio
+    // the bound below is met either way.
+    assert!(
+        allowed * 2 <= RELABELS,
+        "setting {RELABELS} labels took {burst:?}, which spans {windows} \
+         coalescing windows and allows {allowed} frames: this machine is too \
+         loaded to tell a coalesced burst from an uncoalesced one, so this \
+         test measures nothing",
+    );
+    assert!(
+        labels.len() <= allowed,
+        "{} list frames for {RELABELS} directory changes made in {burst:?}: \
+         a client is being sent a frame per change rather than one per \
+         coalescing window, and these are the labels it got: {labels:?}",
+        labels.len(),
+    );
+    assert_eq!(
+        labels.last(),
+        Some(&Some(last)),
+        "the frame that survives the window reports the directory as it stands \
+         at the end of the window, not as it stood when the tick woke: \
+         {labels:?}",
     );
     harness.host.shutdown().await;
 }
