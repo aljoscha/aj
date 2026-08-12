@@ -3352,12 +3352,14 @@ async fn a_reattach_after_a_restart_resumes_fully_when_the_epoch_changed() {
 
 /// Removing an enrollment is active teardown, not bookkeeping (spec 7.1): the
 /// host's rows leave the merged list, its upstream connections close, and its
-/// splices end. Leaving them running would serve a directory that contradicts
-/// the enrollment set.
+/// splices end with the `reset` a withdrawal owes them. Leaving them running
+/// would serve a directory that contradicts the enrollment set.
 ///
 /// Two hosts on one client stream, because a client's attach set spans hosts,
 /// so ending one host's splice must not cost that client the sessions it holds
-/// on the others, and must not ask it to re-attach ids that no longer resolve.
+/// on the others, and the `reset` must name the withdrawn host's sessions and
+/// no others: a client that re-attached everything it holds would take a
+/// perfectly healthy session through a needless full backfill.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_withdrawal_ends_that_hosts_splices_and_leaves_the_others_alone() {
     let cue = Arc::new(tokio::sync::Notify::new());
@@ -3408,6 +3410,24 @@ async fn a_withdrawal_ends_that_hosts_splices_and_leaves_the_others_alone() {
         StatusCode::NO_CONTENT,
     );
 
+    // The `reset` the withdrawal owes, naming the withdrawn host's session and
+    // that one alone (spec 7.1): continuity for it is over, and re-attaching is
+    // how the client is told what became of it (spec 6.5).
+    let torn_down = carried_until(&mut events, "the reset a withdrawal owes", |carried| {
+        !carried.resets.is_empty()
+    })
+    .await;
+    assert_eq!(
+        torn_down.resets,
+        vec!["leaving:s-1".to_string()],
+        "a withdrawal reset something other than the sessions of the host it \
+         withdrew: {torn_down:?}",
+    );
+    assert!(
+        !torn_down.ended,
+        "the client's whole stream ended over one host's withdrawal: {torn_down:?}",
+    );
+
     bounded("the withdrawn host's upstream to close", async {
         while leaving.released() == 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3422,8 +3442,8 @@ async fn a_withdrawal_ends_that_hosts_splices_and_leaves_the_others_alone() {
     );
 
     // The client is still there and still served: a live frame from the host
-    // that stayed, which also bounds the window a `reset` would have arrived in,
-    // since the pump queues one the moment its upstream ends.
+    // that stayed, which also bounds the window a second `reset` would have
+    // arrived in.
     cue.notify_one();
     let carried = carried_until(
         &mut events,
@@ -3437,9 +3457,7 @@ async fn a_withdrawal_ends_that_hosts_splices_and_leaves_the_others_alone() {
     );
     assert!(
         carried.resets.is_empty(),
-        "a withdrawal asked the client to attach ids this gateway no longer \
-         resolves (see the `splice` module docs, which own that decision): \
-         {carried:?}",
+        "the withdrawal reset a session on the host it left alone: {carried:?}",
     );
 
     // And the directory says the same thing the teardown did.
@@ -3478,6 +3496,119 @@ async fn a_withdrawal_ends_that_hosts_splices_and_leaves_the_others_alone() {
         .expect_err("a session on a withdrawn host names nothing here");
     assert_eq!(err.status(), Some(StatusCode::NOT_FOUND), "got {err:?}");
     assert_eq!(err.code(), Some("unknown_session"));
+
+    fixture.shutdown().await;
+    leaving.stop();
+    staying.stop();
+}
+
+/// The whole sequence a withdrawal sets off (spec 7.1): `reset`, re-attach,
+/// per-session refusal, the attachment dropped, healthy hosts untouched.
+///
+/// The refusal being per session is what makes the `reset` safe to send at all.
+/// One that failed the client's stream would cost it every session it holds on
+/// every other host, so the re-attach here names a session on the host that
+/// stayed as well: that one has to be served on the same stream that refuses the
+/// withdrawn one, and nothing more may arrive for the id that was refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_re_attach_after_a_withdrawal_is_refused_for_that_session_alone() {
+    let leaving = FakeHost::start("leaving", Script::Frames(block("s-1", "epoch-1", 0))).await;
+    let staying = FakeHost::start("staying", Script::Frames(block("s-9", "epoch-9", 0))).await;
+    // Enrolled over the wire: a configured host is the file's to remove.
+    let fixture = Fixture::new(&[]).await;
+    for host in [&leaving, &staying] {
+        assert_eq!(
+            fixture.enroll(&host.address.to_string()).await.status(),
+            StatusCode::OK,
+        );
+    }
+    fixture.until_connected("leaving").await;
+    fixture.until_connected("staying").await;
+    let mut events = fixture
+        .attach(&[attach("leaving:s-1"), attach("staying:s-9")])
+        .await;
+    let opened = carried_until(&mut events, "both attach blocks", |carried| {
+        carried.caught_up.len() == 2
+    })
+    .await;
+    assert_eq!(
+        leaving.spliced_attaches().len(),
+        1,
+        "the upstream whose end owes this reset was never opened: {opened:?}",
+    );
+
+    assert_eq!(
+        fixture.withdraw("leaving").await.status(),
+        StatusCode::NO_CONTENT,
+    );
+    let torn_down = carried_until(&mut events, "the reset a withdrawal owes", |carried| {
+        !carried.resets.is_empty()
+    })
+    .await;
+    assert_eq!(torn_down.resets, vec!["leaving:s-1".to_string()]);
+
+    // What a client does with a `reset`: reopen the stream naming the session it
+    // was sent for. It names everything it holds, because changing the attach
+    // set means reopening the stream (spec 6.5), so its healthy session travels
+    // with the refused one.
+    let mut resumed = fixture
+        .client
+        .events(&[attach("leaving:s-1"), attach("staying:s-9")])
+        .await
+        .expect(
+            "the re-attach failed the client's whole stream over one withdrawn \
+             host, which costs it the sessions it holds on every other one",
+        );
+    let served = frames_until(
+        &mut resumed,
+        "the block for the host that stayed",
+        |frame| matches!(frame, Frame::CaughtUp { .. }),
+    )
+    .await;
+    assert_eq!(
+        served
+            .iter()
+            .filter_map(|frame| match frame {
+                Frame::CaughtUp { session, .. } => Some(session.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec!["staying:s-9"],
+        "the host that was never withdrawn was not served: {served:?}",
+    );
+    let Some(Frame::Error {
+        session,
+        epoch,
+        code,
+        message,
+    }) = served
+        .iter()
+        .find(|frame| matches!(frame, Frame::Error { .. }))
+    else {
+        panic!("the re-attach of a withdrawn host's session is refused: {served:?}");
+    };
+    assert_eq!(session, "leaving:s-1", "named as the client named it");
+    assert_eq!(code, "unknown_session");
+    assert_eq!(
+        *epoch, None,
+        "nothing resolved, so no epoch was ever minted for it here",
+    );
+    assert!(
+        message.contains("no host leaving is enrolled here"),
+        "the refusal says why: {message}",
+    );
+
+    // And that is the end of it: an attachment this gateway refused carries
+    // nothing afterwards, so the client that dropped it misses nothing.
+    let after = frames_within(&mut resumed, QUIET).await;
+    assert_eq!(
+        named_sessions(&after)
+            .into_iter()
+            .filter(|session| session.starts_with("leaving:"))
+            .collect::<Vec<_>>(),
+        Vec::<&str>::new(),
+        "the refused attachment went on carrying frames: {after:?}",
+    );
 
     fixture.shutdown().await;
     leaving.stop();

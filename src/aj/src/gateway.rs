@@ -378,10 +378,10 @@ impl Gateway {
     ///    record does not stand, and one written ahead has nothing to put back;
     /// 2. the enrollment and its rows leave the directory, in one publish, so
     ///    nothing serves a directory that contradicts the enrolled set;
-    /// 3. the streams spliced onto that host end, without a `reset`: the
-    ///    re-attach a `reset` asks for would be refused now that the namespace is
-    ///    gone (see [`crate::gateway::splice`], which owns that decision and what
-    ///    the per-session refusal changes about it);
+    /// 3. the streams spliced onto that host end, with the `reset` a withdrawal
+    ///    owes them: the client re-attaches, the ids it names no longer resolve
+    ///    here, and each is refused with its own `error` frame (see
+    ///    [`crate::gateway::splice`], which owns that decision);
     /// 4. the control link stops, awaited, so a withdrawal that has answered has
     ///    nothing left dialing that host.
     ///

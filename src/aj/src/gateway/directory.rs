@@ -172,14 +172,14 @@ pub(crate) struct Withdrawn {
 }
 
 impl Withdrawn {
-    /// End the streams spliced onto this host.
+    /// End the streams spliced onto this host, with the `reset` a withdrawal
+    /// owes them.
     ///
-    /// Not a `reset` today: that asks the client to attach again, and these ids
-    /// no longer resolve here, so the re-attach would be refused. What the
-    /// client is told instead is the directory, where the host's rows and its
-    /// group are gone. Spec 7.1 has the withdrawal owing that `reset` all the
-    /// same, which is safe now that a refusal costs a client only the session it
-    /// names (see [`crate::gateway::splice`]).
+    /// That `reset` asks the client to attach again, and the ids it names no
+    /// longer resolve here, so each is refused with its own `error` frame and
+    /// costs it that attachment and nothing else (spec 6.5). The directory,
+    /// where this host's rows and its group are gone, says the same thing. See
+    /// [`crate::gateway::splice`], which owns the frame.
     pub(crate) fn end_splices(&self) {
         self.serving.cancel();
     }

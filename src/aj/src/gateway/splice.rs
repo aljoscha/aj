@@ -21,16 +21,15 @@
 //! and full when it did not, inherited from the host protocol with no gateway
 //! involvement.
 //!
-//! The one end that is not a drop is a withdrawal: the host stops being this
-//! gateway's, so its upstream ends and its sessions are *not* reset. The client
-//! learns it from the directory, where that host's rows and its group are gone.
-//!
-//! TODO(aljoscha): spec 7.1 has a withdrawal owing those sessions a `reset`,
-//! whose re-attach the gateway then refuses per session. What stood in the way
-//! was that a refused attach failed the client's whole stream, so the `reset`
-//! would have cost it every session on every other host. That is no longer the
-//! case (spec 6.5), so the `reset` is safe to emit and belongs with the
-//! cached-id work, which needs the same edge.
+//! The one end that is not a break in continuity is a withdrawal, and it ends
+//! the same way all the same, `reset` included: the host has stopped being this
+//! gateway's, so the client is asked to re-attach, and what its re-attach finds
+//! is the difference between the two. A withdrawn host's ids resolve to nothing
+//! here, so each is refused with its own `error` frame (spec 6.5), which costs
+//! that client the one attachment and nothing else. That is what makes the
+//! `reset` safe to send: a client attached across several hosts keeps its stream
+//! and every other host's sessions through it, and the directory, where the
+//! withdrawn host's rows and its group are gone, confirms what the refusal said.
 
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::sync::Arc;
@@ -306,10 +305,10 @@ fn unreachable(address: &HostAddress, source: RemoteError) -> GatewayError {
 
 /// Forward one host's frames to one client until the stream ends.
 ///
-/// A withdrawal ends this without a `reset`, which is the one way this stream
-/// stops that is not a break in continuity: the host is not this gateway's any
-/// more, its rows are out of the merged directory, and the ids a `reset` would
-/// have the client offer back no longer resolve here (see the module docs).
+/// However it ends, the sessions it carried are owed a `reset`: continuity for
+/// them is over whether the host dropped the stream or its enrollment was
+/// withdrawn under it, and only the re-attach that `reset` asks for tells the
+/// two apart (see the module docs).
 ///
 /// The whole loop races the withdrawal, not just the read: a pump pacing an
 /// attach block is parked on the client's queue, and a signal it only saw
@@ -321,20 +320,15 @@ async fn pump(
     cancel: CancellationToken,
 ) {
     let ended = tokio::select! {
-        _ = upstream.serving.cancelled() => return,
+        _ = upstream.serving.cancelled() => Some("its host's enrollment was withdrawn".to_string()),
         ended = carry(&upstream, &mut events, &queue, &cancel) => ended,
     };
+    // `None` is the client this stream was for going away, and a client that is
+    // gone is owed nothing.
     let Some(ended) = ended else {
         return;
     };
     tracing::info!("the spliced stream to {} ended: {ended}", upstream.address);
-    // A withdrawal that landed as this stream ended anyway: both are ready at
-    // once and the select above picked this arm, which says nothing about which
-    // happened first. The enrollment is gone either way, so there is nobody left
-    // to re-attach to.
-    if upstream.serving.is_cancelled() {
-        return;
-    }
     // Continuity is broken for exactly the sessions this stream carried, and
     // this gateway does not resume them itself (see the module docs).
     for session in &upstream.sessions {
@@ -544,20 +538,22 @@ mod tests {
     const ROUNDS: usize = 64;
 
     /// An upstream that ended in the very poll its host was withdrawn in sends
-    /// no `reset` (spec 7.1).
+    /// its `reset` all the same (spec 7.1).
     ///
     /// Both are true at once here, which is a state the enrollment reaches for
     /// real: the pump is spawned only after every dial, so a withdrawal during
     /// the dials plus a host that has already closed the stream presents `pump`
-    /// with both on its first poll. Whichever arm wins, the enrollment is gone,
-    /// so a `reset` would ask the client to attach an id this gateway no longer
-    /// resolves (see the module docs, which own that decision).
+    /// with both on its first poll. Whichever arm wins, continuity for the
+    /// sessions this stream carried is over, so the client is asked to re-attach
+    /// and its re-attach is answered per session (see the module docs, which own
+    /// that decision). The tie is what would make the two arms disagree, so it is
+    /// played out rather than reasoned about.
     ///
     /// The fixture leaves `select!` as the only decider: the stream is driven to
     /// its end first, so `carry` completes on its first poll without yielding,
     /// and the token is cancelled before `pump` is polled at all.
     #[tokio::test]
-    async fn an_upstream_that_ended_as_it_was_withdrawn_sends_no_reset() {
+    async fn an_upstream_that_ended_as_it_was_withdrawn_sends_its_reset_anyway() {
         let (address, host) = host_with_no_frames().await;
         let client = RemoteClient::new(address.url()).expect("a client");
         bounded("the withdrawal to race the end of the stream", async {
@@ -587,11 +583,21 @@ mod tests {
                 )
                 .await;
 
-                let carried = frames.recv().now_or_never().flatten();
+                let carried: Vec<DecodedFrame> =
+                    std::iter::from_fn(|| frames.recv().now_or_never().flatten()).collect();
+                assert_eq!(
+                    carried.len(),
+                    1,
+                    "round {round}: the arm that won decided whether this client \
+                     was told its sessions need re-attaching: {carried:?}",
+                );
                 assert!(
-                    carried.is_none(),
-                    "round {round}: a withdrawn host's splice asked the client to \
-                     re-attach an id this gateway no longer resolves: {carried:?}",
+                    matches!(
+                        &carried[0],
+                        DecodedFrame::Known(known)
+                            if matches!(known.value(), Frame::Reset { session } if session == "left:s-1"),
+                    ),
+                    "round {round}: {carried:?}",
                 );
             }
         })
