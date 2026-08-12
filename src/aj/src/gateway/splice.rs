@@ -75,7 +75,8 @@ impl Splice {
     /// attach block is already on its way, so a refusal is an HTTP status rather
     /// than a failure a client would have to look for among the frames (spec
     /// 6.5). A host this gateway holds no link to contributes no upstream at all
-    /// (see [`AttachGroup::dial`]).
+    /// (see [`AttachGroup::dial`]), and so does one withdrawn while this was
+    /// dialing it.
     ///
     /// `shutdown` is the serving gateway's own token, and this splice's is a
     /// child of it: a client that stopped reading never observes a shutdown,
@@ -107,7 +108,17 @@ impl Splice {
             let Some(address) = group.dial.clone() else {
                 continue;
             };
-            let events = dial(&address, &group, tuning.upstream_timeout).await?;
+            // Raced against the withdrawal, because a dial is bounded by
+            // `upstream_timeout` and the dials are sequential: waiting one out on
+            // a host that is no longer this gateway's would hold up every other
+            // host on this stream, answer the client after the withdrawal already
+            // has, and end in a timeout, which is a 503 for the whole stream
+            // rather than the "contributes no upstream" a withdrawn host owes it
+            // (spec 7.1).
+            let events = tokio::select! {
+                _ = group.serving.cancelled() => continue,
+                events = dial(&address, &group, tuning.upstream_timeout) => events?,
+            };
             opened.push((
                 Upstream {
                     host_id: group.host_id,

@@ -3340,6 +3340,101 @@ async fn a_withdrawal_ends_that_hosts_splices_and_leaves_the_others_alone() {
     staying.stop();
 }
 
+/// A withdrawal interrupts an in-flight dial to the host being withdrawn, rather
+/// than waiting it out (spec 7.1: a withdrawal that has answered has nothing left
+/// dialing that host).
+///
+/// The dials of one client's stream are sequential and each is bounded by the
+/// upstream timeout, so a host that takes the request and sits on the response
+/// head holds that whole stream open. If the enrollment behind that dial is
+/// withdrawn meanwhile, waiting the dial out costs the client every session it
+/// holds, on every host: the dial ends in a timeout, a timeout is not a refusal
+/// the host made, and the stream request answers 503 for all of them. Racing the
+/// dial against the withdrawal instead leaves the withdrawn host contributing no
+/// upstream, which is the same thing an unreachable host contributes.
+///
+/// Two hosts, because that collateral is the point, and the withdrawn one sorts
+/// first so its dial is the one in flight when the withdrawal lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_withdrawal_interrupts_the_dial_of_the_host_it_withdraws() {
+    // Never notified: this host takes the attach and never answers its head.
+    let held = Arc::new(tokio::sync::Notify::new());
+    let leaving = FakeHost::start(
+        "leaving",
+        Script::CuedHead {
+            cue: Arc::clone(&held),
+            frames: block("s-1", "epoch-1", 0),
+        },
+    )
+    .await;
+    let staying = FakeHost::start("staying", Script::Frames(block("s-9", "epoch-9", 0))).await;
+    let fixture = Fixture::tuned(
+        TempDir::new().expect("tempdir"),
+        Vec::new(),
+        Tuning {
+            // Short only so that the failure this pins is quick: waiting the dial
+            // out is what the test is about, not how long the wait is.
+            upstream_timeout: Duration::from_secs(3),
+            ..tuning()
+        },
+    )
+    .await;
+    for host in [&leaving, &staying] {
+        assert_eq!(
+            fixture.enroll(&host.address.to_string()).await.status(),
+            StatusCode::OK,
+        );
+    }
+    fixture.until_connected("leaving").await;
+    fixture.until_connected("staying").await;
+
+    let attaching = [attach("leaving:s-1"), attach("staying:s-9")];
+    let (stream, withdrawn) = tokio::join!(fixture.client.events(&attaching), async {
+        bounded("the withdrawn host's dial to be in flight", async {
+            while leaving.spliced_attaches().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            staying.spliced_attaches().is_empty(),
+            "the dials had already moved past the host being withdrawn, so \
+                 there is no in-flight dial here to interrupt: {:?}",
+            staying.spliced_attaches(),
+        );
+        fixture.withdraw("leaving").await
+    },);
+
+    assert_eq!(withdrawn.status(), StatusCode::NO_CONTENT);
+    let mut events = stream.unwrap_or_else(|err| {
+        panic!(
+            "the client's whole stream was refused because this gateway waited \
+             out a dial to a host it had already forgotten: {err:?}"
+        )
+    });
+    let carried = carried_until(
+        &mut events,
+        "the block of the host that stayed",
+        |carried| !carried.caught_up.is_empty(),
+    )
+    .await;
+    assert_eq!(
+        carried.caught_up,
+        vec!["staying:s-9".to_string()],
+        "the sessions of the host that stayed are served as usual: {carried:?}",
+    );
+    assert!(
+        carried.resets.is_empty() && carried.events("leaving:s-1") == 0,
+        "and the withdrawn host contributes no upstream and no re-attach, the \
+         same as a host this gateway cannot reach: {carried:?}",
+    );
+
+    drop(events);
+    fixture.shutdown().await;
+    leaving.stop();
+    staying.stop();
+}
+
 /// A withdrawal reaches a client that has stopped reading, whose upstream is
 /// parked mid-block waiting for room in that client's queue (spec 6.9's pacing).
 ///
