@@ -14,8 +14,8 @@
 //!   stream and re-attaches with a cursor. The no-fault comparisons use the
 //!   full canonical form, the seeded cut sweep uses its convergent tier
 //!   (spec 11.2). The hand-placed cuts further down stay on the full form:
-//!   their scripts raise no transient, so the stronger tier holds and there
-//!   is no reason to give it up.
+//!   no transient goes missing across those cuts, so the stronger tier
+//!   holds and there is no reason to give it up.
 //!
 //! Every wait is bounded by [`DEADLINE`], so a wedged host fails a test
 //! instead of hanging CI.
@@ -3087,13 +3087,19 @@ async fn converges_after_a_cut(scenario: CutScenario, cut: usize) -> CutRun {
 fn missed_transients(remote: &CanonicalState, oracle: &CanonicalState) -> Vec<CanonicalEntry> {
     let mut missed = Vec::new();
     for agent in &oracle.agents {
-        let held = remote
+        // Taken from `held` as they match, so an oracle holding two
+        // identical notices where the client came back with one still
+        // reports the one it lost.
+        let mut held = remote
             .agent(agent.agent)
             .map(transients)
             .unwrap_or_default();
         for entry in transients(agent) {
-            if !held.contains(&entry) {
-                missed.push(entry.clone());
+            match held.iter().position(|candidate| *candidate == entry) {
+                Some(index) => {
+                    held.remove(index);
+                }
+                None => missed.push(entry.clone()),
             }
         }
     }
