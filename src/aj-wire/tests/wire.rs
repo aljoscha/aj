@@ -456,6 +456,14 @@ fn locally_constructed_known_values_serialize_from_typed_data() {
     );
 }
 
+/// Every frame kind is pinned to a fixture on both the paths that write one: the
+/// JSON a wire-decoded frame retains and forwards, and the encoder a locally
+/// built frame writes from its typed value. That contract is the one
+/// `DecodedFrame::session` and `DecodedFrame::rows` read on.
+///
+/// Only the second reaches `FrameRef`. Re-serializing the decoded frame alone
+/// hands back the bytes the fixture was read from, which is identity whatever
+/// the encoder does with it.
 #[test]
 fn every_frame_kind_has_a_pinned_round_trip_fixture() {
     let fixtures = fixture("frames")
@@ -471,8 +479,29 @@ fn every_frame_kind_has_a_pinned_round_trip_fixture() {
             panic!("expected known frame");
         };
         actual_kinds.insert(frame_kind(known.value()));
-        let actual = serde_json::to_value(frame).expect("frame re-serializes");
-        assert_eq!(actual, expected);
+
+        let local = DecodedFrame::try_from(known.value().clone())
+            .unwrap_or_else(|error| panic!("failed to rebuild {expected}: {error}"));
+        let DecodedFrame::Known(rebuilt) = &local else {
+            panic!("expected known frame");
+        };
+        assert!(
+            rebuilt.raw_json().is_none(),
+            "the rebuilt frame retained JSON of its own, so both halves of this \
+             test read the same bytes back and neither reaches the encoder: \
+             {expected}",
+        );
+        let written = serde_json::to_value(&local).expect("the rebuilt frame serializes");
+        assert_eq!(
+            written, expected,
+            "this build writes a frame of this kind in a shape the fixture does \
+             not pin",
+        );
+        let forwarded = serde_json::to_value(&frame).expect("frame re-serializes");
+        assert_eq!(
+            forwarded, expected,
+            "a frame decoded from the wire did not forward the bytes it arrived as",
+        );
     }
 
     assert_eq!(
