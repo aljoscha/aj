@@ -3246,12 +3246,12 @@ async fn a_withdrawal_ends_the_upstream_of_a_client_that_stopped_reading() {
 }
 
 /// A withdrawal the gateway cannot write down does not stand, and neither does
-/// any part of its teardown: the enrollment is back with the rows it had, and
+/// any part of its teardown: the enrollment is there with the rows it had, and
 /// the client watching that host is still being served.
 ///
-/// The order this pins is the reason it holds: nothing is torn down until the
-/// withdrawal is recorded, because a teardown is not a thing a rollback can
-/// undo.
+/// The order this pins is the reason it holds: the withdrawal is written down
+/// before the directory is touched, so a write that fails has nothing to put
+/// back and nothing was ever torn down.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_withdrawal_that_was_not_recorded_leaves_the_splices_alone() {
     let cue = Arc::new(tokio::sync::Notify::new());
@@ -3302,7 +3302,7 @@ async fn a_withdrawal_that_was_not_recorded_leaves_the_splices_alone() {
             .collect::<Vec<_>>(),
         vec!["fake:s-1".to_string()],
         "with the rows it had: this host says nothing further, so a directory \
-         put back empty would stay empty",
+         emptied and refilled would stay empty",
     );
 
     cue.notify_one();
@@ -3315,7 +3315,74 @@ async fn a_withdrawal_that_was_not_recorded_leaves_the_splices_alone() {
         0,
         "the splice was torn down for a withdrawal that did not happen: {carried:?}",
     );
-    assert!(!carried.ended && carried.resets.is_empty(), "{carried:?}");
+    assert!(
+        carried.resets.is_empty(),
+        "a withdrawal that did not happen asked this client to attach its \
+         sessions again: {carried:?}",
+    );
+    assert!(
+        !carried.ended,
+        "and its whole stream ended over it: {carried:?}",
+    );
+
+    std::fs::remove_dir(&state).expect("unstage");
+    fixture.shutdown().await;
+    fake.stop();
+}
+
+/// The same refusal from the other side: a withdrawal that was not recorded
+/// publishes *nothing*, because it never mutated anything.
+///
+/// The reachability channel is where "put it back exactly as it was" is not
+/// enough. A `watch` cannot retract a value a receiver has already read, so a
+/// withdrawal that mutated first and rolled back afterwards presents every
+/// splice on that host with a down edge and then an up edge for a host that
+/// never went anywhere, and an up edge is what a splice answers with a `reset`
+/// (spec 7.1, and `a_reattach_while_a_host_is_down_waits_for_it_to_return` for
+/// the other half of that chain). Whether a given splice observes it is down to
+/// the scheduler, which is why the assertion here is on the channel: the edge is
+/// either published or it is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_withdrawal_that_was_not_recorded_publishes_nothing() {
+    let fake = FakeHost::start("fake", Script::Frames(block("s-1", "epoch-1", 0))).await;
+    let fixture = Fixture::new(&[]).await;
+    assert_eq!(
+        fixture.enroll(&fake.address.to_string()).await.status(),
+        StatusCode::OK,
+    );
+    fixture.until_connected("fake").await;
+    fixture.row("fake:s-1").await;
+
+    // Subscribed once the host has settled, and a receiver counts its current
+    // value as seen, so any wake from here on is this withdrawal's.
+    let directory = &fixture.gateway.inner.directory;
+    let reachable = directory.reachable();
+    let merged = directory.subscribe();
+    assert!(
+        reachable.borrow().contains("fake"),
+        "the host has to be in the reachable set going in, or a channel that \
+         stays quiet says nothing about the edge this is looking for",
+    );
+
+    // A directory where the state file goes, so the write that records the
+    // withdrawal cannot land.
+    let state = fixture.state.path().join("hosts.json");
+    std::fs::remove_file(&state).expect("the recorded enrollment");
+    std::fs::create_dir(&state).expect("stage an unwritable state file");
+    let (status, _, _) = refusal(fixture.withdraw("fake").await).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    assert!(
+        !reachable.has_changed().expect("the directory is alive"),
+        "a withdrawal that did not happen took the host out of the reachable \
+         set and put it back, and every splice on it that saw both edges asks \
+         its client to re-attach the sessions it holds there",
+    );
+    assert!(
+        !merged.has_changed().expect("the directory is alive"),
+        "and it republished the merged directory twice over a set that never \
+         changed (spec 6.8)",
+    );
 
     std::fs::remove_dir(&state).expect("unstage");
     fixture.shutdown().await;

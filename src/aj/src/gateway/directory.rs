@@ -161,15 +161,15 @@ fn own(
 /// An enrollment removed from the directory, and what a withdrawal still owes it
 /// (spec 7.1).
 ///
-/// Removing it is only the first of three steps: its rows are out of the merged
-/// directory, and then the streams spliced onto it end and its link stops.
-/// Carried rather than done at once because a withdrawal the gateway cannot
-/// write down does not stand, and [`Directory::restore`] can only put back what
-/// nothing has torn down yet.
+/// The rows are already out of the merged directory when this exists. What is
+/// left is the client-visible teardown and the connection behind it: the streams
+/// spliced onto that host end, and its control link stops.
 pub(crate) struct Withdrawn {
     /// The address whose link is now to be stopped.
     pub(crate) address: HostAddress,
-    enrollment: Enrollment,
+    /// The withdrawn enrollment's token, which is what every splice onto that
+    /// host holds.
+    serving: CancellationToken,
 }
 
 impl Withdrawn {
@@ -181,7 +181,7 @@ impl Withdrawn {
     /// 7.1). What the client is told instead is the directory, where the host's
     /// rows and its group are gone.
     pub(crate) fn end_splices(&self) {
-        self.enrollment.serving.cancel();
+        self.serving.cancel();
     }
 }
 
@@ -351,50 +351,22 @@ impl Directory {
     ///
     /// The host's rows leave the merged directory here, in the same publish that
     /// removes it from the enrolled set, so nothing ever serves a directory that
-    /// contradicts that set. What this does *not* do is end anything: a
-    /// withdrawal the gateway cannot write down does not stand, and a torn-down
-    /// stream cannot be put back. See [`Withdrawn`].
+    /// contradicts that set. What this does *not* do is end anything, see
+    /// [`Withdrawn`].
     ///
-    /// A configured host is refused: it would come straight back from the
-    /// configuration file on the next start, so removing it here would be a
-    /// promise the gateway cannot keep.
+    /// The refusals are [`Self::dynamic_without`]'s, and a withdrawal reaches
+    /// this only once that answer has been written down, so in practice they are
+    /// unreachable here: the gateway holds one lock across both calls. Checked
+    /// again rather than assumed, because the set is what this mutates.
     pub(crate) fn withdraw(&self, host_id: &str) -> Result<Withdrawn, DirectoryError> {
         let mut hosts = self.lock();
-        let (address, enrollment) = hosts
-            .iter()
-            .find(|(_, enrolled)| enrolled.host_id.as_deref() == Some(host_id))
-            .ok_or_else(|| DirectoryError::UnknownHost {
-                host_id: host_id.to_string(),
-            })?;
-        if enrollment.source == HostSource::Config {
-            return Err(DirectoryError::StaticHost {
-                address: address.clone(),
-            });
-        }
-        let address = address.clone();
+        let address = withdrawable(&hosts, host_id)?;
         let enrollment = hosts.remove(&address).expect("the enrollment just found");
         self.publish(&hosts);
         Ok(Withdrawn {
             address,
-            enrollment,
+            serving: enrollment.serving,
         })
-    }
-
-    /// Put a withdrawal back exactly as it was.
-    ///
-    /// The rollback of a withdrawal the gateway could not record. Exact matters
-    /// twice over: the rows return with it, so a client's directory does not go
-    /// empty until the host next says something, and so does its token, so the
-    /// streams it is serving stay the ones a later withdrawal ends.
-    ///
-    /// NOTE: what the enrollment was told while it was out is lost, because the
-    /// link's own updates find no entry to write into. That is one file write
-    /// wide and self-correcting: the link is still running and reports its next
-    /// connect or failure into the entry that is back.
-    pub(crate) fn restore(&self, withdrawn: Withdrawn) {
-        let mut hosts = self.lock();
-        hosts.insert(withdrawn.address, withdrawn.enrollment);
-        self.publish(&hosts);
     }
 
     /// Settle the id of the host at `address` against what it just reported.
@@ -652,16 +624,31 @@ impl Directory {
     /// are the only ones the gateway is the record of.
     pub(crate) fn dynamic(&self) -> Vec<EnrolledHost> {
         let hosts = self.lock();
-        hosts
-            .iter()
-            .filter(|(_, enrollment)| enrollment.source == HostSource::Dynamic)
-            .filter_map(|(address, enrollment)| {
-                Some(EnrolledHost {
-                    address: address.clone(),
-                    host_id: enrollment.host_id.clone()?,
-                })
-            })
-            .collect()
+        dynamic(&hosts)
+    }
+
+    /// The same as it would stand with `host_id` withdrawn, mutating nothing.
+    ///
+    /// This is what makes a withdrawal write-ahead: the record is written from
+    /// this answer, and only then does the set change ([`Self::withdraw`]), so a
+    /// write that fails has touched nothing and there is nothing to put back. It
+    /// carries the refusals too, for the same reason: a withdrawal that will not
+    /// happen must not be written down. The two answers agree because the gateway
+    /// holds one lock across both calls.
+    ///
+    /// A configured host is refused: it would come straight back from the
+    /// configuration file on the next start, so removing it here would be a
+    /// promise the gateway cannot keep.
+    pub(crate) fn dynamic_without(
+        &self,
+        host_id: &str,
+    ) -> Result<Vec<EnrolledHost>, DirectoryError> {
+        let hosts = self.lock();
+        let withdrawn = withdrawable(&hosts, host_id)?;
+        Ok(dynamic(&hosts)
+            .into_iter()
+            .filter(|host| host.address != withdrawn)
+            .collect())
     }
 
     /// Every enrolled address, for the links to be spawned or stopped over.
@@ -703,6 +690,43 @@ impl Directory {
             true
         });
     }
+}
+
+/// The dynamic enrollments as the state file records them: the ones the gateway
+/// is the record of, and those of them that have an id to record.
+fn dynamic(hosts: &BTreeMap<HostAddress, Enrollment>) -> Vec<EnrolledHost> {
+    hosts
+        .iter()
+        .filter(|(_, enrollment)| enrollment.source == HostSource::Dynamic)
+        .filter_map(|(address, enrollment)| {
+            Some(EnrolledHost {
+                address: address.clone(),
+                host_id: enrollment.host_id.clone()?,
+            })
+        })
+        .collect()
+}
+
+/// The address of the enrollment `host_id` names, or why it cannot be withdrawn.
+///
+/// In one place so that the answer a withdrawal is written down from and the set
+/// it then mutates cannot disagree about what is being withdrawn.
+fn withdrawable(
+    hosts: &BTreeMap<HostAddress, Enrollment>,
+    host_id: &str,
+) -> Result<HostAddress, DirectoryError> {
+    let (address, enrollment) = hosts
+        .iter()
+        .find(|(_, enrolled)| enrolled.host_id.as_deref() == Some(host_id))
+        .ok_or_else(|| DirectoryError::UnknownHost {
+            host_id: host_id.to_string(),
+        })?;
+    if enrollment.source == HostSource::Config {
+        return Err(DirectoryError::StaticHost {
+            address: address.clone(),
+        });
+    }
+    Ok(address.clone())
 }
 
 /// Namespace every host's rows into one directory, and name the hosts it was
@@ -1307,6 +1331,16 @@ mod tests {
             1,
             "a configured host is the file's record, not the gateway's",
         );
+        // Refused where a withdrawal is written down from, so a withdrawal that
+        // will not happen is never recorded, and refused again where it mutates.
+        assert!(matches!(
+            directory.dynamic_without("static"),
+            Err(DirectoryError::StaticHost { .. }),
+        ));
+        assert!(matches!(
+            directory.dynamic_without("absent"),
+            Err(DirectoryError::UnknownHost { .. }),
+        ));
         assert!(matches!(
             directory.withdraw("static"),
             Err(DirectoryError::StaticHost { .. }),
@@ -1315,6 +1349,7 @@ mod tests {
             directory.withdraw("absent"),
             Err(DirectoryError::UnknownHost { .. }),
         ));
+
         // The token a splice onto that host holds, taken before the withdrawal
         // the way a client stream takes it.
         let watching = directory
@@ -1322,15 +1357,36 @@ mod tests {
             .expect("a group")
             .swap_remove(0)
             .serving;
+        let merged_watch = directory.subscribe();
+        let reachable = directory.reachable();
+
+        // The record a withdrawal writes before it does anything: the set as it
+        // will stand, from a directory that has not moved.
+        assert!(
+            directory
+                .dynamic_without("dynamic")
+                .expect("a dynamic host")
+                .is_empty(),
+            "what gets written down is the set without the host being withdrawn",
+        );
+        assert!(
+            !reachable.has_changed().expect("the directory is alive")
+                && !merged_watch.has_changed().expect("alive"),
+            "answering that published an edge for a withdrawal that has not \
+             happened, which a splice cannot be told to forget",
+        );
+        assert_eq!(
+            merged(&directory)[0].0.id,
+            "dynamic:s-1",
+            "and the host is untouched until that write has landed, rows included",
+        );
+        assert!(!watching.is_cancelled());
+
         let withdrawn = directory.withdraw("dynamic").expect("withdraw");
         assert_eq!(withdrawn.address, address("127.0.0.1:1"));
         assert!(
-            !watching.is_cancelled(),
-            "removing an enrollment from the set does not end anything by itself",
-        );
-        assert!(
             directory.sessions().sessions.is_empty(),
-            "and its rows go with it",
+            "the rows leave with the enrollment",
         );
         assert_eq!(
             directory
@@ -1342,24 +1398,16 @@ mod tests {
             vec!["static".to_string()],
             "and so does its group, while the host that stayed keeps its own",
         );
-
-        // A withdrawal the gateway could not record puts everything back, rows
-        // and token alike, so a later one still reaches the streams this one
-        // left running.
-        directory.restore(withdrawn);
-        assert_eq!(
-            merged(&directory)[0].0.id,
-            "dynamic:s-1",
-            "the rows come back with it, not empty until the host speaks again",
+        assert!(
+            !watching.is_cancelled(),
+            "removing an enrollment from the set does not end anything by itself",
         );
-        directory
-            .withdraw("dynamic")
-            .expect("withdraw")
-            .end_splices();
+
+        withdrawn.end_splices();
         assert!(
             watching.is_cancelled(),
-            "a restore that minted a fresh token would leave this stream running \
-             for a host that is gone",
+            "the token a withdrawal ends is the one the splice onto that host \
+             took, or that stream runs on for a host that is gone",
         );
     }
 

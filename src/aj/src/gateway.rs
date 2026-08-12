@@ -353,11 +353,11 @@ impl Gateway {
     ///
     /// Active teardown rather than bookkeeping, in this order:
     ///
-    /// 1. the enrollment and its rows leave the directory, in one publish, so
+    /// 1. the withdrawal is written down, from the set as it would stand without
+    ///    that host and having mutated nothing: a withdrawal the gateway cannot
+    ///    record does not stand, and one written ahead has nothing to put back;
+    /// 2. the enrollment and its rows leave the directory, in one publish, so
     ///    nothing serves a directory that contradicts the enrolled set;
-    /// 2. the withdrawal is written down, and a write that fails puts step 1
-    ///    back exactly as it was, which is only possible while nothing has been
-    ///    torn down;
     /// 3. the streams spliced onto that host end, without a `reset`: the
     ///    re-attach a `reset` asks for would be refused now that the namespace
     ///    is gone, and a refused attach fails the client's *whole* stream, so it
@@ -367,15 +367,20 @@ impl Gateway {
     ///
     /// Steps 3 and 4 both close connections to the host and could be either way
     /// round. The client-visible half goes first.
+    ///
+    /// Writing first is what keeps a refusal invisible. Mutating first and
+    /// putting it back afterwards restores the set exactly and the reachability
+    /// watch not at all: a receiver that read the host's absence cannot be told
+    /// to forget it, and a splice reads the pair of edges as a host that went
+    /// away and returned. It is also the better half of a crash: a process that
+    /// dies between 1 and 2 comes back with the host withdrawn, which is what was
+    /// asked for.
     pub(crate) async fn withdraw(&self, host_id: &str) -> Result<(), GatewayError> {
         let _writing = self.inner.writing.lock().await;
+        let remaining = self.inner.directory.dynamic_without(host_id)?;
+        self.inner.state.save(&remaining)?;
+        // From here nothing can fail, so nothing needs putting back.
         let withdrawn = self.inner.directory.withdraw(host_id)?;
-        if let Err(err) = self.remember() {
-            // A withdrawal the gateway cannot write down would come back as a
-            // surprise after a restart, so it does not stand.
-            self.inner.directory.restore(withdrawn);
-            return Err(err);
-        }
         withdrawn.end_splices();
         self.undial(&withdrawn.address).await;
         Ok(())
