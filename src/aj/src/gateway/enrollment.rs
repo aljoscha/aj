@@ -29,8 +29,11 @@ pub(crate) struct EnrolledHost {
     ///
     /// Recorded rather than re-learned so that a restarted gateway can route and
     /// label a host's sessions from the first instant, including while that host
-    /// is down. An id names a session store (spec 4), so it is a stable identity
-    /// and caching it has no staleness hazard.
+    /// is down. An id names a session store (spec 4), so an entry here going
+    /// stale means that store is gone, and the two records answer that
+    /// differently: a configured host's id is provisional and its next contact
+    /// replaces it, a dynamic enrollment's is the record's referent and a
+    /// different id is refused (see `Directory::adopt`).
     pub(crate) host_id: String,
 }
 

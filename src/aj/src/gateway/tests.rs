@@ -1507,6 +1507,54 @@ async fn a_learned_id_is_written_down_when_it_is_learned() {
     host.stop().await;
 }
 
+/// A learned id is a cache for the next run, so a write that fails is a log line
+/// and nothing more: the host has just answered, and refusing to serve it over a
+/// cache write would trade a working host for a note.
+///
+/// The opposite of an enrollment, which is an operator's instruction and does not
+/// stand unless it is recorded (see
+/// [`an_enrollment_the_gateway_cannot_record_does_not_stand`]). The asymmetry
+/// matters most for exactly the host here: a configured one cannot be
+/// re-enrolled to get out of it.
+///
+/// The host is unreachable while the state file is staged, because its id would
+/// otherwise be learned and written down before there was anything to stage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_learned_id_that_cannot_be_written_down_still_names_its_host() {
+    let mut host = Upstream::start().await;
+    let session = host.create().await;
+    let bridge = Bridge::to(&host).await;
+    bridge.cut();
+    let fixture = Fixture::over(
+        TempDir::new().expect("tempdir"),
+        vec![bridge.address.clone()],
+    )
+    .await;
+    // A directory where the state file goes: the rename that publishes it cannot
+    // land, so the save fails for a reason no permission bit is needed to stage.
+    let state = fixture.state.path().join("hosts.json");
+    std::fs::create_dir(&state).expect("stage an unwritable state file");
+
+    bridge.heal();
+
+    fixture.until_connected(&host.host_id()).await;
+    let row = fixture.row(&host.namespaced(&session)).await;
+    assert!(
+        !row.unreachable,
+        "the host that answered is served under the id it reported: {row:?}",
+    );
+    assert!(
+        state.is_dir(),
+        "the record was written after all, so nothing here measures what this \
+         gateway does when it cannot write one",
+    );
+
+    std::fs::remove_dir(&state).expect("unstage");
+    fixture.shutdown().await;
+    bridge.stop();
+    host.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_host_cannot_be_enrolled_twice() {
     let mut host = Upstream::start().await;

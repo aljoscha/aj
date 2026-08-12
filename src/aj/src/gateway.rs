@@ -14,7 +14,8 @@
 //! - [`directory`] holds the enrolled hosts and composes the merged list.
 //! - [`link`] is one host's control connection, dialing until told to stop.
 //! - [`splice`] is one client stream: the upstreams of the sessions it
-//!   attached, and the `reset` frames a flapping host earns them.
+//!   attached, and the `reset` frames an upstream that broke or was withdrawn
+//!   earns them.
 //! - [`outbound`] is that stream's bounded queue (spec 6.9).
 //! - [`server`] is the HTTP surface, including the proxy.
 
