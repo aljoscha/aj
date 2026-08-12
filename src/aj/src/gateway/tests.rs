@@ -1992,6 +1992,81 @@ async fn a_dynamic_hosts_contact_under_a_new_id_is_refused() {
     rebuilt.stop();
 }
 
+/// A configured host's id is provisional however this gateway came by it, a
+/// restored one included: it is still only the id that answered last time
+/// (spec 7.1).
+///
+/// This is the case a persisted id introduced. The host at a configured address
+/// is rebuilt while the gateway is down, so the id the state file restores names
+/// a store that no longer exists, and the host's first contact is under a new
+/// one. Refusing that contact leaves the group unreachable under a dead id
+/// forever, with no remedy an operator can reach: a configured enrollment cannot
+/// be withdrawn, and the address is the one the operator asked for.
+///
+/// The host is unreachable to begin with, which is what makes the restored id
+/// observable at all: it is what this gateway namespaces by until something
+/// answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restored_id_the_host_no_longer_answers_to_is_replaced_on_contact() {
+    let mut host = Upstream::start().await;
+    let session = host.create().await;
+    let bridge = Bridge::to(&host).await;
+    bridge.cut();
+    let state = TempDir::new().expect("tempdir");
+    std::fs::write(
+        state.path().join("hosts.json"),
+        format!(
+            r#"{{"configured_ids":[{{"address":"{}","host_id":"before"}}]}}"#,
+            bridge.address
+        ),
+    )
+    .expect("write the state");
+
+    let fixture = Fixture::over(state, vec![bridge.address.clone()]).await;
+
+    // The id the file restored is what this gateway namespaces by until the host
+    // answers, or the replacement below is about nothing.
+    let restored = fixture
+        .until_hosts("a dial of the host that is not there", |hosts| {
+            hosts
+                .hosts
+                .first()
+                .filter(|host| host.error.is_some())
+                .map(|host| (host.id.clone(), host.connected, hosts.hosts.len()))
+        })
+        .await;
+    assert_eq!(
+        restored,
+        (Some("before".to_string()), false, 1),
+        "one configured host, named by the id the state file kept, and not there",
+    );
+
+    bridge.heal();
+
+    // Contact, under the id the store that is there now answers to.
+    fixture.until_connected(&host.host_id()).await;
+    let row = fixture.row(&host.namespaced(&session)).await;
+    assert!(!row.unreachable, "{row:?}");
+    let hosts = fixture.hosts().await;
+    assert_eq!(
+        hosts.hosts[0].id.as_deref(),
+        Some(host.host_id().as_str()),
+        "the host the operator configured is reachable under the id it answers \
+         to: {hosts:?}",
+    );
+    let adopted = recorded(&fixture).configured_ids;
+    assert_eq!(
+        adopted,
+        vec![enrolled_as(&bridge.address, &host.host_id())],
+        "and the file records that id, or the next start would restore a store \
+         that is gone all over again: {adopted:?}",
+    );
+
+    fixture.shutdown().await;
+    bridge.stop();
+    host.stop().await;
+}
+
 /// What the gateway's state file records, read back as the gateway wrote it.
 fn recorded(fixture: &Fixture) -> crate::gateway::enrollment::Recorded {
     let text =
