@@ -363,11 +363,15 @@ internally tagged with `kind`:
   per-session status (section 6.8). Cumulative, the latest frame
   supersedes all earlier ones.
 - `error`: `{kind, session, epoch?, code, message, ...}`. The error
-  envelope (section 6.6) as a stream frame, session-scoped. Its
-  first use is the per-session attach refusal: a named session the
-  server cannot resolve produces this instead of an attach block,
-  and the stream lives on for every other session. Reliable-transient
-  class.
+  envelope (section 6.6) as a stream frame, session-scoped. Every
+  per-session resolution failure travels this way, carrying its own
+  code (`unknown_session`, `locked`, ...): a session that cannot be
+  attached for a reason of its own must not fail the request, only
+  itself. Codes come from the same source the HTTP layer uses, a
+  body and a frame cannot drift. Failures of the request itself (a
+  session named twice, a shut-down server, a malformed cursor) stay
+  wholesale, there is no per-session answer to a defective request.
+  Reliable-transient class.
 - `reset`: `{kind, session}`. Continuity for this session is broken
   (head switch, or a gateway lost and regained its host). The client
   must re-attach the session (section 6.5). Its cursor stays valid to
@@ -459,10 +463,16 @@ snapshot request. The stream request names sessions to attach, each
 with an optional cursor: `GET /v1/events?session=<id>[@<epoch>:<seq>]`
 (repeatable). A stream request never fails wholesale over one bad
 session: each named session either gets its attach block or a
-session-scoped `error` frame (`unknown_session`), and the rest are
-served. Failing the whole stream over one dead id would cost a
+session-scoped `error` frame carrying the failure's own code
+(section 6.3), and the rest are
+served. Failing the whole stream over one dead or locked id would
+cost a
 client its healthy sessions on every other host, the same shape of
-punishment the unreachable rule refuses (section 7.1). For each
+punishment the unreachable rule refuses (section 7.1). A client may
+be code-blind about these: any error frame ends that attachment,
+because a client that cannot read the code cannot tell whether more
+is coming either, and the dropped cursor costs only a full backfill
+on a later attach, which this section permits. For each
 resolvable session the server, atomically with
 respect to that session's event flow: registers the subscription,
 projects the durable suffix, and emits in order on the stream: a
