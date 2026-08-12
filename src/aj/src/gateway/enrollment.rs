@@ -5,9 +5,13 @@
 //! request to tolerate. What a client sends and reads about those hosts is the
 //! protocol's own ([`aj_wire::EnrollHostRequest`], [`aj_wire::HostList`]).
 //!
-//! Only dynamic enrollments are written down. A static one comes back from the
-//! configuration file on every start (see [`super::config`]), and persisting it
-//! too would resurrect a host the operator deleted from that file.
+//! It records two different things, and the difference is the point. A dynamic
+//! enrollment exists *because* this file says so, so an entry removed from it
+//! unenrolls that host. A configured host exists because the configuration file
+//! says so, and what this one keeps for it is only the id it answered to, so
+//! that a host which is down when the gateway starts is still named by the id
+//! its sessions are namespaced under. Recording a configured host's existence
+//! here too would resurrect one the operator deleted from that file.
 
 use std::path::{Path, PathBuf};
 
@@ -15,18 +19,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::gateway::config::HostAddress;
 
-/// One dynamically enrolled host as the gateway's state records it.
+/// One host as the gateway's state records it: where to dial it, and the id it
+/// answered to.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct EnrolledHost {
     pub(crate) address: HostAddress,
-    /// The id the host reported when it was enrolled, which is the namespace its
-    /// sessions appear under.
+    /// The id the host reported, which is the namespace its sessions appear
+    /// under.
     ///
     /// Recorded rather than re-learned so that a restarted gateway can route and
     /// label a host's sessions from the first instant, including while that host
-    /// is down. It is fixed for the life of the enrollment: re-namespacing a
-    /// host's sessions under a live client's feet would invalidate every id the
-    /// client holds.
+    /// is down. An id names a session store (spec 4), so it is a stable identity
+    /// and caching it has no staleness hazard.
     pub(crate) host_id: String,
 }
 
@@ -35,12 +39,20 @@ pub(crate) struct EnrollmentFile {
     path: PathBuf,
 }
 
-/// The file's contents. Named so the JSON has a key rather than a bare array,
-/// which is what leaves room for another field later.
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct Persisted {
+/// What one gateway state file holds. Named so the JSON has keys rather than a
+/// bare array, which is what leaves room for another field later.
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Recorded {
+    /// The dynamic enrollments, which this file is the record of: an entry here
+    /// is what makes that host enrolled after a restart.
     #[serde(default)]
-    hosts: Vec<EnrolledHost>,
+    pub(crate) hosts: Vec<EnrolledHost>,
+    /// The ids learned for hosts the configuration file enrolls. Identity only:
+    /// an entry here enrolls nothing, so it cannot bring back a host the
+    /// operator removed from that file, and one whose address is no longer
+    /// configured is simply dropped.
+    #[serde(default)]
+    pub(crate) configured_ids: Vec<EnrolledHost>,
 }
 
 impl EnrollmentFile {
@@ -50,16 +62,18 @@ impl EnrollmentFile {
         }
     }
 
-    /// The enrollments recorded here, empty when there is no file yet.
+    /// What is recorded here, empty when there is no file yet.
     ///
     /// A file that exists and cannot be read is an error rather than an empty
     /// set: answering "no hosts" would make the next write erase the operator's
     /// enrollments, and a gateway that quietly serves nothing is the worst
     /// outcome of a bad byte on disk.
-    pub(crate) fn load(&self) -> Result<Vec<EnrolledHost>, EnrollmentError> {
+    pub(crate) fn load(&self) -> Result<Recorded, EnrollmentError> {
         let text = match std::fs::read_to_string(&self.path) {
             Ok(text) => text,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Recorded::default());
+            }
             Err(source) => {
                 return Err(EnrollmentError::Read {
                     path: self.path.clone(),
@@ -67,19 +81,17 @@ impl EnrollmentFile {
                 });
             }
         };
-        let persisted: Persisted =
-            serde_json::from_str(&text).map_err(|source| EnrollmentError::Parse {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(persisted.hosts)
+        serde_json::from_str(&text).map_err(|source| EnrollmentError::Parse {
+            path: self.path.clone(),
+            source,
+        })
     }
 
-    /// Replaces the recorded set with `hosts`.
+    /// Replaces what is recorded with `recorded`.
     ///
     /// Written through a temp file in the same directory and renamed, so a
     /// reader sees the old set or the new one and never a torn one.
-    pub(crate) fn save(&self, hosts: &[EnrolledHost]) -> Result<(), EnrollmentError> {
+    pub(crate) fn save(&self, recorded: &Recorded) -> Result<(), EnrollmentError> {
         let parent = self.path.parent().ok_or_else(|| EnrollmentError::Write {
             path: self.path.clone(),
             reason: "the state file has no parent directory".to_string(),
@@ -88,10 +100,7 @@ impl EnrollmentFile {
             path: parent.to_path_buf(),
             reason: err.to_string(),
         })?;
-        let body = serde_json::to_vec_pretty(&Persisted {
-            hosts: hosts.to_vec(),
-        })
-        .map_err(|err| EnrollmentError::Write {
+        let body = serde_json::to_vec_pretty(recorded).map_err(|err| EnrollmentError::Write {
             path: self.path.clone(),
             reason: err.to_string(),
         })?;
@@ -148,33 +157,64 @@ mod tests {
     fn the_state_file_round_trips() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let file = EnrollmentFile::new(dir.path());
-        assert!(
-            file.load()
-                .expect("an absent file is an empty set")
-                .is_empty(),
+        assert_eq!(
+            file.load().expect("an absent file is an empty record"),
+            Recorded::default(),
             "a gateway that has enrolled nothing has no file to read",
         );
 
-        let hosts = vec![
-            enrolled("127.0.0.1:6161", "aaa"),
-            enrolled("100.64.0.2:6161", "bbb"),
-        ];
-        file.save(&hosts).expect("save");
-        assert_eq!(file.load().expect("load"), hosts);
+        let recorded = Recorded {
+            hosts: vec![
+                enrolled("127.0.0.1:6161", "aaa"),
+                enrolled("100.64.0.2:6161", "bbb"),
+            ],
+            configured_ids: vec![enrolled("100.64.0.3:6161", "ccc")],
+        };
+        file.save(&recorded).expect("save");
+        assert_eq!(file.load().expect("load"), recorded);
 
-        // A save replaces the set rather than appending to it, which is what
+        // A save replaces the record rather than appending to it, which is what
         // makes a withdrawal outlive the process that served it.
-        file.save(&hosts[..1]).expect("save");
-        assert_eq!(file.load().expect("load"), hosts[..1].to_vec());
+        let shrunk = Recorded {
+            hosts: recorded.hosts[..1].to_vec(),
+            configured_ids: Vec::new(),
+        };
+        file.save(&shrunk).expect("save");
+        assert_eq!(file.load().expect("load"), shrunk);
+    }
+
+    /// A file written before the gateway kept configured hosts' ids reads as
+    /// having none, rather than failing the start of a gateway that has
+    /// enrollments in it.
+    #[test]
+    fn a_file_with_no_configured_ids_reads_as_naming_none() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let file = EnrollmentFile::new(dir.path());
+        std::fs::write(
+            dir.path().join("hosts.json"),
+            r#"{"hosts":[{"address":"http://127.0.0.1:6161","host_id":"aaa"}]}"#,
+        )
+        .expect("write");
+
+        assert_eq!(
+            file.load().expect("load"),
+            Recorded {
+                hosts: vec![enrolled("127.0.0.1:6161", "aaa")],
+                configured_ids: Vec::new(),
+            },
+        );
     }
 
     #[test]
     fn the_state_file_is_created_under_a_directory_that_does_not_exist_yet() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let file = EnrollmentFile::new(&dir.path().join("gateway"));
-        file.save(&[enrolled("127.0.0.1:6161", "aaa")])
-            .expect("the directory is created on the way");
-        assert_eq!(file.load().expect("load").len(), 1);
+        file.save(&Recorded {
+            hosts: vec![enrolled("127.0.0.1:6161", "aaa")],
+            configured_ids: Vec::new(),
+        })
+        .expect("the directory is created on the way");
+        assert_eq!(file.load().expect("load").hosts.len(), 1);
     }
 
     /// A file that exists and does not parse is an error. Reading it as "no
@@ -194,6 +234,16 @@ mod tests {
         assert!(
             matches!(file.load(), Err(EnrollmentError::Parse { .. })),
             "an address the gateway could not dial is corrupt state",
+        );
+
+        std::fs::write(
+            dir.path().join("hosts.json"),
+            r#"{"configured_ids":[{"address":"nope nope","host_id":"aaa"}]}"#,
+        )
+        .expect("write");
+        assert!(
+            matches!(file.load(), Err(EnrollmentError::Parse { .. })),
+            "and so is one in the record that is only an id",
         );
     }
 }

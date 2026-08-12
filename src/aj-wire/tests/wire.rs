@@ -1292,6 +1292,11 @@ fn raw_objects_compare_on_the_text_they_would_emit() {
 /// A gateway's `list` frame names the hosts it has enrolled alongside the rows
 /// (spec 7.1). Additive: a plain host's frame carries no such key, and an older
 /// peer's frame reads as naming none.
+///
+/// A host is named by exactly one of `id` and `address`: the id once the gateway
+/// has spoken to it, and the address it is enrolled at until then. Which one it
+/// is is what tells a client "an empty group labelled by address, no id yet"
+/// from "a group whose sessions it can address".
 #[test]
 fn a_list_frame_names_the_hosts_a_gateway_enrolled() {
     let frame: DecodedFrame = serde_json::from_value(fixture("frames")[5].clone())
@@ -1303,20 +1308,44 @@ fn a_list_frame_names_the_hosts_a_gateway_enrolled() {
         panic!("the fixture at that index is the gateway's list frame");
     };
     assert_eq!(sessions[0].host.as_deref(), Some("workstation"));
+    let named = vec![
+        DirectoryHost {
+            id: Some("workstation".to_string()),
+            address: None,
+            unreachable: false,
+        },
+        DirectoryHost {
+            id: Some("laptop".to_string()),
+            address: None,
+            unreachable: true,
+        },
+        DirectoryHost {
+            id: None,
+            address: Some("http://100.64.0.9:6161".to_string()),
+            unreachable: true,
+        },
+    ];
     assert_eq!(
-        hosts,
-        &vec![
-            DirectoryHost {
-                id: "workstation".to_string(),
-                unreachable: false,
-            },
-            DirectoryHost {
-                id: "laptop".to_string(),
-                unreachable: true,
-            },
-        ],
+        hosts, &named,
         "a host with no rows here is still named, which is what a client renders \
-         an empty group from",
+         an empty group from, and the one this gateway has never spoken to is \
+         labelled by its address with nothing in the id position",
+    );
+
+    // The encoder, not the retained JSON: a frame built here has none, so this
+    // is what pins the shape a gateway writes.
+    let written = serde_json::to_value(
+        DecodedFrame::try_from(Frame::List {
+            sessions: sessions.clone(),
+            hosts: named,
+        })
+        .expect("a local list frame is valid"),
+    )
+    .expect("it serializes");
+    assert_eq!(
+        written["hosts"],
+        fixture("frames")[5]["hosts"],
+        "an absent id is an absent key and never a null or an address: {written}",
     );
 
     let plain = serde_json::to_value(
@@ -1355,11 +1384,13 @@ fn a_merged_directory_writes_the_read_and_the_frame_from_one_value() {
         sessions,
         hosts: vec![
             DirectoryHost {
-                id: "left".to_string(),
+                id: Some("left".to_string()),
+                address: None,
                 unreachable: false,
             },
             DirectoryHost {
-                id: "right".to_string(),
+                id: Some("right".to_string()),
+                address: None,
                 unreachable: true,
             },
         ],

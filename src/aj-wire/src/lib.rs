@@ -294,15 +294,27 @@ pub struct SessionList {
 /// deliberately. A client renders such a host as an empty group rather than as
 /// nothing, which is what keeps "unreachable, contents unknown" tellable from
 /// "no such host".
+///
+/// A gateway names each host by exactly one of [`Self::id`] and
+/// [`Self::address`], so a client labels a group by the id when there is one and
+/// by the address otherwise.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectoryHost {
     /// The id this host's sessions are namespaced under, in the vocabulary
     /// [`SessionSummary::host`] and [`HostSummary::id`] use.
     ///
-    /// A host a gateway has never spoken to has no id and appears here not at
-    /// all: there is no namespace for a client to group anything under, and a
-    /// gateway does not invent one (spec 7.1).
-    pub id: String,
+    /// Absent for a host the gateway has never spoken to: an id is learned by
+    /// asking the host, and a gateway does not invent one, because ids namespace
+    /// sessions and a made-up one would poison every client's state the moment
+    /// the real id arrived (spec 7.1). Such a host carries
+    /// [`Self::address`] instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Where this host is enrolled, carried only while it has no id.
+    ///
+    /// A label and never an id: nothing addresses a session or a host by it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
     /// The gateway's control connection to this host is down, which is what
     /// [`SessionSummary::unreachable`] says about each of its rows.
     #[serde(default)]

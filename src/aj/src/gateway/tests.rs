@@ -282,6 +282,10 @@ impl Bridge {
 /// it.
 struct Fixture {
     state: TempDir,
+    /// The addresses this gateway's configuration names, which a restart keeps:
+    /// the configuration file does not change because the process did (spec 7.1).
+    static_hosts: Vec<HostAddress>,
+    tuning: Tuning,
     gateway: Gateway,
     server: GatewayServer,
     client: RemoteClient,
@@ -307,7 +311,7 @@ impl Fixture {
     async fn tuned(state: TempDir, static_hosts: Vec<HostAddress>, tuning: Tuning) -> Self {
         let gateway = Gateway::new(GatewaySetup {
             state_dir: state.path().to_path_buf(),
-            static_hosts,
+            static_hosts: static_hosts.clone(),
             tuning,
         })
         .expect("a gateway over a fresh state directory");
@@ -318,6 +322,8 @@ impl Fixture {
         let client = RemoteClient::new(&server.url()).expect("client");
         Self {
             state,
+            static_hosts,
+            tuning,
             gateway,
             server,
             client,
@@ -325,18 +331,26 @@ impl Fixture {
         }
     }
 
-    /// The same gateway again over the same state directory: a restart, with
-    /// nothing but that directory carried across.
+    /// The same gateway again over the same state directory and the same
+    /// configuration: a restart, with nothing but those carried across.
     async fn restart(self) -> Self {
+        let static_hosts = self.static_hosts.clone();
+        self.restarted_over(static_hosts).await
+    }
+
+    /// The same, with the configuration the operator now has: what editing that
+    /// file and restarting does.
+    async fn restarted_over(self, static_hosts: Vec<HostAddress>) -> Self {
         let Self {
             state,
+            tuning,
             gateway,
             server,
             ..
         } = self;
         server.shutdown().await;
         gateway.shutdown().await;
-        Self::over(state, Vec::new()).await
+        Self::tuned(state, static_hosts, tuning).await
     }
 
     /// Poll the merged directory until `check` answers, which is how every
@@ -828,6 +842,12 @@ fn newer_row(row: &SessionSummary, extra: &str) -> String {
 /// as absent rather than as unreachable: with one host a client cannot tell an
 /// empty directory from a directory that has not arrived, and the reachable
 /// host's rows are what say the merge ran at all.
+///
+/// The downed one is the *configured* host, which is the enrollment mechanism
+/// spec 7.1 lists first and the one an id has to outlive to be there at all: a
+/// configured host is enrolled by address, so its id is only ever learned, and a
+/// gateway that forgot it would come back with a host it cannot name, cannot
+/// namespace and therefore cannot show.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unreachable_host_survives_a_restart_as_a_group_with_no_rows() {
     let mut down = Upstream::start().await;
@@ -839,13 +859,13 @@ async fn an_unreachable_host_survives_a_restart_as_a_group_with_no_rows() {
     // no longer holds, not one the host lost.
     down.prompt(&session, "first").await;
     settled(&down, &session, 1).await;
-    // Enrolled over the wire, which is the enrollment a gateway remembers: the
-    // id it namespaces that host by is what it writes down (spec 7.1).
-    let fixture = Fixture::new(&[]).await;
-    assert_eq!(
-        fixture.enroll(&down.address()).await.status(),
-        StatusCode::OK
-    );
+    // One host each way, because a learned id has to survive whichever way the
+    // host was enrolled (spec 7.1). The configured one is connected before the
+    // second is enrolled, so its id is learned before anything else writes the
+    // gateway's record: what this test is about is the restart, not the moment
+    // the record happens to be written.
+    let fixture = Fixture::new(&[&down]).await;
+    fixture.until_connected(&down.host_id()).await;
     assert_eq!(fixture.enroll(&up.address()).await.status(), StatusCode::OK);
     let (lost, kept) = (down.namespaced(&session), up.namespaced(&kept));
     fixture.row(&lost).await;
@@ -878,11 +898,13 @@ async fn an_unreachable_host_survives_a_restart_as_a_group_with_no_rows() {
     );
     let mut named = vec![
         DirectoryHost {
-            id: down.host_id(),
+            id: Some(down.host_id()),
+            address: None,
             unreachable: true,
         },
         DirectoryHost {
-            id: up.host_id(),
+            id: Some(up.host_id()),
+            address: None,
             unreachable: false,
         },
     ];
@@ -891,8 +913,9 @@ async fn an_unreachable_host_survives_a_restart_as_a_group_with_no_rows() {
     named.sort_by(|left, right| left.id.cmp(&right.id));
     assert_eq!(
         hosts, &named,
-        "a host with no rows here is still named, which is the empty group a \
-         client renders instead of nothing: {hosts:?}",
+        "a host with no rows here is still named, by the id its sessions are \
+         namespaced under and not by anything this gateway made up, which is the \
+         empty group a client renders instead of nothing: {hosts:?}",
     );
     assert!(
         rows.iter().any(|row| row.id == kept && !row.unreachable),
@@ -917,6 +940,66 @@ async fn an_unreachable_host_survives_a_restart_as_a_group_with_no_rows() {
 
     fixture.shutdown().await;
     down.stop().await;
+    up.stop().await;
+}
+
+/// A configured host this gateway has never spoken to is named by the address it
+/// is enrolled at, and never by an id (spec 7.1).
+///
+/// An id namespaces sessions, so a synthetic one would poison every id a client
+/// holds the moment the real one arrived, and a client that grouped rows under it
+/// would have to re-key them all. An address is a label: the client renders the
+/// empty group by it and addresses nothing with it.
+///
+/// Two hosts, one of them up, because a client cannot tell an empty directory
+/// from one that has not arrived yet: the reachable host's row is what says the
+/// merge ran at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_configured_host_that_never_answered_is_named_by_its_address() {
+    let mut up = Upstream::start().await;
+    let session = up.create().await;
+    // Port 1, where nothing answers: the one host this gateway can never learn
+    // an id from.
+    let silent = HostAddress::parse("127.0.0.1:1").expect("an address");
+    let fixture = Fixture::over(
+        TempDir::new().expect("tempdir"),
+        vec![
+            HostAddress::parse(&up.address()).expect("an address"),
+            silent.clone(),
+        ],
+    )
+    .await;
+
+    // The row first, because this measures nothing until the merge has run: an
+    // empty payload would satisfy any claim about what is not in it.
+    fixture.row(&up.namespaced(&session)).await;
+    let list = fixture
+        .client
+        .sessions()
+        .await
+        .expect("the merged directory");
+
+    assert_eq!(
+        list.hosts,
+        vec![
+            DirectoryHost {
+                id: None,
+                address: Some(silent.to_string()),
+                unreachable: true,
+            },
+            DirectoryHost {
+                id: Some(up.host_id()),
+                address: None,
+                unreachable: false,
+            },
+        ],
+        "the host that has never answered is named by its address with nothing \
+         in the id position, and the one that has is named by the id its \
+         sessions are namespaced under: {:?}",
+        list.hosts,
+    );
+
+    fixture.shutdown().await;
     up.stop().await;
 }
 
@@ -1302,6 +1385,10 @@ async fn an_enrollment_round_trips_and_outlives_the_process() {
     host.stop().await;
 }
 
+/// A configured host is the configuration file's to hold, in both directions:
+/// the gateway will not withdraw one, and it does not keep one after the operator
+/// removes it from the file. The id it learned for it goes too, since an id
+/// records identity and never enrollment (spec 7.1).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_static_config_host_is_enrolled_and_cannot_be_withdrawn() {
     let mut host = Upstream::start().await;
@@ -1326,12 +1413,65 @@ async fn a_static_config_host_is_enrolled_and_cannot_be_withdrawn() {
         "and it is still there"
     );
 
-    // A static entry is the configuration's to hold, so it is not persisted: a
-    // gateway restarted without it forgets it.
-    let fixture = fixture.restart().await;
+    // A static entry is the configuration's to hold, so the gateway records only
+    // its id and never its existence: restarted over a file that no longer names
+    // it, it is gone.
+    let fixture = fixture.restarted_over(Vec::new()).await;
     assert!(
         fixture.hosts().await.hosts.is_empty(),
         "a static host comes back from the configuration or not at all",
+    );
+    let recorded =
+        std::fs::read_to_string(fixture.state.path().join("hosts.json")).unwrap_or_default();
+    assert!(
+        !recorded.contains(&host.host_id()),
+        "and the id learned for it does not sit in the state file waiting to \
+         bring it back at the next restart: {recorded}",
+    );
+
+    fixture.shutdown().await;
+    host.stop().await;
+}
+
+/// A learned id is written down the moment it is learned, not only when
+/// something else happens to write the gateway's record (spec 7.1).
+///
+/// A gateway whose hosts all come from the configuration file never enrolls or
+/// withdraws anything, which is exactly what the other two write paths are. An id
+/// recorded only by those would never be recorded at all on such a gateway, and
+/// every restart while one of its hosts was down would come back unable to name
+/// that host. Nothing here enrolls or withdraws, so the only write that can
+/// happen is the one under test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_learned_id_is_written_down_when_it_is_learned() {
+    let mut host = Upstream::start().await;
+    let fixture = Fixture::new(&[&host]).await;
+
+    fixture.until_connected(&host.host_id()).await;
+
+    let state = EnrollmentFile::new(fixture.state.path());
+    let recorded = bounded("the learned id to be written down", async {
+        loop {
+            let recorded = state.load().expect("the gateway's own record");
+            if !recorded.configured_ids.is_empty() {
+                return recorded;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+
+    assert_eq!(
+        recorded.configured_ids[0].host_id,
+        host.host_id(),
+        "the id this gateway namespaces that host's sessions under is the one it \
+         wrote down",
+    );
+    assert!(
+        recorded.hosts.is_empty(),
+        "and it is recorded as identity only: an entry among the enrollments \
+         would make this file the record of a configured host's existence, and \
+         resurrect one the operator removed from the configuration: {recorded:?}",
     );
 
     fixture.shutdown().await;
@@ -3180,7 +3320,8 @@ async fn a_withdrawal_ends_that_hosts_splices_and_leaves_the_others_alone() {
             .expect("the merged directory")
             .hosts,
         vec![DirectoryHost {
-            id: "staying".to_string(),
+            id: Some("staying".to_string()),
+            address: None,
             unreachable: false,
         }],
         "a host that is not enrolled is not a group either, and the one that is \

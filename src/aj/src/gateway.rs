@@ -213,6 +213,13 @@ impl Gateway {
     /// from the state file: the file is that host's record from here on, and
     /// keeping both would enroll it twice or resurrect it when the operator
     /// removes it from the configuration.
+    ///
+    /// A configured host's *id* comes out of the state file too, and is applied
+    /// once the enrollments are in place: a host that is down when this gateway
+    /// starts is still named by the id its sessions are namespaced under, which
+    /// is what a client renders its empty group from (spec 7.1). Applied last so
+    /// that a cached id can only ever cost itself: a collision drops the id and
+    /// never an enrollment.
     pub(crate) fn new(setup: GatewaySetup) -> Result<Self, GatewayError> {
         let GatewaySetup {
             state_dir,
@@ -231,7 +238,7 @@ impl Gateway {
             }
         }
         let mut pruned = false;
-        for host in remembered {
+        for host in remembered.hosts {
             match directory.enroll(
                 host.address.clone(),
                 HostSource::Dynamic,
@@ -245,6 +252,19 @@ impl Gateway {
                     tracing::info!("dropping the remembered host {}: {err}", host.address);
                     pruned = true;
                 }
+            }
+        }
+        for host in remembered.configured_ids {
+            // Adopted rather than enrolled, so an id whose address the
+            // configuration no longer names brings nothing back with it. That
+            // refusal is the ordinary way an entry here dies, and rewriting the
+            // file is what stops it coming round again.
+            if let Err(err) = directory.adopt(&host.address, &host.host_id) {
+                tracing::info!(
+                    "not restoring the id of the configured host {}: {err}",
+                    host.address
+                );
+                pruned = true;
             }
         }
         let inner = Arc::new(GatewayInner {
@@ -377,7 +397,7 @@ impl Gateway {
     /// asked for.
     pub(crate) async fn withdraw(&self, host_id: &str) -> Result<(), GatewayError> {
         let _writing = self.inner.writing.lock().await;
-        let remaining = self.inner.directory.dynamic_without(host_id)?;
+        let remaining = self.inner.directory.record_without(host_id)?;
         self.inner.state.save(&remaining)?;
         // From here nothing can fail, so nothing needs putting back.
         let withdrawn = self.inner.directory.withdraw(host_id)?;
@@ -451,6 +471,7 @@ impl Gateway {
         let link = Link::spawn(
             address.clone(),
             Arc::clone(&self.inner.directory),
+            self.recorder(),
             self.inner.tuning,
         );
         if let Some(previous) = self.links().insert(address, link) {
@@ -458,6 +479,12 @@ impl Gateway {
             // directory refuses. Stopping the old one anyway keeps a leaked task
             // from writing rows behind the new one's back.
             tokio::spawn(previous.stop());
+        }
+    }
+
+    fn recorder(&self) -> Recorder {
+        Recorder {
+            inner: Arc::downgrade(&self.inner),
         }
     }
 
@@ -469,13 +496,53 @@ impl Gateway {
         }
     }
 
-    /// Write the dynamic enrollments down.
+    /// Write down what this gateway is the record of.
     fn remember(&self) -> Result<(), GatewayError> {
-        Ok(self.inner.state.save(&self.inner.directory.dynamic())?)
+        Ok(self.inner.state.save(&self.inner.directory.record())?)
     }
 
     fn links(&self) -> std::sync::MutexGuard<'_, HashMap<HostAddress, Link>> {
         self.inner.links.lock().expect("the link mutex is poisoned")
+    }
+}
+
+/// Writes the gateway's record down when a link learns something that belongs in
+/// it (spec 7.1).
+///
+/// A host id is learned by speaking to the host, so a link is the only thing that
+/// can learn one, and a gateway whose hosts all come from the configuration file
+/// never enrolls or withdraws anything: an id written down only by those paths
+/// would never reach the file at all, and every restart while such a host is down
+/// would come back unable to name it.
+///
+/// Weak, because the gateway owns the links this is handed to.
+#[derive(Clone)]
+pub(crate) struct Recorder {
+    inner: std::sync::Weak<GatewayInner>,
+}
+
+impl Recorder {
+    /// Write the record down, reporting nothing.
+    ///
+    /// A learned id is a cache for the next run, so a write that fails is worth a
+    /// log line and nothing more: the host has just answered and its sessions
+    /// need a namespace now, and refusing to serve it over a cache write would
+    /// trade a working host for a note. That is the opposite of an enrollment,
+    /// which is an operator's instruction and does not stand unless it is
+    /// recorded.
+    ///
+    /// NOTE: this waits on the same lock a withdrawal holds while it awaits the
+    /// link's teardown. Not a deadlock, because a link races every attempt
+    /// against its own cancellation token, so the withdrawal's `stop` drops this
+    /// wait rather than queueing behind it.
+    pub(crate) async fn write_down(&self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let _writing = inner.writing.lock().await;
+        if let Err(err) = inner.state.save(&inner.directory.record()) {
+            tracing::warn!("could not write down what this gateway just learned: {err}");
+        }
     }
 }
 

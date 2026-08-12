@@ -22,7 +22,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::gateway::config::HostAddress;
-use crate::gateway::enrollment::EnrolledHost;
+use crate::gateway::enrollment::{EnrolledHost, Recorded};
 use crate::gateway::naming::{HostIdError, SessionAddress, addressable_session, validate_host_id};
 
 /// The enrolled hosts and the one directory they merge into.
@@ -183,6 +183,16 @@ impl Withdrawn {
     pub(crate) fn end_splices(&self) {
         self.serving.cancel();
     }
+}
+
+/// What [`Directory::adopt`] settled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Adopted {
+    /// The host named itself for the first time, so its id is new here and
+    /// belongs in the gateway's record.
+    Learned,
+    /// It answered to the id this enrollment already had.
+    Unchanged,
 }
 
 /// Where a proxied request goes: which host, and what that host calls the
@@ -376,11 +386,15 @@ impl Directory {
     /// client holds for that host would silently stop resolving, and re-issuing
     /// them is what `reset` and a fresh enrollment are for. A host whose store
     /// really did change identity is re-enrolled by hand.
+    ///
+    /// Answering whether the id was new is what tells the caller there is
+    /// something to write down: an id is learned by speaking to the host, so this
+    /// is the only place a configured host's ever gets settled (spec 7.1).
     pub(crate) fn adopt(
         &self,
         address: &HostAddress,
         reported: &str,
-    ) -> Result<(), DirectoryError> {
+    ) -> Result<Adopted, DirectoryError> {
         validate_host_id(reported).map_err(|source| DirectoryError::UnusableHostId {
             host_id: reported.to_string(),
             source,
@@ -398,7 +412,7 @@ impl Directory {
                 address: address.clone(),
             })?;
         match enrollment.host_id.as_deref() {
-            Some(known) if known == reported => return Ok(()),
+            Some(known) if known == reported => return Ok(Adopted::Unchanged),
             Some(known) => {
                 return Err(DirectoryError::IdChanged {
                     address: address.clone(),
@@ -416,7 +430,7 @@ impl Directory {
         }
         enrollment.host_id = Some(reported.to_string());
         self.publish(&hosts);
-        Ok(())
+        Ok(Adopted::Learned)
     }
 
     /// Note that the host at `address` is answering again.
@@ -620,11 +634,11 @@ impl Directory {
         }
     }
 
-    /// The enrollments that belong in the state file: the dynamic ones, which
-    /// are the only ones the gateway is the record of.
-    pub(crate) fn dynamic(&self) -> Vec<EnrolledHost> {
+    /// What belongs in the state file as the enrolled set stands (see
+    /// [`Recorded`]).
+    pub(crate) fn record(&self) -> Recorded {
         let hosts = self.lock();
-        dynamic(&hosts)
+        record(&hosts)
     }
 
     /// The same as it would stand with `host_id` withdrawn, mutating nothing.
@@ -639,16 +653,12 @@ impl Directory {
     /// A configured host is refused: it would come straight back from the
     /// configuration file on the next start, so removing it here would be a
     /// promise the gateway cannot keep.
-    pub(crate) fn dynamic_without(
-        &self,
-        host_id: &str,
-    ) -> Result<Vec<EnrolledHost>, DirectoryError> {
+    pub(crate) fn record_without(&self, host_id: &str) -> Result<Recorded, DirectoryError> {
         let hosts = self.lock();
         let withdrawn = withdrawable(&hosts, host_id)?;
-        Ok(dynamic(&hosts)
-            .into_iter()
-            .filter(|host| host.address != withdrawn)
-            .collect())
+        let mut recorded = record(&hosts);
+        recorded.hosts.retain(|host| host.address != withdrawn);
+        Ok(recorded)
     }
 
     /// Every enrolled address, for the links to be spawned or stopped over.
@@ -692,19 +702,28 @@ impl Directory {
     }
 }
 
-/// The dynamic enrollments as the state file records them: the ones the gateway
-/// is the record of, and those of them that have an id to record.
-fn dynamic(hosts: &BTreeMap<HostAddress, Enrollment>) -> Vec<EnrolledHost> {
-    hosts
-        .iter()
-        .filter(|(_, enrollment)| enrollment.source == HostSource::Dynamic)
-        .filter_map(|(address, enrollment)| {
-            Some(EnrolledHost {
-                address: address.clone(),
-                host_id: enrollment.host_id.clone()?,
-            })
-        })
-        .collect()
+/// What the state file records about the enrolled set: the dynamic enrollments,
+/// and the learned ids of the hosts the configuration file enrolls.
+///
+/// A host that has never answered contributes nothing either way. There is no id
+/// to write down for it, and its address is already in the configuration file
+/// that named it.
+fn record(hosts: &BTreeMap<HostAddress, Enrollment>) -> Recorded {
+    let mut recorded = Recorded::default();
+    for (address, enrollment) in hosts {
+        let Some(host_id) = enrollment.host_id.clone() else {
+            continue;
+        };
+        let entry = EnrolledHost {
+            address: address.clone(),
+            host_id,
+        };
+        match enrollment.source {
+            HostSource::Dynamic => recorded.hosts.push(entry),
+            HostSource::Config => recorded.configured_ids.push(entry),
+        }
+    }
+    recorded
 }
 
 /// The address of the enrollment `host_id` names, or why it cannot be withdrawn.
@@ -737,31 +756,40 @@ fn withdrawable(
 /// the order is total. Clients re-sort by activity anyway (spec 9.2), so this is
 /// about being deterministic rather than about presentation.
 ///
-/// A host is named whether or not it has rows here, because it may have none for
-/// two different reasons: it is quiet, or this gateway cannot reach it and never
-/// stored what it last said. A client renders the second as an empty group
-/// rather than as nothing, which is the whole point of naming the hosts
-/// (spec 7.1).
+/// Every enrolled host is named here, whether or not it has rows, because it may
+/// have none for three different reasons: it is quiet, this gateway cannot reach
+/// it and never stored what it last said, or it has never answered at all. A
+/// client renders each as an empty group rather than as nothing, which is the
+/// whole point of naming the hosts (spec 7.1). The last of them is named by its
+/// address, because that is all this gateway knows it by: an id is learned by
+/// asking, and a synthetic one would namespace sessions under a name that stops
+/// being theirs the moment the host answers.
 fn merge(hosts: &BTreeMap<HostAddress, Enrollment>) -> MergedDirectory {
     let mut rows: Vec<(&str, &Row, bool)> = Vec::new();
     let mut enrolled: Vec<DirectoryHost> = Vec::new();
-    for enrollment in hosts.values() {
-        // A host that has never answered has no id to namespace with, and
-        // therefore no rows either, and no group for a client to put under a
-        // name it does not have (spec 7.1).
+    for (address, enrollment) in hosts {
+        enrolled.push(DirectoryHost {
+            id: enrollment.host_id.clone(),
+            // A label only, and only where there is no id to label with. An
+            // address is not something a client can address a session by.
+            address: enrollment.host_id.is_none().then(|| address.to_string()),
+            unreachable: !enrollment.connected,
+        });
+        // A host that has never answered has no id to namespace with, so its
+        // rows have nowhere to appear even if it somehow sent some.
         let Some(host_id) = enrollment.host_id.as_deref() else {
             continue;
         };
-        enrolled.push(DirectoryHost {
-            id: host_id.to_string(),
-            unreachable: !enrollment.connected,
-        });
         for row in &enrollment.rows {
             rows.push((host_id, row, enrollment.connected));
         }
     }
     rows.sort_by(|left, right| right.1.id.cmp(&left.1.id).then_with(|| left.0.cmp(right.0)));
-    enrolled.sort_by(|left, right| left.id.cmp(&right.id));
+    enrolled.sort_by(|left, right| {
+        left.id
+            .cmp(&right.id)
+            .then_with(|| left.address.cmp(&right.address))
+    });
     MergedDirectory {
         sessions: rows
             .into_iter()
@@ -1015,9 +1043,10 @@ mod tests {
     }
 
     /// A host that has never answered has no id, so it has no namespace and
-    /// cannot contribute rows. It is still an enrollment.
+    /// cannot contribute rows. It is named all the same, by the address it is
+    /// enrolled at, which is what a client labels the empty group by (spec 7.1).
     #[test]
-    fn a_host_with_no_id_yet_contributes_nothing() {
+    fn a_host_with_no_id_yet_is_named_by_its_address() {
         let directory = Directory::new();
         let address = address("127.0.0.1:1");
         directory
@@ -1025,17 +1054,33 @@ mod tests {
             .expect("enroll");
         directory.set_rows(&address, vec![row("s-1")]);
 
-        assert!(directory.sessions().sessions.is_empty());
+        assert_eq!(
+            directory.sessions().hosts,
+            vec![DirectoryHost {
+                id: None,
+                address: Some(address.to_string()),
+                unreachable: true,
+            }],
+            "a client has a group to render, and nothing in the id position: an \
+             id namespaces sessions, and a synthetic one would poison every id \
+             this client holds the moment the real one arrived (spec 7.1)",
+        );
         assert!(
-            directory.sessions().hosts.is_empty(),
-            "and no group either: a client has no name to put one under, and an \
-             address is not one (spec 7.1)",
+            validate_host_id(&address.to_string()).is_err(),
+            "and the label could never be taken for an id if it did reach that \
+             position: {address}",
+        );
+        assert!(
+            directory.sessions().sessions.is_empty(),
+            "no namespace, so no rows either",
         );
         assert_eq!(directory.hosts().hosts.len(), 1);
         assert_eq!(directory.hosts().hosts[0].id, None);
-        assert!(
-            directory.dynamic().is_empty(),
-            "and there is nothing to write down about it",
+        assert_eq!(
+            directory.record(),
+            Recorded::default(),
+            "and there is nothing to write down about it: an address is already \
+             in the configuration file that named it",
         );
 
         directory.adopt(&address, "learned").expect("adopt");
@@ -1047,10 +1092,62 @@ mod tests {
         assert_eq!(
             directory.sessions().hosts,
             vec![DirectoryHost {
-                id: "learned".to_string(),
+                id: Some("learned".to_string()),
+                address: None,
                 unreachable: true,
             }],
-            "and so does its group, which it is not connected to fill yet",
+            "and its group is keyed by that id, with no address left to label by",
+        );
+    }
+
+    /// A learned id is written down for every enrollment, not only for the ones
+    /// the state file is the record of (spec 7.1).
+    ///
+    /// The two records are kept apart because they mean different things: a
+    /// dynamic enrollment exists because the file says so, while a configured
+    /// host's entry is identity only, so restoring it can never bring back a host
+    /// the operator removed from the configuration.
+    #[test]
+    fn a_learned_id_is_recorded_whichever_way_the_host_was_enrolled() {
+        let directory = Directory::new();
+        connected(&directory, "127.0.0.1:1", "dynamic", &["s-1"]);
+        let configured = address("127.0.0.1:2");
+        directory
+            .enroll(configured.clone(), HostSource::Config, None)
+            .expect("enroll");
+        let quiet = address("127.0.0.1:3");
+        directory
+            .enroll(quiet.clone(), HostSource::Config, None)
+            .expect("enroll");
+
+        assert_eq!(
+            directory.record(),
+            Recorded {
+                hosts: vec![EnrolledHost {
+                    address: address("127.0.0.1:1"),
+                    host_id: "dynamic".to_string(),
+                }],
+                configured_ids: Vec::new(),
+            },
+            "a configured host that has never answered has no id to record",
+        );
+
+        directory.adopt(&configured, "learned").expect("adopt");
+
+        assert_eq!(
+            directory.record(),
+            Recorded {
+                hosts: vec![EnrolledHost {
+                    address: address("127.0.0.1:1"),
+                    host_id: "dynamic".to_string(),
+                }],
+                configured_ids: vec![EnrolledHost {
+                    address: configured,
+                    host_id: "learned".to_string(),
+                }],
+            },
+            "and the one that answered is recorded by identity, without the file \
+             becoming the record of it being enrolled at all",
         );
     }
 
@@ -1327,18 +1424,19 @@ mod tests {
             .expect("enroll");
 
         assert_eq!(
-            directory.dynamic().len(),
+            directory.record().hosts.len(),
             1,
-            "a configured host is the file's record, not the gateway's",
+            "a configured host's existence is the configuration file's record, \
+             not this one's",
         );
         // Refused where a withdrawal is written down from, so a withdrawal that
         // will not happen is never recorded, and refused again where it mutates.
         assert!(matches!(
-            directory.dynamic_without("static"),
+            directory.record_without("static"),
             Err(DirectoryError::StaticHost { .. }),
         ));
         assert!(matches!(
-            directory.dynamic_without("absent"),
+            directory.record_without("absent"),
             Err(DirectoryError::UnknownHost { .. }),
         ));
         assert!(matches!(
@@ -1362,11 +1460,12 @@ mod tests {
 
         // The record a withdrawal writes before it does anything: the set as it
         // will stand, from a directory that has not moved.
-        assert!(
+        assert_eq!(
             directory
-                .dynamic_without("dynamic")
+                .record_without("dynamic")
                 .expect("a dynamic host")
-                .is_empty(),
+                .hosts,
+            Vec::new(),
             "what gets written down is the set without the host being withdrawn",
         );
         assert!(
@@ -1395,7 +1494,7 @@ mod tests {
                 .iter()
                 .map(|host| host.id.clone())
                 .collect::<Vec<_>>(),
-            vec!["static".to_string()],
+            vec![Some("static".to_string())],
             "and so does its group, while the host that stayed keeps its own",
         );
         assert!(
