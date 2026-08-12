@@ -362,6 +362,12 @@ internally tagged with `kind`:
 - `list`: `{kind, sessions: [...]}`. The full session list with
   per-session status (section 6.8). Cumulative, the latest frame
   supersedes all earlier ones.
+- `error`: `{kind, session, epoch?, code, message, ...}`. The error
+  envelope (section 6.6) as a stream frame, session-scoped. Its
+  first use is the per-session attach refusal: a named session the
+  server cannot resolve produces this instead of an attach block,
+  and the stream lives on for every other session. Reliable-transient
+  class.
 - `reset`: `{kind, session}`. Continuity for this session is broken
   (head switch, or a gateway lost and regained its host). The client
   must re-attach the session (section 6.5). Its cursor stays valid to
@@ -413,7 +419,8 @@ Every frame is in exactly one class:
 - **Reliable-transient** frames are everything else: tool
   start/end, sub-agent end, task start/end, notices, warnings,
   errors, lifecycle brackets, usage updates, queue updates,
-  compaction progress, `caught_up`, `reset`. Not replayable, but
+  compaction progress, `caught_up`, `reset`, and the `error`
+  frame. Not replayable, but
   one-shot: losing one wedges or corrupts client state (a lost
   `ToolExecutionEnd` is an unrendered tool result, a lost
   `SubAgentEnd` is a spinner that never stops). These must be
@@ -450,7 +457,13 @@ Per session the host maintains:
 Attaching is done through the stream itself, there is no separate
 snapshot request. The stream request names sessions to attach, each
 with an optional cursor: `GET /v1/events?session=<id>[@<epoch>:<seq>]`
-(repeatable). For each named session the server, atomically with
+(repeatable). A stream request never fails wholesale over one bad
+session: each named session either gets its attach block or a
+session-scoped `error` frame (`unknown_session`), and the rest are
+served. Failing the whole stream over one dead id would cost a
+client its healthy sessions on every other host, the same shape of
+punishment the unreachable rule refuses (section 7.1). For each
+resolvable session the server, atomically with
 respect to that session's event flow: registers the subscription,
 projects the durable suffix, and emits in order on the stream: a
 `state` frame, the backfill (projected events for entries after the
@@ -586,7 +599,9 @@ Client application rules:
   only advances at `caught_up`, which never came, so discarding the
   partial application and re-attaching is safe, and idempotency
   absorbs whatever was already folded. A re-attach that fails because
-  the session no longer exists (its host was withdrawn) is surfaced,
+  the session no longer exists (its host was withdrawn) fails as a
+  session-scoped `error` frame, never as the stream: the client
+  surfaces it and drops the attachment,
   the session's disappearance from the list finishes the story.
 
 ### 6.6 Commands
@@ -1006,13 +1021,10 @@ incrementally when the host's epochs survived and fully when they did
 not. The same mechanism covers the case where a host evicts a slow
 gateway. Removing an enrollment is active teardown, not bookkeeping:
 the upstream connections close, the host's sessions leave the merged
-list, and its splices end. Leaving them would serve a directory that
-contradicts the enrollment set. Those splices end **without** a
-`reset`: it would ask the client to attach ids the gateway no longer
-resolves, and a refused attach fails a client's whole stream (section
-6.5), so it would cost that client the sessions it holds on every
-other host. The directory is what tells it, the withdrawn host's rows
-and its entry are gone from it.
+list, and its splices end with the `reset` a withdrawal owes
+(section 6.5): the client's re-attach is refused per session with an
+`error` frame, its stream and its sessions on every other host are
+untouched, and the directory confirms what the refusal said.
 
 The gateway does not re-open that upstream itself. Resuming one needs a
 *current* cursor, and the client's cursor advances as it applies the

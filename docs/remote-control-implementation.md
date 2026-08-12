@@ -76,7 +76,11 @@ survived adversarial review. After the phase's work is committed:
    the spec or the manual, both prompts must name those paragraphs
    as targets: prose written by the same hands as the code inherits
    the code's blind spots, and self-written spec deltas have been
-   the falsified paragraphs more than once.
+   the falsified paragraphs more than once, whoever held the pen.
+   Cross-references in a delta are claims, not decoration: a reviewer
+   greps the cited section and confirms it says what the citation
+   claims, a phantom citation has already carried a wrong rule past
+   two reviewers who deferred to it.
 2. Run a **fix pass** that takes both reports, triages them,
    integrates the valid findings, and amends the phase's commits.
    Adversarial review produces false positives, rejecting a finding
