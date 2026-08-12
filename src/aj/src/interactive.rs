@@ -7866,19 +7866,15 @@ mod tests {
     /// short) still resumes: the repair drops the torn record, every box is
     /// `Done`, and the torn sub's flushed history projects without panicking.
     ///
-    // TODO(aljoscha): flaky under load, roughly 2 in 25 runs. Both sightings
-    // were `Sub(2)` resuming `Failed` instead of `Done`, and both were whole
-    // suite runs. It does not reproduce on its own (0 of 10) or over the
-    // binary's own suite (0 of 6), so it needs the machine busy.
-    //
-    // The suspicion is a race in this setup rather than in the resume under
-    // test: `drive_demo_to_completion` returns once the demo's observable
-    // work is done, and under contention one of `parallel-agents`'
-    // sub-agents can still record a failure before the truncation below
-    // reads the log, so the box resumes from a `Failed` record that really
-    // was written. If you hit it, dump the log bytes before truncating and
-    // check whether the failure is already on disk. If it is, the fix is in
-    // the wait, not in the repair.
+    /// `parallel-agents` runs its two children concurrently, so which of
+    /// their lines the log holds back to back is up to the machine, and the
+    /// torn sub's last bracket may hold its `ToolUse` assistant message and
+    /// the tool result answering it, or the tool result alone. Replay reads
+    /// the conclusion off the run's last message either way, so the box
+    /// resumes `Done` for every interleaving. `aj-session`'s
+    /// `an_aborted_run_concludes_the_same_under_either_interleaving` pins
+    /// that directly, on both interleavings, without needing this test to
+    /// draw the unlucky one.
     #[tokio::test]
     async fn aborted_session_resume_loads_and_observes() {
         let dir = TempDir::new().expect("tempdir");
@@ -7967,8 +7963,10 @@ mod tests {
         // Report parity: the attach block's projection and the eager replay
         // agree on the box report. Sub(n) is tool-concluding here (its last
         // flushed entry is a tool result, its concluding assistant text was
-        // torn off), so per spec both show an empty report (a thin box). This
-        // is the "the report matches, per spec" guarantee.
+        // torn off), so the report is whatever its last bracket held, empty
+        // when an interleaved entry split the tool result off from the
+        // assistant message that asked for it. This is the "the report
+        // matches, per spec" guarantee.
         let resumed_report = sub_boxes(&resumed.chat.borrow())
             .into_iter()
             .find(|(m, _, _, _)| *m == n)

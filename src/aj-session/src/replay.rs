@@ -528,13 +528,11 @@ struct OpenRun {
     /// final report carried on the closing [`AgentEvent::SubAgentEnd`].
     report: String,
     /// How the run concluded, carried on the closing
-    /// [`AgentEvent::SubAgentEnd`]. Derived from the run's last assistant
-    /// message stop reason: `Length` -> `Truncated`, `Error`/`Aborted`
-    /// and an interrupted `ToolUse` terminal -> `Failed`, otherwise
-    /// `Completed`. This reconstructs the conclusion on resume without
-    /// any dedicated on-disk entry, because a failed, aborted, or
-    /// interrupted run's terminal message is itself persisted with the
-    /// matching stop reason.
+    /// [`AgentEvent::SubAgentEnd`]. Every message of the run rewrites it
+    /// (see [`ReplayState::bracket_subagent`]), so it speaks for the last
+    /// message the walk saw and not for the bracket as a whole. A
+    /// bracket holds all of the run's trailing entries, so this reads the
+    /// same however the run interleaves with other agents'.
     conclusion: SubAgentConclusion,
 }
 
@@ -598,13 +596,19 @@ fn fallback_settings() -> AgentSettings {
     }
 }
 
-/// Reconstruct a sub-agent run's conclusion from its terminal message's
-/// stop reason. `Length` is a token-cap truncation. A failure is `Error`,
-/// `Aborted`, or a `ToolUse` terminal: a run only ends on `ToolUse` when it
-/// was interrupted mid tool-loop before producing a final answer (a clean
-/// run's last assistant message is always `Stop`), which matches the live
-/// path mapping such an interruption to `Failed`. `Stop` is a clean
-/// completion.
+/// Reconstruct a sub-agent run's conclusion from the last message on its
+/// thread. `Length` is a token-cap truncation. A failure is `Error`,
+/// `Aborted`, or a `ToolUse` terminal: an assistant message is only the
+/// run's last one on `ToolUse` when the run was interrupted mid tool-loop
+/// before the tools it asked for came back (a clean run's last assistant
+/// message is always `Stop`), which matches the live path mapping such an
+/// interruption to `Failed`. `Stop` is a clean completion.
+///
+/// A run whose last message is not an assistant message concluded between
+/// inferences: its tools answered and it was cut before the next one. That
+/// is the aborted-session shape, which resumes as a clean close, so
+/// [`ReplayState::bracket_subagent`] resets the conclusion to `Completed`
+/// on every message and this only speaks for assistant ones.
 ///
 /// This is how a resumed session tells a failed, truncated, or interrupted
 /// run from a clean one without a dedicated on-disk marker: the terminal
@@ -689,7 +693,21 @@ impl ReplayState {
             return;
         };
         self.seen_subs.insert(n);
-        if self.open_runs.entry(n).or_default().start.is_some() {
+        let run = self.open_runs.entry(n).or_default();
+        if matches!(entry.entry, ConversationEntryKind::Message { .. }) {
+            // Every message of the run decides its conclusion afresh: an
+            // assistant message overwrites this from its stop reason in
+            // `capture_sub_report`, which runs on this same entry, while a
+            // user or tool-result message leaves the clean close a run cut
+            // between inferences deserves. Resetting here rather than only
+            // when the bracket opens is what keeps the outcome a property
+            // of the run: a bracket that holds a `ToolUse` assistant
+            // message and the tool result answering it reads as the clean
+            // close it is, the same as when an interleaved entry splits
+            // the two into separate brackets.
+            run.conclusion = SubAgentConclusion::Completed;
+        }
+        if run.start.is_some() {
             // The run may have opened on an entry this walk dropped, in
             // which case its start has to be re-synthesized here so the
             // suffix stays well-bracketed (spec 6.5).
@@ -978,11 +996,9 @@ impl ReplayState {
     ///
     /// Both overwrite rather than accumulate: the report is the most
     /// recent sub-agent assistant message's text, and the conclusion its
-    /// stop reason (see [`conclusion_from_stop_reason`]). A run starts out
-    /// with an empty report and `Completed`, so after its last assistant
-    /// message these hold the final report and conclusion `close_run`
-    /// reads onto the `SubAgentEnd`. A no-op unless `agent_id` names an
-    /// open run.
+    /// stop reason (see [`conclusion_from_stop_reason`]). The report is
+    /// bracket-scoped, so an interleaved run's box shows the report of its
+    /// last bracket. A no-op unless `agent_id` names an open run.
     ///
     /// Split out from projection so deferred replay can advance the
     /// report without cloning the sub-agent's messages into events. The
@@ -1974,6 +1990,142 @@ mod tests {
         let log = subagent_log_with_stop_reason(StopReason::ToolUse);
         let events: Vec<_> = replay(&log).collect();
         assert_eq!(replayed_conclusion(&events), SubAgentConclusion::Failed);
+    }
+
+    /// Two concurrent sub-agents, each cut after its tool result came back
+    /// and before the answer it would have written next. That is the
+    /// aborted-session shape: the run has no terminal assistant message.
+    ///
+    /// `grouped` picks how the two runs interleave in append order. False
+    /// alternates them (`a` call, `b` call, `a` result, `b` result), true
+    /// keeps each run's pair contiguous (`a` call, `a` result, `b` call,
+    /// `b` result). Nothing else differs, so a difference in what replays
+    /// out of the two logs is one the interleaving alone caused.
+    fn log_with_two_aborted_subs(grouped: bool) -> (TempDir, ConversationLog) {
+        let dir = fresh_sessions_dir();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let mut log = ConversationLog::create(&persistence).expect("create log");
+        log.set_system_prompt("p".into()).expect("sp");
+
+        let parent_head = {
+            let mut view = ConversationView::user(&mut log);
+            view.add_message(user_msg("run two checks")).expect("u");
+            view.add_message(assistant_msg(vec![AssistantContent::Text(TextContent {
+                text: "delegating".into(),
+                text_signature: None,
+            })]))
+            .expect("a");
+            view.head().cloned().expect("head")
+        };
+
+        let mut heads = [
+            log.append_subagent_spawn(1, parent_head.clone(), "first task", false, &sub_settings())
+                .expect("spawn 1")
+                .id,
+            log.append_subagent_spawn(2, parent_head, "second task", false, &other_sub_settings())
+                .expect("spawn 2")
+                .id,
+        ];
+
+        let task = |n: usize| user_msg(&format!("task {n}"));
+        let call = |n: usize| {
+            AgentMessage::wire(Message::Assistant(AssistantMessage {
+                content: vec![
+                    AssistantContent::Text(TextContent {
+                        text: format!("on it {n}"),
+                        text_signature: None,
+                    }),
+                    AssistantContent::ToolCall(ToolCall {
+                        id: format!("call-{n}"),
+                        name: "bash".into(),
+                        arguments: json!({"command": "echo hi"}),
+                    }),
+                ],
+                stop_reason: StopReason::ToolUse,
+                ..AssistantMessage::empty()
+            }))
+        };
+        let result = |n: usize| tool_result_msg(&format!("call-{n}"), "bash", "hi", None);
+
+        let steps: Vec<(usize, AgentMessage)> = if grouped {
+            vec![
+                (1, task(1)),
+                (2, task(2)),
+                (1, call(1)),
+                (1, result(1)),
+                (2, call(2)),
+                (2, result(2)),
+            ]
+        } else {
+            vec![
+                (1, task(1)),
+                (2, task(2)),
+                (1, call(1)),
+                (2, call(2)),
+                (1, result(1)),
+                (2, result(2)),
+            ]
+        };
+        for (n, message) in steps {
+            let head = heads[n - 1].clone();
+            let mut view = ConversationView::subagent(&mut log, head, n);
+            view.add_message(message).expect("sub message");
+            heads[n - 1] = view.head().cloned().expect("sub head");
+        }
+
+        (dir, log)
+    }
+
+    /// The conclusion each run's box ends on: the last `SubAgentEnd` per
+    /// sub, which is the one the reducer keeps. An interleaved run's
+    /// bracket opens and closes several times, so the earlier ones are
+    /// overwritten.
+    fn final_conclusions(events: &[AgentEvent]) -> BTreeMap<usize, SubAgentConclusion> {
+        let mut out = BTreeMap::new();
+        for event in events {
+            if let AgentEvent::SubAgentEnd {
+                child: AgentId::Sub(n),
+                conclusion,
+                ..
+            } = event
+            {
+                out.insert(*n, *conclusion);
+            }
+        }
+        out
+    }
+
+    /// A run's outcome is a property of its own messages, so where another
+    /// agent's entries fall between them must not change it. Both runs here
+    /// were cut between inferences, with their tool calls answered, which
+    /// is the aborted-session shape that resumes `Completed` (the box stays
+    /// `Done`).
+    ///
+    /// Bracket-scoped conclusion state fails this: the grouped log's second
+    /// run closes on a bracket holding its `ToolUse` assistant message and
+    /// reads as an interrupted tool loop, while the alternating log's
+    /// closes on one holding only its tool result.
+    #[test]
+    fn an_aborted_run_concludes_the_same_under_either_interleaving() {
+        let expected = BTreeMap::from([
+            (1, SubAgentConclusion::Completed),
+            (2, SubAgentConclusion::Completed),
+        ]);
+        for grouped in [false, true] {
+            let (_dir, log) = log_with_two_aborted_subs(grouped);
+            let full: Vec<_> = replay(&log).collect();
+            let deferred: Vec<_> = replay_deferring_subs(&log).collect();
+            assert_eq!(
+                final_conclusions(&full),
+                expected,
+                "full replay of the grouped={grouped} interleaving",
+            );
+            assert_eq!(
+                final_conclusions(&deferred),
+                expected,
+                "deferred replay of the grouped={grouped} interleaving",
+            );
+        }
     }
 
     /// Deferred replay withholds the sub's content but must still report
