@@ -33,7 +33,7 @@ mod tests;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
 use tokio::sync::Mutex as TokioMutex;
@@ -518,7 +518,7 @@ impl Gateway {
 /// Weak, because the gateway owns the links this is handed to.
 #[derive(Clone)]
 pub(crate) struct Recorder {
-    inner: std::sync::Weak<GatewayInner>,
+    inner: Weak<GatewayInner>,
 }
 
 impl Recorder {

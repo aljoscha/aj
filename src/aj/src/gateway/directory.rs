@@ -364,7 +364,7 @@ impl Directory {
     /// contradicts that set. What this does *not* do is end anything, see
     /// [`Withdrawn`].
     ///
-    /// The refusals are [`Self::dynamic_without`]'s, and a withdrawal reaches
+    /// The refusals are [`Self::record_without`]'s, and a withdrawal reaches
     /// this only once that answer has been written down, so in practice they are
     /// unreachable here: the gateway holds one lock across both calls. Checked
     /// again rather than assumed, because the set is what this mutates.
