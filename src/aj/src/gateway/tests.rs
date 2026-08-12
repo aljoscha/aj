@@ -1249,6 +1249,24 @@ async fn a_proxied_error_body_names_the_session_this_gateways_way() {
 // A host that is not there (spec 6.8's `unreachable`, 6.1's 503)
 // ---------------------------------------------------------------------------
 
+/// The enrolled-host entry `host` has in `list`.
+///
+/// What a client's group header renders its reachability from, and the only
+/// such signal it has for a host it holds no rows for.
+fn host_group<'a>(list: &'a SessionList, host: &str) -> &'a DirectoryHost {
+    list.hosts
+        .iter()
+        .find(|entry| entry.id.as_deref() == Some(host))
+        .unwrap_or_else(|| panic!("{host} is named among the hosts: {:?}", list.hosts))
+}
+
+/// A gateway keeps a downed host's rows, marks them, and marks that host's own
+/// group entry along with them.
+///
+/// Both marks come out of one merge and are asserted on one payload, because a
+/// client renders the rows from `SessionSummary::unreachable` and the header
+/// above them from `DirectoryHost::unreachable`: a header disagreeing with the
+/// rows beneath it is what a regression between the two looks like.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_downed_hosts_sessions_stay_listed_and_read_unreachable() {
     let mut left = Upstream::start().await;
@@ -1263,14 +1281,19 @@ async fn a_downed_hosts_sessions_stay_listed_and_read_unreachable() {
 
     left.stop().await;
 
-    let row = fixture
+    let marked = fixture
         .until("the downed host's row to be marked", |list| {
             list.sessions
                 .iter()
-                .find(|row| row.id == downed && row.unreachable)
-                .cloned()
+                .any(|row| row.id == downed && row.unreachable)
+                .then(|| list.clone())
         })
         .await;
+    let row = marked
+        .sessions
+        .iter()
+        .find(|row| row.id == downed)
+        .expect("the row this waited for");
     assert_eq!(
         row.host.as_deref(),
         Some(left.host_id().as_str()),
@@ -1280,6 +1303,17 @@ async fn a_downed_hosts_sessions_stay_listed_and_read_unreachable() {
     assert!(
         !neighbour.unreachable,
         "one host going away says nothing about the other",
+    );
+    assert!(
+        host_group(&marked, &left.host_id()).unreachable,
+        "the rows read unreachable under a header that reads reachable, so a \
+         client renders the downed host as if it were there: {:?}",
+        marked.hosts,
+    );
+    assert!(
+        !host_group(&marked, &right.host_id()).unreachable,
+        "one host going away marked the other's header too: {:?}",
+        marked.hosts,
     );
     let reported = fixture
         .until_hosts("the downed host to be reported as such", |hosts| {
@@ -1297,14 +1331,19 @@ async fn a_downed_hosts_sessions_stay_listed_and_read_unreachable() {
 
     // And it comes back on its own: the link keeps dialing.
     left.restart().await;
-    fixture
+    let cleared = fixture
         .until("the returned host's row to clear", |list| {
             list.sessions
                 .iter()
-                .find(|row| row.id == downed && !row.unreachable)
-                .cloned()
+                .any(|row| row.id == downed && !row.unreachable)
+                .then(|| list.clone())
         })
         .await;
+    assert!(
+        !host_group(&cleared, &left.host_id()).unreachable,
+        "the rows cleared under a header still marked unreachable: {:?}",
+        cleared.hosts,
+    );
 
     fixture.shutdown().await;
     left.stop().await;
