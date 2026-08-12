@@ -11,7 +11,11 @@
 //! - reducer equivalence: one client attached in process as the oracle and
 //!   one through HTTP, folded with the same [`SessionClient`] and compared on
 //!   [`CanonicalState`], including the fault-injection variant that cuts the
-//!   stream and re-attaches with a cursor.
+//!   stream and re-attaches with a cursor. The no-fault comparisons use the
+//!   full canonical form, the seeded cut sweep uses its convergent tier
+//!   (spec 11.2). The hand-placed cuts further down stay on the full form:
+//!   their scripts raise no transient, so the stronger tier holds and there
+//!   is no reason to give it up.
 //!
 //! Every wait is bounded by [`DEADLINE`], so a wedged host fails a test
 //! instead of hanging CI.
@@ -29,8 +33,8 @@ use aj_app::host::{AttachRequest, Attachment, CommandOutcome, HostSetup, Session
 use aj_app::session_setup::RunConfigSnapshot;
 use aj_app::settings::ConfigLayers;
 use aj_app::test_support::{
-    CanonicalEntry, CanonicalState, assert_canonical_eq, assert_no_dangling,
-    finalized_text_message, scripted_model_info,
+    CanonicalAgent, CanonicalEntry, CanonicalState, ConvergentState, assert_canonical_eq,
+    assert_convergent_eq, assert_no_dangling, finalized_text_message, scripted_model_info,
 };
 use aj_conf::{Config, ConfigLayer};
 use aj_models::auth::AuthStorage;
@@ -953,12 +957,34 @@ impl Attached {
     fn canonical(&self) -> CanonicalState {
         CanonicalState::of(&self.chat, &self.client)
     }
+
+    fn convergent(&self) -> ConvergentState {
+        self.canonical().convergent()
+    }
 }
 
-/// The two folds landed in the same place, with no dangling ids on either.
+/// The two folds landed in the same place on the full canonical form, with
+/// no dangling ids on either.
+///
+/// The tier for a client that saw every frame: nothing is masked, so a
+/// transient the other fold holds is a difference like any other.
 #[track_caller]
 fn assert_converged(remote: &Attached, oracle: &Attached, context: &str) {
     assert_canonical_eq(&remote.canonical(), &oracle.canonical(), context);
+    assert_no_dangling(&remote.chat);
+    assert_no_dangling(&oracle.chat);
+}
+
+/// The two folds landed in the same place on the canonical form's
+/// convergent tier, with no dangling ids on either.
+///
+/// The tier for a client whose connection died: a reliable-transient frame
+/// published while it was away is not replayable (spec 6.4), so both sides
+/// are compared with those artifacts masked out. Everything a backfill
+/// regenerates is still compared, dangling ids included.
+#[track_caller]
+fn assert_converged_across_a_cut(remote: &Attached, oracle: &Attached, context: &str) {
+    assert_convergent_eq(&remote.convergent(), &oracle.convergent(), context);
     assert_no_dangling(&remote.chat);
     assert_no_dangling(&oracle.chat);
 }
@@ -2930,14 +2956,101 @@ fn cut_provider(script: Vec<AssistantMessage>) -> Arc<ScriptedProvider> {
     scripted(script, 1, Duration::from_millis(2))
 }
 
+/// One run of the cut sweep: the turn the session runs, and what the host
+/// does while the client is away.
+#[derive(Clone, Copy, Debug)]
+enum CutScenario {
+    /// A tool turn: the plain case.
+    ToolTurn,
+    /// A turn with a sub-agent in it, whose bracketing is the part a suffix
+    /// projection has to get right.
+    SubAgentTurn,
+    /// A tool turn, then, while the client is cut, a compact that finds
+    /// nothing to compact and a second turn behind it.
+    ///
+    /// The compact is a turn like any other (the host drives it through the
+    /// same turn machinery) and its one-line notice is the cleanest
+    /// reliable-transient the product raises: it appends no log entry, so
+    /// no backfill can regenerate it and the client that was away has no
+    /// way back to it. This is the run that makes the convergent tier
+    /// load-bearing rather than assumed.
+    ///
+    /// The second turn is what puts durable rows *behind* the notice, so
+    /// the two folds disagree on where every one of them sits and the
+    /// mask's renumbering is exercised rather than assumed too. Its
+    /// sub-agent box is a recorded location, which is the thing that
+    /// renumbering exists for.
+    NoticeWhileAway,
+}
+
+impl CutScenario {
+    fn script(self) -> Vec<AssistantMessage> {
+        match self {
+            Self::ToolTurn => tool_turn(),
+            Self::SubAgentTurn => sub_agent_turn(),
+            Self::NoticeWhileAway => {
+                let mut script = tool_turn();
+                script.extend(sub_agent_turn());
+                script
+            }
+        }
+    }
+
+    /// The main-transcript rows the oracle holds once the run has settled.
+    fn rows(self) -> usize {
+        match self {
+            Self::ToolTurn | Self::SubAgentTurn => TURN_ROWS,
+            // Both turns, and the notice row between them.
+            Self::NoticeWhileAway => 2 * TURN_ROWS + 1,
+        }
+    }
+
+    /// What the session does between the cut and the re-attach.
+    ///
+    /// The session is idle here (the caller settled the oracle first),
+    /// which is what lets the compact command through: the host refuses one
+    /// while a turn is running.
+    async fn while_away(self, fixture: &Fixture, session: &str, oracle: &mut Attached) {
+        let Self::NoticeWhileAway = self else { return };
+        let outcome = fixture
+            .client
+            .command(session, &RemoteCommand::Compact(CompactRequest::default()))
+            .await
+            .expect("a compact on an idle session");
+        assert!(matches!(outcome, CommandOutcome::Accepted));
+        oracle.settle().await;
+
+        // What the compact did, not just that it did something: a compact
+        // that found work would summarize instead, and this run needs the
+        // notice.
+        let state = oracle.canonical();
+        let raised = unbacked_notices(state.agent(AgentId::Main).expect("a main transcript"));
+        assert!(
+            matches!(raised.as_slice(), [text] if text.starts_with("Nothing to compact")),
+            "the compact raised the nothing-to-compact notice and nothing else: {raised:?}",
+        );
+
+        fixture.prompt(session, "and one more thing").await;
+        oracle.settle().await;
+    }
+}
+
+/// What one cut run proved, so a sweep of runs that proved nothing fails
+/// instead of passing quietly.
+struct CutRun {
+    /// The cut left the client short of the oracle's durable position,
+    /// which is what makes a cut worth anything: a cut past the turn's last
+    /// durable entry converges trivially.
+    interrupted: bool,
+    /// The client came back without a transient-only row the oracle holds,
+    /// which is the case only the convergent tier can be held to.
+    missed_a_transient: bool,
+}
+
 /// Cut the stream after `cut` live frames, re-attach with the cursor the fold
 /// committed, and require convergence with the oracle.
-///
-/// Answers whether the cut left the client short of the oracle's durable
-/// position, which is what makes a cut worth anything: a cut past the turn's
-/// last durable entry converges trivially.
-async fn converges_after_a_cut(script: Vec<AssistantMessage>, cut: usize) -> bool {
-    let fixture = Fixture::with_provider(cut_provider(script)).await;
+async fn converges_after_a_cut(scenario: CutScenario, cut: usize) -> CutRun {
+    let fixture = Fixture::with_provider(cut_provider(scenario.script())).await;
     let session = fixture.create().await;
     let mut oracle = fixture.oracle(&session).await;
     let mut remote = fixture.remote(&session).await;
@@ -2947,18 +3060,97 @@ async fn converges_after_a_cut(script: Vec<AssistantMessage>, cut: usize) -> boo
     remote.cut();
     let interrupted = remote.client.cursor().map(|cursor| cursor.seq);
     oracle.settle().await;
+    scenario.while_away(&fixture, &session, &mut oracle).await;
     let complete = oracle.client.cursor().map(|cursor| cursor.seq);
     remote.reattach().await;
     remote.settle().await;
 
     assert_eq!(
         main_rows(&oracle.canonical()),
-        TURN_ROWS,
+        scenario.rows(),
         "the compared state is a whole turn",
     );
-    assert_converged(&remote, &oracle, &format!("a cut after {folded} frames"));
+    assert_converged_across_a_cut(&remote, &oracle, &format!("a cut after {folded} frames"));
+    let run = CutRun {
+        interrupted: interrupted < complete,
+        missed_a_transient: !missed_transients(&remote.canonical(), &oracle.canonical()).is_empty(),
+    };
     fixture.shutdown().await;
-    interrupted < complete
+    run
+}
+
+/// The transient-only rows `oracle` holds that `remote` came back without.
+///
+/// Read off the *full* form on both sides, which is the point: it is what
+/// the convergent tier masked away, and a sweep that never produces one
+/// never exercised the mask.
+fn missed_transients(remote: &CanonicalState, oracle: &CanonicalState) -> Vec<CanonicalEntry> {
+    let mut missed = Vec::new();
+    for agent in &oracle.agents {
+        let held = remote
+            .agent(agent.agent)
+            .map(transients)
+            .unwrap_or_default();
+        for entry in transients(agent) {
+            if !held.contains(&entry) {
+                missed.push(entry.clone());
+            }
+        }
+    }
+    missed
+}
+
+/// One agent's transient-only rows: exactly what the convergent tier masks.
+fn transients(agent: &CanonicalAgent) -> Vec<&CanonicalEntry> {
+    agent
+        .entries
+        .iter()
+        .filter(|entry| entry.is_transient_only())
+        .collect()
+}
+
+/// The text of every notice in `agent`'s transcript that no log entry
+/// backs.
+///
+/// Spelled out rather than read through
+/// [`CanonicalEntry::is_transient_only`] on purpose: a run asserts with
+/// this that its own fixture reached the state it needs, so it has to keep
+/// answering even when the mask that predicate drives is the thing under
+/// suspicion.
+fn unbacked_notices(agent: &CanonicalAgent) -> Vec<&str> {
+    agent
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            CanonicalEntry::Notice {
+                text, entry: None, ..
+            } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What a sweep's runs proved between them.
+struct CutTally {
+    runs: usize,
+    interrupted: usize,
+    missed_a_transient: usize,
+}
+
+/// Run `count` seeded cuts of `scenario`, tallying what they proved.
+async fn sweep(scenario: CutScenario, seed: u64, frames: usize, count: usize) -> CutTally {
+    let mut tally = CutTally {
+        runs: 0,
+        interrupted: 0,
+        missed_a_transient: 0,
+    };
+    for cut in cuts(seed, frames, count) {
+        let run = converges_after_a_cut(scenario, cut).await;
+        tally.runs += 1;
+        tally.interrupted += usize::from(run.interrupted);
+        tally.missed_a_transient += usize::from(run.missed_a_transient);
+    }
+    tally
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2983,24 +3175,39 @@ async fn a_stream_cut_at_seeded_boundaries_converges() {
     };
     assert!(frames > 5, "a tool turn is more than a handful of frames");
 
-    let mut interrupted = 0;
-    for cut in cuts(0x5eed_1234_9abc_def0, frames, 6) {
-        interrupted += usize::from(converges_after_a_cut(tool_turn(), cut).await);
-    }
+    let tally = sweep(CutScenario::ToolTurn, 0x5eed_1234_9abc_def0, frames, 6).await;
     assert!(
-        interrupted > 0,
+        tally.interrupted > 0,
         "every cut landed past the turn's last durable entry, which proves nothing",
     );
 
     // And the same for a turn with a sub-agent in it, whose bracketing is the
     // part a suffix projection has to get right.
-    let mut interrupted = 0;
-    for cut in cuts(0x1234_5678_9abc_def0, frames, 4) {
-        interrupted += usize::from(converges_after_a_cut(sub_agent_turn(), cut).await);
-    }
+    let tally = sweep(CutScenario::SubAgentTurn, 0x1234_5678_9abc_def0, frames, 4).await;
     assert!(
-        interrupted > 0,
+        tally.interrupted > 0,
         "every sub-agent cut landed past the turn's last durable entry",
+    );
+
+    // And the run the convergent tier exists for: a notice published while
+    // the client was gone, which nothing replays.
+    let tally = sweep(
+        CutScenario::NoticeWhileAway,
+        0x0bad_c0de_9abc_def0,
+        frames,
+        4,
+    )
+    .await;
+    assert!(
+        tally.interrupted > 0,
+        "every notice-run cut landed past the turn's last durable entry",
+    );
+    assert!(
+        tally.missed_a_transient > 0,
+        "{} of {} runs came back missing a transient the oracle held, so the \
+         convergent tier masked nothing and this sweep measures nothing",
+        tally.missed_a_transient,
+        tally.runs,
     );
 }
 

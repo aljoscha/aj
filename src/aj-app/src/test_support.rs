@@ -8,7 +8,7 @@
 //! Frontend-bound helpers (a `Terminal` stub, the interactive
 //! `SessionWorld` builder) stay in the consuming binary.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -188,7 +188,8 @@ pub fn build_tagged_test_agent(
 }
 
 /// Comparable projection of a [`ChatState`] and the client that folded
-/// into it: the equality oracle for reducer-equivalence tests.
+/// into it: the equality oracle for reducer-equivalence tests, and the
+/// full form of the canonical form's two tiers (spec 11.2).
 ///
 /// Two states that would render the same conversation project onto the
 /// same value, so `assert_eq!` on this type answers "did these two folds
@@ -198,6 +199,10 @@ pub fn build_tagged_test_agent(
 /// `Serialize`, which is what [`CanonicalState::to_pretty_json`] uses to
 /// turn a mismatch into a line-oriented artifact instead of one very long
 /// `{:?}` line.
+///
+/// The full form is the tier for two clients that both saw every frame.
+/// A client that was disconnected is held to [`ConvergentState`] instead,
+/// which masks what a re-attach cannot recover.
 ///
 /// Deliberately not covered:
 ///
@@ -363,6 +368,51 @@ pub enum CanonicalEntry {
     },
 }
 
+impl CanonicalEntry {
+    /// Whether the row is a transient-only artifact: something the live
+    /// stream carried once that no durable entry backs, so no backfill
+    /// regenerates it.
+    ///
+    /// Two shapes qualify. A notice no log entry backs (every locally
+    /// raised one) rides a reliable-transient frame, delivered exactly
+    /// once (spec 6.4). An unfinalized assistant row is the in-flight
+    /// streaming text, which the reducer's own quiesce drops on the way
+    /// into a re-attach because nothing names it and the durable message
+    /// replaces it.
+    ///
+    /// A notice that does carry an origin is not transient-only: the
+    /// entry it derives from is on disk, and a backfill projects the
+    /// notice again from it.
+    pub fn is_transient_only(&self) -> bool {
+        matches!(
+            self,
+            Self::Notice { entry: None, .. }
+                | Self::Assistant {
+                    finalized: false,
+                    ..
+                }
+        )
+    }
+}
+
+/// The convergent tier of the canonical form: a [`CanonicalState`] with
+/// every transient-only artifact masked out (spec 11.2).
+///
+/// This is the tier a client that lost its connection can be held to. A
+/// reliable-transient frame is delivered once and is never replayed
+/// (spec 6.4), so a client disconnected across a transient's only
+/// delivery window legitimately never has it and no re-attach can hand it
+/// over later. Comparing the full form there would assert a promise the
+/// protocol does not make. The no-fault comparisons keep the full form,
+/// where both clients saw every frame and any difference is a real one.
+///
+/// The mask is narrow on purpose: it removes what
+/// [`CanonicalEntry::is_transient_only`] names and nothing else. Notices
+/// with a durable origin, every finalized row, the render indexes and all
+/// the accounting stay under comparison.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ConvergentState(CanonicalState);
+
 impl CanonicalState {
     /// Project the state `client` folded into `chat`.
     ///
@@ -464,24 +514,99 @@ impl CanonicalState {
         self.agents.iter().find(|a| a.agent == id)
     }
 
+    /// This state's [`ConvergentState`]: the same projection with every
+    /// transient-only row taken out and the streaming flag that names one
+    /// cleared.
+    ///
+    /// Dropping rows renumbers the transcript, so the recorded locations
+    /// (a sub-agent's box, a task's launch cell) move with it. Without
+    /// that, two clients that agree on everything but a masked notice
+    /// would still read as different at the first location behind it.
+    pub fn convergent(&self) -> ConvergentState {
+        let mut state = self.clone();
+        // The positions the mask took out, per agent, which is what the
+        // locations below are renumbered against.
+        let mut masked: HashMap<AgentId, Vec<usize>> = HashMap::new();
+        for agent in &mut state.agents {
+            let mut dropped = Vec::new();
+            let mut kept = Vec::with_capacity(agent.entries.len());
+            for (index, entry) in std::mem::take(&mut agent.entries).into_iter().enumerate() {
+                if entry.is_transient_only() {
+                    dropped.push(index);
+                } else {
+                    kept.push(entry);
+                }
+            }
+            agent.entries = kept;
+            // The flag names the streaming row the loop just dropped, so
+            // it goes with it or the tier contradicts itself.
+            agent.render.streaming = false;
+            masked.insert(agent.agent, dropped);
+        }
+        for location in state.sub_boxes.values_mut() {
+            location.index = renumber(masked.get(&location.agent), location.index);
+        }
+        for task in &mut state.tasks {
+            task.cell = renumber(masked.get(&task.owner), task.cell);
+        }
+        ConvergentState(state)
+    }
+
     /// Line-oriented rendering, so a mismatch reads as a diff instead of
     /// one very long line.
     pub fn to_pretty_json(&self) -> String {
-        serde_json::to_string_pretty(self).expect("canonical state serializes")
+        pretty(self)
     }
+}
+
+/// Where `index` lands once `masked`'s positions are taken out of the
+/// transcript, `None` when `index` is one of them.
+///
+/// A masked row is no longer nameable, and the oracle reports that the
+/// same way it reports a dangling id. No location names one today (a box
+/// and a launch cell are both durable rows), so that arm is a definition
+/// rather than a case with a caller.
+fn renumber(masked: Option<&Vec<usize>>, index: Option<usize>) -> Option<usize> {
+    let index = index?;
+    let masked = masked?;
+    if masked.contains(&index) {
+        return None;
+    }
+    Some(index - masked.iter().filter(|&&position| position < index).count())
 }
 
 /// Assert two canonical states are equal, reporting a mismatch as two
 /// line-oriented JSON documents plus `context`.
+///
+/// The full form: for two folds that both saw every frame.
 #[track_caller]
 pub fn assert_canonical_eq(left: &CanonicalState, right: &CanonicalState, context: &str) {
+    assert_tier_eq(left, right, "canonical states", context);
+}
+
+/// Assert two convergent tiers are equal, reporting a mismatch the same
+/// way [`assert_canonical_eq`] does.
+///
+/// For a fold that was disconnected: the transient-only artifacts it
+/// could not have are masked out of both sides.
+#[track_caller]
+pub fn assert_convergent_eq(left: &ConvergentState, right: &ConvergentState, context: &str) {
+    assert_tier_eq(left, right, "convergent tiers", context);
+}
+
+#[track_caller]
+fn assert_tier_eq<T: PartialEq + Serialize>(left: &T, right: &T, tier: &str, context: &str) {
     if left != right {
         panic!(
-            "canonical states differ ({context})\nleft:\n{}\nright:\n{}",
-            left.to_pretty_json(),
-            right.to_pretty_json(),
+            "{tier} differ ({context})\nleft:\n{}\nright:\n{}",
+            pretty(left),
+            pretty(right),
         );
     }
+}
+
+fn pretty<T: Serialize>(value: &T) -> String {
+    serde_json::to_string_pretty(value).expect("the canonical form serializes")
 }
 
 /// Every recorded [`EntryId`](crate::chat::EntryId) that no longer names
@@ -629,5 +754,207 @@ fn canonical_entry(entry: &Entry) -> CanonicalEntry {
             outcome: n.outcome,
             body: n.body.clone(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use aj_agent::events::AgentEvent;
+    use aj_agent::tool::TaskKind;
+    use aj_models::streaming::AssistantMessageEvent;
+
+    use crate::chat::reduce;
+
+    /// The notice a compact that found nothing to compact raises: the
+    /// canonical reliable-transient, appending no entry and carrying no
+    /// durable identity.
+    const TRANSIENT: &str = "Nothing to compact.";
+
+    fn agent_settings() -> AgentSettings {
+        AgentSettings {
+            provider: "scripted".into(),
+            model_id: "scripted".into(),
+            thinking: "off".into(),
+            thinking_display: "default".into(),
+            speed: "standard".into(),
+            verbosity: "default".into(),
+        }
+    }
+
+    /// A fold of one run, optionally with a locally raised `notice` at the
+    /// head of it.
+    ///
+    /// The rows behind the notice are the point: a sub-agent box and a
+    /// task's launch cell both record where they sit, so a mask that drops
+    /// a row without renumbering leaves them naming the wrong one.
+    fn folded(notice: Option<&str>) -> CanonicalState {
+        let mut chat = ChatState::new(agent_settings(), 200_000, Arc::new(Vec::new()));
+        let mut lifecycle = AgentLifecycle::default();
+        let mut apply = |chat: &mut ChatState, event| {
+            let _ = reduce(chat, &mut lifecycle, event, None);
+        };
+        if let Some(text) = notice {
+            apply(
+                &mut chat,
+                AgentEvent::Notice {
+                    agent_id: AgentId::Main,
+                    text: text.to_string(),
+                },
+            );
+        }
+        apply(
+            &mut chat,
+            AgentEvent::SubAgentStart {
+                parent: AgentId::Main,
+                child: AgentId::Sub(1),
+                task: "look into it".to_string(),
+                background: false,
+                settings: agent_settings(),
+            },
+        );
+        apply(
+            &mut chat,
+            AgentEvent::ToolExecutionStart {
+                agent_id: AgentId::Main,
+                call_id: "call-1".to_string(),
+                tool: "bash".to_string(),
+                args: serde_json::json!({"command": "sleep 30"}),
+            },
+        );
+        apply(
+            &mut chat,
+            AgentEvent::TaskStart {
+                agent_id: AgentId::Main,
+                task_id: 1,
+                call_id: "call-1".to_string(),
+                kind: TaskKind::Bash {
+                    command: "sleep 30".to_string(),
+                },
+                label: "sleep 30".to_string(),
+            },
+        );
+        CanonicalState::of_reduced(&chat, &lifecycle)
+    }
+
+    /// The property the fault-injection sweep rests on: a client that was
+    /// disconnected across a transient notice's only delivery window lands
+    /// where a client that got it lands, once both are masked.
+    #[test]
+    fn the_convergent_tier_masks_a_notice_no_entry_backs() {
+        let with = folded(Some(TRANSIENT));
+        let without = folded(None);
+
+        // Name the harm the renumbering answers before the whole-state
+        // comparison runs into it: every row behind the notice sits one
+        // position further down.
+        let box_at = |state: &CanonicalState| state.sub_boxes[&1].index;
+        assert_eq!(
+            box_at(&with),
+            box_at(&without).map(|index| index + 1),
+            "the notice pushed the rows behind it down",
+        );
+        assert_convergent_eq(
+            &with.convergent(),
+            &without.convergent(),
+            "a fold that missed a transient notice",
+        );
+    }
+
+    /// The other half of the tier distinction: the full form is where a
+    /// transient notice is still compared, so two folds that both saw
+    /// every frame are held to it.
+    #[test]
+    fn the_full_form_keeps_the_notice_the_convergent_tier_masks() {
+        let with = folded(Some(TRANSIENT));
+        let main = with.agent(AgentId::Main).expect("a main transcript");
+        assert!(
+            main.entries.iter().any(|entry| matches!(
+                entry,
+                CanonicalEntry::Notice { text, entry: None, .. } if text == TRANSIENT
+            )),
+            "the full form holds the transient notice: {:?}",
+            main.entries,
+        );
+        assert_ne!(
+            with,
+            folded(None),
+            "so two folds that differ only in it read as different",
+        );
+    }
+
+    /// The mask is narrow: a notice a log entry backs is regenerated by a
+    /// backfill, so a re-attached client has it and both tiers compare it.
+    #[test]
+    fn the_convergent_tier_keeps_a_notice_a_log_entry_backs() {
+        let mut chat = ChatState::new(agent_settings(), 200_000, Arc::new(Vec::new()));
+        let mut lifecycle = AgentLifecycle::default();
+        let _ = reduce(
+            &mut chat,
+            &mut lifecycle,
+            AgentEvent::Notice {
+                agent_id: AgentId::Main,
+                text: "Thinking level set to high.".to_string(),
+            },
+            Some(&"entry-7".to_string()),
+        );
+        let projected = CanonicalState::of_reduced(&chat, &lifecycle);
+        let empty = CanonicalState::of_reduced(
+            &ChatState::new(agent_settings(), 200_000, Arc::new(Vec::new())),
+            &AgentLifecycle::default(),
+        );
+
+        assert_ne!(
+            projected.convergent(),
+            empty.convergent(),
+            "a projected settings notice survives the mask",
+        );
+    }
+
+    /// The other transient-only artifact: the in-flight streaming row and
+    /// the flag that names it.
+    #[test]
+    fn the_convergent_tier_masks_the_in_flight_streaming_row() {
+        let mut chat = ChatState::new(agent_settings(), 200_000, Arc::new(Vec::new()));
+        let mut lifecycle = AgentLifecycle::default();
+        let mut partial = finalized_text_message("half a th");
+        partial.response_id = None;
+        let _ = reduce(
+            &mut chat,
+            &mut lifecycle,
+            AgentEvent::MessageUpdate {
+                agent_id: AgentId::Main,
+                message: aj_agent::message::AgentMessage::wire(
+                    aj_models::types::Message::Assistant(partial.clone()),
+                ),
+                event: AssistantMessageEvent::TextDelta {
+                    content_index: 0,
+                    delta: "half a th".to_string(),
+                    partial,
+                },
+            },
+            None,
+        );
+        let streaming = CanonicalState::of_reduced(&chat, &lifecycle);
+        let quiet = CanonicalState::of_reduced(
+            &ChatState::new(agent_settings(), 200_000, Arc::new(Vec::new())),
+            &AgentLifecycle::default(),
+        );
+
+        assert!(
+            streaming
+                .agent(AgentId::Main)
+                .expect("a main transcript")
+                .render
+                .streaming,
+            "the fold is mid-message",
+        );
+        assert_ne!(streaming, quiet, "the full form keeps the open row");
+        assert_convergent_eq(
+            &streaming.convergent(),
+            &quiet.convergent(),
+            "a fold whose in-flight text a re-attach would drop",
+        );
     }
 }
