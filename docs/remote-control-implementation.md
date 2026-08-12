@@ -324,6 +324,40 @@ ruling that settles it, so a batch round needs no new decisions. Two
 larger banked features (remote previews, cross-host prompt history)
 are recorded with their design constraints in spec section 13.
 
+## Status: paused before phase 4, daily-driving
+
+Phases 0 through 3 are complete and accepted. Phase 4 (provisioning)
+is deferred, not abandoned: the operating model for now is pet VMs
+with long-running `aj serve` hosts behind a gateway, driven daily to
+sand off rough edges. Phase 4 resumes on call, its section below is
+current and its kickoff constraints stand (re-verify ember behavior
+against the installed binary, the section 6.11/8 secrets posture as
+implementation constraints).
+
+Daily driving is deployment, so the before-deployment items are due
+now, in order:
+
+1. In-flight work completes: the 11.2 convergent tier, the
+   `aborted_session_resume` flake investigation.
+2. The targeted vacuity sweep (below), rescheduled from
+   before-deployment to before-daily-driving, same scope.
+3. The banked polish batch (`docs/banked-ux.md`).
+4. Reference systemd unit and a short setup note for a long-running
+   `aj serve` on a pet VM, pulled forward from phase 4's deliverables
+   because it is the daily-drive setup. Docs and a unit file only, no
+   provisioning code.
+5. Security posture before anything listens beyond loopback: hosts
+   and gateway run the identity gate per spec 6.11 (`--auth
+   tailscale` with an allowlist, or stay loopback behind SSH), and
+   the tailnet policy gets drafted against the real tailnet. This
+   one is a designer-and-owner task, not an implementer task.
+
+Rough edges found while daily driving follow the standard loop:
+reported, ruled, turned into tasks with the working loop and review
+pipeline unchanged. The banked features (remote previews, cross-host
+prompt history, the render-loop cost, spec section 13) get
+re-prioritized by actual use.
+
 ## Before deployment
 
 Between phase 4 landing and deployment, run the targeted vacuity
