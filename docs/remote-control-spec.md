@@ -581,7 +581,13 @@ Client application rules:
   has no state yet.
 - On `reset`, the client re-attaches (reopens the stream naming the
   session, offering its cursor). The server serves an incremental
-  suffix if the epoch still matches, or a full backfill if not.
+  suffix if the epoch still matches, or a full backfill if not. A
+  `reset` received mid-attach-block abandons the block: the cursor
+  only advances at `caught_up`, which never came, so discarding the
+  partial application and re-attaching is safe, and idempotency
+  absorbs whatever was already folded. A re-attach that fails because
+  the session no longer exists (its host was withdrawn) is surfaced,
+  the session's disappearance from the list finishes the story.
 
 ### 6.6 Commands
 
@@ -966,7 +972,15 @@ no sessions to mark. The signal survives anyway because a gateway's
 `list` frames carry the enrolled hosts with their reachability
 alongside the rows (additive, gateway-only), and a client renders an
 unreachable host it holds no rows for as an empty group rather than
-as nothing. Honest absence beats a cached directory: persisted rows
+as nothing. Learned host ids persist in gateway state: a `host_id` is
+a stable identity (it names the store, section 4), so caching it has
+no staleness hazard, and a rebuilt host correcting it on first
+contact just empties the old group. A configured host that has never
+answered has no id and never gets a synthetic one, ids namespace
+sessions and a fake one would poison client state the moment the real
+id arrived, so its hosts entry carries the configured address and the
+client labels the empty group by address. Honest absence beats a
+cached directory: persisted rows
 could name sessions that no longer exist, and a stale "maybe" is
 worse than a clear "unreachable, contents unknown". `GET /v1/sessions`
 answers the same payload, hosts included, because the read and the
