@@ -324,6 +324,18 @@ ruling that settles it, so a batch round needs no new decisions. Two
 larger banked features (remote previews, cross-host prompt history)
 are recorded with their design constraints in spec section 13.
 
+## Before deployment
+
+Between phase 4 landing and deployment, run the targeted vacuity
+sweep: most of the suite predates the self-asserting-fixture rule and
+is unaudited against the one failure mode passing tests conceal.
+Scope by harm, not count: the catch-up/equivalence layer, flow
+control and eviction, locks and release, the identity gate and id
+validation, the gateway's reset edges, and anything
+security-adjacent. Per test, mutation-check the property it names.
+The selection question is "if this silently broke, what would it
+cost and who would notice".
+
 ## Reporting
 
 At the end of each phase, produce a short report: what landed, test
