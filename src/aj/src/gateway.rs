@@ -528,9 +528,9 @@ impl Gateway {
 /// never reach the state file at all, and every restart while such a host is down
 /// would come back unable to name it.
 ///
-/// Settling one is a directory change and a write to the gateway's record, in
-/// that order and under one lock, which is why it lives here rather than in
-/// either of them.
+/// Settling one is a write to the gateway's record and a change to its
+/// directory, in that order and under one lock, which is why it lives here
+/// rather than in either of them.
 ///
 /// Weak, because the gateway owns the links this is handed to.
 #[derive(Clone)]
