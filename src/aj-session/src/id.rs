@@ -45,6 +45,8 @@ pub fn is_valid_session_id(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lock::SessionLock;
+    use crate::log::{ConversationError, ConversationLog};
     use crate::persistence::ConversationPersistence;
 
     /// Whatever the minting path produces is, by construction, a valid id.
@@ -53,7 +55,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let persistence = ConversationPersistence::new(dir.path().to_path_buf());
         for _ in 0..4 {
-            let log = crate::log::ConversationLog::create(&persistence).expect("create");
+            let log = ConversationLog::create(&persistence).expect("create");
             assert!(
                 is_valid_session_id(log.session_id()),
                 "minted {:?} is not a valid id",
@@ -98,5 +100,79 @@ mod tests {
     fn an_overlong_id_is_rejected() {
         assert!(is_valid_session_id(&"a".repeat(MAX_LEN)));
         assert!(!is_valid_session_id(&"a".repeat(MAX_LEN + 1)));
+    }
+
+    /// The grammar defends nothing on its own, so this pins the entry points
+    /// this module names: each refuses an id outside the grammar instead of
+    /// resolving the path it would name.
+    ///
+    /// A refusal and an empty store are the same answer from the outside, so
+    /// the fixture plants a real file where the traversal would land and an
+    /// identical one where a valid id lands. The valid id draws a positive
+    /// answer out of every entry point below, which is what makes the negative
+    /// answer beside it evidence of a check rather than of an empty directory.
+    #[test]
+    fn the_entry_points_this_module_names_refuse_an_id_outside_the_grammar() {
+        // The store sits one level down, so `../escaped` still lands inside
+        // the temp dir rather than somewhere a test has no business writing.
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("the store");
+        let persistence = ConversationPersistence::new(sessions.clone());
+
+        // An empty log is a well-formed one: current format, resumable, and a
+        // `stat` target. Both copies are empty, so the two ids below differ in
+        // nothing but whether the grammar admits them.
+        const CONTROL: &str = "2026-01-01-00-00-00-000";
+        std::fs::write(sessions.join(format!("{CONTROL}.jsonl")), b"").expect("a log in the store");
+        std::fs::write(dir.path().join("escaped.jsonl"), b"").expect("a log outside the store");
+        assert!(
+            dir.path().join("escaped.jsonl").is_file(),
+            "the traversal target is really there",
+        );
+
+        assert!(
+            persistence
+                .session_metadata(CONTROL)
+                .expect("stat")
+                .is_some(),
+        );
+        assert_eq!(persistence.is_current_format(CONTROL), Some(true));
+        ConversationLog::resume(&persistence, CONTROL).expect("the control log resumes");
+        drop(
+            SessionLock::try_acquire(&persistence, CONTROL, "host-under-test")
+                .expect("acquire")
+                .expect("the control id locks"),
+        );
+
+        for id in ["../escaped", "..", "", "with/slash"] {
+            assert!(!is_valid_session_id(id), "{id:?} is outside the grammar");
+            assert!(
+                persistence
+                    .session_metadata(id)
+                    .expect("a rejected id is not a failure")
+                    .is_none(),
+                "session_metadata resolved {id:?} to a file",
+            );
+            assert_eq!(
+                persistence.is_current_format(id),
+                None,
+                "is_current_format read the file {id:?} names",
+            );
+            assert!(
+                matches!(
+                    ConversationLog::resume(&persistence, id),
+                    Err(ConversationError::InvalidSessionId(named)) if named == id,
+                ),
+                "resume opened the file {id:?} names",
+            );
+            assert!(
+                matches!(
+                    SessionLock::try_acquire(&persistence, id, "host-under-test"),
+                    Err(ConversationError::InvalidSessionId(named)) if named == id,
+                ),
+                "try_acquire built a lock path for {id:?}",
+            );
+        }
     }
 }

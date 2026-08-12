@@ -419,6 +419,11 @@ impl LoggedPeers {
 /// Whether `ip` names this machine, seeing through the IPv4-mapped IPv6 form
 /// a dual-stack listener reports (`::ffff:127.0.0.1`), which
 /// [`std::net::Ipv6Addr::is_loopback`] alone answers `false` for.
+///
+/// Seeing through the form means judging the address inside it, not trusting
+/// the form: `::ffff:100.64.0.9` is a tailnet peer wearing an IPv6 coat, and
+/// answering `true` for it would hand every routable peer of a dual-stack
+/// listener the loopback exemption.
 fn is_loopback(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_loopback(),
@@ -426,5 +431,74 @@ fn is_loopback(ip: IpAddr) -> bool {
             Some(v4) => v4.is_loopback(),
             None => v6.is_loopback(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An address in the IPv4-mapped form, checked to actually be in it.
+    ///
+    /// The check is the point of the helper. `is_loopback` has a plain-IPv4
+    /// arm and a mapped-IPv6 arm, and only the second one is at issue here, so
+    /// a literal that parsed as `IpAddr::V4` would send every case below down
+    /// the arm that is already covered and prove nothing.
+    fn mapped(text: &str) -> IpAddr {
+        let ip: IpAddr = text.parse().expect("an address");
+        let IpAddr::V6(v6) = ip else {
+            panic!("{text} did not parse as IPv6, so this case tests the plain IPv4 arm instead");
+        };
+        assert!(
+            v6.to_ipv4_mapped().is_some(),
+            "{text} is not in the IPv4-mapped form, so this case tests the plain IPv6 arm instead",
+        );
+        ip
+    }
+
+    /// The mapped form is seen through in both directions.
+    ///
+    /// The accept direction is what a dual-stack listener needs. The refuse
+    /// direction is the one that fails open: a routable peer reaching such a
+    /// listener arrives wearing the same coat as loopback does, and only the
+    /// address inside it tells them apart.
+    #[test]
+    fn a_mapped_address_is_judged_by_the_address_inside_it() {
+        assert!(is_loopback(mapped("::ffff:127.0.0.1")));
+        assert!(is_loopback(mapped("::ffff:127.0.0.2")));
+        for routable in ["::ffff:100.64.0.9", "::ffff:0.0.0.0", "::ffff:10.0.2.15"] {
+            assert!(
+                !is_loopback(mapped(routable)),
+                "{routable} is not this machine, whatever form it arrives in",
+            );
+        }
+
+        assert!(is_loopback("127.0.0.1".parse().expect("an address")));
+        assert!(is_loopback("::1".parse().expect("an address")));
+        assert!(!is_loopback("100.64.0.9".parse().expect("an address")));
+        assert!(!is_loopback("2001:db8::1".parse().expect("an address")));
+    }
+
+    /// Where that lands: a `local` gate on a dual-stack listener refuses a
+    /// routable peer, and refuses to serve such an address in the first place.
+    #[tokio::test]
+    async fn local_mode_refuses_a_routable_peer_in_the_mapped_form() {
+        let gate = IdentityGate::local();
+        let peer = SocketAddr::new(mapped("::ffff:100.64.0.9"), 44444);
+
+        let err = gate
+            .authorize(peer)
+            .await
+            .expect_err("a tailnet peer is not loopback, however it is spelled");
+        assert!(matches!(err, IdentityError::Forbidden(_)), "got {err:?}");
+
+        let err = gate
+            .validate_bind(SocketAddr::new(mapped("::ffff:0.0.0.0"), 6161))
+            .expect_err("local mode protects nothing on a wildcard bind");
+        assert!(matches!(err, IdentityError::UnsafeBind(_)), "got {err:?}");
+
+        gate.authorize(SocketAddr::new(mapped("::ffff:127.0.0.1"), 44444))
+            .await
+            .expect("and this machine still gets in");
     }
 }

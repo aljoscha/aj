@@ -292,8 +292,9 @@ mod tests {
     }
 
     /// The refused side learns who to go quit: the holder's record is readable
-    /// while the lock is held, and it survives the release (nothing removes a
-    /// lock file) so a caller only asks after a refusal of its own.
+    /// while the lock is held, and the lock file it lives in outlives the
+    /// release (nothing removes one), so a caller only asks after a refusal of
+    /// its own.
     #[test]
     fn a_taken_lock_records_a_holder_the_refused_side_can_read() {
         let dir = TempDir::new().expect("temp dir");
@@ -357,5 +358,74 @@ mod tests {
                 .expect("an unheld legacy lock file is lockable");
             drop(held);
         }
+    }
+
+    /// Releasing clears the record, so a record that is there belongs to a
+    /// holder that has the lock now. One that outlived its holder would point
+    /// a refused user at a process that has already exited, or at a live one
+    /// that inherited its pid.
+    #[test]
+    fn releasing_a_lock_clears_its_holder_record() {
+        let dir = TempDir::new().expect("temp dir");
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+
+        let held = SessionLock::try_acquire(&persistence, "s-1", "host-a")
+            .expect("acquire")
+            .expect("nobody holds it yet");
+        // Recording the holder is best-effort. If it silently did nothing, the
+        // read below would answer `None` for the wrong reason and this test
+        // would measure nothing.
+        assert_eq!(
+            SessionLock::holder(&persistence, "s-1")
+                .expect("the fixture must record a holder")
+                .host_id,
+            "host-a",
+        );
+
+        drop(held);
+
+        assert_eq!(
+            SessionLock::holder(&persistence, "s-1"),
+            None,
+            "the release left a record behind, which would name a dead holder",
+        );
+    }
+
+    /// A crash releases the lock and leaves the dead holder's record behind,
+    /// so the next holder has to replace it whole. Its own record is shorter
+    /// whenever the dead host's id was longer, and a write that did not
+    /// truncate first would leave the tail of the old one attached.
+    #[test]
+    fn a_record_a_crash_left_behind_is_replaced_whole() {
+        let dir = TempDir::new().expect("temp dir");
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let path = lock_path(persistence.sessions_dir(), "s-1").expect("a well-formed id");
+        fs::create_dir_all(path.parent().expect("a locks dir")).expect("mkdir");
+
+        let stale = format!("{} a-host-whose-id-is-long\n", std::process::id());
+        let ours = format!("{} b\n", std::process::id());
+        assert!(
+            stale.len() > ours.len(),
+            "the stale record is {} bytes and ours is {}: it has to be the longer \
+             one, or an overwrite that never truncated would leave no tail behind \
+             and this test measures nothing",
+            stale.len(),
+            ours.len(),
+        );
+        fs::write(&path, &stale).expect("a record a crash left behind");
+
+        let held = SessionLock::try_acquire(&persistence, "s-1", "b")
+            .expect("acquire")
+            .expect("a crash releases the lock, so it is free");
+
+        assert_eq!(
+            SessionLock::holder(&persistence, "s-1"),
+            Some(LockHolder {
+                pid: std::process::id(),
+                host_id: "b".to_string(),
+            }),
+            "the new record is a hybrid of two holders",
+        );
+        drop(held);
     }
 }
