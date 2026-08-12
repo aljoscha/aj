@@ -53,7 +53,7 @@ use std::cell::RefCell;
 use std::ops::Range;
 use std::rc::Rc;
 
-use aj_wire::SessionSummary;
+use aj_wire::{DirectoryHost, SessionSummary};
 use vaxis::cell::{Color, Style};
 use vaxis::gwidth::{Method, gwidth};
 use vaxis::mouse::{Button, Mouse, Type};
@@ -250,6 +250,14 @@ pub(crate) struct SidebarState {
     pub(crate) too_narrow: bool,
     /// Rows in display order, most recent activity first.
     pub(crate) rows: Vec<SidebarRow>,
+    /// The hosts the peer named alongside its rows, empty against a plain host
+    /// (spec 7.1).
+    ///
+    /// Held rather than read back off the rows, because the entry that matters
+    /// is the one for a host the peer holds no rows for: that host appears
+    /// nowhere else, and it is the one the strip would otherwise draw as
+    /// nothing at all.
+    pub(crate) hosts: Vec<DirectoryHost>,
     /// Where the wheel anchored the drawn run. `None` is the resting state, in
     /// which the run follows the focused row.
     scroll: Option<Anchor>,
@@ -286,7 +294,7 @@ impl SidebarState {
 
     /// The strip's lines in a strip `height` lines tall.
     pub(crate) fn lines(&self, height: u16) -> Vec<StripLine> {
-        strip_lines(&self.rows, height, self.anchor())
+        strip_lines(&self.rows, &self.hosts, height, self.anchor())
     }
 
     /// Move the drawn run `delta` rows in a strip `height` lines tall, and say
@@ -298,13 +306,14 @@ impl SidebarState {
     /// already sits against an end) leaves the anchor alone, so scrolling a
     /// strip that fits cannot quietly switch focus-following off.
     pub(crate) fn scroll_by(&mut self, delta: isize, height: u16) -> bool {
-        // The create row is paid for before any run is chosen, exactly as in
-        // [`strip_lines`].
-        let budget = usize::from(height).saturating_sub(1);
+        let layout = Layout::of(&self.rows, &self.hosts);
+        // The same division the draw lays out under, so the wheel cannot
+        // anchor the run somewhere the draw would not put it (see
+        // [`Layout::split`]).
+        let budget = layout.split(height).rows;
         if budget == 0 {
             return false;
         }
-        let layout = Layout::of(&self.rows);
         let from = layout.visible_run(budget, self.anchor()).start;
         let to = from
             .saturating_add_signed(delta)
@@ -417,6 +426,10 @@ pub(crate) enum StripGesture {
 /// and the create row all take lines away from the rows, and the focused row
 /// has to survive that. Never returns more than `height` lines.
 ///
+/// `hosts` is what the peer says its directory is made of, which is where a
+/// host it holds no rows for comes from: that host is drawn as an empty group,
+/// a header with nothing under it (see [`Layout::empty_groups`]).
+///
 /// `scroll` is where the wheel anchored the run, or `None` to follow the
 /// focused row (see [`SidebarState::scroll_by`]).
 ///
@@ -425,31 +438,28 @@ pub(crate) enum StripGesture {
 /// overrunning: the honest answer at that size is the overflow count.
 pub(crate) fn strip_lines(
     rows: &[SidebarRow],
+    hosts: &[DirectoryHost],
     height: u16,
     scroll: Option<usize>,
 ) -> Vec<StripLine> {
-    let height = usize::from(height);
     if height == 0 {
         return Vec::new();
     }
-    // The create row is always the last line, so it takes its line before
-    // anything else competes for one.
-    let budget = height - 1;
-    if budget == 0 {
-        return vec![StripLine::New];
-    }
-    let layout = Layout::of(rows);
-    layout.lines(layout.visible_run(budget, scroll))
+    let layout = Layout::of(rows, hosts);
+    let budget = layout.split(height);
+    layout.lines(layout.visible_run(budget.rows, scroll), budget)
 }
 
-/// A run of rows sharing a host.
+/// A run of rows sharing a host, or a host the peer holds no rows for.
 struct Group<'a> {
-    /// `None` on rows from a plain host, which are all its own.
-    host: Option<&'a str>,
-    /// Whether the peer can reach none of them, which the header says once
+    /// What the header calls this host. `None` on rows from a plain host, which
+    /// are all its own and are grouped under no name.
+    label: Option<&'a str>,
+    /// Whether the peer can reach none of it, which the header says once
     /// instead of the user reading it off every row.
     unreachable: bool,
-    /// Where the group's rows sit in [`Layout::order`].
+    /// Where the group's rows sit in [`Layout::order`]. Empty for a host the
+    /// peer holds no rows for (spec 7.1).
     span: Range<usize>,
 }
 
@@ -458,33 +468,47 @@ struct Layout<'a> {
     rows: &'a [SidebarRow],
     /// Row indices in display order: activity order, gathered into groups.
     order: Vec<usize>,
-    /// The groups, each a contiguous span of [`Self::order`].
+    /// The groups, each a contiguous span of [`Self::order`], followed by the
+    /// hosts the peer holds no rows for, whose spans are empty.
     groups: Vec<Group<'a>>,
     /// Whether groups wear headers at all. One host, or none, is not a
     /// grouping: a plain single-host connect has to look exactly as it would
     /// have before hosts existed.
+    ///
+    /// A group with no rows is not subject to this: it is its header and
+    /// nothing else (see [`Layout::empty_groups`]).
     headed: bool,
 }
 
+/// How a strip's height divides between the hosts the peer holds no rows for
+/// and the rows (see [`Layout::split`]).
+struct Budget {
+    /// How many of those hosts' headers are drawn.
+    empty: usize,
+    /// Lines left for the rows, the headers over them, and the count of the
+    /// ones that did not fit.
+    rows: usize,
+}
+
 impl<'a> Layout<'a> {
-    fn of(rows: &'a [SidebarRow]) -> Self {
+    fn of(rows: &'a [SidebarRow], hosts: &'a [DirectoryHost]) -> Self {
         // Rows arrive activity-ordered, so gathering by first appearance
         // orders the hosts by their most recent activity and leaves each
         // group's own rows in activity order.
-        let mut hosts: Vec<Option<&str>> = Vec::new();
+        let mut named: Vec<Option<&str>> = Vec::new();
         for row in rows {
             let host = row.host.as_deref();
-            if !hosts.contains(&host) {
-                hosts.push(host);
+            if !named.contains(&host) {
+                named.push(host);
             }
         }
         // A group with no host name gets no header, and a headerless run under
         // someone else's header would read as theirs, so it sorts first. Only
         // reachable in a mixed directory, which a gateway does not produce.
-        hosts.sort_by_key(Option::is_some);
+        named.sort_by_key(Option::is_some);
         let mut order = Vec::with_capacity(rows.len());
-        let mut groups = Vec::with_capacity(hosts.len());
-        for host in hosts {
+        let mut groups = Vec::with_capacity(named.len() + hosts.len());
+        for &host in &named {
             let start = order.len();
             let mut unreachable = true;
             for (index, row) in rows.iter().enumerate() {
@@ -495,11 +519,41 @@ impl<'a> Layout<'a> {
                 order.push(index);
             }
             groups.push(Group {
-                host,
+                label: host,
                 unreachable,
                 span: start..order.len(),
             });
         }
+        // Then the hosts the peer holds no rows for, which no scan over the
+        // rows could have found. They sort after every group that has rows,
+        // because the strip is ordered by activity and these have none.
+        let end = order.len();
+        groups.extend(
+            hosts
+                .iter()
+                .filter(|host| {
+                    // A host whose rows we hold is already a group, named by the
+                    // id those rows carry. An address never matches one: rows
+                    // are namespaced by id (spec 6.2), so a host with no id has
+                    // no rows here either.
+                    host.id
+                        .as_deref()
+                        .is_none_or(|id| !named.contains(&Some(id)))
+                })
+                .filter_map(|host| {
+                    Some(Group {
+                        // The learned id where the peer has one, the configured
+                        // address until it does (spec 7.1). An entry naming
+                        // neither says nothing a header could show.
+                        label: Some(host.id.as_deref().or(host.address.as_deref())?),
+                        // The peer's own answer. There is no row here to derive
+                        // it from, and a host can be up and simply hold no
+                        // sessions.
+                        unreachable: host.unreachable,
+                        span: end..end,
+                    })
+                }),
+        );
         let headed = groups.len() > 1;
         Self {
             rows,
@@ -509,12 +563,49 @@ impl<'a> Layout<'a> {
         }
     }
 
+    /// The hosts the peer holds no rows for, as the label and the mark their
+    /// headers carry (spec 7.1).
+    ///
+    /// They are their headers and nothing else, so they take no part in the
+    /// run: a run reaches into a span of rows, and these have none. That is
+    /// also why [`Self::headed`] does not gate them. Suppressing the header of
+    /// a group with no rows draws the host as nothing at all, which is exactly
+    /// the absence the peer sends these entries to make visible.
+    fn empty_groups(&self) -> impl Iterator<Item = (&'a str, bool)> {
+        self.groups
+            .iter()
+            .filter(|group| group.span.is_empty())
+            .filter_map(|group| Some((group.label?, group.unreachable)))
+    }
+
+    /// How a strip `height` lines tall divides between the hosts the peer holds
+    /// no rows for and the rows.
+    ///
+    /// The create row takes its line first, then those hosts. A row that loses
+    /// its line still leaves the overflow count behind, while a host that lost
+    /// its would leave nothing at all, so the hosts are the ones that cannot be
+    /// cut while anything else can (spec 7.1).
+    ///
+    /// That holds only while the count itself has a line, so the rows keep one
+    /// wherever they have any rows to count. Cutting the count too would leave
+    /// the rows exactly as silent as the host would have been, which is the
+    /// thing this ordering is for.
+    fn split(&self, height: u16) -> Budget {
+        let budget = usize::from(height).saturating_sub(1);
+        let spare = budget.saturating_sub(usize::from(!self.order.is_empty()));
+        let empty = self.empty_groups().count().min(spare);
+        Budget {
+            empty,
+            rows: budget - empty,
+        }
+    }
+
     /// The header a run reaching into `group` draws for it, if any.
     fn header_of(&self, group: &Group<'a>, run: &Range<usize>) -> Option<&'a str> {
         if !self.headed {
             return None;
         }
-        let host = group.host?;
+        let host = group.label?;
         (group.span.start < run.end && run.start < group.span.end).then_some(host)
     }
 
@@ -589,8 +680,8 @@ impl<'a> Layout<'a> {
             .unwrap_or(total)
     }
 
-    /// The lines for a run, in draw order.
-    fn lines(&self, run: Range<usize>) -> Vec<StripLine> {
+    /// The lines for a run, in draw order, within `budget`.
+    fn lines(&self, run: Range<usize>, budget: Budget) -> Vec<StripLine> {
         let mut lines = Vec::with_capacity(run.len() + self.groups.len() + 2);
         for group in &self.groups {
             let from = group.span.start.max(run.start);
@@ -609,9 +700,25 @@ impl<'a> Layout<'a> {
             }));
         }
         let hidden = self.order.len() - run.len();
-        if hidden > 0 {
+        // At a height of one line the create row has the only line there is, so
+        // even the count goes. [`Self::split`] keeps a line for it at every
+        // other height where there is anything to count.
+        if hidden > 0 && budget.rows > 0 {
             lines.push(StripLine::Overflow { hidden });
         }
+        // The hosts with no rows close the strip, below the count of the rows
+        // that did not fit rather than above it: a header there would read as
+        // the group the count belongs to.
+        lines.extend(
+            self.empty_groups()
+                .take(budget.empty)
+                .map(|(host, unreachable)| StripLine::Header {
+                    host: host.to_string(),
+                    unreachable,
+                }),
+        );
+        // The create row is always the last line, whatever else had to be left
+        // out, because it is the affordance a pointer aims at.
         lines.push(StripLine::New);
         lines
     }
@@ -1422,7 +1529,7 @@ mod tests {
             (rows_named(&["a", "b", "c", "d"]), 3),
             (rows_named(&["a", "b", "c", "d"]), 1),
         ] {
-            let lines = strip_lines(&rows, height, None);
+            let lines = strip_lines(&rows, &[], height, None);
             assert_eq!(
                 lines.last(),
                 Some(&StripLine::New),
@@ -1440,7 +1547,7 @@ mod tests {
     /// that pays for the create row.
     #[test]
     fn a_zero_height_strip_draws_nothing() {
-        assert!(strip_lines(&rows_named(&["a", "b"]), 0, None).is_empty());
+        assert!(strip_lines(&rows_named(&["a", "b"]), &[], 0, None).is_empty());
     }
 
     /// One host, or none at all, is not a grouping. A plain connect has to look
@@ -1449,14 +1556,14 @@ mod tests {
     fn a_single_host_gets_no_headers() {
         let hostless = rows_named(&["a", "b", "c"]);
         assert!(
-            headers(&strip_lines(&hostless, 20, None)).is_empty(),
+            headers(&strip_lines(&hostless, &[], 20, None)).is_empty(),
             "rows with no host name nothing to group under",
         );
         let one_host: Vec<SidebarRow> = ["a", "b", "c"]
             .iter()
             .map(|id| row(id).host("builder-1").build())
             .collect();
-        let lines = strip_lines(&one_host, 20, None);
+        let lines = strip_lines(&one_host, &[], 20, None);
         assert!(
             headers(&lines).is_empty(),
             "one host is not a grouping: {lines:?}",
@@ -1476,7 +1583,7 @@ mod tests {
             row("laptop-old").host("laptop").build(),
             row("builder-old").host("builder-1").build(),
         ];
-        let lines = strip_lines(&rows, 20, None);
+        let lines = strip_lines(&rows, &[], 20, None);
         assert_eq!(
             headers(&lines),
             vec![("laptop", false), ("builder-1", false)]
@@ -1506,12 +1613,12 @@ mod tests {
             row("here").host("builder-1").build(),
         ];
         assert_eq!(
-            headers(&strip_lines(&rows, 20, None)),
+            headers(&strip_lines(&rows, &[], 20, None)),
             vec![("laptop", true), ("builder-1", false)],
         );
         rows[1].status = RowStatus::Idle;
         assert_eq!(
-            headers(&strip_lines(&rows, 20, None)),
+            headers(&strip_lines(&rows, &[], 20, None)),
             vec![("laptop", false), ("builder-1", false)],
             "a host with one reachable session is reachable",
         );
@@ -1526,12 +1633,306 @@ mod tests {
             row("named").host("builder-1").build(),
             row("nameless").build(),
         ];
-        let lines = strip_lines(&rows, 20, None);
+        let lines = strip_lines(&rows, &[], 20, None);
         assert_eq!(drawn(&lines, &rows), vec!["nameless", "named"]);
         assert_eq!(headers(&lines), vec![("builder-1", false)]);
         assert!(
             matches!(lines[0], StripLine::Session { .. }),
             "the nameless row is above every header: {lines:?}",
+        );
+    }
+
+    /// A host the peer holds rows for is grouped by those rows, and the peer
+    /// naming it in the directory adds no second, empty group beside them.
+    #[test]
+    fn a_host_the_peer_holds_rows_for_groups_by_its_rows() {
+        let rows = vec![
+            row("laptop-new").host("laptop").build(),
+            row("builder-new").host("builder-1").build(),
+            row("laptop-old").host("laptop").build(),
+        ];
+        let hosts = vec![learned("laptop", false), learned("builder-1", false)];
+        let lines = strip_lines(&rows, &hosts, 20, None);
+        assert_eq!(
+            headers(&lines),
+            vec![("laptop", false), ("builder-1", false)],
+            "one group per host, in the order their rows put them: {lines:?}",
+        );
+        assert_eq!(
+            drawn(&lines, &rows),
+            vec!["laptop-new", "laptop-old", "builder-new"],
+        );
+    }
+
+    /// A host the peer holds no rows for is drawn as an empty group: its header
+    /// with nothing under it, below the hosts that do have rows.
+    ///
+    /// This is the case the directory's host entries exist for. A gateway holds
+    /// a host's rows only for as long as that host has sent them, so across a
+    /// restart it has none for a host that is down, and a strip grouping by the
+    /// rows alone would draw that host as nothing at all (spec 7.1).
+    #[test]
+    fn a_host_the_peer_holds_no_rows_for_draws_an_empty_group() {
+        let rows = vec![row("s-1").host("builder-1").build()];
+        let hosts = vec![learned("builder-1", false), learned("laptop", true)];
+        let lines = strip_lines(&rows, &hosts, 20, None);
+        assert_eq!(
+            headers(&lines),
+            vec![("builder-1", false), ("laptop", true)],
+            "the host with no rows is a group of its own: {lines:?}",
+        );
+        assert_eq!(
+            lines,
+            vec![
+                StripLine::Header {
+                    host: "builder-1".to_string(),
+                    unreachable: false,
+                },
+                StripLine::Session { index: 0 },
+                StripLine::Header {
+                    host: "laptop".to_string(),
+                    unreachable: true,
+                },
+                StripLine::New,
+            ],
+            "and it closes the strip, with no rows under it",
+        );
+    }
+
+    /// A host the gateway has never reached has no id to be named by, so its
+    /// group is labelled by the address it is configured at. The gateway must
+    /// not invent an id for it, and the strip has nothing else to show.
+    #[test]
+    fn a_host_with_no_id_is_labelled_by_its_address() {
+        let rows = vec![row("s-1").host("builder-1").build()];
+        let hosts = vec![learned("builder-1", false), configured("10.0.0.7:7777")];
+        let lines = strip_lines(&rows, &hosts, 20, None);
+        assert_eq!(
+            headers(&lines),
+            vec![("builder-1", false), ("10.0.0.7:7777", true)],
+            "{lines:?}",
+        );
+    }
+
+    /// Several hosts can be waiting on their first contact at once, so an
+    /// address labels more than one group. It is a label and never an id, so
+    /// nothing keys a group by it.
+    #[test]
+    fn two_hosts_can_both_be_labelled_by_their_addresses() {
+        let hosts = vec![configured("10.0.0.7:7777"), configured("10.0.0.8:7777")];
+        let lines = strip_lines(&[], &hosts, 20, None);
+        assert_eq!(
+            headers(&lines),
+            vec![("10.0.0.7:7777", true), ("10.0.0.8:7777", true)],
+            "both hosts are drawn, in the order the peer named them: {lines:?}",
+        );
+    }
+
+    /// A host named both ways at once is labelled by the id. The id is what its
+    /// sessions are namespaced under, so it is the name the rest of the strip is
+    /// read against, and the address only ever stands in for it while there is
+    /// none (spec 7.1).
+    #[test]
+    fn a_host_named_both_ways_is_labelled_by_its_id() {
+        let both = DirectoryHost {
+            id: Some("builder-2".to_string()),
+            address: Some("10.0.0.8:7777".to_string()),
+            unreachable: true,
+        };
+        let lines = strip_lines(&[], &[learned("builder-1", false), both], 20, None);
+        assert_eq!(
+            headers(&lines),
+            vec![("builder-1", false), ("builder-2", true)],
+            "{lines:?}",
+        );
+    }
+
+    /// An address is a label and never an id, so it cannot stand in for one when
+    /// a host is matched to the rows it owns. A host named by an address keeps
+    /// its own empty group even where that address reads exactly like the id
+    /// another host's rows carry, because the two are different hosts and
+    /// merging them would drop one the peer named.
+    #[test]
+    fn an_address_never_matches_a_group_named_by_an_id() {
+        let rows = vec![row("s-1").host("builder-1").build()];
+        let hosts = vec![learned("builder-1", false), configured("builder-1")];
+        let lines = strip_lines(&rows, &hosts, 20, None);
+        assert_eq!(
+            headers(&lines),
+            vec![("builder-1", false), ("builder-1", true)],
+            "two hosts, and only one of them holds rows: {lines:?}",
+        );
+        assert_eq!(drawn(&lines, &rows), vec!["s-1"]);
+    }
+
+    /// A host's first contact relabels its group from the address to the id it
+    /// answered with, and leaves it one group: the id is news about the host
+    /// the strip was already drawing, not a second host.
+    #[test]
+    fn a_hosts_first_contact_relabels_its_empty_group() {
+        let rows = vec![row("s-1").host("builder-1").build()];
+        let waiting = vec![learned("builder-1", false), configured("10.0.0.8:7777")];
+        assert_eq!(
+            headers(&strip_lines(&rows, &waiting, 20, None)),
+            vec![("builder-1", false), ("10.0.0.8:7777", true)],
+        );
+
+        // It answers, so the gateway has its id and can reach it. Its rows are
+        // not here yet: those arrive on its own `list` frame.
+        let met = vec![learned("builder-1", false), learned("builder-2", false)];
+        let lines = strip_lines(&rows, &met, 20, None);
+        assert_eq!(
+            headers(&lines),
+            vec![("builder-1", false), ("builder-2", false)],
+            "the group is relabelled, and it is still one group: {lines:?}",
+        );
+    }
+
+    /// One host is not a grouping, but a host with no rows is nothing except
+    /// its header. It draws one where a single group otherwise would not,
+    /// because the alternative is drawing the host as nothing at all.
+    #[test]
+    fn an_empty_group_draws_where_a_single_host_would_get_no_header() {
+        let lines = strip_lines(&[], &[learned("laptop", true)], 20, None);
+        assert_eq!(
+            headers(&lines),
+            vec![("laptop", true)],
+            "the only host there is, and it is unreachable: {lines:?}",
+        );
+
+        // And a lone host that does hold rows still reads as it did before
+        // hosts existed.
+        let rows = vec![row("s-1").host("builder-1").build()];
+        let lines = strip_lines(&rows, &[learned("builder-1", false)], 20, None);
+        assert!(
+            headers(&lines).is_empty(),
+            "one host with rows is not a grouping: {lines:?}",
+        );
+    }
+
+    /// The mark on a group with no rows is the peer's own answer about that
+    /// host. There is nothing to derive it from: "the peer can reach none of
+    /// these rows" is vacuously true of no rows at all, and would put the mark
+    /// on a host that is up and simply holds no sessions.
+    #[test]
+    fn an_empty_groups_mark_is_the_peers_own_answer() {
+        let hosts = vec![learned("up-and-empty", false), learned("gone", true)];
+        let lines = strip_lines(&[], &hosts, 20, None);
+        assert_eq!(
+            headers(&lines),
+            vec![("up-and-empty", false), ("gone", true)],
+            "{lines:?}",
+        );
+    }
+
+    /// A host entry naming neither an id nor an address says nothing a header
+    /// could show, so nothing is drawn for it. A blank header would claim a
+    /// host is there and refuse to say which.
+    #[test]
+    fn a_host_named_by_neither_an_id_nor_an_address_draws_nothing() {
+        let nameless = DirectoryHost {
+            id: None,
+            address: None,
+            unreachable: true,
+        };
+        let lines = strip_lines(&[], &[learned("builder-1", true), nameless], 20, None);
+        assert_eq!(headers(&lines), vec![("builder-1", true)], "{lines:?}");
+        assert_eq!(
+            lines.len(),
+            2,
+            "one header and the create row, nothing else: {lines:?}",
+        );
+    }
+
+    /// A host the peer holds no rows for takes its line before the rows do. A
+    /// row that loses its line leaves the overflow count behind, so cutting a
+    /// row still tells the user something was cut, while cutting the host would
+    /// leave nothing at all.
+    #[test]
+    fn an_empty_group_takes_its_line_before_the_rows() {
+        let rows = rows_named(&["a", "b", "c"]);
+        // Four lines hold all three rows and the create row with no host in
+        // play, so the host is what displaces them.
+        assert_eq!(
+            drawn(&strip_lines(&rows, &[], 4, None), &rows),
+            vec!["a", "b", "c"],
+        );
+
+        let lines = strip_lines(&rows, &[configured("10.0.0.7:7777")], 4, None);
+        assert_eq!(
+            headers(&lines),
+            vec![("10.0.0.7:7777", true)],
+            "the host kept its line: {lines:?}",
+        );
+        assert_eq!(drawn(&lines, &rows), vec!["a"], "the rows gave theirs up");
+        assert_eq!(hidden(&lines), Some(2), "and they say so: {lines:?}");
+        assert_eq!(lines.len(), 4, "inside the height: {lines:?}");
+    }
+
+    /// Hosts with no rows can eat the whole budget, and the strip still stays
+    /// inside its height with the create row on the last line.
+    #[test]
+    fn hosts_with_no_rows_stay_inside_the_height() {
+        let rows = rows_named(&["a", "b"]);
+        let hosts: Vec<DirectoryHost> = (0..4)
+            .map(|n| configured(&format!("10.0.0.{n}:7777")))
+            .collect();
+        for height in 0..=8 {
+            let lines = strip_lines(&rows, &hosts, height, None);
+            assert!(
+                lines.len() <= usize::from(height),
+                "{height} lines held {lines:?}",
+            );
+            if height > 0 {
+                assert_eq!(
+                    lines.last(),
+                    Some(&StripLine::New),
+                    "{height} lines put the create row last: {lines:?}",
+                );
+            }
+        }
+
+        // Three lines: the create row, the count of what did not fit, and one
+        // host. The rows keep a line wherever they have anything to count, so
+        // the hosts take what is left rather than all of it.
+        let lines = strip_lines(&rows, &hosts, 3, None);
+        assert_eq!(hidden(&lines), Some(2), "the rows still say so: {lines:?}");
+        assert_eq!(headers(&lines).len(), 1, "{lines:?}");
+
+        // With no rows there is nothing to count, and the hosts have the whole
+        // budget.
+        let lines = strip_lines(&[], &hosts, 3, None);
+        assert_eq!(headers(&lines).len(), 2, "{lines:?}");
+        assert_eq!(hidden(&lines), None, "{lines:?}");
+    }
+
+    /// The wheel and the draw divide the height the same way, so a strip with a
+    /// host it holds no rows for can still be scrolled to its last row. A wheel
+    /// measuring against a budget the draw does not use stops short, and the
+    /// rows past where it stops become unreachable.
+    #[test]
+    fn the_wheel_reaches_the_last_row_past_an_empty_group() {
+        let ids: Vec<String> = (0..10).map(|i| format!("s-{i}")).collect();
+        let mut state = SidebarState {
+            visible: true,
+            rows: ids.iter().map(|id| row(id).build()).collect(),
+            hosts: vec![configured("10.0.0.7:7777")],
+            ..SidebarState::default()
+        };
+        let mut moved = 0;
+        for _ in 0..20 {
+            if state.scroll_by(1, 6) {
+                moved += 1;
+            }
+        }
+        assert!(
+            moved > 0,
+            "the wheel never moved the run, so the test measures nothing",
+        );
+        let lines = state.lines(6);
+        assert!(
+            drawn(&lines, &state.rows).contains(&"s-9"),
+            "the wheel reached the last row: {lines:?}",
         );
     }
 
@@ -1541,13 +1942,13 @@ mod tests {
     fn the_rows_that_do_not_fit_are_counted() {
         let rows = rows_named(&["a", "b", "c", "d", "e"]);
         // Six lines: five rows and the create row, so nothing is cut.
-        let whole = strip_lines(&rows, 6, None);
+        let whole = strip_lines(&rows, &[], 6, None);
         assert_eq!(drawn(&whole, &rows), vec!["a", "b", "c", "d", "e"]);
         assert_eq!(hidden(&whole), None, "nothing was left out: {whole:?}");
 
         // One line fewer, and the overflow row costs one of its own: four
         // lines of budget hold three rows and the count of the other two.
-        let cut = strip_lines(&rows, 5, None);
+        let cut = strip_lines(&rows, &[], 5, None);
         assert_eq!(drawn(&cut, &rows), vec!["a", "b", "c"]);
         assert_eq!(hidden(&cut), Some(2));
         assert_eq!(cut.len(), 5, "and it used every line it had: {cut:?}");
@@ -1564,13 +1965,13 @@ mod tests {
             row("d").host("two").build(),
         ];
         // Five lines: create row, one header, two rows, one overflow row.
-        let lines = strip_lines(&rows, 5, None);
+        let lines = strip_lines(&rows, &[], 5, None);
         assert_eq!(drawn(&lines, &rows), vec!["a", "b"]);
         assert_eq!(headers(&lines), vec![("one", false)]);
         assert_eq!(hidden(&lines), Some(2));
 
         // Seven lines fit both headers, all four rows and the create row.
-        let whole = strip_lines(&rows, 7, None);
+        let whole = strip_lines(&rows, &[], 7, None);
         assert_eq!(drawn(&whole, &rows), vec!["a", "b", "c", "d"]);
         assert_eq!(headers(&whole), vec![("one", false), ("two", false)]);
         assert_eq!(hidden(&whole), None);
@@ -1585,7 +1986,7 @@ mod tests {
         rows[4].focused = true;
         // Four lines: the create row, the overflow row, and two rows ending on
         // the focused one.
-        let lines = strip_lines(&rows, 4, None);
+        let lines = strip_lines(&rows, &[], 4, None);
         assert_eq!(drawn(&lines, &rows), vec!["d", "e"]);
         assert_eq!(hidden(&lines), Some(4), "four rows are out of view");
     }
@@ -1599,13 +2000,16 @@ mod tests {
         let mut rows = rows_named(&["a", "b", "c", "d", "e", "f"]);
         rows[0].focused = true;
         assert_eq!(
-            drawn(&strip_lines(&rows, 4, None), &rows),
+            drawn(&strip_lines(&rows, &[], 4, None), &rows),
             vec!["a", "b"],
             "the row below the focused one fills the line it left",
         );
         rows[0].focused = false;
         rows[1].focused = true;
-        assert_eq!(drawn(&strip_lines(&rows, 4, None), &rows), vec!["a", "b"]);
+        assert_eq!(
+            drawn(&strip_lines(&rows, &[], 4, None), &rows),
+            vec!["a", "b"]
+        );
     }
 
     /// The minted id every layout test reads its time of day out of.
@@ -1818,7 +2222,7 @@ mod tests {
                 .build(),
             row("s-2").host("builder-1").attached().build(),
         ];
-        let cells = painted_cells(rows, 6);
+        let cells = painted_cells(rows, Vec::new(), 6);
         let text = |line: usize| -> String {
             cells[line]
                 .iter()
@@ -1852,11 +2256,32 @@ mod tests {
     /// strip carries, so a banded cell is unmistakable.
     const HOVER_BG: Color = Color::Rgb([9, 9, 9]);
 
-    /// A drawn strip over `rows`, ready to be asked what a pointer lands on.
-    fn strip(rows: Vec<SidebarRow>, height: u16) -> SessionSidebar {
+    /// A host the peer has spoken to, so it names it by the id its rows carry.
+    fn learned(id: &str, unreachable: bool) -> DirectoryHost {
+        DirectoryHost {
+            id: Some(id.to_string()),
+            address: None,
+            unreachable,
+        }
+    }
+
+    /// A configured host the gateway has never reached: no id to be named by,
+    /// its address instead, and no rows of its own (spec 7.1).
+    fn configured(address: &str) -> DirectoryHost {
+        DirectoryHost {
+            id: None,
+            address: Some(address.to_string()),
+            unreachable: true,
+        }
+    }
+
+    /// A drawn strip over `rows` and the hosts the peer named beside them,
+    /// ready to be asked what a pointer lands on.
+    fn strip(rows: Vec<SidebarRow>, hosts: Vec<DirectoryHost>, height: u16) -> SessionSidebar {
         let state = Rc::new(RefCell::new(SidebarState {
             visible: true,
             rows,
+            hosts,
             ..SidebarState::default()
         }));
         let mut strip = SessionSidebar::new(state, styles(), HOVER_BG);
@@ -1865,15 +2290,19 @@ mod tests {
     }
 
     /// The strip's painted cells at its own width.
-    fn painted_cells(rows: Vec<SidebarRow>, height: u16) -> Vec<Vec<vaxis::cell::Cell>> {
-        let mut strip = strip(rows, height);
+    fn painted_cells(
+        rows: Vec<SidebarRow>,
+        hosts: Vec<DirectoryHost>,
+        height: u16,
+    ) -> Vec<Vec<vaxis::cell::Cell>> {
+        let mut strip = strip(rows, hosts, height);
         let surface = strip.draw(&crate::test_support::draw_ctx(SIDEBAR_COLS, Some(height)));
         crate::test_support::flatten(&surface)
     }
 
     /// The strip's painted lines at its own width.
-    fn painted(rows: Vec<SidebarRow>, height: u16) -> Vec<String> {
-        painted_cells(rows, height)
+    fn painted(rows: Vec<SidebarRow>, hosts: Vec<DirectoryHost>, height: u16) -> Vec<String> {
+        painted_cells(rows, hosts, height)
             .iter()
             .map(|row| row.iter().map(|cell| cell.char.grapheme()).collect())
             .collect()
@@ -1904,13 +2333,50 @@ mod tests {
                 .build(),
         ];
         assert_eq!(
-            painted(rows, 7),
+            painted(rows, Vec::new(), 7),
             vec![
                 " ~ builder-1 ───────── │",
                 "▌  19-07-19 fix-auth   │",
                 " * s-2      eval-run   │",
                 " ~ laptop ──────── ! ─ │",
                 " ! 18-40-49            │",
+                " + new                 │",
+                "                       │",
+            ],
+        );
+    }
+
+    /// A host the peer holds no rows for, as the strip paints it: a header with
+    /// nothing under it, below the hosts that have rows, named by the id where
+    /// the peer has learned one and by the configured address until it has
+    /// (spec 7.1).
+    ///
+    /// The mark rides in the header's rule exactly as it does over a group
+    /// whose rows are all unreachable, because it says the same thing: nothing
+    /// here can be reached. What the empty group adds is that the contents are
+    /// unknown, which is what having no rows under it says.
+    #[test]
+    fn the_strip_paints_a_host_it_holds_no_rows_for() {
+        let rows = vec![
+            row("2026-08-06-19-07-19-368")
+                .tag("fix-auth")
+                .host("builder-1")
+                .focused()
+                .attached()
+                .build(),
+        ];
+        let hosts = vec![
+            learned("builder-1", false),
+            learned("laptop", true),
+            configured("10.0.0.7:7777"),
+        ];
+        assert_eq!(
+            painted(rows, hosts, 6),
+            vec![
+                " ~ builder-1 ───────── │",
+                "▌  19-07-19 fix-auth   │",
+                " ~ laptop ──────── ! ─ │",
+                " ~ 10.0.0.7:7777 ─ ! ─ │",
                 " + new                 │",
                 "                       │",
             ],
@@ -1929,7 +2395,7 @@ mod tests {
                 .focused()
                 .build(),
         ];
-        assert_eq!(painted(rows, 2)[0], "▌* s-1      busy       │");
+        assert_eq!(painted(rows, Vec::new(), 2)[0], "▌* s-1      busy       │");
     }
 
     /// The glyph says what a session is doing and nothing else. Three rows all
@@ -1945,7 +2411,7 @@ mod tests {
             row("s-3").status(RowStatus::Working).build(),
             row("s-4").status(RowStatus::Unseen).build(),
         ];
-        let cells = painted_cells(rows, 5);
+        let cells = painted_cells(rows, Vec::new(), 5);
         let column = |col: usize| -> Vec<vaxis::cell::Style> {
             (0..4).map(|line| cells[line][col].style).collect()
         };
@@ -1981,7 +2447,7 @@ mod tests {
                 .build(),
             row("2026-08-06-18-40-49-001").tag("listed").build(),
         ];
-        let cells = painted_cells(rows, 4);
+        let cells = painted_cells(rows, Vec::new(), 4);
         let styles = styles();
         // The field starts at column 3: marker, glyph, space. Its time takes
         // columns 3 to 10, the gap column 11, and the tag starts at 12.
@@ -2004,7 +2470,7 @@ mod tests {
         height: u16,
     ) -> (SessionSidebar, Rc<RefCell<Vec<StripGesture>>>) {
         let seen = Rc::new(RefCell::new(Vec::new()));
-        let mut strip = strip(rows, height);
+        let mut strip = strip(rows, Vec::new(), height);
         let sink = Rc::clone(&seen);
         strip.set_on_gesture(Box::new(move |_, gesture| sink.borrow_mut().push(gesture)));
         (strip, seen)

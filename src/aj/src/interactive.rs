@@ -1706,6 +1706,10 @@ fn sync_sidebar(world: &World, shell: &Rc<RefCell<Shell>>) {
         state.visible = rows.len() > 1;
     }
     state.rows = rows;
+    // The hosts ride along beside the rows, because a gateway names hosts it
+    // holds no rows for and those are exactly the ones the rows cannot account
+    // for (spec 7.1).
+    state.hosts = world.directory.hosts().to_vec();
 }
 
 /// Park a session change for the drive loop, which owns the world.
@@ -16593,6 +16597,111 @@ mod tests {
             vec![line_of(&focused)],
             "exactly the focused line wears the marker: {:?}",
             sidebar_rows(&shell),
+        );
+        shut_down(&world).await;
+    }
+
+    /// A host the peer holds no rows for is painted as an empty group, from the
+    /// directory through the mirror to the composed frame (spec 7.1).
+    ///
+    /// Nothing here reaches into the strip. The frame goes through the reducer
+    /// the stream folds into, the mirror is filled by [`sync_sidebar`], and the
+    /// strip is read out of the composed root, so dropping any link in that
+    /// chain fails this: a directory that discards the hosts, a mirror that does
+    /// not carry them, or a layout that groups by the rows alone all render the
+    /// unreachable host as nothing at all.
+    ///
+    /// The rows are the ones the real host published, restamped with the host
+    /// name a gateway would have namespaced them under.
+    #[tokio::test]
+    async fn the_composed_strip_paints_a_host_the_peer_holds_no_rows_for() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let focused = world.session().to_string();
+        assert!(
+            poll_row(&mut world, &shell, &focused, |_| true).await,
+            "the session's own row never arrived",
+        );
+        // One session leaves the strip hidden by default (spec 9.2), so it is
+        // pinned open. Everything the strip then draws comes from the mirror.
+        pin_sidebar_open(&shell);
+
+        let mut sessions = world.directory.rows().to_vec();
+        assert_eq!(sessions.len(), 1, "one row: {sessions:?}");
+        for session in &mut sessions {
+            session.host = Some("builder-1".to_string());
+        }
+        // A gateway's directory: the host these rows came from, a host it has
+        // spoken to and cannot currently reach, and a configured host it has
+        // never reached at all. Only the first has rows.
+        let hosts = vec![
+            aj_wire::DirectoryHost {
+                id: Some("builder-1".to_string()),
+                address: None,
+                unreachable: false,
+            },
+            aj_wire::DirectoryHost {
+                id: Some("laptop".to_string()),
+                address: None,
+                unreachable: true,
+            },
+            aj_wire::DirectoryHost {
+                id: None,
+                address: Some("10.0.0.7:7777".to_string()),
+                unreachable: true,
+            },
+        ];
+        let list = |hosts: Vec<aj_wire::DirectoryHost>| aj_wire::Frame::List {
+            sessions: sessions.clone(),
+            hosts,
+        };
+        let redraw = world
+            .directory
+            .apply(&mut world.chat.borrow_mut(), list(hosts.clone()));
+        assert!(redraw.0, "the directory took the frame as news");
+        sync_sidebar(&world, &shell);
+
+        let painted = sidebar_rows(&shell);
+        assert_eq!(
+            painted.iter().filter(|line| line.contains('~')).count(),
+            3,
+            "a header per host, the two with no rows included: {painted:?}",
+        );
+        assert_eq!(
+            painted,
+            vec![
+                " ~ builder-1 ─────────".to_string(),
+                format!("▌  {}", crate::sidebar::session_label(&focused, 8)),
+                " ~ laptop ──────── ! ─".to_string(),
+                " ~ 10.0.0.7:7777 ─ ! ─".to_string(),
+                " + new".to_string(),
+            ],
+            "the host with rows heads them, and the two with none close the \
+             strip, one labelled by its id and one by its address",
+        );
+
+        // A change confined to the hosts still reaches the screen: the empty
+        // group has no row to carry the news that its host came back.
+        let back = vec![
+            hosts[0].clone(),
+            hosts[1].clone(),
+            aj_wire::DirectoryHost {
+                id: Some("builder-2".to_string()),
+                address: None,
+                unreachable: false,
+            },
+        ];
+        let redraw = world
+            .directory
+            .apply(&mut world.chat.borrow_mut(), list(back));
+        assert!(redraw.0, "first contact is news");
+        sync_sidebar(&world, &shell);
+        let painted = sidebar_rows(&shell);
+        assert_eq!(
+            painted.get(3).map(String::as_str),
+            Some(" ~ builder-2 ─────────"),
+            "the group is relabelled by the id the host answered with, and the \
+             mark comes off with it: {painted:?}",
         );
         shut_down(&world).await;
     }
