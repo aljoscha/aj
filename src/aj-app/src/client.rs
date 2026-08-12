@@ -254,6 +254,28 @@ impl SessionClient {
                 self.needs_queue_refetch = true;
                 Redraw(true)
             }
+            Frame::Error {
+                session, message, ..
+            } => {
+                if !self.is_ours(&session) {
+                    return Redraw(false);
+                }
+                // Not filtered by epoch, the way `reset` is not: the frames
+                // spec 6.5 filters are the ones that carry state under one, and
+                // a refusal for a session the server cannot resolve names none.
+                self.drop_attachment();
+                // The message verbatim, which spec 6.6 makes sufficient on its
+                // own, so a code this build has never heard of still reads.
+                reduce(
+                    chat,
+                    &mut self.lifecycle,
+                    AgentEvent::Error {
+                        agent_id: AgentId::Main,
+                        text: message,
+                    },
+                    None,
+                )
+            }
             Frame::Reset { session } => {
                 if !self.is_ours(&session) {
                     return Redraw(false);
@@ -357,6 +379,27 @@ impl SessionClient {
     /// Whether continuity was broken and the caller owes a re-attach.
     pub fn needs_reattach(&self) -> bool {
         self.needs_reattach
+    }
+
+    /// Drop the attachment for a session the server refused (spec 6.5).
+    ///
+    /// Everything the fold holds about the session comes from an attach block
+    /// that will not come again: the epoch it applied under and the cursor it
+    /// would offer describe a history the server says it cannot resolve, so
+    /// keeping either would have the client ask for one nobody has. The arm
+    /// goes too, or the next `state` frame to arrive would be taken for the
+    /// block this refusal replaced.
+    ///
+    /// Deliberately not what a `reset` does. That one says continuity broke
+    /// and asks for a re-attach, this one says there is nothing left to
+    /// attach to, so a re-attach the client already owed is withdrawn here.
+    /// Collapsing the two would spin a client against a session that is gone.
+    fn drop_attachment(&mut self) {
+        self.attach = Attach::Live;
+        self.epoch = None;
+        self.committed = None;
+        self.applied = None;
+        self.needs_reattach = false;
     }
 
     /// Adopt the epoch of the attach block this client asked for, and
@@ -579,17 +622,15 @@ mod tests {
         AgentMessage::wire(Message::User(UserMessage::text(text)))
     }
 
-    /// The Main transcript's notice rows, which is what the durable
-    /// `Notice` frames above land as.
-    fn notices(chat: &ChatState) -> Vec<String> {
+    /// The Main transcript's notice rows at `level`.
+    fn notices_at(chat: &ChatState, level: NoticeLevel) -> Vec<String> {
         chat.transcript(AgentId::Main)
             .map(|transcript| {
                 transcript
                     .entries()
                     .iter()
                     .filter_map(|entry| match &entry.kind {
-                        EntryKind::Notice(notice) => {
-                            assert_eq!(notice.level, NoticeLevel::Info);
+                        EntryKind::Notice(notice) if notice.level == level => {
                             Some(notice.text.clone())
                         }
                         _ => None,
@@ -597,6 +638,12 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// The Main transcript's informational rows, which is what the durable
+    /// `Notice` frames above land as.
+    fn notices(chat: &ChatState) -> Vec<String> {
+        notices_at(chat, NoticeLevel::Info)
     }
 
     /// Whether an unfinalized streaming row is open in the Main
@@ -608,6 +655,148 @@ mod tests {
                 .iter()
                 .any(|entry| matches!(&entry.kind, EntryKind::Assistant(a) if !a.finalized))
         })
+    }
+
+    /// The Main transcript's error rows, which is what a refusal surfaces as.
+    fn errors(chat: &ChatState) -> Vec<String> {
+        notices_at(chat, NoticeLevel::Error)
+    }
+
+    fn refusal(session: &str, code: &str, message: &str) -> Frame {
+        Frame::Error {
+            session: session.to_string(),
+            epoch: None,
+            code: code.to_string(),
+            message: message.to_string(),
+        }
+    }
+
+    /// A refused attach is surfaced and ends the attachment (spec 6.5): the
+    /// session is gone, so there is nothing left to offer a cursor for and
+    /// nothing to fold.
+    #[test]
+    fn a_refused_attach_surfaces_and_drops_the_attachment() {
+        let (mut client, mut chat) = attached();
+        let _ = client.apply(&mut chat, durable(EPOCH, 2, "entry-2", notice("one")));
+        assert!(client.cursor().is_some(), "the fixture holds a cursor");
+
+        assert!(
+            client
+                .apply(
+                    &mut chat,
+                    refusal(SESSION, "unknown_session", "unknown session session-1"),
+                )
+                .0
+        );
+
+        assert_eq!(
+            errors(&chat),
+            vec!["unknown session session-1"],
+            "the host's own sentence reaches the user (spec 6.6)",
+        );
+        assert_eq!(
+            client.cursor(),
+            None,
+            "a cursor for a session the server cannot resolve asks for a history \
+             nobody has",
+        );
+        assert_eq!(
+            notices(&chat),
+            vec!["one"],
+            "and what the session did show stays on screen",
+        );
+
+        // Nothing more is folded for it: the epoch it applied under went with
+        // the attachment.
+        assert!(
+            !client
+                .apply(&mut chat, durable(EPOCH, 3, "entry-3", notice("after")))
+                .0
+        );
+        assert_eq!(notices(&chat), vec!["one"]);
+    }
+
+    /// The refusal is not a `reset`: one says continuity broke and asks for a
+    /// re-attach, the other says there is nothing left to attach to. A client
+    /// that collapsed them would spin against a session that is gone.
+    #[test]
+    fn a_refusal_withdraws_the_re_attach_a_reset_asked_for() {
+        let (mut client, mut chat) = attached();
+        let _ = client.apply(
+            &mut chat,
+            Frame::Reset {
+                session: SESSION.to_string(),
+            },
+        );
+        assert!(client.needs_reattach(), "the reset asked for one");
+
+        let _ = client.apply(
+            &mut chat,
+            refusal(SESSION, "unknown_session", "unknown session session-1"),
+        );
+
+        assert!(
+            !client.needs_reattach(),
+            "the re-attach the reset asked for would be refused again",
+        );
+    }
+
+    /// A refusal answers the attach the client asked for, so it disarms it.
+    /// Left armed, the next `state` frame to arrive would be taken for the
+    /// block this refusal replaced, and the fold would silently resume on a
+    /// session it was told is gone.
+    #[test]
+    fn a_refusal_disarms_the_attach_it_answered() {
+        let mut client = SessionClient::new(SESSION.to_string());
+        let mut chat = chat();
+        client.expect_attach();
+
+        let _ = client.apply(
+            &mut chat,
+            refusal(SESSION, "unknown_session", "unknown session session-1"),
+        );
+
+        // What a stray `state` frame would do to an armed client: adopt its
+        // epoch and open a block.
+        let _ = client.apply(&mut chat, state("epoch-2", false));
+        assert!(
+            !client
+                .apply(&mut chat, durable("epoch-2", 1, "entry-1", notice("stray")))
+                .0
+        );
+        assert_eq!(notices(&chat), Vec::<String>::new());
+        assert_eq!(client.cursor(), None);
+    }
+
+    /// An error frame for someone else's session is ignored, like every other
+    /// session-scoped frame.
+    #[test]
+    fn a_refusal_for_another_session_is_ignored() {
+        let (mut client, mut chat) = attached();
+        let _ = client.apply(&mut chat, durable(EPOCH, 2, "entry-2", notice("one")));
+        let before = client.cursor();
+
+        assert!(
+            !client
+                .apply(
+                    &mut chat,
+                    refusal("session-2", "unknown_session", "unknown session session-2"),
+                )
+                .0
+        );
+
+        assert_eq!(errors(&chat), Vec::<String>::new());
+        assert_eq!(
+            client.cursor(),
+            before,
+            "another session's refusal drops nothing of ours",
+        );
+        assert!(
+            client
+                .apply(&mut chat, durable(EPOCH, 3, "entry-3", notice("after")))
+                .0,
+            "and the fold carries on",
+        );
     }
 
     #[test]

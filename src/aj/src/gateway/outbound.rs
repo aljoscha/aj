@@ -281,7 +281,9 @@ fn lossy_key(frame: &DecodedFrame) -> Option<LossyKey> {
         // claim about who happens to enqueue one.
         Frame::List { .. } => Some(LossyKey::List),
         Frame::Vms { .. } => Some(LossyKey::Vms),
-        Frame::CaughtUp { .. } | Frame::Reset { .. } | Frame::Heartbeat => None,
+        Frame::CaughtUp { .. } | Frame::Error { .. } | Frame::Reset { .. } | Frame::Heartbeat => {
+            None
+        }
     }
 }
 
@@ -348,6 +350,16 @@ mod tests {
             .expect("an unknown frame decodes")
     }
 
+    /// One session's attach refusal (spec 6.3).
+    fn refusal() -> DecodedFrame {
+        decoded(Frame::Error {
+            session: SESSION.to_string(),
+            epoch: None,
+            code: "unknown_session".to_string(),
+            message: format!("{SESSION} names no session here"),
+        })
+    }
+
     /// Everything already queued, rendered as a comparable summary.
     fn drained(receiver: &mut Receiver) -> Vec<String> {
         let mut out = Vec::new();
@@ -407,6 +419,19 @@ mod tests {
         assert_eq!(sender.offer(reliable("one")), Offered::Queued);
 
         assert_eq!(sender.offer(unknown()), Offered::Evicted);
+
+        assert!(cancelled.is_cancelled());
+    }
+
+    /// A session-scoped refusal is reliable-transient (spec 6.4): losing one
+    /// leaves a client waiting for an attach block that was already answered,
+    /// so it evicts at the bound rather than being dropped.
+    #[tokio::test]
+    async fn a_refusal_is_never_dropped() {
+        let (sender, _receiver, cancelled) = queue(1);
+        assert_eq!(sender.offer(reliable("one")), Offered::Queued);
+
+        assert_eq!(sender.offer(refusal()), Offered::Evicted);
 
         assert!(cancelled.is_cancelled());
     }

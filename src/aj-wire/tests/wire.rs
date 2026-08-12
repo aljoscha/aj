@@ -44,6 +44,7 @@ const FRAME_KINDS: &[&str] = &[
     "state",
     "caught_up",
     "list",
+    "error",
     "reset",
     "heartbeat",
     "vms",
@@ -1874,6 +1875,75 @@ fn a_tag_request_carries_one_string_and_defaults_to_clearing() {
     );
 }
 
+/// The error frame is the error envelope of spec 6.6 with a session on it
+/// (spec 6.3): the same `code` and `message` an error body carries, plus the
+/// epoch when the error is about one.
+///
+/// The epoch is an absent key rather than a null when there is none, in both
+/// directions, which is what an attach refusal writes: the session was never
+/// resolved, so there is no epoch it could be about. Additive fields ride
+/// along, and a client that does not know a `code` renders its `message`
+/// (spec 6.10).
+#[test]
+fn an_error_frame_carries_the_envelope_and_an_optional_epoch() {
+    let refusal = Frame::Error {
+        session: "session-1".to_string(),
+        epoch: None,
+        code: "unknown_session".to_string(),
+        message: "unknown session session-1".to_string(),
+    };
+    let encoded = serde_json::to_value(&refusal).expect("the frame serializes");
+    assert_eq!(
+        encoded,
+        json!({
+            "kind": "error",
+            "session": "session-1",
+            "code": "unknown_session",
+            "message": "unknown session session-1",
+        }),
+        "an absent epoch is an absent key and never a null: {encoded}",
+    );
+
+    let scoped: Frame = serde_json::from_value(json!({
+        "kind": "error",
+        "session": "session-1",
+        "epoch": "epoch-1",
+        "code": "stale_branch",
+        "message": "that branch is gone",
+        "added_later": {"entry": "entry-7"},
+    }))
+    .expect("a newer peer's error frame decodes");
+    let Frame::Error {
+        session,
+        epoch,
+        code,
+        message,
+    } = &scoped
+    else {
+        panic!("expected an error frame, got {scoped:?}");
+    };
+    assert_eq!(
+        (session.as_str(), epoch.as_deref()),
+        ("session-1", Some("epoch-1")),
+    );
+    assert_eq!(
+        (code.as_str(), message.as_str()),
+        ("stale_branch", "that branch is gone"),
+        "an unknown code decodes and carries its own sentence",
+    );
+
+    for missing in [
+        json!({"kind": "error", "session": "session-1", "message": "no code"}),
+        json!({"kind": "error", "session": "session-1", "code": "no_message"}),
+        json!({"kind": "error", "code": "no_session", "message": "no session"}),
+    ] {
+        assert!(
+            serde_json::from_value::<Frame>(missing.clone()).is_err(),
+            "an error frame names a session, a code and a message: {missing}",
+        );
+    }
+}
+
 /// A cursor's `<epoch>:<seq>` encoding round-trips, and the shapes that
 /// are not one are refused rather than guessed at.
 #[test]
@@ -1956,6 +2026,7 @@ fn frame_kind(frame: &Frame) -> &'static str {
         Frame::State { .. } => "state",
         Frame::CaughtUp { .. } => "caught_up",
         Frame::List { .. } => "list",
+        Frame::Error { .. } => "error",
         Frame::Reset { .. } => "reset",
         Frame::Heartbeat => "heartbeat",
         Frame::Vms { .. } => "vms",
@@ -1973,6 +2044,7 @@ fn frame_carries_session(frame: &Frame) -> bool {
         Frame::Event { .. }
         | Frame::State { .. }
         | Frame::CaughtUp { .. }
+        | Frame::Error { .. }
         | Frame::Reset { .. } => true,
         Frame::List { .. } | Frame::Heartbeat | Frame::Vms { .. } => false,
     }
@@ -2015,6 +2087,14 @@ fn local_frames() -> Vec<Frame> {
         Frame::List {
             sessions: Vec::new(),
             hosts: Vec::new(),
+        },
+        Frame::Error {
+            session: "old".to_string(),
+            // The shape an attach refusal takes: the session was never
+            // resolved, so there is no epoch it could be about.
+            epoch: None,
+            code: "unknown_session".to_string(),
+            message: "unknown session old".to_string(),
         },
         Frame::Reset {
             session: "old".to_string(),

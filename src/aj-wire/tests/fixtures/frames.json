@@ -110,5 +110,18 @@
         "host_id": "host-1"
       }
     ]
+  },
+  {
+    "kind": "error",
+    "session": "session-1",
+    "code": "unknown_session",
+    "message": "unknown session session-1"
+  },
+  {
+    "kind": "error",
+    "session": "session-1",
+    "epoch": "epoch-1",
+    "code": "unknown_session",
+    "message": "unknown session session-1"
   }
 ]

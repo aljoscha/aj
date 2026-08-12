@@ -749,6 +749,28 @@ pub enum Frame {
         /// (spec 7.1).
         hosts: Vec<DirectoryHost>,
     },
+    /// The error envelope of spec 6.6 as a stream frame, scoped to one session
+    /// (spec 6.3).
+    ///
+    /// Its first use is the per-session attach refusal: a named session the
+    /// server cannot resolve produces this instead of an attach block, and the
+    /// stream serves every other session it named. Reliable-transient, so it
+    /// is neither dropped as lossy nor treated as durable (spec 6.4).
+    Error {
+        session: String,
+        /// The epoch the error is about, for a code that refers to one.
+        ///
+        /// Absent where the session has no epoch to speak of, which is what an
+        /// attach refusal carries: the session was never resolved, so nothing
+        /// minted one.
+        epoch: Option<String>,
+        /// A stable snake_case token a client may branch on. A code this build
+        /// does not know renders as its `message` (spec 6.10).
+        code: String,
+        /// The human sentence, produced where the facts are and always
+        /// sufficient on its own.
+        message: String,
+    },
     Reset {
         session: String,
     },
@@ -766,6 +788,7 @@ impl Frame {
             Self::Event { session, .. }
             | Self::State { session, .. }
             | Self::CaughtUp { session, .. }
+            | Self::Error { session, .. }
             | Self::Reset { session } => Some(session),
             Self::List { .. } | Self::Heartbeat | Self::Vms { .. } => None,
         }
@@ -803,7 +826,9 @@ impl Frame {
                 )
             ),
             Self::State { .. } | Self::List { .. } | Self::Vms { .. } => true,
-            Self::CaughtUp { .. } | Self::Reset { .. } | Self::Heartbeat => false,
+            Self::CaughtUp { .. } | Self::Error { .. } | Self::Reset { .. } | Self::Heartbeat => {
+                false
+            }
         }
     }
 
@@ -865,6 +890,7 @@ impl Frame {
             Self::Event { session, .. }
             | Self::State { session, .. }
             | Self::CaughtUp { session, .. }
+            | Self::Error { session, .. }
             | Self::Reset { session } => session,
             Self::List { .. } | Self::Heartbeat | Self::Vms { .. } => return false,
         };
@@ -899,6 +925,13 @@ enum FrameRef<'a> {
         sessions: &'a [SessionSummary],
         #[serde(skip_serializing_if = "no_hosts")]
         hosts: &'a [DirectoryHost],
+    },
+    Error {
+        session: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        epoch: Option<&'a str>,
+        code: &'a str,
+        message: &'a str,
     },
     Reset {
         session: &'a str,
@@ -950,6 +983,17 @@ impl Serialize for Frame {
                 last_seq: *last_seq,
             },
             Self::List { sessions, hosts } => FrameRef::List { sessions, hosts },
+            Self::Error {
+                session,
+                epoch,
+                code,
+                message,
+            } => FrameRef::Error {
+                session,
+                epoch: epoch.as_deref(),
+                code,
+                message,
+            },
             Self::Reset { session } => FrameRef::Reset { session },
             Self::Heartbeat => FrameRef::Heartbeat,
             Self::Vms { vms } => FrameRef::Vms { vms },
@@ -1045,6 +1089,20 @@ impl<'de> Deserialize<'de> for Frame {
                     serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
                 Ok(Self::List { sessions, hosts })
             }
+            "error" => {
+                let ErrorFrameFields {
+                    session,
+                    epoch,
+                    code,
+                    message,
+                } = serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
+                Ok(Self::Error {
+                    session,
+                    epoch,
+                    code,
+                    message,
+                })
+            }
             "reset" => {
                 let ResetFrameFields { session } =
                     serde_json::from_str(raw.get()).map_err(D::Error::custom)?;
@@ -1093,6 +1151,15 @@ struct ListFrameFields {
     sessions: Vec<SessionSummary>,
     #[serde(default)]
     hosts: Vec<DirectoryHost>,
+}
+
+#[derive(Deserialize)]
+struct ErrorFrameFields {
+    session: String,
+    #[serde(default)]
+    epoch: Option<String>,
+    code: String,
+    message: String,
 }
 
 #[derive(Deserialize)]
@@ -1564,6 +1631,6 @@ fn is_known_event_type(event_type: &str) -> bool {
 fn is_known_frame_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "event" | "state" | "caught_up" | "list" | "reset" | "heartbeat" | "vms"
+        "event" | "state" | "caught_up" | "list" | "error" | "reset" | "heartbeat" | "vms"
     )
 }

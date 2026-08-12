@@ -155,7 +155,9 @@ fn lossy_key(frame: &Frame) -> Option<LossyKey> {
         Frame::State { session, .. } => Some(LossyKey::State(session.clone())),
         Frame::List { .. } => Some(LossyKey::List),
         Frame::Vms { .. } => Some(LossyKey::Vms),
-        Frame::CaughtUp { .. } | Frame::Reset { .. } | Frame::Heartbeat => None,
+        Frame::CaughtUp { .. } | Frame::Error { .. } | Frame::Reset { .. } | Frame::Heartbeat => {
+            None
+        }
     }
 }
 
@@ -587,6 +589,17 @@ mod tests {
         }
     }
 
+    /// A session-scoped refusal (spec 6.3), reliable-transient like the rest of
+    /// its class.
+    fn refusal(code: &str) -> Frame {
+        Frame::Error {
+            session: SESSION.to_string(),
+            epoch: None,
+            code: code.to_string(),
+            message: format!("no {code} here"),
+        }
+    }
+
     /// Everything queued on `rx`, rendered as a comparable summary.
     fn drained(rx: &mut LiveReceiver) -> Vec<String> {
         let mut out = Vec::new();
@@ -602,6 +615,7 @@ mod tests {
                 },
                 Frame::State { last_seq, .. } => format!("state {last_seq}"),
                 Frame::CaughtUp { last_seq, .. } => format!("caught_up {last_seq}"),
+                Frame::Error { code, .. } => format!("error {code}"),
                 Frame::Reset { .. } => "reset".to_string(),
                 Frame::List { .. } => "list".to_string(),
                 other => format!("{other:?}"),
@@ -791,12 +805,47 @@ mod tests {
             Frame::Event { session, .. }
             | Frame::State { session, .. }
             | Frame::CaughtUp { session, .. }
+            | Frame::Error { session, .. }
             | Frame::Reset { session } => OTHER.clone_into(session),
             Frame::List { .. } | Frame::Heartbeat | Frame::Vms { .. } => {
                 panic!("a host-level frame belongs to no session")
             }
         }
         frame
+    }
+
+    /// A refusal is reliable-transient (spec 6.4), so neither queue rule that
+    /// exists for lossy frames may touch it: it is held behind an attach block
+    /// rather than dropped, and at the bound it evicts rather than being lost.
+    /// A dropped refusal is a client left waiting for an attach block that was
+    /// already answered.
+    #[test]
+    fn a_refusal_is_neither_dropped_during_an_attach_nor_at_the_bound() {
+        let fanout = Fanout::default();
+        let (id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string()]);
+        fanout.publish(refusal("unknown_session"));
+
+        fanout.finish_block(id, SESSION, 0);
+
+        assert_eq!(
+            drained(&mut rx),
+            vec!["error unknown_session"],
+            "a lossy frame published during an attach would have been dropped",
+        );
+
+        let fanout = Fanout::new(NonZeroUsize::new(2));
+        let (id, mut rx, cancelled) = fanout.register(&[SESSION.to_string()]);
+        fanout.finish_block(id, SESSION, 0);
+        fanout.publish(reliable("one"));
+        fanout.publish(reliable("two"));
+
+        fanout.publish(refusal("unknown_session"));
+
+        assert!(
+            cancelled.is_cancelled(),
+            "a refusal that met the bound was dropped instead of evicting: {:?}",
+            drained(&mut rx),
+        );
     }
 
     /// A `reset` published during an attach remains in the live queue.

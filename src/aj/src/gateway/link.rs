@@ -178,10 +178,12 @@ async fn attempt(address: &HostAddress, directory: &Directory, recorder: &Record
                 },
                 // A control connection names no session, so a host publishes it
                 // none of these (spec 6.5). The ones a client asked for reach it
-                // on that client's own spliced stream instead.
+                // on that client's own spliced stream instead, and so does the
+                // refusal of one it cannot serve.
                 Frame::Event { .. }
                 | Frame::State { .. }
                 | Frame::CaughtUp { .. }
+                | Frame::Error { .. }
                 | Frame::Reset { .. } => {}
                 Frame::Heartbeat => {}
                 // A gateway learns about VMs from its own provisioner, not from
