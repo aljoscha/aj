@@ -1388,9 +1388,16 @@ about ordering). The layers:
    end). Then the adversarial variant: inject disconnects at random
    frame boundaries (seeded, shrinking-friendly), forcing re-attach
    with cursors each time, and assert canonical-form convergence at
-   quiescence. Transient-only artifacts (notices from dropped
-   windows, in-flight streaming text) are excluded from the fault
-   variant's comparison by the canonical form's definition.
+   quiescence. The fault variant compares the canonical form's
+   **convergent tier**, which masks transient-only artifacts
+   (notices, in-flight streaming text): reliable-transient frames
+   are not replayable (section 6.4), so a client disconnected across
+   a notice's window legitimately never has it, and comparing them
+   would assert a promise the protocol does not make. The no-fault
+   comparison uses the full form, notices included, there both
+   clients saw everything. The fault sweep includes a scripted turn
+   that emits a notice, so the masking is load-bearing rather than
+   untested.
 3. **Reducer hardening units**: idempotent re-application (projected
    tool start for a known call id, re-synthesized `SubAgentStart` for
    a known sub), quiesce behavior, epoch filtering, cursor invariant.
@@ -1399,8 +1406,13 @@ about ordering). The layers:
    materialization and lock conflicts, per-session cursor isolation.
 5. **Gateway**: two in-process hosts behind a gateway, id
    namespacing, list merging, command routing, splice forwarding,
-   host kill/restart with `reset` emission, `unreachable` surfacing,
-   and incremental-vs-full resume after the host returns.
+   every `reset` edge (host lost, host returned, enrollment
+   withdrawn, identity replaced), `unreachable` surfacing,
+   and incremental-vs-full resume after the host returns. Resets are
+   splice-scoped on every edge: a reset is a statement about broken
+   continuity and only an attachment has continuity, so each client
+   gets them for exactly the sessions it attached, and unattached
+   sessions speak through the list (section 6.5).
 6. **Provisioning**: the local-process backend runs the full
    provision-enroll-create-prompt-destroy cycle in CI (it spawns real
    `aj serve` binaries with the scripted provider), including bundle
@@ -1419,7 +1431,10 @@ zero durable entries follow the cursor but an open sub concluded in
 the gap, head switch refused while busy, stale-epoch frames dropped,
 task-table refetch after `caught_up`, queue enqueue visibility on a
 second client, slow-client eviction and recovery, settings visibility
-for a mid-session joiner, seq non-contiguity tolerated, and the
+for a mid-session joiner, seq non-contiguity tolerated, per-session
+attach refusal (a dead or locked id answered by an `error` frame
+while the same stream's other sessions serve, through a gateway
+included), and the
 identity gate (loopback-only refusal in `local` mode, accept and
 reject paths in `tailscale` mode against a faked whois resolver).
 
