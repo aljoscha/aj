@@ -31,7 +31,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use aj_wire::{Frame, SessionSummary};
+use aj_wire::{DirectoryHost, Frame, SessionSummary};
 
 use crate::chat::{ChatState, Redraw};
 use crate::client::SessionClient;
@@ -85,6 +85,14 @@ pub struct SessionDirectory {
     attached: Vec<Attached>,
     /// The last `list` frame's rows, in the order the peer sent them.
     rows: Vec<SessionSummary>,
+    /// The hosts the last `list` frame named, empty on a plain host's frames.
+    ///
+    /// Held beside the rows rather than derived from them, because a gateway
+    /// names hosts it holds no rows for: after a restart it has none for a host
+    /// that is down, and it stores none deliberately (spec 7.1). Those are
+    /// exactly the hosts a scan over the rows cannot find, and they are what
+    /// tells "unreachable, contents unknown" from "no such host".
+    hosts: Vec<DirectoryHost>,
     /// Each session's durable position as of when the user last looked at it,
     /// compared against a row's `last_seq` to derive unseen output (spec 6.8).
     /// Both sides are the host's own sequence numbers, so neither clock enters
@@ -119,6 +127,7 @@ impl SessionDirectory {
                 delivered: None,
             }],
             rows: Vec::new(),
+            hosts: Vec::new(),
             viewed: HashMap::new(),
             unseen: HashSet::new(),
         }
@@ -158,6 +167,15 @@ impl SessionDirectory {
     /// The rows from the last `list` frame.
     pub fn rows(&self) -> &[SessionSummary] {
         &self.rows
+    }
+
+    /// The hosts from the last `list` frame, empty against a plain host.
+    ///
+    /// A gateway names every host it has enrolled, the ones it holds no rows
+    /// for included, each by its id or, while it has none, by its configured
+    /// address (spec 7.1).
+    pub fn hosts(&self) -> &[DirectoryHost] {
+        &self.hosts
     }
 
     /// The working set always holds at least the focused session, which
@@ -216,14 +234,14 @@ impl SessionDirectory {
     /// this type has no use for.
     fn apply_host_frame(&mut self, frame: Frame) -> Redraw {
         match frame {
-            // A gateway's frame also names its enrolled hosts, which this
-            // reducer drops. The sidebar groups by each row's own `host`, so a
-            // host a gateway holds no rows for renders as nothing rather than
-            // as the empty group spec 7.1 asks for. Holding these names is what
-            // that grouping would read.
-            Frame::List { sessions, .. } => {
-                let changed = self.rows != sessions;
+            Frame::List { sessions, hosts } => {
+                // The hosts are part of the answer: a host the gateway holds no
+                // rows for has no row to carry its label or its reachability,
+                // so comparing rows alone would render such a host once and
+                // never update it again (spec 7.1).
+                let changed = self.rows != sessions || self.hosts != hosts;
                 self.rows = sessions;
+                self.hosts = hosts;
                 self.latch_unseen();
                 Redraw(changed)
             }
@@ -645,9 +663,30 @@ mod tests {
     }
 
     fn list(sessions: Vec<SessionSummary>) -> Frame {
-        Frame::List {
-            sessions,
-            hosts: Vec::new(),
+        list_of(sessions, Vec::new())
+    }
+
+    /// A gateway's `list` frame: rows, and the hosts they came from.
+    fn list_of(sessions: Vec<SessionSummary>, hosts: Vec<DirectoryHost>) -> Frame {
+        Frame::List { sessions, hosts }
+    }
+
+    /// A host the gateway has spoken to, so it knows its id.
+    fn learned(id: &str, unreachable: bool) -> DirectoryHost {
+        DirectoryHost {
+            id: Some(id.to_string()),
+            address: None,
+            unreachable,
+        }
+    }
+
+    /// A configured host the gateway has never reached: no id to name it by,
+    /// its address instead, and no rows at all (spec 7.1).
+    fn configured(address: &str) -> DirectoryHost {
+        DirectoryHost {
+            id: None,
+            address: Some(address.to_string()),
+            unreachable: true,
         }
     }
 
@@ -835,6 +874,58 @@ mod tests {
             assert!(!directory.apply(&mut focused_chat, frame).0);
         }
         assert_eq!(directory.rows().len(), 2, "and they leave the rows alone");
+    }
+
+    /// A gateway's `list` frame names the hosts it has enrolled beside the
+    /// rows, and a change confined to those hosts is news like any other.
+    ///
+    /// A host the gateway holds no rows for has no row to carry its state, so
+    /// a repaint predicate that read only the rows would draw such a host once
+    /// and never again: it could go out, come back, or learn its id, and the
+    /// strip would keep the first label and mark it was given (spec 7.1).
+    #[test]
+    fn a_change_confined_to_the_hosts_is_still_news() {
+        let (mut directory, mut focused_chat) = two_sessions();
+        assert!(directory.hosts().is_empty(), "a plain host names none");
+
+        // One host answering, one configured host that never has, and a row on
+        // neither of them: the rows stay untouched throughout.
+        let sessions = vec![row(FOCUSED, false, 10)];
+        let enrolled = vec![learned("builder-1", false), configured("10.0.0.7:7777")];
+        let redraw = directory.apply(
+            &mut focused_chat,
+            list_of(sessions.clone(), enrolled.clone()),
+        );
+        assert!(redraw.0, "the first hosts are news");
+        assert_eq!(directory.hosts(), enrolled.as_slice());
+
+        let redraw = directory.apply(
+            &mut focused_chat,
+            list_of(sessions.clone(), enrolled.clone()),
+        );
+        assert!(!redraw.0, "the same directory again is not");
+
+        // The host goes out. Nothing about the rows says so.
+        let gone = vec![learned("builder-1", true), configured("10.0.0.7:7777")];
+        let redraw = directory.apply(&mut focused_chat, list_of(sessions.clone(), gone.clone()));
+        assert!(
+            redraw.0,
+            "a host going out is news the rows cannot carry: {:?}",
+            directory.hosts(),
+        );
+        assert_eq!(directory.hosts(), gone.as_slice());
+
+        // And the configured host answers for the first time, which is where
+        // its id comes from and what the strip relabels its group by.
+        let met = vec![learned("builder-1", true), learned("builder-2", false)];
+        let redraw = directory.apply(&mut focused_chat, list_of(sessions.clone(), met.clone()));
+        assert!(redraw.0, "a host learning its id is news too");
+        assert_eq!(directory.hosts(), met.as_slice());
+        assert_eq!(
+            directory.rows(),
+            sessions.as_slice(),
+            "and none of it disturbed the rows",
+        );
     }
 
     /// Output produced while a session was the focused one is output the user
