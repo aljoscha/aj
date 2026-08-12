@@ -3340,6 +3340,63 @@ async fn a_withdrawal_ends_that_hosts_splices_and_leaves_the_others_alone() {
     staying.stop();
 }
 
+/// The last step of a withdrawal stops that host's control link and waits for it
+/// to be gone (spec 7.1): a withdrawal that has answered has nothing left
+/// dialing that host.
+///
+/// Watched as the host seeing its control connection released, because a link
+/// that outlived its enrollment does not misbehave in any way a count of dials
+/// or of frames would show. It holds the connection it already has, forever: the
+/// host keeps a subscriber it cannot get rid of, the gateway keeps a task
+/// writing rows into an entry that is gone, and re-enrolling that address later
+/// races the leaked link against the fresh one (see [`Gateway::dial`]).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_withdrawal_stops_the_control_link_of_the_host_it_withdraws() {
+    // No client attaches here, so this host serves its control connection and
+    // nothing else.
+    let fake = FakeHost::start("fake", Script::Frames(Vec::new())).await;
+    // Enrolled over the wire: a configured host is the file's to remove.
+    let fixture = Fixture::new(&[]).await;
+    assert_eq!(
+        fixture.enroll(&fake.address.to_string()).await.status(),
+        StatusCode::OK,
+    );
+    fixture.until_connected("fake").await;
+    let dialed = fake
+        .attaches()
+        .iter()
+        .filter(|attached| attached.is_empty())
+        .count();
+    assert_eq!(
+        (dialed, fake.control_released()),
+        (1, 0),
+        "one control connection, open: without it there is no link here for a \
+         withdrawal to stop and nothing below measures a teardown",
+    );
+
+    assert_eq!(
+        fixture.withdraw("fake").await.status(),
+        StatusCode::NO_CONTENT,
+    );
+
+    // The close travels on the link's own connection while the 204 travels on
+    // the client's, so the host observes it just after the answer rather than
+    // with it. What is being pinned is that it arrives at all.
+    bounded(
+        "the withdrawn host's control connection to close, which a gateway that \
+         has answered a withdrawal is no longer holding",
+        async {
+            while fake.control_released() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
+    .await;
+
+    fixture.shutdown().await;
+    fake.stop();
+}
+
 /// A withdrawal interrupts an in-flight dial to the host being withdrawn, rather
 /// than waiting it out (spec 7.1: a withdrawal that has answered has nothing left
 /// dialing that host).
@@ -4360,6 +4417,11 @@ struct FakeHost {
     /// How many spliced streams have been released, which is how a test sees an
     /// upstream connection being closed from the gateway's side.
     released: Arc<AtomicUsize>,
+    /// The same for this host's control connections, counted apart because the
+    /// two are torn down by different things: a splice ends with the client
+    /// stream it belongs to, the control link only when the gateway stops
+    /// following this host.
+    control_released: Arc<AtomicUsize>,
     /// How many frames this host's spliced streams have written, scripted and
     /// flooded alike. A count that stops moving is how a test sees the whole
     /// pipeline behind it stall (see [`Self::until_stalled`]).
@@ -4391,6 +4453,7 @@ impl FakeHost {
 
         let attaches: Arc<StdMutex<Vec<Vec<String>>>> = Arc::new(StdMutex::new(Vec::new()));
         let released = Arc::new(AtomicUsize::new(0));
+        let control_released = Arc::new(AtomicUsize::new(0));
         let written = Arc::new(AtomicUsize::new(0));
         let hello = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
@@ -4412,10 +4475,12 @@ impl FakeHost {
                 get({
                     let attaches = Arc::clone(&attaches);
                     let released = Arc::clone(&released);
+                    let control_released = Arc::clone(&control_released);
                     let written = Arc::clone(&written);
                     move |Query(params): Query<Vec<(String, String)>>| {
                         let attaches = Arc::clone(&attaches);
                         let released = Arc::clone(&released);
+                        let control_released = Arc::clone(&control_released);
                         let written = Arc::clone(&written);
                         let script = script.clone();
                         let directory = directory.clone();
@@ -4460,9 +4525,15 @@ impl FakeHost {
                             }
                             // A control connection carries this host's directory
                             // and then stays open, which is what keeps the
-                            // gateway's link to it up.
+                            // gateway's link to it up. Guarded like a spliced
+                            // stream, so a test can watch the gateway let go of
+                            // it.
                             let (frames, tail, guard) = if control {
-                                (vec![directory], Tail::Held, None)
+                                (
+                                    vec![directory],
+                                    Tail::Held,
+                                    Some(Released(Arc::clone(&control_released))),
+                                )
                             } else {
                                 let guard = Some(Released(Arc::clone(&released)));
                                 match &script {
@@ -4542,6 +4613,7 @@ impl FakeHost {
             address: HostAddress::parse(&format!("http://{bound}")).expect("an address"),
             attaches,
             released,
+            control_released,
             written,
             serving,
         }
@@ -4565,6 +4637,11 @@ impl FakeHost {
 
     fn released(&self) -> usize {
         self.released.load(Ordering::Relaxed)
+    }
+
+    /// How many control connections this host has had closed on it.
+    fn control_released(&self) -> usize {
+        self.control_released.load(Ordering::Relaxed)
     }
 
     fn written(&self) -> usize {
