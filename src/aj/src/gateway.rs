@@ -379,9 +379,9 @@ impl Gateway {
     /// 2. the enrollment and its rows leave the directory, in one publish, so
     ///    nothing serves a directory that contradicts the enrolled set;
     /// 3. the streams spliced onto that host end, without a `reset`: the
-    ///    re-attach a `reset` asks for would be refused now that the namespace
-    ///    is gone, and a refused attach fails the client's *whole* stream, so it
-    ///    would cost that client the sessions it holds on every other host;
+    ///    re-attach a `reset` asks for would be refused now that the namespace is
+    ///    gone (see [`crate::gateway::splice`], which owns that decision and what
+    ///    the per-session refusal changes about it);
     /// 4. the control link stops, awaited, so a withdrawal that has answered has
     ///    nothing left dialing that host.
     ///
@@ -430,9 +430,9 @@ impl Gateway {
         // still a change this stream is woken for: the groups are the state the
         // splice compares against, and they are the newer of the two.
         let reachable = self.inner.directory.reachable();
-        let groups = self.inner.directory.group(attach)?;
+        let plan = self.inner.directory.group(attach);
         Splice::open(
-            groups,
+            plan,
             reachable,
             self.inner.directory.subscribe(),
             self.inner.tuning,

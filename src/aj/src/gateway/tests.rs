@@ -589,6 +589,35 @@ fn resets(frames: &[Frame]) -> Vec<String> {
         .collect()
 }
 
+/// The sessions the `error` frames among `frames` refuse (spec 6.3).
+fn refused_sessions<'a>(frames: impl Iterator<Item = &'a Frame>) -> Vec<&'a str> {
+    frames
+        .filter_map(|frame| match frame {
+            Frame::Error { session, .. } => Some(session.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The first `error` frame on `events`: the session it refuses, its code and
+/// its message (spec 6.3).
+async fn refused_session(events: &mut RemoteEvents) -> (String, String, String) {
+    let frames = frames_until(events, "a session-scoped refusal", |frame| {
+        matches!(frame, Frame::Error { .. })
+    })
+    .await;
+    let Some(Frame::Error {
+        session,
+        code,
+        message,
+        ..
+    }) = frames.into_iter().next_back()
+    else {
+        unreachable!("the read stops on an error frame")
+    };
+    (session, code, message)
+}
+
 /// The concatenated text of every finalized assistant message among `frames`.
 fn assistant_text(frames: &[Frame]) -> Vec<String> {
     frames
@@ -2664,25 +2693,123 @@ async fn attaching_an_id_this_gateway_cannot_name_reaches_no_host() {
         // A session half a URL would swallow.
         "fake:..",
     ] {
-        let refused = fixture.client.events(&[attach(id)]).await;
+        let mut events = fixture
+            .client
+            .events(&[attach(id)])
+            .await
+            .unwrap_or_else(|err| panic!("{id:?} did not open a stream: {err}"));
 
-        // The host is read before the answer is unwrapped, so an attach that got
-        // through fails on having reached a host rather than on the shape of what
-        // came back.
+        // The host is read before the frames are, so an attach that got through
+        // fails on having reached a host rather than on the shape of what came
+        // back.
         assert_eq!(
             fake.spliced_attaches(),
             Vec::<Vec<String>>::new(),
             "attaching {id:?} reached a host this gateway cannot address it on",
         );
-        let Err(err) = refused else {
-            panic!("{id:?} names no session on this gateway");
-        };
-        assert_eq!(err.status(), Some(StatusCode::NOT_FOUND), "{id:?}: {err:?}");
-        assert_eq!(err.code(), Some("unknown_session"), "{id:?}");
+        let (refused, code, _) = refused_session(&mut events).await;
+        assert_eq!(refused, id, "the refusal names the id the client sent");
+        assert_eq!(code, "unknown_session", "{id:?}");
     }
 
     fixture.shutdown().await;
     fake.stop();
+}
+
+/// A client's stream never fails wholesale over one bad session (spec 6.5,
+/// 7.1): the sessions this gateway can resolve are served, on every host they
+/// live on, and each id it cannot resolve is refused on that same stream.
+///
+/// Two hosts, because that is what the rule is about: failing the stream over
+/// one dead id costs a client its healthy sessions on every *other* host, and
+/// a single upstream cannot show that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stream_refuses_the_ids_it_cannot_resolve_and_serves_both_hosts() {
+    let mut left = Upstream::start().await;
+    let mut right = Upstream::start().await;
+    let here = left.create().await;
+    let there = right.create().await;
+    let fixture = Fixture::new(&[&left, &right]).await;
+    let (here, there) = (left.namespaced(&here), right.namespaced(&there));
+    fixture.row(&here).await;
+    fixture.row(&there).await;
+    // An id under this gateway's own namespace that its owning host does not
+    // hold, so the refusal below is this gateway's and not that host's.
+    let gone = left.namespaced("20260101-000000-000");
+
+    let mut events = fixture
+        .attach(&[
+            attach(&here),
+            // No host of this gateway answers to that namespace.
+            attach("0123456789abcdef:whatever"),
+            attach(&there),
+            attach(&gone),
+        ])
+        .await;
+
+    let mut blocks = 0;
+    let mut refusals = 0;
+    let opened = frames_until(&mut events, "both blocks and both refusals", |frame| {
+        match frame {
+            Frame::CaughtUp { .. } => blocks += 1,
+            Frame::Error { .. } => refusals += 1,
+            _ => {}
+        }
+        blocks == 2 && refusals == 2
+    })
+    .await;
+    let mut served: Vec<&str> = opened
+        .iter()
+        .filter(|frame| is_caught_up(frame))
+        .filter_map(Frame::session)
+        .collect();
+    served.sort_unstable();
+    assert_eq!(
+        served,
+        {
+            let mut both = vec![here.as_str(), there.as_str()];
+            both.sort_unstable();
+            both
+        },
+        "both hosts' sessions were served on the stream a bad id shared: \
+         {opened:?}",
+    );
+    let refused: Vec<(&str, &str)> = opened
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::Error { session, code, .. } => Some((session.as_str(), code.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        refused,
+        vec![
+            ("0123456789abcdef:whatever", "unknown_session"),
+            (gone.as_str(), "unknown_session"),
+        ],
+        "each unresolvable id is refused by the name the client gave it, in \
+         this gateway's own namespaced vocabulary, whether this gateway or the \
+         owning host is the one that could not resolve it: {opened:?}",
+    );
+
+    // And the stream is a working stream afterwards, not one limping to its
+    // end: a turn on either host still arrives.
+    for (id, text) in [(&here, "done"), (&there, "done")] {
+        fixture
+            .client
+            .command(id, &prompt("go"))
+            .await
+            .expect("the prompt is accepted");
+        let turn = frames_until(&mut events, "the answer", |frame| {
+            !assistant_text(std::slice::from_ref(frame)).is_empty()
+        })
+        .await;
+        assert_eq!(assistant_text(&turn), vec![text.to_string()]);
+    }
+
+    fixture.shutdown().await;
+    left.stop().await;
+    right.stop().await;
 }
 
 /// The owning host's refusal of an attach travels back, code and all: the client
@@ -2988,6 +3115,12 @@ async fn a_gateway_does_not_reopen_an_upstream_it_lost() {
 
 /// A re-attach while the host is still down does not fail the stream, does not
 /// spin on `reset`, and is told when the host comes back (spec 7.1).
+///
+/// Unreachable is **pending**, and the contrast with an id this gateway cannot
+/// resolve is what the same stream carries here: the unresolvable one is
+/// refused with an `error` frame, the unreachable one gets none and is held.
+/// Collapsing the two would either drop a client's attachment over a flap that
+/// is about to heal, or leave it waiting for frames that can never come.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reattach_while_a_host_is_down_waits_for_it_to_return() {
     let mut down = Upstream::start().await;
@@ -3007,8 +3140,14 @@ async fn a_reattach_while_a_host_is_down_waits_for_it_to_return() {
                 .map(|_| ())
         })
         .await;
+    // An id nothing here resolves, on the same stream, so that "no refusal for
+    // the unreachable one" measures the distinction rather than a gateway that
+    // refuses nothing at all.
+    let gone = "0123456789abcdef:whatever";
 
-    let mut events = fixture.attach(&[attach(&waiting), attach(&watched)]).await;
+    let mut events = fixture
+        .attach(&[attach(&waiting), attach(&watched), attach(gone)])
+        .await;
 
     // The healthy host's session is served, which is what failing the whole
     // stream over its neighbour would have cost.
@@ -3022,6 +3161,12 @@ async fn a_reattach_while_a_host_is_down_waits_for_it_to_return() {
         resets(&quiet).is_empty(),
         "a session whose host is known to be down waits rather than being reset \
          over and over: {quiet:?}",
+    );
+    assert_eq!(
+        refused_sessions(opened.iter().chain(quiet.iter())),
+        vec![gone],
+        "an unreachable host's session is pending and is owed no refusal, while \
+         an id this gateway cannot resolve is owed one: {opened:?} {quiet:?}",
     );
 
     down.restart().await;
@@ -3210,11 +3355,9 @@ async fn a_reattach_after_a_restart_resumes_fully_when_the_epoch_changed() {
 /// splices end. Leaving them running would serve a directory that contradicts
 /// the enrollment set.
 ///
-/// Two hosts on one client stream, because a client's attach set spans hosts and
-/// on this protocol a refused attach fails the client's **whole** stream. So
-/// ending one host's splice must not cost that client the sessions it holds on
-/// the others, and must not ask it to re-attach ids that no longer resolve,
-/// which is the same loss by another route.
+/// Two hosts on one client stream, because a client's attach set spans hosts,
+/// so ending one host's splice must not cost that client the sessions it holds
+/// on the others, and must not ask it to re-attach ids that no longer resolve.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_withdrawal_ends_that_hosts_splices_and_leaves_the_others_alone() {
     let cue = Arc::new(tokio::sync::Notify::new());
@@ -3295,7 +3438,8 @@ async fn a_withdrawal_ends_that_hosts_splices_and_leaves_the_others_alone() {
     assert!(
         carried.resets.is_empty(),
         "a withdrawal asked the client to attach ids this gateway no longer \
-         resolves, which would fail its whole stream: {carried:?}",
+         resolves (see the `splice` module docs, which own that decision): \
+         {carried:?}",
     );
 
     // And the directory says the same thing the teardown did.
@@ -3694,6 +3838,7 @@ async fn a_client_that_stops_reading_is_evicted_and_recovers() {
         "fake",
         Script::Flood {
             session: "s-1".to_string(),
+            opening: block("s-1", "epoch-1", 0),
         },
     )
     .await;
@@ -3745,6 +3890,60 @@ async fn a_client_that_stops_reading_is_evicted_and_recovers() {
     assert!(
         named_sessions(&block).contains(&"fake:s-1"),
         "an evicted client attaches again and is served: {block:?}",
+    );
+
+    drop(events);
+    fixture.shutdown().await;
+    fake.stop();
+}
+
+/// A session's `error` frame ends its attach block, because it is what the
+/// server sent instead of one (spec 6.5). Everything that follows for that
+/// session is ordinary live traffic, measured against the client's bound: a
+/// client that will not read it is evicted (spec 6.9) rather than pacing the
+/// upstream it shares with every other session on that host to a standstill.
+///
+/// The host here keeps talking about a session it refused, which a correct one
+/// does not do. That is the point: what a peer may do to this gateway's flow
+/// control must not depend on that peer behaving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_ends_the_block_it_was_sent_instead_of() {
+    let fake = FakeHost::start(
+        "fake",
+        Script::Flood {
+            session: "s-1".to_string(),
+            opening: vec![error_frame("s-1", "unknown_session", "no session s-1 here")],
+        },
+    )
+    .await;
+    let fixture = Fixture::tuned(
+        TempDir::new().expect("tempdir"),
+        vec![fake.address.clone()],
+        Tuning {
+            outbound_queue: NonZeroUsize::new(2).expect("non-zero"),
+            ..tuning()
+        },
+    )
+    .await;
+    fixture.until_connected("fake").await;
+
+    // From here the client reads nothing at all.
+    let events = fixture.attach(&[attach("fake:s-1")]).await;
+    bounded(
+        "the stalled client to be evicted, which paced frames would never do",
+        async {
+            while fake.released() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
+    .await;
+
+    assert!(
+        fake.written() > 2,
+        "the host wrote no more than the client's queue holds, {} frames, so \
+         nothing here ever met the bound",
+        fake.written(),
     );
 
     drop(events);
@@ -4365,6 +4564,17 @@ fn warning_frame(session: &str, epoch: &str, text: &str) -> String {
     .expect("a warning frame")
 }
 
+/// The refusal a host writes instead of a session's attach block (spec 6.5).
+fn error_frame(session: &str, code: &str, message: &str) -> String {
+    serde_json::to_string(&Frame::Error {
+        session: session.to_string(),
+        epoch: None,
+        code: code.to_string(),
+        message: message.to_string(),
+    })
+    .expect("an error frame")
+}
+
 /// What a [`FakeHost`] writes on a stream that attaches something.
 #[derive(Clone)]
 enum Script {
@@ -4373,8 +4583,13 @@ enum Script {
     /// These frames, then the host hangs the stream up. The flap a gateway must
     /// not paper over by dialing again on its own.
     Ends(Vec<String>),
-    /// An attach block, then reliable frames without end.
-    Flood { session: String },
+    /// `opening`, then reliable frames without end for `session`.
+    Flood {
+        session: String,
+        /// What the stream opens with: an attach block, or the refusal a server
+        /// writes instead of one (spec 6.5).
+        opening: Vec<String>,
+    },
     /// These frames, then the ones after `cue` is notified, then silence with
     /// the stream held open. For a live frame that has to arrive at a moment the
     /// test chooses: after another host's block has provably filled the client's
@@ -4539,8 +4754,8 @@ impl FakeHost {
                                 match &script {
                                     Script::Frames(frames) => (frames.clone(), Tail::Held, guard),
                                     Script::Ends(frames) => (frames.clone(), Tail::Ended, guard),
-                                    Script::Flood { session } => (
-                                        block(session, "epoch-1", 0),
+                                    Script::Flood { session, opening } => (
+                                        opening.clone(),
                                         // Only the first stream floods. A client
                                         // that re-attached into an unending one
                                         // would simply be evicted again, which is

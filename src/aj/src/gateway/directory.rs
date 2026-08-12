@@ -110,9 +110,8 @@ impl Row {
     /// route on, and re-emitting it under the host's own id would put an id no
     /// client here can address on the wire. An id [`addressable_session`]
     /// refuses is the same thing one step later: this gateway would publish it
-    /// and then refuse the attach for it, and a refused attach fails a client's
-    /// whole stream (spec 6.5), so one such row would cost that client the
-    /// sessions it holds on every other host.
+    /// and then refuse the attach for it (spec 6.5), telling a client a session
+    /// it can see is not there.
     ///
     /// A host's `list` frame is refused at decode long before this, so it takes
     /// a directory composed some other way to get here.
@@ -175,11 +174,12 @@ pub(crate) struct Withdrawn {
 impl Withdrawn {
     /// End the streams spliced onto this host.
     ///
-    /// Deliberately not a `reset`: that asks the client to attach again, and
-    /// these ids no longer resolve here, so the re-attach would be refused and
-    /// take down the client's sessions on every other host with it (spec 6.5,
-    /// 7.1). What the client is told instead is the directory, where the host's
-    /// rows and its group are gone.
+    /// Not a `reset` today: that asks the client to attach again, and these ids
+    /// no longer resolve here, so the re-attach would be refused. What the
+    /// client is told instead is the directory, where the host's rows and its
+    /// group are gone. Spec 7.1 has the withdrawal owing that `reset` all the
+    /// same, which is safe now that a refusal costs a client only the session it
+    /// names (see [`crate::gateway::splice`]).
     pub(crate) fn end_splices(&self) {
         self.serving.cancel();
     }
@@ -290,6 +290,27 @@ impl AttachGroup {
             .map(|request| SessionAddress::new(&self.host_id, &request.session).to_string())
             .collect()
     }
+}
+
+/// How one client's attach set divides among the enrolled hosts (spec 6.5).
+///
+/// A stream never fails wholesale over one bad session, so an id this gateway
+/// cannot resolve is carried here rather than raised: the hosts it can reach
+/// are served, and each of these is owed one session-scoped `error` frame.
+pub(crate) struct AttachPlan {
+    pub(crate) groups: Vec<AttachGroup>,
+    pub(crate) refused: Vec<Unresolvable>,
+}
+
+/// A session a client named that resolves to no enrolled host (spec 6.5).
+pub(crate) struct Unresolvable {
+    /// The id as the client wrote it, which is the vocabulary its refusal has
+    /// to name: it is what that client asked about, and it may be no id this
+    /// gateway could ever have minted.
+    pub(crate) session: String,
+    /// The sentence the client renders, which says why this gateway resolved
+    /// nothing (spec 6.6).
+    pub(crate) message: String,
 }
 
 impl Directory {
@@ -508,25 +529,33 @@ impl Directory {
     /// Group a client's attach set by the host that owns each session
     /// (spec 7.1).
     ///
-    /// The refusal is [`Self::route`]'s: an id this gateway cannot resolve to an
-    /// enrolled host names no session here, and refusing the whole stream for it
-    /// is what a host does with an attach it cannot serve (spec 6.5). A host
-    /// that is enrolled and not reachable is *not* a refusal, see
-    /// [`AttachGroup::dial`].
-    pub(crate) fn group(
-        &self,
-        requests: &[AttachRequest],
-    ) -> Result<Vec<AttachGroup>, DirectoryError> {
+    /// A stream never fails wholesale over one bad session (spec 6.5), so an id
+    /// this gateway cannot resolve to an enrolled host is set aside for its own
+    /// `error` frame rather than refusing the request: doing the latter would
+    /// cost the client its healthy sessions on every other host. A host that is
+    /// enrolled and not reachable is neither of those, see [`AttachGroup::dial`].
+    pub(crate) fn group(&self, requests: &[AttachRequest]) -> AttachPlan {
         let hosts = self.lock();
         let mut groups: BTreeMap<String, AttachGroup> = BTreeMap::new();
+        let mut refused = Vec::new();
         for request in requests {
+            let owner = match owner(&hosts, &request.session) {
+                Ok(owner) => owner,
+                Err(err) => {
+                    refused.push(Unresolvable {
+                        session: request.session.clone(),
+                        message: err.to_string(),
+                    });
+                    continue;
+                }
+            };
             let Owner {
                 host_id,
                 session,
                 address,
                 connected,
                 serving,
-            } = owner(&hosts, &request.session)?;
+            } = owner;
             let group = groups
                 .entry(host_id.clone())
                 .or_insert_with(|| AttachGroup {
@@ -540,7 +569,10 @@ impl Directory {
                 cursor: request.cursor.clone(),
             });
         }
-        Ok(groups.into_values().collect())
+        AttachPlan {
+            groups: groups.into_values().collect(),
+            refused,
+        }
     }
 
     /// Which host a create is for (spec 6.6).
@@ -986,9 +1018,9 @@ mod tests {
 
     /// A row this gateway would publish and then refuse to route is dropped
     /// where a row with no readable id is. `SessionAddress::parse` refuses an
-    /// empty session half and a dot segment, and a refused attach fails a
-    /// client's whole stream (spec 6.5), so one such row on one host would cost
-    /// a client every session on every other one.
+    /// empty session half and a dot segment, so publishing one would mean
+    /// answering the attach it invites with a refusal (spec 6.5) for a session
+    /// the client had every reason to think was there.
     #[test]
     fn a_row_this_gateway_would_refuse_to_route_is_dropped() {
         let directory = Directory::new();
@@ -1006,9 +1038,9 @@ mod tests {
             .collect();
         let attach: Vec<AttachRequest> = published.iter().map(|id| attaching(id, None)).collect();
         assert!(
-            directory.group(&attach).is_ok(),
-            "this gateway published ids it will not resolve, which fails the whole \
-             stream of any client that attaches them: {published:?}",
+            directory.group(&attach).refused.is_empty(),
+            "this gateway published ids it will not resolve, which costs any \
+             client that attaches them a refusal per session: {published:?}",
         );
         assert_eq!(
             published,
@@ -1266,50 +1298,70 @@ mod tests {
     /// A host that is not reachable still gets a group, with nothing to dial: its
     /// sessions contribute no upstream rather than failing the client's whole
     /// stream, and the group is what tells this gateway whose `reset` to emit
-    /// when that host returns.
+    /// when that host returns. An id that resolves to no host at all is set
+    /// aside for its own refusal, which is the other half of the same rule.
     #[test]
     fn an_attach_set_groups_by_the_host_that_owns_each_session() {
         let directory = Directory::new();
         let left = connected(&directory, "127.0.0.1:1", "left", &["s-1", "s-2"]);
         connected(&directory, "127.0.0.1:2", "right", &["s-9"]);
 
-        let groups = directory
-            .group(&[
-                attaching("left:s-1", Some("epoch-1:3")),
-                attaching("right:s-9", None),
-                attaching("left:s-2", None),
-            ])
-            .expect("every id names an enrolled host");
+        let plan = directory.group(&[
+            attaching("left:s-1", Some("epoch-1:3")),
+            attaching("right:s-9", None),
+            attaching("left:s-2", None),
+        ]);
 
         assert_eq!(
-            rendered(&groups),
+            rendered(&plan.groups),
             vec![
                 "left@http://127.0.0.1:1: s-1@epoch-1:3, s-2".to_string(),
                 "right@http://127.0.0.1:2: s-9".to_string(),
             ],
             "one group per host, in the client's own order within it",
         );
+        assert!(plan.refused.is_empty(), "every id names an enrolled host");
         assert_eq!(
-            groups[0].namespaced(),
+            plan.groups[0].namespaced(),
             vec!["left:s-1".to_string(), "left:s-2".to_string()],
             "and the group knows what a client of this gateway calls them",
         );
 
         directory.disconnected(&left, "gone".to_string());
-        let groups = directory
-            .group(&[attaching("left:s-1", None)])
-            .expect("a host that is not there is not a refusal");
-        assert_eq!(rendered(&groups), vec!["left@-: s-1".to_string()]);
+        let plan = directory.group(&[attaching("left:s-1", None)]);
+        assert_eq!(rendered(&plan.groups), vec!["left@-: s-1".to_string()]);
+        assert!(
+            plan.refused.is_empty(),
+            "a host that is not there is not a refusal",
+        );
 
-        for id in ["s-1", "absent:s-1", ":s-1", "left:", "left:.."] {
-            assert!(
-                matches!(
-                    directory.group(&[attaching(id, None)]),
-                    Err(DirectoryError::UnknownSession { .. }),
-                ),
-                "{id:?} names no session here, so the stream is refused",
-            );
-        }
+        let unresolvable = ["s-1", "absent:s-1", ":s-1", "left:", "left:.."];
+        let plan = directory.group(
+            &unresolvable
+                .iter()
+                .map(|id| attaching(id, None))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            plan.refused
+                .iter()
+                .map(|refused| refused.session.as_str())
+                .collect::<Vec<_>>(),
+            unresolvable,
+            "each id that names no session here is owed its own refusal, by the \
+             name the client gave it",
+        );
+        assert!(plan.groups.is_empty(), "and none of them opens an upstream",);
+        assert!(
+            plan.refused
+                .iter()
+                .all(|refused| refused.message.contains("names no session here")),
+            "the refusal says why: {:?}",
+            plan.refused
+                .iter()
+                .map(|refused| refused.message.as_str())
+                .collect::<Vec<_>>(),
+        );
     }
 
     fn attaching(session: &str, cursor: Option<&str>) -> AttachRequest {
@@ -1458,7 +1510,7 @@ mod tests {
         // the way a client stream takes it.
         let watching = directory
             .group(&[attaching("dynamic:s-1", None)])
-            .expect("a group")
+            .groups
             .swap_remove(0)
             .serving;
         let merged_watch = directory.subscribe();
