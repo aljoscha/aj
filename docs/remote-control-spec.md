@@ -974,8 +974,21 @@ alongside the rows (additive, gateway-only), and a client renders an
 unreachable host it holds no rows for as an empty group rather than
 as nothing. Learned host ids persist in gateway state: a `host_id` is
 a stable identity (it names the store, section 4), so caching it has
-no staleness hazard, and a rebuilt host correcting it on first
-contact just empties the old group. A configured host that has never
+no staleness hazard while that store lives. A different id at the
+same address means a different store, and the two enrollment kinds
+anchor identity differently, so they resolve it differently. A
+configured enrollment names an address, the operator's intent is
+"whatever aj host answers here", so its restored id is provisional:
+contact presenting a new id is handled as a withdrawal of the old
+identity followed by fresh contact, resets for the old group's
+attached sessions, its rows leave, the state file adopts the new id
+(write-ahead). Invalidating the old namespaced ids is not the hazard
+it looks like, the old sessions are genuinely gone with their store,
+so invalidation tells the truth. A dynamic enrollment names a host it
+once shook hands with, its recorded id is the record's referent, so a
+different id at that address is refused, that enrollment's host no
+longer exists, and the error names the remedy that actually works
+there: withdraw and re-enroll. A configured host that has never
 answered has no id and never gets a synthetic one, ids namespace
 sessions and a fake one would poison client state the moment the real
 id arrived, so its hosts entry carries the configured address and the
