@@ -375,6 +375,13 @@ impl Fanout {
     pub(crate) fn detach(&self, id: SubscriberId, session: &str) {
         if let Some(subscriber) = self.lock().get_mut(&id) {
             subscriber.attached.remove(session);
+            // Anything already queued for it goes too. Resolving a session
+            // takes a moment (a materialization reads its log), and another
+            // client can make it live in that window, so the registration this
+            // is undoing may have caught frames of its own.
+            subscriber
+                .live
+                .retain(|frame| frame.session() != Some(session));
         }
     }
 
@@ -828,6 +835,42 @@ mod tests {
             }
         }
         frame
+    }
+
+    /// A session an attach could not resolve is taken back off the stream's
+    /// attach set, frames and all.
+    ///
+    /// The registration covers every session the request named, before any of
+    /// them is resolved, so that an attach in flight counts as use. Resolving
+    /// one takes a moment, and another client can make a session live in that
+    /// window, so undoing the registration has to cover what it caught as well
+    /// as what would come later: this stream was never served that session's
+    /// block, and its frames are undroppable by class, so they would count
+    /// against a bound this client never asked to spend (spec 6.5, 6.9).
+    #[test]
+    fn a_detached_session_leaves_nothing_of_itself_on_the_stream() {
+        let fanout = Fanout::default();
+        let (id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string(), OTHER.to_string()]);
+        fanout.finish_block(id, SESSION, 0);
+        fanout.finish_block(id, OTHER, 0);
+        // Live before the attach that named it got as far as refusing it.
+        fanout.publish(reliable("caught in the window"));
+        fanout.publish(other(reliable("someone else's session")));
+
+        fanout.detach(id, SESSION);
+
+        fanout.publish(reliable("after"));
+        assert_eq!(
+            drained(&mut rx),
+            vec!["warning someone else's session"],
+            "the refused session left frames behind, or took another session's \
+             with it",
+        );
+        assert!(
+            !fanout.attached(SESSION),
+            "and the stream is no longer counted as holding it",
+        );
+        assert!(fanout.attached(OTHER));
     }
 
     /// A refusal is reliable-transient (spec 6.4), so neither queue rule that
