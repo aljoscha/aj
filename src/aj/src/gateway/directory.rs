@@ -1186,9 +1186,11 @@ mod tests {
         let directory = Directory::new();
         let address = connected(&directory, "127.0.0.1:1", "left", &["s-1"]);
 
-        directory
-            .adopt(&address, "left")
-            .expect("the same id again");
+        assert!(
+            matches!(directory.adopt(&address, "left"), Ok(Adopted::Unchanged)),
+            "an id this enrollment already had is not news: a link reports one on \
+             every redial, and each would otherwise rewrite the gateway's record",
+        );
         assert!(matches!(
             directory.adopt(&address, "other"),
             Err(DirectoryError::IdChanged { .. }),
@@ -1206,6 +1208,10 @@ mod tests {
             directory.adopt(&fresh, ""),
             Err(DirectoryError::UnusableHostId { .. }),
         ));
+        assert!(
+            matches!(directory.adopt(&fresh, "learned"), Ok(Adopted::Learned)),
+            "and the first id a host reports is what there is to write down",
+        );
     }
 
     fn enrolled_without_id(directory: &Directory) -> HostAddress {
