@@ -20,7 +20,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::gateway::config::HostAddress;
-use crate::gateway::directory::{Adopted, Directory};
+use crate::gateway::directory::Directory;
 use crate::gateway::{Recorder, Tuning};
 use crate::remote::RemoteClient;
 
@@ -34,9 +34,9 @@ pub(crate) struct Link {
 impl Link {
     /// Start dialing `address` and feeding what it says into `directory`.
     ///
-    /// `recorder` is where an id this host reports for the first time is written
-    /// down: this is where one is learned, so it is where the gateway's record of
-    /// it comes from (spec 7.1).
+    /// `recorder` is where the id this host reports is settled: this is where one
+    /// is learned, so it is where the gateway's record of it comes from
+    /// (spec 7.1).
     pub(crate) fn spawn(
         address: HostAddress,
         directory: Arc<Directory>,
@@ -140,13 +140,12 @@ async fn attempt(address: &HostAddress, directory: &Directory, recorder: &Record
         Ok(hello) => hello,
         Err(err) => return Attempt::Failed(err.to_string()),
     };
-    match directory.adopt(address, &hello.host_id) {
-        // The one thing a link learns that outlives the process. A configured
-        // host is enrolled by address, so this is the only way its id is ever
-        // known, and a restart while it is down has nothing else to name it by.
-        Ok(Adopted::Learned) => recorder.write_down().await,
-        Ok(Adopted::Unchanged) => {}
-        Err(err) => return Attempt::Failed(err.to_string()),
+    // What that name settles is the gateway's to decide: a configured
+    // enrollment's id is provisional and a dynamic one's is the record it was
+    // made from (spec 7.1). A link is where one is learned, so it is also where
+    // the gateway's record of it comes from.
+    if let Err(err) = recorder.settle(address, &hello.host_id).await {
+        return Attempt::Failed(err.to_string());
     }
     // No session is named: this is the control connection of spec 7.1, so the
     // host sends it `list` frames and heartbeats and nothing else.

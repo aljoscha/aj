@@ -46,7 +46,7 @@ use anyhow::{Context, Result, bail};
 use reqwest::StatusCode;
 
 use crate::gateway::config::{AddressError, GatewayConfig, HostAddress};
-use crate::gateway::directory::{Directory, DirectoryError, HostTarget, Route};
+use crate::gateway::directory::{Adopted, Directory, DirectoryError, HostTarget, Route};
 use crate::gateway::enrollment::{EnrollmentError, EnrollmentFile};
 use crate::gateway::link::Link;
 use crate::gateway::server::GatewayServer;
@@ -259,12 +259,18 @@ impl Gateway {
             // configuration no longer names brings nothing back with it. That
             // refusal is the ordinary way an entry here dies, and rewriting the
             // file is what stops it coming round again.
-            if let Err(err) = directory.adopt(&host.address, &host.host_id) {
-                tracing::info!(
-                    "not restoring the id of the configured host {}: {err}",
-                    host.address
-                );
-                pruned = true;
+            match directory.adopt(&host.address, &host.host_id) {
+                Ok(Adopted::Learned | Adopted::Unchanged) => {}
+                // Only a state file naming one address twice reaches this, and
+                // nothing is spliced onto a gateway that is still being built.
+                Ok(Adopted::Replaced(withdrawn)) => withdrawn.end_splices(),
+                Err(err) => {
+                    tracing::info!(
+                        "not restoring the id of the configured host {}: {err}",
+                        host.address
+                    );
+                    pruned = true;
+                }
             }
         }
         let inner = Arc::new(GatewayInner {
@@ -400,9 +406,9 @@ impl Gateway {
         let remaining = self.inner.directory.record_without(host_id)?;
         self.inner.state.save(&remaining)?;
         // From here nothing can fail, so nothing needs putting back.
-        let withdrawn = self.inner.directory.withdraw(host_id)?;
+        let (address, withdrawn) = self.inner.directory.withdraw(host_id)?;
         withdrawn.end_splices();
-        self.undial(&withdrawn.address).await;
+        self.undial(&address).await;
         Ok(())
     }
 
@@ -506,14 +512,17 @@ impl Gateway {
     }
 }
 
-/// Writes the gateway's record down when a link learns something that belongs in
-/// it (spec 7.1).
+/// What a link hands the identity it just learned to (spec 7.1).
 ///
 /// A host id is learned by speaking to the host, so a link is the only thing that
 /// can learn one, and a gateway whose hosts all come from the configuration file
-/// never enrolls or withdraws anything: an id written down only by those paths
-/// would never reach the file at all, and every restart while such a host is down
+/// never enrolls or withdraws anything: an id settled only by those paths would
+/// never reach the state file at all, and every restart while such a host is down
 /// would come back unable to name it.
+///
+/// Settling one is a directory change and a write to the gateway's record, in
+/// that order and under one lock, which is why it lives here rather than in
+/// either of them.
 ///
 /// Weak, because the gateway owns the links this is handed to.
 #[derive(Clone)]
@@ -522,27 +531,49 @@ pub(crate) struct Recorder {
 }
 
 impl Recorder {
-    /// Write the record down, reporting nothing.
+    /// Settle the id the host at `address` reports, and write it down.
     ///
-    /// A learned id is a cache for the next run, so a write that fails is worth a
-    /// log line and nothing more: the host has just answered and its sessions
-    /// need a namespace now, and refusing to serve it over a cache write would
-    /// trade a working host for a note. That is the opposite of an enrollment,
-    /// which is an operator's instruction and does not stand unless it is
-    /// recorded.
+    /// Write-ahead, the way a withdrawal is: the record is written from the set
+    /// as it would stand, and only then does the set change, so a process that
+    /// dies in between comes back holding the id its host reported rather than
+    /// one this gateway has already stopped serving.
+    ///
+    /// A write that fails is a log line and nothing more: a recorded id is a
+    /// cache for the next run, the host has just answered and its sessions need a
+    /// namespace now, and refusing to serve it over a cache write would trade a
+    /// working host for a note. That is the opposite of an enrollment, which is
+    /// an operator's instruction and does not stand unless it is recorded.
+    ///
+    /// The teardown a replaced identity leaves behind is finished here, because
+    /// what a client is owed for it must not wait on the next redial (see
+    /// [`crate::gateway::directory::Withdrawn`]).
     ///
     /// NOTE: this waits on the same lock a withdrawal holds while it awaits the
     /// link's teardown. Not a deadlock, because a link races every attempt
     /// against its own cancellation token, so the withdrawal's `stop` drops this
     /// wait rather than queueing behind it.
-    pub(crate) async fn write_down(&self) {
+    pub(crate) async fn settle(
+        &self,
+        address: &HostAddress,
+        reported: &str,
+    ) -> Result<(), DirectoryError> {
+        // The gateway this link belonged to is gone, so there is no record to
+        // write and nothing reading the directory it would write into.
         let Some(inner) = self.inner.upgrade() else {
-            return;
+            return Ok(());
         };
         let _writing = inner.writing.lock().await;
-        if let Err(err) = inner.state.save(&inner.directory.record()) {
+        let Some(record) = inner.directory.record_adopting(address, reported)? else {
+            return Ok(());
+        };
+        if let Err(err) = inner.state.save(&record) {
             tracing::warn!("could not write down what this gateway just learned: {err}");
         }
+        if let Adopted::Replaced(withdrawn) = inner.directory.adopt(address, reported)? {
+            tracing::info!("the host at {address} answers to {reported} now");
+            withdrawn.end_splices();
+        }
+        Ok(())
     }
 }
 

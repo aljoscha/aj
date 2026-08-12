@@ -57,17 +57,20 @@ struct Enrollment {
     source: HostSource,
     /// The id the host answers to, and the namespace its sessions appear under.
     ///
-    /// `None` only for a configured host that has never answered: an id cannot
-    /// be invented for a store nobody has spoken to. Once set it never changes
-    /// (see [`Directory::adopt`]).
+    /// `None` only for a host that has never answered: an id cannot be invented
+    /// for a store nobody has spoken to. What a later answer under a different id
+    /// does depends on how this enrollment anchors identity, see
+    /// [`Directory::adopt`].
     host_id: Option<String>,
     /// The rows of this host's own last `list` frame, with its own ids.
     rows: Vec<Row>,
     connected: bool,
     /// Why the last connection attempt did not stick, for `GET /v1/hosts`.
     error: Option<String>,
-    /// Cancelled when this enrollment is withdrawn, which is what ends the
-    /// streams spliced onto this host (spec 7.1).
+    /// Cancelled when this identity stops being one this gateway serves, which
+    /// is what ends the streams spliced onto it (spec 7.1): the enrollment is
+    /// withdrawn, or a configured host answers under a different id and this
+    /// token is replaced with the new identity's.
     ///
     /// Held here so that the set a withdrawal mutates and the signal it sends
     /// are the same thing under the same lock: a splice opened from a snapshot
@@ -157,42 +160,57 @@ fn own(
     row.set(UNREACHABLE_FIELD, &!connected)
 }
 
-/// An enrollment removed from the directory, and what a withdrawal still owes it
-/// (spec 7.1).
+/// The client-visible teardown one identity's disappearance still owes, once its
+/// rows are already out of the merged directory (spec 7.1).
 ///
-/// The rows are already out of the merged directory when this exists. What is
-/// left is the client-visible teardown and the connection behind it: the streams
-/// spliced onto that host end, and its control link stops.
+/// Two edges produce one, and both are a withdrawal in the sense that matters to
+/// a client: an enrollment removed ([`Directory::withdraw`]), and a configured
+/// host answering under an id other than the one this gateway held for it
+/// ([`Directory::adopt`]). Either way the ids that identity namespaced stop
+/// resolving here, and the streams spliced onto it are still running.
+#[derive(Debug)]
+#[must_use = "the streams spliced onto an identity that is gone run until this ends them"]
 pub(crate) struct Withdrawn {
-    /// The address whose link is now to be stopped.
-    pub(crate) address: HostAddress,
-    /// The withdrawn enrollment's token, which is what every splice onto that
-    /// host holds.
+    /// The identity's own token, which is what every splice onto it holds.
     serving: CancellationToken,
 }
 
 impl Withdrawn {
-    /// End the streams spliced onto this host, with the `reset` a withdrawal
+    /// End the streams spliced onto that identity, with the `reset` a withdrawal
     /// owes them.
     ///
     /// That `reset` asks the client to attach again, and the ids it names no
     /// longer resolve here, so each is refused with its own `error` frame and
     /// costs it that attachment and nothing else (spec 6.5). The directory,
-    /// where this host's rows and its group are gone, says the same thing. See
+    /// where those rows and that group are gone, says the same thing. See
     /// [`crate::gateway::splice`], which owns the frame.
-    pub(crate) fn end_splices(&self) {
+    pub(crate) fn end_splices(self) {
         self.serving.cancel();
     }
 }
 
 /// What [`Directory::adopt`] settled.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum Adopted {
     /// The host named itself for the first time, so its id is new here and
     /// belongs in the gateway's record.
     Learned,
     /// It answered to the id this enrollment already had.
     Unchanged,
+    /// A configured host answered under a different id, so the store this
+    /// gateway was namespacing is gone and the identity that named it went with
+    /// it (spec 7.1). Its rows have left, and its splices are what the caller
+    /// still owes.
+    Replaced(Withdrawn),
+}
+
+/// What settling a reported id against an enrollment amounts to, worked out
+/// before anything is applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Settling {
+    Learned,
+    Unchanged,
+    Replaced,
 }
 
 /// Where a proxied request goes: which host, and what that host calls the
@@ -389,69 +407,70 @@ impl Directory {
     /// this only once that answer has been written down, so in practice they are
     /// unreachable here: the gateway holds one lock across both calls. Checked
     /// again rather than assumed, because the set is what this mutates.
-    pub(crate) fn withdraw(&self, host_id: &str) -> Result<Withdrawn, DirectoryError> {
+    pub(crate) fn withdraw(
+        &self,
+        host_id: &str,
+    ) -> Result<(HostAddress, Withdrawn), DirectoryError> {
         let mut hosts = self.lock();
         let address = withdrawable(&hosts, host_id)?;
         let enrollment = hosts.remove(&address).expect("the enrollment just found");
         self.publish(&hosts);
-        Ok(Withdrawn {
+        Ok((
             address,
-            serving: enrollment.serving,
-        })
+            Withdrawn {
+                serving: enrollment.serving,
+            },
+        ))
     }
 
     /// Settle the id of the host at `address` against what it just reported.
     ///
-    /// The first answer wins for the life of the enrollment. A host that later
-    /// reports a different id is refused rather than re-namespaced: every id a
-    /// client holds for that host would silently stop resolving, and re-issuing
-    /// them is what `reset` and a fresh enrollment are for. A host whose store
-    /// really did change identity is re-enrolled by hand.
+    /// The two enrollment kinds anchor identity differently, so they answer a
+    /// different id differently (spec 7.1). A dynamic enrollment names a host
+    /// this gateway once shook hands with, so its recorded id is the record's
+    /// referent and a different one is refused: that enrollment's host no longer
+    /// exists, and the remedy is to withdraw it and enroll the address again. A
+    /// configured enrollment names an address, so the operator's intent is
+    /// whatever aj host answers there and its id is provisional: contact
+    /// presenting a new one is handled as a withdrawal of the old identity
+    /// followed by fresh contact, which is why the caller is handed a
+    /// [`Withdrawn`] to finish.
     ///
-    /// Answering whether the id was new is what tells the caller there is
-    /// something to write down: an id is learned by speaking to the host, so this
-    /// is the only place a configured host's ever gets settled (spec 7.1).
+    /// Answering what was settled is what tells the caller there is something to
+    /// write down: an id is learned by speaking to the host, so this is the only
+    /// place a configured host's ever gets settled.
     pub(crate) fn adopt(
         &self,
         address: &HostAddress,
         reported: &str,
     ) -> Result<Adopted, DirectoryError> {
-        validate_host_id(reported).map_err(|source| DirectoryError::UnusableHostId {
-            host_id: reported.to_string(),
-            source,
-        })?;
         let mut hosts = self.lock();
-        let taken = hosts
-            .iter()
-            .find(|(enrolled_at, enrolled)| {
-                *enrolled_at != address && enrolled.host_id.as_deref() == Some(reported)
-            })
-            .map(|(enrolled_at, _)| enrolled_at.clone());
+        let settling = settling(&hosts, address, reported)?;
+        if settling == Settling::Unchanged {
+            return Ok(Adopted::Unchanged);
+        }
         let enrollment = hosts
             .get_mut(address)
-            .ok_or_else(|| DirectoryError::Withdrawn {
-                address: address.clone(),
-            })?;
-        match enrollment.host_id.as_deref() {
-            Some(known) if known == reported => return Ok(Adopted::Unchanged),
-            Some(known) => {
-                return Err(DirectoryError::IdChanged {
-                    address: address.clone(),
-                    expected: known.to_string(),
-                    reported: reported.to_string(),
-                });
+            .expect("the enrollment the settlement just read");
+        let replaced = (settling == Settling::Replaced).then(|| {
+            // The store this gateway was namespacing is gone with the identity
+            // that named it. Its rows describe sessions that no longer exist, and
+            // re-publishing them under the new id would name the new store's
+            // sessions by the old store's rows.
+            enrollment.rows.clear();
+            // Nothing about the new identity is confirmed yet. Its link marks it
+            // connected once its stream is open, which is moments from here.
+            enrollment.connected = false;
+            Withdrawn {
+                serving: std::mem::replace(&mut enrollment.serving, CancellationToken::new()),
             }
-            None => {}
-        }
-        if let Some(taken) = taken {
-            return Err(DirectoryError::DuplicateHost {
-                host_id: reported.to_string(),
-                address: taken,
-            });
-        }
+        });
         enrollment.host_id = Some(reported.to_string());
         self.publish(&hosts);
-        Ok(Adopted::Learned)
+        Ok(match replaced {
+            Some(withdrawn) => Adopted::Replaced(withdrawn),
+            None => Adopted::Learned,
+        })
     }
 
     /// Note that the host at `address` is answering again.
@@ -670,7 +689,31 @@ impl Directory {
     /// [`Recorded`]).
     pub(crate) fn record(&self) -> Recorded {
         let hosts = self.lock();
-        record(&hosts)
+        record(&hosts, None)
+    }
+
+    /// The same as it would stand once the host at `address` had settled
+    /// `reported`, mutating nothing, or `None` when there is nothing to settle.
+    ///
+    /// This is what makes an adoption write-ahead, exactly as
+    /// [`Self::record_without`] makes a withdrawal one: the record is written
+    /// from this answer, and only then does the set change ([`Self::adopt`]), so
+    /// a process that dies in between comes back holding the id its host
+    /// reported rather than one this gateway has already stopped serving. It
+    /// carries the refusals too, so an adoption that will not happen is never
+    /// recorded, and the `None` keeps a link's every redial from rewriting the
+    /// file with what it already says. The two answers agree because the gateway
+    /// holds one lock across both calls.
+    pub(crate) fn record_adopting(
+        &self,
+        address: &HostAddress,
+        reported: &str,
+    ) -> Result<Option<Recorded>, DirectoryError> {
+        let hosts = self.lock();
+        if settling(&hosts, address, reported)? == Settling::Unchanged {
+            return Ok(None);
+        }
+        Ok(Some(record(&hosts, Some((address, reported)))))
     }
 
     /// The same as it would stand with `host_id` withdrawn, mutating nothing.
@@ -688,7 +731,7 @@ impl Directory {
     pub(crate) fn record_without(&self, host_id: &str) -> Result<Recorded, DirectoryError> {
         let hosts = self.lock();
         let withdrawn = withdrawable(&hosts, host_id)?;
-        let mut recorded = record(&hosts);
+        let mut recorded = record(&hosts, None);
         recorded.hosts.retain(|host| host.address != withdrawn);
         Ok(recorded)
     }
@@ -737,13 +780,24 @@ impl Directory {
 /// What the state file records about the enrolled set: the dynamic enrollments,
 /// and the learned ids of the hosts the configuration file enrolls.
 ///
+/// `adopting` names the one enrollment whose id is taken from that pair rather
+/// than from the set, which is how an adoption is recorded before it lands (see
+/// [`Directory::record_adopting`]).
+///
 /// A host that has never answered contributes nothing either way. There is no id
 /// to write down for it, and its address is already in the configuration file
 /// that named it.
-fn record(hosts: &BTreeMap<HostAddress, Enrollment>) -> Recorded {
+fn record(
+    hosts: &BTreeMap<HostAddress, Enrollment>,
+    adopting: Option<(&HostAddress, &str)>,
+) -> Recorded {
     let mut recorded = Recorded::default();
     for (address, enrollment) in hosts {
-        let Some(host_id) = enrollment.host_id.clone() else {
+        let settled = match adopting {
+            Some((adopting_at, reported)) if adopting_at == address => Some(reported.to_string()),
+            _ => enrollment.host_id.clone(),
+        };
+        let Some(host_id) = settled else {
             continue;
         };
         let entry = EnrolledHost {
@@ -756,6 +810,55 @@ fn record(hosts: &BTreeMap<HostAddress, Enrollment>) -> Recorded {
         }
     }
     recorded
+}
+
+/// What settling `reported` against the enrollment at `address` amounts to, or
+/// why it cannot be settled at all.
+///
+/// In one place so that the answer an adoption is written down from and the set
+/// it then mutates cannot disagree about what is being settled.
+fn settling(
+    hosts: &BTreeMap<HostAddress, Enrollment>,
+    address: &HostAddress,
+    reported: &str,
+) -> Result<Settling, DirectoryError> {
+    validate_host_id(reported).map_err(|source| DirectoryError::UnusableHostId {
+        host_id: reported.to_string(),
+        source,
+    })?;
+    let enrollment = hosts
+        .get(address)
+        .ok_or_else(|| DirectoryError::Withdrawn {
+            address: address.clone(),
+        })?;
+    let known = match enrollment.host_id.as_deref() {
+        Some(known) if known == reported => return Ok(Settling::Unchanged),
+        // A dynamic enrollment is the record of the host it shook hands with, so
+        // a different id at that address is a host this enrollment is not about.
+        Some(known) if enrollment.source == HostSource::Dynamic => {
+            return Err(DirectoryError::IdChanged {
+                address: address.clone(),
+                expected: known.to_string(),
+                reported: reported.to_string(),
+            });
+        }
+        known => known,
+    };
+    // One host id is one namespace, wherever the id comes from: two enrollments
+    // answering to one id would give every session of that store two ids that
+    // both route (see [`Directory::enroll`]).
+    if let Some((taken, _)) = hosts.iter().find(|(enrolled_at, enrolled)| {
+        *enrolled_at != address && enrolled.host_id.as_deref() == Some(reported)
+    }) {
+        return Err(DirectoryError::DuplicateHost {
+            host_id: reported.to_string(),
+            address: taken.clone(),
+        });
+    }
+    Ok(match known {
+        Some(_) => Settling::Replaced,
+        None => Settling::Learned,
+    })
 }
 
 /// The address of the enrollment `host_id` names, or why it cannot be withdrawn.
@@ -878,11 +981,13 @@ pub(crate) enum DirectoryError {
         #[source]
         source: HostIdError,
     },
-    /// A host answering to an id other than the one it was enrolled under. Only
-    /// a link sees this, which records it and keeps redialing.
+    /// A host answering to an id other than the one this gateway holds for it,
+    /// on a dynamic enrollment, which is the record of the host it shook hands
+    /// with. Only a link sees this, which records it and keeps redialing. A
+    /// configured enrollment's id is provisional instead ([`Directory::adopt`]).
     #[error(
-        "the host at {address} reports the id {reported:?} but is enrolled as {expected:?}: \
-         re-enroll it if its store really changed"
+        "the host at {address} reports the id {reported:?} but this enrollment is the record \
+         of {expected:?}: withdraw it and enroll {address} again if its store really changed"
     )]
     IdChanged {
         address: HostAddress,
@@ -1213,8 +1318,17 @@ mod tests {
         assert_eq!(directory.hosts().hosts.len(), 2);
     }
 
+    /// A dynamic enrollment names a host this gateway once shook hands with, so
+    /// its recorded id is the record's referent and is fixed for the life of the
+    /// enrollment (spec 7.1). A different id at that address is a different
+    /// store, which this enrollment is not the record of, so it is refused and
+    /// the refusal names the remedy that works here.
+    ///
+    /// The same first contact on a configured enrollment settles nothing for
+    /// good, see [`a_configured_hosts_id_is_provisional`]: that one is enrolled
+    /// by address, so the operator's intent is whatever host answers there.
     #[test]
-    fn an_adopted_id_is_fixed_for_the_life_of_the_enrollment() {
+    fn an_adopted_id_is_fixed_for_the_life_of_a_dynamic_enrollment() {
         let directory = Directory::new();
         let address = connected(&directory, "127.0.0.1:1", "left", &["s-1"]);
 
@@ -1223,11 +1337,26 @@ mod tests {
             "an id this enrollment already had is not news: a link reports one on \
              every redial, and each would otherwise rewrite the gateway's record",
         );
-        assert!(matches!(
-            directory.adopt(&address, "other"),
-            Err(DirectoryError::IdChanged { .. }),
-        ));
+        let Err(err) = directory.adopt(&address, "other") else {
+            panic!("a dynamic enrollment's id is the record's referent");
+        };
+        assert!(matches!(err, DirectoryError::IdChanged { .. }));
+        let refusal = err.to_string();
+        assert!(
+            refusal.contains("withdraw") && refusal.contains("enroll"),
+            "the refusal has to name the remedy that actually works for a dynamic \
+             enrollment, which is withdrawing it and enrolling the address again: \
+             {refusal}",
+        );
         assert_eq!(merged(&directory)[0].0.id, "left:s-1");
+        assert!(
+            matches!(
+                directory.record_adopting(&address, "other"),
+                Err(DirectoryError::IdChanged { .. }),
+            ),
+            "and it is refused where an adoption is written down from too, so \
+             nothing is recorded for one that will not happen",
+        );
 
         // An id the gateway could not namespace with is refused before it is
         // ever recorded.
@@ -1243,6 +1372,177 @@ mod tests {
         assert!(
             matches!(directory.adopt(&fresh, "learned"), Ok(Adopted::Learned)),
             "and the first id a host reports is what there is to write down",
+        );
+    }
+
+    /// A configured enrollment names an address, so the operator's intent is
+    /// "whatever aj host answers here" and its id is provisional: contact
+    /// presenting a different one is a rebuilt host, handled as a withdrawal of
+    /// the old identity followed by fresh contact (spec 7.1).
+    ///
+    /// Invalidating the old namespaced ids is not the hazard it looks like. The
+    /// sessions they named are gone with the store that held them, so the rows
+    /// leave, the ids stop resolving, and the splices onto that identity are owed
+    /// exactly what a withdrawal owes them.
+    #[test]
+    fn a_configured_hosts_id_is_provisional() {
+        let directory = Directory::new();
+        let address = enrolled_without_id(&directory);
+        assert!(matches!(
+            directory.adopt(&address, "before"),
+            Ok(Adopted::Learned),
+        ));
+        directory.connected(&address);
+        directory.set_rows(&address, vec![row("s-1")]);
+        // The token a splice onto that host holds, taken the way a client stream
+        // takes it.
+        let watching = directory
+            .group(&[attaching("before:s-1", None)])
+            .groups
+            .swap_remove(0)
+            .serving;
+
+        let Ok(Adopted::Replaced(withdrawn)) = directory.adopt(&address, "after") else {
+            panic!("a configured host's first contact under a new id replaces the old one");
+        };
+
+        assert!(
+            !watching.is_cancelled(),
+            "replacing the id in the set does not end anything by itself",
+        );
+        withdrawn.end_splices();
+        assert!(
+            watching.is_cancelled(),
+            "the splices onto the identity that is gone went on carrying frames \
+             under a namespace no client of this gateway can address any more",
+        );
+        assert!(
+            matches!(
+                directory.route("before:s-1"),
+                Err(DirectoryError::UnknownSession { .. }),
+            ),
+            "and an id namespaced under it still resolves, to a store that is gone",
+        );
+        assert!(
+            merged(&directory).is_empty(),
+            "the old store's rows describe sessions that no longer exist: {:?}",
+            merged(&directory),
+        );
+        assert_eq!(
+            directory.sessions().hosts,
+            vec![DirectoryHost {
+                id: Some("after".to_string()),
+                address: None,
+                unreachable: true,
+            }],
+            "the group is the new identity's, and nothing about that one is \
+             confirmed until its own link says so",
+        );
+        assert_eq!(
+            directory.record().configured_ids,
+            vec![EnrolledHost {
+                address: address.clone(),
+                host_id: "after".to_string(),
+            }],
+            "and the id this gateway is the record of is the one that answered",
+        );
+
+        assert!(
+            matches!(directory.adopt(&address, "after"), Ok(Adopted::Unchanged)),
+            "the new identity is settled like any other: a redial reporting it \
+             again is not news",
+        );
+        let opened = directory
+            .group(&[attaching("after:s-1", None)])
+            .groups
+            .swap_remove(0)
+            .serving;
+        assert!(
+            !opened.is_cancelled(),
+            "a splice onto the host that answered here would end the moment it \
+             opened, because the enrollment kept the token the old identity's \
+             teardown cancelled",
+        );
+    }
+
+    /// What an adoption would record is answered from a directory that has not
+    /// moved, which is what lets the record be written before the change lands
+    /// (spec 7.1).
+    #[test]
+    fn what_an_adoption_records_is_answered_before_it_happens() {
+        let directory = Directory::new();
+        let dynamic = connected(&directory, "127.0.0.1:1", "dynamic", &["s-1"]);
+        let configured = enrolled_without_id(&directory);
+        let mut merged_watch = directory.subscribe();
+
+        assert_eq!(
+            directory
+                .record_adopting(&dynamic, "dynamic")
+                .expect("an id this enrollment already has"),
+            None,
+            "an id that is not news is nothing to write down: a link reports one \
+             on every redial",
+        );
+        assert_eq!(
+            directory
+                .record_adopting(&configured, "learned")
+                .expect("a first contact")
+                .expect("something to write down")
+                .configured_ids,
+            vec![EnrolledHost {
+                address: configured.clone(),
+                host_id: "learned".to_string(),
+            }],
+        );
+        assert!(
+            !merged_watch.has_changed().expect("the directory is alive"),
+            "answering published an edge for an adoption that has not happened",
+        );
+
+        directory.adopt(&configured, "learned").expect("adopt");
+        assert!(
+            merged_watch.has_changed().expect("alive"),
+            "the adoption itself is what publishes, and nothing below measures a \
+             quiet answer unless this one was loud",
+        );
+        merged_watch.mark_unchanged();
+
+        assert_eq!(
+            directory
+                .record_adopting(&configured, "rebuilt")
+                .expect("a configured host's id is provisional")
+                .expect("something to write down")
+                .configured_ids,
+            vec![EnrolledHost {
+                address: configured.clone(),
+                host_id: "rebuilt".to_string(),
+            }],
+            "the record a replacement writes is the new identity's, not the one \
+             it is about to stop serving",
+        );
+        assert_eq!(
+            directory.hosts().hosts[1].id.as_deref(),
+            Some("learned"),
+            "and the set has not moved: answering is not adopting",
+        );
+
+        // The refusals are the adoption's own, checked where it is written down
+        // from so that one that will not happen is never recorded.
+        assert!(matches!(
+            directory.record_adopting(&configured, "dynamic"),
+            Err(DirectoryError::DuplicateHost { .. }),
+        ));
+        assert!(matches!(
+            directory.record_adopting(&configured, "with:colon"),
+            Err(DirectoryError::UnusableHostId { .. }),
+        ));
+        assert!(matches!(
+            directory.record_adopting(&address("127.0.0.1:9"), "stranger"),
+            Err(DirectoryError::Withdrawn { .. }),
+        ));
+        assert!(
+            !merged_watch.has_changed().expect("alive"),
+            "answering published an edge for an adoption that has not happened",
         );
     }
 
@@ -1539,8 +1839,8 @@ mod tests {
         );
         assert!(!watching.is_cancelled());
 
-        let withdrawn = directory.withdraw("dynamic").expect("withdraw");
-        assert_eq!(withdrawn.address, address("127.0.0.1:1"));
+        let (withdrawn_at, withdrawn) = directory.withdraw("dynamic").expect("withdraw");
+        assert_eq!(withdrawn_at, address("127.0.0.1:1"));
         assert!(
             directory.sessions().sessions.is_empty(),
             "the rows leave with the enrollment",

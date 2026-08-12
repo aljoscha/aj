@@ -1755,6 +1755,229 @@ async fn a_remembered_host_the_configuration_names_too_is_dropped_from_the_state
     fixture.shutdown().await;
 }
 
+/// A configured enrollment names an address, so the operator's intent is
+/// whatever aj host answers there and the id this gateway holds for it is
+/// provisional (spec 7.1). Contact under a new id is a rebuilt host, and it runs
+/// the whole sequence: the old identity is withdrawn, its group's attached
+/// sessions are reset, its rows leave, and the state file adopts the new id.
+///
+/// Two hosts, because that teardown is a splice teardown: the client here is
+/// attached across both, and the one that was not rebuilt has to keep its
+/// session and its stream through it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_configured_hosts_contact_under_a_new_id_replaces_the_old_identity() {
+    let rebuilt = FakeHost::rebuildable("before", "after", "s-2", Script::Blocks).await;
+    let other = FakeHost::with_rows(
+        "other",
+        Script::Blocks,
+        vec![serde_json::to_string(&fake_row("s-9")).expect("a row")],
+    )
+    .await;
+    // Configured rather than enrolled over the wire: the address is what the
+    // operator named, and the id at it is this gateway's to learn.
+    let fixture = Fixture::over(
+        TempDir::new().expect("tempdir"),
+        vec![rebuilt.address.clone(), other.address.clone()],
+    )
+    .await;
+    fixture.until_connected("before").await;
+    fixture.until_connected("other").await;
+    let mut events = fixture
+        .attach(&[attach("before:s-1"), attach("other:s-9")])
+        .await;
+    let opened = carried_until(&mut events, "both attach blocks", |carried| {
+        carried.caught_up.len() == 2
+    })
+    .await;
+    assert_eq!(
+        rebuilt.spliced_attaches().len(),
+        1,
+        "the upstream whose teardown this test is about was never opened: {opened:?}",
+    );
+    let restored = recorded(&fixture).configured_ids;
+    assert!(
+        restored.contains(&enrolled_as(&rebuilt.address, "before")),
+        "the id a configured host answered to is recorded, or there is no \
+         restored id here for contact to replace: {restored:?}",
+    );
+
+    rebuilt.rebuild();
+
+    // The old identity is withdrawn in every sense that matters to the client
+    // attached under it: the sessions it namespaced are reset, and the client's
+    // stream and its other host are untouched.
+    let torn_down = carried_until(
+        &mut events,
+        "the reset a replaced identity owes",
+        |carried| !carried.resets.is_empty(),
+    )
+    .await;
+    assert_eq!(
+        torn_down.resets,
+        vec!["before:s-1".to_string()],
+        "the identity that was replaced reset something other than its own \
+         sessions: {torn_down:?}",
+    );
+    assert!(
+        !torn_down.ended,
+        "the client's whole stream ended over one host being rebuilt: {torn_down:?}",
+    );
+
+    // And the fresh contact behind it: the new identity is the namespace now,
+    // and the rows under it are the rebuilt store's own.
+    fixture.until_connected("after").await;
+    assert!(!fixture.row("after:s-2").await.unreachable);
+    let directory = fixture
+        .client
+        .sessions()
+        .await
+        .expect("the merged directory");
+    assert_eq!(
+        directory
+            .hosts
+            .iter()
+            .filter_map(|host| host.id.clone())
+            .collect::<Vec<_>>(),
+        vec!["after".to_string(), "other".to_string()],
+        "the group of the store that is gone is still there: {directory:?}",
+    );
+    assert!(
+        !directory
+            .sessions
+            .iter()
+            .any(|row| row.host.as_deref() == Some("before")),
+        "and so are its rows, which name sessions that went with it: {directory:?}",
+    );
+    let adopted = recorded(&fixture).configured_ids;
+    assert!(
+        adopted.contains(&enrolled_as(&rebuilt.address, "after"))
+            && !adopted.iter().any(|host| host.host_id == "before"),
+        "the state file is the record of an id that is no longer served, so the \
+         next restart would namespace this host under a store that is gone: \
+         {adopted:?}",
+    );
+
+    // The re-attach the reset asks for: refused for the id the old identity
+    // namespaced, served for the one the new identity does.
+    let mut resumed = fixture
+        .client
+        .events(&[attach("before:s-1"), attach("after:s-2")])
+        .await
+        .expect("a client stream onto the gateway");
+    let served = frames_until(&mut resumed, "the block for the new identity", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+    assert_eq!(
+        refused_sessions(served.iter()),
+        vec!["before:s-1"],
+        "the id the store that is gone was namespaced under is the one refused: \
+         {served:?}",
+    );
+    assert_eq!(
+        named_sessions(&served)
+            .into_iter()
+            .filter(|session| session.starts_with("after:"))
+            .collect::<Vec<_>>(),
+        vec!["after:s-2", "after:s-2"],
+        "and what the rebuilt host does hold is served under its new namespace: \
+         {served:?}",
+    );
+
+    fixture.shutdown().await;
+    rebuilt.stop();
+    other.stop();
+}
+
+/// A dynamic enrollment names a host this gateway shook hands with, so its
+/// recorded id is the record's referent: a different id at that address is a
+/// store this enrollment is not about, and contact under one is refused
+/// (spec 7.1).
+///
+/// The refusal has to name the remedy that works for a dynamic enrollment, which
+/// is withdrawing it and enrolling the address again, so this carries that remedy
+/// out: a message naming one that answers 409 is worse than no message at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dynamic_hosts_contact_under_a_new_id_is_refused() {
+    let rebuilt = FakeHost::rebuildable("before", "after", "s-2", Script::Blocks).await;
+    let fixture = Fixture::new(&[]).await;
+    assert_eq!(
+        fixture.enroll(&rebuilt.address.to_string()).await.status(),
+        StatusCode::OK,
+    );
+    fixture.until_connected("before").await;
+
+    rebuilt.rebuild();
+
+    // The link keeps dialing and keeps being refused, and what it records is
+    // what the operator reads.
+    let refusal = fixture
+        .until_hosts("the refusal of the id at that address", |hosts| {
+            hosts
+                .hosts
+                .iter()
+                .find(|host| host.id.as_deref() == Some("before"))
+                .and_then(|host| host.error.clone())
+                .filter(|error| error.contains("after"))
+        })
+        .await;
+    assert!(
+        refusal.contains("withdraw")
+            && refusal.contains("enroll")
+            && refusal.contains(&rebuilt.address.to_string()),
+        "the refusal has to name the remedy that actually works here, which is \
+         withdrawing this enrollment and enrolling the address again: {refusal}",
+    );
+    let hosts = fixture.hosts().await;
+    assert_eq!(
+        (hosts.hosts[0].id.as_deref(), hosts.hosts[0].connected),
+        (Some("before"), false),
+        "the enrollment keeps the id it is the record of, and says it cannot be \
+         reached: {hosts:?}",
+    );
+    assert_eq!(
+        recorded(&fixture).hosts,
+        vec![enrolled_as(&rebuilt.address, "before")],
+        "and nothing was adopted, so the record still names the host this \
+         enrollment was made from",
+    );
+
+    // The remedy, carried out.
+    assert_eq!(
+        fixture.withdraw("before").await.status(),
+        StatusCode::NO_CONTENT,
+    );
+    let enrolled = fixture.enroll(&rebuilt.address.to_string()).await;
+    assert_eq!(enrolled.status(), StatusCode::OK);
+    let summary: HostSummary = enrolled.json().await.expect("a host summary");
+    assert_eq!(
+        summary.id.as_deref(),
+        Some("after"),
+        "the enrollment the refusal asked for is the record of the host that is \
+         there now",
+    );
+    fixture.until_connected("after").await;
+    assert!(!fixture.row("after:s-2").await.unreachable);
+
+    fixture.shutdown().await;
+    rebuilt.stop();
+}
+
+/// What the gateway's state file records, read back as the gateway wrote it.
+fn recorded(fixture: &Fixture) -> crate::gateway::enrollment::Recorded {
+    let text =
+        std::fs::read_to_string(fixture.state.path().join("hosts.json")).expect("the state file");
+    serde_json::from_str(&text).expect("readable gateway state")
+}
+
+/// One entry of that record.
+fn enrolled_as(address: &HostAddress, host_id: &str) -> crate::gateway::enrollment::EnrolledHost {
+    crate::gateway::enrollment::EnrolledHost {
+        address: address.clone(),
+        host_id: host_id.to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The gateway's own surface (spec 6.1, 6.3)
 // ---------------------------------------------------------------------------
@@ -4711,6 +4934,11 @@ fn error_frame(session: &str, code: &str, message: &str) -> String {
 enum Script {
     /// These frames, then silence with the stream held open.
     Frames(Vec<String>),
+    /// An attach block for every session the stream attached, then silence with
+    /// the stream held open. What a host that holds whatever it is asked for
+    /// looks like, which is what lets one script serve a store whose sessions
+    /// changed under it.
+    Blocks,
     /// These frames, then the host hangs the stream up. The flap a gateway must
     /// not paper over by dialing again on its own.
     Ends(Vec<String>),
@@ -4772,7 +5000,31 @@ struct FakeHost {
     /// flooded alike. A count that stops moving is how a test sees the whole
     /// pipeline behind it stall (see [`Self::until_stalled`]).
     written: Arc<AtomicUsize>,
+    /// Set for a host a test can replace with a different store at the same
+    /// address (see [`Self::rebuildable`]).
+    rebuild: Option<Rebuild>,
     serving: tokio::task::JoinHandle<()>,
+}
+
+/// Everything about a fake host that changes when the store behind its address
+/// does: the id it answers to, and the directory it publishes.
+#[derive(Clone)]
+struct Identity {
+    host_id: String,
+    /// This host's own `list` frame, written out as JSON.
+    directory: String,
+}
+
+/// What a fake host does when a test rebuilds it: take the new identity, and end
+/// the control connection so the gateway's link meets it.
+///
+/// The identity changes before the connection does, so the redial that drop
+/// provokes cannot race the swap and read the old one back.
+#[derive(Clone)]
+struct Rebuild {
+    cue: Arc<tokio::sync::Notify>,
+    becomes: Identity,
+    identity: Arc<StdMutex<Identity>>,
 }
 
 impl FakeHost {
@@ -4785,6 +5037,30 @@ impl FakeHost {
         .await
     }
 
+    /// A host [`Self::rebuild`] can replace with a different store at the same
+    /// address: from then on it answers `hello` under `becomes` and its directory
+    /// is `holding` rather than the `s-1` every other fake host serves.
+    ///
+    /// What a rebuilt host looks like to a gateway. Its store is a different
+    /// store, so its sessions are different sessions, which is what makes the
+    /// rows under the new namespace tell a test which store they came from. The
+    /// control connection ends as the id changes, so the link redials and meets
+    /// the new one, while the streams spliced onto this host are untouched: that
+    /// is what leaves a client still attached under the old identity when the
+    /// change lands, which is the only moment a `reset` for it can be observed.
+    async fn rebuildable(host_id: &str, becomes: &str, holding: &str, script: Script) -> Self {
+        Self::built(
+            host_id,
+            script,
+            vec![serde_json::to_string(&fake_row("s-1")).expect("a row")],
+            Some((
+                becomes.to_string(),
+                vec![serde_json::to_string(&fake_row(holding)).expect("a row")],
+            )),
+        )
+        .await
+    }
+
     /// The same, with the directory this host publishes on its control
     /// connection written out as JSON.
     ///
@@ -4792,6 +5068,15 @@ impl FakeHost {
     /// bytes a host wrote: a row from a host a version ahead carries fields this
     /// build has no type for, and number literals a re-encode would round.
     async fn with_rows(host_id: &str, script: Script, rows: Vec<String>) -> Self {
+        Self::built(host_id, script, rows, None).await
+    }
+
+    async fn built(
+        host_id: &str,
+        script: Script,
+        rows: Vec<String>,
+        rebuilt_as: Option<(String, Vec<String>)>,
+    ) -> Self {
         use axum::extract::Query;
         use axum::response::IntoResponse;
         use axum::response::sse::{Event, Sse};
@@ -4801,19 +5086,40 @@ impl FakeHost {
         let released = Arc::new(AtomicUsize::new(0));
         let control_released = Arc::new(AtomicUsize::new(0));
         let written = Arc::new(AtomicUsize::new(0));
-        let hello = serde_json::json!({
-            "protocol": PROTOCOL_VERSION,
-            "capabilities": [],
-            "app_version": "0",
-            "host_id": host_id,
+        // Read per request rather than baked into the responses, because a
+        // rebuild changes it under a gateway that is already following this host.
+        let identity = Arc::new(StdMutex::new(Identity {
+            host_id: host_id.to_string(),
+            directory: directory_frame(&rows),
+        }));
+        let rebuild = rebuilt_as.map(|(host_id, rows)| Rebuild {
+            cue: Arc::new(tokio::sync::Notify::new()),
+            becomes: Identity {
+                host_id,
+                directory: directory_frame(&rows),
+            },
+            identity: Arc::clone(&identity),
         });
-        let directory = format!(r#"{{"kind":"list","sessions":[{}]}}"#, rows.join(","));
         let app = axum::Router::new()
             .route(
                 "/v1/hello",
-                get(move || {
-                    let hello = hello.clone();
-                    async move { axum::Json(hello) }
+                get({
+                    let identity = Arc::clone(&identity);
+                    move || {
+                        let host_id = identity
+                            .lock()
+                            .expect("the identity mutex is poisoned")
+                            .host_id
+                            .clone();
+                        async move {
+                            axum::Json(serde_json::json!({
+                                "protocol": PROTOCOL_VERSION,
+                                "capabilities": [],
+                                "app_version": "0",
+                                "host_id": host_id,
+                            }))
+                        }
+                    }
                 }),
             )
             .route(
@@ -4823,13 +5129,16 @@ impl FakeHost {
                     let released = Arc::clone(&released);
                     let control_released = Arc::clone(&control_released);
                     let written = Arc::clone(&written);
+                    let rebuild = rebuild.clone();
+                    let identity = Arc::clone(&identity);
                     move |Query(params): Query<Vec<(String, String)>>| {
                         let attaches = Arc::clone(&attaches);
                         let released = Arc::clone(&released);
                         let control_released = Arc::clone(&control_released);
                         let written = Arc::clone(&written);
                         let script = script.clone();
-                        let directory = directory.clone();
+                        let rebuild = rebuild.clone();
+                        let identity = Arc::clone(&identity);
                         async move {
                             let attached: Vec<String> = params
                                 .iter()
@@ -4840,7 +5149,7 @@ impl FakeHost {
                             let spliced = {
                                 let mut held =
                                     attaches.lock().expect("the attaches mutex is poisoned");
-                                held.push(attached);
+                                held.push(attached.clone());
                                 held.iter().filter(|attached| !attached.is_empty()).count()
                             };
                             if !control && matches!(script, Script::Refuse) {
@@ -4876,14 +5185,31 @@ impl FakeHost {
                             // it.
                             let (frames, tail, guard) = if control {
                                 (
-                                    vec![directory],
-                                    Tail::Held,
+                                    vec![
+                                        identity
+                                            .lock()
+                                            .expect("the identity mutex is poisoned")
+                                            .directory
+                                            .clone(),
+                                    ],
+                                    match rebuild {
+                                        Some(rebuild) => Tail::Rebuilt(rebuild),
+                                        None => Tail::Held,
+                                    },
                                     Some(Released(Arc::clone(&control_released))),
                                 )
                             } else {
                                 let guard = Some(Released(Arc::clone(&released)));
                                 match &script {
                                     Script::Frames(frames) => (frames.clone(), Tail::Held, guard),
+                                    Script::Blocks => (
+                                        attached
+                                            .iter()
+                                            .flat_map(|session| block(session, "epoch-1", 0))
+                                            .collect(),
+                                        Tail::Held,
+                                        guard,
+                                    ),
                                     Script::Ends(frames) => (frames.clone(), Tail::Ended, guard),
                                     Script::Flood { session, opening } => (
                                         opening.clone(),
@@ -4938,6 +5264,7 @@ impl FakeHost {
                                     Box::pin(cued(cue, frames, written, guard))
                                 }
                                 Tail::Held => Box::pin(held(guard)),
+                                Tail::Rebuilt(rebuild) => Box::pin(rebuilt(rebuild, guard)),
                                 Tail::Ended => {
                                     drop(guard);
                                     Box::pin(futures::stream::empty())
@@ -4961,8 +5288,20 @@ impl FakeHost {
             released,
             control_released,
             written,
+            rebuild,
             serving,
         }
+    }
+
+    /// Replace the store behind this address: the id this host answers to
+    /// changes, and its control connection ends so the gateway's link meets the
+    /// new one.
+    fn rebuild(&self) {
+        self.rebuild
+            .as_ref()
+            .expect("only a host built to be rebuilt can be")
+            .cue
+            .notify_one();
     }
 
     /// Every stream this host was asked for, control connections included.
@@ -5042,6 +5381,32 @@ enum Tail {
     Flood(String),
     /// A wait for the cue, then these frames, then held open.
     Cued(Arc<tokio::sync::Notify>, Vec<String>),
+    /// A wait for the rebuild cue, at which point this host takes its new id and
+    /// the stream ends. Only a control connection gets one, and only the one
+    /// that is up when the cue fires: the redial after it meets a host whose id
+    /// has already changed.
+    Rebuilt(Rebuild),
+}
+
+/// A stream held open until this host is rebuilt, which ends it.
+fn rebuilt(
+    rebuild: Rebuild,
+    guard: Option<Released>,
+) -> impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>> {
+    futures::StreamExt::flatten(futures::stream::once(async move {
+        rebuild.cue.notified().await;
+        *rebuild
+            .identity
+            .lock()
+            .expect("the identity mutex is poisoned") = rebuild.becomes;
+        drop(guard);
+        futures::stream::empty()
+    }))
+}
+
+/// One host's directory as it travels on its control connection.
+fn directory_frame(rows: &[String]) -> String {
+    format!(r#"{{"kind":"list","sessions":[{}]}}"#, rows.join(","))
 }
 
 /// A wait for `cue`, then `frames`, then silence with the stream held open.
