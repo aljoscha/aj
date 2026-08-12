@@ -1722,9 +1722,17 @@ async fn two_enrollments_at_once_are_both_recorded() {
 }
 
 /// A remembered host the configuration now also names is one host, and the
-/// configuration is its record from then on (spec 7.1).
+/// configuration is the record of it being enrolled at all from then on
+/// (spec 7.1).
+///
+/// Its id is not that record's to lose. An id names a store, and an operator
+/// promoting a dynamic enrollment into the configuration file did not change
+/// which store answers at that address, so the id carries across as the
+/// configured host's. The host is down here, which is the case that makes the
+/// difference: nothing will re-learn the id this run, so a client's group for it
+/// is named by what the state file kept, or by an address.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_remembered_host_the_configuration_names_too_is_dropped_from_the_state() {
+async fn a_remembered_host_the_configuration_names_too_keeps_its_id() {
     let state = TempDir::new().expect("tempdir");
     let address = HostAddress::parse("127.0.0.1:1").expect("an address");
     std::fs::write(
@@ -1739,17 +1747,38 @@ async fn a_remembered_host_the_configuration_names_too_is_dropped_from_the_state
     assert_eq!(hosts.hosts.len(), 1, "one address is one host: {hosts:?}");
     assert_eq!(hosts.hosts[0].source, HostSource::Config);
     assert_eq!(
-        hosts.hosts[0].id, None,
-        "a configured host learns its id from the host, so the remembered one \
-         cannot outlive a store that changed identity",
+        hosts.hosts[0].id.as_deref(),
+        Some("remembered"),
+        "the id a host's sessions are namespaced under does not depend on which \
+         file enrolled it: {hosts:?}",
     );
-    // And it is gone from the state: the file it came from would otherwise
-    // resurrect it once the operator removed it from the configuration.
-    let recorded =
-        std::fs::read_to_string(fixture.state.path().join("hosts.json")).expect("the state file");
-    assert!(
-        !recorded.contains("remembered"),
-        "the remembered enrollment was pruned: {recorded}",
+    assert_eq!(
+        fixture
+            .client
+            .sessions()
+            .await
+            .expect("the merged directory")
+            .hosts,
+        vec![DirectoryHost {
+            id: Some("remembered".to_string()),
+            address: None,
+            unreachable: true,
+        }],
+        "and a client's group for it is named by that id rather than by an \
+         address it cannot address a session with",
+    );
+    // The record has moved rather than gone: the enrollment is the
+    // configuration's, the id is this file's.
+    let recorded = recorded(&fixture);
+    assert_eq!(
+        recorded.hosts,
+        Vec::new(),
+        "the remembered enrollment stayed, and would resurrect this host once the \
+         operator removed it from the configuration",
+    );
+    assert_eq!(
+        recorded.configured_ids,
+        vec![enrolled_as(&address, "remembered")],
     );
 
     fixture.shutdown().await;

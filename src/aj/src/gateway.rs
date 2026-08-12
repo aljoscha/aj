@@ -209,10 +209,13 @@ impl Gateway {
     /// Build a gateway over `setup`, enrolling its configured and remembered
     /// hosts and dialing all of them.
     ///
-    /// A remembered enrollment that the configuration now also names is dropped
-    /// from the state file: the file is that host's record from here on, and
-    /// keeping both would enroll it twice or resurrect it when the operator
-    /// removes it from the configuration.
+    /// A remembered enrollment that the configuration now also names leaves the
+    /// state file's enrollments and carries its id across as that configured
+    /// host's: the configuration is the record of it being enrolled from here
+    /// on, and keeping both would enroll it twice or resurrect it when the
+    /// operator removes it from the configuration. Its id is not that record's
+    /// to lose, though, because an id names a store (spec 4) and promoting an
+    /// enrollment into a file did not change which store answers there.
     ///
     /// A configured host's *id* comes out of the state file too, and is applied
     /// once the enrollments are in place: a host that is down when this gateway
@@ -238,6 +241,7 @@ impl Gateway {
             }
         }
         let mut pruned = false;
+        let mut restoring = remembered.configured_ids;
         for host in remembered.hosts {
             match directory.enroll(
                 host.address.clone(),
@@ -248,13 +252,16 @@ impl Gateway {
                 Err(err) => {
                     // The configuration got there first, which is the ordinary
                     // way this happens: the operator promoted a dynamically
-                    // enrolled host into the file.
+                    // enrolled host into the file. The enrollment is the
+                    // configuration's from here on, and the id it answered to is
+                    // restored onto it like any other configured host's.
                     tracing::info!("dropping the remembered host {}: {err}", host.address);
                     pruned = true;
+                    restoring.push(host);
                 }
             }
         }
-        for host in remembered.configured_ids {
+        for host in restoring {
             // Adopted rather than enrolled, so an id whose address the
             // configuration no longer names brings nothing back with it. That
             // refusal is the ordinary way an entry here dies, and rewriting the
