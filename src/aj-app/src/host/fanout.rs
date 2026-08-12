@@ -362,6 +362,22 @@ impl Fanout {
         }
     }
 
+    /// Take `session` back off a subscriber's attach set, for one its attach
+    /// could not resolve (spec 6.5).
+    ///
+    /// A subscriber is registered for every session its request names before
+    /// any of them is resolved, which is what makes an attach in flight count
+    /// as use. A session that then turns out to be unservable has to come back
+    /// out: this host may hold it later, for another client, and a
+    /// session-scoped frame is undroppable by class, so it would count against
+    /// a bound this client never asked to spend and could evict it over traffic
+    /// it never asked for.
+    pub(crate) fn detach(&self, id: SubscriberId, session: &str) {
+        if let Some(subscriber) = self.lock().get_mut(&id) {
+            subscriber.attached.remove(session);
+        }
+    }
+
     /// Fan `frame` out to every subscriber.
     pub(crate) fn publish(&self, frame: Frame) {
         self.lock().retain(|_, subscriber| subscriber.offer(&frame));
@@ -460,9 +476,9 @@ impl Attachment {
     /// The sessions this stream was served an attach block for.
     ///
     /// A client arms its fold from this rather than from what it asked for:
-    /// an attach that was refused (a lock conflict, an unknown session)
-    /// returns no `Attachment` at all, so nothing here can name a session
-    /// whose block will not arrive.
+    /// a session the attach could not resolve is answered with an `error`
+    /// frame instead of a block (spec 6.5), so it is not here, and arming for
+    /// a block that never comes strands that session's fold.
     pub fn attached(&self) -> &[String] {
         &self.attached
     }

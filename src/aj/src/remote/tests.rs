@@ -75,6 +75,35 @@ pub(crate) fn addr(text: &str) -> SocketAddr {
     text.parse().expect("a socket address")
 }
 
+/// One session to attach, with no cursor.
+fn attach(session: &str) -> AttachRequest {
+    AttachRequest {
+        session: session.to_string(),
+        cursor: None,
+    }
+}
+
+/// The first `error` frame on `events`: the session it refuses, its code, and
+/// its message (spec 6.3).
+async fn refusal(events: &mut RemoteEvents) -> (String, String, String) {
+    bounded("a session-scoped refusal", async {
+        loop {
+            match events.recv().await {
+                Some(Ok(Frame::Error {
+                    session,
+                    code,
+                    message,
+                    ..
+                })) => return (session, code, message),
+                Some(Ok(_)) => continue,
+                Some(Err(err)) => panic!("the stream failed: {err}"),
+                None => panic!("the stream ended before any session was refused"),
+            }
+        }
+    })
+    .await
+}
+
 // ---------------------------------------------------------------------------
 // The identity gate (spec 6.11)
 // ---------------------------------------------------------------------------
@@ -1636,24 +1665,76 @@ async fn an_unknown_session_answers_404_on_every_route() {
     ] {
         refusals.push(fixture.client.command(missing, &command).await.err());
     }
-    // Attaching an unknown session fails as a status before the stream opens.
-    refusals.push(
-        fixture
-            .client
-            .events(&[AttachRequest {
-                session: missing.to_string(),
-                cursor: None,
-            }])
-            .await
-            .err(),
-    );
+    // The stream route is the one that refuses per session rather than per
+    // request (spec 6.5), so its refusal is a frame and lives in
+    // `a_stream_refuses_one_session_and_serves_the_rest`.
 
-    assert_eq!(refusals.len(), 13, "every session-scoped route is covered");
+    assert_eq!(refusals.len(), 12, "every session-scoped route is covered");
     for refusal in refusals {
         let err = refusal.expect("an unknown session is refused");
         assert_eq!(err.status(), Some(StatusCode::NOT_FOUND), "got {err}");
         assert_eq!(err.code(), Some("unknown_session"), "got {err}");
     }
+    fixture.shutdown().await;
+}
+
+/// A stream request never fails wholesale over one bad session (spec 6.5):
+/// the refusal is a session-scoped frame on an open stream rather than a
+/// status, and every other session it named is served on that same stream.
+///
+/// Over the real transport, because the distinction this pins is exactly the
+/// one between an HTTP status and a frame.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_refuses_one_session_and_serves_the_rest() {
+    let fixture = Fixture::new(Vec::new()).await;
+    let session = fixture.create().await;
+
+    let mut events = fixture
+        .client
+        .events(&[
+            // Well-formed and not in the store, and an id the store's grammar
+            // refuses outright (spec 6.2). Both refuse per session.
+            attach("20260101-000000-000"),
+            attach("../elsewhere/reachable"),
+            attach(&session),
+        ])
+        .await
+        .expect("the stream opens rather than failing as a status");
+
+    let mut refused: Vec<(String, String)> = Vec::new();
+    let mut served = false;
+    bounded("the healthy session's block", async {
+        loop {
+            match events.recv().await {
+                Some(Ok(Frame::Error { session, code, .. })) => refused.push((session, code)),
+                Some(Ok(Frame::CaughtUp { session: ended, .. })) if ended == session => {
+                    served = true;
+                    return;
+                }
+                Some(Ok(_)) => continue,
+                Some(Err(err)) => panic!("the stream failed: {err}"),
+                None => panic!("the stream ended before the healthy session was served"),
+            }
+        }
+    })
+    .await;
+
+    assert!(served, "the healthy session's block never arrived");
+    assert_eq!(
+        refused,
+        vec![
+            (
+                "20260101-000000-000".to_string(),
+                "unknown_session".to_string()
+            ),
+            (
+                "../elsewhere/reachable".to_string(),
+                "unknown_session".to_string()
+            ),
+        ],
+        "each unresolvable session is refused on the stream, by the id the \
+         client named",
+    );
     fixture.shutdown().await;
 }
 
@@ -1693,19 +1774,17 @@ async fn a_traversal_id_is_refused_at_the_wire_boundary() {
 
     // The stream route carries its id in a query parameter, where nothing
     // normalizes it, so this is the one that really exercises the host's
-    // gate. An empty id answers the same way.
+    // gate. It refuses per session (spec 6.5), so the refusal is a frame on
+    // an open stream rather than a status. An empty id answers the same way.
     for id in ["../elsewhere/reachable", "..", ""] {
-        let err = fixture
+        let mut events = fixture
             .client
-            .events(&[AttachRequest {
-                session: id.to_string(),
-                cursor: None,
-            }])
+            .events(&[attach(id)])
             .await
-            .err()
-            .unwrap_or_else(|| panic!("{id:?} opened a stream"));
-        assert_eq!(err.status(), Some(StatusCode::NOT_FOUND), "{id:?}: {err}");
-        assert_eq!(err.code(), Some("unknown_session"), "{id:?}: {err}");
+            .unwrap_or_else(|err| panic!("{id:?} did not open a stream: {err}"));
+        let (refused, code, _) = refusal(&mut events).await;
+        assert_eq!(refused, id, "the refusal names the id the client sent");
+        assert_eq!(code, "unknown_session", "{id:?}");
     }
 
     assert!(
@@ -1965,14 +2044,21 @@ async fn a_session_another_host_holds_answers_409_locked() {
         "the rival shares the store, so it discovers the session",
     );
 
+    // The stream refuses per session (spec 6.5), so the lock's refusal is a
+    // frame on an open stream rather than a status.
+    let mut events = rival
+        .events(&[attach(&session)])
+        .await
+        .expect("the stream opens");
+    let (refused, code, message) = refusal(&mut events).await;
+    assert_eq!(
+        (refused.as_str(), code.as_str()),
+        (session.as_str(), "locked")
+    );
+    assert!(message.contains("is held by"), "got {message}");
+    drop(events);
+
     let mut refusals = vec![
-        rival
-            .events(&[AttachRequest {
-                session: session.clone(),
-                cursor: None,
-            }])
-            .await
-            .err(),
         rival
             .command(
                 &session,
@@ -1987,7 +2073,7 @@ async fn a_session_another_host_holds_answers_409_locked() {
             .err(),
         rival.tree(&session).await.err(),
     ];
-    assert_eq!(refusals.len(), 3, "every materializing route is covered");
+    assert_eq!(refusals.len(), 2, "every materializing route is covered");
     for refusal in refusals.drain(..) {
         let err = refusal.expect("the lock refuses");
         assert_eq!(err.status(), Some(StatusCode::CONFLICT), "got {err}");

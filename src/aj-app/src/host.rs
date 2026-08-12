@@ -156,6 +156,28 @@ pub enum HostError {
     Internal(#[source] BoxError),
 }
 
+impl HostError {
+    /// The protocol code this failure travels as (spec 6.1): in an error body,
+    /// and in the `error` frame that refuses one session's attach (spec 6.3).
+    ///
+    /// The vocabulary lives here, beside the failures it names, rather than in
+    /// the HTTP layer, which maps the same variants onto statuses. A frame
+    /// carries no status, so the two would otherwise have to agree by
+    /// discipline.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::UnknownSession(_) => "unknown_session",
+            Self::UnknownTask(_) => "unknown_task",
+            Self::UnknownEntry(_) => "unknown_entry",
+            Self::Conflict { .. } => "conflict",
+            Self::Locked { .. } => "locked",
+            Self::Unsupported(_) => "unsupported",
+            Self::Invalid(_) => "invalid_request",
+            Self::Internal(_) => "internal",
+        }
+    }
+}
+
 /// Why a create did not deliver everything that was asked of it.
 ///
 /// Creating the session is the operation that either happens or does not.
@@ -366,6 +388,17 @@ pub struct AttachRequest {
     /// another epoch, or beyond the session's high-water mark, means a full
     /// backfill (spec 6.5).
     pub cursor: Option<Cursor>,
+}
+
+/// What one attached stream owes one of the sessions it named: the block it
+/// asked for, or the refusal it gets instead (spec 6.5).
+///
+/// Resolved before the stream is handed back and written in the order the
+/// sessions were named, so a client reads one answer per session and can tell
+/// which of them it is waiting for.
+enum Serving {
+    Block(AttachRequest, Arc<LiveSession>),
+    Refusal(Frame),
 }
 
 /// Direct handles into one live session, for a client attached in process.
@@ -656,7 +689,8 @@ impl SessionHost {
         Ok(info)
     }
 
-    /// Open a stream and serve an attach block for every named session.
+    /// Open a stream and serve an attach block for every session it can
+    /// resolve, and a session-scoped refusal for every session it cannot.
     ///
     /// Registering the subscriber and projecting a session's suffix are
     /// atomic with respect to that session's event flow: a durable frame
@@ -666,23 +700,27 @@ impl SessionHost {
     /// a single round trip with no client-side buffer-and-reconcile dance
     /// (spec 6.5).
     ///
-    /// Returning successfully means every named session's block will be
-    /// written, which is what [`Attachment::attached`] reports and what a
-    /// client arms its fold from.
+    /// A stream never fails wholesale over one bad session (spec 6.5). Each
+    /// named session gets one of two answers, in the order it was named: its
+    /// attach block, or an `error` frame carrying why this host could not
+    /// serve it (an id its store could never hold, one it does not have, one
+    /// another writer holds). Refusing the request instead would cost the
+    /// client every healthy session it named. What does fail the request is
+    /// what is wrong with the request rather than with a session: a session
+    /// named twice, and a host that is shut down.
+    ///
+    /// Returning successfully means every session [`Attachment::attached`]
+    /// names will have its block written, which is what a client arms its
+    /// fold from.
     pub async fn attach(&self, requests: &[AttachRequest]) -> Result<Attachment, HostError> {
         self.alive()?;
         // One block per named session is the client contract (spec 6.5), and
         // a duplicate would be served two: the second would open a block
-        // the client is not expecting and quiesce state it just applied.
-        //
-        // The grammar runs in the same pass, ahead of the duplicate rule: an
-        // id this store could never hold is a 404 whether it appears once or
-        // twice (spec 6.2), and validating late would let an attach naming a
-        // good session and a bad one materialize and lock the good one before
-        // refusing.
+        // the client is not expecting and quiesce state it just applied. It
+        // is the request that is malformed, not a session, so it is refused
+        // as one.
         let mut names: Vec<String> = Vec::with_capacity(requests.len());
         for request in requests {
-            validate_session_id(&request.session)?;
             if names.contains(&request.session) {
                 return Err(HostError::Invalid(format!(
                     "session {} is named twice in one attach",
@@ -696,15 +734,29 @@ impl SessionHost {
         // Materializing first would leave a window where an idle session could
         // be released out from under a block about to be served from it.
         let (id, live_frames, cancelled) = self.inner.shared.fanout.register(&names);
-        // Materialize everything up front: a failure must not leave a
-        // half-served stream behind.
-        let mut live = Vec::with_capacity(requests.len());
+        // Resolved up front, so that returning means every block this stream
+        // owes can be written.
+        let mut serving = Vec::with_capacity(requests.len());
+        let mut attached = Vec::with_capacity(requests.len());
         for request in requests {
             match self.live(&request.session).await {
-                Ok(session) => live.push((request.clone(), session)),
+                Ok(session) => {
+                    attached.push(request.session.clone());
+                    serving.push(Serving::Block(request.clone(), session));
+                }
                 Err(err) => {
-                    self.inner.shared.fanout.deregister(id);
-                    return Err(err);
+                    // Off the attach set again: this host may hold the session
+                    // later, for somebody else, and its frames must not reach a
+                    // stream that was never served its block.
+                    self.inner.shared.fanout.detach(id, &request.session);
+                    serving.push(Serving::Refusal(Frame::Error {
+                        session: request.session.clone(),
+                        // The session was never resolved, so there is no epoch
+                        // this could be about.
+                        epoch: None,
+                        code: err.code().to_string(),
+                        message: err.to_string(),
+                    }));
                 }
             }
         }
@@ -721,7 +773,7 @@ impl SessionHost {
             block_rx,
             live_frames,
             cancelled.clone(),
-            names,
+            attached,
             Arc::clone(&self.inner.shared.fanout),
         );
         // Registered above before any block is projected: from here on every
@@ -729,11 +781,15 @@ impl SessionHost {
         // against its boundary, which is the atomicity the doc promises.
         let host = self.clone();
         tokio::spawn(async move {
-            for (request, session) in live {
-                if !host
-                    .serve_block(id, &request, &session, &block_tx, &cancelled)
-                    .await
-                {
+            for item in serving {
+                let served = match item {
+                    Serving::Block(request, session) => {
+                        host.serve_block(id, &request, &session, &block_tx, &cancelled)
+                            .await
+                    }
+                    Serving::Refusal(frame) => send_block_frame(&block_tx, &cancelled, frame).await,
+                };
+                if !served {
                     break;
                 }
             }

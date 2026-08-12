@@ -309,6 +309,14 @@ async fn bounded<T>(what: &str, future: impl std::future::Future<Output = T>) ->
     }
 }
 
+/// One session to attach, with no cursor.
+fn attach_request(session: &str) -> AttachRequest {
+    AttachRequest {
+        session: session.to_string(),
+        cursor: None,
+    }
+}
+
 /// Collect frames until `done` accepts one, that frame included.
 async fn frames_until(
     stream: &mut Attachment,
@@ -1086,6 +1094,12 @@ async fn an_unknown_session_is_refused() {
 /// entry point, and refused off its own shape: it does not reach the store
 /// at all (spec 6.2).
 ///
+/// The stream route is the one entry point whose refusal is per session
+/// rather than per request (spec 6.5), so it has its own test
+/// ([`an_attach_refuses_an_ungrammatical_id_without_asking_the_store`]) and
+/// stays out of the directory-read budget below, which an attach spends on
+/// its own account as an enumeration point (spec 6.8).
+///
 /// One of the ids points at a real, readable log just outside the store, so
 /// the refusal cannot be the file simply not being there.
 #[tokio::test]
@@ -1115,20 +1129,6 @@ async fn an_id_that_is_not_a_session_id_never_reaches_the_store() {
             .command(id, prompt("hi"))
             .await
             .expect_err("a command names no path");
-        assert!(
-            matches!(err, HostError::UnknownSession(_)),
-            "{id:?}: {err:?}"
-        );
-
-        let err = harness
-            .host
-            .attach(&[AttachRequest {
-                session: id.to_string(),
-                cursor: None,
-            }])
-            .await
-            .err()
-            .expect("an attach names no path");
         assert!(
             matches!(err, HostError::UnknownSession(_)),
             "{id:?}: {err:?}"
@@ -1223,18 +1223,245 @@ async fn an_attach_reports_what_it_served_and_refuses_a_duplicate() {
         .expect("a session named twice is refused");
     assert!(matches!(err, HostError::Invalid(_)), "got {err:?}");
 
-    // A refused attach hands back no stream, so a client has nothing to arm
-    // its fold from.
-    let err = harness
+    // A session the host cannot resolve is refused on the stream rather than
+    // as the request (spec 6.5), and it is not among what was served, so a
+    // client has nothing to arm its fold with.
+    let mut stream = harness
         .host
         .attach(&[AttachRequest {
             session: "not-a-session".to_string(),
             cursor: None,
         }])
         .await
-        .err()
-        .expect("an unknown session is refused");
-    assert!(matches!(err, HostError::UnknownSession(_)), "got {err:?}");
+        .expect("a stream naming only an unknown session still opens");
+    assert_eq!(stream.attached(), Vec::<String>::new());
+    let refusal = frames_until(&mut stream, "the refusal", |frame| {
+        matches!(frame, Frame::Error { .. })
+    })
+    .await;
+    assert!(
+        matches!(
+            refusal.last(),
+            Some(Frame::Error { session, code, .. })
+                if session == "not-a-session" && code == "unknown_session",
+        ),
+        "got {refusal:?}",
+    );
+    harness.host.shutdown().await;
+}
+
+/// A stream never fails wholesale over one bad session (spec 6.5): every
+/// session it names gets either its attach block or a session-scoped `error`
+/// frame, and the rest are served in order.
+///
+/// Failing the whole request instead would cost a client every healthy
+/// session it named over one id that is gone.
+#[tokio::test]
+async fn an_attach_refuses_a_session_it_cannot_resolve_and_serves_the_rest() {
+    let harness = Harness::new(Vec::new());
+    let first = harness.create().await;
+    let second = harness.create().await;
+    // A readable log just outside the store, so the grammar's refusal below
+    // cannot be the file simply not being there.
+    let outside = harness._dir.path().join("elsewhere");
+    std::fs::create_dir_all(&outside).expect("a directory beside the store");
+    std::fs::write(outside.join("reachable.jsonl"), "").expect("a log outside the store");
+
+    let mut stream = harness
+        .host
+        .attach(&[
+            attach_request(&first),
+            // In the store's grammar, and not in the store.
+            attach_request("20260101-000000-000"),
+            // Not in the store's grammar at all (spec 6.2).
+            attach_request("../elsewhere/reachable"),
+            attach_request(&second),
+        ])
+        .await
+        .expect("the stream opens");
+
+    assert_eq!(
+        stream.attached(),
+        [first.clone(), second.clone()],
+        "a client arms its fold from what was served, never from what it asked \
+         for",
+    );
+    let frames = frames_until(
+        &mut stream,
+        "the last session's block",
+        |frame| matches!(frame, Frame::CaughtUp { session, .. } if *session == second),
+    )
+    .await;
+    let answers: Vec<(&str, &str)> = frames
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::State { session, .. } => Some(("state", session.as_str())),
+            Frame::CaughtUp { session, .. } => Some(("caught_up", session.as_str())),
+            Frame::Error { session, code, .. } => Some((code.as_str(), session.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        answers,
+        vec![
+            ("state", first.as_str()),
+            ("caught_up", first.as_str()),
+            ("unknown_session", "20260101-000000-000"),
+            ("unknown_session", "../elsewhere/reachable"),
+            ("state", second.as_str()),
+            ("caught_up", second.as_str()),
+        ],
+        "one answer per named session, each in the position it was named in",
+    );
+    let messages: Vec<&str> = frames
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::Error { message, .. } => Some(message.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .all(|message| message.contains("unknown session")),
+        "a refusal carries the sentence a client renders (spec 6.6): {messages:?}",
+    );
+
+    // The refused ids are not attached, so nothing this host later publishes
+    // for them may reach this stream (see the locked-session test below).
+    assert!(
+        outside.join("reachable.jsonl").is_file(),
+        "the traversal target is still there, untouched",
+    );
+    harness.host.shutdown().await;
+}
+
+/// A session an attach refused is taken back off that stream's attach set.
+///
+/// The subscriber is registered for every session its request names before any
+/// of them is resolved, which is what makes an attach in flight count as use.
+/// A session that then turned out to be unservable has to come back out: this
+/// host may hold it later, for somebody else, and its frames are undroppable
+/// by class, so they would count against a bound this client never asked to
+/// spend and could evict it over traffic it never asked for (spec 6.5, 6.9).
+///
+/// A lock conflict is the refusal that can be undone from outside, which is
+/// what makes this reachable at all: an id nothing could ever resolve stays
+/// unresolvable, so it would prove nothing.
+#[tokio::test]
+async fn a_refused_session_stays_off_the_streams_attach_set() {
+    let harness = Harness::new(vec![finalized_text_message("on the record")]);
+    let session = harness.create().await;
+    // Punctuate the log so the session is discoverable on disk, then let this
+    // host go, so the only thing holding it is the rival lock below.
+    let mut writer = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+    writer.pump_until_idle().await;
+    drop(writer);
+    harness.host.shutdown().await;
+
+    let held = SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
+        .expect("try_acquire")
+        .expect("the lock is free once the host tore the session down");
+    let host = harness.revive(vec![finalized_text_message("after the lock")]);
+
+    let mut refused = host
+        .host
+        .attach(&[attach_request(&session)])
+        .await
+        .expect("the stream opens");
+    let refusal = frames_until(&mut refused, "the refusal", |frame| {
+        matches!(frame, Frame::Error { .. })
+    })
+    .await;
+    let Some(Frame::Error { code, message, .. }) = refusal.last() else {
+        panic!("a locked session is refused on the stream: {refusal:?}");
+    };
+    assert_eq!(code, "locked", "{message}");
+    assert!(
+        refused.attached().is_empty(),
+        "a refused session is not one the client may arm its fold for",
+    );
+
+    // The rival lets go, so the very session that was refused is now one this
+    // host can hold. A second client takes it, and its frames must reach that
+    // client alone.
+    drop(held);
+    let mut served = Client::attach(&host.host, &session).await;
+    host.prompt(&session, "again").await;
+    let live = served.pump_until_idle().await;
+    assert!(
+        live.iter().any(|frame| frame.durable_seq().is_some()),
+        "the second client was served nothing durable, so this measures \
+         nothing: {live:?}",
+    );
+
+    // The fan-out offers a frame to every subscriber under one lock, so a
+    // frame the second stream has is one the first would already hold.
+    let leaked = drained(&mut refused);
+    assert!(
+        only(leaked.clone(), &session).is_empty(),
+        "a session this stream was refused reached it anyway: {leaked:?}",
+    );
+    host.host.shutdown().await;
+}
+
+/// The wire boundary's id grammar outlives the per-session refusal (spec
+/// 6.2): an id this store could never hold is now refused on the stream
+/// instead of as the request, and it still reaches no path and no store
+/// lookup on the way.
+#[tokio::test]
+async fn an_attach_refuses_an_ungrammatical_id_without_asking_the_store() {
+    let harness = Harness::new(Vec::new());
+    let outside = harness._dir.path().join("elsewhere");
+    std::fs::create_dir_all(&outside).expect("a directory beside the store");
+    std::fs::write(outside.join("reachable.jsonl"), "").expect("a log outside the store");
+    // Taken after construction's own enumeration, so this measures the attach.
+    let lookups = harness.host.store_membership_lookups();
+
+    let ids = [
+        "",
+        "..",
+        "../elsewhere/reachable",
+        "a/b",
+        "sneaky.jsonl",
+        "hé",
+    ];
+    let mut stream = harness
+        .host
+        .attach(&ids.map(attach_request))
+        .await
+        .expect("a stream naming only ungrammatical ids still opens");
+
+    assert_eq!(
+        harness.host.store_membership_lookups(),
+        lookups,
+        "a refusal off the id's own shape put no question to the store",
+    );
+    assert!(stream.attached().is_empty());
+    let refused = frames_until(
+        &mut stream,
+        "one refusal per id",
+        |frame| matches!(frame, Frame::Error { session, .. } if session == "hé"),
+    )
+    .await;
+    assert_eq!(
+        refused
+            .iter()
+            .filter_map(|frame| match frame {
+                Frame::Error { session, code, .. } if code == "unknown_session" => {
+                    Some(session.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        ids,
+        "every id the grammar refuses is refused on the stream",
+    );
+    assert!(
+        outside.join("reachable.jsonl").is_file(),
+        "the traversal target is still there, untouched",
+    );
     harness.host.shutdown().await;
 }
 
@@ -2089,31 +2316,32 @@ async fn a_live_session_holds_its_lock_until_teardown() {
         "the host holds the session's lock while it is live",
     );
 
-    // A second host over the same store cannot materialize it.
+    // A second host over the same store cannot materialize it. The stream
+    // opens and the session is refused on it (spec 6.5), which is where the
+    // refusal a user reads now lives.
     let rival = harness.revive(Vec::new());
-    let err = rival
+    let mut stream = rival
         .host
-        .attach(&[AttachRequest {
-            session: session.clone(),
-            cursor: None,
-        }])
+        .attach(&[attach_request(&session)])
         .await
-        .expect_err("a locked session cannot be materialized twice");
-    let HostError::Locked { holder, .. } = &err else {
-        panic!("got {err:?}")
+        .expect("the stream opens");
+    let refusal = frames_until(&mut stream, "the refusal", |frame| {
+        matches!(frame, Frame::Error { .. })
+    })
+    .await;
+    let Some(Frame::Error { code, message, .. }) = refusal.last() else {
+        panic!("a locked session cannot be materialized twice: {refusal:?}");
     };
-    let holder = holder.as_ref().expect("the lock file names its holder");
-    assert_eq!(holder.pid, std::process::id());
-    assert_eq!(
-        holder.host_id,
-        harness.host.hello().host_id,
-        "the refusal names the host that holds it, not the one refused",
+    assert_eq!(code, "locked", "{message}");
+    assert!(
+        message.contains(&format!("pid {}", std::process::id())),
+        "the refusal names the process that holds it: {message}",
     );
     assert!(
-        err.to_string()
-            .contains(&format!("pid {}", std::process::id())),
-        "and says so in the message a user reads: {err}",
+        message.contains(&harness.host.hello().host_id),
+        "and the host that holds it, not the one refused: {message}",
     );
+    drop(stream);
 
     harness.host.shutdown().await;
     let reacquired = SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
@@ -2157,25 +2385,33 @@ async fn a_refused_materialization_leaves_the_log_untouched() {
 
     let rival = harness.revive(Vec::new());
     for what in ["command", "attach"] {
-        let err = match what {
+        let refusal = match what {
             "command" => rival
                 .host
                 .command(&session, prompt("hi"))
                 .await
                 .expect_err("a locked session cannot be commanded")
                 .to_string(),
-            _ => rival
-                .host
-                .attach(&[AttachRequest {
-                    session: session.clone(),
-                    cursor: None,
-                }])
-                .await
-                .expect_err("a locked session cannot be attached")
-                .to_string(),
+            // The attach opens its stream and refuses the session on it (spec
+            // 6.5), so the refusal to read is the frame's own message.
+            _ => {
+                let mut stream = rival
+                    .host
+                    .attach(&[attach_request(&session)])
+                    .await
+                    .expect("the stream opens");
+                let frames = frames_until(&mut stream, "the refusal", |frame| {
+                    matches!(frame, Frame::Error { .. })
+                })
+                .await;
+                let Some(Frame::Error { message, .. }) = frames.last() else {
+                    panic!("a locked session cannot be attached: {frames:?}");
+                };
+                message.clone()
+            }
         };
-        assert!(err.contains("is held by pid"), "{what}: {err}");
-        assert!(err.contains("a-rival-writer"), "{what}: {err}");
+        assert!(refusal.contains("is held by pid"), "{what}: {refusal}");
+        assert!(refusal.contains("a-rival-writer"), "{what}: {refusal}");
         assert_eq!(
             std::fs::read(&path).expect("read the log"),
             before,

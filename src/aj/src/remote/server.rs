@@ -494,9 +494,11 @@ fn head_target(request: HeadRequest) -> Result<HeadTarget, ApiError> {
 
 /// Open the unified event stream, attaching every named session.
 ///
-/// The attach happens before the response is returned, so a refusal (an
-/// unknown session, a lock conflict) is an HTTP status rather than an error
-/// frame on a stream that already opened.
+/// The attach happens before the response is returned, so what comes back is
+/// a stream whose blocks are already on their way. A session the host cannot
+/// serve is refused on that stream with an `error` frame rather than failing
+/// the request (spec 6.5); a status is left for what is wrong with the
+/// request itself.
 async fn events(
     State(state): State<Arc<ServerState>>,
     Query(params): Query<Vec<(String, String)>>,
@@ -540,9 +542,9 @@ fn accepted(outcome: CommandOutcome) -> Result<Response, ApiError> {
 /// that is the control connection a gateway opens for `list` frames alone.
 ///
 /// The id itself is not judged here. It is opaque at this layer, and the
-/// host's own gate answers 404 for anything its store could not hold (spec
-/// 6.2), so an empty or malformed id reads the same on this route as on
-/// `/v1/sessions/{id}/...`.
+/// host's own gate refuses anything its store could not hold, per session on
+/// the stream (spec 6.2, 6.5), so an empty or malformed id is answered rather
+/// than failing the request.
 fn attach_requests(params: &[(String, String)]) -> Result<Vec<AttachRequest>, ApiError> {
     let mut requests = Vec::new();
     for (key, value) in params {
@@ -750,22 +752,24 @@ impl IntoResponse for ApiError {
 
 impl From<HostError> for ApiError {
     fn from(err: HostError) -> Self {
-        let (status, code) = match &err {
-            HostError::Invalid(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
-            HostError::UnknownSession(_) => (StatusCode::NOT_FOUND, "unknown_session"),
-            HostError::UnknownTask(_) => (StatusCode::NOT_FOUND, "unknown_task"),
-            HostError::UnknownEntry(_) => (StatusCode::NOT_FOUND, "unknown_entry"),
-            HostError::Conflict { .. } => (StatusCode::CONFLICT, "conflict"),
-            HostError::Locked { .. } => (StatusCode::CONFLICT, "locked"),
-            HostError::Unsupported(_) => (StatusCode::CONFLICT, "unsupported"),
-            HostError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+        let status = match &err {
+            HostError::Invalid(_) => StatusCode::BAD_REQUEST,
+            HostError::UnknownSession(_)
+            | HostError::UnknownTask(_)
+            | HostError::UnknownEntry(_) => StatusCode::NOT_FOUND,
+            HostError::Conflict { .. } | HostError::Locked { .. } | HostError::Unsupported(_) => {
+                StatusCode::CONFLICT
+            }
+            HostError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         if status == StatusCode::INTERNAL_SERVER_ERROR {
             tracing::warn!("the host failed internally: {err}");
         }
         Self {
+            // The code is the host's own (spec 6.1), so a refusal reads the
+            // same whether it travels as this body or as an `error` frame.
+            code: err.code(),
             status,
-            code,
             message: err.to_string(),
         }
     }
