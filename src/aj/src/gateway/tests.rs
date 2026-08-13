@@ -2322,34 +2322,74 @@ async fn a_shutdown_does_not_wait_out_an_attached_client() {
 /// A settled gateway stops talking: its link stays up rather than reconnecting,
 /// and a directory that has not changed is not republished, because `list` is
 /// cumulative and an identical snapshot carries no information (spec 6.8).
+///
+/// The host has to resend its directory for that to be about anything, so this
+/// one does, on cue and twice: the same rows, then rows that differ. The second
+/// is what proves the first was read and merged, because they arrive in order on
+/// one connection, and it is what a quiet window on its own could never say.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unchanged_directory_publishes_nothing() {
-    let mut host = Upstream::start().await;
-    let session = host.create().await;
-    let fixture = Fixture::new(&[&host]).await;
-    fixture.row(&host.namespaced(&session)).await;
+    let settled = vec![serde_json::to_string(&fake_row("s-1")).expect("a row")];
+    let changed = vec![
+        serde_json::to_string(&fake_row("s-1")).expect("a row"),
+        serde_json::to_string(&fake_row("s-2")).expect("a row"),
+    ];
+    let fake = FakeHost::republishing(
+        "fake",
+        settled.clone(),
+        vec![settled.clone(), changed.clone()],
+    )
+    .await;
+    let fixture = Fixture::over(TempDir::new().expect("tempdir"), vec![fake.address.clone()]).await;
+    fixture.row("fake:s-1").await;
 
     let mut events = fixture.client.events(&[]).await.expect("a stream");
-    let first = bounded("the opening directory", async {
-        loop {
-            if let Frame::List { sessions, .. } =
-                events.recv().await.expect("a frame").expect("a good frame")
-            {
-                return sessions;
-            }
-        }
+    let first = frames_until(&mut events, "the opening directory", |frame| {
+        matches!(frame, Frame::List { .. })
     })
     .await;
 
-    // The host republishes its directory as clients come and go, and the
-    // gateway must not turn an unchanged payload into a frame downstream.
-    match tokio::time::timeout(QUIET, events.recv()).await {
-        Err(_) => {}
-        Ok(other) => panic!("a settled gateway published {other:?} after {first:?}"),
-    }
+    fake.republish(0);
+
+    let quiet = frames_within(&mut events, QUIET).await;
+    let republished: Vec<&Frame> = quiet
+        .iter()
+        .filter(|frame| matches!(frame, Frame::List { .. }))
+        .collect();
+    assert!(
+        republished.is_empty(),
+        "the host resent the directory it had already sent, and this gateway made \
+         a frame of it for every client watching: {republished:?} after {first:?}",
+    );
+
+    // The directory that did change, which is what says the identical one before
+    // it reached this gateway at all: they travel in order on one connection, so
+    // this one arriving means that one was read and merged.
+    fake.republish(1);
+    let after = frames_until(
+        &mut events,
+        "the directory that changed",
+        |frame| matches!(frame, Frame::List { sessions, .. } if sessions.len() == 2),
+    )
+    .await;
+    assert_eq!(
+        after
+            .iter()
+            .filter(|frame| matches!(frame, Frame::List { .. }))
+            .count(),
+        1,
+        "one frame for the one snapshot that differs: {after:?}",
+    );
+    assert_eq!(
+        fake.attaches().len(),
+        1,
+        "and one control connection throughout, because a link that reconnected \
+         would republish the directory by itself: {:?}",
+        fake.attaches(),
+    );
 
     fixture.shutdown().await;
-    host.stop().await;
+    fake.stop();
 }
 
 // ---------------------------------------------------------------------------
@@ -5194,6 +5234,9 @@ struct FakeHost {
     /// Set for a host a test can replace with a different store at the same
     /// address (see [`Self::rebuildable`]).
     rebuild: Option<Rebuild>,
+    /// Set for a host whose control connection resends its directory on cue (see
+    /// [`Self::republishing`]).
+    republish: Option<Republish>,
     serving: tokio::task::JoinHandle<()>,
 }
 
@@ -5216,6 +5259,29 @@ struct Rebuild {
     cue: Arc<tokio::sync::Notify>,
     becomes: Identity,
     identity: Arc<StdMutex<Identity>>,
+}
+
+/// What a fake host's control connection does after its opening directory.
+enum ControlScript {
+    /// Held open and silent, which is what every host but the two below does.
+    Held,
+    /// Replaced by a different store on cue (see [`FakeHost::rebuildable`]).
+    Rebuilt {
+        becomes: String,
+        /// The rows the rebuilt store publishes, written out as JSON.
+        holding: Vec<String>,
+    },
+    /// One further directory per cue, each as the rows of a `list` frame (see
+    /// [`FakeHost::republishing`]).
+    Republishes(Vec<Vec<String>>),
+}
+
+/// The directories a host's control connection still owes, each waiting for its
+/// own cue.
+#[derive(Clone)]
+struct Republish {
+    /// One cue and the `list` frame it releases, in the order they are fired.
+    frames: Vec<(Arc<tokio::sync::Notify>, String)>,
 }
 
 impl FakeHost {
@@ -5244,10 +5310,29 @@ impl FakeHost {
             host_id,
             script,
             vec![serde_json::to_string(&fake_row("s-1")).expect("a row")],
-            Some((
-                becomes.to_string(),
-                vec![serde_json::to_string(&fake_row(holding)).expect("a row")],
-            )),
+            ControlScript::Rebuilt {
+                becomes: becomes.to_string(),
+                holding: vec![serde_json::to_string(&fake_row(holding)).expect("a row")],
+            },
+        )
+        .await
+    }
+
+    /// A host whose control connection publishes `rows`, and then one further
+    /// directory per entry of `then`, each waiting for its own
+    /// [`Self::republish`].
+    ///
+    /// What a host resending its `list` looks like, which is ordinary: a host
+    /// publishes its directory as its own clients come and go. One per cue rather
+    /// than all at once, because a gateway that turns an unchanged snapshot into
+    /// a frame downstream is only observable while its clients are idle between
+    /// two of them.
+    async fn republishing(host_id: &str, rows: Vec<String>, then: Vec<Vec<String>>) -> Self {
+        Self::built(
+            host_id,
+            Script::Frames(Vec::new()),
+            rows,
+            ControlScript::Republishes(then),
         )
         .await
     }
@@ -5259,14 +5344,14 @@ impl FakeHost {
     /// bytes a host wrote: a row from a host a version ahead carries fields this
     /// build has no type for, and number literals a re-encode would round.
     async fn with_rows(host_id: &str, script: Script, rows: Vec<String>) -> Self {
-        Self::built(host_id, script, rows, None).await
+        Self::built(host_id, script, rows, ControlScript::Held).await
     }
 
     async fn built(
         host_id: &str,
         script: Script,
         rows: Vec<String>,
-        rebuilt_as: Option<(String, Vec<String>)>,
+        control_script: ControlScript,
     ) -> Self {
         use axum::extract::Query;
         use axum::response::IntoResponse;
@@ -5283,14 +5368,26 @@ impl FakeHost {
             host_id: host_id.to_string(),
             directory: directory_frame(&rows),
         }));
-        let rebuild = rebuilt_as.map(|(host_id, rows)| Rebuild {
-            cue: Arc::new(tokio::sync::Notify::new()),
-            becomes: Identity {
-                host_id,
-                directory: directory_frame(&rows),
-            },
-            identity: Arc::clone(&identity),
-        });
+        let rebuild = match &control_script {
+            ControlScript::Rebuilt { becomes, holding } => Some(Rebuild {
+                cue: Arc::new(tokio::sync::Notify::new()),
+                becomes: Identity {
+                    host_id: becomes.clone(),
+                    directory: directory_frame(holding),
+                },
+                identity: Arc::clone(&identity),
+            }),
+            ControlScript::Held | ControlScript::Republishes(_) => None,
+        };
+        let republish = match &control_script {
+            ControlScript::Republishes(directories) => Some(Republish {
+                frames: directories
+                    .iter()
+                    .map(|rows| (Arc::new(tokio::sync::Notify::new()), directory_frame(rows)))
+                    .collect(),
+            }),
+            ControlScript::Held | ControlScript::Rebuilt { .. } => None,
+        };
         let app = axum::Router::new()
             .route(
                 "/v1/hello",
@@ -5321,6 +5418,7 @@ impl FakeHost {
                     let control_released = Arc::clone(&control_released);
                     let written = Arc::clone(&written);
                     let rebuild = rebuild.clone();
+                    let republish = republish.clone();
                     let identity = Arc::clone(&identity);
                     move |Query(params): Query<Vec<(String, String)>>| {
                         let attaches = Arc::clone(&attaches);
@@ -5329,6 +5427,7 @@ impl FakeHost {
                         let written = Arc::clone(&written);
                         let script = script.clone();
                         let rebuild = rebuild.clone();
+                        let republish = republish.clone();
                         let identity = Arc::clone(&identity);
                         async move {
                             let attached: Vec<String> = params
@@ -5385,7 +5484,10 @@ impl FakeHost {
                                     ],
                                     match rebuild {
                                         Some(rebuild) => Tail::Rebuilt(rebuild),
-                                        None => Tail::Held,
+                                        None => match republish {
+                                            Some(republish) => Tail::Republishes(republish),
+                                            None => Tail::Held,
+                                        },
                                     },
                                     Some(Released(Arc::clone(&control_released))),
                                 )
@@ -5456,6 +5558,9 @@ impl FakeHost {
                                 }
                                 Tail::Held => Box::pin(held(guard)),
                                 Tail::Rebuilt(rebuild) => Box::pin(rebuilt(rebuild, guard)),
+                                Tail::Republishes(republish) => {
+                                    Box::pin(republished(republish, guard))
+                                }
                                 Tail::Ended => {
                                     drop(guard);
                                     Box::pin(futures::stream::empty())
@@ -5480,8 +5585,20 @@ impl FakeHost {
             control_released,
             written,
             rebuild,
+            republish,
             serving,
         }
+    }
+
+    /// Publish the `nth` further directory this host was built with, from the
+    /// control connection that is up.
+    fn republish(&self, nth: usize) {
+        self.republish
+            .as_ref()
+            .expect("only a host built to republish can")
+            .frames[nth]
+            .0
+            .notify_one();
     }
 
     /// Replace the store behind this address: the id this host answers to
@@ -5577,6 +5694,29 @@ enum Tail {
     /// that is up when the cue fires: the redial after it meets a host whose id
     /// has already changed.
     Rebuilt(Rebuild),
+    /// One further directory per cue, then held open. Only a control connection
+    /// gets one.
+    Republishes(Republish),
+}
+
+/// A control connection that writes one further directory per cue, in order, and
+/// is then held open.
+///
+/// The cue is awaited before the frame is composed, so a test that fires it
+/// before this stream is polled loses nothing: a notification with no waiter is
+/// stored.
+fn republished(
+    republish: Republish,
+    guard: Option<Released>,
+) -> impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>> {
+    let cued = futures::StreamExt::then(
+        futures::stream::iter(republish.frames),
+        |(cue, frame)| async move {
+            cue.notified().await;
+            Ok(axum::response::sse::Event::default().data(frame))
+        },
+    );
+    futures::StreamExt::chain(cued, held(guard))
 }
 
 /// A stream held open until this host is rebuilt, which ends it.
