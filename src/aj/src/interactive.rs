@@ -2463,6 +2463,22 @@ async fn apply_command_action(
             ActionEffect::Redraw
         }
         CommandAction::OpenPromptHistory => {
+            // NOTE: the scan walks this process's own session store (see
+            // `spawn_history_scan`), so over a connection the overlay would
+            // answer about the client's machine while looking like the
+            // session's history. Refusing is the honest answer until a
+            // host-side history read exists (spec 13 banks the shape).
+            if world.control.is_remote() {
+                fold_notice(
+                    world,
+                    &remote_unsupported_notice(
+                        "search prompt history",
+                        "the prompts come off this machine's own session logs, \
+                         so run it on the host",
+                    ),
+                );
+                return ActionEffect::Redraw;
+            }
             let handles = shell.borrow().overlay_handles();
             open_prompt_history(
                 &handles.stack,
@@ -6085,19 +6101,27 @@ async fn drive(
                                     // confirm left on the stack and return to
                                     // the transcript. Within this one input
                                     // turn nothing else touched the stack, so
-                                    // `top()` is the palette. A `back()` on an
-                                    // empty stack is a safe no-op (it never
-                                    // runs for the direct-chord entry, which
-                                    // returns `OpenedOverlay`). Bind and drop
-                                    // the borrow in this statement so no
-                                    // RefCell ref outlives it.
-                                    shell.borrow().overlays.borrow_mut().back();
-                                    // Focus `top()` (now the uncovered parent,
-                                    // or the editor when the stack emptied).
-                                    app.post_app_event(UserEvent {
-                                        name: REFOCUS_OVERLAY_EVENT.to_string(),
-                                        data: None,
-                                    });
+                                    // `top()` is the palette.
+                                    //
+                                    // Gated on an open stack because a direct
+                                    // chord reaches here too, when its opener
+                                    // declines: there is no palette to pop,
+                                    // and the refocus would pull focus to the
+                                    // editor, dropping the transcript-focus
+                                    // cursor a refusal has no business
+                                    // touching. Bind and drop the borrows in
+                                    // their own statements so no RefCell ref
+                                    // outlives them.
+                                    if shell.borrow().overlays.borrow().is_open() {
+                                        shell.borrow().overlays.borrow_mut().back();
+                                        // Focus `top()` (now the uncovered
+                                        // parent, or the editor when the stack
+                                        // emptied).
+                                        app.post_app_event(UserEvent {
+                                            name: REFOCUS_OVERLAY_EVENT.to_string(),
+                                            data: None,
+                                        });
+                                    }
                                     app.request_redraw();
                                 }
                             }
@@ -18231,10 +18255,12 @@ mod tests {
     /// A gesture connect mode has no path for folds a notice naming why, rather
     /// than silently doing nothing (spec 9.1).
     ///
-    /// What is left is the two that are genuinely about this machine: an export
-    /// writes a file where the log is, and the session selector previews this
-    /// process's own store. Session switching and creation are no longer among
-    /// them, see `connect_mode_creates_and_switches_sessions`.
+    /// These are the three this arm refuses, all of them about this machine: an
+    /// export writes a file where the log is, the session selector previews
+    /// this process's own store, and prompt history scans that store's logs.
+    /// The session-info overlay refuses too, in its fill rather than here, see
+    /// `spawn_overlay_fetch`. Session switching and creation are no longer
+    /// among them, see `connect_mode_creates_and_switches_sessions`.
     #[tokio::test]
     async fn connect_mode_refuses_the_gestures_about_this_machine() {
         let dir = TempDir::new().expect("tempdir");
@@ -18250,9 +18276,20 @@ mod tests {
                 CommandAction::OpenSessionSelector,
                 "a connection's sessions are the ones in the sidebar",
             ),
+            (
+                CommandAction::OpenPromptHistory,
+                "this machine's own session logs",
+            ),
         ] {
             let before = main_notices(&world).len();
             apply_command(&mut world, &shell, action).await;
+            // The harm first, then the notice: what a refusal has to prevent is
+            // the read of this machine's store, and prompt history parks its
+            // scan the moment the overlay is built.
+            assert!(
+                shell.borrow().take_history_fetch().is_none(),
+                "{action:?} asked for a scan of this machine's store",
+            );
             let notices = main_notices(&world);
             assert!(
                 notices.len() > before
@@ -18266,6 +18303,138 @@ mod tests {
                 "{action:?} opened no overlay"
             );
         }
+        remote.shutdown().await;
+    }
+
+    /// The refusal is what the keyboard gets, not just what the arm returns:
+    /// `Ctrl+R` over a connection travels the real path (input bytes, the
+    /// composed tree, the drive loop's own drain) and comes back a notice.
+    ///
+    /// And it changes nothing else. The chord is reachable from
+    /// transcript-focus mode, where the palette-entry path's pop-and-refocus
+    /// would drop the item cursor the user is navigating with, so the mode
+    /// surviving the refusal is pinned here too.
+    #[tokio::test]
+    async fn the_history_chord_refuses_over_a_connection_and_disturbs_nothing() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut app, mut writer, root) = app_over(&shell).await;
+
+        // Transcript focus needs a user message to land on, so take a turn
+        // first. Tab then engages the mode.
+        assert!(handle_submit(&mut world, "over the wire".to_string()).await);
+        settle(&mut world).await;
+        press(&mut app, &mut writer, b"\t").await;
+        let transcript = Rc::clone(&shell.borrow().transcript);
+        assert!(
+            transcript.borrow().in_focus_mode(),
+            "the fixture never reached transcript focus, so the mode assertion \
+             below measures nothing",
+        );
+
+        // Ctrl+R, then EOF so the loop returns. Both are in the buffer before
+        // the loop reads either, and nothing reaches into the shell between
+        // them: a chord that parks nothing, or a drain that never runs the
+        // command, leaves the notice unfolded and fails here.
+        writer.write_all(&[0x12]).expect("ctrl+r");
+        drop(writer);
+        let mut theme_watch = inert_theme_watch();
+        let mut prompt_history_rx: Option<UnboundedReceiver<Vec<String>>> = None;
+        let mut autocomplete_rx = shell
+            .borrow()
+            .editor
+            .borrow_mut()
+            .take_autocomplete_rx()
+            .expect("editor hands out its autocomplete receiver once");
+        let exit = drive(
+            &mut app,
+            &root,
+            &shell,
+            &mut world,
+            &mut theme_watch,
+            &mut prompt_history_rx,
+            &mut autocomplete_rx,
+        )
+        .await
+        .expect("drive exits without a fatal error");
+        assert!(matches!(exit, SessionExit::Quit), "EOF ends the loop");
+
+        // The overlay is where the scan is requested (`open_prompt_history`
+        // parks it as it builds), and the loop drains that slot itself, so on
+        // this path a closed overlay is the observable that no scan ran.
+        assert!(
+            !shell.borrow().overlays.borrow().is_open(),
+            "the chord opened the overlay instead of refusing",
+        );
+        assert!(
+            main_notices(&world)
+                .last()
+                .is_some_and(|n| n.contains("Can't search prompt history over a connection")),
+            "the chord folded the refusal: {:?}",
+            main_notices(&world),
+        );
+        assert!(
+            transcript.borrow().in_focus_mode(),
+            "the refusal stole focus from the transcript",
+        );
+        remote.shutdown().await;
+    }
+
+    /// And the palette entry to the same refusal keeps its own behavior: the
+    /// palette the confirm left on the stack is popped, so the transcript is
+    /// what the user comes back to.
+    ///
+    /// This is the other side of the drive loop's declined-opener gate. Both
+    /// sides run the real loop, because the two differ only in what the loop
+    /// finds on the overlay stack.
+    #[tokio::test]
+    async fn the_history_palette_command_refuses_and_closes_the_palette() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut app, mut writer, root) = app_over(&shell).await;
+
+        // Ctrl+O, the query that filters to the one row, Enter to confirm, then
+        // EOF. All buffered before the loop reads any of it.
+        writer.write_all(&[0x0f]).expect("ctrl+o");
+        writer.write_all(b"history\r").expect("query + enter");
+        drop(writer);
+        let mut theme_watch = inert_theme_watch();
+        let mut prompt_history_rx: Option<UnboundedReceiver<Vec<String>>> = None;
+        let mut autocomplete_rx = shell
+            .borrow()
+            .editor
+            .borrow_mut()
+            .take_autocomplete_rx()
+            .expect("editor hands out its autocomplete receiver once");
+        let exit = drive(
+            &mut app,
+            &root,
+            &shell,
+            &mut world,
+            &mut theme_watch,
+            &mut prompt_history_rx,
+            &mut autocomplete_rx,
+        )
+        .await
+        .expect("drive exits without a fatal error");
+        assert!(matches!(exit, SessionExit::Quit), "EOF ends the loop");
+
+        // The notice is also the fixture check: it exists only if the palette
+        // opened, filtered to the history row, and confirmed it.
+        assert!(
+            main_notices(&world)
+                .last()
+                .is_some_and(|n| n.contains("Can't search prompt history over a connection")),
+            "the palette never confirmed the command, so this test measures \
+             nothing: {:?}",
+            main_notices(&world),
+        );
+        assert!(
+            !shell.borrow().overlays.borrow().is_open(),
+            "the refusal left the palette on the stack",
+        );
         remote.shutdown().await;
     }
 
