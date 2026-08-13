@@ -1974,12 +1974,21 @@ async fn a_configured_hosts_contact_under_a_new_id_replaces_the_old_identity() {
         vec!["after".to_string(), "other".to_string()],
         "the group of the store that is gone is still there: {directory:?}",
     );
-    assert!(
-        !directory
+    // The rows a client can see now that the rebuilt host has published its own
+    // directory. That `list` arrives moments after the identity is adopted and
+    // replaces a stale row either way, so what the adoption itself drops is
+    // pinned where that ordering cannot hide it, in `Directory::adopt`'s own
+    // test.
+    assert_eq!(
+        directory
             .sessions
             .iter()
-            .any(|row| row.host.as_deref() == Some("before")),
-        "and so are its rows, which name sessions that went with it: {directory:?}",
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["other:s-9", "after:s-2"],
+        "the rebuilt store's own row and the other host's, and nothing else: a \
+         row left over from the store that is gone names a session no id here \
+         holds: {directory:?}",
     );
     let adopted = recorded(&fixture).configured_ids;
     assert!(
