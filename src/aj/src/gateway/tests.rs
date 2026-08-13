@@ -3292,6 +3292,100 @@ async fn a_stream_refuses_the_ids_it_cannot_resolve_and_serves_both_hosts() {
     right.stop().await;
 }
 
+/// The refusals an attach owes are answers to that attach, not live fan-out: a
+/// client naming more ids this gateway cannot resolve than its queue can hold is
+/// served every one of them, and the sessions it holds on real hosts with them
+/// (spec 6.5, 7.1).
+///
+/// A client whose refusals travelled its own bounded queue would be evicted by
+/// its own attach, and the re-attach it made to recover would be evicted the
+/// same way: a sidebar restored with stale ids could never attach again at all.
+///
+/// Two hosts, because what a stream failing here costs is every session on every
+/// other host. The bound is deliberately smaller than the number of dead ids and
+/// checked against it, because a queue that could hold them all would measure
+/// nothing. No turn is driven afterwards: a bound of two makes live fan-out a
+/// race of its own, and what this is about is the attach.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn more_dead_ids_than_the_bound_do_not_evict_the_client_that_named_them() {
+    let mut left = Upstream::start().await;
+    let mut right = Upstream::start().await;
+    let here = left.create().await;
+    let there = right.create().await;
+    let bound = NonZeroUsize::new(2).expect("non-zero");
+    let fixture = Fixture::tuned(
+        TempDir::new().expect("tempdir"),
+        [&left, &right]
+            .iter()
+            .map(|host| HostAddress::parse(&host.address()).expect("a host address"))
+            .collect(),
+        Tuning {
+            outbound_queue: bound,
+            ..tuning()
+        },
+    )
+    .await;
+    let (here, there) = (left.namespaced(&here), right.namespaced(&there));
+    fixture.row(&here).await;
+    fixture.row(&there).await;
+    // Ids under namespaces no host here answers to, so each is this gateway's own
+    // refusal rather than a host's.
+    let dead: Vec<String> = (0..8).map(|n| format!("0123456789abcde{n}:gone")).collect();
+    assert!(
+        dead.len() > bound.get(),
+        "{} dead ids against a bound of {}: a queue that holds them all is not \
+         the queue this test is about",
+        dead.len(),
+        bound.get(),
+    );
+
+    let attaching: Vec<AttachRequest> = dead
+        .iter()
+        .map(|id| attach(id))
+        .chain([attach(&here), attach(&there)])
+        .collect();
+    let mut events = fixture.attach(&attaching).await;
+
+    // Every refusal and both blocks. A stream evicted by its own attach ends
+    // here, which is the harm this is about.
+    let mut blocks = 0;
+    let mut refusals = 0;
+    let opened = frames_until(&mut events, "every refusal and both blocks", |frame| {
+        match frame {
+            Frame::CaughtUp { .. } => blocks += 1,
+            Frame::Error { .. } => refusals += 1,
+            _ => {}
+        }
+        blocks == 2 && refusals == dead.len()
+    })
+    .await;
+    assert_eq!(
+        refused_sessions(opened.iter()),
+        dead.iter().map(String::as_str).collect::<Vec<_>>(),
+        "each id the client named, refused by the name it gave it: {opened:?}",
+    );
+    let mut served: Vec<&str> = opened
+        .iter()
+        .filter(|frame| is_caught_up(frame))
+        .filter_map(Frame::session)
+        .collect();
+    served.sort_unstable();
+    assert_eq!(
+        served,
+        {
+            let mut both = vec![here.as_str(), there.as_str()];
+            both.sort_unstable();
+            both
+        },
+        "and both hosts' sessions served on the stream those refusals shared: \
+         {opened:?}",
+    );
+
+    fixture.shutdown().await;
+    left.stop().await;
+    right.stop().await;
+}
+
 /// The owning host's refusal of an attach travels back, code and all: the client
 /// asked the question and the host answered it (spec 6.10).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
