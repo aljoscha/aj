@@ -1955,6 +1955,22 @@ async fn a_configured_hosts_contact_under_a_new_id_replaces_the_old_identity() {
         !torn_down.ended,
         "the client's whole stream ended over one host being rebuilt: {torn_down:?}",
     );
+    // The window a second `reset` would have arrived in, and the other host's own
+    // stream. Both pumps would answer a teardown of both at once, in whichever
+    // order the scheduler picked, so reading until the first reset says nothing
+    // about the host that was not rebuilt.
+    let others = frames_within(&mut events, QUIET).await;
+    assert!(
+        !resets(&others).contains(&"other:s-9".to_string()),
+        "the host that was not rebuilt was asked to re-attach a session it never \
+         lost: {others:?}",
+    );
+    assert_eq!(
+        other.released(),
+        0,
+        "and its upstream went down with the identity that was replaced, which is \
+         the collateral a client attached across hosts cannot afford",
+    );
 
     // And the fresh contact behind it: the new identity is the namespace now,
     // and the rows under it are the rebuilt store's own.
