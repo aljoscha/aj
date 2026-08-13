@@ -3754,6 +3754,16 @@ async fn a_reattach_while_a_host_is_down_waits_for_it_to_return() {
         vec![waiting.clone()],
         "the host came back, so its sessions are asked to attach again: {returned:?}",
     );
+    // And the window a second `reset` would have arrived in. Which reset comes
+    // first is the order of a map over host ids, so reading until the first one
+    // says nothing about the session that never lost continuity: being asked to
+    // re-attach that one costs the client a backfill it did not need.
+    let others = frames_within(&mut events, QUIET).await;
+    assert!(
+        !resets(&others).contains(&watched),
+        "one host's return reset a session on the host that was there all along: \
+         {others:?}",
+    );
 
     fixture.shutdown().await;
     down.stop().await;
