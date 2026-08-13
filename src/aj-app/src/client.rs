@@ -959,6 +959,38 @@ mod tests {
         );
     }
 
+    /// Inside a block the cursor does not move per frame, so a durable
+    /// frame that came out below an earlier one still applies (spec 6.5).
+    ///
+    /// The block is atomic and its `caught_up` commits it once, which is
+    /// what lets the projection order its events by thread bracketing
+    /// rather than by seq. Advancing per frame would make the cursor
+    /// invariant read everything after the first descent as a duplicate,
+    /// and a thread-scoped backfill would lose most of its rows to it.
+    #[test]
+    fn a_block_keeps_a_frame_that_came_out_below_an_earlier_one() {
+        let (mut client, mut chat) = attached();
+
+        client.expect_attach();
+        let _ = client.apply(&mut chat, state(EPOCH, false));
+        let _ = client.apply(&mut chat, durable(EPOCH, 9, "entry-9", notice("nine")));
+        let _ = client.apply(&mut chat, durable(EPOCH, 5, "entry-5", notice("five")));
+        let _ = client.apply(&mut chat, caught_up(EPOCH, 9));
+
+        assert_eq!(
+            notices(&chat),
+            vec!["nine", "five"],
+            "a block frame below an earlier one was dropped as a duplicate",
+        );
+        assert_eq!(
+            client.cursor().map(|cursor| cursor.seq),
+            Some(9),
+            "the block committed whole at its own mark, which is also what \
+             says this fixture was inside one: a `caught_up` outside a block \
+             commits nothing",
+        );
+    }
+
     #[test]
     fn an_unknown_durable_event_advances_the_cursor() {
         let (mut client, mut chat) = attached();
