@@ -148,6 +148,20 @@ Then connect a client:
 aj connect http://gateway-host:6160
 ```
 
+With more than one host enrolled, a create has to name the host it is for,
+because a session runs an agent in that host's working directory and the
+gateway will not guess (section 6.6 of the remote-control spec). In the TUI the
+create action asks: it opens a picker over the enrolled hosts, with nothing
+selected until you say so. A run with no terminal to ask names the host itself:
+
+```sh
+aj connect http://gateway-host:6160 --new --host 290dc828
+```
+
+The value is a host id, or any prefix of one that only a single host answers to
+(`/v1/hosts` lists them). A value that fits none of them, or several, is refused
+with the candidates listed rather than resolved to a guess.
+
 ## What a restart costs
 
 Restarting a **host** ends its clients' streams and drops sessions that

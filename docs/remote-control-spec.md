@@ -1248,6 +1248,14 @@ recently modified session, and creates one when the host has none.
 `aj connect <url> --new` forces creation, and an optional session-id
 argument attaches a specific one. This is why session creation is
 part of phase 2, a fresh `aj serve` would otherwise be unreachable.
+Through a gateway a create has to name a host once more than one is
+enrolled (section 6.6), which `--host <id>` does for a run with no
+terminal to ask: a host id, or a prefix only one host answers to,
+resolved client-side to the full id the peer matches on. A value that
+fits none of them or several is refused with the candidates listed,
+before the terminal is taken over. A run that attaches a session
+rather than creating one reports that the flag had nothing to point
+at, as `--tag` does.
 
 Not every local action can work over the wire, and the boundary is
 explicit rather than discovered. Supported in connect mode from phase
@@ -1320,6 +1328,14 @@ an explicit toggle wins over the default for the rest of the process.
   strip stays hidden and nothing changes. Creating a new session from
   the sidebar goes through the create command (choosing a host when
   connected to a gateway).
+- Choosing that host is explicit, and only asked for when the answer is
+  open: a plain host and a single-host gateway create in one gesture,
+  because the peer answers it itself (section 6.6). From two hosts up
+  the create action opens a selector over the hosts the directory
+  names, and the chosen one fills the create's `host` field. Nothing is
+  selected when it opens, so a confirm that names no host creates
+  nothing: a create runs an agent in a working directory, and a wrong
+  one is not a cosmetic miss. Cancelling creates nothing either.
 
 Keyboard model, exact layout, and glyph choices are left to
 implementation taste within existing TUI conventions, with one

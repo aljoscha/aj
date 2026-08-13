@@ -25,9 +25,7 @@ mod enrollment;
 mod link;
 mod naming;
 mod outbound;
-// Crate-visible for the same reason `remote`'s server is: a gateway is a peer a
-// client dials, so the tests that drive a client stand one up.
-pub(crate) mod server;
+mod server;
 mod splice;
 
 #[cfg(test)]
@@ -52,7 +50,7 @@ use crate::gateway::config::{AddressError, GatewayConfig, HostAddress};
 use crate::gateway::directory::{Adopted, Directory, DirectoryError, HostTarget, Route};
 use crate::gateway::enrollment::{EnrollmentError, EnrollmentFile};
 use crate::gateway::link::Link;
-use crate::gateway::server::GatewayServer;
+pub(crate) use crate::gateway::server::GatewayServer;
 use crate::gateway::splice::Splice;
 use crate::remote::{RemoteClient, RemoteError};
 

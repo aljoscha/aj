@@ -3,27 +3,29 @@
 //! (spec 6.6, 9.2).
 //!
 //! A create runs an agent in a working directory, so which host it lands on is
-//! never guessed. A plain host serves one directory and a gateway with a single
-//! enrolled host has only one answer, so nothing is asked there and the create
-//! stays one gesture. From two hosts up the answer is the user's to give:
-//! [`choice_is_ambiguous`] says when it has to be asked for, the overlay asks
-//! at a terminal, and [`resolve_host`] answers for a run that has none.
+//! never guessed. A peer with one answer gives it itself, which is what an
+//! absent host field on the wire asks it to do, so a plain host and a
+//! single-host gateway keep their one-gesture create. From two hosts up the
+//! answer is the user's to give: the overlay asks for it at a terminal, and
+//! [`resolve_host`] takes it from the command line for a run that has none.
 //!
 //! # Nothing is chosen on the operator's behalf
 //!
 //! The overlay opens with no host selected. Its first row is a sentinel that
-//! names no host: the band sits there, Enter on it does nothing at all (its
-//! filter key is absent from the id map, exactly as the session selector's
-//! loading row is), and the empty filter key drops it out of the visible set as
-//! soon as anything is typed. So a host is reached only by an affirmative act, a
-//! cursor move or a filter, and a reflexive Enter cannot mint a session
-//! anywhere. Pre-selecting a plausible row would put the create back on a host
-//! nobody named, which is the failure this overlay exists to remove.
+//! names none: the band starts there, a confirm on it does nothing at all, and
+//! its empty filter key drops it out of the visible set as soon as anything is
+//! typed. So a host is reached only by an affirmative act, a cursor move or a
+//! filter, and a reflexive confirm cannot mint a session anywhere.
+//! Pre-selecting a plausible row would put the create back on a host nobody
+//! named, which is the failure this overlay exists to remove.
 //!
-//! A host a gateway has never spoken to has no id, and an id is the only thing
-//! a create can name one by (spec 7.1). Such a host gets a row all the same,
-//! inert by the same mechanism and saying why: a pickable row would be a lie,
-//! and no row at all would be a different one in a list of the peer's hosts.
+//! Rows that name no host this create can be for are inert by one mechanism:
+//! their filter key is absent from the id map the confirm resolves through, so
+//! the callback returns having done nothing and the overlay stays open. Besides
+//! the sentinel that is a host the gateway has never spoken to, which has no id
+//! and so nothing a create could name it by (spec 7.1). It gets a row anyway,
+//! saying why: a pickable row would be a lie, and no row at all would be a
+//! different one in a list of the peer's hosts.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -34,52 +36,60 @@ use aj_wire::DirectoryHost;
 use vaxis::vxfw::{FilterableSelect, SelectItem, to_widget_ref};
 
 use crate::interactive::OverlayHandles;
-use crate::overlay::{OverlayPlacement, close_all, close_key_label, close_top, confirm_key_label};
+use crate::overlay::{OverlayPlacement, close_all, close_top, subtitle_confirm_close};
 use crate::settings_ui::push_window;
 
-/// The sentinel row's filter key. Empty, so it matches only the empty query and
-/// is absent from the id map, which is what makes the row inert.
-const NOTHING_CHOSEN: &str = "";
+/// What a row shows for a host that carries neither of the two names a gateway
+/// can give one, which is a shape no peer sends.
+const UNNAMED: &str = "an unnamed host";
 
-/// What a client calls `host`: its id, or the address a gateway has only ever
-/// known it by (spec 7.1).
+/// A name with something in it, or `None`.
 ///
-/// A gateway names every enrolled host by exactly one of the two, so the
-/// fallback covers a shape no peer sends.
+/// An empty id is not an id: no peer can resolve a create against it, and a row
+/// keyed on it would collide with the sentinel's own empty key and make that row
+/// confirmable. So one is treated exactly like an absent name, here and
+/// everywhere either name is read.
+fn named(name: &Option<String>) -> Option<&str> {
+    name.as_deref().filter(|name| !name.is_empty())
+}
+
+/// What a row calls `host`, for display only: its id, or the address a gateway
+/// has only ever known it by (spec 7.1).
+///
+/// The address is a label and never something a create can name (spec 6.8), so
+/// a row labelled with one is not a row that can be picked. See [`rows`].
 fn host_label(host: &DirectoryHost) -> &str {
-    host.id
-        .as_deref()
-        .or(host.address.as_deref())
-        .unwrap_or("an unnamed host")
+    named(&host.id)
+        .or_else(|| named(&host.address))
+        .unwrap_or(UNNAMED)
 }
 
 /// Whether a create has to be told which host it is for.
 ///
-/// True from two hosts up. A peer that publishes one host or none has exactly
-/// one answer and gives it itself, which is what an absent host field on the
-/// wire asks it to do (spec 6.6).
+/// True from two hosts up, which is exactly where a gateway stops defaulting
+/// the absent host field and refuses instead (spec 6.6). Below that the peer
+/// answers the question itself, whether by having one host to default to or by
+/// having none and saying so.
 pub(crate) fn choice_is_ambiguous(hosts: &[DirectoryHost]) -> bool {
     hosts.len() > 1
 }
 
 /// Why a `--host` value did not name one host.
 ///
-/// Both arms list what the user could have said, which is the vocabulary the
-/// gateway's own refusal uses. Neither list is ever empty: a match set that
+/// Every arm lists what could have been said instead, which is the vocabulary
+/// the gateway's own refusals use. Neither list is ever empty: a match set that
 /// disambiguates nothing holds at least two, and [`resolve_host`] is not called
 /// with no candidates.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum HostQueryError {
-    #[error("{query:?} names none of this peer's hosts: {}", candidates.join(", "))]
+    #[error("an empty value names no host: give an id, or a prefix only one host answers to")]
+    Blank,
+    #[error("{query:?} names no host here: {}", candidates.join(", "))]
     NoMatch {
         query: String,
         candidates: Vec<String>,
     },
-    #[error(
-        "{query:?} names {} of this peer's hosts: {}",
-        matched.len(),
-        matched.join(", ")
-    )]
+    #[error("{query:?} names {} hosts here: {}", matched.len(), matched.join(", "))]
     Ambiguous { query: String, matched: Vec<String> },
 }
 
@@ -90,16 +100,24 @@ pub(crate) enum HostQueryError {
 /// takes to be unique. What comes back is always the full id, because that is
 /// the only form a peer resolves a create against (spec 6.6).
 ///
-/// A host with no id is no candidate: a create cannot name it (spec 7.1). It is
-/// still listed among the candidates a refusal names, so an operator who typed
-/// its address is told what they are looking at rather than that it does not
-/// exist.
+/// A blank value is refused rather than read as a prefix, which every id starts
+/// with: a script whose host variable came out empty has named nothing, and
+/// resolving that against a peer that happens to have one host would be the
+/// guess this whole path exists to avoid.
+///
+/// A host with no id is no candidate, because a create cannot name it (spec
+/// 7.1). It is still listed among the candidates a refusal names, so an
+/// operator who typed its address is shown what they are looking at rather than
+/// told it does not exist.
 ///
 /// `hosts` is expected to hold at least one entry. A peer with no hosts has
 /// nothing to resolve against and nothing to create on either, which is the
 /// peer's own refusal to word.
 pub(crate) fn resolve_host(hosts: &[DirectoryHost], query: &str) -> Result<String, HostQueryError> {
-    let ids = || hosts.iter().filter_map(|host| host.id.as_deref());
+    if query.is_empty() {
+        return Err(HostQueryError::Blank);
+    }
+    let ids = || hosts.iter().filter_map(|host| named(&host.id));
     if let Some(exact) = ids().find(|id| *id == query) {
         return Ok(exact.to_string());
     }
@@ -121,7 +139,7 @@ pub(crate) fn resolve_host(hosts: &[DirectoryHost], query: &str) -> Result<Strin
 }
 
 /// Open the host picker over `hosts`. A confirmed host row parks a
-/// [`SessionRequest::New`] naming it in `handles.session_request`; the sentinel
+/// [`SessionRequest::New`] naming it in `handles.session_request`. The sentinel
 /// row, a host with no id, and Esc park nothing, so nothing is minted. Does not
 /// move focus: the caller posts the refocus event.
 pub(crate) fn open_host_picker(handles: &OverlayHandles, hosts: &[DirectoryHost]) {
@@ -134,20 +152,21 @@ pub(crate) fn open_host_picker(handles: &OverlayHandles, hosts: &[DirectoryHost]
     let ids = Rc::new(ids);
     {
         let mut sel = select.borrow_mut();
+        // A gateway may hold more hosts than the overlay has rows for.
+        sel.set_show_scrollbar(true);
         let ids_c = Rc::clone(&ids);
         let request_c = Rc::clone(&handles.session_request);
         let stack_c = Rc::clone(&handles.stack);
         let editor_c = Rc::clone(&handles.editor);
         sel.on_confirm = Some(Box::new(move |ctx, item| {
-            // A row that names no host this create can be for: the sentinel the
-            // picker opens on, or a host the gateway has never reached. Leave
-            // the overlay open, having done nothing.
             let Some(host) = ids_c.get(&item.filter_key) else {
                 return;
             };
             *request_c.borrow_mut() = Some(SessionRequest::New {
                 host: Some(host.clone()),
             });
+            // A confirmed pick is terminal: tear the whole stack down back to
+            // the transcript, matching the other selectors.
             close_all(&stack_c, ctx, &editor_c);
         }));
         let stack_cancel = Rc::clone(&handles.stack);
@@ -159,8 +178,8 @@ pub(crate) fn open_host_picker(handles: &OverlayHandles, hosts: &[DirectoryHost]
     push_window(
         &handles.stack,
         &handles.chrome,
-        "New session on",
-        subtitle(),
+        "New session",
+        subtitle_confirm_close(),
         to_widget_ref(Rc::clone(&select)),
         focus,
         OverlayPlacement::Small,
@@ -171,40 +190,28 @@ pub(crate) fn open_host_picker(handles: &OverlayHandles, hosts: &[DirectoryHost]
 /// confirm resolves a row through (the callback sees only the filter key).
 ///
 /// A row's filter key is its label, so typing any part of an id or an address
-/// finds it. Only a host with an id reaches the map, which is what leaves every
-/// other row inert.
+/// finds it. Only a host with an id reaches the map.
 fn rows(hosts: &[DirectoryHost]) -> (Vec<SelectItem>, HashMap<String, String>) {
-    let mut items = vec![
-        SelectItem::new("no host chosen", NOTHING_CHOSEN)
-            .with_description("move to a host below, then confirm"),
-    ];
+    // The sentinel's filter key is empty, which is both what keeps it out of the
+    // map and what makes any query at all drop it from the list.
+    let mut items =
+        vec![SelectItem::new("no host chosen", "").with_description("move to one, then confirm")];
     let mut ids = HashMap::new();
     for host in hosts {
         let label = host_label(host);
         let mut item = SelectItem::new(label, label);
-        match (&host.id, host.unreachable) {
-            (Some(id), unreachable) => {
-                ids.insert(label.to_string(), id.clone());
-                if unreachable {
+        match named(&host.id) {
+            Some(id) => {
+                ids.insert(label.to_string(), id.to_string());
+                if host.unreachable {
                     item = item.with_description("unreachable");
                 }
             }
-            // No id, so nothing a create can name: the gateway has never
-            // spoken to this host and does not invent an id for it (spec 7.1).
-            (None, _) => item = item.with_description("never reached, nothing to create on yet"),
+            None => item = item.with_description("never reached, nothing to create on yet"),
         }
         items.push(item);
     }
     (items, ids)
-}
-
-/// The window subtitle: what confirming does, and how to leave.
-fn subtitle() -> String {
-    format!(
-        "{} to create the session there  \u{2022}  {} to cancel",
-        confirm_key_label(),
-        close_key_label(),
-    )
 }
 
 #[cfg(test)]
@@ -247,15 +254,20 @@ mod tests {
 
     /// The row the picker opens on names no host, so it is absent from the id
     /// map and a confirm on it can resolve to nothing. This is what a bare
-    /// Enter lands on.
+    /// confirm lands on.
     #[test]
     fn the_first_row_names_no_host() {
         let (items, ids) = rows(&[learned("aaa"), learned("bbb")]);
-        assert_eq!(items[0].filter_key, NOTHING_CHOSEN);
         assert_eq!(
             ids.get(&items[0].filter_key),
             None,
             "the row the band opens on must resolve to no host at all",
+        );
+        assert!(
+            items[0].filter_key.is_empty(),
+            "and its key has to be empty, which is what drops the row from the \
+             list as soon as a query is typed: {:?}",
+            items[0].filter_key,
         );
         assert_eq!(items.len(), 3, "the sentinel plus one row per host");
     }
@@ -289,6 +301,33 @@ mod tests {
         assert_eq!(descriptions[3], Some("unreachable"));
     }
 
+    /// An id with nothing in it is not a name: it cannot be picked, and it
+    /// cannot make the sentinel row confirmable by colliding with its key.
+    ///
+    /// The client does not police the id grammar a gateway enforces at
+    /// enrollment, so this is the peer's word for a host, taken as it arrives.
+    #[test]
+    fn an_empty_id_leaves_the_sentinel_inert() {
+        let (items, ids) = rows(&[
+            DirectoryHost {
+                id: Some(String::new()),
+                address: None,
+                unreachable: false,
+            },
+            learned("bbb"),
+        ]);
+        assert_eq!(
+            ids.get(&items[0].filter_key),
+            None,
+            "a bare confirm on the first row still names no host",
+        );
+        assert_eq!(
+            items[1].label, UNNAMED,
+            "and the host with the empty id is listed as one that cannot be named",
+        );
+        assert_eq!(ids.len(), 1, "only the real host is pickable: {ids:?}");
+    }
+
     /// An exact id resolves, and it wins over a prefix relation: an id that is
     /// a prefix of a longer one is still that host's own name.
     #[test]
@@ -296,6 +335,16 @@ mod tests {
         let hosts = [learned("abc"), learned("abcdef")];
         assert_eq!(resolve_host(&hosts, "abc").expect("exact"), "abc");
         assert_eq!(resolve_host(&hosts, "abcd").expect("prefix"), "abcdef");
+    }
+
+    /// Only a prefix resolves, never an interior run of characters. A value
+    /// that appears in the middle of an id names it no more than a value that
+    /// appears in none of them.
+    #[test]
+    fn an_interior_substring_is_not_a_prefix() {
+        let hosts = [learned("abcdef")];
+        let err = resolve_host(&hosts, "cde").expect_err("not a prefix");
+        assert!(matches!(err, HostQueryError::NoMatch { .. }), "{err:?}");
     }
 
     /// A prefix that fits several hosts is refused with those hosts named, not
@@ -312,6 +361,21 @@ mod tests {
             message.contains("abc") && message.contains("abd"),
             "the refusal names what could have been meant: {message}",
         );
+    }
+
+    /// A blank value is refused wherever it lands, including against the one
+    /// host a peer that has exactly one would otherwise resolve it to. A script
+    /// whose host variable came out empty named nothing.
+    #[test]
+    fn a_blank_value_names_no_host() {
+        for hosts in [vec![learned("abc")], vec![learned("abc"), learned("bcd")]] {
+            let err = resolve_host(&hosts, "").expect_err("a blank value resolves to nothing");
+            assert!(
+                matches!(err, HostQueryError::Blank),
+                "{err:?} against {} host(s)",
+                hosts.len(),
+            );
+        }
     }
 
     /// A value nothing answers to is refused with every host listed, including

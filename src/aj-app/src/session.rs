@@ -99,14 +99,11 @@ pub enum SessionExit {
 /// turn in flight.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SessionRequest {
-    /// Mint a session on `host`, which names one of the peer's hosts when the
-    /// peer serves several and the user picked one.
+    /// Mint a session, on `host` when the user named one of the peer's hosts.
     ///
-    /// `None` means the peer decides, which is what the wire's absent host
-    /// field means: the one working directory a plain host serves, or the sole
-    /// host of a gateway that has one. A peer with a choice to make refuses
-    /// that rather than guessing, so the frontend asks before parking the
-    /// request (spec 6.6).
+    /// `None` leaves the choice to the peer, which is what an absent host field
+    /// on the wire asks for (spec 6.6). A peer that will not answer it is asked
+    /// the question by the frontend before the request is parked.
     New {
         host: Option<String>,
     },

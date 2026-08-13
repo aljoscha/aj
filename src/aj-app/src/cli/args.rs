@@ -154,6 +154,18 @@ impl Args {
         }
     }
 
+    /// The host `--host` named, for the session a `connect` run creates.
+    ///
+    /// Subcommand-scoped rather than global like `--tag`: a create through a
+    /// gateway is the only thing it can point at, and `connect` is the only
+    /// mode that reaches one.
+    pub fn connect_host(&self) -> Option<&str> {
+        match &self.command {
+            Some(Command::Connect { host, .. }) => host.as_deref(),
+            _ => None,
+        }
+    }
+
     /// Whether `--tag` carries a label for this run to give a session.
     ///
     /// The normalized answer, so a flag that names nothing reads as no flag,
@@ -172,6 +184,14 @@ impl Args {
 /// be a second meaning for one flag, so the run reports instead.
 pub const TAG_WITHOUT_A_CREATE: &str = "--tag has nothing to name: this run resumed a session rather than creating one. \
      Use the session-tag command to relabel it.";
+
+/// What a run says when `--host` named a host for a session it never created.
+///
+/// The flag names where a session is minted. A run that attached one instead is
+/// looking at a session that already lives on a host, and moving it is not
+/// something the flag or anything else can do.
+pub const HOST_WITHOUT_A_CREATE: &str = "--host has nothing to point at: this run attached an existing session rather than \
+     creating one, and a session stays on the host that holds it.";
 
 /// Control-port address a bare `--listen` binds: loopback, because the
 /// port is remote code execution and the identity gate's default mode
@@ -254,8 +274,10 @@ pub enum Command {
         /// the only value it may name is that host's own id, which is what the
         /// host itself accepts (spec 6.6).
         ///
-        /// Consulted only by a create. A run that attaches an existing session
-        /// creates nothing for it to point at, exactly as for `--tag`.
+        /// A create is all it can point at, and it is resolved on every run
+        /// that carries it, so a stale or misspelled value is refused rather
+        /// than dropped. A run that ends up attaching an existing session
+        /// reports [`HOST_WITHOUT_A_CREATE`], as `--tag` does.
         #[arg(long, value_name = "HOST")]
         host: Option<String>,
         /// Launch input for the attached session, interpreted exactly like

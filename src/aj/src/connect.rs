@@ -88,32 +88,34 @@ pub(crate) async fn connect(
 /// The full id of the host `--host` named, refused before the terminal is
 /// taken over.
 ///
-/// The candidates are the hosts the peer publishes, which is a gateway's
-/// enrollments and nothing at all from a plain host (spec 7.1). A plain host is
-/// its own single candidate, named by the id it introduced itself with, which is
-/// also the only value its create route accepts (spec 6.6). The two are told
-/// apart by the working directory a gateway reports none of.
+/// A plain host is its own single candidate, named by the id it introduced
+/// itself with, which is also the only value its create route accepts (spec
+/// 6.6). It is recognized by the working directory a gateway reports none of,
+/// and answered from the handshake alone: a directory read is an enumeration of
+/// the host's whole store (spec 6.7), and there is nothing in it this needs.
 ///
-/// `None` when the peer has no host to name: a gateway with nothing enrolled has
-/// nowhere to create either, and letting it say so beats this client inventing a
-/// refusal of its own.
+/// A gateway's candidates are the hosts it publishes (spec 7.1). `None` when it
+/// publishes none, because then there is nowhere to create at all and the
+/// gateway's own refusal says so better than one invented here.
 async fn resolve_named_host(
     control: &Control,
     hello: &Hello,
     named: &str,
 ) -> Result<Option<String>> {
-    let mut hosts = control
-        .sessions()
-        .await
-        .context("could not read the host's session list")?
-        .hosts;
-    if hosts.is_empty() && hello.working_directory.is_some() {
-        hosts.push(DirectoryHost {
+    let hosts = match &hello.working_directory {
+        Some(_) => vec![DirectoryHost {
             id: Some(hello.host_id.clone()),
             address: None,
             unreachable: false,
-        });
-    }
+        }],
+        None => {
+            control
+                .sessions()
+                .await
+                .context("could not read the host's session list")?
+                .hosts
+        }
+    };
     if hosts.is_empty() {
         return Ok(None);
     }
