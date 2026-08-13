@@ -218,11 +218,12 @@ impl SidebarRow {
     /// hand-named session, whose label is a filename rather than a time of
     /// day, readable.
     fn label(&self, cols: usize) -> String {
+        let session = self.label_source();
         let Some(tag) = &self.tag else {
-            return field(&session_label(&self.id, cols), cols);
+            return field(&session_label(session, cols), cols);
         };
         let id_cols = cols.min(ID_COLS);
-        let id = session_label(&self.id, id_cols);
+        let id = session_label(session, id_cols);
         if cols <= id_cols + ID_TAG_GAP {
             // Too narrow to hold a tag column at all. The tag is what drops:
             // half a time of day would leave every row's anchor unreadable,
@@ -233,6 +234,32 @@ impl SidebarRow {
         // says so with an ellipsis (`field` elides). An id is the other way
         // round: what distinguishes one is its tail (see [`session_label`]).
         field(&format!("{} {}", field(&id, id_cols), one_line(tag)), cols)
+    }
+
+    /// What this row's label is read from: its id with the qualifier its `host`
+    /// field names stripped off the front, and the whole id when the row
+    /// carries no host, is not qualified with it, or has nothing left after it.
+    ///
+    /// Not an id. A gateway resolves the qualified form and nothing else, so
+    /// everything that addresses the session uses `id` as it arrived.
+    ///
+    /// The qualifier is matched from the host the row carries into the id,
+    /// never read out of the id: a client is told which host a row belongs to
+    /// precisely so it does not have to parse an id it is not allowed to parse
+    /// (spec 6.2 goes further than the direction rule, "clients never parse
+    /// session ids", which is why this matches a string it was handed rather
+    /// than looking for a separator). See [`aj_wire::SessionSummary::host`].
+    ///
+    /// One qualifier deep, which is what a gateway writes (the separator is the
+    /// wire's, written down in full in `gateway::naming`). A peer that
+    /// qualifies some other way, or a gateway fronting a gateway, keeps the
+    /// label it has today rather than losing a guessed-at slice of it.
+    fn label_source(&self) -> &str {
+        self.host
+            .as_deref()
+            .and_then(|host| self.id.strip_prefix(host)?.strip_prefix(':'))
+            .filter(|session| !session.is_empty())
+            .unwrap_or(&self.id)
     }
 }
 
@@ -2080,6 +2107,60 @@ mod tests {
         assert_eq!(named.label(19), "er-draft fix-auth  ");
     }
 
+    /// The host id a gateway qualifies its rows with, the length production
+    /// mints (32 hexadecimal characters), so the assertions below are about a
+    /// qualifier that really does swamp the field rather than a short stand-in.
+    const HOST: &str = "c6b6667d8f73e75d168afe4f882b0b8b";
+
+    /// A gateway addresses a session as `<host>:<session>`, and the label is
+    /// about the session, so the qualifier is not part of what a row shows.
+    /// Without this the whole field goes to the qualifier's tail and every row
+    /// on every gateway-fronted host reads as a slice of hex.
+    #[test]
+    fn a_gateway_qualified_id_still_shows_its_time_of_day() {
+        let qualified = row(&format!("{HOST}:{MINTED}")).host(HOST).build();
+        assert_eq!(qualified.label(19), field("19-07-19", 19));
+        // And with a tag beside it, since that is the narrower column.
+        assert_eq!(
+            row(&format!("{HOST}:{MINTED}"))
+                .host(HOST)
+                .tag("fix-auth")
+                .build()
+                .label(19),
+            "19-07-19 fix-auth  ",
+        );
+    }
+
+    /// The qualifier is matched from the host the row carries into the id, and
+    /// never looked for in the id, which a client may not parse (spec 6.2). So
+    /// an id this row's host does not account for keeps the label it has today,
+    /// whole, rather than losing a slice of it to a guess.
+    ///
+    /// The cases with a colon in them are what tells the two apart: a parse
+    /// would find a separator in every one of them and show a time of day.
+    #[test]
+    fn a_host_that_does_not_qualify_the_id_labels_from_the_whole_id() {
+        // Someone else's qualifier, this host's without its separator, the host
+        // alone, and a qualifier with nothing after it.
+        let foreign = format!("other-host:{MINTED}");
+        let unseparated = format!("{HOST}{MINTED}");
+        let empty_session = format!("{HOST}:");
+        for id in [
+            MINTED,
+            "notes-on-the-rust-borrow-checker-draft",
+            foreign.as_str(),
+            unseparated.as_str(),
+            HOST,
+            empty_session.as_str(),
+        ] {
+            assert_eq!(
+                row(id).host(HOST).build().label(19),
+                field(&session_label(id, 19), 19),
+                "{id:?} did not label from the whole id",
+            );
+        }
+    }
+
     /// A tag of wide graphemes is budgeted in display columns, so it cannot
     /// overflow the field and push the separator off its column. Combining
     /// marks take no columns of their own and emoji take two, and both ride
@@ -2340,6 +2421,36 @@ mod tests {
                 " * s-2      eval-run   │",
                 " ~ laptop ──────── ! ─ │",
                 " ! 18-40-49            │",
+                " + new                 │",
+                "                       │",
+            ],
+        );
+    }
+
+    /// The same strip over what a gateway actually sends: ids qualified with a
+    /// 32-character host id, which is the shape every row has through the front
+    /// door. The rows come off wire summaries rather than being built by hand,
+    /// so this covers the derivation together with the host reaching the row.
+    /// The composed frame above the widget is not in it, see the strip's other
+    /// paint tests.
+    #[test]
+    fn the_strip_draws_a_gateways_qualified_rows_by_their_time_of_day() {
+        let mut tagged = at(&format!("{HOST}:{MINTED}"), 0);
+        tagged.tag = Some("vasari".to_string());
+        tagged.host = Some(HOST.to_string());
+        let mut plain = at(&format!("{HOST}:2026-08-06-18-40-49-001"), 1);
+        plain.host = Some(HOST.to_string());
+        let rows = rows_for_display(
+            &[tagged, plain],
+            &format!("{HOST}:{MINTED}"),
+            |_| false,
+            |_| false,
+        );
+        assert_eq!(
+            painted(rows, Vec::new(), 4),
+            vec![
+                "▌  19-07-19 vasari     │",
+                "   18-40-49            │",
                 " + new                 │",
                 "                       │",
             ],
