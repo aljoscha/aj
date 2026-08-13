@@ -1150,17 +1150,21 @@ async fn branch_focused_session(
         .command(&session, Command::Head { target })
         .await
     {
-        shell.borrow().show_toast(head_refusal(branching, &err));
+        // One toast for one failed gesture. The refusal names the action, so
+        // the restoration is a clause on it rather than a second toast that
+        // names the same failure again. It stays a separate sentence because
+        // the fallback arm of `head_refusal` ends in an opaque `{err}` whose
+        // punctuation we do not control.
+        let mut refusal = head_refusal(branching, &err);
         // The head did not move, so the prompt would run against the branch
         // the user meant to leave. Restore it verbatim instead; it is
         // already in prompt history (recorded at the submit site), so it is
         // never lost either way.
         if let Some(prompt) = prompt {
             shell.borrow().editor.borrow_mut().set_text(&prompt);
-            shell
-                .borrow()
-                .show_toast("Branch failed. Your message was restored to the editor.");
+            refusal.push_str(" Your message is back in the editor.");
         }
+        shell.borrow().show_toast(refusal);
         app.request_redraw();
         return;
     }
@@ -15865,19 +15869,20 @@ mod tests {
 
         assert_eq!(world.session(), session, "the session is unchanged");
         let toasts = toast_lines(&shell);
-        assert!(
-            toasts
-                .iter()
-                .any(|t| t == "Can't switch: that branch is no longer in this session."),
-            "the failure names the reason: {toasts:?}",
+        // One toast carries the whole outcome: the reason, and that the
+        // message came back. A second toast would name the same failure twice.
+        assert_eq!(
+            toasts,
+            vec![
+                "Can't switch: that branch is no longer in this session. \
+                 Your message is back in the editor."
+                    .to_string()
+            ],
+            "the refusal and the restoration are one toast: {toasts:?}",
         );
         assert!(
             !toasts.iter().any(|t| t.contains("does-not-exist")),
             "in the gesture's words, not by quoting the host's entry id: {toasts:?}",
-        );
-        assert!(
-            toasts.iter().any(|t| t.contains("Branch failed")),
-            "and says the message came back: {toasts:?}",
         );
         assert_eq!(shell.borrow().editor.borrow().text(), "edited prompt");
         assert!(!world.client().working(), "no turn spawned");
@@ -15948,10 +15953,11 @@ mod tests {
         )
         .await;
         assert!(
-            toast_lines(&shell)
-                .iter()
-                .any(|toast| toast == "Can't branch at the first message."),
-            "the refusal is worded for a human, not quoted from the host: {:?}",
+            toast_lines(&shell).iter().any(|toast| toast
+                == "Can't branch at the first message. \
+                    Your message is back in the editor."),
+            "the refusal is worded for a human, not quoted from the host, and \
+             carries the restoration in the same toast: {:?}",
             toast_lines(&shell),
         );
         assert_eq!(
@@ -17548,6 +17554,19 @@ mod tests {
             toasts.iter().any(|t| t.starts_with("Tag not set:")
                 && t.contains(&format!("at most {} bytes", aj_session::MAX_TAG_BYTES))),
             "the refusal is toasted in the store's own words: {toasts:?}",
+        );
+        // The toast names its subject once. The composer says which field it
+        // refused, so the store's sentence states the rule and leaves the
+        // naming alone. The overlong label is all `a`s, so every "tag" here
+        // comes from the prose rather than from the value.
+        let refusal = toasts
+            .iter()
+            .find(|t| t.starts_with("Tag not set:"))
+            .expect("the refusal toast");
+        assert_eq!(
+            refusal.to_lowercase().matches("tag").count(),
+            1,
+            "a refusal names the field it refused once: {refusal:?}",
         );
         assert_eq!(
             shell.borrow().overlays.borrow().depth(),

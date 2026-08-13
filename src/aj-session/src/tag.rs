@@ -15,6 +15,11 @@ use std::fmt;
 pub const MAX_TAG_BYTES: usize = 80;
 
 /// Why a tag was refused.
+///
+/// The sentences state the rule without naming their subject: every surface
+/// that renders one already says which field it is refusing (`--tag:` on the
+/// launch flag, `Tag not set:` in the TUI, `tag:` on the wire), and a
+/// sentence that named it too would say "tag" twice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TagError {
     /// Longer than [`MAX_TAG_BYTES`] after trimming.
@@ -27,11 +32,10 @@ pub enum TagError {
 impl fmt::Display for TagError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TagError::TooLong { bytes } => write!(
-                f,
-                "a tag is at most {MAX_TAG_BYTES} bytes, this one is {bytes}"
-            ),
-            TagError::Control => write!(f, "a tag is a single line without control characters"),
+            TagError::TooLong { bytes } => {
+                write!(f, "at most {MAX_TAG_BYTES} bytes, and this one is {bytes}")
+            }
+            TagError::Control => write!(f, "a single line, with no control characters"),
         }
     }
 }

@@ -474,7 +474,7 @@ async fn tag(
 /// is: a label the store would refuse is a malformed request, and refusing it
 /// at this layer costs the session neither a materialization nor its lock.
 fn normalized_tag(tag: &str) -> Result<Option<String>, ApiError> {
-    normalize_tag(tag).map_err(|err| ApiError::invalid(err.to_string()))
+    normalize_tag(tag).map_err(|err| ApiError::invalid(format!("tag: {err}")))
 }
 
 /// Resolve a head request into the single target the host switches to.

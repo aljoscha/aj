@@ -621,7 +621,7 @@ impl SessionHost {
             validate_prompt(content)?;
         }
         let tag = normalize_tag(tag.as_deref().unwrap_or_default())
-            .map_err(|err| HostError::Invalid(err.to_string()))?;
+            .map_err(|err| HostError::Invalid(format!("tag: {err}")))?;
         let session = self.mint(settings.as_ref()).await?;
         if tag.is_some() {
             if let Err(err) = self.command(&session, Command::Tag { tag }).await {
