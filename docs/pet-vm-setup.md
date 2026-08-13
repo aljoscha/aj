@@ -61,15 +61,30 @@ systemctl daemon-reload
 systemctl enable --now aj-serve
 ```
 
-Edit `WorkingDirectory`, `AJ_ALLOW` and the listen address first. For a
-second host on the same VM, copy the unit to a second name with its own
-`WorkingDirectory` and port.
+Edit `WorkingDirectory`, `AJ_ALLOW` and the listen address first.
 
 Host and gateway both default to `127.0.0.1:6161`, so anything sharing a
 machine needs its address said out loud. The reference units put the
 gateway on 6160 for that reason, not because the protocol cares.
 
-Credentials go in `/srv/aj/home/.env`, readable by the `aj` user and
+### A second host on the same VM
+
+Copy the unit to a second name with its own `WorkingDirectory`, its own
+port, **and its own `HOME`**.
+
+The separate `HOME` is not tidiness. A session store is named after the
+working directory, and for a directory outside `HOME` that name is just
+its last component, so `/srv/aj/projects/api` and `/srv/aj/archive/api`
+both resolve to `api` and share one store. `host-id` lives in that store,
+so two hosts colliding this way also report the **same** `host_id`, and a
+gateway refuses the second one with `duplicate_host` because one id is
+one namespace. The symptom is a host that runs fine, answers `hello`, and
+never appears in the directory.
+
+Distinct basenames avoid it too, but they rely on nobody ever adding a
+third checkout with an unlucky name. A `HOME` each is structural.
+
+Credentials go in each `HOME`'s `.env`, readable by the `aj` user and
 nobody else. They are the reason `HOME` is not world-readable and the
 reason the gateway's unit gets the same treatment even though it runs no
 agent itself.
@@ -98,8 +113,13 @@ journalctl -u aj-serve -f
 ```
 
 A host that answers `hello` but never appears in the gateway's directory
-is usually the gate refusing the gateway: the gateway is a peer like any
-other and needs a login the host allows.
+has two usual causes: the gate refusing the gateway, since the gateway is
+a peer like any other and needs a login the host allows, or two hosts
+sharing a `host_id` through a colliding store, which the gateway will not
+give a second namespace (above). `GET /v1/hosts` on the gateway tells you
+which: both read `connected: false`, and the `error` on the row says
+whether the last attempt was turned away by the gate or refused over its
+id.
 
 Then connect a client:
 
