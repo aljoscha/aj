@@ -292,12 +292,19 @@ mod tests {
     use std::time::Duration;
 
     use aj_agent::events::AgentSettings;
+    use aj_agent::message::AgentMessage;
+    use aj_agent::tool::ToolDetails;
+    use aj_models::streaming::AssistantMessageEvent;
+    use aj_models::types::{AssistantMessage, Message};
     use futures::FutureExt;
 
     use super::*;
     use crate::remote::tests::bounded;
 
     const SESSION: &str = "left:s-1";
+    /// A second session of the same host, as a client of this gateway addresses
+    /// it: another key in the same namespace.
+    const OTHER: &str = "left:s-2";
 
     fn queue(capacity: usize) -> (Sender, Receiver, CancellationToken) {
         let cancelled = CancellationToken::new();
@@ -326,10 +333,33 @@ mod tests {
         })
     }
 
+    /// A durable event frame, carrying log position `seq`.
+    fn durable(seq: u64) -> DecodedFrame {
+        decoded(Frame::Event {
+            session: SESSION.to_string(),
+            epoch: "epoch-1".to_string(),
+            durability: Some(aj_wire::DurableEvent {
+                seq,
+                entry_id: format!("entry-{seq}"),
+            }),
+            event: AgentEvent::Notice {
+                agent_id: AgentId::Main,
+                text: format!("entry {seq}"),
+            }
+            .into(),
+        })
+    }
+
     /// A lossy frame: a cumulative snapshot a later one supersedes.
     fn lossy(last_seq: u64) -> DecodedFrame {
+        lossy_for(SESSION, last_seq)
+    }
+
+    /// The same, for a named session: the queue carries every session of one
+    /// client's stream.
+    fn lossy_for(session: &str, last_seq: u64) -> DecodedFrame {
         decoded(Frame::State {
-            session: SESSION.to_string(),
+            session: session.to_string(),
             epoch: "epoch-1".to_string(),
             working: true,
             settings: AgentSettings {
@@ -341,6 +371,47 @@ mod tests {
                 verbosity: "default".into(),
             },
             last_seq,
+        })
+    }
+
+    /// A streaming message update: the highest-volume lossy class, keyed by the
+    /// session and the agent whose message it is about.
+    fn streaming(agent_id: AgentId) -> DecodedFrame {
+        let partial = AssistantMessage::empty();
+        decoded(Frame::Event {
+            session: SESSION.to_string(),
+            epoch: "epoch-1".to_string(),
+            durability: None,
+            event: AgentEvent::MessageUpdate {
+                agent_id,
+                message: AgentMessage::wire(Message::Assistant(partial.clone())),
+                event: AssistantMessageEvent::TextDelta {
+                    content_index: 0,
+                    delta: "tick".to_string(),
+                    partial,
+                },
+            }
+            .into(),
+        })
+    }
+
+    /// A background task's cumulative output snapshot, keyed by the session and
+    /// the task it is about.
+    fn task_output(task_id: TaskId) -> DecodedFrame {
+        decoded(Frame::Event {
+            session: SESSION.to_string(),
+            epoch: "epoch-1".to_string(),
+            durability: None,
+            event: AgentEvent::TaskOutput {
+                agent_id: AgentId::Main,
+                task_id,
+                call_id: "call-1".to_string(),
+                partial: ToolDetails::Text {
+                    summary: "running".to_string(),
+                    body: String::new(),
+                },
+            }
+            .into(),
         })
     }
 
@@ -367,8 +438,16 @@ mod tests {
             out.push(match &frame {
                 DecodedFrame::Unknown { kind, .. } => format!("unknown {kind}"),
                 DecodedFrame::Known(known) => match known.value() {
+                    Frame::Event {
+                        durability: Some(durability),
+                        ..
+                    } => format!("durable {}", durability.seq),
                     Frame::Event { event, .. } => match event.known() {
                         Some(AgentEvent::Warning { text, .. }) => format!("warning {text}"),
+                        Some(AgentEvent::MessageUpdate { agent_id, .. }) => {
+                            format!("update {agent_id:?}")
+                        }
+                        Some(AgentEvent::TaskOutput { task_id, .. }) => format!("task {task_id}"),
                         other => format!("event {other:?}"),
                     },
                     Frame::State { last_seq, .. } => format!("state {last_seq}"),
@@ -378,6 +457,17 @@ mod tests {
             });
         }
         out
+    }
+
+    /// How many frames are queued, and how many of those count against the
+    /// bound.
+    ///
+    /// The two differ while a block is queued, which is the whole point of the
+    /// distinction, so a test about either has to be able to say which state its
+    /// fixture reached.
+    fn depth(sender: &Sender) -> (usize, usize) {
+        let state = sender.0.lock();
+        (state.frames.len(), state.live)
     }
 
     /// Lossy overflow drops the snapshot and the client stays. Reliable overflow
@@ -401,13 +491,82 @@ mod tests {
             "an eviction ends the stream and the tasks feeding it",
         );
         assert!(
-            drained(&mut receiver).is_empty(),
-            "eviction closes and clears: what the client missed comes back from a backfill",
+            bounded("the evicted stream to end", receiver.recv())
+                .await
+                .is_none(),
+            "eviction closes and clears, so the stream ends rather than handing \
+             back a prefix: what the client missed comes back from a backfill",
         );
         assert_eq!(
             sender.offer(reliable("four")),
             Offered::Evicted,
             "and nothing is queued for a client that is gone",
+        );
+    }
+
+    /// A durable frame may not be coalesced or dropped, whatever its event is
+    /// (spec 6.4). Nothing here re-sends one: this gateway does not resume an
+    /// upstream itself, so a client that lost a durable frame is missing a log
+    /// entry with nothing to tell it so. At the bound it is evicted instead, and
+    /// the backfill of its re-attach carries the entry from its cursor.
+    #[tokio::test]
+    async fn a_durable_frame_is_neither_coalesced_nor_dropped() {
+        let (sender, _receiver, cancelled) = queue(2);
+
+        assert_eq!(sender.offer(durable(1)), Offered::Queued);
+        assert_eq!(sender.offer(durable(2)), Offered::Queued);
+        assert_eq!(
+            depth(&sender),
+            (2, 2),
+            "two durable frames of one session are two frames, both counted \
+             against the bound, or the eviction below measures nothing",
+        );
+
+        assert_eq!(
+            sender.offer(durable(3)),
+            Offered::Evicted,
+            "a durable frame that met the bound was dropped instead of evicting",
+        );
+        assert!(cancelled.is_cancelled());
+    }
+
+    /// A snapshot supersedes the queued one of its own key and no other. The key
+    /// names what the snapshot is about: the session, and within it the agent or
+    /// the task. A key blind to any of those would let one session's, agent's or
+    /// task's snapshot swallow another's, and a swallowed snapshot is never
+    /// re-sent, so the client holds stale state for it until it re-attaches.
+    #[tokio::test]
+    async fn coalescing_discriminates_by_what_a_snapshot_is_about() {
+        let (sender, mut receiver, _cancelled) = queue(8);
+
+        sender.offer(lossy(1));
+        sender.offer(lossy_for(OTHER, 2));
+        sender.offer(streaming(AgentId::Main));
+        sender.offer(streaming(AgentId::Sub(1)));
+        sender.offer(task_output(7));
+        sender.offer(task_output(8));
+
+        assert_eq!(
+            drained(&mut receiver),
+            vec![
+                "state 1",
+                "state 2",
+                "update Main",
+                "update Sub(1)",
+                "task 7",
+                "task 8",
+            ],
+            "two sessions, two agents and two tasks are six keys, not one",
+        );
+
+        // The same key does supersede, which is what says the six above are six
+        // keys rather than a queue that coalesces nothing at all.
+        sender.offer(streaming(AgentId::Main));
+        sender.offer(streaming(AgentId::Main));
+        assert_eq!(
+            drained(&mut receiver),
+            vec!["update Main"],
+            "one key, one queued snapshot",
         );
     }
 
@@ -552,6 +711,45 @@ mod tests {
         assert_eq!(drained(&mut receiver), vec!["warning paced"]);
     }
 
+    /// Room for a paced frame is the whole queue, and a block already in it is
+    /// what fills that queue: a backfill with nothing live alongside it is the
+    /// ordinary case, and measuring a block against the live bound instead would
+    /// leave it unbounded there. The producer would never stall, so a backfill of
+    /// any size would buffer in this gateway rather than push back on the host
+    /// writing it.
+    #[tokio::test]
+    async fn a_block_is_paced_against_the_whole_queue() {
+        let (sender, mut receiver, cancelled) = queue(2);
+
+        assert!(sender.send_paced(lossy(1)).await, "the block's state frame");
+        assert!(sender.send_paced(reliable("backfill")).await);
+        assert_eq!(
+            depth(&sender),
+            (2, 0),
+            "the queue is full of block frames and holds nothing live, or the \
+             wait below measures nothing",
+        );
+
+        let paced = tokio::spawn({
+            let sender = sender.clone();
+            async move { sender.send_paced(reliable("more backfill")).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !paced.is_finished(),
+            "the queue is full, so the block waits for the client to read",
+        );
+        assert!(!cancelled.is_cancelled(), "waiting is not eviction");
+
+        assert!(receiver.recv().await.is_some(), "the client reads");
+
+        assert!(
+            bounded("the paced frame to land", paced)
+                .await
+                .expect("the task")
+        );
+    }
+
     /// A paced frame does not wait forever: a stream that ends while a block is
     /// in flight releases the task pumping it.
     #[tokio::test]
@@ -582,6 +780,30 @@ mod tests {
         let reading = tokio::spawn(async move { receiver.recv().await.is_some() });
         tokio::time::sleep(Duration::from_millis(20)).await;
         sender.offer(reliable("late"));
+
+        assert!(
+            bounded("the reader to wake", reading)
+                .await
+                .expect("the task")
+        );
+    }
+
+    /// A paced frame wakes the reader too. A block reaches a client that is
+    /// already waiting on an empty queue, which is every client at the moment it
+    /// attaches, so a block queued without a wakeup would hold the attach it
+    /// belongs to until something live happened to arrive.
+    #[tokio::test]
+    async fn a_waiting_reader_is_woken_by_a_block_frame() {
+        let (sender, mut receiver, _cancelled) = queue(4);
+
+        let reading = tokio::spawn(async move { receiver.recv().await.is_some() });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !reading.is_finished(),
+            "the reader is parked on an empty queue, or this test measures nothing",
+        );
+
+        assert!(sender.send_paced(lossy(1)).await, "the block's state frame");
 
         assert!(
             bounded("the reader to wake", reading)
