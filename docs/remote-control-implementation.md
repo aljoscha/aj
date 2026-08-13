@@ -345,7 +345,8 @@ now, in order:
 4. Reference systemd unit and a short setup note for a long-running
    `aj serve` on a pet VM, pulled forward from phase 4's deliverables
    because it is the daily-drive setup. Docs and a unit file only, no
-   provisioning code.
+   provisioning code. Landed: `deploy/aj-serve.service`,
+   `deploy/aj-gateway.service`, `docs/pet-vm-setup.md`.
 5. Security posture before anything listens beyond loopback: hosts
    and gateway run the identity gate per spec 6.11 (`--auth
    tailscale` with an allowlist, or stay loopback behind SSH), and

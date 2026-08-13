@@ -1,0 +1,64 @@
+[Unit]
+Description=aj session host
+Documentation=https://github.com/aljoscha/aj
+After=network-online.target
+Wants=network-online.target
+# The gate verifies each peer against the local tailscale daemon, so the
+# daemon has to be up before we accept anything. Without this the first
+# connections after a reboot fail closed, which is the safe direction but
+# looks like a broken host.
+After=tailscaled.service
+Wants=tailscaled.service
+
+[Service]
+Type=simple
+User=aj
+Group=aj
+
+# One host serves one working directory (spec section 4) and its session
+# store is keyed to it. Point this at the checkout this host is for.
+WorkingDirectory=/srv/aj/workspace
+
+# Sessions, config, credentials and the session store all live under HOME
+# (spec section 4). It must be writable and it must survive restarts:
+# a fresh HOME is a new host with a new host_id, and every namespaced
+# session id a client holds stops resolving.
+Environment=HOME=/srv/aj/home
+
+# The control port runs arbitrary commands through the agent, so it is
+# never served unauthenticated. `tailscale` verifies each peer against the
+# local daemon and admits only the logins named in AJ_ALLOW, or a tagged
+# node carrying the aj control capability granted in the tailnet policy
+# (spec section 6.11).
+#
+# `open` belongs only to a host-private network, such as an ember guest
+# reachable from its hypervisor and nowhere else (spec section 7.4). A pet
+# VM is not that: it holds a real address on a real network, so `open`
+# here would publish a remote shell.
+#
+# The conservative alternative is to drop AJ_AUTH and AJ_ALLOW, leave
+# AJ_LISTEN at its loopback default, and reach the host through an SSH
+# tunnel. That trades the tailnet dependency for a hop.
+Environment=AJ_LISTEN=0.0.0.0:6161
+Environment=AJ_AUTH=tailscale
+Environment=AJ_ALLOW=you@github
+
+ExecStart=/usr/local/bin/aj serve
+
+Restart=on-failure
+RestartSec=5s
+
+StandardOutput=journal
+StandardError=journal
+
+# The agent edits files and runs shell commands on purpose, so hardening it
+# against its own workspace would only break it. These keep it away from
+# the rest of the machine.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=tmpfs
+BindPaths=/srv/aj/workspace /srv/aj/home
+
+[Install]
+WantedBy=multi-user.target

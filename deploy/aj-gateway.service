@@ -1,0 +1,45 @@
+[Unit]
+Description=aj gateway
+Documentation=https://github.com/aljoscha/aj
+After=network-online.target
+Wants=network-online.target
+After=tailscaled.service
+Wants=tailscaled.service
+
+[Service]
+Type=simple
+User=aj
+Group=aj
+
+# A gateway holds no session logs and no working directory of its own
+# (spec section 7.1). Its state is the enrolled set, under HOME.
+WorkingDirectory=/srv/aj
+Environment=HOME=/srv/aj/home
+
+# Same rule as a host: the gateway proxies commands to hosts that run
+# them, so an unauthenticated gateway is an unauthenticated host
+# (spec section 6.11).
+Environment=AJ_LISTEN=0.0.0.0:6160
+Environment=AJ_AUTH=tailscale
+Environment=AJ_ALLOW=you@github
+
+# Static hosts are read from this file. A gateway told about its hosts
+# over /v1/hosts needs no file, and its enrollments persist under HOME
+# either way.
+ExecStart=/usr/local/bin/aj gateway --config /srv/aj/gateway.toml
+
+Restart=on-failure
+RestartSec=5s
+
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=tmpfs
+BindPaths=/srv/aj/home
+ReadOnlyPaths=/srv/aj/gateway.toml
+
+[Install]
+WantedBy=multi-user.target
