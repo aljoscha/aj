@@ -547,7 +547,13 @@ impl Drop for Attachment {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
+    use aj_agent::message::AgentMessage;
+    use aj_agent::tool::ToolDetails;
+    use aj_models::streaming::AssistantMessageEvent;
+    use aj_models::types::{AssistantMessage, Message};
 
     use super::*;
 
@@ -612,6 +618,47 @@ mod tests {
         }
     }
 
+    /// A streaming message update: the highest-volume lossy class, keyed by the
+    /// session and the agent whose message it is about.
+    fn streaming(agent_id: AgentId) -> Frame {
+        let partial = AssistantMessage::empty();
+        Frame::Event {
+            session: SESSION.to_string(),
+            epoch: EPOCH.to_string(),
+            durability: None,
+            event: AgentEvent::MessageUpdate {
+                agent_id,
+                message: AgentMessage::wire(Message::Assistant(partial.clone())),
+                event: AssistantMessageEvent::TextDelta {
+                    content_index: 0,
+                    delta: "tick".to_string(),
+                    partial,
+                },
+            }
+            .into(),
+        }
+    }
+
+    /// A background task's cumulative output snapshot, keyed by the session and
+    /// the task it is about.
+    fn task_output(task_id: TaskId) -> Frame {
+        Frame::Event {
+            session: SESSION.to_string(),
+            epoch: EPOCH.to_string(),
+            durability: None,
+            event: AgentEvent::TaskOutput {
+                agent_id: AgentId::Main,
+                task_id,
+                call_id: "call-1".to_string(),
+                partial: ToolDetails::Text {
+                    summary: "running".to_string(),
+                    body: String::new(),
+                },
+            }
+            .into(),
+        }
+    }
+
     /// A session-scoped refusal (spec 6.3), reliable-transient like the rest of
     /// its class.
     fn refusal(code: &str) -> Frame {
@@ -634,6 +681,10 @@ mod tests {
                 } => format!("durable {}", durability.seq),
                 Frame::Event { event, .. } => match event.known() {
                     Some(AgentEvent::Warning { text, .. }) => format!("warning {text}"),
+                    Some(AgentEvent::MessageUpdate { agent_id, .. }) => {
+                        format!("update {agent_id:?}")
+                    }
+                    Some(AgentEvent::TaskOutput { task_id, .. }) => format!("task {task_id}"),
                     other => format!("event {other:?}"),
                 },
                 Frame::State { last_seq, .. } => format!("state {last_seq}"),
@@ -645,6 +696,22 @@ mod tests {
             });
         }
         out
+    }
+
+    /// How many frames are waiting on `id`'s live queue.
+    ///
+    /// The bound is on this queue, so a test about the bound has to be able to
+    /// say that its fixture reached it, and a test about coalescing that two
+    /// snapshots stayed two frames.
+    fn queued(fanout: &Fanout, id: SubscriberId) -> usize {
+        fanout.lock()[&id]
+            .live
+            .0
+            .state
+            .lock()
+            .expect("live queue mutex poisoned")
+            .frames
+            .len()
     }
 
     /// Reliable live frames collect while a block is produced. Lossy frames
@@ -950,16 +1017,98 @@ mod tests {
         fanout.finish_block(id, SESSION, 0);
         fanout.publish(reliable("one"));
         fanout.publish(reliable("two"));
+        assert_eq!(
+            queued(&fanout, id),
+            2,
+            "the queue is at the bound, or nothing below this measures anything",
+        );
         fanout.publish(Frame::List {
             sessions: Vec::new(),
             hosts: Vec::new(),
         });
         assert!(!cancelled.is_cancelled(), "lossy overflow is only dropped");
+        assert_eq!(
+            queued(&fanout, id),
+            2,
+            "and the snapshot the bound turned away did not land anyway",
+        );
 
         fanout.publish(reliable("three"));
         assert!(cancelled.is_cancelled());
         assert!(fanout.lock().is_empty(), "the subscriber was evicted");
         assert!(drained(&mut rx).is_empty(), "eviction closes and clears");
+    }
+
+    /// A durable frame may not be coalesced or dropped, whatever its event is
+    /// (spec 6.4). Nothing re-sends one: a client that lost a durable frame is
+    /// missing a log entry with nothing to tell it so. At the bound the
+    /// subscriber is evicted instead, and the backfill of its re-attach carries
+    /// the entry from its cursor.
+    #[test]
+    fn a_durable_frame_is_neither_coalesced_nor_dropped() {
+        let fanout = Fanout::new(NonZeroUsize::new(2));
+        let (id, mut rx, cancelled) = fanout.register(&[SESSION.to_string()]);
+        fanout.finish_block(id, SESSION, 0);
+
+        fanout.publish(durable(1));
+        fanout.publish(durable(2));
+        assert_eq!(
+            queued(&fanout, id),
+            2,
+            "two durable frames of one session are two frames, and the queue is \
+             at the bound, or the eviction below measures nothing",
+        );
+
+        fanout.publish(durable(3));
+
+        assert!(
+            cancelled.is_cancelled(),
+            "a durable frame that met the bound was dropped instead of evicting: {:?}",
+            drained(&mut rx),
+        );
+    }
+
+    /// A snapshot supersedes the queued one of its own key and no other. The key
+    /// names what the snapshot is about: the session, and within it the agent or
+    /// the task. A key blind to any of those would let one session's, agent's or
+    /// task's snapshot swallow another's, and a swallowed snapshot is never
+    /// re-sent, so the client holds stale state for it until it re-attaches.
+    #[test]
+    fn coalescing_discriminates_by_what_a_snapshot_is_about() {
+        let fanout = Fanout::default();
+        let (id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string(), OTHER.to_string()]);
+        fanout.finish_block(id, SESSION, 0);
+        fanout.finish_block(id, OTHER, 0);
+
+        fanout.publish(lossy(1));
+        fanout.publish(other(lossy(2)));
+        fanout.publish(streaming(AgentId::Main));
+        fanout.publish(streaming(AgentId::Sub(1)));
+        fanout.publish(task_output(7));
+        fanout.publish(task_output(8));
+
+        assert_eq!(
+            drained(&mut rx),
+            vec![
+                "state 1",
+                "state 2",
+                "update Main",
+                "update Sub(1)",
+                "task 7",
+                "task 8",
+            ],
+            "two sessions, two agents and two tasks are six keys, not one",
+        );
+
+        // The same key does supersede, which is what says the six above are six
+        // keys rather than a queue that coalesces nothing at all.
+        fanout.publish(streaming(AgentId::Main));
+        fanout.publish(streaming(AgentId::Main));
+        assert_eq!(
+            drained(&mut rx),
+            vec!["update Main"],
+            "one key, one queued snapshot",
+        );
     }
 
     /// The attach channel has capacity one and live frames remain hidden until
@@ -991,6 +1140,49 @@ mod tests {
         );
         drop(block_tx);
         assert!(matches!(attachment.try_recv(), Some(Frame::Event { .. })));
+    }
+
+    /// A stream parked on an empty queue is woken by the next live frame, and
+    /// ends when the host closes it.
+    ///
+    /// Every other test here drains with `try_recv`, which never parks, so a
+    /// lost wakeup or a queue that forgets to end would pass all of them and
+    /// hang a real client: a stalled stream is indistinguishable from a quiet
+    /// one until something else happens to wake it.
+    #[tokio::test]
+    async fn a_parked_stream_is_woken_by_a_frame_and_ended_by_a_close() {
+        let fanout = Arc::new(Fanout::default());
+        let (id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string()]);
+        fanout.finish_block(id, SESSION, 0);
+
+        // Published from another task, after this one has parked on `recv`: the
+        // sleep can only elapse while this task is waiting, so the frame has to
+        // carry the wakeup with it.
+        let publishing = tokio::spawn({
+            let fanout = Arc::clone(&fanout);
+            async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                fanout.publish(reliable("late"));
+            }
+        });
+        let woken = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the parked stream to be woken by the live frame");
+        assert!(matches!(woken, Some(Frame::Event { .. })));
+        publishing.await.expect("the publishing task");
+
+        let closing = tokio::spawn({
+            let fanout = Arc::clone(&fanout);
+            async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                fanout.close();
+            }
+        });
+        let ended = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the parked stream to end when the host closes it");
+        assert!(ended.is_none(), "a closed stream hands nothing back");
+        closing.await.expect("the closing task");
     }
 
     /// Dropping the stream deregisters it, so the host stops paying for a
