@@ -19,10 +19,13 @@ Environment=AJ_LISTEN=0.0.0.0:6160
 Environment=AJ_AUTH=tailscale
 Environment=AJ_ALLOW=you@github
 
-# Static hosts come from this file. A gateway told about its hosts over
-# /v1/hosts needs none, and either way its enrollments persist under
-# ~/.aj/gateway/.
-ExecStart=%h/.local/bin/aj gateway --config %h/.aj/gateway.toml
+# Static hosts come from `~/.aj/gateway.toml` when that file exists, and a
+# gateway told about its hosts over /v1/hosts needs no file at all. No
+# --config here on purpose: naming a file explicitly makes it required, so
+# a --config pointing at one that is not written yet is a hard failure,
+# and with Restart=on-failure that is a restart loop rather than a message.
+# Enrollments persist under ~/.aj/gateway/ either way.
+ExecStart=%h/.local/bin/aj gateway
 
 Restart=on-failure
 RestartSec=5s

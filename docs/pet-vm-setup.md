@@ -70,7 +70,7 @@ listens, not after.
 ## Install
 
 ```sh
-loginctl enable-linger "$USER"          # keep user units running with no login session
+sudo loginctl enable-linger "$USER"     # keep user units running with no login session
 install -D -m755 target/release/aj ~/.local/bin/aj
 
 mkdir -p ~/.config/systemd/user
@@ -81,7 +81,9 @@ systemctl --user enable --now aj-serve
 
 `enable-linger` is the one easy thing to forget: without it your units
 stop when you log out and start when you log in, which looks exactly like
-a crash loop tied to your ssh sessions.
+a crash loop tied to your ssh sessions. It needs `sudo` on a machine you
+reach over ssh, where enabling it even for your own account is a
+privileged action.
 
 Edit `WorkingDirectory`, `AJ_ALLOW` and the listen address first. For a
 second host, copy the unit under a second name with its own
@@ -101,17 +103,27 @@ Credentials live in `~/.aj/.env`, readable by you and nobody else.
 ## The gateway
 
 ```sh
-cat > ~/.aj/gateway.toml <<'EOF'
-hosts = ["100.64.0.10:6161", "100.64.0.11:6161"]
-EOF
-
 cp deploy/aj-gateway.service ~/.config/systemd/user/
 systemctl --user enable --now aj-gateway
 ```
 
-Hosts can also be enrolled at runtime over `/v1/hosts`, which persists
-under `~/.aj/gateway/`, so the file is for the ones that should come back
-after a restart on their own.
+Static hosts go in `~/.aj/gateway.toml`, which the gateway reads if it is
+there and does not mind if it is not:
+
+```toml
+hosts = ["100.64.0.10:6161", "100.64.0.11:6161"]
+```
+
+So write it whenever you like, before or after the first start, and
+restart the unit to pick it up. Hosts enrolled at runtime over
+`/v1/hosts` need no file at all: those enrollments persist under
+`~/.aj/gateway/` and come back on their own.
+
+The unit deliberately passes no `--config`. Naming a file explicitly makes
+it required, so a `--config` pointing at one that is not written yet is a
+hard failure, and with `Restart=on-failure` that is a restart loop rather
+than a message. Only use the flag for a file somewhere other than the
+default path.
 
 ## Checking it
 
@@ -141,7 +153,9 @@ aj connect http://gateway-host:6160
 Restarting a **host** ends its clients' streams and drops sessions that
 were never persisted. A session with no content has no log, so it does
 not survive. Clients re-attach with their cursors and resume
-incrementally where the epoch survived.
+incrementally where the epoch survived. The `host_id` is stable across a
+restart, since it lives in the session store rather than in the process,
+so namespaced ids clients are holding keep resolving.
 
 Restarting the **gateway** ends every client stream and drops its
 knowledge of what each host holds. It relearns on reconnect. Learned host
@@ -154,3 +168,15 @@ order itself against system units, so a host may fail its first attempts
 while the network or the tailscale daemon is still coming up. That is
 `Restart=on-failure` doing its job, and `journalctl --user -u aj-serve`
 will show the failed starts before the successful one.
+
+That indefinite retry is deliberate, and it has one cost worth knowing.
+A start that fails permanently, a bad path or a missing file, does not
+end in `failed`: with `RestartSec=5s` the attempts are spaced wider than
+systemd's default rate-limit window, so the unit retries forever and
+`is-active` keeps answering `activating`. A unit stuck there is not
+starting slowly, it is failing every time:
+
+```sh
+systemctl --user show -p NRestarts --value aj-serve   # climbing, not settling
+journalctl --user -u aj-serve -n 20                   # the same error each time
+```
