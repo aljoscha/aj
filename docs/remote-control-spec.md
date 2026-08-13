@@ -1389,11 +1389,13 @@ about ordering). The layers:
    frame boundaries (seeded, shrinking-friendly), forcing re-attach
    with cursors each time, and assert canonical-form convergence at
    quiescence. The fault variant compares the canonical form's
-   **convergent tier**, which masks transient-only artifacts
-   (notices, in-flight streaming text): reliable-transient frames
+   **convergent tier**, which masks exactly the rows no durable
+   entry backs: reliable-transient frames
    are not replayable (section 6.4), so a client disconnected across
    a notice's window legitimately never has it, and comparing them
-   would assert a promise the protocol does not make. The no-fault
+   would assert a promise the protocol does not make. A row with a
+   durable origin is compared in both tiers, whatever its kind, the
+   line is durability, not row type. The no-fault
    comparison uses the full form, notices included, there both
    clients saw everything. The fault sweep includes a scripted turn
    that emits a notice, so the masking is load-bearing rather than
@@ -1498,6 +1500,12 @@ before the next begins.
   suppression and durable-event pacing bound the rate, not the size.
   A row cap or delta encoding is the follow-up if a real store gets
   big enough to hurt.
+- A resumed sub-agent's report text is bracket-scoped: which child's
+  report survives a resume depends on how their log lines
+  interleaved ("the report from the last close"). Accepted while it
+  misleads nobody, and the direction is pre-named if a real log ever
+  shows a wrong report: per-run scoping, a genuine semantic change
+  that should not ride a cleanup.
 - Banked, wanted: previews in connect mode. Rows deliberately carry
   no preview text (section 9.2's "if cheaply available" resolved to
   "not over the wire"), but the selector is poorer for it remotely.
