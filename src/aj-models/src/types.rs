@@ -172,6 +172,22 @@ pub enum StopReason {
     Aborted,
 }
 
+impl StopReason {
+    /// Whether the inference ran to a terminal frame of its own.
+    ///
+    /// `Error` and `Aborted` mean it did not: the stream failed or was
+    /// cancelled, and what got persisted is the partial captured at that
+    /// moment. Such an attempt reports no usage and does not advance a
+    /// turn, so a failed one is retried and the retry is what counts.
+    /// Everything else completed, whatever the model chose to stop for.
+    pub fn completed(&self) -> bool {
+        match self {
+            Self::Stop | Self::Length | Self::ToolUse => true,
+            Self::Error | Self::Aborted => false,
+        }
+    }
+}
+
 impl Default for StopReason {
     fn default() -> Self {
         Self::Stop

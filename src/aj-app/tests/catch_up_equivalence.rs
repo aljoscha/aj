@@ -16,10 +16,10 @@ use aj_app::chat::{ChatState, reduce};
 use aj_app::client::SessionClient;
 use aj_app::session::AgentLifecycle;
 use aj_app::test_support::{
-    CanonicalState, assert_canonical_eq, assert_no_dangling, build_tagged_test_agent,
-    finalized_text_message, scripted_run_config,
+    CanonicalEntry, CanonicalState, assert_canonical_eq, assert_convergent_eq, assert_no_dangling,
+    build_tagged_test_agent, finalized_text_message, scripted_run_config,
 };
-use aj_models::types::{AssistantContent, StopReason, ToolCall};
+use aj_models::types::{AssistantContent, AssistantError, ErrorCategory, StopReason, ToolCall};
 use aj_session::{ConversationPersistence, LogSnapshot, TaggedEvent, project_suffix};
 use aj_wire::{DurableEvent, Frame};
 use tempfile::TempDir;
@@ -213,6 +213,29 @@ async fn scripted_sub_agent_turn() -> (TempDir, Vec<TaggedEvent>, LogSnapshot) {
     .await
 }
 
+/// Drive one scripted turn whose first inference fails transiently and is
+/// retried into a success, and return its tagged live frames plus the log.
+///
+/// Both attempts are persisted: the agent brackets each inference with a
+/// `MessageStart`/`MessageEnd` pair, so the failed partial lands on disk
+/// even though it never reaches the transcript. Only the successful one
+/// reports usage.
+async fn scripted_retried_turn() -> (TempDir, Vec<TaggedEvent>, LogSnapshot) {
+    let mut failed = finalized_text_message("");
+    failed.stop_reason = StopReason::Error;
+    failed.error = Some(AssistantError::new(
+        ErrorCategory::Transient,
+        "stream ended without a terminal event",
+    ));
+    let mut recovered = finalized_text_message("recovered");
+    // Real usage on the attempt that completed, so the surviving
+    // `UsageUpdate` is one carrying tokens rather than an empty default.
+    recovered.usage.input = 40;
+    recovered.usage.output = 7;
+    recovered.usage.total_tokens = 47;
+    recorded_turn(vec![failed, recovered], "try that").await
+}
+
 /// Drive `prompt` against a scripted agent replaying `messages`, and
 /// return the tagged frames it emitted plus the resulting log.
 async fn recorded_turn(
@@ -386,6 +409,82 @@ async fn an_attach_under_a_new_epoch_rebuilds_the_same_state() {
             "the client offers the adopted epoch",
         );
     }
+}
+
+#[tokio::test]
+async fn a_reattach_across_a_retried_inference_gains_no_usage_row() {
+    let (_dir, frames, log) = scripted_retried_turn().await;
+
+    // The fixture only measures something if the failed attempt really was
+    // persisted: that entry is what a projection can over-derive from.
+    let persisted_assistants = log
+        .entries_in_order()
+        .into_iter()
+        .filter(|entry| {
+            matches!(
+                entry.entry,
+                aj_session::ConversationEntryKind::Message { ref message }
+                    if matches!(message.as_stored_wire(), Some(aj_models::types::Message::Assistant(_)))
+            )
+        })
+        .count();
+    assert_eq!(
+        persisted_assistants, 2,
+        "the log has to hold the failed attempt beside the recovery, or a \
+         projection deriving usage per assistant message cannot go wrong here",
+    );
+
+    // The live agent reports usage once: after the inference that completed.
+    let live_usage = frames
+        .iter()
+        .filter(|tagged| matches!(tagged.event, AgentEvent::UsageUpdate { .. }))
+        .count();
+    assert_eq!(
+        live_usage, 1,
+        "a retried turn reports usage once, for the attempt that completed",
+    );
+
+    // The retry emits a "Retrying inference" notice with no durable origin,
+    // which no backfill can hand over (spec 6.4), so the tier for a client
+    // that was disconnected is the convergent one. It masks that notice and
+    // nothing else: usage rows stay under comparison, which is the point here.
+    let expected = uninterrupted(&frames).canonical().convergent();
+    let mut rebuilt = Client::attached();
+    rebuilt.reattach(&log, EPOCH);
+    let rebuilt_state = rebuilt.canonical();
+
+    // The harm is a usage row for an attempt that reported no usage, so name
+    // the usage rows before comparing whole states: this says which message
+    // each one is attached to, where the state comparison would only say that
+    // two long values differ.
+    let usage_rows = |state: &CanonicalState| -> Vec<Option<String>> {
+        state
+            .agent(AgentId::Main)
+            .expect("main transcript")
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                CanonicalEntry::TurnUsage {
+                    after_message_id, ..
+                } => Some(after_message_id.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let live_rows = usage_rows(&uninterrupted(&frames).canonical());
+    assert_eq!(
+        usage_rows(&rebuilt_state),
+        live_rows,
+        "a backfill across the retry derives one usage row, attached to the \
+         message that reported it, and none for the attempt that failed",
+    );
+
+    assert_convergent_eq(
+        &rebuilt_state.convergent(),
+        &expected,
+        "full backfill across a retried inference",
+    );
+    assert_no_dangling(&rebuilt.chat);
 }
 
 /// The degenerate re-application: every event of the real projection,

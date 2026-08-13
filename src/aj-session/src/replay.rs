@@ -1098,25 +1098,42 @@ impl ReplayState {
         // live agent: `UsageUpdate.accumulated_*` reflects the total
         // *before* this turn is folded in, then we add the per-turn
         // delta into the accumulator for the next emission.
-        let acc = self.usage_accumulators.entry(agent_id).or_default();
-        let turn_usage = TokenUsage {
-            accumulated_input: acc.input,
-            turn_input: assistant.usage.input,
-            accumulated_output: acc.output,
-            turn_output: assistant.usage.output,
-            accumulated_cache_write: acc.cache_write,
-            turn_cache_write: assistant.usage.cache_write,
-            accumulated_cache_read: acc.cache_read,
-            turn_cache_read: assistant.usage.cache_read,
-        };
-        out.push_back(transient(AgentEvent::UsageUpdate {
-            agent_id,
-            usage: turn_usage,
-        }));
-        acc.input += assistant.usage.input;
-        acc.output += assistant.usage.output;
-        acc.cache_write += assistant.usage.cache_write;
-        acc.cache_read += assistant.usage.cache_read;
+        //
+        // Only for an inference that completed, though. An attempt that
+        // failed or was cancelled persists the partial captured at that
+        // moment, and the live agent emits no `UsageUpdate` for it: it
+        // reports usage after a successful inference, and a failed
+        // attempt is retried, so the retry is what reports. A resumed
+        // client would otherwise gain a footer row the local one never
+        // had. Projection derives nothing an entry does not record, and
+        // what the entry records here is `stop_reason`.
+        //
+        // NOTE: the discriminator cannot be the token counts. A
+        // completed turn may legitimately report zero (a provider that
+        // omits usage, and every scripted one), so "reported nothing"
+        // and "reported zero" are the same state, and skipping on zero
+        // would drop a `UsageUpdate` the live path did emit.
+        if assistant.stop_reason.completed() {
+            let acc = self.usage_accumulators.entry(agent_id).or_default();
+            let turn_usage = TokenUsage {
+                accumulated_input: acc.input,
+                turn_input: assistant.usage.input,
+                accumulated_output: acc.output,
+                turn_output: assistant.usage.output,
+                accumulated_cache_write: acc.cache_write,
+                turn_cache_write: assistant.usage.cache_write,
+                accumulated_cache_read: acc.cache_read,
+                turn_cache_read: assistant.usage.cache_read,
+            };
+            out.push_back(transient(AgentEvent::UsageUpdate {
+                agent_id,
+                usage: turn_usage,
+            }));
+            acc.input += assistant.usage.input;
+            acc.output += assistant.usage.output;
+            acc.cache_write += assistant.usage.cache_write;
+            acc.cache_read += assistant.usage.cache_read;
+        }
 
         // Track tool_call blocks so subsequent tool_result entries
         // can synthesize a matching `ToolExecutionStart` (with
