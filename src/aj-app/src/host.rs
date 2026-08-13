@@ -66,7 +66,7 @@ use aj_wire::{
 };
 use chrono::{DateTime, Utc};
 use tokio::sync::Mutex as TokioMutex;
-use tokio::sync::mpsc::{Sender, channel, unbounded_channel};
+use tokio::sync::mpsc::{Sender, unbounded_channel};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -767,10 +767,8 @@ impl SessionHost {
         if let Err(err) = self.enumerate().await {
             tracing::warn!("could not re-read the session store for an attach: {err}");
         }
-        let (block_tx, block_rx) = channel(1);
-        let attachment = Attachment::new(
+        let (attachment, block_tx) = Attachment::new(
             id,
-            block_rx,
             live_frames,
             cancelled.clone(),
             attached,

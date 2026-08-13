@@ -16,8 +16,8 @@ use aj_agent::events::{AgentEvent, AgentId};
 use aj_agent::tool::TaskId;
 use aj_wire::{Frame, SessionSummary};
 use tokio::sync::Notify;
-use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::error::TryRecvError;
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio_util::sync::CancellationToken;
 
 /// Enough burst room for normal clients while bounding a stalled stream.
@@ -461,15 +461,23 @@ pub struct Attachment {
 }
 
 impl Attachment {
+    /// Build an attachment and the sender the block is written to.
+    ///
+    /// The channel is made here, with capacity one, because that capacity is
+    /// part of what an attachment is rather than a choice its caller makes:
+    /// the projection that fills the block gets to run exactly one frame
+    /// ahead of the client reading it, so a slow client paces the projection
+    /// instead of letting it build the whole backfill in memory. A caller
+    /// that passed its own channel could pick any depth and lose that.
     pub(crate) fn new(
         id: SubscriberId,
-        block: Receiver<Frame>,
         live: LiveReceiver,
         cancelled: CancellationToken,
         attached: Vec<String>,
         fanout: Arc<Fanout>,
-    ) -> Self {
-        Self {
+    ) -> (Self, Sender<Frame>) {
+        let (block_tx, block) = channel(1);
+        let attachment = Self {
             id,
             block,
             block_done: false,
@@ -477,7 +485,8 @@ impl Attachment {
             cancelled,
             attached,
             fanout,
-        }
+        };
+        (attachment, block_tx)
     }
 
     /// The sessions this stream was served an attach block for.
@@ -641,6 +650,28 @@ mod tests {
 
     /// A background task's cumulative output snapshot, keyed by the session and
     /// the task it is about.
+    /// A streaming tool update for `call_id`, the frame class whose key has to
+    /// discriminate one in-flight tool call from another.
+    fn tool_update(call_id: &str) -> Frame {
+        Frame::Event {
+            session: SESSION.to_string(),
+            epoch: EPOCH.to_string(),
+            durability: None,
+            event: AgentEvent::ToolExecutionUpdate {
+                agent_id: AgentId::Main,
+                call_id: call_id.to_string(),
+                tool: "bash".to_string(),
+                args: serde_json::json!({}),
+                partial: ToolDetails::Text {
+                    summary: "running".to_string(),
+                    body: String::new(),
+                },
+                content: Arc::from(Vec::new()),
+            }
+            .into(),
+        }
+    }
+
     fn task_output(task_id: TaskId) -> Frame {
         Frame::Event {
             session: SESSION.to_string(),
@@ -685,6 +716,9 @@ mod tests {
                         format!("update {agent_id:?}")
                     }
                     Some(AgentEvent::TaskOutput { task_id, .. }) => format!("task {task_id}"),
+                    Some(AgentEvent::ToolExecutionUpdate { call_id, .. }) => {
+                        format!("tool {call_id}")
+                    }
                     other => format!("event {other:?}"),
                 },
                 Frame::State { last_seq, .. } => format!("state {last_seq}"),
@@ -1086,6 +1120,8 @@ mod tests {
         fanout.publish(streaming(AgentId::Sub(1)));
         fanout.publish(task_output(7));
         fanout.publish(task_output(8));
+        fanout.publish(tool_update("call-a"));
+        fanout.publish(tool_update("call-b"));
 
         assert_eq!(
             drained(&mut rx),
@@ -1096,8 +1132,11 @@ mod tests {
                 "update Sub(1)",
                 "task 7",
                 "task 8",
+                "tool call-a",
+                "tool call-b",
             ],
-            "two sessions, two agents and two tasks are six keys, not one",
+            "two sessions, two agents, two tasks and two tool calls are eight \
+             keys, not one",
         );
 
         // The same key does supersede, which is what says the six above are six
@@ -1117,16 +1156,16 @@ mod tests {
     fn attachment_is_producer_paced_and_reads_the_block_before_live() {
         let fanout = Arc::new(Fanout::default());
         let (id, live, cancelled) = fanout.register(&[SESSION.to_string()]);
-        let (block_tx, block_rx) = tokio::sync::mpsc::channel(1);
-        let mut attachment = Attachment::new(
+        let (mut attachment, block_tx) = Attachment::new(
             id,
-            block_rx,
             live,
             cancelled,
             vec![SESSION.to_string()],
             Arc::clone(&fanout),
         );
         block_tx.try_send(lossy(1)).expect("first block frame");
+        // The channel is the attachment's own, so this measures the depth a
+        // real attach runs with rather than one the test chose.
         assert!(
             block_tx.try_send(caught_up(1)).is_err(),
             "the producer cannot preload a second frame",
@@ -1191,10 +1230,8 @@ mod tests {
     fn dropping_an_attachment_deregisters_it() {
         let fanout = Arc::new(Fanout::default());
         let (id, live, cancelled) = fanout.register(&[SESSION.to_string()]);
-        let (_block_tx, block_rx) = tokio::sync::mpsc::channel(1);
-        let attachment = Attachment::new(
+        let (attachment, _block_tx) = Attachment::new(
             id,
-            block_rx,
             live,
             cancelled,
             vec![SESSION.to_string()],

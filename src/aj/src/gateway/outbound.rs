@@ -415,6 +415,28 @@ mod tests {
         })
     }
 
+    /// A streaming tool update for `call_id`, the frame class whose key has to
+    /// discriminate one in-flight tool call from another.
+    fn tool_update(call_id: &str) -> DecodedFrame {
+        decoded(Frame::Event {
+            session: SESSION.to_string(),
+            epoch: "epoch-1".to_string(),
+            durability: None,
+            event: AgentEvent::ToolExecutionUpdate {
+                agent_id: AgentId::Main,
+                call_id: call_id.to_string(),
+                tool: "bash".to_string(),
+                args: serde_json::json!({}),
+                partial: ToolDetails::Text {
+                    summary: "running".to_string(),
+                    body: String::new(),
+                },
+                content: Arc::from(Vec::new()),
+            }
+            .into(),
+        })
+    }
+
     /// A frame kind this build does not know, as it arrives from the wire.
     fn unknown() -> DecodedFrame {
         serde_json::from_str::<DecodedFrame>(r#"{"kind":"something_newer","session":"left:s-1"}"#)
@@ -448,6 +470,9 @@ mod tests {
                             format!("update {agent_id:?}")
                         }
                         Some(AgentEvent::TaskOutput { task_id, .. }) => format!("task {task_id}"),
+                        Some(AgentEvent::ToolExecutionUpdate { call_id, .. }) => {
+                            format!("tool {call_id}")
+                        }
                         other => format!("event {other:?}"),
                     },
                     Frame::State { last_seq, .. } => format!("state {last_seq}"),
@@ -545,6 +570,8 @@ mod tests {
         sender.offer(streaming(AgentId::Sub(1)));
         sender.offer(task_output(7));
         sender.offer(task_output(8));
+        sender.offer(tool_update("call-a"));
+        sender.offer(tool_update("call-b"));
 
         assert_eq!(
             drained(&mut receiver),
@@ -555,8 +582,11 @@ mod tests {
                 "update Sub(1)",
                 "task 7",
                 "task 8",
+                "tool call-a",
+                "tool call-b",
             ],
-            "two sessions, two agents and two tasks are six keys, not one",
+            "two sessions, two agents, two tasks and two tool calls are eight keys, \
+             not one",
         );
 
         // The same key does supersede, which is what says the six above are six
