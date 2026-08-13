@@ -593,6 +593,26 @@ impl SessionHost {
         self.mint(None).await
     }
 
+    /// Whether a create naming `host` is this host's to serve (spec 6.6).
+    ///
+    /// A host serves exactly one working directory, so the only session it can
+    /// create is its own: an absent name and this host's own id are the same
+    /// request, and any other id is a create for a store this process does not
+    /// hold. [`HostError::Unsupported`], so a 409 rather than a 400: nothing
+    /// about the request is malformed, and the very same one against the host
+    /// it names may well succeed.
+    pub fn creates_here(&self, host: Option<&str>) -> Result<(), HostError> {
+        let own = &self.inner.host_id;
+        match host {
+            None => Ok(()),
+            Some(named) if named == own => Ok(()),
+            Some(named) => Err(HostError::Unsupported(format!(
+                "this host is {own}, not {named:?}: a host creates sessions only in its own \
+                 working directory"
+            ))),
+        }
+    }
+
     /// Creates a session with creator-selected settings, a first prompt and a
     /// tag.
     ///

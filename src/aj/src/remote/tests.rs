@@ -1227,6 +1227,58 @@ async fn a_create_naming_another_host_is_refused() {
     fixture.shutdown().await;
 }
 
+/// Both arms of the control seam apply that same rule, so a caller that names a
+/// host is written once and runs in either mode (spec 6.6).
+///
+/// The in-process arm has no HTTP route to enforce it and no reason to be more
+/// permissive: a host serves one working directory whether it is reached across
+/// a connection or from inside this process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn both_control_arms_refuse_a_create_meant_for_another_host() {
+    let fixture = Fixture::new(Vec::new()).await;
+    let own = fixture.host.hello().host_id;
+    let elsewhere = "0123456789abcdef";
+
+    let mut here = Vec::new();
+    for control in [
+        Control::local(fixture.host.clone()),
+        Control::remote(fixture.client()),
+    ] {
+        here.push(
+            control
+                .create(Some(own.clone()), None, None, None)
+                .await
+                .expect("this host's own id is a create for here"),
+        );
+        let err = control
+            .create(Some(elsewhere.to_string()), None, None, None)
+            .await
+            .expect_err("another host's id is not this host's to serve");
+        let refusal = err.to_string();
+        assert!(
+            refusal.contains(&own) && refusal.contains(elsewhere),
+            "the refusal names both the host that answered and the one asked for: {refusal}",
+        );
+    }
+
+    // The store is where a create either happened or did not, so it is what the
+    // count is read from rather than the answers above.
+    let minted = fixture
+        .host
+        .sessions()
+        .await
+        .expect("the host's directory")
+        .sessions
+        .len();
+    assert_eq!(
+        minted,
+        here.len(),
+        "only the creates for this host minted a session",
+    );
+
+    fixture.shutdown().await;
+}
+
 /// A model change travels as the (api, url, name) triple and is resolved
 /// against the host's own catalog, never accepted as a catalog object
 /// (spec 6.6).
@@ -1618,7 +1670,7 @@ async fn both_control_arms_report_a_created_session_whose_label_did_not_stick() 
         Control::remote(fixture.client()),
     ] {
         let err = control
-            .create(None, None, Some("fix-auth".to_string()))
+            .create(None, None, None, Some("fix-auth".to_string()))
             .await
             .expect_err("the sidecar write cannot land");
         assert!(

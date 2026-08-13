@@ -70,6 +70,7 @@ use crate::content_overlay::{ContentStyles, Row, auth_rows, session_info_rows, s
 use crate::control::{Control, ControlError, ControlFrame, Stream};
 use crate::footer::FooterLine;
 use crate::frame_stats_box::FrameStatsBox;
+use crate::host_picker::{choice_is_ambiguous, open_host_picker};
 use crate::image_store::ImageStore;
 use crate::keymap::{HostCtx, build_keymap};
 use crate::login::{
@@ -848,8 +849,9 @@ fn peer_refusal(err: &ControlError) -> String {
 
 /// A session change the drive loop broke out for.
 enum FocusRequest {
-    /// Mint a session and focus it.
-    Create,
+    /// Mint a session and focus it, on `host` when the peer serves more than
+    /// one and the user named one (see [`SessionRequest::New`]).
+    Create { host: Option<String> },
     /// Focus a session that already exists.
     Resume(String),
     /// Move the focused session's head, then re-attach onto the branch that
@@ -893,8 +895,8 @@ async fn apply_focus_request(
     request: FocusRequest,
 ) -> Focus {
     let focus = match request {
-        FocusRequest::Create => {
-            let created = match world.control.create(None, None, None).await {
+        FocusRequest::Create { host } => {
+            let created = match world.control.create(host, None, None, None).await {
                 Ok(session) => focus_session(app, shell, world, session.clone(), true)
                     .await
                     .map(|()| session),
@@ -908,9 +910,14 @@ async fn apply_focus_request(
                     Focus::Moved
                 }
                 Err(err) => {
-                    shell
-                        .borrow()
-                        .show_toast(format!("Failed to start a fresh session: {err}"));
+                    // The refusing server's own sentence, without the transport
+                    // wrapper: a gateway's refusals say they are a gateway's,
+                    // and a client that guessed at the role would be the one
+                    // getting it wrong.
+                    shell.borrow().show_toast(format!(
+                        "Failed to start a fresh session: {}",
+                        peer_refusal(&err)
+                    ));
                     Focus::Same
                 }
             }
@@ -953,6 +960,42 @@ async fn apply_focus_request(
     // is set, and it is about to park on the select.
     app.request_redraw();
     focus
+}
+
+/// Settle which host a create is for, answering the request the drive loop
+/// should act on, or `None` when the user is being asked.
+///
+/// The one gate every create gesture passes: the chord, the palette command and
+/// the strip's create row all park the same request, and only this loop holds
+/// the peer's host list. A peer that offers a choice ([`choice_is_ambiguous`])
+/// gets the picker instead of a guess, and the confirmed pick parks the request
+/// again, this time naming a host. Cancelling parks nothing, so a create nobody
+/// chose a host for never happens.
+///
+/// Everything else, a create the peer can answer itself included, passes
+/// straight through.
+fn park_new_session(
+    app: &mut AsyncApp,
+    shell: &Rc<RefCell<Shell>>,
+    world: &World,
+    request: SessionRequest,
+) -> Option<SessionRequest> {
+    let SessionRequest::New { host: None } = &request else {
+        return Some(request);
+    };
+    let hosts = world.directory.hosts();
+    if !choice_is_ambiguous(hosts) {
+        return Some(request);
+    }
+    // Drop the Shell borrow before the refocus event dispatches through it.
+    let handles = shell.borrow().overlay_handles();
+    open_host_picker(&handles, hosts);
+    app.post_app_event(UserEvent {
+        name: REFOCUS_OVERLAY_EVENT.to_string(),
+        data: None,
+    });
+    app.request_redraw();
+    None
 }
 
 /// Point the frontend at `session`, folding that session's own startup
@@ -2457,9 +2500,10 @@ async fn apply_command_action(
             // Live work is no reason to refuse. The session we leave stays
             // attached and keeps folding, so its turn finishes whether or not
             // anyone is looking at it. No overlay to close either, so the
-            // request parks straight away and the drive loop's post-input
-            // check turns it into `SessionExit::New`.
-            *shell.borrow().session_request.borrow_mut() = Some(SessionRequest::New);
+            // request parks straight away. Which host it is for is the drive
+            // loop's to settle (see `park_new_session`), which is also what
+            // turns it into `SessionExit::New`.
+            *shell.borrow().session_request.borrow_mut() = Some(SessionRequest::New { host: None });
             ActionEffect::Redraw
         }
         CommandAction::OpenPromptHistory => {
@@ -4277,7 +4321,13 @@ impl Shell {
                     }
                 }
                 AjAction::SessionNew => {
-                    park_session_request(&session_request_for_actions, ctx, SessionRequest::New);
+                    // No host named: the loop asks when the peer leaves the
+                    // answer open (see `park_new_session`).
+                    park_session_request(
+                        &session_request_for_actions,
+                        ctx,
+                        SessionRequest::New { host: None },
+                    );
                 }
                 AjAction::ThinkingToggle => {
                     // Matches aj's `aj.thinking.toggle` handler: flip the
@@ -4457,7 +4507,9 @@ impl Shell {
                 .set_on_gesture(Box::new(move |ctx, gesture| {
                     let request = match gesture {
                         StripGesture::Focus(session) => SessionRequest::Resume(session),
-                        StripGesture::New => SessionRequest::New,
+                        // No host named: the loop asks when the peer
+                        // leaves the answer open (see `park_new_session`).
+                        StripGesture::New => SessionRequest::New { host: None },
                     };
                     park_session_request(&session_request, ctx, request);
                 }));
@@ -5116,6 +5168,7 @@ pub async fn run(args: Args) -> Result<()> {
             url,
             session_id,
             new,
+            host,
             prompt: _,
         }) => {
             // Statedness has to come from the layers, not from the effective
@@ -5131,6 +5184,7 @@ pub async fn run(args: Args) -> Result<()> {
                     url,
                     session_id: session_id.as_deref(),
                     new: *new,
+                    host: host.as_deref(),
                 },
             )
             .await?;
@@ -5289,7 +5343,7 @@ pub async fn run(args: Args) -> Result<()> {
         let request = match exit {
             Ok(SessionExit::Quit) => break Ok(()),
             Err(fatal) => break Err(fatal),
-            Ok(SessionExit::New) => FocusRequest::Create,
+            Ok(SessionExit::New { host }) => FocusRequest::Create { host },
             Ok(SessionExit::Switch(session_id)) => FocusRequest::Resume(session_id),
             Ok(SessionExit::Branch { target, prompt }) => FocusRequest::Branch { target, prompt },
         };
@@ -6231,7 +6285,12 @@ async fn drive(
                         // out of the borrow first so no RefCell ref outlives
                         // the statement.
                         let session_request = shell.borrow().take_session_request();
-                        if let Some(request) = session_request {
+                        if let Some(request) = session_request
+                            // A create the peer leaves a choice about goes back
+                            // to the user first, and parks itself again once
+                            // they have named a host.
+                            && let Some(request) = park_new_session(app, shell, world, request)
+                        {
                             break Ok(request.into_exit());
                         }
                     }
@@ -7875,7 +7934,13 @@ mod tests {
             "the demo spawned sub-agents to leave behind"
         );
 
-        let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Create { host: None },
+        )
+        .await;
         assert!(matches!(moved, Focus::Moved));
 
         shut_down(&world).await;
@@ -8359,7 +8424,13 @@ mod tests {
         };
         assert_eq!(contexts(&world), 1, "startup folded this session's context");
 
-        let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Create { host: None },
+        )
+        .await;
         assert!(matches!(moved, Focus::Moved));
         assert_eq!(
             contexts(&world),
@@ -8601,7 +8672,13 @@ mod tests {
         persist_session(&mut world).await;
         let first = world.session().to_string();
 
-        let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Create { host: None },
+        )
+        .await;
         assert!(matches!(moved, Focus::Moved));
         let second = world.session().to_string();
         // Both sessions are attached and owe nothing, so the switch below is a
@@ -8662,7 +8739,13 @@ mod tests {
         let first = world.session().to_string();
         let left_before = main_entries(&world.chat.borrow());
 
-        let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Create { host: None },
+        )
+        .await;
         assert!(matches!(moved, Focus::Moved));
         let created = world.session().to_string();
 
@@ -8706,7 +8789,13 @@ mod tests {
         // create fails without the session already existing.
         world.control =
             Control::remote(crate::remote::RemoteClient::new(&dead_url().await).expect("a client"));
-        let stayed = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
+        let stayed = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Create { host: None },
+        )
+        .await;
 
         assert!(matches!(stayed, Focus::Same), "the create was refused");
         assert!(
@@ -13949,7 +14038,13 @@ mod tests {
         );
 
         // Focus a fresh session. Attaching one lands on the main view.
-        let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Create { host: None },
+        )
+        .await;
         assert!(matches!(moved, Focus::Moved));
 
         // No manual `sync_editor_chrome`: the install already reconciled the
@@ -14401,7 +14496,7 @@ mod tests {
         ));
         assert!(matches!(
             shell.borrow().take_session_request(),
-            Some(SessionRequest::New)
+            Some(SessionRequest::New { host: None })
         ));
     }
 
@@ -14441,7 +14536,7 @@ mod tests {
         ));
         assert_eq!(
             shell.borrow().take_session_request(),
-            Some(SessionRequest::New),
+            Some(SessionRequest::New { host: None }),
             "a new session is parked mid-turn",
         );
         assert!(
@@ -14472,7 +14567,7 @@ mod tests {
         ));
         assert_eq!(
             shell.borrow().take_session_request(),
-            Some(SessionRequest::New),
+            Some(SessionRequest::New { host: None }),
             "a live task does not refuse a new session",
         );
         assert!(
@@ -14750,7 +14845,13 @@ mod tests {
                 .expect("usage")
                 .expect("a live session"),
         ));
-        let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Create { host: None },
+        )
+        .await;
         assert!(matches!(moved, Focus::Moved));
 
         assert_ne!(world.session(), beta, "a fresh session was minted");
@@ -15271,7 +15372,13 @@ mod tests {
         let outgoing = world.session().to_string();
         let task = register_bash_task(&mut world, "sleep 100").await;
 
-        let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Create { host: None },
+        )
+        .await;
         assert!(matches!(moved, Focus::Moved));
         assert_ne!(world.session(), outgoing, "the focus moved");
 
@@ -15310,7 +15417,13 @@ mod tests {
             world_shell_app(&dir, "streaming-text", default_layers()).await;
         run_prompt(&mut world, "in the first session").await;
         let first = world.session().to_string();
-        let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Create { host: None },
+        )
+        .await;
         assert!(matches!(moved, Focus::Moved));
         assert!(
             world.directory.is_attached(&first),
@@ -15430,7 +15543,13 @@ mod tests {
         persist_session(&mut world).await;
         let first = world.session().to_string();
 
-        let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Create { host: None },
+        )
+        .await;
         assert!(matches!(moved, Focus::Moved));
         // Drain first. The switch reopened the stream over both sessions, so
         // `first`'s own re-attach block is still to come, and a swap that
@@ -15475,7 +15594,13 @@ mod tests {
             .cloned()
             .expect("a persisted head");
 
-        let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Create { host: None },
+        )
+        .await;
         assert!(matches!(moved, Focus::Moved));
         world
             .host()
@@ -15547,7 +15672,13 @@ mod tests {
             .cloned()
             .expect("a persisted head");
 
-        let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Create { host: None },
+        )
+        .await;
         assert!(matches!(moved, Focus::Moved));
 
         // Another writer moves the backgrounded session's head. The host mints a
@@ -15623,7 +15754,13 @@ mod tests {
         run_prompt(&mut world, "seed").await;
         let outgoing = world.session().to_string();
 
-        let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Create { host: None },
+        )
+        .await;
         assert!(matches!(moved, Focus::Moved));
         assert_ne!(world.session(), outgoing, "the focus moved");
 
@@ -16010,7 +16147,13 @@ mod tests {
             "armed before the change"
         );
 
-        let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Create { host: None },
+        )
+        .await;
         assert!(matches!(moved, Focus::Moved));
 
         assert!(
@@ -16160,15 +16303,26 @@ mod tests {
         stated: &crate::connect::Stated,
         argv: &[&str],
     ) -> Result<crate::connect::Connected> {
+        dial_at(&remote.url(), config, stated, argv).await
+    }
+
+    /// The same against any peer's url: a gateway is dialed exactly as a host
+    /// is, which is the whole point of it serving a host's API (spec 7.1).
+    async fn dial_at(
+        url: &str,
+        config: &Config,
+        stated: &crate::connect::Stated,
+        argv: &[&str],
+    ) -> Result<crate::connect::Connected> {
         let mut args = vec!["aj", "connect"];
-        let url = remote.url();
-        args.push(&url);
+        args.push(url);
         args.extend_from_slice(argv);
         let args = Args::parse_from(args);
         let Some(CliCommand::Connect {
             url,
             session_id,
             new,
+            host,
             ..
         }) = &args.command
         else {
@@ -16182,6 +16336,7 @@ mod tests {
                 url,
                 session_id: session_id.as_deref(),
                 new: *new,
+                host: host.as_deref(),
             },
         )
         .await
@@ -16190,14 +16345,18 @@ mod tests {
     /// Build the connect-mode world `aj connect <url> [args...]` builds, with
     /// this client's own config and store confined to `dir`.
     async fn connect_world(dir: &TempDir, remote: &RemoteHost, argv: &[&str]) -> World {
+        connect_world_at(dir, &remote.url(), argv).await
+    }
+
+    /// The same against any peer's url.
+    async fn connect_world_at(dir: &TempDir, url: &str, argv: &[&str]) -> World {
         let mut args = vec!["aj", "connect"];
-        let url = remote.url();
-        args.push(&url);
+        args.push(url);
         args.extend_from_slice(argv);
         let args = Args::parse_from(args);
         // A stock install states nothing beyond its argv, so the host defaults
         // every axis it is not told about.
-        let connected = dial(remote, &client_config(), &nothing_stated(), argv)
+        let connected = dial_at(url, &client_config(), &nothing_stated(), argv)
             .await
             .expect("connect to the scripted host");
         let auth = AuthStorage::new(dir.path().join("client-auth.json"));
@@ -16213,7 +16372,16 @@ mod tests {
         remote: &RemoteHost,
         argv: &[&str],
     ) -> (World, Rc<RefCell<Shell>>) {
-        let world = connect_world(dir, remote, argv).await;
+        connect_world_and_shell_at(dir, &remote.url(), argv).await
+    }
+
+    /// The same against any peer's url.
+    async fn connect_world_and_shell_at(
+        dir: &TempDir,
+        url: &str,
+        argv: &[&str],
+    ) -> (World, Rc<RefCell<Shell>>) {
+        let world = connect_world_at(dir, url, argv).await;
         let shell = Rc::new(RefCell::new(Shell::new(
             Rc::clone(&world.chat),
             Rc::clone(&world.status),
@@ -16401,7 +16569,7 @@ mod tests {
 
         let other = world
             .control
-            .create(None, None, None)
+            .create(None, None, None, None)
             .await
             .expect("a second session");
         // Its row has to exist before the visit below: the viewed stamp is the
@@ -16499,7 +16667,7 @@ mod tests {
         run_prompt(&mut world, "seed").await;
         world
             .control
-            .create(None, None, None)
+            .create(None, None, None, None)
             .await
             .expect("a second session");
         let deadline = Instant::now() + SETTLE_DEADLINE;
@@ -16556,12 +16724,12 @@ mod tests {
         let focused = world.session().to_string();
         let background = world
             .control
-            .create(None, None, None)
+            .create(None, None, None, None)
             .await
             .expect("a second session");
         let listed = world
             .control
-            .create(None, None, None)
+            .create(None, None, None, None)
             .await
             .expect("a third session");
         for session in [&background, &listed] {
@@ -16805,7 +16973,7 @@ mod tests {
         for _ in 0..2 {
             world
                 .control
-                .create(None, None, None)
+                .create(None, None, None, None)
                 .await
                 .expect("another session");
         }
@@ -16884,7 +17052,7 @@ mod tests {
         run_prompt(&mut world, "seed").await;
         world
             .control
-            .create(None, None, None)
+            .create(None, None, None, None)
             .await
             .expect("a second session to step onto");
         let deadline = Instant::now() + SETTLE_DEADLINE;
@@ -16980,7 +17148,7 @@ mod tests {
         toggle().await;
         world
             .control
-            .create(None, None, None)
+            .create(None, None, None, None)
             .await
             .expect("a second session");
         let deadline = Instant::now() + SETTLE_DEADLINE;
@@ -17103,7 +17271,7 @@ mod tests {
         for _ in 0..2 {
             world
                 .control
-                .create(None, None, None)
+                .create(None, None, None, None)
                 .await
                 .expect("another session");
         }
@@ -17170,7 +17338,7 @@ mod tests {
         app.handle_input(event);
         assert_eq!(
             shell.borrow().take_session_request(),
-            Some(SessionRequest::New),
+            Some(SessionRequest::New { host: None }),
         );
         shut_down(&world).await;
     }
@@ -17463,7 +17631,7 @@ mod tests {
         .await
         .expect("drive exits without a fatal error");
         assert!(
-            matches!(exit, SessionExit::New),
+            matches!(exit, SessionExit::New { host: None }),
             "the create chord is what ends the loop",
         );
 
@@ -17831,7 +17999,7 @@ mod tests {
         app.handle_input(left_mouse_at(2, 2, vaxis::mouse::Type::Press));
         assert_eq!(
             shell.borrow().take_session_request(),
-            Some(SessionRequest::New),
+            Some(SessionRequest::New { host: None }),
         );
     }
 
@@ -18450,7 +18618,13 @@ mod tests {
         let (mut app, _writer, _root) = app_over(&shell).await;
 
         // A create over the wire mints a session on the host and focuses it.
-        let moved = apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Create).await;
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Create { host: None },
+        )
+        .await;
         assert!(matches!(moved, Focus::Moved), "the create was refused");
         let created = world.session().to_string();
         assert_ne!(created, first, "a fresh session, not the one we were on");
@@ -18821,7 +18995,7 @@ mod tests {
         let (world, _shell) = connect_world_and_shell(&dir, &remote, &[]).await;
         let second = world
             .control
-            .create(None, None, None)
+            .create(None, None, None, None)
             .await
             .expect("a second session");
 
@@ -18922,7 +19096,7 @@ mod tests {
         // be confused.
         let other = world
             .control
-            .create(None, None, None)
+            .create(None, None, None, None)
             .await
             .expect("a second session");
         assert_ne!(other, world.session());
@@ -19102,5 +19276,794 @@ mod tests {
 
         settle(&mut world).await;
         remote.shutdown().await;
+    }
+    // ---- Which host a create is for (spec 6.6, 7.1) ----
+
+    /// A real gateway in front of `hosts`, dialed over HTTP exactly as a client
+    /// dials one in production.
+    ///
+    /// Settling is the fixture's whole subtlety. A gateway learns a host's id by
+    /// asking and its rows by following its stream, so a client that looked
+    /// sooner would see hosts a create cannot name and a directory missing the
+    /// session it means to attach, and would measure nothing about picking a
+    /// host. Every wait is bounded, so a link that never comes up fails the test
+    /// instead of hanging it.
+    struct RemoteGateway {
+        gateway: crate::gateway::Gateway,
+        server: crate::gateway::server::GatewayServer,
+        _state: TempDir,
+    }
+
+    impl RemoteGateway {
+        /// Enroll `hosts` and serve them, once every one of them has an id and a
+        /// live link.
+        async fn over(hosts: &[&RemoteHost]) -> RemoteGateway {
+            let state = TempDir::new().expect("tempdir");
+            let gateway = crate::gateway::Gateway::new(crate::gateway::GatewaySetup {
+                state_dir: state.path().to_path_buf(),
+                // Enrolled below rather than configured, because enrolling
+                // handshakes: it is what adopts each host's id.
+                static_hosts: Vec::new(),
+                tuning: crate::gateway::Tuning::default(),
+            })
+            .expect("a gateway over a fresh state directory");
+            for host in hosts {
+                gateway.enroll(&host.url()).await.expect("enroll a host");
+            }
+            let server = crate::gateway::server::GatewayServer::bind(
+                gateway.clone(),
+                "127.0.0.1:0".parse().expect("a loopback address"),
+                crate::remote::IdentityGate::local(),
+            )
+            .await
+            .expect("bind a loopback gateway port");
+            let fixture = RemoteGateway {
+                gateway,
+                server,
+                _state: state,
+            };
+            let reachable = fixture
+                .until("every enrolled host to be reachable", |hosts| {
+                    let ready = hosts
+                        .iter()
+                        .filter(|host| host.id.is_some() && !host.unreachable)
+                        .count();
+                    (ready == hosts.len()).then_some(ready)
+                })
+                .await;
+            assert_eq!(
+                reachable,
+                hosts.len(),
+                "every host must be nameable and live, or the picker has nothing to pick",
+            );
+            fixture
+        }
+
+        fn url(&self) -> String {
+            self.server.url()
+        }
+
+        /// Poll the merged directory's hosts until `check` answers.
+        async fn until<T>(
+            &self,
+            what: &str,
+            mut check: impl FnMut(&[aj_wire::DirectoryHost]) -> Option<T>,
+        ) -> T {
+            crate::remote::tests::bounded(what, async {
+                loop {
+                    if let Some(found) = check(&self.gateway.sessions().hosts) {
+                        return found;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+        }
+
+        /// Wait until the merged directory holds `n` rows, so a client reading
+        /// it sees the sessions its hosts already have.
+        async fn until_sessions(&self, n: usize) {
+            let rows = crate::remote::tests::bounded(
+                "the merged directory to carry every host's rows",
+                async {
+                    loop {
+                        let rows = self.gateway.sessions().sessions.len();
+                        if rows >= n {
+                            return rows;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                },
+            )
+            .await;
+            assert_eq!(rows, n, "the directory the client will read is complete");
+        }
+
+        /// The enrolled hosts' ids, in the order the picker lists them.
+        fn host_ids(&self) -> Vec<String> {
+            self.gateway
+                .sessions()
+                .hosts
+                .iter()
+                .map(|host| host.id.clone().expect("an adopted id"))
+                .collect()
+        }
+
+        async fn shutdown(self) {
+            self.server.shutdown().await;
+            self.gateway.shutdown().await;
+        }
+    }
+
+    /// How many sessions a host holds in its own store, which is where a create
+    /// either landed or did not.
+    async fn session_count(host: &RemoteHost) -> usize {
+        host.host
+            .sessions()
+            .await
+            .expect("the host's own session list")
+            .sessions
+            .len()
+    }
+
+    /// Two hosts behind a gateway, with one session already on the first of
+    /// them, plus a client attached to it: the configuration a create is
+    /// ambiguous in.
+    ///
+    /// The attached session lives on the *first* host on purpose. It is what the
+    /// picker would inherit from if it inherited anything, so every "created
+    /// nowhere" assertion below would be satisfied by a wrong implementation
+    /// too if the focused session were somewhere else.
+    async fn two_host_gateway(
+        left: &RemoteHost,
+        right: &RemoteHost,
+        client: &TempDir,
+    ) -> (RemoteGateway, Vec<String>, World, Rc<RefCell<Shell>>) {
+        left.host.create().await.expect("seed a session to attach");
+        let gateway = RemoteGateway::over(&[left, right]).await;
+        gateway.until_sessions(1).await;
+        let ids = gateway.host_ids();
+        assert_eq!(ids.len(), 2, "two hosts, so a create has a choice to make");
+        let (world, shell) = connect_world_and_shell_at(client, &gateway.url(), &[]).await;
+        (gateway, ids, world, shell)
+    }
+
+    /// The loop's own parts, so a test can call `drive` the way `run` does.
+    fn drive_parts(
+        shell: &Rc<RefCell<Shell>>,
+    ) -> (
+        ThemeWatch,
+        Option<UnboundedReceiver<Vec<String>>>,
+        UnboundedReceiver<AutocompleteDelivery>,
+    ) {
+        let autocomplete_rx = shell
+            .borrow()
+            .editor
+            .borrow_mut()
+            .take_autocomplete_rx()
+            .expect("editor hands out its autocomplete receiver once");
+        (inert_theme_watch(), None, autocomplete_rx)
+    }
+
+    /// The whole gesture through the real loop: the create chord opens the
+    /// picker because the answer is ambiguous, a cursor move names a host, and
+    /// the confirmed pick is what the loop exits with. Every byte is in the
+    /// input buffer before the loop reads any of them.
+    ///
+    /// This is the wiring test. Nothing reaches into the shell between
+    /// keystrokes, so a create that never consults the host list, a picker that
+    /// never takes focus and a pick that parks nothing all fail here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_picked_host_is_what_the_create_lands_on() {
+        let (left_dir, right_dir, client_dir) = (
+            TempDir::new().expect("tempdir"),
+            TempDir::new().expect("tempdir"),
+            TempDir::new().expect("tempdir"),
+        );
+        let left = RemoteHost::start(&left_dir, "streaming-text").await;
+        let right = RemoteHost::start(&right_dir, "streaming-text").await;
+        let (gateway, ids, mut world, shell) = two_host_gateway(&left, &right, &client_dir).await;
+        let (mut app, mut writer, root) = app_over(&shell).await;
+        let (mut theme_watch, mut prompt_history_rx, mut autocomplete_rx) = drive_parts(&shell);
+        let before = (session_count(&left).await, session_count(&right).await);
+
+        writer
+            .write_all(&chord_bytes(AjAction::SessionNew))
+            .expect("the create chord");
+        // Down moves the band off the row that names no host and onto the first
+        // host, and Enter confirms that one.
+        writer.write_all(b"\x1b[B\r").expect("pick the first host");
+
+        let exit = crate::remote::tests::bounded(
+            "the confirmed pick to end the drive loop",
+            drive(
+                &mut app,
+                &root,
+                &shell,
+                &mut world,
+                &mut theme_watch,
+                &mut prompt_history_rx,
+                &mut autocomplete_rx,
+            ),
+        )
+        .await
+        .expect("drive exits without a fatal error");
+        assert!(
+            matches!(&exit, SessionExit::New { host: Some(host) } if *host == ids[0]),
+            "the loop exits with the host the picker was pointed at, not with none",
+        );
+
+        let SessionExit::New { host } = exit else {
+            panic!("the create is what ended the loop");
+        };
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Create { host: host.clone() },
+        )
+        .await;
+        assert!(
+            matches!(moved, Focus::Moved),
+            "the create landed: {:?}",
+            crate::toasts::toast_texts(&shell.borrow().toasts),
+        );
+
+        // The harm lands in a host's own store, so that is where the assertion
+        // goes first: exactly one of the two hosts gained a session, and it is
+        // the picked one.
+        let picked = ids[0].clone();
+        let expected = if picked == left.host.hello().host_id {
+            (before.0 + 1, before.1)
+        } else {
+            (before.0, before.1 + 1)
+        };
+        assert_eq!(
+            (session_count(&left).await, session_count(&right).await),
+            expected,
+            "the session was minted on the picked host ({picked}) and on no other",
+        );
+        let created = world.session().to_string();
+        assert!(
+            poll_directory(&mut world, &created, |row| row.host.as_deref()
+                == Some(&picked))
+            .await,
+            "and the gateway reports the row under that host: {:?}",
+            world.directory.rows(),
+        );
+
+        gateway.shutdown().await;
+        left.shutdown().await;
+        right.shutdown().await;
+    }
+
+    /// The palette's create command reaches the same picker the chord does, so
+    /// the two triggers are one gesture.
+    ///
+    /// Worth its own pass through the real loop because the palette is on the
+    /// overlay stack when the request parks: the loop pops it and pushes the
+    /// picker in the same input turn, and the keys after it have to reach the
+    /// picker rather than the palette or the editor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_palette_create_asks_the_same_question() {
+        let (left_dir, right_dir, client_dir) = (
+            TempDir::new().expect("tempdir"),
+            TempDir::new().expect("tempdir"),
+            TempDir::new().expect("tempdir"),
+        );
+        let left = RemoteHost::start(&left_dir, "streaming-text").await;
+        let right = RemoteHost::start(&right_dir, "streaming-text").await;
+        let (gateway, ids, mut world, shell) = two_host_gateway(&left, &right, &client_dir).await;
+        let (mut app, mut writer, root) = app_over(&shell).await;
+        let (mut theme_watch, mut prompt_history_rx, mut autocomplete_rx) = drive_parts(&shell);
+
+        // Ctrl+O opens the palette, `new` filters to the create command, and the
+        // Enter after it confirms the row the picker then opens over.
+        writer.write_all(&[0x0f]).expect("the palette chord");
+        writer.write_all(b"new\r").expect("the create command");
+        writer.write_all(b"\x1b[B\r").expect("pick the first host");
+
+        let exit = crate::remote::tests::bounded(
+            "the palette's create to reach the picker and end the loop",
+            drive(
+                &mut app,
+                &root,
+                &shell,
+                &mut world,
+                &mut theme_watch,
+                &mut prompt_history_rx,
+                &mut autocomplete_rx,
+            ),
+        )
+        .await
+        .expect("drive exits without a fatal error");
+
+        assert!(
+            matches!(&exit, SessionExit::New { host: Some(host) } if *host == ids[0]),
+            "the palette's create lands on the picked host, not on none: {:?}",
+            crate::toasts::toast_texts(&shell.borrow().toasts),
+        );
+        assert_eq!(
+            shell.borrow().overlays.borrow().depth(),
+            0,
+            "and the stack is back to the transcript, palette included",
+        );
+
+        gateway.shutdown().await;
+        left.shutdown().await;
+        right.shutdown().await;
+    }
+
+    /// Opening the picker and pressing only Enter creates nothing, anywhere.
+    ///
+    /// The constraint the design exists for: a create runs an agent in a working
+    /// directory, so the picker must not open with a plausible host under the
+    /// band that one reflexive keypress confirms. The attached session is on the
+    /// first host, so an implementation that pre-selected the focused row's host
+    /// (the option this design rejected) would mint a session there and fail on
+    /// the counts below.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn enter_alone_on_the_picker_creates_nowhere() {
+        let (left_dir, right_dir, client_dir) = (
+            TempDir::new().expect("tempdir"),
+            TempDir::new().expect("tempdir"),
+            TempDir::new().expect("tempdir"),
+        );
+        let left = RemoteHost::start(&left_dir, "streaming-text").await;
+        let right = RemoteHost::start(&right_dir, "streaming-text").await;
+        let (gateway, _ids, mut world, shell) = two_host_gateway(&left, &right, &client_dir).await;
+        let (mut app, mut writer, root) = app_over(&shell).await;
+        let (mut theme_watch, mut prompt_history_rx, mut autocomplete_rx) = drive_parts(&shell);
+        let before = (session_count(&left).await, session_count(&right).await);
+
+        writer
+            .write_all(&chord_bytes(AjAction::SessionNew))
+            .expect("the create chord");
+        writer.write_all(b"\r").expect("a reflexive confirm");
+
+        // The loop is expected to keep running: a create that has not been told
+        // which host it is for is not a create yet.
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(500),
+            drive(
+                &mut app,
+                &root,
+                &shell,
+                &mut world,
+                &mut theme_watch,
+                &mut prompt_history_rx,
+                &mut autocomplete_rx,
+            ),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "the loop left the picker for a create nobody chose a host for",
+        );
+        assert_eq!(
+            shell.borrow().overlays.borrow().depth(),
+            1,
+            "the picker is still open and still asking",
+        );
+        assert_eq!(
+            shell.borrow().take_session_request(),
+            None,
+            "and nothing was parked behind it",
+        );
+        assert_eq!(
+            (session_count(&left).await, session_count(&right).await),
+            before,
+            "no session was minted on either host",
+        );
+
+        gateway.shutdown().await;
+        left.shutdown().await;
+        right.shutdown().await;
+    }
+
+    /// Cancelling the picker leaves the create undone and the client where it
+    /// was, with nothing minted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelling_the_picker_mints_nothing() {
+        let (left_dir, right_dir, client_dir) = (
+            TempDir::new().expect("tempdir"),
+            TempDir::new().expect("tempdir"),
+            TempDir::new().expect("tempdir"),
+        );
+        let left = RemoteHost::start(&left_dir, "streaming-text").await;
+        let right = RemoteHost::start(&right_dir, "streaming-text").await;
+        let (gateway, _ids, mut world, shell) = two_host_gateway(&left, &right, &client_dir).await;
+        let (mut app, mut writer, root) = app_over(&shell).await;
+        let (mut theme_watch, mut prompt_history_rx, mut autocomplete_rx) = drive_parts(&shell);
+        let before = (session_count(&left).await, session_count(&right).await);
+        let focused = world.session().to_string();
+
+        writer
+            .write_all(&chord_bytes(AjAction::SessionNew))
+            .expect("the create chord");
+        // A cursor move onto a host, then Esc: even a picker that was pointed at
+        // one creates nothing until it is confirmed.
+        writer.write_all(b"\x1b[B\x1b").expect("point, then cancel");
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(500),
+            drive(
+                &mut app,
+                &root,
+                &shell,
+                &mut world,
+                &mut theme_watch,
+                &mut prompt_history_rx,
+                &mut autocomplete_rx,
+            ),
+        )
+        .await;
+        assert!(outcome.is_err(), "a cancelled create does not end the loop");
+        assert_eq!(
+            shell.borrow().overlays.borrow().depth(),
+            0,
+            "the picker closed",
+        );
+        assert_eq!(
+            (session_count(&left).await, session_count(&right).await),
+            before,
+            "and nothing was minted",
+        );
+        assert_eq!(world.session(), focused, "the client stayed where it was");
+
+        gateway.shutdown().await;
+        left.shutdown().await;
+        right.shutdown().await;
+    }
+
+    /// A gateway with one host answers the question itself, so the create stays
+    /// one gesture: no overlay, and the chord ends the loop as it always did.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_single_host_gateway_creates_without_asking() {
+        let (host_dir, client_dir) = (
+            TempDir::new().expect("tempdir"),
+            TempDir::new().expect("tempdir"),
+        );
+        let host = RemoteHost::start(&host_dir, "streaming-text").await;
+        host.host.create().await.expect("seed a session to attach");
+        let gateway = RemoteGateway::over(&[&host]).await;
+        gateway.until_sessions(1).await;
+        let (mut world, shell) = connect_world_and_shell_at(&client_dir, &gateway.url(), &[]).await;
+        let (mut app, mut writer, root) = app_over(&shell).await;
+        let (mut theme_watch, mut prompt_history_rx, mut autocomplete_rx) = drive_parts(&shell);
+        let before = session_count(&host).await;
+
+        writer
+            .write_all(&chord_bytes(AjAction::SessionNew))
+            .expect("the create chord");
+
+        let exit = crate::remote::tests::bounded(
+            "the create chord to end the drive loop",
+            drive(
+                &mut app,
+                &root,
+                &shell,
+                &mut world,
+                &mut theme_watch,
+                &mut prompt_history_rx,
+                &mut autocomplete_rx,
+            ),
+        )
+        .await
+        .expect("drive exits without a fatal error");
+        assert!(
+            matches!(exit, SessionExit::New { host: None }),
+            "one host is not a choice: the peer's own defaulting rule answers it",
+        );
+        assert_eq!(
+            shell.borrow().overlays.borrow().depth(),
+            0,
+            "and nothing was opened to ask",
+        );
+
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Create { host: None },
+        )
+        .await;
+        assert!(
+            matches!(moved, Focus::Moved),
+            "the create landed: {:?}",
+            crate::toasts::toast_texts(&shell.borrow().toasts),
+        );
+        assert_eq!(
+            session_count(&host).await,
+            before + 1,
+            "on the one host there is",
+        );
+
+        gateway.shutdown().await;
+        host.shutdown().await;
+    }
+
+    /// A refused create reports the refusing server's own sentence. A gateway
+    /// says it is a gateway; nothing in the toast claims a host answered, which
+    /// is what the transport wrapper would have said for both.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refused_create_reads_in_the_refusing_server_s_words() {
+        let (left_dir, right_dir, client_dir) = (
+            TempDir::new().expect("tempdir"),
+            TempDir::new().expect("tempdir"),
+            TempDir::new().expect("tempdir"),
+        );
+        let left = RemoteHost::start(&left_dir, "streaming-text").await;
+        let right = RemoteHost::start(&right_dir, "streaming-text").await;
+        let (gateway, _ids, mut world, shell) = two_host_gateway(&left, &right, &client_dir).await;
+        let (mut app, _writer, _root) = app_over(&shell).await;
+        let before = (session_count(&left).await, session_count(&right).await);
+
+        let stayed = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Create {
+                host: Some("a-host-that-went-away".to_string()),
+            },
+        )
+        .await;
+
+        assert!(matches!(stayed, Focus::Same), "the create was refused");
+        let toasts = crate::toasts::toast_texts(&shell.borrow().toasts);
+        // Collapsed to one line: a toast wraps to its box, and what is under
+        // test is the wording rather than where the breaks fall.
+        let refusal = toasts
+            .iter()
+            .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+            .find(|text| text.starts_with("Failed to start a fresh session:"))
+            .unwrap_or_else(|| panic!("the refusal is reported: {toasts:?}"));
+        assert!(
+            refusal.contains("no host a-host-that-went-away is enrolled here"),
+            "the gateway's own sentence reaches the user: {refusal}",
+        );
+        assert!(
+            !refusal.contains("the host answered"),
+            "and nothing misattributes it to a host: {refusal}",
+        );
+        assert_eq!(
+            (session_count(&left).await, session_count(&right).await),
+            before,
+            "a clean refusal mints nothing",
+        );
+
+        gateway.shutdown().await;
+        left.shutdown().await;
+        right.shutdown().await;
+    }
+
+    /// `--host` is the same answer for a run with no terminal to ask: the named
+    /// host is the one the created session lands on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_host_flag_creates_on_the_host_it_names() {
+        let (left_dir, right_dir, client_dir) = (
+            TempDir::new().expect("tempdir"),
+            TempDir::new().expect("tempdir"),
+            TempDir::new().expect("tempdir"),
+        );
+        let left = RemoteHost::start(&left_dir, "streaming-text").await;
+        let right = RemoteHost::start(&right_dir, "streaming-text").await;
+        left.host.create().await.expect("seed a session");
+        let gateway = RemoteGateway::over(&[&left, &right]).await;
+        gateway.until_sessions(1).await;
+        let target = right.host.hello().host_id;
+        let before = (session_count(&left).await, session_count(&right).await);
+
+        // A prefix of the id, which is what an operator types: what travels is
+        // the full id it resolves to.
+        let prefix = &target[..8];
+        let mut world =
+            connect_world_at(&client_dir, &gateway.url(), &["--new", "--host", prefix]).await;
+
+        assert_eq!(
+            (session_count(&left).await, session_count(&right).await),
+            (before.0, before.1 + 1),
+            "the named host is the one that gained a session",
+        );
+        let created = world.session().to_string();
+        assert!(
+            poll_directory(&mut world, &created, |row| row.host.as_deref()
+                == Some(&target))
+            .await,
+            "and the gateway reports the row under it: {:?}",
+            world.directory.rows(),
+        );
+
+        gateway.shutdown().await;
+        left.shutdown().await;
+        right.shutdown().await;
+    }
+
+    /// A `--host` no host answers to is refused before the terminal is taken
+    /// over, with the candidates named and nothing created.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unmatched_host_flag_is_refused_with_the_candidates() {
+        let (left_dir, right_dir) = (
+            TempDir::new().expect("tempdir"),
+            TempDir::new().expect("tempdir"),
+        );
+        let left = RemoteHost::start(&left_dir, "streaming-text").await;
+        let right = RemoteHost::start(&right_dir, "streaming-text").await;
+        let gateway = RemoteGateway::over(&[&left, &right]).await;
+        let ids = gateway.host_ids();
+        let before = (session_count(&left).await, session_count(&right).await);
+
+        let refused = dial_at(
+            &gateway.url(),
+            &client_config(),
+            &nothing_stated(),
+            &["--new", "--host", "nowhere"],
+        )
+        .await;
+        let report = match refused {
+            Err(err) => format!("{err:#}"),
+            Ok(_) => panic!("a host nothing answers to is refused"),
+        };
+        assert!(
+            report.contains("--host") && report.contains(&ids[0]) && report.contains(&ids[1]),
+            "the refusal names the flag and every host that could have been meant: {report}",
+        );
+        // The value it could not resolve, quoted. This is what tells the
+        // client's own refusal apart from the gateway's refusal to guess, which
+        // lists the same hosts and would otherwise satisfy the assertion above.
+        assert!(
+            report.contains("\"nowhere\""),
+            "and it quotes what could not be resolved: {report}",
+        );
+        assert_eq!(
+            (session_count(&left).await, session_count(&right).await),
+            before,
+            "and a refused flag creates nothing",
+        );
+
+        gateway.shutdown().await;
+        left.shutdown().await;
+        right.shutdown().await;
+    }
+
+    /// A `--host` no host answers to is refused even where a create naming no
+    /// host would have gone through, so the flag is never quietly dropped.
+    ///
+    /// One host is the case where ignoring the value costs nothing on the wire:
+    /// the peer's own defaulting rule would have created the session anyway, and
+    /// the operator would never learn that the host they named was not consulted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unmatched_host_flag_is_refused_even_where_a_create_would_work() {
+        let host_dir = TempDir::new().expect("tempdir");
+        let host = RemoteHost::start(&host_dir, "streaming-text").await;
+        let gateway = RemoteGateway::over(&[&host]).await;
+        let before = session_count(&host).await;
+
+        let refused = dial_at(
+            &gateway.url(),
+            &client_config(),
+            &nothing_stated(),
+            &["--new", "--host", "nowhere"],
+        )
+        .await;
+        let report = match refused {
+            Err(err) => format!("{err:#}"),
+            Ok(_) => panic!("the flag named a host this gateway does not have"),
+        };
+        assert!(
+            report.contains("--host") && report.contains("\"nowhere\""),
+            "the client refuses what it could not resolve: {report}",
+        );
+        assert_eq!(
+            session_count(&host).await,
+            before,
+            "and the one host it does have gained nothing",
+        );
+
+        gateway.shutdown().await;
+        host.shutdown().await;
+    }
+
+    /// A create through a gateway that cannot answer the question, from a run
+    /// that cannot be asked, names the flag that answers it. Without that the
+    /// refusal tells an operator to name a host and leaves them no way to.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unanswered_create_names_the_flag() {
+        let (left_dir, right_dir) = (
+            TempDir::new().expect("tempdir"),
+            TempDir::new().expect("tempdir"),
+        );
+        let left = RemoteHost::start(&left_dir, "streaming-text").await;
+        let right = RemoteHost::start(&right_dir, "streaming-text").await;
+        let gateway = RemoteGateway::over(&[&left, &right]).await;
+
+        let refused = dial_at(
+            &gateway.url(),
+            &client_config(),
+            &nothing_stated(),
+            &["--new"],
+        )
+        .await;
+        let report = match refused {
+            Err(err) => format!("{err:#}"),
+            Ok(_) => panic!("a gateway with two hosts will not guess which host to create on"),
+        };
+        assert!(
+            report.contains("--host"),
+            "the refusal says how to answer it: {report}",
+        );
+
+        gateway.shutdown().await;
+        left.shutdown().await;
+        right.shutdown().await;
+    }
+
+    /// A plain host is one candidate, its own: the flag may name it, and naming
+    /// anything else is refused here rather than on the host (spec 6.6).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_host_flag_against_a_plain_host_names_that_host() {
+        let (host_dir, client_dir) = (
+            TempDir::new().expect("tempdir"),
+            TempDir::new().expect("tempdir"),
+        );
+        let remote = RemoteHost::start(&host_dir, "streaming-text").await;
+        let own = remote.host.hello().host_id;
+        let before = session_count(&remote).await;
+
+        let world =
+            connect_world_at(&client_dir, &remote.url(), &["--new", "--host", &own[..8]]).await;
+        assert_eq!(
+            session_count(&remote).await,
+            before + 1,
+            "the host named is the host there is",
+        );
+        drop(world);
+
+        let refused = dial(
+            &remote,
+            &client_config(),
+            &nothing_stated(),
+            &["--new", "--host", "some-other-host"],
+        )
+        .await;
+        let report = match refused {
+            Err(err) => format!("{err:#}"),
+            Ok(_) => panic!("a host this host is not is refused"),
+        };
+        assert!(
+            report.contains("--host") && report.contains(&own),
+            "the refusal names the one host it could have meant: {report}",
+        );
+        assert_eq!(
+            session_count(&remote).await,
+            before + 1,
+            "and the refused run created nothing",
+        );
+
+        remote.shutdown().await;
+    }
+
+    /// Poll the client's own directory until `session`'s row satisfies
+    /// `wanted`. A gateway republishes its merged directory as its hosts report,
+    /// so the row arrives a beat after the create answered.
+    async fn poll_directory(
+        world: &mut World,
+        session: &str,
+        wanted: impl Fn(&aj_wire::SessionSummary) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        while Instant::now() < deadline {
+            fold_ready_frames(world);
+            if world
+                .directory
+                .rows()
+                .iter()
+                .any(|row| row.id == session && wanted(row))
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
     }
 }

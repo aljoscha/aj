@@ -25,7 +25,9 @@ mod enrollment;
 mod link;
 mod naming;
 mod outbound;
-mod server;
+// Crate-visible for the same reason `remote`'s server is: a gateway is a peer a
+// client dials, so the tests that drive a client stand one up.
+pub(crate) mod server;
 mod splice;
 
 #[cfg(test)]

@@ -8,17 +8,19 @@
 //! Session selection is the spec's: an explicit id, else `--new` creates,
 //! else the host's most recently modified session, else create one. A create
 //! carries the settings this client's user actually stated, because
-//! per-session settings follow whoever creates the session (spec section 8).
+//! per-session settings follow whoever creates the session (spec section 8),
+//! and the host `--host` named when the peer serves more than one.
 
 use std::path::PathBuf;
 
 use aj_app::cli::args::Args;
 use aj_conf::{Config, ConfigLayer};
 use aj_models::{speed_name, thinking_config_name, verbosity_name};
-use aj_wire::{Hello, ModelSelection, SessionSettings};
+use aj_wire::{DirectoryHost, Hello, ModelSelection, SessionSettings};
 use anyhow::{Context, Result, anyhow};
 
 use crate::control::{Control, ControlError};
+use crate::host_picker::resolve_host;
 use crate::remote::RemoteClient;
 
 /// Which session `aj connect` opens with.
@@ -28,6 +30,8 @@ pub(crate) struct ConnectTarget<'a> {
     pub(crate) session_id: Option<&'a str>,
     /// Whether `--new` asked for a fresh session.
     pub(crate) new: bool,
+    /// The host `--host` named, for the session this run creates.
+    pub(crate) host: Option<&'a str>,
 }
 
 /// A connected client: the control surface, the focused session, and what the
@@ -68,7 +72,11 @@ pub(crate) async fn connect(
     // for its label is a round trip that reports after the terminal is gone,
     // and the flag is this client's own input to validate (spec 6.6).
     let tag = args.launch_tag().map_err(|err| anyhow!("--tag: {err}"))?;
-    let (session, created) = resolve_session(&control, &target, settings, tag).await?;
+    let host = match target.host {
+        Some(named) => resolve_named_host(&control, &hello, named).await?,
+        None => None,
+    };
+    let (session, created) = resolve_session(&control, &target, host, settings, tag).await?;
     Ok(Connected {
         control,
         session,
@@ -77,11 +85,49 @@ pub(crate) async fn connect(
     })
 }
 
+/// The full id of the host `--host` named, refused before the terminal is
+/// taken over.
+///
+/// The candidates are the hosts the peer publishes, which is a gateway's
+/// enrollments and nothing at all from a plain host (spec 7.1). A plain host is
+/// its own single candidate, named by the id it introduced itself with, which is
+/// also the only value its create route accepts (spec 6.6). The two are told
+/// apart by the working directory a gateway reports none of.
+///
+/// `None` when the peer has no host to name: a gateway with nothing enrolled has
+/// nowhere to create either, and letting it say so beats this client inventing a
+/// refusal of its own.
+async fn resolve_named_host(
+    control: &Control,
+    hello: &Hello,
+    named: &str,
+) -> Result<Option<String>> {
+    let mut hosts = control
+        .sessions()
+        .await
+        .context("could not read the host's session list")?
+        .hosts;
+    if hosts.is_empty() && hello.working_directory.is_some() {
+        hosts.push(DirectoryHost {
+            id: Some(hello.host_id.clone()),
+            address: None,
+            unreachable: false,
+        });
+    }
+    if hosts.is_empty() {
+        return Ok(None);
+    }
+    resolve_host(&hosts, named)
+        .map(Some)
+        .map_err(|err| anyhow!("--host: {err}"))
+}
+
 /// Resolve the session to attach per spec 9.1, creating one when that is what
 /// the rule says.
 async fn resolve_session(
     control: &Control,
     target: &ConnectTarget<'_>,
+    host: Option<String>,
     settings: Option<SessionSettings>,
     tag: Option<String>,
 ) -> Result<(String, bool)> {
@@ -89,7 +135,7 @@ async fn resolve_session(
         return Ok((id.to_string(), false));
     }
     if target.new {
-        return Ok((create(control, settings, tag).await?, true));
+        return Ok((create(control, host, settings, tag).await?, true));
     }
     let list = control
         .sessions()
@@ -106,7 +152,7 @@ async fn resolve_session(
         Some(session) => Ok((session, false)),
         // A fresh `aj serve` holds nothing, and connect mode would otherwise
         // have nothing to attach at all.
-        None => Ok((create(control, settings, tag).await?, true)),
+        None => Ok((create(control, host, settings, tag).await?, true)),
     }
 }
 
@@ -118,16 +164,23 @@ async fn resolve_session(
 /// that nobody asked for and nobody is looking at.
 async fn create(
     control: &Control,
+    host: Option<String>,
     settings: Option<SessionSettings>,
     tag: Option<String>,
 ) -> Result<String> {
-    match control.create(settings, None, tag).await {
+    match control.create(host, settings, None, tag).await {
         Ok(session) => Ok(session),
         Err(ControlError::PartialCreate { session, message }) => {
             eprintln!("aj: warning: {message}");
             Ok(session)
         }
-        Err(err) => Err(err).context("could not create a session on the host"),
+        // A peer serving several hosts will not guess which one a create is
+        // for, and a run with no terminal cannot be asked, so the refusal
+        // names the flag that answers it.
+        Err(err) if err.ambiguous_host() => {
+            Err(err).context("could not create a session: name the host it is for with --host <id>")
+        }
+        Err(err) => Err(err).context("could not create a session"),
     }
 }
 

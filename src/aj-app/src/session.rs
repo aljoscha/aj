@@ -80,8 +80,10 @@ pub enum SessionExit {
     Quit,
     /// A resume pick: rebuild onto the identified session.
     Switch(String),
-    /// New session: rebuild onto a freshly minted session.
-    New,
+    /// New session: rebuild onto a freshly minted session, on `host` when the
+    /// peer serves more than one and the user named one (see
+    /// [`SessionRequest::New`]).
+    New { host: Option<String> },
     /// Branch the current session: move its head to `target` and, when set,
     /// auto-submit `prompt` as the branch's first turn. `prompt` is `None`
     /// for a tree-view switch, which only moves the head.
@@ -97,7 +99,17 @@ pub enum SessionExit {
 /// turn in flight.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SessionRequest {
-    New,
+    /// Mint a session on `host`, which names one of the peer's hosts when the
+    /// peer serves several and the user picked one.
+    ///
+    /// `None` means the peer decides, which is what the wire's absent host
+    /// field means: the one working directory a plain host serves, or the sole
+    /// host of a gateway that has one. A peer with a choice to make refuses
+    /// that rather than guessing, so the frontend asks before parking the
+    /// request (spec 6.6).
+    New {
+        host: Option<String>,
+    },
     Resume(String),
     /// Switch the current session's head to `head`, with no prompt. Parked
     /// by the session-tree overlay's confirm, which names a segment tip
@@ -110,7 +122,7 @@ pub enum SessionRequest {
 impl SessionRequest {
     pub fn into_exit(self) -> SessionExit {
         match self {
-            SessionRequest::New => SessionExit::New,
+            SessionRequest::New { host } => SessionExit::New { host },
             SessionRequest::Resume(id) => SessionExit::Switch(id),
             SessionRequest::Branch { head } => SessionExit::Branch {
                 target: HeadTarget::Entry(head),

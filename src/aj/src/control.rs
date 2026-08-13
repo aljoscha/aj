@@ -115,6 +115,19 @@ impl ControlError {
             Self::Remote(err) => err.status() == Some(StatusCode::BAD_REQUEST),
         }
     }
+
+    /// Whether a create was refused for naming no host on a peer that serves
+    /// several (spec 6.6's `ambiguous_host`).
+    ///
+    /// Only a gateway answers this, and only to a client that did not say which
+    /// host it meant, so a caller that cannot ask a user says how to name one
+    /// instead of relaying a refusal with no remedy in it.
+    pub(crate) fn ambiguous_host(&self) -> bool {
+        match self {
+            Self::Host(_) | Self::PartialCreate { .. } => false,
+            Self::Remote(err) => err.code() == Some("ambiguous_host"),
+        }
+    }
 }
 
 /// The host this frontend drives.
@@ -232,6 +245,12 @@ impl Control {
     /// and an optional tag, answering its id (spec section 8: per-session
     /// settings follow whoever creates the session).
     ///
+    /// `host` names which of the peer's hosts the session is for. `None` leaves
+    /// that to the peer, which is what an absent host field means on the wire:
+    /// the one working directory a plain host serves, or the sole host of a
+    /// gateway that has one. A gateway with a choice to make refuses rather
+    /// than guessing (spec 6.6), so a caller with a user to ask asks first.
+    ///
     /// `tag` is expected to have been normalized already, which is what lets
     /// the local and the remote arm hand it on unchanged.
     ///
@@ -241,19 +260,21 @@ impl Control {
     /// strands the session it just made.
     pub(crate) async fn create(
         &self,
+        host: Option<String>,
         settings: Option<SessionSettings>,
         prompt: Option<Vec<UserContent>>,
         tag: Option<String>,
     ) -> Result<String, ControlError> {
         match self {
-            Self::Local(local) => Ok(local.host.create_with(settings, prompt, tag).await?),
+            Self::Local(local) => {
+                local.host.creates_here(host.as_deref())?;
+                Ok(local.host.create_with(settings, prompt, tag).await?)
+            }
             Self::Remote(remote) => {
                 let created = remote
                     .client
                     .create_session(CreateSessionRequest {
-                        // The create is for the server this client is attached
-                        // to, which is what an absent host means (spec 6.6).
-                        host: None,
+                        host,
                         settings,
                         prompt: prompt.map(|content| PromptInput::Content { content }),
                         tag,

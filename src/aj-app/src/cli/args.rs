@@ -244,6 +244,20 @@ pub enum Command {
         /// Create a fresh session instead of attaching an existing one.
         #[arg(long)]
         new: bool,
+        /// Which of the peer's hosts a created session is for, needed when a
+        /// gateway has more than one enrolled and there is no terminal to ask.
+        ///
+        /// Names a host by its id, or by any prefix of an id that only one
+        /// host answers to. A value that matches none of them, or several, is
+        /// refused with the candidates listed rather than resolved to a guess:
+        /// a create runs an agent in a working directory. Against a plain host
+        /// the only value it may name is that host's own id, which is what the
+        /// host itself accepts (spec 6.6).
+        ///
+        /// Consulted only by a create. A run that attaches an existing session
+        /// creates nothing for it to point at, exactly as for `--tag`.
+        #[arg(long, value_name = "HOST")]
+        host: Option<String>,
         /// Launch input for the attached session, interpreted exactly like
         /// the top-level [`Args::prompt`]: a mix of `@file` attachments and
         /// messages, auto-submitted as the next turn.
