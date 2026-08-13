@@ -1400,6 +1400,19 @@ about ordering). The layers:
    clients saw everything. The fault sweep includes a scripted turn
    that emits a notice, so the masking is load-bearing rather than
    untested.
+
+   The projection derives a row only where the entry records the thing
+   the row reports, and for a turn's usage what records it is the
+   entry's stop reason: usage is synthesized for an inference that ran
+   to a terminal frame of its own, never for one that failed or was
+   cancelled, because the live agent reports usage after a successful
+   inference and a failed attempt is retried. The token values cannot
+   serve as the discriminator, since a completed turn may legitimately
+   report zero and "reported nothing" is then indistinguishable from
+   "reported zero", so gating on them drops a real usage row instead of
+   suppressing a phantom one. Both directions are pinned: the
+   equivalence sweep catches the dropped row and a retried-inference
+   test catches the phantom.
 3. **Reducer hardening units**: idempotent re-application (projected
    tool start for a known call id, re-synthesized `SubAgentStart` for
    a known sub), quiesce behavior, epoch filtering, cursor invariant.
