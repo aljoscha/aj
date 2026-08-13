@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -203,11 +203,21 @@ impl Upstream {
 /// resume through it is incremental.
 struct Bridge {
     address: HostAddress,
-    /// Whether a new connection is piped through or closed at once.
-    open: Arc<AtomicBool>,
-    /// The pipes in flight, so a cut can break them.
-    piping: Arc<StdMutex<Vec<tokio::task::AbortHandle>>>,
+    /// Whether connections are passed through, and the pipes in flight.
+    pipes: Arc<StdMutex<Pipes>>,
     accepting: tokio::task::JoinHandle<()>,
+}
+
+/// What a bridge is doing for the connections through it.
+///
+/// One lock over both fields, so a cut cannot land between the decision to pipe
+/// a connection and the handle that would abort it. A pipe registered after the
+/// cut drained the list would carry its connection on, and the flap the test
+/// asked for would never happen: the gateway would keep its stream, the `reset`
+/// would never come, and the wait for it would end at the deadline.
+struct Pipes {
+    open: bool,
+    piping: Vec<tokio::task::AbortHandle>,
 }
 
 impl Bridge {
@@ -217,59 +227,66 @@ impl Bridge {
             .expect("bind a bridge port");
         let bound = listener.local_addr().expect("local addr");
         let target = upstream.addr;
-        let open = Arc::new(AtomicBool::new(true));
-        let piping: Arc<StdMutex<Vec<tokio::task::AbortHandle>>> =
-            Arc::new(StdMutex::new(Vec::new()));
+        let pipes = Arc::new(StdMutex::new(Pipes {
+            open: true,
+            piping: Vec::new(),
+        }));
         let accepting = tokio::spawn({
-            let open = Arc::clone(&open);
-            let piping = Arc::clone(&piping);
+            let pipes = Arc::clone(&pipes);
             async move {
                 loop {
-                    let Ok((mut inbound, _)) = listener.accept().await else {
-                        return;
+                    let inbound = match listener.accept().await {
+                        Ok((inbound, _)) => inbound,
+                        // A dial this bridge cut mid-handshake arrives as an
+                        // error and says nothing about the listener. Ending the
+                        // loop over one would leave every later dial hanging on a
+                        // bridge that stopped accepting, which is a test timing
+                        // out on a wait its own fixture broke. Paced so that a
+                        // listener that really is done cannot spin.
+                        Err(_) => {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                            continue;
+                        }
                     };
+                    let mut held = pipes.lock().expect("the bridge mutex is poisoned");
                     // Accepted and closed at once while cut, so a dial fails
                     // rather than hanging on a connection nothing answers.
-                    if !open.load(Ordering::Relaxed) {
+                    if !held.open {
                         continue;
                     }
                     let pipe = tokio::spawn(async move {
+                        let mut inbound = inbound;
                         let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await else {
                             return;
                         };
                         let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
                     });
-                    piping
-                        .lock()
-                        .expect("the bridge mutex is poisoned")
-                        .push(pipe.abort_handle());
+                    held.piping.push(pipe.abort_handle());
                 }
             }
         });
         Self {
             address: HostAddress::parse(&format!("http://{bound}")).expect("an address"),
-            open,
-            piping,
+            pipes,
             accepting,
         }
     }
 
     /// Break every connection through the bridge, and refuse new ones.
     fn cut(&self) {
-        self.open.store(false, Ordering::Relaxed);
-        for pipe in self
-            .piping
-            .lock()
-            .expect("the bridge mutex is poisoned")
-            .drain(..)
-        {
+        let mut held = self.pipes.lock().expect("the bridge mutex is poisoned");
+        held.open = false;
+        for pipe in held.piping.drain(..) {
             pipe.abort();
         }
     }
 
     /// Let connections through again.
     fn heal(&self) {
-        self.open.store(true, Ordering::Relaxed);
+        self.pipes
+            .lock()
+            .expect("the bridge mutex is poisoned")
+            .open = true;
     }
 
     fn stop(self) {
