@@ -71,8 +71,12 @@ pub fn display_path(path: &Path) -> String {
 
 /// [`display_path`] against a given home, for a caller that knows one and for
 /// tests that must not read the environment.
+///
+/// A relative home abbreviates nothing: an empty `$HOME` is a prefix of every
+/// path, and `~//etc/hosts` names a directory nobody has.
 pub fn display_path_with_home(path: &Path, home: Option<&Path>) -> String {
     if let Some(home) = home
+        && home.is_absolute()
         && let Ok(rel) = path.strip_prefix(home)
     {
         if rel.as_os_str().is_empty() {
@@ -268,6 +272,11 @@ mod tests {
             display_path_with_home(home, Some(home)),
             "~",
             "the home directory itself is the whole abbreviation, with nothing after it",
+        );
+        assert_eq!(
+            display_path_with_home(&outside, Some(Path::new(""))),
+            "/etc/hosts",
+            "an exported but empty $HOME abbreviates nothing, it is not a prefix of everything",
         );
     }
 

@@ -106,7 +106,9 @@ async fn resolve_named_host(
         Some(_) => vec![DirectoryHost {
             id: Some(hello.host_id.clone()),
             address: None,
-            name: None,
+            // The host named itself in this handshake, and this row stands in
+            // for what a gateway would have published about it.
+            name: hello.name.clone(),
             unreachable: false,
         }],
         None => {

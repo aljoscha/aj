@@ -1,7 +1,8 @@
 //! Remote-control protocol data types.
 //!
-//! This crate contains only serializable models. Transport and session
-//! behavior live in their respective frontend and application crates.
+//! This crate contains only serializable models and the rules a field's value
+//! has to satisfy ([`normalize_host_name`]). Transport and session behavior
+//! live in their respective frontend and application crates.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -290,9 +291,10 @@ impl std::error::Error for HostNameError {}
 
 /// Validate and normalize a name a host reports for itself.
 ///
-/// The one rule for [`Hello::name`] and [`DirectoryHost::name`], so what a
-/// host may state, what a gateway republishes and what a client is willing to
-/// paint cannot drift apart.
+/// The one rule behind [`Hello::name`] and [`DirectoryHost::name`]: a host
+/// states a name that satisfies it, a gateway republishes what it was told,
+/// and a reader applies this before painting, so the three cannot drift
+/// apart.
 ///
 /// `Ok(None)` covers everything that names nothing, so a caller treats "no
 /// name" and "a name that is blank" as one case. Surrounding whitespace is
@@ -300,9 +302,14 @@ impl std::error::Error for HostNameError {}
 /// the same label.
 ///
 /// Control characters are refused rather than stripped: a name reaches a
-/// terminal, and an escape sequence in one is a rendering hazard rather than
-/// a label. Refusing also keeps a rewritten name from claiming to be
-/// something the operator did not type.
+/// terminal, and the newline and the escape in one are a rendering hazard
+/// rather than a label. Refusing also keeps a rewritten name from claiming to
+/// be something the operator did not type.
+///
+/// Deliberately the same rule as a session tag's (`aj_session::normalize_tag`)
+/// over a field with a different owner. The two crates are siblings with no
+/// edge between them, so the rule is stated twice on purpose. They are free to
+/// diverge, and a change to what a label may contain is worth making in both.
 pub fn normalize_host_name(name: &str) -> Result<Option<String>, HostNameError> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -434,11 +441,11 @@ pub struct DirectoryHost {
     /// A label and never an id: nothing addresses a session or a host by it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
-    /// What the host called itself when the gateway last heard from it,
+    /// What the host called itself when the gateway last heard from it, to be
     /// republished as [`Hello::name`] stated it.
     ///
     /// A third label rather than a replacement for the two above: a client
-    /// prefers the name for a group header and still addresses the host by
+    /// labels a group by the name, and still addresses that host's sessions by
     /// [`Self::id`]. Absent for a host that reported none and for one the
     /// gateway has never spoken to.
     #[serde(default, skip_serializing_if = "Option::is_none")]

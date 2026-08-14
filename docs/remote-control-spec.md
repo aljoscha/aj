@@ -290,11 +290,12 @@ A host's `name` is display metadata and never an address: clients
 label a host by it and keep addressing sessions by `host_id`, and
 names may collide the way session tags may. The host is the sole
 authority, it states the name at startup (`--name`, else its working
-directory abbreviated to `~` under home) and there is no rename over
-the wire, renaming is a restart. A name is one trimmed line of at most
-80 bytes with no control characters, and a reader applies that itself
-rather than trusting a sender. Absent, from an older host or one whose
-directory made no legal name, means the reader falls back to the id.
+directory abbreviated to `~` under home, and a directory over the cap
+keeps its tail) and there is no rename over the wire, renaming is a
+restart. A name is one trimmed line of at most 80 bytes with no
+control characters, and a reader applies that itself rather than
+trusting a sender. Absent, from an older host or one whose directory
+made no legal name, means the reader falls back to the id.
 
 SSE streams send a heartbeat frame every 30 seconds when otherwise
 idle. Clients treat a silent stream (no frame for ~60s) as dead and
@@ -1036,7 +1037,14 @@ answers the same payload, hosts included, because the read and the
 frames are one composition: a client that reads the directory and a
 client that watches it must not disagree about which hosts there are.
 Every enrolled host is among them, named by its id, or by its address
-for as long as it has none.
+for as long as it has none. Each also carries the `name` that host
+reported for itself (section 6.1), learned wherever its `host_id` is
+and refreshed on every contact: the id rules identity, the name
+follows the latest handshake. A gateway states no name of its own and
+invents none, so a host it has never spoken to carries none, and the
+name a down host last reported outlives a gateway restart with the id
+it belongs to, which is what keeps an unreachable host's group
+readable.
 Clients re-attach with their cursors as usual, which resumes
 incrementally when the host's epochs survived and fully when they did
 not. The same mechanism covers the case where a host evicts a slow

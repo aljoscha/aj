@@ -270,10 +270,10 @@ pub struct HostSetup {
     /// What this host calls itself for a reader, `None` to derive a name
     /// from the working directory.
     ///
-    /// The value is expected to have been through
-    /// [`aj_wire::normalize_host_name`] already, as a `--name` flag's is:
-    /// validating at the edge is what keeps a name a host would not state
-    /// from costing a startup.
+    /// A value that is not a legal name ([`aj_wire::normalize_host_name`]) is
+    /// dropped in favour of the derivation, so nothing a caller states can put
+    /// one on the wire. The `--name` flag refuses first, with a message, which
+    /// is what keeps a name a host would not state from costing a startup.
     pub name: Option<String>,
     /// How long an idle, unattached session is held before it is released,
     /// `None` for [`DEFAULT_IDLE_GRACE`].
@@ -300,10 +300,10 @@ fn derive_host_name(working_directory: &Path, home: Option<&Path>) -> Option<Str
 
 /// `path` cut to [`MAX_HOST_NAME_BYTES`] from the end.
 ///
-/// A path is distinguished by its tail, so an over-long one loses its head,
-/// which is also the end every surface that renders a path name elides.
-/// Whole segments where one fits inside the cap, so what is left reads as a
-/// path rather than as a severed first segment.
+/// A path is told from another by its tail, so an over-long one loses its
+/// head. Whole segments where one fits, so what is left reads as a path
+/// rather than as a severed first segment, and the severed segment is dropped
+/// only when dropping it leaves something to name.
 fn keep_tail(path: &str) -> &str {
     if path.len() <= MAX_HOST_NAME_BYTES {
         return path;
@@ -313,9 +313,14 @@ fn keep_tail(path: &str) -> &str {
     while !path.is_char_boundary(start) {
         start += 1;
     }
+    if path.as_bytes()[start - 1] == b'/' {
+        // The window already begins a segment, so there is nothing severed to
+        // drop. `start` is at least one, because the cap is not zero.
+        return &path[start..];
+    }
     match path[start..].find('/') {
-        Some(offset) => &path[start + offset + 1..],
-        None => &path[start..],
+        Some(offset) if start + offset + 1 < path.len() => &path[start + offset + 1..],
+        _ => &path[start..],
     }
 }
 
@@ -594,11 +599,13 @@ impl SessionHost {
             live_capacity,
         } = setup;
         let host_id = resolve_host_id(persistence.sessions_dir())?;
-        // A startup fact like the id: derived per hello, it could hand two
-        // clients different answers when the environment moves under a
-        // long-lived process.
-        let name =
-            name.or_else(|| derive_host_name(&working_directory, aj_conf::home_dir().as_deref()));
+        // A startup fact like the id. Derived per hello instead, it could
+        // answer two clients differently when the environment moves under a
+        // long-lived process. A stated name is re-checked here because this
+        // field is public and what it holds ends up painted on a peer.
+        let name = name
+            .and_then(|name| normalize_host_name(&name).ok().flatten())
+            .or_else(|| derive_host_name(&working_directory, aj_conf::home_dir().as_deref()));
         let inner = Arc::new(HostInner {
             shared: Arc::new(HostShared {
                 config,
@@ -2125,6 +2132,34 @@ mod tests {
             Some("b".repeat(MAX_HOST_NAME_BYTES).as_str()),
             "a segment that does not fit is cut, because there is nothing else to keep",
         );
+    }
+
+    /// A segment is dropped because it was severed, not because it is at the
+    /// front. When the cut lands exactly on a separator the whole window is
+    /// already whole segments, and dropping the first would throw away the
+    /// part that tells this host from its neighbour.
+    #[test]
+    fn a_tail_that_starts_on_a_separator_keeps_every_segment_it_has() {
+        let head = "a".repeat(10);
+        let tail = "b".repeat(69);
+        let path = format!("/{head}/{tail}");
+        assert_eq!(path.len(), MAX_HOST_NAME_BYTES + 1, "one byte over the cap");
+
+        assert_eq!(
+            derive_host_name(Path::new(&path), None).as_deref(),
+            Some(format!("{head}/{tail}").as_str()),
+            "only the leading separator went",
+        );
+    }
+
+    /// Dropping the severed segment must leave a name behind. A path whose
+    /// only separator inside the cap is its last byte has nothing after it.
+    #[test]
+    fn a_trailing_separator_does_not_swallow_the_whole_name() {
+        let path = format!("/{}/", "a".repeat(90));
+        let name = derive_host_name(Path::new(&path), None).expect("a legal name");
+        assert!(name.len() <= MAX_HOST_NAME_BYTES, "{name:?} fits the cap");
+        assert!(path.ends_with(&name), "{name:?} is the tail of {path:?}");
     }
 
     /// The cut lands on a character boundary rather than inside a character,

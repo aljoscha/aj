@@ -229,7 +229,6 @@ mod tests {
 
     fn unreachable(id: &str) -> DirectoryHost {
         DirectoryHost {
-            name: None,
             unreachable: true,
             ..learned(id)
         }

@@ -16,6 +16,14 @@ Type=simple
 # becomes projects-api), which is what keeps two checkouts apart.
 WorkingDirectory=%h/projects/api
 
+# What clients call this host, in place of its id. Absent, the host names
+# itself after the working directory above (~/projects/api), which is
+# usually enough. Name it when a fleet holds two clones a path does not
+# tell apart. AJ_NAME reaches every aj run that inherits it, so
+# `aj serve --name ...` on the ExecStart line is the narrower way to set
+# it.
+#Environment=AJ_NAME=projects-api
+
 # The control port runs arbitrary commands through the agent, so it is
 # never served unauthenticated. `tailscale` verifies each peer against the
 # local daemon and admits only the logins named in AJ_ALLOW, or a tagged

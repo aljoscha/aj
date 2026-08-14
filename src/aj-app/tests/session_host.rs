@@ -6,6 +6,7 @@
 //! the client fold ([`SessionClient`]) would receive.
 
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -1602,31 +1603,53 @@ async fn a_host_reports_the_name_it_was_given_or_derives_one() {
         "{derived:?} is this host's own working directory, not a constant",
     );
 
-    let named = SessionHost::new(HostSetup {
-        config: Arc::new(StdMutex::new(Config::default())),
-        layers: Arc::new(StdMutex::new(ConfigLayers {
-            user: Config::default(),
-            project: ConfigLayer::default(),
-            project_path: None,
-        })),
-        catalog: Arc::new(Vec::new()),
-        run_config: snapshot(scripted(Vec::new(), 0, Duration::ZERO)),
-        restore: None,
-        persistence: harness.persistence.clone(),
-        auth: AuthStorage::new(harness._dir.path().join("auth.json")),
-        working_directory: harness._dir.path().to_path_buf(),
-        name: Some("the-fleet-host".to_string()),
-        idle_grace: None,
-        live_capacity: None,
-    })
-    .expect("a host over the claimed store");
+    let named = |name: Option<&str>, working_directory: PathBuf| {
+        SessionHost::new(HostSetup {
+            config: Arc::new(StdMutex::new(Config::default())),
+            layers: Arc::new(StdMutex::new(ConfigLayers {
+                user: Config::default(),
+                project: ConfigLayer::default(),
+                project_path: None,
+            })),
+            catalog: Arc::new(Vec::new()),
+            run_config: snapshot(scripted(Vec::new(), 0, Duration::ZERO)),
+            restore: None,
+            persistence: harness.persistence.clone(),
+            auth: AuthStorage::new(harness._dir.path().join("auth.json")),
+            working_directory,
+            name: name.map(str::to_string),
+            idle_grace: None,
+            live_capacity: None,
+        })
+        .expect("a host over the claimed store")
+    };
+
+    let stated = named(Some("the-fleet-host"), harness._dir.path().to_path_buf());
     assert_eq!(
-        named.hello().name.as_deref(),
+        stated.hello().name.as_deref(),
         Some("the-fleet-host"),
         "a stated name is reported as stated, and the derivation stays out of it",
     );
 
-    named.shutdown().await;
+    // Nothing reads or creates this path: the host only renders it.
+    let home = aj_conf::home_dir().expect("$HOME is set, or the reading below measures nothing");
+    let under_home = named(None, home.join("work/aj"));
+    assert_eq!(
+        under_home.hello().name.as_deref(),
+        Some("~/work/aj"),
+        "a host under home is named the way its operator writes the path",
+    );
+
+    let illegal = named(Some("two\nlines"), harness._dir.path().to_path_buf());
+    let fallback = illegal.hello().name.expect("a name is still derived");
+    assert!(
+        fallback.ends_with(&directory),
+        "a name no peer would render is dropped for the derivation, not passed on: {fallback:?}",
+    );
+
+    illegal.shutdown().await;
+    under_home.shutdown().await;
+    stated.shutdown().await;
     harness.host.shutdown().await;
 }
 

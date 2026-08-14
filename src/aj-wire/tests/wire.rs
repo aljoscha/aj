@@ -1657,6 +1657,11 @@ fn a_hosts_name_is_absent_rather_than_empty() {
     let hello: Hello = serde_json::from_value(fixture("models")["hello"].clone())
         .expect("the pinned hello decodes");
     assert_eq!(hello.name.as_deref(), Some("~/work/project"));
+    assert_eq!(
+        hello.working_directory.as_deref(),
+        Some(std::path::Path::new("/home/dev/work/project")),
+        "the pinned name is the one that directory derives",
+    );
 
     let nameless = Hello {
         name: None,
@@ -1726,6 +1731,12 @@ fn a_host_name_is_one_trimmed_line_within_the_cap() {
         Err(HostNameError::TooLong {
             bytes: MAX_HOST_NAME_BYTES + 1,
         }),
+    );
+    let padded = format!("  {}  ", "a".repeat(MAX_HOST_NAME_BYTES));
+    assert!(padded.len() > MAX_HOST_NAME_BYTES);
+    assert!(
+        normalize_host_name(&padded).is_ok(),
+        "the trim happens first, so padding cannot push a legal name over the cap",
     );
     let wide = "é".repeat(MAX_HOST_NAME_BYTES / 2 + 1);
     assert!(

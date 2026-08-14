@@ -136,8 +136,10 @@ pub struct Args {
     /// Name the host this run serves, shown in place of its id wherever a
     /// client lists hosts.
     ///
-    /// Global like the other control-port flags, since any run that binds one
-    /// is a host. A run that serves nothing carries the name to no effect.
+    /// Global so it reads the same on either side of a subcommand and reaches
+    /// the host an interactive `--listen` run serves, not only `aj serve`. A
+    /// run that serves no host of its own carries it to no effect, `aj
+    /// gateway` included: a gateway names the hosts behind it, not itself.
     ///
     /// Absent, the host names itself after its working directory, `~`-
     /// abbreviated under home. That is a fallback: a fleet of clones is
@@ -496,8 +498,12 @@ mod tests {
         assert!(!parse(&["aj", "--tag", "two\nlines"]).has_launch_tag());
     }
 
-    /// `--name` is global like the control-port flags it belongs with, since
-    /// any run that binds a port is a host worth naming.
+    /// `--name` is global so it reads the same on either side of a
+    /// subcommand, the way the control-port flags do.
+    ///
+    /// Nothing here asserts what an absent flag yields: `AJ_NAME` in the
+    /// environment answers that, and this suite must not depend on the
+    /// operator's. The host's own fallback is pinned where it happens.
     #[test]
     fn the_name_flag_parses_on_either_side_of_a_subcommand() {
         for argv in [
@@ -511,11 +517,6 @@ mod tests {
                 "{argv:?}",
             );
         }
-        assert_eq!(
-            parse(&["aj", "serve"]).host_name(),
-            Ok(None),
-            "no flag, and the host derives its own",
-        );
     }
 
     /// A name no peer would render is refused where the operator typed it, so
