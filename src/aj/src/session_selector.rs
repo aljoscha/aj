@@ -19,8 +19,9 @@
 //! palette uses for its actions), since the widget hands the confirm callback
 //! only the row's filter key.
 //!
-//! Archived sessions are left out, and the overlay's own toggle
-//! ([`ACTION_SESSION_TOGGLE_ARCHIVED`]) puts them back inline, marked. A
+//! Archived sessions are left out, the one the user is in excepted, and the
+//! overlay's own toggle ([`ACTION_SESSION_TOGGLE_ARCHIVED`]) puts the rest
+//! back inline, marked. A
 //! picker is where hiding them earns its keep, so the toggle belongs to this
 //! overlay rather than to whatever the strip is showing. Every preview the
 //! scan delivers is kept, revealed or not, so the toggle answers from what

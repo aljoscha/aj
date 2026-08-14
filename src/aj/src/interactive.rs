@@ -1031,7 +1031,12 @@ async fn focus_session(
     // reset abandoned. The loop discharges these set-wide, but focusing can
     // arrive first, and the reopen is what makes the switch show the session as
     // it now is.
+    // Or unless the set itself is about to change: a session the user
+    // archived leaves it on the way out, and the peer only learns that from a
+    // stream opened without it. A swap that skipped the reopen would drop the
+    // row and leave the host holding the session for the rest of the process.
     let reopening = attaching
+        || world.directory.would_retire(&session)
         || world
             .directory
             .client_for(&session)
@@ -2280,27 +2285,36 @@ fn focused_archived(world: &World) -> bool {
 ///
 /// One gesture for both directions, off the bit the peer publishes: archiving
 /// is explicit in both directions and nothing else ever changes it, so the
-/// user pressing the same chord twice is how a mistake is undone.
+/// user pressing the same chord twice is how a mistake is undone. What the
+/// peer accepted is recorded on its row, because rows are coalesced on a tick
+/// (spec 6.8) and the second press must not read the state the first one
+/// replaced.
 ///
 /// Always spoken, because the strip is not always the answer: it is hidden
 /// under one row and the focused session stays in view either way, so nothing
 /// on screen need change. The peer applies the bit under the session's own
 /// lock and republishes the row.
 async fn apply_archive(world: &mut World, archived: bool) {
+    let session = world.session().to_string();
     match world
         .control
-        .command(world.session(), Command::Archive { archived })
+        .command(&session, Command::Archive { archived })
         .await
     {
-        Ok(_) if archived => fold_notice(
-            world,
-            "Archived. It leaves the session lists once you move on.",
-        ),
-        Ok(_) => fold_notice(world, "Unarchived. It is back in the session lists."),
-        // A peer older than the endpoint refuses the request itself rather
-        // than the session, and its message quotes a path (spec 6.10 makes
-        // probing the check, since capabilities are declared-only). Worded
-        // here so the refusal names the feature the user asked for.
+        Ok(_) if archived => {
+            world.directory.mark_archived(&session, archived);
+            fold_notice(
+                world,
+                "Archived. It leaves the session lists once you move on.",
+            );
+        }
+        Ok(_) => {
+            world.directory.mark_archived(&session, archived);
+            fold_notice(world, "Unarchived. It is back in the session lists.");
+        }
+        // A peer older than the endpoint refuses the request itself rather than
+        // the session, and its own message quotes a path the user never typed.
+        // Worded here so the refusal names the feature they asked for.
         Err(err) if err.unknown_endpoint() => {
             fold_notice(world, "This host does not support archiving sessions.");
         }
@@ -16732,9 +16746,6 @@ mod tests {
         chord_key_bytes(c, chord.alt, chord.ctrl)
     }
 
-    /// Poll until the sidebar's row for `session` satisfies `wanted`, folding
-    /// and re-mirroring each time round. The host debounces `list` frames, so a
-    /// row's status arrives a coalescing tick behind the change.
     /// Poll until the peer's own row for `session` satisfies `wanted`, folding
     /// each time round.
     ///
@@ -16762,6 +16773,9 @@ mod tests {
         false
     }
 
+    /// Poll until the sidebar's row for `session` satisfies `wanted`, folding
+    /// and re-mirroring each time round. The host debounces `list` frames, so a
+    /// row's status arrives a coalescing tick behind the change.
     async fn poll_row(
         world: &mut World,
         shell: &Rc<RefCell<Shell>>,
@@ -16788,16 +16802,27 @@ mod tests {
     }
 
     /// The archive gesture, end to end and both ways: the chord reaches the
-    /// peer, the peer publishes the bit, the row leaves the strip once the
-    /// user is elsewhere, and the same chord brings it back.
+    /// peer, the peer publishes the bit, the row leaves the strip once the user
+    /// is elsewhere, the host is let go of it, and the same gesture brings it
+    /// back.
     ///
-    /// Every hop is the real one: a real host, the command over the control
-    /// seam, the row off a `list` frame, and the strip built by the loop's own
-    /// sync.
+    /// The session moved to is one the client already holds, which is the
+    /// ordinary case and the one that can go wrong quietly: a swap onto an
+    /// attached session needs no stream of its own, so the reopen that tells
+    /// the peer to let the archived session go has to be asked for by the set
+    /// changing rather than by the target being new.
+    ///
+    /// The release is read off the host, not off the client's own bookkeeping.
+    /// A client that drops the row and never renegotiates its stream looks
+    /// right from the inside and holds the session forever from the outside.
     #[tokio::test]
     async fn the_archive_chord_puts_a_session_away_and_brings_it_back() {
+        const GRACE: Duration = Duration::from_millis(200);
         let dir = TempDir::new().expect("tempdir");
-        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let (mut world, shell, mut app, mut writer, _root) =
+            world_shell_app_with_idle_grace(&dir, "streaming-text", default_layers(), Some(GRACE))
+                .await;
+        // Punctuate the log: a session with nothing on disk is never released.
         run_prompt(&mut world, "seed").await;
         let home = world.session().to_string();
         let other = world
@@ -16810,9 +16835,22 @@ mod tests {
             "the second session never appeared in the rows",
         );
 
+        // Visit the second session and come back, so both are in the working
+        // set and the switch below is a swap rather than a first attach.
+        for target in [other.clone(), home.clone()] {
+            let moved =
+                apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Resume(target))
+                    .await;
+            assert!(matches!(moved, Focus::Moved), "the visit was refused");
+        }
+        assert!(
+            world.directory.is_attached(&other),
+            "the second session is not in the working set, so the switch below \
+             would take the attach path and this test measures nothing",
+        );
+
         // Archive the one on screen. It stays: the strip is what says where
         // the user is, and they are still here.
-        let (mut app, mut writer, _root) = app_over(&shell).await;
         writer
             .write_all(&chord_bytes(AjAction::SessionArchive))
             .expect("the archive chord");
@@ -16839,7 +16877,7 @@ mod tests {
             main_notices(&world),
         );
         assert!(
-            poll_row(&mut world, &shell, &home, |row| row.archived).await,
+            poll_directory_row(&mut world, &home, |row| row.archived).await,
             "the peer never published the bit",
         );
         sync_sidebar(&world, &shell);
@@ -16849,10 +16887,19 @@ mod tests {
             strip_row_ids(&shell),
         );
 
-        // Leaving is when it goes.
-        let moved =
-            apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Resume(other)).await;
+        // Leaving is when it goes, and when the peer is told.
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(other.clone()),
+        )
+        .await;
         assert!(matches!(moved, Focus::Moved));
+        assert!(
+            released(&world, &home).await,
+            "the host still holds the archived session, so its lock never frees",
+        );
         sync_sidebar(&world, &shell);
         assert!(
             !strip_row_ids(&shell).contains(&home),
@@ -16861,7 +16908,7 @@ mod tests {
         );
         assert!(
             !world.directory.is_attached(&home),
-            "the archived session is still in the working set, so the host cannot release it",
+            "and the client still holds it",
         );
 
         // And back: the palette command is the same path the chord took.
@@ -16882,10 +16929,64 @@ mod tests {
             main_notices(&world),
         );
         assert!(
-            poll_row(&mut world, &shell, &home, |row| !row.archived).await,
+            poll_directory_row(&mut world, &home, |row| !row.archived).await,
             "the bit is still set on the peer",
         );
         shut_down(&world).await;
+    }
+
+    /// Two presses of the gesture leave the session as it started, however
+    /// quickly they follow one another. The peer coalesces its rows on a tick,
+    /// so a direction read from the last row alone would archive twice.
+    #[tokio::test]
+    async fn a_second_press_undoes_the_first() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        run_prompt(&mut world, "seed").await;
+        let home = world.session().to_string();
+        assert!(
+            poll_directory_row(&mut world, &home, |row| !row.archived).await,
+            "the session starts archived, so this measures nothing",
+        );
+
+        apply_command(&mut world, &shell, CommandAction::ArchiveSession).await;
+        apply_command(&mut world, &shell, CommandAction::ArchiveSession).await;
+        assert_eq!(
+            main_notices(&world)
+                .iter()
+                .filter(|notice| notice.starts_with("Archived"))
+                .count(),
+            1,
+            "the second press archived again instead of undoing: {:?}",
+            main_notices(&world),
+        );
+        assert!(
+            poll_directory_row(&mut world, &home, |row| !row.archived).await,
+            "the session was left archived by a pair of presses",
+        );
+        shut_down(&world).await;
+    }
+
+    /// Poll until the host reports `session` released, which is what a client
+    /// detaching it is for (spec section 5). The caller has to run a host with
+    /// a short idle grace for this to answer inside the deadline.
+    async fn released(world: &World, session: &str) -> bool {
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        while Instant::now() < deadline {
+            let listed = world
+                .host()
+                .sessions()
+                .await
+                .expect("session list")
+                .sessions
+                .into_iter()
+                .find(|entry| entry.id == session);
+            if listed.is_some_and(|entry| !entry.live) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
     }
 
     /// A peer that does not know the archive endpoint is told about by name,
@@ -17630,6 +17731,50 @@ mod tests {
     /// On a terminal with no width to spare the strip holds itself back, rather
     /// than taking its fixed width off a transcript that has none to give.
     ///
+    /// The strip shows itself once there is a choice to make, and an archived
+    /// session is not one: the count that decides is the rows on show, so a
+    /// second session the user has put away leaves the strip where it was.
+    ///
+    /// The default is the only thing under test here, so the toggle is left
+    /// alone: an explicit ask would pin `visible` and answer for it.
+    #[tokio::test]
+    async fn an_archived_session_does_not_bring_the_strip_out() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        run_prompt(&mut world, "seed").await;
+        let other = world
+            .control
+            .create(None, None, None, None)
+            .await
+            .expect("a second session");
+        assert!(
+            poll_row(&mut world, &shell, &other, |_| true).await,
+            "the second session never appeared in the rows",
+        );
+        assert!(
+            shell.borrow().sidebar.borrow().visible,
+            "two sessions and the strip is hidden, so the archived case below \
+             would pass whatever the count did",
+        );
+
+        world
+            .control
+            .command(&other, Command::Archive { archived: true })
+            .await
+            .expect("archive the second session");
+        assert!(
+            poll_directory_row(&mut world, &other, |row| row.archived).await,
+            "the peer never published the bit",
+        );
+        sync_sidebar(&world, &shell);
+        assert!(
+            !shell.borrow().sidebar.borrow().visible,
+            "the strip counted a session it is not showing: {:?}",
+            strip_row_ids(&shell),
+        );
+        shut_down(&world).await;
+    }
+
     /// The user's ask survives: it is the drawn width that yields, not
     /// `visible`, so widening the terminal brings the strip back.
     #[tokio::test]

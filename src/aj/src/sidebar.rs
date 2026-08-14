@@ -1,5 +1,5 @@
-//! The session sidebar: a strip listing every session the peer offers
-//! (spec 9.2).
+//! The session sidebar: a strip listing the sessions the peer offers that the
+//! user has not put away (spec 9.2).
 //!
 //! The widget is read-only chrome. It renders from a [`SidebarState`] mirror
 //! the drive loop refreshes once per iteration from the client's session
@@ -19,7 +19,7 @@
 //! per-group cap (see [`GROUP_CAP`]), and what moved is carried by the glyphs,
 //! which is a signal that costs a row no movement.
 //!
-//! A row answers three independent questions, and each gets exactly one
+//! A row answers four independent questions, and each gets exactly one
 //! encoding so none of them has to be read out of a combination:
 //!
 //! - What is the session doing: the status glyph and its color. It says the
@@ -30,6 +30,11 @@
 //!   because brightness survives a monochrome or low-contrast theme.
 //! - Which session is on screen: the [`FOCUS_MARKER`] in the leftmost column,
 //!   so focus never rests on color alone.
+//! - Has the user put it away: a strike through the label field, which is only
+//!   ever seen on a revealed row or on one the working set is holding open
+//!   (see [`SidebarRow::put_away`]). A strike rather than a brightness,
+//!   because brightness is spoken for and an archived row the client holds
+//!   open has to answer both questions at once.
 //!
 //! An unattached session running a turn therefore reads as a bright glyph
 //! beside a dim label. That is the intended reading: something is happening
@@ -262,13 +267,16 @@ impl SidebarRow {
     /// Whether the strip leaves this row out of the default view.
     ///
     /// Archiving is the user saying they are done with a session, so the row
-    /// goes. The two exemptions are the working set, and they are the cap's
-    /// first two for the same reason: a row the client holds open is part of
-    /// what the user is working on right now, and hiding one would leave the
-    /// strip describing a working set the user cannot see. What the session is
-    /// doing exempts nothing here. The cap suppresses a row the user did not
-    /// ask about, this hides one they asked to put away, and a turn running
-    /// inside it does not undo the asking.
+    /// goes. The exemption is the working set, which is the cap's first two
+    /// and for the same reason: a row the client holds open is part of what
+    /// the user is working on right now, and hiding one would leave the strip
+    /// describing a working set the user cannot see. Focus is named beside
+    /// attachment for the reader, though the focused session is always in the
+    /// working set, so it never decides this on its own.
+    ///
+    /// What the session is doing exempts nothing here. The cap suppresses a
+    /// row the user did not ask about, this hides one they asked to put away,
+    /// and a turn running inside it does not undo the asking.
     fn put_away(&self) -> bool {
         self.archived && !self.focused && !self.attached
     }
@@ -1763,11 +1771,15 @@ mod tests {
             .collect();
         rows.extend((0..GROUP_CAP).map(|at| self::at(&format!("session-b-{at}"), 2)));
         let display = rows_for_display(&rows, "none", |_| false, |_| false, false);
-        assert_eq!(display.len(), GROUP_CAP, "the archived rows are in the set");
         let lines = folded(&display, &[], 20);
         assert!(
             folds(&lines).is_empty(),
             "the cap held a row back over sessions the strip is not showing: {lines:?}",
+        );
+        assert_eq!(
+            display.len(),
+            GROUP_CAP,
+            "the archived rows are in the set, so the group was never full",
         );
     }
 

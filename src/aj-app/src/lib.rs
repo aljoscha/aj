@@ -191,8 +191,13 @@ mod tests {
         );
     }
 
-    /// A session with a log and an archived sidecar in the same store, so the
-    /// listing is built the way the command builds it.
+    /// Two sessions in one store, one of them archived: a real log the store
+    /// minted, and a copy of it under a second id.
+    ///
+    /// Copied rather than minted twice because ids carry the time of day, so a
+    /// second mint would either collide or cost the test a wall-clock second.
+    /// What the listing reads of a session is its first line and its file
+    /// stat, and the copy answers both.
     fn store_with_two_sessions() -> (TempDir, ConversationPersistence, String, String) {
         use aj_agent::message::AgentMessage;
         use aj_models::types::{Message, UserMessage};
@@ -200,8 +205,7 @@ mod tests {
 
         let dir = TempDir::new().expect("tempdir");
         let persistence = ConversationPersistence::new(dir.path().join("sessions"));
-        let mut ids = Vec::new();
-        for _ in 0..2 {
+        let kept = {
             let mut log = ConversationLog::create(&persistence).expect("create log");
             // The listing reads each session's first line to tell the current
             // format from the old one, so a log with nothing written is not a
@@ -218,13 +222,11 @@ mod tests {
                 },
             )
             .expect("a prompt");
-            ids.push(log.session_id().to_string());
-            // Minted ids carry the time of day, so two in the same second
-            // would collide.
-            std::thread::sleep(std::time::Duration::from_millis(1100));
-        }
-        let put_away = ids.pop().expect("the second session");
-        let kept = ids.pop().expect("the first session");
+            log.session_id().to_string()
+        };
+        let put_away = "2024-02-03-04-05-06-007".to_string();
+        let log_path = |id: &str| persistence.sessions_dir().join(format!("{id}.jsonl"));
+        std::fs::copy(log_path(&kept), log_path(&put_away)).expect("a second session in the store");
         persistence
             .write_archived(&put_away, true)
             .expect("archive the second session");

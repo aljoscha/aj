@@ -147,10 +147,13 @@ pub const ACTION_SESSION_TAG: &str = "aj.session.tag";
 /// user is asking for. It joins the sidebar's `alt` cluster with the rest of
 /// the strip's interactions.
 ///
-/// The bit is display metadata: it hides the row and nothing else, so the
-/// gesture is allowed whatever the session is doing, and a turn inside an
-/// archived session runs to its end. Explicit in both directions, since
-/// nothing else ever sets or clears it.
+/// The bit carries no lifecycle meaning: it cancels nothing and releases
+/// nothing the session needs to resume, so the gesture is allowed whatever the
+/// session is doing and a turn inside an archived session runs to its end.
+/// What it does change is what the client shows and what it holds: the row
+/// leaves the default views once the user is elsewhere, and leaving is also
+/// when the client stops holding the session open, so the host can let it go.
+/// Explicit in both directions, since nothing else ever sets or clears it.
 pub const ACTION_SESSION_ARCHIVE: &str = "aj.session.archive";
 
 /// Shows the archived sessions in the sidebar, or hides them again. Default
@@ -159,14 +162,14 @@ pub const ACTION_SESSION_ARCHIVE: &str = "aj.session.archive";
 /// NOTE: `u` for unhide, paired with the `alt+h` that put a row away.
 ///
 /// A view mode of the strip and nothing more: it lapses with the process and
-/// changes no session. Revealed rows draw in their own places, struck through
-/// (see [`ACTION_SESSION_ARCHIVE`]).
+/// changes no session. Revealed rows draw in their own places, struck through,
+/// and keep the brightness that says where they sit in the working set.
 pub const ACTION_SIDEBAR_ARCHIVED: &str = "aj.sidebar.archived";
 
 /// Shows the archived sessions in the session selector, or hides them again.
-/// Default binding: `ctrl+t`. Handled inside the selector overlay
-/// (contextual; only the focused selector reads it), which is the same key and
-/// feel as the prompt-history and agent-picker scope toggles.
+/// Default binding: `ctrl+t`. Handled inside the selector overlay, so only the
+/// focused selector reads it, which is the same key and feel as the
+/// prompt-history and agent-picker scope toggles.
 ///
 /// The selector's own control rather than the sidebar's reveal reaching into
 /// it: the overlay is a picker over this machine's store and it answers for
