@@ -8,10 +8,16 @@
 //! mirroring keeps the draw path free of any borrow the loop also wants.
 //!
 //! The strip is an orientation instrument, not a store browser. That is what
-//! decides its behavior: rows order by last activity so the sessions in play
-//! sort to the top, the drawn window follows the focused row so focus is never
-//! off screen, and the stepping chords walk the order the user can see. The
-//! session selector is the browser.
+//! decides its behavior: the drawn window follows the focused row so focus is
+//! never off screen, the stepping chords walk the order the user can see, and
+//! the session selector is the browser.
+//!
+//! Activity decides what is visible, never where it sits. Groups sit in the
+//! order their labels sort and rows sit where their group put them, whatever
+//! happens on them, because a row that moves between the look and the click is
+//! a row the pointer misses. Recency still decides which rows survive the
+//! per-group cap (see [`GROUP_CAP`]), and what moved is carried by the glyphs,
+//! which is a signal that costs a row no movement.
 //!
 //! A row answers three independent questions, and each gets exactly one
 //! encoding so none of them has to be read out of a combination:
@@ -38,14 +44,15 @@
 //!
 //! Layout is a pure function, [`strip_lines`], producing one [`StripLine`] per
 //! drawn line, and drawing is a dumb map over its result. The height
-//! arithmetic (host headers, the overflow row and the create row all take
-//! lines away from the rows) therefore lives in one testable place.
+//! arithmetic (host headers, the per-group fold lines, the overflow row and
+//! the create row all take lines away from the rows) therefore lives in one
+//! testable place.
 //!
 //! Pointer gestures are a second trigger for actions the chords already
 //! dispatch, never a behavior of their own (spec 9.2). The strip resolves a
-//! click into a [`StripGesture`], which names a session or a create and
-//! nothing else, and the shell hands that to the same place the chord's
-//! handler hands its own answer. A draw records what each line it paints
+//! click into a [`StripGesture`], which names a session, a group to fold, or
+//! a create and nothing else, and the shell hands that to the same place the
+//! chord's handler hands its own answer. A draw records what each line it paints
 //! resolves to, so a click answers with the session the user is looking at
 //! even when the mirror has moved since (see [`SessionSidebar::gestures`]).
 
@@ -54,6 +61,7 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use aj_wire::{DirectoryHost, SessionSummary};
+use chrono::{DateTime, Utc};
 use vaxis::cell::{Color, Style};
 use vaxis::gwidth::{Method, gwidth};
 use vaxis::mouse::{Button, Mouse, Type};
@@ -83,6 +91,28 @@ pub(crate) const MIN_COLS_WITH_SIDEBAR: u16 = SIDEBAR_COLS + 20;
 
 /// The focused row's marker, in the column left of the status glyph.
 const FOCUS_MARKER: &str = "▌";
+
+/// The glyph a folded group's trailing line wears, pointing at the rows the
+/// cap holds back.
+const FOLDED_MARKER: &str = "▸";
+
+/// The glyph an unfolded group's trailing line wears, pointing at the rows it
+/// revealed. Clicking it folds them away again.
+const UNFOLDED_MARKER: &str = "▾";
+
+/// Boring rows a group shows before the rest fold behind its trailing line.
+///
+/// Boring is [`SidebarRow::boring`]: the rows the cap is allowed to hold back.
+/// The exempt ones are usually the recent ones anyway, so the exemptions
+/// rarely add a line.
+///
+/// Five, because three hosts then fit a laptop-height pane with room to spare,
+/// which is the case that made the strip unreadable: one host with two dozen
+/// idle sessions buried every other host. The cost is that a host's deep tail
+/// is one gesture away rather than in view, which is the fold line's whole
+/// job. A constant rather than a setting: a number the user has to tune is a
+/// design that has not been made.
+const GROUP_CAP: usize = 5;
 
 /// The rule between the strip and the transcript, drawn on every line of the
 /// strip's height so the transcript's edge is one unbroken line.
@@ -181,6 +211,12 @@ pub(crate) struct SidebarRow {
     /// Whether the client folds frames for this session, which is what makes
     /// the working set legible (spec 9.2).
     pub(crate) attached: bool,
+    /// When the peer says the session last did something, on the peer's clock.
+    ///
+    /// Nothing places a row by it (see the module doc). It is what the
+    /// per-group cap selects on: which rows a group keeps is a question about
+    /// activity, where it keeps them is not (see [`GROUP_CAP`]).
+    pub(crate) last_activity: DateTime<Utc>,
 }
 
 impl SidebarRow {
@@ -202,6 +238,23 @@ impl SidebarRow {
         } else {
             Presence::Listed
         }
+    }
+
+    /// Whether the per-group cap may hold this row back (see [`GROUP_CAP`]).
+    ///
+    /// The four exemptions are the strip's standing promises, read off the two
+    /// axes a row already encodes: the working set (focused, attached) and
+    /// what the session is doing (working, unseen output).
+    ///
+    /// A row on a host the peer cannot reach is boring, which is deliberate:
+    /// its glyph says the peer cannot answer for it at all, so there is no
+    /// working or attention signal left to suppress, and a host that has gone
+    /// out with two dozen sessions on it is exactly the crowd the cap exists
+    /// to bound. Holding it open still exempts it, like any other row.
+    fn boring(&self) -> bool {
+        !self.focused
+            && !self.attached
+            && !matches!(self.status, RowStatus::Working | RowStatus::Unseen)
     }
 
     /// What the row shows in a label field of `cols` columns: the id-derived
@@ -263,6 +316,34 @@ impl SidebarRow {
     }
 }
 
+/// The groups the user unfolded, keyed by the label their header draws.
+///
+/// `None` is the unlabeled group a plain host's rows sit in, which the cap
+/// bounds like any other and which therefore folds like any other.
+///
+/// Client state and nothing else: it outlives every refresh of the mirror,
+/// lapses with the process, and is never sent anywhere. Held as a list because
+/// it holds one entry per host the user has opened up, which is a handful.
+#[derive(Default)]
+struct Unfolded(Vec<Option<String>>);
+
+impl Unfolded {
+    /// Whether `group` is unfolded, so its rows escape the cap.
+    fn holds(&self, group: Option<&str>) -> bool {
+        self.0.iter().any(|held| held.as_deref() == group)
+    }
+
+    /// Unfold `group` if it is folded, fold it if it is not.
+    fn toggle(&mut self, group: Option<&str>) {
+        match self.0.iter().position(|held| held.as_deref() == group) {
+            Some(at) => {
+                self.0.swap_remove(at);
+            }
+            None => self.0.push(group.map(str::to_string)),
+        }
+    }
+}
+
 /// What the sidebar draws, mirrored from the session directory once per drive
 /// loop iteration.
 #[derive(Default)]
@@ -275,7 +356,7 @@ pub(crate) struct SidebarState {
     /// Whether the terminal is too narrow to spare the columns, resolved per
     /// frame by the shell, which is the only place the width is known.
     pub(crate) too_narrow: bool,
-    /// Rows in display order, most recent activity first.
+    /// Rows in display order (see [`rows_for_display`]).
     pub(crate) rows: Vec<SidebarRow>,
     /// The hosts the peer named alongside its rows, empty against a plain host
     /// (spec 7.1).
@@ -285,6 +366,8 @@ pub(crate) struct SidebarState {
     /// nowhere else, and it is the one the strip would otherwise draw as
     /// nothing at all.
     pub(crate) hosts: Vec<DirectoryHost>,
+    /// The groups the user opened past the cap.
+    unfolded: Unfolded,
     /// Where the wheel anchored the drawn run. `None` is the resting state, in
     /// which the run follows the focused row.
     scroll: Option<Anchor>,
@@ -321,7 +404,50 @@ impl SidebarState {
 
     /// The strip's lines in a strip `height` lines tall.
     pub(crate) fn lines(&self, height: u16) -> Vec<StripLine> {
-        strip_lines(&self.rows, &self.hosts, height, self.anchor())
+        strip_lines(
+            &self.rows,
+            &self.hosts,
+            &self.unfolded,
+            height,
+            self.anchor(),
+        )
+    }
+
+    /// Fold `group` if it is unfolded, unfold it if it is not, so the cap
+    /// either holds its boring rows back or shows all of them.
+    ///
+    /// `group` is the label a header draws, `None` the unlabeled group a plain
+    /// host's rows sit in. Naming the group rather than a row is what lets the
+    /// pointer undo what the chord did and the other way round: both name the
+    /// same thing.
+    pub(crate) fn toggle_fold(&mut self, group: Option<&str>) {
+        self.unfolded.toggle(group);
+        // The wheel's anchor is an index into a display order this just
+        // changed, so keeping it would leave the user looking at rows they did
+        // not ask for, and an unfold whose rows all land above the anchor
+        // would look like a gesture that did nothing at all. Dropping it hands
+        // the strip back to focus-following, the same answer a focus change
+        // gets (see [`Anchor`]).
+        self.scroll = None;
+    }
+
+    /// Fold or unfold the group the focused row sits in, and say whether there
+    /// was one to work on.
+    ///
+    /// The keyboard's half of the fold gesture. It reads the group off the
+    /// focused row because that is the row the user is looking at, and a
+    /// chord that asked which host it meant would be a second selection.
+    pub(crate) fn toggle_focused_fold(&mut self) -> bool {
+        let Some(group) = self
+            .rows
+            .iter()
+            .find(|row| row.focused)
+            .map(|row| row.host.clone())
+        else {
+            return false;
+        };
+        self.toggle_fold(group.as_deref());
+        true
     }
 
     /// Move the drawn run `delta` rows in a strip `height` lines tall, and say
@@ -333,7 +459,7 @@ impl SidebarState {
     /// already sits against an end) leaves the anchor alone, so scrolling a
     /// strip that fits cannot quietly switch focus-following off.
     pub(crate) fn scroll_by(&mut self, delta: isize, height: u16) -> bool {
-        let layout = Layout::of(&self.rows, &self.hosts);
+        let layout = Layout::of(&self.rows, &self.hosts, &self.unfolded);
         // The same division the draw lays out under, so the wheel cannot
         // anchor the run somewhere the draw would not put it (see
         // [`Layout::split`]).
@@ -365,11 +491,16 @@ fn focused_id(rows: &[SidebarRow]) -> Option<&str> {
 
 /// Build the display rows from the peer's directory.
 ///
-/// Ordered by last activity, newest first, with ties broken by id descending so
-/// the order is total: an unstable order would reshuffle under a user stepping
-/// through it. `unseen` answers spec 6.8's "has it moved since I looked" for a
-/// row the caller already holds, and `attached` answers "do I hold it open" for
-/// a session id, which keeps this linear.
+/// Ordered by id descending, which is a stable key and, on the ids the app
+/// mints, puts the newest session at the top of its group. Nothing here reads
+/// activity: a row that moved out from under the pointer between the look and
+/// the click is a row the user cannot hit, so the strip holds still and lets
+/// the glyphs carry what changed (spec 9.2, and see the module doc). The
+/// per-group cap is where recency is still read (see [`GROUP_CAP`]).
+///
+/// `unseen` answers spec 6.8's "has it moved since I looked" for a row the
+/// caller already holds, and `attached` answers "do I hold it open" for a
+/// session id, which keeps this linear.
 pub(crate) fn rows_for_display(
     rows: &[SessionSummary],
     focused: &str,
@@ -377,11 +508,7 @@ pub(crate) fn rows_for_display(
     attached: impl Fn(&str) -> bool,
 ) -> Vec<SidebarRow> {
     let mut ordered: Vec<&SessionSummary> = rows.iter().collect();
-    ordered.sort_by(|l, r| {
-        r.last_activity
-            .cmp(&l.last_activity)
-            .then_with(|| r.id.cmp(&l.id))
-    });
+    ordered.sort_by(|l, r| r.id.cmp(&l.id));
     ordered
         .into_iter()
         .map(|row| SidebarRow {
@@ -391,6 +518,7 @@ pub(crate) fn rows_for_display(
             tag: row.tag.clone(),
             host: row.host.clone(),
             id: row.id.clone(),
+            last_activity: row.last_activity,
         })
         .collect()
 }
@@ -398,21 +526,31 @@ pub(crate) fn rows_for_display(
 /// The session a next/previous step lands on, walking the displayed order and
 /// wrapping at the ends.
 ///
-/// `None` when there is nothing to move to: fewer than two rows, or no row
-/// claiming focus (the directory and the rows disagree, so any answer would be
-/// a guess).
+/// The displayed order is the layout's, so a step skips the rows the cap holds
+/// back and crosses group boundaries where the strip does. That is the point:
+/// stepping is orientation across hosts, and a step that walked the hidden
+/// rows would attach a stale session per press without showing anything (spec
+/// 9.2). A host's tail is reached by unfolding it, which over a connection is
+/// the only way there: the session selector browses this client's own store
+/// and refuses over the wire.
+///
+/// `None` when there is nothing to move to: fewer than two displayed rows, or
+/// no row claiming focus (the directory and the rows disagree, so any answer
+/// would be a guess). A focused row is never one the cap holds back, so it is
+/// always in the order this walks.
 pub(crate) fn step_session(state: &SidebarState, forward: bool) -> Option<String> {
-    let len = state.rows.len();
-    if len < 2 {
+    let layout = Layout::of(&state.rows, &state.hosts, &state.unfolded);
+    let order = &layout.order;
+    if order.len() < 2 {
         return None;
     }
-    let at = state.rows.iter().position(|row| row.focused)?;
+    let at = order.iter().position(|&index| state.rows[index].focused)?;
     let next = if forward {
-        (at + 1) % len
+        (at + 1) % order.len()
     } else {
-        (at + len - 1) % len
+        (at + order.len() - 1) % order.len()
     };
-    Some(state.rows[next].id.clone())
+    Some(state.rows[order[next]].id.clone())
 }
 
 /// One drawn line of the strip.
@@ -427,6 +565,16 @@ pub(crate) enum StripLine {
     /// A session row, named by its index into the rows the layout was built
     /// from, so a caller resolves it without re-deriving the display order.
     Session { index: usize },
+    /// A group's trailing fold line, the affordance that opens the group past
+    /// the cap and closes it again (see [`GROUP_CAP`]).
+    Fold {
+        /// The group this line belongs to, named as its header names it.
+        /// `None` is the unlabeled group a plain host's rows sit in.
+        host: Option<String>,
+        /// How many of the group's rows the cap holds back. Zero exactly when
+        /// the group is unfolded, and the line is then what folds it again.
+        hidden: usize,
+    },
     /// How many rows did not fit.
     Overflow { hidden: usize },
     /// The create affordance, always the last line.
@@ -443,36 +591,45 @@ pub(crate) enum StripLine {
 pub(crate) enum StripGesture {
     /// Focus the session on the row that was clicked.
     Focus(String),
+    /// Fold or unfold the group whose fold line was clicked, `None` being the
+    /// unlabeled group (see [`SidebarState::toggle_fold`]).
+    Fold(Option<String>),
     /// Create a session.
     New,
 }
 
 /// Lay the strip out for `rows` in `height` lines.
 ///
-/// The one place the height arithmetic lives. Host headers, the overflow row
-/// and the create row all take lines away from the rows, and the focused row
-/// has to survive that. Never returns more than `height` lines.
+/// The one place the height arithmetic lives. Host headers, the fold lines,
+/// the overflow row and the create row all take lines away from the rows, and
+/// the focused row has to survive that. Never returns more than `height`
+/// lines.
 ///
 /// `hosts` is what the peer says its directory is made of, which is where a
 /// host it holds no rows for comes from: that host is drawn as an empty group,
-/// a header with nothing under it (see [`Layout::empty_groups`]).
+/// a header with nothing under it (see [`Layout::empty_headers`]).
+///
+/// `unfolded` names the groups that show every row rather than the cap's share
+/// of them (see [`GROUP_CAP`]).
 ///
 /// `scroll` is where the wheel anchored the run, or `None` to follow the
 /// focused row (see [`SidebarState::scroll_by`]).
 ///
-/// A height that cannot fit even the focused row and its header (two lines of
-/// strip, with hosts to group) gives up on showing a row rather than
-/// overrunning: the honest answer at that size is the overflow count.
-pub(crate) fn strip_lines(
+/// A height that cannot fit even the focused row and the chrome of its group
+/// (a header, a fold line) gives up on showing a row rather than overrunning.
+/// What is left at that size is the overflow count, which still says how many
+/// rows are there to be seen.
+fn strip_lines(
     rows: &[SidebarRow],
     hosts: &[DirectoryHost],
+    unfolded: &Unfolded,
     height: u16,
     scroll: Option<usize>,
 ) -> Vec<StripLine> {
     if height == 0 {
         return Vec::new();
     }
-    let layout = Layout::of(rows, hosts);
+    let layout = Layout::of(rows, hosts, unfolded);
     let budget = layout.split(height);
     layout.lines(layout.visible_run(budget.rows, scroll), budget)
 }
@@ -488,22 +645,45 @@ struct Group<'a> {
     /// Where the group's rows sit in [`Layout::order`]. Empty for a host the
     /// peer holds no rows for (spec 7.1).
     span: Range<usize>,
+    /// How many of the group's rows the cap holds back, zero when it holds
+    /// back none (see [`GROUP_CAP`]).
+    hidden: usize,
+    /// Whether the user opened this group past the cap.
+    unfolded: bool,
+}
+
+/// The rows of one group that the cap holds back: its boring rows past the
+/// [`GROUP_CAP`] most recently active of them, as indices into `rows`.
+fn held_back(rows: &[SidebarRow], members: &[usize]) -> Vec<usize> {
+    let mut boring: Vec<usize> = members
+        .iter()
+        .copied()
+        .filter(|&at| rows[at].boring())
+        .collect();
+    // A copy is sorted, never the group: recency picks which rows survive and
+    // nothing else in the strip reads it, so the survivors stay exactly where
+    // the group had them. The sort is stable, so rows sharing a stamp are cut
+    // from the tail of the display order rather than arbitrarily.
+    boring.sort_by_key(|&at| std::cmp::Reverse(rows[at].last_activity));
+    boring.split_off(boring.len().min(GROUP_CAP))
 }
 
 /// The display order of the rows and the host groups over it.
 struct Layout<'a> {
     rows: &'a [SidebarRow],
-    /// Row indices in display order: activity order, gathered into groups.
+    /// Row indices in display order: the groups in label order, each holding
+    /// the rows the cap left it, in the order they arrived.
     order: Vec<usize>,
-    /// The groups, each a contiguous span of [`Self::order`], followed by the
-    /// hosts the peer holds no rows for, whose spans are empty.
+    /// The groups, each a contiguous span of [`Self::order`]. A host the peer
+    /// holds no rows for is a group whose span is empty, sitting where its
+    /// label sorts.
     groups: Vec<Group<'a>>,
     /// Whether groups wear headers at all. One host, or none, is not a
     /// grouping: a plain single-host connect has to look exactly as it would
     /// have before hosts existed.
     ///
     /// A group with no rows is not subject to this: it is its header and
-    /// nothing else (see [`Layout::empty_groups`]).
+    /// nothing else (see [`Layout::empty_headers`]).
     headed: bool,
 }
 
@@ -512,49 +692,37 @@ struct Layout<'a> {
 struct Budget {
     /// How many of those hosts' headers are drawn.
     empty: usize,
-    /// Lines left for the rows, the headers over them, and the count of the
-    /// ones that did not fit.
+    /// Lines left for the rows, the headers and fold lines over them, and the
+    /// count of the ones that did not fit.
     rows: usize,
 }
 
 impl<'a> Layout<'a> {
-    fn of(rows: &'a [SidebarRow], hosts: &'a [DirectoryHost]) -> Self {
-        // Rows arrive activity-ordered, so gathering by first appearance
-        // orders the hosts by their most recent activity and leaves each
-        // group's own rows in activity order.
-        let mut named: Vec<Option<&str>> = Vec::new();
-        for row in rows {
+    fn of(rows: &'a [SidebarRow], hosts: &'a [DirectoryHost], unfolded: &Unfolded) -> Self {
+        // Rows gathered under the host they name, keeping the order they
+        // arrived in, which is the display order (see [`rows_for_display`]).
+        let mut gathered: Vec<(Option<&str>, Vec<usize>)> = Vec::new();
+        for (index, row) in rows.iter().enumerate() {
             let host = row.host.as_deref();
-            if !named.contains(&host) {
-                named.push(host);
+            match gathered.iter_mut().find(|(label, _)| *label == host) {
+                Some((_, members)) => members.push(index),
+                None => gathered.push((host, vec![index])),
             }
         }
-        // A group with no host name gets no header, and a headerless run under
-        // someone else's header would read as theirs, so it sorts first. Only
-        // reachable in a mixed directory, which a gateway does not produce.
-        named.sort_by_key(Option::is_some);
-        let mut order = Vec::with_capacity(rows.len());
-        let mut groups = Vec::with_capacity(named.len() + hosts.len());
-        for &host in &named {
-            let start = order.len();
-            let mut unreachable = true;
-            for (index, row) in rows.iter().enumerate() {
-                if row.host.as_deref() != host {
-                    continue;
-                }
-                unreachable &= row.status == RowStatus::Unreachable;
-                order.push(index);
-            }
-            groups.push(Group {
-                label: host,
-                unreachable,
-                span: start..order.len(),
-            });
-        }
+        let mut groups: Vec<Group<'a>> = gathered
+            .iter()
+            .map(|&(label, _)| Group {
+                label,
+                // Refined against the group's own rows below. A group built
+                // from rows always has some.
+                unreachable: true,
+                span: 0..0,
+                hidden: 0,
+                unfolded: unfolded.holds(label),
+            })
+            .collect();
         // Then the hosts the peer holds no rows for, which no scan over the
-        // rows could have found. They sort after every group that has rows,
-        // because the strip is ordered by activity and these have none.
-        let end = order.len();
+        // rows could have found (spec 7.1).
         groups.extend(
             hosts
                 .iter()
@@ -565,22 +733,63 @@ impl<'a> Layout<'a> {
                     // no rows here either.
                     host.id
                         .as_deref()
-                        .is_none_or(|id| !named.contains(&Some(id)))
+                        .is_none_or(|id| !gathered.iter().any(|&(label, _)| label == Some(id)))
                 })
                 .filter_map(|host| {
+                    // The learned id where the peer has one, the configured
+                    // address until it does (spec 7.1). An entry naming
+                    // neither says nothing a header could show.
+                    let label = host.id.as_deref().or(host.address.as_deref())?;
                     Some(Group {
-                        // The learned id where the peer has one, the configured
-                        // address until it does (spec 7.1). An entry naming
-                        // neither says nothing a header could show.
-                        label: Some(host.id.as_deref().or(host.address.as_deref())?),
+                        label: Some(label),
                         // The peer's own answer. There is no row here to derive
                         // it from, and a host can be up and simply hold no
                         // sessions.
                         unreachable: host.unreachable,
-                        span: end..end,
+                        span: 0..0,
+                        hidden: 0,
+                        unfolded: unfolded.holds(Some(label)),
                     })
                 }),
         );
+        // Alphabetical by the label the header draws, byte order and no
+        // casefolding: a section that holds still is worth more when the place
+        // it holds still in can be guessed, and ids are lowercase hex until
+        // hosts carry names. `None` sorts first, which is the rule it always
+        // had: a headerless run under someone else's header would read as
+        // theirs. Hosts with no rows interleave here rather than sinking to
+        // the bottom, because a host is looked up by its name whether or not
+        // it holds anything. The sort is stable, so two hosts drawing one
+        // label keep the order the peer named them in.
+        groups.sort_by(|left, right| left.label.cmp(&right.label));
+        let mut order = Vec::with_capacity(rows.len());
+        for group in &mut groups {
+            let start = order.len();
+            // Taken rather than copied, so two groups drawing the same label
+            // cannot both claim one host's rows.
+            let members = gathered
+                .iter_mut()
+                .find(|(label, _)| *label == group.label)
+                .map(|(_, members)| std::mem::take(members))
+                .unwrap_or_default();
+            if members.is_empty() {
+                // A host the peer holds no rows for keeps the empty span at
+                // its own place in the order, and the mark the peer gave it.
+                group.span = start..start;
+                continue;
+            }
+            group.unreachable = members
+                .iter()
+                .all(|&at| rows[at].status == RowStatus::Unreachable);
+            let held = if group.unfolded {
+                Vec::new()
+            } else {
+                held_back(rows, &members)
+            };
+            group.hidden = held.len();
+            order.extend(members.iter().copied().filter(|at| !held.contains(at)));
+            group.span = start..order.len();
+        }
         let headed = groups.len() > 1;
         Self {
             rows,
@@ -590,19 +799,19 @@ impl<'a> Layout<'a> {
         }
     }
 
-    /// The hosts the peer holds no rows for, as the label and the mark their
-    /// headers carry (spec 7.1).
+    /// How many headers the hosts the peer holds no rows for need (spec 7.1).
     ///
     /// They are their headers and nothing else, so they take no part in the
     /// run: a run reaches into a span of rows, and these have none. That is
-    /// also why [`Self::headed`] does not gate them. Suppressing the header of
-    /// a group with no rows draws the host as nothing at all, which is exactly
-    /// the absence the peer sends these entries to make visible.
-    fn empty_groups(&self) -> impl Iterator<Item = (&'a str, bool)> {
+    /// also why [`Self::headed`] does not gate them, and why they are given a
+    /// budget of their own. Suppressing the header of a group with no rows
+    /// draws the host as nothing at all, which is exactly the absence the peer
+    /// sends these entries to make visible.
+    fn empty_headers(&self) -> usize {
         self.groups
             .iter()
-            .filter(|group| group.span.is_empty())
-            .filter_map(|group| Some((group.label?, group.unreachable)))
+            .filter(|group| group.span.is_empty() && group.label.is_some())
+            .count()
     }
 
     /// How a strip `height` lines tall divides between the hosts the peer holds
@@ -620,7 +829,7 @@ impl<'a> Layout<'a> {
     fn split(&self, height: u16) -> Budget {
         let budget = usize::from(height).saturating_sub(1);
         let spare = budget.saturating_sub(usize::from(!self.order.is_empty()));
-        let empty = self.empty_groups().count().min(spare);
+        let empty = self.empty_headers().min(spare);
         Budget {
             empty,
             rows: budget - empty,
@@ -633,19 +842,47 @@ impl<'a> Layout<'a> {
             return None;
         }
         let host = group.label?;
-        (group.span.start < run.end && run.start < group.span.end).then_some(host)
+        self.reaches(group, run).then_some(host)
     }
 
-    /// Lines the run `order[run]` occupies: one per row, one per header it
-    /// reaches, and one for the overflow row when it leaves any row out. The
-    /// create row is not counted, it is paid for before a run is chosen.
+    /// Whether a run of the display order draws any of `group`'s rows.
+    ///
+    /// A group with no rows is reached by nothing, however the run falls
+    /// around it. Its span is the empty range where it sits, which a run
+    /// spanning that point would otherwise overlap, and it draws out of the
+    /// budget of its own instead (see [`Self::split`]). Counting it here as
+    /// well would charge its header twice and take the second line from the
+    /// rows.
+    fn reaches(&self, group: &Group<'a>, run: &Range<usize>) -> bool {
+        !group.span.is_empty() && group.span.start < run.end && run.start < group.span.end
+    }
+
+    /// Whether `group` draws its fold line under a run that reaches it: it has
+    /// rows the cap holds back, or the user unfolded it and the line is what
+    /// folds it again (spec 9.2, the pointer must be able to undo what the
+    /// pointer did).
+    ///
+    /// Tied to the run the same way a header is, so a group that draws a row
+    /// draws its affordance: a cap that held rows back silently would be a
+    /// strip that lies about what the peer offers.
+    fn folds(&self, group: &Group<'a>, run: &Range<usize>) -> bool {
+        (group.hidden > 0 || group.unfolded) && self.reaches(group, run)
+    }
+
+    /// Lines the run `order[run]` occupies: one per row, one per header and
+    /// fold line it reaches, and one for the overflow row when it leaves any
+    /// row out. The create row is not counted, it is paid for before a run is
+    /// chosen.
     fn cost(&self, run: Range<usize>) -> usize {
-        let headers = self
+        let chrome: usize = self
             .groups
             .iter()
-            .filter(|group| self.header_of(group, &run).is_some())
-            .count();
-        headers + run.len() + usize::from(run.len() < self.order.len())
+            .map(|group| {
+                usize::from(self.header_of(group, &run).is_some())
+                    + usize::from(self.folds(group, &run))
+            })
+            .sum();
+        chrome + run.len() + usize::from(run.len() < self.order.len())
     }
 
     /// The run of the display order to draw in `budget` lines: the longest one
@@ -654,8 +891,8 @@ impl<'a> Layout<'a> {
     ///
     /// Following focus scrolls by the least it can. The run stays anchored at
     /// the top until focus would fall past its bottom edge, which keeps a step
-    /// from jumping the whole strip. With no focused row it shows the top,
-    /// which is the most recently active end.
+    /// from jumping the whole strip. With no focused row it shows the top of
+    /// the order.
     fn visible_run(&self, budget: usize, scroll: Option<usize>) -> Range<usize> {
         // An anchor the user set outranks the focused row: they scrolled to
         // look elsewhere, and following focus would undo that on the very next
@@ -709,8 +946,23 @@ impl<'a> Layout<'a> {
 
     /// The lines for a run, in draw order, within `budget`.
     fn lines(&self, run: Range<usize>, budget: Budget) -> Vec<StripLine> {
-        let mut lines = Vec::with_capacity(run.len() + self.groups.len() + 2);
+        let mut lines = Vec::with_capacity(run.len() + 2 * self.groups.len() + 2);
+        let mut empty = 0;
         for group in &self.groups {
+            if group.span.is_empty() {
+                // A host the peer holds no rows for is its header and nothing
+                // else, drawn where its label sorts rather than pushed to an
+                // end (spec 7.1). It is drawn out of its own budget, so the
+                // rows cannot crowd it out (see [`Self::split`]).
+                if let Some(host) = group.label.filter(|_| empty < budget.empty) {
+                    lines.push(StripLine::Header {
+                        host: host.to_string(),
+                        unreachable: group.unreachable,
+                    });
+                    empty += 1;
+                }
+                continue;
+            }
             let from = group.span.start.max(run.start);
             let to = group.span.end.min(run.end);
             if from >= to {
@@ -725,6 +977,12 @@ impl<'a> Layout<'a> {
             lines.extend((from..to).map(|at| StripLine::Session {
                 index: self.order[at],
             }));
+            if self.folds(group, &run) {
+                lines.push(StripLine::Fold {
+                    host: group.label.map(str::to_string),
+                    hidden: group.hidden,
+                });
+            }
         }
         let hidden = self.order.len() - run.len();
         // At a height of one line the create row has the only line there is, so
@@ -733,17 +991,6 @@ impl<'a> Layout<'a> {
         if hidden > 0 && budget.rows > 0 {
             lines.push(StripLine::Overflow { hidden });
         }
-        // The hosts with no rows close the strip, below the count of the rows
-        // that did not fit rather than above it: a header there would read as
-        // the group the count belongs to.
-        lines.extend(
-            self.empty_groups()
-                .take(budget.empty)
-                .map(|(host, unreachable)| StripLine::Header {
-                    host: host.to_string(),
-                    unreachable,
-                }),
-        );
         // The create row is always the last line, whatever else had to be left
         // out, because it is the affordance a pointer aims at.
         lines.push(StripLine::New);
@@ -925,9 +1172,10 @@ impl SessionSidebar {
     /// bubbling phase. The strip sees the press in the capturing phase only,
     /// where it deliberately does nothing but drop its band.
     ///
-    /// And a gesture names a session, which no action carries: a chord steps
-    /// the order, a click points at a row. The two can only meet at the
-    /// request they park, which is where the switch actually happens.
+    /// And a gesture names what the chord's handler works out for itself: a
+    /// session it stepped to, or the group the focused row sits in. The two
+    /// meet at the state the switch or the fold is applied to, not at the
+    /// keymap, which is why the click needs no binding of its own.
     pub(crate) fn set_on_gesture(
         &mut self,
         on_gesture: Box<dyn FnMut(&mut EventContext, StripGesture)>,
@@ -1055,6 +1303,21 @@ impl SessionSidebar {
             StripLine::Overflow { hidden } => {
                 (" ", " ", dim, field(&format!("…{hidden} more"), cols), dim)
             }
+            StripLine::Fold { hidden, .. } => (
+                " ",
+                // The triangle is what tells this line from the overflow
+                // count above the create row: that one says the height cut
+                // rows off, this one says the group is holding them and points
+                // at which way it would move.
+                if *hidden > 0 {
+                    FOLDED_MARKER
+                } else {
+                    UNFOLDED_MARKER
+                },
+                dim,
+                field(&fold_label(*hidden), cols),
+                dim,
+            ),
             StripLine::New => (" ", "+", dim, field("new", cols), dim),
         };
         // The band reaches the pad and stops short of the separator, which
@@ -1090,11 +1353,22 @@ impl SessionSidebar {
     }
 }
 
+/// What a fold line says: how many rows its group is holding back, or that it
+/// is holding none and this line is what folds it again.
+fn fold_label(hidden: usize) -> String {
+    if hidden > 0 {
+        format!("{hidden} more")
+    } else {
+        "fold".to_string()
+    }
+}
+
 /// What a click on `line` asks for, resolved against the rows the layout that
 /// produced it was built from.
 fn gesture_for(line: &StripLine, rows: &[SidebarRow]) -> Option<StripGesture> {
     match line {
         StripLine::Session { index } => Some(StripGesture::Focus(rows.get(*index)?.id.clone())),
+        StripLine::Fold { host, .. } => Some(StripGesture::Fold(host.clone())),
         StripLine::New => Some(StripGesture::New),
         StripLine::Header { .. } | StripLine::Overflow { .. } => None,
     }
@@ -1352,36 +1626,49 @@ mod tests {
         rows.iter().map(|row| row.id.as_str()).collect()
     }
 
-    /// Rows order by activity, newest first, which is what makes the strip an
-    /// orientation instrument: the sessions in play sort to the top rather than
-    /// wherever their creation date puts them.
+    /// Rows sit where their ids put them, newest minted id first, whatever the
+    /// activity on them says. A row that climbed to the top when a message
+    /// arrived would move out from under a pointer aimed at it, which is the
+    /// whole reason the strip holds still (spec 9.2).
     #[test]
-    fn rows_order_by_activity_not_by_id() {
-        // Ids ascend while activity descends, so an id-ordered result is the
-        // exact reverse and cannot pass by accident.
+    fn rows_order_by_id_not_by_activity() {
+        // Activity descends as the ids ascend, so an activity-ordered result
+        // is the exact reverse and cannot pass by accident.
         let rows = vec![
             at("session-a", 30),
             at("session-b", 10),
             at("session-c", 20),
         ];
         let display = rows_for_display(&rows, "session-b", |_| false, |_| false);
-        assert_eq!(ids(&display), vec!["session-b", "session-c", "session-a"]);
-        assert!(display[0].focused, "the focused row is marked");
-        assert!(!display[1].focused);
+        assert_eq!(ids(&display), vec!["session-c", "session-b", "session-a"]);
+        assert!(display[1].focused, "the focused row is marked");
+        assert!(!display[0].focused);
+
+        // The stamps move, the rows do not. The busiest session is now the
+        // oldest id, and it stays at the bottom where its id puts it.
+        let stirred = vec![at("session-a", 0), at("session-b", 40), at("session-c", 40)];
+        let display = rows_for_display(&stirred, "session-b", |_| false, |_| false);
+        assert_eq!(
+            ids(&display),
+            vec!["session-c", "session-b", "session-a"],
+            "activity moved and the order did not",
+        );
     }
 
-    /// Equal stamps are broken by id so the order is total. Without a tiebreak
-    /// the sort would leave equal rows in input order, which reshuffles under a
-    /// user stepping through them.
+    /// The row carries the stamp the cap selects on, so the layout can choose
+    /// which rows survive without the order having to encode it.
     #[test]
-    fn rows_with_equal_activity_order_by_id() {
-        let now = chrono::Utc::now();
-        let mut a = at("session-a", 0);
-        let mut b = at("session-b", 0);
-        a.last_activity = now;
-        b.last_activity = now;
-        let display = rows_for_display(&[a, b], "session-a", |_| false, |_| false);
-        assert_eq!(ids(&display), vec!["session-b", "session-a"]);
+    fn a_row_carries_the_activity_the_cap_reads() {
+        let rows = vec![at("session-a", 30), at("session-b", 10)];
+        let display = rows_for_display(&rows, "session-a", |_| false, |_| false);
+        assert_eq!(
+            display[0].last_activity, rows[1].last_activity,
+            "session-b's stamp rode into its row",
+        );
+        assert!(
+            display[1].last_activity < display[0].last_activity,
+            "and the older row kept the older stamp",
+        );
     }
 
     /// The directory's answers ride into the row: what the peer says about the
@@ -1397,11 +1684,11 @@ mod tests {
             |_| false,
             |id| id == "session-a",
         );
-        assert_eq!(display[0].tag.as_deref(), Some("fix-auth"));
-        assert_eq!(display[0].host.as_deref(), Some("builder-1"));
-        assert_eq!(display[0].presence(), Presence::Background);
+        assert_eq!(display[1].tag.as_deref(), Some("fix-auth"));
+        assert_eq!(display[1].host.as_deref(), Some("builder-1"));
+        assert_eq!(display[1].presence(), Presence::Background);
         assert_eq!(
-            display[1].presence(),
+            display[0].presence(),
             Presence::Focused,
             "the focused row outranks its attachment",
         );
@@ -1421,6 +1708,7 @@ mod tests {
                 status: RowStatus::Idle,
                 focused: false,
                 attached: false,
+                last_activity: DateTime::UNIX_EPOCH,
             },
         }
     }
@@ -1451,6 +1739,14 @@ mod tests {
             self
         }
 
+        /// How long ago the row last did something, which is what the cap
+        /// selects on.
+        fn active(mut self, minutes_ago: i64) -> Self {
+            self.row.last_activity =
+                DateTime::UNIX_EPOCH + chrono::Duration::minutes(1_000 - minutes_ago);
+            self
+        }
+
         fn build(self) -> SidebarRow {
             self.row
         }
@@ -1458,6 +1754,24 @@ mod tests {
 
     fn rows_named(ids: &[&str]) -> Vec<SidebarRow> {
         ids.iter().map(|id| row(id).build()).collect()
+    }
+
+    /// The strip's lines with every group folded and no wheel anchor, which is
+    /// the resting state.
+    fn folded(rows: &[SidebarRow], hosts: &[DirectoryHost], height: u16) -> Vec<StripLine> {
+        strip_lines(rows, hosts, &Unfolded::default(), height, None)
+    }
+
+    /// The strip's lines with `group` unfolded.
+    fn unfolded(
+        rows: &[SidebarRow],
+        hosts: &[DirectoryHost],
+        group: Option<&str>,
+        height: u16,
+    ) -> Vec<StripLine> {
+        let mut open = Unfolded::default();
+        open.toggle(group);
+        strip_lines(rows, hosts, &open, height, None)
     }
 
     fn state_of(focused_at: usize, len: usize) -> SidebarState {
@@ -1517,6 +1831,175 @@ mod tests {
         assert_eq!(step_session(&unfocused, true), None);
     }
 
+    /// A plain host holding eight rows, of which the cap holds two back.
+    ///
+    /// The two it holds (`s-7` and `s-6`) sit in the middle of the group, so
+    /// stepping over them in either direction lands somewhere a walk of the
+    /// mirror's own rows would not.
+    fn stepping_state(focused: &str) -> SidebarState {
+        let rows = [
+            ("s-8", 6),
+            ("s-7", 90),
+            ("s-6", 91),
+            ("s-5", 5),
+            ("s-4", 4),
+            ("s-3", 3),
+            ("s-2", 2),
+            ("s-1", 1),
+        ]
+        .into_iter()
+        .map(|(id, minutes)| {
+            let built = row(id).active(minutes);
+            if id == focused {
+                built.focused()
+            } else {
+                built
+            }
+            .build()
+        })
+        .collect();
+        SidebarState {
+            visible: true,
+            rows,
+            ..SidebarState::default()
+        }
+    }
+
+    /// Stepping walks what the strip draws, so it steps over the rows the cap
+    /// holds back rather than focusing them one at a time. Each of those
+    /// focuses would attach a session the user cannot even see (spec 9.2).
+    #[test]
+    fn stepping_steps_over_the_rows_the_cap_holds_back() {
+        let state = stepping_state("s-8");
+        assert_eq!(
+            drawn(&state.lines(20), &state.rows),
+            vec!["s-8", "s-5", "s-4", "s-3", "s-2", "s-1"],
+            "the fixture folds two rows away, or this test measures nothing",
+        );
+        assert_eq!(
+            step_session(&state, true).as_deref(),
+            Some("s-5"),
+            "forward past the two folded rows",
+        );
+        assert_eq!(
+            step_session(&state, false).as_deref(),
+            Some("s-1"),
+            "and backward off the top wraps to the last drawn row",
+        );
+
+        let state = stepping_state("s-5");
+        assert_eq!(
+            step_session(&state, false).as_deref(),
+            Some("s-8"),
+            "backward past them too",
+        );
+        assert_eq!(step_session(&state, true).as_deref(), Some("s-4"));
+    }
+
+    /// Unfolding a group puts its rows back in the walk, because stepping and
+    /// the strip read the same layout rather than two copies of the rule.
+    #[test]
+    fn stepping_walks_a_group_the_user_unfolded() {
+        let mut state = stepping_state("s-8");
+        state.toggle_fold(None);
+        assert_eq!(step_session(&state, true).as_deref(), Some("s-7"));
+        state.toggle_fold(None);
+        assert_eq!(
+            step_session(&state, true).as_deref(),
+            Some("s-5"),
+            "and folding it again takes them back out",
+        );
+    }
+
+    /// Stepping walks the strip's grouped order, not the order the rows sit in
+    /// the mirror. Those differ as soon as a peer's rows interleave two hosts,
+    /// and the chord has to move the way the eye does.
+    #[test]
+    fn stepping_walks_the_order_the_strip_draws() {
+        let state = SidebarState {
+            visible: true,
+            rows: vec![
+                row("s-3").host("laptop").focused().build(),
+                row("s-2").host("builder-1").build(),
+                row("s-1").host("laptop").build(),
+            ],
+            ..SidebarState::default()
+        };
+        assert_eq!(
+            drawn(&state.lines(20), &state.rows),
+            vec!["s-2", "s-3", "s-1"],
+            "the strip groups them, and the fixture interleaves the hosts",
+        );
+        assert_eq!(
+            step_session(&state, true).as_deref(),
+            Some("s-1"),
+            "forward is the row below the focused one on screen",
+        );
+        assert_eq!(
+            step_session(&state, false).as_deref(),
+            Some("s-2"),
+            "and backward the row above it",
+        );
+    }
+
+    /// The fold is the user's, and no row carries it, so replacing every row
+    /// leaves the group open. That the drive loop's own refresh does the same
+    /// is pinned where the refresh runs, in the shell's sidebar tests.
+    #[test]
+    fn an_unfolded_group_outlives_the_rows_it_was_made_on() {
+        let mut state = stepping_state("s-8");
+        state.toggle_fold(None);
+        assert_eq!(drawn(&state.lines(20), &state.rows).len(), 8);
+
+        state.rows = stepping_state("s-8").rows;
+        assert_eq!(
+            drawn(&state.lines(20), &state.rows).len(),
+            8,
+            "the group is still open after the rows were replaced",
+        );
+    }
+
+    /// The chord folds the group the focused row sits in, and nothing else. It
+    /// reads the group off that row because that is the one the user is
+    /// looking at, and it says whether there was a row to read.
+    #[test]
+    fn the_chord_folds_the_group_the_focused_row_sits_in() {
+        let mut rows: Vec<SidebarRow> = (1..=8)
+            .map(|n| row(&format!("b-{n}")).host("builder-1").active(n).build())
+            .collect();
+        rows.extend((1..=8).map(|n| row(&format!("l-{n}")).host("laptop").active(n).build()));
+        rows[8].focused = true;
+        let mut state = SidebarState {
+            visible: true,
+            rows,
+            ..SidebarState::default()
+        };
+        assert!(state.toggle_focused_fold(), "there was a focused row");
+        assert_eq!(
+            folds(&state.lines(30)),
+            vec![(Some("builder-1"), 3), (Some("laptop"), 0)],
+            "the focused row's host opened and the other did not",
+        );
+
+        assert!(state.toggle_focused_fold());
+        assert_eq!(
+            folds(&state.lines(30)),
+            vec![(Some("builder-1"), 3), (Some("laptop"), 2)],
+            "and the same chord folds it back, the focused row being exempt",
+        );
+
+        state.rows[8].focused = false;
+        assert!(
+            !state.toggle_focused_fold(),
+            "with no focused row there is no group to work on",
+        );
+        assert_eq!(
+            folds(&state.lines(30)),
+            vec![(Some("builder-1"), 3), (Some("laptop"), 3)],
+            "and nothing moved, beyond the row that stopped being exempt",
+        );
+    }
+
     /// The rows a layout draws, by id, in the order the lines come out.
     fn drawn<'a>(lines: &[StripLine], rows: &'a [SidebarRow]) -> Vec<&'a str> {
         lines
@@ -1546,6 +2029,18 @@ mod tests {
         })
     }
 
+    /// The fold lines a layout draws, as the group they belong to and the
+    /// count they hold back, in order.
+    fn folds(lines: &[StripLine]) -> Vec<(Option<&str>, usize)> {
+        lines
+            .iter()
+            .filter_map(|line| match line {
+                StripLine::Fold { host, hidden } => Some((host.as_deref(), *hidden)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The create row is the last line, always, whatever else the strip had to
     /// leave out. It is the affordance a pointer aims at, so it cannot move.
     #[test]
@@ -1556,7 +2051,7 @@ mod tests {
             (rows_named(&["a", "b", "c", "d"]), 3),
             (rows_named(&["a", "b", "c", "d"]), 1),
         ] {
-            let lines = strip_lines(&rows, &[], height, None);
+            let lines = folded(&rows, &[], height);
             assert_eq!(
                 lines.last(),
                 Some(&StripLine::New),
@@ -1574,7 +2069,7 @@ mod tests {
     /// that pays for the create row.
     #[test]
     fn a_zero_height_strip_draws_nothing() {
-        assert!(strip_lines(&rows_named(&["a", "b"]), &[], 0, None).is_empty());
+        assert!(folded(&rows_named(&["a", "b"]), &[], 0).is_empty());
     }
 
     /// One host, or none at all, is not a grouping. A plain connect has to look
@@ -1583,14 +2078,14 @@ mod tests {
     fn a_single_host_gets_no_headers() {
         let hostless = rows_named(&["a", "b", "c"]);
         assert!(
-            headers(&strip_lines(&hostless, &[], 20, None)).is_empty(),
+            headers(&folded(&hostless, &[], 20)).is_empty(),
             "rows with no host name nothing to group under",
         );
         let one_host: Vec<SidebarRow> = ["a", "b", "c"]
             .iter()
             .map(|id| row(id).host("builder-1").build())
             .collect();
-        let lines = strip_lines(&one_host, &[], 20, None);
+        let lines = folded(&one_host, &[], 20);
         assert!(
             headers(&lines).is_empty(),
             "one host is not a grouping: {lines:?}",
@@ -1598,26 +2093,33 @@ mod tests {
         assert_eq!(drawn(&lines, &one_host), vec!["a", "b", "c"]);
     }
 
-    /// Distinct hosts group, hosts in order of their most recent activity and
-    /// rows in activity order inside each group.
+    /// Distinct hosts group, the groups sit where their labels sort, and each
+    /// group keeps the order its rows arrived in. Nothing here reads activity:
+    /// a section that floated on it would move the click targets under the
+    /// pointer (spec 9.2).
     #[test]
-    fn distinct_hosts_group_by_most_recent_activity() {
-        // Activity order interleaves the hosts, so a layout that merely kept
-        // the input order, or that sorted the hosts by name, would differ.
+    fn groups_sit_where_their_labels_sort() {
+        // The rows arrive as the display order has them, id descending (see
+        // `rows_for_display`), which puts the hosts in the reverse of the
+        // order they are drawn in: a layout that kept the order it was given
+        // would differ.
         let rows = vec![
-            row("laptop-new").host("laptop").build(),
-            row("builder-new").host("builder-1").build(),
-            row("laptop-old").host("laptop").build(),
-            row("builder-old").host("builder-1").build(),
+            row("laptop-b").host("laptop").active(0).build(),
+            row("laptop-a").host("laptop").active(30).build(),
+            row("builder-b").host("builder-1").active(1).build(),
+            row("builder-a").host("builder-1").active(31).build(),
         ];
-        let lines = strip_lines(&rows, &[], 20, None);
+        let lines = folded(&rows, &[], 20);
         assert_eq!(
             headers(&lines),
-            vec![("laptop", false), ("builder-1", false)]
+            vec![("builder-1", false), ("laptop", false)],
+            "alphabetical by the label the header draws, and the busiest host \
+             is the one that sorts second",
         );
         assert_eq!(
             drawn(&lines, &rows),
-            vec!["laptop-new", "laptop-old", "builder-new", "builder-old"],
+            vec!["builder-b", "builder-a", "laptop-b", "laptop-a"],
+            "and a group holds its rows in the order it was handed them",
         );
         // And the header sits above its own rows, not somewhere in the list.
         assert!(matches!(lines[0], StripLine::Header { .. }));
@@ -1640,13 +2142,13 @@ mod tests {
             row("here").host("builder-1").build(),
         ];
         assert_eq!(
-            headers(&strip_lines(&rows, &[], 20, None)),
-            vec![("laptop", true), ("builder-1", false)],
+            headers(&folded(&rows, &[], 20)),
+            vec![("builder-1", false), ("laptop", true)],
         );
         rows[1].status = RowStatus::Idle;
         assert_eq!(
-            headers(&strip_lines(&rows, &[], 20, None)),
-            vec![("laptop", false), ("builder-1", false)],
+            headers(&folded(&rows, &[], 20)),
+            vec![("builder-1", false), ("laptop", false)],
             "a host with one reachable session is reachable",
         );
     }
@@ -1660,7 +2162,7 @@ mod tests {
             row("named").host("builder-1").build(),
             row("nameless").build(),
         ];
-        let lines = strip_lines(&rows, &[], 20, None);
+        let lines = folded(&rows, &[], 20);
         assert_eq!(drawn(&lines, &rows), vec!["nameless", "named"]);
         assert_eq!(headers(&lines), vec![("builder-1", false)]);
         assert!(
@@ -1674,55 +2176,58 @@ mod tests {
     #[test]
     fn a_host_the_peer_holds_rows_for_groups_by_its_rows() {
         let rows = vec![
-            row("laptop-new").host("laptop").build(),
-            row("builder-new").host("builder-1").build(),
-            row("laptop-old").host("laptop").build(),
+            row("laptop-b").host("laptop").build(),
+            row("laptop-a").host("laptop").build(),
+            row("builder-a").host("builder-1").build(),
         ];
         let hosts = vec![learned("laptop", false), learned("builder-1", false)];
-        let lines = strip_lines(&rows, &hosts, 20, None);
+        let lines = folded(&rows, &hosts, 20);
         assert_eq!(
             headers(&lines),
-            vec![("laptop", false), ("builder-1", false)],
-            "one group per host, in the order their rows put them: {lines:?}",
+            vec![("builder-1", false), ("laptop", false)],
+            "one group per host and no empty twin beside either: {lines:?}",
         );
         assert_eq!(
             drawn(&lines, &rows),
-            vec!["laptop-new", "laptop-old", "builder-new"],
+            vec!["builder-a", "laptop-b", "laptop-a"],
         );
     }
 
-    /// A host the peer holds no rows for is drawn as an empty group: its header
-    /// with nothing under it, below the hosts that do have rows.
+    /// A host the peer holds no rows for is drawn as an empty group: its
+    /// header with nothing under it, sitting where its label sorts among the
+    /// hosts that do have rows.
     ///
     /// This is the case the directory's host entries exist for. A gateway holds
     /// a host's rows only for as long as that host has sent them, so across a
     /// restart it has none for a host that is down, and a strip grouping by the
-    /// rows alone would draw that host as nothing at all (spec 7.1).
+    /// rows alone would draw that host as nothing at all (spec 7.1). It
+    /// interleaves rather than sinking to the bottom, because a host is looked
+    /// up by its name whether or not it is holding anything.
     #[test]
     fn a_host_the_peer_holds_no_rows_for_draws_an_empty_group() {
         let rows = vec![row("s-1").host("builder-1").build()];
-        let hosts = vec![learned("builder-1", false), learned("laptop", true)];
-        let lines = strip_lines(&rows, &hosts, 20, None);
+        let hosts = vec![learned("builder-1", false), learned("aleph", true)];
+        let lines = folded(&rows, &hosts, 20);
         assert_eq!(
             headers(&lines),
-            vec![("builder-1", false), ("laptop", true)],
+            vec![("aleph", true), ("builder-1", false)],
             "the host with no rows is a group of its own: {lines:?}",
         );
         assert_eq!(
             lines,
             vec![
                 StripLine::Header {
+                    host: "aleph".to_string(),
+                    unreachable: true,
+                },
+                StripLine::Header {
                     host: "builder-1".to_string(),
                     unreachable: false,
                 },
                 StripLine::Session { index: 0 },
-                StripLine::Header {
-                    host: "laptop".to_string(),
-                    unreachable: true,
-                },
                 StripLine::New,
             ],
-            "and it closes the strip, with no rows under it",
+            "and it sits above the host it sorts above, with no rows under it",
         );
     }
 
@@ -1733,10 +2238,10 @@ mod tests {
     fn a_host_with_no_id_is_labelled_by_its_address() {
         let rows = vec![row("s-1").host("builder-1").build()];
         let hosts = vec![learned("builder-1", false), configured("10.0.0.7:7777")];
-        let lines = strip_lines(&rows, &hosts, 20, None);
+        let lines = folded(&rows, &hosts, 20);
         assert_eq!(
             headers(&lines),
-            vec![("builder-1", false), ("10.0.0.7:7777", true)],
+            vec![("10.0.0.7:7777", true), ("builder-1", false)],
             "{lines:?}",
         );
     }
@@ -1746,12 +2251,42 @@ mod tests {
     /// nothing keys a group by it.
     #[test]
     fn two_hosts_can_both_be_labelled_by_their_addresses() {
-        let hosts = vec![configured("10.0.0.7:7777"), configured("10.0.0.8:7777")];
-        let lines = strip_lines(&[], &hosts, 20, None);
+        // Named the other way round by the peer, so what places them here is
+        // the label rather than the order they arrived in.
+        let hosts = vec![configured("10.0.0.8:7777"), configured("10.0.0.7:7777")];
+        let lines = folded(&[], &hosts, 20);
         assert_eq!(
             headers(&lines),
             vec![("10.0.0.7:7777", true), ("10.0.0.8:7777", true)],
-            "both hosts are drawn, in the order the peer named them: {lines:?}",
+            "both hosts are drawn, where their labels sort: {lines:?}",
+        );
+    }
+
+    /// Labels sort in byte order with no casefolding, and two hosts drawing
+    /// one label keep the order the peer named them in.
+    ///
+    /// Byte order is the predictable rule while labels are ids: it needs no
+    /// table and no locale, and the cost is that a capitalised name sorts
+    /// above every lowercase one. The tie-break matters because a host known
+    /// only by an address can draw the same label as another host's id, and
+    /// two groups swapping places between frames is the thing this order
+    /// exists to prevent.
+    #[test]
+    fn labels_sort_in_byte_order_and_ties_keep_the_peers_order() {
+        let hosts = vec![learned("aaa", false), learned("Zeta", false)];
+        assert_eq!(
+            headers(&folded(&[], &hosts, 20)),
+            vec![("Zeta", false), ("aaa", false)],
+            "casefolding would have put aaa first",
+        );
+
+        // Both draw "dup", one an id the peer can reach and one an address it
+        // cannot, so the marks tell the order apart.
+        let twins = vec![learned("dup", false), configured("dup")];
+        assert_eq!(
+            headers(&folded(&[], &twins, 20)),
+            vec![("dup", false), ("dup", true)],
+            "the tie kept the order the peer named them in",
         );
     }
 
@@ -1766,7 +2301,7 @@ mod tests {
             address: Some("10.0.0.8:7777".to_string()),
             unreachable: true,
         };
-        let lines = strip_lines(&[], &[learned("builder-1", false), both], 20, None);
+        let lines = folded(&[], &[learned("builder-1", false), both], 20);
         assert_eq!(
             headers(&lines),
             vec![("builder-1", false), ("builder-2", true)],
@@ -1783,7 +2318,7 @@ mod tests {
     fn an_address_never_matches_a_group_named_by_an_id() {
         let rows = vec![row("s-1").host("builder-1").build()];
         let hosts = vec![learned("builder-1", false), configured("builder-1")];
-        let lines = strip_lines(&rows, &hosts, 20, None);
+        let lines = folded(&rows, &hosts, 20);
         assert_eq!(
             headers(&lines),
             vec![("builder-1", false), ("builder-1", true)],
@@ -1800,14 +2335,14 @@ mod tests {
         let rows = vec![row("s-1").host("builder-1").build()];
         let waiting = vec![learned("builder-1", false), configured("10.0.0.8:7777")];
         assert_eq!(
-            headers(&strip_lines(&rows, &waiting, 20, None)),
-            vec![("builder-1", false), ("10.0.0.8:7777", true)],
+            headers(&folded(&rows, &waiting, 20)),
+            vec![("10.0.0.8:7777", true), ("builder-1", false)],
         );
 
         // It answers, so the gateway has its id and can reach it. Its rows are
         // not here yet: those arrive on its own `list` frame.
         let met = vec![learned("builder-1", false), learned("builder-2", false)];
-        let lines = strip_lines(&rows, &met, 20, None);
+        let lines = folded(&rows, &met, 20);
         assert_eq!(
             headers(&lines),
             vec![("builder-1", false), ("builder-2", false)],
@@ -1820,7 +2355,7 @@ mod tests {
     /// because the alternative is drawing the host as nothing at all.
     #[test]
     fn an_empty_group_draws_where_a_single_host_would_get_no_header() {
-        let lines = strip_lines(&[], &[learned("laptop", true)], 20, None);
+        let lines = folded(&[], &[learned("laptop", true)], 20);
         assert_eq!(
             headers(&lines),
             vec![("laptop", true)],
@@ -1830,7 +2365,7 @@ mod tests {
         // And a lone host that does hold rows still reads as it did before
         // hosts existed.
         let rows = vec![row("s-1").host("builder-1").build()];
-        let lines = strip_lines(&rows, &[learned("builder-1", false)], 20, None);
+        let lines = folded(&rows, &[learned("builder-1", false)], 20);
         assert!(
             headers(&lines).is_empty(),
             "one host with rows is not a grouping: {lines:?}",
@@ -1844,10 +2379,10 @@ mod tests {
     #[test]
     fn an_empty_groups_mark_is_the_peers_own_answer() {
         let hosts = vec![learned("up-and-empty", false), learned("gone", true)];
-        let lines = strip_lines(&[], &hosts, 20, None);
+        let lines = folded(&[], &hosts, 20);
         assert_eq!(
             headers(&lines),
-            vec![("up-and-empty", false), ("gone", true)],
+            vec![("gone", true), ("up-and-empty", false)],
             "{lines:?}",
         );
     }
@@ -1862,7 +2397,7 @@ mod tests {
             address: None,
             unreachable: true,
         };
-        let lines = strip_lines(&[], &[learned("builder-1", true), nameless], 20, None);
+        let lines = folded(&[], &[learned("builder-1", true), nameless], 20);
         assert_eq!(headers(&lines), vec![("builder-1", true)], "{lines:?}");
         assert_eq!(
             lines.len(),
@@ -1880,12 +2415,9 @@ mod tests {
         let rows = rows_named(&["a", "b", "c"]);
         // Four lines hold all three rows and the create row with no host in
         // play, so the host is what displaces them.
-        assert_eq!(
-            drawn(&strip_lines(&rows, &[], 4, None), &rows),
-            vec!["a", "b", "c"],
-        );
+        assert_eq!(drawn(&folded(&rows, &[], 4), &rows), vec!["a", "b", "c"],);
 
-        let lines = strip_lines(&rows, &[configured("10.0.0.7:7777")], 4, None);
+        let lines = folded(&rows, &[configured("10.0.0.7:7777")], 4);
         assert_eq!(
             headers(&lines),
             vec![("10.0.0.7:7777", true)],
@@ -1894,6 +2426,163 @@ mod tests {
         assert_eq!(drawn(&lines, &rows), vec!["a"], "the rows gave theirs up");
         assert_eq!(hidden(&lines), Some(2), "and they say so: {lines:?}");
         assert_eq!(lines.len(), 4, "inside the height: {lines:?}");
+    }
+
+    /// A host with no rows costs the strip exactly one line, wherever its
+    /// label sorts it to.
+    ///
+    /// Its header is drawn out of a budget of its own, so a layout that also
+    /// charged the run for it would take a second line from the rows and hide
+    /// a row it had room for. That can only happen where the host sorts
+    /// between two hosts that do have rows, which is why the fixture puts it
+    /// there and why the same strip is measured with the host renamed to sort
+    /// last.
+    #[test]
+    fn a_host_with_no_rows_costs_one_line_wherever_it_sorts() {
+        let rows = vec![
+            row("s-a").host("aaa").build(),
+            row("s-c").host("ccc").build(),
+        ];
+        let between = vec![
+            learned("aaa", false),
+            learned("bbb", true),
+            learned("ccc", false),
+        ];
+        let lines = folded(&rows, &between, 6);
+        assert_eq!(
+            drawn(&lines, &rows),
+            vec!["s-a", "s-c"],
+            "both rows fit beside the three headers and the create row: \
+             {lines:?}",
+        );
+        assert_eq!(hidden(&lines), None, "so nothing was cut: {lines:?}");
+        assert_eq!(lines.len(), 6, "and the height is spent: {lines:?}");
+
+        let after = vec![
+            learned("aaa", false),
+            learned("ccc", false),
+            learned("zzz", true),
+        ];
+        assert_eq!(
+            folded(&rows, &after, 6).len(),
+            lines.len(),
+            "the same strip costs the same whether the rowless host sorts \
+             between the other two or after them",
+        );
+    }
+
+    /// A host the user unfolded that later holds no rows costs nothing either.
+    /// It draws no fold line (there is nothing to fold), so charging the run
+    /// for one would take a line for something the strip never draws, and no
+    /// affordance would be left to get it back.
+    #[test]
+    fn a_rowless_host_the_user_unfolded_costs_no_fold_line() {
+        let rows = vec![
+            row("s-a").host("aaa").build(),
+            row("s-c").host("ccc").build(),
+        ];
+        let hosts = vec![
+            learned("aaa", false),
+            learned("bbb", true),
+            learned("ccc", false),
+        ];
+        let lines = unfolded(&rows, &hosts, Some("bbb"), 6);
+        assert!(folds(&lines).is_empty(), "no fold line is drawn: {lines:?}");
+        assert_eq!(
+            drawn(&lines, &rows),
+            vec!["s-a", "s-c"],
+            "and no row lost its line to one: {lines:?}",
+        );
+    }
+
+    /// A fold line is chrome the group pays for, so a run that reaches no row
+    /// of a group pays for neither its header nor its fold line.
+    #[test]
+    fn a_group_the_run_does_not_reach_costs_nothing() {
+        let mut rows: Vec<SidebarRow> = (1..=8)
+            .map(|n| row(&format!("a-{n}")).host("aaa").active(n).build())
+            .collect();
+        rows.extend((1..=8).map(|n| row(&format!("z-{n}")).host("zzz").active(n).build()));
+        // Six lines: the create row, the overflow count, and four for the
+        // first group's header, two of its rows and its fold line. The second
+        // group is out of the run and costs nothing at all.
+        let lines = folded(&rows, &[], 6);
+        assert_eq!(headers(&lines), vec![("aaa", false)], "{lines:?}");
+        assert_eq!(folds(&lines), vec![(Some("aaa"), 3)], "{lines:?}");
+        assert_eq!(drawn(&lines, &rows).len(), 2, "{lines:?}");
+        assert_eq!(lines.len(), 6, "{lines:?}");
+    }
+
+    /// The mark on a header answers for the host, not for the rows that
+    /// happened to survive the cap. A host with one reachable session is
+    /// reachable even when the cap holds that session back, or the strip would
+    /// declare a host out on the strength of what it is not showing.
+    #[test]
+    fn the_header_mark_reads_every_row_the_cap_hid() {
+        let mut rows: Vec<SidebarRow> = (1..=5)
+            .map(|n| {
+                row(&format!("gone-{n}"))
+                    .host("laptop")
+                    .status(RowStatus::Unreachable)
+                    .active(n)
+                    .build()
+            })
+            .collect();
+        // Older than all of them, so the cap is what takes it off screen.
+        rows.push(row("here").host("laptop").active(90).build());
+        let lines = folded(&rows, &[learned("zeta", false)], 20);
+        assert_eq!(
+            drawn(&lines, &rows).len(),
+            5,
+            "the reachable row is the one the cap held: {lines:?}",
+        );
+        assert_eq!(
+            headers(&lines),
+            vec![("laptop", false), ("zeta", false)],
+            "and the host is still answering: {lines:?}",
+        );
+    }
+
+    /// Folding drops the wheel's anchor, so the gesture always shows its own
+    /// result. An anchor is an index into a display order the fold just
+    /// changed: kept, it would leave the user looking at rows they did not ask
+    /// for, and an unfold whose rows all land above it would look like a
+    /// gesture that did nothing.
+    #[test]
+    fn folding_hands_the_strip_back_to_focus_following() {
+        let mut state = SidebarState {
+            visible: true,
+            rows: (1..=12)
+                .map(|n| row(&format!("s-{n:02}")).active(n).build())
+                .collect(),
+            ..SidebarState::default()
+        };
+        let mut moved = 0;
+        for _ in 0..8 {
+            if state.scroll_by(1, 6) {
+                moved += 1;
+            }
+        }
+        assert!(
+            moved > 0,
+            "the wheel never moved the run, so this test measures nothing",
+        );
+        let scrolled = drawn(&state.lines(6), &state.rows);
+        assert!(
+            !scrolled.contains(&"s-01"),
+            "the wheel moved the run off the top, or this test measures \
+             nothing: {scrolled:?}",
+        );
+
+        state.toggle_fold(None);
+        let opened = drawn(&state.lines(6), &state.rows);
+        assert_eq!(
+            opened.first(),
+            Some(&"s-01"),
+            "unfolding drew the group from its top rather than leaving the run \
+             where the wheel had it, where the rows it revealed would all sit \
+             above the view: {opened:?}",
+        );
     }
 
     /// Hosts with no rows can eat the whole budget, and the strip still stays
@@ -1905,7 +2594,7 @@ mod tests {
             .map(|n| configured(&format!("10.0.0.{n}:7777")))
             .collect();
         for height in 0..=8 {
-            let lines = strip_lines(&rows, &hosts, height, None);
+            let lines = folded(&rows, &hosts, height);
             assert!(
                 lines.len() <= usize::from(height),
                 "{height} lines held {lines:?}",
@@ -1922,13 +2611,13 @@ mod tests {
         // Three lines: the create row, the count of what did not fit, and one
         // host. The rows keep a line wherever they have anything to count, so
         // the hosts take what is left rather than all of it.
-        let lines = strip_lines(&rows, &hosts, 3, None);
+        let lines = folded(&rows, &hosts, 3);
         assert_eq!(hidden(&lines), Some(2), "the rows still say so: {lines:?}");
         assert_eq!(headers(&lines).len(), 1, "{lines:?}");
 
         // With no rows there is nothing to count, and the hosts have the whole
         // budget.
-        let lines = strip_lines(&[], &hosts, 3, None);
+        let lines = folded(&[], &hosts, 3);
         assert_eq!(headers(&lines).len(), 2, "{lines:?}");
         assert_eq!(hidden(&lines), None, "{lines:?}");
     }
@@ -1942,7 +2631,9 @@ mod tests {
         let ids: Vec<String> = (0..10).map(|i| format!("s-{i}")).collect();
         let mut state = SidebarState {
             visible: true,
-            rows: ids.iter().map(|id| row(id).build()).collect(),
+            // Attached, so every row is on screen to be scrolled to and the
+            // height is the only thing cutting any of them (see [`GROUP_CAP`]).
+            rows: ids.iter().map(|id| row(id).attached().build()).collect(),
             hosts: vec![configured("10.0.0.7:7777")],
             ..SidebarState::default()
         };
@@ -1964,18 +2655,18 @@ mod tests {
     }
 
     /// Rows that do not fit are counted, not dropped in silence. What is cut is
-    /// the least recently active end, because that is how the rows are ordered.
+    /// the tail of the display order, which is where the run ends.
     #[test]
     fn the_rows_that_do_not_fit_are_counted() {
         let rows = rows_named(&["a", "b", "c", "d", "e"]);
         // Six lines: five rows and the create row, so nothing is cut.
-        let whole = strip_lines(&rows, &[], 6, None);
+        let whole = folded(&rows, &[], 6);
         assert_eq!(drawn(&whole, &rows), vec!["a", "b", "c", "d", "e"]);
         assert_eq!(hidden(&whole), None, "nothing was left out: {whole:?}");
 
         // One line fewer, and the overflow row costs one of its own: four
         // lines of budget hold three rows and the count of the other two.
-        let cut = strip_lines(&rows, &[], 5, None);
+        let cut = folded(&rows, &[], 5);
         assert_eq!(drawn(&cut, &rows), vec!["a", "b", "c"]);
         assert_eq!(hidden(&cut), Some(2));
         assert_eq!(cut.len(), 5, "and it used every line it had: {cut:?}");
@@ -1992,16 +2683,239 @@ mod tests {
             row("d").host("two").build(),
         ];
         // Five lines: create row, one header, two rows, one overflow row.
-        let lines = strip_lines(&rows, &[], 5, None);
+        let lines = folded(&rows, &[], 5);
         assert_eq!(drawn(&lines, &rows), vec!["a", "b"]);
         assert_eq!(headers(&lines), vec![("one", false)]);
         assert_eq!(hidden(&lines), Some(2));
 
         // Seven lines fit both headers, all four rows and the create row.
-        let whole = strip_lines(&rows, &[], 7, None);
+        let whole = folded(&rows, &[], 7);
         assert_eq!(drawn(&whole, &rows), vec!["a", "b", "c", "d"]);
         assert_eq!(headers(&whole), vec![("one", false), ("two", false)]);
         assert_eq!(hidden(&whole), None);
+    }
+
+    /// Eight boring rows of one plain host, in display order, with the five
+    /// most recently active of them scattered through it.
+    ///
+    /// Three layouts disagree about this fixture, which is what makes it worth
+    /// building: keeping the first five leaves `s-8 s-7 s-6 s-5 s-4`, drawing
+    /// the survivors in the order recency selected them leaves `s-1 s-2 s-3
+    /// s-5 s-7`, and the rule is neither.
+    fn scattered_rows() -> Vec<SidebarRow> {
+        vec![
+            row("s-8").active(62).build(),
+            row("s-7").active(5).build(),
+            row("s-6").active(61).build(),
+            row("s-5").active(4).build(),
+            row("s-4").active(60).build(),
+            row("s-3").active(3).build(),
+            row("s-2").active(2).build(),
+            row("s-1").active(1).build(),
+        ]
+    }
+
+    /// The cap keeps a group's most recently active rows and leaves them
+    /// exactly where the group had them, and one line says how many it is
+    /// holding back.
+    #[test]
+    fn the_cap_selects_by_recency_and_draws_in_place() {
+        let rows = scattered_rows();
+        let lines = folded(&rows, &[], 20);
+        assert_eq!(
+            drawn(&lines, &rows),
+            vec!["s-7", "s-5", "s-3", "s-2", "s-1"],
+            "the five most recent rows, in the order the group holds them",
+        );
+        assert_eq!(
+            folds(&lines),
+            vec![(None, 3)],
+            "and the group says how many it is holding: {lines:?}",
+        );
+        assert_eq!(
+            hidden(&lines),
+            None,
+            "nothing here was cut by the height: {lines:?}",
+        );
+    }
+
+    /// A group with no more than the cap's worth of boring rows draws no fold
+    /// line: there is nothing behind it, and an affordance that opens nothing
+    /// is noise on every quiet strip.
+    #[test]
+    fn a_group_inside_the_cap_draws_no_fold_line() {
+        let rows = rows_named(&["a", "b", "c", "d", "e"]);
+        let lines = folded(&rows, &[], 20);
+        assert_eq!(drawn(&lines, &rows), vec!["a", "b", "c", "d", "e"]);
+        assert!(folds(&lines).is_empty(), "{lines:?}");
+    }
+
+    /// The cap never holds back a row the strip has promised to show: the
+    /// focused row and the ones the client holds open (spec 9.2), and the ones
+    /// wearing the working or attention glyph (spec 6.8).
+    #[test]
+    fn the_cap_never_holds_back_an_exempt_row() {
+        for (what, exempt) in [
+            ("the focused row", row("s-0").focused()),
+            ("a row the client holds open", row("s-0").attached()),
+            ("a working row", row("s-0").status(RowStatus::Working)),
+            (
+                "a row with unseen output",
+                row("s-0").status(RowStatus::Unseen),
+            ),
+        ] {
+            // The exempt row is by far the least recently active in the group,
+            // so it is the first thing a cap that ignored its exemption would
+            // cut, and six boring rows leave the cap something to hold back.
+            let mut rows = vec![exempt.active(500).build()];
+            rows.extend((1..=6).map(|n| row(&format!("s-{n}")).active(n).build()));
+            let lines = folded(&rows, &[], 20);
+            assert!(
+                drawn(&lines, &rows).contains(&"s-0"),
+                "{what} survived the cap: {lines:?}",
+            );
+            assert_eq!(
+                folds(&lines),
+                vec![(None, 1)],
+                "{what}: the boring row past the cap is what folded: {lines:?}",
+            );
+        }
+    }
+
+    /// A row on a host the peer cannot reach is boring. Its glyph says the peer
+    /// cannot answer for it at all, so there is no live signal to suppress, and
+    /// a host that went out holding two dozen sessions is exactly the crowd the
+    /// cap is for.
+    #[test]
+    fn the_cap_binds_a_host_that_has_gone_out() {
+        let rows: Vec<SidebarRow> = (1..=8)
+            .map(|n| {
+                row(&format!("s-{n}"))
+                    .host("laptop")
+                    .status(RowStatus::Unreachable)
+                    .active(n)
+                    .build()
+            })
+            .collect();
+        // A second host, so the strip wears headers at all and the mark on
+        // this one can be read (one host is not a grouping).
+        let lines = folded(&rows, &[learned("zeta", false)], 20);
+        assert_eq!(drawn(&lines, &rows).len(), 5, "{lines:?}");
+        assert_eq!(folds(&lines), vec![(Some("laptop"), 3)], "{lines:?}");
+        assert_eq!(
+            headers(&lines),
+            vec![("laptop", true), ("zeta", false)],
+            "and the header still says the host cannot be reached",
+        );
+    }
+
+    /// Unfolding a group shows every row it was holding, and its line stays
+    /// behind as what folds them away again: the pointer has to be able to
+    /// undo what the pointer did (spec 9.2).
+    #[test]
+    fn unfolding_a_group_shows_its_tail_and_keeps_the_line() {
+        let rows = scattered_rows();
+        let lines = unfolded(&rows, &[], None, 20);
+        assert_eq!(
+            drawn(&lines, &rows),
+            vec!["s-8", "s-7", "s-6", "s-5", "s-4", "s-3", "s-2", "s-1"],
+            "every row, still in the order the group holds them",
+        );
+        assert_eq!(
+            folds(&lines),
+            vec![(None, 0)],
+            "and the line is still there, holding nothing: {lines:?}",
+        );
+
+        // A group with nothing to hold back keeps the line too once it has
+        // been unfolded, or the gesture would have no way back.
+        let quiet = rows_named(&["a", "b"]);
+        assert_eq!(folds(&unfolded(&quiet, &[], None, 20)), vec![(None, 0)]);
+    }
+
+    /// Each group is capped on its own, and unfolding one leaves the others
+    /// exactly as they were. Bounding each host's share is the whole point: a
+    /// single budget shared between them is what let one host bury the rest.
+    #[test]
+    fn the_cap_binds_each_group_on_its_own() {
+        let mut rows: Vec<SidebarRow> = (1..=8)
+            .map(|n| row(&format!("b-{n}")).host("builder-1").active(n).build())
+            .collect();
+        rows.extend((1..=7).map(|n| row(&format!("l-{n}")).host("laptop").active(n).build()));
+        let lines = folded(&rows, &[], 30);
+        assert_eq!(
+            folds(&lines),
+            vec![(Some("builder-1"), 3), (Some("laptop"), 2)],
+            "one line per group, each counting its own: {lines:?}",
+        );
+        assert_eq!(drawn(&lines, &rows).len(), 10, "{lines:?}");
+
+        let lines = unfolded(&rows, &[], Some("builder-1"), 30);
+        assert_eq!(
+            folds(&lines),
+            vec![(Some("builder-1"), 0), (Some("laptop"), 2)],
+            "the unfolded group opened and the other did not: {lines:?}",
+        );
+        assert_eq!(drawn(&lines, &rows).len(), 13, "{lines:?}");
+    }
+
+    /// The fold line costs a line like a header does, and the strip stays
+    /// inside its height with the create row on the last line whatever the cap
+    /// is doing.
+    ///
+    /// Where a row and its group's chrome cannot both fit, the row is what
+    /// goes: a strip that overran its height would paint over the transcript
+    /// beside it, and a group drawing a row without its fold line would hide
+    /// rows in silence.
+    #[test]
+    fn the_fold_line_is_paid_for_out_of_the_height() {
+        let rows = scattered_rows();
+        for height in 0..=12 {
+            let lines = folded(&rows, &[], height);
+            assert!(
+                lines.len() <= usize::from(height),
+                "{height} lines held {lines:?}",
+            );
+            if height > 0 {
+                assert_eq!(
+                    lines.last(),
+                    Some(&StripLine::New),
+                    "{height} lines put the create row last: {lines:?}",
+                );
+            }
+        }
+
+        // Eight lines: the create row, the fold line, the overflow count and
+        // the five rows the cap left.
+        let whole = folded(&rows, &[], 8);
+        assert_eq!(drawn(&whole, &rows).len(), 5, "{whole:?}");
+        assert_eq!(folds(&whole), vec![(None, 3)], "{whole:?}");
+    }
+
+    /// The two counts answer different questions and are drawn as two lines:
+    /// the group's fold line says what the cap is holding, the overflow count
+    /// says what the height cut.
+    #[test]
+    fn the_fold_count_and_the_height_cut_are_counted_apart() {
+        // Four rows the client holds open and six boring ones, so the cap
+        // holds one back and nine rows want to be drawn.
+        let mut rows: Vec<SidebarRow> = (1..=4)
+            .map(|n| row(&format!("open-{n}")).attached().active(n).build())
+            .collect();
+        rows.extend((1..=6).map(|n| row(&format!("s-{n}")).active(n).build()));
+        let lines = folded(&rows, &[], 6);
+        assert_eq!(
+            folds(&lines),
+            vec![(None, 1)],
+            "the cap is holding one row: {lines:?}",
+        );
+        assert_eq!(
+            hidden(&lines),
+            Some(6),
+            "and the height cut six more of the nine: {lines:?}",
+        );
+        assert_eq!(drawn(&lines, &rows).len(), 3, "{lines:?}");
+        assert_eq!(lines.len(), 6, "which is every line it had: {lines:?}");
     }
 
     /// The focused row is drawn even when the store holds more sessions than
@@ -2013,7 +2927,7 @@ mod tests {
         rows[4].focused = true;
         // Four lines: the create row, the overflow row, and two rows ending on
         // the focused one.
-        let lines = strip_lines(&rows, &[], 4, None);
+        let lines = folded(&rows, &[], 4);
         assert_eq!(drawn(&lines, &rows), vec!["d", "e"]);
         assert_eq!(hidden(&lines), Some(4), "four rows are out of view");
     }
@@ -2027,16 +2941,13 @@ mod tests {
         let mut rows = rows_named(&["a", "b", "c", "d", "e", "f"]);
         rows[0].focused = true;
         assert_eq!(
-            drawn(&strip_lines(&rows, &[], 4, None), &rows),
+            drawn(&folded(&rows, &[], 4), &rows),
             vec!["a", "b"],
             "the row below the focused one fills the line it left",
         );
         rows[0].focused = false;
         rows[1].focused = true;
-        assert_eq!(
-            drawn(&strip_lines(&rows, &[], 4, None), &rows),
-            vec!["a", "b"]
-        );
+        assert_eq!(drawn(&folded(&rows, &[], 4), &rows), vec!["a", "b"]);
     }
 
     /// The minted id every layout test reads its time of day out of.
@@ -2310,18 +3221,18 @@ mod tests {
                 .map(|cell| cell.char.grapheme())
                 .collect()
         };
-        assert_eq!(text(0), " ~ laptop ──────── ! ─ │", "the header is marked");
-        assert_eq!(text(1), " ! s-1                 │", "and so is the row");
-        assert_eq!(text(2), " ~ builder-1 ───────── │");
-        assert_eq!(text(3), "   s-2                 │");
+        assert_eq!(text(0), " ~ builder-1 ───────── │");
+        assert_eq!(text(1), "   s-2                 │");
+        assert_eq!(text(2), " ~ laptop ──────── ! ─ │", "the header is marked");
+        assert_eq!(text(3), " ! s-1                 │", "and so is the row");
         let styles = styles();
         assert_ne!(styles.text, styles.dim, "the two brightnesses differ");
         assert_eq!(
-            cells[1][3].style, styles.text,
+            cells[3][3].style, styles.text,
             "a row the client holds open is drawn as held open",
         );
         assert_eq!(
-            cells[3][3].style, styles.text,
+            cells[1][3].style, styles.text,
             "the same as one whose host is answering",
         );
     }
@@ -2457,10 +3368,10 @@ mod tests {
         );
     }
 
-    /// A host the peer holds no rows for, as the strip paints it: a header with
-    /// nothing under it, below the hosts that have rows, named by the id where
-    /// the peer has learned one and by the configured address until it has
-    /// (spec 7.1).
+    /// A host the peer holds no rows for, as the strip paints it: a header
+    /// with nothing under it, in the place its label sorts it to among the
+    /// hosts that have rows, named by the id where the peer has learned one
+    /// and by the configured address until it has (spec 7.1).
     ///
     /// The mark rides in the header's rule exactly as it does over a group
     /// whose rows are all unreachable, because it says the same thing: nothing
@@ -2484,12 +3395,37 @@ mod tests {
         assert_eq!(
             painted(rows, hosts, 6),
             vec![
+                " ~ 10.0.0.7:7777 ─ ! ─ │",
                 " ~ builder-1 ───────── │",
                 "▌  19-07-19 fix-auth   │",
                 " ~ laptop ──────── ! ─ │",
-                " ~ 10.0.0.7:7777 ─ ! ─ │",
                 " + new                 │",
                 "                       │",
+            ],
+        );
+    }
+
+    /// The two counted lines read differently, because they count different
+    /// things: a group's fold line wears a triangle pointing the way the
+    /// gesture moves, the strip's overflow count is the plain "…n more" above
+    /// the create row. A user reading one for the other would click a line
+    /// that does nothing, or wait for a fold that never comes.
+    ///
+    /// What the line looks like once the group is open is pinned where the
+    /// click opens it, in the shell's own pointer tests.
+    #[test]
+    fn a_fold_line_reads_differently_from_the_overflow_count() {
+        // Six lines: three rows, the fold line, the count of the two the
+        // height cut, and the create row.
+        assert_eq!(
+            painted(scattered_rows(), Vec::new(), 6),
+            [
+                "   s-7                 │",
+                "   s-5                 │",
+                "   s-3                 │",
+                " ▸ 3 more              │",
+                "   …2 more             │",
+                " + new                 │",
             ],
         );
     }
@@ -2646,13 +3582,13 @@ mod tests {
     /// not the third.
     #[test]
     fn a_click_names_the_session_on_the_line_it_landed_on() {
-        // Two hosts, so the strip wears headers: `~ laptop`, its two rows,
-        // `~ builder-1`, its two rows, then the create row.
+        // Two hosts, so the strip wears headers: `~ builder-1`, its two rows,
+        // `~ laptop`, its two rows, then the create row.
         let rows = vec![
-            row("laptop-new").host("laptop").focused().build(),
-            row("builder-new").host("builder-1").build(),
-            row("laptop-old").host("laptop").build(),
-            row("builder-old").host("builder-1").build(),
+            row("laptop-b").host("laptop").focused().build(),
+            row("laptop-a").host("laptop").build(),
+            row("builder-b").host("builder-1").build(),
+            row("builder-a").host("builder-1").build(),
         ];
         let (mut strip, seen) = wired(rows, 8);
         for line in [1, 2, 4, 5] {
@@ -2661,7 +3597,7 @@ mod tests {
         }
         assert_eq!(
             *seen.borrow(),
-            focus_of(&["laptop-new", "laptop-old", "builder-new", "builder-old"]),
+            focus_of(&["builder-b", "builder-a", "laptop-b", "laptop-a"]),
             "the lines under the headers name the rows below them",
         );
 
@@ -2678,9 +3614,8 @@ mod tests {
     ///
     /// The drive loop refreshes the mirror at the top of every iteration and
     /// paints only once the frame budget has elapsed, so a press handled in
-    /// between sees rows that have already moved. A background session going
-    /// active reorders them, and a new row at the top shifts every index by
-    /// one.
+    /// between sees rows that have already moved: a session created or ended
+    /// on any host shifts the rows below it by one.
     #[test]
     fn a_click_names_the_session_that_was_painted_on_the_line() {
         let (mut strip, seen) = wired(rows_named(&["a", "b", "c"]), 8);
@@ -2747,6 +3682,49 @@ mod tests {
             deliver(&mut strip, &press(line));
         }
         assert!(seen.borrow().is_empty());
+    }
+
+    /// A click on a fold line names the group it belongs to, and nothing else.
+    /// The gesture is the pointer's trigger for the fold action, so it carries
+    /// the same thing the chord works out from the focused row.
+    #[test]
+    fn a_click_on_a_fold_line_names_its_group() {
+        let mut rows: Vec<SidebarRow> = (1..=8)
+            .map(|n| row(&format!("b-{n}")).host("builder-1").active(n).build())
+            .collect();
+        rows.extend((1..=8).map(|n| row(&format!("l-{n}")).host("laptop").active(n).build()));
+        // A header, five rows and a fold line per group, then the create row.
+        let (mut strip, seen) = wired(rows, 15);
+        let ctx = deliver(&mut strip, &press(6));
+        assert!(ctx.consume_event, "the fold line acted on the press");
+        deliver(&mut strip, &press(13));
+        assert_eq!(
+            *seen.borrow(),
+            vec![
+                StripGesture::Fold(Some("builder-1".to_string())),
+                StripGesture::Fold(Some("laptop".to_string())),
+            ],
+            "each line named its own group",
+        );
+
+        // A plain host's rows sit in the unlabeled group, which folds like any
+        // other and has no name to be asked for.
+        let (mut strip, seen) = wired(scattered_rows(), 15);
+        deliver(&mut strip, &press(5));
+        assert_eq!(*seen.borrow(), vec![StripGesture::Fold(None)]);
+    }
+
+    /// The fold line wears the hover band, because a click on it does
+    /// something. The band marks what a click acts on and nothing else.
+    #[test]
+    fn the_band_marks_a_fold_line() {
+        let (mut strip, _) = wired(scattered_rows(), 10);
+        deliver(&mut strip, &motion(5));
+        assert_eq!(
+            banded(&painted_bgs(&mut strip, 10)),
+            vec![5],
+            "the fold line under the pointer is banded",
+        );
     }
 
     /// The background of each painted line's first label cell.
@@ -2875,7 +3853,9 @@ mod tests {
     #[test]
     fn the_wheel_scrolls_a_strip_that_overflows() {
         let ids: Vec<String> = (0..10).map(|i| format!("s-{i}")).collect();
-        let rows: Vec<SidebarRow> = ids.iter().map(|id| row(id).build()).collect();
+        // Attached, so the cap holds none of them back and the height is what
+        // decides which rows are on screen (see [`GROUP_CAP`]).
+        let rows: Vec<SidebarRow> = ids.iter().map(|id| row(id).attached().build()).collect();
         // Six lines: four rows, the overflow count, the create row.
         let (mut strip, _) = wired(rows, 6);
         assert_eq!(shown(&strip), ["s-0", "s-1", "s-2", "s-3"]);
@@ -2923,7 +3903,7 @@ mod tests {
     #[test]
     fn the_wheel_scrolls_from_where_the_run_already_sits() {
         let ids: Vec<String> = (0..10).map(|i| format!("s-{i}")).collect();
-        let mut rows: Vec<SidebarRow> = ids.iter().map(|id| row(id).build()).collect();
+        let mut rows: Vec<SidebarRow> = ids.iter().map(|id| row(id).attached().build()).collect();
         rows[9].focused = true;
         let (mut strip, _) = wired(rows, 6);
         assert_eq!(
@@ -2954,7 +3934,9 @@ mod tests {
             ids.iter()
                 .enumerate()
                 .map(|(at, id)| {
-                    let built = row(id);
+                    // Attached, so every row stays on screen and the wheel is
+                    // the only thing moving the run (see [`GROUP_CAP`]).
+                    let built = row(id).attached();
                     if Some(at) == focused {
                         built.focused()
                     } else {

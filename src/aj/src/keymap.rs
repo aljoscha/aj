@@ -244,6 +244,7 @@ pub(crate) fn build_keymap() -> Keymap<AjAction, HostCtx> {
             // session under an open overlay would leave it scoped to a session
             // nobody is looking at.
             | AjAction::SidebarToggle
+            | AjAction::SidebarFold
             | AjAction::SessionNext
             | AjAction::SessionPrev
             | AjAction::SessionNew

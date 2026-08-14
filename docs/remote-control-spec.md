@@ -1333,10 +1333,18 @@ an explicit toggle wins over the default for the rest of the process.
   is always safe because re-attach reconciliation absorbs a rebuild
   (section 6.5).
 - The strip is an orientation instrument, not a store browser, the
-  session selector is the browser. Rows order by last activity,
-  newest first, client-side (ties broken by id), the view windows
-  around the focused row so focus is always visible, and the stepping
-  chords walk the displayed order. Focusing a cold session
+  session selector is the browser. It holds still, so a row can be
+  aimed at: hosts sit in the order their displayed labels sort and
+  rows sit in a stable order inside their host, both client-side, and
+  activity decides what is visible rather than where it sits. Each
+  host shows a bounded share of the strip and folds the rest of its
+  idle rows behind a per-host line that opens that host and closes it
+  again, so no one busy host buries the others. Recency chooses which
+  rows a host keeps in view, and a row is never folded away while it
+  is focused, while the client holds it open, or while it wears the
+  working or attention glyph. The view windows around
+  the focused row so focus is always visible, and the stepping chords
+  walk the displayed order. Focusing a cold session
   materializes it, that is what focusing means. The working set is
   legible: rows distinguish attached sessions from merely listed
   ones, so what the client holds open (and the locks that retention
@@ -1362,11 +1370,13 @@ an explicit toggle wins over the default for the rest of the process.
 Keyboard model, exact layout, and glyph choices are left to
 implementation taste within existing TUI conventions, with one
 requirement: new interactions (sidebar toggle and focus, session
-switching, remote session creation, session tagging) are `AjAction`s
-riding the existing keybinding system, so they get default chords and
-user overrides like every other action. Pointer gestures are a second
-trigger for the same actions, never a separate behavior: a click on a
-sidebar row dispatches the switch action that the chord dispatches.
+switching, remote session creation, session tagging, folding a host's
+sessions) are `AjAction`s riding the existing keybinding system, so
+they get default chords and user overrides like every other action.
+Pointer gestures are a second trigger for the same actions, never a
+separate behavior: a click on a sidebar row dispatches the switch
+action that the chord dispatches, and a click on a host's fold line
+dispatches the fold action.
 
 Rows show the session's tag where one is set (section 6.8), falling
 back to the id-derived label. A tag is set at launch (`--tag` on `aj`

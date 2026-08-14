@@ -89,6 +89,15 @@ pub const ACTION_AGENT_PICKER: &str = "aj.agent.open";
 /// the strip would cost width and say nothing (spec 9.2).
 pub const ACTION_SIDEBAR_TOGGLE: &str = "aj.sidebar.toggle";
 
+/// Folds or unfolds the host group the focused session sits in. Default
+/// binding: `alt+m`, for the "n more" the folded line reads.
+///
+/// A group shows a bounded share of the strip and holds the rest of its idle
+/// sessions behind that line, so no one host can bury the others (spec 9.2).
+/// This is how the keyboard opens one up and closes it again. A click on the
+/// line is the same action's second trigger.
+pub const ACTION_SIDEBAR_FOLD: &str = "aj.sidebar.fold";
+
 /// Moves focus to the next session in the sidebar's order. Default binding:
 /// `alt+j`.
 ///
@@ -98,10 +107,12 @@ pub const ACTION_SIDEBAR_TOGGLE: &str = "aj.sidebar.toggle";
 /// OSC introducers every escape sequence starts with. A terminal cannot tell
 /// them from the start of a sequence, and neither can we.
 ///
-/// The order is the peer's own, which is activity-ordered, so this walks from
-/// the busiest session outward. Wraps at the end, and showing the sidebar is
-/// not a precondition: the switch is the point, the strip only says where you
-/// are.
+/// The order is the strip's displayed order, which holds still: groups sit
+/// where their names sort and rows sit where their group put them, so the
+/// chord builds muscle memory. It walks only what is displayed, so a folded
+/// group's held-back rows are reached by unfolding it or through the session
+/// selector. Wraps at the end, and showing the sidebar is not a precondition:
+/// the switch is the point, the strip only says where you are.
 pub const ACTION_SESSION_NEXT: &str = "aj.session.next";
 
 /// Moves focus to the previous session in the sidebar's order. Default
@@ -120,7 +131,8 @@ pub const ACTION_SESSION_NEW: &str = "aj.session.new";
 ///
 /// NOTE: `r` for rename rather than `t` for tag, because `alt+t` is the
 /// thinking toggle. It joins the sidebar's `alt` cluster (`alt+s`, `alt+j`,
-/// `alt+k`, `alt+n`), which is where the rest of the strip's interactions live.
+/// `alt+k`, `alt+n`, `alt+m`), which is where the rest of the strip's
+/// interactions live.
 ///
 /// Submitting an empty label clears the tag, which is the same "blank clears"
 /// rule the wire and the launch flag follow, so there is no second gesture for
@@ -295,6 +307,11 @@ pub const AJ_KEYBINDINGS: &[(&str, &str, &str)] = &[
         ACTION_SIDEBAR_TOGGLE,
         "alt+s",
         "Show or hide the session sidebar",
+    ),
+    (
+        ACTION_SIDEBAR_FOLD,
+        "alt+m",
+        "Fold or unfold the focused session's host",
     ),
     (ACTION_SESSION_NEXT, "alt+j", "Focus the next session"),
     (ACTION_SESSION_PREV, "alt+k", "Focus the previous session"),

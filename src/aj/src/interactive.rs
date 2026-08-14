@@ -1736,8 +1736,9 @@ fn sync_status(world: &World) -> bool {
 ///
 /// Rows come from the peer's `list` frames, so a session the client has never
 /// attached is listed too and that is where its attention glyph comes from
-/// (spec 6.8). Order is the peer's, which is activity-ordered, so the row a
-/// user wants is near the top without this having to sort.
+/// (spec 6.8). The strip's own order is put on them here
+/// ([`crate::sidebar::rows_for_display`]), and it holds still under a refresh:
+/// what a fresh directory changes is the glyphs, not the places.
 fn sync_sidebar(world: &World, shell: &Rc<RefCell<Shell>>) {
     // A peer that has sent no `list` frame yet leaves the strip empty rather
     // than inventing a row for the focused session: the next frame fills it,
@@ -2133,6 +2134,7 @@ async fn handle_host_action(
         | AjAction::CopyMessage
         | AjAction::BranchMessage
         | AjAction::SidebarToggle
+        | AjAction::SidebarFold
         | AjAction::SessionNext
         | AjAction::SessionPrev
         | AjAction::SessionNew
@@ -4308,6 +4310,14 @@ impl Shell {
                     state.toggled = true;
                     ctx.redraw = true;
                 }
+                // The fold gesture's keyboard half: the group the focused row
+                // sits in opens past the cap or closes back to it. Client
+                // state, so it never reaches the loop that owns the world.
+                AjAction::SidebarFold => {
+                    if sidebar_for_actions.borrow_mut().toggle_focused_fold() {
+                        ctx.redraw = true;
+                    }
+                }
                 // Stepping the sidebar's order rather than the working set's:
                 // the strip is what the user is reading, so next means the row
                 // below the one highlighted, whether or not that session has
@@ -4502,14 +4512,24 @@ impl Shell {
         }
         // A pointer gesture on the strip parks the request the stepping and
         // create chords park, through the function they both call, so a click
-        // triggers the action rather than reimplementing it (spec 9.2).
+        // triggers the action rather than reimplementing it (spec 9.2). The
+        // fold is the same arrangement one level in: the click and the chord
+        // meet at the state the layout reads.
         {
             let session_request = Rc::clone(&session_request);
+            let sidebar_for_gesture = Rc::clone(&sidebar);
             sidebar_strip
                 .borrow_mut()
                 .set_on_gesture(Box::new(move |ctx, gesture| {
                     let request = match gesture {
                         StripGesture::Focus(session) => SessionRequest::Resume(session),
+                        StripGesture::Fold(group) => {
+                            sidebar_for_gesture
+                                .borrow_mut()
+                                .toggle_fold(group.as_deref());
+                            ctx.redraw = true;
+                            return;
+                        }
                         // No host named: the loop asks when the peer
                         // leaves the answer open (see `settle_create_host`).
                         StripGesture::New => SessionRequest::New { host: None },
@@ -16869,14 +16889,14 @@ mod tests {
         assert_eq!(
             painted,
             vec![
+                " ~ 10.0.0.7:7777 ─ ! ─".to_string(),
                 " ~ builder-1 ─────────".to_string(),
                 format!("▌  {}", crate::sidebar::session_label(&focused, 8)),
                 " ~ laptop ──────── ! ─".to_string(),
-                " ~ 10.0.0.7:7777 ─ ! ─".to_string(),
                 " + new".to_string(),
             ],
-            "the host with rows heads them, and the two with none close the \
-             strip, one labelled by its id and one by its address",
+            "the host with rows heads them, the two with none sit where their \
+             labels sort, one labelled by its id and one by its address",
         );
 
         // A change confined to the hosts still reaches the screen: the empty
@@ -16897,10 +16917,27 @@ mod tests {
         sync_sidebar(&world, &shell);
         let painted = sidebar_rows(&shell);
         assert_eq!(
-            painted.get(3).map(String::as_str),
+            painted.get(2).map(String::as_str),
             Some(" ~ builder-2 ─────────"),
             "the group is relabelled by the id the host answered with, and the \
              mark comes off with it: {painted:?}",
+        );
+
+        // The fold is the user's, and the loop rewrites this mirror once per
+        // iteration. A refresh that took the fold with it would close every
+        // group the user had opened, once a frame.
+        shell
+            .borrow()
+            .sidebar
+            .borrow_mut()
+            .toggle_fold(Some("builder-1"));
+        sync_sidebar(&world, &shell);
+        let painted = sidebar_rows(&shell);
+        assert_eq!(
+            painted.get(2).map(String::as_str),
+            Some(" ▾ fold"),
+            "the group the user opened is still open after a refresh: \
+             {painted:?}",
         );
         shut_down(&world).await;
     }
@@ -17797,6 +17834,7 @@ mod tests {
             status: RowStatus::Idle,
             focused,
             attached: focused,
+            last_activity: chrono::DateTime::UNIX_EPOCH,
         }
     }
 
@@ -17804,6 +17842,19 @@ mod tests {
     fn sidebar_rows_named(count: usize) -> Vec<SidebarRow> {
         (0..count)
             .map(|at| sidebar_row(&format!("s-{at:02}"), None, at == 0))
+            .collect()
+    }
+
+    /// A strip of `count` sessions the per-host cap never holds back: they are
+    /// all attached, and the working set is exempt. What is on screen is then
+    /// the height's business alone, which is what the overflow and wheel tests
+    /// are about.
+    fn sidebar_rows_held_open(count: usize) -> Vec<SidebarRow> {
+        (0..count)
+            .map(|at| SidebarRow {
+                attached: true,
+                ..sidebar_row(&format!("s-{at:02}"), None, at == 0)
+            })
             .collect()
     }
 
@@ -17932,22 +17983,22 @@ mod tests {
             ],
         );
         let cells = strip_lines_painted(&shell);
+        assert_eq!(strip_line_text(&cells, 0), " ~ builder-1 ───────── │");
+        assert_eq!(strip_line_text(&cells, 1), "   s-here              │");
         assert_eq!(
-            strip_line_text(&cells, 0),
+            strip_line_text(&cells, 2),
             " ~ laptop ──────── ! ─ │",
             "the unreachable host's header keeps its mark",
         );
-        assert_eq!(strip_line_text(&cells, 1), " ! s-out               │");
-        assert_eq!(strip_line_text(&cells, 2), " ~ builder-1 ───────── │");
-        assert_eq!(strip_line_text(&cells, 3), "   s-here              │");
+        assert_eq!(strip_line_text(&cells, 3), " ! s-out               │");
         let styles = strip_styles(&shell);
         assert_ne!(styles.text, styles.dim, "the two brightnesses differ");
         assert_eq!(
-            cells[1][3].style, styles.text,
+            cells[3][3].style, styles.text,
             "a session the client holds open is drawn as held open",
         );
         assert_eq!(
-            cells[3][3].style, styles.text,
+            cells[1][3].style, styles.text,
             "the same as one whose host is answering",
         );
     }
@@ -17991,6 +18042,183 @@ mod tests {
         );
     }
 
+    /// The fold gesture, driven the way a user drives it: a press at the
+    /// coordinates the fold line was painted at opens that host's group, and a
+    /// press at the same place closes it again.
+    ///
+    /// Through the composed frame and the real input path, so a strip left out
+    /// of the layout, a fold line that resolves to nothing, or a gesture the
+    /// shell drops on the floor all fail here.
+    #[tokio::test]
+    async fn a_click_on_the_fold_line_opens_that_host_and_closes_it_again() {
+        let (mut app, _writer, shell, root) = init_app().await;
+        // Eight sessions on one host and two on another, so the busy host has
+        // rows to hold back and the quiet one has none.
+        let mut rows: Vec<SidebarRow> = (0..8)
+            .map(|at| sidebar_row(&format!("b-{at}"), Some("builder-1"), at == 0))
+            .collect();
+        rows.extend((0..2).map(|at| sidebar_row(&format!("l-{at}"), Some("laptop"), false)));
+        show_sidebar(&shell, rows);
+        app.render(&root).expect("render");
+        assert_eq!(
+            strip_labels(&shell)[..12],
+            [
+                "~ builder-1 ─────────",
+                "b-0",
+                "b-1",
+                "b-2",
+                "b-3",
+                "b-4",
+                "b-5",
+                "▸ 2 more",
+                "~ laptop ────────────",
+                "l-0",
+                "l-1",
+                "+ new",
+            ],
+            "the busy host shows the focused row, the cap's share of the rest, \
+             and what it is holding back",
+        );
+
+        // Line 7 of the strip, one column into the label field: the fold line
+        // as painted, which is what a pointer would be aimed at. The pointer
+        // moves there first and the frame is settled, so the band is already
+        // on that line and the press is the only thing left that can arm a
+        // frame.
+        app.handle_input(motion_at(7, 3));
+        app.render(&root).expect("render");
+        assert!(!app.needs_redraw(), "the frame settled on the hover");
+        app.handle_input(left_mouse_at(7, 3, vaxis::mouse::Type::Press));
+        assert!(
+            app.needs_redraw(),
+            "the click armed a frame, or the group would open with nothing \
+             painting it until the next unrelated event",
+        );
+        app.render(&root).expect("render");
+        assert_eq!(
+            strip_labels(&shell)[..14],
+            [
+                "~ builder-1 ─────────",
+                "b-0",
+                "b-1",
+                "b-2",
+                "b-3",
+                "b-4",
+                "b-5",
+                "b-6",
+                "b-7",
+                "▾ fold",
+                "~ laptop ────────────",
+                "l-0",
+                "l-1",
+                "+ new",
+            ],
+            "the click opened the group and left the line as the way back",
+        );
+        assert!(
+            shell.borrow().take_session_request().is_none(),
+            "and it asked for no session: the fold is not a switch",
+        );
+
+        app.handle_input(left_mouse_at(9, 3, vaxis::mouse::Type::Press));
+        app.render(&root).expect("render");
+        assert_eq!(
+            strip_labels(&shell)[7],
+            "▸ 2 more",
+            "and a click on the line it left folds the group back: {:?}",
+            strip_labels(&shell),
+        );
+    }
+
+    /// The chord and the click are two triggers for one action (spec 9.2): the
+    /// chord folds the group the focused row sits in, and the click on that
+    /// group's line undoes exactly that.
+    #[tokio::test]
+    async fn the_fold_chord_and_the_fold_click_work_the_same_group() {
+        let (mut app, mut writer, shell, root) = init_app().await;
+        let mut rows: Vec<SidebarRow> = (0..8)
+            .map(|at| sidebar_row(&format!("b-{at}"), Some("builder-1"), at == 0))
+            .collect();
+        rows.extend((0..8).map(|at| sidebar_row(&format!("l-{at}"), Some("laptop"), false)));
+        show_sidebar(&shell, rows);
+        app.render(&root).expect("render");
+        assert_eq!(
+            strip_labels(&shell)[7],
+            "▸ 2 more",
+            "the focused row's host is folded to start with: {:?}",
+            strip_labels(&shell),
+        );
+
+        writer
+            .write_all(&chord_bytes(AjAction::SidebarFold))
+            .expect("write chord");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        assert!(
+            app.needs_redraw(),
+            "the chord armed a frame, or nothing would repaint the strip it \
+             just folded",
+        );
+        app.render(&root).expect("render");
+        let opened = strip_labels(&shell);
+        assert_eq!(opened[9], "▾ fold", "the chord opened it: {opened:?}");
+        assert_eq!(
+            opened[16], "▸ 3 more",
+            "and the other host is untouched: {opened:?}",
+        );
+
+        app.handle_input(left_mouse_at(9, 3, vaxis::mouse::Type::Press));
+        app.render(&root).expect("render");
+        assert_eq!(
+            strip_labels(&shell)[7],
+            "▸ 2 more",
+            "the click folded back what the chord opened: {:?}",
+            strip_labels(&shell),
+        );
+    }
+
+    /// The fold chord is inert while an overlay is up, like the rest of the
+    /// sidebar's chords: a modal owns the keyboard, and a strip folding under
+    /// it would move rows the user cannot even see.
+    ///
+    /// NOTE: the strip is read after the overlay closes, for the reason the
+    /// pointer test beside this one gives: the test compositor blits a scrim's
+    /// whole grid over the base content.
+    #[tokio::test]
+    async fn the_fold_chord_is_inert_under_an_overlay() {
+        let (mut app, mut writer, shell, root) = init_app().await;
+        let rows: Vec<SidebarRow> = (0..8)
+            .map(|at| sidebar_row(&format!("b-{at}"), Some("builder-1"), at == 0))
+            .collect();
+        show_sidebar(&shell, rows);
+        app.render(&root).expect("render");
+        assert_eq!(strip_labels(&shell)[6], "▸ 2 more", "folded to start with");
+
+        writer.write_all(&[0x0f]).expect("write ctrl+o");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        assert!(shell.borrow().overlays.borrow().is_open(), "the palette");
+
+        writer
+            .write_all(&chord_bytes(AjAction::SidebarFold))
+            .expect("write chord");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+
+        writer.write_all(b"\x1b").expect("write esc");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        assert!(!shell.borrow().overlays.borrow().is_open(), "esc closes it");
+        app.render(&root).expect("render");
+        assert_eq!(
+            strip_labels(&shell)[6],
+            "▸ 2 more",
+            "the group is as it was, so the chord did nothing under the \
+             overlay: {:?}",
+            strip_labels(&shell),
+        );
+    }
+
     /// A click on the create row parks the create the chord parks.
     #[tokio::test]
     async fn a_click_on_the_create_row_parks_a_create() {
@@ -18020,7 +18248,7 @@ mod tests {
         );
         app.render(&root).expect("render");
         assert!(
-            strip_labels(&shell)[0].starts_with("~ laptop"),
+            strip_labels(&shell)[0].starts_with("~ builder-1"),
             "a header leads the strip: {:?}",
             strip_labels(&shell),
         );
@@ -18029,7 +18257,7 @@ mod tests {
 
         // More rows than the terminal has lines, so the strip counts what it
         // left out on the line above the create row.
-        show_sidebar(&shell, sidebar_rows_named(60));
+        show_sidebar(&shell, sidebar_rows_held_open(60));
         app.render(&root).expect("render");
         let labels = strip_labels(&shell);
         assert!(
@@ -18126,7 +18354,7 @@ mod tests {
     #[tokio::test]
     async fn the_wheel_over_the_strip_scrolls_it() {
         let (mut app, _writer, shell, root) = init_app().await;
-        show_sidebar(&shell, sidebar_rows_named(60));
+        show_sidebar(&shell, sidebar_rows_held_open(60));
         app.render(&root).expect("render");
         assert_eq!(strip_labels(&shell)[0], "s-00");
 
