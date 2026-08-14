@@ -45,8 +45,8 @@ use aj_session::{ConversationPersistence, ThreadFilter};
 use aj_wire::{
     CancelRequest, CompactRequest, CreateSessionRequest, Cursor, DecodedFrame, ErrorResponse,
     Frame, HeadRequest, ModelSelection, PROTOCOL_VERSION, PromptInput, PromptRequest,
-    QueueOperation, QueueRequest, QueueState, SessionSettings, SettingsRequest, SteerRequest,
-    TagRequest, TaskTable,
+    QueueOperation, QueueRequest, QueueState, SessionSettings, SessionSummary, SettingsRequest,
+    SteerRequest, TagRequest, TaskTable,
 };
 use async_trait::async_trait;
 use reqwest::StatusCode;
@@ -788,16 +788,20 @@ impl Transport {
         }
     }
 
-    /// Whether the host says the session's main agent has a turn in flight.
-    async fn working(&self, session: &str) -> bool {
+    /// The host's own row for `session`.
+    ///
+    /// One read, so `working` and `last_seq` answer about the same moment: a
+    /// settling client compares the two against each other, and two reads
+    /// could pair an idle flag with a position from before the turn ended.
+    async fn row(&self, session: &str) -> SessionSummary {
         let list = match self {
             Self::Local(host) => host.sessions().await.expect("the sessions read"),
             Self::Remote(client) => client.sessions().await.expect("the sessions read"),
         };
         list.sessions
-            .iter()
+            .into_iter()
             .find(|entry| entry.id == session)
-            .is_some_and(|entry| entry.working)
+            .unwrap_or_else(|| panic!("the host lists {session}"))
     }
 }
 
@@ -830,6 +834,16 @@ struct Attached {
     source: Source,
     client: SessionClient,
     chat: ChatState,
+    /// The highest durable position this client has been handed, which is what
+    /// [`Self::settle`] compares against the host's own published mark.
+    ///
+    /// Counted here rather than read off the fold, because the fold's cursor
+    /// deliberately lags what it applied by one durable frame: an entry's
+    /// trailing untagged events may still be in flight, so the client claims
+    /// only the entry before it (see `SessionClient::cursor`). That lag is
+    /// right for the offer a re-attach makes and wrong for the question this
+    /// asks, which is whether everything the host published has arrived.
+    delivered: Option<u64>,
 }
 
 impl Attached {
@@ -841,6 +855,7 @@ impl Attached {
             source,
             client: SessionClient::new(session.to_string()),
             chat: ChatState::new(settings(), 200_000, Arc::new(Vec::new())),
+            delivered: None,
         };
         this.client.expect_attach();
         this.apply_block().await;
@@ -860,6 +875,9 @@ impl Attached {
         let session = self.client.session().to_string();
         self.source = self.transport.attach(&session, cursor).await;
         self.client.expect_attach();
+        // The block that follows re-delivers from the offered cursor, so what
+        // was delivered before it says nothing about where this client is now.
+        self.delivered = None;
         self.apply_block().await
     }
 
@@ -905,36 +923,100 @@ impl Attached {
         count
     }
 
-    /// Fold until the host reports the session idle and the stream has been
-    /// quiet for [`QUIET`], so a comparison never races the tail of a turn.
+    /// Fold until the client has caught up with the host, then hold one quiet
+    /// gap for the tail, so a comparison never races the end of a turn.
     ///
-    /// The host's own directory read is the authority for "idle", not the
-    /// fold's `working` flag. The `state` frame that would set that flag is
-    /// lossy, and one published while this client's attach block was still
-    /// being written is dropped rather than queued (spec 6.5), so a client
-    /// that attached just before a short turn may never be told the turn ran
-    /// at all.
+    /// The exit condition is the contract rather than a beat. One `sessions()`
+    /// read gives a coherent pair (see [`Transport::row`]), and the client has
+    /// caught up when that row says the main agent is idle and everything the
+    /// host published on the way there has been delivered here (see
+    /// [`Self::delivered`]). Both halves are needed: the flag says the host
+    /// stopped working, the position says this client heard about it.
+    ///
+    /// The host's own row is the authority for "idle", not the fold's
+    /// `working` flag. The `state` frame that would set that flag is lossy,
+    /// and one published while this client's attach block was still being
+    /// written is dropped rather than queued (spec 6.5), so a client that
+    /// attached just before a short turn may never be told the turn ran at
+    /// all.
+    ///
+    /// The quiet gap comes after, as a guard and not as the exit: the last
+    /// things a turn produces are reliable transients that no cursor covers
+    /// (the `AgentEnd` that clears the main agent's running mark, the `state`
+    /// frame behind it), and they are published after the durable position
+    /// this waits on.
+    ///
+    /// A stream that ends here is a failure, never a settled client: an
+    /// evicted or dropped client would otherwise read as a converged one and
+    /// poison every assertion after it.
     async fn settle(&mut self) {
         let session = self.client.session().to_string();
-        bounded("the client to settle", async {
+        // What the deadline should say if it fires, rewritten on every read so
+        // the panic names the half that never arrived rather than the wait.
+        let mut waiting_for = "the first sessions read".to_string();
+        let caught_up = tokio::time::timeout(DEADLINE, async {
             loop {
-                match tokio::time::timeout(QUIET, self.source.recv()).await {
-                    Ok(Some(frame)) => self.apply(frame).await,
-                    Ok(None) => return,
-                    // Quiet and idle: every frame the turn produced was
-                    // published before the host stopped reporting itself
-                    // working, so the gap means they have all been read.
-                    Err(_) if !self.transport.working(&session).await => return,
-                    // Still working: a slow turn may take its time, the outer
-                    // bound is what fails a wedged one.
-                    Err(_) => continue,
+                let row = self.transport.row(&session).await;
+                // A row with no durable position has none to reach: nothing
+                // the host published is outstanding by definition.
+                let target = row.last_seq.unwrap_or(0);
+                let here = self.delivered.unwrap_or(0);
+                if !row.working && here >= target {
+                    return;
                 }
+                waiting_for = match row.working {
+                    true => format!("the turn to end, delivered {here} of {target}"),
+                    false => format!("the rest of the turn, delivered {here} of {target}"),
+                };
+                self.fold_one("the turn to end").await;
             }
         })
         .await;
+        assert!(
+            caught_up.is_ok(),
+            "timed out waiting for {waiting_for}: the host and this client \
+             never agreed the turn was over",
+        );
+
+        let tail = tokio::time::timeout(DEADLINE, async {
+            while self.fold_one("the tail of the turn").await {}
+        })
+        .await;
+        assert!(
+            tail.is_ok(),
+            "timed out waiting for the stream to go quiet after the turn",
+        );
+    }
+
+    /// Fold one frame if one arrives within [`QUIET`], answering whether it
+    /// did.
+    ///
+    /// A stream that ends under a settling client is a failure and says so:
+    /// an evicted or dropped client would otherwise read as a settled one.
+    /// `what` is what the caller was waiting for when the stream went.
+    async fn fold_one(&mut self, what: &str) -> bool {
+        match tokio::time::timeout(QUIET, self.source.recv()).await {
+            Ok(Some(frame)) => {
+                self.apply(frame).await;
+                true
+            }
+            Ok(None) => {
+                panic!("the stream ended while the client was settling, waiting for {what}")
+            }
+            Err(_) => false,
+        }
     }
 
     async fn apply(&mut self, frame: Frame) {
+        match &frame {
+            // A block delivers whole and says so at its own mark (spec 6.5).
+            Frame::CaughtUp { last_seq, .. } => self.delivered = Some(*last_seq),
+            Frame::Event {
+                durability: Some(durable),
+                ..
+            } => self.delivered = Some(durable.seq),
+            _ => {}
+        }
         let _ = self.client.apply(&mut self.chat, frame);
         // Neither task events nor queue updates are replayable, so every
         // `caught_up` leaves both reads outstanding (spec 6.5, 6.7). A real
