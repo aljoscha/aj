@@ -584,6 +584,7 @@ pub fn freeze_and_seed(
 
 #[cfg(test)]
 mod tests {
+    use aj_conf::ConfigLayer;
     use clap::Parser;
     use tempfile::TempDir;
 
@@ -591,6 +592,16 @@ mod tests {
 
     fn empty_auth(dir: &TempDir) -> AuthStorage {
         AuthStorage::new(dir.path().join("auth.json"))
+    }
+
+    /// The stock configuration: nothing stated anywhere, so a composed host
+    /// takes its defaults and the test measures only what it sets.
+    fn layers() -> ConfigLayers {
+        ConfigLayers {
+            user: Config::default(),
+            project: ConfigLayer::default(),
+            project_path: None,
+        }
     }
 
     /// The spill directory reaches tool construction as a path, and stays
@@ -612,6 +623,41 @@ mod tests {
             builtin_tool_options(&config).spill_dir,
             Some(PathBuf::from("/var/tmp/aj-spill")),
         );
+    }
+
+    /// `--name` reaches the host a run composes, which is the only path it
+    /// travels: nothing else in a run carries it, and a host that never got it
+    /// answers with a derived name that reads plausibly enough to hide the
+    /// break until someone reads the sidebar.
+    ///
+    /// A name the wire would not carry stops the composition rather than
+    /// being dropped on the way, so the operator hears about it instead of
+    /// wondering why their host is labelled by its directory.
+    #[tokio::test]
+    async fn the_name_flag_reaches_the_composed_host() {
+        let dir = TempDir::new().expect("tempdir");
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let compose =
+            |args: &Args| compose_host(args, layers(), &empty_auth(&dir), &persistence, None);
+
+        let illegal =
+            Args::parse_from(["aj", "--scripted", "streaming-text", "--name", "two\nlines"]);
+        let err = compose(&illegal).err().expect("an illegal name is refused");
+        assert!(err.to_string().contains("--name"), "got {err}");
+
+        let named = Args::parse_from([
+            "aj",
+            "--scripted",
+            "streaming-text",
+            "--name",
+            "the-fleet-host",
+        ]);
+        let composed = compose(&named).expect("compose a host");
+        assert_eq!(
+            composed.host.hello().name.as_deref(),
+            Some("the-fleet-host"),
+        );
+        composed.host.shutdown().await;
     }
 
     /// The scripted path applies the CLI > config provider-id

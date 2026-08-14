@@ -21,6 +21,7 @@ use aj_app::settings::ConfigLayers;
 use aj_conf::Config;
 use aj_models::auth::AuthStorage;
 use aj_session::ConversationPersistence;
+use aj_wire::Hello;
 use anyhow::{Context, Result, bail};
 
 use crate::remote::{IdentityGate, IdentityMode, RemoteServer, TailscaleWhois};
@@ -134,18 +135,25 @@ pub(crate) async fn run(mut args: Args) -> Result<()> {
         }
     };
 
-    let hello = host.hello();
-    match &hello.name {
-        // The id is what a gateway enrolls and what names the store, so it
-        // stays in the line the name now leads.
-        Some(name) => println!("aj serving {name} ({}) on {}", hello.host_id, server.url()),
-        None => println!("aj serving {} on {}", hello.host_id, server.url()),
-    }
+    println!("{}", banner(&host.hello(), &server.url()));
     wait_for_shutdown().await;
 
     server.shutdown().await;
     host.shutdown().await;
     Ok(())
+}
+
+/// What a `serve` run prints once it is up.
+///
+/// Leads with the name, which is what the operator who started this process
+/// recognizes, and keeps the id, which is what a gateway enrolls and what
+/// names the session store. A host that reports no name has only the id to be
+/// known by.
+fn banner(hello: &Hello, url: &str) -> String {
+    match &hello.name {
+        Some(name) => format!("aj serving {name} ({}) on {url}", hello.host_id),
+        None => format!("aj serving {} on {url}", hello.host_id),
+    }
 }
 
 /// Resolve when the process is asked to stop: Ctrl+C, or SIGTERM from a
@@ -189,6 +197,31 @@ mod tests {
             "an address with no port is refused",
         );
         assert!(resolve_listen("no-such-host.invalid:6161").is_err());
+    }
+
+    /// The line a host prints when it comes up names it the way its operator
+    /// does, and still carries the id a gateway is told to enroll.
+    #[test]
+    fn the_banner_leads_with_the_name_and_keeps_the_id() {
+        let mut hello = Hello {
+            protocol: 1,
+            capabilities: Vec::new(),
+            app_version: "0.1.0".to_string(),
+            host_id: "c6b6667d8f73e75d".to_string(),
+            working_directory: None,
+            name: Some("~/work/umber/aj".to_string()),
+        };
+        assert_eq!(
+            banner(&hello, "http://127.0.0.1:6161"),
+            "aj serving ~/work/umber/aj (c6b6667d8f73e75d) on http://127.0.0.1:6161",
+        );
+
+        hello.name = None;
+        assert_eq!(
+            banner(&hello, "http://127.0.0.1:6161"),
+            "aj serving c6b6667d8f73e75d on http://127.0.0.1:6161",
+            "a nameless host is announced by the id alone, not by an empty pair of brackets",
+        );
     }
 
     #[test]
