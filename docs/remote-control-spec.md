@@ -1269,10 +1269,32 @@ current epoch, so spend on a branch abandoned by a head switch is not
 re-derivable after the reset and the banner under-reports it.
 Accepted, an exit banner does not earn host-authoritative usage on
 the wire, and such a read is the named fix if it ever matters.
-Not supported
-over the wire in v1: HTML export and the session-info overlay, both
-read host-local files, run them on the host. An unsupported action in
-connect mode surfaces a clear notice, it never silently does nothing.
+The rest of the
+boundary is a work list, not the design. The target is that
+everything a session's host knows is askable over the wire, through
+host-side reads that share one doctrine. Each feature gets its own
+endpoint with a capability string (section 6.10), and a client
+consumes it by calling, folding a notice that names what the peer
+does not serve. A read is user-paced and capped: it happens when the
+user asks and reads only what was asked, so the enumeration contract
+(section 6.8) stays intact. The wire carries facts and the client
+renders them. A gateway routes a per-session read to the session's
+owning host and relays that host's own answer, and a read that spans
+hosts merges the hosts that answer and names the ones that did not.
+Export's output is a file for the person at the terminal: the host
+renders the document and the client writes it in its own working
+directory.
+
+Status, not design: four gestures still refuse over a connection, in
+two classes. The session-info overlay and HTML export read host-local
+files no endpoint serves yet. The session selector and prompt-history
+search read this client's own session store, which over a connection
+would answer about the wrong machine, so they refuse instead (the
+sidebar lists a peer's sessions meanwhile, section 9.2, and cross-host
+history is banked, section 13). The same class leaks through one more
+surface, the editor's prompt recall ring, a known gap being closed.
+Each refusal surfaces a clear notice, an unsupported action never
+silently does nothing.
 
 Connection state (connected, reconnecting, catching up) is surfaced in
 the footer/status line.
