@@ -103,6 +103,22 @@ impl ControlError {
         }
     }
 
+    /// Whether the peer does not know the endpoint the request named (spec
+    /// 6.1's 404 `unknown_endpoint`).
+    ///
+    /// Told apart from an unknown entry because it says nothing about the
+    /// session: the peer is older than the feature being asked for. Spec 6.10
+    /// makes this the sanctioned check, since capabilities are declared-only
+    /// and a gateway's hello cannot speak for the hosts behind it, so a caller
+    /// attempts the request and reads this off the refusal.
+    pub(crate) fn unknown_endpoint(&self) -> bool {
+        match self {
+            // A host in this process has every endpoint this process knows.
+            Self::Host(_) | Self::PartialCreate { .. } => false,
+            Self::Remote(err) => err.code() == Some("unknown_endpoint"),
+        }
+    }
+
     /// Whether the peer refused the request as malformed (spec 6.1's 400).
     ///
     /// Told apart from the other refusals because the host's message quotes

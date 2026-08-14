@@ -18,17 +18,29 @@
 //! through a shared filter-key -> id map (the same indirection the command
 //! palette uses for its actions), since the widget hands the confirm callback
 //! only the row's filter key.
+//!
+//! Archived sessions are left out, and the overlay's own toggle
+//! ([`ACTION_SESSION_TOGGLE_ARCHIVED`]) puts them back inline, marked. A
+//! picker is where hiding them earns its keep, so the toggle belongs to this
+//! overlay rather than to whatever the strip is showing. Every preview the
+//! scan delivers is kept, revealed or not, so the toggle answers from what
+//! has already been read rather than starting the walk again.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use aj_app::keybindings::{ACTION_SESSION_TOGGLE_ARCHIVED, action_shortcut};
 use aj_app::session::SessionRequest;
 use aj_session::SessionPreview;
 use chrono::{DateTime, Datelike, Utc};
-use vaxis::vxfw::{FilterableSelect, SelectItem, to_widget_ref};
+use vaxis::vxfw::{
+    DrawContext, Event, EventContext, FilterableSelect, OverlayWindow, RelativePoint, SelectItem,
+    SubSurface, Surface, Widget, draw_widget, to_widget_ref,
+};
 
 use crate::interactive::OverlayHandles;
+use crate::keymap::action_matches;
 use crate::overlay::{OverlayPlacement, close_all, close_key_label, close_top, confirm_key_label};
 use crate::settings_ui::push_window;
 use crate::text::one_line;
@@ -58,6 +70,13 @@ pub(crate) struct SessionScan {
     /// filter_key -> session_id, filled by [`extend_session_scan`] and read
     /// by the confirm callback (which sees only the row's filter key).
     ids: Rc<RefCell<HashMap<String, String>>>,
+    /// Every preview delivered so far, archived ones included, shared with
+    /// the widget so its toggle can rebuild the rows without rescanning.
+    seen: Rc<RefCell<Vec<SessionPreview>>>,
+    /// Whether archived sessions are being shown, flipped by the widget's
+    /// toggle and read here so a batch arriving after it lands filters the
+    /// same way.
+    reveal: Rc<Cell<bool>>,
 }
 
 impl SessionScan {
@@ -125,20 +144,110 @@ pub(crate) fn open_session_selector(handles: &OverlayHandles, current: String) {
             close_top(&stack_cancel, ctx, &editor_cancel)
         }));
     }
-    push_window(
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let reveal = Rc::new(Cell::new(false));
+    let selector = Rc::new(RefCell::new(SessionSelector {
+        select: Rc::clone(&select),
+        ids: Rc::clone(&ids),
+        seen: Rc::clone(&seen),
+        reveal: Rc::clone(&reveal),
+        current: current.clone(),
+        window: None,
+    }));
+    let window = push_window(
         &handles.stack,
         &handles.chrome,
         "Resume session",
-        subtitle(),
-        to_widget_ref(Rc::clone(&select)),
+        subtitle(false),
+        to_widget_ref(Rc::clone(&selector)),
         focus,
         OverlayPlacement::Large,
     );
+    selector.borrow_mut().window = Some(window);
     *handles.session_scan.borrow_mut() = Some(SessionScan {
         select,
         current,
         ids,
+        seen,
+        reveal,
     });
+}
+
+/// The selector widget: the list, and what the archived toggle needs to
+/// rebuild it in place.
+///
+/// It wraps the [`FilterableSelect`] rather than replacing it, for one chord
+/// the select has no hook for. Everything else (typing, navigation, Enter,
+/// Esc) falls through to the select underneath, which still owns them.
+pub(crate) struct SessionSelector {
+    select: Rc<RefCell<FilterableSelect>>,
+    ids: Rc<RefCell<HashMap<String, String>>>,
+    seen: Rc<RefCell<Vec<SessionPreview>>>,
+    reveal: Rc<Cell<bool>>,
+    current: String,
+    /// The window frame, for the subtitle the toggle rewrites. `None` until
+    /// the push that creates it returns.
+    window: Option<Rc<RefCell<OverlayWindow>>>,
+}
+
+impl SessionSelector {
+    /// Rebuild the rows for the current setting of the toggle, keeping the
+    /// highlight on the row it was on when that row survives.
+    ///
+    /// From the previews already delivered, so revealing does not wait on a
+    /// second walk of the store. A batch still to arrive fills in behind this
+    /// through [`extend_session_scan`], which reads the same flag.
+    fn rebuild(&self, now: DateTime<Utc>) {
+        let was = self.select.borrow().selected().map(|item| item.filter_key);
+        let items = build_items(
+            &self.ids,
+            &self.seen.borrow(),
+            &self.current,
+            self.reveal.get(),
+            now,
+        );
+        {
+            let select = self.select.borrow();
+            select.set_items(items);
+            if let Some(key) = was {
+                select.select_matching(|item| item.filter_key == key);
+            }
+        }
+        if let Some(window) = &self.window {
+            window.borrow_mut().subtitle = subtitle(self.reveal.get());
+        }
+    }
+}
+
+impl Widget for SessionSelector {
+    fn draw(&mut self, ctx: &DrawContext) -> Surface {
+        // The select is drawn as a child so both identities stay on the focus
+        // path: returning its surface bare would let the caller re-stamp it
+        // with this widget's identity and drop the select, and its Enter and
+        // Esc with it.
+        let mut surface = Surface::with_size(ctx.max.size());
+        surface.children.push(SubSurface {
+            origin: RelativePoint { row: 0, col: 0 },
+            surface: draw_widget(&to_widget_ref(Rc::clone(&self.select)), ctx),
+            z_index: 0,
+        });
+        surface
+    }
+
+    fn capture_event(&mut self, ctx: &mut EventContext, event: &Event) {
+        let Event::KeyPress(key) = event else {
+            return;
+        };
+        if action_matches(key, ACTION_SESSION_TOGGLE_ARCHIVED) {
+            self.reveal.set(!self.reveal.get());
+            self.rebuild(Utc::now());
+            ctx.consume_and_redraw();
+        }
+    }
+
+    fn wants_events(&self) -> bool {
+        true
+    }
 }
 
 /// Append a streamed batch of previews to the selector's list: build one
@@ -158,20 +267,8 @@ pub(crate) fn extend_session_scan(
     first: bool,
     chase_current: bool,
 ) -> bool {
-    let items: Vec<SelectItem> = {
-        let mut ids = scan.ids.borrow_mut();
-        previews
-            .iter()
-            .map(|preview| {
-                let is_current = preview.session_id == scan.current;
-                let item = build_item(preview, is_current, now);
-                ids.insert(item.filter_key.clone(), preview.session_id.clone());
-                item
-            })
-            .collect()
-        // Drop the map borrow before touching the select: the confirm
-        // callback (fired from the widget's own dispatch) reads the map.
-    };
+    scan.seen.borrow_mut().extend_from_slice(previews);
+    let items = build_items(&scan.ids, previews, &scan.current, scan.reveal.get(), now);
     if first {
         scan.select.borrow().set_items(items);
     } else {
@@ -187,6 +284,38 @@ pub(crate) fn extend_session_scan(
     scan.select
         .borrow()
         .select_matching(|item| ids.borrow().get(&item.filter_key) == Some(&current))
+}
+
+/// Build the rows for `previews`, dropping the archived ones unless `reveal`,
+/// and record each row's filter key against its session id for confirm.
+///
+/// The session the user is in stays listed whatever its bit says, which is the
+/// sidebar's exemption for the row it draws as focused: archiving the session
+/// you are working in leaves it in front of you, and it goes when you leave.
+///
+/// The map keeps the rows a filter dropped: it is the only way back from a
+/// filter key to a session, and a row revealed later must resolve without
+/// having been rebuilt. It is never read for a row that is not on show, since
+/// only a highlighted row can be confirmed.
+fn build_items(
+    ids: &Rc<RefCell<HashMap<String, String>>>,
+    previews: &[SessionPreview],
+    current: &str,
+    reveal: bool,
+    now: DateTime<Utc>,
+) -> Vec<SelectItem> {
+    let mut ids = ids.borrow_mut();
+    previews
+        .iter()
+        .filter(|preview| reveal || !preview.archived || preview.session_id == current)
+        .map(|preview| {
+            let item = build_item(preview, preview.session_id == current, now);
+            ids.insert(item.filter_key.clone(), preview.session_id.clone());
+            item
+        })
+        .collect()
+    // The map borrow ends with this function, before the select is touched:
+    // the confirm callback fires from the widget's own dispatch and reads it.
 }
 
 /// Build one row: the truncated first user message (tagged `(current)` for
@@ -224,13 +353,19 @@ fn haystack(preview: &SessionPreview, tag: Option<&str>) -> String {
     format!("{first} {tag} {}", preview.session_id)
 }
 
-/// The confirm/close subtitle. Enter and Esc are the widget's built-in
-/// keys (not rebindable actions), so they keep the fixed convention. Only
-/// the labels resolve through the keybinding data.
-fn subtitle() -> String {
+/// The footer. Enter and Esc are the widget's built-in keys (not rebindable
+/// actions), so they keep the fixed convention. Only the labels resolve
+/// through the keybinding data.
+///
+/// The toggle hint names what the chord would show, not the state the list is
+/// in, so the footer reads as the offer it is.
+fn subtitle(reveal: bool) -> String {
     let confirm = confirm_key_label();
     let close = close_key_label();
-    format!("{confirm} to resume  \u{2022}  {close} to close")
+    let toggle = action_shortcut(ACTION_SESSION_TOGGLE_ARCHIVED)
+        .expect("aj.session.toggle_archived has a default chord");
+    let offer = if reveal { "hide" } else { "show" };
+    format!("{confirm} to resume  \u{2022}  {toggle} {offer} archived  \u{2022}  {close} to close")
 }
 
 /// The primary (left) column: the first user message, truncated, with a
@@ -262,7 +397,16 @@ fn format_secondary(preview: &SessionPreview, now: DateTime<Utc>) -> String {
     let msg_word = if count == 1 { "msg" } else { "msgs" };
     let created = format_created(now, preview.created_at);
     let last = format_age(now, preview.last_message_at);
-    format!("{count} {msg_word} · created {created} · last {last}")
+    let line = format!("{count} {msg_word} · created {created} · last {last}");
+    // Leading this column rather than the label's: being archived is a fact
+    // about the session, like its age and its size, and the label column is
+    // the user's own words. It also keeps clear of the `(current)` suffix,
+    // which answers a different question and can be on the same row.
+    if preview.archived {
+        format!("archived · {line}")
+    } else {
+        line
+    }
 }
 
 /// Render `then` as a coarse age relative to `now`: `now / 5m / 3h / 2d /
@@ -384,6 +528,8 @@ mod tests {
             select,
             current: current.to_string(),
             ids,
+            seen: Rc::new(RefCell::new(Vec::new())),
+            reveal: Rc::new(Cell::new(false)),
         };
         extend_session_scan(&scan, &previews, Utc::now(), true, true);
         (scan, request_slot)
@@ -588,6 +734,8 @@ mod tests {
             select,
             current: "2025-05-08".to_string(),
             ids,
+            seen: Rc::new(RefCell::new(Vec::new())),
+            reveal: Rc::new(Cell::new(false)),
         };
 
         // First batch: two newer sessions, no current row. Replaces the
@@ -634,6 +782,8 @@ mod tests {
             select,
             current: "2025-05-08".to_string(),
             ids,
+            seen: Rc::new(RefCell::new(Vec::new())),
+            reveal: Rc::new(Cell::new(false)),
         };
 
         let batch1 = vec![
@@ -981,12 +1131,175 @@ mod tests {
         );
     }
 
+    /// An archived session for the selector's fixtures.
+    fn put_away(preview: SessionPreview) -> SessionPreview {
+        SessionPreview {
+            archived: true,
+            ..preview
+        }
+    }
+
+    /// The rows for `previews`, as the overlay builds them.
+    fn rows_for(previews: &[SessionPreview], current: &str, reveal: bool) -> Vec<String> {
+        let ids = Rc::new(RefCell::new(HashMap::new()));
+        build_items(&ids, previews, current, reveal, Utc::now())
+            .into_iter()
+            .map(|item| item.label)
+            .collect()
+    }
+
+    /// Archived sessions are out of the list until the toggle asks for them,
+    /// and a revealed one comes back where its date puts it rather than into a
+    /// group of its own.
+    #[test]
+    fn archived_previews_leave_the_list_until_the_toggle_asks() {
+        let previews = vec![
+            preview("2025-05-10", Some("still working"), 1, Duration::minutes(1)),
+            put_away(preview(
+                "2025-05-09",
+                Some("done with"),
+                1,
+                Duration::hours(1),
+            )),
+            preview("2025-05-08", Some("also working"), 1, Duration::hours(2)),
+        ];
+        assert_eq!(
+            rows_for(&previews, "none", false),
+            vec!["still working", "also working"],
+            "an archived session is listed before anything asked for it",
+        );
+        assert_eq!(
+            rows_for(&previews, "none", true),
+            vec!["still working", "done with", "also working"],
+            "the reveal dropped a row, or moved one out of its place",
+        );
+    }
+
+    /// The session the user is in is listed whatever its bit says, which is
+    /// the sidebar's exemption for the row it draws as focused: archiving the
+    /// session you are working in leaves it in front of you.
+    #[test]
+    fn the_current_session_is_listed_though_archived() {
+        let previews = vec![
+            put_away(preview(
+                "current",
+                Some("what I am in"),
+                1,
+                Duration::minutes(1),
+            )),
+            put_away(preview(
+                "2025-05-09",
+                Some("done with"),
+                1,
+                Duration::hours(1),
+            )),
+        ];
+        assert_eq!(
+            rows_for(&previews, "current", false),
+            vec!["what I am in (current)"],
+            "the session on screen dropped out from under the user",
+        );
+    }
+
+    /// A revealed row says it is archived, in the column that carries the rest
+    /// of the session's facts.
+    #[test]
+    fn a_revealed_row_is_marked_archived() {
+        // The same session either way, so the only difference between the two
+        // descriptions is what the bit adds.
+        let plain = preview("2025-05-09", Some("done with"), 1, Duration::hours(1));
+        let now = Utc::now();
+        let described = |preview: &SessionPreview| format_secondary(preview, now);
+        assert!(
+            !described(&plain).contains("archived"),
+            "a session nobody archived is marked as one: {}",
+            described(&plain),
+        );
+        assert_eq!(
+            described(&put_away(plain.clone())),
+            format!("archived · {}", described(&plain)),
+            "the marker displaced the row's own facts, or is not there at all",
+        );
+    }
+
+    /// A batch landing after the toggle filters the way the toggle set: the
+    /// scan is still streaming while the user works the overlay, and rows
+    /// arriving behind a reveal must not come out hidden.
+    #[test]
+    fn a_batch_after_the_toggle_follows_it() {
+        let (_handles, scan) = selector_over(
+            &[preview(
+                "2025-05-10",
+                Some("first"),
+                1,
+                Duration::minutes(1),
+            )],
+            "",
+        );
+        scan.reveal.set(true);
+
+        let later = vec![put_away(preview(
+            "2025-05-07",
+            Some("late and archived"),
+            1,
+            Duration::hours(3),
+        ))];
+        extend_session_scan(&scan, &later, Utc::now(), false, false);
+        assert_eq!(
+            scan.select.borrow().visible_labels(),
+            vec!["first", "late and archived"],
+            "the batch filtered against its own idea of the setting",
+        );
+    }
+
+    /// Every preview stays in the scan, revealed or not, so the toggle answers
+    /// from what has been read rather than walking the store again.
+    #[test]
+    fn the_scan_keeps_the_previews_it_filtered_out() {
+        let (_handles, scan) = selector_over(
+            &[put_away(preview(
+                "2025-05-09",
+                Some("done with"),
+                1,
+                Duration::hours(1),
+            ))],
+            "",
+        );
+        assert!(
+            scan.select.borrow().visible_labels().is_empty(),
+            "the archived row was listed",
+        );
+        assert_eq!(
+            scan.seen.borrow().len(),
+            1,
+            "the filtered row was dropped, so a reveal would have to rescan",
+        );
+    }
+
+    /// The footer says the chord and what it offers, so the toggle is
+    /// discoverable from the overlay rather than from the keybinding list.
+    #[test]
+    fn the_footer_offers_the_archived_toggle_both_ways() {
+        let hidden = subtitle(false);
+        let shown = subtitle(true);
+        let chord = action_shortcut(ACTION_SESSION_TOGGLE_ARCHIVED).expect("a default chord");
+        assert!(hidden.contains(&chord), "{hidden}");
+        assert!(
+            hidden.contains("show archived"),
+            "the footer offers no way to see archived sessions: {hidden}",
+        );
+        assert!(
+            shown.contains("hide archived"),
+            "the footer still offers to show what it is showing: {shown}",
+        );
+    }
+
     /// The confirm/close subtitle resolves its key labels from the
     /// keybinding data, so a rebind moves both the rendered hint and the
     /// assertion together rather than tracking a literal.
     #[test]
     fn subtitle_resolves_confirm_and_close_labels() {
-        let s = subtitle();
+        let s = subtitle(false);
         assert!(s.contains(&confirm_key_label()), "{s}");
         assert!(s.contains(&close_key_label()), "{s}");
     }

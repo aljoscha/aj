@@ -25,10 +25,10 @@ use crate::keybindings::{
     ACTION_AGENT_PICKER, ACTION_BRANCH_MESSAGE, ACTION_CHAT_PAGE_DOWN, ACTION_CHAT_PAGE_UP,
     ACTION_CHAT_SCROLL_BOTTOM, ACTION_CHAT_SCROLL_TOP, ACTION_CLIPBOARD_PASTE_IMAGE,
     ACTION_COPY_MESSAGE, ACTION_DEQUEUE, ACTION_HISTORY_OPEN, ACTION_OVERLAY_CLOSE_ALL,
-    ACTION_PALETTE_OPEN, ACTION_SESSION_NEW, ACTION_SESSION_NEXT, ACTION_SESSION_PREV,
-    ACTION_SESSION_TAG, ACTION_SIDEBAR_FOLD, ACTION_SIDEBAR_TOGGLE, ACTION_SUBMIT_STEERING,
-    ACTION_THINKING_TOGGLE, ACTION_TOOLS_EXPAND, ACTION_TRANSCRIPT_FOCUS, AJ_KEYBINDINGS,
-    default_chord, effective_chord, set_overrides,
+    ACTION_PALETTE_OPEN, ACTION_SESSION_ARCHIVE, ACTION_SESSION_NEW, ACTION_SESSION_NEXT,
+    ACTION_SESSION_PREV, ACTION_SESSION_TAG, ACTION_SIDEBAR_ARCHIVED, ACTION_SIDEBAR_FOLD,
+    ACTION_SIDEBAR_TOGGLE, ACTION_SUBMIT_STEERING, ACTION_THINKING_TOGGLE, ACTION_TOOLS_EXPAND,
+    ACTION_TRANSCRIPT_FOCUS, AJ_KEYBINDINGS, default_chord, effective_chord, set_overrides,
 };
 
 /// A global keymap action, the typed counterpart of the `aj.*` action-ID
@@ -94,6 +94,11 @@ pub enum AjAction {
     SessionNew,
     /// Edit the focused session's tag (`aj.session.tag`).
     SessionTag,
+    /// Archive the focused session, or unarchive it (`aj.session.archive`).
+    SessionArchive,
+    /// Show the archived sessions in the sidebar, or hide them again
+    /// (`aj.sidebar.archived`).
+    SidebarArchived,
     /// Cancel the viewed agent's running turn (the Ctrl+C ladder's first
     /// rung).
     CancelTurn,
@@ -120,6 +125,8 @@ impl AjAction {
             AjAction::SessionPrev => ACTION_SESSION_PREV,
             AjAction::SessionNew => ACTION_SESSION_NEW,
             AjAction::SessionTag => ACTION_SESSION_TAG,
+            AjAction::SessionArchive => ACTION_SESSION_ARCHIVE,
+            AjAction::SidebarArchived => ACTION_SIDEBAR_ARCHIVED,
             AjAction::Steer => ACTION_SUBMIT_STEERING,
             AjAction::Dequeue => ACTION_DEQUEUE,
             AjAction::ChatPageUp => ACTION_CHAT_PAGE_UP,
@@ -455,6 +462,8 @@ pub fn global_bindings() -> Vec<GlobalBinding> {
         compiled(AjAction::SessionPrev, ACTION_SESSION_PREV, Capture),
         compiled(AjAction::SessionNew, ACTION_SESSION_NEW, Capture),
         compiled(AjAction::SessionTag, ACTION_SESSION_TAG, Capture),
+        compiled(AjAction::SessionArchive, ACTION_SESSION_ARCHIVE, Capture),
+        compiled(AjAction::SidebarArchived, ACTION_SIDEBAR_ARCHIVED, Capture),
         compiled(AjAction::Steer, ACTION_SUBMIT_STEERING, Capture),
         compiled(AjAction::Dequeue, ACTION_DEQUEUE, Capture),
         compiled(AjAction::ChatPageUp, ACTION_CHAT_PAGE_UP, Capture),

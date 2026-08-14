@@ -15,7 +15,9 @@
 //! host, so browsing the store must not leave one behind per session visited.
 //! [`WORKING_SET`] bounds it, the focused session is never the one dropped,
 //! and a session that falls out keeps its `list` row and so keeps carrying its
-//! attention signal.
+//! attention signal. The set holds no archived session but the focused one:
+//! archiving says the user is done there, so leaving one is what lets the host
+//! release it.
 //!
 //! The focused session's transcript is **not** stored here. A frontend holds
 //! it behind widgets that cannot be repointed, so it lives in the frontend's
@@ -314,6 +316,22 @@ impl SessionDirectory {
         // Everything the session did while it was the focused one was on
         // screen, so leaving is the moment its output counts as seen.
         self.mark_viewed(&previous);
+        // Leaving an archived session is leaving it for good: the user said
+        // they were done there, so it goes rather than sitting in the set
+        // holding a lock the host could release. Only here, once the incoming
+        // transcript is in the frontend's cell and the outgoing one is parked,
+        // because dropping an entry before that would take the transcript with
+        // it. The reopen the caller has already asked for leaves them unnamed
+        // (see [`Self::attach_requests`], which passes over the same entries).
+        let archived: HashSet<String> = self
+            .rows
+            .iter()
+            .filter(|row| row.archived)
+            .map(|row| row.id.clone())
+            .collect();
+        self.attached.retain(|attached| {
+            attached.session == session || !archived.contains(&attached.session)
+        });
         // NOTE: the truncation here and the one `attach_requests` applies to
         // the same admission have to agree, or the reopened stream would name a
         // session this no longer folds (or drop one it does). Both keep the
@@ -321,6 +339,18 @@ impl SessionDirectory {
         // front, and only one session is ever admitted at a time.
         (self.attached.len() > WORKING_SET)
             .then(|| self.attached.pop().expect("longer than the bound").session)
+    }
+
+    /// Whether the peer's row for `session` says the user has put it away.
+    ///
+    /// Off the rows and nothing else: the bit is the peer's to publish (spec
+    /// 6.8), so a client that has seen no row for a session treats it as
+    /// unarchived and keeps holding it.
+    fn rows_archived(&self, session: &str) -> bool {
+        self.rows
+            .iter()
+            .find(|row| row.id == session)
+            .is_some_and(|row| row.archived)
     }
 
     /// Note that the user has stopped looking at `session`, so its output up to
@@ -455,6 +485,11 @@ impl SessionDirectory {
     /// named exactly once. A reset on a background session reopens the stream
     /// admitting a session the set already holds, and the consumer waits for
     /// the admitted session's catch-up before it paints the switch.
+    ///
+    /// Archived sessions are passed over, so the stream this opens is what
+    /// detaches them. The admitted one is named regardless: a user who focuses
+    /// an archived session is asking to work in it, and a focus that attached
+    /// nothing would leave the frontend on a transcript no stream feeds.
     pub fn attach_requests(&self, admitting: Option<&str>) -> Vec<AttachRequest> {
         let mut requests = Vec::with_capacity(WORKING_SET);
         if let Some(session) = admitting {
@@ -465,11 +500,15 @@ impl SessionDirectory {
                 cursor: self.client_for(session).and_then(|client| client.cursor()),
             });
         }
+        let kept = admitting.unwrap_or_else(|| self.focused());
         let room = WORKING_SET - requests.len();
         requests.extend(
             self.attached
                 .iter()
                 .filter(|attached| Some(attached.session.as_str()) != admitting)
+                .filter(|attached| {
+                    attached.session == kept || !self.rows_archived(&attached.session)
+                })
                 .take(room)
                 .map(|attached| AttachRequest {
                     session: attached.session.clone(),
@@ -1238,6 +1277,118 @@ mod tests {
             "renewing session-1 moved the axe onto session-2",
         );
         assert!(directory.is_attached("session-1"));
+    }
+
+    /// An archived row for a session the user has just left takes it out of
+    /// the working set: leaving is when archiving takes effect, and a session
+    /// still in the set is one the host cannot release.
+    ///
+    /// The set the reopen names has to agree with the set this keeps, so both
+    /// are asserted here.
+    #[test]
+    fn leaving_an_archived_session_drops_it_from_the_working_set() {
+        let mut directory = SessionDirectory::new("session-0".to_string());
+        let mut focused_chat = chat();
+        directory.focus(&mut focused_chat, "session-1", chat);
+        let _ = directory.apply(
+            &mut focused_chat,
+            list(vec![
+                SessionSummary {
+                    archived: true,
+                    ..row("session-1", false, 1)
+                },
+                row("session-0", false, 1),
+            ]),
+        );
+        assert!(
+            directory.is_attached("session-1"),
+            "archiving the session on screen detached it, so the user lost what they were reading",
+        );
+
+        // The reopen this focus asks for is what detaches it on the peer, so
+        // the set that reopen names has to leave it out already. Asked before
+        // the focus, which is the order the caller works in.
+        let leaving = directory.attach_requests(Some("session-0"));
+        let named: Vec<&str> = leaving
+            .iter()
+            .map(|request| request.session.as_str())
+            .collect();
+        assert_eq!(
+            named,
+            vec!["session-0"],
+            "the reopen still names the archived session, so the host keeps holding it",
+        );
+
+        directory.focus(&mut focused_chat, "session-0", || {
+            panic!("still in the set")
+        });
+        assert!(
+            !directory.is_attached("session-1"),
+            "the archived session is still in the working set, holding a lock the host could release",
+        );
+        let requests = directory.attach_requests(None);
+        let named: Vec<&str> = requests
+            .iter()
+            .map(|request| request.session.as_str())
+            .collect();
+        assert_eq!(
+            named,
+            vec!["session-0"],
+            "a later re-attach picked the archived session back up",
+        );
+    }
+
+    /// Focusing an archived session attaches it like any other. Archiving hides
+    /// a row, it does not close a door: the reveal is there so a session can be
+    /// opened again, and one that attached nothing would paint a transcript no
+    /// stream feeds.
+    #[test]
+    fn focusing_an_archived_session_attaches_it() {
+        let mut directory = SessionDirectory::new("session-0".to_string());
+        let mut focused_chat = chat();
+        let _ = directory.apply(
+            &mut focused_chat,
+            list(vec![
+                SessionSummary {
+                    archived: true,
+                    ..row("session-1", false, 1)
+                },
+                row("session-0", false, 1),
+            ]),
+        );
+
+        let requests = directory.attach_requests(Some("session-1"));
+        let named: Vec<&str> = requests
+            .iter()
+            .map(|request| request.session.as_str())
+            .collect();
+        assert_eq!(
+            named[0], "session-1",
+            "the session being focused was passed over for being archived: {named:?}",
+        );
+        directory.focus(&mut focused_chat, "session-1", chat);
+        assert!(
+            directory.is_attached("session-1"),
+            "and the focus itself dropped it",
+        );
+    }
+
+    /// The rows are the only source for the bit, so a session the peer has not
+    /// published stays in the set. A client that dropped what it could not
+    /// account for would detach the whole set on its first frame.
+    #[test]
+    fn a_session_with_no_row_is_not_treated_as_archived() {
+        let mut directory = SessionDirectory::new("session-0".to_string());
+        let mut focused_chat = chat();
+        directory.focus(&mut focused_chat, "session-1", chat);
+
+        directory.focus(&mut focused_chat, "session-0", || {
+            panic!("still in the set")
+        });
+        assert!(
+            directory.is_attached("session-1"),
+            "a session the peer has published no row for was dropped as archived",
+        );
     }
 
     /// The attach set a focus will leave is what the caller must attach, so the

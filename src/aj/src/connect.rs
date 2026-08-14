@@ -6,10 +6,11 @@
 //! session it opens with, and the host facts the chrome needs.
 //!
 //! Session selection is the spec's: an explicit id, else `--new` creates,
-//! else the host's most recently modified session, else create one. A create
-//! carries the settings this client's user actually stated, because
-//! per-session settings follow whoever creates the session (spec section 8),
-//! and the host `--host` named when the peer serves more than one.
+//! else the host's most recently modified session that is not archived, else
+//! create one. A create carries the settings this client's user actually
+//! stated, because per-session settings follow whoever creates the session
+//! (spec section 8), and the host `--host` named when the peer serves more
+//! than one.
 
 use std::path::PathBuf;
 
@@ -129,6 +130,11 @@ async fn resolve_named_host(
 
 /// Resolve the session to attach per spec 9.1, creating one when that is what
 /// the rule says.
+///
+/// The default attach passes over archived rows, so a host whose sessions are
+/// all archived creates one exactly as an empty host does. An explicit id is
+/// answered whatever its bit says: archiving puts a session away, it does not
+/// close it, so naming one always works.
 async fn resolve_session(
     control: &Control,
     target: &ConnectTarget<'_>,
@@ -147,15 +153,19 @@ async fn resolve_session(
         .await
         .context("could not read the host's session list")?;
     // Most recently modified, with the id as the tie-break: ids are minted as
-    // timestamps, so the higher one is the younger session.
+    // timestamps, so the higher one is the younger session. An archived
+    // session is one its user is done with, and this is the one branch that
+    // picks a session nobody named, so those rows are passed over.
     let latest = list
         .sessions
         .iter()
+        .filter(|summary| !summary.archived)
         .max_by_key(|summary| (summary.last_activity, summary.id.clone()))
         .map(|summary| summary.id.clone());
     match latest {
         Some(session) => Ok((session, false)),
-        // A fresh `aj serve` holds nothing, and connect mode would otherwise
+        // A fresh `aj serve` holds nothing, and a host holding only archived
+        // sessions offers nothing either, so connect mode would otherwise
         // have nothing to attach at all.
         None => Ok((create(control, host, settings, tag).await?, true)),
     }
@@ -267,9 +277,17 @@ fn creator_settings(args: &Args, config: &Config, stated: &Stated) -> Option<Ses
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use aj_app::cli::args::Command as CliCommand;
+    use aj_app::host::{Command, SessionHost};
+    use aj_wire::SessionSummary;
     use clap::Parser;
+    use tempfile::TempDir;
 
     use super::*;
+    use crate::remote::tests::{HostHandles, addr, bounded, scripted, scripted_host};
+    use crate::remote::{IdentityGate, RemoteServer};
 
     fn args(argv: &[&str]) -> Args {
         Args::try_parse_from(argv).expect("args parse")
@@ -361,5 +379,202 @@ mod tests {
         );
         assert_eq!(settings.speed.as_deref(), Some("fast"));
         assert_eq!(settings.thinking.as_deref(), Some("high"));
+    }
+
+    /// A real host behind a real loopback control port, with the [`Control`] a
+    /// client drives it through.
+    ///
+    /// Session selection reads what the host publishes, so both the archive
+    /// and the read that answers it cross the wire. The store is the guard's,
+    /// so nothing outlives the test.
+    struct Peer {
+        _dir: TempDir,
+        host: SessionHost,
+        server: RemoteServer,
+        control: Control,
+    }
+
+    impl Peer {
+        async fn start() -> Self {
+            let dir = TempDir::new().expect("tempdir");
+            let host = scripted_host(
+                &dir,
+                scripted(Vec::new(), 0, Duration::ZERO),
+                HostHandles::new(&dir),
+            );
+            let server =
+                RemoteServer::bind(host.clone(), addr("127.0.0.1:0"), IdentityGate::local())
+                    .await
+                    .expect("bind a loopback control port");
+            let control = Control::remote(RemoteClient::new(&server.url()).expect("client"));
+            Self {
+                _dir: dir,
+                host,
+                server,
+                control,
+            }
+        }
+
+        /// A session on the host, which is the only way a fresh one holds any.
+        async fn create(&self) -> String {
+            bounded("a create", self.control.create(None, None, None, None))
+                .await
+                .expect("create a session")
+        }
+
+        async fn archive(&self, session: &str) {
+            bounded(
+                "an archive",
+                self.control
+                    .command(session, Command::Archive { archived: true }),
+            )
+            .await
+            .expect("archive the session");
+        }
+
+        async fn rows(&self) -> Vec<SessionSummary> {
+            bounded("the session list", self.control.sessions())
+                .await
+                .expect("the session list")
+                .sessions
+        }
+
+        async fn row(&self, session: &str) -> SessionSummary {
+            self.rows()
+                .await
+                .into_iter()
+                .find(|summary| summary.id == session)
+                .unwrap_or_else(|| panic!("{session} is in the host's directory"))
+        }
+
+        /// Dial this peer the way `aj connect <url> [argv...]` does, from argv
+        /// through the handshake to the session it opens with.
+        async fn dial(&self, argv: &[&str]) -> Connected {
+            let url = self.server.url();
+            let mut line = vec!["aj", "connect", &url];
+            line.extend_from_slice(argv);
+            let args = args(&line);
+            let Some(CliCommand::Connect {
+                url,
+                session_id,
+                new,
+                host,
+                ..
+            }) = &args.command
+            else {
+                panic!("connect args parse as connect");
+            };
+            bounded(
+                "connect to resolve a session",
+                connect(
+                    &args,
+                    &Config::default(),
+                    &nothing_stated(),
+                    ConnectTarget {
+                        url,
+                        session_id: session_id.as_deref(),
+                        new: *new,
+                        host: host.as_deref(),
+                    },
+                ),
+            )
+            .await
+            .expect("connect to the host")
+        }
+
+        async fn shutdown(self) {
+            self.host.shutdown().await;
+            self.server.shutdown().await;
+        }
+    }
+
+    /// Bare connect takes the newest session its user is not done with, so an
+    /// archived row is passed over even when it is the one the rule would
+    /// otherwise have landed on.
+    #[tokio::test]
+    async fn bare_connect_passes_over_an_archived_session() {
+        let peer = Peer::start().await;
+        let older = peer.create().await;
+        let newer = peer.create().await;
+        // The premise: unarchived, `newer` is what bare connect picks, so
+        // archiving it is what the next dial is answering. Without this the
+        // test measures nothing.
+        assert_eq!(
+            peer.dial(&[]).await.session,
+            newer,
+            "the fixture's second session is not the one bare connect takes"
+        );
+
+        peer.archive(&newer).await;
+        assert!(
+            peer.row(&newer).await.archived,
+            "the archive command did not set the bit the host publishes"
+        );
+
+        let connected = peer.dial(&[]).await;
+        assert_eq!(
+            connected.session, older,
+            "bare connect attached the archived session"
+        );
+        assert!(
+            !connected.created,
+            "bare connect created a session instead of attaching the unarchived one"
+        );
+        peer.shutdown().await;
+    }
+
+    /// A host whose every session is archived offers nothing to attach, so
+    /// bare connect creates, exactly as against a host holding none.
+    #[tokio::test]
+    async fn bare_connect_creates_when_every_session_is_archived() {
+        let peer = Peer::start().await;
+        let put_away = peer.create().await;
+        peer.archive(&put_away).await;
+        let rows = peer.rows().await;
+        assert!(
+            !rows.is_empty() && rows.iter().all(|summary| summary.archived),
+            "the fixture holds {} sessions and not all are archived, so a create here proves nothing",
+            rows.len()
+        );
+
+        let connected = peer.dial(&[]).await;
+        assert_ne!(
+            connected.session, put_away,
+            "bare connect attached the archived session"
+        );
+        assert!(
+            connected.created,
+            "bare connect reported an attach for the session it minted"
+        );
+        assert!(
+            !peer.row(&connected.session).await.archived,
+            "the session bare connect created is archived"
+        );
+        peer.shutdown().await;
+    }
+
+    /// Naming a session is asking for that one: the archived bit puts a
+    /// session away rather than closing it, so an explicit id is answered
+    /// whatever the bit says.
+    #[tokio::test]
+    async fn an_explicit_id_resolves_an_archived_session() {
+        let peer = Peer::start().await;
+        let put_away = peer.create().await;
+        peer.archive(&put_away).await;
+        assert!(
+            peer.row(&put_away).await.archived,
+            "the archive command did not set the bit the host publishes"
+        );
+
+        let connected = peer.dial(&[&put_away]).await;
+        assert_eq!(
+            connected.session, put_away,
+            "an explicit id did not attach the archived session it named"
+        );
+        assert!(
+            !connected.created,
+            "an explicit id created a session instead of attaching the one it named"
+        );
+        peer.shutdown().await;
     }
 }

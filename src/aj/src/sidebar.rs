@@ -211,6 +211,8 @@ pub(crate) struct SidebarRow {
     /// Whether the client folds frames for this session, which is what makes
     /// the working set legible (spec 9.2).
     pub(crate) attached: bool,
+    /// Whether the user has put the session away (spec 6.8).
+    pub(crate) archived: bool,
     /// When the peer says the session last did something, on the peer's clock.
     ///
     /// Nothing places a row by it (see the module doc). It is what the
@@ -255,6 +257,20 @@ impl SidebarRow {
         !self.focused
             && !self.attached
             && !matches!(self.status, RowStatus::Working | RowStatus::Unseen)
+    }
+
+    /// Whether the strip leaves this row out of the default view.
+    ///
+    /// Archiving is the user saying they are done with a session, so the row
+    /// goes. The two exemptions are the working set, and they are the cap's
+    /// first two for the same reason: a row the client holds open is part of
+    /// what the user is working on right now, and hiding one would leave the
+    /// strip describing a working set the user cannot see. What the session is
+    /// doing exempts nothing here. The cap suppresses a row the user did not
+    /// ask about, this hides one they asked to put away, and a turn running
+    /// inside it does not undo the asking.
+    fn put_away(&self) -> bool {
+        self.archived && !self.focused && !self.attached
     }
 
     /// What the row shows in a label field of `cols` columns: the id-derived
@@ -368,6 +384,12 @@ pub(crate) struct SidebarState {
     pub(crate) hosts: Vec<DirectoryHost>,
     /// The groups the user opened past the cap.
     unfolded: Unfolded,
+    /// Whether the strip shows the sessions the user has put away.
+    ///
+    /// Client state like [`Unfolded`]: it outlives every refresh of the
+    /// mirror, lapses with the process, and is never sent anywhere. Off by
+    /// default, which is the whole point of archiving one.
+    pub(crate) reveal_archived: bool,
     /// Where the wheel anchored the drawn run. `None` is the resting state, in
     /// which the run follows the focused row.
     scroll: Option<Anchor>,
@@ -501,11 +523,17 @@ fn focused_id(rows: &[SidebarRow]) -> Option<&str> {
 /// `unseen` answers spec 6.8's "has it moved since I looked" for a row the
 /// caller already holds, and `attached` answers "do I hold it open" for a
 /// session id, which keeps this linear.
+///
+/// Archived rows are left out unless `reveal_archived`, which is the toggle
+/// that shows them inline. They never enter the row set, so no cap counts one
+/// and neither does the row count that decides whether the strip shows at
+/// all. See [`SidebarRow::put_away`] for what stays regardless.
 pub(crate) fn rows_for_display(
     rows: &[SessionSummary],
     focused: &str,
     unseen: impl Fn(&SessionSummary) -> bool,
     attached: impl Fn(&str) -> bool,
+    reveal_archived: bool,
 ) -> Vec<SidebarRow> {
     let mut ordered: Vec<&SessionSummary> = rows.iter().collect();
     ordered.sort_by(|l, r| r.id.cmp(&l.id));
@@ -515,11 +543,13 @@ pub(crate) fn rows_for_display(
             status: RowStatus::of(row, unseen(row)),
             focused: row.id == focused,
             attached: attached(&row.id),
+            archived: row.archived,
             tag: row.tag.clone(),
             host: row.host.clone(),
             id: row.id.clone(),
             last_activity: row.last_activity,
         })
+        .filter(|row| reveal_archived || !row.put_away())
         .collect()
 }
 
@@ -1248,12 +1278,24 @@ impl SessionSidebar {
         }
     }
 
-    /// The style a label is drawn in: the working-set axis, as brightness.
+    /// The style a label is drawn in: the working-set axis, as brightness, and
+    /// the put-away axis, as a strike through the field.
+    ///
+    /// Two encodings because they answer two questions, and a revealed
+    /// archived row has to answer both: an attached one is still attached, and
+    /// dimming it to say "archived" would take back what brightness just said.
+    /// A strike is what the app already draws through work that is done with
+    /// (the todo list uses it for the same meaning), and it survives an
+    /// archived row being the focused one, where brightness is spoken for.
     fn label_style(&self, row: &SidebarRow) -> Style {
-        match row.presence() {
+        let presence = match row.presence() {
             Presence::Focused => self.styles.accent,
             Presence::Background => self.styles.text,
             Presence::Listed => self.styles.dim,
+        };
+        Style {
+            strikethrough: row.archived,
+            ..presence
         }
     }
 
@@ -1627,6 +1669,108 @@ mod tests {
         rows.iter().map(|row| row.id.as_str()).collect()
     }
 
+    /// A summary for a session the user has put away.
+    fn archived(id: &str, minutes: i64) -> SessionSummary {
+        SessionSummary {
+            archived: true,
+            ..at(id, minutes)
+        }
+    }
+
+    /// The default view drops the rows the user archived, and the toggle puts
+    /// them back where their ids say they go rather than in a group of their
+    /// own: a revealed row is in the list the user is reading, and a second
+    /// list would make them find it twice.
+    #[test]
+    fn archived_rows_leave_the_default_view_and_the_reveal_puts_them_back() {
+        let rows = vec![
+            at("session-a", 30),
+            archived("session-b", 10),
+            at("session-c", 20),
+        ];
+        let hidden = rows_for_display(&rows, "session-a", |_| false, |_| false, false);
+        assert_eq!(
+            ids(&hidden),
+            vec!["session-c", "session-a"],
+            "an archived row is in the default view",
+        );
+        let revealed = rows_for_display(&rows, "session-a", |_| false, |_| false, true);
+        assert_eq!(
+            ids(&revealed),
+            vec!["session-c", "session-b", "session-a"],
+            "the reveal moved a row out of its place",
+        );
+        assert!(
+            revealed[1].archived,
+            "the revealed row does not say it is archived, so nothing can draw it as such",
+        );
+    }
+
+    /// The two exemptions: the session on screen and the ones the client holds
+    /// open stay in the default view however archived they are, because the
+    /// strip is what says where the working set is (spec 9.2). Archiving the
+    /// focused session is allowed and leaves it on screen, so this is the
+    /// state right after that gesture.
+    #[test]
+    fn an_archived_row_the_client_holds_open_stays_in_view() {
+        let rows = vec![
+            archived("session-a", 30),
+            archived("session-b", 20),
+            archived("session-c", 10),
+        ];
+        let display =
+            rows_for_display(&rows, "session-c", |_| false, |id| id == "session-b", false);
+        assert_eq!(
+            ids(&display),
+            vec!["session-c", "session-b"],
+            "the working set is not what the archive bit hides",
+        );
+        assert_eq!(display[0].presence(), Presence::Focused);
+        assert_eq!(display[1].presence(), Presence::Background);
+    }
+
+    /// A working turn does not exempt an archived row, which is what tells this
+    /// filter from the cap. Archiving is the user saying they are done with the
+    /// session, and the ruling allows it while the session works: the turn runs
+    /// to its end out of sight.
+    #[test]
+    fn a_working_archived_row_still_leaves_the_view() {
+        let working = SessionSummary {
+            working: true,
+            ..archived("session-b", 1)
+        };
+        let display = rows_for_display(
+            &[at("session-a", 30), working],
+            "session-a",
+            |_| false,
+            |_| false,
+            false,
+        );
+        assert_eq!(
+            ids(&display),
+            vec!["session-a"],
+            "a turn inside an archived session put its row back",
+        );
+    }
+
+    /// Archived rows are gone before the cap counts, so a group's five places
+    /// go to rows the user can see. A filter that ran after the cap would spend
+    /// places on rows it then dropped, and the group would draw short.
+    #[test]
+    fn an_archived_row_spends_none_of_a_groups_cap() {
+        let mut rows: Vec<SessionSummary> = (0..GROUP_CAP)
+            .map(|at| archived(&format!("session-a-{at}"), 1))
+            .collect();
+        rows.extend((0..GROUP_CAP).map(|at| self::at(&format!("session-b-{at}"), 2)));
+        let display = rows_for_display(&rows, "none", |_| false, |_| false, false);
+        assert_eq!(display.len(), GROUP_CAP, "the archived rows are in the set");
+        let lines = folded(&display, &[], 20);
+        assert!(
+            folds(&lines).is_empty(),
+            "the cap held a row back over sessions the strip is not showing: {lines:?}",
+        );
+    }
+
     /// Rows sit where their ids put them, newest minted id first, whatever the
     /// activity on them says. A row that climbed to the top when a message
     /// arrived would move out from under a pointer aimed at it, which is the
@@ -1640,7 +1784,7 @@ mod tests {
             at("session-b", 10),
             at("session-c", 20),
         ];
-        let display = rows_for_display(&rows, "session-b", |_| false, |_| false);
+        let display = rows_for_display(&rows, "session-b", |_| false, |_| false, false);
         assert_eq!(ids(&display), vec!["session-c", "session-b", "session-a"]);
         assert!(display[1].focused, "the focused row is marked");
         assert!(!display[0].focused);
@@ -1648,7 +1792,7 @@ mod tests {
         // The stamps move, the rows do not. The busiest session is now the
         // oldest id, and it stays at the bottom where its id puts it.
         let stirred = vec![at("session-a", 0), at("session-b", 40), at("session-c", 40)];
-        let display = rows_for_display(&stirred, "session-b", |_| false, |_| false);
+        let display = rows_for_display(&stirred, "session-b", |_| false, |_| false, false);
         assert_eq!(
             ids(&display),
             vec!["session-c", "session-b", "session-a"],
@@ -1661,7 +1805,7 @@ mod tests {
     #[test]
     fn a_row_carries_the_activity_the_cap_reads() {
         let rows = vec![at("session-a", 30), at("session-b", 10)];
-        let display = rows_for_display(&rows, "session-a", |_| false, |_| false);
+        let display = rows_for_display(&rows, "session-a", |_| false, |_| false, false);
         assert_eq!(
             display[0].last_activity, rows[1].last_activity,
             "session-b's stamp rode into its row",
@@ -1684,6 +1828,7 @@ mod tests {
             "session-b",
             |_| false,
             |id| id == "session-a",
+            false,
         );
         assert_eq!(display[1].tag.as_deref(), Some("fix-auth"));
         assert_eq!(display[1].host.as_deref(), Some("builder-1"));
@@ -1709,6 +1854,7 @@ mod tests {
                 status: RowStatus::Idle,
                 focused: false,
                 attached: false,
+                archived: false,
                 last_activity: DateTime::UNIX_EPOCH,
             },
         }
@@ -1737,6 +1883,11 @@ mod tests {
 
         fn attached(mut self) -> Self {
             self.row.attached = true;
+            self
+        }
+
+        fn archived(mut self) -> Self {
+            self.row.archived = true;
             self
         }
 
@@ -3361,6 +3512,7 @@ mod tests {
             &format!("{HOST}:{MINTED}"),
             |_| false,
             |_| false,
+            false,
         );
         assert_eq!(
             painted(rows, Vec::new(), 4),
@@ -3514,6 +3666,46 @@ mod tests {
                 .collect();
             assert_eq!(time, expected, "line {line} drew the wrong eight columns");
         }
+    }
+
+    /// A revealed archived row is struck through, and keeps the brightness its
+    /// place in the working set earned. Two axes, two encodings: the strike
+    /// says the user is done with the session, the brightness says the client
+    /// still holds it open, and neither answer is readable off the other.
+    #[test]
+    fn a_revealed_archived_row_draws_struck_through() {
+        let rows = vec![
+            row("2026-08-06-19-07-19-368").focused().archived().build(),
+            row("2026-08-06-18-40-49-001").attached().archived().build(),
+            row("2026-08-06-17-01-02-002").build(),
+        ];
+        let cells = painted_cells(rows, Vec::new(), 5);
+        let styles = styles();
+        // The label field starts at column 3: marker, glyph, space.
+        assert!(
+            cells[0][3].style.strikethrough,
+            "the archived row on screen draws like any other",
+        );
+        assert_eq!(
+            cells[0][3].style,
+            Style {
+                strikethrough: true,
+                ..styles.accent
+            },
+            "the focused row lost its brightness to the strike",
+        );
+        assert_eq!(
+            cells[1][3].style,
+            Style {
+                strikethrough: true,
+                ..styles.text
+            },
+            "an archived row the client holds open reads as unheld",
+        );
+        assert_eq!(
+            cells[2][3].style, styles.dim,
+            "a row nobody archived came out struck through",
+        );
     }
 
     /// A drawn strip that records every gesture it resolves.

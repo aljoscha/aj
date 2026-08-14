@@ -288,7 +288,8 @@ pub enum Command {
         /// Base URL of the host's control port (e.g.
         /// `http://100.64.0.2:6161`).
         url: String,
-        /// Session to attach. Omit to take the host's latest.
+        /// Session to attach. Omit to take the host's latest session that is
+        /// not archived. Naming one works whatever its archived bit says.
         session_id: Option<String>,
         /// Create a fresh session instead of attaching an existing one.
         #[arg(long)]

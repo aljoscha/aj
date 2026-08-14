@@ -143,6 +143,14 @@ pub const COMMANDS: &[Command] = &[
         action: CommandAction::OpenSessionTag,
     },
     Command {
+        name: "archive",
+        title: "archive",
+        category: "session",
+        description: "Put this session away, or bring it back. It keeps working either way.",
+        action_id: Some(crate::keybindings::ACTION_SESSION_ARCHIVE),
+        action: CommandAction::ArchiveSession,
+    },
+    Command {
         name: "export",
         title: "export",
         category: "session",
@@ -296,6 +304,12 @@ pub enum CommandAction {
     /// (an empty submission clears it), `Esc` cancels. A label the
     /// store would refuse is reported and changes nothing.
     OpenSessionTag,
+    /// Archive the focused session, or unarchive one that is archived.
+    ///
+    /// Display metadata only: the log, the lock and any turn in flight are
+    /// untouched, so this is never refused for being busy. An archived
+    /// session leaves the default views and stays reachable by name.
+    ArchiveSession,
     /// Open the prompt-history search overlay. `Enter` recalls the
     /// chosen prompt into the editor; `Esc` cancels.
     OpenPromptHistory,

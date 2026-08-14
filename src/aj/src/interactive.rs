@@ -1743,11 +1743,13 @@ fn sync_sidebar(world: &World, shell: &Rc<RefCell<Shell>>) {
     // A peer that has sent no `list` frame yet leaves the strip empty rather
     // than inventing a row for the focused session: the next frame fills it,
     // and a fabricated row would carry no status.
+    let reveal_archived = shell.borrow().sidebar.borrow().reveal_archived;
     let rows = crate::sidebar::rows_for_display(
         world.directory.rows(),
         world.session(),
         |row| world.directory.is_unseen(row),
         |id| world.directory.is_attached(id),
+        reveal_archived,
     );
     let sidebar = Rc::clone(&shell.borrow().sidebar);
     let mut state = sidebar.borrow_mut();
@@ -2120,6 +2122,10 @@ async fn handle_host_action(
             *shell.borrow().command_slot.borrow_mut() = Some(CommandAction::OpenSessionTag);
             false
         }
+        AjAction::SessionArchive => {
+            *shell.borrow().command_slot.borrow_mut() = Some(CommandAction::ArchiveSession);
+            false
+        }
         // Handled inside the controller's dispatch-side handler (see
         // `Shell::new`), never parked for the host.
         AjAction::ThinkingToggle
@@ -2135,6 +2141,7 @@ async fn handle_host_action(
         | AjAction::BranchMessage
         | AjAction::SidebarToggle
         | AjAction::SidebarFold
+        | AjAction::SidebarArchived
         | AjAction::SessionNext
         | AjAction::SessionPrev
         | AjAction::SessionNew
@@ -2252,6 +2259,55 @@ fn focused_tag(world: &World) -> Option<String> {
         .and_then(|row| row.tag.clone())
 }
 
+/// Whether the peer reports the focused session as archived, `false` when it
+/// has not published a row for it yet.
+///
+/// Read off the directory for the same reason the tag is: it is the row the
+/// strip draws, so the gesture acts on the state the user can see. A session
+/// with no row yet reads as unarchived, which makes the first press archive
+/// it. That is the reversible direction, and the row that arrives says what
+/// happened.
+fn focused_archived(world: &World) -> bool {
+    world
+        .directory
+        .rows()
+        .iter()
+        .find(|row| row.id == world.session())
+        .is_some_and(|row| row.archived)
+}
+
+/// Put the focused session away, or bring it back, and say which happened.
+///
+/// One gesture for both directions, off the bit the peer publishes: archiving
+/// is explicit in both directions and nothing else ever changes it, so the
+/// user pressing the same chord twice is how a mistake is undone.
+///
+/// Always spoken, because the strip is not always the answer: it is hidden
+/// under one row and the focused session stays in view either way, so nothing
+/// on screen need change. The peer applies the bit under the session's own
+/// lock and republishes the row.
+async fn apply_archive(world: &mut World, archived: bool) {
+    match world
+        .control
+        .command(world.session(), Command::Archive { archived })
+        .await
+    {
+        Ok(_) if archived => fold_notice(
+            world,
+            "Archived. It leaves the session lists once you move on.",
+        ),
+        Ok(_) => fold_notice(world, "Unarchived. It is back in the session lists."),
+        // A peer older than the endpoint refuses the request itself rather
+        // than the session, and its message quotes a path (spec 6.10 makes
+        // probing the check, since capabilities are declared-only). Worded
+        // here so the refusal names the feature the user asked for.
+        Err(err) if err.unknown_endpoint() => {
+            fold_notice(world, "This host does not support archiving sessions.");
+        }
+        Err(err) => fold_notice(world, &format!("Could not archive the session: {err}")),
+    }
+}
+
 /// Send a confirmed tag edit to the peer that owns the session.
 ///
 /// The one path for both modes: the host applies it under the session's own
@@ -2289,6 +2345,10 @@ async fn apply_command_action(
     redraw_tx: &UnboundedSender<()>,
 ) -> ActionEffect {
     match action {
+        CommandAction::ArchiveSession => {
+            apply_archive(world, !focused_archived(world)).await;
+            ActionEffect::Redraw
+        }
         CommandAction::Compact => {
             // `/compact` runs as a tracked turn on the main agent, so the
             // host refuses it while one is already running. Its own wording
@@ -4326,6 +4386,15 @@ impl Shell {
                     state.toggled = true;
                     ctx.redraw = true;
                 }
+                // Which sessions the strip shows is client state too, so the
+                // reveal never reaches the loop that owns the world either.
+                // The rows themselves are rebuilt by the next `sync_sidebar`,
+                // which is where the filter lives.
+                AjAction::SidebarArchived => {
+                    let mut state = sidebar_for_actions.borrow_mut();
+                    state.reveal_archived = !state.reveal_archived;
+                    ctx.redraw = true;
+                }
                 // The fold gesture's keyboard half: the group the focused row
                 // sits in opens past the cap or closes back to it. Client
                 // state, so it never reaches the loop that owns the world.
@@ -4473,7 +4542,8 @@ impl Shell {
                 | AjAction::PasteImage
                 | AjAction::HistoryOpen
                 | AjAction::AgentPickerOpen
-                | AjAction::SessionTag => {
+                | AjAction::SessionTag
+                | AjAction::SessionArchive => {
                     *action_slot.borrow_mut() = Some(*action);
                 }
             })
@@ -14756,6 +14826,80 @@ mod tests {
         );
     }
 
+    /// The selector's archived toggle, every byte of it real: an archived
+    /// session on disk is out of the list, the chord on the keyboard puts it
+    /// back marked, and the same chord takes it away again.
+    ///
+    /// Through the composed tree rather than the widget, because the widget is
+    /// only reached if the overlay actually installed it: the chord is matched
+    /// on the focus path, and a selector pushed as a bare list would swallow
+    /// the press with nothing to show for it.
+    #[tokio::test]
+    async fn the_selector_toggle_reveals_an_archived_session() {
+        let dir = TempDir::new().expect("tempdir");
+        let put_away = create_disk_session(&dir, "the session I am done with").await;
+
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        run_prompt(&mut world, "the session I am working in").await;
+        world
+            .persistence
+            .write_archived(&put_away, true)
+            .expect("archive the session on disk");
+
+        let effect = apply_command(&mut world, &shell, CommandAction::OpenSessionSelector).await;
+        assert!(matches!(effect, ActionEffect::OpenedOverlay));
+        focus_overlay(&mut app, &root);
+        let scan = shell
+            .borrow()
+            .take_session_scan()
+            .expect("open parked a preview scan");
+        let mut previews = Vec::new();
+        world
+            .persistence
+            .list_session_previews_streaming(&|| false, &mut |batch| previews.extend(batch));
+        assert!(
+            previews.iter().any(|preview| preview.archived),
+            "the scan read no archived session, so this test measures nothing",
+        );
+        extend_session_scan(&scan, &previews, Utc::now(), true, true);
+        app.render(&root).expect("render");
+
+        let listed = |shell: &Rc<RefCell<Shell>>| -> String {
+            flatten(&shell.borrow_mut().draw(&full_draw_ctx())).join("\n")
+        };
+        assert!(
+            !listed(&shell).contains("done with"),
+            "the archived session is listed before anything asked for it: {}",
+            listed(&shell),
+        );
+
+        let chord = action_id_bytes(aj_app::keybindings::ACTION_SESSION_TOGGLE_ARCHIVED);
+        writer.write_all(&chord).expect("the toggle chord");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        app.render(&root).expect("render");
+        let revealed = listed(&shell);
+        assert!(
+            revealed.contains("done with"),
+            "the chord revealed nothing: {revealed}",
+        );
+        assert!(
+            revealed.contains("archived ·"),
+            "the revealed row is not marked as archived: {revealed}",
+        );
+
+        writer.write_all(&chord).expect("the toggle chord again");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        app.render(&root).expect("render");
+        assert!(
+            !listed(&shell).contains("done with"),
+            "the toggle only goes one way: {}",
+            listed(&shell),
+        );
+    }
+
     /// Confirming the pre-selected current session is a no-op close (parks
     /// nothing); Esc cancels the same way.
     #[tokio::test]
@@ -16560,18 +16704,64 @@ mod tests {
         let aj_app::actions::ChordKey::Char(c) = chord.key else {
             panic!("{action:?} is not a plain-character chord");
         };
-        assert!(!chord.ctrl, "{action:?} is not a ctrl chord");
+        chord_key_bytes(c, chord.alt, chord.ctrl)
+    }
+
+    /// The bytes a terminal sends for a character chord: ESC ahead of it for
+    /// alt, and the control code in place of it for ctrl.
+    fn chord_key_bytes(c: char, alt: bool, ctrl: bool) -> Vec<u8> {
         let mut bytes = Vec::new();
-        if chord.alt {
+        if alt {
             bytes.push(0x1b);
         }
-        bytes.push(u8::try_from(c).expect("an ascii chord key"));
+        let byte = u8::try_from(c).expect("an ascii chord key");
+        bytes.push(if ctrl { byte & 0x1f } else { byte });
         bytes
+    }
+
+    /// The bytes for an action id's chord, for the overlay-local chords that
+    /// have no [`AjAction`] of their own.
+    fn action_id_bytes(action_id: &str) -> Vec<u8> {
+        let chord = aj_app::actions::parse_chord(
+            aj_app::keybindings::effective_chord(action_id).expect("a default chord"),
+        )
+        .expect("the chord parses");
+        let aj_app::actions::ChordKey::Char(c) = chord.key else {
+            panic!("{action_id} is not a plain-character chord");
+        };
+        chord_key_bytes(c, chord.alt, chord.ctrl)
     }
 
     /// Poll until the sidebar's row for `session` satisfies `wanted`, folding
     /// and re-mirroring each time round. The host debounces `list` frames, so a
     /// row's status arrives a coalescing tick behind the change.
+    /// Poll until the peer's own row for `session` satisfies `wanted`, folding
+    /// each time round.
+    ///
+    /// The directory's rows rather than the strip's, which are the peer's
+    /// answer before the strip's filters have had them: an archived row is not
+    /// on the strip at all, so a poll there could only ever time out.
+    async fn poll_directory_row(
+        world: &mut World,
+        session: &str,
+        wanted: impl Fn(&aj_wire::SessionSummary) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        while Instant::now() < deadline {
+            fold_ready_frames(world);
+            if world
+                .directory
+                .rows()
+                .iter()
+                .any(|row| row.id == session && wanted(row))
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
     async fn poll_row(
         world: &mut World,
         shell: &Rc<RefCell<Shell>>,
@@ -16595,6 +16785,214 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         false
+    }
+
+    /// The archive gesture, end to end and both ways: the chord reaches the
+    /// peer, the peer publishes the bit, the row leaves the strip once the
+    /// user is elsewhere, and the same chord brings it back.
+    ///
+    /// Every hop is the real one: a real host, the command over the control
+    /// seam, the row off a `list` frame, and the strip built by the loop's own
+    /// sync.
+    #[tokio::test]
+    async fn the_archive_chord_puts_a_session_away_and_brings_it_back() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        run_prompt(&mut world, "seed").await;
+        let home = world.session().to_string();
+        let other = world
+            .control
+            .create(None, None, None, None)
+            .await
+            .expect("a second session");
+        assert!(
+            poll_row(&mut world, &shell, &other, |_| true).await,
+            "the second session never appeared in the rows",
+        );
+
+        // Archive the one on screen. It stays: the strip is what says where
+        // the user is, and they are still here.
+        let (mut app, mut writer, _root) = app_over(&shell).await;
+        writer
+            .write_all(&chord_bytes(AjAction::SessionArchive))
+            .expect("the archive chord");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        let parked = shell
+            .borrow()
+            .take_host_action()
+            .expect("the chord parked a host action");
+        assert_eq!(parked, AjAction::SessionArchive);
+        handle_host_action(&mut world, &shell, parked).await;
+        let command = shell
+            .borrow()
+            .command_slot
+            .borrow_mut()
+            .take()
+            .expect("the action parked its command");
+        apply_command(&mut world, &shell, command).await;
+        assert!(
+            main_notices(&world)
+                .iter()
+                .any(|n| n.starts_with("Archived")),
+            "the gesture said nothing: {:?}",
+            main_notices(&world),
+        );
+        assert!(
+            poll_row(&mut world, &shell, &home, |row| row.archived).await,
+            "the peer never published the bit",
+        );
+        sync_sidebar(&world, &shell);
+        assert!(
+            strip_row_ids(&shell).contains(&home),
+            "the session on screen left the strip: {:?}",
+            strip_row_ids(&shell),
+        );
+
+        // Leaving is when it goes.
+        let moved =
+            apply_focus_request(&mut app, &shell, &mut world, FocusRequest::Resume(other)).await;
+        assert!(matches!(moved, Focus::Moved));
+        sync_sidebar(&world, &shell);
+        assert!(
+            !strip_row_ids(&shell).contains(&home),
+            "the archived session is still on the strip after the user left it: {:?}",
+            strip_row_ids(&shell),
+        );
+        assert!(
+            !world.directory.is_attached(&home),
+            "the archived session is still in the working set, so the host cannot release it",
+        );
+
+        // And back: the palette command is the same path the chord took.
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(home.clone()),
+        )
+        .await;
+        assert!(matches!(moved, Focus::Moved));
+        apply_command(&mut world, &shell, CommandAction::ArchiveSession).await;
+        assert!(
+            main_notices(&world)
+                .iter()
+                .any(|n| n.starts_with("Unarchived")),
+            "the second press did not unarchive: {:?}",
+            main_notices(&world),
+        );
+        assert!(
+            poll_row(&mut world, &shell, &home, |row| !row.archived).await,
+            "the bit is still set on the peer",
+        );
+        shut_down(&world).await;
+    }
+
+    /// A peer that does not know the archive endpoint is told about by name,
+    /// not left silent (spec 9.1). Capabilities are declared-only and a
+    /// gateway cannot speak for the hosts behind it, so probing the endpoint
+    /// is the check the spec sanctions, and this is what the probe finds.
+    ///
+    /// The peer here is a real host reached at a path it does not serve, which
+    /// is the same 404 and the same `unknown_endpoint` code an older host
+    /// answers the archive route with. Nothing else in the request differs.
+    #[tokio::test]
+    async fn a_peer_without_the_endpoint_says_so() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let elsewhere = format!("{}/nowhere", remote.url());
+        world.control =
+            Control::remote(crate::remote::RemoteClient::new(&elsewhere).expect("a client"));
+
+        apply_command(&mut world, &shell, CommandAction::ArchiveSession).await;
+        let notices = main_notices(&world);
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice == "This host does not support archiving sessions."),
+            "the refusal does not name what the user asked for: {notices:?}",
+        );
+        remote.shutdown().await;
+    }
+
+    /// The strip's reveal, every byte of it real: an archived row is out of
+    /// the default view, the chord on the keyboard puts it back struck
+    /// through, and the same chord takes it away again.
+    #[tokio::test]
+    async fn the_reveal_chord_shows_the_archived_rows() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        run_prompt(&mut world, "seed").await;
+        let home = world.session().to_string();
+        let put_away = world
+            .control
+            .create(None, None, None, None)
+            .await
+            .expect("a second session");
+        world
+            .control
+            .command(&put_away, Command::Archive { archived: true })
+            .await
+            .expect("archive the session nobody is in");
+        assert!(
+            poll_directory_row(&mut world, &put_away, |row| row.archived).await,
+            "the peer never published the bit",
+        );
+        shell.borrow().sidebar.borrow_mut().toggled = true;
+        shell.borrow().sidebar.borrow_mut().visible = true;
+        sync_sidebar(&world, &shell);
+        assert!(
+            strip_row_ids(&shell).contains(&home),
+            "the strip is not showing the session on screen: {:?}",
+            strip_row_ids(&shell),
+        );
+        assert!(
+            !strip_row_ids(&shell).contains(&put_away),
+            "an archived row is in the default view: {:?}",
+            strip_row_ids(&shell),
+        );
+
+        let (mut app, mut writer, _root) = app_over(&shell).await;
+        writer
+            .write_all(&chord_bytes(AjAction::SidebarArchived))
+            .expect("the reveal chord");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        sync_sidebar(&world, &shell);
+        let revealed = strip_row_ids(&shell);
+        let at = revealed
+            .iter()
+            .position(|id| id == &put_away)
+            .unwrap_or_else(|| panic!("the chord revealed nothing: {revealed:?}"));
+        // The strip draws one line per displayed row, in the row set's order,
+        // and this peer serves one unlabelled group so no header shifts them.
+        let painted = strip_lines_painted(&shell);
+        assert!(
+            painted[at][3].style.strikethrough,
+            "the revealed row draws like any other row",
+        );
+        let home_at = revealed
+            .iter()
+            .position(|id| id == &home)
+            .expect("the session on screen is displayed");
+        assert!(
+            !painted[home_at][3].style.strikethrough,
+            "a row nobody archived came out struck through",
+        );
+
+        writer
+            .write_all(&chord_bytes(AjAction::SidebarArchived))
+            .expect("the reveal chord again");
+        let event = app.next_input().await.expect("input event");
+        app.handle_input(event);
+        sync_sidebar(&world, &shell);
+        assert!(
+            !strip_row_ids(&shell).contains(&put_away),
+            "the reveal only goes one way: {:?}",
+            strip_row_ids(&shell),
+        );
+        shut_down(&world).await;
     }
 
     /// A session with a turn running wears the working glyph, and a session that
@@ -17855,6 +18253,7 @@ mod tests {
             status: RowStatus::Idle,
             focused,
             attached: focused,
+            archived: false,
             last_activity: chrono::DateTime::UNIX_EPOCH,
         }
     }
@@ -17888,6 +18287,20 @@ mod tests {
         crate::test_support::flatten(&surface)
             .into_iter()
             .map(|row| row.into_iter().take(usize::from(SIDEBAR_COLS)).collect())
+            .collect()
+    }
+
+    /// The sessions the strip is displaying, in its order: the row set the
+    /// loop's sync built, which is what the filters answer. Read rather than
+    /// the painted labels, which carry a minted id's time of day alone.
+    fn strip_row_ids(shell: &Rc<RefCell<Shell>>) -> Vec<String> {
+        shell
+            .borrow()
+            .sidebar
+            .borrow()
+            .rows
+            .iter()
+            .map(|row| row.id.clone())
             .collect()
     }
 

@@ -139,6 +139,40 @@ pub const ACTION_SESSION_NEW: &str = "aj.session.new";
 /// removing one.
 pub const ACTION_SESSION_TAG: &str = "aj.session.tag";
 
+/// Archives the focused session, or unarchives one already archived. Default
+/// binding: `alt+h`.
+///
+/// NOTE: `h` for hide, the letter "archive" has left free (`alt+a` is the
+/// agent picker, `alt+r` the tag editor), and what the row does is what the
+/// user is asking for. It joins the sidebar's `alt` cluster with the rest of
+/// the strip's interactions.
+///
+/// The bit is display metadata: it hides the row and nothing else, so the
+/// gesture is allowed whatever the session is doing, and a turn inside an
+/// archived session runs to its end. Explicit in both directions, since
+/// nothing else ever sets or clears it.
+pub const ACTION_SESSION_ARCHIVE: &str = "aj.session.archive";
+
+/// Shows the archived sessions in the sidebar, or hides them again. Default
+/// binding: `alt+u`.
+///
+/// NOTE: `u` for unhide, paired with the `alt+h` that put a row away.
+///
+/// A view mode of the strip and nothing more: it lapses with the process and
+/// changes no session. Revealed rows draw in their own places, struck through
+/// (see [`ACTION_SESSION_ARCHIVE`]).
+pub const ACTION_SIDEBAR_ARCHIVED: &str = "aj.sidebar.archived";
+
+/// Shows the archived sessions in the session selector, or hides them again.
+/// Default binding: `ctrl+t`. Handled inside the selector overlay
+/// (contextual; only the focused selector reads it), which is the same key and
+/// feel as the prompt-history and agent-picker scope toggles.
+///
+/// The selector's own control rather than the sidebar's reveal reaching into
+/// it: the overlay is a picker over this machine's store and it answers for
+/// what it lists, so the toggle is part of it and its chord is on its footer.
+pub const ACTION_SESSION_TOGGLE_ARCHIVED: &str = "aj.session.toggle_archived";
+
 /// Toggles the agent picker between showing only running sub-agents
 /// and all sub-agents in the session. Default binding: `ctrl+t`.
 /// Handled inside the agent-picker overlay (contextual; only the
@@ -321,6 +355,21 @@ pub const AJ_KEYBINDINGS: &[(&str, &str, &str)] = &[
         "Create and focus a new session",
     ),
     (ACTION_SESSION_TAG, "alt+r", "Tag the focused session"),
+    (
+        ACTION_SESSION_ARCHIVE,
+        "alt+h",
+        "Archive or unarchive the focused session",
+    ),
+    (
+        ACTION_SIDEBAR_ARCHIVED,
+        "alt+u",
+        "Show or hide archived sessions in the sidebar",
+    ),
+    (
+        ACTION_SESSION_TOGGLE_ARCHIVED,
+        "ctrl+t",
+        "Show or hide archived sessions (session selector)",
+    ),
     (
         ACTION_AGENT_TOGGLE_SCOPE,
         "ctrl+t",
