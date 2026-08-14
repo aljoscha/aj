@@ -649,6 +649,7 @@ mod tests {
             tag: None,
             host: None,
             unreachable: false,
+            archived: false,
         }
     }
 

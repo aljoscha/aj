@@ -896,6 +896,7 @@ impl SessionHost {
                         // (spec 6.8). Every row here is this host's own.
                         host: None,
                         unreachable: false,
+                        archived: false,
                     },
                 )
             })
@@ -1821,6 +1822,7 @@ fn summarize(session: &Arc<LiveSession>) -> SessionSummary {
         tag: status.tag.clone(),
         host: None,
         unreachable: false,
+        archived: false,
     }
 }
 

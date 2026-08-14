@@ -2,9 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
 use aj_wire::{
-    CancelRequest, CompactRequest, CreateSessionRequest, Cursor, DecodedAgentEvent, DecodedFrame,
-    DirectoryHost, EnrollHostRequest, ErrorResponse, Frame, HeadRequest, Hello, HostList,
-    HostSource, HostSummary, MergedDirectory, ModelSelection, PromptInput, PromptRequest,
+    ArchiveRequest, CancelRequest, CompactRequest, CreateSessionRequest, Cursor, DecodedAgentEvent,
+    DecodedFrame, DirectoryHost, EnrollHostRequest, ErrorResponse, Frame, HeadRequest, Hello,
+    HostList, HostSource, HostSummary, MergedDirectory, ModelSelection, PromptInput, PromptRequest,
     QueueCounts, QueueOperation, QueueOutcome, QueueRequest, QueueState, RawObject, SessionCreated,
     SessionList, SessionSettings, SessionSummary, SessionTree, SettingsRequest, SteerRequest,
     TagRequest, TaskDetails, TaskTable, VmList,
@@ -1699,6 +1699,7 @@ fn a_rows_tag_and_host_are_absent_rather_than_empty() {
         tag: None,
         host: None,
         unreachable: false,
+        archived: false,
     };
     let encoded = serde_json::to_value(&row).expect("the row serializes");
     assert!(
@@ -1722,6 +1723,72 @@ fn a_rows_tag_and_host_are_absent_rather_than_empty() {
     assert_eq!(
         serde_json::from_value::<SessionSummary>(encoded).expect("it decodes again"),
         labelled,
+    );
+}
+
+/// A row says it is archived only when it is, and a row that says nothing is
+/// not: absent reads as unarchived, which is what every row an older host
+/// wrote says, and what keeps the key off the great majority of rows (spec
+/// 6.8, 6.10).
+///
+/// The bit is orthogonal to liveness. The fixture's archived row is the live
+/// one deliberately: archiving a session that is up and working is allowed and
+/// changes nothing but this field.
+#[test]
+fn an_archived_row_says_so_and_an_unarchived_one_stays_silent() {
+    let list: SessionList = serde_json::from_value(fixture("models")["session_list"].clone())
+        .expect("the pinned session list decodes");
+    let [archived, plain] = &list.sessions[..] else {
+        panic!("the fixture pins one archived row and one that is not");
+    };
+    assert_eq!((archived.archived, archived.live), (true, true));
+    assert!(!plain.archived, "a row with no key is not archived");
+
+    let row = SessionSummary {
+        archived: false,
+        ..pinned_row()
+    };
+    let encoded = serde_json::to_value(&row).expect("the row serializes");
+    assert!(
+        encoded.get("archived").is_none(),
+        "an unarchived row emits no key: {encoded}",
+    );
+    assert_eq!(
+        serde_json::from_value::<SessionSummary>(encoded).expect("it decodes again"),
+        row,
+        "and a row lacking the key reads back as unarchived",
+    );
+
+    let put_away = SessionSummary {
+        archived: true,
+        ..row
+    };
+    let encoded = serde_json::to_value(&put_away).expect("the row serializes");
+    assert_eq!(encoded["archived"], json!(true));
+    assert_eq!(
+        serde_json::from_value::<SessionSummary>(encoded).expect("it decodes again"),
+        put_away,
+    );
+}
+
+/// The archive command's body: one bool, where `false` unarchives (spec 6.6),
+/// so a client needs no second route to put a session back. A blank body is
+/// the same request, which is what the server's `{}` default reads it as.
+#[test]
+fn an_archive_request_carries_one_bool_and_defaults_to_unarchiving() {
+    assert_eq!(
+        serde_json::to_value(ArchiveRequest { archived: true }).unwrap(),
+        json!({"archived": true}),
+    );
+    assert_eq!(
+        serde_json::from_value::<ArchiveRequest>(json!({})).unwrap(),
+        ArchiveRequest::default(),
+    );
+    assert!(!ArchiveRequest::default().archived);
+    assert!(
+        serde_json::from_value::<ArchiveRequest>(json!({"archived": false, "extra": 1}))
+            .is_ok_and(|request| !request.archived),
+        "a field this build has no type for is ignored (spec 6.10)",
     );
 }
 
