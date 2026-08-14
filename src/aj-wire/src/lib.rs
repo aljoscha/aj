@@ -19,6 +19,14 @@ use serde_json::value::RawValue;
 /// The current remote-control protocol version.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// The capability a host declares when it serves `POST
+/// /v1/sessions/{id}/archive` (spec 6.10).
+///
+/// Honest self-description, not a gate: a client attempts the route and reads
+/// a 404 as "this host does not archive", because a gateway's own hello cannot
+/// speak for the hosts behind it.
+pub const ARCHIVE_CAPABILITY: &str = "archive";
+
 /// A creator-selected model, resolved against the receiving host's catalog.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelSelection {
@@ -208,6 +216,16 @@ pub struct TagRequest {
     pub tag: String,
 }
 
+/// Sets or clears a session's archived bit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveRequest {
+    /// The bit to leave the session with. `false` unarchives, so setting and
+    /// clearing are one route, and an absent field reads as `false` the same
+    /// way a blank [`TagRequest`] clears a label.
+    #[serde(default)]
+    pub archived: bool,
+}
+
 /// Server identity and supported protocol features.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
@@ -271,6 +289,24 @@ pub struct SessionSummary {
     pub host: Option<String>,
     #[serde(default)]
     pub unreachable: bool,
+    /// Whether the user has put the session away.
+    ///
+    /// Display metadata with no lifecycle meaning: an archived session keeps
+    /// its log, its lock and any turn it is running. It changes only by the
+    /// archive command, so nothing a session does clears it, and what a client
+    /// makes of it is the client's own business.
+    ///
+    /// Absent reads as unarchived, which is what an older host's rows say and
+    /// what the great majority of rows say, so the key is written only when it
+    /// is set.
+    #[serde(default, skip_serializing_if = "not_archived")]
+    pub archived: bool,
+}
+
+/// Unarchived reads as absent, so a row carries the key only when the session
+/// is put away.
+fn not_archived(archived: &bool) -> bool {
+    !archived
 }
 
 /// The complete session directory returned by the sessions read.

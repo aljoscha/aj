@@ -479,6 +479,7 @@ impl Driver {
             Command::Compact { instructions } => self.compact(instructions),
             Command::Settings(change) => self.settings(change).await,
             Command::Tag { tag } => self.tag(tag),
+            Command::Archive { archived } => self.archive(archived),
             Command::Head { target } => self.head_switch(target).await,
             Command::KillTask { task } => self.kill_task(task),
         }
@@ -609,6 +610,29 @@ impl Driver {
         // After the write, so a sidecar that would not be written leaves the
         // row saying what the store still says.
         self.session.status().tag = tag;
+        self.shared.fanout.mark_list_dirty();
+        Ok(CommandOutcome::Accepted)
+    }
+
+    /// Write the session's archived sidecar and put the new bit on its row.
+    ///
+    /// Here rather than at the host's surface for the reason [`Self::tag`]
+    /// gives: this task holds the session's advisory lock, which is what
+    /// orders two writers of one store on a session's sidecars.
+    ///
+    /// The bit is display metadata and nothing else, so this appends no log
+    /// entry, publishes no `state` frame, and touches nothing about the
+    /// session's life: a session working through a turn goes on working,
+    /// archived. Nothing else in this driver writes it either, so a prompt to
+    /// an archived session leaves it archived.
+    fn archive(&self, archived: bool) -> Result<CommandOutcome, HostError> {
+        self.shared
+            .persistence
+            .write_archived(self.session.id(), archived)
+            .map_err(internal)?;
+        // After the write, so a sidecar that would not be written leaves the
+        // row saying what the store still says.
+        self.session.status().archived = archived;
         self.shared.fanout.mark_list_dirty();
         Ok(CommandOutcome::Accepted)
     }
@@ -1140,14 +1164,15 @@ impl Driver {
         // The status lock nests under the log lock here. That is the order the
         // driver always takes them in, and nothing takes the log lock while
         // holding the status.
-        let (last_activity, tag) = {
+        let (last_activity, tag, archived) = {
             let status = self.session.status();
-            (status.last_activity, status.tag.clone())
+            (status.last_activity, status.tag.clone(), status.archived)
         };
         Some(ReleasedRow {
             file,
             last_activity,
             tag,
+            archived,
         })
     }
 }

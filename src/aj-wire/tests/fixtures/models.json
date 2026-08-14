@@ -18,7 +18,8 @@
         "last_activity": "2026-08-03T12:00:00Z",
         "tag": "fix-auth",
         "host": "workstation",
-        "unreachable": false
+        "unreachable": false,
+        "archived": true
       },
       {
         "id": "session-0",

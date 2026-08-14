@@ -878,6 +878,154 @@ fn newer_row(row: &SessionSummary, extra: &str) -> String {
     format!("{},{extra}}}", &known[..known.len() - 1])
 }
 
+/// An archived row reaches a client archived. The bit is not one of the three
+/// fields a gateway owns, so it travels as the host wrote it, through the merge
+/// where two hosts' rows meet.
+///
+/// Two hosts, and only one of them archived, so a merge that set the field for
+/// everyone would fail here rather than pass by accident.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_archived_row_reaches_a_client_archived() {
+    let left = FakeHost::with_rows(
+        "left",
+        Script::Frames(Vec::new()),
+        vec![
+            serde_json::to_string(&SessionSummary {
+                archived: true,
+                ..fake_row("s-2")
+            })
+            .expect("a row"),
+        ],
+    )
+    .await;
+    let right = FakeHost::with_rows(
+        "right",
+        Script::Frames(Vec::new()),
+        vec![serde_json::to_string(&fake_row("s-1")).expect("a row")],
+    )
+    .await;
+    let fixture = Fixture::tuned(
+        TempDir::new().expect("tempdir"),
+        vec![left.address.clone(), right.address.clone()],
+        tuning(),
+    )
+    .await;
+    fixture
+        .until("both hosts' rows", |list| {
+            (list.sessions.len() == 2).then_some(())
+        })
+        .await;
+
+    let mut events = fixture.attach(&[]).await;
+    let seen = decoded_until(&mut events, "the merged directory", |frame| {
+        list_frame(frame).is_some_and(|(rows, _)| rows.len() == 2)
+    })
+    .await;
+    let (carried, _) = seen
+        .iter()
+        .rev()
+        .find_map(list_frame)
+        .expect("a list frame with both rows");
+    assert_eq!(
+        carried
+            .iter()
+            .map(|row| (row.id.as_str(), row.archived))
+            .collect::<Vec<_>>(),
+        vec![("left:s-2", true), ("right:s-1", false)],
+        "the archived host's row is archived and the other host's is not",
+    );
+
+    // The sessions read is the same composition, so it carries the same rows.
+    let read: SessionList = fixture
+        .http
+        .get(format!("{}/v1/sessions", fixture.server.url()))
+        .send()
+        .await
+        .expect("the sessions read")
+        .json()
+        .await
+        .expect("a directory");
+    assert_eq!(
+        read.sessions
+            .iter()
+            .map(|row| (row.id.as_str(), row.archived))
+            .collect::<Vec<_>>(),
+        vec![("left:s-2", true), ("right:s-1", false)],
+        "a client that reads the directory sees what a client watching it sees",
+    );
+
+    fixture.shutdown().await;
+    left.stop();
+    right.stop();
+}
+
+/// An archive lands on the host that owns the session, through a gateway that
+/// knows nothing about the route: per-session requests are proxied by the
+/// namespace, not by an enumeration of the routes this build has heard of
+/// (spec 6.10, 7.1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_archive_reaches_the_owning_host_through_a_gateway() {
+    let mut left = Upstream::start().await;
+    let mut right = Upstream::start().await;
+    let session = left.create().await;
+    let elsewhere = right.create().await;
+    let fixture = Fixture::new(&[&left, &right]).await;
+    fixture.row(&left.namespaced(&session)).await;
+
+    let response = fixture
+        .http
+        .post(format!(
+            "{}/v1/sessions/{}/archive",
+            fixture.server.url(),
+            left.namespaced(&session)
+        ))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(r#"{"archived":true}"#)
+        .send()
+        .await
+        .expect("the archive request");
+
+    // The owning host's own directory is read before the response is unwrapped,
+    // so a request that never arrived fails on the session it did not archive
+    // rather than on the shape of the answer that came back.
+    assert_eq!(
+        archived_ids(&left).await,
+        vec![session.clone()],
+        "the archive landed on the session it named",
+    );
+    assert!(
+        archived_ids(&right).await.is_empty(),
+        "and on no session of the host that owns nothing here: {elsewhere}",
+    );
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    // The gateway learns its rows from the host's stream, so the merged
+    // directory catches up rather than being current the moment the POST
+    // answers.
+    fixture
+        .until("the merged row to be archived", |list| {
+            list.sessions
+                .iter()
+                .find(|row| row.id == left.namespaced(&session) && row.archived)
+                .map(|_| ())
+        })
+        .await;
+
+    fixture.shutdown().await;
+    left.stop().await;
+    right.stop().await;
+}
+
+/// The archived sessions one host reports about itself, with no gateway in the
+/// way.
+async fn archived_ids(host: &Upstream) -> Vec<String> {
+    let list = host.host.sessions().await.expect("the host's directory");
+    list.sessions
+        .into_iter()
+        .filter(|row| row.archived)
+        .map(|row| row.id)
+        .collect()
+}
+
 /// A gateway marks a host's sessions unreachable while it still has their rows,
 /// and after a restart it has none: it stores no rows, deliberately (spec 7.1).
 /// The signal survives because its `list` frames name the enrolled hosts with
@@ -5227,6 +5375,7 @@ fn fake_row(id: &str) -> SessionSummary {
         tag: None,
         host: None,
         unreachable: false,
+        archived: false,
     }
 }
 

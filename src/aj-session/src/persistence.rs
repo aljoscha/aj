@@ -7,12 +7,18 @@
 
 use aj_models::types::{Message, UserContent};
 use chrono::{DateTime, NaiveDateTime, Utc};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 
 use crate::log::{ConversationEntry, ConversationEntryKind, ConversationError};
+
+/// The extension of the sidecar holding a session's label.
+const TAG_SIDECAR: &str = "tag";
+
+/// The extension of the sidecar whose existence archives a session.
+const ARCHIVED_SIDECAR: &str = "archived";
 
 /// Handles persistence operations for conversations, including listing
 /// existing session files and resolving their paths.
@@ -46,13 +52,14 @@ impl ConversationPersistence {
         self.sessions_dir.join("meta")
     }
 
-    /// The tag sidecar's path, or `None` for an id the grammar rejects.
+    /// A session's sidecar path under `extension`, or `None` for an id the
+    /// grammar rejects.
     ///
-    /// An invalid id must not become a path (see [`crate::id`]), and this is a
-    /// write path, so the check is not optional.
-    fn tag_path(&self, session_id: &str) -> Option<PathBuf> {
+    /// An invalid id must not become a path (see [`crate::id`]), and these are
+    /// write paths, so the check is not optional.
+    fn sidecar_path(&self, session_id: &str, extension: &str) -> Option<PathBuf> {
         crate::id::is_valid_session_id(session_id)
-            .then(|| self.meta_dir().join(format!("{session_id}.tag")))
+            .then(|| self.meta_dir().join(format!("{session_id}.{extension}")))
     }
 
     /// The session's tag, `Ok(None)` when it has none.
@@ -61,7 +68,7 @@ impl ConversationPersistence {
     /// go through [`Self::enumerate_tags`] instead, which finds the sidecars
     /// that exist in a single directory read.
     pub fn read_tag(&self, session_id: &str) -> Result<Option<String>, ConversationError> {
-        let Some(path) = self.tag_path(session_id) else {
+        let Some(path) = self.sidecar_path(session_id, TAG_SIDECAR) else {
             return Ok(None);
         };
         match fs::read_to_string(&path) {
@@ -88,7 +95,7 @@ impl ConversationPersistence {
     /// the tag command sets the session's row on the strength of this
     /// returning.
     pub fn write_tag(&self, session_id: &str, tag: Option<&str>) -> Result<(), ConversationError> {
-        let Some(path) = self.tag_path(session_id) else {
+        let Some(path) = self.sidecar_path(session_id, TAG_SIDECAR) else {
             return Err(ConversationError::InvalidSessionId(session_id.to_string()));
         };
         let Some(tag) = tag else {
@@ -109,6 +116,73 @@ impl ConversationPersistence {
         Ok(())
     }
 
+    /// Whether the session is archived.
+    ///
+    /// One `stat` and no read at all: the sidecar's existence is the whole
+    /// answer. Callers that list a whole store go through
+    /// [`Self::enumerate_archived`] instead, which finds the sidecars that
+    /// exist in a single directory read.
+    pub fn read_archived(&self, session_id: &str) -> Result<bool, ConversationError> {
+        let Some(path) = self.sidecar_path(session_id, ARCHIVED_SIDECAR) else {
+            return Ok(false);
+        };
+        match fs::metadata(&path) {
+            // A directory under the name is not a sidecar, which is the answer
+            // an enumeration gives for it too.
+            Ok(metadata) => Ok(metadata.is_file()),
+            // No sidecar is the unarchived case, not a failure.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Set or clear the session's archived bit by creating or removing its
+    /// sidecar.
+    ///
+    /// The existence of the file is the bit, so there is no content to tear:
+    /// the create and the remove each publish the whole answer in one
+    /// operation, and a reader sees one state or the other. Callers hold the
+    /// session's lock, which is what orders two writers.
+    ///
+    /// An id the grammar rejects is an error rather than a quiet no-op, for
+    /// the reason [`Self::write_tag`] gives: the archive command sets the
+    /// session's row on the strength of this returning.
+    pub fn write_archived(
+        &self,
+        session_id: &str,
+        archived: bool,
+    ) -> Result<(), ConversationError> {
+        let Some(path) = self.sidecar_path(session_id, ARCHIVED_SIDECAR) else {
+            return Err(ConversationError::InvalidSessionId(session_id.to_string()));
+        };
+        if !archived {
+            return match fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                // Already unarchived, which is what the caller asked for.
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                // A directory under the sidecar's name is not the bit either
+                // (see [`Self::read_archived`]), so the session already reads
+                // as unarchived and the remove had nothing to do. Raising here
+                // would refuse the state the store is in, and go on refusing
+                // it.
+                Err(_) if fs::metadata(&path).is_ok_and(|meta| !meta.is_file()) => Ok(()),
+                Err(err) => Err(err.into()),
+            };
+        }
+        fs::create_dir_all(self.meta_dir())?;
+        match fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(_) => Ok(()),
+            // Already archived, and the file holds nothing to bring up to
+            // date, so this leaves it exactly as it is.
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     /// Every tag sidecar in the store, with the fingerprint of the file it was
     /// read from.
     ///
@@ -118,17 +192,40 @@ impl ConversationPersistence {
     /// store has no `meta/` directory and costs a single failed `read_dir`,
     /// which is what makes the untagged case free (spec 6.8): a caller cannot
     /// ask per session without paying a `stat` per session.
-    pub fn enumerate_tags(&self) -> Result<Vec<TagMetadata>, ConversationError> {
+    pub fn enumerate_tags(&self) -> Result<Vec<SidecarMetadata>, ConversationError> {
+        self.enumerate_sidecars(TAG_SIDECAR)
+    }
+
+    /// Every archived sidecar in the store, with the fingerprint of the file
+    /// it was found at.
+    ///
+    /// The same shape as [`Self::enumerate_tags`], for the axis whose answer is
+    /// the file's existence: one directory read for the whole listing and no
+    /// sidecar opened at all. A store with no `meta/` directory pays a single
+    /// failed `read_dir`, and one that has the directory pays a read of it per
+    /// axis, never a `stat` per session.
+    pub fn enumerate_archived(&self) -> Result<Vec<SidecarMetadata>, ConversationError> {
+        self.enumerate_sidecars(ARCHIVED_SIDECAR)
+    }
+
+    /// The sidecars under `extension` the store holds.
+    ///
+    /// One directory read per axis, which is what keeps a listing off the
+    /// per-session `stat` a caller asking session by session would pay.
+    fn enumerate_sidecars(
+        &self,
+        extension: &str,
+    ) -> Result<Vec<SidecarMetadata>, ConversationError> {
         let meta = self.meta_dir();
         let entries = match fs::read_dir(&meta) {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(err) => return Err(err.into()),
         };
-        let mut tags = Vec::new();
+        let mut sidecars = Vec::new();
         for entry in entries {
             let path = entry?.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("tag") {
+            if path.extension().and_then(|s| s.to_str()) != Some(extension) {
                 continue;
             }
             let Some(session_id) = path.file_stem().and_then(|s| s.to_str()) else {
@@ -151,13 +248,13 @@ impl ConversationPersistence {
             let Ok(modified) = metadata.modified() else {
                 continue;
             };
-            tags.push(TagMetadata {
+            sidecars.push(SidecarMetadata {
                 session_id: session_id.to_string(),
                 modified_at: modified.into(),
                 size_bytes: metadata.len(),
             });
         }
-        Ok(tags)
+        Ok(sidecars)
     }
 
     /// The label of every tagged session in the store, keyed by session id.
@@ -189,6 +286,31 @@ impl ConversationPersistence {
                 Some((sidecar.session_id, tag))
             })
             .collect()
+    }
+
+    /// The id of every archived session in the store.
+    ///
+    /// Driven by [`Self::enumerate_archived`], so the cost is one directory
+    /// read and nothing per session: the listing is the answer, since the
+    /// sidecar's existence is the bit.
+    ///
+    /// A directory that cannot be read reports nothing archived rather than
+    /// raising, for the reason [`Self::tags_by_session`] gives: the bit is
+    /// display metadata and must not cost a listing its rows.
+    fn archived_sessions(&self) -> HashSet<String> {
+        match self.enumerate_archived() {
+            Ok(sidecars) => sidecars
+                .into_iter()
+                .map(|sidecar| sidecar.session_id)
+                .collect(),
+            Err(err) => {
+                tracing::debug!(
+                    "could not enumerate archived sidecars in {}: {err}",
+                    self.meta_dir().display()
+                );
+                HashSet::new()
+            }
+        }
     }
 
     /// Get metadata about all conversation sessions, sorted by creation
@@ -398,11 +520,13 @@ impl ConversationPersistence {
     ) -> Result<Vec<SessionPreview>, ConversationError> {
         let candidates = self.preview_candidates()?;
         let mut tags = self.tags_by_session();
+        let archived = self.archived_sessions();
         let total = candidates.len();
         let mut previews = Vec::with_capacity(total);
         for (i, (session_id, path)) in candidates.into_iter().enumerate() {
             if let Some(mut preview) = read_preview(session_id, &path, &|| false) {
                 preview.tag = tags.remove(&preview.session_id);
+                preview.archived = archived.contains(&preview.session_id);
                 previews.push(preview);
             }
             // Tick progress for every file, including the pre-refactor
@@ -443,10 +567,12 @@ impl ConversationPersistence {
                 return;
             }
         };
-        // Read once up front rather than per file: the labels are a single
-        // directory read of `meta/` (see [`Self::tags_by_session`]), and the
-        // walk they annotate is the same snapshot of the store.
+        // Read once up front rather than per file: both axes are a single
+        // directory read of `meta/` (see [`Self::tags_by_session`] and
+        // [`Self::archived_sessions`]), and the walk they annotate is the same
+        // snapshot of the store.
         let mut tags = self.tags_by_session();
+        let archived = self.archived_sessions();
         for (session_id, path) in candidates {
             if cancel() {
                 break;
@@ -460,6 +586,7 @@ impl ConversationPersistence {
                     break;
                 }
                 preview.tag = tags.remove(&preview.session_id);
+                preview.archived = archived.contains(&preview.session_id);
                 emit(vec![preview]);
             }
         }
@@ -514,12 +641,13 @@ fn read_preview(
     }
 }
 
-/// A tag sidecar the store holds, with the file state it was found at.
+/// A session sidecar the store holds, with the file state it was found at.
 ///
-/// The fingerprint is what lets a caller cache the tag it read: a sidecar whose
-/// modification time and size have not moved holds the same label.
+/// The fingerprint is what lets a caller cache what it derived from the file: a
+/// sidecar whose modification time and size have not moved holds the same
+/// answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TagMetadata {
+pub struct SidecarMetadata {
     pub session_id: String,
     pub modified_at: DateTime<Utc>,
     pub size_bytes: u64,
@@ -627,6 +755,12 @@ pub struct SessionPreview {
     /// [`ConversationPersistence::list_session_previews_streaming`]) and the
     /// per-file walk leaves it unset.
     pub tag: Option<String>,
+    /// Whether the session is archived.
+    ///
+    /// Its sidecar's existence is the bit, so the listing fills it from the
+    /// same directory read the labels come from and the per-file walk leaves
+    /// it false.
+    pub archived: bool,
 }
 
 /// Open `path`, walk every JSONL line, and assemble a
@@ -734,8 +868,9 @@ fn read_session_preview_file(
         size_bytes,
         message_count,
         first_user_message,
-        // Not in the log: the listing fills it from the tag sidecars.
+        // Not in the log: the listing fills these from the sidecars.
         tag: None,
+        archived: false,
     }))
 }
 
@@ -879,6 +1014,15 @@ mod tests {
             // Clearing is refused on the same terms: it is a write too.
             assert!(persistence.write_tag(id, None).is_err());
             assert_eq!(persistence.read_tag(id).expect("read"), None);
+            assert!(
+                matches!(
+                    persistence.write_archived(id, true),
+                    Err(ConversationError::InvalidSessionId(named)) if named == id,
+                ),
+                "{id:?} is refused by the archived write as well",
+            );
+            assert!(persistence.write_archived(id, false).is_err());
+            assert!(!persistence.read_archived(id).expect("read"));
         }
         assert!(
             !dir.path().join("meta").exists(),
@@ -983,6 +1127,164 @@ mod tests {
         assert!(
             persistence.read_tag("2024-01-01-00-00-00").is_err(),
             "and reading it is the failure the listing spares the caller",
+        );
+    }
+
+    /// The archived bit round-trips through the sidecar's existence, and
+    /// clearing removes the file. Setting it twice is the same answer, and so
+    /// is clearing a session that was never archived: the caller states the
+    /// bit it wants rather than toggling one.
+    #[test]
+    fn an_archived_bit_round_trips_and_clears() {
+        let (dir, persistence) = fixture();
+        let id = "2024-01-01-00-00-00";
+
+        assert!(
+            !persistence.read_archived(id).expect("read"),
+            "a session with no sidecar is not archived",
+        );
+
+        persistence.write_archived(id, true).expect("archive");
+        assert!(persistence.read_archived(id).expect("read"));
+        assert!(
+            dir.path()
+                .join("meta")
+                .join(format!("{id}.archived"))
+                .is_file(),
+            "the sidecar lands in meta/, beside the label's and out of the \
+             directory the logs live in",
+        );
+
+        let sidecar = dir.path().join("meta").join(format!("{id}.archived"));
+        let written_at = std::fs::metadata(&sidecar)
+            .and_then(|meta| meta.modified())
+            .expect("the sidecar's timestamp");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        persistence
+            .write_archived(id, true)
+            .expect("archiving an archived session is not an error");
+        assert!(persistence.read_archived(id).expect("read"));
+        assert_eq!(
+            std::fs::metadata(&sidecar)
+                .and_then(|meta| meta.modified())
+                .expect("the sidecar's timestamp"),
+            written_at,
+            "and it leaves the file alone rather than rewriting it",
+        );
+
+        persistence.write_archived(id, false).expect("unarchive");
+        assert!(!persistence.read_archived(id).expect("read"));
+        assert!(
+            !dir.path()
+                .join("meta")
+                .join(format!("{id}.archived"))
+                .exists(),
+            "unarchiving removes the sidecar rather than emptying it",
+        );
+        persistence
+            .write_archived(id, false)
+            .expect("unarchiving an unarchived session is not an error");
+    }
+
+    /// The two sidecars are two axes over one directory: archiving keeps the
+    /// label, and neither listing reports the other's files. A session is
+    /// archived by its own sidecar and by nothing else.
+    #[test]
+    fn the_archived_bit_and_the_label_are_independent() {
+        let (_dir, persistence) = fixture();
+        let tagged = "2024-01-01-00-00-00";
+        let archived = "2024-01-02-00-00-00";
+        persistence
+            .write_tag(tagged, Some("fix-auth"))
+            .expect("tag");
+        persistence.write_archived(tagged, true).expect("archive");
+        persistence.write_archived(archived, true).expect("archive");
+
+        assert_eq!(
+            persistence.read_tag(tagged).expect("read"),
+            Some("fix-auth".to_string()),
+            "archiving a session leaves its label alone",
+        );
+        assert!(
+            !persistence
+                .read_archived("2024-01-03-00-00-00")
+                .expect("read"),
+            "and a session nobody archived is not archived",
+        );
+
+        let ids = |sidecars: Vec<SidecarMetadata>| -> Vec<String> {
+            let mut ids: Vec<String> = sidecars
+                .into_iter()
+                .map(|sidecar| sidecar.session_id)
+                .collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(
+            ids(persistence.enumerate_tags().expect("enumerate")),
+            vec![tagged.to_string()],
+            "the label listing reports the tag sidecars and nothing else",
+        );
+        assert_eq!(
+            ids(persistence.enumerate_archived().expect("enumerate")),
+            vec![tagged.to_string(), archived.to_string()],
+            "and the archived listing reports the archived sidecars",
+        );
+    }
+
+    /// Enumerating the archived sessions is one directory read that opens no
+    /// file, and a store with nothing archived does not even have the
+    /// directory. A stray in `meta/` is not the bit, a directory named like a
+    /// sidecar least of all: it cannot be removed by an unarchive, so reading
+    /// it as archived would strand the session.
+    #[test]
+    fn enumerating_archived_finds_the_sidecars_that_exist() {
+        let (dir, persistence) = fixture();
+        assert!(
+            persistence
+                .enumerate_archived()
+                .expect("enumerate")
+                .is_empty(),
+            "an unarchived store has no meta directory and nothing archived",
+        );
+
+        let meta = dir.path().join("meta");
+        std::fs::create_dir_all(&meta).expect("meta");
+        std::fs::write(meta.join("notes.txt"), "not a sidecar").expect("write");
+        std::fs::write(meta.join("with slash.archived"), "invalid id").expect("write");
+        std::fs::create_dir_all(meta.join("2024-01-01-00-00-00.archived")).expect("a directory");
+
+        assert!(
+            persistence
+                .enumerate_archived()
+                .expect("enumerate")
+                .is_empty(),
+            "none of those is an archived session",
+        );
+        assert!(
+            !persistence
+                .read_archived("2024-01-01-00-00-00")
+                .expect("read"),
+            "and a directory under the name is not the bit either",
+        );
+        persistence
+            .write_archived("2024-01-01-00-00-00", false)
+            .expect("unarchiving what the store already reads as unarchived");
+
+        persistence
+            .write_archived("2024-01-02-00-00-00", true)
+            .expect("archive");
+        let found = persistence.enumerate_archived().expect("enumerate");
+        assert_eq!(
+            found
+                .iter()
+                .map(|sidecar| sidecar.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["2024-01-02-00-00-00"],
+        );
+        assert_eq!(
+            found[0].size_bytes, 0,
+            "the sidecar carries no content: its existence is the answer",
         );
     }
 
@@ -1353,6 +1655,46 @@ mod tests {
             labelled(streamed),
             expected,
             "the streaming listing labels its rows the same way",
+        );
+    }
+
+    /// A preview carries the archived bit off the sidecar directory, on both
+    /// listings. It is the only place a local listing can learn the bit: the
+    /// per-file walk reads the log, which never held it.
+    #[test]
+    fn previews_carry_the_archived_bit() {
+        let (_dir, persistence) = fixture();
+        let mut ids = Vec::new();
+        for i in 0..2 {
+            let mut log = ConversationLog::create(&persistence).expect("create");
+            append_user_then_assistant(&mut log, &format!("prompt {i}"), &format!("reply {i}"));
+            ids.push(log.session_id().to_string());
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        persistence.write_archived(&ids[1], true).expect("archive");
+
+        let filed = |previews: Vec<SessionPreview>| -> Vec<(String, bool)> {
+            let mut rows: Vec<(String, bool)> = previews
+                .into_iter()
+                .map(|preview| (preview.session_id, preview.archived))
+                .collect();
+            rows.sort();
+            rows
+        };
+        let expected = vec![(ids[0].clone(), false), (ids[1].clone(), true)];
+        assert_eq!(
+            filed(persistence.list_session_previews(|_, _| {}).expect("list")),
+            expected,
+        );
+
+        let mut streamed = Vec::new();
+        persistence.list_session_previews_streaming(&|| false, &mut |batch| {
+            streamed.extend(batch);
+        });
+        assert_eq!(
+            filed(streamed),
+            expected,
+            "the streaming listing files its rows the same way",
         );
     }
 

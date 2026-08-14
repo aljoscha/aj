@@ -1029,6 +1029,7 @@ mod tests {
             tag: None,
             host: None,
             unreachable: false,
+            archived: false,
         })
         .expect("a row is an object");
         raw.set("preview", &format!("what {id} was doing"))

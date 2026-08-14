@@ -61,7 +61,7 @@ pub use log::{
     Conversation, ConversationEntry, ConversationEntryKind, ConversationError, ConversationLog,
     EntryId, EntryRef, LogSnapshot, SessionSettings, ThreadFilter, ThreadKind,
 };
-pub use persistence::{ConversationPersistence, SessionMetadata, SessionPreview, TagMetadata};
+pub use persistence::{ConversationPersistence, SessionMetadata, SessionPreview, SidecarMetadata};
 pub use prompt_history::{
     PromptEntry, all_workspaces_history, all_workspaces_history_streaming, scan_file_user_prompts,
     workspace_history, workspace_history_streaming,

@@ -1565,6 +1565,7 @@ mod tests {
             tag: None,
             host: None,
             unreachable,
+            archived: false,
         }
     }
 

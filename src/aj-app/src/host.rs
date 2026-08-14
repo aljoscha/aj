@@ -60,9 +60,9 @@ use aj_session::{
     normalize_tag, project_suffix,
 };
 use aj_wire::{
-    AgentQueue, Cursor, DurableEvent, Frame, Hello, ModelSelection, PROTOCOL_VERSION, QueueCounts,
-    QueueState, SessionList, SessionSettings, SessionSummary, SessionTree, TaskDetails,
-    TaskSummary, TaskTable, TreeSegment,
+    ARCHIVE_CAPABILITY, AgentQueue, Cursor, DurableEvent, Frame, Hello, ModelSelection,
+    PROTOCOL_VERSION, QueueCounts, QueueState, SessionList, SessionSettings, SessionSummary,
+    SessionTree, TaskDetails, TaskSummary, TaskTable, TreeSegment,
 };
 use chrono::{DateTime, Utc};
 use tokio::sync::Mutex as TokioMutex;
@@ -308,6 +308,15 @@ pub enum Command {
     /// refused label from costing a materialization.
     Tag {
         tag: Option<String>,
+    },
+    /// Set or clear the session's archived bit.
+    ///
+    /// Display metadata and nothing else: it touches nothing about the
+    /// session's life, so a session working through a turn takes it without
+    /// interruption. Explicit in both directions, `false` unarchives, and
+    /// nothing else ever clears it.
+    Archive {
+        archived: bool,
     },
     /// Switch the session's head. Refused while work is live.
     Head {
@@ -575,12 +584,17 @@ impl SessionHost {
         Ok(Self { inner })
     }
 
-    /// Protocol identity and capabilities (spec 6.1). The capability list is
-    /// empty: everything the protocol carries today is in its base version.
+    /// Protocol identity and capabilities (spec 6.1).
+    ///
+    /// The list names the routes this host serves past the protocol-1
+    /// baseline, which spec 6.10 asks a new endpoint to arrive with. It is
+    /// self-description and not a gate: what a peer does with it is the peer's
+    /// business, and a client that simply attempts a route and reads the
+    /// refusal is following the same section.
     pub fn hello(&self) -> Hello {
         Hello {
             protocol: PROTOCOL_VERSION,
-            capabilities: Vec::new(),
+            capabilities: vec![ARCHIVE_CAPABILITY.to_string()],
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             host_id: self.inner.host_id.clone(),
             working_directory: Some(self.inner.working_directory.clone()),
@@ -896,6 +910,7 @@ impl SessionHost {
                         // (spec 6.8). Every row here is this host's own.
                         host: None,
                         unreachable: false,
+                        archived: session.archived,
                     },
                 )
             })
@@ -1507,6 +1522,18 @@ impl SessionHost {
                 self.inner.cold.label(&session_id)
             }
         };
+        // One `stat` beside it, and the same reasoning about a read that
+        // failed: the session goes live with the bit the host last knew.
+        let archived = match self.inner.persistence.read_archived(&session_id) {
+            Ok(archived) => archived,
+            Err(err) => {
+                tracing::warn!(
+                    session = session_id,
+                    "could not read whether the session is archived: {err}"
+                );
+                self.inner.cold.archived(&session_id)
+            }
+        };
         let log = core.log.lock().await;
         let status = SessionStatus {
             epoch: mint_epoch(),
@@ -1522,6 +1549,7 @@ impl SessionHost {
             driven_subs: std::collections::BTreeSet::new(),
             last_activity: self.opening_stamp(&log, &session_id),
             tag,
+            archived,
             last_work: Instant::now(),
         };
         drop(log);
@@ -1821,6 +1849,7 @@ fn summarize(session: &Arc<LiveSession>) -> SessionSummary {
         tag: status.tag.clone(),
         host: None,
         unreachable: false,
+        archived: status.archived,
     }
 }
 

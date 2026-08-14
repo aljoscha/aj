@@ -84,6 +84,9 @@ pub(crate) struct ReleasedRow {
     /// without waiting for an enumeration. A tag set while the session was
     /// live is newer than anything the directory cache read.
     pub(crate) tag: Option<String>,
+    /// The session's archived bit as the driver held it, for the same reason
+    /// and on the same terms as [`Self::tag`].
+    pub(crate) archived: bool,
 }
 
 /// The per-session state the host publishes, readable without awaiting.
@@ -140,6 +143,13 @@ pub(crate) struct SessionStatus {
     /// Held here so a directory refresh, which runs on a coalescing tick, can
     /// answer for a live session without going near the filesystem.
     pub(crate) tag: Option<String>,
+    /// Whether the user has put the session away, read from its sidecar at
+    /// materialization and kept current by the archive command.
+    ///
+    /// Held here for the same reason [`Self::tag`] is. Display metadata with
+    /// no lifecycle meaning: nothing in this module consults it, and no turn,
+    /// release or head switch changes it.
+    pub(crate) archived: bool,
     /// The same instant on the monotonic clock, for the host's own release
     /// timer.
     ///
