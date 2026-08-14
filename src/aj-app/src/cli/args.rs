@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 
 use aj_session::{TagError, normalize_tag};
+use aj_wire::{HostNameError, normalize_host_name};
 use clap::{Parser, Subcommand, ValueEnum};
 
 /// Top-level CLI for the `aj` binary.
@@ -132,6 +133,18 @@ pub struct Args {
     #[arg(long, global = true)]
     pub tag: Option<String>,
 
+    /// Name the host this run serves, shown in place of its id wherever a
+    /// client lists hosts.
+    ///
+    /// Global like the other control-port flags, since any run that binds one
+    /// is a host. A run that serves nothing carries the name to no effect.
+    ///
+    /// Absent, the host names itself after its working directory, `~`-
+    /// abbreviated under home. That is a fallback: a fleet of clones is
+    /// easier to read with names its operator chose.
+    #[arg(long, global = true, env = "AJ_NAME")]
+    pub name: Option<String>,
+
     /// Subcommand selector for the non-conversational utilities
     /// (`list-sessions`, `continue`, `update-models`) and the
     /// remote-control modes (`serve`, `connect`).
@@ -150,6 +163,20 @@ impl Args {
     pub fn launch_tag(&self) -> Result<Option<String>, TagError> {
         match &self.tag {
             Some(tag) => normalize_tag(tag),
+            None => Ok(None),
+        }
+    }
+
+    /// The validated `--name` value for the host this run serves.
+    ///
+    /// `Ok(None)` covers both "no flag" and a flag whose value names nothing,
+    /// which is what leaves the host to derive a name from its working
+    /// directory. Validated here for the reason [`Self::launch_tag`] is: a
+    /// name a peer would refuse to render never reaches the wire, and the
+    /// refusal reads before anything is served.
+    pub fn host_name(&self) -> Result<Option<String>, HostNameError> {
+        match &self.name {
+            Some(name) => normalize_host_name(name),
             None => Ok(None),
         }
     }
@@ -467,5 +494,52 @@ mod tests {
         assert!(!parse(&["aj"]).has_launch_tag());
         assert!(!parse(&["aj", "--tag", "   "]).has_launch_tag());
         assert!(!parse(&["aj", "--tag", "two\nlines"]).has_launch_tag());
+    }
+
+    /// `--name` is global like the control-port flags it belongs with, since
+    /// any run that binds a port is a host worth naming.
+    #[test]
+    fn the_name_flag_parses_on_either_side_of_a_subcommand() {
+        for argv in [
+            ["aj", "--name", "umber/aj", "serve"],
+            ["aj", "serve", "--name", "umber/aj"],
+        ] {
+            let args = parse(&argv);
+            assert_eq!(
+                args.host_name(),
+                Ok(Some("umber/aj".to_string())),
+                "{argv:?}",
+            );
+        }
+        assert_eq!(
+            parse(&["aj", "serve"]).host_name(),
+            Ok(None),
+            "no flag, and the host derives its own",
+        );
+    }
+
+    /// A name no peer would render is refused where the operator typed it, so
+    /// the host never comes up under one. The trim and the blank-names-nothing
+    /// rule are the ones the wire applies.
+    #[test]
+    fn an_illegal_name_is_refused_at_the_flag() {
+        assert_eq!(
+            parse(&["aj", "--name", "two\nlines"]).host_name(),
+            Err(HostNameError::Control),
+        );
+        let long = "a".repeat(aj_wire::MAX_HOST_NAME_BYTES + 1);
+        assert!(matches!(
+            parse(&["aj", "--name", &long]).host_name(),
+            Err(HostNameError::TooLong { .. }),
+        ));
+        assert_eq!(
+            parse(&["aj", "--name", "  spaced  "]).host_name(),
+            Ok(Some("spaced".to_string())),
+        );
+        assert_eq!(
+            parse(&["aj", "--name", "   "]).host_name(),
+            Ok(None),
+            "a flag that names nothing leaves the derivation to it",
+        );
     }
 }

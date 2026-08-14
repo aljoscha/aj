@@ -908,6 +908,7 @@ fn merge(hosts: &BTreeMap<HostAddress, Enrollment>) -> MergedDirectory {
             // A label only, and only where there is no id to label with. An
             // address is not something a client can address a session by.
             address: enrollment.host_id.is_none().then(|| address.to_string()),
+            name: None,
             unreachable: !enrollment.connected,
         });
         // A host that has never answered has no id to namespace with, so its
@@ -1197,6 +1198,7 @@ mod tests {
             vec![DirectoryHost {
                 id: None,
                 address: Some(address.to_string()),
+                name: None,
                 unreachable: true,
             }],
             "a client has a group to render, and nothing in the id position: an \
@@ -1232,6 +1234,7 @@ mod tests {
             vec![DirectoryHost {
                 id: Some("learned".to_string()),
                 address: None,
+                name: None,
                 unreachable: true,
             }],
             "and its group is keyed by that id, with no address left to label by",
@@ -1434,6 +1437,7 @@ mod tests {
             vec![DirectoryHost {
                 id: Some("after".to_string()),
                 address: None,
+                name: None,
                 unreachable: true,
             }],
             "the group is the new identity's, and nothing about that one is \

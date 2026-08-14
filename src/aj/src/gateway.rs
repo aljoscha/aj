@@ -315,6 +315,10 @@ impl Gateway {
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             host_id: self.inner.id.clone(),
             working_directory: None,
+            // A gateway names the hosts behind it and not itself: there is no
+            // group header for a gateway to label, and a client that reached
+            // one addressed it directly.
+            name: None,
         }
     }
 

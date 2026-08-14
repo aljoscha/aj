@@ -136,6 +136,7 @@ impl Harness {
             persistence: persistence.clone(),
             auth: AuthStorage::new(dir.path().join("auth.json")),
             working_directory: dir.path().to_path_buf(),
+            name: None,
             idle_grace,
             live_capacity,
         })
@@ -193,6 +194,7 @@ impl Harness {
             persistence: self.persistence.clone(),
             auth: AuthStorage::new(dir.path().join("auth.json")),
             working_directory: dir.path().to_path_buf(),
+            name: None,
             idle_grace,
             live_capacity: None,
         })
@@ -1568,12 +1570,63 @@ async fn the_host_id_is_claimed_not_written_over() {
         persistence: harness.persistence.clone(),
         auth: AuthStorage::new(harness._dir.path().join("auth.json")),
         working_directory: harness._dir.path().to_path_buf(),
+        name: None,
         idle_grace: None,
         live_capacity: None,
     })
     .err()
     .expect("a blank host id is refused");
     assert!(err.to_string().contains("empty"), "got {err}");
+    harness.host.shutdown().await;
+}
+
+/// A host states a name for a reader beside the id it is addressed by: what
+/// it was given, else one it derives from the working directory it serves.
+///
+/// The id keeps its job either way. A name is a label, and a host that could
+/// not make one reports none rather than a placeholder.
+#[tokio::test]
+async fn a_host_reports_the_name_it_was_given_or_derives_one() {
+    let harness = Harness::new(Vec::new());
+    let hello = harness.host.hello();
+    let derived = hello.name.expect("a host with no name given derives one");
+    let directory = harness
+        ._dir
+        .path()
+        .file_name()
+        .expect("the temp directory has a name")
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        derived.ends_with(&directory),
+        "{derived:?} is this host's own working directory, not a constant",
+    );
+
+    let named = SessionHost::new(HostSetup {
+        config: Arc::new(StdMutex::new(Config::default())),
+        layers: Arc::new(StdMutex::new(ConfigLayers {
+            user: Config::default(),
+            project: ConfigLayer::default(),
+            project_path: None,
+        })),
+        catalog: Arc::new(Vec::new()),
+        run_config: snapshot(scripted(Vec::new(), 0, Duration::ZERO)),
+        restore: None,
+        persistence: harness.persistence.clone(),
+        auth: AuthStorage::new(harness._dir.path().join("auth.json")),
+        working_directory: harness._dir.path().to_path_buf(),
+        name: Some("the-fleet-host".to_string()),
+        idle_grace: None,
+        live_capacity: None,
+    })
+    .expect("a host over the claimed store");
+    assert_eq!(
+        named.hello().name.as_deref(),
+        Some("the-fleet-host"),
+        "a stated name is reported as stated, and the derivation stays out of it",
+    );
+
+    named.shutdown().await;
     harness.host.shutdown().await;
 }
 

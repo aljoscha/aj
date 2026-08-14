@@ -677,6 +677,7 @@ mod tests {
         DirectoryHost {
             id: Some(id.to_string()),
             address: None,
+            name: None,
             unreachable,
         }
     }
@@ -687,6 +688,7 @@ mod tests {
         DirectoryHost {
             id: None,
             address: Some(address.to_string()),
+            name: None,
             unreachable: true,
         }
     }

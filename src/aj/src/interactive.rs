@@ -16874,16 +16874,19 @@ mod tests {
             aj_wire::DirectoryHost {
                 id: Some("builder-1".to_string()),
                 address: None,
+                name: None,
                 unreachable: false,
             },
             aj_wire::DirectoryHost {
                 id: Some("laptop".to_string()),
                 address: None,
+                name: None,
                 unreachable: true,
             },
             aj_wire::DirectoryHost {
                 id: None,
                 address: Some("10.0.0.7:7777".to_string()),
+                name: None,
                 unreachable: true,
             },
         ];
@@ -16924,6 +16927,7 @@ mod tests {
             aj_wire::DirectoryHost {
                 id: Some("builder-2".to_string()),
                 address: None,
+                name: None,
                 unreachable: false,
             },
         ];

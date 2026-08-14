@@ -9,12 +9,12 @@ use crate::schema::{Config, ConfigError};
 
 /// The user's home directory from `$HOME`, or `None` when it is unset.
 ///
-/// The single place this crate reads `$HOME`. Each caller adapts the
+/// The single place `$HOME` is read. Each caller adapts the
 /// `None` case to its own policy: [`Config::get_config_dir`] turns it
 /// into [`ConfigError::HomeNotFound`], path display falls back to the
 /// unabbreviated path, and instruction/skill discovery skips the
 /// user-level lookup.
-pub(crate) fn home_dir() -> Option<PathBuf> {
+pub fn home_dir() -> Option<PathBuf> {
     env::var("HOME").ok().map(PathBuf::from)
 }
 
@@ -69,11 +69,18 @@ pub fn display_path(path: &Path) -> String {
     display_path_with_home(path, home_dir().as_deref())
 }
 
-fn display_path_with_home(path: &Path, home: Option<&Path>) -> String {
-    if let Some(home) = home {
-        if let Ok(rel) = path.strip_prefix(&home) {
-            return format!("~/{}", rel.display());
+/// [`display_path`] against a given home, for a caller that knows one and for
+/// tests that must not read the environment.
+pub fn display_path_with_home(path: &Path, home: Option<&Path>) -> String {
+    if let Some(home) = home
+        && let Ok(rel) = path.strip_prefix(home)
+    {
+        if rel.as_os_str().is_empty() {
+            // The home directory itself, where `~/` would trail a separator
+            // over nothing.
+            return "~".to_string();
         }
+        return format!("~/{}", rel.display());
     }
     path.display().to_string()
 }
@@ -256,6 +263,11 @@ mod tests {
         assert_eq!(
             display_path_with_home(&inside, None),
             inside.display().to_string()
+        );
+        assert_eq!(
+            display_path_with_home(home, Some(home)),
+            "~",
+            "the home directory itself is the whole abbreviation, with nothing after it",
         );
     }
 

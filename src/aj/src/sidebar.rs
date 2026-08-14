@@ -2300,6 +2300,7 @@ mod tests {
         let both = DirectoryHost {
             id: Some("builder-2".to_string()),
             address: Some("10.0.0.8:7777".to_string()),
+            name: None,
             unreachable: true,
         };
         let lines = folded(&[], &[learned("builder-1", false), both], 20);
@@ -2396,6 +2397,7 @@ mod tests {
         let nameless = DirectoryHost {
             id: None,
             address: None,
+            name: None,
             unreachable: true,
         };
         let lines = folded(&[], &[learned("builder-1", true), nameless], 20);
@@ -3254,6 +3256,7 @@ mod tests {
         DirectoryHost {
             id: Some(id.to_string()),
             address: None,
+            name: None,
             unreachable,
         }
     }
@@ -3264,6 +3267,7 @@ mod tests {
         DirectoryHost {
             id: None,
             address: Some(address.to_string()),
+            name: None,
             unreachable: true,
         }
     }

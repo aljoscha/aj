@@ -4,10 +4,11 @@ use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
 use aj_wire::{
     ArchiveRequest, CancelRequest, CompactRequest, CreateSessionRequest, Cursor, DecodedAgentEvent,
     DecodedFrame, DirectoryHost, EnrollHostRequest, ErrorResponse, Frame, HeadRequest, Hello,
-    HostList, HostSource, HostSummary, MergedDirectory, ModelSelection, PromptInput, PromptRequest,
-    QueueCounts, QueueOperation, QueueOutcome, QueueRequest, QueueState, RawObject, SessionCreated,
-    SessionList, SessionSettings, SessionSummary, SessionTree, SettingsRequest, SteerRequest,
-    TagRequest, TaskDetails, TaskTable, VmList,
+    HostList, HostNameError, HostSource, HostSummary, MAX_HOST_NAME_BYTES, MergedDirectory,
+    ModelSelection, PromptInput, PromptRequest, QueueCounts, QueueOperation, QueueOutcome,
+    QueueRequest, QueueState, RawObject, SessionCreated, SessionList, SessionSettings,
+    SessionSummary, SessionTree, SettingsRequest, SteerRequest, TagRequest, TaskDetails, TaskTable,
+    VmList, normalize_host_name,
 };
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
@@ -1326,7 +1327,8 @@ fn raw_objects_compare_on_the_text_they_would_emit() {
 /// A host is named by exactly one of `id` and `address`: the id once the gateway
 /// has spoken to it, and the address it is enrolled at until then. Which one it
 /// is is what tells a client "an empty group labelled by address, no id yet"
-/// from "a group whose sessions it can address".
+/// from "a group whose sessions it can address". A `name` rides on top of
+/// either, for the host that reported one.
 #[test]
 fn a_list_frame_names_the_hosts_a_gateway_enrolled() {
     let frame: DecodedFrame = serde_json::from_value(fixture("frames")[5].clone())
@@ -1342,16 +1344,19 @@ fn a_list_frame_names_the_hosts_a_gateway_enrolled() {
         DirectoryHost {
             id: Some("workstation".to_string()),
             address: None,
+            name: Some("~/work/lewitt/aj".to_string()),
             unreachable: false,
         },
         DirectoryHost {
             id: Some("laptop".to_string()),
             address: None,
+            name: None,
             unreachable: true,
         },
         DirectoryHost {
             id: None,
             address: Some("http://100.64.0.9:6161".to_string()),
+            name: None,
             unreachable: true,
         },
     ];
@@ -1416,11 +1421,13 @@ fn a_merged_directory_writes_the_read_and_the_frame_from_one_value() {
             DirectoryHost {
                 id: Some("left".to_string()),
                 address: None,
+                name: None,
                 unreachable: false,
             },
             DirectoryHost {
                 id: Some("right".to_string()),
                 address: None,
+                name: None,
                 unreachable: true,
             },
         ],
@@ -1638,6 +1645,100 @@ fn non_event_wire_models_have_pinned_round_trip_fixtures() {
     assert_round_trip::<HostList>(&fixtures["hosts"]);
     assert_round_trip::<VmList>(&fixtures["vms"]);
     assert_round_trip::<ErrorResponse>(&fixtures["error"]);
+}
+
+/// The name a host reports for itself is display metadata it may not have: an
+/// older host says nothing, and neither does one whose working directory made
+/// no legal name. Absent is a key that is not there rather than an empty
+/// string, in both directions, so a reader can tell "no name" from "a name
+/// that is blank" and fall back to the id for the one case that means it.
+#[test]
+fn a_hosts_name_is_absent_rather_than_empty() {
+    let hello: Hello = serde_json::from_value(fixture("models")["hello"].clone())
+        .expect("the pinned hello decodes");
+    assert_eq!(hello.name.as_deref(), Some("~/work/project"));
+
+    let nameless = Hello {
+        name: None,
+        ..hello.clone()
+    };
+    let written = serde_json::to_value(&nameless).expect("a nameless hello serializes");
+    assert!(
+        written.get("name").is_none(),
+        "an absent name is an absent key and never a null or an empty string: {written}",
+    );
+    let older: Hello = serde_json::from_value(written).expect("a hello with no name decodes");
+    assert_eq!(older.name, None);
+}
+
+/// A field this build has never heard of does not cost the handshake, which
+/// is what makes a name additive: it reached older clients as an unknown key
+/// before they had a type for it (spec 6.10).
+#[test]
+fn a_hello_from_a_newer_host_still_decodes_with_its_name() {
+    let mut newer = fixture("models")["hello"].clone();
+    newer["fleet"] = json!({"region": "eu", "weight": 3});
+
+    let decoded: Hello =
+        serde_json::from_value(newer).expect("a hello with unknown fields decodes");
+    assert_eq!(
+        decoded.name.as_deref(),
+        Some("~/work/project"),
+        "and the fields this build does know arrive intact",
+    );
+    assert_eq!(decoded.host_id, "host-1");
+}
+
+/// What a legal host name is, for every peer that states, republishes or
+/// paints one. Blank names nothing, so a caller has one case for "no name"
+/// rather than two.
+///
+/// Control characters are refused rather than trimmed away: a name is painted
+/// into a terminal, and the escape that would move its cursor must not
+/// survive the trip as a label.
+#[test]
+fn a_host_name_is_one_trimmed_line_within_the_cap() {
+    assert_eq!(
+        normalize_host_name("  ~/work/umber/aj  "),
+        Ok(Some("~/work/umber/aj".to_string())),
+    );
+    for blank in ["", "   ", "\t", " \n "] {
+        assert_eq!(
+            normalize_host_name(blank),
+            Ok(None),
+            "{blank:?} names nothing",
+        );
+    }
+
+    assert_eq!(
+        normalize_host_name("two\nlines"),
+        Err(HostNameError::Control)
+    );
+    assert_eq!(
+        normalize_host_name("\u{1b}[31mred"),
+        Err(HostNameError::Control),
+        "an escape sequence is not a label",
+    );
+
+    assert!(normalize_host_name(&"a".repeat(MAX_HOST_NAME_BYTES)).is_ok());
+    assert_eq!(
+        normalize_host_name(&"a".repeat(MAX_HOST_NAME_BYTES + 1)),
+        Err(HostNameError::TooLong {
+            bytes: MAX_HOST_NAME_BYTES + 1,
+        }),
+    );
+    let wide = "é".repeat(MAX_HOST_NAME_BYTES / 2 + 1);
+    assert!(
+        wide.chars().count() <= MAX_HOST_NAME_BYTES,
+        "fits by characters"
+    );
+    assert!(
+        matches!(
+            normalize_host_name(&wide),
+            Err(HostNameError::TooLong { .. })
+        ),
+        "but the cap is bytes, which is what the payload costs",
+    );
 }
 
 /// A directory row carries `last_seq` only when the session is live (spec

@@ -222,12 +222,14 @@ mod tests {
         DirectoryHost {
             id: Some(id.to_string()),
             address: None,
+            name: None,
             unreachable: false,
         }
     }
 
     fn unreachable(id: &str) -> DirectoryHost {
         DirectoryHost {
+            name: None,
             unreachable: true,
             ..learned(id)
         }
@@ -239,6 +241,7 @@ mod tests {
         DirectoryHost {
             id: None,
             address: Some(address.to_string()),
+            name: None,
             unreachable: true,
         }
     }
@@ -312,6 +315,7 @@ mod tests {
             DirectoryHost {
                 id: Some(String::new()),
                 address: None,
+                name: None,
                 unreachable: false,
             },
             learned("bbb"),

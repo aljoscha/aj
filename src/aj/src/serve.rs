@@ -134,7 +134,13 @@ pub(crate) async fn run(mut args: Args) -> Result<()> {
         }
     };
 
-    println!("aj serving {} on {}", host.hello().host_id, server.url());
+    let hello = host.hello();
+    match &hello.name {
+        // The id is what a gateway enrolls and what names the store, so it
+        // stays in the line the name now leads.
+        Some(name) => println!("aj serving {name} ({}) on {}", hello.host_id, server.url()),
+        None => println!("aj serving {} on {}", hello.host_id, server.url()),
+    }
     wait_for_shutdown().await;
 
     server.shutdown().await;

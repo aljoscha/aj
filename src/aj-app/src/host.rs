@@ -60,9 +60,10 @@ use aj_session::{
     normalize_tag, project_suffix,
 };
 use aj_wire::{
-    ARCHIVE_CAPABILITY, AgentQueue, Cursor, DurableEvent, Frame, Hello, ModelSelection,
-    PROTOCOL_VERSION, QueueCounts, QueueState, SessionList, SessionSettings, SessionSummary,
-    SessionTree, TaskDetails, TaskSummary, TaskTable, TreeSegment,
+    ARCHIVE_CAPABILITY, AgentQueue, Cursor, DurableEvent, Frame, Hello, MAX_HOST_NAME_BYTES,
+    ModelSelection, PROTOCOL_VERSION, QueueCounts, QueueState, SessionList, SessionSettings,
+    SessionSummary, SessionTree, TaskDetails, TaskSummary, TaskTable, TreeSegment,
+    normalize_host_name,
 };
 use chrono::{DateTime, Utc};
 use tokio::sync::Mutex as TokioMutex;
@@ -266,6 +267,14 @@ pub struct HostSetup {
     pub auth: AuthStorage,
     /// The one working directory this host serves (spec section 4).
     pub working_directory: PathBuf,
+    /// What this host calls itself for a reader, `None` to derive a name
+    /// from the working directory.
+    ///
+    /// The value is expected to have been through
+    /// [`aj_wire::normalize_host_name`] already, as a `--name` flag's is:
+    /// validating at the edge is what keeps a name a host would not state
+    /// from costing a startup.
+    pub name: Option<String>,
     /// How long an idle, unattached session is held before it is released,
     /// `None` for [`DEFAULT_IDLE_GRACE`].
     pub idle_grace: Option<Duration>,
@@ -275,6 +284,39 @@ pub struct HostSetup {
     /// Tuning, not policy: the bound governs live fan-out only, and eviction
     /// and its recovery behave the same at any value.
     pub live_capacity: Option<NonZeroUsize>,
+}
+
+/// The name a host reports when nothing named it: its working directory,
+/// abbreviated to `~` under `home`.
+///
+/// The whole path and not its last segments, because which segments tell two
+/// clones apart is not something a host can know about its neighbours.
+/// `None` when the path makes no legal name, which leaves the host labelled
+/// by its id as an older host's clients already have it.
+fn derive_host_name(working_directory: &Path, home: Option<&Path>) -> Option<String> {
+    let displayed = aj_conf::display_path_with_home(working_directory, home);
+    normalize_host_name(keep_tail(&displayed)).ok().flatten()
+}
+
+/// `path` cut to [`MAX_HOST_NAME_BYTES`] from the end.
+///
+/// A path is distinguished by its tail, so an over-long one loses its head,
+/// which is also the end every surface that renders a path name elides.
+/// Whole segments where one fits inside the cap, so what is left reads as a
+/// path rather than as a severed first segment.
+fn keep_tail(path: &str) -> &str {
+    if path.len() <= MAX_HOST_NAME_BYTES {
+        return path;
+    }
+    let mut start = path.len() - MAX_HOST_NAME_BYTES;
+    // Terminates: the length itself is a boundary.
+    while !path.is_char_boundary(start) {
+        start += 1;
+    }
+    match path[start..].find('/') {
+        Some(offset) => &path[start + offset + 1..],
+        None => &path[start..],
+    }
 }
 
 /// A mutation of one session.
@@ -486,6 +528,9 @@ struct HostInner {
     base_run_config: RunConfigSnapshot,
     host_id: String,
     working_directory: PathBuf,
+    /// What this host calls itself on the wire: `--name`, else the working
+    /// directory's abbreviation, else nothing.
+    name: Option<String>,
     sessions: TokioMutex<HashMap<String, LiveEntry>>,
     /// Wall clock and monotonic clock read at the same moment, for
     /// projecting a task's `Instant` onto wall time (see [`wall_clock`]).
@@ -544,10 +589,16 @@ impl SessionHost {
             persistence,
             auth,
             working_directory,
+            name,
             idle_grace,
             live_capacity,
         } = setup;
         let host_id = resolve_host_id(persistence.sessions_dir())?;
+        // A startup fact like the id: derived per hello, it could hand two
+        // clients different answers when the environment moves under a
+        // long-lived process.
+        let name =
+            name.or_else(|| derive_host_name(&working_directory, aj_conf::home_dir().as_deref()));
         let inner = Arc::new(HostInner {
             shared: Arc::new(HostShared {
                 config,
@@ -563,6 +614,7 @@ impl SessionHost {
             base_run_config: run_config,
             host_id,
             working_directory,
+            name,
             sessions: TokioMutex::new(HashMap::new()),
             clock_anchor: (Utc::now(), Instant::now()),
             idle_grace: idle_grace.unwrap_or(DEFAULT_IDLE_GRACE),
@@ -598,6 +650,7 @@ impl SessionHost {
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             host_id: self.inner.host_id.clone(),
             working_directory: Some(self.inner.working_directory.clone()),
+            name: self.inner.name.clone(),
         }
     }
 
@@ -2014,4 +2067,90 @@ fn spawn_list_publisher(inner: &Arc<HostInner>) {
             fanout.publish_list(host.directory().await.sessions);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The name a host falls back to is its whole working directory, written
+    /// the way a person writes it. Not its last segments: how deep two clones
+    /// differ is not something a host can know.
+    #[test]
+    fn a_derived_name_is_the_working_directory_under_a_tilde() {
+        let home = Path::new("/home/umber");
+        assert_eq!(
+            derive_host_name(Path::new("/home/umber/work/umber/aj"), Some(home)).as_deref(),
+            Some("~/work/umber/aj"),
+        );
+        assert_eq!(
+            derive_host_name(home, Some(home)).as_deref(),
+            Some("~"),
+            "a host serving home itself is named for it, with nothing trailing",
+        );
+    }
+
+    /// Only a directory under home is abbreviated, and the abbreviation needs
+    /// a home to measure against.
+    #[test]
+    fn a_directory_outside_home_keeps_its_absolute_path() {
+        let outside = Path::new("/srv/build/aj");
+        assert_eq!(
+            derive_host_name(outside, Some(Path::new("/home/umber"))).as_deref(),
+            Some("/srv/build/aj"),
+        );
+        assert_eq!(
+            derive_host_name(outside, None).as_deref(),
+            Some("/srv/build/aj"),
+            "with no home there is nothing to abbreviate against",
+        );
+    }
+
+    /// Over the cap the head goes: a path is told from another by its tail.
+    /// Whole segments where one fits, so what is left still reads as a path.
+    #[test]
+    fn an_overlong_path_keeps_its_tail() {
+        let home = Path::new("/home/u");
+        let long_segment = "a".repeat(76);
+        let deep = home.join(&long_segment).join("aj");
+        assert_eq!(
+            derive_host_name(&deep, Some(home)).as_deref(),
+            Some(format!("{long_segment}/aj").as_str()),
+            "the `~/` head goes and the segment under it survives whole",
+        );
+
+        let one_segment = format!("/{}", "b".repeat(100));
+        assert_eq!(
+            derive_host_name(Path::new(&one_segment), None).as_deref(),
+            Some("b".repeat(MAX_HOST_NAME_BYTES).as_str()),
+            "a segment that does not fit is cut, because there is nothing else to keep",
+        );
+    }
+
+    /// The cut lands on a character boundary rather than inside a character,
+    /// so a path of multi-byte segments yields a name and not a panic.
+    #[test]
+    fn an_overlong_path_of_wide_characters_is_cut_between_characters() {
+        let wide = format!("/{}", "€".repeat(40));
+        assert!(
+            !wide.is_char_boundary(wide.len() - MAX_HOST_NAME_BYTES),
+            "the naive cut would split a character"
+        );
+
+        let name = derive_host_name(Path::new(&wide), None).expect("a legal name");
+        assert!(name.len() <= MAX_HOST_NAME_BYTES, "{name:?} fits the cap");
+        assert!(wide.ends_with(&name), "{name:?} is the tail of {wide:?}");
+        assert!(
+            name.chars().all(|char| char == '€'),
+            "whole characters only: {name:?}"
+        );
+    }
+
+    /// A working directory that makes no legal name leaves the host labelled
+    /// by its id, which is what a client did with every host before names.
+    #[test]
+    fn a_path_that_makes_no_legal_name_yields_none() {
+        assert_eq!(derive_host_name(Path::new("/srv/two\nlines"), None), None);
+        assert_eq!(derive_host_name(Path::new(""), None), None);
+    }
 }

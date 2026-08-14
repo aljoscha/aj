@@ -728,6 +728,9 @@ pub fn compose_host(
 ) -> Result<ComposedHost> {
     let config = layers.effective();
     let speed = resolve_speed(args, &config)?;
+    let name = args
+        .host_name()
+        .map_err(|err| anyhow::anyhow!("--name: {err}"))?;
     let (run_config, restore) = build_initial_run_config(args, &config, auth, speed)?;
     let catalog = crate::commands::load_model_catalog();
     let config = Arc::new(StdMutex::new(config));
@@ -741,6 +744,7 @@ pub fn compose_host(
         persistence: persistence.clone(),
         auth: auth.clone(),
         working_directory: std::env::current_dir().unwrap_or_default(),
+        name,
         idle_grace,
         live_capacity: None,
     })?;

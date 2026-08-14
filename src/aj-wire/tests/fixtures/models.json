@@ -4,7 +4,8 @@
     "capabilities": ["events", "vms"],
     "app_version": "0.1.0",
     "host_id": "host-1",
-    "working_directory": "/work/project"
+    "working_directory": "/work/project",
+    "name": "~/work/project"
   },
   "session_list": {
     "sessions": [

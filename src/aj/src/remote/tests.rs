@@ -467,6 +467,7 @@ pub(crate) fn scripted_host(
         persistence: ConversationPersistence::new(dir.path().join("sessions")),
         auth: AuthStorage::new(dir.path().join("auth.json")),
         working_directory: dir.path().to_path_buf(),
+        name: None,
         idle_grace: None,
         live_capacity: None,
     })
@@ -1172,7 +1173,7 @@ fn sub_box(state: &CanonicalState, child: usize) -> (SubAgentStatus, bool) {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn hello_reports_the_protocol_and_the_working_directory() {
+async fn hello_reports_the_protocol_the_working_directory_and_the_name() {
     let fixture = Fixture::new(Vec::new()).await;
 
     let hello = fixture.client.hello().await.expect("hello");
@@ -1183,6 +1184,15 @@ async fn hello_reports_the_protocol_and_the_working_directory() {
     assert!(
         hello.working_directory.is_some(),
         "a host serves one working directory",
+    );
+    let stated = fixture.host.hello().name;
+    assert!(
+        stated.is_some(),
+        "a host given no name derives one, or the reading below measures nothing",
+    );
+    assert_eq!(
+        hello.name, stated,
+        "and a client reads the name the host states for itself",
     );
     fixture.shutdown().await;
 }

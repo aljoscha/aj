@@ -17,7 +17,7 @@ pub use env::{
     AGENTS_MD_PREFIX, AgentEnv, ContextFile, ContextFileKind, SystemPrompt, SystemPromptSource,
     USER_AGENTS_MD_PREFIX,
 };
-pub use paths::display_path;
+pub use paths::{display_path, display_path_with_home, home_dir};
 pub use schema::{
     Config, ConfigDiagnostic, ConfigError, ConfigLayer, ConfigOption, ConfigSpeed,
     ConfigThinkingDisplay, ConfigThinkingLevel, ConfigVerbosity, Severity, ValueKind,

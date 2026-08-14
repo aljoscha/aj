@@ -235,6 +235,88 @@ pub struct Hello {
     pub host_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<PathBuf>,
+    /// What this host calls itself, for a reader rather than for addressing.
+    ///
+    /// Display metadata and never an id: sessions are namespaced by
+    /// [`Self::host_id`] and a client that showed a name still addresses the
+    /// host by the id. Names may collide, two clones of one repo being the
+    /// obvious case, and that is accepted the way a session tag's collisions
+    /// are.
+    ///
+    /// The host is the authority: it states the name at startup and there is
+    /// no rename over the wire. Absent means the peer offers none, from an
+    /// older host or a working directory that made no legal name, and a
+    /// reader falls back to the id. A present one satisfies
+    /// [`normalize_host_name`], though a reader that paints it should apply
+    /// that itself rather than trust the sender.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// Longest host name we carry, in bytes.
+///
+/// A name labels a group header in a 24-column strip, so anything near this
+/// is elided on screen long before it gets here. The cap bounds the payload,
+/// not the display.
+pub const MAX_HOST_NAME_BYTES: usize = 80;
+
+/// Why a host name was refused.
+///
+/// The sentences state the rule without naming their subject: the surface
+/// that renders one already says which field it is refusing (`--name:` on the
+/// flag).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostNameError {
+    /// Longer than [`MAX_HOST_NAME_BYTES`] after trimming.
+    TooLong { bytes: usize },
+    /// Carries a control character, which includes the escape a name would
+    /// otherwise smuggle into a terminal that paints it.
+    Control,
+}
+
+impl fmt::Display for HostNameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HostNameError::TooLong { bytes } => write!(
+                f,
+                "at most {MAX_HOST_NAME_BYTES} bytes, and this one is {bytes}"
+            ),
+            HostNameError::Control => write!(f, "a single line, with no control characters"),
+        }
+    }
+}
+
+impl std::error::Error for HostNameError {}
+
+/// Validate and normalize a name a host reports for itself.
+///
+/// The one rule for [`Hello::name`] and [`DirectoryHost::name`], so what a
+/// host may state, what a gateway republishes and what a client is willing to
+/// paint cannot drift apart.
+///
+/// `Ok(None)` covers everything that names nothing, so a caller treats "no
+/// name" and "a name that is blank" as one case. Surrounding whitespace is
+/// trimmed, because a name that differs from another only by padding reads as
+/// the same label.
+///
+/// Control characters are refused rather than stripped: a name reaches a
+/// terminal, and an escape sequence in one is a rendering hazard rather than
+/// a label. Refusing also keeps a rewritten name from claiming to be
+/// something the operator did not type.
+pub fn normalize_host_name(name: &str) -> Result<Option<String>, HostNameError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(HostNameError::Control);
+    }
+    if trimmed.len() > MAX_HOST_NAME_BYTES {
+        return Err(HostNameError::TooLong {
+            bytes: trimmed.len(),
+        });
+    }
+    Ok(Some(trimmed.to_string()))
 }
 
 /// Counts of pending messages by delivery class.
@@ -332,8 +414,9 @@ pub struct SessionList {
 /// "no such host".
 ///
 /// A gateway names each host by exactly one of [`Self::id`] and
-/// [`Self::address`], so a client labels a group by the id when there is one and
-/// by the address otherwise.
+/// [`Self::address`], and carries [`Self::name`] on top of that when the host
+/// reported one: a client labels a group by the name, else the id, else the
+/// address, and addresses that host's sessions by the id either way.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectoryHost {
     /// The id this host's sessions are namespaced under, in the vocabulary
@@ -351,6 +434,15 @@ pub struct DirectoryHost {
     /// A label and never an id: nothing addresses a session or a host by it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
+    /// What the host called itself when the gateway last heard from it,
+    /// republished as [`Hello::name`] stated it.
+    ///
+    /// A third label rather than a replacement for the two above: a client
+    /// prefers the name for a group header and still addresses the host by
+    /// [`Self::id`]. Absent for a host that reported none and for one the
+    /// gateway has never spoken to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// The gateway's control connection to this host is down, which is what
     /// [`SessionSummary::unreachable`] says about each of its rows.
     #[serde(default)]

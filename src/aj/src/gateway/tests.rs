@@ -1094,11 +1094,13 @@ async fn an_unreachable_host_survives_a_restart_as_a_group_with_no_rows() {
         DirectoryHost {
             id: Some(down.host_id()),
             address: None,
+            name: None,
             unreachable: true,
         },
         DirectoryHost {
             id: Some(up.host_id()),
             address: None,
+            name: None,
             unreachable: false,
         },
     ];
@@ -1179,11 +1181,13 @@ async fn a_configured_host_that_never_answered_is_named_by_its_address() {
             DirectoryHost {
                 id: None,
                 address: Some(silent.to_string()),
+                name: None,
                 unreachable: true,
             },
             DirectoryHost {
                 id: Some(up.host_id()),
                 address: None,
+                name: None,
                 unreachable: false,
             },
         ],
@@ -2014,6 +2018,7 @@ async fn a_remembered_host_the_configuration_names_too_keeps_its_id() {
         vec![DirectoryHost {
             id: Some("remembered".to_string()),
             address: None,
+            name: None,
             unreachable: true,
         }],
         "and a client's group for it is named by that id rather than by an \
@@ -4232,6 +4237,7 @@ async fn a_withdrawal_ends_that_hosts_splices_and_leaves_the_others_alone() {
         vec![DirectoryHost {
             id: Some("staying".to_string()),
             address: None,
+            name: None,
             unreachable: false,
         }],
         "a host that is not enrolled is not a group either, and the one that is \

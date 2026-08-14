@@ -281,9 +281,20 @@ is SSE, one `data: <json>` frame per line. Reads are plain GETs. No
 WebSockets, no JSON-RPC, no correlation ids.
 
 All routes live under `/v1/`. `GET /v1/hello` returns protocol
-version, capability list, app version, `host_id`, and the working
-directory (a gateway omits the working directory and advertises its
-own capabilities). It is the reachability and identity probe.
+version, capability list, app version, `host_id`, the working
+directory, and a `name` (a gateway omits the working directory and the
+name, and advertises its own capabilities). It is the reachability and
+identity probe.
+
+A host's `name` is display metadata and never an address: clients
+label a host by it and keep addressing sessions by `host_id`, and
+names may collide the way session tags may. The host is the sole
+authority, it states the name at startup (`--name`, else its working
+directory abbreviated to `~` under home) and there is no rename over
+the wire, renaming is a restart. A name is one trimmed line of at most
+80 bytes with no control characters, and a reader applies that itself
+rather than trusting a sender. Absent, from an older host or one whose
+directory made no legal name, means the reader falls back to the id.
 
 SSE streams send a heartbeat frame every 30 seconds when otherwise
 idle. Clients treat a silent stream (no frame for ~60s) as dead and
