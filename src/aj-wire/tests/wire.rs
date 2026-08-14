@@ -1729,7 +1729,7 @@ fn a_rows_tag_and_host_are_absent_rather_than_empty() {
 /// A row says it is archived only when it is, and a row that says nothing is
 /// not: absent reads as unarchived, which is what every row an older host
 /// wrote says, and what keeps the key off the great majority of rows (spec
-/// 6.8, 6.10).
+/// 6.10).
 ///
 /// The bit is orthogonal to liveness. The fixture's archived row is the live
 /// one deliberately: archiving a session that is up and working is allowed and
@@ -1771,9 +1771,9 @@ fn an_archived_row_says_so_and_an_unarchived_one_stays_silent() {
     );
 }
 
-/// The archive command's body: one bool, where `false` unarchives (spec 6.6),
-/// so a client needs no second route to put a session back. A blank body is
-/// the same request, which is what the server's `{}` default reads it as.
+/// The archive command's body: one bool, where `false` unarchives, so a
+/// client needs no second route to put a session back. A blank body is the
+/// same request, which is what the server's `{}` default reads it as.
 #[test]
 fn an_archive_request_carries_one_bool_and_defaults_to_unarchiving() {
     assert_eq!(

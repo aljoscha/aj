@@ -142,7 +142,7 @@ impl ConversationPersistence {
     /// The existence of the file is the bit, so there is no content to tear:
     /// the create and the remove each publish the whole answer in one
     /// operation, and a reader sees one state or the other. Callers hold the
-    /// session's lock (spec 6.6), which is what orders two writers.
+    /// session's lock, which is what orders two writers.
     ///
     /// An id the grammar rejects is an error rather than a quiet no-op, for
     /// the reason [`Self::write_tag`] gives: the archive command sets the
@@ -160,12 +160,27 @@ impl ConversationPersistence {
                 Ok(()) => Ok(()),
                 // Already unarchived, which is what the caller asked for.
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                // A directory under the sidecar's name is not the bit either
+                // (see [`Self::read_archived`]), so the session already reads
+                // as unarchived and the remove had nothing to do. Raising here
+                // would refuse the state the store is in, and go on refusing
+                // it.
+                Err(_) if fs::metadata(&path).is_ok_and(|meta| !meta.is_file()) => Ok(()),
                 Err(err) => Err(err.into()),
             };
         }
         fs::create_dir_all(self.meta_dir())?;
-        File::create(&path)?;
-        Ok(())
+        match fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(_) => Ok(()),
+            // Already archived, and the file holds nothing to bring up to
+            // date, so this leaves it exactly as it is.
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(err) => Err(err.into()),
+        }
     }
 
     /// Every tag sidecar in the store, with the fingerprint of the file it was
@@ -184,10 +199,11 @@ impl ConversationPersistence {
     /// Every archived sidecar in the store, with the fingerprint of the file
     /// it was found at.
     ///
-    /// The same cost and the same shape as [`Self::enumerate_tags`], for the
-    /// axis whose answer is the file's existence: nothing here opens a
-    /// sidecar, and a store with nothing archived pays one failed `read_dir`
-    /// for the whole listing.
+    /// The same shape as [`Self::enumerate_tags`], for the axis whose answer is
+    /// the file's existence: one directory read for the whole listing and no
+    /// sidecar opened at all. A store with no `meta/` directory pays a single
+    /// failed `read_dir`, and one that has the directory pays a read of it per
+    /// axis, never a `stat` per session.
     pub fn enumerate_archived(&self) -> Result<Vec<SidecarMetadata>, ConversationError> {
         self.enumerate_sidecars(ARCHIVED_SIDECAR)
     }
@@ -739,8 +755,7 @@ pub struct SessionPreview {
     /// [`ConversationPersistence::list_session_previews_streaming`]) and the
     /// per-file walk leaves it unset.
     pub tag: Option<String>,
-    /// Whether the session is archived, which hides it from the pickers that
-    /// filter (spec 6.8).
+    /// Whether the session is archived.
     ///
     /// Its sidecar's existence is the bit, so the listing fills it from the
     /// same directory read the labels come from and the per-file walk leaves
@@ -1136,13 +1151,26 @@ mod tests {
                 .join("meta")
                 .join(format!("{id}.archived"))
                 .is_file(),
-            "the sidecar is where spec 6.8 puts session metadata",
+            "the sidecar lands in meta/, beside the label's and out of the \
+             directory the logs live in",
         );
 
+        let sidecar = dir.path().join("meta").join(format!("{id}.archived"));
+        let written_at = std::fs::metadata(&sidecar)
+            .and_then(|meta| meta.modified())
+            .expect("the sidecar's timestamp");
+        std::thread::sleep(std::time::Duration::from_millis(10));
         persistence
             .write_archived(id, true)
             .expect("archiving an archived session is not an error");
         assert!(persistence.read_archived(id).expect("read"));
+        assert_eq!(
+            std::fs::metadata(&sidecar)
+                .and_then(|meta| meta.modified())
+                .expect("the sidecar's timestamp"),
+            written_at,
+            "and it leaves the file alone rather than rewriting it",
+        );
 
         persistence.write_archived(id, false).expect("unarchive");
         assert!(!persistence.read_archived(id).expect("read"));
@@ -1239,6 +1267,9 @@ mod tests {
                 .expect("read"),
             "and a directory under the name is not the bit either",
         );
+        persistence
+            .write_archived("2024-01-01-00-00-00", false)
+            .expect("unarchiving what the store already reads as unarchived");
 
         persistence
             .write_archived("2024-01-02-00-00-00", true)
@@ -1628,8 +1659,8 @@ mod tests {
     }
 
     /// A preview carries the archived bit off the sidecar directory, on both
-    /// listings. The local selector filters on it, so a row that lost the bit
-    /// would show a session the user has put away.
+    /// listings. It is the only place a local listing can learn the bit: the
+    /// per-file walk reads the log, which never held it.
     #[test]
     fn previews_carry_the_archived_bit() {
         let (_dir, persistence) = fixture();

@@ -7132,8 +7132,9 @@ async fn archived_of(host: &SessionHost, session: &str) -> Option<bool> {
 }
 
 /// Archiving puts the bit on the session's row and on the stream, and
-/// unarchiving takes it off both. It is display metadata, so this is the only
-/// place it shows: no log entry, no `state` frame (spec 6.8).
+/// unarchiving takes it off both. It is display metadata, so the directory is
+/// the only place it shows: nothing about the session's state changed, so
+/// there is no `state` frame and no entry in the log.
 #[tokio::test]
 async fn an_archive_reaches_the_row_and_the_directory() {
     let harness = Harness::new(Vec::new());
@@ -7150,7 +7151,8 @@ async fn an_archive_reaches_the_row_and_the_directory() {
         matches!(frame, Frame::CaughtUp { .. })
     })
     .await;
-    assert_eq!(archived_of(&harness.host, &session).await, Some(false));
+    let before = summary(&harness.host, &session).await.expect("listed");
+    assert!(!before.archived);
     // Past the debounce of everything above, so a directory frame from here on
     // can only be one the archive earned.
     tokio::time::sleep(LIST_SETTLE).await;
@@ -7161,15 +7163,27 @@ async fn an_archive_reaches_the_row_and_the_directory() {
         .command(&session, Command::Archive { archived: true })
         .await
         .expect("the archive is accepted");
-    frames_until(&mut stream, "the bit to be published", |frame| {
+    let frames = frames_until(&mut stream, "the bit to be published", |frame| {
         matches!(frame, Frame::List { sessions, .. }
         if sessions.iter().any(|entry| entry.id == session && entry.archived))
     })
     .await;
-    assert_eq!(
-        archived_of(&harness.host, &session).await,
-        Some(true),
+    let after = summary(&harness.host, &session).await.expect("listed");
+    assert!(
+        after.archived,
         "and the row a fresh listing builds carries it too",
+    );
+    assert_eq!(
+        after.last_seq, before.last_seq,
+        "the archive appended nothing to the log",
+    );
+    let published: Vec<&Frame> = frames
+        .iter()
+        .filter(|frame| !matches!(frame, Frame::List { .. }))
+        .collect();
+    assert!(
+        published.is_empty(),
+        "the archive published something besides the directory: {published:?}",
     );
     assert!(
         harness
@@ -7263,7 +7277,7 @@ async fn archiving_a_working_session_leaves_the_turn_alone() {
 
 /// New work does not un-archive. The bit changes by the archive command and
 /// nothing else, so a session someone put away and then prompted stays put
-/// away until it is explicitly brought back (spec 6.6).
+/// away until it is explicitly brought back.
 #[tokio::test]
 async fn a_prompt_does_not_un_archive_a_session() {
     let harness = Harness::new(vec![finalized_text_message("recorded")]);
@@ -7351,11 +7365,12 @@ async fn an_archived_bit_survives_a_release_and_a_restart() {
         .command(&session, Command::Archive { archived: true })
         .await
         .expect("the archive is accepted");
+    // Every poll here is an enumeration point, so what this asserts is that a
+    // cold row carries the bit at all. The release's own handover is
+    // `a_release_hands_the_archived_bit_to_the_row_it_leaves`, which reads the
+    // frames instead for exactly that reason.
     let released = until_released(&harness.host, &session).await;
-    assert!(
-        released.archived,
-        "the row the release recorded carries the bit",
-    );
+    assert!(released.archived, "the cold row carries the bit");
     harness.host.shutdown().await;
 
     let revived = harness.revive(Vec::new());
@@ -7381,6 +7396,128 @@ async fn an_archived_bit_survives_a_release_and_a_restart() {
         "and it did not lose the bit on the way to being live",
     );
     revived.host.shutdown().await;
+}
+
+/// A head switch does not move the bit. It is session-scoped and lives in a
+/// sidecar, so a branch the switch mints cannot carry a different answer and
+/// the store's file is not the switch's to touch.
+#[tokio::test]
+async fn a_head_switch_does_not_move_the_archived_bit() {
+    let harness = Harness::new(vec![
+        finalized_text_message("first"),
+        finalized_text_message("second"),
+    ]);
+    let session = harness.create().await;
+    harness.prompt(&session, "one").await;
+    harness.prompt(&session, "two").await;
+    harness
+        .host
+        .command(&session, Command::Archive { archived: true })
+        .await
+        .expect("the archive is accepted");
+
+    // Branch back to an earlier head, which mints a fresh epoch and replaces
+    // the session's projection wholesale.
+    let head = {
+        let handles = harness
+            .host
+            .local_handles(&session)
+            .await
+            .expect("live session");
+        let log = handles.log.lock().await;
+        let head = log.head().cloned().expect("a head");
+        let conversation = log.linearize(&head, ThreadFilter::USER);
+        conversation
+            .entries()
+            .iter()
+            .rev()
+            .nth(2)
+            .expect("an earlier entry")
+            .id
+            .clone()
+    };
+    harness
+        .host
+        .command(
+            &session,
+            Command::Head {
+                target: HeadTarget::Entry(head),
+            },
+        )
+        .await
+        .expect("head switch on an idle session");
+
+    assert_eq!(
+        archived_of(&harness.host, &session).await,
+        Some(true),
+        "the bit is the session's, not the branch's",
+    );
+    assert!(
+        harness
+            .persistence
+            .read_archived(&session)
+            .expect("read the sidecar"),
+        "and the sidecar the switch could not touch still holds it",
+    );
+    harness.host.shutdown().await;
+}
+
+/// A sidecar directory the host cannot read for a moment does not cost a
+/// session its bit. The read says nothing about the bit, so the session goes
+/// live with what the host already knew, and its release hands that on.
+#[tokio::test]
+async fn an_unreadable_sidecar_does_not_cost_a_live_session_its_archived_bit() {
+    let harness = Harness::with_idle_grace(vec![finalized_text_message("recorded")], IDLE_GRACE);
+    let session = harness.create().await;
+    harness.prompt(&session, "hi").await;
+    harness
+        .host
+        .command(&session, Command::Archive { archived: true })
+        .await
+        .expect("the archive is accepted");
+    until_released(&harness.host, &session).await;
+    assert_eq!(
+        archived_of(&harness.host, &session).await,
+        Some(true),
+        "cold and archived",
+    );
+
+    // The sidecar's own mode is not what makes it unreadable: the bit is the
+    // file's existence, which is a `stat`, and a `stat` turns on the search
+    // permission of the directory holding it.
+    let meta = harness.persistence.sessions_dir().join("meta");
+    let mode = std::fs::metadata(&meta)
+        .expect("the meta directory")
+        .permissions();
+    std::fs::set_permissions(&meta, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+        .expect("drop the search bit");
+    if harness.persistence.read_archived(&session).is_ok() {
+        // Root ignores the permission bits, so there is nothing to prove here.
+        std::fs::set_permissions(&meta, mode).expect("restore the mode");
+        harness.host.shutdown().await;
+        return;
+    }
+
+    harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("materialize");
+    let live = summary(&harness.host, &session)
+        .await
+        .expect("the session is listed");
+    assert!(live.live, "materialized");
+    assert!(
+        live.archived,
+        "the bit survived a read the host could not do",
+    );
+
+    // And the release hands the same bit back, so the loss cannot outlive the
+    // session's live period either.
+    std::fs::set_permissions(&meta, mode).expect("restore the mode");
+    let released = until_released(&harness.host, &session).await;
+    assert!(released.archived);
+    harness.host.shutdown().await;
 }
 
 /// The host says it serves the archive route, so a peer can tell a host that

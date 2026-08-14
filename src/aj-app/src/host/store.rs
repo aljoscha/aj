@@ -110,8 +110,8 @@ pub(crate) struct ColdSession {
     /// The session's label, `None` when it has no sidecar or none this host
     /// could read (spec 6.8).
     pub(crate) tag: Option<String>,
-    /// Whether the user has put the session away (spec 6.8), which is the
-    /// existence of its archived sidecar.
+    /// Whether the user has put the session away, which is the existence of
+    /// its archived sidecar.
     pub(crate) archived: bool,
 }
 
@@ -171,24 +171,6 @@ struct Tagged {
     tag: Option<String>,
 }
 
-/// A session's archived bit, plus the sidecar state it came from.
-///
-/// The same contract [`Tagged`] states, for the axis whose answer is the
-/// file's existence: `at` is `None` for a bit the host recorded itself, which
-/// a release does with what its driver held, and the next enumeration pins the
-/// entry to the file it finds.
-///
-/// The bit is held rather than implied by the entry's presence, because a
-/// listing only ever reports the sidecars that exist. An entry saying `false`
-/// is what a release leaves behind to say the session was unarchived under its
-/// own lock, and it is what makes that release tellable from an id the cache
-/// never held (see [`ColdSessions::record_archived`]).
-#[derive(Clone, Copy, PartialEq)]
-struct Archived {
-    at: Option<Fingerprint>,
-    archived: bool,
-}
-
 /// A cold row's activity stamp, plus the file state it describes.
 ///
 /// The fingerprint is what lets the host's own knowledge outrank a `stat`. A
@@ -217,6 +199,11 @@ struct Row {
 /// enumerates (every host does, at startup) none of them outgrows it. Entries
 /// that [`ColdSessions::contains`] adds in between are not evicted until the
 /// next enumeration.
+///
+/// The two sidecar maps are evicted against the sidecar listing rather than
+/// the log one, because a sidecar outlives its log: deleting a session's log
+/// by hand leaves its label and its archived bit in `meta/`, and the entry
+/// stays until the file does.
 #[derive(Default)]
 struct Cache {
     /// The answer a refresh serves. What an enumeration point last found, plus
@@ -230,7 +217,18 @@ struct Cache {
     /// sidecar a listing found, and those a release recorded. Absence is the
     /// unarchived answer, which is what makes an unarchived store cost
     /// nothing.
-    archived: HashMap<String, Archived>,
+    ///
+    /// The bit is held rather than implied by the entry's presence, because a
+    /// listing only ever reports the sidecars that exist. An entry saying
+    /// `false` is what a release leaves behind to say the session was
+    /// unarchived under its own lock, and it is what makes that release
+    /// tellable from an id the cache never held (see
+    /// [`ColdSessions::record_archived`]).
+    ///
+    /// No fingerprint, where [`Tagged`] carries one: a fingerprint is what
+    /// lets a caller skip re-reading a file, and this axis reads none. The
+    /// listing's own report that the sidecar exists is the whole answer.
+    archived: HashMap<String, bool>,
 }
 
 impl<S: SessionStore> ColdSessions<S> {
@@ -258,10 +256,7 @@ impl<S: SessionStore> ColdSessions<S> {
                 id: id.clone(),
                 last_activity: row.last_activity,
                 tag: cache.tags.get(id).and_then(|tagged| tagged.tag.clone()),
-                archived: cache
-                    .archived
-                    .get(id)
-                    .is_some_and(|archived| archived.archived),
+                archived: cache.archived.get(id).copied().unwrap_or(false),
             })
             .collect()
     }
@@ -291,10 +286,7 @@ impl<S: SessionStore> ColdSessions<S> {
     /// Touches no filesystem. What a materialization falls back to when it
     /// cannot read the sidecar itself, on the reasoning [`Self::label`] gives.
     pub(crate) fn archived(&self, id: &str) -> bool {
-        self.cache()
-            .archived
-            .get(id)
-            .is_some_and(|archived| archived.archived)
+        self.cache().archived.get(id).copied().unwrap_or(false)
     }
 
     /// Re-read the store and bring the rows up to date. The enumeration point
@@ -391,7 +383,7 @@ impl<S: SessionStore> ColdSessions<S> {
         // costs one more `readdir` at an enumeration point and no per-file
         // read at all, since the sidecar's existence is the whole answer.
         match self.enumerate_archived_sidecars() {
-            Ok(sidecars) => self.record_archived(&sidecars, &filed, &live),
+            Ok(sidecars) => self.record_archived(&sidecars, &filed),
             Err(err) => tracing::warn!("could not read the store's archived sidecars: {err}"),
         }
         self.evict(&enumerated, &known);
@@ -535,13 +527,7 @@ impl<S: SessionStore> ColdSessions<S> {
         // the session is not archived is how a release states what it did
         // under the session's lock, which a sidecar listing taken before that
         // write must not undo (see [`Self::record_archived`]).
-        cache.archived.insert(
-            file.session_id.clone(),
-            Archived {
-                at: None,
-                archived: *archived,
-            },
-        );
+        cache.archived.insert(file.session_id.clone(), *archived);
     }
 
     /// The label in `sidecar`, read once per fingerprint into the cache.
@@ -716,37 +702,34 @@ impl<S: SessionStore> ColdSessions<S> {
     /// reports only the sidecars that exist, so without the release's own
     /// `false` an unarchive that landed mid-scan would read as an id the cache
     /// never held and be quietly re-archived until the next enumeration point.
-    fn record_archived(
-        &self,
-        sidecars: &[SidecarMetadata],
-        filed: &HashMap<String, Archived>,
-        live: impl Fn(&str) -> bool,
-    ) {
+    ///
+    /// The comparison catches a republished entry, it does not prove one is
+    /// absent. A session archived and unarchived again while the scan ran
+    /// leaves the value it started at and is written from the listing, which
+    /// stands until the next enumeration point. The window is the tail of one
+    /// `readdir` and no test can reach it; recording a generation per entry is
+    /// what closing it would cost, for a race between a scan and two commands
+    /// on one session.
+    ///
+    /// A live session's entry is written like any other. Nothing reads it
+    /// while the session is live, a directory answers a live row from the
+    /// host's own status, and its release overwrites the entry with what its
+    /// driver held.
+    fn record_archived(&self, sidecars: &[SidecarMetadata], filed: &HashMap<String, bool>) {
         let present: HashSet<&str> = sidecars
             .iter()
             .map(|sidecar| sidecar.session_id.as_str())
             .collect();
         let mut cache = self.cache();
-        let gone = |id: &String, held: &Archived| {
-            filed.get(id).is_some_and(|before| before == held) && !present.contains(id.as_str())
+        let gone = |id: &String, held: &bool| {
+            filed.get(id) == Some(held) && !present.contains(id.as_str())
         };
         cache.archived.retain(|id, held| !gone(id, held));
         for sidecar in sidecars {
-            // A live session's bit is the host's own, held in memory and handed
-            // to the cold cache by its release, so the file can only be staler.
-            if live(&sidecar.session_id) {
-                continue;
-            }
             if cache.archived.get(&sidecar.session_id) != filed.get(&sidecar.session_id) {
                 continue;
             }
-            cache.archived.insert(
-                sidecar.session_id.clone(),
-                Archived {
-                    at: Some(Fingerprint::of(sidecar.modified_at, sidecar.size_bytes)),
-                    archived: true,
-                },
-            );
+            cache.archived.insert(sidecar.session_id.clone(), true);
         }
     }
 
@@ -2117,6 +2100,43 @@ mod tests {
             filed(cold.rows()),
             [("live".to_string(), true)],
             "the scan finds the sidecar the release left and agrees",
+        );
+    }
+
+    /// A scan does not un-archive a session a release archived while it ran,
+    /// which is the direction that loses work: the bit would read as cleared
+    /// until the next enumeration point, and nothing but the archive command
+    /// may clear it.
+    ///
+    /// The scan's listing predates the sidecar, so only the entry the release
+    /// published says the session is archived. Recognising that entry as one
+    /// this scan did not look at is what spares it.
+    #[test]
+    fn a_scan_does_not_unarchive_a_session_a_release_filed() {
+        let store = FakeStore::default();
+        store.put("held", 5);
+        let cold = Arc::new(ColdSessions::new(store));
+        cold.enumerate(|_| false).expect("enumerate");
+        assert_eq!(filed(cold.rows()), [("held".to_string(), false)]);
+
+        let releasing = Arc::downgrade(&cold);
+        cold.store.during_archived_listing(move || {
+            let cold = releasing.upgrade().expect("the cache outlives the scan");
+            // Materialized, archived and released while this scan runs: the
+            // sidecar is on disk, but the scan listed the directory before it
+            // was written.
+            cold.store.archive("held", 9);
+            cold.note_released(&ReleasedRow {
+                archived: true,
+                ..released("held", 5, 100)
+            });
+        });
+
+        cold.enumerate(|_| false).expect("enumerate");
+        assert_eq!(
+            filed(cold.rows()),
+            [("held".to_string(), true)],
+            "the scan evicted a bit the release published under the lock",
         );
     }
 

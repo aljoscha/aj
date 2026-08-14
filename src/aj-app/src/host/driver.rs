@@ -623,8 +623,8 @@ impl Driver {
     /// The bit is display metadata and nothing else, so this appends no log
     /// entry, publishes no `state` frame, and touches nothing about the
     /// session's life: a session working through a turn goes on working,
-    /// archived. Nothing else in this driver clears it either, so a prompt to
-    /// an archived session leaves it archived (spec 6.6).
+    /// archived. Nothing else in this driver writes it either, so a prompt to
+    /// an archived session leaves it archived.
     fn archive(&self, archived: bool) -> Result<CommandOutcome, HostError> {
         self.shared
             .persistence

@@ -451,7 +451,7 @@ async fn tag(
     accepted(state.host.command(&session, Command::Tag { tag }).await?)
 }
 
-/// Set or clear the session's archived bit (spec 6.6).
+/// Set or clear the session's archived bit.
 ///
 /// Accepted whatever the session is doing: the bit is display metadata, and a
 /// refusal while a turn ran would be exactly the lifecycle coupling it is not

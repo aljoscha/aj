@@ -309,12 +309,12 @@ pub enum Command {
     Tag {
         tag: Option<String>,
     },
-    /// Set or clear the session's archived bit (spec 6.6).
+    /// Set or clear the session's archived bit.
     ///
-    /// Display metadata and nothing else: it hides a row in the clients that
-    /// filter and touches nothing about the session's life, so a session
-    /// working through a turn takes it without interruption. Explicit in both
-    /// directions, `false` unarchives, and nothing else ever clears it.
+    /// Display metadata and nothing else: it touches nothing about the
+    /// session's life, so a session working through a turn takes it without
+    /// interruption. Explicit in both directions, `false` unarchives, and
+    /// nothing else ever clears it.
     Archive {
         archived: bool,
     },
@@ -584,9 +584,13 @@ impl SessionHost {
         Ok(Self { inner })
     }
 
-    /// Protocol identity and capabilities (spec 6.1). The list names the
-    /// routes past the protocol-1 baseline this host serves, so a peer can
-    /// tell an older host from one that simply refused.
+    /// Protocol identity and capabilities (spec 6.1).
+    ///
+    /// The list names the routes this host serves past the protocol-1
+    /// baseline, which spec 6.10 asks a new endpoint to arrive with. It is
+    /// self-description and not a gate: what a peer does with it is the peer's
+    /// business, and a client that simply attempts a route and reads the
+    /// refusal is following the same section.
     pub fn hello(&self) -> Hello {
         Hello {
             protocol: PROTOCOL_VERSION,

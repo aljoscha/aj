@@ -304,8 +304,10 @@ impl Gateway {
     ///
     /// No working directory: a gateway serves none of its own, and that absence
     /// is how a client tells the two roles apart. The capability list is empty
-    /// for the same reason a host's is, everything the protocol carries today is
-    /// in its base version.
+    /// where a host's names the routes it serves past the baseline: this hello
+    /// is the gateway's own, and a gateway cannot answer for hosts that need
+    /// not agree with each other. A client that wants a route attempts it and
+    /// reads the refusal (spec 6.10).
     pub(crate) fn hello(&self) -> Hello {
         Hello {
             protocol: PROTOCOL_VERSION,

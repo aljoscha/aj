@@ -1568,9 +1568,9 @@ async fn post_archive(
 }
 
 /// The archive route sets the bit and clears it, and the bit reaches the row a
-/// client reads back (spec 6.6, 6.8). `false` unarchives, which is why there is
-/// no second route for it, and a blank body reads as `false` the same way a
-/// blank tag body clears a label.
+/// client reads back. `false` unarchives, which is why there is no second route
+/// for it, and a blank body reads as `false` the same way a blank tag body
+/// clears a label.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_archive_route_sets_and_clears_the_bit() {
     let fixture = Fixture::new(Vec::new()).await;

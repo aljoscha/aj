@@ -216,7 +216,7 @@ pub struct TagRequest {
     pub tag: String,
 }
 
-/// Sets or clears a session's archived bit (spec 6.6).
+/// Sets or clears a session's archived bit.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchiveRequest {
     /// The bit to leave the session with. `false` unarchives, so setting and
@@ -289,12 +289,12 @@ pub struct SessionSummary {
     pub host: Option<String>,
     #[serde(default)]
     pub unreachable: bool,
-    /// Whether the user has put the session away (spec 6.8).
+    /// Whether the user has put the session away.
     ///
     /// Display metadata with no lifecycle meaning: an archived session keeps
-    /// its log, its lock and any turn it is running, and clients that filter
-    /// on the bit offer a way to reveal what it hides. It changes only by the
-    /// archive command, so nothing a session does clears it.
+    /// its log, its lock and any turn it is running. It changes only by the
+    /// archive command, so nothing a session does clears it, and what a client
+    /// makes of it is the client's own business.
     ///
     /// Absent reads as unarchived, which is what an older host's rows say and
     /// what the great majority of rows say, so the key is written only when it

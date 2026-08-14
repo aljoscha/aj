@@ -143,8 +143,8 @@ pub(crate) struct SessionStatus {
     /// Held here so a directory refresh, which runs on a coalescing tick, can
     /// answer for a live session without going near the filesystem.
     pub(crate) tag: Option<String>,
-    /// Whether the user has put the session away (spec 6.8), read from its
-    /// sidecar at materialization and kept current by the archive command.
+    /// Whether the user has put the session away, read from its sidecar at
+    /// materialization and kept current by the archive command.
     ///
     /// Held here for the same reason [`Self::tag`] is. Display metadata with
     /// no lifecycle meaning: nothing in this module consults it, and no turn,
