@@ -1291,10 +1291,8 @@ files no endpoint serves yet. The session selector and prompt-history
 search read this client's own session store, which over a connection
 would answer about the wrong machine, so they refuse instead (the
 sidebar lists a peer's sessions meanwhile, section 9.2, and cross-host
-history is banked, section 13). The same class leaks through one more
-surface, the editor's prompt recall ring, a known gap being closed.
-Each refusal surfaces a clear notice, an unsupported action never
-silently does nothing.
+history is banked, section 13). Each refusal surfaces a clear notice,
+an unsupported action never silently does nothing.
 
 Connection state (connected, reconnecting, catching up) is surfaced in
 the footer/status line.

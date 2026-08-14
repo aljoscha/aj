@@ -3636,6 +3636,17 @@ fn spawn_session_export(
 /// logs on a blocking thread, delivering the entries (oldest-first) to the
 /// drive loop over the returned receiver.
 ///
+/// `None` over a connection, where the ring holds this run's own submissions
+/// and nothing else. The scan reads this process's store, keyed on this
+/// machine's git root, while the session being driven lives on another
+/// machine: a seeded entry would be a prompt from someone else's work, loaded
+/// into the editor and one Enter away from being submitted into a session it
+/// was never typed for. It is the same store, and the same reasoning, that
+/// makes the prompt-history overlay refuse here (see
+/// [`CommandAction::OpenPromptHistory`]), and the two surfaces answer alike.
+/// This run's own submissions stay: they were typed at this keyboard into this
+/// session, and up-to-repeat-what-I-just-typed is what the ring is for.
+///
 /// The scan walks on-disk JSONL logs (blocking IO), so it runs off the loop
 /// and never delays first paint. We reuse the shared
 /// [`aj_session::workspace_history`] scanner (the same one the prompt-history
@@ -3644,9 +3655,11 @@ fn spawn_session_export(
 /// we reverse to oldest-first for [`TextArea::seed_history`], which splices
 /// them in beneath any prompts submitted this session so an Up press still
 /// reaches the most-recent live submission first.
-fn spawn_prompt_history_bootstrap(
-    persistence: ConversationPersistence,
-) -> UnboundedReceiver<Vec<String>> {
+fn spawn_prompt_history_bootstrap(world: &World) -> Option<UnboundedReceiver<Vec<String>>> {
+    if world.control.is_remote() {
+        return None;
+    }
+    let persistence = world.persistence.clone();
     let (tx, rx) = unbounded_channel();
     tokio::task::spawn_blocking(move || {
         // Stop the walk once the receiver is gone (the app is quitting before
@@ -3661,7 +3674,7 @@ fn spawn_prompt_history_bootstrap(
         entries.reverse();
         let _ = tx.send(entries);
     });
-    rx
+    Some(rx)
 }
 
 /// Await the backgrounded prompt-history bootstrap. Mirrors [`recv_theme`]: an
@@ -5325,8 +5338,9 @@ pub async fn run(args: Args) -> Result<()> {
     // installs the result once it lands, so a large backlog never delays first
     // paint. Spawned once here, not per session: the editor persists across
     // session switches, so re-seeding would duplicate entries. `drive` clears
-    // the receiver after the one delivery, making its arm a no-op thereafter.
-    let mut prompt_history_rx = Some(spawn_prompt_history_bootstrap(persistence.clone()));
+    // the receiver after the one delivery, making its arm a no-op thereafter,
+    // and pends forever on the `None` a connection answers with.
+    let mut prompt_history_rx = spawn_prompt_history_bootstrap(&world);
 
     // Take the editor's autocomplete delivery receiver once, before the
     // session loop. The widget owns the async pipeline (it spawns the query
@@ -18776,6 +18790,186 @@ mod tests {
         assert!(
             transcript.borrow().in_focus_mode(),
             "the refusal stole focus from the transcript",
+        );
+        remote.shutdown().await;
+    }
+
+    /// Write a session into the store at `dir` whose one user prompt is
+    /// `prompt`, as an earlier run over that store would have left it, and
+    /// answer the store.
+    ///
+    /// Asserts the scanner can see it, because every test below turns on this
+    /// store holding a prompt: one that seeded nothing would measure nothing.
+    fn store_holding_a_prompt(dir: std::path::PathBuf, prompt: &str) -> ConversationPersistence {
+        use aj_agent::message::AgentMessage;
+        use aj_models::types::{Message, UserMessage};
+        use aj_session::{ConversationEntryKind, ConversationLog, ThreadKind};
+
+        let persistence = ConversationPersistence::new(dir);
+        {
+            let mut log = ConversationLog::create(&persistence).expect("create log");
+            log.set_system_prompt("system".to_string())
+                .expect("system prompt");
+            let root = log.system_prompt_id().cloned().expect("system prompt id");
+            log.append(
+                Some(root),
+                ThreadKind::User,
+                None,
+                ConversationEntryKind::Message {
+                    message: AgentMessage::wire(Message::User(UserMessage::text(prompt))),
+                },
+            )
+            .expect("the prompt");
+        }
+        let scanned: Vec<String> =
+            aj_session::workspace_history(&persistence, TextArea::HISTORY_LIMIT, &|| false)
+                .into_iter()
+                .map(|entry| entry.text)
+                .collect();
+        assert_eq!(
+            scanned,
+            vec![prompt.to_string()],
+            "the fixture store holds no prompt to leak, so the test that reads \
+             it measures nothing",
+        );
+        persistence
+    }
+
+    /// Over a connection the ring is seeded from nothing. The scan reads this
+    /// client's store, keyed on this machine's git root, and the session being
+    /// driven is on another machine: a seeded entry is one Up press away from
+    /// being submitted into a session it was never typed for.
+    ///
+    /// The pair to the `Ctrl+R` refusal above, which answers about the same
+    /// store. This is the deterministic half of the fix: no receiver means no
+    /// delivery can race an Up press.
+    #[tokio::test]
+    async fn a_connection_seeds_the_recall_ring_from_nothing() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        store_holding_a_prompt(
+            dir.path().join("client-sessions"),
+            "prompt-typed-on-the-client",
+        );
+        let world = connect_world(&dir, &remote, &[]).await;
+
+        assert!(
+            spawn_prompt_history_bootstrap(&world).is_none(),
+            "a connection asked this machine's store for the ring's contents",
+        );
+        remote.shutdown().await;
+    }
+
+    /// A local run is unchanged: the ring is seeded from the store the session
+    /// itself lives in, which is what makes Up reach a prompt from yesterday.
+    #[tokio::test]
+    async fn a_local_run_seeds_the_recall_ring_from_its_own_store() {
+        let dir = TempDir::new().expect("tempdir");
+        store_holding_a_prompt(
+            dir.path().join("sessions"),
+            "prompt-from-an-earlier-session",
+        );
+        let world = scripted_world_with_layers(&dir, "streaming-text", default_layers()).await;
+
+        let mut rx = spawn_prompt_history_bootstrap(&world)
+            .expect("a local run seeds the ring from its own store");
+        let seeded = crate::remote::tests::bounded("the scan to deliver", rx.recv())
+            .await
+            .expect("the scan delivers once");
+        assert!(
+            seeded.contains(&"prompt-from-an-earlier-session".to_string()),
+            "the scan found the store's own prompts: {seeded:?}",
+        );
+        shut_down(&world).await;
+    }
+
+    /// A delivered seed reaches the editor's ring: the drive loop's seed arm
+    /// splices it in and an Up press produces it.
+    ///
+    /// The arm had no coverage at all, which is why the ring's mode-blindness
+    /// had nothing to fail. Delivered before the loop reads a byte, so the
+    /// scan's landing cannot race the keystroke.
+    #[tokio::test]
+    async fn a_delivered_ring_seed_reaches_the_editor() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell, mut app, mut writer, root) =
+            world_shell_app(&dir, "streaming-text", default_layers()).await;
+        let (tx, rx) = unbounded_channel();
+        tx.send(vec!["older prompt".to_string(), "newer prompt".to_string()])
+            .expect("the seed is queued before the loop starts");
+        let mut prompt_history_rx = Some(rx);
+        let (mut theme_watch, _, mut autocomplete_rx) = drive_parts(&shell);
+
+        // Up, then EOF so the loop returns. Both are buffered before the loop
+        // reads either.
+        writer.write_all(b"\x1b[A").expect("up");
+        drop(writer);
+        let exit = drive(
+            &mut app,
+            &root,
+            &shell,
+            &mut world,
+            &mut theme_watch,
+            &mut prompt_history_rx,
+            &mut autocomplete_rx,
+        )
+        .await
+        .expect("drive exits without a fatal error");
+        assert!(matches!(exit, SessionExit::Quit), "EOF ends the loop");
+
+        assert_eq!(
+            shell.borrow().editor.borrow().text(),
+            "newer prompt",
+            "Up produced the newest seeded entry",
+        );
+        shut_down(&world).await;
+    }
+
+    /// Over a connection Up still reaches what this session submitted. The ring
+    /// keeps this run's own prompts, which were typed at this keyboard into
+    /// this session, and holds nothing from the client's store.
+    ///
+    /// Every byte travels the real path with the ring wired the way `run`
+    /// wires it, so a seed that came back would be staged in the editor here,
+    /// which is exactly the harm.
+    #[tokio::test]
+    async fn up_over_a_connection_recalls_this_sessions_own_prompt() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        store_holding_a_prompt(
+            dir.path().join("client-sessions"),
+            "prompt-typed-on-the-client",
+        );
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut app, mut writer, root) = app_over(&shell).await;
+        let mut prompt_history_rx = spawn_prompt_history_bootstrap(&world);
+        let (mut theme_watch, _, mut autocomplete_rx) = drive_parts(&shell);
+
+        // Typed, submitted, recalled, then EOF. All buffered before the loop
+        // reads any of it.
+        writer.write_all(b"remote work\r").expect("type and submit");
+        writer.write_all(b"\x1b[A").expect("up");
+        drop(writer);
+        let exit = crate::remote::tests::bounded(
+            "the loop to end on EOF",
+            drive(
+                &mut app,
+                &root,
+                &shell,
+                &mut world,
+                &mut theme_watch,
+                &mut prompt_history_rx,
+                &mut autocomplete_rx,
+            ),
+        )
+        .await
+        .expect("drive exits without a fatal error");
+        assert!(matches!(exit, SessionExit::Quit), "EOF ends the loop");
+
+        assert_eq!(
+            shell.borrow().editor.borrow().text(),
+            "remote work",
+            "Up produced this session's own submission",
         );
         remote.shutdown().await;
     }
