@@ -1535,6 +1535,82 @@ async fn the_tag_route_sets_and_clears_a_label() {
     fixture.shutdown().await;
 }
 
+/// Whether the host reports `session` as archived over the wire.
+async fn remote_archived(fixture: &Fixture, session: &str) -> bool {
+    fixture
+        .client
+        .sessions()
+        .await
+        .expect("the sessions read")
+        .sessions
+        .into_iter()
+        .find(|row| row.id == session)
+        .expect("the session is listed")
+        .archived
+}
+
+/// Post a raw archive body, so a test can send shapes the typed request
+/// cannot.
+async fn post_archive(
+    fixture: &Fixture,
+    session: &str,
+    body: serde_json::Value,
+) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!(
+            "{}/v1/sessions/{session}/archive",
+            fixture.server.url()
+        ))
+        .json(&body)
+        .send()
+        .await
+        .expect("the request reaches the host")
+}
+
+/// The archive route sets the bit and clears it, and the bit reaches the row a
+/// client reads back (spec 6.6, 6.8). `false` unarchives, which is why there is
+/// no second route for it, and a blank body reads as `false` the same way a
+/// blank tag body clears a label.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_archive_route_sets_and_clears_the_bit() {
+    let fixture = Fixture::new(Vec::new()).await;
+    let session = fixture.create().await;
+    assert!(!remote_archived(&fixture, &session).await);
+
+    let response = post_archive(&fixture, &session, serde_json::json!({"archived": true})).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert!(
+        remote_archived(&fixture, &session).await,
+        "the row a client reads back says the session is put away",
+    );
+
+    for clearing in [
+        serde_json::json!({"archived": false}),
+        serde_json::json!({}),
+    ] {
+        post_archive(&fixture, &session, serde_json::json!({"archived": true})).await;
+        assert!(remote_archived(&fixture, &session).await);
+        let response = post_archive(&fixture, &session, clearing.clone()).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED, "{clearing}");
+        assert!(
+            !remote_archived(&fixture, &session).await,
+            "{clearing} unarchives the session",
+        );
+    }
+
+    // An unknown session is the ordinary 404, not an archive-specific answer.
+    let response = post_archive(
+        &fixture,
+        "2020-01-01-00-00-00-000",
+        serde_json::json!({"archived": true}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let error: ErrorResponse = response.json().await.expect("the error shape");
+    assert_eq!(error.code, "unknown_session");
+    fixture.shutdown().await;
+}
+
 /// A label the store would not keep is a 400 naming why, and it changes
 /// nothing: the refusal happens at the wire boundary, so the session is not
 /// even materialized for it.

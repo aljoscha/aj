@@ -63,6 +63,12 @@ const BUDGET: u64 = 16 * 1024;
 /// it moves if either constant above does.
 const STARTUP_BUDGET: u64 = 900 * 1024;
 
+/// The sidecar axes an enumeration lists: labels and archived bits, one
+/// `readdir` of `meta/` each. What the assertions below are about is that the
+/// count is per axis and never per session (spec 6.8), so it moves when an
+/// axis is added and not otherwise.
+const SIDECAR_AXES: u64 = 2;
+
 /// This process's cumulative read bytes, `rchar` from `/proc/self/io`. Counts
 /// every read that reached a file descriptor, page cache or not.
 fn read_bytes() -> u64 {
@@ -177,8 +183,8 @@ async fn the_directory_costs_a_first_line_at_startup_and_nothing_per_refresh() {
     );
     assert_eq!(
         host.store_sidecar_directory_reads(),
-        1,
-        "which reads the sidecar directory exactly once as well",
+        SIDECAR_AXES,
+        "which lists the sidecar directory once per axis and no more",
     );
 
     let listed = host.sessions().await.expect("sessions").sessions;
@@ -253,8 +259,10 @@ async fn the_directory_costs_a_first_line_at_startup_and_nothing_per_refresh() {
          listings: the refresh is enumerating the store",
     );
     assert_eq!(
-        sidecars_enumerated, polls,
+        sidecars_enumerated,
+        polls * SIDECAR_AXES,
         "the host listed the sidecar directory {sidecars_enumerated} times over \
-         {polls} explicit listings: the refresh is going after the labels",
+         {polls} explicit listings of {SIDECAR_AXES} axes: the refresh is going \
+         after the sidecars",
     );
 }

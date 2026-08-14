@@ -19,6 +19,14 @@ use serde_json::value::RawValue;
 /// The current remote-control protocol version.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// The capability a host declares when it serves `POST
+/// /v1/sessions/{id}/archive` (spec 6.10).
+///
+/// Honest self-description, not a gate: a client attempts the route and reads
+/// a 404 as "this host does not archive", because a gateway's own hello cannot
+/// speak for the hosts behind it.
+pub const ARCHIVE_CAPABILITY: &str = "archive";
+
 /// A creator-selected model, resolved against the receiving host's catalog.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelSelection {

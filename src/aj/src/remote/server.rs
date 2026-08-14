@@ -29,9 +29,9 @@ use aj_conf::ConfigVerbosity;
 use aj_models::{speed_from_name, thinking_config_from_name};
 use aj_session::normalize_tag;
 use aj_wire::{
-    CancelRequest, CompactRequest, CreateSessionRequest, Cursor, ErrorResponse, Frame, HeadRequest,
-    PromptRequest, QueueOperation, QueueOutcome, QueueRequest, SessionCreated, SessionSettings,
-    SettingsRequest, SteerRequest, TagRequest,
+    ArchiveRequest, CancelRequest, CompactRequest, CreateSessionRequest, Cursor, ErrorResponse,
+    Frame, HeadRequest, PromptRequest, QueueOperation, QueueOutcome, QueueRequest, SessionCreated,
+    SessionSettings, SettingsRequest, SteerRequest, TagRequest,
 };
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, FromRequest, Path, Query, Request, State};
@@ -197,6 +197,7 @@ fn router(state: Arc<ServerState>) -> Router {
         .route("/v1/sessions/{id}/compact", post(compact))
         .route("/v1/sessions/{id}/settings", post(settings))
         .route("/v1/sessions/{id}/tag", post(tag))
+        .route("/v1/sessions/{id}/archive", post(archive))
         .route("/v1/sessions/{id}/head", post(head))
         .fallback(unknown_endpoint)
         // Outside the routes rather than per handler, so an unauthorized
@@ -448,6 +449,29 @@ async fn tag(
 ) -> Result<Response, ApiError> {
     let tag = normalized_tag(&request.tag)?;
     accepted(state.host.command(&session, Command::Tag { tag }).await?)
+}
+
+/// Set or clear the session's archived bit (spec 6.6).
+///
+/// Accepted whatever the session is doing: the bit is display metadata, and a
+/// refusal while a turn ran would be exactly the lifecycle coupling it is not
+/// allowed to have.
+async fn archive(
+    State(state): State<Arc<ServerState>>,
+    Path(session): Path<String>,
+    Body(request): Body<ArchiveRequest>,
+) -> Result<Response, ApiError> {
+    accepted(
+        state
+            .host
+            .command(
+                &session,
+                Command::Archive {
+                    archived: request.archived,
+                },
+            )
+            .await?,
+    )
 }
 
 /// The label as the store keeps it, `None` for anything that clears it.

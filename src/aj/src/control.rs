@@ -25,10 +25,10 @@ use aj_app::session_setup::thinking_display_name;
 use aj_models::types::UserContent;
 use aj_models::{speed_name, thinking_config_name, verbosity_name};
 use aj_wire::{
-    CancelRequest, CompactRequest, CreateSessionRequest, Frame, HeadRequest, ModelSelection,
-    PromptInput, PromptRequest, QueueOperation, QueueRequest, QueueState, SessionList,
-    SessionSettings, SessionTree, SettingsRequest, SteerRequest, TagRequest, TaskDetails,
-    TaskTable,
+    ArchiveRequest, CancelRequest, CompactRequest, CreateSessionRequest, Frame, HeadRequest,
+    ModelSelection, PromptInput, PromptRequest, QueueOperation, QueueRequest, QueueState,
+    SessionList, SessionSettings, SessionTree, SettingsRequest, SteerRequest, TagRequest,
+    TaskDetails, TaskTable,
 };
 use futures::FutureExt;
 use reqwest::StatusCode;
@@ -355,6 +355,7 @@ fn wire_command(command: Command) -> RemoteCommand {
         Command::Tag { tag } => RemoteCommand::Tag(TagRequest {
             tag: tag.unwrap_or_default(),
         }),
+        Command::Archive { archived } => RemoteCommand::Archive(ArchiveRequest { archived }),
         Command::Head { target } => RemoteCommand::Head(match target {
             HeadTarget::Entry(entry) => HeadRequest::entry(entry),
             HeadTarget::Before(entry) => HeadRequest::before(entry),
