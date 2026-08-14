@@ -1269,6 +1269,14 @@ current epoch, so spend on a branch abandoned by a head switch is not
 re-derivable after the reset and the banner under-reports it.
 Accepted, an exit banner does not earn host-authoritative usage on
 the wire, and such a read is the named fix if it ever matters.
+
+The editor's prompt recall ring works in connect mode and holds this
+run's own submissions, whichever session they went to. It is not
+seeded from this client's session store, which over a connection
+would stage prompts from unrelated local work for submission into the
+remote session. That is design, not a refusal: Up serves everything
+typed this run, and an unseeded ring needs no notice.
+
 The rest of the
 boundary is a work list, not the design. The target is that
 everything a session's host knows is askable over the wire, through
