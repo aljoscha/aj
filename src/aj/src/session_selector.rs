@@ -343,6 +343,7 @@ mod tests {
             message_count: count,
             first_user_message: first_user.map(|s| s.to_string()),
             tag: None,
+            archived: false,
         }
     }
 
@@ -694,6 +695,7 @@ mod tests {
             message_count: 42,
             first_user_message: Some("refactor".into()),
             tag: None,
+            archived: false,
         };
         assert_eq!(
             format_secondary(&p, now),

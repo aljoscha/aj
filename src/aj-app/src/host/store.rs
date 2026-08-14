@@ -30,7 +30,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex as StdMutex, MutexGuard};
 
-use aj_session::{ConversationError, ConversationPersistence, SessionMetadata, TagMetadata};
+use aj_session::{ConversationError, ConversationPersistence, SessionMetadata, SidecarMetadata};
 
 use crate::host::live::ReleasedRow;
 use chrono::{DateTime, Utc};
@@ -57,7 +57,7 @@ pub(crate) trait SessionStore {
 
     /// Every tag sidecar in the store, with its fingerprint. One directory
     /// read, and none at all for a store that has no tagged session.
-    fn enumerate_tags(&self) -> Result<Vec<TagMetadata>, ConversationError>;
+    fn enumerate_tags(&self) -> Result<Vec<SidecarMetadata>, ConversationError>;
 
     /// The tag in one session's sidecar, `Ok(None)` when it has none or its
     /// sidecar says nothing usable. Opens the file and reads it.
@@ -80,7 +80,7 @@ impl SessionStore for ConversationPersistence {
         ConversationPersistence::is_current_format(self, session_id)
     }
 
-    fn enumerate_tags(&self) -> Result<Vec<TagMetadata>, ConversationError> {
+    fn enumerate_tags(&self) -> Result<Vec<SidecarMetadata>, ConversationError> {
         ConversationPersistence::enumerate_tags(self)
     }
 
@@ -482,7 +482,7 @@ impl<S: SessionStore> ColdSessions<S> {
     /// recording "untagged". A read that failed says nothing about the label,
     /// and the alternative would drop a session's tag off its row until the
     /// file changed again.
-    fn tag(&self, sidecar: &TagMetadata) {
+    fn tag(&self, sidecar: &SidecarMetadata) {
         let at = Fingerprint::of(sidecar.modified_at, sidecar.size_bytes);
         // The entry as it stood before the read, which is the only one this
         // read is an answer about.
@@ -615,7 +615,7 @@ impl<S: SessionStore> ColdSessions<S> {
     /// label its driver held under the session's own lock. The id alone cannot
     /// tell those apart the way it can for a row, because a label arrives on a
     /// session that already has one.
-    fn evict_tags(&self, sidecars: &[TagMetadata], labelled: &HashMap<String, Tagged>) {
+    fn evict_tags(&self, sidecars: &[SidecarMetadata], labelled: &HashMap<String, Tagged>) {
         let present: HashSet<&str> = sidecars
             .iter()
             .map(|sidecar| sidecar.session_id.as_str())
@@ -631,7 +631,7 @@ impl<S: SessionStore> ColdSessions<S> {
         self.store.enumerate_sessions()
     }
 
-    fn enumerate_sidecars(&self) -> Result<Vec<TagMetadata>, ConversationError> {
+    fn enumerate_sidecars(&self) -> Result<Vec<SidecarMetadata>, ConversationError> {
         self.sidecar_directory_reads.fetch_add(1, Ordering::Relaxed);
         self.store.enumerate_tags()
     }
@@ -766,7 +766,7 @@ mod tests {
                 .map(|file| SessionMetadata::new(file.id, at(file.modified), file.size)))
         }
 
-        fn enumerate_tags(&self) -> Result<Vec<TagMetadata>, ConversationError> {
+        fn enumerate_tags(&self) -> Result<Vec<SidecarMetadata>, ConversationError> {
             if *self.sidecars_unreadable.lock().expect("readable") {
                 return Err(std::io::Error::other("meta/ is not readable").into());
             }
@@ -774,7 +774,7 @@ mod tests {
             sidecars.sort_by(|left, right| left.id.cmp(&right.id));
             Ok(sidecars
                 .iter()
-                .map(|sidecar| TagMetadata {
+                .map(|sidecar| SidecarMetadata {
                     session_id: sidecar.id.clone(),
                     modified_at: at(sidecar.modified),
                     size_bytes: sidecar.size(),
