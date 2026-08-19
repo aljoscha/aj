@@ -381,6 +381,29 @@ impl SessionClient {
         self.needs_reattach
     }
 
+    /// Whether an attach block this client armed for is still to come.
+    ///
+    /// This is what a caller folding a block waits on. It is the client's own
+    /// arm rather than a frame kind, which is what makes the wait end on
+    /// everything that ends a block: the `caught_up` that commits it, and the
+    /// refusal that replaces it for a session the server cannot resolve (spec
+    /// 6.5). A peer that answers neither is not covered by anything here, so a
+    /// caller still owes the wait a deadline of its own.
+    pub fn awaiting_attach(&self) -> bool {
+        self.attach != Attach::Live
+    }
+
+    /// Whether this client holds an attachment: an epoch adopted from an
+    /// attach block, which every session frame it folds is filtered against.
+    ///
+    /// False before the first block, and false again once a refusal drops the
+    /// attachment (see [`Self::apply`]). So for a caller whose block has just
+    /// stopped being awaited, this is what tells a block that landed from one
+    /// the server replaced with a refusal.
+    pub fn attached(&self) -> bool {
+        self.epoch.is_some()
+    }
+
     /// Drop the attachment for a session the server refused (spec 6.5).
     ///
     /// Everything the fold holds about the session comes from an attach block

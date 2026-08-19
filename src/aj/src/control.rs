@@ -15,6 +15,8 @@
 //! refused this" apart from "the transport failed". The recovery is the same
 //! either way, a re-attach with a cursor (spec 6.5).
 
+use std::time::Duration;
+
 use aj_agent::events::AgentId;
 use aj_agent::tool::TaskId;
 use aj_app::host::{
@@ -33,7 +35,7 @@ use aj_wire::{
 use futures::FutureExt;
 use reqwest::StatusCode;
 
-use crate::remote::{RemoteClient, RemoteCommand, RemoteError, RemoteEvents};
+use crate::remote::{RemoteClient, RemoteCommand, RemoteError, RemoteEvents, SILENCE};
 
 /// Why a control operation did not do what was asked.
 ///
@@ -445,9 +447,14 @@ pub(crate) enum Stream {
         /// a drain never swallows a lost stream.
         lost: Option<RemoteError>,
         /// The sessions this stream was opened for, which is what
-        /// [`Stream::attached`] answers from. The host's attach is
-        /// all-or-nothing, so a stream that exists carries a block for every
-        /// session named in its request and for no other.
+        /// [`Stream::attached`] answers from.
+        ///
+        /// The request, because the protocol gives a client no per-session
+        /// answer at attach time: a host's attach is all-or-nothing, and a
+        /// gateway that cannot resolve one of the ids answers that one with an
+        /// `error` frame on this very stream instead (spec 6.5, 7.1). So this
+        /// says which sessions the peer was asked about, and the peer's answer
+        /// about each arrives as frames.
         attached: Vec<String>,
     },
 }
@@ -478,6 +485,21 @@ impl Stream {
             Self::Remote { attached, .. } => attached.as_slice(),
         };
         names.iter().any(|name| name == session)
+    }
+
+    /// How long this stream may say nothing before whatever it was serving
+    /// counts as gone.
+    ///
+    /// A connection answers the tolerance it was built with, which is what lets
+    /// a caller tune it ([`RemoteClient::with_silence`]). An in-process stream
+    /// has no transport to fall silent, but its host can still stop producing,
+    /// so it answers the same span: the number is the protocol's own on how
+    /// long a peer may say nothing (spec 6.1), not a property of HTTP.
+    pub(crate) fn silence(&self) -> Duration {
+        match self {
+            Self::Local(_) => SILENCE,
+            Self::Remote { events, .. } => events.silence(),
+        }
     }
 
     /// The next frame, awaiting one.
