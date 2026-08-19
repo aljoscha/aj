@@ -700,21 +700,6 @@ async fn open_tree_overlay(
     Ok(open_session_tree(&handles, rows, tree.head))
 }
 
-/// Fold one frame off the focused session's stream, answering whether anything
-/// renderable changed.
-///
-/// `block` is the attach block still arriving, when there is one. A frame during
-/// a catch-up has to go through the block's own fold, which is where the
-/// `caught_up` that ends it is recognized: applied straight to the directory it
-/// would commit the client and leave the block waiting for a frame that has
-/// already been and gone.
-fn fold_stream_frame(world: &mut World, block: Option<&mut Block>, frame: aj_wire::Frame) -> bool {
-    match block {
-        Some(block) => block.fold(world, frame),
-        None => world.directory.apply(&mut world.chat.borrow_mut(), frame).0,
-    }
-}
-
 /// Fold every frame already queued on the focused session's stream.
 ///
 /// Called once per drive-loop iteration, so the chrome mirrors never lag the
@@ -722,23 +707,12 @@ fn fold_stream_frame(world: &mut World, block: Option<&mut Block>, frame: aj_wir
 /// returns) and a streaming burst collapses into one redraw rather than one
 /// per chunk. Returns whether anything renderable changed.
 ///
-/// An arriving `block` is fed the same way, so a block that lands as one burst
-/// is folded in one iteration rather than one frame per iteration. The drain
-/// stops at the block's end: what follows a `caught_up` is live traffic, and the
-/// reads the block obliges are due before it (spec 6.7).
-///
 /// A stream that failed mid-drain reports nothing here: the failure is held
 /// for the loop's frame arm, which is the one place a lost stream is handled.
-fn fold_ready_frames(world: &mut World, mut block: Option<&mut Block>) -> bool {
+fn fold_ready_frames(world: &mut World) -> bool {
     let mut redraw = false;
-    while block
-        .as_deref()
-        .is_none_or(|block| block.settled().is_none())
-    {
-        let Some(frame) = world.stream.try_recv() else {
-            break;
-        };
-        redraw |= fold_stream_frame(world, block.as_deref_mut(), frame);
+    while let Some(frame) = world.stream.try_recv() {
+        redraw |= world.directory.apply(&mut world.chat.borrow_mut(), frame).0;
     }
     redraw
 }
@@ -6001,9 +5975,10 @@ impl Resume {
 
     /// The attach block this recovery is folding, if it is that far along.
     ///
-    /// The loop folds every frame through this while it is `Some`, which is the
-    /// same thing as the stream being open: a `None` says nothing arrives on
-    /// `world.stream` any more, so the frame arm has to stay off it.
+    /// A `None` says nothing arrives on `world.stream` any more: the stream that
+    /// died has not been replaced yet, so the loop's frame arm has to stay off it.
+    /// [`Self::arriving`] answers the same question where a mutable borrow cannot
+    /// be held.
     fn block_mut(&mut self) -> Option<&mut Block> {
         match &mut self.step {
             ResumeStep::Waiting => None,
@@ -6011,7 +5986,9 @@ impl Resume {
         }
     }
 
-    /// Whether the stream this recovery holds is one frames still arrive on.
+    /// Whether frames still arrive on the stream this recovery holds, which is
+    /// [`Self::block_mut`] without the borrow: a `select!` guard is not a place a
+    /// block can be taken out of.
     fn arriving(&self) -> bool {
         matches!(self.step, ResumeStep::CatchingUp(_))
     }
@@ -6746,8 +6723,16 @@ async fn drive(
             frame = world.stream.recv(), if resume.as_ref().is_none_or(Resume::arriving) => {
                 match frame {
                     ControlFrame::Frame(frame) => {
-                        let block = resume.as_mut().and_then(Resume::block_mut);
-                        if fold_stream_frame(world, block, frame) {
+                        // A frame during a catch-up goes through the arriving
+                        // block's own fold, which is where the `caught_up` that
+                        // ends the block is recognized. Applied straight to the
+                        // directory it would commit the client and leave the
+                        // block waiting for a frame already gone by.
+                        let redraw = match resume.as_mut().and_then(Resume::block_mut) {
+                            Some(block) => block.fold(world, frame),
+                            None => world.directory.apply(&mut world.chat.borrow_mut(), frame).0,
+                        };
+                        if redraw {
                             app.request_redraw();
                         }
                     }
@@ -6924,13 +6909,12 @@ async fn drive(
         // returns). One drain per iteration is what keeps the chrome mirrors
         // below from lagging the host by a frame.
         //
-        // Suspended while a lost stream's reopen is pending: what is queued
-        // there belongs to the stream that died, which the reopen replaces. An
-        // arriving attach block is drained into the block itself, so a block
-        // that lands as one burst is folded in one iteration.
-        if resume.as_ref().is_none_or(Resume::arriving)
-            && fold_ready_frames(world, resume.as_mut().and_then(Resume::block_mut))
-        {
+        // Suspended while a re-attach is pending: the attach block a resumed
+        // stream carries is folded one frame per iteration by the arm above, and
+        // draining it here would swallow the `caught_up` that fold is watching
+        // for. The block channel is producer-paced with room for one frame
+        // (spec 6.9), so a block arrives at the pace of those reads anyway.
+        if resume.is_none() && fold_ready_frames(world) {
             app.request_redraw();
         }
         // A task kill parked by the remote task viewer, which has no registry
@@ -7773,7 +7757,7 @@ mod tests {
     async fn settle(world: &mut World) {
         let deadline = Instant::now() + SETTLE_DEADLINE;
         loop {
-            fold_ready_frames(world, None);
+            fold_ready_frames(world);
             let quiet = world
                 .control
                 .sessions()
@@ -7788,7 +7772,7 @@ mod tests {
             // work that just finished can still be in flight (in process they
             // are already queued, so this converges at once).
             if quiet && !world.client().working() {
-                fold_ready_frames(world, None);
+                fold_ready_frames(world);
                 return;
             }
             assert!(Instant::now() < deadline, "the session never went quiet",);
@@ -10216,7 +10200,7 @@ mod tests {
         assert_eq!(quit_arm_running_work(&world), None);
 
         handle_submit(&mut world, "go".to_string()).await;
-        fold_ready_frames(&mut world, None);
+        fold_ready_frames(&mut world);
         assert_eq!(
             quit_arm_running_work(&world).as_deref(),
             Some("1 agent still running")
@@ -10238,7 +10222,7 @@ mod tests {
         let mut world = scripted_world(&dir, "streaming-text").await;
 
         handle_submit(&mut world, "hi there".to_string()).await;
-        fold_ready_frames(&mut world, None);
+        fold_ready_frames(&mut world);
         assert!(world.client().working(), "the host accepted the prompt");
 
         // The frame arm, until the turn is over.
@@ -10310,7 +10294,7 @@ mod tests {
         let mut world = scripted_world(&dir, "streaming-text").await;
 
         auto_submit_launch(&mut world, vec![UserContent::text("launch me")]).await;
-        fold_ready_frames(&mut world, None);
+        fold_ready_frames(&mut world);
         assert!(world.client().working(), "the launch prompt started a turn");
 
         settle(&mut world).await;
@@ -10338,7 +10322,7 @@ mod tests {
         let mut world = scripted_world(&dir, "streaming-text").await;
 
         auto_submit_launch(&mut world, Vec::new()).await;
-        fold_ready_frames(&mut world, None);
+        fold_ready_frames(&mut world);
         assert!(!world.client().working());
         assert!(!world.chat.borrow().has_conversation());
         shut_down(&world).await;
@@ -10428,7 +10412,7 @@ mod tests {
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         install_busy_script(world.handles());
         handle_submit(&mut world, "go".to_string()).await;
-        fold_ready_frames(&mut world, None);
+        fold_ready_frames(&mut world);
         assert!(world.client().working(), "the session is busy");
 
         apply_command(&mut world, &shell, CommandAction::Compact).await;
@@ -10502,7 +10486,7 @@ mod tests {
         std::fs::remove_file(&log_path).expect("clear the fault");
         install_busy_script(world.handles());
         handle_submit(&mut world, "again".to_string()).await;
-        fold_ready_frames(&mut world, None);
+        fold_ready_frames(&mut world);
         assert!(world.client().working(), "the session survived the error");
         settle(&mut world).await;
         assert!(
@@ -10546,7 +10530,7 @@ mod tests {
             )
             .await
             .expect("the head switch is accepted");
-        fold_ready_frames(&mut world, None);
+        fold_ready_frames(&mut world);
         assert!(
             world.client().needs_reattach(),
             "the reset frame left the client owing a re-attach",
@@ -10603,7 +10587,7 @@ mod tests {
             )
             .await
             .expect("the head switch is accepted");
-        fold_ready_frames(&mut world, None);
+        fold_ready_frames(&mut world);
         assert!(
             world.client().needs_reattach(),
             "the reset left an obligation"
@@ -11017,7 +11001,7 @@ mod tests {
         // Wait the host's `list` coalescing out (spec 6.8) before draining, so
         // no frame of the switch is still to come.
         tokio::time::sleep(Duration::from_millis(400)).await;
-        fold_ready_frames(&mut world, None);
+        fold_ready_frames(&mut world);
         refresh_client_reads(&mut world).await;
         assert!(
             world.client().needs_reattach(),
@@ -11245,7 +11229,7 @@ mod tests {
         // stream the loop parks on has nothing left to say. A frame would wake
         // the loop for free and the retry would ride along on it.
         tokio::time::sleep(Duration::from_millis(400)).await;
-        fold_ready_frames(&mut world, None);
+        fold_ready_frames(&mut world);
 
         // Point the world at a session the host does not have, so every read is
         // refused.
@@ -11423,7 +11407,7 @@ mod tests {
         let mut world = scripted_world(&dir, "streaming-text").await;
 
         handle_submit(&mut world, "first".to_string()).await;
-        fold_ready_frames(&mut world, None);
+        fold_ready_frames(&mut world);
         assert!(world.client().working());
 
         // Wait until the prompt's own user message landed before
@@ -11459,7 +11443,7 @@ mod tests {
             "busy submit queues instead of spawning",
         );
         assert_eq!(snapshot.text, "second");
-        fold_ready_frames(&mut world, None);
+        fold_ready_frames(&mut world);
         assert_eq!(
             world.chat.borrow().queue().queues.len(),
             1,
@@ -11507,7 +11491,7 @@ mod tests {
         );
 
         handle_submit(&mut world, "go".to_string()).await;
-        fold_ready_frames(&mut world, None);
+        fold_ready_frames(&mut world);
         assert!(
             cancel_viewed_turn(&world).await,
             "running turn is cancelled"
@@ -11602,7 +11586,7 @@ mod tests {
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
 
         handle_submit(&mut world, "first".to_string()).await;
-        fold_ready_frames(&mut world, None);
+        fold_ready_frames(&mut world);
         assert!(world.client().working(), "busy");
 
         // Busy + editor text: queue as steering, clear the editor.
@@ -11657,7 +11641,7 @@ mod tests {
             .borrow_mut()
             .insert_at_cursor("hi there");
         assert!(handle_host_action(&mut world, &shell, AjAction::Steer).await);
-        fold_ready_frames(&mut world, None);
+        fold_ready_frames(&mut world);
         assert!(world.client().working(), "idle steer spawned a prompt turn");
         assert!(
             world
@@ -11700,7 +11684,7 @@ mod tests {
         // The turn has to still be in flight when the Alt+Enter lands below.
         install_busy_script(world.handles());
         handle_submit(&mut world, "running prompt".to_string()).await;
-        fold_ready_frames(&mut world, None);
+        fold_ready_frames(&mut world);
         assert!(world.client().working(), "the session is busy");
 
         let transcript = Rc::clone(&shell.borrow().transcript);
@@ -11799,7 +11783,7 @@ mod tests {
         // The turn has to still be in flight when the Alt+Enter lands below.
         install_busy_script(world.handles());
         handle_submit(&mut world, "running prompt".to_string()).await;
-        fold_ready_frames(&mut world, None);
+        fold_ready_frames(&mut world);
         assert!(world.client().working(), "the session is busy");
 
         let transcript = Rc::clone(&shell.borrow().transcript);
@@ -11838,7 +11822,7 @@ mod tests {
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
 
         handle_submit(&mut world, "first".to_string()).await;
-        fold_ready_frames(&mut world, None);
+        fold_ready_frames(&mut world);
         handle_submit(&mut world, "queued line".to_string()).await;
         assert_eq!(
             world.handles().queues.snapshot(AgentId::Main).text,
@@ -11869,7 +11853,7 @@ mod tests {
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
 
         handle_submit(&mut world, "first".to_string()).await;
-        fold_ready_frames(&mut world, None);
+        fold_ready_frames(&mut world);
         handle_submit(&mut world, "second".to_string()).await;
 
         assert!(handle_host_action(&mut world, &shell, AjAction::CancelTurn).await);
@@ -15046,7 +15030,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         handle_submit(&mut world, "go".to_string()).await;
-        fold_ready_frames(&mut world, None);
+        fold_ready_frames(&mut world);
         assert!(world.client().working(), "busy");
 
         // The selector opens read-only mid-turn.
@@ -15123,7 +15107,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         handle_submit(&mut world, "go".to_string()).await;
-        fold_ready_frames(&mut world, None);
+        fold_ready_frames(&mut world);
         assert!(world.client().working(), "busy");
 
         assert!(matches!(
@@ -15730,7 +15714,7 @@ mod tests {
         let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
         // Start a turn so the session is busy.
         handle_submit(&mut world, "first".to_string()).await;
-        fold_ready_frames(&mut world, None);
+        fold_ready_frames(&mut world);
         assert!(world.client().working(), "a turn is in flight");
         {
             let sh = shell.borrow();
@@ -15918,7 +15902,7 @@ mod tests {
         // A live turn refuses the switch.
         install_busy_script(world.handles());
         handle_submit(&mut world, "busy".to_string()).await;
-        fold_ready_frames(&mut world, None);
+        fold_ready_frames(&mut world);
         assert!(world.client().working(), "a turn is in flight");
         apply_focus_request(&mut app, &shell, &mut world, branch()).await;
         assert!(
@@ -16081,7 +16065,7 @@ mod tests {
                 Instant::now() < deadline,
                 "the backgrounded session never folded the turn it was given",
             );
-            fold_ready_frames(&mut world, None);
+            fold_ready_frames(&mut world);
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
@@ -16231,7 +16215,7 @@ mod tests {
                 Instant::now() < deadline,
                 "the background session's reset was never folded",
             );
-            fold_ready_frames(&mut world, None);
+            fold_ready_frames(&mut world);
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(
@@ -16312,7 +16296,7 @@ mod tests {
                 Instant::now() < deadline,
                 "the background session's reset was never folded",
             );
-            fold_ready_frames(&mut world, None);
+            fold_ready_frames(&mut world);
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         // The obligation is a background session's, so a check that only ever
@@ -16808,7 +16792,7 @@ mod tests {
         )
         .await;
 
-        fold_ready_frames(&mut world, None);
+        fold_ready_frames(&mut world);
         assert!(world.client().working(), "the branch prompt ran as a turn");
         assert!(
             toast_lines(&shell)
@@ -17173,7 +17157,7 @@ mod tests {
     ) -> bool {
         let deadline = Instant::now() + SETTLE_DEADLINE;
         while Instant::now() < deadline {
-            fold_ready_frames(world, None);
+            fold_ready_frames(world);
             if world
                 .directory
                 .rows()
@@ -17198,7 +17182,7 @@ mod tests {
     ) -> bool {
         let deadline = Instant::now() + SETTLE_DEADLINE;
         while Instant::now() < deadline {
-            fold_ready_frames(world, None);
+            fold_ready_frames(world);
             sync_sidebar(world, shell);
             if shell
                 .borrow()
@@ -17625,7 +17609,7 @@ mod tests {
             .expect("a second session");
         let deadline = Instant::now() + SETTLE_DEADLINE;
         loop {
-            fold_ready_frames(&mut world, None);
+            fold_ready_frames(&mut world);
             sync_sidebar(&world, &shell);
             if shell.borrow().sidebar.borrow().rows.len() >= 2 {
                 break;
@@ -18016,7 +18000,7 @@ mod tests {
         }
         let deadline = Instant::now() + SETTLE_DEADLINE;
         loop {
-            fold_ready_frames(&mut world, None);
+            fold_ready_frames(&mut world);
             sync_sidebar(&world, &shell);
             if shell.borrow().sidebar.borrow().rows.len() >= 3 {
                 break;
@@ -18094,7 +18078,7 @@ mod tests {
             .expect("a second session to step onto");
         let deadline = Instant::now() + SETTLE_DEADLINE;
         loop {
-            fold_ready_frames(&mut world, None);
+            fold_ready_frames(&mut world);
             sync_sidebar(&world, &shell);
             if shell.borrow().sidebar.borrow().rows.len() >= 2 {
                 break;
@@ -18163,7 +18147,7 @@ mod tests {
         // something to say once they do.
         let deadline = Instant::now() + SETTLE_DEADLINE;
         loop {
-            fold_ready_frames(&mut world, None);
+            fold_ready_frames(&mut world);
             sync_sidebar(&world, &shell);
             if !shell.borrow().sidebar.borrow().rows.is_empty() {
                 break;
@@ -18190,7 +18174,7 @@ mod tests {
             .expect("a second session");
         let deadline = Instant::now() + SETTLE_DEADLINE;
         loop {
-            fold_ready_frames(&mut world, None);
+            fold_ready_frames(&mut world);
             sync_sidebar(&world, &shell);
             if shell.borrow().sidebar.borrow().rows.len() >= 2 {
                 break;
@@ -18358,7 +18342,7 @@ mod tests {
         }
         let deadline = Instant::now() + SETTLE_DEADLINE;
         loop {
-            fold_ready_frames(&mut world, None);
+            fold_ready_frames(&mut world);
             sync_sidebar(&world, &shell);
             if shell.borrow().sidebar.borrow().rows.len() >= 3 {
                 break;
@@ -19607,7 +19591,7 @@ mod tests {
         let session = world.session().to_string();
 
         assert!(handle_submit(&mut world, "hello".to_string()).await);
-        fold_ready_frames(&mut world, None);
+        fold_ready_frames(&mut world);
         // Cut the connection mid-turn: the state the transport error leaves
         // the stream in.
         world.stream.cut();
@@ -21552,7 +21536,7 @@ mod tests {
             .expect("the host's own handles");
         install_busy_script(&handles);
         assert!(handle_submit(&mut world, "keep busy".to_string()).await);
-        fold_ready_frames(&mut world, None);
+        fold_ready_frames(&mut world);
         apply_command(&mut world, &shell, CommandAction::Compact).await;
         assert!(
             main_notices(&world)
@@ -21580,7 +21564,7 @@ mod tests {
         // Wait for the background task to show up in the client's model.
         let deadline = Instant::now() + SETTLE_DEADLINE;
         loop {
-            fold_ready_frames(&mut world, None);
+            fold_ready_frames(&mut world);
             let known = world.chat.borrow().tasks().keys().next().copied();
             if let Some(task) = known {
                 let command = match &world.chat.borrow().tasks()[&task].kind {
@@ -21886,7 +21870,7 @@ mod tests {
         // this and then fails the assertion below, which is the point.
         let deadline = Instant::now() + SETTLE_DEADLINE;
         let prompts = loop {
-            fold_ready_frames(&mut world, None);
+            fold_ready_frames(&mut world);
             let prompts: Vec<String> = world
                 .chat
                 .borrow()
@@ -22860,7 +22844,7 @@ mod tests {
     ) -> bool {
         let deadline = Instant::now() + SETTLE_DEADLINE;
         while Instant::now() < deadline {
-            fold_ready_frames(world, None);
+            fold_ready_frames(world);
             if world
                 .directory
                 .rows()
