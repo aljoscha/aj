@@ -401,6 +401,7 @@ mod tests {
                 &dir,
                 scripted(Vec::new(), 0, Duration::ZERO),
                 HostHandles::new(&dir),
+                None,
             );
             let server =
                 RemoteServer::bind(host.clone(), addr("127.0.0.1:0"), IdentityGate::local())

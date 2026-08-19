@@ -20,7 +20,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::gateway::config::HostAddress;
-use crate::gateway::directory::Directory;
+use crate::gateway::directory::{Directory, Reported};
 use crate::gateway::{Recorder, Tuning};
 use crate::remote::RemoteClient;
 
@@ -140,11 +140,12 @@ async fn attempt(address: &HostAddress, directory: &Directory, recorder: &Record
         Ok(hello) => hello,
         Err(err) => return Attempt::Failed(err.to_string()),
     };
-    // What that name settles is the gateway's to decide: a configured
-    // enrollment's id is provisional and a dynamic one's is the record it was
-    // made from (spec 7.1). A link is where one is learned, so it is also where
-    // the gateway's record of it comes from.
-    if let Err(err) = recorder.settle(address, &hello.host_id).await {
+    // What that id settles is the gateway's to decide: a configured
+    // enrollment's is provisional and a dynamic one's is the record it was made
+    // from (spec 7.1). A link is where one is learned, so it is also where the
+    // gateway's record of it comes from, and the same goes for the name this
+    // host reports beside it.
+    if let Err(err) = recorder.settle(address, &Reported::of(&hello)).await {
         return Attempt::Failed(err.to_string());
     }
     // No session is named: this is the control connection of spec 7.1, so the

@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::gateway::config::HostAddress;
 
-/// One host as the gateway's state records it: where to dial it, and the id it
-/// answered to.
+/// One host as the gateway's state records it: where to dial it, and what it
+/// said about itself when this gateway last spoke to it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct EnrolledHost {
     pub(crate) address: HostAddress,
@@ -35,6 +35,15 @@ pub(crate) struct EnrolledHost {
     /// replaces it, a dynamic enrollment's is the record's referent and a
     /// different id is refused (see `Directory::adopt`).
     pub(crate) host_id: String,
+    /// What the host called itself at that contact, republished as
+    /// `DirectoryHost::name` (spec 7.1).
+    ///
+    /// Recorded beside the id for the same reason and to a different end: the
+    /// id is what a down host's sessions are still namespaced under, this is
+    /// what its group header still reads as. Absent for a host that reported
+    /// none, and for a record written before a gateway kept names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) name: Option<String>,
 }
 
 /// The gateway's enrollment state, as one file under `~/.aj/gateway/`.
@@ -153,6 +162,15 @@ mod tests {
         EnrolledHost {
             address: HostAddress::parse(address).expect("an address"),
             host_id: host_id.to_string(),
+            name: None,
+        }
+    }
+
+    /// The same record with the name the host reported for itself.
+    fn named(address: &str, host_id: &str, name: &str) -> EnrolledHost {
+        EnrolledHost {
+            name: Some(name.to_string()),
+            ..enrolled(address, host_id)
         }
     }
 
@@ -169,9 +187,9 @@ mod tests {
         let recorded = Recorded {
             hosts: vec![
                 enrolled("127.0.0.1:6161", "aaa"),
-                enrolled("100.64.0.2:6161", "bbb"),
+                named("100.64.0.2:6161", "bbb", "~/work/umber/aj"),
             ],
-            configured_ids: vec![enrolled("100.64.0.3:6161", "ccc")],
+            configured_ids: vec![named("100.64.0.3:6161", "ccc", "~/workshop")],
         };
         file.save(&recorded).expect("save");
         assert_eq!(file.load().expect("load"), recorded);
@@ -188,7 +206,8 @@ mod tests {
 
     /// A file written before the gateway kept configured hosts' ids reads as
     /// having none, rather than failing the start of a gateway that has
-    /// enrollments in it.
+    /// enrollments in it. A host recorded before it kept names reads as
+    /// reporting none, which is what leaves it labelled by its id.
     #[test]
     fn a_file_with_no_configured_ids_reads_as_naming_none() {
         let dir = tempfile::TempDir::new().expect("tempdir");

@@ -17,7 +17,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use aj_app::host::AttachRequest;
-use aj_wire::{DirectoryHost, HostList, HostSource, HostSummary, MergedDirectory, RawObject};
+use aj_wire::{
+    DirectoryHost, Hello, HostList, HostSource, HostSummary, MergedDirectory, RawObject,
+    normalize_host_name,
+};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -62,6 +65,13 @@ struct Enrollment {
     /// does depends on how this enrollment anchors identity, see
     /// [`Directory::adopt`].
     host_id: Option<String>,
+    /// What the host called itself at the latest contact, republished as
+    /// [`DirectoryHost::name`] (spec 7.1).
+    ///
+    /// The id rules identity and this follows it: a host that reports a
+    /// different name keeps its sessions and changes its label. `None` for a
+    /// host that reported none and for one that has never answered.
+    name: Option<String>,
     /// The rows of this host's own last `list` frame, with its own ids.
     rows: Vec<Row>,
     connected: bool,
@@ -80,10 +90,67 @@ struct Enrollment {
 }
 
 impl Enrollment {
-    /// What this gateway knows the host by: its id, or the address it was
-    /// enrolled at while it has never answered and so has no id.
-    fn name(&self, address: &HostAddress) -> String {
-        self.host_id.clone().unwrap_or_else(|| address.to_string())
+    /// What a reader calls this host: the name it reports, else the id its
+    /// sessions are namespaced under, else the address it is enrolled at while
+    /// it has never answered (spec 7.1).
+    ///
+    /// For prose about the host. A message that asks its reader to *name* a
+    /// host wants [`Self::candidate`] instead, because a name addresses
+    /// nothing.
+    fn label(&self, address: &HostAddress) -> String {
+        self.name
+            .clone()
+            .or_else(|| self.host_id.clone())
+            .unwrap_or_else(|| address.to_string())
+    }
+
+    /// This host as a message that asks for one to be named lists it: the id a
+    /// create resolves against, with the host's own name beside it where it has
+    /// one, or the address while it has no id at all.
+    ///
+    /// The id and not the name, because a create names a host by its id
+    /// (spec 6.6) and a refusal that listed labels would be instructions that
+    /// do not work.
+    fn candidate(&self, address: &HostAddress) -> String {
+        match (&self.host_id, &self.name) {
+            (Some(host_id), Some(name)) => format!("{host_id} ({name})"),
+            (Some(host_id), None) => host_id.clone(),
+            (None, _) => address.to_string(),
+        }
+    }
+}
+
+/// What a host said about itself when this gateway last spoke to it (spec 6.1).
+///
+/// The two arrive in one handshake and are not interchangeable: the id rules
+/// identity and namespaces the host's sessions, the name is a label that
+/// follows the latest contact. Carried together so that a gateway learning one
+/// cannot forget the other.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Reported {
+    pub(crate) host_id: String,
+    pub(crate) name: Option<String>,
+}
+
+impl Reported {
+    /// What the host at the other end of `hello` says it is.
+    pub(crate) fn of(hello: &Hello) -> Self {
+        Self::new(&hello.host_id, hello.name.as_deref())
+    }
+
+    /// A contact's report, with the name held to the rule a reader applies.
+    ///
+    /// Normalized here, at the one place a peer's word for itself enters this
+    /// gateway, because a host is not trusted to have applied
+    /// [`normalize_host_name`] and this gateway hands the name on to clients
+    /// that paint it. An illegal one is dropped rather than refused: the id is
+    /// what the contact is for, and a label that cannot be shown must not cost
+    /// a working host its enrollment.
+    pub(crate) fn new(host_id: &str, name: Option<&str>) -> Self {
+        Self {
+            host_id: host_id.to_string(),
+            name: name.and_then(|name| normalize_host_name(name).ok().flatten()),
+        }
     }
 }
 
@@ -192,10 +259,11 @@ impl Withdrawn {
 /// What [`Directory::adopt`] settled.
 #[derive(Debug)]
 pub(crate) enum Adopted {
-    /// The host named itself for the first time, so its id is new here and
-    /// belongs in the gateway's record.
+    /// The host told this gateway something it did not hold: an id, where it had
+    /// none for that host, or a different name for itself. Either belongs in the
+    /// gateway's record.
     Learned,
-    /// It answered to the id this enrollment already had.
+    /// It answered to the id and the name this enrollment already had.
     Unchanged,
     /// A configured host answered under a different id, so the store this
     /// gateway was namespacing is gone and the identity that named it went with
@@ -204,10 +272,32 @@ pub(crate) enum Adopted {
     Replaced(Withdrawn),
 }
 
-/// What settling a reported id against an enrollment amounts to, worked out
-/// before anything is applied.
+/// What settling a reported identity against an enrollment amounts to, worked
+/// out before anything is applied.
+///
+/// Two answers in one, because a contact carries two things: what it does to
+/// the identity this gateway serves, and whether the label it republishes
+/// changes. Both callers read the pair, which is what keeps the record a
+/// settlement is written from and the set it then mutates in step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Settling {
+struct Settling {
+    identity: Identity,
+    /// Whether the host reports a name other than the one held for it.
+    renames: bool,
+}
+
+impl Settling {
+    /// Whether applying this changes anything at all. A contact that changes
+    /// nothing is not written down and not published: a link's every redial
+    /// reaches here, and `list` is cumulative (spec 6.8).
+    fn changes(self) -> bool {
+        self.identity != Identity::Unchanged || self.renames
+    }
+}
+
+/// What a reported id does to the identity an enrollment holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Identity {
     Learned,
     Unchanged,
     Replaced,
@@ -229,6 +319,8 @@ struct Owner<'a> {
     /// The id the host answers to, which is the namespace the session id
     /// carried.
     host_id: String,
+    /// What a refusal about this host calls it (see [`Enrollment::label`]).
+    label: String,
     /// What that host calls the session.
     session: String,
     /// The address the host is enrolled at, which is what a link or an upstream
@@ -261,6 +353,7 @@ fn owner<'a>(
         .ok_or_else(|| unknown(format!("no host {} is enrolled here", named.host)))?;
     Ok(Owner {
         host_id: named.host,
+        label: enrollment.label(address),
         session: named.session,
         address,
         connected: enrollment.connected,
@@ -342,7 +435,7 @@ impl Directory {
         }
     }
 
-    /// Enroll `address`, with `host_id` when it is already known.
+    /// Enroll `address`, with what the host reported when it is already known.
     ///
     /// Two refusals keep the enrolled set free of duplicates (spec 7.1): one
     /// address is one enrollment, and one host id is one namespace. The second
@@ -358,33 +451,40 @@ impl Directory {
         &self,
         address: HostAddress,
         source: HostSource,
-        host_id: Option<String>,
+        reported: Option<Reported>,
     ) -> Result<(), DirectoryError> {
-        if let Some(host_id) = &host_id {
-            validate_host_id(host_id).map_err(|source| DirectoryError::UnusableHostId {
-                host_id: host_id.clone(),
-                source,
+        if let Some(reported) = &reported {
+            validate_host_id(&reported.host_id).map_err(|source| {
+                DirectoryError::UnusableHostId {
+                    host_id: reported.host_id.clone(),
+                    source,
+                }
             })?;
         }
         let mut hosts = self.lock();
         if hosts.contains_key(&address) {
             return Err(DirectoryError::AddressEnrolled { address });
         }
-        if let Some(host_id) = &host_id
-            && let Some((taken, _)) = hosts
-                .iter()
-                .find(|(_, enrolled)| enrolled.host_id.as_deref() == Some(host_id.as_str()))
+        if let Some(reported) = &reported
+            && let Some((taken, _)) = hosts.iter().find(|(_, enrolled)| {
+                enrolled.host_id.as_deref() == Some(reported.host_id.as_str())
+            })
         {
             return Err(DirectoryError::DuplicateHost {
-                host_id: host_id.clone(),
+                host_id: reported.host_id.clone(),
                 address: taken.clone(),
             });
         }
+        let (host_id, name) = match reported {
+            Some(reported) => (Some(reported.host_id), reported.name),
+            None => (None, None),
+        };
         hosts.insert(
             address,
             Enrollment {
                 source,
                 host_id,
+                name,
                 rows: Vec::new(),
                 connected: false,
                 error: None,
@@ -423,7 +523,8 @@ impl Directory {
         ))
     }
 
-    /// Settle the id of the host at `address` against what it just reported.
+    /// Settle what the host at `address` reports about itself against what this
+    /// enrollment holds.
     ///
     /// The two enrollment kinds anchor identity differently, so they answer a
     /// different id differently (spec 7.1). A dynamic enrollment names a host
@@ -436,23 +537,27 @@ impl Directory {
     /// followed by fresh contact, which is why the caller is handed a
     /// [`Withdrawn`] to finish.
     ///
+    /// The name is not identity and is settled without any of that: it follows
+    /// the latest contact, so a host that restarted under a different one keeps
+    /// its sessions and changes what a client's header reads.
+    ///
     /// Answering what was settled is what tells the caller there is something to
     /// write down: an id is learned by speaking to the host, so this is the only
     /// place a configured host's ever gets settled.
     pub(crate) fn adopt(
         &self,
         address: &HostAddress,
-        reported: &str,
+        reported: &Reported,
     ) -> Result<Adopted, DirectoryError> {
         let mut hosts = self.lock();
         let settling = settling(&hosts, address, reported)?;
-        if settling == Settling::Unchanged {
+        if !settling.changes() {
             return Ok(Adopted::Unchanged);
         }
         let enrollment = hosts
             .get_mut(address)
             .expect("the enrollment the settlement just read");
-        let replaced = (settling == Settling::Replaced).then(|| {
+        let replaced = (settling.identity == Identity::Replaced).then(|| {
             // The store this gateway was namespacing is gone with the identity
             // that named it. Its rows describe sessions that no longer exist, and
             // re-publishing them under the new id would name the new store's
@@ -465,7 +570,8 @@ impl Directory {
                 serving: std::mem::replace(&mut enrollment.serving, CancellationToken::new()),
             }
         });
-        enrollment.host_id = Some(reported.to_string());
+        enrollment.host_id = Some(reported.host_id.clone());
+        enrollment.name = reported.name.clone();
         self.publish(&hosts);
         Ok(match replaced {
             Some(withdrawn) => Adopted::Replaced(withdrawn),
@@ -534,9 +640,7 @@ impl Directory {
         let hosts = self.lock();
         let owner = owner(&hosts, id)?;
         if !owner.connected {
-            return Err(DirectoryError::Unreachable {
-                host: owner.host_id,
-            });
+            return Err(DirectoryError::Unreachable { host: owner.label });
         }
         Ok(Route {
             address: owner.address.clone(),
@@ -570,6 +674,7 @@ impl Directory {
             };
             let Owner {
                 host_id,
+                label: _,
                 session,
                 address,
                 connected,
@@ -623,7 +728,7 @@ impl Directory {
                     return Err(DirectoryError::AmbiguousHost {
                         hosts: hosts
                             .iter()
-                            .map(|(address, enrollment)| enrollment.name(address))
+                            .map(|(address, enrollment)| enrollment.candidate(address))
                             .collect(),
                     });
                 }
@@ -640,7 +745,7 @@ impl Directory {
                 host_id: host_id.clone(),
             }),
             _ => Err(DirectoryError::Unreachable {
-                host: enrollment.name(address),
+                host: enrollment.label(address),
             }),
         }
     }
@@ -707,10 +812,10 @@ impl Directory {
     pub(crate) fn record_adopting(
         &self,
         address: &HostAddress,
-        reported: &str,
+        reported: &Reported,
     ) -> Result<Option<Recorded>, DirectoryError> {
         let hosts = self.lock();
-        if settling(&hosts, address, reported)? == Settling::Unchanged {
+        if !settling(&hosts, address, reported)?.changes() {
             return Ok(None);
         }
         Ok(Some(record(&hosts, Some((address, reported)))))
@@ -780,29 +885,37 @@ impl Directory {
 /// What the state file records about the enrolled set: the dynamic enrollments,
 /// and the learned ids of the hosts the configuration file enrolls.
 ///
-/// `adopting` names the one enrollment whose id is taken from that pair rather
-/// than from the set, which is how an adoption is recorded before it lands (see
-/// [`Directory::record_adopting`]).
+/// `adopting` names the one enrollment whose report is taken from that pair
+/// rather than from the set, which is how an adoption is recorded before it
+/// lands (see [`Directory::record_adopting`]). The id and the name come from the
+/// same side of that choice, so a record cannot pair one host's id with
+/// another's name.
 ///
 /// A host that has never answered contributes nothing either way. There is no id
 /// to write down for it, and its address is already in the configuration file
 /// that named it.
 fn record(
     hosts: &BTreeMap<HostAddress, Enrollment>,
-    adopting: Option<(&HostAddress, &str)>,
+    adopting: Option<(&HostAddress, &Reported)>,
 ) -> Recorded {
     let mut recorded = Recorded::default();
     for (address, enrollment) in hosts {
         let settled = match adopting {
-            Some((adopting_at, reported)) if adopting_at == address => Some(reported.to_string()),
-            _ => enrollment.host_id.clone(),
+            Some((adopting_at, reported)) if adopting_at == address => {
+                Some((reported.host_id.clone(), reported.name.clone()))
+            }
+            _ => enrollment
+                .host_id
+                .clone()
+                .map(|host_id| (host_id, enrollment.name.clone())),
         };
-        let Some(host_id) = settled else {
+        let Some((host_id, name)) = settled else {
             continue;
         };
         let entry = EnrolledHost {
             address: address.clone(),
             host_id,
+            name,
         };
         match enrollment.source {
             HostSource::Dynamic => recorded.hosts.push(entry),
@@ -820,10 +933,11 @@ fn record(
 fn settling(
     hosts: &BTreeMap<HostAddress, Enrollment>,
     address: &HostAddress,
-    reported: &str,
+    reported: &Reported,
 ) -> Result<Settling, DirectoryError> {
-    validate_host_id(reported).map_err(|source| DirectoryError::UnusableHostId {
-        host_id: reported.to_string(),
+    let id = &reported.host_id;
+    validate_host_id(id).map_err(|source| DirectoryError::UnusableHostId {
+        host_id: id.clone(),
         source,
     })?;
     let enrollment = hosts
@@ -831,15 +945,21 @@ fn settling(
         .ok_or_else(|| DirectoryError::Withdrawn {
             address: address.clone(),
         })?;
+    let renames = enrollment.name != reported.name;
     let known = match enrollment.host_id.as_deref() {
-        Some(known) if known == reported => return Ok(Settling::Unchanged),
+        Some(known) if known == id => {
+            return Ok(Settling {
+                identity: Identity::Unchanged,
+                renames,
+            });
+        }
         // A dynamic enrollment is the record of the host it shook hands with, so
         // a different id at that address is a host this enrollment is not about.
         Some(known) if enrollment.source == HostSource::Dynamic => {
             return Err(DirectoryError::IdChanged {
                 address: address.clone(),
                 expected: known.to_string(),
-                reported: reported.to_string(),
+                reported: id.clone(),
             });
         }
         known => known,
@@ -848,16 +968,19 @@ fn settling(
     // answering to one id would give every session of that store two ids that
     // both route (see [`Directory::enroll`]).
     if let Some((taken, _)) = hosts.iter().find(|(enrolled_at, enrolled)| {
-        *enrolled_at != address && enrolled.host_id.as_deref() == Some(reported)
+        *enrolled_at != address && enrolled.host_id.as_deref() == Some(id.as_str())
     }) {
         return Err(DirectoryError::DuplicateHost {
-            host_id: reported.to_string(),
+            host_id: id.clone(),
             address: taken.clone(),
         });
     }
-    Ok(match known {
-        Some(_) => Settling::Replaced,
-        None => Settling::Learned,
+    Ok(Settling {
+        identity: match known {
+            Some(_) => Identity::Replaced,
+            None => Identity::Learned,
+        },
+        renames,
     })
 }
 
@@ -908,7 +1031,10 @@ fn merge(hosts: &BTreeMap<HostAddress, Enrollment>) -> MergedDirectory {
             // A label only, and only where there is no id to label with. An
             // address is not something a client can address a session by.
             address: enrollment.host_id.is_none().then(|| address.to_string()),
-            name: None,
+            // What the host called itself at the latest contact, off the
+            // enrollment rather than off a live hello: this is what keeps an
+            // unreachable host's header readable, here and across a restart.
+            name: enrollment.name.clone(),
             unreachable: !enrollment.connected,
         });
         // A host that has never answered has no id to namespace with, so its
@@ -961,8 +1087,8 @@ pub(crate) enum DirectoryError {
     /// serve a request for it.
     #[error("host {host} is not reachable from this gateway")]
     Unreachable {
-        /// What this gateway knows the host by: its id, or its address when it
-        /// has never answered and so has no id.
+        /// What a reader calls the host (see [`Enrollment::label`]). Prose about
+        /// a host, so the name it reports for itself is what it reads as.
         host: String,
     },
     /// A create named no host and there is more than one to choose from. Never
@@ -972,7 +1098,12 @@ pub(crate) enum DirectoryError {
         hosts.len(),
         hosts.join(", ")
     )]
-    AmbiguousHost { hosts: Vec<String> },
+    AmbiguousHost {
+        /// Each host as [`Enrollment::candidate`] lists it: the id a create
+        /// names it by, and the name it reports beside that. A list of labels
+        /// would be instructions that do not work.
+        hosts: Vec<String>,
+    },
     /// A create arrived at a gateway that has no host to create on.
     #[error("no host is enrolled on this gateway, so there is nowhere to create a session")]
     NoHostEnrolled,
@@ -1055,11 +1186,16 @@ mod tests {
             .collect()
     }
 
+    /// A host reporting `id` and no name for itself.
+    fn reports(id: &str) -> Reported {
+        Reported::new(id, None)
+    }
+
     /// A host with `id` at `raw`, connected, holding `rows`.
     fn connected(directory: &Directory, raw: &str, id: &str, rows: &[&str]) -> HostAddress {
         let address = address(raw);
         directory
-            .enroll(address.clone(), HostSource::Dynamic, Some(id.to_string()))
+            .enroll(address.clone(), HostSource::Dynamic, Some(reports(id)))
             .expect("enroll");
         directory.connected(&address);
         directory.set_rows(&address, rows.iter().map(|id| row(id)).collect());
@@ -1223,7 +1359,9 @@ mod tests {
              in the configuration file that named it",
         );
 
-        directory.adopt(&address, "learned").expect("adopt");
+        directory
+            .adopt(&address, &reports("learned"))
+            .expect("adopt");
         assert_eq!(
             merged(&directory)[0].0.id,
             "learned:s-1",
@@ -1267,13 +1405,16 @@ mod tests {
                 hosts: vec![EnrolledHost {
                     address: address("127.0.0.1:1"),
                     host_id: "dynamic".to_string(),
+                    name: None,
                 }],
                 configured_ids: Vec::new(),
             },
             "a configured host that has never answered has no id to record",
         );
 
-        directory.adopt(&configured, "learned").expect("adopt");
+        directory
+            .adopt(&configured, &reports("learned"))
+            .expect("adopt");
 
         assert_eq!(
             directory.record(),
@@ -1281,10 +1422,12 @@ mod tests {
                 hosts: vec![EnrolledHost {
                     address: address("127.0.0.1:1"),
                     host_id: "dynamic".to_string(),
+                    name: None,
                 }],
                 configured_ids: vec![EnrolledHost {
                     address: configured,
                     host_id: "learned".to_string(),
+                    name: None,
                 }],
             },
             "and the one that answered is recorded by identity, without the file \
@@ -1305,7 +1448,7 @@ mod tests {
             directory.enroll(
                 address("127.0.0.1:9"),
                 HostSource::Dynamic,
-                Some("left".to_string()),
+                Some(reports("left")),
             ),
             Err(DirectoryError::DuplicateHost { .. }),
         ));
@@ -1316,7 +1459,7 @@ mod tests {
             .enroll(second.clone(), HostSource::Dynamic, None)
             .expect("an address of its own");
         assert!(matches!(
-            directory.adopt(&second, "left"),
+            directory.adopt(&second, &reports("left")),
             Err(DirectoryError::DuplicateHost { .. }),
         ));
         assert_eq!(directory.hosts().hosts.len(), 2);
@@ -1337,11 +1480,14 @@ mod tests {
         let address = connected(&directory, "127.0.0.1:1", "left", &["s-1"]);
 
         assert!(
-            matches!(directory.adopt(&address, "left"), Ok(Adopted::Unchanged)),
+            matches!(
+                directory.adopt(&address, &reports("left")),
+                Ok(Adopted::Unchanged)
+            ),
             "an id this enrollment already had is not news: a link reports one on \
              every redial, and each would otherwise rewrite the gateway's record",
         );
-        let Err(err) = directory.adopt(&address, "other") else {
+        let Err(err) = directory.adopt(&address, &reports("other")) else {
             panic!("a dynamic enrollment's id is the record's referent");
         };
         assert!(matches!(err, DirectoryError::IdChanged { .. }));
@@ -1355,7 +1501,7 @@ mod tests {
         assert_eq!(merged(&directory)[0].0.id, "left:s-1");
         assert!(
             matches!(
-                directory.record_adopting(&address, "other"),
+                directory.record_adopting(&address, &reports("other")),
                 Err(DirectoryError::IdChanged { .. }),
             ),
             "and it is refused where an adoption is written down from too, so \
@@ -1366,15 +1512,18 @@ mod tests {
         // ever recorded.
         let fresh = enrolled_without_id(&directory);
         assert!(matches!(
-            directory.adopt(&fresh, "with:colon"),
+            directory.adopt(&fresh, &reports("with:colon")),
             Err(DirectoryError::UnusableHostId { .. }),
         ));
         assert!(matches!(
-            directory.adopt(&fresh, ""),
+            directory.adopt(&fresh, &reports("")),
             Err(DirectoryError::UnusableHostId { .. }),
         ));
         assert!(
-            matches!(directory.adopt(&fresh, "learned"), Ok(Adopted::Learned)),
+            matches!(
+                directory.adopt(&fresh, &reports("learned")),
+                Ok(Adopted::Learned)
+            ),
             "and the first id a host reports is what there is to write down",
         );
     }
@@ -1393,7 +1542,7 @@ mod tests {
         let directory = Directory::new();
         let address = enrolled_without_id(&directory);
         assert!(matches!(
-            directory.adopt(&address, "before"),
+            directory.adopt(&address, &reports("before")),
             Ok(Adopted::Learned),
         ));
         directory.connected(&address);
@@ -1406,7 +1555,7 @@ mod tests {
             .swap_remove(0)
             .serving;
 
-        let Ok(Adopted::Replaced(withdrawn)) = directory.adopt(&address, "after") else {
+        let Ok(Adopted::Replaced(withdrawn)) = directory.adopt(&address, &reports("after")) else {
             panic!("a configured host's first contact under a new id replaces the old one");
         };
 
@@ -1448,12 +1597,16 @@ mod tests {
             vec![EnrolledHost {
                 address: address.clone(),
                 host_id: "after".to_string(),
+                name: None,
             }],
             "and the id this gateway is the record of is the one that answered",
         );
 
         assert!(
-            matches!(directory.adopt(&address, "after"), Ok(Adopted::Unchanged)),
+            matches!(
+                directory.adopt(&address, &reports("after")),
+                Ok(Adopted::Unchanged)
+            ),
             "the new identity is settled like any other: a redial reporting it \
              again is not news",
         );
@@ -1482,7 +1635,7 @@ mod tests {
 
         assert_eq!(
             directory
-                .record_adopting(&dynamic, "dynamic")
+                .record_adopting(&dynamic, &reports("dynamic"))
                 .expect("an id this enrollment already has"),
             None,
             "an id that is not news is nothing to write down: a link reports one \
@@ -1490,13 +1643,14 @@ mod tests {
         );
         assert_eq!(
             directory
-                .record_adopting(&configured, "learned")
+                .record_adopting(&configured, &reports("learned"))
                 .expect("a first contact")
                 .expect("something to write down")
                 .configured_ids,
             vec![EnrolledHost {
                 address: configured.clone(),
                 host_id: "learned".to_string(),
+                name: None,
             }],
         );
         assert!(
@@ -1504,7 +1658,9 @@ mod tests {
             "answering published an edge for an adoption that has not happened",
         );
 
-        directory.adopt(&configured, "learned").expect("adopt");
+        directory
+            .adopt(&configured, &reports("learned"))
+            .expect("adopt");
         assert!(
             merged_watch.has_changed().expect("alive"),
             "the adoption itself is what publishes, and nothing below measures a \
@@ -1514,13 +1670,14 @@ mod tests {
 
         assert_eq!(
             directory
-                .record_adopting(&configured, "rebuilt")
+                .record_adopting(&configured, &reports("rebuilt"))
                 .expect("a configured host's id is provisional")
                 .expect("something to write down")
                 .configured_ids,
             vec![EnrolledHost {
                 address: configured.clone(),
                 host_id: "rebuilt".to_string(),
+                name: None,
             }],
             "the record a replacement writes is the new identity's, not the one \
              it is about to stop serving",
@@ -1534,15 +1691,15 @@ mod tests {
         // The refusals are the adoption's own, checked where it is written down
         // from so that one that will not happen is never recorded.
         assert!(matches!(
-            directory.record_adopting(&configured, "dynamic"),
+            directory.record_adopting(&configured, &reports("dynamic")),
             Err(DirectoryError::DuplicateHost { .. }),
         ));
         assert!(matches!(
-            directory.record_adopting(&configured, "with:colon"),
+            directory.record_adopting(&configured, &reports("with:colon")),
             Err(DirectoryError::UnusableHostId { .. }),
         ));
         assert!(matches!(
-            directory.record_adopting(&address("127.0.0.1:9"), "stranger"),
+            directory.record_adopting(&address("127.0.0.1:9"), &reports("stranger")),
             Err(DirectoryError::Withdrawn { .. }),
         ));
         assert!(
@@ -1773,6 +1930,138 @@ mod tests {
         );
     }
 
+    /// What a refusal calls a host follows what it asks of its reader. Prose
+    /// about a host reads as the name that host reports for itself, and a
+    /// message that asks for a host to be named lists the id a create resolves
+    /// against with the name beside it, because a list of labels would be
+    /// instructions that do not work (spec 6.6).
+    #[test]
+    fn a_refusal_names_a_host_by_its_name_and_a_create_by_its_id() {
+        let directory = Directory::new();
+        let left = connected(&directory, "127.0.0.1:1", "left", &["s-1"]);
+        directory
+            .adopt(&left, &Reported::new("left", Some("~/work/umber/aj")))
+            .expect("the host names itself");
+        connected(&directory, "127.0.0.1:2", "right", &[]);
+
+        let Err(DirectoryError::AmbiguousHost { hosts }) = directory.create_target(None) else {
+            panic!("two enrolled hosts and no name is ambiguous");
+        };
+        assert_eq!(
+            hosts,
+            vec!["left (~/work/umber/aj)".to_string(), "right".to_string()],
+            "a create names a host by its id, so that is what the list leads \
+             with, and a host that reported no name has nothing to add",
+        );
+
+        directory.disconnected(&left, "gone".to_string());
+        let Err(DirectoryError::Unreachable { host }) = directory.create_target(Some("left"))
+        else {
+            panic!("a host that is not there cannot take a create");
+        };
+        assert_eq!(
+            host, "~/work/umber/aj",
+            "prose about a host reads as the name it reports",
+        );
+        let Err(DirectoryError::Unreachable { host }) = directory.route("left:s-1") else {
+            panic!("a session on a host that is not there does not route");
+        };
+        assert_eq!(
+            host, "~/work/umber/aj",
+            "and one refusal about one host says the same thing wherever it is \
+             raised",
+        );
+    }
+
+    /// A gateway does not trust a peer's word for itself. The name it
+    /// republishes is one a reader's rule allows, so nothing a host sends can
+    /// ride a group header into a terminal, and a name that is only padding
+    /// reads as no name at all.
+    #[test]
+    fn a_reported_name_is_held_to_the_rule_a_reader_applies() {
+        assert_eq!(
+            Reported::new("left", Some("  ~/work/umber/aj  ")).name,
+            Some("~/work/umber/aj".to_string()),
+            "padding makes no second label",
+        );
+        assert_eq!(
+            Reported::new("left", Some("first\nsecond")).name,
+            None,
+            "a name that would split the line it is drawn on is dropped",
+        );
+        assert_eq!(Reported::new("left", Some("   ")).name, None);
+        assert_eq!(
+            Reported::new("left", Some(&"a".repeat(81))).name,
+            None,
+            "and so is one past the cap the wire carries",
+        );
+        assert_eq!(
+            Reported::new("left", Some("~/work/umber/aj")).host_id,
+            "left",
+            "an unusable name costs the label and never the contact",
+        );
+    }
+
+    /// A link reports what its host says about itself on every redial, so a
+    /// contact that changes nothing is neither written down nor published. A
+    /// different name is a change: it is what a client's header reads, and a
+    /// record holding the old one would label the host by it after a restart.
+    #[test]
+    fn a_repeat_contact_is_settled_only_when_something_changed() {
+        let directory = Directory::new();
+        let address = connected(&directory, "127.0.0.1:1", "left", &["s-1"]);
+        let first = Reported::new("left", Some("~/work/umber/aj"));
+        directory.adopt(&address, &first).expect("the first name");
+
+        assert_eq!(
+            directory
+                .record_adopting(&address, &first)
+                .expect("a repeat contact is not a refusal"),
+            None,
+            "the same id and the same name are not news, and a redial that \
+             rewrote the state file would do it once per reconnect",
+        );
+
+        let renamed = Reported::new("left", Some("~/workshop"));
+        let record = directory
+            .record_adopting(&address, &renamed)
+            .expect("settling a name")
+            .expect("a name that changed is written down before it is applied");
+        assert_eq!(
+            record.hosts.first().and_then(|host| host.name.clone()),
+            Some("~/workshop".to_string()),
+            "written ahead from the report, not from the set it is about to \
+             change: {record:?}",
+        );
+        directory.adopt(&address, &renamed).expect("adopt");
+        assert_eq!(
+            directory.sessions().hosts,
+            vec![DirectoryHost {
+                id: Some("left".to_string()),
+                address: None,
+                name: Some("~/workshop".to_string()),
+                unreachable: false,
+            }],
+            "and the merged directory republishes the latest name under the id \
+             the host still answers to",
+        );
+        assert_eq!(
+            merged(&directory)[0].0.id,
+            "left:s-1",
+            "a label following its host costs that host's sessions nothing",
+        );
+
+        directory
+            .adopt(&address, &Reported::new("left", None))
+            .expect("adopt");
+        assert_eq!(
+            directory.sessions().hosts[0].name,
+            None,
+            "a host that stops naming itself loses the label rather than \
+             keeping one it no longer claims",
+        );
+    }
+
     #[test]
     fn only_a_dynamic_enrollment_is_withdrawn_and_written_down() {
         let directory = Directory::new();
@@ -1782,7 +2071,7 @@ mod tests {
             .enroll(
                 configured.clone(),
                 HostSource::Config,
-                Some("static".to_string()),
+                Some(reports("static")),
             )
             .expect("enroll");
 

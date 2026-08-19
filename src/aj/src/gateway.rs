@@ -47,7 +47,7 @@ use anyhow::{Context, Result, bail};
 use reqwest::StatusCode;
 
 use crate::gateway::config::{AddressError, GatewayConfig, HostAddress};
-use crate::gateway::directory::{Adopted, Directory, DirectoryError, HostTarget, Route};
+use crate::gateway::directory::{Adopted, Directory, DirectoryError, HostTarget, Reported, Route};
 use crate::gateway::enrollment::{EnrollmentError, EnrollmentFile};
 use crate::gateway::link::Link;
 pub(crate) use crate::gateway::server::GatewayServer;
@@ -247,7 +247,7 @@ impl Gateway {
             match directory.enroll(
                 host.address.clone(),
                 HostSource::Dynamic,
-                Some(host.host_id.clone()),
+                Some(Reported::new(&host.host_id, host.name.as_deref())),
             ) {
                 Ok(()) => {}
                 Err(err) => {
@@ -267,7 +267,10 @@ impl Gateway {
             // configuration no longer names brings nothing back with it. That
             // refusal is the ordinary way an entry here dies, and rewriting the
             // file is what stops it coming round again.
-            match directory.adopt(&host.address, &host.host_id) {
+            match directory.adopt(
+                &host.address,
+                &Reported::new(&host.host_id, host.name.as_deref()),
+            ) {
                 Ok(Adopted::Learned | Adopted::Unchanged) => {}
                 // Only a state file naming one address twice reaches this, and
                 // nothing is spliced onto a gateway that is still being built.
@@ -362,7 +365,7 @@ impl Gateway {
             self.inner.directory.enroll(
                 address.clone(),
                 HostSource::Dynamic,
-                Some(hello.host_id.clone()),
+                Some(Reported::of(&hello)),
             )?;
             if let Err(err) = self.remember() {
                 // An enrollment the gateway cannot write down would come back as
@@ -569,7 +572,7 @@ impl Recorder {
     pub(crate) async fn settle(
         &self,
         address: &HostAddress,
-        reported: &str,
+        reported: &Reported,
     ) -> Result<(), DirectoryError> {
         // The gateway this link belonged to is gone, so there is no record to
         // write and nothing reading the directory it would write into.
@@ -584,7 +587,7 @@ impl Recorder {
             tracing::warn!("could not write down what this gateway just learned: {err}");
         }
         if let Adopted::Replaced(withdrawn) = inner.directory.adopt(address, reported)? {
-            tracing::info!("the host at {address} answers to {reported} now");
+            tracing::info!("the host at {address} answers to {} now", reported.host_id);
             withdrawn.end_splices();
         }
         Ok(())

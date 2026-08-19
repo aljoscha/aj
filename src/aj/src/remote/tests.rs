@@ -448,7 +448,8 @@ impl HostHandles {
     }
 }
 
-/// A host over `dir`'s session store, running `provider`.
+/// A host over `dir`'s session store, running `provider` and calling itself
+/// `name`, or deriving a name from `dir` where that is `None` (spec 6.1).
 ///
 /// The one recipe for a test host in this crate: the transport fixture, the
 /// second host of a lock conflict and the gateway's upstreams all come from
@@ -457,6 +458,7 @@ pub(crate) fn scripted_host(
     dir: &TempDir,
     provider: Arc<ScriptedProvider>,
     handles: HostHandles,
+    name: Option<&str>,
 ) -> SessionHost {
     SessionHost::new(HostSetup {
         config: handles.config,
@@ -467,7 +469,7 @@ pub(crate) fn scripted_host(
         persistence: ConversationPersistence::new(dir.path().join("sessions")),
         auth: AuthStorage::new(dir.path().join("auth.json")),
         working_directory: dir.path().to_path_buf(),
-        name: None,
+        name: name.map(str::to_string),
         idle_grace: None,
         live_capacity: None,
     })
@@ -631,7 +633,7 @@ impl Fixture {
     ) -> Self {
         let dir = TempDir::new().expect("tempdir");
         let handles = HostHandles::new(&dir);
-        let host = scripted_host(&dir, provider, handles.clone());
+        let host = scripted_host(&dir, provider, handles.clone(), None);
         let server = RemoteServer::bind_with(host.clone(), addr("127.0.0.1:0"), gate, heartbeat)
             .await
             .expect("bind a loopback control port");
@@ -659,6 +661,7 @@ impl Fixture {
             &self._dir,
             scripted(Vec::new(), 0, Duration::ZERO),
             HostHandles::new(&self._dir),
+            None,
         );
         let server = RemoteServer::bind_with(
             host.clone(),

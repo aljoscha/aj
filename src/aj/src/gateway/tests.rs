@@ -74,8 +74,14 @@ struct Upstream {
 
 impl Upstream {
     async fn start() -> Self {
+        Self::named(None).await
+    }
+
+    /// A host calling itself `name`, or deriving one from its working directory
+    /// where that is `None`.
+    async fn named(name: Option<&str>) -> Self {
         let dir = TempDir::new().expect("tempdir");
-        let (host, server) = Self::serve(&dir, None).await;
+        let (host, server) = Self::serve(&dir, None, name).await;
         let addr = server.local_addr();
         Self {
             dir,
@@ -85,8 +91,13 @@ impl Upstream {
         }
     }
 
-    /// A host over `dir`'s store, served on `at` or on a fresh loopback port.
-    async fn serve(dir: &TempDir, at: Option<SocketAddr>) -> (SessionHost, RemoteServer) {
+    /// A host over `dir`'s store, served on `at` or on a fresh loopback port,
+    /// calling itself `name` or deriving a name from `dir` (spec 6.1).
+    async fn serve(
+        dir: &TempDir,
+        at: Option<SocketAddr>,
+        name: Option<&str>,
+    ) -> (SessionHost, RemoteServer) {
         let provider = scripted(
             vec![
                 finalized_text_message("done"),
@@ -95,7 +106,7 @@ impl Upstream {
             0,
             Duration::ZERO,
         );
-        let host = scripted_host(dir, provider, HostHandles::new(dir));
+        let host = scripted_host(dir, provider, HostHandles::new(dir), name);
         let server = RemoteServer::bind(
             host.clone(),
             at.unwrap_or_else(|| addr("127.0.0.1:0")),
@@ -112,6 +123,15 @@ impl Upstream {
 
     fn host_id(&self) -> String {
         self.host.hello().host_id
+    }
+
+    /// The name this host reports for itself, which a real host always has: it
+    /// derives one from its working directory when nothing named it (spec 6.1).
+    fn host_name(&self) -> String {
+        self.host
+            .hello()
+            .name
+            .expect("a host names itself, from its working directory if nothing else")
     }
 
     /// A namespaced id for one of this host's sessions, as a gateway client
@@ -166,7 +186,13 @@ impl Upstream {
     /// not: an epoch is minted per materialization and never persisted (spec
     /// 6.5), so a restart is what makes a cursor stale.
     async fn restart(&mut self) {
-        let (host, server) = Self::serve(&self.dir, Some(self.addr)).await;
+        self.restart_as(None).await;
+    }
+
+    /// The same, with the host calling itself `name` this time round: what a
+    /// gateway meets when an operator restarts a host under a new one.
+    async fn restart_as(&mut self, name: Option<&str>) {
+        let (host, server) = Self::serve(&self.dir, Some(self.addr), name).await;
         self.host = host;
         self.server = Some(server);
     }
@@ -1094,13 +1120,13 @@ async fn an_unreachable_host_survives_a_restart_as_a_group_with_no_rows() {
         DirectoryHost {
             id: Some(down.host_id()),
             address: None,
-            name: None,
+            name: Some(down.host_name()),
             unreachable: true,
         },
         DirectoryHost {
             id: Some(up.host_id()),
             address: None,
-            name: None,
+            name: Some(up.host_name()),
             unreachable: false,
         },
     ];
@@ -1137,6 +1163,150 @@ async fn an_unreachable_host_survives_a_restart_as_a_group_with_no_rows() {
     fixture.shutdown().await;
     down.stop().await;
     up.stop().await;
+}
+
+/// A host's name outlives the gateway process that learned it, so a host that is
+/// down when the gateway comes back is still labelled by its name rather than
+/// regressing to hex (spec 7.1). This is what the name is written down for.
+///
+/// One host of each enrollment kind, because the two learn a name on different
+/// paths: a dynamic enrollment records what the enrolling handshake reported, a
+/// configured host has nothing but its link's contact to learn one from.
+///
+/// The record is read before the restart, because with nothing in the file this
+/// measures nothing: the names would come off the live hosts instead, which is
+/// the case that needs no persistence at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_downed_hosts_name_survives_a_gateway_restart() {
+    let mut configured = Upstream::named(Some("~/work/umber/aj")).await;
+    let mut dynamic = Upstream::named(Some("~/workshop")).await;
+    let configured_at = HostAddress::parse(&configured.address()).expect("an address");
+    let dynamic_at = HostAddress::parse(&dynamic.address()).expect("an address");
+
+    let fixture = Fixture::new(&[&configured]).await;
+    fixture.until_connected(&configured.host_id()).await;
+    assert_eq!(
+        fixture.enroll(&dynamic.address()).await.status(),
+        StatusCode::OK,
+    );
+    fixture.until_connected(&dynamic.host_id()).await;
+
+    let record = recorded(&fixture);
+    assert_eq!(
+        record.configured_ids,
+        vec![enrolled_naming(
+            &configured_at,
+            &configured.host_id(),
+            "~/work/umber/aj",
+        )],
+        "a configured host's name is written down beside the id its link learned, \
+         or there is nothing here for a restart to read: {record:?}",
+    );
+    assert_eq!(
+        record.hosts,
+        vec![enrolled_naming(
+            &dynamic_at,
+            &dynamic.host_id(),
+            "~/workshop"
+        )],
+        "and so is the name the enrolling handshake reported: {record:?}",
+    );
+
+    configured.stop().await;
+    dynamic.stop().await;
+    let fixture = fixture.restart().await;
+
+    let labelled = fixture
+        .until("both hosts, unreachable, in the merged directory", |list| {
+            (list.hosts.len() == 2 && list.hosts.iter().all(|host| host.unreachable))
+                .then(|| list.hosts.clone())
+        })
+        .await;
+    let mut named = vec![
+        DirectoryHost {
+            id: Some(configured.host_id()),
+            address: None,
+            name: Some("~/work/umber/aj".to_string()),
+            unreachable: true,
+        },
+        DirectoryHost {
+            id: Some(dynamic.host_id()),
+            address: None,
+            name: Some("~/workshop".to_string()),
+            unreachable: true,
+        },
+    ];
+    // A host id is minted at random, so which of these two sorts first is not
+    // the fixture's to say.
+    named.sort_by(|left, right| left.id.cmp(&right.id));
+    assert_eq!(
+        labelled, named,
+        "a host this gateway cannot reach is still published under the name it \
+         reported, off the record and not off a hello it cannot have: {labelled:?}",
+    );
+
+    fixture.shutdown().await;
+}
+
+/// A name follows the host that reports it: one that comes back calling itself
+/// something else is relabelled, and the record follows, or the next restart
+/// would bring the old label back.
+///
+/// Its id does not move with it, which is the whole distinction: the sessions
+/// this gateway namespaced under that id are still that host's, and still
+/// address the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_comes_back_under_a_new_name_is_relabelled() {
+    let mut host = Upstream::named(Some("~/work/umber/aj")).await;
+    let session = host.create().await;
+    let at = HostAddress::parse(&host.address()).expect("an address");
+    let fixture = Fixture::new(&[&host]).await;
+    fixture.until_connected(&host.host_id()).await;
+    let named = host.namespaced(&session);
+    fixture.row(&named).await;
+
+    let before = fixture
+        .until("the name this host started under", |list| {
+            list.hosts.first().map(|host| host.name.clone())
+        })
+        .await;
+    assert_eq!(
+        before,
+        Some("~/work/umber/aj".to_string()),
+        "the first name has to be published, or a relabelling is unobservable",
+    );
+
+    host.stop().await;
+    host.restart_as(Some("the-builder")).await;
+
+    let relabelled = fixture
+        .until("the name the host came back under", |list| {
+            list.hosts
+                .iter()
+                .find(|host| host.name.as_deref() == Some("the-builder"))
+                .cloned()
+        })
+        .await;
+    assert_eq!(
+        relabelled.id,
+        Some(host.host_id()),
+        "the id is identity and does not move with the label: {relabelled:?}",
+    );
+    let row = fixture.row(&named).await;
+    assert!(
+        !row.unreachable,
+        "and the session it namespaced is served under the id it always had: {row:?}",
+    );
+    let record = recorded(&fixture);
+    assert_eq!(
+        record.configured_ids,
+        vec![enrolled_naming(&at, &host.host_id(), "the-builder")],
+        "the record follows the latest contact, or the next restart would label \
+         this host by a name it no longer answers with: {record:?}",
+    );
+
+    fixture.shutdown().await;
+    host.stop().await;
 }
 
 /// A configured host this gateway has never spoken to is named by the address it
@@ -1181,19 +1351,21 @@ async fn a_configured_host_that_never_answered_is_named_by_its_address() {
             DirectoryHost {
                 id: None,
                 address: Some(silent.to_string()),
+                // A host that has never answered has said nothing about itself,
+                // so there is no name to republish for it either.
                 name: None,
                 unreachable: true,
             },
             DirectoryHost {
                 id: Some(up.host_id()),
                 address: None,
-                name: None,
+                name: Some(up.host_name()),
                 unreachable: false,
             },
         ],
         "the host that has never answered is named by its address with nothing \
          in the id position, and the one that has is named by the id its \
-         sessions are namespaced under: {:?}",
+         sessions are namespaced under and by the name it reported: {:?}",
         list.hosts,
     );
 
@@ -2339,7 +2511,11 @@ async fn a_restored_id_the_host_no_longer_answers_to_is_replaced_on_contact() {
     let adopted = recorded(&fixture).configured_ids;
     assert_eq!(
         adopted,
-        vec![enrolled_as(&bridge.address, &host.host_id())],
+        vec![enrolled_naming(
+            &bridge.address,
+            &host.host_id(),
+            &host.host_name()
+        )],
         "and the file records that id, or the next start would restore a store \
          that is gone all over again: {adopted:?}",
     );
@@ -2356,11 +2532,25 @@ fn recorded(fixture: &Fixture) -> crate::gateway::enrollment::Recorded {
     serde_json::from_str(&text).expect("readable gateway state")
 }
 
-/// One entry of that record.
+/// One entry of that record, for a host that reports no name for itself (every
+/// [`FakeHost`], whose hello carries none).
 fn enrolled_as(address: &HostAddress, host_id: &str) -> crate::gateway::enrollment::EnrolledHost {
     crate::gateway::enrollment::EnrolledHost {
         address: address.clone(),
         host_id: host_id.to_string(),
+        name: None,
+    }
+}
+
+/// The same for a host that names itself, which every real one does (spec 6.1).
+fn enrolled_naming(
+    address: &HostAddress,
+    host_id: &str,
+    name: &str,
+) -> crate::gateway::enrollment::EnrolledHost {
+    crate::gateway::enrollment::EnrolledHost {
+        name: Some(name.to_string()),
+        ..enrolled_as(address, host_id)
     }
 }
 
