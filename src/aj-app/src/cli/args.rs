@@ -204,6 +204,88 @@ impl Args {
     pub fn has_launch_tag(&self) -> bool {
         matches!(self.launch_tag(), Ok(Some(_)))
     }
+
+    /// How a `connect` run's positionals divide, or `None` for every other
+    /// command.
+    ///
+    /// The one place the connect grammar is interpreted: both the session to
+    /// open and the launch input read it, so they cannot disagree about which
+    /// positional is which.
+    pub fn connect_launch(&self) -> Option<ConnectLaunch<'_>> {
+        let Some(Command::Connect {
+            session_id,
+            new,
+            prompt,
+            ..
+        }) = &self.command
+        else {
+            return None;
+        };
+        // Clap fills the id slot before the prompt slot, so under `--new`,
+        // which names no session, that slot holds the launch input's first
+        // word.
+        let (session, leading) = match (*new, session_id.as_deref()) {
+            (true, first) => (ConnectSession::Fresh, first),
+            (false, Some(id)) => (ConnectSession::Named(id), None),
+            (false, None) => (ConnectSession::Latest, None),
+        };
+        Some(ConnectLaunch {
+            session,
+            prompt: leading
+                .into_iter()
+                .chain(prompt.iter().map(String::as_str))
+                .collect(),
+        })
+    }
+
+    /// The launch turn's positionals, in argv order, from whichever slot clap
+    /// filled: top-level `aj <args...>`, `aj continue ID <args...>`, or
+    /// `aj connect URL [ID] <args...>`.
+    ///
+    /// Clap's greedy positional consumption keeps the slots disjoint, so a
+    /// subcommand that took none leaves the top-level slot to answer.
+    pub fn launch_positionals(&self) -> Vec<&str> {
+        if let Some(launch) = self.connect_launch() {
+            if launch.prompt.is_empty() {
+                return self.top_level_positionals();
+            }
+            return launch.prompt;
+        }
+        match &self.command {
+            Some(Command::Continue { prompt, .. }) if !prompt.is_empty() => {
+                prompt.iter().map(String::as_str).collect()
+            }
+            _ => self.top_level_positionals(),
+        }
+    }
+
+    fn top_level_positionals(&self) -> Vec<&str> {
+        self.prompt.iter().map(String::as_str).collect()
+    }
+}
+
+/// What a `connect` run's positionals ask for.
+pub struct ConnectLaunch<'a> {
+    /// The session to open with.
+    pub session: ConnectSession<'a>,
+    /// Launch input for it, in argv order.
+    pub prompt: Vec<&'a str>,
+}
+
+/// The session a `connect` run asks for (spec 9.1).
+///
+/// Three states, not an id beside a flag: a run that creates names no session,
+/// so "create this named session" has no spelling and no reader has to decide
+/// which of the two wins.
+pub enum ConnectSession<'a> {
+    /// The id named on the command line, attached whatever its archived bit
+    /// says.
+    Named(&'a str),
+    /// `--new`: a session this run creates, whatever the host already holds.
+    Fresh,
+    /// Nothing named: the host's most recently modified session that is not
+    /// archived, and a fresh one when it holds none.
+    Latest,
 }
 
 /// What a run says when `--tag` named a session it never created.
@@ -282,14 +364,20 @@ pub enum Command {
     ///
     /// Launch input follows the session id, exactly as for `continue`:
     /// `aj connect URL ID <args...>` attaches and auto-submits the args as
-    /// the next turn. Supplying input without an id is ambiguous (the first
-    /// positional is read as the session id), so the id has to be explicit.
+    /// the next turn. Without an id the grammar is ambiguous (the first
+    /// positional is read as the session id), so a run that resumes has to
+    /// name its session to carry input. `--new` names none, so under it every
+    /// positional is launch input: `aj connect URL --new <args...>`.
     Connect {
         /// Base URL of the host's control port (e.g.
         /// `http://100.64.0.2:6161`).
         url: String,
         /// Session to attach. Omit to take the host's latest session that is
         /// not archived. Naming one works whatever its archived bit says.
+        ///
+        /// Read as launch input rather than an id under `--new`, which
+        /// creates the session it opens and so names none. Interpreted by
+        /// [`Args::connect_launch`], never field by field.
         session_id: Option<String>,
         /// Create a fresh session instead of attaching an existing one.
         #[arg(long)]
@@ -542,6 +630,67 @@ mod tests {
             parse(&["aj", "--name", "   "]).host_name(),
             Ok(None),
             "a flag that names nothing leaves the derivation to it",
+        );
+    }
+
+    /// The three states of the grammar, and the fourth argv shape that is not
+    /// a state: a run under `--new` creates, so the id slot holds input.
+    #[test]
+    fn connect_positionals_divide_by_whether_the_run_creates() {
+        let latest = parse(&["aj", "connect", "http://host:6161"]);
+        let latest = latest.connect_launch().expect("a connect run");
+        assert!(matches!(latest.session, ConnectSession::Latest));
+        assert!(latest.prompt.is_empty());
+
+        let named = parse(&["aj", "connect", "http://host:6161", "ID", "do", "this"]);
+        let named = named.connect_launch().expect("a connect run");
+        assert!(matches!(named.session, ConnectSession::Named("ID")));
+        assert_eq!(named.prompt, ["do", "this"]);
+
+        let fresh = parse(&["aj", "connect", "http://host:6161", "--new"]);
+        let fresh = fresh.connect_launch().expect("a connect run");
+        assert!(matches!(fresh.session, ConnectSession::Fresh));
+        assert!(fresh.prompt.is_empty());
+
+        // The reported shape: one quoted sentence, which clap binds to the id
+        // slot because it fills that one first.
+        let created = parse(&["aj", "connect", "http://host:6161", "--new", "do this"]);
+        let created = created.connect_launch().expect("a connect run");
+        assert!(
+            matches!(created.session, ConnectSession::Fresh),
+            "a run that creates resolved to a session to attach",
+        );
+        assert_eq!(
+            created.prompt,
+            ["do this"],
+            "the launch input was read as a session id",
+        );
+    }
+
+    /// Under `--new` the id slot is the launch input's first word, so the turn
+    /// reads in argv order rather than losing or reordering it.
+    #[test]
+    fn a_created_session_keeps_its_launch_input_in_order() {
+        let args = parse(&["aj", "connect", "http://host:6161", "--new", "do", "this"]);
+        assert_eq!(args.launch_positionals(), ["do", "this"]);
+    }
+
+    /// Only a connect run has this grammar, and the other slots keep theirs.
+    #[test]
+    fn the_other_launch_slots_are_untouched() {
+        assert!(parse(&["aj", "hello"]).connect_launch().is_none());
+        assert!(
+            parse(&["aj", "continue", "ID", "do", "this"])
+                .connect_launch()
+                .is_none()
+        );
+        assert_eq!(
+            parse(&["aj", "hello", "there"]).launch_positionals(),
+            ["hello", "there"]
+        );
+        assert_eq!(
+            parse(&["aj", "continue", "ID", "do", "this"]).launch_positionals(),
+            ["do", "this"]
         );
     }
 }

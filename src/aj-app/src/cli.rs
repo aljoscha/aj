@@ -17,7 +17,7 @@ use anyhow::Result;
 
 use aj_models::types::UserContent;
 
-use crate::cli::args::{Args, Command};
+use crate::cli::args::Args;
 
 /// The prompt content supplied on the command line, ready to submit.
 ///
@@ -57,20 +57,11 @@ impl InitialInput {
 /// Resolve the command-line positionals into the launch turn content,
 /// relative to `cwd` (for `@file` path resolution).
 ///
-/// The positionals come from whichever slot clap populated: the
-/// top-level `aj <args...>`, `aj continue ID <args...>` or
-/// `aj connect URL ID <args...>` (its greedy positional consumption keeps
-/// them disjoint). `@file` arguments are resolved into `<file>` text +
-/// image attachments; a missing file is an error.
+/// Which positionals those are is [`Args::launch_positionals`]. `@file`
+/// arguments are resolved into `<file>` text + image attachments; a missing
+/// file is an error.
 pub fn initial_input(args: &Args, cwd: &Path, image_auto_resize: bool) -> Result<InitialInput> {
-    let positionals: &[String] = match &args.command {
-        Some(Command::Continue { prompt, .. } | Command::Connect { prompt, .. })
-            if !prompt.is_empty() =>
-        {
-            prompt
-        }
-        _ => &args.prompt,
-    };
+    let positionals = args.launch_positionals();
 
     let mut file_args = Vec::new();
     let mut messages = Vec::new();
@@ -78,7 +69,7 @@ pub fn initial_input(args: &Args, cwd: &Path, image_auto_resize: bool) -> Result
         if token.starts_with('@') {
             file_args.push(token.to_string());
         } else {
-            messages.push(token.as_str());
+            messages.push(token);
         }
     }
 
@@ -170,6 +161,21 @@ mod tests {
     fn prefers_connect_slot() {
         assert_eq!(
             content_text(&["aj", "connect", "http://host:6161", "ID", "do", "thing"]).as_deref(),
+            Some("do thing")
+        );
+    }
+
+    /// A run under `--new` names no session, so its first positional is launch
+    /// input: a quoted prompt reaches the turn instead of being read as the id
+    /// of a session to attach.
+    #[test]
+    fn a_created_session_takes_the_first_positional_as_input() {
+        assert_eq!(
+            content_text(&["aj", "connect", "http://host:6161", "--new", "do thing"]).as_deref(),
+            Some("do thing")
+        );
+        assert_eq!(
+            content_text(&["aj", "connect", "http://host:6161", "--new", "do", "thing"]).as_deref(),
             Some("do thing")
         );
     }

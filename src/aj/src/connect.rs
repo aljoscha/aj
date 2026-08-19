@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 
-use aj_app::cli::args::Args;
+use aj_app::cli::args::{Args, ConnectSession};
 use aj_conf::{Config, ConfigLayer};
 use aj_models::{speed_name, thinking_config_name, verbosity_name};
 use aj_wire::{DirectoryHost, Hello, ModelSelection, SessionSettings};
@@ -27,10 +27,8 @@ use crate::remote::RemoteClient;
 /// Which session `aj connect` opens with.
 pub(crate) struct ConnectTarget<'a> {
     pub(crate) url: &'a str,
-    /// The session named on the command line, if any.
-    pub(crate) session_id: Option<&'a str>,
-    /// Whether `--new` asked for a fresh session.
-    pub(crate) new: bool,
+    /// What the command line asked for, per spec 9.1.
+    pub(crate) session: ConnectSession<'a>,
     /// The host `--host` named, for the session this run creates.
     pub(crate) host: Option<&'a str>,
 }
@@ -142,32 +140,33 @@ async fn resolve_session(
     settings: Option<SessionSettings>,
     tag: Option<String>,
 ) -> Result<(String, bool)> {
-    if let Some(id) = target.session_id {
-        return Ok((id.to_string(), false));
-    }
-    if target.new {
-        return Ok((create(control, host, settings, tag).await?, true));
-    }
-    let list = control
-        .sessions()
-        .await
-        .context("could not read the host's session list")?;
-    // Most recently modified, with the id as the tie-break: ids are minted as
-    // timestamps, so the higher one is the younger session. An archived
-    // session is one its user is done with, and this is the one branch that
-    // picks a session nobody named, so those rows are passed over.
-    let latest = list
-        .sessions
-        .iter()
-        .filter(|summary| !summary.archived)
-        .max_by_key(|summary| (summary.last_activity, summary.id.clone()))
-        .map(|summary| summary.id.clone());
-    match latest {
-        Some(session) => Ok((session, false)),
-        // A fresh `aj serve` holds nothing, and a host holding only archived
-        // sessions offers nothing either, so connect mode would otherwise
-        // have nothing to attach at all.
-        None => Ok((create(control, host, settings, tag).await?, true)),
+    match target.session {
+        ConnectSession::Named(id) => Ok((id.to_string(), false)),
+        ConnectSession::Fresh => Ok((create(control, host, settings, tag).await?, true)),
+        ConnectSession::Latest => {
+            let list = control
+                .sessions()
+                .await
+                .context("could not read the host's session list")?;
+            // Most recently modified, with the id as the tie-break: ids are
+            // minted as timestamps, so the higher one is the younger session.
+            // An archived session is one its user is done with, and this is
+            // the one branch that picks a session nobody named, so those rows
+            // are passed over.
+            let latest = list
+                .sessions
+                .iter()
+                .filter(|summary| !summary.archived)
+                .max_by_key(|summary| (summary.last_activity, summary.id.clone()))
+                .map(|summary| summary.id.clone());
+            match latest {
+                Some(session) => Ok((session, false)),
+                // A fresh `aj serve` holds nothing, and a host holding only
+                // archived sessions offers nothing either, so connect mode
+                // would otherwise have nothing to attach at all.
+                None => Ok((create(control, host, settings, tag).await?, true)),
+            }
+        }
     }
 }
 
@@ -455,16 +454,10 @@ mod tests {
             let mut line = vec!["aj", "connect", &url];
             line.extend_from_slice(argv);
             let args = args(&line);
-            let Some(CliCommand::Connect {
-                url,
-                session_id,
-                new,
-                host,
-                ..
-            }) = &args.command
-            else {
+            let Some(CliCommand::Connect { url, host, .. }) = &args.command else {
                 panic!("connect args parse as connect");
             };
+            let launch = args.connect_launch().expect("connect args carry a launch");
             bounded(
                 "connect to resolve a session",
                 connect(
@@ -473,8 +466,7 @@ mod tests {
                     &nothing_stated(),
                     ConnectTarget {
                         url,
-                        session_id: session_id.as_deref(),
-                        new: *new,
+                        session: launch.session,
                         host: host.as_deref(),
                     },
                 ),
@@ -575,6 +567,67 @@ mod tests {
         assert!(
             !connected.created,
             "an explicit id created a session instead of attaching the one it named"
+        );
+        peer.shutdown().await;
+    }
+
+    /// `--new` with launch input creates. The grammar puts that input in the
+    /// session-id slot, and a run that read it as an id would attach nothing
+    /// and leave the host without the session it was asked for.
+    #[tokio::test]
+    async fn new_with_launch_input_creates_a_session() {
+        let peer = Peer::start().await;
+        let held = peer.create().await;
+
+        let connected = peer
+            .dial(&["--new", "Reply with the single word: ok"])
+            .await;
+
+        let rows = peer.rows().await;
+        assert_eq!(
+            rows.len(),
+            2,
+            "the host holds {} sessions, so the run created none",
+            rows.len(),
+        );
+        assert!(
+            rows.iter().any(|summary| summary.id == connected.session),
+            "connect opened {} which the host does not hold",
+            connected.session,
+        );
+        assert_ne!(
+            connected.session, held,
+            "--new attached the session the host already held",
+        );
+        assert!(
+            connected.created,
+            "connect reported a resume for the session it minted",
+        );
+        peer.shutdown().await;
+    }
+
+    /// Launch input that happens to name a session the host holds is still
+    /// launch input: under `--new` the id slot carries no id at all, so the
+    /// run creates rather than attaching what the prompt spells.
+    #[tokio::test]
+    async fn new_creates_when_the_launch_input_names_a_session() {
+        let peer = Peer::start().await;
+        let held = peer.create().await;
+
+        let connected = peer.dial(&["--new", &held]).await;
+
+        assert_ne!(
+            connected.session, held,
+            "the launch input was resolved as the session to attach",
+        );
+        assert_eq!(
+            peer.rows().await.len(),
+            2,
+            "the run attached the session its prompt spelled instead of creating one",
+        );
+        assert!(
+            connected.created,
+            "connect reported a resume for the session it minted",
         );
         peer.shutdown().await;
     }
