@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 
-use aj_app::cli::args::{Args, ConnectSession};
+use aj_app::cli::args::{Args, ConnectLaunch, ConnectSession};
 use aj_conf::{Config, ConfigLayer};
 use aj_models::{speed_name, thinking_config_name, verbosity_name};
 use aj_wire::{DirectoryHost, Hello, ModelSelection, SessionSettings};
@@ -25,12 +25,24 @@ use crate::host_picker::resolve_host;
 use crate::remote::RemoteClient;
 
 /// Which session `aj connect` opens with.
+///
+/// Built only from a [`ConnectLaunch`], so the run this dials is the one the
+/// command line asked for: there is no field-by-field spelling for a caller to
+/// assemble a different target from the same argv.
 pub(crate) struct ConnectTarget<'a> {
-    pub(crate) url: &'a str,
-    /// What the command line asked for, per spec 9.1.
-    pub(crate) session: ConnectSession<'a>,
-    /// The host `--host` named, for the session this run creates.
-    pub(crate) host: Option<&'a str>,
+    url: &'a str,
+    session: ConnectSession<'a>,
+    host: Option<&'a str>,
+}
+
+impl<'a> ConnectTarget<'a> {
+    pub(crate) fn of(launch: &ConnectLaunch<'a>) -> Self {
+        Self {
+            url: launch.url,
+            session: launch.session,
+            host: launch.host,
+        }
+    }
 }
 
 /// A connected client: the control surface, the focused session, and what the
@@ -278,7 +290,6 @@ fn creator_settings(args: &Args, config: &Config, stated: &Stated) -> Option<Ses
 mod tests {
     use std::time::Duration;
 
-    use aj_app::cli::args::Command as CliCommand;
     use aj_app::host::{Command, SessionHost};
     use aj_wire::SessionSummary;
     use clap::Parser;
@@ -454,21 +465,16 @@ mod tests {
             let mut line = vec!["aj", "connect", &url];
             line.extend_from_slice(argv);
             let args = args(&line);
-            let Some(CliCommand::Connect { url, host, .. }) = &args.command else {
-                panic!("connect args parse as connect");
-            };
-            let launch = args.connect_launch().expect("connect args carry a launch");
+            let launch = args
+                .connect_launch()
+                .expect("connect args parse as connect");
             bounded(
                 "connect to resolve a session",
                 connect(
                     &args,
                     &Config::default(),
                     &nothing_stated(),
-                    ConnectTarget {
-                        url,
-                        session: launch.session,
-                        host: host.as_deref(),
-                    },
+                    ConnectTarget::of(&launch),
                 ),
             )
             .await

@@ -5550,8 +5550,8 @@ pub async fn run(args: Args) -> Result<()> {
     // Connect mode dials the host before anything touches the terminal, so an
     // unreachable host or a protocol mismatch reports on the normal screen
     // (spec 9.1).
-    let mut world = match (&args.command, args.connect_launch()) {
-        (Some(CliCommand::Connect { url, host, .. }), Some(launch)) => {
+    let mut world = match args.connect_launch() {
+        Some(launch) => {
             // Statedness has to come from the layers, not from the effective
             // config: only a create sends stated axes (spec section 8), and the
             // effective config cannot tell a written entry from a fallback.
@@ -5561,16 +5561,12 @@ pub async fn run(args: Args) -> Result<()> {
                 &args,
                 &layers.effective(),
                 &stated,
-                ConnectTarget {
-                    url,
-                    session: launch.session,
-                    host: host.as_deref(),
-                },
+                ConnectTarget::of(&launch),
             )
             .await?;
             build_connect_world(&args, connected, layers, &diagnostics, &auth, &persistence).await?
         }
-        _ => build_world(&args, layers, &diagnostics, &auth, &persistence, None).await?,
+        None => build_world(&args, layers, &diagnostics, &auth, &persistence, None).await?,
     };
 
     // The control port serves the very host this shell renders, so a remote
@@ -17006,21 +17002,10 @@ mod tests {
         args.push(url);
         args.extend_from_slice(argv);
         let args = Args::parse_from(args);
-        let Some(CliCommand::Connect { url, host, .. }) = &args.command else {
-            panic!("connect args parse as connect");
-        };
-        let launch = args.connect_launch().expect("connect args carry a launch");
-        crate::connect::connect(
-            &args,
-            config,
-            stated,
-            ConnectTarget {
-                url,
-                session: launch.session,
-                host: host.as_deref(),
-            },
-        )
-        .await
+        let launch = args
+            .connect_launch()
+            .expect("connect args parse as connect");
+        crate::connect::connect(&args, config, stated, ConnectTarget::of(&launch)).await
     }
 
     /// Build the connect-mode world `aj connect <url> [args...]` builds, with

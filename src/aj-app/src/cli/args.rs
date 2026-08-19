@@ -205,18 +205,18 @@ impl Args {
         matches!(self.launch_tag(), Ok(Some(_)))
     }
 
-    /// How a `connect` run's positionals divide, or `None` for every other
-    /// command.
+    /// What a `connect` run asks for, or `None` for every other command.
     ///
-    /// The one place the connect grammar is interpreted: both the session to
-    /// open and the launch input read it, so they cannot disagree about which
+    /// The one place the connect grammar is interpreted: the session to open
+    /// and the launch input both read it, so they cannot disagree about which
     /// positional is which.
     pub fn connect_launch(&self) -> Option<ConnectLaunch<'_>> {
         let Some(Command::Connect {
+            url,
             session_id,
             new,
+            host,
             prompt,
-            ..
         }) = &self.command
         else {
             return None;
@@ -230,7 +230,9 @@ impl Args {
             (false, None) => (ConnectSession::Latest, None),
         };
         Some(ConnectLaunch {
+            url,
             session,
+            host: host.as_deref(),
             prompt: leading
                 .into_iter()
                 .chain(prompt.iter().map(String::as_str))
@@ -264,10 +266,14 @@ impl Args {
     }
 }
 
-/// What a `connect` run's positionals ask for.
+/// What a `connect` run's command line asks for.
 pub struct ConnectLaunch<'a> {
+    /// Base url of the peer's control port.
+    pub url: &'a str,
     /// The session to open with.
     pub session: ConnectSession<'a>,
+    /// The peer's host `--host` named, for a session this run creates.
+    pub host: Option<&'a str>,
     /// Launch input for it, in argv order.
     pub prompt: Vec<&'a str>,
 }
@@ -277,6 +283,7 @@ pub struct ConnectLaunch<'a> {
 /// Three states, not an id beside a flag: a run that creates names no session,
 /// so "create this named session" has no spelling and no reader has to decide
 /// which of the two wins.
+#[derive(Clone, Copy)]
 pub enum ConnectSession<'a> {
     /// The id named on the command line, attached whatever its archived bit
     /// says.
