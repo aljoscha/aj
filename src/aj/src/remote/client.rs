@@ -51,7 +51,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// The host heartbeats every 30 seconds, so two missed heartbeats is the
 /// signal (spec 6.1). The caller reconnects with backoff.
-const SILENCE: Duration = Duration::from_secs(60);
+pub(crate) const SILENCE: Duration = Duration::from_secs(60);
 
 /// Why a remote call did not answer what was asked.
 #[derive(Debug, thiserror::Error)]
@@ -443,6 +443,11 @@ impl RemoteEvents {
             deadline: tokio::time::Instant::now() + silence,
             done: false,
         }
+    }
+
+    /// How long this stream may be silent before it counts as dead.
+    pub(crate) fn silence(&self) -> Duration {
+        self.silence
     }
 
     /// The next frame, `None` once the stream ended.

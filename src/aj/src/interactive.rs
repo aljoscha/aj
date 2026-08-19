@@ -23,7 +23,7 @@ use aj_agent::types::UsageSummary;
 use aj_app::actions::AjAction;
 use aj_app::chat::ChatState;
 use aj_app::cli::args::{Args, Command as CliCommand, HOST_WITHOUT_A_CREATE, TAG_WITHOUT_A_CREATE};
-use aj_app::client::SessionClient;
+use aj_app::client::{Attach, SessionClient};
 use aj_app::commands::CommandAction;
 use aj_app::directory::SessionDirectory;
 use aj_app::host::{
@@ -562,6 +562,19 @@ impl World {
     fn client_mut(&mut self) -> &mut SessionClient {
         self.directory.client_mut()
     }
+
+    /// Give up on the focused session's attach block, answering `false` so a
+    /// caller can end its fold on this call.
+    ///
+    /// The arm is the only record that a block is outstanding, so dropping the
+    /// wait without taking it back leaves the session armed for a block nobody
+    /// is bringing: the next on-change `state` frame would be read as that
+    /// block's opening and the cursor would stop advancing (see
+    /// [`SessionClient::abandon_attach`]).
+    fn abandon_attach_block(&mut self) -> CatchUp {
+        self.client_mut().abandon_attach();
+        CatchUp::Stalled
+    }
 }
 
 #[cfg(test)]
@@ -704,8 +717,29 @@ fn fold_ready_frames(world: &mut World) -> bool {
     redraw
 }
 
-/// Fold the attach block the host is writing, up to and including its
-/// `caught_up`, and report whether the block completed.
+/// What became of the attach block a catch-up was waiting for.
+///
+/// Two ways of not landing, because they have two answers. A block that stopped
+/// arriving is asked for again. A refusal is not: the peer has said attaching
+/// cannot succeed now, so the directory's own rule is what asks again, when the
+/// session's row says the answer can have changed
+/// ([`aj_app::directory::SessionDirectory::rows_returned`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CatchUp {
+    /// The block arrived whole and its `caught_up` committed it.
+    Caught,
+    /// A refusal replaced the block (spec 6.5). The stream is live, the fold has
+    /// dropped the attachment and folded what that costs, and nothing here asks
+    /// again.
+    Refused,
+    /// The block stopped arriving: the stream failed, it was abandoned, or it
+    /// went quiet about the session past the deadline. The caller owes another
+    /// attach.
+    Stalled,
+}
+
+/// Fold the attach block the focused session's client is waiting for, up to and
+/// including its `caught_up`, and report what became of it.
 ///
 /// The block is producer-paced (spec 6.9): it is generated at the pace the
 /// client reads it rather than queued before the attach returns, so draining
@@ -713,21 +747,91 @@ fn fold_ready_frames(world: &mut World) -> bool {
 /// transcript. Awaiting the block's end is also what makes the reads it
 /// obliges observe the state it established.
 ///
-/// A stream that closes mid-block leaves what was applied in place and
-/// answers `false`: the caller owes another attach. It stays silent about the
-/// reason, which the caller reports.
-async fn fold_attach_block(world: &mut World) -> bool {
+/// ## What ends the wait
+///
+/// The client's own arm, not a frame kind, so the wait ends on everything that
+/// ends a block: the `caught_up` that commits it, and the refusal that replaces
+/// it for a session the server cannot resolve (spec 6.5). Reading the arm rather
+/// than the wire is also what keeps a `caught_up` the fold *rejected* from
+/// reporting a block complete. A client that is not armed has no block coming
+/// and is not waited on at all.
+///
+/// A `reset` for this session ends it too, and at once: spec 6.5 says a reset
+/// received mid-block abandons the block, since the cursor only advances at a
+/// `caught_up` that is now not coming. Waiting on past it would hand a peer
+/// whose upstream is flapping one fresh deadline per flap, which is the
+/// unbounded wait this function exists to not have.
+///
+/// ## The deadline
+///
+/// Silence *about the session*, never total elapsed time. A producer-paced block
+/// is as long as the history behind it, and a client's cursor does not move
+/// until the block completes (spec 6.5), so a block cut short by a total
+/// deadline is re-served from the same cursor and cut short again: that trades a
+/// hang for a livelock. Silence about the session only runs out once the block
+/// has stopped arriving.
+///
+/// The bound is not optional, because this runs off the drive loop's `select!`
+/// and every wait in it freezes the paint and the input with it. A peer that
+/// keeps its stream warm and says nothing about the session, which a gateway
+/// with no link to the owning host does, would otherwise park the whole shell
+/// forever. How long that freeze may last at all is [ws-wmo]'s question, not
+/// this function's.
+///
+/// Frames for the session are a coarse measure of progress: one under an epoch
+/// the fold drops still counts. That over-approximation is deliberate, the
+/// alternative being a progress signal the fold does not currently expose, and
+/// the frame that actually matters, `reset`, is handled above rather than
+/// counted.
+///
+/// Whatever the block did apply stays applied. A block that stopped arriving
+/// leaves the client re-owing its re-attach
+/// ([`aj_app::client::SessionClient::abandon_attach`]), so something asks again;
+/// a refused one deliberately does not. This stays silent about the reason, which
+/// the caller reports.
+async fn fold_attach_block(world: &mut World) -> CatchUp {
+    // Nothing armed, so no block was asked for or the peer did not attach the
+    // session. Either way none is coming and nothing is waited on. Answered
+    // before the arm can be read as a verdict: what this client holds at this
+    // point describes a previous block, not one this call was owed. Nor is the
+    // re-attach re-owed, or a plain view swap would ask for one.
+    if world.client().attach_phase() == Attach::Live {
+        return CatchUp::Stalled;
+    }
+    let session = world.session().to_string();
+    let silence = world.stream.silence();
+    let mut deadline = Instant::now() + silence;
     loop {
-        let ControlFrame::Frame(frame) = world.stream.recv().await else {
-            return false;
+        let frame = match tokio::time::timeout_at(deadline.into(), world.stream.recv()).await {
+            Ok(ControlFrame::Frame(frame)) => frame,
+            // The block went quiet, or the stream is gone.
+            _ => return world.abandon_attach_block(),
         };
-        let ends_block = matches!(
-            &frame,
-            aj_wire::Frame::CaughtUp { session, .. } if *session == world.session()
-        );
+        let mine = frame.session() == Some(session.as_str());
+        // Spec 6.5: a `reset` mid-block abandons the block. Folded first,
+        // because folding is what records the re-attach it asks for.
+        let abandons = mine && matches!(frame, aj_wire::Frame::Reset { .. });
+        if mine {
+            deadline = Instant::now() + silence;
+        }
         let _ = world.directory.apply(&mut world.chat.borrow_mut(), frame);
-        if ends_block {
-            return true;
+        if abandons {
+            return world.abandon_attach_block();
+        }
+        if world.client().attach_phase() == Attach::Live {
+            // The block is over and the cursor says how it went: a `caught_up`
+            // commits one, and the refusal that replaces a block drops
+            // everything the fold held about the session, cursor included.
+            //
+            // A refusal is deliberately not abandoned. The fold withdrew the
+            // re-attach obligation over it and the directory puts it back when
+            // the session's row returns, so re-owing one here would ask again
+            // straight away, which is the spin that rule exists to avoid.
+            return if world.client().cursor().is_some() {
+                CatchUp::Caught
+            } else {
+                CatchUp::Refused
+            };
         }
     }
 }
@@ -1124,9 +1228,14 @@ async fn focus_session(
     // mirrors the `world.status` reset above, which resets chrome for the same
     // install-to-first-draw window.
     // Fold the attach block before the chrome reconcile below, so the first
-    // frame is drawn against the session's real history and settings. A swap
-    // onto an already-attached session has no block coming, and awaiting one
-    // would hang the loop on a `caught_up` the host has no reason to send.
+    // frame is drawn against the session's real history and settings.
+    //
+    // Only when this call opened a stream. The fold's own precondition is the
+    // client's arm, and that is not the same fact: an arm is set for every
+    // session a stream was opened over, so a background session can be armed for
+    // a block that is still arriving, or that a peer with no link to its host
+    // will never bring. Awaiting either would park the loop on a swap, which
+    // spec 9.2 makes instant.
     if reopening {
         fold_attach_block(world).await;
     }
@@ -1219,10 +1328,22 @@ async fn branch_focused_session(
         app.request_redraw();
         return;
     }
-    if let Err(err) = reattach(world, shell).await {
-        // The switch took but the stream did not reopen, so the transcript
-        // on screen describes a branch the session left.
-        fold_warning(world, &format!("Lost the session's event stream: {err}"));
+    // The switch took, so what is on screen now describes a branch the session
+    // left, and it is the re-attach that replaces it. Both ways it can fail cost
+    // the user the same thing, a transcript of the wrong branch, so both are
+    // reported: the request being refused, and the block it opened never
+    // landing. The re-attach the abandoned block re-owes is what asks again.
+    match reattach(world, shell).await {
+        // A refusal has already said on screen that nothing is following the
+        // session, which covers this too: the branch switch took and no
+        // transcript follows it.
+        Ok(CatchUp::Caught | CatchUp::Refused) => {}
+        Ok(CatchUp::Stalled) => fold_warning(
+            world,
+            "The branch switch was not served through, so this transcript is still \
+             the branch you left.",
+        ),
+        Err(err) => fold_warning(world, &format!("Lost the session's event stream: {err}")),
     }
     shell
         .borrow()
@@ -1265,14 +1386,15 @@ fn head_refusal(branching: bool, err: &ControlError) -> String {
 /// before the new branch's backfill lands. A `reset` frame still queued on
 /// the outgoing stream goes away with it.
 ///
-/// Answers whether the attach block completed. A stream that dropped inside
-/// it leaves the client owing another attach, which the caller retries.
-async fn reattach(world: &mut World, shell: &Rc<RefCell<Shell>>) -> Result<bool, ControlError> {
+/// Answers what became of the attach block. A caller has to act on every outcome
+/// but [`CatchUp::Caught`]: the stream a block fails on may well be alive, so
+/// nothing else notices.
+async fn reattach(world: &mut World, shell: &Rc<RefCell<Shell>>) -> Result<CatchUp, ControlError> {
     let mut stream = open_stream(&world.control, &mut world.directory).await?;
     std::mem::swap(&mut world.stream, &mut stream);
     drop(stream);
     refresh_local_handles(world, shell).await?;
-    let complete = fold_attach_block(world).await;
+    let caught = fold_attach_block(world).await;
     refresh_client_reads(world).await;
     // Adopting an epoch resets the chat model, and both the transcript's
     // render cache and the image store are keyed by entry id, which is a
@@ -1280,7 +1402,7 @@ async fn reattach(world: &mut World, shell: &Rc<RefCell<Shell>>) -> Result<bool,
     // to the tail is what clears that cache, so a row of the branch we left
     // cannot be reused for a different entry of the one we joined.
     shell.borrow().transcript.borrow_mut().reset_to_tail();
-    Ok(complete)
+    Ok(caught)
 }
 
 /// Re-read the focused session's direct handles, for a local run.
@@ -5854,21 +5976,32 @@ async fn advance_resume(
             }
         }
         ResumeStep::CatchingUp => {
-            let complete = fold_attach_block(world).await;
+            let caught = fold_attach_block(world).await;
             refresh_client_reads(world).await;
             // The block may have been served under a fresh epoch (a host
             // restart mints one), which resets the chat model and restarts its
             // entry ids. Dropping the view to the tail is what clears the
             // render cache keyed by them.
             shell.borrow().transcript.borrow_mut().reset_to_tail();
-            if !complete {
-                // The stream died inside the block. What was applied stays,
-                // and the next attach serves the rest from our cursor.
-                state.failed();
-                return Ok(Some(state));
+            match caught {
+                CatchUp::Caught => {
+                    fold_notice(world, reattached_notice(&world.control));
+                    Ok(None)
+                }
+                // What was applied stays, and the next attach serves the rest
+                // from our cursor.
+                CatchUp::Stalled => {
+                    tracing::warn!("the session's attach block did not land");
+                    state.failed();
+                    Ok(Some(state))
+                }
+                // The recovery is over and it did not get the session back.
+                // Asking again now is what the peer just answered, so the
+                // recovery stops here and the directory's rule takes it from the
+                // session's own `list` row. The fold has already said on screen
+                // that nothing is following the session.
+                CatchUp::Refused => Ok(None),
             }
-            fold_notice(world, reattached_notice(&world.control));
-            Ok(None)
         }
     }
 }
@@ -5887,38 +6020,61 @@ fn reattached_notice(control: &Control) -> &'static str {
 /// state that is left (`None` when nothing is pending).
 ///
 /// Leaving the obligation undischarged would silently freeze the transcript:
-/// every later frame carries an epoch the fold filters out. A refused attach
-/// keeps the obligation, so `retry` paces the next attempt: without it a peer
-/// that keeps refusing turns into one attach (and one warning row) per loop
-/// iteration. Nothing gives up, so a peer that keeps refusing keeps being asked
-/// at [`RETRY_BACKOFF_MAX`], which is what makes the shell outlast a session
-/// its host is slow to hand back.
+/// every later frame carries an epoch the fold filters out.
+///
+/// One rule, with the peer's answer as the discriminator. An attach that failed
+/// without the peer answering about the session, a request that could not be
+/// made or a block that stopped arriving, keeps the obligation and `retry` paces
+/// the next attempt: without the pacing a peer that keeps failing turns into one
+/// attach and one warning row per loop iteration, and nothing gives up, so a
+/// shell outlasts a session its host is slow to hand back.
+///
+/// A refusal is the peer answering. Asking again on a timer would only re-ask a
+/// question that has been answered, so that one leaves here discharged and the
+/// asking passes to the directory, which owes it again when the session's `list`
+/// row says the answer can have changed
+/// ([`aj_app::directory::SessionDirectory::rows_returned`]). Still nothing gives
+/// up, and nothing spins.
 async fn discharge_reattach(
     world: &mut World,
     shell: &Rc<RefCell<Shell>>,
     retry: &mut Retry,
 ) -> Option<Resume> {
-    match reattach(world, shell).await {
-        // A block that did not complete leaves a dead stream, which the frame
-        // arm picks up as a loss like any other.
-        Ok(_) => {
+    let failure = match reattach(world, shell).await {
+        // The block landed, so the client is back on its session.
+        Ok(CatchUp::Caught) => {
             retry.clear();
-            None
+            return None;
         }
-        Err(err) => {
-            fold_warning(world, &format!("Lost the session's event stream: {err}"));
-            retry.failed();
-            // A connection hands the obligation to the resume machinery, which
-            // paces its own attempts and paints the connection state while it
-            // does. An in-process host keeps retrying right here instead,
-            // because the resume path reads a failed local open as the host
-            // being gone and ends the shell (see `advance_resume`): this
-            // obligation arrives on a stream that is still live, so a refusal
-            // says the session moved rather than that the host did, and it must
-            // not cost the user the buffer they were typing in.
-            world.control.is_remote().then(Resume::lost)
+        // Refused. The obligation is discharged and deliberately not re-owed:
+        // the peer has answered, and the directory is what asks again when the
+        // session's row says the answer can have changed.
+        Ok(CatchUp::Refused) => {
+            retry.clear();
+            return None;
         }
-    }
+        // It did not. This has to reach the pacing below rather than read as a
+        // discharge: the stream the block failed on may well be alive, so the
+        // loop's frame arm will not notice anything, and the arm the attach set
+        // has already been taken back, so the obligation alone would ask again
+        // unpaced. Its own sentence, because the connection is not what was
+        // lost: it is up, and it stopped serving this session's block.
+        Ok(CatchUp::Stalled) => {
+            "The re-attach was not served through, so this client is asking again.".to_string()
+        }
+        Err(err) => format!("Lost the session's event stream: {err}"),
+    };
+    fold_warning(world, &failure);
+    retry.failed();
+    // A connection hands the obligation to the resume machinery, which
+    // paces its own attempts and paints the connection state while it
+    // does. An in-process host keeps retrying right here instead,
+    // because the resume path reads a failed local open as the host
+    // being gone and ends the shell (see `advance_resume`): this
+    // obligation arrives on a stream that is still live, so a refusal
+    // says the session moved rather than that the host did, and it must
+    // not cost the user the buffer they were typing in.
+    world.control.is_remote().then(Resume::lost)
 }
 
 async fn drive(
@@ -10551,8 +10707,17 @@ mod tests {
 
     /// Poll `observed` until it answers `Some`, bounded by [`SETTLE_DEADLINE`] so
     /// a loop that never gets there fails a test instead of hanging it.
-    async fn poll_for<T>(mut observed: impl FnMut() -> Option<T>) -> Option<T> {
-        let deadline = Instant::now() + SETTLE_DEADLINE;
+    async fn poll_for<T>(observed: impl FnMut() -> Option<T>) -> Option<T> {
+        settled(SETTLE_DEADLINE, observed).await
+    }
+
+    /// The same, on a budget the caller picks.
+    ///
+    /// For a wait nested inside another bound: a budget that can outlast the
+    /// bound around it fails on whichever of the two trips first, so the failure
+    /// names the harness rather than the harm.
+    async fn settled<T>(within: Duration, mut observed: impl FnMut() -> Option<T>) -> Option<T> {
+        let deadline = Instant::now() + within;
         while Instant::now() < deadline {
             if let Some(value) = observed() {
                 return Some(value);
@@ -10821,7 +10986,11 @@ mod tests {
         world.stream = open_stream(&world.control, &mut world.directory)
             .await
             .expect("re-attach");
-        assert!(fold_attach_block(&mut world).await, "the block completed");
+        assert_eq!(
+            fold_attach_block(&mut world).await,
+            CatchUp::Caught,
+            "the block completed",
+        );
         assert!(owes_client_reads(&world), "the block obliged both reads");
         assert!(
             !world.client().needs_reattach(),
@@ -19260,6 +19429,1006 @@ mod tests {
         remote.shutdown().await;
     }
 
+    /// A peer that answers a stream request with `script`, then keeps the
+    /// connection warm without ever saying anything about a session again.
+    ///
+    /// The shape a gateway takes when it cannot serve what a client attached:
+    /// the stream is open, its own frames keep arriving, and the attach block is
+    /// replaced by a refusal, abandoned by a `reset`, or simply never begun
+    /// (spec 6.5, 7.1). No real host can be asked to behave any of those ways,
+    /// and the warmth is the whole point: it is what the transport's silence
+    /// deadline cannot see, because the connection is not silent.
+    ///
+    /// One frame every `beat`, `script` first and heartbeats after, so a script
+    /// also sets the pace its frames arrive at.
+    struct WarmPeer {
+        url: String,
+        /// Aborting this closes the listener. A connection already being served
+        /// is left to the runtime's own teardown at the end of the test, which is
+        /// soon enough: this peer owns a port, not a path, so it has no scratch
+        /// space that could outlive it.
+        serving: tokio::task::JoinHandle<()>,
+        /// Heartbeats written, so a test can say whether the connection was
+        /// carrying anything while it waited.
+        beats: Arc<std::sync::atomic::AtomicUsize>,
+        /// Streams opened, one per attach. What a test reads to find out whether
+        /// the client came back and asked for the session again, which is the far
+        /// end of the recovery rather than the client's own bookkeeping.
+        opens: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl WarmPeer {
+        /// One script, replayed on every stream this peer serves.
+        async fn start(script: Vec<String>, beat: Duration) -> WarmPeer {
+            WarmPeer::answering(vec![script], beat).await
+        }
+
+        /// A script per stream, the last one repeating. What a peer that changes
+        /// its answer looks like: refuse the first attach, serve the second.
+        async fn answering(scripts: Vec<Vec<String>>, beat: Duration) -> WarmPeer {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind a loopback port");
+            let url = format!(
+                "http://{}",
+                listener.local_addr().expect("the bound address")
+            );
+            let beats = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let scripts = Arc::new(scripts);
+            let counted = Arc::clone(&beats);
+            let opened = Arc::clone(&opens);
+            let serving = tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let counted = Arc::clone(&counted);
+                    let opened = Arc::clone(&opened);
+                    let scripts = Arc::clone(&scripts);
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+                        let mut buffer = [0u8; 4096];
+                        let read = socket.read(&mut buffer).await.unwrap_or(0);
+                        let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                        // A block that lands obliges the task and queue reads
+                        // (spec 6.7). A peer that left those hanging would park
+                        // the caller in a request rather than in the fold, which
+                        // is a different failure than the one under test, so they
+                        // are answered with the wire types' own empty values.
+                        if !request.contains("/v1/events") {
+                            let body = if request.contains("/queue") {
+                                serde_json::to_string(&aj_wire::QueueState::default())
+                                    .expect("a queue state")
+                            } else {
+                                serde_json::to_string(&aj_wire::TaskTable::default())
+                                    .expect("a task table")
+                            };
+                            let answer = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                                 content-length: {}\r\n\r\n{body}",
+                                body.len(),
+                            );
+                            let _ = socket.write_all(answer.as_bytes()).await;
+                            return;
+                        }
+                        // Which stream this is, counted before it is served so
+                        // the script and the count cannot disagree.
+                        let nth = opened.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let script = &scripts[nth.min(scripts.len() - 1)];
+                        let head = b"HTTP/1.1 200 OK\r\n\
+                                     content-type: text/event-stream\r\n\
+                                     cache-control: no-cache\r\n\r\n";
+                        if socket.write_all(head).await.is_err() {
+                            return;
+                        }
+                        let idle =
+                            serde_json::to_string(&aj_wire::Frame::Heartbeat).expect("a heartbeat");
+                        for frame in script.iter().chain(std::iter::repeat(&idle)) {
+                            if socket
+                                .write_all(format!("data: {frame}\n\n").as_bytes())
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            if *frame == idle {
+                                counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            tokio::time::sleep(beat).await;
+                        }
+                    });
+                }
+            });
+            WarmPeer {
+                url,
+                serving,
+                beats,
+                opens,
+            }
+        }
+
+        fn beats(&self) -> usize {
+            self.beats.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn opens(&self) -> usize {
+            self.opens.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+    impl Drop for WarmPeer {
+        fn drop(&mut self) {
+            self.serving.abort();
+        }
+    }
+
+    /// Point `world` at a peer of its own, with a silence budget short enough to
+    /// wait out, and leave its current stream reported lost.
+    ///
+    /// The budget has to be tunable for these tests to run at all: in production
+    /// it is a minute, and it is the same number the catch-up bounds itself by.
+    fn redirect_to(world: &mut World, peer: &WarmPeer, silence: Duration) {
+        world.control = Control::remote(
+            crate::remote::RemoteClient::new(&peer.url)
+                .expect("a client against the warm peer")
+                .with_silence(silence),
+        );
+        world.stream.cut();
+    }
+
+    /// A `state` frame opening a block under `epoch`, as a peer writes it.
+    fn block_opening(session: &str, epoch: &str) -> String {
+        serde_json::to_string(&aj_wire::Frame::State {
+            session: session.to_string(),
+            epoch: epoch.to_string(),
+            working: false,
+            settings: aj_agent::events::AgentSettings {
+                provider: "scripted".into(),
+                model_id: "scripted".into(),
+                thinking: "off".into(),
+                thinking_display: "default".into(),
+                speed: "standard".into(),
+                verbosity: "default".into(),
+            },
+            last_seq: 0,
+        })
+        .expect("a state frame")
+    }
+
+    /// The `caught_up` that commits a block under `epoch`.
+    fn block_end(session: &str, epoch: &str) -> String {
+        serde_json::to_string(&aj_wire::Frame::CaughtUp {
+            session: session.to_string(),
+            epoch: epoch.to_string(),
+            last_seq: 0,
+        })
+        .expect("a caught_up frame")
+    }
+
+    /// A catch-up gives up on a peer that keeps its connection warm and never
+    /// serves the block, and leaves the re-attach owed so something asks again.
+    ///
+    /// The bound is what this pins, and the structural assertion at the end is
+    /// what makes it about the catch-up's own bound rather than the transport's:
+    /// the two are deliberately the same number, so no stopwatch can tell them
+    /// apart. [`the_loop_survives_a_peer_that_serves_no_block`] is the same case
+    /// through the composed loop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_catch_up_gives_up_on_a_peer_that_serves_no_block() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+
+        // Ten heartbeats to the budget, so the connection is unmistakably
+        // carrying frames for the whole wait.
+        let silence = Duration::from_millis(600);
+        let peer = WarmPeer::start(Vec::new(), silence / 10).await;
+        redirect_to(&mut world, &peer, silence);
+
+        let state = advance_resume(&mut world, &shell, Resume::lost())
+            .await
+            .expect("a connection's recovery is never fatal")
+            .expect("the warm peer answered the open, so a block is now awaited");
+        assert_eq!(
+            state.connection(),
+            Connection::CatchingUp,
+            "the recovery got as far as catching up, which is the state under test",
+        );
+
+        let waited = Instant::now();
+        let state = crate::remote::tests::bounded(
+            "the catch-up to give up on a peer that serves no block",
+            advance_resume(&mut world, &shell, state),
+        )
+        .await
+        .expect("a connection's recovery is never fatal")
+        .expect("a block that never came leaves the recovery pending");
+        let waited = waited.elapsed();
+
+        assert_eq!(
+            state.connection(),
+            Connection::Reconnecting,
+            "the recovery starts over from the open, so the next attempt asks again",
+        );
+        assert!(
+            world.directory.needs_reattach(),
+            "the block was abandoned but the re-attach was not re-owed, so the \
+             session is armed for a block nobody is bringing",
+        );
+        assert!(
+            (silence..silence * 4).contains(&waited),
+            "the catch-up gave up after {waited:?}, not within its own {silence:?} \
+             budget, so what ended the wait was not the block going quiet",
+        );
+        assert!(
+            peer.beats() > 1,
+            "the peer wrote {} heartbeats, so it was not keeping the connection \
+             warm and this test cannot speak to the catch-up's own bound",
+            peer.beats(),
+        );
+        // The claim no stopwatch can make. A stream the transport gave up on
+        // latches done and yields nothing further, so reading another frame off
+        // this one proves the transport's deadline is not what fired.
+        assert!(
+            matches!(
+                crate::remote::tests::bounded(
+                    "another frame from the warm peer",
+                    world.stream.recv(),
+                )
+                .await,
+                ControlFrame::Frame(_),
+            ),
+            "the stream was already dead, so the transport's deadline is what \
+             fired and this test says nothing about the catch-up's own bound",
+        );
+        remote.shutdown().await;
+    }
+
+    /// A block that keeps arriving is not cut off, however long it takes in
+    /// total.
+    ///
+    /// This is the difference between the bound the catch-up has and a total
+    /// budget, and it is the whole reason the deadline is measured on silence
+    /// about the session. A block is as long as the history behind it and a
+    /// client's cursor does not move until its `caught_up` (spec 6.5), so a total
+    /// budget would cut a large backfill short, be re-served the identical block
+    /// from the identical cursor, and cut it short again: a livelock where the
+    /// bug was a hang.
+    ///
+    /// The frames here are spaced under the budget and their sum is well over
+    /// it, so a deadline that does not move fires before the block ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_catch_up_lets_a_slow_block_finish() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let session = world.session().to_string();
+
+        let silence = Duration::from_millis(800);
+        let beat = silence / 2;
+        let epoch = "epoch-slow";
+        // Four gaps of half the budget: each frame on its own is comfortably in
+        // time, and the block as a whole takes twice what a total budget allows.
+        let script = vec![
+            block_opening(&session, epoch),
+            block_opening(&session, epoch),
+            block_opening(&session, epoch),
+            block_opening(&session, epoch),
+            block_end(&session, epoch),
+        ];
+        let peer = WarmPeer::start(script, beat).await;
+        redirect_to(&mut world, &peer, silence);
+
+        // One bound around the whole recovery, not around each step: a catch-up
+        // that keeps giving up and asking again is otherwise an unbounded loop of
+        // individually bounded steps, and this test would hang where it has to
+        // fail.
+        let opened = Instant::now();
+        crate::remote::tests::bounded("the slow block to be folded through", async {
+            let mut state = Some(Resume::lost());
+            while let Some(pending) = state.take() {
+                state = advance_resume(&mut world, &shell, pending)
+                    .await
+                    .expect("a connection's recovery is never fatal");
+            }
+        })
+        .await;
+        let took = opened.elapsed();
+
+        assert!(
+            took > silence,
+            "the block finished in {took:?}, inside the {silence:?} budget, so a \
+             total deadline would not have cut it and this test measures nothing",
+        );
+        assert!(
+            main_notices(&world)
+                .iter()
+                .any(|text| text == "Reconnected to the host."),
+            "the slow block was cut short instead of folded through: {:?}",
+            main_notices(&world),
+        );
+        assert!(
+            !world.directory.needs_reattach(),
+            "a block that landed owes no further re-attach",
+        );
+        remote.shutdown().await;
+    }
+
+    /// A `reset` for the session being caught up ends the catch-up at once.
+    ///
+    /// Spec 6.5: a `reset` received mid-block abandons the block, because the
+    /// cursor only advances at a `caught_up` that is now not coming. Waiting past
+    /// it is what would hand a peer whose upstream flaps one fresh deadline per
+    /// flap, and a flap period under the budget is then an unbounded wait again:
+    /// the original bug, through the new bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_reset_inside_the_block_ends_the_catch_up() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let session = world.session().to_string();
+
+        // A budget long enough that waiting it out would be the failure: if the
+        // reset is not what ends this, the `bounded` below is what does.
+        let silence = Duration::from_secs(120);
+        let script = vec![
+            block_opening(&session, "epoch-reset"),
+            serde_json::to_string(&aj_wire::Frame::Reset {
+                session: session.clone(),
+            })
+            .expect("a reset frame"),
+        ];
+        let peer = WarmPeer::start(script, Duration::from_millis(20)).await;
+        redirect_to(&mut world, &peer, silence);
+
+        let state = advance_resume(&mut world, &shell, Resume::lost())
+            .await
+            .expect("a connection's recovery is never fatal")
+            .expect("the peer answered the open, so a block is now awaited");
+        assert_eq!(state.connection(), Connection::CatchingUp);
+
+        let waited = Instant::now();
+        let state = crate::remote::tests::bounded(
+            "the reset to end the catch-up",
+            advance_resume(&mut world, &shell, state),
+        )
+        .await
+        .expect("a connection's recovery is never fatal")
+        .expect("an abandoned block leaves the recovery pending");
+        let waited = waited.elapsed();
+
+        assert_eq!(state.connection(), Connection::Reconnecting);
+        assert!(
+            waited < silence,
+            "the catch-up waited {waited:?} of its {silence:?} budget, so it sat \
+             through the reset rather than ending on it",
+        );
+        assert!(
+            world.directory.needs_reattach(),
+            "the reset asks for a re-attach and the abandoned block owes one",
+        );
+        remote.shutdown().await;
+    }
+
+    /// The drive loop survives a peer that serves no block: it keeps painting,
+    /// keeps reading input, and keeps asking for the session.
+    ///
+    /// The harm is the loop. `fold_attach_block` is awaited from the loop's body,
+    /// not from its `select!`, so a wait in it that only a frame can end costs
+    /// the user the paint and the keyboard along with the session. A test that
+    /// calls the recovery step directly proves the step and says nothing about
+    /// that, so this one composes the real loop and writes real bytes into its
+    /// input.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_loop_survives_a_peer_that_serves_no_block() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+
+        let silence = Duration::from_millis(600);
+        let peer = WarmPeer::start(Vec::new(), silence / 10).await;
+        redirect_to(&mut world, &peer, silence);
+
+        let editor = Rc::clone(&shell.borrow().editor);
+        let typed = "the loop is still mine";
+        let asked = Arc::clone(&peer.opens);
+        let (exit, observed) = crate::remote::tests::bounded(
+            "the drive loop to come back for its input",
+            drive_until(&mut world, &shell, |mut writer| async move {
+                // Read at the peer, not in the client: a second stream is the
+                // loop having given up on the first block and asked again, which
+                // is the far end of the recovery under test. A client parked in
+                // the fold never opens one.
+                let stalled = settled(Duration::from_secs(8), || {
+                    (asked.load(std::sync::atomic::Ordering::Relaxed) >= 2).then_some(())
+                })
+                .await;
+                writer.write_all(typed.as_bytes()).expect("write key bytes");
+                let reached = settled(Duration::from_secs(8), || {
+                    let text = editor.borrow().text();
+                    text.contains(typed).then_some(text)
+                })
+                .await;
+                drop(writer);
+                (stalled, reached)
+            }),
+        )
+        .await;
+
+        let (stalled, reached) = observed;
+        assert!(
+            stalled.is_some(),
+            "the peer was asked for {} streams, so the loop never gave up on the \
+             first block and this test cannot speak to what happens after: {:?}",
+            peer.opens(),
+            main_notices(&world),
+        );
+        assert!(
+            reached.is_some(),
+            "the loop read no input after the stalled catch-up, so it is parked \
+             in the fold and the user's terminal is gone",
+        );
+        assert!(
+            matches!(exit, Ok(SessionExit::Quit)),
+            "the loop did not end on its input closing",
+        );
+        remote.shutdown().await;
+    }
+
+    /// A re-attach the peer answers with a refusal instead of a block leaves the
+    /// drive loop running and reading its input.
+    ///
+    /// The refusal replaces the block and says it is not coming (spec 6.5). The
+    /// client's fold already understands it and drops the attachment, so a
+    /// catch-up that waits for a `caught_up` regardless is waiting for a frame it
+    /// has been told will never arrive, on a stream that stays open. The frame
+    /// here is the one a gateway with no link to the owning host writes,
+    /// `unknown_session` and all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_loop_keeps_its_input_when_a_re_attach_is_refused() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+
+        let refusal = "no host serves this session any more";
+        let script = vec![
+            serde_json::to_string(&aj_wire::Frame::Error {
+                session: world.session().to_string(),
+                // The session was never resolved, so nothing minted one.
+                epoch: None,
+                code: "unknown_session".to_string(),
+                message: refusal.to_string(),
+            })
+            .expect("an error frame"),
+        ];
+        let peer = WarmPeer::start(script, Duration::from_millis(50)).await;
+        // The production budget on purpose: a refusal has to end the catch-up on
+        // its own, and a short budget would let the deadline do it instead.
+        redirect_to(&mut world, &peer, crate::remote::SILENCE);
+
+        let chat = Rc::clone(&world.chat);
+        let editor = Rc::clone(&shell.borrow().editor);
+        let typed = "the loop is still mine";
+        let (exit, observed) = crate::remote::tests::bounded(
+            "the drive loop to come back for its input",
+            drive_until(&mut world, &shell, |mut writer| async move {
+                let refused = settled(Duration::from_secs(8), || {
+                    notices_of(&chat.borrow())
+                        .iter()
+                        .any(|text| text == refusal)
+                        .then_some(())
+                })
+                .await;
+                // Only now: the refusal landing is what says the catch-up ran, so
+                // a keystroke after it is one a parked loop would never read.
+                writer.write_all(typed.as_bytes()).expect("write key bytes");
+                let reached = settled(Duration::from_secs(8), || {
+                    let text = editor.borrow().text();
+                    text.contains(typed).then_some(text)
+                })
+                .await;
+                drop(writer);
+                (refused, reached)
+            }),
+        )
+        .await;
+
+        let (refused, reached) = observed;
+        assert!(
+            refused.is_some(),
+            "the peer's refusal never reached the transcript, so the catch-up \
+             never ran and the rest of this measures nothing: {:?}",
+            main_notices(&world),
+        );
+        assert!(
+            reached.is_some(),
+            "the loop read no input after the refused re-attach, so it is parked \
+             in the catch-up and the user's terminal is gone",
+        );
+        assert!(
+            matches!(exit, Ok(SessionExit::Quit)),
+            "the loop did not end on its input closing",
+        );
+        remote.shutdown().await;
+    }
+
+    /// A fold with nothing armed reports no block, whatever the client already
+    /// holds, and leaves no re-attach owed.
+    ///
+    /// The arm is what says a block was owed. A client that has been caught up
+    /// before holds a cursor from that block, so reading what it holds as this
+    /// call's verdict would report a block complete for an attach the peer never
+    /// served. And a re-owed re-attach here would turn every plain view swap into
+    /// a request for one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fold_with_nothing_armed_reports_no_block() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, _shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+
+        // What the startup attach leaves: its block folded, so nothing armed,
+        // and a cursor committed from it.
+        assert_eq!(
+            world.client().attach_phase(),
+            Attach::Live,
+            "the startup block was folded, which is the state under test",
+        );
+        assert!(
+            world.client().cursor().is_some(),
+            "and it committed a cursor, without which this test cannot tell a \
+             verdict read off the client from the right answer",
+        );
+
+        assert_eq!(
+            fold_attach_block(&mut world).await,
+            CatchUp::Stalled,
+            "a fold with nothing armed reported a block it was never owed",
+        );
+        assert!(
+            !world.directory.needs_reattach(),
+            "nothing was armed, so nothing was abandoned and no re-attach is owed",
+        );
+        remote.shutdown().await;
+    }
+
+    /// A swap onto a session whose attach block is still outstanding does not
+    /// park the loop on it.
+    ///
+    /// Spec 9.2 makes a focus switch a view swap. The arm cannot be the fold's
+    /// whole precondition, because it is set for every session a stream was
+    /// opened over and stays set until that session's block is folded: a peer
+    /// that will never bring one leaves it set for good. So a swap has to be
+    /// gated on whether *this call* opened a stream, and the fold's own check is
+    /// not that fact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_swap_does_not_wait_for_a_background_block() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let (mut app, _writer, _root) = app_over(&shell).await;
+        let first = world.session().to_string();
+
+        // A second session, so there is a background one to swap back to.
+        let moved = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Create { host: None },
+        )
+        .await;
+        assert!(matches!(moved, Focus::Moved));
+
+        // Now a peer that answers the attach and serves no block, and one
+        // recovery step to open a stream over the whole set through it. Both
+        // sessions come out of that armed for blocks that will never arrive.
+        let silence = Duration::from_secs(120);
+        let peer = WarmPeer::start(Vec::new(), Duration::from_millis(20)).await;
+        redirect_to(&mut world, &peer, silence);
+        let resuming = advance_resume(&mut world, &shell, Resume::lost())
+            .await
+            .expect("a connection's recovery is never fatal")
+            .expect("the peer answered the open, so a block is now awaited");
+        assert_eq!(resuming.connection(), Connection::CatchingUp);
+        assert_ne!(
+            world
+                .directory
+                .client_for(&first)
+                .map(SessionClient::attach_phase),
+            Some(Attach::Live),
+            "the reopen left the background session armed, which is what makes \
+             this a test of the swap rather than of an idle client",
+        );
+
+        // The swap itself. It opens no stream, so it is owed no block, and the
+        // budget above is two minutes: a swap that waits on the arm hangs here.
+        let swap = apply_focus_request(
+            &mut app,
+            &shell,
+            &mut world,
+            FocusRequest::Resume(first.clone()),
+        );
+        let moved = crate::remote::tests::bounded("the swap onto a background session", swap).await;
+
+        assert!(matches!(moved, Focus::Moved));
+        assert_eq!(world.session(), first);
+        remote.shutdown().await;
+    }
+
+    /// A re-attach owed on a live stream, whose block then never lands, is paced
+    /// and asked again rather than read as discharged.
+    ///
+    /// This is the arm the loop reaches for a `reset` that arrives while the
+    /// connection is fine, and the failure it has to survive is the one nothing
+    /// else notices: the stream is alive, so the loop's frame arm sees nothing
+    /// wrong, and arming the client already cleared the obligation, so the
+    /// obligation will not ask again either. Reading it as a discharge leaves the
+    /// client on a transcript nothing feeds, with the pacing cleared.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_reattach_whose_block_never_lands_is_paced_and_retried() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let session = world.session().to_string();
+
+        // Continuity broken on a stream that is still live, which is what a
+        // `reset` means (spec 6.3).
+        let _ = world.directory.apply(
+            &mut world.chat.borrow_mut(),
+            aj_wire::Frame::Reset {
+                session: session.clone(),
+            },
+        );
+        assert!(
+            world.directory.needs_reattach(),
+            "the reset left the obligation this arm exists to discharge",
+        );
+
+        // The re-attach will be served by a peer that brings no block. The
+        // stream is deliberately left alone: a cut one would take the loop down
+        // the resume path instead of this one.
+        let silence = Duration::from_millis(600);
+        let peer = WarmPeer::start(Vec::new(), silence / 10).await;
+        world.control = Control::remote(
+            crate::remote::RemoteClient::new(&peer.url)
+                .expect("a client against the warm peer")
+                .with_silence(silence),
+        );
+
+        let mut retry = Retry::default();
+        let resume = crate::remote::tests::bounded(
+            "the re-attach to give up on a block that never lands",
+            discharge_reattach(&mut world, &shell, &mut retry),
+        )
+        .await;
+
+        assert!(
+            resume.is_some(),
+            "a connection whose re-attach did not land hands the recovery on, and \
+             this one reported itself discharged instead: {:?}",
+            main_notices(&world),
+        );
+        assert!(
+            !retry.ready(),
+            "the next attempt was not paced, so a peer that keeps failing is \
+             asked once per loop iteration",
+        );
+        assert!(
+            main_notices(&world)
+                .iter()
+                .any(|text| text.contains("not served through")),
+            "nothing told the user the re-attach did not land: {:?}",
+            main_notices(&world),
+        );
+        remote.shutdown().await;
+    }
+
+    /// A `list` row for `session`, as a peer publishes it.
+    fn listed_row(session: &str) -> aj_wire::SessionSummary {
+        aj_wire::SessionSummary {
+            id: session.to_string(),
+            live: true,
+            working: false,
+            queued: aj_wire::QueueCounts::default(),
+            tasks: 0,
+            last_seq: Some(0),
+            last_activity: Utc::now(),
+            tag: None,
+            host: None,
+            unreachable: false,
+            archived: false,
+        }
+    }
+
+    /// A `list` frame carrying exactly `sessions`.
+    fn list_of(sessions: &[&str]) -> String {
+        serde_json::to_string(&aj_wire::Frame::List {
+            sessions: sessions.iter().map(|id| listed_row(id)).collect(),
+            hosts: Vec::new(),
+        })
+        .expect("a list frame")
+    }
+
+    /// A peer that keeps refusing is asked once, not once per retry.
+    ///
+    /// This is the behaviour the fix pass left behind when it removed the
+    /// terminal refusal outcome on a spec argument: the recovery retried on a
+    /// backoff and folded the peer's `error` frame again on every attempt,
+    /// measured at thirteen rows in the first minute against a real gateway. The
+    /// refusal is an answer, so asking again on a timer adds nothing and costs
+    /// the transcript.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refusal_is_folded_once_however_long_the_client_waits() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let session = world.session().to_string();
+
+        let refusal = "no host serves this session any more";
+        let script = vec![
+            serde_json::to_string(&aj_wire::Frame::Error {
+                session: session.clone(),
+                epoch: None,
+                code: "unknown_session".to_string(),
+                message: refusal.to_string(),
+            })
+            .expect("an error frame"),
+            // And then the peer keeps listing the session, which is the other way
+            // a client could be tempted to ask again: on the row being present
+            // rather than on it having returned. Nothing has changed here, so
+            // nothing has answered differently, and a rule that reads presence
+            // instead of the transition spins against exactly the refusal whose
+            // row never leaves, a session held by a rival writer.
+            list_of(&[&session]),
+            list_of(&[&session]),
+        ];
+        // The leading `list` is load-bearing and goes FIRST, before the refusal.
+        // The rule reads a transition against the rows it already holds, and a
+        // client that has folded no list yet holds none, so a first row arriving
+        // after a refusal is new information and legitimately does ask again.
+        // Without this frame the test would be measuring that instead.
+        let script = std::iter::once(list_of(&[&session]))
+            .chain(script)
+            .collect::<Vec<_>>();
+        let peer = WarmPeer::start(script, Duration::from_millis(20)).await;
+        redirect_to(&mut world, &peer, Duration::from_millis(400));
+
+        // Long enough that the old backoff would have asked many times over: it
+        // caps at RETRY_BACKOFF_MAX and ramps from RETRY_BACKOFF_MIN, so this
+        // window allowed a dozen attempts and a dozen rows.
+        let window = RETRY_BACKOFF_MAX * 3;
+        let chat = Rc::clone(&world.chat);
+        let (exit, ()) = crate::remote::tests::bounded(
+            "the loop to run out its window",
+            drive_until(&mut world, &shell, |writer| async move {
+                let seen = settled(Duration::from_secs(8), || {
+                    notices_of(&chat.borrow())
+                        .iter()
+                        .any(|text| text == refusal)
+                        .then_some(())
+                })
+                .await;
+                assert!(
+                    seen.is_some(),
+                    "the refusal never landed, so nothing here measures how often \
+                     it lands",
+                );
+                tokio::time::sleep(window).await;
+                drop(writer);
+            }),
+        )
+        .await;
+
+        assert!(matches!(exit, Ok(SessionExit::Quit)));
+        let rows = notices_of(&world.chat.borrow());
+        assert_eq!(
+            rows.iter().filter(|text| *text == refusal).count(),
+            1,
+            "the peer's refusal was folded {} times over {window:?}: {rows:?}",
+            rows.iter().filter(|text| *text == refusal).count(),
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|text| *text == aj_app::directory::WITHHELD_NOTICE)
+                .count(),
+            1,
+            "and what it costs the user is said exactly once: {rows:?}",
+        );
+        assert_eq!(
+            peer.opens(),
+            1,
+            "the client opened {} streams, so it kept asking a peer that had \
+             already answered",
+            peer.opens(),
+        );
+        assert!(
+            world.directory.rows().iter().any(|row| row.id == session),
+            "the peer listed the session throughout, without which this test \
+             measures a row arriving rather than a row staying put",
+        );
+        remote.shutdown().await;
+    }
+
+    /// A refused session re-attaches by itself when its row returns to the
+    /// peer's list, with no gesture from the user.
+    ///
+    /// The edge nobody had seen work. A refusal says attaching cannot succeed
+    /// now, and the peer's directory is the only thing that says when that could
+    /// have changed. It says so by listing the session again (spec 6.5, 7.1). Without this the client stops asking and never starts, which is a
+    /// dead end no gesture recovers: a re-focus of the focused session is a
+    /// no-op, and the session stays in the working set so nothing else reopens
+    /// the stream either.
+    ///
+    /// Driven through the real loop and asserted at the peer, because the claim
+    /// is that the client asks again on its own: a test that folded the frames
+    /// by hand would prove the rule and not the wiring.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refused_session_rejoins_when_its_row_returns() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let session = world.session().to_string();
+        let epoch = "epoch-rejoined";
+
+        let peer = WarmPeer::answering(
+            vec![
+                // The first attach is refused, and then the peer's directory
+                // tells the story the rule reads: the session is gone, and then
+                // it is back. Only the transition says the answer changed.
+                vec![
+                    serde_json::to_string(&aj_wire::Frame::Error {
+                        session: session.clone(),
+                        epoch: None,
+                        code: "unknown_session".to_string(),
+                        message: "no host serves this session any more".to_string(),
+                    })
+                    .expect("an error frame"),
+                    list_of(&[]),
+                    list_of(&[&session]),
+                ],
+                // The second attach is served, which is the rejoin.
+                vec![block_opening(&session, epoch), block_end(&session, epoch)],
+            ],
+            Duration::from_millis(30),
+        )
+        .await;
+        redirect_to(&mut world, &peer, Duration::from_millis(400));
+
+        // Read at the peer. The claim is that the client asks again on its own,
+        // and a second stream is that, at the far end: the discharge path folds
+        // no notice on success, so the client's own transcript would say nothing
+        // either way.
+        let asked = Arc::clone(&peer.opens);
+        let (exit, rejoined) = crate::remote::tests::bounded(
+            "the client to rejoin its session on the row's return",
+            drive_until(&mut world, &shell, |writer| async move {
+                // No keystroke anywhere in here on purpose: the writer is only
+                // dropped, to end the loop once the rejoin has happened.
+                let rejoined = settled(Duration::from_secs(10), || {
+                    (asked.load(std::sync::atomic::Ordering::Relaxed) >= 2).then_some(())
+                })
+                .await;
+                // The second stream is open. Give its block a moment to land
+                // before the loop is stopped out from under it.
+                if rejoined.is_some() {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+                drop(writer);
+                rejoined
+            }),
+        )
+        .await;
+
+        assert!(matches!(exit, Ok(SessionExit::Quit)));
+        assert!(
+            rejoined.is_some(),
+            "the client never re-attached after its row came back, so a refusal \
+             is still a dead end: {:?}",
+            main_notices(&world),
+        );
+        assert_eq!(
+            peer.opens(),
+            2,
+            "the peer served {} streams: the rejoin is a second attach, and one \
+             stream means the client never asked again",
+            peer.opens(),
+        );
+        assert!(
+            world.client().holds_attachment(),
+            "the client is following its session again",
+        );
+        assert!(
+            !world.directory.needs_reattach(),
+            "and owes nothing further",
+        );
+        remote.shutdown().await;
+    }
+
+    /// A session refused twice still rejoins on the second return of its row.
+    ///
+    /// A refusal after an earlier one moves neither the epoch nor the arm: the
+    /// client is already following nothing. So a rule that read the refusal off
+    /// that transition saw the first one and missed every one after it, leaving
+    /// the session stranded with nothing watching for its row. The bit lives on
+    /// the client for this reason, set wherever an attachment is dropped.
+    ///
+    /// Two full cycles, driven through the real loop, asserted at the peer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_session_refused_twice_still_rejoins() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let session = world.session().to_string();
+        let epoch = "epoch-second-time";
+
+        let refusal = |session: &str| {
+            serde_json::to_string(&aj_wire::Frame::Error {
+                session: session.to_string(),
+                epoch: None,
+                code: "unknown_session".to_string(),
+                message: "no host serves this session any more".to_string(),
+            })
+            .expect("an error frame")
+        };
+        let peer = WarmPeer::answering(
+            vec![
+                // First refusal, then the row leaves and returns.
+                vec![
+                    list_of(&[&session]),
+                    refusal(&session),
+                    list_of(&[]),
+                    list_of(&[&session]),
+                ],
+                // The rejoin is refused too, and the row goes and comes again.
+                // The client is following nothing before this refusal as well as
+                // after it, which is what the old rule could not see.
+                vec![refusal(&session), list_of(&[]), list_of(&[&session])],
+                // The third attach is served.
+                vec![block_opening(&session, epoch), block_end(&session, epoch)],
+            ],
+            Duration::from_millis(30),
+        )
+        .await;
+        redirect_to(&mut world, &peer, Duration::from_millis(400));
+
+        let asked = Arc::clone(&peer.opens);
+        let (exit, rejoined) = crate::remote::tests::bounded(
+            "the client to rejoin after a second refusal",
+            drive_until(&mut world, &shell, |writer| async move {
+                let rejoined = settled(Duration::from_secs(12), || {
+                    (asked.load(std::sync::atomic::Ordering::Relaxed) >= 3).then_some(())
+                })
+                .await;
+                if rejoined.is_some() {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+                drop(writer);
+                rejoined
+            }),
+        )
+        .await;
+
+        assert!(matches!(exit, Ok(SessionExit::Quit)));
+        assert!(
+            rejoined.is_some(),
+            "the client stopped asking after the second refusal, so a session \
+             refused more than once is stranded: {:?}",
+            main_notices(&world),
+        );
+        assert!(
+            world.client().holds_attachment(),
+            "the client is following its session again after two refusals",
+        );
+        // Two refusals are two things that happened, and the second is the one a
+        // user would otherwise have no way to learn about.
+        let rows = main_notices(&world);
+        assert_eq!(
+            rows.iter()
+                .filter(|text| *text == aj_app::directory::WITHHELD_NOTICE)
+                .count(),
+            2,
+            "each refusal says what it costs, once: {rows:?}",
+        );
+        remote.shutdown().await;
+    }
+
     /// A loopback address with nothing behind it: bound to take a free port,
     /// then released, so a client dialing it is refused rather than left
     /// waiting.
@@ -19289,7 +20458,11 @@ mod tests {
         world.stream = open_stream(&world.control, &mut world.directory)
             .await
             .expect("re-attach");
-        assert!(fold_attach_block(&mut world).await, "the block completed");
+        assert_eq!(
+            fold_attach_block(&mut world).await,
+            CatchUp::Caught,
+            "the block completed",
+        );
         assert!(
             world.client().needs_task_refetch() && world.client().needs_queue_refetch(),
             "the block obliged both reads",
