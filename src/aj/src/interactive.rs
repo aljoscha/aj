@@ -19672,15 +19672,31 @@ mod tests {
         opens: Arc<std::sync::atomic::AtomicUsize>,
     }
 
+    /// What a peer does once it has written a stream's script.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum After {
+        /// Heartbeats, forever: the connection stays up and says nothing further
+        /// about any session.
+        Warm,
+        /// Drops the socket, which is a stream dying where its reader is waiting
+        /// for a block.
+        Cut,
+    }
+
     impl WarmPeer {
         /// One script, replayed on every stream this peer serves.
         async fn start(script: Vec<String>, beat: Duration) -> WarmPeer {
-            WarmPeer::answering(vec![script], beat).await
+            WarmPeer::answering(vec![script], beat, After::Warm).await
+        }
+
+        /// The same, cutting each stream once its script is written.
+        async fn start_cutting(script: Vec<String>, beat: Duration) -> WarmPeer {
+            WarmPeer::answering(vec![script], beat, After::Cut).await
         }
 
         /// A script per stream, the last one repeating. What a peer that changes
         /// its answer looks like: refuse the first attach, serve the second.
-        async fn answering(scripts: Vec<Vec<String>>, beat: Duration) -> WarmPeer {
+        async fn answering(scripts: Vec<Vec<String>>, beat: Duration, after: After) -> WarmPeer {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind a loopback port");
@@ -19746,6 +19762,11 @@ mod tests {
                                 return;
                             }
                             if *frame == idle {
+                                // The script is written, so a cutting peer drops
+                                // the socket here rather than keeping it warm.
+                                if after == After::Cut {
+                                    return;
+                                }
                                 counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                             tokio::time::sleep(beat).await;
@@ -20213,6 +20234,65 @@ mod tests {
         remote.shutdown().await;
     }
 
+    /// A stream that keeps dying inside its attach block is reopened on the
+    /// backoff, not once per loop iteration.
+    ///
+    /// This failure arrives on the loop's frame arm rather than as a step of the
+    /// recovery, so the arm has to hand it to the recovery that opened the stream
+    /// instead of starting a fresh one over it: a fresh one drops the pacing the
+    /// previous attempts earned. Every attach costs the host a full projection and
+    /// is served the identical suffix, because a client's cursor does not move
+    /// until the block completes (spec 6.5), so an unpaced reopen is a livelock
+    /// against a peer that cannot serve a block through.
+    ///
+    /// The backoff is only visible as a rate, so the assertion is the count over a
+    /// window: the first delay is [`RETRY_BACKOFF_MIN`] and doubles, which puts a
+    /// handful of attempts in the window and hundreds without the pacing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_loop_paces_a_stream_that_dies_inside_the_block() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+
+        // The cut is what ends every attempt, so the budget is long enough that
+        // the deadline cannot be what does.
+        let peer = WarmPeer::start_cutting(Vec::new(), Duration::from_millis(5)).await;
+        redirect_to(&mut world, &peer, Duration::from_secs(120));
+
+        let window = Duration::from_secs(2);
+        let asked = Arc::clone(&peer.opens);
+        let (exit, opens) = crate::remote::tests::bounded(
+            "the drive loop to keep reopening a stream that dies in its block",
+            drive_until(&mut world, &shell, |writer| async move {
+                tokio::time::sleep(window).await;
+                let opens = asked.load(std::sync::atomic::Ordering::Relaxed);
+                drop(writer);
+                opens
+            }),
+        )
+        .await;
+
+        assert!(
+            opens > 1,
+            "the peer was asked for {opens} streams in {window:?}, so the loop \
+             never came back after the first cut and this test says nothing about \
+             the rate it comes back at",
+        );
+        // Four doublings from the minimum already exceed the window, so anything
+        // near it is paced and anything unpaced is orders of magnitude away.
+        assert!(
+            opens <= 8,
+            "the peer was asked for {opens} streams in {window:?}, so a stream \
+             that died inside its block was reopened unpaced, one host projection \
+             per loop iteration",
+        );
+        assert!(
+            matches!(exit, Ok(SessionExit::Quit)),
+            "the loop did not end on its input closing",
+        );
+        remote.shutdown().await;
+    }
+
     /// A re-attach the peer answers with a refusal instead of a block leaves the
     /// drive loop running and reading its input.
     ///
@@ -20630,6 +20710,7 @@ mod tests {
                 ],
             ],
             Duration::from_millis(30),
+            After::Warm,
         )
         .await;
         redirect_to(&mut world, &peer, Duration::from_millis(400));
@@ -20730,6 +20811,7 @@ mod tests {
                 ],
             ],
             Duration::from_millis(30),
+            After::Warm,
         )
         .await;
         redirect_to(&mut world, &peer, Duration::from_millis(400));
