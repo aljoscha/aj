@@ -775,12 +775,19 @@ enum CatchUp {
 /// the frame that actually matters, `reset`, is handled above rather than
 /// counted.
 ///
-/// Nothing here enforces the deadline, because a fold that only ever sees the
-/// frames it is handed cannot notice silence. [`Self::deadline`] is what a driver
-/// waits on, and [`World::abandon_attach_block`] is how it gives up.
+/// The silence measured is silence as the fold sees it, not silence on the wire:
+/// the deadline moves when a frame is folded, and a driver can be elsewhere while
+/// it passes. [`Self::fold_ready`] is what keeps that from costing a block that
+/// had in fact arrived.
+///
+/// [`Self::fold`] does not enforce the deadline, because a fold that only ever sees
+/// the frames it is handed cannot notice silence. Enforcing it is the driver's:
+/// [`Self::fold_through`] times its own wait out, and the drive loop wakes at
+/// [`Self::deadline`] and gives up through [`World::abandon_attach_block`].
 struct Block {
-    /// The session whose block this is, held rather than re-read so the fold
-    /// keeps measuring the session it was opened over.
+    /// The session this block is for, which is the focused one: a fold reads the
+    /// focused client for the verdict, and [`Block::fold`] asserts the two agree.
+    /// Held rather than re-read so the per-frame test is a string compare.
     session: String,
     /// How long the block may say nothing about the session.
     silence: Duration,
@@ -834,6 +841,9 @@ impl Block {
     /// caller: a peer that keeps its stream warm and says nothing about the
     /// session, which a gateway with no link to the owning host does, would
     /// otherwise park it forever.
+    ///
+    /// Nothing is painted while this runs, so what [`Folded::opened`] asks of a
+    /// painting driver is the caller's to do once, after the fold.
     async fn fold_through(&mut self, world: &mut World) -> CatchUp {
         loop {
             if let Some(caught) = self.settled {
@@ -849,15 +859,51 @@ impl Block {
         }
     }
 
-    /// Fold one frame into the block, answering whether anything renderable
-    /// changed.
+    /// Fold everything already queued for the block, for a driver about to give
+    /// up on it.
+    ///
+    /// A deadline is a clock reading, and a driver can have been elsewhere while
+    /// it passed: the drive loop's own iteration holds awaits bounded by the
+    /// request timeout rather than by this budget. Frames in hand say the block
+    /// did not stop arriving after all, and folding them is cheaper for everyone
+    /// than a projection re-served from a cursor that never moved (spec 6.5).
+    fn fold_ready(&mut self, world: &mut World) {
+        while self.settled.is_none() {
+            let Some(frame) = world.stream.try_recv() else {
+                return;
+            };
+            self.fold(world, frame);
+        }
+    }
+
+    /// Fold one frame into the block.
     ///
     /// Frames land in the model as they arrive rather than being held back to the
     /// block's end, which is what lets a driver paint a catch-up while it runs.
     /// The block's atomicity is the client's cursor, and that does not move until
     /// the `caught_up` commits it (spec 6.5), so applying early moves nothing
     /// early.
-    fn fold(&mut self, world: &mut World, frame: aj_wire::Frame) -> bool {
+    ///
+    /// A frame past the block's end is applied and decides nothing: the verdict
+    /// [`Self::settled`] holds is about the block, and live traffic must not
+    /// re-open the question. So a driver may keep handing frames to a block it
+    /// has not retired yet.
+    fn fold(&mut self, world: &mut World, frame: aj_wire::Frame) -> Folded {
+        // The verdict below is the focused client's, so the fold and the focus
+        // have to be the same session. Nothing moves the focus under a live
+        // block today: the loop's own focus change leaves `drive`, and the
+        // awaiting driver holds the loop for the whole fold.
+        debug_assert_eq!(
+            world.session(),
+            self.session,
+            "a block folded against another session's client",
+        );
+        if self.settled.is_some() {
+            return Folded {
+                redraw: world.directory.apply(&mut world.chat.borrow_mut(), frame).0,
+                opened: false,
+            };
+        }
         let mine = frame.session() == Some(self.session.as_str());
         // Spec 6.5: a `reset` mid-block abandons the block. Folded first,
         // because folding is what records the re-attach it asks for.
@@ -865,10 +911,12 @@ impl Block {
         if mine {
             self.deadline = Instant::now() + self.silence;
         }
+        let armed = world.client().attach_phase();
         let redraw = world.directory.apply(&mut world.chat.borrow_mut(), frame).0;
+        let phase = world.client().attach_phase();
         if abandons {
             self.settle(world.abandon_attach_block());
-        } else if world.client().attach_phase() == Attach::Live {
+        } else if phase == Attach::Live {
             // The block is over and the cursor says how it went: a `caught_up`
             // commits one, and the refusal that replaces a block drops
             // everything the fold held about the session, cursor included.
@@ -884,8 +932,26 @@ impl Block {
             };
             self.settle(caught);
         }
-        redraw
+        Folded {
+            redraw,
+            opened: armed == Attach::Requested && phase == Attach::Applying,
+        }
     }
+}
+
+/// What folding one frame into a [`Block`] changed.
+#[derive(Clone, Copy, Debug)]
+struct Folded {
+    /// Something renderable moved, so a paint is owed.
+    redraw: bool,
+    /// The frame was the block's opening `state`, so its epoch is now adopted.
+    ///
+    /// A driver that paints while the block arrives owes the transcript a drop
+    /// to the tail on this. Adopting an epoch resets the chat model and restarts
+    /// its entry ids, and both the render cache and the image store are keyed by
+    /// them, so a row of the epoch just left could otherwise be painted for an
+    /// entry of the one just joined.
+    opened: bool,
 }
 
 /// Fold the attach block the focused session's client is waiting for, up to and
@@ -5917,11 +5983,15 @@ impl Retry {
 /// waiting for is folded, so the loop opens the stream in one iteration and
 /// starts folding in the next.
 ///
-/// Neither step blocks the loop. The catch-up is loop state, not an await: its
-/// [`Block`] is fed from the `select!`'s own frame arm, so a backfill of any
-/// length keeps painting and keeps reading the keyboard. What the loop owes such
-/// a state is the wake [`Self::due`] asks for, since a block that stops arriving
-/// ends in silence and silence is not an event.
+/// The catch-up is loop state rather than an await: its [`Block`] is fed from
+/// the `select!`'s own frame arm, so a backfill of any length keeps painting and
+/// keeps reading the keyboard. The steps themselves are still awaited from the
+/// loop's body, and the open and the post-block reads park it for as long as
+/// their own request timeouts allow.
+///
+/// What the loop owes such a state is the wake [`Self::due`] asks for: a block
+/// that stops arriving ends in silence, and nothing is guaranteed to bring the
+/// loop back for that on its own.
 struct Resume {
     step: ResumeStep,
     /// Pacing for the whole recovery rather than for one step of it: a stream
@@ -5975,8 +6045,10 @@ impl Resume {
 
     /// The attach block this recovery is folding, if it is that far along.
     ///
-    /// A `None` says nothing arrives on `world.stream` any more: the stream that
-    /// died has not been replaced yet, so the loop's frame arm has to stay off it.
+    /// A `None` says no block is arriving: the stream has not been reopened yet,
+    /// or the last block stalled and the reopen is waiting out its backoff. The
+    /// loop's frame arm stays off the stream either way, since a stream that
+    /// ended is permanently ready and would spin it.
     /// [`Self::arriving`] answers the same question where a mutable borrow cannot
     /// be held.
     fn block_mut(&mut self) -> Option<&mut Block> {
@@ -5986,9 +6058,8 @@ impl Resume {
         }
     }
 
-    /// Whether frames still arrive on the stream this recovery holds, which is
-    /// [`Self::block_mut`] without the borrow: a `select!` guard is not a place a
-    /// block can be taken out of.
+    /// Whether a block is arriving, which is [`Self::block_mut`] as a question
+    /// rather than an accessor, for the `select!` guard and the loop's exit.
     fn arriving(&self) -> bool {
         matches!(self.step, ResumeStep::CatchingUp(_))
     }
@@ -6095,10 +6166,12 @@ async fn advance_resume(
                 }
             }
         }
-        ResumeStep::CatchingUp(ref block) => {
+        ResumeStep::CatchingUp(ref mut block) => {
             // The block is over: either its own frames ended it, or it reached
-            // its deadline without them, which is the loop's way of saying it
-            // went quiet and the only end this step has to word itself.
+            // its deadline without them. The deadline is a clock reading, so
+            // what is already in hand is folded before the block is given up on
+            // (see `Block::fold_ready`).
+            block.fold_ready(world);
             let caught = match block.settled() {
                 Some(caught) => caught,
                 None => world.abandon_attach_block(),
@@ -6728,11 +6801,24 @@ async fn drive(
                         // ends the block is recognized. Applied straight to the
                         // directory it would commit the client and leave the
                         // block waiting for a frame already gone by.
-                        let redraw = match resume.as_mut().and_then(Resume::block_mut) {
+                        let folded = match resume.as_mut().and_then(Resume::block_mut) {
                             Some(block) => block.fold(world, frame),
-                            None => world.directory.apply(&mut world.chat.borrow_mut(), frame).0,
+                            None => Folded {
+                                redraw: world
+                                    .directory
+                                    .apply(&mut world.chat.borrow_mut(), frame)
+                                    .0,
+                                opened: false,
+                            },
                         };
-                        if redraw {
+                        // This loop paints between the frames of a block, so the
+                        // caches keyed by entry id are dropped the moment the
+                        // block's epoch is adopted rather than once it ends (see
+                        // `Folded::opened`).
+                        if folded.opened {
+                            shell.borrow().transcript.borrow_mut().reset_to_tail();
+                        }
+                        if folded.redraw {
                             app.request_redraw();
                         }
                     }
@@ -6909,11 +6995,11 @@ async fn drive(
         // returns). One drain per iteration is what keeps the chrome mirrors
         // below from lagging the host by a frame.
         //
-        // Suspended while a re-attach is pending: the attach block a resumed
-        // stream carries is folded one frame per iteration by the arm above, and
-        // draining it here would swallow the `caught_up` that fold is watching
-        // for. The block channel is producer-paced with room for one frame
-        // (spec 6.9), so a block arrives at the pace of those reads anyway.
+        // Suspended while a re-attach is pending. This drain applies frames
+        // straight to the directory, so it would swallow the `caught_up` the
+        // arriving block is watching for and leave a block that had landed to be
+        // abandoned at its deadline. The arm above folds the block instead, one
+        // frame per iteration.
         if resume.is_none() && fold_ready_frames(world) {
             app.request_redraw();
         }
@@ -7016,6 +7102,18 @@ async fn drive(
             }
         }
     };
+
+    // The recovery is loop state, so leaving takes it with us: a block still
+    // arriving loses the only thing folding it and the only deadline that would
+    // give up on it. Taking the arm back is what leaves something asking, and
+    // the connection state the recovery was painting stops being true here, so
+    // the session this loop is re-entered on does not inherit it.
+    if let Some(state) = resume.take() {
+        if state.arriving() {
+            world.abandon_attach_block();
+        }
+        world.connection = Connection::Connected;
+    }
 
     exit
 }
@@ -10677,35 +10775,36 @@ mod tests {
         );
     }
 
-    /// Drive a lost stream's recovery to completion the way the drive loop does,
-    /// leaving `world.connection` on the state it ends in.
+    /// Drive a lost stream's recovery to completion, answering the connection
+    /// states it passed through in order.
     ///
-    /// The loop drives a recovery in two halves: `advance_resume` opens the stream
-    /// and acts on the block's end, and the frame arm folds the block in between.
-    /// A caller that only ran the first would reopen the stream forever, since a
-    /// block nothing feeds never ends.
-    ///
-    /// Spelled out here rather than composed, for the callers that assert on what
-    /// the recovery converged on and want it under their own control. That the
-    /// real loop drives it this way is
-    /// [`the_loop_re_attaches_an_evicted_local_stream`] and
+    /// A recovery needs two things the loop provides: the gate on when a step may
+    /// run, and something folding the block in between, since a block nothing
+    /// feeds never ends and the step that acts on its end never comes. This runs
+    /// the gate for real and folds the block with the awaiting driver, which is
+    /// not how the loop folds it: the loop folds one frame per `select!` turn and
+    /// takes its bound from the merged wake. So this proves what a recovery
+    /// converges on, under a caller's own control, and says nothing about the
+    /// loop's own driver. That one is
     /// [`the_loop_reads_input_while_a_block_arrives`].
     async fn drive_resume(
         world: &mut World,
         shell: &Rc<RefCell<Shell>>,
-    ) -> Result<(), ControlError> {
+    ) -> Result<Vec<Connection>, ControlError> {
+        let mut seen = Vec::new();
         let mut pending = Some(Resume::lost());
         let deadline = Instant::now() + SETTLE_DEADLINE;
         while let Some(mut state) = pending.take() {
             assert!(Instant::now() < deadline, "the re-attach never settled");
+            if seen.last() != Some(&state.connection()) {
+                seen.push(state.connection());
+            }
             world.connection = state.connection();
             if state.ready() {
                 pending = advance_resume(world, shell, state).await?;
                 continue;
             }
             match state.block_mut() {
-                // The loop's frame arm. A block advances on the frames it is
-                // waiting for, and its own deadline is what bounds the wait.
                 Some(block) => {
                     block.fold_through(world).await;
                 }
@@ -10715,7 +10814,7 @@ mod tests {
             pending = Some(state);
         }
         world.connection = Connection::Connected;
-        Ok(())
+        Ok(seen)
     }
 
     /// An in-process subscriber is evicted like any other when the shell stops
@@ -19602,10 +19701,17 @@ mod tests {
 
         // The drive loop's own recovery: re-attach with the client's cursor,
         // fold the block, discharge the reads.
-        drive_resume(&mut world, &shell)
+        let seen = drive_resume(&mut world, &shell)
             .await
             .expect("a connection's re-attach is never fatal");
-        assert_eq!(world.connection, Connection::Connected);
+        // The two steps exist so that the catching-up state is painted before the
+        // block is folded, which only holds if the recovery passes through both.
+        assert_eq!(
+            seen,
+            vec![Connection::Reconnecting, Connection::CatchingUp],
+            "the recovery skipped a connection state, so one of them is never on \
+             screen",
+        );
         assert!(
             main_notices(&world)
                 .iter()
@@ -20405,6 +20511,257 @@ mod tests {
         assert!(
             !world.directory.needs_reattach(),
             "nothing was armed, so nothing was abandoned and no re-attach is owed",
+        );
+        remote.shutdown().await;
+    }
+
+    /// A block that ended decides nothing more, whatever arrives next.
+    ///
+    /// The verdict is read off the focused client, and a client with no block
+    /// coming already reads `Live` with a cursor from the block before, which is
+    /// the reading that says `Caught`. So a fold that re-decides turns "no block
+    /// was owed" into "the block landed" on the first frame it sees, and the
+    /// recovery that acts on that reports a reconnection the peer never served.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_settled_block_does_not_re_decide_itself() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, _shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+
+        let mut block = Block::open(&world);
+        assert_eq!(
+            block.settled(),
+            Some(CatchUp::Stalled),
+            "the startup block was folded, so this one is over before it starts, \
+             which is the state under test",
+        );
+        assert!(
+            world.client().cursor().is_some(),
+            "and the client holds a cursor, without which a re-decided verdict \
+             would read the same as the right answer",
+        );
+
+        // A frame that names no session at all is enough to re-open the question.
+        block.fold(&mut world, aj_wire::Frame::Heartbeat);
+        assert_eq!(
+            block.settled(),
+            Some(CatchUp::Stalled),
+            "a block nobody will bring now reports itself caught",
+        );
+        remote.shutdown().await;
+    }
+
+    /// Folding a block's opening frame reports the epoch adoption, and its
+    /// frames report the repaint they owe.
+    ///
+    /// Both are what a driver that paints between a block's frames acts on: the
+    /// loop's paint is gated on the redraw latch, so a fold that reports nothing
+    /// leaves a backfill invisible until something else asks for a frame, and the
+    /// caches keyed by entry id have to be dropped where the adoption happens
+    /// rather than where the block ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_block_reports_its_opening_and_its_repaints() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let session = world.session().to_string();
+        let epoch = "epoch-folded";
+
+        let peer = WarmPeer::start(
+            vec![
+                block_opening(&session, epoch),
+                block_note(&session, epoch, 1, "a row on screen"),
+                block_end(&session, epoch, 1),
+            ],
+            Duration::from_millis(10),
+        )
+        .await;
+        redirect_to(&mut world, &peer, Duration::from_secs(30));
+
+        let mut state = advance_resume(&mut world, &shell, Resume::lost())
+            .await
+            .expect("a connection's recovery is never fatal")
+            .expect("the peer answered the open, so a block is arriving");
+        let block = state.block_mut().expect("the open armed a block");
+
+        let mut folds = Vec::new();
+        while block.settled().is_none() {
+            if let ControlFrame::Frame(frame) =
+                crate::remote::tests::bounded("a frame of the block", world.stream.recv()).await
+            {
+                folds.push(block.fold(&mut world, frame));
+            }
+        }
+
+        assert_eq!(
+            block.settled(),
+            Some(CatchUp::Caught),
+            "the scripted block did not land, so the folds below are not a \
+             block's: {folds:?}",
+        );
+        assert!(
+            folds.first().is_some_and(|folded| folded.opened),
+            "the block's opening frame did not report the epoch it adopted, so a \
+             painting driver never drops the caches keyed by the entry ids that \
+             adoption restarts: {folds:?}",
+        );
+        assert_eq!(
+            folds.iter().filter(|folded| folded.opened).count(),
+            1,
+            "more than the opening frame reported an adoption, so a painting \
+             driver would drop the user's scroll position mid-block: {folds:?}",
+        );
+        assert!(
+            folds.iter().filter(|folded| folded.redraw).count() > 1,
+            "only one frame of the block reported a repaint, so the rows the \
+             backfill added do not reach the screen until something else asks \
+             for a frame: {folds:?}",
+        );
+        remote.shutdown().await;
+    }
+
+    /// A block whose frames are in hand is folded, not given up on, when its
+    /// deadline passes while the driver was elsewhere.
+    ///
+    /// The deadline is a clock reading and the drive loop's own iteration holds
+    /// awaits bounded by the request timeout rather than by the silence budget: a
+    /// peer read at the foot of the iteration can outlast it. Abandoning then
+    /// costs the host a full projection to re-serve the identical suffix, because
+    /// a client's cursor does not move until the block completes (spec 6.5), and
+    /// nothing about the block had actually stopped arriving.
+    ///
+    /// The sleep here stands in for that long iteration, and the fixture
+    /// assertion is that the deadline really did pass before the step ran.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_block_in_hand_survives_a_deadline_the_driver_slept_through() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let session = world.session().to_string();
+        let epoch = "epoch-in-hand";
+
+        let silence = Duration::from_millis(300);
+        // The whole block, written as fast as the peer can, so it is queued long
+        // before the budget runs out.
+        let peer = WarmPeer::start(
+            vec![
+                block_opening(&session, epoch),
+                block_note(&session, epoch, 1, "in hand"),
+                block_end(&session, epoch, 1),
+            ],
+            Duration::from_millis(1),
+        )
+        .await;
+        redirect_to(&mut world, &peer, silence);
+
+        let state = advance_resume(&mut world, &shell, Resume::lost())
+            .await
+            .expect("a connection's recovery is never fatal")
+            .expect("the peer answered the open, so a block is arriving");
+
+        // The driver was elsewhere for longer than the block's whole budget.
+        tokio::time::sleep(silence * 2).await;
+        assert!(
+            state.ready(),
+            "the block is still inside its deadline, so the step below is not the \
+             one that gives up and this test measures nothing",
+        );
+
+        let left = advance_resume(&mut world, &shell, state)
+            .await
+            .expect("a connection's recovery is never fatal");
+        assert!(
+            left.is_none(),
+            "a block that was sitting in hand was abandoned at its deadline, so \
+             the host is asked to project the identical suffix again",
+        );
+        assert!(
+            !world.directory.needs_reattach(),
+            "and the client re-owes an attach for a block it already has",
+        );
+        assert!(
+            main_notices(&world)
+                .iter()
+                .any(|text| text == "Reconnected to the host."),
+            "the block landed but the recovery did not report it: {:?}",
+            main_notices(&world),
+        );
+        remote.shutdown().await;
+    }
+
+    /// A session change during a catch-up leaves nothing of the recovery behind:
+    /// no connection state that outlives it, and no block nobody is folding.
+    ///
+    /// This is only reachable because the loop now reads input during a catch-up.
+    /// The recovery is loop state, so the block goes when the loop does, and two
+    /// things would otherwise outlive it: the `Catching up` the status line was
+    /// painting, which nothing else writes, and the client's arm, which is the
+    /// only record that a block is owed. A session left armed for a block nobody
+    /// brings reads the next on-change `state` frame as that block's opening and
+    /// stops advancing its cursor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_session_change_mid_catch_up_leaves_no_recovery_behind() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let session = world.session().to_string();
+        let epoch = "epoch-interrupted";
+
+        // A second row, so the step chord has somewhere to go, then a block that
+        // starts and never ends.
+        let mut script = vec![list_of(&[&session, "other-session"])];
+        script.push(block_opening(&session, epoch));
+        script.extend(
+            (1..=20).map(|seq| block_note(&session, epoch, seq, &format!("backfill {seq}"))),
+        );
+        let peer = WarmPeer::start(script, Duration::from_millis(60)).await;
+        redirect_to(&mut world, &peer, Duration::from_secs(30));
+
+        let chat = Rc::clone(&world.chat);
+        let strip = Rc::clone(&shell.borrow().sidebar);
+        let (exit, arriving) = crate::remote::tests::bounded(
+            "the drive loop to break out of a catch-up",
+            drive_until(&mut world, &shell, |mut writer| async move {
+                // Both halves of the state the chord has to interrupt: a block
+                // arriving, and a second row to step onto.
+                let arriving = settled(Duration::from_secs(5), || {
+                    let started = notices_of(&chat.borrow())
+                        .iter()
+                        .any(|text| text == "backfill 1");
+                    let stepable = strip.borrow().rows.len() >= 2;
+                    (started && stepable).then_some(())
+                })
+                .await;
+                writer
+                    .write_all(&chord_bytes(AjAction::SessionNext))
+                    .expect("write the step chord");
+                (arriving, ())
+            }),
+        )
+        .await;
+
+        let (arriving, ()) = arriving;
+        assert!(
+            arriving.is_some(),
+            "the chord went in without a block arriving over two rows, so there \
+             was no catch-up for it to interrupt: {:?}",
+            main_notices(&world),
+        );
+        assert!(
+            matches!(exit, Ok(SessionExit::Switch(_))),
+            "the chord did not break the loop out for a switch, so nothing was \
+             interrupted",
+        );
+        assert_eq!(
+            world.connection,
+            Connection::Connected,
+            "the recovery is gone but the connection state it painted is not, so \
+             the status line keeps claiming a catch-up nothing is running",
+        );
+        assert!(
+            world.directory.needs_reattach(),
+            "the block was left with no driver and no re-attach owed, so the \
+             session waits forever for a block nobody brings",
         );
         remote.shutdown().await;
     }
