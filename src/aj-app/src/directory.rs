@@ -35,11 +35,27 @@
 
 use std::collections::{HashMap, HashSet};
 
+use aj_agent::events::{AgentEvent, AgentId};
 use aj_wire::{DirectoryHost, Frame, SessionSummary};
 
 use crate::chat::{ChatState, Redraw};
 use crate::client::SessionClient;
 use crate::host::AttachRequest;
+
+/// What a refused session costs the user, folded once when the refusal lands.
+///
+/// The peer's own refusal is folded immediately above this and says what
+/// happened. This says what it means and what will happen next, because the
+/// connection stays healthy either way and a transcript that simply stops
+/// reads exactly like one that is quiet.
+///
+/// The promise is one the directory keeps: the row's return to the peer's list
+/// is what asks again (see [`SessionDirectory::rows_returned`]). Worded as a
+/// condition rather than a reassurance, because a session that never leaves the
+/// list never returns to it, and a user watching for that is watching for the
+/// right thing.
+pub const WITHHELD_NOTICE: &str = "Nothing is following this session now. It re-attaches by itself \
+                                   if the session returns to the peer's list.";
 
 /// How many sessions a client keeps attached, the focused one included.
 ///
@@ -74,6 +90,12 @@ struct Attached {
     /// resumption and wrong here: the last entry of every turn the user
     /// watched would read back as unseen.
     delivered: Option<u64>,
+    /// Whether this refusal has already been reported to the user.
+    ///
+    /// Cleared when the re-attach is owed again, so a session refused, returned
+    /// and refused once more says so twice: two refusals are two things that
+    /// happened, and the row is how a user learns the second one.
+    noticed: bool,
 }
 
 /// Every session a peer offers, plus the fold state for the working set.
@@ -129,6 +151,7 @@ impl SessionDirectory {
                 session,
                 chat: None,
                 delivered: None,
+                noticed: false,
             }],
             rows: Vec::new(),
             hosts: Vec::new(),
@@ -213,10 +236,28 @@ impl SessionDirectory {
         let attached = &mut self.attached[index];
         // Read off the envelope before the fold consumes the frame.
         let delivered = delivered_seq(&frame);
-        let redraw = match &mut attached.chat {
+        let mut redraw = match &mut attached.chat {
             Some(chat) => attached.client.apply(chat, frame),
             None => attached.client.apply(focused_chat, frame),
         };
+        // The client raises the bit when it drops an attachment, so this asks the
+        // one place that decides what a refusal is rather than matching the frame
+        // kind a second time. `noticed` is what holds the notice to one row per
+        // refusal, since the bit stays up for as long as nothing is asking.
+        if attached.client.withheld() && !std::mem::replace(&mut attached.noticed, true) {
+            let chat = match &mut attached.chat {
+                Some(chat) => chat,
+                None => focused_chat,
+            };
+            let noticed = attached.client.apply_local(
+                chat,
+                AgentEvent::Warning {
+                    agent_id: AgentId::Main,
+                    text: WITHHELD_NOTICE.to_string(),
+                },
+            );
+            redraw = Redraw(redraw.0 || noticed.0);
+        }
         if let Some(seq) = delivered {
             // Last write wins rather than a maximum. A block re-delivers
             // entries at or below the position already reached and commits the
@@ -234,6 +275,50 @@ impl SessionDirectory {
         Redraw(redraw.0 && index == 0)
     }
 
+    /// Put the re-attach obligation back on every withheld session whose row has
+    /// just returned to the peer's list, answering whether any did.
+    ///
+    /// This is the discriminator the refusal rule turns on
+    /// ([`SessionClient::drop_attachment`]). A refusal says attaching cannot
+    /// succeed *now*; the peer's directory is the only thing that says when that
+    /// could have changed, and it says so by listing the session again. Asking
+    /// on any other schedule is either a retry loop or a timer, and the protocol
+    /// hands us a fact instead (spec 6.5, 7.1).
+    ///
+    /// Set-wide, because the obligation is: a user who had five sessions
+    /// attached when a host went down expects five back when it returns, not the
+    /// one they happen to be looking at.
+    ///
+    /// A genuine edge, absent-then-present, computed against the rows this frame
+    /// replaces. That ordering-tolerance matters: a withdrawal can refuse the
+    /// attach before or after the row leaves the list, and only the transition
+    /// says the answer changed.
+    ///
+    /// Two consequences of reading a transition rather than presence, both
+    /// intended. A refusal whose row never leaves never fires, which is the one
+    /// case this rule does not cover: a `locked` session stays listed while a
+    /// rival writer holds it, and no field of a `list` row tells held from
+    /// attachable. And a client holding no rows yet, before its first `list`, has
+    /// no "absent" to transition from, so a first row arriving after a refusal
+    /// does ask again: that is new information rather than a spin, and it can
+    /// happen once.
+    fn rows_returned(&mut self, sessions: &[SessionSummary]) -> bool {
+        let listed = |rows: &[SessionSummary], id: &str| rows.iter().any(|row| row.id == id);
+        let mut asked = false;
+        for attached in self.attached.iter_mut() {
+            if !attached.client.withheld()
+                || listed(&self.rows, &attached.session)
+                || !listed(sessions, &attached.session)
+            {
+                continue;
+            }
+            attached.noticed = false;
+            attached.client.owe_reattach();
+            asked = true;
+        }
+        asked
+    }
+
     /// Fold a frame carrying no session: the directory's own rows, or a kind
     /// this type has no use for.
     fn apply_host_frame(&mut self, frame: Frame) -> Redraw {
@@ -244,6 +329,7 @@ impl SessionDirectory {
                 // so comparing rows alone would render such a host once and
                 // never update it again (spec 7.1).
                 let changed = self.rows != sessions || self.hosts != hosts;
+                let returned = self.rows_returned(&sessions);
                 self.rows = sessions;
                 self.hosts = hosts;
                 self.latch_unseen();
@@ -252,7 +338,7 @@ impl SessionDirectory {
                 // the one the user is in, and it goes when they leave it.
                 let focused = self.focused().to_string();
                 let retired = self.retire_archived(&focused);
-                Redraw(changed || !retired.is_empty())
+                Redraw(changed || !retired.is_empty() || returned)
             }
             // `vms` belongs to whatever renders VM state and `heartbeat` exists
             // to keep the connection warm, so neither is the directory's to
@@ -311,6 +397,7 @@ impl SessionDirectory {
                         session: session.to_string(),
                         chat: None,
                         delivered: None,
+                        noticed: false,
                     },
                 );
                 chat

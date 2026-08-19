@@ -72,6 +72,15 @@ pub struct SessionClient {
     needs_task_refetch: bool,
     needs_queue_refetch: bool,
     needs_reattach: bool,
+    /// Refused, and nothing is asking again yet.
+    ///
+    /// Set by [`Self::drop_attachment`], which is the one place that learns a
+    /// refusal happened, and cleared by [`Self::owe_reattach`]. Held here rather
+    /// than derived from the epoch and the arm because a refusal after an earlier
+    /// one moves neither: the client is already following nothing, so there is no
+    /// transition left to read, and a session refused twice would look attached
+    /// to anything watching for one.
+    withheld: bool,
 }
 
 impl SessionClient {
@@ -91,6 +100,7 @@ impl SessionClient {
             needs_task_refetch: false,
             needs_queue_refetch: false,
             needs_reattach: false,
+            withheld: false,
         }
     }
 
@@ -415,6 +425,35 @@ impl SessionClient {
         self.attach
     }
 
+    /// Whether this client holds an attachment: an epoch adopted from an attach
+    /// block, which is what its session frames are folded under.
+    ///
+    /// False before the first block, and false again once a refusal drops the
+    /// attachment (see [`Self::apply`]).
+    pub fn holds_attachment(&self) -> bool {
+        self.epoch.is_some()
+    }
+
+    /// Whether this session was refused and nothing is asking again yet.
+    ///
+    /// True from the refusal until something owes the re-attach
+    /// ([`Self::owe_reattach`]), so a caller reading it across one folded frame
+    /// sees each refusal, including a repeat one.
+    pub fn withheld(&self) -> bool {
+        self.withheld
+    }
+
+    /// Owe a re-attach: this client is not following its session, and something
+    /// has to ask for it again.
+    ///
+    /// [`Self::needs_reattach`] is the only record that one is owed, so every
+    /// path that leaves the client not following has to end here or nothing
+    /// anywhere will ask.
+    pub fn owe_reattach(&mut self) {
+        self.needs_reattach = true;
+        self.withheld = false;
+    }
+
     /// Give up on an attach block that never arrived, re-owing the re-attach.
     ///
     /// [`Self::expect_attach`] discharges [`Self::needs_reattach`] on the
@@ -430,28 +469,37 @@ impl SessionClient {
     /// [`Self::apply`]'s `error` arm).
     pub fn abandon_attach(&mut self) {
         self.attach = Attach::Live;
-        self.needs_reattach = true;
+        self.owe_reattach();
     }
 
     /// Drop the attachment for a session the server refused (spec 6.5).
     ///
     /// Everything the fold holds about the session comes from an attach block
-    /// that will not come again: the epoch it applied under and the cursor it
-    /// would offer describe a history the server says it cannot resolve, so
-    /// keeping either would have the client ask for one nobody has. The arm
-    /// goes too, or the next `state` frame to arrive would be taken for the
-    /// block this refusal replaced.
+    /// that is not coming: the epoch it applied under and the cursor it would
+    /// offer describe a history the server says it cannot resolve, so keeping
+    /// either would have the client ask for one nobody has. The arm goes too, or
+    /// the next `state` frame to arrive would be taken for the block this
+    /// refusal replaced.
     ///
-    /// Deliberately not what a `reset` does. That one says continuity broke
-    /// and asks for a re-attach, this one says there is nothing left to
-    /// attach to, so a re-attach the client already owed is withdrawn here.
-    /// Collapsing the two would spin a client against a session that is gone.
+    /// Withdrawing the re-attach obligation is half a rule, and the other half
+    /// is not here. Asking again immediately is noise, because nothing has
+    /// changed since the refusal, and never asking again strands the client on a
+    /// session whose host was only restarting. So the obligation is withdrawn
+    /// *until the peer's own directory says the answer can have changed*, which
+    /// is `SessionDirectory`'s to notice, and it puts the obligation back
+    /// ([`Self::owe_reattach`]). Spec 6.5 permits the later attach that costs a
+    /// full backfill. What it does not ask for is a retry loop.
+    ///
+    /// Deliberately not what a `reset` does. That one says continuity broke on a
+    /// session the server still has, so its obligation stands and is discharged
+    /// at once.
     fn drop_attachment(&mut self) {
         self.attach = Attach::Live;
         self.epoch = None;
         self.committed = None;
         self.applied = None;
         self.needs_reattach = false;
+        self.withheld = true;
     }
 
     /// Adopt the epoch of the attach block this client asked for, and
