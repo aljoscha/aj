@@ -10442,10 +10442,12 @@ mod tests {
 
     /// The user rows of the Main transcript, in order.
     fn user_rows(world: &World) -> Vec<String> {
-        world
-            .chat
-            .borrow()
-            .transcript(AgentId::Main)
+        user_rows_of(&world.chat.borrow())
+    }
+
+    /// The same, off a chat model a caller already holds.
+    fn user_rows_of(chat: &ChatState) -> Vec<String> {
+        chat.transcript(AgentId::Main)
             .map(|transcript| {
                 transcript
                     .entries()
@@ -19954,6 +19956,39 @@ mod tests {
         .expect("a durable notice frame")
     }
 
+    /// A durable user row inside a block, which is what unhides the transcript:
+    /// a chat slot with no user or assistant entry shows the empty-state splash
+    /// instead.
+    fn block_user_row(session: &str, epoch: &str, seq: u64, text: &str) -> String {
+        let event = user_row_event(text);
+        let AgentEvent::MessageEnd { message, .. } = &event else {
+            unreachable!("a user row is a message_end");
+        };
+        serde_json::to_string(&aj_wire::Frame::Event {
+            session: session.to_string(),
+            epoch: epoch.to_string(),
+            durability: Some(aj_wire::DurableEvent {
+                seq,
+                // A `message_end` frame carries the message's own id, which the
+                // encoding checks.
+                entry_id: message.id().to_string(),
+            }),
+            event: event.into(),
+        })
+        .expect("a durable user frame")
+    }
+
+    /// The event a user row is projected from, for the wire frame above and for
+    /// the local seed it has to collide with.
+    fn user_row_event(text: &str) -> AgentEvent {
+        AgentEvent::MessageEnd {
+            agent_id: AgentId::Main,
+            message: aj_agent::message::AgentMessage::wire(aj_models::types::Message::User(
+                aj_models::types::UserMessage::text(text),
+            )),
+        }
+    }
+
     /// The `caught_up` that commits a block under `epoch` at `last_seq`, which
     /// is the position the block's own durable frames left.
     fn block_end(session: &str, epoch: &str, last_seq: u64) -> String {
@@ -20762,6 +20797,87 @@ mod tests {
             world.directory.needs_reattach(),
             "the block was left with no driver and no re-attach owed, so the \
              session waits forever for a block nobody brings",
+        );
+        remote.shutdown().await;
+    }
+
+    /// A block that adopts a fresh epoch does not leave the row cache pointing at
+    /// the epoch it replaced.
+    ///
+    /// Adopting an epoch resets the chat model, which restarts its entry ids, and
+    /// the transcript's row cache is keyed by them and validated on a
+    /// length-proxy fingerprint. So an entry of the new epoch whose kind and
+    /// length match the old one's at the same id paints the old one's surface. The
+    /// loop paints between the frames of a block, so the cache has to be dropped
+    /// where the adoption happens rather than where the block ends: for the whole
+    /// of a catch-up the user would otherwise be reading rows from the history
+    /// that was abandoned.
+    ///
+    /// The two rows here are built to collide: same kind, same level, same length,
+    /// same id, same width. The paint from inside the block is the whole test, and
+    /// the fixture assertions are that the first row really was cached and the
+    /// second really did land.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_block_adopting_an_epoch_drops_the_row_cache() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let session = world.session().to_string();
+        let (width, height) = (100, 40);
+        let (before, after) = ("aaaa", "bbbb");
+
+        // A row of the epoch about to be left, painted so its surface is cached
+        // under its entry id.
+        fold_event(&mut world, user_row_event(before));
+        let seeded = painted_rows(&shell, width, height).join("\n");
+        assert!(
+            seeded.contains(before),
+            "the row this test is about was never painted, so nothing cached it: \
+             {seeded}",
+        );
+
+        let epoch = "epoch-adopted";
+        let mut script = vec![
+            block_opening(&session, epoch),
+            block_user_row(&session, epoch, 1, after),
+        ];
+        // Enough tail to keep the block open while the paint below happens.
+        script.extend((2..=20).map(|seq| block_note(&session, epoch, seq, &format!("tail {seq}"))));
+        let peer = WarmPeer::start(script, Duration::from_millis(60)).await;
+        redirect_to(&mut world, &peer, Duration::from_secs(30));
+
+        let chat = Rc::clone(&world.chat);
+        let painting = Rc::clone(&shell);
+        let (exit, painted) = crate::remote::tests::bounded(
+            "the drive loop to fold a block under a fresh epoch",
+            drive_until(&mut world, &shell, |writer| async move {
+                let painted = settled(Duration::from_secs(8), || {
+                    let landed = user_rows_of(&chat.borrow()).iter().any(|row| row == after);
+                    // Painted from inside the block, which is the window the row
+                    // cache is stale in.
+                    landed.then(|| painted_rows(&painting, width, height).join("\n"))
+                })
+                .await;
+                drop(writer);
+                painted
+            }),
+        )
+        .await;
+
+        let painted = painted.expect("the new epoch's row never landed in the model");
+        assert!(
+            !painted.contains(before),
+            "a row of the epoch the block replaced is still on screen, so the \
+             cache keyed by the entry ids that adoption restarts was not dropped: \
+             {painted}",
+        );
+        assert!(
+            painted.contains(after),
+            "the new epoch's row is in the model but not on screen: {painted}",
+        );
+        assert!(
+            matches!(exit, Ok(SessionExit::Quit)),
+            "the loop did not end on its input closing",
         );
         remote.shutdown().await;
     }
