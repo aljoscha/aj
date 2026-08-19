@@ -316,7 +316,10 @@ mod startup_tests {
     /// Launch input for connect mode follows the session id, exactly as for
     /// `continue`. The grammar is ambiguous without the id: the first free
     /// positional is the session, so `aj connect URL "do this"` asks for a
-    /// session called `do this` rather than submitting a prompt.
+    /// session called `do this` rather than submitting a prompt. What that
+    /// binding means for a run that creates is
+    /// [`Args::connect_launch`](aj_app::cli::args::Args::connect_launch),
+    /// which is where the id slot is read.
     #[test]
     fn connect_takes_launch_input_after_the_session_id() {
         let with_prompt = args_of(&["aj", "connect", "http://host:6161", "ID", "do", "this"]);
