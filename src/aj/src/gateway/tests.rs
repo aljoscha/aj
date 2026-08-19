@@ -1279,11 +1279,14 @@ async fn a_host_that_comes_back_under_a_new_name_is_relabelled() {
     host.stop().await;
     host.restart_as(Some("the-builder")).await;
 
+    // Reachable as well as renamed: a link settles the name it was told before
+    // it reports the connection (see `gateway::link`), so waiting on the name
+    // alone would race the row assertion below against one loopback request.
     let relabelled = fixture
         .until("the name the host came back under", |list| {
             list.hosts
                 .iter()
-                .find(|host| host.name.as_deref() == Some("the-builder"))
+                .find(|host| host.name.as_deref() == Some("the-builder") && !host.unreachable)
                 .cloned()
         })
         .await;

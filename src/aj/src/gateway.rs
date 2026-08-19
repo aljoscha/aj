@@ -218,12 +218,13 @@ impl Gateway {
     /// to lose, though, because an id names a store (spec 4) and promoting an
     /// enrollment into a file did not change which store answers there.
     ///
-    /// A configured host's *id* comes out of the state file too, and is applied
-    /// once the enrollments are in place: a host that is down when this gateway
-    /// starts is still named by the id its sessions are namespaced under, which
-    /// is what a client renders its empty group from (spec 7.1). Applied last so
-    /// that a cached id can only ever cost itself: a collision drops the id and
-    /// never an enrollment.
+    /// A configured host's *id* comes out of the state file too, with the name
+    /// that host last reported, and both are applied once the enrollments are in
+    /// place: a host that is down when this gateway starts is still named by the
+    /// id its sessions are namespaced under and still labelled by the name it
+    /// calls itself, which is what a client renders its empty group from
+    /// (spec 7.1). Applied last so that a cached id can only ever cost itself: a
+    /// collision drops the id and never an enrollment.
     pub(crate) fn new(setup: GatewaySetup) -> Result<Self, GatewayError> {
         let GatewaySetup {
             state_dir,
@@ -529,13 +530,13 @@ impl Gateway {
     }
 }
 
-/// What a link hands the identity it just learned to (spec 7.1).
+/// What a link hands what a host just said about itself to (spec 7.1).
 ///
-/// A host id is learned by speaking to the host, so a link is the only thing that
-/// can learn one, and a gateway whose hosts all come from the configuration file
-/// never enrolls or withdraws anything: an id settled only by those paths would
-/// never reach the state file at all, and every restart while such a host is down
-/// would come back unable to name it.
+/// A host's id and its name are learned by speaking to the host, so a link is
+/// the only thing that can learn either, and a gateway whose hosts all come from
+/// the configuration file never enrolls or withdraws anything: a report settled
+/// only by those paths would never reach the state file at all, and every restart
+/// while such a host is down would come back unable to name it.
 ///
 /// Settling one is a write to the gateway's record and a change to its
 /// directory, in that order and under one lock, which is why it lives here
@@ -548,18 +549,21 @@ pub(crate) struct Recorder {
 }
 
 impl Recorder {
-    /// Settle the id the host at `address` reports, and write it down.
+    /// Settle what the host at `address` reports about itself, and write it
+    /// down.
     ///
     /// Write-ahead, the way a withdrawal is: the record is written from the set
     /// as it would stand, and only then does the set change, so a process that
     /// dies in between comes back holding the id its host reported rather than
     /// one this gateway has already stopped serving.
     ///
-    /// A write that fails is a log line and nothing more: a recorded id is a
-    /// cache for the next run, the host has just answered and its sessions need a
+    /// A write that fails is a log line and nothing more: the record is a cache
+    /// for the next run, the host has just answered and its sessions need a
     /// namespace now, and refusing to serve it over a cache write would trade a
     /// working host for a note. That is the opposite of an enrollment, which is
-    /// an operator's instruction and does not stand unless it is recorded.
+    /// an operator's instruction and does not stand unless it is recorded. The
+    /// cost of losing that write is the next start: an unreachable host is
+    /// labelled by the name the last successful write recorded.
     ///
     /// The teardown a replaced identity leaves behind is finished here, because
     /// what a client is owed for it must not wait on the next redial (see

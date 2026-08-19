@@ -38,21 +38,11 @@ use vaxis::vxfw::{FilterableSelect, SelectItem, to_widget_ref};
 use crate::interactive::OverlayHandles;
 use crate::overlay::{OverlayPlacement, close_all, close_top, subtitle_confirm_close};
 use crate::settings_ui::push_window;
-use crate::sidebar::host_label;
+use crate::sidebar::{host_label, named};
 
 /// What a row shows for a host that carries neither of the two names a gateway
 /// can give one, which is a shape no peer sends.
 const UNNAMED: &str = "an unnamed host";
-
-/// A name with something in it, or `None`.
-///
-/// An empty id is not an id: no peer can resolve a create against it, and a row
-/// keyed on it would collide with the sentinel's own empty key and make that row
-/// confirmable. So one is treated exactly like an absent name, here and
-/// everywhere either name is read.
-fn named(name: &Option<String>) -> Option<&str> {
-    name.as_deref().filter(|name| !name.is_empty())
-}
 
 /// What a row calls `host`, for display only: [`host_label`]'s answer, or
 /// [`UNNAMED`] for an entry that carries no name of any kind.

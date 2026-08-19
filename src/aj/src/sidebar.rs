@@ -340,7 +340,11 @@ impl SidebarRow {
     }
 }
 
-/// The groups the user unfolded, keyed by the label their header draws.
+/// The groups the user unfolded, keyed as [`Group::key`] keys them: the host id
+/// a group's rows carry, and not the text its header draws.
+///
+/// A header's text is not identity. Keying this by the label would fold a host
+/// under one name and leave it unfoldable under the next one it reports.
 ///
 /// `None` is the unlabeled group a plain host's rows sit in, which the cap
 /// bounds like any other and which therefore folds like any other.
@@ -688,7 +692,8 @@ struct Group<'a> {
     /// unfold as one group and fold as another.
     key: Option<&'a str>,
     /// What the header draws for it (see [`host_label`]). `None` exactly where
-    /// the key is: a headerless run belongs to no host by name.
+    /// the key is, both being held to the same rule about what names something
+    /// (see [`named`]): a headerless run belongs to no host by name.
     label: Option<&'a str>,
     /// Whether the peer can reach none of it, which the header says once
     /// instead of the user reading it off every row.
@@ -810,7 +815,7 @@ impl<'a> Layout<'a> {
                     // address until it does (spec 7.1). An entry naming neither
                     // is not a group: it can hold no rows, and a header keyed on
                     // nothing would fold the plain host's unlabeled run.
-                    let key = host.id.as_deref().or(host.address.as_deref())?;
+                    let key = named(&host.id).or_else(|| named(&host.address))?;
                     Some(Group {
                         key: Some(key),
                         label: host_label(host),
@@ -1074,6 +1079,17 @@ impl<'a> Layout<'a> {
     }
 }
 
+/// A host's `field` where it names something, `None` where it is absent or
+/// empty.
+///
+/// An empty string is no name. A peer's word for a host arrives unpoliced (spec
+/// 6.2), and nothing downstream can carry one: a strip group keyed on it says
+/// nothing about the host it claims is there, and a create-flow row keyed on it
+/// collides with the sentinel row that deliberately names none.
+pub(crate) fn named(field: &Option<String>) -> Option<&str> {
+    field.as_deref().filter(|text| !text.is_empty())
+}
+
 /// What a client calls one of a peer's hosts: the name that host reports for
 /// itself, else the id its sessions are namespaced under, else the address the
 /// peer has only ever known it by (spec 7.1).
@@ -1086,10 +1102,9 @@ impl<'a> Layout<'a> {
 /// and addresses sessions by [`DirectoryHost::id`], and two hosts may report
 /// one name (two clones of one repo) the way two sessions may share a tag.
 pub(crate) fn host_label(host: &DirectoryHost) -> Option<&str> {
-    [&host.name, &host.id, &host.address]
-        .into_iter()
-        .filter_map(|field| field.as_deref())
-        .find(|text| !text.is_empty())
+    named(&host.name)
+        .or_else(|| named(&host.id))
+        .or_else(|| named(&host.address))
 }
 
 /// The visible part of a session id: its time of day.
@@ -2732,6 +2747,12 @@ mod tests {
     /// A host entry naming neither an id nor an address says nothing a header
     /// could show, so nothing is drawn for it. A blank header would claim a
     /// host is there and refuse to say which.
+    ///
+    /// An id or an address with nothing in it is that same entry: a client does
+    /// not police the grammar a gateway enforces at enrollment, so this is the
+    /// peer's word taken as it arrives (spec 6.2). Such an entry is not a group
+    /// at all, which is also what keeps it from turning the one real host's
+    /// single run into a grouping that wears a header.
     #[test]
     fn a_host_named_by_neither_an_id_nor_an_address_draws_nothing() {
         let nameless = DirectoryHost {
@@ -2740,12 +2761,43 @@ mod tests {
             name: None,
             unreachable: true,
         };
-        let lines = folded(&[], &[learned("builder-1", true), nameless], 20);
-        assert_eq!(headers(&lines), vec![("builder-1", true)], "{lines:?}");
-        assert_eq!(
-            lines.len(),
-            2,
-            "one header and the create row, nothing else: {lines:?}",
+        let blank = DirectoryHost {
+            id: Some(String::new()),
+            address: Some(String::new()),
+            name: Some(String::new()),
+            unreachable: true,
+        };
+        for entry in [nameless, blank] {
+            let hosts = vec![learned("builder-1", true), entry.clone()];
+            let lines = folded(&[], &hosts, 20);
+            assert_eq!(
+                headers(&lines),
+                vec![("builder-1", true)],
+                "{entry:?} drew a header: {lines:?}",
+            );
+            assert_eq!(
+                lines.len(),
+                2,
+                "one header and the create row, nothing else: {lines:?}",
+            );
+        }
+
+        // The rows of one real host are one run, and an entry that names nothing
+        // is not a second group to head them with.
+        let rows = vec![row("s-1").host("builder-1").build()];
+        let hosts = vec![
+            learned("builder-1", false),
+            DirectoryHost {
+                id: Some(String::new()),
+                address: None,
+                name: None,
+                unreachable: true,
+            },
+        ];
+        let lines = folded(&rows, &hosts, 20);
+        assert!(
+            headers(&lines).is_empty(),
+            "one host with rows is still not a grouping: {lines:?}",
         );
     }
 
