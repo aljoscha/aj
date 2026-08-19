@@ -2574,6 +2574,12 @@ async fn hello_names_the_gateway_and_omits_a_working_directory() {
         hello.working_directory, None,
         "a gateway serves no working directory of its own (spec 6.1)",
     );
+    assert_eq!(
+        hello.name, None,
+        "and it names the hosts behind it rather than itself: there is no group \
+         header for a gateway to label, and a client that reached one addressed \
+         it directly (spec 7.1)",
+    );
     let id = hello.host_id;
 
     let fixture = fixture.restart().await;

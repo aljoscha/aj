@@ -39,33 +39,40 @@ use crate::interactive::OverlayHandles;
 use crate::overlay::{OverlayPlacement, close_all, close_top, subtitle_confirm_close};
 use crate::settings_ui::push_window;
 use crate::sidebar::{host_label, named};
+use crate::text::one_line;
 
 /// What a row shows for a host that carries neither of the two names a gateway
 /// can give one, which is a shape no peer sends.
 const UNNAMED: &str = "an unnamed host";
 
-/// What a row calls `host`, for display only: [`host_label`]'s answer, or
+/// What this client calls `host` on screen: [`host_label`]'s answer, or
 /// [`UNNAMED`] for an entry that carries no name of any kind.
+///
+/// Held to the rule a reader applies rather than to the sender's word for
+/// itself (spec 6.1): a name reaches a terminal, and this is the one place a
+/// plain host's own hello is painted without a gateway having normalized it.
 ///
 /// Neither a name nor an address is something a create can name (spec 6.8), so
 /// a row labelled with one of those is not necessarily a row that can be
 /// picked. See [`rows`].
-fn row_label(host: &DirectoryHost) -> &str {
-    host_label(host).unwrap_or(UNNAMED)
+fn row_label(host: &DirectoryHost) -> String {
+    one_line(host_label(host).unwrap_or(UNNAMED))
 }
 
 /// This host as a refusal that asks for one to be named lists it: the id a
-/// create resolves against, with the name the host reports beside it, or what
-/// the row would call a host that has no id.
+/// create resolves against, with the name the host reports beside it, or the
+/// address a peer has only ever known it by.
 ///
 /// The id leads because it is the only value `--host` and a peer's create route
 /// accept (spec 6.6), and a list of labels would be instructions that do not
-/// work. The same shape the peer's own refusals use.
+/// work. The peer states its own refusals the same way, which is a rule stated
+/// twice on purpose: the two are different processes and neither can hold the
+/// other to it.
 fn host_candidate(host: &DirectoryHost) -> String {
     match (named(&host.id), named(&host.name)) {
-        (Some(id), Some(name)) => format!("{id} ({name})"),
+        (Some(id), Some(name)) => format!("{id} ({})", one_line(name)),
         (Some(id), None) => id.to_string(),
-        (None, _) => row_label(host).to_string(),
+        (None, _) => row_label(host),
     }
 }
 
@@ -191,15 +198,21 @@ pub(crate) fn open_host_picker(handles: &OverlayHandles, hosts: &[DirectoryHost]
 /// The picker's rows, sentinel first, and the filter-key -> host-id map its
 /// confirm resolves a row through (the callback sees only the filter key).
 ///
-/// A row's filter key is its id with the name beside it, so typing any part of
-/// either finds it, and two hosts reporting one name still key one row each.
-/// Only a host with an id reaches the map.
+/// A row's filter key is the name it draws with the id beside it, so typing any
+/// part of either finds the row, and two hosts reporting one name still key one
+/// row each. Only a host with an id reaches the map.
 ///
-/// Ordered by the label the row draws, which is the rule the strip's groups
-/// follow (spec 9.2): the peer lists its hosts in its own enrolled order, and a
-/// row that sits somewhere else each time the picker opens is a row the pointer
-/// cannot learn to aim at. The label is not elided here: it is this row's key,
-/// and two deep clones cut to one width would be one key.
+/// Ordered by the label the row draws, the rule the strip's groups follow (spec
+/// 9.2), so one host sits in the same place in both and a row can be aimed at
+/// from memory.
+///
+/// The label is whole here, where the strip's header elides one by shape: a row
+/// is built before the overlay has a width, and the width can change under it,
+/// so the only thing that can cut a row to fit is the widget drawing it. That
+/// widget clips the row's tail, which is the wrong end for a path, and a name
+/// long enough to reach the clip therefore reads differently here than in the
+/// header. Cutting to a guessed budget would trade that for cutting names that
+/// would have fitted.
 fn rows(hosts: &[DirectoryHost]) -> (Vec<SelectItem>, HashMap<String, String>) {
     // The sentinel's filter key is empty, which is both what keeps it out of the
     // map and what makes any query at all drop it from the list.
@@ -209,18 +222,20 @@ fn rows(hosts: &[DirectoryHost]) -> (Vec<SelectItem>, HashMap<String, String>) {
     let mut ordered: Vec<&DirectoryHost> = hosts.iter().collect();
     ordered.sort_by(|left, right| {
         row_label(left)
-            .cmp(row_label(right))
+            .cmp(&row_label(right))
             .then_with(|| named(&left.id).cmp(&named(&right.id)))
     });
     for host in ordered {
         let label = row_label(host);
         match named(&host.id) {
             Some(id) => {
+                // The id is in the key whether or not it is on screen, which is
+                // what keeps two hosts reporting one name two rows.
                 let key = match named(&host.name) {
-                    Some(name) => format!("{name} {id}"),
+                    Some(_) => format!("{label} {id}"),
                     None => id.to_string(),
                 };
-                let mut item = SelectItem::new(label, &key);
+                let mut item = SelectItem::new(&label, &key);
                 if host.unreachable {
                     item = item.with_description("unreachable");
                 }
@@ -228,7 +243,7 @@ fn rows(hosts: &[DirectoryHost]) -> (Vec<SelectItem>, HashMap<String, String>) {
                 items.push(item);
             }
             None => items.push(
-                SelectItem::new(label, label)
+                SelectItem::new(&label, &label)
                     .with_description("never reached, nothing to create on yet"),
             ),
         }
@@ -354,12 +369,38 @@ mod tests {
         );
 
         let deep = "~/work/umber/materialize/src/interchange";
-        let (items, _) = rows(&[calling_itself("290dc828", deep)]);
+        let (items, ids) = rows(&[calling_itself("290dc828", deep)]);
         assert_eq!(
             items[1].label, deep,
-            "a name wider than the strip's header field is not cut here: this \
-             label is the row's key, and two deep clones cut to one width would \
-             be one key",
+            "a name wider than the strip's header field is handed over whole: \
+             a row has no width to cut it to yet, so the widget that draws it is \
+             the only thing that can",
+        );
+        assert_eq!(
+            ids.get(&items[1].filter_key),
+            Some(&"290dc828".to_string()),
+            "and it still resolves, however wide it is",
+        );
+    }
+
+    /// A peer's word for itself is not trusted: the rule a reader applies (spec
+    /// 6.1) is applied here, so nothing a host calls itself can carry an escape
+    /// into the terminal that paints it, on the row or in the refusal.
+    #[test]
+    fn a_name_a_peer_reports_is_held_to_the_rule_before_it_is_painted() {
+        let hosts = [calling_itself("290dc828", "first\u{1b}[2Jsecond")];
+        let (items, _) = rows(&hosts);
+        assert_eq!(
+            items[1].label, "first[2Jsecond",
+            "the row paints no control character: {:?}",
+            items[1].label,
+        );
+        let refusal = resolve_host(&hosts, "zz")
+            .expect_err("no match")
+            .to_string();
+        assert!(
+            !refusal.contains('\u{1b}'),
+            "and neither does the refusal: {refusal:?}",
         );
     }
 

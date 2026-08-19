@@ -602,7 +602,10 @@ pub(crate) fn step_session(state: &SidebarState, forward: bool) -> Option<String
 pub(crate) enum StripLine {
     /// A host's group header, drawn above that host's rows.
     Header {
-        host: String,
+        /// What the header reads, as [`Group::label`] draws it and not as its
+        /// group is keyed: this is text for a reader, and nothing resolves a
+        /// host by it.
+        label: String,
         /// Whether the peer can reach none of the host's rows.
         unreachable: bool,
     },
@@ -1035,9 +1038,9 @@ impl<'a> Layout<'a> {
                 // else, drawn where its label sorts rather than pushed to an
                 // end (spec 7.1). It is drawn out of its own budget, so the
                 // rows cannot crowd it out (see [`Self::split`]).
-                if let Some(host) = group.label.filter(|_| empty < budget.empty) {
+                if let Some(label) = group.label.filter(|_| empty < budget.empty) {
                     lines.push(StripLine::Header {
-                        host: host.to_string(),
+                        label: label.to_string(),
                         unreachable: group.unreachable,
                     });
                     empty += 1;
@@ -1049,9 +1052,9 @@ impl<'a> Layout<'a> {
             if from >= to {
                 continue;
             }
-            if let Some(host) = self.header_of(group, &run) {
+            if let Some(label) = self.header_of(group, &run) {
                 lines.push(StripLine::Header {
-                    host: host.to_string(),
+                    label: label.to_string(),
                     unreachable: group.unreachable,
                 });
             }
@@ -1098,9 +1101,9 @@ pub(crate) fn named(field: &Option<String>) -> Option<&str> {
 /// create-flow picker cannot label one host two ways. `None` for an entry
 /// carrying none of the three, which is a shape no peer sends.
 ///
-/// A label and never an address: a client that shows a name still groups rows
-/// and addresses sessions by [`DirectoryHost::id`], and two hosts may report
-/// one name (two clones of one repo) the way two sessions may share a tag.
+/// A label and never an id: a client that shows a name still groups rows and
+/// addresses sessions by [`DirectoryHost::id`], and two hosts may report one
+/// name (two clones of one repo) the way two sessions may share a tag.
 pub(crate) fn host_label(host: &DirectoryHost) -> Option<&str> {
     named(&host.name)
         .or_else(|| named(&host.id))
@@ -1206,8 +1209,9 @@ fn elide_to_cols(text: &str, cols: usize) -> String {
 /// name was produced, because the wire deliberately does not say which it was
 /// and should not grow a bit for typography (spec 6.1).
 ///
-/// One rule for every surface that shows a host name, so two of them cannot
-/// disagree about which end of one path they kept.
+/// For a field of a known width, which is the strip's: the create-flow picker
+/// hands its rows over whole, because a row is built before its overlay has a
+/// width (see [`crate::host_picker`]).
 fn elide_host_name(name: &str, cols: usize) -> String {
     if !name.contains('/') {
         return elide_to_cols(name, cols);
@@ -1234,16 +1238,16 @@ fn field(text: &str, cols: usize) -> String {
     out
 }
 
-/// A host header's label field: the name, then a rule out to the field's edge,
+/// A host header's label field: `label`, then a rule out to the field's edge,
 /// with the unreachable mark set into the rule's tail.
 ///
 /// The mark rides inside the rule rather than hanging off its end because the
 /// rule has to reach the strip's edge either way.
-fn header_field(host: &str, unreachable: bool, cols: usize) -> String {
+fn header_field(label: &str, unreachable: bool, cols: usize) -> String {
     let mark = if unreachable { UNREACHABLE_MARK } else { "" };
     let mark_cols = mark.chars().count();
-    // The name, one space, one rule character, and the mark, in that order.
-    let name = elide_host_name(&one_line(host), cols.saturating_sub(mark_cols + 2));
+    // The label, one space, one rule character, and the mark, in that order.
+    let name = elide_host_name(&one_line(label), cols.saturating_sub(mark_cols + 2));
     let rule = cols.saturating_sub(width_of(&name) + 1 + mark_cols);
     format!("{name} {}{mark}", "─".repeat(rule))
 }
@@ -1427,11 +1431,11 @@ impl SessionSidebar {
         let cols = label_cols(width);
         let dim = self.styles.dim;
         let (marker, glyph, glyph_style, label, label_style) = match line {
-            StripLine::Header { host, unreachable } => (
+            StripLine::Header { label, unreachable } => (
                 " ",
                 "~",
                 dim,
-                field(&header_field(host, *unreachable, cols), cols),
+                field(&header_field(label, *unreachable, cols), cols),
                 dim,
             ),
             StripLine::Session { index } => {
@@ -2274,7 +2278,7 @@ mod tests {
         lines
             .iter()
             .filter_map(|line| match line {
-                StripLine::Header { host, unreachable } => Some((host.as_str(), *unreachable)),
+                StripLine::Header { label, unreachable } => Some((label.as_str(), *unreachable)),
                 _ => None,
             })
             .collect()
@@ -2475,11 +2479,11 @@ mod tests {
             lines,
             vec![
                 StripLine::Header {
-                    host: "aleph".to_string(),
+                    label: "aleph".to_string(),
                     unreachable: true,
                 },
                 StripLine::Header {
-                    host: "builder-1".to_string(),
+                    label: "builder-1".to_string(),
                     unreachable: false,
                 },
                 StripLine::Session { index: 0 },

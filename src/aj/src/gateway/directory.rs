@@ -125,11 +125,13 @@ impl Enrollment {
 /// The two arrive in one handshake and are not interchangeable: the id rules
 /// identity and namespaces the host's sessions, the name is a label that
 /// follows the latest contact. Carried together so that a gateway learning one
-/// cannot forget the other.
+/// cannot forget the other, and built only by the constructors below, so a name
+/// that reached a client through this gateway satisfies
+/// [`normalize_host_name`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Reported {
-    pub(crate) host_id: String,
-    pub(crate) name: Option<String>,
+    host_id: String,
+    name: Option<String>,
 }
 
 impl Reported {
@@ -138,19 +140,26 @@ impl Reported {
         Self::new(&hello.host_id, hello.name.as_deref())
     }
 
-    /// A contact's report, with the name held to the rule a reader applies.
+    /// A contact's report of an id and a name, from a handshake or from this
+    /// gateway's own record of one.
     ///
-    /// Normalized here, at the one place a peer's word for itself enters this
-    /// gateway, because a host is not trusted to have applied
-    /// [`normalize_host_name`] and this gateway hands the name on to clients
-    /// that paint it. An illegal one is dropped rather than refused: the id is
-    /// what the contact is for, and a label that cannot be shown must not cost
-    /// a working host its enrollment.
+    /// An illegal name is dropped rather than refused: the id is what the
+    /// contact is for, and a label that cannot be shown must not cost a working
+    /// host its enrollment.
     pub(crate) fn new(host_id: &str, name: Option<&str>) -> Self {
         Self {
             host_id: host_id.to_string(),
+            // A host is not trusted to have applied the rule, and this gateway
+            // hands the name on to clients that paint it, so it is applied here,
+            // at the one place a peer's word for itself enters.
             name: name.and_then(|name| normalize_host_name(name).ok().flatten()),
         }
+    }
+
+    /// The id this contact answers to, which is the namespace its sessions
+    /// appear under.
+    pub(crate) fn host_id(&self) -> &str {
+        &self.host_id
     }
 }
 
@@ -262,6 +271,12 @@ pub(crate) enum Adopted {
     /// The host told this gateway something it did not hold: an id, where it had
     /// none for that host, or a different name for itself. Either belongs in the
     /// gateway's record.
+    ///
+    /// One variant for both because neither owes a client anything beyond the
+    /// directory it is about to read. That is also why only [`Self::Replaced`]
+    /// is worth a log line: a replacement ends streams and an operator reading
+    /// back from a client's reset needs the sentence, while a relabelling shows
+    /// up on the very header it changed.
     Learned,
     /// It answered to the id and the name this enrollment already had.
     Unchanged,
@@ -275,10 +290,10 @@ pub(crate) enum Adopted {
 /// What settling a reported identity against an enrollment amounts to, worked
 /// out before anything is applied.
 ///
-/// Two answers in one, because a contact carries two things: what it does to
-/// the identity this gateway serves, and whether the label it republishes
-/// changes. Both callers read the pair, which is what keeps the record a
-/// settlement is written from and the set it then mutates in step.
+/// A contact carries two things, so this answers for both: what it does to the
+/// identity this gateway serves, and whether the label it republishes changes.
+/// Worked out in one place, so the record a settlement is written from and the
+/// set it then mutates cannot disagree about either.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Settling {
     identity: Identity,
@@ -319,7 +334,9 @@ struct Owner<'a> {
     /// The id the host answers to, which is the namespace the session id
     /// carried.
     host_id: String,
-    /// What a refusal about this host calls it (see [`Enrollment::label`]).
+    /// What a refusal about this host calls it (see [`Enrollment::label`]),
+    /// resolved with the map held because a caller cannot read the enrollment
+    /// again once the lock is gone.
     label: String,
     /// What that host calls the session.
     session: String,

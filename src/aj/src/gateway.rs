@@ -591,7 +591,10 @@ impl Recorder {
             tracing::warn!("could not write down what this gateway just learned: {err}");
         }
         if let Adopted::Replaced(withdrawn) = inner.directory.adopt(address, reported)? {
-            tracing::info!("the host at {address} answers to {} now", reported.host_id);
+            tracing::info!(
+                "the host at {address} answers to {} now",
+                reported.host_id()
+            );
             withdrawn.end_splices();
         }
         Ok(())
