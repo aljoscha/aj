@@ -3443,14 +3443,18 @@ mod tests {
     /// whole, rather than losing a slice of it to a guess.
     ///
     /// The cases with a colon in them are what tells the two apart: a parse
-    /// would find a separator in every one of them and show a time of day.
+    /// would find a separator in every one of them and show a time of day. The
+    /// id that begins with this host and is separated further along tells the
+    /// match apart from a hunt for the separator after the prefix.
     #[test]
     fn a_host_that_does_not_qualify_the_id_labels_from_the_whole_id() {
         // Someone else's qualifier, this host's without its separator, the host
-        // alone, and a qualifier with nothing after it.
+        // alone, a qualifier with nothing after it, and a longer host's whose
+        // name this one is a prefix of.
         let foreign = format!("other-host:{MINTED}");
         let unseparated = format!("{HOST}{MINTED}");
         let empty_session = format!("{HOST}:");
+        let longer_host = format!("{HOST}x:{MINTED}");
         for id in [
             MINTED,
             "notes-on-the-rust-borrow-checker-draft",
@@ -3458,6 +3462,7 @@ mod tests {
             unseparated.as_str(),
             HOST,
             empty_session.as_str(),
+            longer_host.as_str(),
         ] {
             assert_eq!(
                 row(id).host(HOST).build().label(19),
