@@ -450,11 +450,15 @@ pub(crate) enum Stream {
         /// [`Stream::attached`] answers from.
         ///
         /// The request, because the protocol gives a client no per-session
-        /// answer at attach time: a host's attach is all-or-nothing, and a
-        /// gateway that cannot resolve one of the ids answers that one with an
-        /// `error` frame on this very stream instead (spec 6.5, 7.1). So this
-        /// says which sessions the peer was asked about, and the peer's answer
-        /// about each arrives as frames.
+        /// answer at attach time. A stream request never fails wholesale over
+        /// one bad session (spec 6.5), and what becomes of each named session
+        /// arrives afterwards, in one of three shapes: its attach block, a
+        /// session-scoped `error` frame, or, for a session on a host a gateway
+        /// cannot currently reach, nothing at all beyond the `unreachable` mark
+        /// on its `list` row (spec 7.1).
+        ///
+        /// So this says which sessions the peer was asked about and nothing
+        /// about which it will serve. Whoever folds a block owes it a deadline.
         attached: Vec<String>,
     },
 }
@@ -487,14 +491,19 @@ impl Stream {
         names.iter().any(|name| name == session)
     }
 
-    /// How long this stream may say nothing before whatever it was serving
-    /// counts as gone.
+    /// How long this stream may be silent before it counts as dead.
     ///
     /// A connection answers the tolerance it was built with, which is what lets
     /// a caller tune it ([`RemoteClient::with_silence`]). An in-process stream
-    /// has no transport to fall silent, but its host can still stop producing,
-    /// so it answers the same span: the number is the protocol's own on how
-    /// long a peer may say nothing (spec 6.1), not a property of HTTP.
+    /// has no transport to fall silent and answers the same span, so that a
+    /// caller has one number to reach for in either mode.
+    ///
+    /// Spec 6.1 scopes this to the stream: two missed heartbeats, and heartbeats
+    /// are host-level. So a caller bounding a wait for one *session* is
+    /// borrowing a scale rather than reading a budget the protocol defines for
+    /// it, and inherits a minute of patience by doing so. Whether that is the
+    /// right patience for a session-scoped wait is a live question, see the
+    /// beads behind [`crate::interactive`]'s catch-up.
     pub(crate) fn silence(&self) -> Duration {
         match self {
             Self::Local(_) => SILENCE,
