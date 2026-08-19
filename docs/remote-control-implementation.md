@@ -338,7 +338,9 @@ Daily driving is deployment, so the before-deployment items are due
 now, in order:
 
 1. In-flight work completes: the 11.2 convergent tier, the
-   `aborted_session_resume` flake investigation.
+   `aborted_session_resume` flake investigation. Landed: the tier
+   merged with its spec prose, and the flake was diagnosed and fixed
+   (the TODO note it had planted went with it).
 2. The targeted vacuity sweep (below), rescheduled from
    before-deployment to before-daily-driving, same scope.
 3. The banked polish batch (`docs/banked-ux.md`).

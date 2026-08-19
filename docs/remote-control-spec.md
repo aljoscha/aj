@@ -1,6 +1,6 @@
 # Remote control and VM provisioning
 
-## Status: draft, phase 3 in progress
+## Status: phases 0 through 3 landed and accepted, phase 4 (provisioning) paused, daily-driving
 
 Companion document: `docs/remote-control-implementation.md`, the manual
 for the implementing agent.
@@ -671,7 +671,12 @@ protocol-1 baseline (section 6.10). The response names the session in
 the answering server's id vocabulary, namespaced through a gateway.
 
 Request bodies are the `aj-wire` types, which are the source of truth
-once landed. Errors cross the wire as a small envelope, not bare
+once landed. Their JSON is flat: a request that wraps a payload type
+flattens it, so a prompt's body is `{text: ...}` with the optional
+`agent` beside it, never `{input: {text: ...}}`, and a settings
+change carries its axes at the top level the same way. The wire shape
+is the field names, not the Rust nesting.
+Errors cross the wire as a small envelope, not bare
 prose: `{code, message, ...fields}`. The `message` is the human
 sentence, produced where the facts live and always sufficient on its
 own. An unknown `code` renders as its `message` verbatim, so codes
