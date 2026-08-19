@@ -20111,10 +20111,15 @@ mod tests {
     /// This is the freeze the block became loop state for. A backfill is
     /// producer-paced (spec 6.9), so its length is the history behind it, and a
     /// loop that awaits one shows a frozen frame and ignores the keyboard for that
-    /// whole time. The keystroke here goes in while the block is provably
-    /// mid-flight, which is the moment an awaited fold would not have read it: the
-    /// tests above type after a block ended, so they cannot tell a loop that
-    /// survives a catch-up from one that only comes back afterwards.
+    /// whole time. The tests above type after a block has ended, so they cannot
+    /// tell a loop that survives a catch-up from one that only comes back
+    /// afterwards.
+    ///
+    /// What tells them apart is the order, not a stopwatch: a loop parked on the
+    /// fold cannot read a key until the block is over, so its echo strictly
+    /// follows the notice the block's end folds. The keystroke goes in while the
+    /// block is provably still open, and reaching the editor before that notice is
+    /// the claim.
     ///
     /// The block is spaced under the silence budget and runs to more than twice it
     /// in total, so a driver measuring anything but silence about the session
@@ -20127,17 +20132,21 @@ mod tests {
         let session = world.session().to_string();
 
         let silence = Duration::from_millis(500);
-        let beat = silence / 2;
+        let beat = Duration::from_millis(200);
         let epoch = "epoch-arriving";
         // Durable notices rather than bare `state` frames: each one shows on
         // screen, so the block's progress is observable from outside the loop and
-        // the keystroke below can be timed against it instead of against a sleep.
+        // the keystroke below can be timed against the block rather than against a
+        // sleep. Six gaps under the budget leave more than a second of block still
+        // to come once the first one is on screen.
         let script = vec![
             block_opening(&session, epoch),
             block_note(&session, epoch, 1, "backfill one"),
             block_note(&session, epoch, 2, "backfill two"),
             block_note(&session, epoch, 3, "backfill three"),
-            block_end(&session, epoch, 3),
+            block_note(&session, epoch, 4, "backfill four"),
+            block_note(&session, epoch, 5, "backfill five"),
+            block_end(&session, epoch, 5),
         ];
         let peer = WarmPeer::start(script, beat).await;
         redirect_to(&mut world, &peer, silence);
@@ -20149,8 +20158,8 @@ mod tests {
         let (exit, observed) = crate::remote::tests::bounded(
             "the drive loop to fold a slow block through",
             drive_until(&mut world, &shell, |mut writer| async move {
-                // The block has started and has not ended: the one window where a
-                // keystroke says something about a catch-up.
+                // The block has shown a frame of itself and has not ended: the one
+                // window where a keystroke says anything about a catch-up.
                 let arriving = settled(Duration::from_secs(5), || {
                     let notices = notices_of(&chat.borrow());
                     let started = notices.iter().any(|text| text == "backfill one");
@@ -20159,9 +20168,17 @@ mod tests {
                 })
                 .await;
                 writer.write_all(typed.as_bytes()).expect("write key bytes");
-                let reached = settled(Duration::from_secs(5), || {
-                    let text = editor.borrow().text();
-                    text.contains(typed).then_some(text)
+                // Whichever comes first settles it, so an echo that only arrives
+                // once the block is over reads as the freeze it is rather than as
+                // a slow keystroke.
+                let echoed_inside = settled(Duration::from_secs(5), || {
+                    let ended = notices_of(&chat.borrow()).iter().any(|text| text == landed);
+                    let echoed = editor.borrow().text().contains(typed);
+                    match (echoed, ended) {
+                        (true, false) => Some(true),
+                        (_, true) => Some(false),
+                        (false, false) => None,
+                    }
                 })
                 .await;
                 let caught = settled(Duration::from_secs(5), || {
@@ -20172,23 +20189,25 @@ mod tests {
                 })
                 .await;
                 drop(writer);
-                (arriving, reached, caught)
+                (arriving, echoed_inside, caught)
             }),
         )
         .await;
 
-        let (arriving, reached, caught) = observed;
+        let (arriving, echoed_inside, caught) = observed;
         assert!(
             arriving.is_some(),
             "no frame of the block was ever on screen with the block still open, \
-             so the keystroke below is not one an awaited fold would have missed: \
-             {:?}",
+             so the keystroke below went in at an unknown point and this test \
+             measures nothing: {:?}",
             main_notices(&world),
         );
-        assert!(
-            reached.is_some(),
-            "the loop read no input while the block was arriving, so a catch-up \
-             still costs the user their terminal for as long as it takes",
+        assert_eq!(
+            echoed_inside,
+            Some(true),
+            "the keystroke reached the editor only after the block had ended, so \
+             the loop is parked on the catch-up and the user's terminal is gone \
+             for as long as the backfill takes",
         );
         assert!(
             caught.is_some(),
