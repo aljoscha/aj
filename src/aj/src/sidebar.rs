@@ -1054,7 +1054,7 @@ impl<'a> Layout<'a> {
 /// session's id in full.
 pub(crate) fn session_label(id: &str, cols: usize) -> String {
     let label = minted_time(id).map_or_else(|| one_line(id), |time| time.join("-"));
-    truncate_to_cols(&label, cols)
+    tail_within_cols(&label, cols).to_string()
 }
 
 /// The hour, minute and second a minted `YYYY-MM-DD-HH-MM-SS-mmm` id carries.
@@ -1079,27 +1079,23 @@ fn width_of(text: &str) -> usize {
     usize::from(gwidth(text, Method::Unicode))
 }
 
-/// Trim `label` from its head until it fits `cols` display columns, which keeps
-/// the tail where a hand-named session's distinguishing part is.
-fn truncate_to_cols(label: &str, cols: usize) -> String {
+/// The longest tail of `text` that fits `cols` display columns, which is what
+/// a label whose distinguishing part is its end keeps.
+fn tail_within_cols(text: &str, cols: usize) -> &str {
     let Ok(budget) = u16::try_from(cols) else {
-        return label.to_string();
+        return text;
     };
-    if gwidth(label, Method::Unicode) <= budget {
-        return label.to_string();
+    if gwidth(text, Method::Unicode) <= budget {
+        return text;
     }
-    let mut out = String::new();
-    // Build from the tail so the trailing characters survive, then reverse.
-    for ch in label.chars().rev() {
-        let mut candidate = String::with_capacity(out.len() + 4);
-        candidate.push(ch);
-        candidate.push_str(&out);
-        if gwidth(&candidate, Method::Unicode) > budget {
+    let mut kept = text.len();
+    for (at, _) in text.char_indices().rev() {
+        if gwidth(&text[at..], Method::Unicode) > budget {
             break;
         }
-        out = candidate;
+        kept = at;
     }
-    out
+    &text[kept..]
 }
 
 /// Trim `text` to `cols` display columns from its tail, marking the cut with an
@@ -1129,6 +1125,33 @@ fn elide_to_cols(text: &str, cols: usize) -> String {
     out
 }
 
+/// `name` in `cols` display columns, cut at whichever end its shape says is
+/// expendable and marked with an ellipsis.
+///
+/// A name holding a path separator is read as a path, and a path is told from
+/// another by its tail, so the head goes: `…/work/umber/aj`. A name without one
+/// reads left to right and its head is what its author chose first, so the tail
+/// goes: `builder-1-ext…`. The rule keys on the shape rather than on how the
+/// name was produced, because the wire deliberately does not say which it was
+/// and should not grow a bit for typography (spec 6.1).
+///
+/// One rule for every surface that shows a host name, so two of them cannot
+/// disagree about which end of one path they kept.
+fn elide_host_name(name: &str, cols: usize) -> String {
+    if !name.contains('/') {
+        return elide_to_cols(name, cols);
+    }
+    if width_of(name) <= cols {
+        return name.to_string();
+    }
+    if cols == 0 {
+        return String::new();
+    }
+    // The ellipsis has to fit beside whatever is kept, as it does the other way
+    // round.
+    format!("…{}", tail_within_cols(name, cols - 1))
+}
+
 /// `text` in a field of exactly `cols` display columns, elided if it is too
 /// wide and padded with spaces if it is too narrow.
 ///
@@ -1149,7 +1172,7 @@ fn header_field(host: &str, unreachable: bool, cols: usize) -> String {
     let mark = if unreachable { UNREACHABLE_MARK } else { "" };
     let mark_cols = mark.chars().count();
     // The name, one space, one rule character, and the mark, in that order.
-    let name = elide_to_cols(&one_line(host), cols.saturating_sub(mark_cols + 2));
+    let name = elide_host_name(&one_line(host), cols.saturating_sub(mark_cols + 2));
     let rule = cols.saturating_sub(width_of(&name) + 1 + mark_cols);
     format!("{name} {}{mark}", "─".repeat(rule))
 }
@@ -3331,6 +3354,39 @@ mod tests {
                 "{host:?} did not rule out to the edge",
             );
         }
+    }
+
+    /// Which end of a host name a header drops is decided by the name's shape:
+    /// a path keeps the tail that tells it from its neighbours, a written name
+    /// keeps the head its author chose first.
+    ///
+    /// The default name is the host's whole working directory and the field is
+    /// 19 columns, so this is the common case rather than an edge.
+    #[test]
+    fn a_path_name_keeps_its_tail_and_a_written_name_keeps_its_head() {
+        assert_eq!(
+            header_field("~/work/umber/aj", false, 19),
+            format!("~/work/umber/aj {}", "─".repeat(3)),
+            "a name that fits is not cut at either end",
+        );
+        assert_eq!(
+            header_field("~/work/umber/materialize/src", false, 19),
+            "…/materialize/src ─".to_string(),
+            "a deeper clone loses its head, and the ellipsis says so",
+        );
+        assert_eq!(
+            header_field("builder-1-extra-long", false, 19),
+            "builder-1-extra-… ─".to_string(),
+            "a name with no separator in it loses its tail instead",
+        );
+        assert_eq!(
+            gwidth(
+                &header_field("~/work/umber/materialize/src", true, 19),
+                Method::Unicode,
+            ),
+            19,
+            "and an elided path still rules out to the edge",
+        );
     }
 
     /// The working set is legible: the three states get three brightnesses, and
