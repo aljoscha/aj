@@ -1622,6 +1622,52 @@ mod tests {
         );
     }
 
+    /// The rejoin rule is set-wide: every withheld session whose row returns is
+    /// re-owed, not only the one on screen. A host going down refuses the whole
+    /// working set, so its return has to bring the whole set back, and a rule
+    /// that asked only for the focused session would strand the background ones
+    /// silently: the discharge path folds no notice, so a stranded session
+    /// reads exactly like a quiet one.
+    #[test]
+    fn a_returning_row_re_owes_every_withheld_session() {
+        let refusal = |session: &str| Frame::Error {
+            session: session.to_string(),
+            epoch: None,
+            code: "unknown_session".to_string(),
+            message: "no host serves this session any more".to_string(),
+        };
+        let mut directory = SessionDirectory::new("session-0".to_string());
+        let mut focused_chat = chat();
+        directory.focus(&mut focused_chat, "session-1", chat);
+        let both = || vec![row("session-0", false, 0), row("session-1", false, 0)];
+        let _ = directory.apply(&mut focused_chat, list(both()));
+        for session in ["session-0", "session-1"] {
+            let _ = directory.apply(&mut focused_chat, refusal(session));
+        }
+        // The premise: both sessions are withheld and neither owes a re-attach,
+        // without which the return below re-owes nothing this test can see.
+        for session in ["session-0", "session-1"] {
+            let client = directory.client_for(session).expect("an attached client");
+            assert!(client.withheld(), "{session} is not withheld");
+            assert!(!client.needs_reattach(), "{session} still owes a re-attach");
+        }
+
+        let _ = directory.apply(&mut focused_chat, list(Vec::new()));
+        let _ = directory.apply(&mut focused_chat, list(both()));
+
+        // The background session first, so a rule that only re-owes the focused
+        // one fails on the session it strands.
+        for session in ["session-0", "session-1"] {
+            assert!(
+                directory
+                    .client_for(session)
+                    .expect("an attached client")
+                    .needs_reattach(),
+                "{session}'s row returned and nothing asks for it again",
+            );
+        }
+    }
+
     /// The attach set a focus will leave is what the caller must attach, so the
     /// session about to be displaced is already absent from it and the session
     /// coming in is first. Naming the displaced session would keep the peer
