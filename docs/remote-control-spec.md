@@ -633,6 +633,41 @@ Client application rules:
   session-scoped `error` frame, never as the stream: the client
   surfaces it and drops the attachment,
   the session's disappearance from the list finishes the story.
+- A refusal is answered by the directory, not by a clock. A client
+  whose attach was refused stops asking: nothing has changed since
+  the refusal, asking again immediately is noise, and asking on a
+  schedule is a timer standing in for a fact the protocol carries.
+  What asks again is the peer's own directory, on the edge that says
+  the answer can have changed, and the refusal's error code names
+  which edge that is. A session the peer could not resolve
+  (`unknown_session`, a withdrawn host's sessions) re-asks when its
+  row returns to the list, absent then present. A session a rival
+  writer holds (`locked`, section 5's advisory lock surfaced as a
+  409) stays listed the whole time, so absence usually has no edge
+  to offer: a locked refusal watches the row's `locked` bit (section
+  6.8) going true then false, the rival letting go being the fact
+  that changes that refusal's answer, and it keeps the
+  absent-then-present edge besides, because a row can leave and
+  return anyway (a host restart, a withdrawal), returning rebuilt
+  with the bit already false and no transition left to see. Either
+  edge re-asks, whichever fires first. A re-ask that is refused
+  again re-enters the withheld state with its edges re-armed, the
+  refusal itself being fresh evidence the bit is true, so a race
+  against a release still in flight costs one refusal and keeps
+  watching rather than stranding. A client holding no rows yet
+  re-asks on the first list it folds, whatever the codes were: that
+  is new information rather than a spin, and it can happen once.
+  Both edges are transitions between the rows one folded list
+  replaces and the next, not a live watch, so a change that happened
+  while the client was disconnected is seen at the first frame after
+  it. Both edges are set-wide, every refused session
+  whose edge fired re-asks, not only the one on screen. A code the
+  client does not know keeps the absent-then-present edge, the
+  additive-codes rule (section 6.6) applied to rejoining. Against a
+  peer that never publishes `locked` the bit edge cannot fire,
+  and a locked refusal waits indefinitely: that is the degradation
+  this contract chooses, the gap an old peer always had, never a
+  retry loop.
 
 ### 6.6 Commands
 
@@ -778,6 +813,26 @@ Per-session status in `list` frames and `GET /v1/sessions`:
   host's rows say. Changed only by the archive command (section 6.6),
   and unlike the tag there is deliberately no create-time field or
   launch flag (section 9.2 carries the reason).
+- `locked`: the session's advisory lock (section 5) is held by a
+  writer that is not this host, so asking this host for it would be
+  refused right now, a command with the 409, an attach with the
+  `error` frame section 6.5 describes. A session live in this host
+  is never
+  `locked` on its own rows: the bit names a rival, and the host knows
+  its own holdings without asking the filesystem (its own flock would
+  probe as held, locks belong to the open file description). A hint,
+  never a gate: the flock is the only authority and the bit may lag
+  it, so a client acts by
+  attempting and reading the answer. The bit's two jobs are smaller,
+  it says when re-asking after a locked refusal is worth it (section
+  6.5's second edge) and it lets a row read as in use elsewhere.
+  Absent reads false, which is what an older host's rows say, and a
+  reader treats false and absent alike as no promise of anything. An
+  additive row field under section 6.10's ignore-unknown-fields
+  rule, not a capability registry entry, and not one of the fields a
+  gateway owns, so it passes through a merge raw. How the host keeps
+  the bit current, and the residue it accepts, is with the
+  enumeration contract below.
 - `host`: which enrolled host a row belongs to, filled by a gateway
   and absent from a plain host's rows. Clients group by it and must
   not derive it from the id, ids are opaque (section 6.2).
@@ -829,7 +884,11 @@ way). A concurrent writer
 in the same directory is a conflict the session locks exist to
 surface, not a workload to poll for, its sessions cannot be served by
 this host anyway, and its activity becomes visible at the next
-enumeration point. Reading a log to produce a directory row is never
+enumeration point, with one deliberate exception: the rival's hold
+itself, the one fact of another writer's that this host publishes
+(the `locked` bit, section 6.8), moves on a watch over the lock
+directory, an event, never a poll, priced below. Reading a log to
+produce a directory row is never
 correct, live or cold: a live session's facts are in memory, and a
 cold row needs only enumeration metadata plus two small cached reads,
 the format sniff (first line, cached against the file it was taken
@@ -845,14 +904,45 @@ directory pays a single failed readdir per axis. Two axes ride this
 today: the tag, whose sidecar is then read once per fingerprint the
 enumeration reports, and the archived bit, which costs no content
 read at all, the sidecar's existence is the whole answer. Between
-enumeration points the bits move only through the host's own hands:
+enumeration points the sidecar bits move only through the host's own
+hands:
 the tag and archive commands land on the live session's row under its
 lock and publish through the debounced `list` path, and a release
 hands the driver's row, sidecar axes included, to the cold cache.
 (Materializing one session still reads that session's own sidecars,
 that is a user-paced open, not a listing.)
+The `locked` axis (section 6.8) is the one whose fact belongs to
+another writer, so it alone gets an event source. The lock directory
+is watched. Taking a lock writes its holder record and a clean
+release truncates it while the lock is still held (section 5), so
+both directions of the bit are file events, and each event costs one
+non-blocking probe of the one lock it names, upstream of the refresh
+path, which goes on composing frames from memory alone. The probe is
+its own primitive, shared and instantaneous, never the acquire path,
+so it stamps no holder record, and the instant it holds a free lock
+can refuse one racing acquire, a disclosed cost of asking at all.
+Enumeration points sweep the lock directory the same way the sidecar
+axes are swept: one readdir, a stat per lock file (lock files are
+one per session ever minted, so this doubles a constant the log
+stats already pay, not the shape), and a probe only of files whose
+stat shows a holder record, skipping the locks this host itself
+holds, which it knows from its live map. An empty record reads free
+unprobed, so a settled store's sweep probes nothing, and the one
+misread that filter permits, a holder that failed to write its
+record, reads free until an attempt refuses and sets the bit, the
+answer that was always the authority. The host's own refused
+materialization is the third source, setting the bit at every
+refusal it issues. Residue, disclosed rather than papered over: a
+rival that crashes frees the lock with no file event, and a probe
+landing inside a clean release's closing window (the record clears
+before the flock frees) can read held with no event to follow where
+the platform does not report the close. Either way the row can stay
+`locked` until the next attempt, event, or enumeration point. The
+bit is a hint and the attempt is the truth, which is what keeps this
+field from quietly becoming a gate.
 Enumeration is therefore readdir per axis,
-stats and a sniff per file that moved, cheap enough to run
+stats and a sniff per file that moved, the lock sweep's stat per
+lock file and probe per holder record found, cheap enough to run
 synchronously at startup.
 This contract has teeth on both fronts. The polling variant of this
 design read hundreds of gigabytes a day re-deriving an unchanged
