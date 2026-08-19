@@ -17462,6 +17462,69 @@ mod tests {
         shut_down(&world).await;
     }
 
+    /// The strip labels its groups by the names the peer publishes for its
+    /// hosts, and sorts them by what it draws (spec 7.1, 9.2).
+    ///
+    /// The same chain as the test above, end to end: a `list` frame carrying
+    /// names, through the reducer and the mirror, to the composed frame. Cutting
+    /// any link renders hex ids instead, and so does a layout that keeps sorting
+    /// by the ids the rows carry.
+    ///
+    /// The ids here are chosen so that the two orders disagree: by id this reads
+    /// laptop, builder-1, deep-clone, and every host would be a hex string on a
+    /// real gateway.
+    #[tokio::test]
+    async fn the_composed_strip_labels_its_groups_by_name_and_sorts_by_label() {
+        let dir = TempDir::new().expect("tempdir");
+        let (mut world, shell) = world_and_shell(&dir, "streaming-text").await;
+        let focused = world.session().to_string();
+        assert!(
+            poll_row(&mut world, &shell, &focused, |_| true).await,
+            "the session's own row never arrived",
+        );
+        pin_sidebar_open(&shell);
+
+        let mut sessions = world.directory.rows().to_vec();
+        assert_eq!(sessions.len(), 1, "one row: {sessions:?}");
+        for session in &mut sessions {
+            session.host = Some("builder-1".to_string());
+        }
+        let named = |id: &str, name: &str| aj_wire::DirectoryHost {
+            id: Some(id.to_string()),
+            address: None,
+            name: Some(name.to_string()),
+            unreachable: false,
+        };
+        let redraw = world.directory.apply(
+            &mut world.chat.borrow_mut(),
+            aj_wire::Frame::List {
+                sessions: sessions.clone(),
+                hosts: vec![
+                    named("aaa-laptop", "~/workshop"),
+                    named("builder-1", "~/work/umber/aj"),
+                    named("zzz-deep", "~/work/umber/materialize/src"),
+                ],
+            },
+        );
+        assert!(redraw.0, "the directory took the frame as news");
+        sync_sidebar(&world, &shell);
+
+        assert_eq!(
+            sidebar_rows(&shell),
+            vec![
+                " ~ ~/work/umber/aj ───".to_string(),
+                format!("▌  {}", crate::sidebar::session_label(&focused, 8)),
+                " ~ …/materialize/src ─".to_string(),
+                " ~ ~/workshop ────────".to_string(),
+                " + new".to_string(),
+            ],
+            "every header reads the host's own name, the groups sit where those \
+             names sort rather than where the ids would put them, and the deep \
+             clone keeps the tail that tells it from its neighbours",
+        );
+        shut_down(&world).await;
+    }
+
     /// Resuming the session already focused does nothing at all.
     ///
     /// Not merely "moves nowhere": running the switch body would fold a notice
@@ -19032,6 +19095,44 @@ mod tests {
         assert!(
             answer.contains("plain text-only demo"),
             "the host's own script produced it: {answer}"
+        );
+        remote.shutdown().await;
+    }
+
+    /// `--host` against a plain host resolves against that host's own handshake,
+    /// so a value it does not answer to is refused before the terminal is taken
+    /// over, with the host named the way that host names itself (spec 6.6, 7.1).
+    ///
+    /// The whole path: the hello this client already holds, the single candidate
+    /// synthesized from it, and the refusal a person reads. The id leads because
+    /// it is the only value the flag accepts, and the name is there because hex
+    /// alone says nothing about which host was reached.
+    #[tokio::test]
+    async fn connect_mode_refuses_a_host_the_peer_does_not_answer_to() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let hello = remote.host.hello();
+        let name = hello.name.clone().expect(
+            "a host names itself from its working directory, or this test has \
+             nothing to look for",
+        );
+
+        let Err(refusal) = dial_at(
+            &remote.url(),
+            &client_config(),
+            &nothing_stated(),
+            &["--host", "no-such-host"],
+        )
+        .await
+        else {
+            panic!("a host this peer does not answer to resolves to nothing");
+        };
+        let refusal = refusal.to_string();
+
+        assert!(
+            refusal.contains(&hello.host_id) && refusal.contains(&name),
+            "the refusal names the id the flag would accept and the name the \
+             host reported for itself: {refusal}",
         );
         remote.shutdown().await;
     }

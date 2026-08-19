@@ -1408,6 +1408,16 @@ back to the id-derived label. A tag is set at launch (`--tag` on `aj`
 and on `aj connect --new`, riding the create command's tag field) or
 on the focused session through the tag action.
 
+A host's group header reads the name that host reports for itself
+(section 6.1), else the id its sessions are namespaced under, else the
+address the peer has only ever known it by. The create-flow host
+selector labels its rows by the same preference, so one host reads the
+same way wherever it appears, and both keep addressing that host by its
+`host_id`. A label too wide for its field is cut at the end its own
+shape says is expendable, and the cut is marked: a name holding a path
+separator keeps the tail that tells one clone from another, a name
+without one keeps the head its author chose first.
+
 ## 10. Crate layout
 
 - **`aj-wire`** (new): the protocol crate. Frame types, wire versions

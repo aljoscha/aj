@@ -38,6 +38,7 @@ use vaxis::vxfw::{FilterableSelect, SelectItem, to_widget_ref};
 use crate::interactive::OverlayHandles;
 use crate::overlay::{OverlayPlacement, close_all, close_top, subtitle_confirm_close};
 use crate::settings_ui::push_window;
+use crate::sidebar::host_label;
 
 /// What a row shows for a host that carries neither of the two names a gateway
 /// can give one, which is a shape no peer sends.
@@ -53,15 +54,29 @@ fn named(name: &Option<String>) -> Option<&str> {
     name.as_deref().filter(|name| !name.is_empty())
 }
 
-/// What a row calls `host`, for display only: its id, or the address a gateway
-/// has only ever known it by (spec 7.1).
+/// What a row calls `host`, for display only: [`host_label`]'s answer, or
+/// [`UNNAMED`] for an entry that carries no name of any kind.
 ///
-/// The address is a label and never something a create can name (spec 6.8), so
-/// a row labelled with one is not a row that can be picked. See [`rows`].
-fn host_label(host: &DirectoryHost) -> &str {
-    named(&host.id)
-        .or_else(|| named(&host.address))
-        .unwrap_or(UNNAMED)
+/// Neither a name nor an address is something a create can name (spec 6.8), so
+/// a row labelled with one of those is not necessarily a row that can be
+/// picked. See [`rows`].
+fn row_label(host: &DirectoryHost) -> &str {
+    host_label(host).unwrap_or(UNNAMED)
+}
+
+/// This host as a refusal that asks for one to be named lists it: the id a
+/// create resolves against, with the name the host reports beside it, or what
+/// the row would call a host that has no id.
+///
+/// The id leads because it is the only value `--host` and a peer's create route
+/// accept (spec 6.6), and a list of labels would be instructions that do not
+/// work. The same shape the peer's own refusals use.
+fn host_candidate(host: &DirectoryHost) -> String {
+    match (named(&host.id), named(&host.name)) {
+        (Some(id), Some(name)) => format!("{id} ({name})"),
+        (Some(id), None) => id.to_string(),
+        (None, _) => row_label(host).to_string(),
+    }
 }
 
 /// Whether a create has to be told which host it is for.
@@ -126,10 +141,7 @@ pub(crate) fn resolve_host(hosts: &[DirectoryHost], query: &str) -> Result<Strin
         [sole] => Ok((*sole).to_string()),
         [] => Err(HostQueryError::NoMatch {
             query: query.to_string(),
-            candidates: hosts
-                .iter()
-                .map(|host| host_label(host).to_string())
-                .collect(),
+            candidates: hosts.iter().map(host_candidate).collect(),
         }),
         _ => Err(HostQueryError::Ambiguous {
             query: query.to_string(),
@@ -189,27 +201,47 @@ pub(crate) fn open_host_picker(handles: &OverlayHandles, hosts: &[DirectoryHost]
 /// The picker's rows, sentinel first, and the filter-key -> host-id map its
 /// confirm resolves a row through (the callback sees only the filter key).
 ///
-/// A row's filter key is its label, so typing any part of an id or an address
-/// finds it. Only a host with an id reaches the map.
+/// A row's filter key is its id with the name beside it, so typing any part of
+/// either finds it, and two hosts reporting one name still key one row each.
+/// Only a host with an id reaches the map.
+///
+/// Ordered by the label the row draws, which is the rule the strip's groups
+/// follow (spec 9.2): the peer lists its hosts in its own enrolled order, and a
+/// row that sits somewhere else each time the picker opens is a row the pointer
+/// cannot learn to aim at. The label is not elided here: it is this row's key,
+/// and two deep clones cut to one width would be one key.
 fn rows(hosts: &[DirectoryHost]) -> (Vec<SelectItem>, HashMap<String, String>) {
     // The sentinel's filter key is empty, which is both what keeps it out of the
     // map and what makes any query at all drop it from the list.
     let mut items =
         vec![SelectItem::new("no host chosen", "").with_description("move to one, then confirm")];
     let mut ids = HashMap::new();
-    for host in hosts {
-        let label = host_label(host);
-        let mut item = SelectItem::new(label, label);
+    let mut ordered: Vec<&DirectoryHost> = hosts.iter().collect();
+    ordered.sort_by(|left, right| {
+        row_label(left)
+            .cmp(row_label(right))
+            .then_with(|| named(&left.id).cmp(&named(&right.id)))
+    });
+    for host in ordered {
+        let label = row_label(host);
         match named(&host.id) {
             Some(id) => {
-                ids.insert(label.to_string(), id.to_string());
+                let key = match named(&host.name) {
+                    Some(name) => format!("{name} {id}"),
+                    None => id.to_string(),
+                };
+                let mut item = SelectItem::new(label, &key);
                 if host.unreachable {
                     item = item.with_description("unreachable");
                 }
+                ids.insert(key, id.to_string());
+                items.push(item);
             }
-            None => item = item.with_description("never reached, nothing to create on yet"),
+            None => items.push(
+                SelectItem::new(label, label)
+                    .with_description("never reached, nothing to create on yet"),
+            ),
         }
-        items.push(item);
     }
     (items, ids)
 }
@@ -230,6 +262,14 @@ mod tests {
     fn unreachable(id: &str) -> DirectoryHost {
         DirectoryHost {
             unreachable: true,
+            ..learned(id)
+        }
+    }
+
+    /// A host that reports a name for itself, as every host does (spec 6.1).
+    fn calling_itself(id: &str, name: &str) -> DirectoryHost {
+        DirectoryHost {
+            name: Some(name.to_string()),
             ..learned(id)
         }
     }
@@ -274,15 +314,18 @@ mod tests {
         assert_eq!(items.len(), 3, "the sentinel plus one row per host");
     }
 
-    /// Every host is listed, and only one with an id can be confirmed.
+    /// Every host is listed, and only one with an id can be confirmed. The rows
+    /// sit where their labels sort rather than where the peer happened to list
+    /// them.
     #[test]
     fn only_a_host_with_an_id_resolves() {
         let (items, ids) = rows(&[learned("aaa"), unseen("127.0.0.1:9"), unreachable("ccc")]);
         let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
         assert_eq!(
             labels,
-            vec!["no host chosen", "aaa", "127.0.0.1:9", "ccc"],
-            "an unreached host is named by its address rather than left out",
+            vec!["no host chosen", "127.0.0.1:9", "aaa", "ccc"],
+            "an unreached host is named by its address rather than left out, and \
+             the sentinel keeps the top whatever sorts under it",
         );
         assert_eq!(ids.get("aaa"), Some(&"aaa".to_string()));
         assert_eq!(ids.get("ccc"), Some(&"ccc".to_string()));
@@ -296,11 +339,74 @@ mod tests {
             .map(|item| item.description.as_deref())
             .collect();
         assert_eq!(
-            descriptions[2],
+            descriptions[1],
             Some("never reached, nothing to create on yet"),
             "the row says why it cannot be picked: {descriptions:?}",
         );
         assert_eq!(descriptions[3], Some("unreachable"));
+    }
+
+    /// A row reads as the host's own name and still resolves to the id a create
+    /// names it by, and either one typed into the filter finds it.
+    #[test]
+    fn a_named_hosts_row_reads_as_the_name_and_resolves_to_the_id() {
+        let (items, ids) = rows(&[calling_itself("290dc828", "~/work/umber/aj")]);
+        assert_eq!(items[1].label, "~/work/umber/aj");
+        assert_eq!(
+            ids.get(&items[1].filter_key),
+            Some(&"290dc828".to_string()),
+            "a confirm resolves the row to the id, never to what it reads as",
+        );
+        let key = &items[1].filter_key;
+        assert!(
+            key.contains("290dc828") && key.contains("~/work/umber/aj"),
+            "and the filter matches either vocabulary: {key:?}",
+        );
+
+        let deep = "~/work/umber/materialize/src/interchange";
+        let (items, _) = rows(&[calling_itself("290dc828", deep)]);
+        assert_eq!(
+            items[1].label, deep,
+            "a name wider than the strip's header field is not cut here: this \
+             label is the row's key, and two deep clones cut to one width would \
+             be one key",
+        );
+    }
+
+    /// Two clones of one repo report one name, which is accepted the way two
+    /// sessions sharing a tag is. Each still keys its own row, or the second
+    /// would take the first's place in the map and become unpickable.
+    #[test]
+    fn two_hosts_reporting_one_name_are_both_pickable() {
+        let (items, ids) = rows(&[
+            calling_itself("aaa", "~/work/aj"),
+            calling_itself("bbb", "~/work/aj"),
+        ]);
+        assert_eq!(items.len(), 3, "the sentinel plus one row per host");
+        assert_eq!(ids.get(&items[1].filter_key), Some(&"aaa".to_string()));
+        assert_eq!(
+            ids.get(&items[2].filter_key),
+            Some(&"bbb".to_string()),
+            "the second row is the second host: {ids:?}",
+        );
+    }
+
+    /// A refusal has to be actionable, so it lists the id `--host` accepts with
+    /// the name beside it. A list of names would be instructions that do not
+    /// work here.
+    #[test]
+    fn a_refusal_names_the_id_the_host_flag_accepts() {
+        let hosts = [calling_itself("290dc828", "~/work/umber/aj")];
+        let err = resolve_host(&hosts, "zz").expect_err("no match");
+        assert_eq!(
+            err.to_string(),
+            "\"zz\" names no host here: 290dc828 (~/work/umber/aj)",
+        );
+        assert!(
+            resolve_host(&hosts, "~/work/umber/aj").is_err(),
+            "a name resolves no host, which is why the id is what the refusal \
+             leads with",
+        );
     }
 
     /// An id with nothing in it is not a name: it cannot be picked, and it

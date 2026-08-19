@@ -446,10 +446,12 @@ impl SidebarState {
     /// Fold `group` if it is unfolded, unfold it if it is not, so the cap
     /// either holds its boring rows back or shows all of them.
     ///
-    /// `group` is the label a header draws, `None` the unlabeled group a plain
-    /// host's rows sit in. Naming the group rather than a row is what lets the
-    /// pointer undo what the chord did and the other way round: both name the
-    /// same thing.
+    /// `group` is the host id a group's rows carry ([`Group::key`]), `None` the
+    /// unlabeled group a plain host's rows sit in. Naming the group rather than
+    /// a row is what lets the pointer undo what the chord did and the other way
+    /// round: both name the same thing. The id and not the header's text,
+    /// because a host that renames itself would otherwise fold twice and unfold
+    /// neither.
     pub(crate) fn toggle_fold(&mut self, group: Option<&str>) {
         self.unfolded.toggle(group);
         // The wheel's anchor is an index into a display order this just
@@ -606,8 +608,10 @@ pub(crate) enum StripLine {
     /// A group's trailing fold line, the affordance that opens the group past
     /// the cap and closes it again (see [`GROUP_CAP`]).
     Fold {
-        /// The group this line belongs to, named as its header names it.
-        /// `None` is the unlabeled group a plain host's rows sit in.
+        /// The group this line belongs to, keyed as [`Group::key`] keys it and
+        /// not as its header reads: a click here folds what the chord folds
+        /// (see [`SidebarState::toggle_fold`]). `None` is the unlabeled group a
+        /// plain host's rows sit in.
         host: Option<String>,
         /// How many of the group's rows the cap holds back. Zero exactly when
         /// the group is unfolded, and the line is then what folds it again.
@@ -674,8 +678,17 @@ fn strip_lines(
 
 /// A run of rows sharing a host, or a host the peer holds no rows for.
 struct Group<'a> {
-    /// What the header calls this host. `None` on rows from a plain host, which
-    /// are all its own and are grouped under no name.
+    /// The host this group is, as its rows name it: the id its sessions are
+    /// namespaced under, or the address for a host the peer has no id for.
+    /// `None` on rows from a plain host, which are all its own and are grouped
+    /// under no name.
+    ///
+    /// The group's identity rather than its text, which is why a fold is
+    /// remembered by it: a host that changes what it calls itself must not
+    /// unfold as one group and fold as another.
+    key: Option<&'a str>,
+    /// What the header draws for it (see [`host_label`]). `None` exactly where
+    /// the key is: a headerless run belongs to no host by name.
     label: Option<&'a str>,
     /// Whether the peer can reach none of it, which the header says once
     /// instead of the user reading it off every row.
@@ -688,6 +701,21 @@ struct Group<'a> {
     hidden: usize,
     /// Whether the user opened this group past the cap.
     unfolded: bool,
+}
+
+/// What the header draws for the host `key` names: the name the peer publishes
+/// for it, else `key` itself.
+///
+/// A group is keyed on what its rows say (an id), and a name arrives on the
+/// peer's own entry for that host, so the two are joined here. A key the peer
+/// publishes no entry for keeps labelling itself, which is what a client mid
+/// refresh has.
+fn labelled<'a>(hosts: &'a [DirectoryHost], key: &'a str) -> &'a str {
+    hosts
+        .iter()
+        .find(|host| host.id.as_deref() == Some(key))
+        .and_then(host_label)
+        .unwrap_or(key)
 }
 
 /// The rows of one group that the cap holds back: its boring rows past the
@@ -742,21 +770,25 @@ impl<'a> Layout<'a> {
         let mut gathered: Vec<(Option<&str>, Vec<usize>)> = Vec::new();
         for (index, row) in rows.iter().enumerate() {
             let host = row.host.as_deref();
-            match gathered.iter_mut().find(|(label, _)| *label == host) {
+            match gathered.iter_mut().find(|(key, _)| *key == host) {
                 Some((_, members)) => members.push(index),
                 None => gathered.push((host, vec![index])),
             }
         }
         let mut groups: Vec<Group<'a>> = gathered
             .iter()
-            .map(|&(label, _)| Group {
-                label,
+            .map(|&(key, _)| Group {
+                key,
+                // The rows carry the id and the peer's own entry carries the
+                // name, so the label is looked up there rather than read off a
+                // row.
+                label: key.map(|key| labelled(hosts, key)),
                 // Refined against the group's own rows below. A group built
                 // from rows always has some.
                 unreachable: true,
                 span: 0..0,
                 hidden: 0,
-                unfolded: unfolded.holds(label),
+                unfolded: unfolded.holds(key),
             })
             .collect();
         // Then the hosts the peer holds no rows for, which no scan over the
@@ -771,35 +803,41 @@ impl<'a> Layout<'a> {
                     // no rows here either.
                     host.id
                         .as_deref()
-                        .is_none_or(|id| !gathered.iter().any(|&(label, _)| label == Some(id)))
+                        .is_none_or(|id| !gathered.iter().any(|&(key, _)| key == Some(id)))
                 })
                 .filter_map(|host| {
                     // The learned id where the peer has one, the configured
-                    // address until it does (spec 7.1). An entry naming
-                    // neither says nothing a header could show.
-                    let label = host.id.as_deref().or(host.address.as_deref())?;
+                    // address until it does (spec 7.1). An entry naming neither
+                    // is not a group: it can hold no rows, and a header keyed on
+                    // nothing would fold the plain host's unlabeled run.
+                    let key = host.id.as_deref().or(host.address.as_deref())?;
                     Some(Group {
-                        label: Some(label),
+                        key: Some(key),
+                        label: host_label(host),
                         // The peer's own answer. There is no row here to derive
                         // it from, and a host can be up and simply hold no
                         // sessions.
                         unreachable: host.unreachable,
                         span: 0..0,
                         hidden: 0,
-                        unfolded: unfolded.holds(Some(label)),
+                        unfolded: unfolded.holds(Some(key)),
                     })
                 }),
         );
         // Alphabetical by the label the header draws, byte order and no
         // casefolding: a section that holds still is worth more when the place
-        // it holds still in can be guessed, and ids are lowercase hex until
-        // hosts carry names. `None` sorts first, which is the rule it always
-        // had: a headerless run under someone else's header would read as
-        // theirs. Hosts with no rows interleave here rather than sinking to
-        // the bottom, because a host is looked up by its name whether or not
-        // it holds anything. The sort is stable, so two hosts drawing one
-        // label keep the order the peer named them in.
-        groups.sort_by(|left, right| left.label.cmp(&right.label));
+        // it holds still in can be guessed. `None` sorts first, which is the
+        // rule it always had: a headerless run under someone else's header
+        // would read as theirs. Hosts with no rows interleave here rather than
+        // sinking to the bottom, because a host is looked up by its name
+        // whether or not it holds anything. Two hosts reporting one name break
+        // the tie by key, so a pair of clones of one repo holds an order at
+        // all, and it is the order their ids give.
+        groups.sort_by(|left, right| {
+            left.label
+                .cmp(&right.label)
+                .then_with(|| left.key.cmp(&right.key))
+        });
         let mut order = Vec::with_capacity(rows.len());
         for group in &mut groups {
             let start = order.len();
@@ -807,7 +845,7 @@ impl<'a> Layout<'a> {
             // cannot both claim one host's rows.
             let members = gathered
                 .iter_mut()
-                .find(|(label, _)| *label == group.label)
+                .find(|(key, _)| *key == group.key)
                 .map(|(_, members)| std::mem::take(members))
                 .unwrap_or_default();
             if members.is_empty() {
@@ -1017,7 +1055,7 @@ impl<'a> Layout<'a> {
             }));
             if self.folds(group, &run) {
                 lines.push(StripLine::Fold {
-                    host: group.label.map(str::to_string),
+                    host: group.key.map(str::to_string),
                     hidden: group.hidden,
                 });
             }
@@ -1034,6 +1072,24 @@ impl<'a> Layout<'a> {
         lines.push(StripLine::New);
         lines
     }
+}
+
+/// What a client calls one of a peer's hosts: the name that host reports for
+/// itself, else the id its sessions are namespaced under, else the address the
+/// peer has only ever known it by (spec 7.1).
+///
+/// One rule for every surface that names a host, so the strip's header and the
+/// create-flow picker cannot label one host two ways. `None` for an entry
+/// carrying none of the three, which is a shape no peer sends.
+///
+/// A label and never an address: a client that shows a name still groups rows
+/// and addresses sessions by [`DirectoryHost::id`], and two hosts may report
+/// one name (two clones of one repo) the way two sessions may share a tag.
+pub(crate) fn host_label(host: &DirectoryHost) -> Option<&str> {
+    [&host.name, &host.id, &host.address]
+        .into_iter()
+        .filter_map(|field| field.as_deref())
+        .find(|text| !text.is_empty())
 }
 
 /// The visible part of a session id: its time of day.
@@ -2449,15 +2505,14 @@ mod tests {
         );
     }
 
-    /// Labels sort in byte order with no casefolding, and two hosts drawing
-    /// one label keep the order the peer named them in.
+    /// Labels sort in byte order with no casefolding, and two hosts drawing one
+    /// label under one key keep the order the peer named them in.
     ///
-    /// Byte order is the predictable rule while labels are ids: it needs no
-    /// table and no locale, and the cost is that a capitalised name sorts
-    /// above every lowercase one. The tie-break matters because a host known
-    /// only by an address can draw the same label as another host's id, and
-    /// two groups swapping places between frames is the thing this order
-    /// exists to prevent.
+    /// Byte order is the predictable rule: it needs no table and no locale, and
+    /// the cost is that a capitalised name sorts above every lowercase one. The
+    /// tie-break matters because a host known only by an address can draw the
+    /// same label as another host's id, and two groups swapping places between
+    /// frames is the thing this order exists to prevent.
     #[test]
     fn labels_sort_in_byte_order_and_ties_keep_the_peers_order() {
         let hosts = vec![learned("aaa", false), learned("Zeta", false)];
@@ -2474,6 +2529,105 @@ mod tests {
             headers(&folded(&[], &twins, 20)),
             vec![("dup", false), ("dup", true)],
             "the tie kept the order the peer named them in",
+        );
+    }
+
+    /// A group reads as the name its host reports for itself, whether the group
+    /// holds rows or is a host the peer holds none for. The id is what the rows
+    /// carry and what a session is addressed by, so it stays the fallback and
+    /// never the label of a host that named itself (spec 7.1).
+    #[test]
+    fn a_group_reads_as_the_name_its_host_reports() {
+        let rows = vec![row("s-1").host("290dc828").build()];
+        let hosts = vec![
+            calling_itself("290dc828", "~/work/umber/aj", false),
+            calling_itself("cbcfaabe", "~/workshop", true),
+            learned("nameless", false),
+            configured("10.0.0.7:7777"),
+        ];
+        let lines = folded(&rows, &hosts, 20);
+        assert_eq!(
+            headers(&lines),
+            vec![
+                ("10.0.0.7:7777", true),
+                ("nameless", false),
+                ("~/work/umber/aj", false),
+                ("~/workshop", true),
+            ],
+            "a named host reads as its name, one that reported none as its id, \
+             and one the peer has never spoken to as its address: {lines:?}",
+        );
+        assert_eq!(
+            drawn(&lines, &rows),
+            vec!["s-1"],
+            "and the row still sits under its own host, which it names by id",
+        );
+    }
+
+    /// Groups sit where their *labels* sort, so the strip reorders the moment
+    /// hosts carry names: the id order and the name order need not agree, and
+    /// the order a reader can predict is the one they can see.
+    ///
+    /// Two hosts reporting one name break the tie by the id their rows carry, so
+    /// a pair of clones of one repo holds an order rather than swapping places
+    /// between frames.
+    #[test]
+    fn groups_sort_by_name_once_their_hosts_are_named() {
+        let hosts = vec![
+            calling_itself("aaa", "~/workshop", false),
+            calling_itself("bbb", "~/work/umber/aj", false),
+        ];
+        assert_eq!(
+            headers(&folded(&[], &hosts, 20)),
+            vec![("~/work/umber/aj", false), ("~/workshop", false)],
+            "the id order is the opposite of the name order, and the names win",
+        );
+
+        let twins = vec![
+            calling_itself("bbb", "~/work/aj", false),
+            calling_itself("aaa", "~/work/aj", true),
+        ];
+        assert_eq!(
+            headers(&folded(&[], &twins, 20)),
+            vec![("~/work/aj", true), ("~/work/aj", false)],
+            "one label, and the ids place them: the unreachable one is aaa",
+        );
+    }
+
+    /// A fold is remembered by the id a group's rows carry, not by what its
+    /// header reads. The pointer's fold line and the chord's focused row have to
+    /// name the same group, and only the id is the same string on both paths.
+    #[test]
+    fn a_fold_is_keyed_on_the_host_id_and_not_on_its_label() {
+        let mut state = SidebarState {
+            visible: true,
+            rows: (0..8)
+                .map(|at| row(&format!("s-{at}")).host("290dc828").build())
+                .collect(),
+            hosts: vec![
+                calling_itself("290dc828", "~/work/umber/aj", false),
+                learned("other", false),
+            ],
+            ..SidebarState::default()
+        };
+        let lines = state.lines(30);
+        assert_eq!(
+            headers(&lines),
+            vec![("other", false), ("~/work/umber/aj", false)],
+            "the header of the group holding the rows reads the name: {lines:?}",
+        );
+        assert_eq!(
+            folds(&lines),
+            vec![(Some("290dc828"), 3)],
+            "and the fold line names the host by id, which is what a click on it \
+             hands back: {lines:?}",
+        );
+
+        state.toggle_fold(Some("290dc828"));
+        assert_eq!(
+            folds(&state.lines(30)),
+            vec![(Some("290dc828"), 0)],
+            "so the pointer and the chord fold one group and not two",
         );
     }
 
@@ -3477,6 +3631,14 @@ mod tests {
             address: None,
             name: None,
             unreachable,
+        }
+    }
+
+    /// A host that reports a name for itself, as every host does (spec 6.1).
+    fn calling_itself(id: &str, name: &str, unreachable: bool) -> DirectoryHost {
+        DirectoryHost {
+            name: Some(name.to_string()),
+            ..learned(id, unreachable)
         }
     }
 
