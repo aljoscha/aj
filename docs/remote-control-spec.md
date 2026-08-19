@@ -194,7 +194,12 @@ Responsibilities:
   remote clients detach by reopening the stream without naming the
   session, and a client keeps a small bounded working set of
   background sessions attached (section 9.2), detaching what falls
-  out of it. Retained locks inside the working set are use, not a
+  out of it. The set is LRU-bounded and holds no archived session but
+  the one the user is in (section 9.2): an archived session is
+  dropped from the set the moment the bit and an unfocused session
+  meet, whichever of the two moved, so the host can release a session
+  its user said they were done with. Retained locks inside the
+  working set are use, not a
   leak. Visiting, though, is not retention: browsing fifty sessions
   must not leave fifty live drivers and fifty held locks behind.
   Without release-on-idle a
@@ -283,7 +288,8 @@ WebSockets, no JSON-RPC, no correlation ids.
 All routes live under `/v1/`. `GET /v1/hello` returns protocol
 version, capability list, app version, `host_id`, the working
 directory, and a `name` (a gateway omits the working directory and the
-name, and advertises its own capabilities). It is the reachability and
+name, and its capability list speaks only for the gateway itself,
+section 6.10). It is the reachability and
 identity probe.
 
 A host's `name` is display metadata and never an address: clients
@@ -302,7 +308,9 @@ idle. Clients treat a silent stream (no frame for ~60s) as dead and
 reconnect with backoff.
 
 Error responses carry `{code, message}`. The vocabulary: 400 malformed
-request, 404 unknown session/task/entry, 409 conflict (busy refusal, lock
+request, 404 unknown session/task/entry, or an endpoint the peer does
+not serve (code `unknown_endpoint`, the answer a capability probe
+reads, section 6.10), 409 conflict (busy refusal, lock
 conflict, or a request the host cannot serve such as a model it has no
 credentials for), 500 the host failed internally, 503 upstream host
 unreachable (gateway only).
@@ -645,6 +653,7 @@ viewed agent to that parameter:
 | `.../{id}/compact` | optional instructions | Manual compaction. |
 | `.../{id}/settings` | model / thinking / thinking display / speed / verbosity changes | Host applies, logs, and emits the synthesized frames. |
 | `.../{id}/tag` | tag string, empty clears | Set the session's tag: session-scoped display metadata (section 6.8), a single trimmed line, length-capped. Materializes like any command so the session lock covers the sidecar write. |
+| `.../{id}/archive` | `{archived: bool}`, absent reads false | Set or clear the session's archived bit: session-scoped display metadata (section 6.8). `false` unarchives, so one route serves both directions. Materializes like any command, so the session lock covers the sidecar write and a rival writer's lock refuses it like any command (section 5). Nothing else refuses it: the bit has no lifecycle meaning, so a busy refusal like the head switch's below would be exactly the coupling it must not acquire, and a session working through a turn takes it and goes on working. The bit lands on the session's row through the ordinary debounced `list` path (section 6.8). Not in the protocol-1 baseline, arrives with the `archive` capability (section 6.10). |
 | `.../{id}/head` | target: an entry id, or `{before: <entry_id>}` | Switch the session head. 409 while working or tasks live. Clears queues, new epoch, `reset` frame. The `before` shape resolves any named entry to its parent server-side, atomically with the switch. An unknown entry is 404, an entry with no parent is refused. Its consumer is the branch-from-a-message gesture (replace the message rather than append after it), but the contract is deliberately not restricted to user-thread entries: every head `before` can reach is reachable through the plain entry shape already, so a restriction would police nothing. |
 | `.../{id}/tasks/{task_id}/kill` | — | Kill a background task. |
 
@@ -754,12 +763,26 @@ Per-session status in `list` frames and `GET /v1/sessions`:
   written atomically) that a head switch cannot move. Untagged
   sessions have no file. Set at create (create body / launch flag) or
   by the tag command (section 6.6).
+- `archived`: user-set bit, display metadata with no lifecycle
+  meaning: an archived session keeps its log, its lock, and any turn
+  it is running. Session-scoped like the tag and stored the same way,
+  a sidecar file (`meta/<session id>.archived`) a head switch cannot
+  move, whose existence is the whole bit, there is nothing to read
+  inside. Unarchived sessions have no file and their rows carry no
+  key: absent reads false on the wire, which is also what an older
+  host's rows say. Changed only by the archive command (section 6.6),
+  and unlike the tag there is deliberately no create-time field or
+  launch flag (section 9.2 carries the reason).
 - `host`: which enrolled host a row belongs to, filled by a gateway
   and absent from a plain host's rows. Clients group by it and must
   not derive it from the id, ids are opaque (section 6.2).
 - `unreachable` (gateway only): the owning host connection is down.
 
-There is deliberately no "needs attention" bit on the server. A client
+There is deliberately no "needs attention" bit on the server. The
+archived bit is not that bit and does not breach this rule: archived
+is durable, user-stated, store-scoped intent, one answer every client
+of the store shares, where attention is relative to one client's
+looking and only that client can derive it. A client
 derives it from seqs, not stamps: a session is unseen when the last
 durable seq the client has evidence of (applied frames while
 attached, `last_seq` on live rows while not) exceeds the seq the user
@@ -808,10 +831,25 @@ the format sniff (first line, cached against the file it was taken
 from so a settled store re-sniffs nothing, keyed on the file rather
 than the path alone so a sniff that landed on a log another process
 was midway through writing recovers) and the tag sidecar where one
-exists (section 6.8). Enumeration is therefore readdir,
+exists (section 6.8). A listing reads sidecar axes by enumerating the
+sidecar directory, one readdir per axis plus a stat per sidecar found
+(the fingerprint that keys the caches, and what rejects a directory
+named like a sidecar), never by asking session by session, which
+would pay a stat per session. A store that never grew a sidecar
+directory pays a single failed readdir per axis. Two axes ride this
+today: the tag, whose sidecar is then read once per fingerprint the
+enumeration reports, and the archived bit, which costs no content
+read at all, the sidecar's existence is the whole answer. Between
+enumeration points the bits move only through the host's own hands:
+the tag and archive commands land on the live session's row under its
+lock and publish through the debounced `list` path, and a release
+hands the driver's row, sidecar axes included, to the cold cache.
+(Materializing one session still reads that session's own sidecars,
+that is a user-paced open, not a listing.)
+Enumeration is therefore readdir per axis,
 stats and a sniff per file that moved, cheap enough to run
 synchronously at startup.
-This contract has teeth on both axes. The polling variant of this
+This contract has teeth on both fronts. The polling variant of this
 design read hundreds of gigabytes a day re-deriving an unchanged
 400-file directory, and deriving a cold `last_seq` once, at startup,
 still put the whole store's bytes in front of the first frame.
@@ -912,9 +950,18 @@ especially with long-lived VMs. Rules:
 - New endpoints, frame kinds, and event types arrive with a capability
   string. New means relative to a released baseline: protocol 1
   implies the whole section 6 surface as it stands at first release,
-  and capabilities exist for what comes after, which is why `hello`
-  advertises none today. Probing an endpoint (404 vs 2xx) is a valid
-  fallback check.
+  and capabilities exist for what comes after. The registry so far,
+  one string per feature with the surface it covers (an endpoint, a
+  frame kind, an event type) and who advertises
+  it: `archive` covers `POST /v1/sessions/{id}/archive` (section
+  6.6), advertised by hosts. A capability is self-description, never
+  a gate: probing an endpoint (404 vs 2xx) is a valid fallback check,
+  and what a peer does with the list is the peer's business. A
+  gateway's `hello` advertises only what the gateway itself serves
+  past the baseline, nothing today: it cannot answer for hosts that
+  need not agree with each other, so a client that wants a
+  capability's route through a gateway attempts it and reads the
+  refusal, the sanctioned fallback above.
 - The pinned-shape tests in `events.rs` extend to round-trip tests:
   serialize-deserialize must be identity on the wire-visible parts,
   and decoding must survive forward-compat fixtures (extra fields,
@@ -1263,9 +1310,12 @@ sections 6.6 and 8), and restore notices are client-rendered from the
 attach `state` frame, the host publishes none (section 6.3).
 
 Session selection: bare `aj connect <url>` attaches the host's most
-recently modified session, and creates one when the host has none.
-`aj connect <url> --new` forces creation, and an optional session-id
-argument attaches a specific one. This is why session creation is
+recently modified unarchived session (section 6.8), and creates one
+when the host offers none: a host whose sessions are all archived
+creates exactly as an empty one does. An explicit session-id argument
+attaches that session whatever its archived bit says, archiving puts
+a session away, it does not close it. `aj connect <url> --new` forces
+creation. This is why session creation is
 part of phase 2, a fresh `aj serve` would otherwise be unreachable.
 Through a gateway a create has to name a host once more than one is
 enrolled (section 6.6), which `--host <id>` does for a run with no
@@ -1327,13 +1377,31 @@ the footer/status line.
 ### 9.2 The sidebar
 
 A persistent sidebar lists sessions. It shows itself by default
-whenever the directory offers more than one session and stays hidden
-otherwise (a lone local session has nothing to choose between), and
-an explicit toggle wins over the default for the rest of the process.
+whenever the directory offers more than one session it would display
+(archived rows it has put away count for nothing, see below) and
+stays hidden otherwise (a lone local session has nothing to choose
+between), and an explicit toggle wins over the default for the rest
+of the process.
 
-- Against a host or gateway: all sessions from the `list` frames, with
-  glyphs for working / idle / unseen-output / unreachable, plus modest
-  metadata (age, preview text if cheaply available).
+- Against a host or gateway: all sessions from the `list` frames,
+  minus the archived rows put away below, with glyphs for working /
+  idle / unseen-output / unreachable, plus modest metadata (age,
+  preview text if cheaply available).
+- Archived rows (section 6.8) leave the display set. Two exemptions
+  only, focus and attachment: the row the user is in, and rows the
+  client holds open, stay visible. What the session is doing exempts
+  nothing, a working or attention glyph does not put an archived row
+  back, a turn running inside it does not undo the user's asking, the
+  turn completes out of view. Attention latches while a row is hidden
+  (section 6.8) and shows wherever the row does. The filter runs
+  before any counting: a put-away row spends none of its host's share
+  of the strip and does not count toward the show-itself default
+  above, and a row the exemptions or the reveal keep in view
+  counts like any displayed one. An explicit
+  reveal action shows the put-away rows, marked as archived, so one
+  can be focused again, which materializes it as any focus does, and
+  toggled back. The reveal is client state that lasts the process,
+  like the strip's own toggle, and is never sent anywhere.
 - Switching focus is instant and stateful: the client keeps one
   `ChatState` per session it has attached, live frames keep arriving
   for background sessions over the same unified stream (attachment is
@@ -1349,7 +1417,17 @@ an explicit toggle wins over the default for the rest of the process.
   enough that juggling a handful of sessions never pays a re-attach,
   small enough that a browse through the store does not pile up live
   drivers and locks on the host (section 5). The focused session is
-  never detached. A session that falls out of the set is detached,
+  never detached. Archived sessions do not ride the LRU: the set
+  holds no archived session but the one the user is in, enforced
+  whenever the bit or the focus moves. Leaving an archived session
+  drops it from the set at once, and a row arriving archived (a peer
+  client asked, section 6.8's bit is one answer every client shares)
+  drops an unfocused session the same way: the user said they were
+  done there, and keeping it attached would hold a lock the host
+  could release
+  (section 5). That immediate exit is the release path that makes
+  archiving mean something on the host, not just in the view. A
+  session that falls out of the set either way is detached,
   the host releases it after its idle grace, its lock frees, and its
   row keeps carrying the attention signal like any unattached
   session. Re-focusing it costs an ordinary re-attach, incremental
@@ -1365,9 +1443,12 @@ an explicit toggle wins over the default for the rest of the process.
   host shows a bounded share of the strip and folds the rest of its
   idle rows behind a per-host line that opens that host and closes it
   again, so no one busy host buries the others. Recency chooses which
-  rows a host keeps in view, and a row is never folded away while it
-  is focused, while the client holds it open, or while it wears the
-  working or attention glyph. The view windows around
+  rows a host keeps in view, and the fold never takes a row that is
+  focused, that the client holds open, or that wears the working or
+  attention glyph. That promise is about the per-host cap alone: an
+  archived row is not folded away, it is put away by the filter
+  above, whose only exemptions are focus and attachment. The view
+  windows around
   the focused row so focus is always visible, and the stepping chords
   walk the displayed order. Focusing a cold session
   materializes it, that is what focusing means. The working set is
@@ -1395,7 +1476,8 @@ an explicit toggle wins over the default for the rest of the process.
 Keyboard model, exact layout, and glyph choices are left to
 implementation taste within existing TUI conventions, with one
 requirement: new interactions (sidebar toggle and focus, session
-switching, remote session creation, session tagging, folding a host's
+switching, remote session creation, session tagging, archiving and
+the archived reveal, folding a host's
 sessions) are `AjAction`s riding the existing keybinding system, so
 they get default chords and user overrides like every other action.
 Pointer gestures are a second trigger for the same actions, never a
@@ -1407,6 +1489,34 @@ Rows show the session's tag where one is set (section 6.8), falling
 back to the id-derived label. A tag is set at launch (`--tag` on `aj`
 and on `aj connect --new`, riding the create command's tag field) or
 on the focused session through the tag action.
+
+The archive action toggles the focused session's archived bit
+(section 6.6): the client asks for the opposite of the bit it holds,
+so the wire only ever carries an explicit direction, and it records
+an accepted answer ahead of the peer's next `list` frame, so a
+double press inside one debounce tick undoes rather than repeats.
+The gesture is never refused for being busy, matching the command it
+rides, and the refusal that remains is section 5's lock conflict, a
+rival writer, not busy work. Both
+directions leave the user a notice naming what changed, and a peer
+that does not serve the route leaves the named notice section 9.1's
+never-silently-does-nothing rule demands: the command's own error is
+the probe section 6.10 sanctions, its envelope code telling a peer
+without the endpoint from a session the peer does not know. The
+archived axis follows one rule across the client surface: a listing
+lists, only pickers filter. `aj list-sessions` prints every session
+and marks the archived ones, while the sidebar (above) and the
+session selector put archived rows away by default behind an
+explicit reveal. The selector's reveal is a first-class control of
+the overlay, its chord advertised in the overlay's footer, and it
+lapses with the overlay where the strip's reveal outlives its
+refreshes. The selector exempts the session the user is currently
+in, as the sidebar exempts its focused row, and an exempted row
+still wears its archived marker, so the exemption cannot pass the
+bit off as cleared. There is no way to
+create a session already archived, no create field and no launch
+flag, deliberately: archiving is a judgment about a session that has
+been seen, not a property a session starts life with.
 
 A host's group header reads the name that host reports for itself
 (section 6.1), else the id its sessions are namespaced under, else the
