@@ -5,12 +5,12 @@
 //! nobody sees. What it produces is the [`Control`] the shell drives, the
 //! session it opens with, and the host facts the chrome needs.
 //!
-//! Session selection is the spec's: an explicit id, else `--new` creates,
-//! else the host's most recently modified session that is not archived, else
-//! create one. A create carries the settings this client's user actually
-//! stated, because per-session settings follow whoever creates the session
-//! (spec section 8), and the host `--host` named when the peer serves more
-//! than one.
+//! Session selection is the spec's, and the command line has already been
+//! read into the three states it has (`aj_app::cli::args::ConnectSession`): a
+//! session named, one this run creates, or the host's own choice. A create
+//! carries the settings this client's user actually stated, because
+//! per-session settings follow whoever creates the session (spec section 8),
+//! and the host `--host` named when the peer serves more than one.
 
 use std::path::PathBuf;
 
@@ -23,27 +23,6 @@ use anyhow::{Context, Result, anyhow};
 use crate::control::{Control, ControlError};
 use crate::host_picker::resolve_host;
 use crate::remote::RemoteClient;
-
-/// Which session `aj connect` opens with.
-///
-/// Built only from a [`ConnectLaunch`], so the run this dials is the one the
-/// command line asked for: there is no field-by-field spelling for a caller to
-/// assemble a different target from the same argv.
-pub(crate) struct ConnectTarget<'a> {
-    url: &'a str,
-    session: ConnectSession<'a>,
-    host: Option<&'a str>,
-}
-
-impl<'a> ConnectTarget<'a> {
-    pub(crate) fn of(launch: &ConnectLaunch<'a>) -> Self {
-        Self {
-            url: launch.url,
-            session: launch.session,
-            host: launch.host,
-        }
-    }
-}
 
 /// A connected client: the control surface, the focused session, and what the
 /// handshake said about the host.
@@ -59,7 +38,12 @@ pub(crate) struct Connected {
     pub(crate) created: bool,
 }
 
-/// Dial `target`, settle version skew, and resolve the session to open.
+/// Dial what `launch` asks for, settle version skew, and resolve the session
+/// to open.
+///
+/// Taking the whole launch rather than its parts is what keeps the run that is
+/// dialled the run the command line asked for: a caller outside `aj_app` has no
+/// way to assemble one that says something else.
 ///
 /// The launch prompt is not submitted here: the caller submits it through the
 /// ordinary prompt path once the shell is attached, exactly as a local run
@@ -68,10 +52,10 @@ pub(crate) async fn connect(
     args: &Args,
     config: &Config,
     stated: &Stated,
-    target: ConnectTarget<'_>,
+    launch: &ConnectLaunch<'_>,
 ) -> Result<Connected> {
-    let client = RemoteClient::new(target.url)
-        .with_context(|| format!("could not use {:?} as a control-port URL", target.url))?;
+    let client = RemoteClient::new(launch.url())
+        .with_context(|| format!("could not use {:?} as a control-port URL", launch.url()))?;
     let hello: Hello = client
         .hello()
         .await
@@ -83,11 +67,12 @@ pub(crate) async fn connect(
     // for its label is a round trip that reports after the terminal is gone,
     // and the flag is this client's own input to validate (spec 6.6).
     let tag = args.launch_tag().map_err(|err| anyhow!("--tag: {err}"))?;
-    let host = match target.host {
+    let host = match launch.host() {
         Some(named) => resolve_named_host(&control, &hello, named).await?,
         None => None,
     };
-    let (session, created) = resolve_session(&control, &target, host, settings, tag).await?;
+    let (session, created) =
+        resolve_session(&control, launch.session(), host, settings, tag).await?;
     Ok(Connected {
         control,
         session,
@@ -147,12 +132,12 @@ async fn resolve_named_host(
 /// close it, so naming one always works.
 async fn resolve_session(
     control: &Control,
-    target: &ConnectTarget<'_>,
+    session: ConnectSession<'_>,
     host: Option<String>,
     settings: Option<SessionSettings>,
     tag: Option<String>,
 ) -> Result<(String, bool)> {
-    match target.session {
+    match session {
         ConnectSession::Named(id) => Ok((id.to_string(), false)),
         ConnectSession::Fresh => Ok((create(control, host, settings, tag).await?, true)),
         ConnectSession::Latest => {
@@ -470,12 +455,7 @@ mod tests {
                 .expect("connect args parse as connect");
             bounded(
                 "connect to resolve a session",
-                connect(
-                    &args,
-                    &Config::default(),
-                    &nothing_stated(),
-                    ConnectTarget::of(&launch),
-                ),
+                connect(&args, &Config::default(), &nothing_stated(), &launch),
             )
             .await
             .expect("connect to the host")
@@ -580,10 +560,21 @@ mod tests {
     /// `--new` with launch input creates. The grammar puts that input in the
     /// session-id slot, and a run that read it as an id would attach nothing
     /// and leave the host without the session it was asked for.
+    ///
+    /// The prompt's text goes nowhere here: `connect` resolves a session and
+    /// the shell submits the turn later, so what it carries is pinned in the
+    /// composed world instead.
     #[tokio::test]
     async fn new_with_launch_input_creates_a_session() {
         let peer = Peer::start().await;
         let held = peer.create().await;
+        // Every assertion below reads against this one row. Without it a create
+        // and an attach leave the same count behind.
+        assert_eq!(
+            peer.rows().await.len(),
+            1,
+            "the fixture host does not hold the single session the counts are read against",
+        );
 
         let connected = peer
             .dial(&["--new", "Reply with the single word: ok"])
@@ -619,6 +610,13 @@ mod tests {
     async fn new_creates_when_the_launch_input_names_a_session() {
         let peer = Peer::start().await;
         let held = peer.create().await;
+        // Every assertion below reads against this one row. Without it a create
+        // and an attach leave the same count behind.
+        assert_eq!(
+            peer.rows().await.len(),
+            1,
+            "the fixture host does not hold the single session the counts are read against",
+        );
 
         let connected = peer.dial(&["--new", &held]).await;
 

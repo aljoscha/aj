@@ -1262,19 +1262,21 @@ axis (command, `state` frame, creator-follows rule, live-only, see
 sections 6.6 and 8), and restore notices are client-rendered from the
 attach `state` frame, the host publishes none (section 6.3).
 
-Session selection: bare `aj connect <url>` attaches the host's most
-recently modified session, and creates one when the host has none.
-`aj connect <url> --new` forces creation, and an optional session-id
-argument attaches a specific one. This is why session creation is
-part of phase 2, a fresh `aj serve` would otherwise be unreachable.
-Launch input follows the session, as it does for `continue`, and the
-grammar reads the first free positional as the session id: a run that
-resumes has to name its session to carry input. A run under `--new`
-names no session, so every positional after the url is launch input
-and `aj connect <url> --new "<prompt>"` is how a create opens with a
-turn. The two are one rule with three states, an id, a create, or the
-host's choice, so "create this named session" has no spelling and no
-reader has to decide which of an id and a flag wins.
+Session selection asks for one of three things: bare `aj connect <url>`
+attaches the host's most recently modified session and creates one
+when the host has none, a session-id argument attaches that specific
+session, and `aj connect <url> --new` creates. This is why session
+creation is part of phase 2, a fresh `aj serve` would otherwise be
+unreachable. Launch input follows the session, as it does for
+`continue`, and the grammar reads the first free positional as the
+session id: a run that resumes has to name its session to carry input.
+A run under `--new` names no session, so every positional after the
+url is launch input, and `aj connect <url> --new "<prompt>"` is how a
+create opens with a turn. That makes the three states exclusive rather
+than composable: an id typed alongside `--new` is read as the first
+word of the launch input, because nothing distinguishes it from a
+one-word prompt, so "create this named session" is not expressible and
+no reader has to rank an id against a flag.
 Through a gateway a create has to name a host once more than one is
 enrolled (section 6.6), which `--host <id>` does for a run with no
 terminal to ask: a host id, or a prefix only one host answers to,
