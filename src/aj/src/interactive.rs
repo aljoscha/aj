@@ -65,7 +65,7 @@ use vaxis::vxfw::{
 };
 
 use crate::agent_picker::{AgentPickerOutcome, PickerSnapshot, open_agent_picker};
-use crate::connect::{ConnectTarget, Connected};
+use crate::connect::Connected;
 use crate::content_overlay::{ContentStyles, Row, auth_rows, session_info_rows, set_rows};
 use crate::control::{Control, ControlError, ControlFrame, Stream};
 use crate::footer::FooterLine;
@@ -2167,6 +2167,15 @@ async fn auto_submit_launch(world: &mut World, content: Vec<UserContent>) {
         },
     )
     .await;
+}
+
+/// Submit the launch turn this run was started with, if it carries one.
+///
+/// Takes the resolved input rather than its content blocks: only `aj_app`'s
+/// resolver can produce one, so a run cannot be wired to open with something
+/// other than what its own argv carried.
+async fn submit_launch(world: &mut World, launch: aj_app::cli::InitialInput) {
+    auto_submit_launch(world, launch.into_content()).await;
 }
 
 /// Cancel the viewed agent's running turn. Returns whether anything was
@@ -5536,12 +5545,11 @@ pub async fn run(args: Args) -> Result<()> {
     // Resolve launch attachments before terminal setup so failures leave
     // the terminal untouched. Image handling uses the effective project-over-user
     // setting, just like images read later through the read_file tool.
-    let launch_content = aj_app::cli::initial_input(
+    let launch = aj_app::cli::initial_input(
         &args,
         &std::env::current_dir().unwrap_or_default(),
         layers.effective().image_auto_resize,
-    )?
-    .into_content();
+    )?;
 
     let auth = AuthStorage::at_default_path().context("failed to open ~/.aj/auth.json")?;
     let sessions_dir = Config::get_sessions_dir_path()?;
@@ -5550,23 +5558,24 @@ pub async fn run(args: Args) -> Result<()> {
     // Connect mode dials the host before anything touches the terminal, so an
     // unreachable host or a protocol mismatch reports on the normal screen
     // (spec 9.1).
-    let mut world = match args.connect_launch() {
-        Some(launch) => {
+    let mut world = match &args.command {
+        Some(CliCommand::Connect { .. }) => {
+            // Every connect command has a launch. Reading it as "not a connect
+            // run" instead would start a local agent in this directory for a
+            // user who asked for a remote host.
+            let launch = args
+                .connect_launch()
+                .expect("a connect command carries a launch");
             // Statedness has to come from the layers, not from the effective
             // config: only a create sends stated axes (spec section 8), and the
             // effective config cannot tell a written entry from a fallback.
             let (user_layer, _) = Config::load_layer();
             let stated = crate::connect::Stated::new(user_layer, layers.project.clone());
-            let connected = crate::connect::connect(
-                &args,
-                &layers.effective(),
-                &stated,
-                ConnectTarget::of(&launch),
-            )
-            .await?;
+            let connected =
+                crate::connect::connect(&args, &layers.effective(), &stated, &launch).await?;
             build_connect_world(&args, connected, layers, &diagnostics, &auth, &persistence).await?
         }
-        None => build_world(&args, layers, &diagnostics, &auth, &persistence, None).await?,
+        _ => build_world(&args, layers, &diagnostics, &auth, &persistence, None).await?,
     };
 
     // The control port serves the very host this shell renders, so a remote
@@ -5589,7 +5598,7 @@ pub async fn run(args: Args) -> Result<()> {
     // Auto-submit the launch prompt as the initial session's first turn.
     // This sits before the outer session loop below, so an in-process
     // session change never resubmits, matching `aj`.
-    auto_submit_launch(&mut world, launch_content).await;
+    submit_launch(&mut world, launch).await;
 
     // Resolve the configured theme (default `light`, matching `aj`) and
     // load it at the env-detected color mode. `AsyncApp::init` runs the
@@ -17005,7 +17014,7 @@ mod tests {
         let launch = args
             .connect_launch()
             .expect("connect args parse as connect");
-        crate::connect::connect(&args, config, stated, ConnectTarget::of(&launch)).await
+        crate::connect::connect(&args, config, stated, &launch).await
     }
 
     /// Build the connect-mode world `aj connect <url> [args...]` builds, with
@@ -17030,6 +17039,17 @@ mod tests {
         build_connect_world(&args, connected, default_layers(), &[], &auth, &persistence)
             .await
             .expect("build the connect-mode world")
+    }
+
+    /// The launch turn `argv` carries for a connect run, derived the way the
+    /// shell derives it: through the same accessor and the same resolver, so a
+    /// test composing this with [`connect_world`] runs one argv end to end.
+    fn connect_launch_input(url: &str, argv: &[&str]) -> aj_app::cli::InitialInput {
+        let mut line = vec!["aj", "connect", url];
+        line.extend_from_slice(argv);
+        let args = Args::parse_from(line);
+        aj_app::cli::initial_input(&args, std::path::Path::new("/"), true)
+            .expect("resolve the launch input")
     }
 
     /// A connect-mode world plus a Shell over it, for the action paths.
@@ -21815,6 +21835,122 @@ mod tests {
                 .len(),
             listed.sessions.len(),
             "a refused tag costs the host no session",
+        );
+        remote.shutdown().await;
+    }
+
+    /// The launch turn a `--new` run carries reaches the remote session. This
+    /// is the only test that runs one argv through both halves of the launch
+    /// path, the create and the turn, so the two cannot drift apart while each
+    /// stays green on its own.
+    ///
+    /// The shell's own call to these two is the residue: deriving the content
+    /// has to happen before the terminal is taken, so an unreadable `@file`
+    /// reports on the normal screen, which leaves the submit a second statement
+    /// no test below the drive loop can reach.
+    #[tokio::test]
+    async fn a_created_session_submits_the_launch_turn_its_argv_carried() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let argv = ["--new", "wake up and answer"];
+
+        let mut world = connect_world(&dir, &remote, &argv).await;
+        let launch = connect_launch_input(&remote.url(), &argv);
+        assert!(
+            !launch.is_empty(),
+            "the argv carried no launch turn, so submitting it proves nothing",
+        );
+
+        submit_launch(&mut world, launch).await;
+        fold_ready_frames(&mut world);
+        settle(&mut world).await;
+
+        let prompts: Vec<String> = world
+            .chat
+            .borrow()
+            .transcript(AgentId::Main)
+            .expect("main transcript")
+            .entries()
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                EntryKind::User(user) => Some(user.joined_text()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            prompts,
+            vec!["wake up and answer"],
+            "the session the run created never ran the turn its argv carried",
+        );
+        remote.shutdown().await;
+    }
+
+    /// A run whose launch input fills the session-id slot is still a create,
+    /// all the way through the world the shell renders: the host gains the
+    /// row, `--tag` names it, and nothing reports a resume.
+    #[tokio::test]
+    async fn connect_new_with_a_launch_prompt_creates_rather_than_resuming() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let held = remote.host.create().await.expect("create on the host");
+        // A run that read the prompt as an id, or fell back to the host's
+        // choice, would land on this row. Without it the test cannot tell a
+        // create from an attach.
+        assert_eq!(
+            remote
+                .host
+                .sessions()
+                .await
+                .expect("the host's rows")
+                .sessions
+                .len(),
+            1,
+            "the fixture host does not hold the one session the assertions read against",
+        );
+
+        let world = connect_world(
+            &dir,
+            &remote,
+            &[
+                "--tag",
+                "fix-auth",
+                "--new",
+                "Reply with the single word: ok",
+            ],
+        )
+        .await;
+
+        let rows = remote
+            .host
+            .sessions()
+            .await
+            .expect("the host's rows")
+            .sessions;
+        assert_eq!(
+            rows.len(),
+            2,
+            "the host holds {} sessions, so the run created none",
+            rows.len(),
+        );
+        let opened = rows
+            .iter()
+            .find(|row| row.id == world.session())
+            .expect("the client opened a session the host does not hold");
+        assert_ne!(
+            opened.id, held,
+            "the run attached the session the host already held",
+        );
+        assert_eq!(
+            opened.tag.as_deref(),
+            Some("fix-auth"),
+            "--tag did not name the session the run created",
+        );
+        assert!(
+            !main_notices(&world)
+                .iter()
+                .any(|notice| notice.contains("--tag has nothing to name")),
+            "the run reported a resume for the session it created: {:?}",
+            main_notices(&world),
         );
         remote.shutdown().await;
     }

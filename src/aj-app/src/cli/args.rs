@@ -189,10 +189,7 @@ impl Args {
     /// gateway is the only thing it can point at, and `connect` is the only
     /// mode that reaches one.
     pub fn connect_host(&self) -> Option<&str> {
-        match &self.command {
-            Some(Command::Connect { host, .. }) => host.as_deref(),
-            _ => None,
-        }
+        self.connect_launch().and_then(|launch| launch.host())
     }
 
     /// Whether `--tag` carries a label for this run to give a session.
@@ -207,9 +204,9 @@ impl Args {
 
     /// What a `connect` run asks for, or `None` for every other command.
     ///
-    /// The one place the connect grammar is interpreted: the session to open
-    /// and the launch input both read it, so they cannot disagree about which
-    /// positional is which.
+    /// The one interpretation of the connect grammar: the session to open, the
+    /// host a create names, and the launch input all come from here, so no two
+    /// readers can disagree about which positional is which.
     pub fn connect_launch(&self) -> Option<ConnectLaunch<'_>> {
         let Some(Command::Connect {
             url,
@@ -244,46 +241,62 @@ impl Args {
     /// filled: top-level `aj <args...>`, `aj continue ID <args...>`, or
     /// `aj connect URL [ID] <args...>`.
     ///
-    /// Clap's greedy positional consumption keeps the slots disjoint, so a
-    /// subcommand that took none leaves the top-level slot to answer.
+    /// A subcommand's own slot answers when it holds anything, else the
+    /// top-level one does. Both can be filled at once: a bare positional
+    /// before a subcommand swallows the subcommand name, but a flag between
+    /// them re-opens subcommand matching, so `aj "do this" --tag t connect URL`
+    /// carries its turn in the top-level slot.
     pub fn launch_positionals(&self) -> Vec<&str> {
-        if let Some(launch) = self.connect_launch() {
-            if launch.prompt.is_empty() {
-                return self.top_level_positionals();
-            }
-            return launch.prompt;
-        }
-        match &self.command {
-            Some(Command::Continue { prompt, .. }) if !prompt.is_empty() => {
+        let subcommand = match (self.connect_launch(), &self.command) {
+            (Some(launch), _) => launch.prompt,
+            (None, Some(Command::Continue { prompt, .. })) => {
                 prompt.iter().map(String::as_str).collect()
             }
-            _ => self.top_level_positionals(),
+            (None, _) => Vec::new(),
+        };
+        if subcommand.is_empty() {
+            return self.prompt.iter().map(String::as_str).collect();
         }
-    }
-
-    fn top_level_positionals(&self) -> Vec<&str> {
-        self.prompt.iter().map(String::as_str).collect()
+        subcommand
     }
 }
 
 /// What a `connect` run's command line asks for.
+///
+/// Obtained only from [`Args::connect_launch`], which is what makes it the
+/// answer to "what did this run ask for" rather than one of several: a caller
+/// in another crate cannot assemble one that says something else.
+#[derive(Debug)]
 pub struct ConnectLaunch<'a> {
+    url: &'a str,
+    session: ConnectSession<'a>,
+    host: Option<&'a str>,
+    prompt: Vec<&'a str>,
+}
+
+impl<'a> ConnectLaunch<'a> {
     /// Base url of the peer's control port.
-    pub url: &'a str,
+    pub fn url(&self) -> &'a str {
+        self.url
+    }
+
     /// The session to open with.
-    pub session: ConnectSession<'a>,
+    pub fn session(&self) -> ConnectSession<'a> {
+        self.session
+    }
+
     /// The peer's host `--host` named, for a session this run creates.
-    pub host: Option<&'a str>,
-    /// Launch input for it, in argv order.
-    pub prompt: Vec<&'a str>,
+    pub fn host(&self) -> Option<&'a str> {
+        self.host
+    }
 }
 
 /// The session a `connect` run asks for (spec 9.1).
 ///
-/// Three states, not an id beside a flag: a run that creates names no session,
-/// so "create this named session" has no spelling and no reader has to decide
-/// which of the two wins.
-#[derive(Clone, Copy)]
+/// One value for three states rather than an id and a flag that can both
+/// speak: a run that creates names no session, so it has no id to overrule
+/// and no reader has to rank them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnectSession<'a> {
     /// The id named on the command line, attached whatever its archived bit
     /// says.
@@ -371,10 +384,10 @@ pub enum Command {
     ///
     /// Launch input follows the session id, exactly as for `continue`:
     /// `aj connect URL ID <args...>` attaches and auto-submits the args as
-    /// the next turn. Without an id the grammar is ambiguous (the first
-    /// positional is read as the session id), so a run that resumes has to
-    /// name its session to carry input. `--new` names none, so under it every
-    /// positional is launch input: `aj connect URL --new <args...>`.
+    /// the next turn. Without an id the first positional is read as one, so a
+    /// run that resumes has to name its session to carry input. `--new` names
+    /// no session, so under it every positional is launch input:
+    /// `aj connect URL --new <args...>`.
     Connect {
         /// Base URL of the host's control port (e.g.
         /// `http://100.64.0.2:6161`).
@@ -382,9 +395,8 @@ pub enum Command {
         /// Session to attach. Omit to take the host's latest session that is
         /// not archived. Naming one works whatever its archived bit says.
         ///
-        /// Read as launch input rather than an id under `--new`, which
-        /// creates the session it opens and so names none. Interpreted by
-        /// [`Args::connect_launch`], never field by field.
+        /// Under `--new` this is launch input rather than an id, because a run
+        /// that creates its session has none to name.
         session_id: Option<String>,
         /// Create a fresh session instead of attaching an existing one.
         #[arg(long)]
@@ -646,25 +658,26 @@ mod tests {
     fn connect_positionals_divide_by_whether_the_run_creates() {
         let latest = parse(&["aj", "connect", "http://host:6161"]);
         let latest = latest.connect_launch().expect("a connect run");
-        assert!(matches!(latest.session, ConnectSession::Latest));
+        assert_eq!(latest.session(), ConnectSession::Latest);
         assert!(latest.prompt.is_empty());
 
         let named = parse(&["aj", "connect", "http://host:6161", "ID", "do", "this"]);
         let named = named.connect_launch().expect("a connect run");
-        assert!(matches!(named.session, ConnectSession::Named("ID")));
+        assert_eq!(named.session(), ConnectSession::Named("ID"));
         assert_eq!(named.prompt, ["do", "this"]);
 
         let fresh = parse(&["aj", "connect", "http://host:6161", "--new"]);
         let fresh = fresh.connect_launch().expect("a connect run");
-        assert!(matches!(fresh.session, ConnectSession::Fresh));
+        assert_eq!(fresh.session(), ConnectSession::Fresh);
         assert!(fresh.prompt.is_empty());
 
-        // The reported shape: one quoted sentence, which clap binds to the id
-        // slot because it fills that one first.
+        // One quoted sentence, which clap binds to the id slot because it
+        // fills that one first.
         let created = parse(&["aj", "connect", "http://host:6161", "--new", "do this"]);
         let created = created.connect_launch().expect("a connect run");
-        assert!(
-            matches!(created.session, ConnectSession::Fresh),
+        assert_eq!(
+            created.session(),
+            ConnectSession::Fresh,
             "a run that creates resolved to a session to attach",
         );
         assert_eq!(
@@ -680,6 +693,64 @@ mod tests {
     fn a_created_session_keeps_its_launch_input_in_order() {
         let args = parse(&["aj", "connect", "http://host:6161", "--new", "do", "this"]);
         assert_eq!(args.launch_positionals(), ["do", "this"]);
+    }
+
+    /// An id typed under `--new` is launch input like any other positional.
+    /// Nothing tells it from a one-word prompt, so the grammar reads it the one
+    /// way it can and the run creates.
+    #[test]
+    fn an_id_under_new_is_read_as_input() {
+        let args = parse(&[
+            "aj",
+            "connect",
+            "http://host:6161",
+            "2026-08-04-12-00-00-000",
+            "--new",
+            "and",
+            "more",
+        ]);
+        let launch = args.connect_launch().expect("a connect run");
+        assert_eq!(launch.session(), ConnectSession::Fresh);
+        assert_eq!(launch.prompt, ["2026-08-04-12-00-00-000", "and", "more"]);
+    }
+
+    /// Both positional slots can be filled at once, so the slot table needs a
+    /// rule for it. A bare positional before a subcommand swallows the
+    /// subcommand name, but a flag between them re-opens subcommand matching,
+    /// and then the run's turn is the one in the top-level slot.
+    #[test]
+    fn a_subcommand_with_an_empty_slot_yields_to_the_top_level_one() {
+        let swallowed = parse(&["aj", "hello", "connect", "http://host:6161"]);
+        assert!(swallowed.command.is_none());
+        assert_eq!(
+            swallowed.launch_positionals(),
+            ["hello", "connect", "http://host:6161"]
+        );
+
+        for argv in [
+            vec!["aj", "hello", "--tag", "t", "connect", "http://host:6161"],
+            vec![
+                "aj",
+                "hello",
+                "--tag",
+                "t",
+                "connect",
+                "http://host:6161",
+                "--new",
+            ],
+            vec!["aj", "hello", "--tag", "t", "continue", "ID"],
+        ] {
+            let args = parse(&argv);
+            assert!(
+                args.command.is_some(),
+                "{argv:?} parsed with no subcommand, so it no longer reaches the fallback",
+            );
+            assert_eq!(
+                args.launch_positionals(),
+                ["hello"],
+                "{argv:?} dropped the turn its top-level slot carried",
+            );
+        }
     }
 
     /// Only a connect run has this grammar, and the other slots keep theirs.
