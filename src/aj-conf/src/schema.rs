@@ -518,6 +518,28 @@ fn toml_value_to_item(value: &toml::Value) -> toml_edit::Item {
     }
 }
 
+/// Columns the interactive session sidebar takes when it is shown.
+///
+/// Five of them go to the strip's chrome (the focus marker, the status
+/// glyph, their separating space, and a pad and the rule on the right)
+/// and the rest to the label field, which carries an eight-column time
+/// of day, a gap, and the session's tag or host name. So this leaves a
+/// tag fourteen columns, which is what a hand-written name usually
+/// wants.
+pub const DEFAULT_SIDEBAR_COLS: u16 = 28;
+
+/// Columns below which the strip would be chrome with no label beside
+/// it: five go to the chrome whatever the width.
+const MIN_SIDEBAR_COLS: u16 = 7;
+
+/// Columns above which a strip is not a strip.
+///
+/// A ceiling because a typo (`280` for `28`) otherwise reads as a strip
+/// no terminal is wide enough to show, and the user is told nothing:
+/// the strip holds itself back and looks disabled. Refusing it names
+/// the mistake instead.
+const MAX_SIDEBAR_COLS: u16 = 200;
+
 /// Application configuration loaded from `~/.aj/config.toml`.
 ///
 /// All fields are optional. Missing fields use application defaults.
@@ -598,6 +620,12 @@ pub struct Config {
     /// Show a frame-statistics debug overlay in the corner of the
     /// interactive TUI. Off by default.
     pub show_frame_stats: bool,
+    /// Columns the interactive session sidebar takes when it is shown.
+    /// Defaults to [`DEFAULT_SIDEBAR_COLS`], and must be in
+    /// `MIN_SIDEBAR_COLS..=MAX_SIDEBAR_COLS`. The strip holds itself
+    /// back on a terminal too narrow to spare this many columns, so a
+    /// wide strip costs nothing on a small pane beyond not appearing.
+    pub sidebar_cols: u16,
     /// Whether `read_file` resizes images to fit within the inline
     /// image budget before attaching them to tool results. Defaults
     /// to `true`; setting to `false` attaches the raw bytes, which
@@ -682,6 +710,7 @@ impl Default for Config {
             show_token_usage: true,
             compact_transcript: false,
             show_frame_stats: false,
+            sidebar_cols: DEFAULT_SIDEBAR_COLS,
             // Image features: resize and inline-render by default;
             // blocking is opt-in.
             image_auto_resize: true,
@@ -931,6 +960,39 @@ impl Config {
             },
             display_fn: |c| c.show_frame_stats.to_string(),
             to_toml_fn: |c| bool_item(c.show_frame_stats, false),
+        },
+        ConfigOption {
+            name: "sidebar_cols",
+            description: "Columns the session sidebar takes when shown (7–200).",
+            kind: ValueKind::Number,
+            apply_toml_fn: |v, c| {
+                // Accept a TOML integer or float (so both `28` and
+                // `28.0` parse), reject any other type, then hold the
+                // value to a width the strip can draw.
+                #[allow(clippy::as_conversions)]
+                let n: i64 = match v {
+                    toml::Value::Integer(i) => i,
+                    toml::Value::Float(f) => f as i64,
+                    _ => {
+                        return Err(<toml::de::Error as serde::de::Error>::custom(
+                            "sidebar_cols must be a number",
+                        ));
+                    }
+                };
+                let cols = u16::try_from(n)
+                    .ok()
+                    .filter(|cols| (MIN_SIDEBAR_COLS..=MAX_SIDEBAR_COLS).contains(cols))
+                    .ok_or_else(|| {
+                        <toml::de::Error as serde::de::Error>::custom(format!(
+                            "sidebar_cols must be in the range \
+                             {MIN_SIDEBAR_COLS}–{MAX_SIDEBAR_COLS} columns"
+                        ))
+                    })?;
+                c.sidebar_cols = cols;
+                Ok(())
+            },
+            display_fn: |c| c.sidebar_cols.to_string(),
+            to_toml_fn: |c| int_item(u64::from(c.sidebar_cols), u64::from(DEFAULT_SIDEBAR_COLS)),
         },
         ConfigOption {
             name: "image_auto_resize",
@@ -1999,6 +2061,7 @@ disabled_skills = ["scratch"]
 show_thinking_block = true
 show_token_usage = false
 show_frame_stats = true
+sidebar_cols = 40
 bash_rtk = true
 "#;
         let (config, diagnostics) = parse_config(toml_str, Path::new("/tmp/config.toml"));
@@ -2021,6 +2084,7 @@ bash_rtk = true
         assert!(config.show_thinking_block);
         assert!(!config.show_token_usage);
         assert!(config.show_frame_stats);
+        assert_eq!(config.sidebar_cols, 40);
         assert!(config.bash_rtk);
     }
 
@@ -2138,6 +2202,66 @@ keybindings = "nope"
         );
     }
 
+    /// The strip's width is a config value with a floor and a ceiling: below
+    /// the floor the columns are all chrome, above the ceiling the strip is
+    /// no strip and, worse, would silently never show.
+    #[test]
+    fn sidebar_cols_parses_and_holds_its_range() {
+        let opt = Config::option("sidebar_cols").unwrap();
+        assert_eq!(Config::default().sidebar_cols, DEFAULT_SIDEBAR_COLS);
+
+        // A width in range is accepted and stored.
+        let mut config = Config::default();
+        assert!(
+            opt.apply_toml(toml::Value::Integer(40), &mut config)
+                .is_ok()
+        );
+        assert_eq!(config.sidebar_cols, 40);
+
+        // A float is floored to a column count.
+        let mut config = Config::default();
+        assert!(
+            opt.apply_toml(toml::Value::Float(36.0), &mut config)
+                .is_ok()
+        );
+        assert_eq!(config.sidebar_cols, 36);
+
+        // Both ends of the range are refused, and so is a negative count,
+        // which `u16` cannot even hold.
+        for refused in [0, 6, 201, -1, i64::from(u16::MAX) + 1] {
+            let mut config = Config::default();
+            let Err(err) = opt.apply_toml(toml::Value::Integer(refused), &mut config) else {
+                panic!("{refused} columns was accepted");
+            };
+            assert!(
+                err.to_string().contains("range"),
+                "{refused} was refused without naming the range: {err}",
+            );
+            assert_eq!(
+                config.sidebar_cols, DEFAULT_SIDEBAR_COLS,
+                "a refused width was written anyway",
+            );
+        }
+
+        // A width that is not a number at all is refused rather than read
+        // for its digits.
+        let mut config = Config::default();
+        assert!(
+            opt.apply_toml(toml::Value::String("wide".to_string()), &mut config)
+                .is_err()
+        );
+
+        // The default is not written back into a pristine config file.
+        assert!(opt.to_toml(&Config::default()).is_none());
+        assert!(
+            opt.to_toml(&Config {
+                sidebar_cols: 40,
+                ..Config::default()
+            })
+            .is_some()
+        );
+    }
+
     #[test]
     fn number_item_emits_only_when_changed() {
         // At default the key is dropped; off-default it round-trips.
@@ -2156,19 +2280,25 @@ keybindings = "nope"
     /// interactive settings window feeds edits to `apply_str` as
     /// strings, so an option whose `kind`/validation can't round-trip a
     /// sane value would silently fail to apply from the window. Driven
-    /// with a per-kind literal rather than each field's default
-    /// `display()` because the latter is the `<unset>`/`<empty>`
-    /// sentinel for unset `Option`/empty-list fields.
+    /// with a per-kind literal, except where an option's own range
+    /// excludes it, because the alternative (each field's default
+    /// `display()`) is the `<unset>`/`<empty>` sentinel for unset
+    /// `Option`/empty-list fields.
     #[test]
     fn every_option_applies_its_string_value() {
         for option in Config::OPTIONS {
             let mut config = Config::default();
-            let value = match option.kind {
-                ValueKind::Bool => "true".to_string(),
-                ValueKind::Number => "1".to_string(),
-                ValueKind::StringList => "a, b".to_string(),
-                ValueKind::Enum(variants) => variants[0].to_string(),
-                ValueKind::String => "x".to_string(),
+            let value = match option.name {
+                // A one-column strip is below the floor, and the point of
+                // the floor is that it refuses.
+                "sidebar_cols" => DEFAULT_SIDEBAR_COLS.to_string(),
+                _ => match option.kind {
+                    ValueKind::Bool => "true".to_string(),
+                    ValueKind::Number => "1".to_string(),
+                    ValueKind::StringList => "a, b".to_string(),
+                    ValueKind::Enum(variants) => variants[0].to_string(),
+                    ValueKind::String => "x".to_string(),
+                },
             };
             option.apply_str(&value, &mut config).unwrap_or_else(|e| {
                 panic!(
