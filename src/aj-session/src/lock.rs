@@ -529,21 +529,46 @@ mod tests {
     fn a_probe_creates_no_lock_file() {
         let dir = TempDir::new().expect("temp dir");
         let persistence = ConversationPersistence::new(dir.path().join("sessions"));
-        let path = lock_path(persistence.sessions_dir(), "s-1").expect("a well-formed id");
 
+        // The store any real host has: a `locks/` directory, because some
+        // other session has been locked in it. Probing a store without one
+        // proves nothing, a creating probe fails on the missing parent.
+        drop(
+            acquire(&persistence, "s-other")
+                .expect("acquire")
+                .expect("nobody holds it yet"),
+        );
+        let locks = locks_dir(persistence.sessions_dir());
+        assert!(
+            locks.is_dir(),
+            "the fixture must have a locks directory, or a creating probe fails \
+             on the missing parent and this test measures nothing",
+        );
+
+        let path = lock_path(persistence.sessions_dir(), "s-1").expect("a well-formed id");
         assert!(
             !SessionLock::is_held(&persistence, "s-1").expect("probe"),
             "a session with no lock file cannot be held by anybody",
         );
         assert!(!path.exists(), "the probe created the lock file");
-        assert!(
-            !path.parent().expect("a locks dir").exists(),
-            "the probe created the locks directory",
-        );
         // The harm the file would do, at the boundary where it lands: the id
         // is still there to be claimed.
         claim_session_id(persistence.sessions_dir(), "s-1")
             .expect("the probe left the id claimable");
+    }
+
+    /// A store nobody has locked has no lock directory, and a probe against it
+    /// answers rather than failing on the absence.
+    #[test]
+    fn a_probe_of_a_store_with_no_locks_reads_free() {
+        let dir = TempDir::new().expect("temp dir");
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+
+        assert!(!SessionLock::is_held(&persistence, "s-1").expect("probe"));
+        assert!(
+            !locks_dir(persistence.sessions_dir()).exists(),
+            "the probe created the locks directory",
+        );
     }
 
     /// The probe is not the acquire path, so it stamps no holder record. One
