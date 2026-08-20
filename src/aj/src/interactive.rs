@@ -92,11 +92,11 @@ use crate::settings_ui::{
     SkillsFill, UNSET_VALUE, build_skill_rows, open_model, open_settings, open_skills,
     open_thinking, skills_placeholder_row,
 };
-use crate::sidebar::{
-    MIN_COLS_WITH_SIDEBAR, SIDEBAR_COLS, SessionSidebar, SidebarState, StripGesture, step_session,
-};
 #[cfg(test)]
-use crate::sidebar::{RowStatus, SidebarRow};
+use crate::sidebar::{RowStatus, SIDEBAR_COLS, SidebarRow};
+use crate::sidebar::{
+    SessionSidebar, SidebarState, StripGesture, min_cols_with_sidebar, step_session,
+};
 use crate::splash::{SPLASH_WAKE_EVENT, Splash};
 use crate::status::{Connection, STATUS_WAKE_EVENT, StatusLine, StatusState};
 use crate::task_output::{TaskBacking, TaskOutputView, open_task_output};
@@ -2008,11 +2008,21 @@ fn sync_status(world: &World) -> bool {
 /// (spec 6.8). The strip's own order is put on them here
 /// ([`crate::sidebar::rows_for_display`]), and it holds still under a refresh:
 /// what a fresh directory changes is the glyphs, not the places.
+///
+/// The configured width rides along, because the loop is the only place that
+/// holds both the live config and the strip. Re-read every iteration rather
+/// than seeded once, so a width changed in the settings window is the width
+/// the next frame draws.
 fn sync_sidebar(world: &World, shell: &Rc<RefCell<Shell>>) {
     // A peer that has sent no `list` frame yet leaves the strip empty rather
     // than inventing a row for the focused session: the next frame fills it,
     // and a fabricated row would carry no status.
     let reveal_archived = shell.borrow().sidebar.borrow().reveal_archived;
+    let cols = world
+        .config
+        .lock()
+        .expect("config mutex poisoned")
+        .sidebar_cols;
     let rows = crate::sidebar::rows_for_display(
         world.directory.rows(),
         world.session(),
@@ -2022,6 +2032,7 @@ fn sync_sidebar(world: &World, shell: &Rc<RefCell<Shell>>) {
     );
     let sidebar = Rc::clone(&shell.borrow().sidebar);
     let mut state = sidebar.borrow_mut();
+    state.set_cols(cols);
     // Showing itself once the peer offers a choice is the default, and an
     // explicit toggle outranks it for the rest of the process (spec 9.2).
     if !state.toggled {
@@ -5050,11 +5061,8 @@ impl Shell {
     /// Columns the sidebar takes from the left of the base column, which
     /// anything floated over that column has to clear.
     fn sidebar_cols(&self) -> u16 {
-        if self.sidebar.borrow().shown() {
-            SIDEBAR_COLS
-        } else {
-            0
-        }
+        let sidebar = self.sidebar.borrow();
+        if sidebar.shown() { sidebar.cols() } else { 0 }
     }
 
     /// Hold the strip back on a terminal with no width to spare.
@@ -5064,7 +5072,9 @@ impl Shell {
     /// nothing. Kept apart from `visible` so the user's ask survives a resize
     /// and comes back when the width does.
     fn suppress_sidebar_if_too_narrow(&self, terminal_cols: u16) {
-        self.sidebar.borrow_mut().too_narrow = terminal_cols < MIN_COLS_WITH_SIDEBAR;
+        let mut sidebar = self.sidebar.borrow_mut();
+        let too_narrow = terminal_cols < min_cols_with_sidebar(sidebar.cols());
+        sidebar.too_narrow = too_narrow;
     }
 
     fn overlay_handles(&self) -> OverlayHandles {
@@ -17896,10 +17906,10 @@ mod tests {
         assert_eq!(
             painted,
             vec![
-                " ~ 10.0.0.7:7777 ─ ! ─".to_string(),
-                " ~ builder-1 ─────────".to_string(),
+                " ~ 10.0.0.7:7777 ───── ! ─".to_string(),
+                " ~ builder-1 ─────────────".to_string(),
                 format!("▌  {}", crate::sidebar::session_label(&focused, 8)),
-                " ~ laptop ──────── ! ─".to_string(),
+                " ~ laptop ──────────── ! ─".to_string(),
                 " + new".to_string(),
             ],
             "the host with rows heads them, the two with none sit where their \
@@ -17926,7 +17936,7 @@ mod tests {
         let painted = sidebar_rows(&shell);
         assert_eq!(
             painted.get(2).map(String::as_str),
-            Some(" ~ builder-2 ─────────"),
+            Some(" ~ builder-2 ─────────────"),
             "the group is relabelled by the id the host answered with, and the \
              mark comes off with it: {painted:?}",
         );
@@ -18000,10 +18010,10 @@ mod tests {
         assert_eq!(
             sidebar_rows(&shell),
             vec![
-                " ~ ~/work/umber/aj ───".to_string(),
+                " ~ ~/work/umber/aj ───────".to_string(),
                 format!("▌  {}", crate::sidebar::session_label(&focused, 8)),
-                " ~ …/materialize/src ─".to_string(),
-                " ~ ~/workshop ────────".to_string(),
+                " ~ …mber/materialize/src ─".to_string(),
+                " ~ ~/workshop ────────────".to_string(),
                 " + new".to_string(),
             ],
             "every header reads the host's own name, the groups sit where those \
@@ -18334,8 +18344,11 @@ mod tests {
         let (world, shell) = world_and_shell(&dir, "streaming-text").await;
         shell.borrow().sidebar.borrow_mut().visible = true;
         shell.borrow().sidebar.borrow_mut().toggled = true;
+        // Nothing has configured a width, so the strip is at its default and
+        // the threshold is the one that width implies.
+        let minimum = min_cols_with_sidebar(SIDEBAR_COLS);
 
-        let narrow = painted_rows(&shell, MIN_COLS_WITH_SIDEBAR - 1, 20);
+        let narrow = painted_rows(&shell, minimum - 1, 20);
         let header = narrow
             .iter()
             .find(|row| row.contains("aj"))
@@ -18348,7 +18361,7 @@ mod tests {
         assert!(
             narrow
                 .iter()
-                .all(|row| row.chars().count() <= usize::from(MIN_COLS_WITH_SIDEBAR - 1)),
+                .all(|row| row.chars().count() <= usize::from(minimum - 1)),
             "and nothing painted past the screen",
         );
         assert!(
@@ -18358,9 +18371,136 @@ mod tests {
 
         // One more column than the minimum, and it comes back.
         assert_eq!(
-            sidebar_width_at(&shell, MIN_COLS_WITH_SIDEBAR),
+            sidebar_width_at(&shell, minimum),
             SIDEBAR_COLS,
             "the strip returns once the width is there",
+        );
+        shut_down(&world).await;
+    }
+
+    /// A width the user configured, in columns, chosen so a terminal that has
+    /// room for the default has none for this one.
+    const CONFIGURED_COLS: u16 = 40;
+
+    /// The configured width is the width the composed frame draws, and the
+    /// threshold the strip yields at moves with it.
+    ///
+    /// The second half is the one that matters: the strip is inflexible, so a
+    /// strip wider than the default that kept the default's threshold would
+    /// draw its full width on a terminal with nothing left over, and the
+    /// transcript beside it would get no columns at all.
+    #[tokio::test]
+    async fn a_configured_width_reaches_the_frame_and_moves_the_threshold() {
+        let dir = TempDir::new().expect("tempdir");
+        let (world, shell) = world_and_shell(&dir, "streaming-text").await;
+        world
+            .config
+            .lock()
+            .expect("config mutex poisoned")
+            .sidebar_cols = CONFIGURED_COLS;
+        shell.borrow().sidebar.borrow_mut().visible = true;
+        shell.borrow().sidebar.borrow_mut().toggled = true;
+        sync_sidebar(&world, &shell);
+        assert_eq!(
+            sidebar_width(&shell),
+            CONFIGURED_COLS,
+            "the configured width never reached the paint",
+        );
+
+        // The terminal the default would have shown itself on. This one has
+        // to hold back, and the transcript keeps every column.
+        let held_back = min_cols_with_sidebar(SIDEBAR_COLS);
+        assert!(
+            held_back < min_cols_with_sidebar(CONFIGURED_COLS),
+            "the widths have to straddle the threshold or this measures nothing",
+        );
+        let narrow = painted_rows(&shell, held_back, 20);
+        assert!(
+            shell.borrow().sidebar.borrow().too_narrow,
+            "a strip wider than the default has to yield sooner: {narrow:?}",
+        );
+        let header = narrow
+            .iter()
+            .find(|row| row.contains(APP_TITLE))
+            .expect("the transcript is painted, so it kept its columns");
+        assert_eq!(
+            header.len() - header.trim_start().len(),
+            0,
+            "the transcript starts at column zero: {header:?}",
+        );
+
+        // And the width it does need brings it back.
+        assert_eq!(
+            sidebar_width_at(&shell, min_cols_with_sidebar(CONFIGURED_COLS)),
+            CONFIGURED_COLS,
+            "the strip returns once its own width is there",
+        );
+        shut_down(&world).await;
+    }
+
+    /// A width set from the settings window is the width the next frame
+    /// draws. The loop re-reads the setting, so the strip the user asked for
+    /// is the strip they get rather than one a restart owes them.
+    #[tokio::test]
+    async fn the_settings_window_moves_the_strip_width() {
+        let dir = TempDir::new().expect("tempdir");
+        let project_path = dir.path().join("repo").join(".aj").join("config.toml");
+        let layers = ConfigLayers {
+            user: Config::default(),
+            project: aj_conf::ConfigLayer::default(),
+            project_path: Some(project_path.clone()),
+        };
+        let (world, shell, _app, _writer, _root) =
+            world_shell_app(&dir, "streaming-text", layers).await;
+        shell.borrow().sidebar.borrow_mut().visible = true;
+        shell.borrow().sidebar.borrow_mut().toggled = true;
+        sync_sidebar(&world, &shell);
+        assert_eq!(
+            sidebar_width(&shell),
+            SIDEBAR_COLS,
+            "the strip starts at the shipped default",
+        );
+
+        let notice = apply_setting_change(
+            &world,
+            &shell,
+            &mut inert_theme_watch(),
+            PersistAction::ProjectSet,
+            "sidebar_cols",
+            &CONFIGURED_COLS.to_string(),
+        )
+        .await;
+        assert!(
+            notice.is_some_and(|notice| notice.contains(&CONFIGURED_COLS.to_string())),
+            "the change is confirmed in words as well as columns",
+        );
+        sync_sidebar(&world, &shell);
+        assert_eq!(
+            sidebar_width(&shell),
+            CONFIGURED_COLS,
+            "the strip is still the width it was before the setting changed",
+        );
+
+        // A width the strip cannot draw is refused, and refused before it
+        // reaches the running session.
+        let refusal = apply_setting_change(
+            &world,
+            &shell,
+            &mut inert_theme_watch(),
+            PersistAction::ProjectSet,
+            "sidebar_cols",
+            "1",
+        )
+        .await;
+        assert!(
+            refusal.is_some_and(|notice| notice.starts_with("Can't set sidebar_cols")),
+            "a one-column strip was taken rather than refused",
+        );
+        sync_sidebar(&world, &shell);
+        assert_eq!(
+            sidebar_width(&shell),
+            CONFIGURED_COLS,
+            "a width the schema refused was drawn anyway",
         );
         shut_down(&world).await;
     }
@@ -19074,10 +19214,10 @@ mod tests {
             ],
         );
         let cells = strip_lines_painted(&shell);
-        assert_eq!(strip_line_text(&cells, 0), "▌  19-07-19 fix-auth   │");
+        assert_eq!(strip_line_text(&cells, 0), "▌  19-07-19 fix-auth       │");
         assert_eq!(
             strip_line_text(&cells, 1),
-            "   18-40-49 rewrite-t… │",
+            "   18-40-49 rewrite-the-g… │",
             "an over-long tag elides inside its own column",
         );
         let styles = strip_styles(&shell);
@@ -19113,14 +19253,14 @@ mod tests {
             ],
         );
         let cells = strip_lines_painted(&shell);
-        assert_eq!(strip_line_text(&cells, 0), " ~ builder-1 ───────── │");
-        assert_eq!(strip_line_text(&cells, 1), "   s-here              │");
+        assert_eq!(strip_line_text(&cells, 0), " ~ builder-1 ───────────── │");
+        assert_eq!(strip_line_text(&cells, 1), "   s-here                  │");
         assert_eq!(
             strip_line_text(&cells, 2),
-            " ~ laptop ──────── ! ─ │",
+            " ~ laptop ──────────── ! ─ │",
             "the unreachable host's header keeps its mark",
         );
-        assert_eq!(strip_line_text(&cells, 3), " ! s-out               │");
+        assert_eq!(strip_line_text(&cells, 3), " ! s-out                   │");
         let styles = strip_styles(&shell);
         assert_ne!(styles.text, styles.dim, "the two brightnesses differ");
         assert_eq!(
@@ -19193,7 +19333,7 @@ mod tests {
         assert_eq!(
             strip_labels(&shell)[..12],
             [
-                "~ builder-1 ─────────",
+                "~ builder-1 ─────────────",
                 "b-0",
                 "b-1",
                 "b-2",
@@ -19201,7 +19341,7 @@ mod tests {
                 "b-4",
                 "b-5",
                 "▸ 2 more",
-                "~ laptop ────────────",
+                "~ laptop ────────────────",
                 "l-0",
                 "l-1",
                 "+ new",
@@ -19228,7 +19368,7 @@ mod tests {
         assert_eq!(
             strip_labels(&shell)[..14],
             [
-                "~ builder-1 ─────────",
+                "~ builder-1 ─────────────",
                 "b-0",
                 "b-1",
                 "b-2",
@@ -19238,7 +19378,7 @@ mod tests {
                 "b-6",
                 "b-7",
                 "▾ fold",
-                "~ laptop ────────────",
+                "~ laptop ────────────────",
                 "l-0",
                 "l-1",
                 "+ new",
