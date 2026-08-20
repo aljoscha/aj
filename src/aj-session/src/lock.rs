@@ -21,6 +21,9 @@ use nix::fcntl::{Flock, FlockArg};
 use crate::log::ConversationError;
 use crate::persistence::ConversationPersistence;
 
+/// The extension of a session's lock file.
+const LOCK_FILE: &str = "lock";
+
 /// Exclusive advisory lock on one session, held while it is live.
 ///
 /// Released when the value is dropped, and by the kernel when the process
@@ -139,6 +142,70 @@ impl SessionLock {
             host_id: host_id.trim().to_string(),
         })
     }
+
+    /// Whether some writer holds `session_id`'s lock right now.
+    ///
+    /// A shared non-blocking probe, released before this returns. It is never
+    /// the acquire path: it creates no file and writes nothing, so it stamps no
+    /// holder record and cannot claim an unminted id. A session with no lock
+    /// file reads free, which is the only thing the absence can mean.
+    ///
+    /// Two costs the caller accepts by asking at all. A shared lock conflicts
+    /// with an exclusive one, so for the instant this holds a free lock it can
+    /// refuse one racing acquire. And `flock` locks belong to the open file
+    /// description rather than the process, so this reads a lock the calling
+    /// process itself holds as held, exactly as a rival's: a caller that wants
+    /// "held by somebody else" must exclude its own holdings before asking.
+    pub fn is_held(
+        persistence: &ConversationPersistence,
+        session_id: &str,
+    ) -> Result<bool, ConversationError> {
+        let path = lock_path(persistence.sessions_dir(), session_id)
+            .ok_or_else(|| ConversationError::InvalidSessionId(session_id.to_string()))?;
+        let file = match OpenOptions::new().read(true).open(&path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err.into()),
+        };
+        match Flock::lock(file, FlockArg::LockSharedNonblock) {
+            // Won it, so nobody held it exclusively. Dropping the flock here
+            // is what keeps the window this opens down to the probe itself.
+            Ok(_) => Ok(false),
+            Err((_, Errno::EWOULDBLOCK)) => Ok(true),
+            Err((_, errno)) => Err(ConversationError::Io(errno.into())),
+        }
+    }
+
+    /// Every lock file the store holds, one directory read plus a `stat` each.
+    ///
+    /// The sweep that keeps a directory's `locked` bits current (spec 6.8).
+    /// [`LockMetadata::has_holder_record`] is the filter for which of them are
+    /// worth a [`Self::is_held`] probe: a record is written under the won lock
+    /// and truncated by a clean release, so an empty file is a lock nobody has
+    /// taken since the last release of it. The record is never the answer, only
+    /// the filter, because a holder that failed to write one leaves it empty
+    /// while holding the lock.
+    pub fn enumerate_locks(
+        persistence: &ConversationPersistence,
+    ) -> Result<Vec<LockMetadata>, ConversationError> {
+        let files = persistence.session_files(&locks_dir(persistence.sessions_dir()), LOCK_FILE)?;
+        Ok(files
+            .into_iter()
+            .map(|(session_id, metadata)| LockMetadata {
+                session_id,
+                has_holder_record: metadata.len() > 0,
+            })
+            .collect())
+    }
+}
+
+/// One lock file in the store, as a sweep sees it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LockMetadata {
+    pub session_id: String,
+    /// Whether the file carries a holder record, which is what a sweep filters
+    /// on rather than probing every lock a store ever minted.
+    pub has_holder_record: bool,
 }
 
 /// Stamp `pid host_id` onto a lock file we just won, replacing whatever the
@@ -186,11 +253,13 @@ pub(crate) fn claim_session_id(sessions_dir: &Path, session_id: &str) -> std::io
 /// where an id becomes a path, and taking a lock creates directories: an id
 /// carrying `..` would make them outside the store (see [`crate::id`]).
 pub(crate) fn lock_path(sessions_dir: &Path, session_id: &str) -> Option<PathBuf> {
-    crate::id::is_valid_session_id(session_id).then(|| {
-        sessions_dir
-            .join("locks")
-            .join(format!("{session_id}.lock"))
-    })
+    crate::id::is_valid_session_id(session_id)
+        .then(|| locks_dir(sessions_dir).join(format!("{session_id}.{LOCK_FILE}")))
+}
+
+/// The directory holding the store's session locks.
+fn locks_dir(sessions_dir: &Path) -> PathBuf {
+    sessions_dir.join("locks")
 }
 
 #[cfg(test)]
@@ -425,6 +494,226 @@ mod tests {
                 host_id: "b".to_string(),
             }),
             "the new record is a hybrid of two holders",
+        );
+        drop(held);
+    }
+
+    /// The probe answers the question the holder record cannot: who has the
+    /// lock right now. A record is a hint left by a writer, the flock is the
+    /// fact, and only the second one moves when a rival lets go.
+    #[test]
+    fn a_probe_reads_a_hold_and_its_release() {
+        let dir = TempDir::new().expect("temp dir");
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+
+        let held = acquire(&persistence, "s-1")
+            .expect("acquire")
+            .expect("nobody holds it yet");
+        assert!(
+            SessionLock::is_held(&persistence, "s-1").expect("probe"),
+            "a lock somebody holds reads held",
+        );
+
+        drop(held);
+        assert!(
+            !SessionLock::is_held(&persistence, "s-1").expect("probe"),
+            "a released lock reads free, which is the transition the bit exists for",
+        );
+    }
+
+    /// The probe must not create the file it asks about. A lock file is also
+    /// the claim that reserves a session id ([`claim_session_id`]), so a probe
+    /// that created one would mint an id nobody asked for and make the real
+    /// creation of that id fail forever.
+    #[test]
+    fn a_probe_creates_no_lock_file() {
+        let dir = TempDir::new().expect("temp dir");
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let path = lock_path(persistence.sessions_dir(), "s-1").expect("a well-formed id");
+
+        assert!(
+            !SessionLock::is_held(&persistence, "s-1").expect("probe"),
+            "a session with no lock file cannot be held by anybody",
+        );
+        assert!(!path.exists(), "the probe created the lock file");
+        assert!(
+            !path.parent().expect("a locks dir").exists(),
+            "the probe created the locks directory",
+        );
+        // The harm the file would do, at the boundary where it lands: the id
+        // is still there to be claimed.
+        claim_session_id(persistence.sessions_dir(), "s-1")
+            .expect("the probe left the id claimable");
+    }
+
+    /// The probe is not the acquire path, so it stamps no holder record. One
+    /// that a crash left behind is evidence about that crash, and a probe that
+    /// truncated or rewrote it would destroy the only name a later refusal has
+    /// to report.
+    #[test]
+    fn a_probe_leaves_the_holder_record_alone() {
+        let dir = TempDir::new().expect("temp dir");
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let path = lock_path(persistence.sessions_dir(), "s-1").expect("a well-formed id");
+        fs::create_dir_all(path.parent().expect("a locks dir")).expect("mkdir");
+        let stale = format!("{} a-crashed-host\n", std::process::id());
+        fs::write(&path, &stale).expect("a record a crash left behind");
+
+        assert!(
+            !SessionLock::is_held(&persistence, "s-1").expect("probe"),
+            "a crash frees the lock however loud the record it left",
+        );
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("read the lock file"),
+            stale,
+            "the probe rewrote the record",
+        );
+    }
+
+    /// The probe takes a shared lock to ask, so it has to give it back before
+    /// returning. One that leaked would leave the session unacquirable for the
+    /// life of the host that asked.
+    #[test]
+    fn a_probe_releases_what_it_took() {
+        let dir = TempDir::new().expect("temp dir");
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let claimed = acquire(&persistence, "s-1")
+            .expect("acquire")
+            .expect("nobody holds it yet");
+        drop(claimed);
+
+        for _ in 0..3 {
+            assert!(!SessionLock::is_held(&persistence, "s-1").expect("probe"));
+        }
+
+        acquire(&persistence, "s-1")
+            .expect("acquire")
+            .expect("the probes released what they took");
+    }
+
+    /// The probe takes a *shared* lock, so two hosts sweeping one store do not
+    /// read each other's asking as a hold. An exclusive probe would pass every
+    /// other test here and report a free lock as held whenever another prober
+    /// happened to be inside its own probe.
+    #[test]
+    fn a_probe_does_not_collide_with_another_probe() {
+        let dir = TempDir::new().expect("temp dir");
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let claimed = acquire(&persistence, "s-1")
+            .expect("acquire")
+            .expect("nobody holds it yet");
+        drop(claimed);
+
+        // Another prober, caught mid-probe: a shared lock on the same file,
+        // held across the probe below.
+        let path = lock_path(persistence.sessions_dir(), "s-1").expect("a well-formed id");
+        let peer = OpenOptions::new().read(true).open(&path).expect("open");
+        let peer = Flock::lock(peer, FlockArg::LockSharedNonblock)
+            .map_err(|(_, errno)| errno)
+            .expect("a free lock takes a shared probe");
+
+        assert!(
+            !SessionLock::is_held(&persistence, "s-1").expect("probe"),
+            "a lock nobody holds read as held because another prober was asking",
+        );
+
+        drop(peer);
+    }
+
+    #[test]
+    fn a_probe_refuses_an_id_the_grammar_rejects() {
+        let dir = TempDir::new().expect("temp dir");
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+
+        for id in ["../../escaped", "..", "", "with space"] {
+            let err = SessionLock::is_held(&persistence, id)
+                .err()
+                .unwrap_or_else(|| panic!("{id:?} was probed"));
+            assert!(
+                matches!(&err, ConversationError::InvalidSessionId(named) if named == id),
+                "{id:?}: {err}",
+            );
+        }
+        assert!(
+            !dir.path().join("sessions").exists(),
+            "a refused probe made a directory",
+        );
+    }
+
+    /// The sweep's filter: one entry per lock file the store ever minted, and
+    /// the record flag says which of them are worth a probe. A settled store
+    /// carries records for nothing, so it is swept without probing at all.
+    #[test]
+    fn a_sweep_flags_the_locks_whose_records_are_worth_probing() {
+        let dir = TempDir::new().expect("temp dir");
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+
+        assert_eq!(
+            SessionLock::enumerate_locks(&persistence).expect("sweep a store with no locks"),
+            Vec::new(),
+            "a store nobody has locked has no locks directory to read",
+        );
+
+        // A minted id with no holder: the claim creates the file empty.
+        claim_session_id(persistence.sessions_dir(), "s-1").expect("claim");
+        let held = SessionLock::try_acquire(&persistence, "s-2", "host-a")
+            .expect("acquire")
+            .expect("nobody holds it yet");
+
+        let swept = |persistence: &ConversationPersistence| {
+            let mut locks = SessionLock::enumerate_locks(persistence).expect("sweep");
+            locks.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+            locks
+        };
+        assert_eq!(
+            swept(&persistence),
+            vec![
+                LockMetadata {
+                    session_id: "s-1".to_string(),
+                    has_holder_record: false,
+                },
+                LockMetadata {
+                    session_id: "s-2".to_string(),
+                    has_holder_record: true,
+                },
+            ],
+            "a claim leaves an empty file, a hold leaves a record",
+        );
+
+        drop(held);
+        assert!(
+            swept(&persistence)
+                .iter()
+                .all(|lock| !lock.has_holder_record),
+            "a clean release truncates its record, so a settled store probes nothing",
+        );
+    }
+
+    /// The sweep reads the lock directory and only the lock directory: a
+    /// stray file in there is not a lock, and neither is one whose name is not
+    /// a session id.
+    #[test]
+    fn a_sweep_ignores_what_is_not_a_lock() {
+        let dir = TempDir::new().expect("temp dir");
+        let persistence = ConversationPersistence::new(dir.path().join("sessions"));
+        let held = acquire(&persistence, "s-1")
+            .expect("acquire")
+            .expect("nobody holds it yet");
+        let locks = locks_dir(persistence.sessions_dir());
+
+        fs::write(locks.join("notes.txt"), "not a lock").expect("write");
+        fs::write(locks.join("../stray.lock"), "outside the locks dir").expect("write");
+        fs::write(locks.join("with space.lock"), "not a session id").expect("write");
+        fs::create_dir_all(locks.join("s-2.lock")).expect("a directory named like a lock");
+
+        assert_eq!(
+            SessionLock::enumerate_locks(&persistence)
+                .expect("sweep")
+                .into_iter()
+                .map(|lock| lock.session_id)
+                .collect::<Vec<_>>(),
+            vec!["s-1".to_string()],
         );
         drop(held);
     }

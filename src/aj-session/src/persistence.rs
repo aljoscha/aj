@@ -10,7 +10,7 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::log::{ConversationEntry, ConversationEntryKind, ConversationError};
 
@@ -216,13 +216,38 @@ impl ConversationPersistence {
         &self,
         extension: &str,
     ) -> Result<Vec<SidecarMetadata>, ConversationError> {
-        let meta = self.meta_dir();
-        let entries = match fs::read_dir(&meta) {
+        let files = self.session_files(&self.meta_dir(), extension)?;
+        Ok(files
+            .into_iter()
+            .filter_map(|(session_id, metadata)| {
+                let modified = metadata.modified().ok()?;
+                Some(SidecarMetadata {
+                    session_id,
+                    modified_at: modified.into(),
+                    size_bytes: metadata.len(),
+                })
+            })
+            .collect())
+    }
+
+    /// Every per-session file under `dir` carrying `extension`, with the stat
+    /// it was found at.
+    ///
+    /// The sweep shape every per-session axis shares: one directory read plus
+    /// one `stat` per file found, never a `stat` per session in the store. A
+    /// directory that does not exist reads empty, which is what makes an axis
+    /// no session has used cost a single failed `read_dir`.
+    pub(crate) fn session_files(
+        &self,
+        dir: &Path,
+        extension: &str,
+    ) -> Result<Vec<(String, fs::Metadata)>, ConversationError> {
+        let entries = match fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(err) => return Err(err.into()),
         };
-        let mut sidecars = Vec::new();
+        let mut found = Vec::new();
         for entry in entries {
             let path = entry?.path();
             if path.extension().and_then(|s| s.to_str()) != Some(extension) {
@@ -238,23 +263,16 @@ impl ConversationPersistence {
                 // Vanished since the directory read.
                 continue;
             };
-            // A directory named like a sidecar is not one, and offering it
-            // would cost a failed open at every enumeration for the life of
-            // the store: the read fails, so nothing is cached, so it is tried
-            // again next time.
+            // A directory named like one of these files is not one, and
+            // offering it would cost a failed open at every enumeration for
+            // the life of the store: the read fails, so nothing is cached, so
+            // it is tried again next time.
             if !metadata.is_file() {
                 continue;
             }
-            let Ok(modified) = metadata.modified() else {
-                continue;
-            };
-            sidecars.push(SidecarMetadata {
-                session_id: session_id.to_string(),
-                modified_at: modified.into(),
-                size_bytes: metadata.len(),
-            });
+            found.push((session_id.to_string(), metadata));
         }
-        Ok(sidecars)
+        Ok(found)
     }
 
     /// The label of every tagged session in the store, keyed by session id.

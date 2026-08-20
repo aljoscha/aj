@@ -56,7 +56,7 @@ pub use compaction::{
 };
 pub use id::is_valid_session_id;
 pub use listener::{AppendHandoff, persistence_listener, persisting_forwarder};
-pub use lock::{LockHolder, SessionLock};
+pub use lock::{LockHolder, LockMetadata, SessionLock};
 pub use log::{
     Conversation, ConversationEntry, ConversationEntryKind, ConversationError, ConversationLog,
     EntryId, EntryRef, LogSnapshot, SessionSettings, ThreadFilter, ThreadKind,
