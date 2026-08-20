@@ -1059,6 +1059,7 @@ pub(crate) struct SettingsValues {
     pub(crate) show_token_usage: bool,
     pub(crate) compact_transcript: bool,
     pub(crate) show_frame_stats: bool,
+    pub(crate) sidebar_cols: String,
     pub(crate) image_auto_resize: bool,
     pub(crate) show_image_in_terminal: bool,
     pub(crate) image_block: bool,
@@ -1120,6 +1121,7 @@ impl SettingsValues {
             show_token_usage: config.show_token_usage,
             compact_transcript: config.compact_transcript,
             show_frame_stats: config.show_frame_stats,
+            sidebar_cols: config.sidebar_cols.to_string(),
             image_auto_resize: config.image_auto_resize,
             show_image_in_terminal: config.show_image_in_terminal,
             image_block: config.image_block,
@@ -1209,6 +1211,7 @@ fn row_value_kind(
         "show_token_usage" => (values.show_token_usage.to_string(), bool_cycle()),
         "compact_transcript" => (values.compact_transcript.to_string(), bool_cycle()),
         "show_frame_stats" => (values.show_frame_stats.to_string(), bool_cycle()),
+        "sidebar_cols" => (values.sidebar_cols.clone(), RowKind::Submenu),
         "image_auto_resize" => (values.image_auto_resize.to_string(), bool_cycle()),
         "show_image_in_terminal" => (values.show_image_in_terminal.to_string(), bool_cycle()),
         "image_block" => (values.image_block.to_string(), bool_cycle()),
@@ -2307,6 +2310,33 @@ mod tests {
         match &row.kind {
             RowKind::Cycle(vals) => assert_eq!(vals, &["true".to_string(), "false".to_string()]),
             RowKind::Submenu => panic!("show_frame_stats must be a bool cycle row"),
+        }
+    }
+
+    /// The width row carries the configured columns, and it opens a submenu
+    /// rather than cycling: there is nothing to cycle through.
+    #[test]
+    fn sidebar_cols_surfaces_as_a_row_carrying_its_columns() {
+        let config = Config {
+            sidebar_cols: 40,
+            ..Config::default()
+        };
+        let values = SettingsValues::from_config(&config, &[]);
+        let inherited = SettingsValues::from_config(&Config::default(), &[]);
+        let rows = build_setting_rows(&values, &inherited, false, &BTreeSet::new());
+        let row = rows
+            .iter()
+            .find(|r| r.id == "sidebar_cols")
+            .expect("sidebar_cols row is present");
+        assert_eq!(row.value, "40", "the row shows a width nobody configured");
+        assert_eq!(
+            row.clear_to,
+            aj_conf::DEFAULT_SIDEBAR_COLS.to_string(),
+            "clearing a project override has to name the width it reverts to",
+        );
+        match &row.kind {
+            RowKind::Submenu => {}
+            RowKind::Cycle(vals) => panic!("a width is entered, not cycled: {vals:?}"),
         }
     }
 
