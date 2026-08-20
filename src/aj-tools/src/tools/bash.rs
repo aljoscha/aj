@@ -1965,6 +1965,97 @@ mod tests {
         );
     }
 
+    /// A command whose shell exits while a descendant still holds a
+    /// pipe write end must not hold the turn open until that descendant
+    /// is done: `read_stream` returns only on EOF, and EOF needs every
+    /// write end closed, so the wait is otherwise unbounded. The
+    /// timeout does not cover this case, the loop breaks on
+    /// `ChildExit::Exited` and discards the deadline with it.
+    ///
+    /// Linux-only: the fixture proves the descendant inherited fd 1 by
+    /// reading it back from `/proc`, which is the one proof that
+    /// survives a run where the turn never returns at all.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn descendant_holding_a_pipe_does_not_hold_the_turn_open() {
+        /// How long the turn may take once the shell has exited. Well
+        /// above any bounded drain, well below the descendant's own
+        /// lifetime, so a run that reaches it is waiting on EOF.
+        const BOUND: Duration = Duration::from_secs(5);
+
+        let dir = TempDir::new().expect("create temp dir");
+        let fd1_path = dir.path().join("descendant-fd1");
+
+        // The descendant records its fd 1 and writes to stdout before
+        // the shell is allowed to exit, so the evidence lands whatever
+        // the tool does next. It then holds the pipe until this test
+        // drops `dir`, with `$SECONDS` as a backstop so it cannot
+        // outlive the test process by more than a few seconds.
+        let command = format!(
+            "{{ readlink /proc/$BASHPID/fd/1 > '{fd1}'; \
+                echo descendant-wrote; \
+                while [ -d '{dir}' ] && [ $SECONDS -lt 30 ]; do sleep 0.05; done; }} & \
+             until [ -s '{fd1}' ]; do sleep 0.01; done; \
+             echo shell-done",
+            fd1 = fd1_path.display(),
+            dir = dir.path().display(),
+        );
+
+        let mut ctx = DummyToolContext::default();
+        let result = tokio::time::timeout(
+            BOUND,
+            BashTool::default().execute(
+                &mut ctx,
+                BashInput {
+                    command,
+                    // Short so that a fix which spends the command's
+                    // remaining timeout budget on the drain still
+                    // finishes inside `BOUND`.
+                    timeout: 1,
+                    description: "test descendant holding the pipes".to_string(),
+                    run_in_background: false,
+                },
+            ),
+        )
+        .await;
+
+        let inherited = std::fs::read_to_string(&fd1_path).unwrap_or_default();
+        assert!(
+            inherited.starts_with("pipe:"),
+            "the descendant should have inherited the stdout pipe, its fd 1 was {inherited:?}: \
+             with nothing holding a write end this test measures nothing"
+        );
+
+        let outcome = result
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the shell exited at once, but the turn was still waiting on capture \
+                     after {BOUND:?}, with the descendant still holding the pipe"
+                )
+            })
+            .expect("execute");
+
+        assert!(!outcome.is_error, "the command itself succeeded");
+        match &outcome.details {
+            ToolDetails::Bash {
+                exit_code, stdout, ..
+            } => {
+                // `Some(0)` is what puts this run on the `Exited` arm
+                // of the select: a timeout or a cancel leaves it unset.
+                assert_eq!(*exit_code, Some(0), "the shell exited normally");
+                assert!(
+                    stdout.contains("shell-done"),
+                    "the shell's own output is reported, stdout: {stdout:?}"
+                );
+                assert!(
+                    stdout.contains("descendant-wrote"),
+                    "output written before the shell exited is reported, stdout: {stdout:?}"
+                );
+            }
+            other => panic!("expected Bash details, got {other:?}"),
+        }
+    }
+
     /// `emit_update` is invoked at least once during execution; the
     /// snapshot carries the same `command` the caller passed, no
     /// structured truncation summary, and an unset exit code.
