@@ -971,6 +971,7 @@ impl SessionHost {
                         host: None,
                         unreachable: false,
                         archived: session.archived,
+                        locked: session.locked,
                     },
                 )
             })
@@ -1012,6 +1013,28 @@ impl SessionHost {
     #[cfg(any(test, feature = "test-support"))]
     pub fn store_sidecar_directory_reads(&self) -> u64 {
         self.inner.cold.sidecar_directory_reads()
+    }
+
+    /// How many times the host has read its session store's `locks/`
+    /// directory.
+    ///
+    /// The third of the enumeration's directory reads (spec 6.8), for the axis
+    /// whose fact belongs to another writer. Like the sidecar listings it
+    /// transfers no bytes, so no byte budget can see it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn store_lock_directory_reads(&self) -> u64 {
+        self.inner.cold.lock_directory_reads()
+    }
+
+    /// How many session locks the host has probed.
+    ///
+    /// The per-file half of the lock axis's budget: the holder record filters
+    /// which locks are worth asking about, so this is the only way to tell a
+    /// settled store probing nothing from one asking per lock file it ever
+    /// minted. A probe transfers no bytes either.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn store_lock_probes(&self) -> u64 {
+        self.inner.cold.lock_probes()
     }
 
     /// How many membership questions the host has put to its session store.
@@ -1379,15 +1402,25 @@ impl SessionHost {
 
     /// Take a session's advisory lock, refusing when another writer holds
     /// it.
+    ///
+    /// Either answer moves the session's `locked` bit (spec 6.8): a refusal is
+    /// this host being told a rival holds the session, and a won lock is this
+    /// host holding it, which is the one thing that cannot read locked on its
+    /// own rows.
     fn acquire(&self, id: &str) -> Result<SessionLock, HostError> {
-        SessionLock::try_acquire(&self.inner.persistence, id, &self.inner.host_id)
-            .map_err(|err| HostError::Internal(Box::new(err)))?
-            .ok_or_else(|| HostError::Locked {
-                session: id.to_string(),
-                // Read only on the refusal path, and the record is cleared on
-                // release, so what it names is a holder that has the lock now.
-                holder: SessionLock::holder(&self.inner.persistence, id),
-            })
+        let taken = SessionLock::try_acquire(&self.inner.persistence, id, &self.inner.host_id)
+            .map_err(|err| HostError::Internal(Box::new(err)))?;
+        if self.inner.cold.note_locked(id, taken.is_none()) {
+            // Publish only when the bit actually moved, so a stream of
+            // refusals against one held session costs one frame.
+            self.inner.shared.fanout.mark_list_dirty();
+        }
+        taken.ok_or_else(|| HostError::Locked {
+            session: id.to_string(),
+            // Read only on the refusal path, and the record is cleared on
+            // release, so what it names is a holder that has the lock now.
+            holder: SessionLock::holder(&self.inner.persistence, id),
+        })
     }
 
     /// Resolves creator overrides into a complete per-session run config.
@@ -1910,6 +1943,9 @@ fn summarize(session: &Arc<LiveSession>) -> SessionSummary {
         host: None,
         unreachable: false,
         archived: status.archived,
+        // Never locked: the bit names a rival, and this host holds this
+        // session's lock for as long as it is live (spec 6.8).
+        locked: false,
     }
 }
 

@@ -5581,6 +5581,7 @@ fn fake_row(id: &str) -> SessionSummary {
         host: None,
         unreachable: false,
         archived: false,
+        locked: false,
     }
 }
 

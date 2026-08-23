@@ -1812,6 +1812,7 @@ fn a_rows_tag_and_host_are_absent_rather_than_empty() {
         host: None,
         unreachable: false,
         archived: false,
+        locked: false,
     };
     let encoded = serde_json::to_value(&row).expect("the row serializes");
     assert!(

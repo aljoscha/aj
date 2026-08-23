@@ -95,12 +95,21 @@ fn seed_cold_logs(sessions_dir: &std::path::Path) {
     let body: String = std::iter::repeat_n(entry, LOG_BYTES / 400)
         .map(|line| format!("{line}\n"))
         .collect();
+    // Every session ever minted has a lock file, and a released one carries no
+    // holder record, so this is the shape the lock sweep meets on a settled
+    // store: a dense directory, a stat each, and nothing to probe. Without
+    // these files the sweep would find an empty directory and the probe count
+    // below would be zero whatever the filter did.
+    let locks = sessions_dir.join("locks");
+    std::fs::create_dir_all(&locks).expect("locks dir");
     for i in 0..COLD_LOGS {
         std::fs::write(
             sessions_dir.join(format!("2020-01-01-00-00-00-{i:03}.jsonl")),
             &body,
         )
         .expect("write a cold log");
+        std::fs::write(locks.join(format!("2020-01-01-00-00-00-{i:03}.lock")), b"")
+            .expect("write a released lock file");
     }
 }
 
@@ -187,6 +196,17 @@ async fn the_directory_costs_a_first_line_at_startup_and_nothing_per_refresh() {
         SIDECAR_AXES,
         "which lists the sidecar directory once per axis and no more",
     );
+    assert_eq!(
+        host.store_lock_directory_reads(),
+        1,
+        "and reads the lock directory once, not once per session (spec 6.8)",
+    );
+    assert_eq!(
+        host.store_lock_probes(),
+        0,
+        "a store whose sessions nobody holds is swept without a probe: all \
+         {COLD_LOGS} lock files are there and none carries a holder record",
+    );
 
     let listed = host.sessions().await.expect("sessions").sessions;
     assert_eq!(
@@ -213,6 +233,8 @@ async fn the_directory_costs_a_first_line_at_startup_and_nothing_per_refresh() {
     let before = read_bytes();
     let enumerations = host.store_directory_reads();
     let sidecar_enumerations = host.store_sidecar_directory_reads();
+    let lock_enumerations = host.store_lock_directory_reads();
+    let lock_probes = host.store_lock_probes();
     // Every explicit listing below is an enumeration point, so the count is
     // attributable: what must not appear in it is a refresh.
     let mut polls = 0_u64;
@@ -246,6 +268,8 @@ async fn the_directory_costs_a_first_line_at_startup_and_nothing_per_refresh() {
     let read = read_bytes() - before;
     let enumerated = host.store_directory_reads() - enumerations;
     let sidecars_enumerated = host.store_sidecar_directory_reads() - sidecar_enumerations;
+    let locks_enumerated = host.store_lock_directory_reads() - lock_enumerations;
+    let probed = host.store_lock_probes() - lock_probes;
     host.shutdown().await;
 
     assert!(
@@ -265,5 +289,15 @@ async fn the_directory_costs_a_first_line_at_startup_and_nothing_per_refresh() {
         "the host listed the sidecar directory {sidecars_enumerated} times over \
          {polls} explicit listings of {SIDECAR_AXES} axes: the refresh is going \
          after the sidecars",
+    );
+    assert_eq!(
+        locks_enumerated, polls,
+        "the host read the lock directory {locks_enumerated} times over {polls} \
+         explicit listings: the refresh is sweeping the locks",
+    );
+    assert_eq!(
+        probed, 0,
+        "the host probed {probed} locks over {polls} listings of a store nobody \
+         else holds: the record filter is not filtering",
     );
 }

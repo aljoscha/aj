@@ -1416,6 +1416,68 @@ async fn a_refused_session_stays_off_the_streams_attach_set() {
     host.host.shutdown().await;
 }
 
+/// The `locked` bit through the real host, end to end (spec 6.8): a rival's
+/// hold reaches the session's row, and the host's own hold never does.
+///
+/// The row is read from the host's directory rather than from the cache,
+/// because what the client is owed is the field on the wire.
+#[tokio::test]
+async fn a_rival_writers_hold_reaches_the_row() {
+    let harness = Harness::new(vec![finalized_text_message("on the record")]);
+    let session = harness.create().await;
+    let mut writer = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+    writer.pump_until_idle().await;
+
+    let row = |list: aj_wire::SessionList| {
+        list.sessions
+            .into_iter()
+            .find(|row| row.id == session)
+            .expect("the session is in the directory")
+    };
+
+    // While this host holds it, which is the one case that must never read
+    // locked: `flock` belongs to the open file description, so a naive probe
+    // of our own lock would say held.
+    let mine = row(harness.host.sessions().await.expect("sessions"));
+    assert!(mine.live, "the fixture must hold the session live here");
+    assert!(!mine.locked, "the host published its own hold as a rival's");
+
+    drop(writer);
+    harness.host.shutdown().await;
+    let held = SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
+        .expect("try_acquire")
+        .expect("the lock is free once the host tore the session down");
+    let host = harness.revive(vec![finalized_text_message("after the lock")]);
+
+    let rivals = row(host.host.sessions().await.expect("sessions"));
+    assert!(
+        !rivals.live,
+        "the revived host must not hold the session, or the bit below is its own",
+    );
+    assert!(
+        rivals.locked,
+        "a session a rival writer holds reads locked on the row",
+    );
+
+    // The rival lets go. The bit falls at the next enumeration point, which
+    // this listing is.
+    drop(held);
+    assert!(
+        !row(host.host.sessions().await.expect("sessions")).locked,
+        "the release left the row claiming a holder that is gone",
+    );
+
+    // And a session this host has taken reads unheld, the live-row rule again
+    // on a row that was locked a moment ago.
+    let served = Client::attach(&host.host, &session).await;
+    let taken = row(host.host.sessions().await.expect("sessions"));
+    assert!(taken.live, "the attach must have materialized the session");
+    assert!(!taken.locked, "a session this host now holds reads locked");
+    drop(served);
+    host.host.shutdown().await;
+}
+
 /// The wire boundary's id grammar outlives the per-session refusal (spec
 /// 6.2): an id this store could never hold is now refused on the stream
 /// instead of as the request, and it still reaches no path and no store

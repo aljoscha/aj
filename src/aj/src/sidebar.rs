@@ -1739,6 +1739,7 @@ mod tests {
             host: None,
             unreachable,
             archived: false,
+            locked: false,
         }
     }
 

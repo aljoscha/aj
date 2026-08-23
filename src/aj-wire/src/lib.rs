@@ -388,14 +388,31 @@ pub struct SessionSummary {
     /// Absent reads as unarchived, which is what an older host's rows say and
     /// what the great majority of rows say, so the key is written only when it
     /// is set.
-    #[serde(default, skip_serializing_if = "not_archived")]
+    #[serde(default, skip_serializing_if = "unset")]
     pub archived: bool,
+    /// Whether a writer other than the host that published this row holds the
+    /// session's advisory lock, so asking that host for the session would be
+    /// refused right now.
+    ///
+    /// Display metadata and a rejoin edge, never a gate (spec 6.8). The lock
+    /// itself is the only authority and this bit may lag it in either
+    /// direction, so a client acts by attempting and reading the answer rather
+    /// than by branching on this. A session live in the host that published the
+    /// row is never locked on it: the bit names a rival.
+    ///
+    /// Absent reads as unheld, which is what an older host's rows say, and a
+    /// reader treats false and absent alike as no promise of anything.
+    #[serde(default, skip_serializing_if = "unset")]
+    pub locked: bool,
 }
 
-/// Unarchived reads as absent, so a row carries the key only when the session
-/// is put away.
-fn not_archived(archived: &bool) -> bool {
-    !archived
+/// A bit whose false is its absence on the wire, so a row carries the key only
+/// when it is set.
+///
+/// Shared by every such bit rather than one predicate per field: what it means
+/// is "this reads false when the key is missing", which is one rule.
+fn unset(flag: &bool) -> bool {
+    !flag
 }
 
 /// The complete session directory returned by the sessions read.

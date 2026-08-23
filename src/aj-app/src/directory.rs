@@ -836,6 +836,7 @@ mod tests {
             host: None,
             unreachable: false,
             archived: false,
+            locked: false,
         }
     }
 

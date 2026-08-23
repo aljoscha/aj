@@ -32,7 +32,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex as StdMutex, MutexGuard};
 
-use aj_session::{ConversationError, ConversationPersistence, SessionMetadata, SidecarMetadata};
+use aj_session::{
+    ConversationError, ConversationPersistence, LockMetadata, SessionLock, SessionMetadata,
+    SidecarMetadata,
+};
 
 use crate::host::live::ReleasedRow;
 use chrono::{DateTime, Utc};
@@ -65,6 +68,15 @@ pub(crate) trait SessionStore {
     /// one directory read, for the axis whose answer is the file's existence.
     fn enumerate_archived(&self) -> Result<Vec<SidecarMetadata>, ConversationError>;
 
+    /// Every session lock in the store, with whether it carries a holder
+    /// record. One directory read plus a `stat` each, and no lock is asked
+    /// about.
+    fn enumerate_locks(&self) -> Result<Vec<LockMetadata>, ConversationError>;
+
+    /// Whether a writer holds this session's lock right now. One non-blocking
+    /// shared probe, which writes nothing.
+    fn probe_lock(&self, session_id: &str) -> Result<bool, ConversationError>;
+
     /// The tag in one session's sidecar, `Ok(None)` when it has none or its
     /// sidecar says nothing usable. Opens the file and reads it.
     fn read_tag(&self, session_id: &str) -> Result<Option<String>, ConversationError>;
@@ -94,6 +106,14 @@ impl SessionStore for ConversationPersistence {
         ConversationPersistence::enumerate_archived(self)
     }
 
+    fn enumerate_locks(&self) -> Result<Vec<LockMetadata>, ConversationError> {
+        SessionLock::enumerate_locks(self)
+    }
+
+    fn probe_lock(&self, session_id: &str) -> Result<bool, ConversationError> {
+        SessionLock::is_held(self, session_id)
+    }
+
     fn read_tag(&self, session_id: &str) -> Result<Option<String>, ConversationError> {
         ConversationPersistence::read_tag(self, session_id)
     }
@@ -113,6 +133,8 @@ pub(crate) struct ColdSession {
     /// Whether the user has put the session away, which is the existence of
     /// its archived sidecar.
     pub(crate) archived: bool,
+    /// Whether a writer that is not this host holds the session's lock.
+    pub(crate) locked: bool,
 }
 
 /// The store's sessions as the host last saw them. Both the row and the
@@ -125,6 +147,8 @@ pub(crate) struct ColdSessions<S> {
     sidecar_directory_reads: AtomicU64,
     membership_lookups: AtomicU64,
     tag_reads: AtomicU64,
+    lock_directory_reads: AtomicU64,
+    lock_probes: AtomicU64,
 }
 
 /// A log file's identity for caching: a file whose modification time and size
@@ -229,6 +253,18 @@ struct Cache {
     /// lets a caller skip re-reading a file, and this axis reads none. The
     /// listing's own report that the sidecar exists is the whole answer.
     archived: HashMap<String, bool>,
+    /// The sessions a rival writer holds, as the host last established. Its
+    /// members are the rows that read `locked` (spec 6.8).
+    ///
+    /// A set rather than a map of bits, because membership is the bit and the
+    /// unheld answer is the overwhelmingly common one: a store whose sessions
+    /// nobody else holds keeps this empty rather than an entry per lock file
+    /// it has ever minted.
+    ///
+    /// Never contains a session this host holds live. A probe of one would
+    /// read held, since `flock` belongs to the open file description, so the
+    /// sweep skips them and a won acquire clears the entry a refusal left.
+    locked: HashSet<String>,
 }
 
 impl<S: SessionStore> ColdSessions<S> {
@@ -240,6 +276,8 @@ impl<S: SessionStore> ColdSessions<S> {
             sidecar_directory_reads: AtomicU64::new(0),
             membership_lookups: AtomicU64::new(0),
             tag_reads: AtomicU64::new(0),
+            lock_directory_reads: AtomicU64::new(0),
+            lock_probes: AtomicU64::new(0),
         }
     }
 
@@ -257,6 +295,7 @@ impl<S: SessionStore> ColdSessions<S> {
                 last_activity: row.last_activity,
                 tag: cache.tags.get(id).and_then(|tagged| tagged.tag.clone()),
                 archived: cache.archived.get(id).copied().unwrap_or(false),
+                locked: cache.locked.contains(id),
             })
             .collect()
     }
@@ -311,7 +350,7 @@ impl<S: SessionStore> ColdSessions<S> {
         // the scan ran recognisable under an id the scan did see (see
         // [`Self::evict_tags`]). The archived bits are taken the same way and
         // for the same reason (see [`Self::record_archived`]).
-        let (known, labelled, filed) = {
+        let (known, labelled, filed, held_before) = {
             let cache = self.cache();
             let known: HashSet<String> = cache
                 .rows
@@ -319,7 +358,12 @@ impl<S: SessionStore> ColdSessions<S> {
                 .chain(cache.formats.keys())
                 .cloned()
                 .collect();
-            (known, cache.tags.clone(), cache.archived.clone())
+            (
+                known,
+                cache.tags.clone(),
+                cache.archived.clone(),
+                cache.locked.clone(),
+            )
         };
         let enumerated = self.enumerate_store()?;
         for metadata in &enumerated {
@@ -386,8 +430,89 @@ impl<S: SessionStore> ColdSessions<S> {
             Ok(sidecars) => self.record_archived(&sidecars, &filed),
             Err(err) => tracing::warn!("could not read the store's archived sidecars: {err}"),
         }
+        // The fourth, over `locks/`, for the one axis whose fact belongs to
+        // another writer (spec 6.8). A stat per lock file, and a probe only of
+        // the ones a stat shows a holder record on.
+        //
+        // A directory this host cannot read costs the axis its refresh and
+        // nothing else, on the same reasoning as the tag sidecars: the bit is a
+        // hint, and one that cannot be re-established must not take a row down
+        // with it.
+        match self.enumerate_locks() {
+            Ok(locks) => self.record_locked(&self.probe(&locks, &live), &held_before),
+            Err(err) => tracing::warn!("could not read the store's session locks: {err}"),
+        }
         self.evict(&enumerated, &known);
         Ok(())
+    }
+
+    /// Ask which of `locks` a rival holds, probing as few of them as possible.
+    fn probe(&self, locks: &[LockMetadata], live: &impl Fn(&str) -> bool) -> Vec<(String, bool)> {
+        let mut verdicts = Vec::new();
+        for lock in locks {
+            // A session this host holds is never locked on its own rows, and
+            // asking would say held anyway: `flock` belongs to the open file
+            // description, so this host's own lock refuses this host's probe.
+            if live(&lock.session_id) {
+                continue;
+            }
+            if !lock.has_holder_record {
+                // Nobody has taken this lock since the last release of it, so
+                // it reads free unprobed and a settled store is swept without
+                // a single probe. The one misread this permits is a holder that
+                // failed to write its record, which reads free until an attempt
+                // is refused and sets the bit, the answer that was always the
+                // authority.
+                verdicts.push((lock.session_id.clone(), false));
+                continue;
+            }
+            match self.probe_lock(&lock.session_id) {
+                Ok(held) => verdicts.push((lock.session_id.clone(), held)),
+                // No verdict rather than a guess: the entry keeps whatever it
+                // held, and the next attempt or sweep asks again.
+                Err(err) => {
+                    tracing::warn!("could not probe the lock of {}: {err}", lock.session_id)
+                }
+            }
+        }
+        verdicts
+    }
+
+    /// Record what a sweep established about the locks it probed.
+    ///
+    /// `held_before` is what the cache held when the sweep started, and the
+    /// comparison against it is eligibility rather than truth, exactly as for
+    /// the archived bit. An entry that has moved since then was written by a
+    /// refused acquire, which is this host having actually asked for the
+    /// session and been told no, so it outranks a probe taken before that
+    /// attempt and is left alone.
+    fn record_locked(&self, verdicts: &[(String, bool)], held_before: &HashSet<String>) {
+        let mut cache = self.cache();
+        for (session_id, held) in verdicts {
+            if cache.locked.contains(session_id) != held_before.contains(session_id) {
+                continue;
+            }
+            if *held {
+                cache.locked.insert(session_id.clone());
+            } else {
+                cache.locked.remove(session_id);
+            }
+        }
+    }
+
+    /// Record that an acquire of `session_id` was refused, or won.
+    ///
+    /// The refusal source of the bit (spec 6.8), and the authority among the
+    /// three: a row says held from the moment this host has been told no, and
+    /// stops the moment this host holds the session itself. Returns whether the
+    /// bit moved, which is what a caller publishes on.
+    pub(crate) fn note_locked(&self, session_id: &str, locked: bool) -> bool {
+        let mut cache = self.cache();
+        if locked {
+            cache.locked.insert(session_id.to_string())
+        } else {
+            cache.locked.remove(session_id)
+        }
     }
 
     /// How many times this has read the store's directory.
@@ -443,6 +568,26 @@ impl<S: SessionStore> ColdSessions<S> {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn membership_lookups(&self) -> u64 {
         self.membership_lookups.load(Ordering::Relaxed)
+    }
+
+    /// How many times this has read the store's lock directory.
+    ///
+    /// One read per enumeration point, never one per session: the same shape
+    /// the sidecar axes are swept with, and the number the spec's cost claim
+    /// for the `locked` axis is about (spec 6.8).
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn lock_directory_reads(&self) -> u64 {
+        self.lock_directory_reads.load(Ordering::Relaxed)
+    }
+
+    /// How many locks this has probed.
+    ///
+    /// The cost that the holder record filters, and the one a byte budget
+    /// cannot see: a probe transfers nothing. A settled store's sweep leaves
+    /// this where it was.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn lock_probes(&self) -> u64 {
+        self.lock_probes.load(Ordering::Relaxed)
     }
 
     /// Whether the store holds a current-format log for `id`.
@@ -748,6 +893,16 @@ impl<S: SessionStore> ColdSessions<S> {
         self.store.enumerate_archived()
     }
 
+    fn enumerate_locks(&self) -> Result<Vec<LockMetadata>, ConversationError> {
+        self.lock_directory_reads.fetch_add(1, Ordering::Relaxed);
+        self.store.enumerate_locks()
+    }
+
+    fn probe_lock(&self, session_id: &str) -> Result<bool, ConversationError> {
+        self.lock_probes.fetch_add(1, Ordering::Relaxed);
+        self.store.probe_lock(session_id)
+    }
+
     fn cache(&self) -> MutexGuard<'_, Cache> {
         self.cache.lock().expect("cold session cache poisoned")
     }
@@ -792,6 +947,28 @@ mod tests {
         /// is the only window that axis has: it reads no file, so a release
         /// landing here is one the scan's listing cannot know about.
         during_archived_listing: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+        /// The store's lock files. The listing reports
+        /// [`FakeLock::has_holder_record`] and a probe answers
+        /// [`FakeLock::held`], so all four combinations are reachable: a rival
+        /// holding one, a record a crash left on a free lock, a holder that
+        /// never wrote its record, and a settled lock.
+        locks: StdMutex<Vec<FakeLock>>,
+        /// Set to fail the read of the lock directory, as a permission change
+        /// on `locks/` does.
+        locks_unreadable: StdMutex<bool>,
+        /// The ids a probe was asked about, in order.
+        probes: StdMutex<Vec<String>>,
+        /// Run once inside the lock listing and after it was taken, the window
+        /// a refusal can land in while a sweep is between its listing and its
+        /// probes.
+        during_lock_listing: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    #[derive(Clone)]
+    struct FakeLock {
+        id: String,
+        has_holder_record: bool,
+        held: bool,
     }
 
     /// One log in the fake store. `modified` and `size` are independent, as
@@ -899,6 +1076,38 @@ mod tests {
                     size_bytes: sidecar.size(),
                 })
                 .collect())
+        }
+
+        fn enumerate_locks(&self) -> Result<Vec<LockMetadata>, ConversationError> {
+            if *self.locks_unreadable.lock().expect("readable") {
+                return Err(std::io::Error::other("locks/ is not readable").into());
+            }
+            let mut locks = self.locks.lock().expect("locks").clone();
+            locks.sort_by(|left, right| left.id.cmp(&right.id));
+            let listed: Vec<LockMetadata> = locks
+                .iter()
+                .map(|lock| LockMetadata {
+                    session_id: lock.id.clone(),
+                    has_holder_record: lock.has_holder_record,
+                })
+                .collect();
+            if let Some(interleave) = self.during_lock_listing.lock().expect("hook").take() {
+                interleave();
+            }
+            Ok(listed)
+        }
+
+        fn probe_lock(&self, session_id: &str) -> Result<bool, ConversationError> {
+            self.probes
+                .lock()
+                .expect("probes")
+                .push(session_id.to_string());
+            Ok(self
+                .locks
+                .lock()
+                .expect("locks")
+                .iter()
+                .any(|lock| lock.id == session_id && lock.held))
         }
 
         fn read_tag(&self, session_id: &str) -> Result<Option<String>, ConversationError> {
@@ -1038,6 +1247,36 @@ mod tests {
         }
 
         /// Unarchive `id`, which removes its sidecar.
+        /// Put a lock file in the store: `record` is what a `stat` shows and
+        /// `held` is what a probe answers, which are independent in the field.
+        fn lock(&self, id: &str, record: bool, held: bool) {
+            let mut locks = self.locks.lock().expect("locks");
+            locks.retain(|lock| lock.id != id);
+            locks.push(FakeLock {
+                id: id.to_string(),
+                has_holder_record: record,
+                held,
+            });
+        }
+
+        /// A rival lets go cleanly: the record is truncated while the lock is
+        /// still held, and the lock frees.
+        fn release(&self, id: &str) {
+            self.lock(id, false, false);
+        }
+
+        fn locks_unreadable(&self, unreadable: bool) {
+            *self.locks_unreadable.lock().expect("readable") = unreadable;
+        }
+
+        fn during_lock_listing(&self, interleave: impl FnOnce() + Send + 'static) {
+            *self.during_lock_listing.lock().expect("hook") = Some(Box::new(interleave));
+        }
+
+        fn probes(&self) -> Vec<String> {
+            self.probes.lock().expect("probes").clone()
+        }
+
         fn unarchive(&self, id: &str) {
             self.archived
                 .lock()
@@ -1116,6 +1355,15 @@ mod tests {
     }
 
     /// The archived bits the rows carry, paired with their ids.
+    fn barred(cold: Vec<ColdSession>) -> Vec<(String, bool)> {
+        let mut rows: Vec<(String, bool)> = cold
+            .into_iter()
+            .map(|session| (session.id, session.locked))
+            .collect();
+        rows.sort();
+        rows
+    }
+
     fn filed(cold: Vec<ColdSession>) -> Vec<(String, bool)> {
         let mut rows: Vec<(String, bool)> = cold
             .into_iter()
@@ -2179,6 +2427,185 @@ mod tests {
             filed(cold.rows()),
             [("held".to_string(), false)],
             "the bit the release handed over outlived the scan's listing",
+        );
+    }
+
+    /// The sweep's whole job: a rival's hold reaches the row, and the row
+    /// follows the rival letting go.
+    #[test]
+    fn a_cold_row_carries_the_hold_a_sweep_found() {
+        let store = FakeStore::default();
+        store.put("held", 5);
+        store.put("free", 5);
+        store.lock("held", true, true);
+        store.lock("free", true, false);
+        let cold = ColdSessions::new(store);
+
+        cold.enumerate(|_| false).expect("enumerate");
+        assert_eq!(
+            barred(cold.rows()),
+            [("free".to_string(), false), ("held".to_string(), true)],
+            "a lock a rival holds reads locked, one whose record a crash left does not",
+        );
+
+        cold.store.release("held");
+        cold.enumerate(|_| false).expect("enumerate");
+        assert_eq!(
+            barred(cold.rows()),
+            [("free".to_string(), false), ("held".to_string(), false)],
+            "the release cleared the bit, which is the edge a refused client waits on",
+        );
+    }
+
+    /// The record is the filter, not the answer. A settled store is swept
+    /// without a single probe, which is what keeps the axis's cost the readdir
+    /// and the stats (spec 6.8).
+    #[test]
+    fn a_settled_store_is_swept_without_a_probe() {
+        let store = FakeStore::default();
+        for id in ["a", "b", "c"] {
+            store.put(id, 5);
+            // Every session ever minted has a lock file, and a released one
+            // carries no record.
+            store.lock(id, false, false);
+        }
+        let cold = ColdSessions::new(store);
+
+        for _ in 0..5 {
+            cold.enumerate(|_| false).expect("enumerate");
+        }
+
+        assert_eq!(
+            barred(cold.rows()),
+            [
+                ("a".to_string(), false),
+                ("b".to_string(), false),
+                ("c".to_string(), false)
+            ],
+        );
+        assert_eq!(cold.lock_probes(), 0, "a settled store was probed");
+        assert_eq!(
+            cold.lock_directory_reads(),
+            5,
+            "one directory read per enumeration, never one per session",
+        );
+    }
+
+    /// A holder that failed to write its record holds the lock all the same.
+    /// The filter misses it, which is the disclosed cost of the filter, and the
+    /// refusal that follows is what corrects the row.
+    #[test]
+    fn a_hold_with_no_record_reads_free_until_an_attempt_refuses() {
+        let store = FakeStore::default();
+        store.put("held", 5);
+        store.lock("held", false, true);
+        let cold = ColdSessions::new(store);
+
+        cold.enumerate(|_| false).expect("enumerate");
+        assert_eq!(
+            barred(cold.rows()),
+            [("held".to_string(), false)],
+            "an unrecorded holder is not probed, so the sweep cannot see it",
+        );
+        assert_eq!(cold.lock_probes(), 0);
+
+        assert!(
+            cold.note_locked("held", true),
+            "the refusal moved the bit, so the caller has a frame to publish",
+        );
+        assert_eq!(
+            barred(cold.rows()),
+            [("held".to_string(), true)],
+            "the attempt is the authority the filter defers to",
+        );
+        assert!(
+            !cold.note_locked("held", true),
+            "a second refusal of the same session moves nothing",
+        );
+    }
+
+    /// A session this host holds is never locked on its own rows, and asking
+    /// would say held anyway: `flock` belongs to the open file description, so
+    /// this host's own lock refuses this host's probe.
+    #[test]
+    fn a_live_sessions_lock_is_not_probed() {
+        let store = FakeStore::default();
+        store.put("mine", 5);
+        store.put("theirs", 5);
+        // Both locks are held, and only one of them by a rival.
+        store.lock("mine", true, true);
+        store.lock("theirs", true, true);
+        let cold = ColdSessions::new(store);
+
+        cold.enumerate(|id| id == "mine").expect("enumerate");
+
+        assert_eq!(
+            cold.store.probes(),
+            ["theirs".to_string()],
+            "the host probed a lock it holds itself",
+        );
+        assert!(
+            !cold.rows().iter().any(|row| row.id == "mine" && row.locked),
+            "the host's own session reads locked on its own row",
+        );
+    }
+
+    /// A refusal that lands while a sweep is between its listing and its
+    /// probes wins. The host asked for the session and was told no, which
+    /// outranks a probe taken before the attempt.
+    #[test]
+    fn a_sweep_does_not_clear_a_refusal_that_landed_while_it_ran() {
+        let store = FakeStore::default();
+        store.put("held", 5);
+        // Free as far as the sweep can tell, so without the guard the sweep
+        // writes `false` over the refusal below.
+        store.lock("held", false, false);
+        let cold = Arc::new(ColdSessions::new(store));
+        cold.enumerate(|_| false).expect("enumerate");
+        assert_eq!(
+            barred(cold.rows()),
+            [("held".to_string(), false)],
+            "the fixture must start unlocked, or the assertion below proves nothing",
+        );
+
+        let refusing = Arc::downgrade(&cold);
+        cold.store.during_lock_listing(move || {
+            let cold = refusing.upgrade().expect("the cache outlives the scan");
+            // A rival took it, and this host's own acquire has just been
+            // refused, after the listing was taken.
+            cold.store.lock("held", true, true);
+            cold.note_locked("held", true);
+        });
+
+        cold.enumerate(|_| false).expect("enumerate");
+        assert_eq!(
+            barred(cold.rows()),
+            [("held".to_string(), true)],
+            "the sweep's staler view undid a refusal",
+        );
+    }
+
+    /// A lock directory the host cannot read costs the axis its refresh and
+    /// nothing else. The bit is a hint, and one that cannot be re-established
+    /// must not take a row down with it.
+    #[test]
+    fn an_unreadable_lock_directory_does_not_fail_a_scan() {
+        let store = FakeStore::default();
+        store.put("held", 5);
+        store.lock("held", true, true);
+        let cold = ColdSessions::new(store);
+        cold.enumerate(|_| false).expect("enumerate");
+        assert_eq!(barred(cold.rows()), [("held".to_string(), true)]);
+
+        cold.store.locks_unreadable(true);
+        cold.store.put("new", 7);
+        cold.enumerate(|_| false)
+            .expect("a lock directory the scan cannot reach does not fail it");
+
+        assert_eq!(
+            barred(cold.rows()),
+            [("held".to_string(), true), ("new".to_string(), false)],
+            "the rows are all there and the bit we had stands",
         );
     }
 }
