@@ -128,6 +128,21 @@ const UPDATE_DEBOUNCE: Duration = Duration::from_millis(100);
 /// within its budget, even for a command that ignores `SIGTERM`.
 const KILL_GRACE: Duration = Duration::from_secs(2);
 
+/// How long the capture pipes get to close once the command has ended.
+///
+/// Deliberately a constant rather than a slice of the command's
+/// `timeout`: this is not "how long may the command run" but "how long
+/// do we wait for its pipes to close afterwards", and a slice would
+/// make the bound depend on when the child exited (an exit one second
+/// into a 30s budget would leave a 29s wait, which is most of the
+/// hang it is meant to prevent).
+const CAPTURE_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Window for the pipes to close after the escalation `SIGKILL`. The
+/// kernel closes a killed process's descriptors, so this covers
+/// scheduling the readers, not any cleanup of theirs.
+const CAPTURE_CLOSE_GRACE: Duration = Duration::from_millis(200);
+
 #[derive(Clone)]
 pub struct BashTool {
     /// When true, eligible commands are dispatched through `rtk`
@@ -496,12 +511,12 @@ impl ToolDefinition for BashTool {
             terminate_process_group(&mut child, child_pid).await;
         }
 
-        // The reader tasks exit when their pipe closes (which happens
-        // when the child terminates). Awaiting them ensures every
-        // captured byte is in `stdout_state` / `stderr_state` before
-        // we build the outcome.
-        await_reader(stdout_reader, &capture_error).await;
-        await_reader(stderr_reader, &capture_error).await;
+        // The reader tasks own the pipe read ends, and their streams end
+        // only at EOF, which needs every write end closed. The kill
+        // above does not reach a descendant that left the group, so
+        // every exit reason drains under the same bound.
+        let capture_end =
+            drain_capture(stdout_reader, stderr_reader, &capture_error, child_pid).await;
         let capture_error = capture_error.lock().unwrap().clone();
 
         // Finalize per-stream: apply truncate_tail to the rolling tail
@@ -544,6 +559,7 @@ impl ToolDefinition for BashTool {
             exit_code,
             input.timeout,
             full_output_path.as_deref(),
+            capture_end,
         );
         if let Some(error) = &capture_error {
             wire.push_str(&format!("\nOutput capture failed: {error}"));
@@ -805,10 +821,137 @@ fn record_capture_error(error_slot: &Mutex<Option<String>>, error: String) {
     }
 }
 
-async fn await_reader(reader: tokio::task::JoinHandle<()>, capture_error: &Mutex<Option<String>>) {
-    if let Err(error) = reader.await {
-        record_capture_error(capture_error, format!("capture reader task: {error}"));
+async fn await_reader(
+    reader: &mut Option<tokio::task::JoinHandle<()>>,
+    capture_error: &Mutex<Option<String>>,
+) {
+    if let Some(handle) = reader.as_mut() {
+        if let Err(error) = handle.await {
+            record_capture_error(capture_error, format!("capture reader task: {error}"));
+        }
+        // Clearing the slot is what keeps a later drain round from
+        // polling a handle that already returned, which panics.
+        *reader = None;
     }
+}
+
+/// How a command's output capture ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureEnd {
+    /// Both pipes closed on their own: the capture is complete.
+    Closed,
+    /// A straggler still held a pipe when the drain expired, so the
+    /// pipes were taken back and the output may be incomplete.
+    Cut,
+}
+
+/// Escalation step for signalling a command's process group.
+#[derive(Clone, Copy, Debug)]
+enum GroupSignal {
+    Term,
+    Kill,
+}
+
+/// Wait for the capture pipes to close now the command has ended, and
+/// take them back if something still holds them.
+///
+/// Returns [`CaptureEnd::Cut`] when the wait had to be cut short, which
+/// means the output is possibly incomplete and the command's process
+/// group has been killed. Callers report that; `pgid` is the child's
+/// pid, which is its group id because it was spawned with
+/// `process_group(0)`.
+///
+/// Every exit reason comes through here, including the paths that
+/// already killed the group: [`read_stream`] returns only on EOF, EOF
+/// needs every write end closed, and a descendant that left the group
+/// holds one just as well as one that stayed.
+///
+/// The escalation keys on EOF rather than on the child, because the
+/// caller has already reaped it and [`Child::wait`] would hand back
+/// the cached status without waiting at all.
+async fn drain_capture(
+    stdout_reader: tokio::task::JoinHandle<()>,
+    stderr_reader: tokio::task::JoinHandle<()>,
+    capture_error: &Mutex<Option<String>>,
+    pgid: i32,
+) -> CaptureEnd {
+    let mut stdout_reader = Some(stdout_reader);
+    let mut stderr_reader = Some(stderr_reader);
+
+    if drain_round(
+        &mut stdout_reader,
+        &mut stderr_reader,
+        capture_error,
+        CAPTURE_DRAIN_GRACE,
+    )
+    .await
+    {
+        return CaptureEnd::Closed;
+    }
+
+    // Something the command started outlived it holding a write end.
+    // Signalling a reaped leader's group is a theoretical stray kill if
+    // the pid were recycled, but the drain only expires while a member
+    // of that group is alive and holding our pipe.
+    signal_process_group(pgid, GroupSignal::Term);
+    if !drain_round(
+        &mut stdout_reader,
+        &mut stderr_reader,
+        capture_error,
+        CAPTURE_DRAIN_GRACE,
+    )
+    .await
+    {
+        signal_process_group(pgid, GroupSignal::Kill);
+        drain_round(
+            &mut stdout_reader,
+            &mut stderr_reader,
+            capture_error,
+            CAPTURE_CLOSE_GRACE,
+        )
+        .await;
+    }
+
+    // A holder outside the group survives both signals, so the last
+    // word is dropping the read ends: the reader tasks own them, the
+    // turn returns, the host keeps no descriptors, and the holder's
+    // next write fails.
+    for reader in [stdout_reader, stderr_reader].into_iter().flatten() {
+        reader.abort();
+    }
+    CaptureEnd::Cut
+}
+
+/// One drain window: both readers, bounded by `budget`, concurrently so
+/// a stalled stream cannot spend the other's budget. True iff both are
+/// finished.
+async fn drain_round(
+    stdout_reader: &mut Option<tokio::task::JoinHandle<()>>,
+    stderr_reader: &mut Option<tokio::task::JoinHandle<()>>,
+    capture_error: &Mutex<Option<String>>,
+    budget: Duration,
+) -> bool {
+    let _ = tokio::time::timeout(budget, async {
+        tokio::join!(
+            await_reader(stdout_reader, capture_error),
+            await_reader(stderr_reader, capture_error),
+        );
+    })
+    .await;
+    stdout_reader.is_none() && stderr_reader.is_none()
+}
+
+/// Trailer for a run whose capture was cut short, in
+/// [`CaptureEnd::Cut`]'s terms: what happened, what it costs the
+/// reader, and the supported way to avoid it.
+fn capture_cut_trailer() -> String {
+    format!(
+        "Output capture was cut short: a process this command started still held \
+         stdout/stderr {}s after the command ended, so its process group was killed \
+         and the pipes were closed. The output above may be incomplete. Use \
+         run_in_background for work that should outlive the call.",
+        CAPTURE_DRAIN_GRACE.as_secs(),
+    )
 }
 
 /// [`TaskOutputSource`] over a background bash task's shared stream
@@ -953,11 +1096,10 @@ async fn drive_background_bash(task: BackgroundBash) {
         }
     };
 
-    // Readers exit when their pipe closes; awaiting them guarantees
-    // the final tails and the spill file are complete before the
-    // notice renders.
-    await_reader(stdout_reader, &capture_error).await;
-    await_reader(stderr_reader, &capture_error).await;
+    // The task is over, so the same bound applies one level down: a
+    // straggler holding the pipes would otherwise keep the notice from
+    // ever rendering and the registry row from ever settling.
+    let capture_end = drain_capture(stdout_reader, stderr_reader, &capture_error, child_pid).await;
     let capture_error = capture_error.lock().unwrap().clone();
     let status = background_terminal_status(process_status, capture_error.is_some());
 
@@ -987,6 +1129,10 @@ async fn drive_background_bash(task: BackgroundBash) {
     }
     if let Some(error) = capture_error {
         body.push_str(&format!("\nOutput capture failed: {error}"));
+    }
+    if capture_end == CaptureEnd::Cut {
+        body.push('\n');
+        body.push_str(&capture_cut_trailer());
     }
     if !body.ends_with('\n') {
         body.push('\n');
@@ -1142,6 +1288,7 @@ fn build_wire_content(
     exit_code: Option<i32>,
     timeout_secs: u64,
     full_output_path: Option<&std::path::Path>,
+    capture_end: CaptureEnd,
 ) -> String {
     let mut wire = render_stream_block(
         stdout,
@@ -1180,6 +1327,12 @@ fn build_wire_content(
             }
             wire.push_str(&format!("Command timed out after {} seconds", timeout_secs));
         }
+    }
+    if capture_end == CaptureEnd::Cut {
+        if !wire.is_empty() && !wire.ends_with('\n') {
+            wire.push('\n');
+        }
+        wire.push_str(&capture_cut_trailer());
     }
     wire
 }
@@ -1307,6 +1460,32 @@ fn decode_stream_output(bytes: Vec<u8>) -> String {
     crate::sanitize_terminal_output(&lossy)
 }
 
+/// Send one signal to a command's process group.
+///
+/// `pgid` is the child's pid, which equals its group id because the
+/// child was spawned with `process_group(0)`. That also guarantees the
+/// id is greater than 1, so this never targets group 0 (our own) or -1
+/// (every process). Errors mean the group is already gone (`ESRCH`) or
+/// we lack permission, and there is nothing actionable to do with
+/// either. Process groups are a Unix notion; elsewhere a straggler
+/// keeps its descriptors until the readers are dropped.
+fn signal_process_group(pgid: i32, signal: GroupSignal) {
+    debug_assert!(pgid > 1, "child pid/pgid must be > 1");
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{Signal, killpg};
+        use nix::unistd::Pid;
+
+        let signal = match signal {
+            GroupSignal::Term => Signal::SIGTERM,
+            GroupSignal::Kill => Signal::SIGKILL,
+        };
+        let _ = killpg(Pid::from_raw(pgid), signal);
+    }
+    #[cfg(not(unix))]
+    let _ = signal;
+}
+
 /// Terminate the child's whole process group and reap the child.
 ///
 /// Sends `SIGTERM` to the group first so the command (and any
@@ -1314,30 +1493,20 @@ fn decode_stream_output(bytes: Vec<u8>) -> String {
 /// waits up to [`KILL_GRACE`] for the leader to exit before escalating
 /// to an unconditional `SIGKILL`. Returns once the child has been
 /// reaped, so the handle never outlives the call.
+///
+/// Only for a child that is still running: the grace window keys on
+/// [`Child::wait`], which returns the cached status instantly once the
+/// child has been reaped. [`drain_capture`] is what signals a group
+/// after that point.
 #[cfg(unix)]
 async fn terminate_process_group(child: &mut Child, pgid: i32) {
-    use nix::sys::signal::{Signal, killpg};
-    use nix::unistd::Pid;
-
-    // `pgid` is the child's PID, which equals its process-group id
-    // because it was spawned with `process_group(0)`. `killpg` signals
-    // the whole group, reaching the immediate child plus every
-    // descendant. That `process_group(0)` also guarantees the group id
-    // is the child PID (> 1), so we never target group 0 (our own
-    // group) or -1 (every process).
-    debug_assert!(pgid > 1, "child pid/pgid must be > 1");
-    let group = Pid::from_raw(pgid);
-
-    // Errors here mean the group is already gone (ESRCH) or we lack
-    // permission; either way `child.wait()` below resolves the handle,
-    // so there is nothing actionable to do with them.
-    let _ = killpg(group, Signal::SIGTERM);
+    signal_process_group(pgid, GroupSignal::Term);
     if tokio::time::timeout(KILL_GRACE, child.wait())
         .await
         .is_err()
     {
         // Still alive after the grace window: escalate and reap.
-        let _ = killpg(group, Signal::SIGKILL);
+        signal_process_group(pgid, GroupSignal::Kill);
         let _ = child.wait().await;
     }
 }
@@ -1963,6 +2132,97 @@ mod tests {
             wire.contains("Command timed out after 1 seconds"),
             "wire: {wire:?}"
         );
+    }
+
+    /// A command whose shell exits while a descendant still holds a
+    /// pipe write end must not hold the turn open until that descendant
+    /// is done: `read_stream` returns only on EOF, and EOF needs every
+    /// write end closed, so the wait is otherwise unbounded. The
+    /// timeout does not cover this case, the loop breaks on
+    /// `ChildExit::Exited` and discards the deadline with it.
+    ///
+    /// Linux-only: the fixture proves the descendant inherited fd 1 by
+    /// reading it back from `/proc`, which is the one proof that
+    /// survives a run where the turn never returns at all.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn descendant_holding_a_pipe_does_not_hold_the_turn_open() {
+        /// How long the turn may take once the shell has exited. Well
+        /// above any bounded drain, well below the descendant's own
+        /// lifetime, so a run that reaches it is waiting on EOF.
+        const BOUND: Duration = Duration::from_secs(5);
+
+        let dir = TempDir::new().expect("create temp dir");
+        let fd1_path = dir.path().join("descendant-fd1");
+
+        // The descendant records its fd 1 and writes to stdout before
+        // the shell is allowed to exit, so the evidence lands whatever
+        // the tool does next. It then holds the pipe until this test
+        // drops `dir`, with `$SECONDS` as a backstop so it cannot
+        // outlive the test process by more than a few seconds.
+        let command = format!(
+            "{{ readlink /proc/$BASHPID/fd/1 > '{fd1}'; \
+                echo descendant-wrote; \
+                while [ -d '{dir}' ] && [ $SECONDS -lt 30 ]; do sleep 0.05; done; }} & \
+             until [ -s '{fd1}' ]; do sleep 0.01; done; \
+             echo shell-done",
+            fd1 = fd1_path.display(),
+            dir = dir.path().display(),
+        );
+
+        let mut ctx = DummyToolContext::default();
+        let result = tokio::time::timeout(
+            BOUND,
+            BashTool::default().execute(
+                &mut ctx,
+                BashInput {
+                    command,
+                    // Short so that a fix which spends the command's
+                    // remaining timeout budget on the drain still
+                    // finishes inside `BOUND`.
+                    timeout: 1,
+                    description: "test descendant holding the pipes".to_string(),
+                    run_in_background: false,
+                },
+            ),
+        )
+        .await;
+
+        let inherited = std::fs::read_to_string(&fd1_path).unwrap_or_default();
+        assert!(
+            inherited.starts_with("pipe:"),
+            "the descendant should have inherited the stdout pipe, its fd 1 was {inherited:?}: \
+             with nothing holding a write end this test measures nothing"
+        );
+
+        let outcome = result
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the shell exited at once, but the turn was still waiting on capture \
+                     after {BOUND:?}, with the descendant still holding the pipe"
+                )
+            })
+            .expect("execute");
+
+        assert!(!outcome.is_error, "the command itself succeeded");
+        match &outcome.details {
+            ToolDetails::Bash {
+                exit_code, stdout, ..
+            } => {
+                // `Some(0)` is what puts this run on the `Exited` arm
+                // of the select: a timeout or a cancel leaves it unset.
+                assert_eq!(*exit_code, Some(0), "the shell exited normally");
+                assert!(
+                    stdout.contains("shell-done"),
+                    "the shell's own output is reported, stdout: {stdout:?}"
+                );
+                assert!(
+                    stdout.contains("descendant-wrote"),
+                    "output written before the shell exited is reported, stdout: {stdout:?}"
+                );
+            }
+            other => panic!("expected Bash details, got {other:?}"),
+        }
     }
 
     /// `emit_update` is invoked at least once during execution; the
