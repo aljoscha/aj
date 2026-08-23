@@ -30,7 +30,9 @@ at the end for orchestration.
   fresh process group, drains stdout/stderr through two reader tasks
   into per-stream rolling tails (`StreamState`) teed into a spill file
   (`SpillState`), and `select!`s on cancellation / timeout / child
-  exit. `execute` does not return until one of those fires. Progress
+  exit. `execute` does not return until one of those fires and the
+  capture pipes have closed, which a bounded drain takes care of when
+  something the command started still holds them. Progress
   snapshots go through `ToolContext::emit_update`, which is a no-op in
   production (lib.rs:1857 — sync trait method vs async bus).
 - `agent` (`src/aj-tools/src/tools/agent.rs`): delegates to

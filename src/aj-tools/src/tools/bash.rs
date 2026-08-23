@@ -42,12 +42,23 @@
 //!   the structured per-stream summary (that's only meaningful once
 //!   the stream has closed).
 //! - **Cancellation / timeout.** The child is launched in a fresh
-//!   process group (`process_group(0)`) so we can signal the entire
-//!   tree on cancel or timeout. Plain `Child::kill()` only terminates
-//!   the immediate child and leaks any grandchildren the shell forked.
-//!   On Unix we `SIGTERM` the process group, give it a short grace
-//!   period, then escalate to `SIGKILL`; non-Unix builds fall back to
-//!   killing just the immediate child.
+//!   process group (`process_group(0)`) so we can signal every
+//!   descendant the shell forked on cancel or timeout, which a plain
+//!   `Child::kill()` would leak. On Unix we `SIGTERM` the process
+//!   group, give it a short grace period, then escalate to `SIGKILL`.
+//!   Non-Unix builds fall back to killing just the immediate child. A
+//!   descendant that left the group (`setsid`) is out of reach of all
+//!   of this, which is what the capture drain below bounds.
+//! - **Capture drain.** Capture ends when the command ends. The reader
+//!   tasks stop at EOF, EOF needs every write end of the pipes closed,
+//!   and a process that outlives the command holds one unless it
+//!   redirected the tool's stdout and stderr away. So once the command
+//!   has ended, for any reason, the drain waits
+//!   [`CAPTURE_DRAIN_GRACE`] for the pipes to close and then takes
+//!   them back: `SIGTERM` to the group, the same grace again,
+//!   `SIGKILL`, and finally aborting the reader tasks, which drops the
+//!   read ends whatever still holds the far side. A run that got that
+//!   far says so in a trailer, see [`capture_cut_trailer`].
 //! - **`Sequential` execution.** `bash` runs arbitrary commands, so it
 //!   runs in `Sequential` mode: a batch containing it serializes
 //!   around any other in-flight tool calls.
@@ -78,7 +89,10 @@ working directory of the agent session.
 
 - There are no permissions checks or sandboxing. You are free to run any command
   you consider reasonable and safe.
-- Commands have a configurable timeout to prevent hanging (default: 30s).
+- Commands have a configurable timeout to prevent hanging (default: 30s). It
+  bounds the command itself: a process the command leaves behind still holding
+  its stdout or stderr gets a couple of seconds to let go, after which its
+  process group is killed and the reported output may be incomplete.
 - Output is truncated to the last 2000 lines or 50KB per stream (whichever
   fires first). When truncated, the full output is saved to a temp file and
   the marker points at it.
@@ -2154,19 +2168,22 @@ mod tests {
 
         let dir = TempDir::new().expect("create temp dir");
         let fd1_path = dir.path().join("descendant-fd1");
+        let pid_path = dir.path().join("descendant-pid");
 
-        // The descendant records its fd 1 and writes to stdout before
-        // the shell is allowed to exit, so the evidence lands whatever
-        // the tool does next. It then holds the pipe until this test
-        // drops `dir`, with `$SECONDS` as a backstop so it cannot
+        // The descendant records its fd 1, its pid, and writes to stdout
+        // before the shell is allowed to exit, so the evidence lands
+        // whatever the tool does next. It then holds the pipe until this
+        // test drops `dir`, with `$SECONDS` as a backstop so it cannot
         // outlive the test process by more than a few seconds.
         let command = format!(
             "{{ readlink /proc/$BASHPID/fd/1 > '{fd1}'; \
+                echo $BASHPID > '{pid}'; \
                 echo descendant-wrote; \
                 while [ -d '{dir}' ] && [ $SECONDS -lt 30 ]; do sleep 0.05; done; }} & \
-             until [ -s '{fd1}' ]; do sleep 0.01; done; \
+             until [ -s '{fd1}' ] && [ -s '{pid}' ]; do sleep 0.01; done; \
              echo shell-done",
             fd1 = fd1_path.display(),
+            pid = pid_path.display(),
             dir = dir.path().display(),
         );
 
@@ -2223,6 +2240,322 @@ mod tests {
             }
             other => panic!("expected Bash details, got {other:?}"),
         }
+
+        let wire = extract_text(&outcome.content);
+        assert!(
+            wire.contains(&capture_cut_trailer()),
+            "the model is told the capture was cut short, wire: {wire:?}"
+        );
+        let pid = read_pid(&pid_path);
+        wait_until(
+            || !process_is_live(pid),
+            "the pipe holder to be killed with its group",
+        );
+    }
+
+    /// The rule from the other side: a straggler that redirected the
+    /// tool's stdout and stderr away has let go of the capture channel,
+    /// so it reaches EOF at once and is none of the tool's business. It
+    /// keeps running and nothing is reported.
+    ///
+    /// This is what keeps the drain from becoming an unconditional kill
+    /// of everything a command leaves behind, which would break every
+    /// `nohup`-style daemon that behaves.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_straggler_that_let_go_of_the_pipes_is_left_alone() {
+        let dir = TempDir::new().expect("create temp dir");
+        let pid_path = dir.path().join("daemon-pid");
+
+        // `exec` drops this subshell's copies of the pipes before it
+        // does anything else, which is the daemon discipline the tool
+        // description asks for. The shell waits for its pid so the test
+        // never races the fork.
+        let command = format!(
+            "{{ exec >/dev/null 2>&1; \
+                echo $BASHPID > '{pid}'; \
+                while [ -d '{dir}' ] && [ $SECONDS -lt 30 ]; do sleep 0.05; done; }} & \
+             until [ -s '{pid}' ]; do sleep 0.01; done; \
+             echo shell-done",
+            pid = pid_path.display(),
+            dir = dir.path().display(),
+        );
+
+        let mut ctx = DummyToolContext::default();
+        let start = Instant::now();
+        let outcome = BashTool::default()
+            .execute(
+                &mut ctx,
+                BashInput {
+                    command,
+                    timeout: 30,
+                    description: "test daemon that redirected its output".to_string(),
+                    run_in_background: false,
+                },
+            )
+            .await
+            .expect("execute");
+        let elapsed = start.elapsed();
+
+        let pid = read_pid(&pid_path);
+        assert!(
+            process_is_live(pid),
+            "the straggler let go of the pipes and must be left running: \
+             a test that kills it here measures nothing"
+        );
+        assert!(
+            elapsed < CAPTURE_DRAIN_GRACE,
+            "capture closed with the shell, so no drain window should have been \
+             spent, took {elapsed:?}"
+        );
+        assert!(!outcome.is_error);
+        let wire = extract_text(&outcome.content);
+        assert!(
+            !wire.contains(&capture_cut_trailer()),
+            "nothing was cut short, so nothing is reported, wire: {wire:?}"
+        );
+        match &outcome.details {
+            ToolDetails::Bash {
+                exit_code, stdout, ..
+            } => {
+                assert_eq!(*exit_code, Some(0));
+                assert!(stdout.contains("shell-done"), "stdout: {stdout:?}");
+            }
+            other => panic!("expected Bash details, got {other:?}"),
+        }
+    }
+
+    /// A holder in its own session survives the process-group kill, so
+    /// dropping the pipe read ends is the only thing that ends the wait.
+    /// This is the timeout path, where the group kill already ran and a
+    /// `setsid`ed descendant walked away from it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_holder_outside_the_group_is_bounded_by_dropping_the_pipes() {
+        /// Timeout, two drain windows, the post-kill window, and room
+        /// for a loaded machine.
+        const BOUND: Duration = Duration::from_secs(12);
+
+        let dir = TempDir::new().expect("create temp dir");
+        let pid_path = dir.path().join("session-leader-pid");
+
+        // `setsid` leaves the tool's process group, keeping the
+        // inherited pipes. The shell then blocks so the run ends on the
+        // timeout rather than on child exit.
+        let command = format!(
+            "setsid bash -c \"echo \\$$ > '{pid}'; \
+                while [ -d '{dir}' ] && [ \\$SECONDS -lt 30 ]; do sleep 0.05; done\" & \
+             until [ -s '{pid}' ]; do sleep 0.01; done; \
+             sleep 30",
+            pid = pid_path.display(),
+            dir = dir.path().display(),
+        );
+
+        let mut ctx = DummyToolContext::default();
+        let result = tokio::time::timeout(
+            BOUND,
+            BashTool::default().execute(
+                &mut ctx,
+                BashInput {
+                    command,
+                    timeout: 1,
+                    description: "test holder outside the process group".to_string(),
+                    run_in_background: false,
+                },
+            ),
+        )
+        .await;
+
+        let pid = read_pid(&pid_path);
+        let outcome = result
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the command timed out at 1s, but the turn was still waiting on capture \
+                     after {BOUND:?}: the group kill cannot reach a holder in its own session"
+                )
+            })
+            .expect("execute");
+
+        assert!(
+            process_is_live(pid),
+            "the holder is outside the group and no signal of ours reaches it, so the wait \
+             ended by dropping the read ends: with it dead this test measures the kill instead"
+        );
+        assert!(outcome.is_error, "the command timed out");
+        let wire = extract_text(&outcome.content);
+        assert!(
+            wire.contains("Command timed out after 1 seconds"),
+            "wire: {wire:?}"
+        );
+        assert!(
+            wire.contains(&capture_cut_trailer()),
+            "the incomplete capture is reported beside the timeout, wire: {wire:?}"
+        );
+    }
+
+    /// A straggler can hold one stream and not the other, so the drain
+    /// rounds have to cope with the two readers finishing in different
+    /// windows: here stdout reaches EOF with the shell and stderr is
+    /// held open past the grace.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_straggler_holding_one_stream_is_drained_like_any_other() {
+        let dir = TempDir::new().expect("create temp dir");
+        let pid_path = dir.path().join("stderr-holder-pid");
+
+        // `exec >/dev/null` drops only this subshell's stdout, so the
+        // stderr pipe is the one thing keeping capture open.
+        let command = format!(
+            "{{ exec >/dev/null; \
+                echo $BASHPID > '{pid}'; \
+                while [ -d '{dir}' ] && [ $SECONDS -lt 30 ]; do sleep 0.05; done; }} & \
+             until [ -s '{pid}' ]; do sleep 0.01; done; \
+             echo shell-done",
+            pid = pid_path.display(),
+            dir = dir.path().display(),
+        );
+
+        let mut ctx = DummyToolContext::default();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            BashTool::default().execute(
+                &mut ctx,
+                BashInput {
+                    command,
+                    timeout: 1,
+                    description: "test straggler holding stderr only".to_string(),
+                    run_in_background: false,
+                },
+            ),
+        )
+        .await;
+
+        let pid = read_pid(&pid_path);
+        let outcome = result
+            .unwrap_or_else(|_| panic!("the turn was still waiting on the held stderr pipe"))
+            .expect("execute");
+
+        let wire = extract_text(&outcome.content);
+        assert!(
+            wire.contains(&capture_cut_trailer()),
+            "one held stream is enough to cut the capture short, wire: {wire:?}"
+        );
+        match &outcome.details {
+            ToolDetails::Bash {
+                exit_code, stdout, ..
+            } => {
+                assert_eq!(*exit_code, Some(0));
+                // The stream that did close is complete: a partial
+                // drain must not cost the output it already had.
+                assert!(stdout.contains("shell-done"), "stdout: {stdout:?}");
+            }
+            other => panic!("expected Bash details, got {other:?}"),
+        }
+        wait_until(
+            || !process_is_live(pid),
+            "the stderr holder to be killed with its group",
+        );
+    }
+
+    /// The drain escalates rather than giving up: the group gets a
+    /// `SIGTERM` first, so a holder that cleans up on signals gets the
+    /// chance, and a holder that takes the signal and keeps the pipes
+    /// anyway is killed in the next window.
+    ///
+    /// Mirrors `cancellation_escalates_to_sigkill_when_sigterm_is_ignored`
+    /// for the drain's own escalation, which cannot key on the child
+    /// because the child has already been reaped.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_drain_escalates_from_sigterm_to_sigkill() {
+        let dir = TempDir::new().expect("create temp dir");
+        let pid_path = dir.path().join("holder-pid");
+        let termed_path = dir.path().join("holder-was-termed");
+
+        // The holder records `SIGTERM` and carries on holding the pipes,
+        // so the run can only end on the escalation. `trap` fires
+        // between commands, i.e. within one `sleep` of the signal.
+        let command = format!(
+            "{{ trap \"echo termed > '{termed}'\" TERM; \
+                echo $BASHPID > '{pid}'; \
+                while [ -d '{dir}' ] && [ $SECONDS -lt 30 ]; do sleep 0.05; done; }} & \
+             until [ -s '{pid}' ]; do sleep 0.01; done; \
+             echo shell-done",
+            termed = termed_path.display(),
+            pid = pid_path.display(),
+            dir = dir.path().display(),
+        );
+
+        let mut ctx = DummyToolContext::default();
+        let result = tokio::time::timeout(
+            Duration::from_secs(15),
+            BashTool::default().execute(
+                &mut ctx,
+                BashInput {
+                    command,
+                    timeout: 1,
+                    description: "test drain escalation".to_string(),
+                    run_in_background: false,
+                },
+            ),
+        )
+        .await;
+
+        let pid = read_pid(&pid_path);
+        let outcome = result
+            .unwrap_or_else(|_| panic!("the turn was still waiting on the held pipes"))
+            .expect("execute");
+
+        assert!(
+            termed_path.exists(),
+            "the group is signalled before it is killed, so a holder can clean up: \
+             without the TERM this test measures only the kill"
+        );
+        wait_until(
+            || !process_is_live(pid),
+            "the holder that shrugged off SIGTERM to be killed",
+        );
+        let wire = extract_text(&outcome.content);
+        assert!(wire.contains(&capture_cut_trailer()), "wire: {wire:?}");
+    }
+
+    /// Read a pid a fixture wrote, failing with the shape of the file
+    /// rather than a parse error.
+    #[cfg(target_os = "linux")]
+    fn read_pid(path: &Path) -> i32 {
+        let raw = std::fs::read_to_string(path).unwrap_or_default();
+        raw.trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("fixture should have recorded a pid, file held {raw:?}"))
+    }
+
+    /// Whether `pid` is a live process. Reads `/proc` rather than
+    /// signalling: signal 0 also succeeds for a zombie that nobody has
+    /// reaped yet, which would read as alive right after a kill.
+    #[cfg(target_os = "linux")]
+    fn process_is_live(pid: i32) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        // The state letter follows the parenthesised comm field, which
+        // may itself contain spaces and parentheses.
+        let Some((_, after_comm)) = stat.rsplit_once(')') else {
+            return false;
+        };
+        !matches!(after_comm.split_whitespace().next(), Some("Z") | None)
+    }
+
+    /// Spin until `cond` holds, bounded, for a state a signal reaches
+    /// asynchronously.
+    #[cfg(target_os = "linux")]
+    fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
+        for _ in 0..200 {
+            if cond() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out waiting for {what}");
     }
 
     /// `emit_update` is invoked at least once during execution; the
@@ -2522,6 +2855,40 @@ mod tests {
             body.contains(&format!("Full output: {}", spill_path.display())),
             "notice body: {body:?}"
         );
+    }
+
+    /// The driver's join is the same defect one level down: a straggler
+    /// holding the pipes after the task's own process exited would keep
+    /// the completion notice from ever rendering and the registry row
+    /// from ever settling. Same drain, so the notice arrives, says the
+    /// capture was cut short, and still reports the real exit status.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn background_task_with_a_pipe_holder_still_finishes() {
+        let dir = TempDir::new().expect("create temp dir");
+        let mut ctx = DummyToolContext::default();
+        let command = format!(
+            "{{ echo descendant-wrote; \
+                while [ -d '{dir}' ] && [ $SECONDS -lt 30 ]; do sleep 0.05; done; }} & \
+             echo shell-done",
+            dir = dir.path().display(),
+        );
+
+        let (id, _spill_path, _spill_dir) = start_background(&mut ctx, &command, 30).await;
+        let registry = ctx.task_registry();
+        let status = await_terminal(&registry, id).await;
+
+        // The task's own process succeeded: a cut capture is not a
+        // capture failure and must not be reported as one.
+        assert_eq!(status, aj_agent::tool::TaskStatus::Exited(Some(0)));
+        let notices = registry.drain_notices(aj_agent::events::AgentId::Main);
+        assert_eq!(notices.len(), 1);
+        let body = &notices[0].body;
+        assert!(
+            body.contains(&capture_cut_trailer()),
+            "notice body: {body:?}"
+        );
+        assert!(body.contains("shell-done"), "notice body: {body:?}");
     }
 
     /// The detached driver announces the task on the bus as its
