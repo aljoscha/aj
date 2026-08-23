@@ -235,7 +235,6 @@ fn parse_callback_request(path_and_query: &str) -> Option<CallbackParams> {
 mod tests {
     use std::time::Duration;
 
-    use tokio::io::AsyncWriteExt as _;
     use tokio::net::TcpStream;
 
     use super::*;

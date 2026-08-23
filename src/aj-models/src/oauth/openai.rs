@@ -467,7 +467,6 @@ pub(crate) fn extract_account_id(access_token: &str) -> Option<String> {
 mod tests {
     use std::time::Duration;
 
-    use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
     use super::*;
