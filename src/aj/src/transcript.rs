@@ -236,6 +236,10 @@ struct CachedEntry {
 /// interactive entries" assumption still holds.
 struct EntryRenderCache {
     slots: HashMap<(AgentId, EntryId), CachedEntry>,
+    /// The model incarnation the slots were built under. Entry ids restart
+    /// whenever the model does, so slots of an older one are not stale, they
+    /// belong to different entries that happen to share a key.
+    generation: u64,
     /// Monotonic lookup counter stamped onto a slot's `last_used` on every
     /// access, so eviction can drop the coldest slot.
     tick: u64,
@@ -249,6 +253,7 @@ impl EntryRenderCache {
     fn new() -> EntryRenderCache {
         EntryRenderCache {
             slots: HashMap::new(),
+            generation: 0,
             tick: 0,
             hits: 0,
             misses: 0,
@@ -262,10 +267,37 @@ impl EntryRenderCache {
         self.slots.clear();
     }
 
+    /// Empty the cache when the model it was filled for is gone.
+    ///
+    /// The one invalidation no fingerprint can express. A fingerprint says
+    /// whether an entry changed, and after a reset there is no old entry to
+    /// have changed: `EntryId(0)` of the new incarnation is a different entry
+    /// that happens to be filed where the old one was, and the fingerprint is
+    /// a length proxy, so two short prompts agree. Checked here rather than at
+    /// the callers because a caller that forgets shows the previous session's
+    /// content, and the ones that used to remember could not cover the paths
+    /// that do not draw.
+    fn retire(&mut self, generation: u64) {
+        if self.generation != generation {
+            self.slots.clear();
+            self.generation = generation;
+        }
+    }
+
     /// The cached surface for `key` when the slot's fingerprint and width both
     /// match (a HIT). Otherwise `None` (a MISS), and the caller rebuilds and
     /// calls [`insert`](Self::insert).
-    fn get(&mut self, key: (AgentId, EntryId), fingerprint: u64, width: u16) -> Option<Surface> {
+    ///
+    /// `generation` is the model incarnation `key` belongs to, and a lookup
+    /// under a new one empties the cache first (see [`Self::retire`]).
+    fn get(
+        &mut self,
+        key: (AgentId, EntryId),
+        generation: u64,
+        fingerprint: u64,
+        width: u16,
+    ) -> Option<Surface> {
+        self.retire(generation);
         self.tick += 1;
         let tick = self.tick;
         match self.slots.get_mut(&key) {
@@ -283,7 +315,15 @@ impl EntryRenderCache {
 
     /// Store `surface` for `key` under `(fingerprint, width)`, replacing any
     /// prior slot for the key, and evict the coldest slot when over capacity.
-    fn insert(&mut self, key: (AgentId, EntryId), fingerprint: u64, width: u16, surface: Surface) {
+    fn insert(
+        &mut self,
+        key: (AgentId, EntryId),
+        generation: u64,
+        fingerprint: u64,
+        width: u16,
+        surface: Surface,
+    ) {
+        self.retire(generation);
         let last_used = self.tick;
         self.slots.insert(
             key,
@@ -336,6 +376,10 @@ struct EntryTextSlot {
 /// append-only session cannot grow it without limit.
 struct EntryTextCache {
     slots: HashMap<EntryId, EntryTextSlot>,
+    /// The model incarnation the slots were built under, for the same reason
+    /// [`EntryRenderCache::generation`] carries one, and more sharply: this key
+    /// is an entry id alone.
+    generation: u64,
     /// Monotonic lookup counter stamped onto a slot's `last_used` on every
     /// access, so eviction can drop the coldest slot.
     tick: u64,
@@ -345,6 +389,7 @@ impl EntryTextCache {
     fn new() -> EntryTextCache {
         EntryTextCache {
             slots: HashMap::new(),
+            generation: 0,
             tick: 0,
         }
     }
@@ -358,9 +403,30 @@ impl EntryTextCache {
         self.slots.clear();
     }
 
+    /// Empty the cache when the model it was filled for is gone, the same
+    /// invalidation [`EntryRenderCache::retire`] performs and for the same
+    /// reason. Select-to-copy reaches this cache without drawing, so a clear
+    /// hung off the draw path would not cover it.
+    fn retire(&mut self, generation: u64) {
+        if self.generation != generation {
+            self.slots.clear();
+            self.generation = generation;
+        }
+    }
+
     /// The cached rows for `id` when the slot's fingerprint and width both
     /// match, else `None` (the caller then lays the entry out and inserts).
-    fn get(&mut self, id: EntryId, fingerprint: u64, width: u16) -> Option<Rc<Vec<Vec<Cell>>>> {
+    ///
+    /// `generation` is the model incarnation `id` belongs to, and a lookup
+    /// under a new one empties the cache first (see [`Self::retire`]).
+    fn get(
+        &mut self,
+        id: EntryId,
+        generation: u64,
+        fingerprint: u64,
+        width: u16,
+    ) -> Option<Rc<Vec<Vec<Cell>>>> {
+        self.retire(generation);
         self.tick += 1;
         let tick = self.tick;
         match self.slots.get_mut(&id) {
@@ -374,7 +440,15 @@ impl EntryTextCache {
 
     /// Store `rows` for `id` under `(fingerprint, width)`, replacing any prior
     /// slot for the id, and evict the coldest slot when over capacity.
-    fn insert(&mut self, id: EntryId, fingerprint: u64, width: u16, rows: Rc<Vec<Vec<Cell>>>) {
+    fn insert(
+        &mut self,
+        id: EntryId,
+        generation: u64,
+        fingerprint: u64,
+        width: u16,
+        rows: Rc<Vec<Vec<Cell>>>,
+    ) {
+        self.retire(generation);
         let last_used = self.tick;
         self.slots.insert(
             id,
@@ -556,6 +630,7 @@ impl Builder for EntryBuilder {
             agent,
             entry_id: entry.id,
             fingerprint,
+            generation: chat.generation(),
             border,
             bypass_cache,
             copy_label: Rc::clone(&self.copy_label),
@@ -579,6 +654,9 @@ struct CachingEntry {
     agent: AgentId,
     entry_id: EntryId,
     fingerprint: u64,
+    /// The model incarnation `entry_id` belongs to. Read under the same borrow
+    /// as the fingerprint, so the pair always describes one observation.
+    generation: u64,
     /// Which border this entry's bubble gets on the miss-path build. Already
     /// folded into `fingerprint`.
     border: EntryBorder,
@@ -609,7 +687,10 @@ impl Widget for CachingEntry {
         // `RefMut` is released before the miss path re-borrows it. A
         // bypass entry (an animated Running box) always rebuilds.
         if !self.bypass_cache {
-            let cached = self.cache.borrow_mut().get(key, self.fingerprint, width);
+            let cached = self
+                .cache
+                .borrow_mut()
+                .get(key, self.generation, self.fingerprint, width);
             if let Some(surface) = cached {
                 return surface;
             }
@@ -644,9 +725,13 @@ impl Widget for CachingEntry {
         // A bypass entry is never stored, so it can't strand a stale slot when
         // its glyph advances or when it later concludes and becomes cacheable.
         if !self.bypass_cache {
-            self.cache
-                .borrow_mut()
-                .insert(key, self.fingerprint, width, surface.clone());
+            self.cache.borrow_mut().insert(
+                key,
+                self.generation,
+                self.fingerprint,
+                width,
+                surface.clone(),
+            );
         }
         surface
     }
@@ -1947,8 +2032,13 @@ impl TranscriptView {
         }
     }
 
-    /// Re-engage follow-tail so the next draw pins the viewport to the
-    /// bottom, and drop the render cache.
+    /// Re-engage follow-tail so the next draw pins the viewport to the bottom,
+    /// and drop the view state a swap or a switch invalidates.
+    ///
+    /// Not what keeps a new model off the old one's cached surfaces: the caches
+    /// retire an incarnation's slots on their own (see
+    /// [`EntryRenderCache::retire`]), so a caller that forgets this loses the
+    /// scroll position rather than the correctness.
     ///
     /// Two callers use it. On a session rebuild the view's `chat` cell keeps
     /// its identity across the swap (the outer loop overwrites its contents
@@ -1958,25 +2048,21 @@ impl TranscriptView {
     /// per-view scroll). The draw path refreshes `item_count` before
     /// scrolling, so we needn't touch the list's scroll offset here.
     pub(crate) fn reset_to_tail(&mut self) {
-        // Clear the cache: the reused `chat` cell now holds a different
-        // session whose transcript restarts `EntryId` at 0, so its entries
-        // collide with the previous session's cache keys `(AgentId, EntryId)`.
-        // The draw-time global clear can't be relied on to catch this. A fresh
-        // session's globals `(Main, tools_expanded=false, hide_thinking=false)`
-        // usually match the outgoing session's, so no global change fires, and
-        // a coincidental fingerprint+width match would then replay the old
-        // session's surface. Length-proxy fingerprints make that coincidence
-        // easy (two same-length prompts collide), so we drop every slot here.
-        //
-        // On a view switch the keys don't collide (different `AgentId`) and
-        // the draw's global-input clear catches the change anyway, so the
-        // clear here is redundant but harmless.
+        // A different session in the reused `chat` cell is a different
+        // incarnation of the model, and the caches retire an incarnation's
+        // slots themselves now (see `EntryRenderCache::retire`), so this clear
+        // is not what keeps a fresh session off the previous one's surface.
+        // What it is still for is the other caller: a view switch, which is the
+        // same incarnation and so passes the retirement untouched. The render
+        // cache keys views apart (`AgentId` is in the key) and the draw's
+        // global-input clear catches the switch anyway, so this one is
+        // belt-and-braces.
         self.cache.borrow_mut().clear();
-        // The reused `chat` cell may now hold a different session whose entry
-        // ids collide with the cached rows', the same hazard the render cache
-        // clear above guards. Drop the per-entry text cache so select-to-copy
-        // re-lays the new transcript's entries rather than reading the previous
-        // session's rows.
+        // The text cache is the one that needs it. Its key is an `EntryId`
+        // alone, so two views collide outright, and select-to-copy reaches it
+        // without drawing, so the draw's global-input clear cannot be what
+        // covers the switch. Keying it by `(AgentId, EntryId)` would retire
+        // this clear the way the retirement retired the one above.
         self.entry_text.clear();
         self.agent_click = None;
         self.agent_hit_rows.clear();
@@ -2656,15 +2742,15 @@ impl TranscriptView {
         // the borrow across `widget.draw`, which is safe because the entry
         // widget captures no `chat` handle (the same rationale as the visible
         // `CachingEntry`).
-        let fingerprint = {
+        let (generation, fingerprint) = {
             let chat = self.chat.borrow();
             let agent = chat.active_view();
             match chat.transcript(agent).and_then(|t| t.get(id)) {
-                Some(entry) => entry_fingerprint(entry, &chat),
+                Some(entry) => (chat.generation(), entry_fingerprint(entry, &chat)),
                 None => return Rc::new(Vec::new()),
             }
         };
-        if let Some(rows) = self.entry_text.get(id, fingerprint, width) {
+        if let Some(rows) = self.entry_text.get(id, generation, fingerprint, width) {
             return rows;
         }
         // MISS: lay the entry out under the same per-entry constraints the
@@ -2710,7 +2796,7 @@ impl TranscriptView {
         };
         let rows = Rc::new(rows);
         self.entry_text
-            .insert(id, fingerprint, width, Rc::clone(&rows));
+            .insert(id, generation, fingerprint, width, Rc::clone(&rows));
         rows
     }
 
@@ -6297,6 +6383,14 @@ mod tests {
         }
     }
 
+    /// A notice row, the cheapest entry whose fingerprint is a length proxy.
+    fn notice(text: &str) -> AgentEvent {
+        AgentEvent::Notice {
+            agent_id: AgentId::Main,
+            text: text.to_string(),
+        }
+    }
+
     fn user_end(text: &str) -> AgentEvent {
         AgentEvent::MessageEnd {
             agent_id: AgentId::Main,
@@ -7162,6 +7256,94 @@ mod tests {
         assert!(
             view.cache.borrow().misses > misses_before,
             "toggling syntax_highlight forced misses",
+        );
+    }
+
+    /// A reset is a new incarnation of the model, and its `EntryId(0)` is not
+    /// the old one's, so no cache slot survives it.
+    ///
+    /// The collision this rules out is cheap to hit rather than exotic: entry
+    /// ids restart at 0, the surface cache is keyed `(AgentId, EntryId)`, and
+    /// the fingerprint that validates a slot is a length proxy, so two notices
+    /// of the same length under the same id agree on every part of the key.
+    /// Nothing about the *entry* has changed in a way a fingerprint can see,
+    /// because it is a different entry.
+    #[test]
+    fn a_reset_retires_the_slots_of_the_incarnation_it_ended() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        apply(&chat, &mut life, notice("alpha"));
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(60, 24);
+        let _ = view.draw(&ctx);
+        let first = crate::test_support::rows(&view.draw(&ctx)).join("\n");
+        assert!(
+            first.contains("alpha"),
+            "the first incarnation drew: {first}"
+        );
+        let retired_id = entry_id(&chat, 0);
+        assert!(
+            view.cache.borrow().hits > 0,
+            "nothing was cached, so there is no stale slot for the reset to \
+             retire and this test measures nothing",
+        );
+
+        // A different notice of the same length at the same id: same kind, same
+        // length, same width, same agent, so the whole key and its validation
+        // agree with the retired slot's.
+        chat.borrow_mut().reset(&mut life);
+        apply(&chat, &mut life, notice("omega"));
+        assert_eq!(
+            entry_id(&chat, 0),
+            retired_id,
+            "the new entry must reuse the retired one's id, or nothing collides",
+        );
+
+        let rows = crate::test_support::rows(&view.draw(&ctx)).join("\n");
+        assert!(
+            rows.contains("omega") && !rows.contains("alpha"),
+            "the new incarnation replayed the surface of the one it replaced: {rows}",
+        );
+    }
+
+    /// The same retirement, on the path that never draws.
+    ///
+    /// Select-to-copy lays entries out through the text cache on demand, so a
+    /// clear hung off the draw would not cover it: this asks for the text of
+    /// `EntryId(0)` before and after a reset and must not be told the old
+    /// incarnation's.
+    #[test]
+    fn a_reset_retires_the_text_of_the_incarnation_it_ended() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        apply(&chat, &mut life, notice("alpha"));
+        let mut view = transcript_view(&chat);
+
+        let text_of = |view: &mut TranscriptView, chat: &Rc<RefCell<ChatState>>| {
+            let id = entry_id(chat, 0);
+            view.entry_rows(id, 60)
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|cell| cell.char.grapheme())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        };
+        let before = text_of(&mut view, &chat);
+        assert!(
+            before.contains("alpha"),
+            "the fixture never laid the first entry out, so there is nothing \
+             cached to go stale: {before:?}",
+        );
+
+        chat.borrow_mut().reset(&mut life);
+        apply(&chat, &mut life, notice("omega"));
+        let after = text_of(&mut view, &chat);
+        assert!(
+            after.contains("omega") && !after.contains("alpha"),
+            "select-to-copy read the previous incarnation's rows: {after:?}",
         );
     }
 

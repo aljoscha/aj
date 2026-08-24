@@ -14,6 +14,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use aj_agent::events::{AgentId, AgentSettings, CompactionPhase};
@@ -501,7 +502,17 @@ pub struct ChatState {
     pub show_image_in_terminal: bool,
     /// Whether fenced code blocks in rendered markdown are syntax-highlighted.
     pub syntax_highlight: bool,
+    /// Which incarnation of the model this is, unique for the life of the
+    /// process (see [`Self::generation`]).
+    generation: u64,
 }
+
+/// Source of [`ChatState::generation`] values.
+///
+/// Process-global and never reused, which is the whole point: a fresh model in
+/// a reused cell must not be able to look like the one it replaced, and a
+/// per-model counter starting at zero would do exactly that.
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 impl ChatState {
     /// Build a fresh model seeded with the Main agent's settings and
@@ -531,7 +542,21 @@ impl ChatState {
             tools_expanded: false,
             show_image_in_terminal: true,
             syntax_highlight: false,
+            generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
         }
+    }
+
+    /// Which incarnation of the model this is.
+    ///
+    /// Entry ids are positions in a transcript, so they restart at 0 whenever
+    /// the transcript does: on [`Self::reset`], and on a fresh model swapped
+    /// into a reused cell. Anything caching per-entry work keyed on an entry id
+    /// therefore has to know which incarnation the id belonged to, or an entry
+    /// of the new one collides with the old one's slot. This is that answer,
+    /// and it is unique for the life of the process, so no two incarnations
+    /// ever share one.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// The transcript for `id`, if one exists.
@@ -981,6 +1006,9 @@ impl ChatState {
     /// goes with its transcript, and Main's occupancy numerator goes with
     /// the turns it measured.
     pub fn reset(&mut self, lifecycle: &mut AgentLifecycle) {
+        // Entry ids restart here, so this is a new incarnation and nothing
+        // keyed on an id of the old one may survive it.
+        self.generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
         self.transcripts.clear();
         self.transcripts
             .insert(AgentId::Main, Transcript::default());
