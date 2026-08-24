@@ -1752,6 +1752,7 @@ mod tests {
     use std::path::Path;
     use std::pin::Pin;
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{self, AtomicBool};
     use std::task::{Context, Poll};
     use tempfile::TempDir;
     use tokio::io::{AsyncRead, ReadBuf};
@@ -2460,7 +2461,8 @@ mod tests {
         wait_until(
             || !process_is_live(pid),
             "the pipe holder to be killed with its group",
-        );
+        )
+        .await;
     }
 
     /// The rule from the other side: a straggler that redirected the
@@ -2508,6 +2510,11 @@ mod tests {
         let elapsed = start.elapsed();
 
         let pid = read_pid(&pid_path);
+        // Long enough for a teardown that should never have started to
+        // have signalled: the guard is disarmed on this path, and
+        // without the wait a stray SIGTERM would still be in flight
+        // when the assertion reads the process table.
+        tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             process_is_live(pid),
             "the straggler let go of the pipes and must be left running: \
@@ -2664,7 +2671,8 @@ mod tests {
         wait_until(
             || !process_is_live(pid),
             "the stderr holder to be killed with its group",
-        );
+        )
+        .await;
     }
 
     /// The drain escalates rather than giving up: the group gets a
@@ -2724,9 +2732,705 @@ mod tests {
         wait_until(
             || !process_is_live(pid),
             "the holder that shrugged off SIGTERM to be killed",
-        );
+        )
+        .await;
         let wire = extract_text(&outcome.content);
         assert!(wire.contains(&capture_cut_trailer()), "wire: {wire:?}");
+    }
+
+    /// A drop can land mid-drain, when the child has already been
+    /// reaped and the drain is waiting on a straggler's pipes. The
+    /// guard has to tear the group down from there too, which is why
+    /// its escalation runs on a timer: `Child::wait` answers instantly
+    /// from the cached status at that point and would collapse the
+    /// grace to nothing.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_drop_during_the_drain_still_kills_the_group() {
+        let dir = TempDir::new().expect("create temp dir");
+        let pid_path = dir.path().join("holder-pid");
+        let termed_path = dir.path().join("holder-was-termed");
+
+        // The shell exits at once and the holder keeps the pipes, so
+        // execute is inside the drain when the timeout below drops it.
+        // The holder cleans up on SIGTERM, which is what the guard's
+        // grace has to leave room for even here, where the child was
+        // reaped long before the drop.
+        let command = format!(
+            "{{ trap \"echo termed > '{termed}'; exit\" TERM; \
+                echo $BASHPID > '{pid}'; \
+                while [ -d '{dir}' ] && [ $SECONDS -lt 30 ]; do sleep 0.05; done; }} & \
+             until [ -s '{pid}' ]; do sleep 0.01; done; \
+             echo shell-done",
+            termed = termed_path.display(),
+            pid = pid_path.display(),
+            dir = dir.path().display(),
+        );
+
+        let mut ctx = DummyToolContext::default();
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(300),
+            BashTool::default().execute(
+                &mut ctx,
+                BashInput {
+                    command,
+                    timeout: 30,
+                    description: "test drop during the drain".to_string(),
+                    run_in_background: false,
+                },
+            ),
+        )
+        .await;
+
+        assert!(
+            dropped.is_err(),
+            "the future has to still be draining when it is dropped, \
+             otherwise this measures a completed call"
+        );
+        let pid = read_pid(&pid_path);
+        wait_until(
+            || !process_is_live(pid),
+            "the dropped command's group to be killed",
+        )
+        .await;
+        assert!(
+            termed_path.exists(),
+            "the holder should have run its SIGTERM handler: an escalation keyed on the \
+             already-reaped child would answer instantly and kill it with no grace at all"
+        );
+    }
+
+    /// When a cancel does reach bash's own arm (the window where the
+    /// token fires while a poll is in flight), the group kill cannot
+    /// touch a holder in its own session, so the bounded drain is what
+    /// returns the turn. The holder survives, which is what says the
+    /// wait ended by dropping the read ends.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_cancel_with_a_holder_outside_the_group_is_still_bounded() {
+        let dir = TempDir::new().expect("create temp dir");
+        let pid_path = dir.path().join("session-leader-pid");
+
+        let command = format!(
+            "setsid bash -c \"echo \\$$ > '{pid}'; \
+                while [ -d '{dir}' ] && [ \\$SECONDS -lt 30 ]; do sleep 0.05; done\" & \
+             until [ -s '{pid}' ]; do sleep 0.01; done; \
+             sleep 30",
+            pid = pid_path.display(),
+            dir = dir.path().display(),
+        );
+
+        let mut ctx = DummyToolContext::default();
+        let token = ctx.cancellation.clone();
+        let ready = pid_path.clone();
+        tokio::spawn(async move {
+            wait_until(
+                || {
+                    std::fs::metadata(&ready)
+                        .map(|m| m.len() > 0)
+                        .unwrap_or(false)
+                },
+                "the holder to be up before the cancel: cancelling first would leave \
+                 nothing for the drain to be bounded against",
+            )
+            .await;
+            token.cancel();
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(12),
+            BashTool::default().execute(
+                &mut ctx,
+                BashInput {
+                    command,
+                    timeout: 60,
+                    description: "test cancel with a holder outside the group".to_string(),
+                    run_in_background: false,
+                },
+            ),
+        )
+        .await;
+
+        let pid = read_pid(&pid_path);
+        let outcome = result
+            .unwrap_or_else(|_| {
+                panic!("the cancelled turn was still waiting on a holder no signal reaches")
+            })
+            .expect("execute");
+
+        assert!(
+            process_is_live(pid),
+            "the holder is in its own session, so no kill of ours reaches it and the \
+             drain's abort is what ended the wait: with it dead this measures the kill"
+        );
+        assert!(outcome.is_error, "cancellation marks the outcome");
+        let wire = extract_text(&outcome.content);
+        assert!(wire.contains("Command cancelled"), "wire: {wire:?}");
+        assert!(
+            wire.contains(&capture_cut_trailer()),
+            "the incomplete capture is reported beside the cancel, wire: {wire:?}"
+        );
+    }
+
+    /// A failure between the spawn and the first await leaks the
+    /// command unless the guard is already armed. `spill_dir` is user
+    /// configuration, so an unwritable or full one turns every call
+    /// into this path, which is the failure this guard exists to
+    /// prevent arriving through the back door.
+    ///
+    /// The error's own text is asserted so the second phase cannot be
+    /// satisfied by some unrelated failure. What no assertion here can
+    /// hold is that the spill step is still *after* the spawn: moving
+    /// it before would keep this test green, and would do so precisely
+    /// because the guard is supposed to kill the child faster than it
+    /// can leave a trace of its own.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_spill_failure_does_not_leak_the_command() {
+        let dir = TempDir::new().expect("create temp dir");
+        let allowed = dir.path().join("spill");
+        // `SpillState::new` runs `create_dir_all`, which cannot make a
+        // directory underneath a regular file.
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"").expect("write blocker");
+        let refused = blocker.join("spill");
+
+        let ran = dir.path().join("ran");
+        let leaked = dir.path().join("leaked");
+        let input = |marker: &Path| BashInput {
+            command: format!("sleep 1; touch '{}'", marker.display()),
+            timeout: 30,
+            description: "test spill failure".to_string(),
+            run_in_background: false,
+        };
+
+        // With a usable spill directory the command reaches its marker,
+        // which is what makes the second phase's absence mean
+        // something.
+        let mut ctx = DummyToolContext::default();
+        BashTool::new(false, Some(allowed))
+            .execute(&mut ctx, input(&ran))
+            .await
+            .expect("execute");
+        assert!(ran.exists(), "the command writes its marker when it runs");
+
+        let mut ctx = DummyToolContext::default();
+        let outcome = BashTool::new(false, Some(refused))
+            .execute(&mut ctx, input(&leaked))
+            .await;
+        let error = outcome
+            .err()
+            .expect("an unusable spill directory fails the call")
+            .to_string();
+        assert!(
+            error.contains("Not a directory"),
+            "the call has to fail on the spill directory, not on something before it: {error}"
+        );
+
+        // Past the command's own sleep: if the guard was armed at the
+        // spawn the child never got here, and if it was armed after the
+        // spill it is still running.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            !leaked.exists(),
+            "the command outlived the error return that abandoned it"
+        );
+    }
+
+    /// A command that ignores `SIGTERM` is still killed. Nothing else
+    /// pins the escalation on the guard's path: every other teardown
+    /// test uses a command that goes away on the first signal.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_dropped_command_that_ignores_sigterm_is_killed() {
+        let dir = TempDir::new().expect("create temp dir");
+        let pid_path = dir.path().join("shell-pid");
+        let command = format!(
+            "trap '' TERM; echo $$ > '{pid}'; while true; do sleep 0.2; done",
+            pid = pid_path.display(),
+        );
+
+        let mut ctx = DummyToolContext::default();
+        drop_when_ready(
+            BashTool::default().execute(
+                &mut ctx,
+                BashInput {
+                    command,
+                    timeout: 60,
+                    description: "test sigterm-ignoring command".to_string(),
+                    run_in_background: false,
+                },
+            ),
+            &pid_path,
+        )
+        .await;
+
+        let pid = read_pid(&pid_path);
+        assert!(
+            process_is_live(pid),
+            "the command shrugs off the SIGTERM, otherwise this measures the grace"
+        );
+        wait_until(
+            || !process_is_live(pid),
+            "the SIGTERM-ignoring command to be killed after the grace",
+        )
+        .await;
+    }
+
+    /// The teardown drops the pipe read ends, which is one of the two
+    /// harms a dropped command leaves behind and the one no other test
+    /// looks at.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_dropped_command_releases_its_capture_readers() {
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c")
+            .arg("sleep 30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let child = cmd.spawn().expect("spawn");
+        let pgid: i32 = child.id().expect("pid").try_into().expect("pid fits");
+
+        // Stand-ins for the capture readers: they never finish on their
+        // own, so finishing at all means the teardown aborted them.
+        let stdout_reader = tokio::spawn(std::future::pending::<()>());
+        let stderr_reader = tokio::spawn(std::future::pending::<()>());
+        let mut guard = ProcessGuard::arm(child).expect("arm");
+        guard.watch_readers([stdout_reader.abort_handle(), stderr_reader.abort_handle()]);
+
+        assert!(
+            !stdout_reader.is_finished() && !stderr_reader.is_finished(),
+            "the readers have to be running before the drop"
+        );
+        drop(guard);
+
+        wait_until(
+            || stdout_reader.is_finished() && stderr_reader.is_finished(),
+            "both capture readers to be aborted",
+        )
+        .await;
+        wait_until(
+            || !process_is_live(pgid),
+            "the dropped command to be killed",
+        )
+        .await;
+    }
+
+    /// The tool hands its reader abort handles to the guard, so a
+    /// dropped call releases the pipe read ends as well as the process
+    /// group. Losing that handoff leaves both reader tasks running on
+    /// a pipe nobody will ever close, which is the second harm this
+    /// bead names and the one every other test here reaches through a
+    /// guard it wired itself.
+    ///
+    /// The oracle is a straggler in its own session, out of reach of
+    /// the group kill, whose next write to the inherited pipe fails
+    /// once the host has let go of the read end. It ignores `SIGPIPE`
+    /// so the failed write is an error it can report rather than the
+    /// signal that would kill it, and it reports into a file rather
+    /// than into the pipe under test.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_dropped_call_releases_the_pipes_the_tool_opened() {
+        let dir = TempDir::new().expect("create temp dir");
+        let pid_path = dir.path().join("session-leader-pid");
+        let write_failed = dir.path().join("write-failed");
+
+        let command = format!(
+            "setsid bash -c \"trap '' PIPE; echo \\$$ > '{pid}'; \
+                while [ -d '{dir}' ] && [ \\$SECONDS -lt 30 ]; do \
+                    echo tick || {{ echo gone > '{failed}'; exit 0; }}; \
+                    sleep 0.05; \
+                done\" & \
+             until [ -s '{pid}' ]; do sleep 0.01; done; \
+             sleep 30",
+            pid = pid_path.display(),
+            dir = dir.path().display(),
+            failed = write_failed.display(),
+        );
+
+        let mut ctx = DummyToolContext::default();
+        drop_when_ready(
+            BashTool::default().execute(
+                &mut ctx,
+                BashInput {
+                    command,
+                    timeout: 60,
+                    description: "test reader release through the tool".to_string(),
+                    run_in_background: false,
+                },
+            ),
+            &pid_path,
+        )
+        .await;
+
+        let holder = read_pid(&pid_path);
+        assert!(
+            process_is_live(holder),
+            "the holder is in its own session, so no kill of ours reaches it: with it dead \
+             this would measure the kill instead of the descriptors"
+        );
+        wait_until(
+            || write_failed.exists(),
+            "the straggler's write to fail once the host released the read ends",
+        )
+        .await;
+    }
+
+    /// The grace is the group's, not the leader's. `bash` exits the
+    /// instant it takes the `SIGTERM` while the descendants it forked
+    /// are still running their handlers, so a teardown that waits on
+    /// the child kills exactly the processes the grace was for.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_grace_outlives_a_leader_that_exits_at_once() {
+        let dir = TempDir::new().expect("create temp dir");
+        let pid_path = dir.path().join("descendant-pid");
+        let cleaned_path = dir.path().join("descendant-cleaned-up");
+
+        // The leader goes on the first signal. Its descendant needs
+        // half a second to finish cleaning up, far longer than the
+        // leader survives and far shorter than the grace.
+        let command = format!(
+            "{{ trap \"sleep 0.5; echo done > '{cleaned}'; exit 0\" TERM; \
+                echo $BASHPID > '{pid}'; \
+                while [ -d '{dir}' ] && [ $SECONDS -lt 30 ]; do sleep 0.05; done; }} & \
+             trap 'exit 0' TERM; \
+             until [ -s '{pid}' ]; do sleep 0.01; done; \
+             sleep 30",
+            cleaned = cleaned_path.display(),
+            pid = pid_path.display(),
+            dir = dir.path().display(),
+        );
+
+        let mut ctx = DummyToolContext::default();
+        drop_when_ready(
+            BashTool::default().execute(
+                &mut ctx,
+                BashInput {
+                    command,
+                    timeout: 60,
+                    description: "test a leader that exits at once".to_string(),
+                    run_in_background: false,
+                },
+            ),
+            &pid_path,
+        )
+        .await;
+
+        let descendant = read_pid(&pid_path);
+        wait_until(
+            || cleaned_path.exists(),
+            "the descendant to finish its SIGTERM handler: a grace that ends when the \
+             leader dies takes the handler down with it",
+        )
+        .await;
+        wait_until(
+            || !process_is_live(descendant),
+            "the descendant to be killed once the grace is over",
+        )
+        .await;
+    }
+
+    /// A drop landing after the leader was reaped still kills the
+    /// group. That is the drain-expiry case, where the shell is gone
+    /// and a holder of the turn's pipes is still alive: skipping the
+    /// escalation there leaves it running, which would make a cancelled
+    /// command strictly weaker than a completed one, since the
+    /// completion path kills the same holder.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_reaped_leader_still_gets_its_group_killed() {
+        let dir = TempDir::new().expect("create temp dir");
+        let shell_pid_path = dir.path().join("shell-pid");
+        let holder_pid_path = dir.path().join("holder-pid");
+
+        // The holder ignores SIGTERM, so only the escalation can end
+        // it. The shell exits as soon as the holder is up, which puts
+        // the call in the drain with its leader already reaped.
+        let command = format!(
+            "echo $$ > '{shell}'; \
+             {{ trap '' TERM; echo $BASHPID > '{holder}'; \
+                while [ -d '{dir}' ] && [ $SECONDS -lt 30 ]; do sleep 0.05; done; }} & \
+             until [ -s '{holder}' ]; do sleep 0.01; done; \
+             echo shell-done",
+            shell = shell_pid_path.display(),
+            holder = holder_pid_path.display(),
+            dir = dir.path().display(),
+        );
+
+        let mut ctx = DummyToolContext::default();
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(300),
+            BashTool::default().execute(
+                &mut ctx,
+                BashInput {
+                    command,
+                    timeout: 60,
+                    description: "test a drop with the leader already reaped".to_string(),
+                    run_in_background: false,
+                },
+            ),
+        )
+        .await;
+        assert!(
+            dropped.is_err(),
+            "the call has to still be draining when it is dropped"
+        );
+
+        let shell = read_pid(&shell_pid_path);
+        let holder = read_pid(&holder_pid_path);
+        assert!(
+            !process_is_live(shell),
+            "the shell has to be gone before the drop, otherwise this measures the \
+             live-leader path and says nothing about a reaped one"
+        );
+        assert!(
+            process_is_live(holder),
+            "the holder has to outlive the SIGTERM it ignores, otherwise the escalation \
+             has nothing left to kill"
+        );
+        wait_until(
+            || !process_is_live(holder),
+            "the SIGTERM-immune holder of a reaped leader's group to be killed",
+        )
+        .await;
+    }
+
+    /// A guard dropped after its runtime is gone has nothing to spawn
+    /// onto, and still signals rather than panicking on a runtime that
+    /// is not there.
+    ///
+    /// This is the guard carried out of the runtime and dropped on a
+    /// plain thread. It is NOT the host-exit path: a runtime that is
+    /// shutting down still answers `Handle::try_current` with `Ok`, so
+    /// what a host exit does with an in-flight command is a separate
+    /// question and a separate test.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_guard_dropped_without_a_runtime_still_kills_the_group() {
+        let dir = TempDir::new().expect("create temp dir");
+        let pid_path = dir.path().join("descendant-pid");
+
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let (guard, pgid, descendant) = runtime.block_on(async {
+            let command = format!(
+                "{{ echo $BASHPID > '{pid}'; \
+                    while [ -d '{dir}' ] && [ $SECONDS -lt 30 ]; do sleep 0.05; done; }} & \
+                 until [ -s '{pid}' ]; do sleep 0.01; done; \
+                 sleep 30",
+                pid = pid_path.display(),
+                dir = dir.path().display(),
+            );
+            let mut cmd = Command::new("bash");
+            cmd.arg("-c")
+                .arg(&command)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0);
+            let child = cmd.spawn().expect("spawn");
+            let pgid: i32 = child.id().expect("pid").try_into().expect("pid fits");
+            // The readers are irrelevant here, only their handles are.
+            let readers = [
+                tokio::spawn(std::future::pending::<()>()).abort_handle(),
+                tokio::spawn(std::future::pending::<()>()).abort_handle(),
+            ];
+            // Wait for the descendant so the group has a member the
+            // immediate child's death would not take with it.
+            for _ in 0..400 {
+                if std::fs::metadata(&pid_path)
+                    .map(|m| m.len() > 0)
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let descendant = read_pid(&pid_path);
+            let mut guard = ProcessGuard::arm(child).expect("arm");
+            guard.watch_readers(readers);
+            (guard, pgid, descendant)
+        });
+
+        assert!(
+            process_is_live(pgid) && process_is_live(descendant),
+            "the command and its descendant should be running before the runtime goes: \
+             otherwise this measures nothing"
+        );
+
+        // The host is on its way out: no runtime, no async, no reap.
+        drop(runtime);
+        drop(guard);
+
+        for _ in 0..400 {
+            if !process_is_live(pgid) && !process_is_live(descendant) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the group outlived the runtime: leader {pgid}, descendant {descendant}");
+    }
+
+    /// The `SIGTERM` lands even when the spawned teardown is never
+    /// polled, which is what a host exit does to it: a runtime being
+    /// dropped shuts down inside its own context, so the guard's spawn
+    /// is answered with a handle whose future is discarded unpolled.
+    /// A teardown that owned the first signal would send nothing at
+    /// all here and the whole group would outlive the host.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_guard_dropped_by_a_dying_runtime_still_signals() {
+        let dir = TempDir::new().expect("create temp dir");
+        let pid_path = dir.path().join("shell-pid");
+        let termed_path = dir.path().join("shell-was-termed");
+        // The trap is installed before the pid appears, so a readable
+        // pid also says the command can answer a signal.
+        let command = format!(
+            "trap \"echo termed > '{termed}'; exit\" TERM; \
+             echo $$ > '{pid}'; \
+             while [ -d '{dir}' ] && [ $SECONDS -lt 30 ]; do sleep 0.05; done",
+            termed = termed_path.display(),
+            pid = pid_path.display(),
+            dir = dir.path().display(),
+        );
+        let held = GuardHeldByItsRuntime::spawn(command, &pid_path);
+
+        held.drop_the_runtime();
+
+        for _ in 0..400 {
+            if termed_path.exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "the command never took a SIGTERM: on this path the only signal is the one Drop \
+             sends itself, since the teardown it spawned is discarded unpolled"
+        );
+    }
+
+    /// The residue of the guarantee above, specified rather than
+    /// fixed: escalation belongs to the spawned teardown and dies with
+    /// the runtime, so a command that ignores `SIGTERM` outlives the
+    /// host that held it. Under a live host the same command is
+    /// killed, which is what
+    /// `a_dropped_command_that_ignores_sigterm_is_killed` holds.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_term_immune_command_outlives_the_runtime_that_held_it() {
+        let dir = TempDir::new().expect("create temp dir");
+        let pid_path = dir.path().join("shell-pid");
+        let command = format!(
+            "trap '' TERM; echo $$ > '{pid}'; \
+             while [ -d '{dir}' ] && [ $SECONDS -lt 30 ]; do sleep 0.05; done",
+            pid = pid_path.display(),
+            dir = dir.path().display(),
+        );
+        let held = GuardHeldByItsRuntime::spawn(command, &pid_path);
+        let pid = held.pid;
+
+        held.drop_the_runtime();
+
+        // Past the point a live host would have escalated. What
+        // survives this survives because there was nothing left to
+        // escalate, not because the kill is still on its way.
+        std::thread::sleep(KILL_GRACE + Duration::from_millis(500));
+        assert!(
+            process_is_live(pid),
+            "a SIGTERM-immune command was killed after its runtime went: the escalation is \
+             a courtesy of the spawned teardown, and a synchronous kill in Drop would stall \
+             every host exit by the grace, per live guard"
+        );
+    }
+
+    /// A command running under an armed guard that only the runtime's
+    /// own shutdown can drop, which is the shape a host exit has.
+    ///
+    /// The command is expected to write its pid to `pid_path` once it
+    /// is ready to take a signal, and to end on its own if nobody ever
+    /// signals it.
+    #[cfg(target_os = "linux")]
+    struct GuardHeldByItsRuntime {
+        runtime: tokio::runtime::Runtime,
+        pid: i32,
+        dropped_in_runtime_context: Arc<AtomicBool>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl GuardHeldByItsRuntime {
+        fn spawn(command: String, pid_path: &Path) -> Self {
+            let dropped_in_runtime_context = Arc::new(AtomicBool::new(false));
+            let probe = Arc::clone(&dropped_in_runtime_context);
+            let runtime = tokio::runtime::Runtime::new().expect("runtime");
+            // The task never finishes, so nothing but the runtime's
+            // shutdown reaches the guard.
+            runtime.spawn(async move {
+                let mut cmd = Command::new("bash");
+                cmd.arg("-c")
+                    .arg(&command)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .process_group(0);
+                let child = cmd.spawn().expect("spawn");
+                let _guard = ProcessGuard::arm(child).expect("arm");
+                let _probe = DropContextProbe(probe);
+                std::future::pending::<()>().await;
+            });
+
+            for _ in 0..400 {
+                if std::fs::metadata(pid_path)
+                    .map(|m| m.len() > 0)
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let pid = read_pid(pid_path);
+            assert!(
+                process_is_live(pid),
+                "the command has to be running when the runtime goes, \
+                 otherwise this measures nothing"
+            );
+            Self {
+                runtime,
+                pid,
+                dropped_in_runtime_context,
+            }
+        }
+
+        /// End the host, and hold the construction to the shape it
+        /// claims before the caller reads anything into the result.
+        fn drop_the_runtime(self) {
+            let context = self.dropped_in_runtime_context;
+            drop(self.runtime);
+            assert!(
+                context.load(atomic::Ordering::SeqCst),
+                "the guard was dropped outside the runtime context, which is the plain-thread \
+                 case another test already covers: this fixture only measures the host-exit \
+                 shape while a shutting-down runtime still answers Handle::try_current with Ok"
+            );
+        }
+    }
+
+    /// Records where its drop landed, so a tokio that stops shutting
+    /// down in-context cannot quietly turn the host-exit tests into
+    /// the plain-thread case.
+    #[cfg(target_os = "linux")]
+    struct DropContextProbe(Arc<AtomicBool>);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for DropContextProbe {
+        fn drop(&mut self) {
+            self.0.store(
+                tokio::runtime::Handle::try_current().is_ok(),
+                atomic::Ordering::SeqCst,
+            );
+        }
     }
 
     /// Read a pid a fixture wrote, failing with the shape of the file
@@ -2756,16 +3460,49 @@ mod tests {
     }
 
     /// Spin until `cond` holds, bounded, for a state a signal reaches
-    /// asynchronously.
+    /// asynchronously. Yields to the runtime rather than blocking the
+    /// thread: a teardown spawned by a dropped guard has to be polled
+    /// before it can change anything.
     #[cfg(target_os = "linux")]
-    fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
-        for _ in 0..200 {
+    async fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
+        for _ in 0..400 {
             if cond() {
                 return;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("timed out waiting for {what}");
+    }
+
+    /// Drive a tool call until its fixture reports ready, then drop it,
+    /// which is what the driver does to a cancelled turn.
+    ///
+    /// The handshake is the fixture's own marker rather than a fixed
+    /// delay, so a loaded machine cannot drop a command that has not
+    /// started yet and leave the test measuring an empty process group.
+    /// A call that finishes on its own before the marker appears is a
+    /// broken fixture, not a passed test.
+    #[cfg(target_os = "linux")]
+    async fn drop_when_ready<F: std::future::Future>(future: F, ready: &Path) {
+        let mut future = std::pin::pin!(future);
+        for _ in 0..400 {
+            tokio::select! {
+                biased;
+                _ = future.as_mut() => {
+                    panic!("the call ended before {} appeared, so nothing was dropped", ready.display())
+                }
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+            if std::fs::metadata(ready)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+            {
+                // Dropping the future here is the whole point: it
+                // happens on the way out of this scope.
+                return;
+            }
+        }
+        panic!("the fixture never reported ready at {}", ready.display());
     }
 
     /// `emit_update` is invoked at least once during execution; the
