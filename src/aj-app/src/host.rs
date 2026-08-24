@@ -101,6 +101,20 @@ const LIST_COALESCE: Duration = Duration::from_millis(200);
 /// session this one is done with, which is the failure this exists to fix.
 pub const DEFAULT_IDLE_GRACE: Duration = Duration::from_secs(30);
 
+/// How often the host re-probes the sessions it publishes as locked.
+///
+/// The falling edge of the `locked` bit (spec 6.8), and the only recurring
+/// question the host owes: a rival letting go is invisible otherwise, cleanly
+/// or by crashing, and the client's half of the contract forbids it from asking
+/// on a schedule (spec 6.5). Rising edges are events the host already has, its
+/// own refusal and the enumeration sweep, so this tick only ever clears.
+///
+/// Deliberately its own constant rather than a share of the idle grace: the two
+/// pace unrelated things, and tuning one must not silently move the other. The
+/// scale is a rejoin the user is waiting through, and a tick over an empty set
+/// is one set check, so seconds is what this costs nothing to make.
+pub const LOCK_PROBE_TICK: Duration = Duration::from_secs(2);
+
 /// File in the session store holding this store's stable host id.
 ///
 /// It names the store, not the process: session ids are unique within a
@@ -639,6 +653,7 @@ impl SessionHost {
             tracing::warn!("could not read the session store at startup: {err}");
         }
         spawn_list_publisher(&inner);
+        spawn_lock_probe(&inner);
         spawn_idle_sweeper(&inner);
         Ok(Self { inner })
     }
@@ -1013,6 +1028,17 @@ impl SessionHost {
     #[cfg(any(test, feature = "test-support"))]
     pub fn store_sidecar_directory_reads(&self) -> u64 {
         self.inner.cold.sidecar_directory_reads()
+    }
+
+    /// The directory as the host publishes it, without enumerating.
+    ///
+    /// [`Self::sessions`] is an enumeration point, so a test that wants to know
+    /// what the host is publishing right now cannot ask through it: the ask
+    /// would itself refresh what it is asking about. This is the same snapshot
+    /// a `list` frame carries.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn published_directory(&self) -> SessionList {
+        self.directory().await
     }
 
     /// How many times the host has read its session store's `locks/`
@@ -2081,6 +2107,69 @@ fn spawn_idle_sweeper(inner: &Arc<HostInner>) {
                 if !host.release_if_idle(&session).await {
                     idle_since.remove(&session);
                 }
+            }
+        }
+    });
+}
+
+/// Clear the `locked` bit of any session whose rival has let go.
+///
+/// The host's half of spec 6.5's rejoin contract. A refused client is forbidden
+/// to ask on a schedule, which buys it the host's diligence instead, and this is
+/// where that debt is paid: the rising edges are events the host already has,
+/// its own refusal and the enumeration sweep, and the falling edge has none at
+/// all. A clean release truncates the holder record and a crash releases by
+/// closing a descriptor, and neither reaches this process. Asking the flock is
+/// the only read the fact supports, so this paces that read rather than standing
+/// in for a signal.
+///
+/// Both release paths are bounded by the same constant, because a probe asks
+/// whether the lock is held rather than waiting to be told that it was dropped.
+///
+/// Costs nothing on a settled host: the set of published locks is read first and
+/// almost always empty, so a tick is a set check, and the session map is not
+/// even locked. A non-empty set costs one probe per member, which is a few
+/// microseconds each.
+///
+/// Holds a weak reference, so a host whose last handle is gone lets this task
+/// exit rather than probing for one nobody holds.
+fn spawn_lock_probe(inner: &Arc<HostInner>) {
+    let weak = Arc::downgrade(inner);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(LOCK_PROBE_TICK).await;
+            let Some(inner) = weak.upgrade() else { return };
+            let host = SessionHost { inner };
+            if host.alive().is_err() {
+                return;
+            }
+            let published = host.inner.cold.locked();
+            if published.is_empty() {
+                continue;
+            }
+            // A session this host holds is never published as locked, so this
+            // filters nothing in the normal case. It is here because the one
+            // way the set could hold a live session is a bug elsewhere, and the
+            // probe would then read this host's own flock as a rival's and pin
+            // the bit true for as long as the session lived.
+            let live: HashSet<String> = host.inner.sessions.lock().await.keys().cloned().collect();
+            let mut freed = false;
+            for session in published {
+                if live.contains(&session) {
+                    continue;
+                }
+                match host.inner.cold.probe_lock(&session) {
+                    Ok(true) => {}
+                    Ok(false) => freed |= host.inner.cold.note_locked(&session, false),
+                    // The lock is unreadable, which says nothing about who
+                    // holds it. The bit stands and the next tick asks again.
+                    Err(err) => {
+                        tracing::warn!("could not probe the lock of {session}: {err}")
+                    }
+                }
+            }
+            if freed {
+                host.inner.shared.fanout.mark_list_dirty();
             }
         }
     });

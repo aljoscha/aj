@@ -515,6 +515,14 @@ impl<S: SessionStore> ColdSessions<S> {
         }
     }
 
+    /// The sessions this host currently publishes as locked.
+    ///
+    /// Touches no filesystem. What the probe tick asks about, and empty in the
+    /// normal state, which is what makes a tick over a settled host free.
+    pub(crate) fn locked(&self) -> Vec<String> {
+        self.cache().locked.iter().cloned().collect()
+    }
+
     /// How many times this has read the store's directory.
     ///
     /// The refresh contract is about the filesystem work a refresh does *not*
@@ -898,7 +906,10 @@ impl<S: SessionStore> ColdSessions<S> {
         self.store.enumerate_locks()
     }
 
-    fn probe_lock(&self, session_id: &str) -> Result<bool, ConversationError> {
+    /// Ask the filesystem whether a rival holds one session's lock.
+    ///
+    /// Counted, because a probe transfers no bytes and no budget can see it.
+    pub(crate) fn probe_lock(&self, session_id: &str) -> Result<bool, ConversationError> {
         self.lock_probes.fetch_add(1, Ordering::Relaxed);
         self.store.probe_lock(session_id)
     }

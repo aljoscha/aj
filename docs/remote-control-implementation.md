@@ -362,15 +362,13 @@ prompt history, the render-loop cost, spec section 13) get
 re-prioritized by actual use.
 
 The `locked` row bit (spec 6.5, 6.8) is published: a refused acquire
-sets it, a won one clears it, and an enumeration point sweeps the lock
-directory to re-establish it. Two things it does not have yet. No
-client waits on its edge, so a locked refusal still does not rejoin on
-its own. And nothing refreshes it between enumeration points, which on
-an idle host never come: measured live, a host with a connected client
-and nobody typing enumerates nothing at all, so a rival that lets go
-stays published as holding the session. What bounds that is still
-under design, and the bit is a hint either way, so the escape hatch is
-what it always was, attempting the session and reading the answer.
+sets it, a won one clears it, an enumeration point sweeps the lock
+directory to find rivals' holds, and a probe tick clears it when a
+rival lets go, cleanly or by crashing. What remains is the client
+half: nothing waits on the bit's falling edge yet, so a locked refusal
+still does not rejoin on its own. The bit is a hint either way, so the
+escape hatch is what it always was, attempting the session and reading
+the answer.
 
 ## Before deployment
 

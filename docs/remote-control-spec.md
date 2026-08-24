@@ -886,8 +886,8 @@ surface, not a workload to poll for, its sessions cannot be served by
 this host anyway, and its activity becomes visible at the next
 enumeration point, with one deliberate exception: the rival's hold
 itself, the one fact of another writer's that this host publishes
-(the `locked` bit, section 6.8), moves on a watch over the lock
-directory, an event, never a poll, priced below. Reading a log to
+(the `locked` bit, section 6.8), is kept current by a probe tick,
+priced below. Reading a log to
 produce a directory row is never
 correct, live or cold: a live session's facts are in memory, and a
 cold row needs only enumeration metadata plus two small cached reads,
@@ -912,34 +912,57 @@ hands the driver's row, sidecar axes included, to the cold cache.
 (Materializing one session still reads that session's own sidecars,
 that is a user-paced open, not a listing.)
 The `locked` axis (section 6.8) is the one whose fact belongs to
-another writer, so it alone gets an event source. The lock directory
-is watched. Taking a lock writes its holder record and a clean
-release truncates it while the lock is still held (section 5), so
-both directions of the bit are file events, and each event costs one
-non-blocking probe of the one lock it names, upstream of the refresh
-path, which goes on composing frames from memory alone. The probe is
-its own primitive, shared and instantaneous, never the acquire path,
-so it stamps no holder record, and the instant it holds a free lock
-can refuse one racing acquire, a disclosed cost of asking at all.
+another writer, so it alone is asked about outside an enumeration
+point. The three sources are the host's own refused materialization,
+which sets the bit at every refusal it issues, the enumeration sweep,
+which finds rivals' holds for display, and a probe tick, which is the
+only one that clears.
+
+The falling edge is the host's to own, and it is why the tick exists.
+Section 6.5 forbids a refused client from asking on a schedule, and
+that silence is bought with this: one process per store, which owns
+the lock directory and whose probe is authoritative and free of side
+effects, asks the recurring question so that N clients need not. It
+has to recur, because nothing reports a rival letting go. A clean
+release truncates the holder record and a crash closes a descriptor,
+and the second has no portable event at all, so waiting to be told
+covers one of the two release paths and the wrong one: the rival that
+vanished ungracefully is the rival the lock exists to surface. Asking
+the flock covers both with one mechanism. Nor can enumeration bound
+it, because enumeration is demand-paced and an idle host reaches no
+enumeration point at all, so a bit that only fell there would not
+fall.
+
+The tick probes exactly the sessions the host currently publishes as
+locked, on a host constant of seconds, and clears through the ordinary
+dirty-mark and debounced list path. That set is empty in the normal
+state, so a settled host pays a set check per tick and nothing else,
+and a non-empty one pays a probe per member, which is microseconds.
+The tick never sets the bit: rising edges have their own events.
+
+The probe is its own primitive, shared and instantaneous, never the
+acquire path, so it stamps no holder record and creates no lock file,
+which would otherwise mint a session id (section 5). The instant it
+holds a free lock it can refuse one racing acquire, a disclosed cost
+of asking at all.
+
 Enumeration points sweep the lock directory the same way the sidecar
 axes are swept: one readdir, a stat per lock file (lock files are
 one per session ever minted, so this doubles a constant the log
 stats already pay, not the shape), and a probe only of files whose
 stat shows a holder record, skipping the locks this host itself
 holds, which it knows from its live map. An empty record reads free
-unprobed, so a settled store's sweep probes nothing, and the one
-misread that filter permits, a holder that failed to write its
-record, reads free until an attempt refuses and sets the bit, the
-answer that was always the authority. The host's own refused
-materialization is the third source, setting the bit at every
-refusal it issues. Residue, disclosed rather than papered over: a
-rival that crashes frees the lock with no file event, and a probe
-landing inside a clean release's closing window (the record clears
-before the flock frees) can read held with no event to follow where
-the platform does not report the close. Either way the row can stay
-`locked` until the next attempt, event, or enumeration point. The
-bit is a hint and the attempt is the truth, which is what keeps this
-field from quietly becoming a gate.
+unprobed, so a settled store's sweep probes nothing.
+
+Residue, disclosed rather than papered over: a rival's new hold
+between enumeration points is visible only at the next one, since the
+tick asks only about sessions already published as locked; a holder
+that failed to write its record reads free to the sweep's filter
+until an attempt refuses and sets the bit, the answer that was always
+the authority; and the momentary shared probe can refuse one racing
+acquire. What is bounded, and by the tick rather than by demand, is
+every way a hold ends. The bit is a hint and the attempt is the truth,
+which is what keeps this field from quietly becoming a gate.
 Enumeration is therefore readdir per axis,
 stats and a sniff per file that moved, the lock sweep's stat per
 lock file and probe per holder record found, cheap enough to run

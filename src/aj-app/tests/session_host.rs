@@ -16,7 +16,7 @@ use aj_app::chat::ChatState;
 use aj_app::client::SessionClient;
 use aj_app::host::{
     AttachRequest, Attachment, Command, CommandOutcome, CreateError, HeadTarget, HostError,
-    HostSetup, QueueOp, SessionHost, SettingsAxis, SettingsChange,
+    HostSetup, LOCK_PROBE_TICK, QueueOp, SessionHost, SettingsAxis, SettingsChange,
 };
 use aj_app::session_setup::RunConfigSnapshot;
 use aj_app::settings::{ConfigLayers, PersistAction};
@@ -1412,6 +1412,198 @@ async fn a_refused_session_stays_off_the_streams_attach_set() {
     assert!(
         only(leaked.clone(), &session).is_empty(),
         "a session this stream was refused reached it anyway: {leaked:?}",
+    );
+    host.host.shutdown().await;
+}
+
+/// A writer in another process holding one session's advisory lock.
+///
+/// An owning guard, because every assertion between taking the lock and
+/// releasing it can fail: a bare child would be left holding the lock, and
+/// holding the test harness's stdio, for as long as its sleep runs. Its output
+/// goes to null for the same reason, a leaked child that owns a pipe is a
+/// harness that never sees EOF.
+struct RivalWriter(std::process::Child);
+
+impl RivalWriter {
+    /// Take `session`'s lock in a subprocess, returning once it is held.
+    ///
+    /// `exec` twice over, so the pid this holds is the one owning the
+    /// descriptor: killing a shell that forked the sleep would leave the lock
+    /// held by the child. `<>` rather than `>` so opening the file does not
+    /// truncate the holder record, and the record is written under the won lock
+    /// exactly as a host writes its own. A rival that recorded nothing is a
+    /// different case: the sweep's filter reads it free, which the spec allows
+    /// and an attempt corrects.
+    async fn holding(persistence: &ConversationPersistence, session: &str) -> Self {
+        let lock = persistence
+            .sessions_dir()
+            .join("locks")
+            .join(format!("{session}.lock"));
+        let child = std::process::Command::new("sh")
+            .args([
+                "-c",
+                r#"exec 9<>"$1"; flock -x 9; printf '%s a-rival-writer
+' $$ >&9; exec sleep 600"#,
+                "sh",
+                &lock.to_string_lossy(),
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a rival writer");
+        let rival = Self(child);
+        for _ in 0..100 {
+            if SessionLock::is_held(persistence, session).expect("probe") {
+                return rival;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the rival never took the lock, so nothing measured against it means anything");
+    }
+
+    /// Kill it without letting it release, which is what a crash is.
+    fn crash(mut self) {
+        self.0.kill().expect("kill the rival");
+        self.0.wait().expect("reap the rival");
+    }
+}
+
+impl Drop for RivalWriter {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// The tick asks about the sessions the host publishes as locked and nothing
+/// else, so a host with no rival anywhere pays a set check per tick (spec 6.8).
+///
+/// Both halves are needed and neither is enough. That no probe happens over an
+/// empty set is also what a tick that never runs looks like, so the second half
+/// takes the set off empty and watches the probes start, which is the same tick
+/// proving it was alive for the first half.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_tick_probes_nothing_until_something_is_held() {
+    let harness = Harness::new(vec![finalized_text_message("on the record")]);
+    let session = harness.create().await;
+    let mut writer = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+    writer.pump_until_idle().await;
+    drop(writer);
+
+    assert!(
+        !harness
+            .host
+            .published_directory()
+            .await
+            .sessions
+            .iter()
+            .any(|row| row.locked),
+        "a session already reads locked, so the quiet below is not an empty \
+         set's and this test measures nothing",
+    );
+    let settled = harness.host.store_lock_probes();
+    tokio::time::sleep(LOCK_PROBE_TICK * 3).await;
+    assert_eq!(
+        harness.host.store_lock_probes(),
+        settled,
+        "the tick probed a store where this host holds every lock there is",
+    );
+
+    // Off empty: a rival takes the session this host just released, and the
+    // refusal that follows publishes the bit the tick then watches.
+    harness.host.shutdown().await;
+    let rival = RivalWriter::holding(&harness.persistence, &session).await;
+    let host = harness.revive(vec![finalized_text_message("after the lock")]);
+    drop(host.host.attach(&[attach_request(&session)]).await);
+    assert!(
+        host.host
+            .published_directory()
+            .await
+            .sessions
+            .iter()
+            .any(|row| row.id == session && row.locked),
+        "the refusal did not publish the hold, so the tick has nothing to ask \
+         about and the probes below would stay flat for the wrong reason",
+    );
+
+    let armed = host.host.store_lock_probes();
+    tokio::time::sleep(LOCK_PROBE_TICK * 3).await;
+    assert!(
+        host.host.store_lock_probes() > armed,
+        "the tick never asked about a session this host publishes as locked, so \
+         the flat count above says nothing about the empty set",
+    );
+    drop(rival);
+    host.host.shutdown().await;
+}
+
+/// A rival that crashes frees the lock with no event of any kind, and the row
+/// still stops claiming it is held (spec 6.5, 6.8).
+///
+/// The crash path is the whole reason the bit is kept current by a probe rather
+/// than by watching the lock directory: a clean release truncates the holder
+/// record, which is a file event, but a crash releases by closing a descriptor,
+/// which is not. So this holds the flock in a real subprocess and kills it
+/// without letting it release, leaving the record behind exactly as a crash
+/// does, and nothing but the probe tick can notice.
+///
+/// Deliberately no enumeration point after the kill: a `sessions()` call would
+/// sweep the locks and clear the bit for the wrong reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crashed_rivals_hold_falls_away_on_its_own() {
+    let harness = Harness::new(vec![finalized_text_message("on the record")]);
+    let session = harness.create().await;
+    let mut writer = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "hi").await;
+    writer.pump_until_idle().await;
+    drop(writer);
+    harness.host.shutdown().await;
+
+    let rival = RivalWriter::holding(&harness.persistence, &session).await;
+    let host = harness.revive(vec![finalized_text_message("after the lock")]);
+
+    // The refusal is the rising edge, and the listing below is the last
+    // enumeration point this test allows itself.
+    drop(host.host.attach(&[attach_request(&session)]).await);
+    let locked_now = |list: aj_wire::SessionList| {
+        list.sessions
+            .into_iter()
+            .find(|row| row.id == session)
+            .expect("the session is in the directory")
+            .locked
+    };
+    assert!(
+        locked_now(host.host.sessions().await.expect("sessions")),
+        "the refusal did not publish the rival's hold, so the fall below would \
+         be from a bit that was never set",
+    );
+
+    // The rival dies without releasing. The record it wrote stays behind, which
+    // is what makes this a crash rather than a release.
+    rival.crash();
+    assert!(
+        SessionLock::holder(&harness.persistence, &session).is_some(),
+        "a clean release clears the holder record, so this is not the crash \
+         path and the test measures the wrong thing",
+    );
+
+    let mut cleared = false;
+    for _ in 0..100 {
+        // Reads what the host publishes without enumerating, so the sweep
+        // cannot be what clears the bit.
+        if !locked_now(host.host.published_directory().await) {
+            cleared = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        cleared,
+        "a crashed rival's hold is published forever: nothing tells this host \
+         the lock was freed, so only a probe can find out",
     );
     host.host.shutdown().await;
 }
