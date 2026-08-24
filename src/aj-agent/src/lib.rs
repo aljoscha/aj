@@ -1958,10 +1958,12 @@ impl Agent {
         };
 
         // Run the tool unless the before-hook short-circuited it,
-        // racing against cancel. On cancel we drop the tool future
-        // (bash tears down its process tree; other tools just exit)
-        // and synthesize a cancelled outcome so the transcript still
-        // pairs `tool_use` with `tool_result`.
+        // racing against cancel. On cancel we drop the tool future and
+        // synthesize a cancelled outcome so the transcript still pairs
+        // `tool_use` with `tool_result`. The drop is all the notice a
+        // tool gets: it is never polled again, so releasing whatever it
+        // holds (a child process group, a file handle) is the tool's
+        // own duty on drop, and a tool that leaks there is a tool bug.
         //
         // Tool-input parse failures surface as a `ToolCall` with
         // `arguments == Value::Null`; the tool's own deserializer

@@ -43,12 +43,20 @@
 //!   the stream has closed).
 //! - **Cancellation / timeout.** The child is launched in a fresh
 //!   process group (`process_group(0)`) so we can signal every
-//!   descendant the shell forked on cancel or timeout, which a plain
-//!   `Child::kill()` would leak. On Unix we `SIGTERM` the process
-//!   group, give it a short grace period, then escalate to `SIGKILL`.
-//!   Non-Unix builds fall back to killing just the immediate child. A
+//!   descendant the shell forked, which a plain `Child::kill()` would
+//!   leak. On Unix we `SIGTERM` the process group, give it a grace
+//!   period, then escalate to `SIGKILL`. The timeout path falls back
+//!   to killing just the immediate child on non-Unix. The drop path
+//!   has no such fallback, so there a cancelled command's processes
+//!   survive and only the tool's own descriptors are released. A
 //!   descendant that left the group (`setsid`) is out of reach of all
 //!   of this, which is what the capture drain below bounds.
+//!
+//!   Timeout runs through the `select!` loop's own arm. Cancellation
+//!   mostly does not: the driver drops this future instead of polling
+//!   it again, so the loop's cancel arm only runs in the narrow window
+//!   where the token fires while a poll is in flight. What actually
+//!   tears a cancelled command down is [`ProcessGuard`], on drop.
 //! - **Capture drain.** Capture ends when the command ends. The reader
 //!   tasks stop at EOF, EOF needs every write end of the pipes closed,
 //!   and a process that outlives the command holds one unless it
@@ -140,7 +148,11 @@ const UPDATE_DEBOUNCE: Duration = Duration::from_millis(100);
 /// Kept comfortably below `task_stop`'s own `STOP_GRACE` (5s) so that a
 /// `task_stop` blocking on the status flip still observes the kill
 /// within its budget, even for a command that ignores `SIGTERM`.
-const KILL_GRACE: Duration = Duration::from_secs(2);
+///
+/// Public because it is the teardown's whole budget, and a caller (or a
+/// test) that wants to say "this returned without waiting out the
+/// teardown" has to say it in terms of this.
+pub const KILL_GRACE: Duration = Duration::from_secs(2);
 
 /// How long the capture pipes get to close once the command has ended.
 ///
@@ -363,7 +375,7 @@ impl ToolDefinition for BashTool {
             cmd.process_group(0);
         }
 
-        let mut child = match cmd.spawn() {
+        let child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
                 return Ok(spawn_error_outcome(
@@ -373,15 +385,21 @@ impl ToolDefinition for BashTool {
             }
         };
 
-        // `child.id()` is `Some` between spawn and the eventual `wait`
-        // that reaps the zombie, so this never trips in practice.
-        let child_pid: i32 = child
-            .id()
-            .ok_or("child PID unavailable after spawn")?
-            .try_into()
-            .map_err(|e| format!("child PID does not fit in i32: {e}"))?;
-        let stdout = child.stdout.take().expect("stdout was piped above");
-        let stderr = child.stderr.take().expect("stderr was piped above");
+        // Armed on the line after the spawn, before anything that can
+        // fail: every `?` below this point would otherwise return with
+        // the command running and nothing left to reach it.
+        let mut guard = ProcessGuard::arm(child)?;
+        let child_pid = guard.pgid();
+        let stdout = guard
+            .child_mut()
+            .stdout
+            .take()
+            .expect("stdout was piped above");
+        let stderr = guard
+            .child_mut()
+            .stderr
+            .take()
+            .expect("stderr was piped above");
 
         // The spill file is created eagerly so both reader tasks can
         // tee into it without coordinating creation. If no truncation
@@ -409,6 +427,11 @@ impl ToolDefinition for BashTool {
             "stderr",
         ));
 
+        // The readers own the pipe read ends, so the teardown drops them
+        // too. They cannot be handed over at arming time because they do
+        // not exist until the child's pipes do.
+        guard.watch_readers([stdout_reader.abort_handle(), stderr_reader.abort_handle()]);
+
         if input.run_in_background {
             // Background mode: the spill file is the canonical full
             // output — it must stay reachable for `read_file`, task
@@ -421,10 +444,9 @@ impl ToolDefinition for BashTool {
                 Ok(path) => path,
                 Err(err) => {
                     // The child is already running but has no registry
-                    // entry yet — bailing without killing it would
-                    // leak a process that task_stop and shutdown can
-                    // never reach.
-                    terminate_process_group(&mut child, child_pid).await;
+                    // entry yet, so nothing here can ever reach it
+                    // again. Returning drops the still-armed guard,
+                    // which tears the group down.
                     return Err(err.into());
                 }
             };
@@ -447,8 +469,12 @@ impl ToolDefinition for BashTool {
             // first, then `TaskOutput` / `TaskEnd`. That first emit
             // races this future's own return, so `TaskStart` may land
             // before or after the launch's `ToolExecutionEnd`.
+            //
+            // Disarming here is what lets a background task outlive the
+            // turn that started it: its lifetime now belongs to the
+            // driver and the task registry.
             tokio::spawn(drive_background_bash(BackgroundBash {
-                child,
+                child: guard.disarm(),
                 child_pid,
                 stdout_reader,
                 stderr_reader,
@@ -508,7 +534,7 @@ impl ToolDefinition for BashTool {
                 _ = tokio::time::sleep_until(timeout_at) => {
                     break ChildExit::TimedOut;
                 }
-                res = child.wait() => {
+                res = guard.child_mut().wait() => {
                     let status = res?;
                     break ChildExit::Exited(status.code());
                 }
@@ -522,7 +548,7 @@ impl ToolDefinition for BashTool {
         // Cancel/timeout paths: signal the whole process group so any
         // shell-spawned grandchildren die with the parent.
         if matches!(outcome_kind, ChildExit::Cancelled | ChildExit::TimedOut) {
-            terminate_process_group(&mut child, child_pid).await;
+            terminate_process_group(guard.child_mut(), child_pid).await;
         }
 
         // The reader tasks own the pipe read ends, and their streams end
@@ -563,6 +589,10 @@ impl ToolDefinition for BashTool {
             ChildExit::Exited(code) => code,
             ChildExit::Cancelled | ChildExit::TimedOut => None,
         };
+
+        // The command has ended and its capture is closed, so there is
+        // nothing left for a drop to tear down.
+        drop(guard.disarm());
 
         let mut wire = build_wire_content(
             &stdout_str,
@@ -1474,15 +1504,195 @@ fn decode_stream_output(bytes: Vec<u8>) -> String {
     crate::sanitize_terminal_output(&lossy)
 }
 
+/// Owns a spawned command's teardown for as long as this tool's future
+/// can be dropped.
+///
+/// The driver races a tool against cancellation and drops the losing
+/// future rather than polling it again, so a tool cannot clean up by
+/// observing its own token: a drop is the one moment nothing polls it.
+/// Dropping a [`Child`] does not signal the process and dropping a
+/// `JoinHandle` only detaches its task, so without this a cancelled
+/// turn leaves the whole process group running and both pipe read ends
+/// held.
+///
+/// Armed at the spawn, before the first fallible step, because a
+/// command that outlives an early `?` leaks exactly as a cancelled one
+/// does. Disarm when the command's lifetime belongs to someone else:
+/// the normal return, where the command has already ended, and the
+/// background handoff, where the driver takes over. Every other way out
+/// (a `?`, a panic unwinding through the turn, the driver's drop)
+/// leaves it armed and tears the group down.
+///
+/// Only the `SIGTERM` is guaranteed. The escalation to `SIGKILL` and
+/// the reap run on the runtime, so a host exiting under an in-flight
+/// command loses them and a command that ignores the signal outlives
+/// it. What is lost has an heir: init reaps the orphan, and the pipe
+/// read ends close with the host process.
+struct ProcessGuard {
+    /// `None` once disarmed.
+    armed: Option<ArmedProcess>,
+}
+
+struct ArmedProcess {
+    child: Child,
+    pgid: i32,
+    /// Empty between the spawn and [`ProcessGuard::watch_readers`]: the
+    /// reader tasks do not exist for the first few lines of a call.
+    readers: Vec<tokio::task::AbortHandle>,
+}
+
+impl ProcessGuard {
+    /// Take ownership of a freshly spawned child.
+    ///
+    /// Fails only if the pid is unavailable, which cannot happen
+    /// between a spawn and the reap, and which would leave nothing to
+    /// signal anyway.
+    fn arm(child: Child) -> Result<Self, aj_agent::BoxError> {
+        // The pid is the group id, because the child was spawned with
+        // `process_group(0)`.
+        let pgid: i32 = child
+            .id()
+            .ok_or("child PID unavailable after spawn")?
+            .try_into()
+            .map_err(|e| format!("child PID does not fit in i32: {e}"))?;
+        Ok(Self {
+            armed: Some(ArmedProcess {
+                child,
+                pgid,
+                readers: Vec::new(),
+            }),
+        })
+    }
+
+    /// The command's process-group id.
+    fn pgid(&self) -> i32 {
+        self.expect_armed().pgid
+    }
+
+    /// The child, for the caller that is still driving it.
+    fn child_mut(&mut self) -> &mut Child {
+        &mut self
+            .armed
+            .as_mut()
+            .expect("the guard stays armed until the command's lifetime moves")
+            .child
+    }
+
+    /// Hand the capture readers to the teardown, which drops the pipe
+    /// read ends after it has signalled.
+    fn watch_readers(&mut self, readers: [tokio::task::AbortHandle; 2]) {
+        self.armed
+            .as_mut()
+            .expect("the guard stays armed until the command's lifetime moves")
+            .readers
+            .extend(readers);
+    }
+
+    /// Hand the command's lifetime back to the caller.
+    fn disarm(&mut self) -> Child {
+        self.armed
+            .take()
+            .expect("the guard is disarmed exactly once")
+            .child
+    }
+
+    fn expect_armed(&self) -> &ArmedProcess {
+        self.armed
+            .as_ref()
+            .expect("the guard stays armed until the command's lifetime moves")
+    }
+}
+
+impl Drop for ProcessGuard {
+    fn drop(&mut self) {
+        let Some(armed) = self.armed.take() else {
+            return;
+        };
+        // The first signal leaves from `Drop` itself rather than from
+        // the teardown, because a spawn is not a promise: a runtime
+        // that is shutting down answers one by dropping the future
+        // unpolled, and then nothing would ever be sent.
+        signal_process_group(armed.pgid, GroupSignal::Term);
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(tear_down_process(armed));
+            }
+            Err(_) => {
+                // Dropped outside a runtime, so there is nothing to
+                // escalate or reap on. The descriptors are still ours
+                // to release.
+                for reader in &armed.readers {
+                    reader.abort();
+                }
+            }
+        }
+    }
+}
+
+/// Finish what [`ProcessGuard`]'s `Drop` started: give the group its
+/// grace, escalate to `SIGKILL`, reap what is still ours, and drop the
+/// pipe read ends.
+///
+/// The grace is a timer on every path, never [`Child::wait`]. Once the
+/// leader has been reaped, `wait` answers instantly from a cached
+/// status and the grace collapses to nothing. Waiting on a live child
+/// is no better: `bash` exits the moment it takes the `SIGTERM` while
+/// the descendants it forked are still running their handlers, and
+/// those descendants are who the grace is for.
+///
+/// The `SIGKILL` goes to the group whatever became of the leader,
+/// because a reaped leader is exactly the drain-expiry case where a
+/// pipe holder is still alive and still holding a turn's descriptors.
+/// The stray-kill worry that would argue for skipping it does not
+/// survive its own two cases: a group with a live member still owns
+/// its id, since the id stays reserved for as long as the group is
+/// non-empty, and a group that has emptied answers `ESRCH` and reaches
+/// nobody. The signal is either on target or a no-op, which is what
+/// `drain_capture` says about the same hazard on the completion path.
+///
+/// The residue, so that argument is not read as more than it is: once
+/// the group has emptied *and* the leader has been reaped, the pid
+/// number is free, so a `SIGKILL` landing after a full pid-space
+/// wraparound inside the grace window could reach a stranger. That is
+/// the same theoretical stray kill the completion path already
+/// accepts, and reaping after the kill rather than before is what
+/// keeps the leader's zombie pinning the id for the whole window.
+async fn tear_down_process(armed: ArmedProcess) {
+    let ArmedProcess {
+        mut child,
+        pgid,
+        readers,
+    } = armed;
+    // `Drop` sent the `SIGTERM` before spawning this. The sleep is the
+    // window that signal gets.
+    tokio::time::sleep(KILL_GRACE).await;
+    signal_process_group(pgid, GroupSignal::Kill);
+    if child.id().is_some() {
+        // Bounded, because a `SIGKILL` is only delivered once the
+        // target leaves an uninterruptible wait, and a teardown that
+        // parks forever on one is a leak of a different shape.
+        let _ = tokio::time::timeout(KILL_GRACE, child.wait()).await;
+    }
+    // Dropping the read ends comes last. A command handling its
+    // `SIGTERM` dies of `SIGPIPE` before it reaches its handler if its
+    // output disappears first, which costs exactly the cleanup the
+    // grace was for (measured against this teardown, not assumed).
+    for reader in &readers {
+        reader.abort();
+    }
+}
+
 /// Send one signal to a command's process group.
 ///
 /// `pgid` is the child's pid, which equals its group id because the
 /// child was spawned with `process_group(0)`. That also guarantees the
-/// id is greater than 1, so this never targets group 0 (our own) or -1
-/// (every process). Errors mean the group is already gone (`ESRCH`) or
-/// we lack permission, and there is nothing actionable to do with
-/// either. Process groups are a Unix notion; elsewhere a straggler
-/// keeps its descriptors until the readers are dropped.
+/// id is greater than 1, so this never targets group 0, which is our
+/// own, or group 1, which `killpg` turns into the `kill(-1)` broadcast
+/// to every process we are allowed to signal. Errors mean the group is
+/// already gone (`ESRCH`) or we lack permission, and there is nothing
+/// actionable to do with either. Process groups are a Unix notion.
+/// Elsewhere a straggler keeps its descriptors until the readers are
+/// dropped.
 fn signal_process_group(pgid: i32, signal: GroupSignal) {
     debug_assert!(pgid > 1, "child pid/pgid must be > 1");
     #[cfg(unix)]
