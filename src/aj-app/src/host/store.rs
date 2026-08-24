@@ -1365,7 +1365,7 @@ mod tests {
         rows
     }
 
-    /// The archived bits the rows carry, paired with their ids.
+    /// The locked bits the rows carry, paired with their ids.
     fn barred(cold: Vec<ColdSession>) -> Vec<(String, bool)> {
         let mut rows: Vec<(String, bool)> = cold
             .into_iter()
@@ -1375,6 +1375,7 @@ mod tests {
         rows
     }
 
+    /// The archived bits the rows carry, paired with their ids.
     fn filed(cold: Vec<ColdSession>) -> Vec<(String, bool)> {
         let mut rows: Vec<(String, bool)> = cold
             .into_iter()
