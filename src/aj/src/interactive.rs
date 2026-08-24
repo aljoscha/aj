@@ -867,6 +867,13 @@ impl Block {
     /// request timeout rather than by this budget. Frames in hand say the block
     /// did not stop arriving after all, and folding them is cheaper for everyone
     /// than a projection re-served from a cursor that never moved (spec 6.5).
+    ///
+    /// A rescue and not a guarantee: what the drain sees is what the transport
+    /// has already handed over, not what the peer has written. For a remote
+    /// stream that is one non-blocking poll, and the frames may still be in the
+    /// kernel buffer with the connection task yet to run, so a block that had
+    /// arrived can still be given up on. That costs a re-projection and loses
+    /// nothing, which is the same worst case as not trying.
     fn fold_ready(&mut self, world: &mut World) {
         while self.settled.is_none() {
             let Some(frame) = world.stream.try_recv() else {
@@ -20761,8 +20768,13 @@ mod tests {
     /// a client's cursor does not move until the block completes (spec 6.5), and
     /// nothing about the block had actually stopped arriving.
     ///
-    /// The sleep here stands in for that long iteration, and the fixture
-    /// assertion is that the deadline really did pass before the step ran.
+    /// In-process, because the rule is the driver's and the drain is a channel
+    /// read: the block is queued, the deadline is set into the past rather than
+    /// waited out, and neither half depends on a machine being fast. Over a real
+    /// transport the same drain sees only what the connection task has forwarded,
+    /// so what the rescue catches there is a scheduling question and not a rule.
+    /// [`a_composed_catch_up_past_its_deadline_loses_nothing`] is that case, and
+    /// it asserts the invariant both of its outcomes hold.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_block_in_hand_survives_a_deadline_the_driver_slept_through() {
         let dir = TempDir::new().expect("tempdir");
@@ -20770,10 +20782,89 @@ mod tests {
         let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
         let session = world.session().to_string();
         let epoch = "epoch-in-hand";
+        let silence = Duration::from_millis(300);
+
+        let mut state = advance_resume(&mut world, &shell, Resume::lost())
+            .await
+            .expect("a connection's recovery is never fatal")
+            .expect("the peer answered the open, so a block is arriving");
+
+        // The whole block, in hand: decoded frames the drain reads straight
+        // out of memory. What the peer has written and what a drain can see
+        // are two different things over a connection, and only the second one
+        // is this rule's business.
+        world.stream = Stream::Remote {
+            events: crate::remote::RemoteEvents::scripted(
+                vec![
+                    block_opening(&session, epoch),
+                    block_note(&session, epoch, 1, "in hand"),
+                    block_end(&session, epoch, 1),
+                ],
+                silence,
+            ),
+            lost: None,
+            attached: vec![session.clone()],
+        };
+
+        let ResumeStep::CatchingUp(ref mut block) = state.step else {
+            panic!("the open left a block to catch up on");
+        };
+        assert!(
+            block.settled().is_none(),
+            "the block is over before the step below runs, so nothing it folds \
+             decides anything and this test measures nothing",
+        );
+        // The driver was elsewhere while the deadline passed. Set rather than
+        // slept through: the rule is about a deadline already behind us, and
+        // sleeping for one puts the machine's speed in the assertion.
+        block.deadline = Instant::now() - Duration::from_millis(1);
+        assert!(
+            state.ready(),
+            "the block is still inside its deadline, so the step below is not the \
+             one that gives up and this test measures nothing",
+        );
+
+        let left = advance_resume(&mut world, &shell, state)
+            .await
+            .expect("a connection's recovery is never fatal");
+        assert!(
+            left.is_none(),
+            "a block that was sitting in hand was abandoned at its deadline, so \
+             the host is asked to project the identical suffix again",
+        );
+        assert!(
+            !world.directory.needs_reattach(),
+            "and the client re-owes an attach for a block it already has",
+        );
+        assert!(
+            main_notices(&world)
+                .iter()
+                .any(|text| text == "Reconnected to the host."),
+            "the block landed but the recovery did not report it: {:?}",
+            main_notices(&world),
+        );
+        remote.shutdown().await;
+    }
+
+    /// The same recovery over the real transport, which can only be asserted on
+    /// the outcome: the rescue fires or it does not, depending on whether the
+    /// connection task has forwarded the frames yet, and on a loaded machine it
+    /// has not.
+    ///
+    /// What holds either way is that the two halves of the client agree. A block
+    /// that landed owes no re-attach and says so on screen, and one that was
+    /// given up on owes one and keeps the recovery going. The state this rules
+    /// out is the incoherent pair, a client that folded the block and still
+    /// believes it is owed one, or that abandoned it and forgot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_composed_catch_up_past_its_deadline_loses_nothing() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let session = world.session().to_string();
+        let epoch = "epoch-composed";
 
         let silence = Duration::from_millis(300);
-        // The whole block, written as fast as the peer can, so it is queued long
-        // before the budget runs out.
         let peer = WarmPeer::start(
             vec![
                 block_opening(&session, epoch),
@@ -20801,20 +20892,21 @@ mod tests {
         let left = advance_resume(&mut world, &shell, state)
             .await
             .expect("a connection's recovery is never fatal");
-        assert!(
-            left.is_none(),
-            "a block that was sitting in hand was abandoned at its deadline, so \
-             the host is asked to project the identical suffix again",
-        );
-        assert!(
+        let landed = left.is_none();
+        assert_eq!(
+            landed,
             !world.directory.needs_reattach(),
-            "and the client re-owes an attach for a block it already has",
+            "the client folded the block and still owes an attach, or gave up on \
+              one and owes nothing: landed {landed}, re-attach owed {}",
+            world.directory.needs_reattach(),
         );
-        assert!(
+        assert_eq!(
+            landed,
             main_notices(&world)
                 .iter()
                 .any(|text| text == "Reconnected to the host."),
-            "the block landed but the recovery did not report it: {:?}",
+            "the recovery reported an outcome it did not reach: landed {landed}, \
+             notices {:?}",
             main_notices(&world),
         );
         remote.shutdown().await;

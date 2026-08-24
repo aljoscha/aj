@@ -445,6 +445,34 @@ impl RemoteEvents {
         }
     }
 
+    /// A stream of frames already decoded off the wire, for a test that needs a
+    /// drain to see them.
+    ///
+    /// The frames are handed over as an in-memory stream, so every poll of this
+    /// makes progress. Over a connection they arrive through a task that
+    /// forwards chunks between a caller's polls, which is why a test cannot
+    /// assert that a non-blocking drain sees a frame the peer has written:
+    /// whether it does is a scheduling question. Frames a drive loop must fold
+    /// are pinned against this, and what the real transport is asserted on is
+    /// the outcome either way.
+    #[cfg(test)]
+    pub(crate) fn scripted(frames: Vec<String>, silence: Duration) -> Self {
+        let events = frames.into_iter().map(|data| {
+            Ok(eventsource_stream::Event {
+                event: "message".to_string(),
+                data,
+                id: String::new(),
+                retry: None,
+            })
+        });
+        Self {
+            events: Box::pin(futures::stream::iter(events)),
+            silence,
+            deadline: tokio::time::Instant::now() + silence,
+            done: false,
+        }
+    }
+
     /// How long this stream may be silent before it counts as dead.
     pub(crate) fn silence(&self) -> Duration {
         self.silence
