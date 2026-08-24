@@ -2670,13 +2670,20 @@ async fn a_live_session_holds_its_lock_until_teardown() {
         panic!("a locked session cannot be materialized twice: {refusal:?}");
     };
     assert_eq!(code, "locked", "{message}");
+    // The refusal names a holder, which is what a user needs to go and quit
+    // it. That the holder named is the one holding rather than the one
+    // refused cannot be checked here: both hosts run in this process, so
+    // they share a pid, and `revive` shares the store, so they resolve the
+    // same host id. `a_refused_materialization_leaves_the_log_untouched` is
+    // where the two are distinguishable, because there the holder is the
+    // test's own lock under a host id no host has.
     assert!(
         message.contains(&format!("pid {}", std::process::id())),
         "the refusal names the process that holds it: {message}",
     );
     assert!(
         message.contains(&harness.host.hello().host_id),
-        "and the host that holds it, not the one refused: {message}",
+        "and the host id it was taken under: {message}",
     );
     drop(stream);
 
