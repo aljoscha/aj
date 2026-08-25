@@ -87,6 +87,7 @@ dependencies = [
  "aj-session",
  "aj-tools",
  "aj-wire",
+ "anthropic-sdk",
  "anyhow",
  "arboard",
  "base64",
