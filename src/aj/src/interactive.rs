@@ -723,7 +723,7 @@ fn fold_ready_frames(world: &mut World) -> bool {
 /// arriving is asked for again. A refusal is not: the peer has said attaching
 /// cannot succeed now, so the directory's own rule is what asks again, when the
 /// session's row says the answer can have changed
-/// ([`aj_app::directory::SessionDirectory::rows_returned`]).
+/// ([`aj_app::directory::SessionDirectory::rejoin_edges_fired`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CatchUp {
     /// The block arrived whole and its `caught_up` committed it.
@@ -6248,8 +6248,8 @@ fn reattached_notice(control: &Control) -> &'static str {
 /// question that has been answered, so that one leaves here discharged and the
 /// asking passes to the directory, which owes it again when the session's `list`
 /// row says the answer can have changed
-/// ([`aj_app::directory::SessionDirectory::rows_returned`]). Still nothing gives
-/// up, and nothing spins.
+/// ([`aj_app::directory::SessionDirectory::rejoin_edges_fired`]). Still nothing
+/// gives up, and nothing spins.
 async fn discharge_reattach(
     world: &mut World,
     shell: &Rc<RefCell<Shell>>,
@@ -21218,21 +21218,54 @@ mod tests {
 
     /// A `list` frame carrying exactly `sessions`.
     fn list_of(sessions: &[&str]) -> String {
+        let rows: Vec<(&str, bool)> = sessions.iter().map(|session| (*session, false)).collect();
+        list_holding(&rows)
+    }
+
+    /// A `list` frame whose rows carry the `locked` bit each pair names, which
+    /// is what a peer publishes about a session a rival writer holds (spec 6.8).
+    fn list_holding(sessions: &[(&str, bool)]) -> String {
         serde_json::to_string(&aj_wire::Frame::List {
-            sessions: sessions.iter().map(|id| listed_row(id)).collect(),
+            sessions: sessions
+                .iter()
+                .map(|(session, locked)| aj_wire::SessionSummary {
+                    locked: *locked,
+                    ..listed_row(session)
+                })
+                .collect(),
             hosts: Vec::new(),
         })
         .expect("a list frame")
     }
 
-    /// A peer that keeps refusing is asked once, not once per retry.
+    /// A per-session attach refusal carrying `code`, as a peer sends one.
+    fn refusal_frame(session: &str, code: &str, message: &str) -> String {
+        serde_json::to_string(&aj_wire::Frame::Error {
+            session: session.to_string(),
+            epoch: None,
+            code: code.to_string(),
+            message: message.to_string(),
+        })
+        .expect("an error frame")
+    }
+
+    /// A peer that keeps refusing is asked once, not once per retry, and a peer
+    /// whose rows never carry the `locked` bit leaves a locked refusal waiting
+    /// rather than spinning.
     ///
-    /// This is the behaviour the fix pass left behind when it removed the
-    /// terminal refusal outcome on a spec argument: the recovery retried on a
+    /// Two claims, one property, one fixture. The recovery once retried on a
     /// backoff and folded the peer's `error` frame again on every attempt,
-    /// measured at thirteen rows in the first minute against a real gateway. The
-    /// refusal is an answer, so asking again on a timer adds nothing and costs
-    /// the transcript.
+    /// measured at thirteen rows in the first minute against a real gateway,
+    /// which is why a refusal is an answer and never a schedule.
+    ///
+    /// `locked` is the code that makes this the hard case, and the reason this
+    /// test asserts about it rather than about a session the peer cannot
+    /// resolve. It is the one refusal with two edges armed (spec 6.5), and
+    /// against a peer whose rows carry no bit the second of them can never
+    /// fire, so this is where a client has most to gain from asking anyway and
+    /// must not: the wait is the gap an old peer always had, chosen over a
+    /// timer, and either edge read as presence instead of as a transition spins
+    /// here.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_refusal_is_folded_once_however_long_the_client_waits() {
         let dir = TempDir::new().expect("tempdir");
@@ -21240,21 +21273,17 @@ mod tests {
         let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
         let session = world.session().to_string();
 
-        let refusal = "no host serves this session any more";
+        let refusal = "another writer holds this session";
         let script = vec![
-            serde_json::to_string(&aj_wire::Frame::Error {
-                session: session.clone(),
-                epoch: None,
-                code: "unknown_session".to_string(),
-                message: refusal.to_string(),
-            })
-            .expect("an error frame"),
+            refusal_frame(&session, "locked", refusal),
             // And then the peer keeps listing the session, which is the other way
             // a client could be tempted to ask again: on the row being present
-            // rather than on it having returned. Nothing has changed here, so
+            // rather than on it having returned, or on the bit reading false
+            // rather than on it having fallen. Nothing has changed here, so
             // nothing has answered differently, and a rule that reads presence
-            // instead of the transition spins against exactly the refusal whose
-            // row never leaves, a session held by a rival writer.
+            // instead of the transition spins against exactly this peer: a
+            // session held by a rival writer, listed throughout, on rows that
+            // say nothing about the hold.
             list_of(&[&session]),
             list_of(&[&session]),
         ];
@@ -21305,7 +21334,7 @@ mod tests {
         );
         assert_eq!(
             rows.iter()
-                .filter(|text| *text == aj_app::directory::WITHHELD_NOTICE)
+                .filter(|text| *text == aj_app::directory::WITHHELD_LOCKED_NOTICE)
                 .count(),
             1,
             "and what it costs the user is said exactly once: {rows:?}",
@@ -21318,9 +21347,14 @@ mod tests {
             peer.opens(),
         );
         assert!(
-            world.directory.rows().iter().any(|row| row.id == session),
-            "the peer listed the session throughout, without which this test \
-             measures a row arriving rather than a row staying put",
+            world
+                .directory
+                .rows()
+                .iter()
+                .any(|row| row.id == session && !row.locked),
+            "the peer listed the session throughout and published no hold on \
+             it, without which this test measures a row arriving or a bit \
+             falling rather than a peer that said nothing new",
         );
         remote.shutdown().await;
     }
@@ -21512,6 +21546,205 @@ mod tests {
                 .count(),
             2,
             "each refusal says what it costs, once: {rows:?}",
+        );
+        remote.shutdown().await;
+    }
+
+    /// A session a rival writer holds rejoins by itself when the rival lets go.
+    ///
+    /// The second edge, through the real loop. A held session's row stays on the
+    /// peer's list for as long as the hold lasts, so the absence edge this
+    /// client already had has nothing to fire on and the release is the only
+    /// thing that says the answer changed. It arrives as the row's `locked` bit
+    /// going false (spec 6.5, 6.8). Without this the client stops asking and
+    /// never starts, and the rival letting go is invisible to it forever.
+    ///
+    /// Asserted at the peer, because the claim is that the client asks again on
+    /// its own and the discharge path folds no notice: the transcript of a
+    /// client that rejoined reads exactly like the transcript of one that gave
+    /// up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_locked_session_rejoins_when_the_rival_lets_go() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let session = world.session().to_string();
+        let epoch = "epoch-released";
+
+        let peer = WarmPeer::answering(
+            vec![
+                vec![
+                    // The rival's hold, published on the row and answered on the
+                    // attach with the code that names it. The row goes first, so
+                    // the fall below is a transition and not a first sighting.
+                    list_holding(&[(&session, true)]),
+                    refusal_frame(&session, "locked", "held by another writer"),
+                    // The rival lets go. The row never left the list, so this one
+                    // bit is the whole of what changed.
+                    list_holding(&[(&session, false)]),
+                ],
+                // The second attach is served, which is the rejoin.
+                vec![
+                    block_opening(&session, epoch),
+                    block_end(&session, epoch, 0),
+                ],
+            ],
+            Duration::from_millis(30),
+            After::Warm,
+        )
+        .await;
+        redirect_to(&mut world, &peer, Duration::from_millis(400));
+
+        let asked = Arc::clone(&peer.opens);
+        let (exit, rejoined) = crate::remote::tests::bounded(
+            "the client to rejoin its session when the hold ends",
+            drive_until(&mut world, &shell, |writer| async move {
+                // No keystroke anywhere in here on purpose: the writer is only
+                // dropped, to end the loop once the rejoin has happened.
+                let rejoined = settled(Duration::from_secs(10), || {
+                    (asked.load(std::sync::atomic::Ordering::Relaxed) >= 2).then_some(())
+                })
+                .await;
+                if rejoined.is_some() {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+                drop(writer);
+                rejoined
+            }),
+        )
+        .await;
+
+        assert!(matches!(exit, Ok(SessionExit::Quit)));
+        // The premise before the claim: this was a locked refusal that the
+        // client waited out, not some other way of losing an attachment.
+        let notices = main_notices(&world);
+        assert!(
+            notices
+                .iter()
+                .any(|text| text == aj_app::directory::WITHHELD_LOCKED_NOTICE),
+            "the client never withheld the session as held by a rival, so \
+             nothing here was waiting on the bit: {notices:?}",
+        );
+        assert!(
+            rejoined.is_some(),
+            "the rival let go and the client never asked again, so a locked \
+             refusal is still a dead end: {notices:?}",
+        );
+        assert_eq!(
+            peer.opens(),
+            2,
+            "the peer served {} streams: the rejoin is a second attach, and \
+             any more than two is a client asking on something other than the \
+             edge",
+            peer.opens(),
+        );
+        assert!(
+            world.client().holds_attachment(),
+            "the client is following its session again",
+        );
+        assert!(
+            !world.directory.needs_reattach(),
+            "and owes nothing further",
+        );
+        remote.shutdown().await;
+    }
+
+    /// The bit's fall is read against the rows the client already held, so an
+    /// edge that spans a lost connection still fires.
+    ///
+    /// Both edges are transitions between the rows one folded list replaces and
+    /// the next, never a live watch (spec 6.5), and losing a stream replaces no
+    /// rows. So a hold that ended while the client was away is seen at the first
+    /// list after it comes back. A client that rebuilt its baseline on
+    /// reconnect, or that armed the edge from the rows on the connection the
+    /// refusal arrived on, would have nothing to compare this fall against.
+    ///
+    /// The hold is folded before the redirect, which is the disconnect: the
+    /// peer's very first list carries the release, so the only true the client
+    /// can measure against is the one it kept.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_locked_edge_reads_across_a_lost_connection() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "streaming-text").await;
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        let session = world.session().to_string();
+        let epoch = "epoch-released-while-away";
+
+        let held = aj_wire::Frame::List {
+            sessions: vec![aj_wire::SessionSummary {
+                locked: true,
+                ..listed_row(&session)
+            }],
+            hosts: Vec::new(),
+        };
+        let _ = world
+            .directory
+            .apply(&mut world.chat.borrow_mut(), held.clone());
+        assert!(
+            world
+                .directory
+                .rows()
+                .iter()
+                .any(|row| row.id == session && row.locked),
+            "the baseline this test spans a disconnect with was never folded, \
+             so the release below has no true to fall from",
+        );
+
+        let peer = WarmPeer::answering(
+            vec![
+                vec![
+                    // A new connection, and the rival still had the session when
+                    // this attach reached the peer.
+                    refusal_frame(&session, "locked", "held by another writer"),
+                    // The first list this connection carries already says the
+                    // hold is over. Nothing on this stream ever said it was on.
+                    list_holding(&[(&session, false)]),
+                ],
+                vec![
+                    block_opening(&session, epoch),
+                    block_end(&session, epoch, 0),
+                ],
+            ],
+            Duration::from_millis(30),
+            After::Warm,
+        )
+        .await;
+        redirect_to(&mut world, &peer, Duration::from_millis(400));
+
+        let asked = Arc::clone(&peer.opens);
+        let (exit, rejoined) = crate::remote::tests::bounded(
+            "the client to rejoin on a hold that ended while it was away",
+            drive_until(&mut world, &shell, |writer| async move {
+                let rejoined = settled(Duration::from_secs(10), || {
+                    (asked.load(std::sync::atomic::Ordering::Relaxed) >= 2).then_some(())
+                })
+                .await;
+                if rejoined.is_some() {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+                drop(writer);
+                rejoined
+            }),
+        )
+        .await;
+
+        assert!(matches!(exit, Ok(SessionExit::Quit)));
+        let notices = main_notices(&world);
+        assert!(
+            notices
+                .iter()
+                .any(|text| text == aj_app::directory::WITHHELD_LOCKED_NOTICE),
+            "the client never withheld the session as held by a rival, so \
+             nothing here was waiting on the bit: {notices:?}",
+        );
+        assert!(
+            rejoined.is_some(),
+            "the release landed on the connection after the one that carried \
+             the hold, and the client did not read it: {notices:?}",
+        );
+        assert!(
+            world.client().holds_attachment(),
+            "the client is following its session again",
         );
         remote.shutdown().await;
     }

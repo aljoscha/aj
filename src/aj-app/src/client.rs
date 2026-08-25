@@ -26,6 +26,39 @@ use aj_wire::{AgentQueue, Cursor, DecodedAgentEvent, Frame, QueueState, TaskTabl
 use crate::chat::{ChatState, Redraw, reduce};
 use crate::session::AgentLifecycle;
 
+/// Why a session is withheld, which names the edge in the peer's directory
+/// that re-asks for it (spec 6.5).
+///
+/// Read off the refusal's code once, where the frame is folded, so the wire's
+/// vocabulary stays in this module and whatever watches the directory reads a
+/// decision rather than a token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// The `locked` code: a rival writer holds the session (spec section 5).
+    /// Its row stays listed for as long as the hold lasts, so the edge that
+    /// says the answer can have changed is the row's `locked` bit going true
+    /// then false, the rival letting go (spec 6.8). The absence edge is kept
+    /// besides, because a row can leave and return anyway and comes back
+    /// rebuilt with the bit already false.
+    Locked,
+    /// Every other code, the ones this build has never heard of included: the
+    /// row's return to the list is the edge, and nothing else. An unknown
+    /// refusal behaves like the refusals this build knows rather than like the
+    /// most specific one, which is spec 6.6's additive codes applied to
+    /// rejoining.
+    Other,
+}
+
+impl Refusal {
+    fn from_code(code: &str) -> Self {
+        if code == "locked" {
+            Self::Locked
+        } else {
+            Self::Other
+        }
+    }
+}
+
 /// Where the client stands relative to an attach block (spec 6.5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Attach {
@@ -72,7 +105,8 @@ pub struct SessionClient {
     needs_task_refetch: bool,
     needs_queue_refetch: bool,
     needs_reattach: bool,
-    /// Refused, and nothing is asking again yet.
+    /// Refused, and nothing is asking again yet, carrying the reason so the
+    /// directory knows which edge re-asks.
     ///
     /// Set by [`Self::drop_attachment`], which is the one place that learns a
     /// refusal happened, and cleared by [`Self::owe_reattach`]. Held here rather
@@ -80,7 +114,7 @@ pub struct SessionClient {
     /// one moves neither: the client is already following nothing, so there is no
     /// transition left to read, and a session refused twice would look attached
     /// to anything watching for one.
-    withheld: bool,
+    withheld: Option<Refusal>,
 }
 
 impl SessionClient {
@@ -100,7 +134,7 @@ impl SessionClient {
             needs_task_refetch: false,
             needs_queue_refetch: false,
             needs_reattach: false,
-            withheld: false,
+            withheld: None,
         }
     }
 
@@ -275,7 +309,10 @@ impl SessionClient {
                 Redraw(true)
             }
             Frame::Error {
-                session, message, ..
+                session,
+                code,
+                message,
+                ..
             } => {
                 if !self.is_ours(&session) {
                     return Redraw(false);
@@ -284,14 +321,20 @@ impl SessionClient {
                 // spec 6.5 filters are the ones that carry state under one, and
                 // a refusal for a session the server cannot resolve names none.
                 //
-                // Dropping the attachment reads every error frame as an attach
-                // refusal, which is what the two that exist are (a host's
-                // unresolvable session, a gateway's withdrawn host). Spec
-                // section 5 reserves the kind for a turn's fatal error too, on a
-                // session that stays live. Nothing emits that today, and the day
-                // something does, this arm has to branch on the code rather than
-                // tear the attachment down over a turn that failed.
-                self.drop_attachment();
+                // Every error frame drops the attachment, whatever its code,
+                // which is what the two that exist are (a host's unresolvable
+                // session, a gateway's withdrawn host) and what a rival's hold
+                // is too. The code decides only which edge asks again, never
+                // whether to let go: a refused client is following nothing
+                // either way, and a code this build has never heard of has to
+                // behave like the refusals it knows (spec 6.6).
+                //
+                // Spec section 5 reserves the kind for a turn's fatal error too,
+                // on a session that stays live. Nothing emits that today, and
+                // the day something does it arrives on the unknown-code path and
+                // tears the attachment down over a turn that failed. Telling
+                // that kind from a refusal is the branch this arm still owes.
+                self.drop_attachment(Refusal::from_code(&code));
                 // The message verbatim, which spec 6.6 makes sufficient on its
                 // own, so a code this build has never heard of still reads.
                 reduce(
@@ -434,12 +477,13 @@ impl SessionClient {
         self.epoch.is_some()
     }
 
-    /// Whether this session was refused and nothing is asking again yet.
+    /// Why this session was refused, `None` once something is asking again.
     ///
-    /// True from the refusal until something owes the re-attach
+    /// Set from the refusal until something owes the re-attach
     /// ([`Self::owe_reattach`]), so a caller reading it across one folded frame
-    /// sees each refusal, including a repeat one.
-    pub fn withheld(&self) -> bool {
+    /// sees each refusal, including a repeat one. The reason is what names the
+    /// edge that re-asks (see [`Refusal`]).
+    pub fn withheld(&self) -> Option<Refusal> {
         self.withheld
     }
 
@@ -451,7 +495,7 @@ impl SessionClient {
     /// anywhere will ask.
     pub fn owe_reattach(&mut self) {
         self.needs_reattach = true;
-        self.withheld = false;
+        self.withheld = None;
     }
 
     /// Give up on an attach block that never arrived, re-owing the re-attach.
@@ -487,19 +531,20 @@ impl SessionClient {
     /// session whose host was only restarting. So the obligation is withdrawn
     /// *until the peer's own directory says the answer can have changed*, which
     /// is `SessionDirectory`'s to notice, and it puts the obligation back
-    /// ([`Self::owe_reattach`]). Spec 6.5 permits the later attach that costs a
-    /// full backfill. What it does not ask for is a retry loop.
+    /// ([`Self::owe_reattach`]). `refusal` is what tells it which edge to watch.
+    /// Spec 6.5 permits the later attach that costs a full backfill. What it
+    /// does not ask for is a retry loop.
     ///
     /// Deliberately not what a `reset` does. That one says continuity broke on a
     /// session the server still has, so its obligation stands and is discharged
     /// at once.
-    fn drop_attachment(&mut self) {
+    fn drop_attachment(&mut self, refusal: Refusal) {
         self.attach = Attach::Live;
         self.epoch = None;
         self.committed = None;
         self.applied = None;
         self.needs_reattach = false;
-        self.withheld = true;
+        self.withheld = Some(refusal);
     }
 
     /// Adopt the epoch of the attach block this client asked for, and

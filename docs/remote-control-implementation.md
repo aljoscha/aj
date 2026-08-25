@@ -361,14 +361,16 @@ pipeline unchanged. The banked features (remote previews, cross-host
 prompt history, the render-loop cost, spec section 13) get
 re-prioritized by actual use.
 
-The `locked` row bit (spec 6.5, 6.8) is published: a refused acquire
-sets it, a won one clears it, an enumeration point sweeps the lock
-directory to find rivals' holds, and a probe tick clears it when a
-rival lets go, cleanly or by crashing. What remains is the client
-half: nothing waits on the bit's falling edge yet, so a locked refusal
-still does not rejoin on its own. The bit is a hint either way, so the
-escape hatch is what it always was, attempting the session and reading
-the answer.
+The `locked` row bit (spec 6.5, 6.8) is published and read: a refused
+acquire sets it, a won one clears it, an enumeration point sweeps the
+lock directory to find rivals' holds, and a probe tick clears it when a
+rival lets go, cleanly or by crashing. A client refused with `locked`
+waits for the bit to fall and re-attaches on its own when it does,
+keeping the absent-then-present edge every refusal has. Against a peer
+that never publishes the bit that edge cannot fire and the refusal
+waits, the gap an old peer always had, and deliberately not a timer.
+The bit is a hint either way, so the escape hatch is what it always
+was, attempting the session and reading the answer.
 
 ## Before deployment
 

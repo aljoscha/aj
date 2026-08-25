@@ -959,8 +959,11 @@ between enumeration points is visible only at the next one, since the
 tick asks only about sessions already published as locked; a holder
 that failed to write its record reads free to the sweep's filter
 until an attempt refuses and sets the bit, the answer that was always
-the authority; and the momentary shared probe can refuse one racing
-acquire. What is bounded, and by the tick rather than by demand, is
+the authority; the momentary shared probe can refuse one racing
+acquire; and a row a gateway relays for a host it cannot reach carries
+the bit as last known, with no writer to move it until that host is
+back, the row's `unreachable` mark being the disclosure.
+What is bounded, and by the tick rather than by demand, is
 every way a hold ends. The bit is a hint and the attempt is the truth,
 which is what keeps this field from quietly becoming a gate.
 Enumeration is therefore readdir per axis,
