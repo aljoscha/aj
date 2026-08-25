@@ -303,6 +303,87 @@ mod tests {
         })
     }
 
+    /// Build a log holding one assistant turn and one compaction
+    /// checkpoint carrying `usage`, the shape a compacted session has on
+    /// disk. Returns the log and the guard owning its directory.
+    fn log_with_compaction(usage: Option<Usage>) -> (tempfile::TempDir, ConversationLog) {
+        let dir = tempfile::tempdir().unwrap();
+        let persistence = ConversationPersistence::new(dir.path().to_path_buf());
+        let mut log = ConversationLog::create(&persistence).unwrap();
+        let first_kept = {
+            let mut head = ConversationView::user(&mut log);
+            head.add_message(AgentMessage::wire(user("hi"))).unwrap();
+            head.add_message(AgentMessage::wire(assistant_with_usage(100, 50, 0.10)))
+                .unwrap()
+                .id
+        };
+        log.append_compaction(
+            ThreadFilter::USER,
+            "summary".into(),
+            first_kept,
+            1_000,
+            None,
+            usage,
+        )
+        .unwrap();
+        (dir, log)
+    }
+
+    /// A compaction's own spend reaches both the session total and its
+    /// own subtotal.
+    ///
+    /// The summarizer exchange is never a message entry, so this entry
+    /// is the only place the spend exists: a fold that misses it loses
+    /// the money rather than misplacing it.
+    #[test]
+    fn stats_folds_compaction_spend_into_the_total_and_its_subtotal() {
+        let mut usage = Usage {
+            input: 40_000,
+            output: 900,
+            total_tokens: 40_900,
+            ..Usage::default()
+        };
+        usage.cost.total = 0.25;
+        let (_dir, log) = log_with_compaction(Some(usage));
+
+        let stats = log.stats();
+        assert_eq!(stats.compactions, 1, "the fixture must record a compaction");
+        // The total first: a reader who checks one number checks this one.
+        assert!(
+            (stats.usage.cost.total - 0.35).abs() < 1e-9,
+            "session total is the turn's $0.10 plus the summarizer's $0.25, got {}",
+            stats.usage.cost.total
+        );
+        assert_eq!(
+            stats.usage.total_tokens, 41_050,
+            "the turn's 150 tokens plus the summarizer's 40900"
+        );
+        assert!(
+            (stats.compaction_usage.cost.total - 0.25).abs() < 1e-9,
+            "the compaction line reports the summarizer's share, got {}",
+            stats.compaction_usage.cost.total
+        );
+        assert_eq!(stats.compaction_usage.total_tokens, 40_900);
+    }
+
+    /// A compaction written before the spend was recorded carries no
+    /// usage. It must fold as nothing and leave the session total alone,
+    /// so an old log reads as unknown rather than as free.
+    #[test]
+    fn stats_treats_a_compaction_without_usage_as_unrecorded() {
+        let (_dir, log) = log_with_compaction(None);
+
+        let stats = log.stats();
+        assert_eq!(stats.compactions, 1);
+        assert!(
+            (stats.usage.cost.total - 0.10).abs() < 1e-9,
+            "only the assistant turn contributes, got {}",
+            stats.usage.cost.total
+        );
+        assert_eq!(stats.compaction_usage.total_tokens, 0);
+        assert_eq!(stats.compaction_usage.cost.total, 0.0);
+    }
+
     /// The digest sums token usage and dollar cost across every assistant
     /// message in the file.
     #[test]

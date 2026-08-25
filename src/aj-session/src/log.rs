@@ -3076,13 +3076,22 @@ mod tests {
                 read_files: vec!["/tmp/a".into()],
                 modified_files: vec!["/tmp/b".into()],
             };
+            let mut usage = aj_models::types::Usage {
+                input: 40_000,
+                output: 900,
+                cache_read: 1_000,
+                cache_write: 200,
+                total_tokens: 42_100,
+                ..Default::default()
+            };
+            usage.cost.total = 0.25;
             log.append_compaction(
                 ThreadFilter::USER,
                 "the summary".into(),
                 first_kept.clone(),
                 1234,
                 Some(details),
-                None,
+                Some(usage),
             )
             .expect("append compaction");
 
@@ -3105,11 +3114,17 @@ mod tests {
                 first_kept_entry_id,
                 tokens_before,
                 details,
-                ..
+                usage,
             } => {
                 assert_eq!(summary, "the summary");
                 assert_eq!(first_kept_entry_id, &first_kept);
                 assert_eq!(*tokens_before, 1234);
+                // The durability edge: the summarizer's spend has no
+                // other record, so a field that does not survive the
+                // round trip loses it outright.
+                let usage = usage.as_ref().expect("compaction usage survives a resume");
+                assert_eq!(usage.total_tokens, 42_100);
+                assert!((usage.cost.total - 0.25).abs() < 1e-9);
                 let details = details.as_ref().expect("details present");
                 assert_eq!(details.read_files, vec!["/tmp/a".to_string()]);
                 assert_eq!(details.modified_files, vec!["/tmp/b".to_string()]);

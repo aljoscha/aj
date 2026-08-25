@@ -587,6 +587,111 @@ mod tests {
         }
     }
 
+    /// A compaction's checkpoint carries what the summarizer spent,
+    /// summed over every call the compaction made.
+    ///
+    /// A cut that lands mid-turn costs a second call for the turn
+    /// prefix, and both are the user's money. The scripted model is
+    /// given real rates because the default scripted `ModelCost` is all
+    /// zeros, against which a dropped dollar figure reads as correct.
+    #[tokio::test]
+    async fn the_checkpoint_records_what_every_summarizer_call_spent() {
+        use aj_session::{ConversationEntryKind, ConversationPersistence};
+        use tempfile::TempDir;
+        use tokio_util::sync::CancellationToken;
+
+        use crate::test_support::{build_test_agent, finalized_text_message, scripted_run_config};
+
+        fn priced(text: &str, input: u64, output: u64) -> aj_models::types::AssistantMessage {
+            let mut m = finalized_text_message(text);
+            m.usage.input = input;
+            m.usage.output = output;
+            m
+        }
+
+        let dir = TempDir::new().expect("tempdir");
+        let store = ConversationPersistence::new(dir.path().to_path_buf());
+        let run_config = scripted_run_config(vec![
+            finalized_text_message("first answer"),
+            // Long enough to blow the keep-recent budget on its own, so
+            // the cut snaps to this assistant message and lands inside
+            // the turn its user prompt started.
+            finalized_text_message(&format!("second answer {}", "X".repeat(4000))),
+            priced("SUMMARY", 40_000, 900),
+            priced("PREFIX", 5_000, 100),
+        ]);
+        {
+            let mut guard = run_config.lock().expect("run config mutex poisoned");
+            guard.model_info = Arc::new(aj_models::registry::ModelInfo {
+                cost: aj_models::registry::ModelCost {
+                    input: 3.0,
+                    output: 15.0,
+                    cache_read: 0.3,
+                    cache_write: 3.75,
+                    tiers: Vec::new(),
+                },
+                ..crate::test_support::scripted_model_info()
+            });
+        }
+        let (mut agent, log, _persistence) = build_test_agent(&store, &run_config);
+
+        agent
+            .prompt("first question".to_string(), CancellationToken::new())
+            .await
+            .expect("first turn");
+        agent
+            .prompt("second question".to_string(), CancellationToken::new())
+            .await
+            .expect("second turn");
+
+        let handoff = AppendHandoff::default();
+        let outcome = run_compaction(
+            &mut agent,
+            &log,
+            &handoff,
+            CompactionReason::Manual,
+            None,
+            100,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            matches!(outcome, CompactionOutcome::Compacted { .. }),
+            "expected a compaction, got {outcome:?}"
+        );
+
+        let guard = log.lock().await;
+        let entry = guard
+            .entries_in_order()
+            .into_iter()
+            .find_map(|e| match &e.entry {
+                ConversationEntryKind::Compaction { usage, summary, .. } => {
+                    Some((usage.clone(), summary.clone()))
+                }
+                _ => None,
+            })
+            .expect("a compaction checkpoint was written");
+        let (usage, summary) = entry;
+        let usage = usage.expect("the checkpoint records the summarizer's usage");
+
+        assert!(
+            summary.contains("PREFIX"),
+            "the fixture must reach the split-turn path, which is the second \
+             summarizer call, or this test only measures the first: {summary}"
+        );
+        assert_eq!(
+            usage.total_tokens, 46_000,
+            "40900 for the summary call plus 5100 for the turn prefix"
+        );
+        // (45000 * 3.0 + 1000 * 15.0) / 1e6
+        let expected = 0.135 + 0.015;
+        assert!(
+            (usage.cost.total - expected).abs() < 1e-9,
+            "the checkpoint totals both calls' dollars: got {} expected {expected}",
+            usage.cost.total
+        );
+    }
+
     /// The checkpoint's append and the `CompactionEnd` that stands for it
     /// have to be one atomic step. Emitting after dropping the log guard
     /// lets another durable append take a higher position and reach the
