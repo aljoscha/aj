@@ -143,6 +143,11 @@ pub fn catalog() -> Vec<(&'static str, &'static str, fn() -> Vec<ProviderScript>
             "background sub-agent fails: failed agent box plus an error completion notice",
             background_agent_failure,
         ),
+        (
+            "background-agent-slow",
+            "background sub-agent streams slowly after the parent's turn ends (attach a second client during it)",
+            background_agent_slow,
+        ),
     ]
 }
 
@@ -703,6 +708,58 @@ the scripted provider error.";
     let parent_wrap = builder().start().text_block(wrap).done(DoneReason::Stop);
 
     vec![parent_tools, child_failure, parent_wrap]
+}
+
+/// Parent spawns a background sub-agent and ends its turn; the sub then
+/// streams slowly for ~10 seconds. For that window the session is idle
+/// while a background sub runs, which is the shape to attach a second
+/// client into: the joiner inherits a running sub it never saw start,
+/// and its footer, picker, and spinner must read it as live.
+fn background_agent_slow() -> Vec<ProviderScript> {
+    let parent_tools = builder()
+        .start()
+        .text_block("Delegating a slow check to a background sub-agent.")
+        .tool_call_block_chunked(
+            "agent-call-background-slow",
+            "agent",
+            serde_json::json!({
+                "task": "Work through a slow checklist and report.",
+                "description": "Slow background sub-agent.",
+                "run_in_background": true,
+            }),
+            0,
+            Duration::ZERO,
+        )
+        // Keeps the parent's tool batch open until the detached child has
+        // started its inference, so the child pops the slow script and the
+        // parent's wrap-up pops its own (same ordering barrier as the
+        // background-failure demo above).
+        .tool_call_block_chunked(
+            "background-slow-barrier",
+            "bash",
+            serde_json::json!({
+                "command": "sleep 1",
+                "timeout": 5,
+                "description": "Keep the parent busy while the sub-agent starts."
+            }),
+            0,
+            Duration::ZERO,
+        )
+        .done(DoneReason::ToolUse);
+
+    let child_slow = builder()
+        .start()
+        .text_block("Working through the checklist, this takes a while.")
+        .delay(Duration::from_secs(10))
+        .text_block(" Done, reporting back.")
+        .done(DoneReason::Stop);
+
+    let parent_wrap = builder()
+        .start()
+        .text_block("Spawned. It reports when it finishes.")
+        .done(DoneReason::Stop);
+
+    vec![parent_tools, child_slow, parent_wrap]
 }
 
 // ===========================================================================

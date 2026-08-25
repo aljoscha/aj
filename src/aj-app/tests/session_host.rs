@@ -5600,6 +5600,76 @@ async fn attaching_mid_sub_run_leaves_the_bracket_open() {
     harness.host.shutdown().await;
 }
 
+/// A client attaching while a sub-agent runs receives the opening half of
+/// the bracket repair: the block synthesizes an untagged `AgentStart(Sub n)`
+/// for the live run, before `caught_up`, so the joiner's lifecycle set
+/// matches a continuously attached client's the moment the attach flips
+/// live. Without it the footer's agent count, the picker, the spinner, and
+/// every busy-gated gesture read the inherited sub as idle.
+#[tokio::test]
+async fn an_attach_block_opens_the_bracket_of_a_live_sub() {
+    let harness = Harness::with_provider(scripted(sub_agent_turn(), 1, Duration::from_millis(20)));
+    let session = harness.create().await;
+    let mut all_along = Client::attach(&harness.host, &session).await;
+    harness.prompt(&session, "delegate it").await;
+
+    // Join once the sub-agent's first message is durable, so its spawn
+    // root is in the log and its run is still live.
+    frames_until(&mut all_along.stream, "the sub-agent to start", |frame| {
+        matches!(
+            frame,
+            Frame::Event { event, .. }
+                if matches!(event.known(), Some(AgentEvent::AgentStart { agent_id: AgentId::Sub(1) }))
+        )
+    })
+    .await
+    .into_iter()
+    .for_each(|frame| {
+        let _ = all_along.client.apply(&mut all_along.chat, frame);
+    });
+
+    // Raw attach so the block's frames themselves are assertable.
+    let mut stream = harness
+        .host
+        .attach(&[AttachRequest {
+            session: session.to_string(),
+            cursor: None,
+        }])
+        .await
+        .expect("attach");
+    let frames = frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+
+    // Collected up to and including `caught_up`, so presence in `frames`
+    // is itself the ordering guarantee: a bracket emitted after
+    // `caught_up` never enters the block and fails the expect below as
+    // missing (verified by mutation, moving the synthesis after the
+    // `caught_up` send reddens exactly that expect).
+    let start = frames.iter().position(|frame| {
+        matches!(
+            frame,
+            Frame::Event { durability: None, event, .. }
+                if matches!(event.known(), Some(AgentEvent::AgentStart { agent_id: AgentId::Sub(1) }))
+        )
+    });
+    start.expect("the block synthesizes an untagged AgentStart for the live sub");
+
+    // And the fold turns it into the mark every reader derives from.
+    let mut joiner = SessionClient::new(session.to_string());
+    let mut chat = ChatState::new(settings(), 200_000, Arc::new(Vec::new()));
+    joiner.expect_attach();
+    for frame in frames {
+        let _ = joiner.apply(&mut chat, frame);
+    }
+    assert!(
+        joiner.lifecycle().is_running(AgentId::Sub(1)),
+        "the joiner reads the inherited sub as running",
+    );
+    harness.host.shutdown().await;
+}
+
 /// A sub-agent that concluded while a client was away gets an `AgentEnd`
 /// after `caught_up`, including when zero durable entries follow the
 /// client's cursor.

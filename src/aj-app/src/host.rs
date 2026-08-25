@@ -1801,6 +1801,40 @@ impl SessionHost {
                 return false;
             }
         }
+        // The opening half of the lifecycle repair: a sub-agent still
+        // running when this client attached announced itself only through a
+        // live `AgentStart` this client never saw, so the block synthesizes
+        // it. After the backfill events so the box the reducer's
+        // `AgentStart` arm reopens exists, and before `caught_up` so the
+        // lifecycle set is complete the moment the attach flips live, with
+        // no window in which the footer, the picker, or a busy-gated
+        // gesture reads the sub as idle. `open_subs` is already
+        // liveness-scoped (`close_finished_runs` force-closes non-live
+        // runs), so no second filter here. Idempotent on re-attach:
+        // `mark_running` is a set insert and `reopen_sub_box` leaves a
+        // running box alone.
+        for child in &backfill.open_subs {
+            if !send_block_frame(
+                block,
+                cancelled,
+                Frame::Event {
+                    session: session.id().to_string(),
+                    epoch: epoch.clone(),
+                    // Synthesized bracketing, so untagged: like the closing
+                    // sweep below, tagging it durable would make the
+                    // client's cursor invariant drop it.
+                    durability: None,
+                    event: aj_agent::events::AgentEvent::AgentStart {
+                        agent_id: AgentId::Sub(*child),
+                    }
+                    .into(),
+                },
+            )
+            .await
+            {
+                return false;
+            }
+        }
         if !send_block_frame(
             block,
             cancelled,

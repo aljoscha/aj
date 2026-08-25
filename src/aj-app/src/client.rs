@@ -1334,6 +1334,43 @@ mod tests {
         assert!(!client.lifecycle().is_running(AgentId::Sub(1)));
     }
 
+    /// The first-attach twin of the seed test above: a client that was NOT
+    /// attached when a background sub started has no mark to keep, so the
+    /// block's synthesized opening bracket (an untagged `AgentStart(Sub n)`
+    /// the host emits before `caught_up`) is what creates it. After the
+    /// fold the inherited sub reads as running.
+    #[test]
+    fn a_first_attach_block_marks_an_inherited_sub_running() {
+        let (mut client, mut chat) = attached();
+        assert!(
+            !client.lifecycle().is_running(AgentId::Sub(1)),
+            "a fresh client holds no mark, the block has to create it, \
+             otherwise this test measures nothing",
+        );
+
+        client.expect_attach();
+        let _ = client.apply(
+            &mut chat,
+            live(
+                EPOCH,
+                AgentEvent::AgentStart {
+                    agent_id: AgentId::Sub(1),
+                },
+            ),
+        );
+        let _ = client.apply(&mut chat, state(EPOCH, false));
+        let _ = client.apply(&mut chat, caught_up(EPOCH, 0));
+
+        assert!(
+            !client.lifecycle().is_running(AgentId::Main),
+            "the idle state seed still holds for the main agent",
+        );
+        assert!(
+            client.lifecycle().is_running(AgentId::Sub(1)),
+            "the synthesized bracket marks the inherited sub running",
+        );
+    }
+
     /// An attach that was never served must arm nothing: the host's next
     /// on-change `state` frame would otherwise be mistaken for a block, and
     /// the fold would quiesce and stop advancing its cursor until a

@@ -19700,6 +19700,81 @@ mod tests {
         shut_down(&world).await;
     }
 
+    /// The harm boundary of the inherited-sub repair, composed: a client
+    /// that connects while a background sub-agent runs on the host counts
+    /// it in the footer's activity segment and ticks its spinner. The
+    /// fixture prompts the host BEFORE the client exists and gates on the
+    /// parent turn being over, so the sub's live `AgentStart` is entirely
+    /// in the past and only the attach block's synthesized bracket can
+    /// carry the fact to this client.
+    #[tokio::test]
+    async fn attaching_over_a_running_background_sub_counts_it_in_the_footer() {
+        let dir = TempDir::new().expect("tempdir");
+        let remote = RemoteHost::start(&dir, "background-agent-slow").await;
+        let session = remote.host.create().await.expect("create session");
+        remote
+            .host
+            .command(
+                &session,
+                Command::Prompt {
+                    agent: AgentId::Main,
+                    content: vec![UserContent::text("delegate it")],
+                },
+            )
+            .await
+            .expect("prompt accepted");
+
+        // Gate: the shape under test is an IDLE session with a RUNNING
+        // background sub. Idle proves the parent turn, and with it the
+        // sub's live AgentStart, predates the attach below, so a green
+        // footer cannot have learned the sub from a live frame. The running
+        // agent task proves the sub has not finished yet.
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        loop {
+            let list = remote.host.sessions().await.expect("session list");
+            let idle = list
+                .sessions
+                .iter()
+                .any(|row| row.id == session && !row.working);
+            let table = remote.host.tasks(&session).await.expect("task table");
+            let sub_running = table.tasks.iter().any(|task| {
+                matches!(task.kind, aj_agent::tool::TaskKind::Agent { .. })
+                    && task.status == aj_agent::tool::TaskStatus::Running
+            });
+            if idle && sub_running {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the host never reached idle-with-a-running-sub \
+                 (idle {idle}, sub running {sub_running}), \
+                 this test would otherwise measure nothing",
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let (mut world, shell) = connect_world_and_shell(&dir, &remote, &[]).await;
+        assert_eq!(
+            world.session(),
+            session,
+            "bare connect attached the one existing session",
+        );
+
+        fold_ready_frames(&mut world);
+        // The same mirror the drive loop runs before every render.
+        let ticking = sync_status(&world);
+        let footer = footer_row(&shell);
+        assert!(
+            footer.contains("1 agent"),
+            "the footer counts the inherited background sub: {footer}",
+        );
+        assert!(
+            ticking,
+            "the status sync reports animation, so the sub's spinner ticks",
+        );
+        remote.host.shutdown().await;
+    }
+
     /// The connect-mode smoke test (spec 11.7): a prompt submitted over the
     /// wire streams the host's answer into the transcript, and the footer
     /// shows the host's settings rather than this client's.
