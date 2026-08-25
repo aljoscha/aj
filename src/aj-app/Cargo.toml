@@ -45,6 +45,13 @@ tokio = { workspace = true, features = ["test-util"] }
 # `cargo test --workspace`, where `aj`'s dev-dependency happens to turn
 # the feature on and the resolver unifies it.
 aj-app = { path = ".", features = ["test-support"] }
+# `replay_sse_events` drives a provider adapter's real stream state from
+# a list of SSE frames. The cost tests use it so their fixtures are
+# messages an adapter produced rather than messages a test hand-built,
+# which is the difference between pinning the pricing and restating it.
+aj-models = { path = "../aj-models/", features = ["test-support"] }
+# The SSE frame types the replayed fixtures are written in.
+anthropic-sdk = { path = "../anthropic-sdk" }
 
 [features]
 # Exposes the `test_support` module (scripted-provider / run-config
