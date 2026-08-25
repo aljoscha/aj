@@ -3054,6 +3054,33 @@ mod tests {
     }
 
     #[test]
+    fn a_compaction_line_written_before_usage_was_recorded_still_parses() {
+        // Every log on disk predates the usage field. Reading one must
+        // yield None (the spend is unknown) rather than failing or
+        // inventing a zero, which downstream would render as free.
+        let line = r#"{"id":"00000001","parent_id":"00000000","timestamp":"2026-07-01T00:00:00Z","thread":"user","type":"compaction","summary":"older summary","first_kept_entry_id":"00000000","tokens_before":1234}"#;
+
+        let entry: ConversationEntry =
+            serde_json::from_str(line).expect("a pre-usage compaction line still parses");
+        match entry.entry {
+            ConversationEntryKind::Compaction {
+                summary,
+                tokens_before,
+                usage,
+                ..
+            } => {
+                assert_eq!(summary, "older summary");
+                assert_eq!(tokens_before, 1234);
+                assert!(
+                    usage.is_none(),
+                    "an old entry records no spend, which is not the same as recording zero"
+                );
+            }
+            other => panic!("expected a Compaction entry, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn append_compaction_flushes_and_round_trips() {
         // A `Compaction` entry is punctuation: appending it must
         // materialize the file immediately and survive a resume with
