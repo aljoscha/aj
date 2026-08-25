@@ -145,7 +145,7 @@ fn registry_model(provider: &str, id: &str) -> ModelInfo {
 /// store (handles OAuth refresh and env-var fallbacks).
 async fn resolve_key(provider_id: &str) -> String {
     let auth = AuthStorage::at_default_path().expect("auth.json path (HOME unset?)");
-    auth.get_api_key(provider_id)
+    auth.get_api_key(provider_id, None)
         .await
         .unwrap_or_else(|e| panic!("failed to resolve credentials for {provider_id:?}: {e}"))
         .unwrap_or_else(|| {

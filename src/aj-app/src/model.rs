@@ -197,7 +197,7 @@ fn install_api_key_resolver(options: &mut StreamOptions, auth: &AuthStorage, pro
         let auth = auth.clone();
         let provider_id = provider_id.clone();
         async move {
-            match auth.get_api_key(&provider_id).await {
+            match auth.get_api_key(&provider_id, None).await {
                 Ok(Some(key)) => Ok(key),
                 Ok(None) => Err(missing_key_message(&provider_id)),
                 Err(err) => Err(format!(

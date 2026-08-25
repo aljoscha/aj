@@ -64,8 +64,94 @@ pub enum AuthCredential {
     OAuth(OAuthCredentials),
 }
 
+/// The label a bare entry's credential adopts when a second account
+/// joins its provider and the entry becomes a labeled set.
+pub const DEFAULT_ACCOUNT_LABEL: &str = "default";
+
+/// A provider's slot in `auth.json`: one bare credential, or a labeled
+/// set of credentials with a store-default label.
+///
+/// The bare variants share the `"type"` tag space and the exact bytes of
+/// [`AuthCredential`], so every pre-accounts file parses unchanged and a
+/// single login still writes the shape it always did. The set adds one
+/// tag:
+/// `{ "type": "accounts", "default": "personal", "accounts": { "personal": {...} } }`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+enum StoredEntry {
+    #[serde(rename = "api_key")]
+    ApiKey { key: String },
+    #[serde(rename = "oauth")]
+    OAuth(OAuthCredentials),
+    #[serde(rename = "accounts")]
+    Accounts {
+        /// The label unlabeled resolution uses. Every writer keeps it
+        /// naming a key of `accounts`; a hand-edited file that breaks
+        /// the invariant resolves like a missing account rather than
+        /// failing the whole parse, so one damaged entry cannot take
+        /// down every provider's credentials.
+        default: String,
+        accounts: HashMap<String, AuthCredential>,
+    },
+}
+
+impl StoredEntry {
+    fn from_credential(credential: AuthCredential) -> Self {
+        match credential {
+            AuthCredential::ApiKey { key } => Self::ApiKey { key },
+            AuthCredential::OAuth(creds) => Self::OAuth(creds),
+        }
+    }
+
+    /// Resolve `label` to a credential. `None` means the bare credential
+    /// or a set's default account; `Some` only ever matches inside a set,
+    /// so a labeled ask against a bare entry is a miss, never a silent
+    /// answer from a credential the caller did not name.
+    fn resolve(&self, label: Option<&str>) -> Option<AuthCredential> {
+        match (self, label) {
+            (Self::ApiKey { key }, None) => Some(AuthCredential::ApiKey { key: key.clone() }),
+            (Self::OAuth(creds), None) => Some(AuthCredential::OAuth(creds.clone())),
+            (Self::ApiKey { .. } | Self::OAuth(_), Some(_)) => None,
+            (Self::Accounts { default, accounts }, label) => {
+                accounts.get(label.unwrap_or(default)).cloned()
+            }
+        }
+    }
+
+    /// The concrete slot `label` resolves against, recorded before any
+    /// await so a refresh writes back to the slot it read, not to
+    /// wherever the default points by the time the write happens.
+    fn slot(&self, label: Option<&str>) -> Slot {
+        match self {
+            Self::ApiKey { .. } | Self::OAuth(_) => Slot::Bare,
+            Self::Accounts { default, .. } => Slot::Account(label.unwrap_or(default).to_string()),
+        }
+    }
+}
+
+/// Where a resolved credential lives in its provider's entry.
+#[derive(Clone, Debug)]
+enum Slot {
+    /// The provider's bare (unlabeled) entry.
+    Bare,
+    /// One account of a labeled set.
+    Account(String),
+}
+
+/// A labeled set's contents, for surfaces that render per account.
+///
+/// `None` from [`AuthStorage::accounts`] means the provider holds a bare
+/// credential or nothing; [`AuthStorage::get`] distinguishes those two.
+#[derive(Debug, Clone)]
+pub struct ProviderAccounts {
+    /// The label unlabeled resolution uses.
+    pub default: String,
+    /// Every account, sorted by label for stable display.
+    pub accounts: Vec<(String, AuthCredential)>,
+}
+
 /// In-memory shape of the entire `auth.json` file.
-type AuthData = HashMap<String, AuthCredential>;
+type AuthData = HashMap<String, StoredEntry>;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -96,6 +182,19 @@ pub enum AuthError {
     /// `auth.json` was hand-edited with a bogus provider id.
     #[error("unknown OAuth provider: {0}")]
     UnknownProvider(String),
+    /// An account operation named a label the provider's entry does not
+    /// hold.
+    #[error("provider {provider:?} has no account labeled {label:?}")]
+    UnknownAccount { provider: String, label: String },
+    /// Removing the default account of a set that still has others. The
+    /// caller picks a new default first: silently re-pointing the
+    /// default would move what unlabeled resolution bills against.
+    #[error("account {label:?} is provider {provider:?}'s default; set another default first")]
+    RemovingDefault { provider: String, label: String },
+    /// An account label the store refuses (empty, or one that would
+    /// collide with the name a bare entry adopts on conversion).
+    #[error("invalid account label: {0}")]
+    InvalidLabel(String),
     /// Couldn't acquire the file lock within the timeout.
     #[error("auth storage lock timed out")]
     LockTimeout,
@@ -215,7 +314,8 @@ impl AuthStorage {
             .contains_key(provider_id)
     }
 
-    /// Read the credential currently stored for `provider_id`, if any.
+    /// Read the credential currently stored for `provider_id`, if any:
+    /// the bare credential, or the default account of a labeled set.
     ///
     /// Performs a fresh disk read every call so multiple processes can
     /// share the file without a stale-cache problem. Acquires the
@@ -223,11 +323,52 @@ impl AuthStorage {
     pub async fn get(&self, provider_id: &str) -> Result<Option<AuthCredential>, AuthError> {
         let _lock = FileLock::acquire(&self.path).await?;
         let data = read_auth_file(&self.path)?;
-        Ok(data.get(provider_id).cloned())
+        Ok(data.get(provider_id).and_then(|entry| entry.resolve(None)))
     }
 
-    /// Persist a credential for `provider_id`, replacing any existing
-    /// entry. Atomic w.r.t. concurrent reads/writes via the file lock.
+    /// Read one account of `provider_id`'s labeled set. A bare entry
+    /// holds no labels, so any `label` against it reads `None`.
+    pub async fn get_account(
+        &self,
+        provider_id: &str,
+        label: &str,
+    ) -> Result<Option<AuthCredential>, AuthError> {
+        let _lock = FileLock::acquire(&self.path).await?;
+        let data = read_auth_file(&self.path)?;
+        Ok(data
+            .get(provider_id)
+            .and_then(|entry| entry.resolve(Some(label))))
+    }
+
+    /// The labeled set stored for `provider_id`, or `None` when the
+    /// provider holds a bare credential or nothing.
+    pub async fn accounts(&self, provider_id: &str) -> Result<Option<ProviderAccounts>, AuthError> {
+        let _lock = FileLock::acquire(&self.path).await?;
+        let data = read_auth_file(&self.path)?;
+        Ok(match data.get(provider_id) {
+            Some(StoredEntry::Accounts { default, accounts }) => {
+                let mut accounts: Vec<(String, AuthCredential)> = accounts
+                    .iter()
+                    .map(|(label, cred)| (label.clone(), cred.clone()))
+                    .collect();
+                accounts.sort_by(|a, b| a.0.cmp(&b.0));
+                Some(ProviderAccounts {
+                    default: default.clone(),
+                    accounts,
+                })
+            }
+            _ => None,
+        })
+    }
+
+    /// Persist a credential for `provider_id`. Atomic w.r.t. concurrent
+    /// reads/writes via the file lock.
+    ///
+    /// Against a bare or absent entry this replaces the whole slot,
+    /// exactly as it always did. Against a labeled set it replaces the
+    /// DEFAULT account's credential and preserves the rest: this method's
+    /// callers (a login, a key paste) predate accounts and must not be
+    /// able to flatten a set they do not know exists.
     pub async fn set(
         &self,
         provider_id: &str,
@@ -235,12 +376,142 @@ impl AuthStorage {
     ) -> Result<(), AuthError> {
         let _lock = FileLock::acquire(&self.path).await?;
         let mut data = read_auth_file(&self.path)?;
-        data.insert(provider_id.to_string(), credential);
+        let entry = match data.remove(provider_id) {
+            Some(StoredEntry::Accounts {
+                default,
+                mut accounts,
+            }) => {
+                accounts.insert(default.clone(), credential);
+                StoredEntry::Accounts { default, accounts }
+            }
+            _ => StoredEntry::from_credential(credential),
+        };
+        data.insert(provider_id.to_string(), entry);
+        write_auth_file(&self.path, &data)
+    }
+
+    /// Persist a credential under `label` in `provider_id`'s labeled set,
+    /// creating or growing the set as needed.
+    ///
+    /// A bare entry converts on first growth: the existing credential is
+    /// kept under [`DEFAULT_ACCOUNT_LABEL`] and STAYS the store default,
+    /// so adding an account never silently moves what unlabeled
+    /// resolution bills against. `label` may not be empty, and may not be
+    /// the adopted name while a bare entry still holds it (that write
+    /// would overwrite the credential the conversion exists to keep; use
+    /// [`AuthStorage::set`] to replace it deliberately).
+    pub async fn set_account(
+        &self,
+        provider_id: &str,
+        label: &str,
+        credential: AuthCredential,
+    ) -> Result<(), AuthError> {
+        if label.is_empty() {
+            return Err(AuthError::InvalidLabel("empty label".to_string()));
+        }
+        let _lock = FileLock::acquire(&self.path).await?;
+        let mut data = read_auth_file(&self.path)?;
+        let entry = match data.remove(provider_id) {
+            None => StoredEntry::Accounts {
+                default: label.to_string(),
+                accounts: HashMap::from([(label.to_string(), credential)]),
+            },
+            Some(StoredEntry::Accounts {
+                default,
+                mut accounts,
+            }) => {
+                accounts.insert(label.to_string(), credential);
+                StoredEntry::Accounts { default, accounts }
+            }
+            Some(bare) => {
+                if label == DEFAULT_ACCOUNT_LABEL {
+                    // Put the bare entry back before refusing, `remove`
+                    // above already took it out of the map.
+                    data.insert(provider_id.to_string(), bare);
+                    write_auth_file(&self.path, &data)?;
+                    return Err(AuthError::InvalidLabel(format!(
+                        "{label:?} is the name the existing credential adopts; \
+                         pick another, or replace it with set()"
+                    )));
+                }
+                let existing = bare.resolve(None).expect("a bare entry resolves unlabeled");
+                StoredEntry::Accounts {
+                    default: DEFAULT_ACCOUNT_LABEL.to_string(),
+                    accounts: HashMap::from([
+                        (DEFAULT_ACCOUNT_LABEL.to_string(), existing),
+                        (label.to_string(), credential),
+                    ]),
+                }
+            }
+        };
+        data.insert(provider_id.to_string(), entry);
+        write_auth_file(&self.path, &data)
+    }
+
+    /// Point `provider_id`'s default at `label`. Errors when the entry
+    /// is not a labeled set holding that label.
+    pub async fn set_default_account(
+        &self,
+        provider_id: &str,
+        label: &str,
+    ) -> Result<(), AuthError> {
+        let _lock = FileLock::acquire(&self.path).await?;
+        let mut data = read_auth_file(&self.path)?;
+        match data.get_mut(provider_id) {
+            Some(StoredEntry::Accounts { default, accounts }) if accounts.contains_key(label) => {
+                *default = label.to_string();
+            }
+            _ => {
+                return Err(AuthError::UnknownAccount {
+                    provider: provider_id.to_string(),
+                    label: label.to_string(),
+                });
+            }
+        }
+        write_auth_file(&self.path, &data)
+    }
+
+    /// Remove one account from `provider_id`'s labeled set.
+    ///
+    /// Removing the last account removes the provider's entry entirely.
+    /// Removing the default while other accounts remain is refused
+    /// ([`AuthError::RemovingDefault`]): the caller picks a new default
+    /// first, so the store never re-points billing on its own. A set
+    /// that shrinks to one account stays a set, its label was chosen
+    /// deliberately and collapsing it back to bare would discard it.
+    pub async fn remove_account(&self, provider_id: &str, label: &str) -> Result<(), AuthError> {
+        let _lock = FileLock::acquire(&self.path).await?;
+        let mut data = read_auth_file(&self.path)?;
+        let Some(StoredEntry::Accounts { default, accounts }) = data.get_mut(provider_id) else {
+            return Err(AuthError::UnknownAccount {
+                provider: provider_id.to_string(),
+                label: label.to_string(),
+            });
+        };
+        if !accounts.contains_key(label) {
+            return Err(AuthError::UnknownAccount {
+                provider: provider_id.to_string(),
+                label: label.to_string(),
+            });
+        }
+        if label == default {
+            if accounts.len() > 1 {
+                return Err(AuthError::RemovingDefault {
+                    provider: provider_id.to_string(),
+                    label: label.to_string(),
+                });
+            }
+            data.remove(provider_id);
+        } else {
+            accounts.remove(label);
+        }
         write_auth_file(&self.path, &data)
     }
 
     /// Remove the credential stored for `provider_id`. No-op if none
-    /// exists. Atomic w.r.t. concurrent operations via the file lock.
+    /// exists. Removes a labeled set whole, every account of it: this is
+    /// the logout-everything path. Atomic w.r.t. concurrent operations
+    /// via the file lock.
     pub async fn remove(&self, provider_id: &str) -> Result<(), AuthError> {
         let _lock = FileLock::acquire(&self.path).await?;
         let mut data = read_auth_file(&self.path)?;
@@ -288,17 +559,27 @@ impl AuthStorage {
     /// priority chain:
     ///
     /// 1. Runtime override (CLI `--api-key` flag).
-    /// 2. Stored API key in `auth.json`.
-    /// 3. Stored OAuth tokens, auto-refreshed under the file lock if
+    /// 2. Stored credential in `auth.json`: the bare credential or, for a
+    ///    labeled set, the `account` slot (`None` = the store default).
+    ///    Stored OAuth tokens auto-refresh under the file lock when
     ///    expired.
-    /// 4. Environment variables.
+    /// 3. Environment variables, for unlabeled asks only.
     ///
     /// A stored credential is checked before the environment so a
     /// deliberate `aj login` or hand-edited `auth.json` entry stays
     /// authoritative. A stray exported key (say an `ANTHROPIC_API_KEY`
     /// left in a shell profile) must not silently shadow, and mis-bill
     /// against, a configured subscription. The explicit per-run
-    /// override is the runtime `--api-key` in step 1, not ambient env.
+    /// override is the runtime `--api-key` in step 1, not ambient env,
+    /// and it wins even over an explicit `account`: it is the louder,
+    /// more local instruction.
+    ///
+    /// An `account` that misses (a label the set does not hold, any
+    /// label against a bare entry, a dangling default) resolves to
+    /// `Ok(None)` with NO environment fallback: serving a credential
+    /// other than the one named is exactly the mis-billing this chain
+    /// exists to prevent, and the caller names the label in its own
+    /// missing-credential message.
     ///
     /// Returns `Ok(None)` when no source has a key. A stored OAuth
     /// credential whose provider id isn't in the registry (e.g. a
@@ -310,7 +591,11 @@ impl AuthStorage {
     /// an upstream 401 mid-request rather than a re-login prompt.
     /// OAuth *refresh* failures bubble out as [`AuthError::OAuth`].
     /// Callers typically surface a "log in again" prompt.
-    pub async fn get_api_key(&self, provider_id: &str) -> Result<Option<String>, AuthError> {
+    pub async fn get_api_key(
+        &self,
+        provider_id: &str,
+        account: Option<&str>,
+    ) -> Result<Option<String>, AuthError> {
         // 1. Runtime override.
         if let Some(key) = self
             .state
@@ -323,40 +608,56 @@ impl AuthStorage {
             return Ok(Some(key));
         }
 
-        // 2 & 3. Stored credential, checked before the environment so a
-        //        deliberate login stays authoritative (see the doc
-        //        comment). Each arm that yields a usable key returns
-        //        here. Otherwise we fall through to the env fallback.
-        match self.get(provider_id).await? {
-            Some(AuthCredential::ApiKey { key }) => return Ok(Some(key)),
-            Some(AuthCredential::OAuth(creds)) => {
-                // A stored OAuth credential under a provider id we have
-                // no flow for (a hand-edited or renamed id) can be
-                // neither validated nor refreshed. Treat it as
-                // unconfigured and let the caller prompt a fresh login
-                // rather than hard-erroring on what is effectively a typo.
-                let Ok(provider) = self.lookup_oauth_provider(provider_id).await else {
-                    return Ok(None);
-                };
-                let now = now_unix_ms();
-                if !creds.is_expired_at(now) {
-                    return Ok(Some(provider.get_api_key(&creds)));
+        // 2. Stored credential, checked before the environment so a
+        //    deliberate login stays authoritative (see the doc
+        //    comment). Each arm that yields a usable key returns
+        //    here.
+        let entry = {
+            let _lock = FileLock::acquire(&self.path).await?;
+            read_auth_file(&self.path)?.remove(provider_id)
+        };
+        if let Some(entry) = entry {
+            // The slot is fixed from this read: a refresh writes back to
+            // the slot it read, whatever the default points at by then.
+            let slot = entry.slot(account);
+            match entry.resolve(account) {
+                Some(AuthCredential::ApiKey { key }) => return Ok(Some(key)),
+                Some(AuthCredential::OAuth(creds)) => {
+                    // A stored OAuth credential under a provider id we have
+                    // no flow for (a hand-edited or renamed id) can be
+                    // neither validated nor refreshed. Treat it as
+                    // unconfigured and let the caller prompt a fresh login
+                    // rather than hard-erroring on what is effectively a typo.
+                    let Ok(provider) = self.lookup_oauth_provider(provider_id).await else {
+                        return Ok(None);
+                    };
+                    let now = now_unix_ms();
+                    if !creds.is_expired_at(now) {
+                        return Ok(Some(provider.get_api_key(&creds)));
+                    }
+                    // A refresh failure bubbles as `AuthError::OAuth`. An
+                    // `Ok(None)` means a sibling process cleared or replaced
+                    // the slot while we held the lock, so we fall through
+                    // rather than inventing a credential.
+                    if let Some(key) = self
+                        .refresh_oauth_with_lock(provider_id, &slot, &*provider)
+                        .await?
+                    {
+                        return Ok(Some(key));
+                    }
                 }
-                // A refresh failure bubbles as `AuthError::OAuth`. An
-                // `Ok(None)` means a sibling process cleared or replaced
-                // the entry while we held the lock, so we fall through to
-                // env rather than inventing a credential.
-                if let Some(key) = self
-                    .refresh_oauth_with_lock(provider_id, &*provider)
-                    .await?
-                {
-                    return Ok(Some(key));
-                }
+                // The entry exists but the asked slot does not (a missing
+                // label, a label against a bare entry, a dangling
+                // default). Unconfigured, never a different credential.
+                None => return Ok(None),
             }
-            None => {}
         }
 
-        // 4. Environment variables, the lowest-priority fallback.
+        // 3. Environment variables, the lowest-priority fallback, and
+        //    only for unlabeled asks: env keys carry no account identity.
+        if account.is_some() {
+            return Ok(None);
+        }
         Ok(get_env_api_key(provider_id))
     }
 
@@ -368,9 +669,29 @@ impl AuthStorage {
         provider_id: &str,
         callbacks: &dyn OAuthCallbacks,
     ) -> Result<(), AuthError> {
+        self.login_account(provider_id, None, callbacks).await
+    }
+
+    /// Run an OAuth login flow and persist the result under `label` in
+    /// `provider_id`'s labeled set (`None` keeps [`AuthStorage::login`]'s
+    /// unlabeled write, which replaces the bare entry or a set's default
+    /// slot). The flow runs before any write, so a failed or cancelled
+    /// login leaves the store untouched.
+    pub async fn login_account(
+        &self,
+        provider_id: &str,
+        label: Option<&str>,
+        callbacks: &dyn OAuthCallbacks,
+    ) -> Result<(), AuthError> {
         let provider = self.lookup_oauth_provider(provider_id).await?;
         let creds = provider.login(callbacks).await?;
-        self.set(provider_id, AuthCredential::OAuth(creds)).await
+        match label {
+            Some(label) => {
+                self.set_account(provider_id, label, AuthCredential::OAuth(creds))
+                    .await
+            }
+            None => self.set(provider_id, AuthCredential::OAuth(creds)).await,
+        }
     }
 
     /// Remove any stored credential for `provider_id`, regardless of
@@ -421,19 +742,30 @@ impl AuthStorage {
     /// Always re-reads `auth.json` under the lock — a sibling process
     /// may have already refreshed by the time we got the lock, in
     /// which case we use *its* token instead of doing another
-    /// upstream call.
+    /// upstream call. `slot` is the place the caller's read resolved,
+    /// and it is where the refreshed token is written back: never the
+    /// default-of-the-moment, which a sibling may have re-pointed.
     async fn refresh_oauth_with_lock(
         &self,
         provider_id: &str,
+        slot: &Slot,
         provider: &dyn OAuthProvider,
     ) -> Result<Option<String>, AuthError> {
         let _lock = FileLock::acquire(&self.path).await?;
 
         let mut data = read_auth_file(&self.path)?;
-        let creds = match data.get(provider_id) {
-            Some(AuthCredential::OAuth(c)) => c.clone(),
-            // Either the entry vanished or it's now an api_key;
-            // either way, nothing to refresh.
+        let creds = match (data.get(provider_id), slot) {
+            (Some(StoredEntry::OAuth(c)), Slot::Bare) => c.clone(),
+            (Some(StoredEntry::Accounts { accounts, .. }), Slot::Account(label)) => {
+                match accounts.get(label) {
+                    Some(AuthCredential::OAuth(c)) => c.clone(),
+                    // The slot vanished or is now an api_key; nothing
+                    // to refresh.
+                    _ => return Ok(None),
+                }
+            }
+            // The entry changed shape under a sibling's write; nothing
+            // to refresh in the slot we read.
             _ => return Ok(None),
         };
 
@@ -447,7 +779,17 @@ impl AuthStorage {
 
         let refreshed = provider.refresh_token(&creds).await?;
         let api_key = provider.get_api_key(&refreshed);
-        data.insert(provider_id.to_string(), AuthCredential::OAuth(refreshed));
+        match (data.get_mut(provider_id), slot) {
+            (Some(entry @ StoredEntry::OAuth(_)), Slot::Bare) => {
+                *entry = StoredEntry::OAuth(refreshed);
+            }
+            (Some(StoredEntry::Accounts { accounts, .. }), Slot::Account(label)) => {
+                accounts.insert(label.clone(), AuthCredential::OAuth(refreshed));
+            }
+            // Unreachable in practice: the shapes were just matched
+            // above under the same lock.
+            _ => return Ok(None),
+        }
         write_auth_file(&self.path, &data)?;
         Ok(Some(api_key))
     }
@@ -552,8 +894,9 @@ fn read_auth_file(path: &Path) -> Result<AuthData, AuthError> {
 
 /// In-place rewrite of any legacy OAuth-typed `"openai"` entry to
 /// `"openai-codex"`. Idempotent; leaves the data alone if the
-/// destination id is already populated or if the source isn't an
-/// OAuth entry.
+/// destination id is already populated or if the source isn't a bare
+/// OAuth entry. A labeled set under `"openai"` is never legacy: sets
+/// postdate the rename, so one there is user-authored and stays put.
 fn migrate_legacy_openai_oauth(data: &mut AuthData) {
     const LEGACY_ID: &str = "openai";
     const NEW_ID: &str = "openai-codex";
@@ -561,7 +904,7 @@ fn migrate_legacy_openai_oauth(data: &mut AuthData) {
     // Only OAuth credentials migrate. The legacy `openai` slot also
     // legitimately stored hand-written `api_key` entries (plain
     // `OPENAI_API_KEY` paste-ins), and those stay where they are.
-    if !matches!(data.get(LEGACY_ID), Some(AuthCredential::OAuth(_))) {
+    if !matches!(data.get(LEGACY_ID), Some(StoredEntry::OAuth(_))) {
         return;
     }
     // Don't clobber a user-authored entry under the new id.
@@ -850,7 +1193,7 @@ mod tests {
             .set_runtime_api_key("openai", "from-runtime".into())
             .await;
 
-        let key = storage.get_api_key("openai").await.unwrap();
+        let key = storage.get_api_key("openai", None).await.unwrap();
         assert_eq!(key.as_deref(), Some("from-runtime"));
     }
 
@@ -872,7 +1215,10 @@ mod tests {
             .await
             .unwrap();
 
-        let key = storage.get_api_key("custom-provider-xyz").await.unwrap();
+        let key = storage
+            .get_api_key("custom-provider-xyz", None)
+            .await
+            .unwrap();
         assert_eq!(key.as_deref(), Some("from-file"));
     }
 
@@ -922,7 +1268,11 @@ mod tests {
 
         // Nothing stored yet, so the env var is the fallback.
         assert_eq!(
-            storage.get_api_key("openrouter").await.unwrap().as_deref(),
+            storage
+                .get_api_key("openrouter", None)
+                .await
+                .unwrap()
+                .as_deref(),
             Some("from-env"),
         );
 
@@ -937,7 +1287,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            storage.get_api_key("openrouter").await.unwrap().as_deref(),
+            storage
+                .get_api_key("openrouter", None)
+                .await
+                .unwrap()
+                .as_deref(),
             Some("from-file"),
         );
     }
@@ -990,7 +1344,7 @@ mod tests {
             .await
             .unwrap();
 
-        let key = storage.get_api_key("stub").await.unwrap();
+        let key = storage.get_api_key("stub", None).await.unwrap();
         assert_eq!(key.as_deref(), Some("refreshed-a"));
 
         // Confirm the refreshed creds were persisted.
@@ -1045,7 +1399,7 @@ mod tests {
             .await
             .unwrap();
 
-        let key = storage.get_api_key("stub").await.unwrap();
+        let key = storage.get_api_key("stub", None).await.unwrap();
         assert_eq!(key.as_deref(), Some("fresh-a"));
     }
 
@@ -1057,7 +1411,7 @@ mod tests {
         let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
 
         let key = storage
-            .get_api_key("nonexistent-provider-zzz")
+            .get_api_key("nonexistent-provider-zzz", None)
             .await
             .unwrap();
         assert!(key.is_none());
@@ -1105,7 +1459,7 @@ mod tests {
             .await
             .unwrap();
 
-        match storage.get_api_key("stub").await {
+        match storage.get_api_key("stub", None).await {
             Err(AuthError::OAuth(_)) => {}
             other => panic!("expected AuthError::OAuth, got {other:?}"),
         }
@@ -1140,7 +1494,7 @@ mod tests {
             .await
             .unwrap();
 
-        let key = storage.get_api_key("typod-provider").await.unwrap();
+        let key = storage.get_api_key("typod-provider", None).await.unwrap();
         assert!(
             key.is_none(),
             "unknown OAuth provider should resolve to None, got {key:?}"
@@ -1438,6 +1792,423 @@ mod tests {
         assert!(
             !lock_path.exists(),
             "stolen lock directory should be removed"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Labeled accounts
+    // -----------------------------------------------------------------
+
+    fn api_key(key: &str) -> AuthCredential {
+        AuthCredential::ApiKey { key: key.into() }
+    }
+
+    /// A pre-accounts auth.json, as literal bytes rather than a
+    /// round-trip through our own serializer: a serializer bug that
+    /// changed the written shape would keep a round-trip green while
+    /// every real user's file stopped parsing.
+    #[tokio::test]
+    async fn pre_accounts_file_parses_unchanged() {
+        let (_dir, path) = scratch_path("legacy-shape");
+        std::fs::write(
+            &path,
+            r#"{
+  "anthropic": { "type": "oauth", "refresh": "r1", "access": "a1", "expires": 9999999999999 },
+  "openrouter": { "type": "api_key", "key": "sk-or" }
+}"#,
+        )
+        .unwrap();
+        let storage = AuthStorage::with_providers(path, HashMap::new());
+
+        match storage.get("anthropic").await.unwrap() {
+            Some(AuthCredential::OAuth(c)) => assert_eq!(c.access, "a1"),
+            other => panic!("unexpected credential: {other:?}"),
+        }
+        assert_eq!(
+            storage
+                .get_api_key("openrouter", None)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("sk-or"),
+        );
+        // A bare entry is not a labeled set.
+        assert!(storage.accounts("anthropic").await.unwrap().is_none());
+    }
+
+    /// Growing a bare entry keeps the existing credential under the
+    /// adopted label AND as the default: adding an account never moves
+    /// what unlabeled resolution bills against.
+    #[tokio::test]
+    async fn growing_a_bare_entry_keeps_it_the_default() {
+        let (_dir, path) = scratch_path("grow");
+        let storage = AuthStorage::with_providers(path.clone(), HashMap::new());
+        storage.set("prov-x", api_key("first")).await.unwrap();
+        storage
+            .set_account("prov-x", "work", api_key("second"))
+            .await
+            .unwrap();
+
+        let set = storage.accounts("prov-x").await.unwrap().expect("a set");
+        assert_eq!(set.default, DEFAULT_ACCOUNT_LABEL);
+        assert_eq!(
+            set.accounts
+                .iter()
+                .map(|(l, _)| l.as_str())
+                .collect::<Vec<_>>(),
+            vec![DEFAULT_ACCOUNT_LABEL, "work"],
+            "sorted labels, both credentials present",
+        );
+        assert_eq!(
+            storage
+                .get_api_key("prov-x", None)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("first"),
+            "unlabeled resolution still bills the pre-existing credential",
+        );
+        assert_eq!(
+            storage
+                .get_api_key("prov-x", Some("work"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("second"),
+        );
+
+        // And the disk shape is the documented one.
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(json["prov-x"]["type"], "accounts");
+        assert_eq!(json["prov-x"]["default"], DEFAULT_ACCOUNT_LABEL);
+        assert_eq!(json["prov-x"]["accounts"]["work"]["type"], "api_key");
+    }
+
+    /// A label the set does not hold resolves to nothing, never to the
+    /// default: serving a different credential than the one named is
+    /// the mis-billing the chain exists to prevent.
+    #[tokio::test]
+    async fn an_absent_label_never_falls_back_to_the_default() {
+        let (_dir, path) = scratch_path("absent-label");
+        let storage = AuthStorage::with_providers(path, HashMap::new());
+        storage
+            .set_account("prov-x", "personal", api_key("k1"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .get_api_key("prov-x", None)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("k1"),
+            "the default resolves, otherwise this test measures nothing",
+        );
+        assert_eq!(
+            storage.get_api_key("prov-x", Some("work")).await.unwrap(),
+            None,
+        );
+        assert!(
+            storage
+                .get_account("prov-x", "work")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Any label against a bare entry is a miss.
+    #[tokio::test]
+    async fn a_label_against_a_bare_entry_misses() {
+        let (_dir, path) = scratch_path("label-vs-bare");
+        let storage = AuthStorage::with_providers(path, HashMap::new());
+        storage.set("prov-x", api_key("k1")).await.unwrap();
+        assert_eq!(
+            storage.get_api_key("prov-x", Some("work")).await.unwrap(),
+            None,
+        );
+    }
+
+    /// A labeled ask never falls through to the environment: env keys
+    /// carry no account identity, so serving one for a named account
+    /// would bill a credential the caller did not pick.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_labeled_miss_ignores_the_environment() {
+        let _env = EnvVarGuard::set("OPENROUTER_API_KEY", "from-env");
+        let (_dir, path) = scratch_path("label-no-env");
+        let storage = AuthStorage::with_providers(path, HashMap::new());
+
+        assert_eq!(
+            storage
+                .get_api_key("openrouter", None)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("from-env"),
+            "the env var is set and serves unlabeled asks, \
+             otherwise this test measures nothing",
+        );
+        assert_eq!(
+            storage
+                .get_api_key("openrouter", Some("work"))
+                .await
+                .unwrap(),
+            None,
+        );
+    }
+
+    /// The runtime override is the loudest instruction and wins even
+    /// over an explicit account pick.
+    #[tokio::test]
+    async fn runtime_override_wins_over_a_labeled_ask() {
+        let (_dir, path) = scratch_path("override-vs-label");
+        let storage = AuthStorage::with_providers(path, HashMap::new());
+        storage
+            .set_account("prov-x", "work", api_key("stored"))
+            .await
+            .unwrap();
+        storage
+            .set_runtime_api_key("prov-x", "override".into())
+            .await;
+        assert_eq!(
+            storage
+                .get_api_key("prov-x", Some("work"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("override"),
+        );
+    }
+
+    /// An expired token in a NON-default slot refreshes in place: the
+    /// refreshed credential lands back in its own slot and the default
+    /// account's credential is untouched.
+    #[tokio::test]
+    async fn refresh_writes_the_labeled_slot_not_the_default() {
+        struct StubProvider;
+
+        #[async_trait]
+        impl OAuthProvider for StubProvider {
+            fn id(&self) -> &str {
+                "stub"
+            }
+            fn name(&self) -> &str {
+                "Stub"
+            }
+            async fn login(
+                &self,
+                _callbacks: &dyn OAuthCallbacks,
+            ) -> Result<OAuthCredentials, OAuthError> {
+                Ok(OAuthCredentials::new("r", "a", 0))
+            }
+            async fn refresh_token(
+                &self,
+                _credentials: &OAuthCredentials,
+            ) -> Result<OAuthCredentials, OAuthError> {
+                Ok(OAuthCredentials::new(
+                    "refreshed-r",
+                    "refreshed-a",
+                    i64::MAX,
+                ))
+            }
+        }
+
+        let (_dir, path) = scratch_path("labeled-refresh");
+        let mut providers: HashMap<String, Arc<dyn OAuthProvider>> = HashMap::new();
+        providers.insert("stub".into(), Arc::new(StubProvider));
+        let storage = AuthStorage::with_providers(path, providers);
+
+        // Default account holds a FRESH token, the picked account an
+        // expired one, so only the picked slot has any business moving.
+        storage
+            .set_account(
+                "stub",
+                "personal",
+                AuthCredential::OAuth(OAuthCredentials::new("p-r", "p-a", i64::MAX)),
+            )
+            .await
+            .unwrap();
+        storage
+            .set_account(
+                "stub",
+                "work",
+                AuthCredential::OAuth(OAuthCredentials::new("w-r", "w-a", 1)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .accounts("stub")
+                .await
+                .unwrap()
+                .expect("a set")
+                .default,
+            "personal",
+            "the first account is the default, \
+             otherwise this test measures nothing",
+        );
+
+        let key = storage.get_api_key("stub", Some("work")).await.unwrap();
+        assert_eq!(key.as_deref(), Some("refreshed-a"));
+
+        match storage.get_account("stub", "work").await.unwrap() {
+            Some(AuthCredential::OAuth(c)) => assert_eq!(c.access, "refreshed-a"),
+            other => panic!("unexpected credential: {other:?}"),
+        }
+        match storage.get_account("stub", "personal").await.unwrap() {
+            Some(AuthCredential::OAuth(c)) => {
+                assert_eq!(c.access, "p-a", "the default slot is untouched")
+            }
+            other => panic!("unexpected credential: {other:?}"),
+        }
+    }
+
+    /// An unlabeled write against a labeled set replaces the default
+    /// slot and preserves the rest: pre-accounts callers cannot flatten
+    /// a set they do not know exists.
+    #[tokio::test]
+    async fn an_unlabeled_set_replaces_only_the_default_slot() {
+        let (_dir, path) = scratch_path("unlabeled-set");
+        let storage = AuthStorage::with_providers(path, HashMap::new());
+        storage
+            .set_account("prov-x", "personal", api_key("k1"))
+            .await
+            .unwrap();
+        storage
+            .set_account("prov-x", "work", api_key("k2"))
+            .await
+            .unwrap();
+
+        storage.set("prov-x", api_key("k1-replaced")).await.unwrap();
+
+        let set = storage
+            .accounts("prov-x")
+            .await
+            .unwrap()
+            .expect("still a set");
+        assert_eq!(set.default, "personal");
+        assert_eq!(
+            storage
+                .get_api_key("prov-x", None)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("k1-replaced"),
+        );
+        assert_eq!(
+            storage
+                .get_api_key("prov-x", Some("work"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("k2"),
+            "the sibling account survived the unlabeled write",
+        );
+    }
+
+    /// Labels the store refuses: empty anywhere, and the adopted name
+    /// while a bare entry still holds it (that write would overwrite
+    /// the credential the conversion exists to keep).
+    #[tokio::test]
+    async fn invalid_labels_are_refused_and_leave_the_store_intact() {
+        let (_dir, path) = scratch_path("bad-labels");
+        let storage = AuthStorage::with_providers(path, HashMap::new());
+
+        assert!(matches!(
+            storage.set_account("prov-x", "", api_key("k")).await,
+            Err(AuthError::InvalidLabel(_)),
+        ));
+
+        storage.set("prov-x", api_key("keep-me")).await.unwrap();
+        assert!(matches!(
+            storage
+                .set_account("prov-x", DEFAULT_ACCOUNT_LABEL, api_key("clobber"))
+                .await,
+            Err(AuthError::InvalidLabel(_)),
+        ));
+        assert_eq!(
+            storage
+                .get_api_key("prov-x", None)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("keep-me"),
+            "the refused write left the bare credential in place",
+        );
+    }
+
+    /// Default-account lifecycle: removing the default while others
+    /// remain is refused, re-pointing then removing works, removing
+    /// the last account drops the provider's entry.
+    #[tokio::test]
+    async fn removing_accounts_respects_the_default() {
+        let (_dir, path) = scratch_path("remove-accounts");
+        let storage = AuthStorage::with_providers(path, HashMap::new());
+        storage
+            .set_account("prov-x", "personal", api_key("k1"))
+            .await
+            .unwrap();
+        storage
+            .set_account("prov-x", "work", api_key("k2"))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            storage.remove_account("prov-x", "personal").await,
+            Err(AuthError::RemovingDefault { .. }),
+        ));
+        assert!(matches!(
+            storage.remove_account("prov-x", "ghost").await,
+            Err(AuthError::UnknownAccount { .. }),
+        ));
+        assert!(matches!(
+            storage.set_default_account("prov-x", "ghost").await,
+            Err(AuthError::UnknownAccount { .. }),
+        ));
+
+        storage.set_default_account("prov-x", "work").await.unwrap();
+        storage.remove_account("prov-x", "personal").await.unwrap();
+        let set = storage.accounts("prov-x").await.unwrap().expect("a set");
+        assert_eq!(set.default, "work");
+        assert_eq!(set.accounts.len(), 1, "a one-account set stays a set");
+
+        storage.remove_account("prov-x", "work").await.unwrap();
+        assert!(!storage.has("prov-x").await.unwrap());
+        assert!(storage.accounts("prov-x").await.unwrap().is_none());
+    }
+
+    /// A hand-edited default that names no account resolves like a
+    /// missing account (no key, no env fallback, no parse failure), so
+    /// one damaged entry cannot take down the file or borrow a sibling
+    /// credential.
+    #[tokio::test]
+    async fn a_dangling_default_resolves_to_nothing() {
+        let (_dir, path) = scratch_path("dangling-default");
+        std::fs::write(
+            &path,
+            r#"{
+  "prov-x": {
+    "type": "accounts",
+    "default": "gone",
+    "accounts": { "work": { "type": "api_key", "key": "k2" } }
+  }
+}"#,
+        )
+        .unwrap();
+        let storage = AuthStorage::with_providers(path, HashMap::new());
+
+        assert_eq!(storage.get_api_key("prov-x", None).await.unwrap(), None);
+        assert_eq!(
+            storage
+                .get_api_key("prov-x", Some("work"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("k2"),
+            "the intact account still resolves by name",
         );
     }
 }

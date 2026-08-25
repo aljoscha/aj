@@ -881,7 +881,7 @@ async fn resolve_trusted_model(
 ) -> Result<TrustedModel, RunnerError> {
     let auth = AuthStorage::at_default_path().map_err(|error| RunnerError(error.to_string()))?;
     if auth
-        .get_api_key(&model.provider)
+        .get_api_key(&model.provider, None)
         .await
         .map_err(|error| RunnerError(error.to_string()))?
         .is_none()

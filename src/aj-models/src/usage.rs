@@ -206,7 +206,7 @@ pub mod anthropic {
         }
 
         async fn fetch(&self, auth: &AuthStorage) -> Result<UsageReport, UsageError> {
-            let Some(key) = auth.get_api_key(self.provider_id()).await? else {
+            let Some(key) = auth.get_api_key(self.provider_id(), None).await? else {
                 return Ok(UsageReport::NotConfigured);
             };
             // Same OAuth-token sniff the SDK client uses to pick its
@@ -828,7 +828,7 @@ pub mod codex {
     /// Resolve the Codex OAuth token, its account id, and a built HTTP
     /// client, shared by the usage read and the reset-credit consume.
     async fn resolve(auth: &AuthStorage) -> Result<Resolved, UsageError> {
-        let Some(token) = auth.get_api_key(PROVIDER_ID).await? else {
+        let Some(token) = auth.get_api_key(PROVIDER_ID, None).await? else {
             return Ok(Resolved::NotConfigured);
         };
         // Both endpoints authenticate the account via the
