@@ -63,8 +63,16 @@ pub const WITHHELD_NOTICE: &str = "Nothing is following this session now. It re-
 /// the wrong thing to watch for here: a locked session stays on the peer's list
 /// for as long as the hold lasts, and what asks again is the hold ending, which
 /// the peer's rows report (spec 6.8).
-pub const WITHHELD_LOCKED_NOTICE: &str = "Nothing is following this session now. Another writer holds it, and it re-attaches by \
-     itself once that writer lets go.";
+///
+/// A condition and not a promise, for the same reason the one above is one, and
+/// the condition is what the peer reports rather than what the rival does. A
+/// peer that never publishes the bit cannot report the release and this session
+/// waits, which spec 6.5 chooses over a retry. Saying it re-attaches "once that
+/// writer lets go" would promise the user exactly what that degradation
+/// withholds.
+pub const WITHHELD_LOCKED_NOTICE: &str = "Nothing is following this session now. Another writer \
+                                          holds it, and it re-attaches by itself if the peer \
+                                          reports that writer letting go.";
 
 /// What to tell the user about a refusal, which is what will end it.
 fn withheld_notice(refusal: Refusal) -> &'static str {
@@ -107,12 +115,6 @@ struct Attached {
     /// resumption and wrong here: the last entry of every turn the user
     /// watched would read back as unseen.
     delivered: Option<u64>,
-    /// Whether this refusal has already been reported to the user.
-    ///
-    /// Cleared when the re-attach is owed again, so a session refused, returned
-    /// and refused once more says so twice: two refusals are two things that
-    /// happened, and the row is how a user learns the second one.
-    noticed: bool,
 }
 
 /// Every session a peer offers, plus the fold state for the working set.
@@ -168,7 +170,6 @@ impl SessionDirectory {
                 session,
                 chat: None,
                 delivered: None,
-                noticed: false,
             }],
             rows: Vec::new(),
             hosts: Vec::new(),
@@ -253,16 +254,23 @@ impl SessionDirectory {
         let attached = &mut self.attached[index];
         // Read off the envelope before the fold consumes the frame.
         let delivered = delivered_seq(&frame);
+        // What the client was waiting on before this frame, so the notice below
+        // can be raised on the transition rather than latched beside it. A flag
+        // recording "already said" is a second copy of this fact, and it drifts
+        // from it on every path that resumes asking without an edge firing: a
+        // reconnect arms the session, a `reset` sends it back, and a refusal
+        // after either of those would find the flag still set and say nothing.
+        let asked_before = attached.client.withheld();
         let mut redraw = match &mut attached.chat {
             Some(chat) => attached.client.apply(chat, frame),
             None => attached.client.apply(focused_chat, frame),
         };
-        // The client raises the bit when it drops an attachment, so this asks the
-        // one place that decides what a refusal is rather than matching the frame
-        // kind a second time. `noticed` is what holds the notice to one row per
-        // refusal, since the bit stays up for as long as nothing is asking.
-        if let Some(refusal) = attached.client.withheld()
-            && !std::mem::replace(&mut attached.noticed, true)
+        // The client raises this when it drops an attachment, so this asks the
+        // one place that decides what a refusal is rather than matching the
+        // frame kind a second time.
+        let asked_now = attached.client.withheld();
+        if let Some(refusal) = asked_now
+            && asked_now != asked_before
         {
             let chat = match &mut attached.chat {
                 Some(chat) => chat,
@@ -346,7 +354,6 @@ impl SessionDirectory {
             if !returned && !released {
                 continue;
             }
-            attached.noticed = false;
             attached.client.owe_reattach();
             asked = true;
         }
@@ -431,7 +438,6 @@ impl SessionDirectory {
                         session: session.to_string(),
                         chat: None,
                         delivered: None,
-                        noticed: false,
                     },
                 );
                 chat
@@ -1721,13 +1727,16 @@ mod tests {
     /// not leave the peer's list while the hold lasts, so a user told to watch
     /// for its return is watching for something that will not happen.
     ///
-    /// Both codes in one body, so a selector collapsed either way reddens this
-    /// on the arm it broke.
+    /// Both codes in one body, and each arm asserts the OTHER sentence is
+    /// absent. Comparing only against the constant the implementation folds
+    /// pins nothing about what the constant says: give the two the same text
+    /// and every assertion still holds while every locked refusal misdirects
+    /// the user.
     #[test]
     fn a_refusal_notice_names_the_edge_that_will_end_it() {
-        for (code, expected) in [
-            ("locked", WITHHELD_LOCKED_NOTICE),
-            ("unknown_session", WITHHELD_NOTICE),
+        for (code, expected, wrong) in [
+            ("locked", WITHHELD_LOCKED_NOTICE, WITHHELD_NOTICE),
+            ("unknown_session", WITHHELD_NOTICE, WITHHELD_LOCKED_NOTICE),
         ] {
             let mut directory = SessionDirectory::new(FOCUSED.to_string());
             let mut focused_chat = chat();
@@ -1738,7 +1747,92 @@ mod tests {
                 "the {code} refusal told the user to watch for the wrong \
                  thing: {folded:?}",
             );
+            assert!(
+                !folded.iter().any(|text| text == wrong),
+                "the {code} refusal folded the other edge's sentence too, so \
+                 the two say the same thing and one of them is a lie: \
+                 {folded:?}",
+            );
         }
+    }
+
+    /// Nothing that resumes asking leaves a session marked refused. The
+    /// withheld state means "refused, and nothing is asking again yet", so
+    /// every path back to following has to end it, not only the row edges.
+    ///
+    /// Two such paths, and neither goes through the edges: a reconnect arms
+    /// every session `attach_requests` names, refused ones included, and a
+    /// gateway sends a `reset` per session when a host's link returns.
+    #[test]
+    fn nothing_that_resumes_asking_leaves_a_session_withheld() {
+        type Resume = fn(&mut SessionDirectory, &mut ChatState);
+        let paths: [(&str, Resume); 2] = [
+            ("an arm for a reconnect's attach", |directory, _| {
+                directory.expect_attach(|_| true)
+            }),
+            ("a reset from the peer", |directory, chat| {
+                let _ = directory.apply(
+                    chat,
+                    Frame::Reset {
+                        session: FOCUSED.to_string(),
+                    },
+                );
+            }),
+        ];
+        for (what, resume) in paths {
+            let mut directory = SessionDirectory::new(FOCUSED.to_string());
+            let mut focused_chat = chat();
+            let _ = directory.apply(&mut focused_chat, list(vec![held_row(FOCUSED)]));
+            let _ = directory.apply(&mut focused_chat, refusal(FOCUSED, "locked"));
+            assert_eq!(
+                directory.client().withheld(),
+                Some(Refusal::Locked),
+                "the session is not withheld before {what}, so this leg \
+                 measures nothing",
+            );
+
+            resume(&mut directory, &mut focused_chat);
+
+            assert_eq!(
+                directory.client().withheld(),
+                None,
+                "{what} left the session marked refused, so a later row \
+                 transition re-asks for a session this client is already \
+                 following",
+            );
+        }
+    }
+
+    /// The harm the rule above prevents, which for a locked refusal is not a
+    /// race but a certainty.
+    ///
+    /// A reconnect that succeeds is this client taking the lock the rival had,
+    /// and a host publishes its own live sessions unlocked. So the very attach
+    /// that fixes the session manufactures the fall the edge watches for, and a
+    /// stale withheld mark turns it into a redundant re-attach of the whole
+    /// working set.
+    #[test]
+    fn a_landed_attach_is_not_re_asked_when_the_host_publishes_it_unlocked() {
+        let mut directory = SessionDirectory::new(FOCUSED.to_string());
+        let mut focused_chat = chat();
+        let _ = directory.apply(&mut focused_chat, list(vec![held_row(FOCUSED)]));
+        let _ = directory.apply(&mut focused_chat, refusal(FOCUSED, "locked"));
+        assert_eq!(
+            directory.client().withheld(),
+            Some(Refusal::Locked),
+            "the session is not withheld, so the reconnect below resumes nothing",
+        );
+
+        // The reconnect arms it and its block lands: this client now holds the
+        // session, and the row says so.
+        directory.expect_attach(|_| true);
+        let _ = directory.apply(&mut focused_chat, list(vec![row(FOCUSED, false, 0)]));
+
+        assert!(
+            !directory.client().needs_reattach(),
+            "the client asked again for a session it had just attached, which \
+             costs a stream reopen and a backfill for the whole working set",
+        );
     }
 
     /// The headline of the second edge: a locked refusal re-asks when the rival
@@ -1766,14 +1860,13 @@ mod tests {
             "something already owes the re-attach",
         );
 
-        let redraw = directory.apply(&mut focused_chat, list(vec![row(FOCUSED, false, 0)]));
+        let _ = directory.apply(&mut focused_chat, list(vec![row(FOCUSED, false, 0)]));
 
         assert!(
             directory.client().needs_reattach(),
             "the rival let go and nothing asks for the session again, so a \
              locked refusal is still a dead end",
         );
-        assert!(redraw.0, "and the release does not reach the screen");
     }
 
     /// A locked refusal keeps the absence edge besides. A held session's row can
@@ -1900,8 +1993,13 @@ mod tests {
             "the first fall did not fire, so the re-arm below measures nothing",
         );
 
-        // The re-ask goes out, and the rival still has the session: the second
-        // refusal arrives before the row has caught up with the hold.
+        // The re-ask goes out and the rival still has the session. The held row
+        // after the refusal is not fixture convenience: a host sets the bit on
+        // the very acquire it refuses and publishes within its list debounce,
+        // while the earliest clear is a probe tick away, so a refusal is
+        // followed by a fresh `true` by construction. That is what re-arms this
+        // edge, rather than the client assuming a refusal means the bit is set,
+        // which against a peer that never publishes it would fire on every list.
         directory.expect_attach(|_| true);
         let _ = directory.apply(&mut focused_chat, refusal(FOCUSED, "locked"));
         assert!(

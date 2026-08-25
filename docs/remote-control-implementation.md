@@ -367,8 +367,9 @@ lock directory to find rivals' holds, and a probe tick clears it when a
 rival lets go, cleanly or by crashing. A client refused with `locked`
 waits for the bit to fall and re-attaches on its own when it does,
 keeping the absent-then-present edge every refusal has. Against a peer
-that never publishes the bit that edge cannot fire and the refusal
-waits, the gap an old peer always had, and deliberately not a timer.
+that never publishes the bit it is the bit's edge that cannot fire, and
+a locked refusal then waits on absence alone, the gap an old peer always
+had, and deliberately not a timer.
 The bit is a hint either way, so the escape hatch is what it always
 was, attempting the session and reading the answer.
 

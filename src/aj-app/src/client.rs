@@ -169,10 +169,17 @@ impl SessionClient {
     /// ignored and its durable frames advance the cursor in projection
     /// order, which is not seq order.
     ///
-    /// Arming also satisfies [`Self::needs_reattach`].
+    /// Arming also satisfies [`Self::needs_reattach`], and ends a withheld
+    /// state: an arm is something asking again, which is the one condition
+    /// [`Self::withheld`] tracks.
     pub fn expect_attach(&mut self) {
         self.attach = Attach::Requested;
         self.needs_reattach = false;
+        // Not only the edges' business. A reconnect arms every session
+        // `attach_requests` names, withheld ones included, so an arm that left
+        // this set would leave a client attached and still marked refused, and
+        // the next row transition would re-ask for a session it already holds.
+        self.withheld = None;
     }
 
     /// Fold one frame, updating `chat` and the client's own bookkeeping.
@@ -355,7 +362,15 @@ impl SessionClient {
                 // offer: the server decides whether it can resume from it.
                 // An armed attach stays armed, so a `reset` that overtakes
                 // the block the client already asked for cannot disarm it.
-                self.needs_reattach = true;
+                //
+                // Through `owe_reattach` rather than by assignment, so that one
+                // function stays the only place the obligation is taken on and
+                // the withheld state released. A reset reaches a refused
+                // session too (a gateway sends one per session when a host's
+                // link returns), and one that left it marked refused would have
+                // the client re-ask on a later row for a session this reset is
+                // already sending it back to.
+                self.owe_reattach();
                 Redraw(true)
             }
             Frame::List { .. } | Frame::Heartbeat | Frame::Vms { .. } => Redraw(false),

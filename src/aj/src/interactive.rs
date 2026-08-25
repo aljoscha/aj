@@ -21238,6 +21238,23 @@ mod tests {
         .expect("a list frame")
     }
 
+    /// The same at durable position `last_seq`, so two otherwise identical
+    /// lists can be told apart by what the client ends up holding.
+    fn list_holding_at(sessions: &[(&str, bool)], last_seq: u64) -> String {
+        serde_json::to_string(&aj_wire::Frame::List {
+            sessions: sessions
+                .iter()
+                .map(|(session, locked)| aj_wire::SessionSummary {
+                    locked: *locked,
+                    last_seq: Some(last_seq),
+                    ..listed_row(session)
+                })
+                .collect(),
+            hosts: Vec::new(),
+        })
+        .expect("a list frame")
+    }
+
     /// A per-session attach refusal carrying `code`, as a peer sends one.
     fn refusal_frame(session: &str, code: &str, message: &str) -> String {
         serde_json::to_string(&aj_wire::Frame::Error {
@@ -21284,8 +21301,12 @@ mod tests {
             // instead of the transition spins against exactly this peer: a
             // session held by a rival writer, listed throughout, on rows that
             // say nothing about the hold.
-            list_of(&[&session]),
-            list_of(&[&session]),
+            // Distinguishable, so the assertion at the end can tell that both
+            // were folded. Identical lists would leave the premise satisfied by
+            // the leading one alone, and deleting these two, which is the whole
+            // pressure this test applies, would not fail anything.
+            list_holding_at(&[(&session, false)], 1),
+            list_holding_at(&[(&session, false)], 2),
         ];
         // The leading `list` is load-bearing and goes FIRST, before the refusal.
         // The rule reads a transition against the rows it already holds, and a
@@ -21351,10 +21372,11 @@ mod tests {
                 .directory
                 .rows()
                 .iter()
-                .any(|row| row.id == session && !row.locked),
-            "the peer listed the session throughout and published no hold on \
-             it, without which this test measures a row arriving or a bit \
-             falling rather than a peer that said nothing new",
+                .any(|row| row.id == session && !row.locked && row.last_seq == Some(2)),
+            "the client did not fold the last of the peer's lists, so the two \
+             it sent after the refusal are not what this test measured, and a \
+             peer that said nothing new is not what it watched: {:?}",
+            world.directory.rows(),
         );
         remote.shutdown().await;
     }
@@ -21627,8 +21649,10 @@ mod tests {
         );
         assert!(
             rejoined.is_some(),
-            "the rival let go and the client never asked again, so a locked \
-             refusal is still a dead end: {notices:?}",
+            "the client did not re-attach: either the rival's hold never \
+             reached it, leaving the release with no true to fall from, or it \
+             did and the fall did not ask again. The peer sent the hold first \
+             on the same stream, so the second is the likelier: {notices:?}",
         );
         assert_eq!(
             peer.opens(),
@@ -21687,7 +21711,10 @@ mod tests {
                 .iter()
                 .any(|row| row.id == session && row.locked),
             "the baseline this test spans a disconnect with was never folded, \
-             so the release below has no true to fall from",
+             so the release below has no true to fall from. This assertion and \
+             the seeding above are one unit: without them the client holds no \
+             rows, the peer's first list is an absent-then-present edge, and \
+             every assertion below passes having measured the other edge",
         );
 
         let peer = WarmPeer::answering(
