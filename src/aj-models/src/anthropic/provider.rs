@@ -207,7 +207,7 @@ async fn run_stream_inner(
             }
             SelectOutcome::Ready(None) => break,
             SelectOutcome::Cancelled => {
-                producer.push(AssistantMessageEvent::aborted(state.partial.clone()));
+                producer.push(state.cancelled());
                 return Ok(());
             }
         }
@@ -224,6 +224,14 @@ async fn run_stream_inner(
 /// Build a structurally-complete empty partial for this model. Used
 /// as the abort payload when cancellation fires before the SSE
 /// state machine has accumulated anything.
+///
+/// No pricing step: there is no `StreamState` yet and the usage is all
+/// zeros, so sealing would compute `total_tokens = 0` and a zero cost.
+/// The invariant every other exit seals for holds here for free. The
+/// upstream may still have billed input processing for a request
+/// cancelled this late, but no count for it ever reached the client, and
+/// an estimate would put a guess where everything downstream reads
+/// measurement.
 fn empty_partial(model: &ModelInfo) -> AssistantMessage {
     let mut partial = AssistantMessage::empty();
     partial.api = API_NAME.to_string();
@@ -1258,6 +1266,7 @@ impl StreamState {
                     error.message().to_string(),
                 ));
                 self.partial.stop_reason = StopReason::Error;
+                self.seal();
                 events.push(AssistantMessageEvent::Error {
                     reason: ErrorReason::Error,
                     error: self.partial.clone(),
@@ -1278,11 +1287,42 @@ impl StreamState {
         self.saw_terminal
     }
 
+    /// Complete the running partial's usage: total its tokens and price
+    /// them at the rates snapshotted for this call.
+    ///
+    /// Every terminal message leaves this state through here, so a
+    /// clean stop, a truncation, a mid-stream error frame and a cancel
+    /// all carry finalized usage. Anthropic reports input and cache
+    /// counts in `message_start`, so a partial abandoned mid-stream
+    /// already holds tokens the user was billed for, and pricing them
+    /// is what keeps `total_tokens == input + output + cache_read +
+    /// cache_write` true for every persisted message.
+    ///
+    /// Idempotent: `finalize_usage` assigns rather than accumulates, so
+    /// an exit that seals what `process` already sealed prices the same
+    /// tokens once.
+    fn seal(&mut self) {
+        finalize_usage(&mut self.partial.usage, &self.cost);
+    }
+
+    /// The terminal event for a stream the client cancelled mid-flight.
+    ///
+    /// Cancellation is the exit most likely to carry unpriced tokens:
+    /// `message_start` has usually landed, so the partial holds the
+    /// input and cache counts the request was billed for even though no
+    /// output completed. Sealing here rather than at the call site is
+    /// what stops the arm from handing out a partial that skipped
+    /// pricing.
+    fn cancelled(&mut self) -> AssistantMessageEvent {
+        self.seal();
+        AssistantMessageEvent::aborted(self.partial.clone())
+    }
+
     /// Build the stream's terminal event, classifying a stream that ended
     /// before its wire terminal frame as a retryable truncation error
     /// rather than a successful `Done`. Otherwise defers to
     /// [`Self::finalize`].
-    fn finalize_or_truncate(self) -> AssistantMessageEvent {
+    fn finalize_or_truncate(mut self) -> AssistantMessageEvent {
         if self.saw_terminal() {
             self.finalize()
         } else {
@@ -1290,6 +1330,7 @@ impl StreamState {
                 api = %self.partial.api,
                 "stream ended before terminal frame; treating turn as truncated (retryable)"
             );
+            self.seal();
             AssistantMessageEvent::truncated(self.partial.clone())
         }
     }
@@ -1298,8 +1339,7 @@ impl StreamState {
     /// whenever the SSE producer terminates without already having
     /// emitted an `Error` event (which is its own terminator).
     fn finalize(mut self) -> AssistantMessageEvent {
-        // Compute total tokens + usage cost on the running message.
-        finalize_usage(&mut self.partial.usage, &self.cost);
+        self.seal();
 
         let (stop_reason, done_reason) = match self.stop_reason {
             // `PauseTurn` ("server wants to keep going", e.g. a long
@@ -2260,6 +2300,104 @@ mod tests {
         );
         assert_eq!(complete.stop_reason, StopReason::Stop);
         assert!(complete.error.is_none());
+    }
+
+    /// Every terminal message carries finalized usage, whatever the
+    /// exit. `empty_a_message` reports 12 input, 4 cache-read and 2
+    /// cache-write tokens in `message_start`, so each of these streams
+    /// abandons a partial the request was already billed for.
+    ///
+    /// The three exits are separate tests rather than one loop because
+    /// each reaches its arm by a different route, and a mutation that
+    /// unseals one arm has to redden exactly one of them.
+    #[test]
+    fn a_truncated_stream_prices_the_tokens_it_received() {
+        let model = fake_model();
+        let truncated = replay_sse_events(
+            &model,
+            [
+                ServerSentEvent::MessageStart {
+                    message: empty_a_message(),
+                },
+                ServerSentEvent::ContentBlockStart {
+                    index: 0,
+                    content_block: AContentBlock::TextBlock {
+                        text: String::new(),
+                        citations: Vec::new(),
+                    },
+                },
+                ServerSentEvent::ContentBlockDelta {
+                    index: 0,
+                    delta: AContentBlockDelta::TextDelta {
+                        text: "partial".into(),
+                    },
+                },
+            ],
+        );
+        assert_eq!(
+            truncated.usage.total_tokens, 18,
+            "a truncated turn totals the tokens the wire reported"
+        );
+        // 12 * 3.0/1e6 + 4 * 0.3/1e6 + 2 * 3.75/1e6
+        let expected = 0.000_036 + 0.000_001_2 + 0.000_007_5;
+        assert!(
+            (truncated.usage.cost.total - expected).abs() < 1e-12,
+            "a truncated turn is priced at the state's rates: got {} expected {expected}",
+            truncated.usage.cost.total
+        );
+    }
+
+    #[test]
+    fn a_mid_stream_error_frame_prices_the_tokens_it_received() {
+        let model = fake_model();
+        let errored = replay_sse_events(
+            &model,
+            [
+                ServerSentEvent::MessageStart {
+                    message: empty_a_message(),
+                },
+                ServerSentEvent::Error {
+                    error: anthropic_sdk::messages::ApiError::OverloadedError {
+                        message: "overloaded".into(),
+                    },
+                },
+            ],
+        );
+        assert_eq!(errored.stop_reason, StopReason::Error);
+        assert_eq!(
+            errored.usage.total_tokens, 18,
+            "an errored turn totals the tokens the wire reported"
+        );
+        let expected = 0.000_036 + 0.000_001_2 + 0.000_007_5;
+        assert!(
+            (errored.usage.cost.total - expected).abs() < 1e-12,
+            "an errored turn is priced at the state's rates: got {} expected {expected}",
+            errored.usage.cost.total
+        );
+    }
+
+    #[test]
+    fn a_cancelled_stream_prices_the_tokens_it_received() {
+        let mut state = StreamState::new(&fake_model());
+        let _ = state.process(ServerSentEvent::MessageStart {
+            message: empty_a_message(),
+        });
+        match state.cancelled() {
+            AssistantMessageEvent::Error { error, reason } => {
+                assert_eq!(reason, ErrorReason::Aborted);
+                assert_eq!(
+                    error.usage.total_tokens, 18,
+                    "a cancelled turn totals the tokens the wire reported"
+                );
+                let expected = 0.000_036 + 0.000_001_2 + 0.000_007_5;
+                assert!(
+                    (error.usage.cost.total - expected).abs() < 1e-12,
+                    "a cancelled turn is priced at the state's rates: got {} expected {expected}",
+                    error.usage.cost.total
+                );
+            }
+            other => panic!("expected an aborted Error event, got {other:?}"),
+        }
     }
 
     #[test]
