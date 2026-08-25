@@ -1545,11 +1545,12 @@ async fn reattach(world: &mut World, shell: &Rc<RefCell<Shell>>) -> Result<Catch
     refresh_local_handles(world, shell).await?;
     let caught = fold_attach_block(world).await;
     refresh_client_reads(world).await;
-    // Adopting an epoch resets the chat model, and both the transcript's
-    // render cache and the image store are keyed by entry id, which is a
-    // per-transcript counter that starts over with it. Dropping the view back
-    // to the tail is what clears that cache, so a row of the branch we left
-    // cannot be reused for a different entry of the one we joined.
+    // Adopting an epoch restarts the transcript under the view, so the view
+    // state that named positions in the old one goes with it: the scroll
+    // offset, a selection anchored in entries that no longer exist, an
+    // in-flight glide. Not the caches keyed by entry id, which retire the
+    // incarnation they were filled for without being told (see
+    // `EntryRenderCache::retire`).
     shell.borrow().transcript.borrow_mut().reset_to_tail();
     Ok(caught)
 }
@@ -6193,9 +6194,9 @@ async fn advance_resume(
             };
             refresh_client_reads(world).await;
             // The block may have been served under a fresh epoch (a host
-            // restart mints one), which resets the chat model and restarts its
-            // entry ids. Dropping the view to the tail is what clears the
-            // render cache keyed by them.
+            // restart mints one), which restarts the transcript under the view.
+            // Opening it at the new tail is what this is for: the caches keyed
+            // by entry id need no telling (see `EntryRenderCache::retire`).
             shell.borrow().transcript.borrow_mut().reset_to_tail();
             match caught {
                 CatchUp::Caught => {
@@ -6827,9 +6828,11 @@ async fn drive(
                             },
                         };
                         // This loop paints between the frames of a block, so the
-                        // caches keyed by entry id are dropped the moment the
-                        // block's epoch is adopted rather than once it ends (see
-                        // `Folded::opened`).
+                        // view opens at the new incarnation's tail the moment
+                        // the block's epoch is adopted rather than once it ends
+                        // (see `Folded::opened`). A paint in between would
+                        // otherwise land on the outgoing transcript's scroll
+                        // position.
                         if folded.opened {
                             shell.borrow().transcript.borrow_mut().reset_to_tail();
                         }

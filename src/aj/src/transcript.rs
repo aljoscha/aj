@@ -2037,8 +2037,11 @@ impl TranscriptView {
     ///
     /// Not what keeps a new model off the old one's cached surfaces: the caches
     /// retire an incarnation's slots on their own (see
-    /// [`EntryRenderCache::retire`]), so a caller that forgets this loses the
-    /// scroll position rather than the correctness.
+    /// [`EntryRenderCache::retire`]). What a caller that forgets this loses is
+    /// view state, and not only the scroll position: the selection stays
+    /// anchored in entries that are gone, and the list's geometry is keyed by
+    /// index, so a swap to content of the same length keeps the outgoing
+    /// entries' measured heights and self-heals only as rows redraw.
     ///
     /// Two callers use it. On a session rebuild the view's `chat` cell keeps
     /// its identity across the swap (the outer loop overwrites its contents
@@ -7411,9 +7414,12 @@ mod tests {
     /// A session rebuild reuses the `chat` cell but installs a fresh session
     /// whose transcript restarts `EntryId` at 0. With same-length content the
     /// new entry's fingerprint collides with the cached slot, and the globals
-    /// are unchanged, so only the `reset_to_tail` clear stops the previous
-    /// session's surface from being replayed. Without that clear this test
-    /// reads the stale "hello".
+    /// are unchanged, so the draw-time global clear does not fire either.
+    ///
+    /// The path as the shell runs it, `reset_to_tail` and all. That call clears
+    /// both caches whatever the incarnation says, so this passes under a
+    /// retirement that cannot tell a swap from a reset. What the retirement
+    /// itself is worth is the test below.
     #[test]
     fn session_rebuild_does_not_serve_the_previous_sessions_surface() {
         // The shell holds `chat` by identity across a swap; the view shares it.
@@ -7448,6 +7454,59 @@ mod tests {
         assert!(
             rows.contains("world") && !rows.contains("hello"),
             "fresh session content, not the previous session's cached surface: {rows:?}",
+        );
+    }
+
+    /// The same swap with nothing papering it: the retirement alone keeps the
+    /// fresh session off the previous one's surface, with no clear from the
+    /// call site.
+    ///
+    /// This is the one test that reaches the claim the change rests on, that no
+    /// call site has to remember. Every other test of the retirement is passed
+    /// by a counter that cannot tell a swap from a reset: the two reset tests go
+    /// through `ChatState::reset`, which bumps a per-model counter just as well
+    /// as a process-global one, and the twin above papers with `reset_to_tail`.
+    /// Here a per-model counter, minted at 0 in `new` and bumped only by
+    /// `reset`, hands the fresh model the generation the outgoing one already
+    /// had, the collided slot is not retired, and this reads the stale "hello".
+    #[test]
+    fn a_swapped_in_session_needs_no_clear_from_its_call_site() {
+        let chat = empty_chat();
+        let mut life = AgentLifecycle::default();
+        apply(&chat, &mut life, user_end("hello"));
+        let mut view = transcript_view(&chat);
+        let ctx = draw_ctx(60, 24);
+        let _ = view.draw(&ctx);
+        let first = crate::test_support::rows(&view.draw(&ctx));
+        assert!(
+            first.join("\n").contains("hello"),
+            "the outgoing session was never drawn, so there is no surface here \
+             for a swap to replay: {first:?}",
+        );
+        assert!(
+            view.cache.borrow().hits > 0,
+            "the first session's slot was never cached, so there is nothing \
+             here for a swap to collide with",
+        );
+
+        // The same collision the twin above builds: `EntryId(0)` again, content
+        // of the same length so the fingerprint matches, and globals that match
+        // so the draw-time clear stays quiet.
+        {
+            let mut fresh = ChatState::new(cache_settings(), 0, Arc::new(Vec::new()));
+            let mut fresh_life = AgentLifecycle::default();
+            let _ = reduce(&mut fresh, &mut fresh_life, user_end("world"), None);
+            *chat.borrow_mut() = fresh;
+        }
+        // And no `reset_to_tail`. Nothing between the swap and the draw tells
+        // the view anything happened.
+
+        let rows = crate::test_support::rows(&view.draw(&ctx)).join("\n");
+        assert!(
+            rows.contains("world") && !rows.contains("hello"),
+            "the swapped-in session was served the previous one's cached \
+             surface, so the retirement needs a call site to remember after \
+             all: {rows:?}",
         );
     }
 
