@@ -183,7 +183,7 @@ pub async fn run_compaction(
             plan.first_kept_entry_id.clone(),
             plan.tokens_before,
             Some(plan.file_ops.clone()),
-            Some(summarizer_usage.clone()),
+            Some(summarizer_usage),
         ) {
             Ok(entry) => entry,
             Err(err) => {

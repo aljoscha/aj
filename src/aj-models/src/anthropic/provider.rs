@@ -1414,7 +1414,8 @@ fn into_unified_usage(au: &AUsage) -> Usage {
         output: au.output_tokens,
         cache_read: au.cache_read_input_tokens.unwrap_or(0),
         cache_write: au.cache_creation_input_tokens.unwrap_or(0),
-        // Anthropic doesn't supply a total; we compute it at finalize.
+        // Anthropic doesn't supply a total, the stream state computes
+        // it when it seals.
         total_tokens: 0,
         cost: Default::default(),
     }

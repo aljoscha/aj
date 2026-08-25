@@ -139,24 +139,30 @@ fn cost_label(total: f64) -> String {
 ///
 /// Compaction is the one cost with no message behind it, so without a
 /// line of its own it is spend the reader cannot attribute to anything
-/// they remember doing. Sessions whose compactions predate the
-/// accounting have runs but no recorded usage, and they say so rather
-/// than reporting zero, which would read as free.
+/// they remember doing. Runs whose spend was never recorded are named
+/// separately rather than folded in, because a subtotal that silently
+/// covers some of the runs reads as if it covered all of them.
 fn compaction_label(stats: &SessionStats) -> String {
-    if stats.compactions == 0 {
+    let runs = stats.compactions;
+    if runs == 0 {
         return "(none)".to_string();
     }
-    let runs = stats.compactions;
     let plural = if runs == 1 { "run" } else { "runs" };
-    let usage = &stats.compaction_usage;
-    if usage.total_tokens == 0 {
+    let missing = runs.saturating_sub(stats.compactions_with_usage);
+    if stats.compactions_with_usage == 0 {
         return format!("{runs} {plural}, not recorded");
     }
-    format!(
+    let usage = &stats.compaction_usage;
+    let recorded = format!(
         "{runs} {plural}, {} tokens, {}",
         usage.total_tokens,
         cost_label(usage.cost.total)
-    )
+    );
+    if missing == 0 {
+        recorded
+    } else {
+        format!("{recorded} ({missing} not recorded)")
+    }
 }
 
 #[cfg(test)]
@@ -198,6 +204,7 @@ mod tests {
                 },
             },
             compaction_usage: Usage::default(),
+            compactions_with_usage: 0,
             settings: SessionSettings {
                 model: Some(("anthropic".to_string(), "claude-sonnet-4-5".to_string())),
                 thinking: Some("medium".to_string()),
@@ -283,6 +290,51 @@ mod tests {
             RowView::Kv("Bash".to_string(), "8".to_string()),
         ];
         assert_eq!(rows, expected);
+    }
+
+    /// The compaction line reports the recorded spend, and says how many
+    /// runs it does not cover rather than letting a partial subtotal
+    /// read as a complete one.
+    #[test]
+    fn the_compaction_line_separates_recorded_runs_from_unrecorded_ones() {
+        let mut stats = sample_stats();
+        stats.compactions = 3;
+        stats.compactions_with_usage = 2;
+        stats.compaction_usage = Usage {
+            total_tokens: 40_900,
+            cost: UsageCost {
+                total: 0.25,
+                ..UsageCost::default()
+            },
+            ..Usage::default()
+        };
+        assert_eq!(
+            value_of(&digest(&stats, None), "of which compaction"),
+            "3 runs, 40900 tokens, $0.2500 (1 not recorded)"
+        );
+
+        stats.compactions_with_usage = 3;
+        assert_eq!(
+            value_of(&digest(&stats, None), "of which compaction"),
+            "3 runs, 40900 tokens, $0.2500",
+            "nothing missing, nothing to qualify"
+        );
+
+        stats.compactions = 0;
+        stats.compactions_with_usage = 0;
+        assert_eq!(
+            value_of(&digest(&stats, None), "of which compaction"),
+            "(none)"
+        );
+    }
+
+    fn value_of(rows: &[InfoRow], key: &str) -> String {
+        rows.iter()
+            .find_map(|r| match r {
+                InfoRow::Kv { key: k, value } if k == key => Some(value.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no {key} row"))
     }
 
     /// An untagged session says so rather than dropping the row, so the page's

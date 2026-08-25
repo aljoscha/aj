@@ -226,9 +226,14 @@ async fn run_stream_inner(
     Ok(())
 }
 
+///
 /// Build a structurally-complete empty partial for this model. Used
 /// as the abort payload when cancellation fires before the SSE state
 /// machine has accumulated anything.
+///
+/// No pricing step: there is no stream state yet and the usage is all
+/// zeros, so sealing would compute a zero total and a zero cost, and the
+/// invariant every other exit seals for holds here for free.
 fn empty_partial(model: &ModelInfo) -> AssistantMessage {
     let mut partial = AssistantMessage::empty();
     partial.api = API_NAME.to_string();
@@ -1915,6 +1920,11 @@ mod tests {
     fn a_cancelled_stream_harvests_and_prices_the_usage_it_saw() {
         let mut state = StreamState::new(&fake_model());
         let _ = state.process(usage_chunk());
+        assert!(
+            state.partial.usage.total_tokens == 0,
+            "the cancel must find the usage still unharvested in the side field, \
+             or this test measures a seal that had nothing left to do"
+        );
 
         match state.cancelled() {
             AssistantMessageEvent::Error { error, .. } => {

@@ -681,11 +681,17 @@ impl Agent {
     /// compaction summary. `max_tokens` caps the response;
     /// `system_prompt` and the single user `text` define the request.
     ///
-    /// The returned message carries the usage its provider priced, and
-    /// accounting for it is the caller's job: an out-of-band call's
-    /// spend belongs to whoever made the call, and only the caller knows
-    /// where it should land. Dropping the message drops real spend that
-    /// nothing else records.
+    /// A successful call returns the message with the usage its provider
+    /// priced, and accounting for it is the caller's job: an out-of-band
+    /// call's spend belongs to whoever made the call, and only the
+    /// caller knows where it should land.
+    ///
+    /// The abort and error exits return a [`TurnError`] and drop the
+    /// message, so the spend of a cancelled or failed call reaches
+    /// nobody. Those partials are priced by their adapter and the tokens
+    /// were billed, so this is a known hole rather than an absence of
+    /// spend, and closing it needs somewhere durable to put a failure's
+    /// usage.
     pub async fn complete_oneshot(
         &self,
         system_prompt: &str,

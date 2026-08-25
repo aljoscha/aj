@@ -69,11 +69,17 @@ pub struct SessionStats {
     /// zero cost.
     pub usage: Usage,
     /// The share of `usage` spent on compaction summaries rather than on
-    /// the conversation itself. Summed from the compaction entries'
-    /// recorded usage, so entries written before compaction was
-    /// accounted contribute nothing and this reads as an underestimate
-    /// on old sessions rather than as a zero.
+    /// the conversation itself, summed from the compaction entries that
+    /// recorded any.
     pub compaction_usage: Usage,
+    /// How many of `compactions` carried a recorded usage. Entries
+    /// written before compaction was accounted carry none, and their
+    /// spend is unknown rather than zero, so a caller comparing this
+    /// against `compactions` can tell a subtotal that is complete from
+    /// one that is an underestimate. Without the count the two are
+    /// indistinguishable, since a summarizer that legitimately reported
+    /// nothing also sums to zero.
+    pub compactions_with_usage: usize,
     /// Model / thinking / speed currently recorded on the user thread.
     pub settings: SessionSettings,
 }
@@ -97,6 +103,7 @@ impl ConversationLog {
         let mut total_entries = 0;
         let mut usage = Usage::default();
         let mut compaction_usage = Usage::default();
+        let mut compactions_with_usage = 0;
         let mut last_activity: Option<DateTime<Utc>> = None;
         let mut per_tool: HashMap<String, usize> = HashMap::new();
 
@@ -129,6 +136,7 @@ impl ConversationLog {
                 } => {
                     compactions += 1;
                     if let Some(u) = entry_usage {
+                        compactions_with_usage += 1;
                         usage.accumulate(u);
                         compaction_usage.accumulate(u);
                     }
@@ -161,6 +169,7 @@ impl ConversationLog {
             compactions,
             usage,
             compaction_usage,
+            compactions_with_usage,
             settings,
         }
     }
@@ -364,6 +373,7 @@ mod tests {
             stats.compaction_usage.cost.total
         );
         assert_eq!(stats.compaction_usage.total_tokens, 40_900);
+        assert_eq!(stats.compactions_with_usage, 1, "its spend is known");
     }
 
     /// A compaction written before the spend was recorded carries no
@@ -375,13 +385,19 @@ mod tests {
 
         let stats = log.stats();
         assert_eq!(stats.compactions, 1);
+        // The distinction a zero subtotal cannot carry on its own: a
+        // summarizer that reported nothing sums to zero too, so the
+        // count is what separates unknown from free.
+        assert_eq!(
+            stats.compactions_with_usage, 0,
+            "an entry with no usage is not a recorded zero"
+        );
         assert!(
             (stats.usage.cost.total - 0.10).abs() < 1e-9,
             "only the assistant turn contributes, got {}",
             stats.usage.cost.total
         );
         assert_eq!(stats.compaction_usage.total_tokens, 0);
-        assert_eq!(stats.compaction_usage.cost.total, 0.0);
     }
 
     /// The digest sums token usage and dollar cost across every assistant
