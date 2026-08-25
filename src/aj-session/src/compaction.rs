@@ -794,6 +794,7 @@ mod tests {
                 first_kept_entry_id: first_kept.to_string(),
                 tokens_before: 0,
                 details: None,
+                usage: None,
             },
         }
     }

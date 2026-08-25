@@ -75,6 +75,7 @@ pub fn digest(stats: &SessionStats, tag: Option<&str>) -> Vec<InfoRow> {
         kv("cache write", &stats.usage.cache_write.to_string()),
         kv("total tokens", &stats.usage.total_tokens.to_string()),
         kv("cost", &cost_label(stats.usage.cost.total)),
+        kv("of which compaction", &compaction_label(stats)),
         InfoRow::Blank,
         InfoRow::Header(format!("Tool calls ({})", stats.tool_calls)),
     ];
@@ -133,6 +134,31 @@ fn cost_label(total: f64) -> String {
     format!("${total:.4}")
 }
 
+/// The compaction share of the session's spend, as runs, tokens and
+/// dollars.
+///
+/// Compaction is the one cost with no message behind it, so without a
+/// line of its own it is spend the reader cannot attribute to anything
+/// they remember doing. Sessions whose compactions predate the
+/// accounting have runs but no recorded usage, and they say so rather
+/// than reporting zero, which would read as free.
+fn compaction_label(stats: &SessionStats) -> String {
+    if stats.compactions == 0 {
+        return "(none)".to_string();
+    }
+    let runs = stats.compactions;
+    let plural = if runs == 1 { "run" } else { "runs" };
+    let usage = &stats.compaction_usage;
+    if usage.total_tokens == 0 {
+        return format!("{runs} {plural}, not recorded");
+    }
+    format!(
+        "{runs} {plural}, {} tokens, {}",
+        usage.total_tokens,
+        cost_label(usage.cost.total)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -171,6 +197,7 @@ mod tests {
                     total: 0.33,
                 },
             },
+            compaction_usage: Usage::default(),
             settings: SessionSettings {
                 model: Some(("anthropic".to_string(), "claude-sonnet-4-5".to_string())),
                 thinking: Some("medium".to_string()),
@@ -246,6 +273,10 @@ mod tests {
             RowView::Kv("cache write".to_string(), "250".to_string()),
             RowView::Kv("total tokens".to_string(), "3750".to_string()),
             RowView::Kv("cost".to_string(), "$0.3300".to_string()),
+            RowView::Kv(
+                "of which compaction".to_string(),
+                "1 run, not recorded".to_string(),
+            ),
             RowView::Blank,
             RowView::Header("Tool calls (31)".to_string()),
             RowView::Kv("read_file".to_string(), "12".to_string()),

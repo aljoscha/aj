@@ -12,7 +12,7 @@ use std::sync::Arc;
 use aj_agent::events::{AgentEvent, AgentId, CompactionPhase, CompactionReason};
 use aj_agent::message::AgentMessage;
 use aj_agent::{Agent, TurnError};
-use aj_models::types::{AssistantContent, Message, StopReason};
+use aj_models::types::{AssistantContent, AssistantMessage, Message, StopReason, Usage};
 use aj_session::compaction as planning;
 use aj_session::{AppendHandoff, ConversationLog, ThreadFilter};
 use tokio::sync::Mutex as TokioMutex;
@@ -21,6 +21,17 @@ use tokio_util::sync::CancellationToken;
 /// Upper bound on summary output tokens, clamped against the model's
 /// own `max_tokens`.
 const SUMMARY_OUTPUT_CAP: u64 = 8192;
+
+/// The text blocks of a summarizer response, concatenated.
+fn assistant_text(message: &AssistantMessage) -> String {
+    let mut out = String::new();
+    for block in &message.content {
+        if let AssistantContent::Text(t) = block {
+            out.push_str(&t.text);
+        }
+    }
+    out
+}
 
 /// Outcome of a compaction run, for callers that render text (the CLI)
 /// rather than relying on the emitted events (the TUI).
@@ -102,6 +113,11 @@ pub async fn run_compaction(
         None => planning::initial_summary_prompt(&conversation_text, custom_instructions),
     };
 
+    // The summarizer's spend is out-of-band: its exchange never becomes
+    // a message entry, so this accumulator is the only record of it, and
+    // it rides along on the compaction entry written below.
+    let mut summarizer_usage = Usage::default();
+
     emit_progress(agent, reason, CompactionPhase::Summarizing).await;
     let mut summary = match agent
         .complete_oneshot(
@@ -112,7 +128,10 @@ pub async fn run_compaction(
         )
         .await
     {
-        Ok(text) => text,
+        Ok(message) => {
+            summarizer_usage.accumulate(&message.usage);
+            assistant_text(&message)
+        }
         Err(TurnError::Aborted) => return finish_canceled(agent, reason, plan.tokens_before).await,
         Err(err) => return finish_failed(agent, reason, plan.tokens_before, err.to_string()).await,
     };
@@ -133,7 +152,10 @@ pub async fn run_compaction(
             )
             .await
         {
-            Ok(text) => text,
+            Ok(message) => {
+                summarizer_usage.accumulate(&message.usage);
+                assistant_text(&message)
+            }
             Err(TurnError::Aborted) => {
                 return finish_canceled(agent, reason, plan.tokens_before).await;
             }
@@ -161,6 +183,7 @@ pub async fn run_compaction(
             plan.first_kept_entry_id.clone(),
             plan.tokens_before,
             Some(plan.file_ops.clone()),
+            Some(summarizer_usage.clone()),
         ) {
             Ok(entry) => entry,
             Err(err) => {

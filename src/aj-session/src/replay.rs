@@ -2475,6 +2475,7 @@ mod tests {
             first_kept,
             100_000,
             None,
+            None,
         )
         .expect("append compaction");
 
@@ -3654,8 +3655,15 @@ mod tests {
             ))
             .expect("second assistant");
         }
-        log.append_compaction(ThreadFilter::USER, "summary".into(), first_kept, 500, None)
-            .expect("compaction");
+        log.append_compaction(
+            ThreadFilter::USER,
+            "summary".into(),
+            first_kept,
+            500,
+            None,
+            None,
+        )
+        .expect("compaction");
         let parent_head = log.head().cloned().expect("head present");
         let spawn = log
             .append_subagent_spawn(1, parent_head, "do thing", true, &sub_settings())

@@ -847,7 +847,14 @@ mod tests {
         let checkpoint = log
             .lock()
             .await
-            .append_compaction(ThreadFilter::USER, "summary".into(), first_kept, 100, None)
+            .append_compaction(
+                ThreadFilter::USER,
+                "summary".into(),
+                first_kept,
+                100,
+                None,
+                None,
+            )
             .expect("append the compaction checkpoint");
         handoff.file(checkpoint);
         bus.emit(AgentEvent::CompactionEnd {
@@ -958,7 +965,14 @@ mod tests {
         let earlier = log
             .lock()
             .await
-            .append_compaction(ThreadFilter::USER, "earlier".into(), first_kept, 100, None)
+            .append_compaction(
+                ThreadFilter::USER,
+                "earlier".into(),
+                first_kept,
+                100,
+                None,
+                None,
+            )
             .expect("append the compaction checkpoint");
         handoff.file(earlier);
         bus.emit(AgentEvent::CompactionEnd {

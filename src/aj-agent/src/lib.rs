@@ -674,20 +674,25 @@ impl Agent {
     }
 
     /// Run a single, bus-silent completion against the agent's provider
-    /// and return the concatenated assistant text. Does not touch the
-    /// transcript, emits no events, and does not accumulate usage.
-    /// Honors `cancel`.
+    /// and return the whole assistant message. Does not touch the
+    /// transcript and emits no events. Honors `cancel`.
     ///
     /// Used for out-of-band model calls — today, generating a
     /// compaction summary. `max_tokens` caps the response;
     /// `system_prompt` and the single user `text` define the request.
+    ///
+    /// The returned message carries the usage its provider priced, and
+    /// accounting for it is the caller's job: an out-of-band call's
+    /// spend belongs to whoever made the call, and only the caller knows
+    /// where it should land. Dropping the message drops real spend that
+    /// nothing else records.
     pub async fn complete_oneshot(
         &self,
         system_prompt: &str,
         text: String,
         max_tokens: u64,
         cancel: CancellationToken,
-    ) -> Result<String, TurnError> {
+    ) -> Result<AssistantMessage, TurnError> {
         let context = Context {
             system_prompt: Some(system_prompt.to_string()),
             messages: vec![Message::User(UserMessage::text(text))],
@@ -724,15 +729,7 @@ impl Agent {
                     .unwrap_or_else(|| "summary generation failed".to_string());
                 Err(TurnError::Recoverable(detail.into()))
             }
-            _ => {
-                let mut out = String::new();
-                for block in &message.content {
-                    if let AssistantContent::Text(t) = block {
-                        out.push_str(&t.text);
-                    }
-                }
-                Ok(out)
-            }
+            _ => Ok(message),
         }
     }
 

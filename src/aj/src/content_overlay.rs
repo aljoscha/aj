@@ -1183,6 +1183,7 @@ mod tests {
                     total: 0.33,
                 },
             },
+            compaction_usage: Usage::default(),
             settings: SessionSettings {
                 model: Some(("anthropic".to_string(), "claude-sonnet-4-5".to_string())),
                 thinking: Some("medium".to_string()),

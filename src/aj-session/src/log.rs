@@ -210,6 +210,16 @@ pub enum ConversationEntryKind {
         /// `None` when extraction found nothing.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         details: Option<crate::compaction::CompactionDetails>,
+        /// What the summarizer itself cost, priced by the provider that
+        /// produced it, summed over the one or two calls a compaction
+        /// makes. This is out-of-band spend: the summarizer exchange is
+        /// never a message entry, so the log has no other record of it,
+        /// and a session's totals would omit it entirely.
+        ///
+        /// `None` on entries written before compaction was accounted,
+        /// and on those the spend is simply unknown rather than zero.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<aj_models::types::Usage>,
     },
 }
 
@@ -1443,6 +1453,7 @@ impl ConversationLog {
         first_kept_entry_id: EntryId,
         tokens_before: u64,
         details: Option<crate::compaction::CompactionDetails>,
+        usage: Option<aj_models::types::Usage>,
     ) -> Result<EntryRef, ConversationError> {
         if !self.core.entries.contains_key(&first_kept_entry_id) {
             return Err(ConversationError::InvalidAppend(format!(
@@ -1459,6 +1470,7 @@ impl ConversationLog {
                 first_kept_entry_id,
                 tokens_before,
                 details,
+                usage,
             },
         )
     }
@@ -3070,6 +3082,7 @@ mod tests {
                 first_kept.clone(),
                 1234,
                 Some(details),
+                None,
             )
             .expect("append compaction");
 
@@ -3092,6 +3105,7 @@ mod tests {
                 first_kept_entry_id,
                 tokens_before,
                 details,
+                ..
             } => {
                 assert_eq!(summary, "the summary");
                 assert_eq!(first_kept_entry_id, &first_kept);
@@ -3115,7 +3129,14 @@ mod tests {
             view.add_message(user_text("hi")).expect("u");
         }
         let err = log
-            .append_compaction(ThreadFilter::USER, "s".into(), "no-such-id".into(), 0, None)
+            .append_compaction(
+                ThreadFilter::USER,
+                "s".into(),
+                "no-such-id".into(),
+                0,
+                None,
+                None,
+            )
             .expect_err("must reject unknown first_kept id");
         assert!(matches!(err, ConversationError::InvalidAppend(_)));
     }
@@ -3139,8 +3160,15 @@ mod tests {
             kept.id
         };
 
-        log.append_compaction(ThreadFilter::USER, "SUMMARY".into(), kept_user, 999, None)
-            .expect("compaction");
+        log.append_compaction(
+            ThreadFilter::USER,
+            "SUMMARY".into(),
+            kept_user,
+            999,
+            None,
+            None,
+        )
+        .expect("compaction");
 
         let head = log.latest_leaf(ThreadFilter::USER).expect("head");
         let convo = log.linearize(&head, ThreadFilter::USER);
@@ -3207,8 +3235,15 @@ mod tests {
             .expect("retained tool result");
             first_kept.id
         };
-        log.append_compaction(ThreadFilter::USER, "SUMMARY".into(), first_kept, 999, None)
-            .expect("compaction");
+        log.append_compaction(
+            ThreadFilter::USER,
+            "SUMMARY".into(),
+            first_kept,
+            999,
+            None,
+            None,
+        )
+        .expect("compaction");
 
         let head = log.latest_leaf(ThreadFilter::USER).expect("head");
         let conversation = log.linearize(&head, ThreadFilter::USER);
@@ -3295,6 +3330,7 @@ mod tests {
                 "sum".to_string(),
                 user.id.clone(),
                 42,
+                None,
                 None,
             )
             .expect("compaction"),

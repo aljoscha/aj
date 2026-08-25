@@ -58,14 +58,22 @@ pub struct SessionStats {
     pub subagents: usize,
     /// Compaction checkpoints recorded in this session.
     pub compactions: usize,
-    /// Aggregate token usage and dollar cost, summed over every assistant
-    /// message in the file. Like the other counts this spans all threads
-    /// and branches, so it reflects total spend on the session rather than
-    /// the cost of the currently projected conversation. The cost figures
-    /// are the per-response amounts recorded when each response arrived, so
-    /// a model whose pricing was unknown contributes zero and a non-trivial
-    /// token count can still report a zero cost.
+    /// Aggregate token usage and dollar cost for the session: every
+    /// assistant message in the file, plus the summarizer spend recorded
+    /// on its compaction entries. Like the other counts this spans all
+    /// threads and branches, so it reflects total spend on the session
+    /// rather than the cost of the currently projected conversation. The
+    /// cost figures are the per-response amounts recorded when each
+    /// response arrived, so a model whose pricing was unknown
+    /// contributes zero and a non-trivial token count can still report a
+    /// zero cost.
     pub usage: Usage,
+    /// The share of `usage` spent on compaction summaries rather than on
+    /// the conversation itself. Summed from the compaction entries'
+    /// recorded usage, so entries written before compaction was
+    /// accounted contribute nothing and this reads as an underestimate
+    /// on old sessions rather than as a zero.
+    pub compaction_usage: Usage,
     /// Model / thinking / speed currently recorded on the user thread.
     pub settings: SessionSettings,
 }
@@ -88,6 +96,7 @@ impl ConversationLog {
         let mut compactions = 0;
         let mut total_entries = 0;
         let mut usage = Usage::default();
+        let mut compaction_usage = Usage::default();
         let mut last_activity: Option<DateTime<Utc>> = None;
         let mut per_tool: HashMap<String, usize> = HashMap::new();
 
@@ -115,7 +124,15 @@ impl ConversationLog {
                     }
                 }
                 ConversationEntryKind::SubAgentSpawn { .. } => subagents += 1,
-                ConversationEntryKind::Compaction { .. } => compactions += 1,
+                ConversationEntryKind::Compaction {
+                    usage: entry_usage, ..
+                } => {
+                    compactions += 1;
+                    if let Some(u) = entry_usage {
+                        usage.accumulate(u);
+                        compaction_usage.accumulate(u);
+                    }
+                }
                 _ => {}
             }
         }
@@ -143,6 +160,7 @@ impl ConversationLog {
             subagents,
             compactions,
             usage,
+            compaction_usage,
             settings,
         }
     }
