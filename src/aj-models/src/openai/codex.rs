@@ -275,7 +275,7 @@ async fn run_stream_inner(
             SelectOutcome::Ready(Some(Err(err))) => return Err(classify_codex_client_error(&err)),
             SelectOutcome::Ready(None) => break,
             SelectOutcome::Cancelled => {
-                producer.push(AssistantMessageEvent::aborted(state.partial().clone()));
+                producer.push(state.cancelled());
                 return Ok(());
             }
         }

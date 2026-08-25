@@ -29,6 +29,14 @@
 //!   from a static [`AssistantMessage`]. Use this when the test cares
 //!   about the agent's behaviour on the finalized message and not the
 //!   streaming shape (the bulk of `event_protocol_tests`'s scripts).
+//!
+//! Like a real adapter, this provider seals the usage on every terminal
+//! event it emits: `total_tokens` is recomputed from the four counts and
+//! the cost from the model's rates. A script therefore supplies token
+//! counts and gets dollars computed for it, and a `usage.cost` set on a
+//! fixture is overwritten rather than replayed. Scripted models usually
+//! carry `ModelCost::default()`, whose rates are zero, so a fixture that
+//! wants a non-zero cost has to give its `ModelInfo` real rates.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -39,7 +47,7 @@ pub mod demos;
 
 use crate::cancel::{SelectOutcome, select_cancel};
 use crate::provider::Provider;
-use crate::registry::ModelInfo;
+use crate::registry::{ModelInfo, calculate_cost};
 use crate::streaming::{
     AssistantMessageEvent, AssistantMessageEventStream, DoneReason, ErrorReason,
 };
@@ -248,6 +256,22 @@ impl Provider for ScriptedProvider {
 // Stream driver
 // ---------------------------------------------------------------------------
 
+/// Seal a terminal event's usage the way a real adapter's stream state
+/// does: total the four token counts and price them at the model's
+/// rates. A no-op on non-terminal events.
+fn seal(model: &ModelInfo, event: &mut AssistantMessageEvent) {
+    let message = match event {
+        AssistantMessageEvent::Done { message, .. } => message,
+        AssistantMessageEvent::Error { error, .. } => error,
+        _ => return,
+    };
+    message.usage.total_tokens = message.usage.input
+        + message.usage.output
+        + message.usage.cache_read
+        + message.usage.cache_write;
+    calculate_cost(&model.cost, &mut message.usage);
+}
+
 /// Spawn a tokio task that drains `script` onto a fresh stream, honouring
 /// the per-step delays. Returns the consumer-side handle.
 ///
@@ -278,14 +302,18 @@ fn spawn_script(
                             m.model = model.id.clone();
                             m
                         });
-                        producer.push(AssistantMessageEvent::aborted(partial));
+                        let mut event = AssistantMessageEvent::aborted(partial);
+                        seal(&model, &mut event);
+                        producer.push(event);
                         return;
                     }
                 }
             }
-            let is_terminal = step.event.is_terminal();
-            last_partial = Some(step.event.partial().clone());
-            producer.push(step.event);
+            let mut event = step.event;
+            let is_terminal = event.is_terminal();
+            seal(&model, &mut event);
+            last_partial = Some(event.partial().clone());
+            producer.push(event);
             if is_terminal {
                 saw_terminal = true;
                 break;
@@ -312,10 +340,12 @@ fn spawn_empty_done(model: ModelInfo) -> AssistantMessageEventStream {
     message.provider = model.provider.clone();
     message.model = model.id.clone();
     message.stop_reason = StopReason::Stop;
-    stream.push(AssistantMessageEvent::Done {
+    let mut event = AssistantMessageEvent::Done {
         reason: DoneReason::Stop,
         message,
-    });
+    };
+    seal(&model, &mut event);
+    stream.push(event);
     stream
 }
 

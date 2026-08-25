@@ -302,7 +302,7 @@ async fn run_stream_inner(
             SelectOutcome::Ready(Some(Err(err))) => return Err(classify_client_error(&err)),
             SelectOutcome::Ready(None) => break,
             SelectOutcome::Cancelled => {
-                producer.push(AssistantMessageEvent::aborted(state.partial().clone()));
+                producer.push(state.cancelled());
                 return Ok(());
             }
         }
@@ -1039,14 +1039,6 @@ impl StreamState {
         }
     }
 
-    /// Borrow the running partial message snapshot. Used by the abort
-    /// path in [`super::responses::run_stream_inner`] /
-    /// [`super::codex::run_stream_inner`] to project the current state
-    /// onto an [`AssistantMessageEvent::aborted`] event.
-    pub(super) fn partial(&self) -> &AssistantMessage {
-        &self.partial
-    }
-
     pub(super) fn process(&mut self, event: ResponseStreamEvent) -> Vec<AssistantMessageEvent> {
         let mut out = Vec::new();
         match event {
@@ -1470,11 +1462,60 @@ impl StreamState {
         self.finish_status.is_some()
     }
 
+    /// The service-tier price multiplier for this turn.
+    ///
+    /// The tier the server actually served at wins over the one we
+    /// asked for, so this is only final once `final_response` has
+    /// landed. Resolved through the injected `cost_multiplier` because
+    /// Codex prices the same tiers on a different curve.
+    fn tier_multiplier(&self) -> f64 {
+        let server_tier = self
+            .final_response
+            .as_ref()
+            .and_then(|r| r.service_tier.clone());
+        (self.cost_multiplier)(
+            &self.partial.model,
+            server_tier.as_ref(),
+            self.requested_tier.as_ref(),
+        )
+    }
+
+    /// Complete the running partial's usage: harvest whatever the
+    /// terminal response reported, total the tokens and price them at
+    /// the rates snapshotted for this call, tier multiplier included.
+    ///
+    /// This API reports usage only on the terminal lifecycle event, so
+    /// an exit taken before that event prices a zero usage. The one
+    /// exit where that is not academic is a cancel that wins the poll
+    /// after `response.completed` was processed: the response is
+    /// captured, and without this the turn is handed out unharvested.
+    ///
+    /// Idempotent, and it must stay whole to be: `finalize_usage`
+    /// applies the multiplier with `*=` to cost fields `calculate_cost`
+    /// assigned in the same call. Calling only the multiplying half
+    /// would compound it.
+    fn seal(&mut self) {
+        let multiplier = self.tier_multiplier();
+        if let Some(usage) = self.final_response.as_ref().and_then(|r| r.usage.as_ref()) {
+            apply_usage(&mut self.partial.usage, usage);
+        }
+        finalize_usage(&mut self.partial.usage, &self.cost, multiplier);
+    }
+
+    /// The terminal event for a stream the client cancelled mid-flight.
+    ///
+    /// Named rather than written inline at the cancel arm so the seal
+    /// cannot be dropped from it without a test noticing.
+    pub(super) fn cancelled(&mut self) -> AssistantMessageEvent {
+        self.seal();
+        AssistantMessageEvent::aborted(self.partial.clone())
+    }
+
     /// Build the stream's terminal event, classifying a stream that ended
     /// before its terminal lifecycle event as a retryable truncation
     /// error rather than a successful `Done`. Otherwise defers to
     /// [`Self::finalize`].
-    pub(super) fn finalize_or_truncate(self) -> AssistantMessageEvent {
+    pub(super) fn finalize_or_truncate(mut self) -> AssistantMessageEvent {
         if self.saw_terminal() {
             self.finalize()
         } else {
@@ -1482,25 +1523,16 @@ impl StreamState {
                 api = %self.partial.api,
                 "stream ended before terminal frame; treating turn as truncated (retryable)"
             );
+            // `finish_status` and `final_response` are set together, so
+            // a truncated turn never has usage to harvest and this
+            // seals a zero. It runs for the invariant, not for tokens.
+            self.seal();
             AssistantMessageEvent::truncated(self.partial.clone())
         }
     }
 
     pub(super) fn finalize(mut self) -> AssistantMessageEvent {
-        // Apply usage / cost from the captured terminal response.
-        let server_tier = self
-            .final_response
-            .as_ref()
-            .and_then(|r| r.service_tier.clone());
-        let multiplier = (self.cost_multiplier)(
-            &self.partial.model,
-            server_tier.as_ref(),
-            self.requested_tier.as_ref(),
-        );
-        if let Some(usage) = self.final_response.as_ref().and_then(|r| r.usage.as_ref()) {
-            apply_usage(&mut self.partial.usage, usage);
-        }
-        finalize_usage(&mut self.partial.usage, &self.cost, multiplier);
+        self.seal();
 
         // Classify the terminal status.
         let has_tool_use = self

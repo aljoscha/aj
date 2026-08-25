@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use aj_models::ThinkingConfig;
 use aj_models::provider::Provider;
-use aj_models::registry::ModelInfo;
+use aj_models::registry::{ModelInfo, calculate_cost};
 use aj_models::streaming::{AssistantMessageEvent, AssistantMessageEventStream};
 use aj_models::types::{
     AssistantContent, AssistantMessage, Context, ErrorCategory, Message, SimpleStreamOptions,
@@ -1299,7 +1299,21 @@ impl Agent {
             //    the matching `MessageUpdate` so streaming listeners
             //    see the terminal event.
             let final_message = if aborted_during_stream {
-                let aborted_event = AssistantMessageEvent::aborted(latest_partial.clone());
+                // `latest_partial` is a mid-stream snapshot, and
+                // mid-stream partials are unpriced by definition: the
+                // adapters seal on the way out of the stream, and this
+                // arm never reaches that exit. Price it here from the
+                // same rates the adapter's state snapshotted, so a
+                // cancelled turn is recorded the way every other
+                // terminal message is. This message is exactly what the
+                // persistence listener writes on a cancel.
+                let mut partial = latest_partial.clone();
+                partial.usage.total_tokens = partial.usage.input
+                    + partial.usage.output
+                    + partial.usage.cache_read
+                    + partial.usage.cache_write;
+                calculate_cost(&self.model_info.cost, &mut partial.usage);
+                let aborted_event = AssistantMessageEvent::aborted(partial);
                 let aborted_message = aborted_event.partial().clone();
                 self.bus
                     .emit(AgentEvent::MessageUpdate {
@@ -5064,6 +5078,106 @@ mod event_protocol_tests {
             .prompt("second".to_string(), CancellationToken::new())
             .await
             .expect("follow-up prompt should succeed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_turn_prices_the_partial_the_agent_synthesizes() {
+        // The one terminal message built outside a provider adapter.
+        // `latest_partial` is a mid-stream snapshot, so it is unpriced
+        // by construction, and the agent's biased cancel arm means this
+        // synthesis (not the provider's own abort path) is what the
+        // persistence listener records. The scripted model carries real
+        // rates because the default scripted `ModelCost` is all zeros,
+        // against which any pricing bug would read as correct.
+        use aj_models::scripted::ProviderScript;
+
+        let mut partial = AssistantMessage::empty();
+        partial.api = SCRIPT_API.to_string();
+        partial.provider = SCRIPT_PROVIDER.to_string();
+        partial.model = SCRIPT_MODEL.to_string();
+        // The counts an opening frame reports: the request was billed
+        // for these before a single output token existed.
+        partial.usage.input = 1_000;
+        partial.usage.cache_read = 2_000;
+        partial.usage.cache_write = 500;
+
+        let mut final_msg = partial.clone();
+        final_msg.stop_reason = StopReason::Stop;
+
+        let slow_script = ProviderScript::new()
+            .push_immediate(AssistantMessageEvent::Start {
+                partial: partial.clone(),
+            })
+            .push(
+                std::time::Duration::from_secs(60),
+                AssistantMessageEvent::Done {
+                    reason: DoneReason::Stop,
+                    message: final_msg,
+                },
+            );
+
+        let provider: Arc<dyn Provider> = Arc::new(
+            ScriptedProvider::new(vec![slow_script]).on_exhausted(ExhaustedBehavior::Panic),
+        );
+        let model_info = Arc::new(ModelInfo {
+            cost: ModelCost {
+                input: 3.0,
+                output: 15.0,
+                cache_read: 0.3,
+                cache_write: 3.75,
+                tiers: Vec::new(),
+            },
+            ..scripted_model_info()
+        });
+        let mut agent = Agent::with_provider(
+            std::env::temp_dir(),
+            Vec::new(),
+            Vec::new(),
+            provider,
+            model_info,
+            StreamOptions::default(),
+            None,
+        );
+        agent.seed_session(AgentSeed {
+            assembled_system_prompt: Some("test system prompt".to_string()),
+            ..AgentSeed::default()
+        });
+
+        let cancel = CancellationToken::new();
+        let cancel_for_fire = cancel.clone();
+        let fire_handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            cancel_for_fire.cancel();
+        });
+        let err = agent
+            .prompt("first".to_string(), cancel)
+            .await
+            .expect_err("mid-stream cancel should abort the turn");
+        fire_handle.await.expect("cancel firer joined");
+        assert!(matches!(err, crate::TurnError::Aborted), "got {err:?}");
+
+        let messages = agent.messages();
+        let last_assistant = match messages.last().and_then(|m| m.as_stored_wire()) {
+            Some(Message::Assistant(a)) => a,
+            _ => panic!("expected trailing assistant message"),
+        };
+        assert_eq!(last_assistant.stop_reason, StopReason::Aborted);
+        assert_eq!(
+            last_assistant.usage.input, 1_000,
+            "the fixture must reach the synthesis with tokens on the partial, \
+             or this test measures nothing"
+        );
+        assert_eq!(
+            last_assistant.usage.total_tokens, 3_500,
+            "a cancelled turn totals the tokens the wire reported"
+        );
+        // 1000 * 3.0/1e6 + 2000 * 0.3/1e6 + 500 * 3.75/1e6
+        let expected = 0.003 + 0.000_6 + 0.001_875;
+        assert!(
+            (last_assistant.usage.cost.total - expected).abs() < 1e-12,
+            "a cancelled turn is priced at the agent's own model rates: got {} expected {expected}",
+            last_assistant.usage.cost.total
+        );
     }
 
     #[tokio::test]

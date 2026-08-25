@@ -213,7 +213,7 @@ async fn run_stream_inner(
             // break on), so we consume to stream end.
             SelectOutcome::Ready(None) => break,
             SelectOutcome::Cancelled => {
-                producer.push(AssistantMessageEvent::aborted(state.partial.clone()));
+                producer.push(state.cancelled());
                 return Ok(());
             }
         }
@@ -1135,11 +1135,40 @@ impl StreamState {
         self.finish_reason.is_some()
     }
 
+    /// Complete the running partial's usage: fold in whatever the wire
+    /// reported, total the tokens and price them at the rates
+    /// snapshotted for this call.
+    ///
+    /// Chat completions reports usage in a chunk of its own rather than
+    /// in the opening frame, so this adapter holds it aside in
+    /// `self.usage` until a terminal event is built. An exit taken
+    /// before that chunk arrives therefore prices a zero usage, and one
+    /// taken after prices what arrived: every exit hands out a message
+    /// whose `total_tokens` equals its four counts.
+    ///
+    /// Idempotent: `apply_usage` and `finalize_usage` both assign
+    /// rather than accumulate.
+    fn seal(&mut self) {
+        if let Some(usage) = self.usage.as_ref() {
+            apply_usage(&mut self.partial.usage, usage);
+        }
+        finalize_usage(&mut self.partial.usage, &self.cost);
+    }
+
+    /// The terminal event for a stream the client cancelled mid-flight.
+    ///
+    /// Named rather than written inline at the cancel arm so the seal
+    /// cannot be dropped from it without a test noticing.
+    fn cancelled(&mut self) -> AssistantMessageEvent {
+        self.seal();
+        AssistantMessageEvent::aborted(self.partial.clone())
+    }
+
     /// Build the stream's terminal event, classifying a stream that ended
     /// before its `finish_reason` as a retryable truncation error rather
     /// than a successful `Done`.
     /// Otherwise defers to [`Self::finalize`].
-    fn finalize_or_truncate(self) -> AssistantMessageEvent {
+    fn finalize_or_truncate(mut self) -> AssistantMessageEvent {
         if self.saw_terminal() {
             self.finalize()
         } else {
@@ -1147,6 +1176,7 @@ impl StreamState {
                 api = %self.partial.api,
                 "stream ended before terminal frame; treating turn as truncated (retryable)"
             );
+            self.seal();
             AssistantMessageEvent::truncated(self.partial.clone())
         }
     }
@@ -1166,10 +1196,7 @@ impl StreamState {
         // already carries the complete, closed content.
         let _ = tail;
 
-        if let Some(usage) = self.usage.as_ref() {
-            apply_usage(&mut self.partial.usage, usage);
-        }
-        finalize_usage(&mut self.partial.usage, &self.cost);
+        self.seal();
 
         let (stop_reason, done_reason, error_detail) = classify_finish(&self.finish_reason);
 
