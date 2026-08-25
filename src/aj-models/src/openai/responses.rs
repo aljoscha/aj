@@ -2153,6 +2153,32 @@ mod tests {
         assert!((msg.usage.cost.total - 5.625).abs() < 1e-9);
     }
 
+    /// A cancel that fires after `response.completed` was processed
+    /// still has the tier multiplier to apply. Sealing must resolve it
+    /// the same way `finalize` does, or a flex turn is billed at full
+    /// price on the one exit that skips finalize.
+    #[test]
+    fn a_cancelled_stream_keeps_the_service_tier_multiplier() {
+        let mut state = StreamState::new(&fake_model(false), Some(ServiceTier::Flex));
+        state.partial.usage.input = 1_000_000;
+        state.partial.usage.output = 1_000_000;
+        let event = state.cancelled();
+        let msg = match event {
+            AssistantMessageEvent::Error { error, .. } => error,
+            other => panic!("expected an aborted Error event, got {other:?}"),
+        };
+        assert_eq!(
+            msg.usage.total_tokens, 2_000_000,
+            "a cancelled turn totals the tokens it holds"
+        );
+        // 1.25 (input) + 10.0 (output) = 11.25 at full price; flex halves it.
+        assert!(
+            (msg.usage.cost.total - 5.625).abs() < 1e-9,
+            "a cancelled flex turn is priced at the flex rate: got {}",
+            msg.usage.cost.total
+        );
+    }
+
     #[test]
     fn finalize_usage_composes_context_tier_with_multiplier() {
         // A large request on a gpt-5.6-sol-shaped model: the context tier
