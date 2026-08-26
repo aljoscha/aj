@@ -1066,7 +1066,7 @@ impl ReplayState {
             api: assistant.api.clone(),
             provider: assistant.provider.clone(),
             model: assistant.model.clone(),
-            account: None,
+            account: assistant.account.clone(),
             response_id: assistant.response_id.clone(),
             usage: assistant.usage.clone(),
             stop_reason: assistant.stop_reason.clone(),
@@ -1313,6 +1313,14 @@ mod tests {
         }))
     }
 
+    fn assistant_msg_with_account(content: Vec<AssistantContent>, account: &str) -> AgentMessage {
+        AgentMessage::wire(Message::Assistant(AssistantMessage {
+            content,
+            account: Some(account.to_string()),
+            ..AssistantMessage::empty()
+        }))
+    }
+
     fn tool_result_msg(
         id: &str,
         name: &str,
@@ -1431,22 +1439,25 @@ mod tests {
         {
             let mut view = ConversationView::user(&mut log);
             view.add_message(user_msg("hi")).expect("user msg");
-            view.add_message(assistant_msg(vec![
-                AssistantContent::Thinking(ThinkingContent {
-                    thinking: "let me think".into(),
-                    thinking_signature: None,
-                    redacted: false,
-                }),
-                AssistantContent::Text(TextContent {
-                    text: "hello".into(),
-                    text_signature: None,
-                }),
-                AssistantContent::ToolCall(ToolCall {
-                    id: "call-1".into(),
-                    name: "read_file".into(),
-                    arguments: json!({"path": "/tmp/x"}),
-                }),
-            ]))
+            view.add_message(assistant_msg_with_account(
+                vec![
+                    AssistantContent::Thinking(ThinkingContent {
+                        thinking: "let me think".into(),
+                        thinking_signature: None,
+                        redacted: false,
+                    }),
+                    AssistantContent::Text(TextContent {
+                        text: "hello".into(),
+                        text_signature: None,
+                    }),
+                    AssistantContent::ToolCall(ToolCall {
+                        id: "call-1".into(),
+                        name: "read_file".into(),
+                        arguments: json!({"path": "/tmp/x"}),
+                    }),
+                ],
+                "work",
+            ))
             .expect("assistant msg");
             view.add_message(tool_result_msg("call-1", "read_file", "result body", None))
                 .expect("tool result msg");
@@ -1507,11 +1518,21 @@ mod tests {
             other => panic!("expected user MessageStart, got {other:?}"),
         }
 
-        // Assistant MessageEnd carries the finalized content.
+        // The projected assistant pair carries the finalized identity.
+        match &events[2] {
+            AgentEvent::MessageStart { message, .. } => match message.as_stored_wire() {
+                Some(Message::Assistant(a)) => {
+                    assert_eq!(a.account.as_deref(), Some("work"));
+                }
+                other => panic!("expected assistant, got {other:?}"),
+            },
+            other => panic!("expected assistant MessageStart, got {other:?}"),
+        }
         match &events[3] {
             AgentEvent::MessageEnd { message, .. } => match message.as_stored_wire() {
                 Some(Message::Assistant(a)) => {
                     assert_eq!(a.content.len(), 3);
+                    assert_eq!(a.account.as_deref(), Some("work"));
                 }
                 other => panic!("expected assistant, got {other:?}"),
             },
