@@ -691,15 +691,18 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     )?;
     let (gateway, server) = start(&args, config.as_deref(), state_dir).await?;
 
+    let signals = crate::serve::ShutdownSignals::new();
     println!(
         "aj gateway {} serving on {}",
         gateway.hello().host_id,
         server.url()
     );
-    crate::serve::wait_for_shutdown().await;
-
-    server.shutdown().await;
-    gateway.shutdown().await;
+    signals
+        .shutdown(async move {
+            server.shutdown().await;
+            gateway.shutdown().await;
+        })
+        .await;
     Ok(())
 }
 

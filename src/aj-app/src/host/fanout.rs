@@ -304,12 +304,19 @@ impl LiveReceiver {
 
 /// The host's subscriber registry.
 pub(crate) struct Fanout {
-    subscribers: StdMutex<HashMap<SubscriberId, Subscriber>>,
+    state: StdMutex<FanoutState>,
     next_id: AtomicU64,
     /// Pinged whenever the session directory changed. The list publisher
     /// coalesces on it (spec 6.8).
     list_dirty: Notify,
     live_capacity: NonZeroUsize,
+}
+
+struct FanoutState {
+    /// Terminal once set. Keeping this under the registry lock makes a close
+    /// atomic with every registration that could otherwise follow it.
+    closed: bool,
+    subscribers: HashMap<SubscriberId, Subscriber>,
 }
 
 impl Default for Fanout {
@@ -323,7 +330,10 @@ impl Fanout {
     /// or [`DEFAULT_LIVE_CAPACITY`] when the caller has no opinion.
     pub(crate) fn new(live_capacity: Option<NonZeroUsize>) -> Self {
         Self {
-            subscribers: StdMutex::new(HashMap::new()),
+            state: StdMutex::new(FanoutState {
+                closed: false,
+                subscribers: HashMap::new(),
+            }),
             next_id: AtomicU64::new(1),
             list_dirty: Notify::new(),
             live_capacity: live_capacity.unwrap_or(DEFAULT_LIVE_CAPACITY),
@@ -347,19 +357,24 @@ impl Fanout {
             .iter()
             .map(|session| (session.clone(), AttachState::Attaching))
             .collect();
-        self.lock().insert(
-            id,
-            Subscriber {
-                live,
-                attached,
-                accepted_list: None,
-            },
-        );
+        let mut state = self.lock();
+        if state.closed {
+            live.close();
+        } else {
+            state.subscribers.insert(
+                id,
+                Subscriber {
+                    live,
+                    attached,
+                    accepted_list: None,
+                },
+            );
+        }
         (id, receiver, cancelled)
     }
 
     pub(crate) fn deregister(&self, id: SubscriberId) {
-        if let Some(subscriber) = self.lock().remove(&id) {
+        if let Some(subscriber) = self.lock().subscribers.remove(&id) {
             subscriber.live.evict();
         }
     }
@@ -375,7 +390,7 @@ impl Fanout {
     /// a bound this client never asked to spend and could evict it over traffic
     /// it never asked for.
     pub(crate) fn detach(&self, id: SubscriberId, session: &str) {
-        if let Some(subscriber) = self.lock().get_mut(&id) {
+        if let Some(subscriber) = self.lock().subscribers.get_mut(&id) {
             subscriber.attached.remove(session);
             // Anything already queued for it goes too. Resolving a session
             // takes a moment (a materialization reads its log), and another
@@ -389,20 +404,23 @@ impl Fanout {
 
     /// Fan `frame` out to every subscriber.
     pub(crate) fn publish(&self, frame: Frame) {
-        self.lock().retain(|_, subscriber| subscriber.offer(&frame));
+        self.lock()
+            .subscribers
+            .retain(|_, subscriber| subscriber.offer(&frame));
     }
 
     /// Fan a directory out to every subscriber that does not already have it
     /// (see [`Subscriber::offer_list`]).
     pub(crate) fn publish_list(&self, sessions: Vec<SessionSummary>) {
         self.lock()
+            .subscribers
             .retain(|_, subscriber| subscriber.offer_list(&sessions));
     }
 
     /// Switches a session to live delivery and filters duplicate durables.
     pub(crate) fn finish_block(&self, id: SubscriberId, session: &str, boundary: u64) {
-        let mut subscribers = self.lock();
-        let Some(subscriber) = subscribers.get_mut(&id) else {
+        let mut state = self.lock();
+        let Some(subscriber) = state.subscribers.get_mut(&id) else {
             return;
         };
         subscriber.live.retain(|frame| {
@@ -416,7 +434,9 @@ impl Fanout {
 
     /// Drop every subscriber, closing its stream.
     pub(crate) fn close(&self) {
-        for (_, subscriber) in self.lock().drain() {
+        let mut state = self.lock();
+        state.closed = true;
+        for (_, subscriber) in state.subscribers.drain() {
             subscriber.live.close();
         }
     }
@@ -428,6 +448,7 @@ impl Fanout {
     /// flight as use (spec section 5: attachment is the retention signal).
     pub(crate) fn attached(&self, session: &str) -> bool {
         self.lock()
+            .subscribers
             .values()
             .any(|subscriber| subscriber.attached.contains_key(session))
     }
@@ -441,10 +462,8 @@ impl Fanout {
         &self.list_dirty
     }
 
-    fn lock(&self) -> MutexGuard<'_, HashMap<SubscriberId, Subscriber>> {
-        self.subscribers
-            .lock()
-            .expect("fanout subscribers mutex poisoned")
+    fn lock(&self) -> MutexGuard<'_, FanoutState> {
+        self.state.lock().expect("fanout state mutex poisoned")
     }
 }
 
@@ -741,7 +760,7 @@ mod tests {
     /// say that its fixture reached it, and a test about coalescing that two
     /// snapshots stayed two frames.
     fn queued(fanout: &Fanout, id: SubscriberId) -> usize {
-        fanout.lock()[&id]
+        fanout.lock().subscribers[&id]
             .live
             .0
             .state
@@ -1115,7 +1134,10 @@ mod tests {
 
         fanout.publish(reliable("three"));
         assert!(cancelled.is_cancelled());
-        assert!(fanout.lock().is_empty(), "the subscriber was evicted");
+        assert!(
+            fanout.lock().subscribers.is_empty(),
+            "the subscriber was evicted"
+        );
         assert!(drained(&mut rx).is_empty(), "eviction closes and clears");
     }
 
@@ -1270,6 +1292,26 @@ mod tests {
         closing.await.expect("the closing task");
     }
 
+    /// Closing the registry is terminal. A registration that begins after it
+    /// returns receives a live channel already at EOF rather than recreating a
+    /// subscriber that no later close can reach.
+    #[tokio::test]
+    async fn a_registration_after_close_is_already_closed() {
+        let fanout = Fanout::default();
+        fanout.close();
+
+        let (_id, mut rx, _cancelled) = fanout.register(&[SESSION.to_string()]);
+
+        assert!(
+            fanout.lock().subscribers.is_empty(),
+            "a closed fanout retains no late subscriber"
+        );
+        let ended = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("the late receiver is closed synchronously");
+        assert!(ended.is_none(), "a late receiver starts at EOF");
+    }
+
     /// Dropping the stream deregisters it, so the host stops paying for a
     /// client that went away.
     #[test]
@@ -1283,10 +1325,10 @@ mod tests {
             vec![SESSION.to_string()],
             Arc::clone(&fanout),
         );
-        assert_eq!(fanout.lock().len(), 1);
+        assert_eq!(fanout.lock().subscribers.len(), 1);
 
         drop(attachment);
 
-        assert!(fanout.lock().is_empty());
+        assert!(fanout.lock().subscribers.is_empty());
     }
 }

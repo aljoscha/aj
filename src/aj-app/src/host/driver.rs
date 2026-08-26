@@ -83,11 +83,12 @@ fn resolve_head_target(
 /// so we prefer it. A wedged turn must not hang the process, hence the
 /// bound.
 ///
-/// NOTE: `SessionHost::shutdown` winds its sessions down one at a time, so a
-/// host holding several wedged sessions pays this per session. Fine while a
-/// host holds a handful. The fix, if it ever matters, is to drive the
-/// teardowns concurrently rather than to shorten the grace.
+/// Every session gets this grace concurrently under the host's total shutdown
+/// deadline, so adding sessions does not add their waits together.
 const TURN_DRAIN_GRACE: Duration = Duration::from_secs(5);
+
+/// How long teardown waits to acquire a session's log for its final flush.
+const LOG_FLUSH_GRACE: Duration = Duration::from_secs(5);
 
 pub(crate) struct Driver {
     session: Arc<LiveSession>,
@@ -212,7 +213,8 @@ impl Driver {
         self.publish_event(entry, event);
         self.refresh_state();
         self.shared.fanout.mark_list_dirty();
-        if let Some((owner, conditional)) = trigger
+        if !self.draining
+            && let Some((owner, conditional)) = trigger
             && (!conditional
                 || self.session.core.task_registry.has_notices(owner)
                 || self.session.has_queued(owner))
@@ -1127,6 +1129,7 @@ impl Driver {
                 () = &mut grace => {
                     tracing::warn!(
                         session = self.session.id(),
+                        phase = "turn drain",
                         "turns still running after the cancellation grace; aborting them"
                     );
                     self.turns.shutdown().await;
@@ -1135,15 +1138,36 @@ impl Driver {
             }
         }
         self.drain_events();
-        crate::shutdown_background_tasks(&self.session.core.task_registry).await;
+        if !crate::shutdown_background_tasks_quietly(&self.session.core.task_registry).await {
+            tracing::warn!(
+                session = self.session.id(),
+                phase = "background task quiesce",
+                "background tasks still running after the shutdown grace; proceeding"
+            );
+        }
+        // Detached task drivers emit their terminal events while quiescing.
+        // Publish those before the host closes the attachment streams.
+        self.drain_events();
         // Buffered non-punctuation entries (the state records, spawn
         // roots) are lost with the process otherwise: nothing else forces
         // them out.
-        if let Err(err) = self.session.core.log.lock().await.flush_pending() {
-            tracing::warn!(
-                session = self.session.id(),
-                "failed to flush the conversation log at teardown: {err}"
-            );
+        match tokio::time::timeout(LOG_FLUSH_GRACE, self.session.core.log.lock()).await {
+            Ok(mut log) => {
+                if let Err(err) = log.flush_pending() {
+                    tracing::warn!(
+                        session = self.session.id(),
+                        phase = "log flush",
+                        "failed to flush the conversation log at teardown: {err}"
+                    );
+                }
+            }
+            Err(_) => {
+                tracing::warn!(
+                    session = self.session.id(),
+                    phase = "log flush",
+                    "the conversation log remained locked through the flush grace; pending entries were not flushed"
+                );
+            }
         }
     }
 

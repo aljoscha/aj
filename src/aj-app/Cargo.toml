@@ -34,6 +34,7 @@ url = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tracing-subscriber = { workspace = true }
 # The moved print-mode tests use `#[tokio::test(start_paused = true)]`,
 # which needs tokio's `test-util` feature (not part of `full`), so the
 # crate is testable in isolation and not only via workspace feature

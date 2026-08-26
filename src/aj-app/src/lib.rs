@@ -60,14 +60,20 @@ pub use system_prompt::SYSTEM_PROMPT;
 /// child run), so this only guards against a wedged driver.
 const TASK_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
-/// Kill the background-task tree and await driver quiescence with a
-/// bounded grace, so process groups are reliably killed and reaped
-/// before the caller tears the rest of the world down.
+/// Kill the background-task tree and await driver quiescence with a bounded grace.
 pub async fn shutdown_background_tasks(registry: &TaskRegistry) {
-    registry.shutdown();
-    if !registry.quiesce(TASK_SHUTDOWN_GRACE).await {
-        tracing::warn!("background tasks still running after the shutdown grace; proceeding");
+    if !shutdown_background_tasks_quietly(registry).await {
+        tracing::warn!(
+            phase = "background task quiesce",
+            "background tasks still running after the shutdown grace; proceeding"
+        );
     }
+}
+
+/// Kill the background-task tree and report whether every driver quiesced.
+pub(crate) async fn shutdown_background_tasks_quietly(registry: &TaskRegistry) -> bool {
+    registry.shutdown();
+    registry.quiesce(TASK_SHUTDOWN_GRACE).await
 }
 
 /// `aj list-sessions`: list existing conversation sessions

@@ -11,6 +11,9 @@
 //! every remote client attach as peers rather than to two hosts over one
 //! session store, which the store's advisory locks would refuse anyway.
 
+use std::future::Future;
+#[cfg(unix)]
+use std::future::pending;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 
@@ -135,11 +138,14 @@ pub(crate) async fn run(mut args: Args) -> Result<()> {
         }
     };
 
+    let signals = ShutdownSignals::new();
     println!("{}", banner(&host.hello(), &server.url()));
-    wait_for_shutdown().await;
-
-    server.shutdown().await;
-    host.shutdown().await;
+    signals
+        .shutdown(async move {
+            server.shutdown().await;
+            host.shutdown().await;
+        })
+        .await;
     Ok(())
 }
 
@@ -156,29 +162,109 @@ fn banner(hello: &Hello, url: &str) -> String {
     }
 }
 
-/// Resolve when the process is asked to stop: Ctrl+C, or SIGTERM from a
-/// service manager (the reference unit runs `aj serve` under systemd).
-pub(crate) async fn wait_for_shutdown() {
+/// Persistent stop-signal streams shared by serving modes.
+pub(crate) struct ShutdownSignals {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
+    interrupt: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    terminate: Option<tokio::signal::unix::Signal>,
+    #[cfg(windows)]
+    interrupt: Option<tokio::signal::windows::CtrlC>,
+}
 
-        let mut terminate = match signal(SignalKind::terminate()) {
-            Ok(stream) => stream,
-            Err(err) => {
-                tracing::warn!("could not listen for SIGTERM: {err}");
+impl ShutdownSignals {
+    /// Install listeners for every stop signal this platform supports.
+    pub(crate) fn new() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+
+            let interrupt = signal(SignalKind::interrupt())
+                .inspect_err(|err| tracing::warn!("could not listen for SIGINT: {err}"))
+                .ok();
+            let terminate = signal(SignalKind::terminate())
+                .inspect_err(|err| tracing::warn!("could not listen for SIGTERM: {err}"))
+                .ok();
+            Self {
+                interrupt,
+                terminate,
+            }
+        }
+        #[cfg(windows)]
+        {
+            let interrupt = tokio::signal::windows::ctrl_c()
+                .inspect_err(|err| tracing::warn!("could not listen for Ctrl+C: {err}"))
+                .ok();
+            Self { interrupt }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Self {}
+        }
+    }
+
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        loop {
+            if self.interrupt.is_none() && self.terminate.is_none() {
                 let _ = tokio::signal::ctrl_c().await;
                 return;
             }
-        };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = terminate.recv() => {}
+            enum Kind {
+                Interrupt,
+                Terminate,
+            }
+            let (kind, signal) = tokio::select! {
+                signal = recv_unix(&mut self.interrupt) => (Kind::Interrupt, signal),
+                signal = recv_unix(&mut self.terminate) => (Kind::Terminate, signal),
+            };
+            if signal.is_some() {
+                return;
+            }
+            match kind {
+                Kind::Interrupt => self.interrupt = None,
+                Kind::Terminate => self.terminate = None,
+            }
+        }
+        #[cfg(windows)]
+        {
+            match &mut self.interrupt {
+                Some(interrupt) => {
+                    let _ = interrupt.recv().await;
+                }
+                None => {
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
         }
     }
-    #[cfg(not(unix))]
+
+    /// Await one stop signal, then let `teardown` finish unless another arrives.
+    pub(crate) async fn shutdown<F>(mut self, teardown: F)
+    where
+        F: Future<Output = ()>,
     {
-        let _ = tokio::signal::ctrl_c().await;
+        self.recv().await;
+        tokio::select! {
+            biased;
+            _ = self.recv() => {
+                eprintln!("aj: received a second shutdown signal; exiting immediately");
+                std::process::exit(1);
+            }
+            () = teardown => {}
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn recv_unix(signal: &mut Option<tokio::signal::unix::Signal>) -> Option<()> {
+    match signal {
+        Some(signal) => signal.recv().await,
+        None => pending().await,
     }
 }
 

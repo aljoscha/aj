@@ -42,6 +42,7 @@ vaxis = { path = "../vaxis/" }
 
 [dev-dependencies]
 aj-app = { path = "../aj-app/", features = ["test-support"] }
+nix = { workspace = true }
 serial_test = { workspace = true }
 
 [lints]

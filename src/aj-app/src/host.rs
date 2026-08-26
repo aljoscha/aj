@@ -69,7 +69,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc::{Sender, unbounded_channel};
 use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::host::driver::Driver;
@@ -91,6 +91,12 @@ use fanout::Fanout;
 /// frame per event would swamp every client's queue for data that is
 /// cumulative anyway (spec 6.8).
 const LIST_COALESCE: Duration = Duration::from_millis(200);
+
+/// Total grace for draining every session driver during host shutdown.
+const HOST_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+
+/// Time retained inside the total grace for Tokio to complete aborted joins.
+const HOST_ABORT_GRACE: Duration = Duration::from_secs(1);
 
 /// How long a session stays live with nothing running and nobody attached
 /// before the host releases it (spec section 5).
@@ -563,6 +569,35 @@ struct LiveEntry {
     driver: JoinHandle<()>,
 }
 
+/// Driver abort handles retained while a shutdown future owns their joins.
+///
+/// Dropping a shutdown future must not detach drivers it already removed from
+/// the session map. A second stop exits the process, but cancellation by any
+/// other caller still releases the advisory locks instead of orphaning them.
+struct ShutdownAborts(Vec<(String, AbortHandle)>);
+
+impl Drop for ShutdownAborts {
+    fn drop(&mut self) {
+        for (_, driver) in &self.0 {
+            if !driver.is_finished() {
+                driver.abort();
+            }
+        }
+    }
+}
+
+/// Close every attachment whenever the shutdown owner leaves its future.
+///
+/// On the normal path this runs after driver joins. If the caller cancels the
+/// future, [`ShutdownAborts`] runs first and this still leaves no parked stream.
+struct ShutdownFinish<'a>(&'a HostInner);
+
+impl Drop for ShutdownFinish<'_> {
+    fn drop(&mut self) {
+        self.0.shared.fanout.close();
+    }
+}
+
 struct HostInner {
     shared: Arc<HostShared>,
     persistence: ConversationPersistence,
@@ -573,6 +608,9 @@ struct HostInner {
     /// directory's abbreviation, else nothing.
     name: Option<String>,
     sessions: TokioMutex<HashMap<String, LiveEntry>>,
+    /// Every spawned driver, independently of the async session-map lock.
+    /// Shutdown can still abort these when a release is holding that map.
+    driver_aborts: StdMutex<HashMap<String, AbortHandle>>,
     /// Wall clock and monotonic clock read at the same moment, for
     /// projecting a task's `Instant` onto wall time (see [`wall_clock`]).
     /// Read once per host rather than per call, so the same task's start
@@ -659,6 +697,7 @@ impl SessionHost {
             working_directory,
             name,
             sessions: TokioMutex::new(HashMap::new()),
+            driver_aborts: StdMutex::new(HashMap::new()),
             clock_anchor: (Utc::now(), Instant::now()),
             idle_grace: idle_grace.unwrap_or(DEFAULT_IDLE_GRACE),
             shut_down: AtomicBool::new(false),
@@ -1301,30 +1340,114 @@ impl SessionHost {
     /// Tear every live session down and close every client stream.
     ///
     /// Each session's turns are cancelled through the graceful path (so
-    /// transcripts stay consistent), its background tasks quiesced and its
-    /// log flushed, and only then is its advisory lock released, which
-    /// happens when its driver task ends.
+    /// transcripts stay consistent), its background tasks quiesced, and its
+    /// log given a bounded final flush. Its advisory lock is released when the
+    /// driver ends. Drivers wind down concurrently under one host-wide deadline.
+    /// A driver still running then is named and aborted.
     ///
     /// Terminal: every later request fails rather than rebuilding a session
     /// behind a driver nobody will ever tell to stop.
     pub async fn shutdown(&self) {
-        // Set before the map is drained, so a request that raced this
-        // cannot materialize a session between the drain and the flag.
-        self.inner.shut_down.store(true, Ordering::Release);
-        let entries: Vec<LiveEntry> = {
-            let mut sessions = self.inner.sessions.lock().await;
-            sessions.drain().map(|(_, entry)| entry).collect()
+        // Set before awaiting anything, so a request cannot materialize a
+        // session behind teardown. Another caller cannot improve on the owner
+        // already doing this work, and must not close its streams early.
+        if self.inner.shut_down.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let _finish = ShutdownFinish(&self.inner);
+        let deadline = tokio::time::Instant::now() + HOST_SHUTDOWN_GRACE;
+        let graceful_deadline = deadline - HOST_ABORT_GRACE;
+        let mut aborts = ShutdownAborts(
+            self.inner
+                .driver_aborts
+                .lock()
+                .expect("driver aborts mutex poisoned")
+                .iter()
+                .map(|(session, abort)| (session.clone(), abort.clone()))
+                .collect(),
+        );
+        let mut map_aborted = HashSet::new();
+        let entries: Vec<LiveEntry> = match tokio::time::timeout_at(
+            graceful_deadline,
+            self.inner.sessions.lock(),
+        )
+        .await
+        {
+            Ok(mut sessions) => sessions.drain().map(|(_, entry)| entry).collect(),
+            Err(_) => {
+                // An idle release can hold the map while its request is queued
+                // behind a stuck command. The independent handles are what let
+                // the host end those drivers without first acquiring the map.
+                for (session, abort) in &aborts.0 {
+                    if !abort.is_finished() {
+                        tracing::warn!(
+                            session = session.as_str(),
+                            phase = "session map drain",
+                            "the live session map remained locked through the graceful cutoff; aborting its driver before the host deadline"
+                        );
+                        abort.abort();
+                        map_aborted.insert(session.clone());
+                    }
+                }
+                match tokio::time::timeout_at(deadline, self.inner.sessions.lock()).await {
+                    Ok(mut sessions) => sessions.drain().map(|(_, entry)| entry).collect(),
+                    Err(_) => {
+                        tracing::warn!(
+                            phase = "session map drain",
+                            "the live session map remained locked through the host deadline"
+                        );
+                        return;
+                    }
+                }
+            }
         };
+
+        let mut drivers = JoinSet::new();
         for entry in entries {
             let LiveEntry { session, driver } = entry;
+            let id = session.id().to_string();
             session.send(Request::Shutdown);
             // The driver holds the session lock, so joining it is what
             // releases it. Dropping our own handle first keeps the session
             // from outliving the task.
             drop(session);
-            let _ = driver.await;
+            if !aborts.0.iter().any(|(session, _)| session == &id) {
+                aborts.0.push((id.clone(), driver.abort_handle()));
+            }
+            drivers.spawn(async move { (id, driver.await) });
         }
-        self.inner.shared.fanout.close();
+
+        while !drivers.is_empty() {
+            match tokio::time::timeout_at(graceful_deadline, drivers.join_next()).await {
+                Ok(Some(joined)) => warn_driver_join(joined),
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        for (session, abort) in &aborts.0 {
+            if !abort.is_finished() {
+                if !map_aborted.contains(session) {
+                    tracing::warn!(
+                        session = session.as_str(),
+                        phase = "session driver join",
+                        "session driver did not finish before the abort cutoff; aborting it before the host deadline"
+                    );
+                }
+                abort.abort();
+            }
+        }
+        while !drivers.is_empty() {
+            match tokio::time::timeout_at(deadline, drivers.join_next()).await {
+                Ok(Some(joined)) => warn_driver_join(joined),
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        self.inner
+            .driver_aborts
+            .lock()
+            .expect("driver aborts mutex poisoned")
+            .clear();
     }
 
     /// Release `session` if its driver reports it idle, answering whether it
@@ -1380,6 +1503,11 @@ impl SessionHost {
         // The driver returns right after answering, and its return is what
         // drops the session's lock.
         let _ = entry.driver.await;
+        self.inner
+            .driver_aborts
+            .lock()
+            .expect("driver aborts mutex poisoned")
+            .remove(session);
         drop(sessions);
         if reaped {
             // A reaped session left no row, so what the host knows about its
@@ -1713,6 +1841,15 @@ impl SessionHost {
             events,
             requests,
         );
+        // Synchronize the terminal check with shutdown's abort snapshot. If
+        // shutdown wins, this materialization drops its lock and core without
+        // starting a driver behind a host that has already torn down.
+        let mut driver_aborts = self
+            .inner
+            .driver_aborts
+            .lock()
+            .expect("driver aborts mutex poisoned");
+        self.alive()?;
         // The lock rides into the driver task: it is released when the task
         // ends, which is what `shutdown` awaits.
         let handle = tokio::spawn(async move {
@@ -1720,6 +1857,8 @@ impl SessionHost {
             driver.run().await;
             drop(lock);
         });
+        driver_aborts.insert(session_id.clone(), handle.abort_handle());
+        drop(driver_aborts);
         sessions.insert(
             session_id,
             LiveEntry {
@@ -1930,6 +2069,30 @@ impl SessionHost {
             status.working != working_seen || status.settings != settings_seen
         });
         true
+    }
+}
+
+/// Report an abnormal session-driver join. Cancellation is the expected
+/// outcome after the host's abort cutoff.
+fn warn_driver_join(
+    joined: Result<(String, Result<(), tokio::task::JoinError>), tokio::task::JoinError>,
+) {
+    match joined {
+        Ok((_, Ok(()))) => {}
+        Ok((_, Err(err))) if err.is_cancelled() => {}
+        Ok((session, Err(err))) => {
+            tracing::warn!(
+                session,
+                phase = "session driver join",
+                "session driver ended abnormally during shutdown: {err}"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                phase = "session driver join",
+                "session driver join waiter ended abnormally during shutdown: {err}"
+            );
+        }
     }
 }
 

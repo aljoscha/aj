@@ -5,9 +5,10 @@
 //! frames asserted on are the ones a network server would serialize and
 //! the client fold ([`SessionClient`]) would receive.
 
+use std::io::{self, Write};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use aj_agent::events::{AgentEvent, AgentId, AgentSettings};
@@ -31,6 +32,7 @@ use aj_models::types::{AssistantContent, AssistantMessage, StopReason, ToolCall,
 use aj_session::{ConversationPersistence, SessionLock, ThreadFilter};
 use aj_wire::{Frame, ModelSelection, SessionSettings, SessionSummary};
 use tempfile::TempDir;
+use tracing_subscriber::fmt::MakeWriter;
 
 /// Every wait in this file is bounded by this, so a wedged host fails a
 /// test instead of hanging CI.
@@ -46,6 +48,55 @@ const LIST_SETTLE: Duration = Duration::from_millis(600);
 /// burst is allowed to produce, so a host that lengthens its window still
 /// passes and one that shortens it has to move this too.
 const LIST_WINDOW: Duration = Duration::from_millis(200);
+
+#[derive(Clone)]
+struct TraceCapture(Arc<StdMutex<Vec<u8>>>);
+
+struct TraceWriter(Arc<StdMutex<Vec<u8>>>);
+
+impl Write for TraceWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .expect("trace capture mutex poisoned")
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for TraceCapture {
+    type Writer = TraceWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        TraceWriter(Arc::clone(&self.0))
+    }
+}
+
+fn trace_capture() -> (Arc<StdMutex<Vec<u8>>>, usize) {
+    static CAPTURE: OnceLock<Arc<StdMutex<Vec<u8>>>> = OnceLock::new();
+    let capture = Arc::clone(CAPTURE.get_or_init(|| {
+        let capture = Arc::new(StdMutex::new(Vec::new()));
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(TraceCapture(Arc::clone(&capture)))
+            .try_init()
+            .expect("install the session-host test trace capture");
+        capture
+    }));
+    let start = capture.lock().expect("trace capture mutex poisoned").len();
+    (capture, start)
+}
+
+fn traces_since(capture: &Arc<StdMutex<Vec<u8>>>, start: usize) -> String {
+    let captured = capture.lock().expect("trace capture mutex poisoned");
+    String::from_utf8_lossy(&captured[start..]).into_owned()
+}
 
 /// A host over a temp sessions store, plus the store handles a test needs
 /// to look behind the host's back (the lock, the on-disk log).
@@ -9094,9 +9145,10 @@ async fn the_directory_follows_the_store_it_caches() {
 #[tokio::test]
 async fn shutdown_cancels_gracefully_and_flushes() {
     let harness = Harness::with_provider(scripted(
-        vec![finalized_text_message(
-            "an answer streamed slowly enough to be interrupted",
-        )],
+        vec![
+            finalized_text_message("an answer streamed slowly enough to be interrupted"),
+            finalized_text_message("a queued follow-up shutdown must never start"),
+        ],
         1,
         Duration::from_millis(40),
     ));
@@ -9123,12 +9175,52 @@ async fn shutdown_cancels_gracefully_and_flushes() {
         )
     })
     .await;
+    harness
+        .prompt(&session, "do this after the current turn")
+        .await;
+    let queue = harness.host.queue(&session).await.expect("queue read");
+    assert!(
+        queue
+            .queues
+            .iter()
+            .any(|queue| { queue.agent_id == AgentId::Main && queue.follow_up.len() == 1 }),
+        "the queued follow-up must be present or the draining-wake assertion measures nothing: {queue:?}"
+    );
     let log_path = harness
         .persistence
         .sessions_dir()
         .join(format!("{session}.jsonl"));
 
     harness.host.shutdown().await;
+
+    let mut teardown_frames = Vec::new();
+    while let Some(frame) = bounded("the shutdown stream to close", stream.recv()).await {
+        teardown_frames.push(frame);
+    }
+    assert!(
+        teardown_frames.iter().any(|frame| matches!(
+            frame,
+            Frame::Event { event, .. }
+                if matches!(event.known(), Some(AgentEvent::MessageEnd { .. }))
+        )),
+        "the graceful terminal message reaches the client before EOF: {teardown_frames:?}"
+    );
+    assert!(
+        notice(&teardown_frames, CANCELLED),
+        "the cancellation notice reaches the client before EOF: {:?}",
+        events(&teardown_frames)
+            .into_iter()
+            .map(event_kind)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        teardown_frames.iter().all(|frame| !matches!(
+            frame,
+            Frame::Event { event, .. }
+                if matches!(event.known(), Some(AgentEvent::AgentStart { .. }))
+        )),
+        "joining the cancelled turn did not wake its queued follow-up during drain"
+    );
 
     // Read the log back the way a resume would, so the assertions are
     // about entries rather than about substrings of a file.
@@ -9329,6 +9421,574 @@ async fn shutdown_releases_every_session() {
         .await
         .is_some()
     {}
+}
+
+/// A detached sub-agent is a real background task, not part of the parent
+/// turn. Shutdown waits for its cancellation to emit terminal events and
+/// publishes those events before closing the attachment.
+#[tokio::test]
+async fn shutdown_publishes_a_detached_sub_agents_terminal_events_before_eof() {
+    let harness =
+        Harness::with_provider(scripted(detached_sub_turn(), 1, Duration::from_millis(20)));
+    let session = harness.create().await;
+    let mut stream = harness
+        .host
+        .attach(&[attach_request(&session)])
+        .await
+        .expect("attach");
+    frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+    harness
+        .prompt(&session, "look into it in the background")
+        .await;
+    let started = frames_until(&mut stream, "the detached task to start", |frame| {
+        matches!(
+            frame,
+            Frame::Event { event, .. }
+                if matches!(
+                    event.known(),
+                    Some(AgentEvent::TaskStart {
+                        kind: TaskKind::Agent { agent_id: 1, .. },
+                        ..
+                    })
+                )
+        )
+    })
+    .await;
+    let task = started
+        .iter()
+        .find_map(|frame| match frame {
+            Frame::Event { event, .. } => match event.known() {
+                Some(AgentEvent::TaskStart { task_id, .. }) => Some(*task_id),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("the running detached task has an id");
+    assert_eq!(
+        running_agent_task(&harness, &session).await,
+        Some(task),
+        "the fixture reached a live detached driver before shutdown"
+    );
+
+    harness.host.shutdown().await;
+
+    let mut teardown = Vec::new();
+    while let Some(frame) = bounded("the shutdown stream to close", stream.recv()).await {
+        teardown.push(frame);
+    }
+    let task_end = teardown.iter().position(|frame| {
+        matches!(
+            frame,
+            Frame::Event { event, .. }
+                if matches!(
+                    event.known(),
+                    Some(AgentEvent::TaskEnd {
+                        task_id,
+                        status: TaskStatus::Killed,
+                        ..
+                    }) if *task_id == task
+                )
+        )
+    });
+    let task_end = task_end.unwrap_or_else(|| {
+        panic!(
+            "the detached task's killed TaskEnd reaches the attachment before EOF: {:?}",
+            events(&teardown)
+                .into_iter()
+                .map(event_kind)
+                .collect::<Vec<_>>()
+        )
+    });
+    assert!(
+        teardown[task_end + 1..]
+            .iter()
+            .all(|frame| !matches!(frame, Frame::State { working: true, .. })),
+        "TaskEnd did not start a wake while the driver was draining: {:?}",
+        &teardown[task_end..]
+    );
+    assert!(
+        teardown.iter().any(|frame| matches!(
+            frame,
+            Frame::Event { event, .. }
+                if matches!(
+                    event.known(),
+                    Some(AgentEvent::AgentEnd { agent_id: AgentId::Sub(1), .. })
+                )
+        )),
+        "the detached sub-agent's own terminal event also precedes EOF"
+    );
+}
+
+/// A later shutdown caller cannot interfere with the owner already winding
+/// drivers down or close attachment streams before that work completes.
+#[tokio::test]
+async fn concurrent_shutdown_does_not_close_the_owners_fanout_early() {
+    let harness = Harness::new(Vec::new());
+    let session = harness.create().await;
+    let mut stream = harness
+        .host
+        .attach(&[attach_request(&session)])
+        .await
+        .expect("attach");
+    frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+    let log = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session")
+        .log;
+    let held = log.lock().await;
+    assert!(
+        log.try_lock().is_err(),
+        "the fixture did not hold the final flush"
+    );
+
+    let first_host = harness.host.clone();
+    let first = tokio::spawn(async move { first_host.shutdown().await });
+    bounded("the first caller to claim shutdown", async {
+        loop {
+            if harness.host.sessions().await.is_err() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let second_host = harness.host.clone();
+    let second = tokio::spawn(async move { second_host.shutdown().await });
+    tokio::task::yield_now().await;
+    while stream.try_recv().is_some() {}
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), stream.recv())
+            .await
+            .is_err(),
+        "the later caller closed fanout while the owner was still flushing"
+    );
+
+    drop(held);
+    bounded("the teardown owner to finish", first)
+        .await
+        .expect("first shutdown task");
+    bounded("the waiting shutdown caller to finish", second)
+        .await
+        .expect("second shutdown task");
+    while bounded("fanout to close after teardown", stream.recv())
+        .await
+        .is_some()
+    {}
+}
+
+/// Cancelling the shutdown future cannot detach drivers it already took out of
+/// the map. Its drop guards abort them and close streams, so no later caller or
+/// host drop can wait forever on state the cancelled future alone owned.
+#[tokio::test]
+async fn cancelling_the_shutdown_owner_aborts_its_drivers_and_closes_fanout() {
+    let harness = Harness::new(Vec::new());
+    let session = harness.create().await;
+    let mut stream = harness
+        .host
+        .attach(&[attach_request(&session)])
+        .await
+        .expect("attach");
+    frames_until(&mut stream, "caught_up", |frame| {
+        matches!(frame, Frame::CaughtUp { .. })
+    })
+    .await;
+    let log = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session")
+        .log;
+    let held = log.lock().await;
+    let command_host = harness.host.clone();
+    let command_session = session.clone();
+    let command = tokio::spawn(async move {
+        command_host
+            .command(
+                &command_session,
+                Command::Settings(SettingsChange {
+                    agent: AgentId::Main,
+                    persist: PersistAction::None,
+                    axis: SettingsAxis::Thinking(Some(aj_models::ThinkingConfig::High)),
+                }),
+            )
+            .await
+    });
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !command.is_finished(),
+        "the command must be stuck ahead of Shutdown or owner cancellation measures nothing"
+    );
+    let owner_host = harness.host.clone();
+    let owner = tokio::spawn(async move { owner_host.shutdown().await });
+    bounded("the owner to drain the session map", async {
+        loop {
+            let directory = harness.host.published_directory().await;
+            if directory.sessions.iter().all(|row| !row.live) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+
+    owner.abort();
+    assert!(
+        owner
+            .await
+            .expect_err("the owner task was cancelled")
+            .is_cancelled(),
+        "the fixture cancelled shutdown while it owned the driver joins"
+    );
+    tokio::time::timeout(Duration::from_millis(100), harness.host.shutdown())
+        .await
+        .expect("a later shutdown call does not wedge");
+    while bounded("the cancelled owner's fanout to close", stream.recv())
+        .await
+        .is_some()
+    {}
+    assert!(
+        bounded("the cancelled owner to refuse its stuck command", command)
+            .await
+            .expect("command task")
+            .is_err(),
+        "aborting the orphaned driver refuses the command it could not finish"
+    );
+    bounded("the cancelled driver to release its advisory lock", async {
+        loop {
+            if let Some(lock) =
+                SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
+                    .expect("try_acquire")
+            {
+                drop(lock);
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    drop(held);
+}
+
+/// A held log cannot pin a driver's final flush forever, and the warning says
+/// which session and phase gave up its pending entries.
+#[tokio::test(start_paused = true)]
+async fn shutdown_bounds_and_names_a_locked_log_flush() {
+    let (capture, start) = trace_capture();
+    let harness = Harness::new(Vec::new());
+    let session = harness.create().await;
+    let log = harness
+        .host
+        .local_handles(&session)
+        .await
+        .expect("live session")
+        .log;
+    let held = log.lock().await;
+    assert!(
+        log.try_lock().is_err(),
+        "the fixture did not hold the log lock"
+    );
+    let began = tokio::time::Instant::now();
+
+    harness.host.shutdown().await;
+
+    let elapsed = began.elapsed();
+    assert!(
+        elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(6),
+        "the flush used its own grace rather than the host deadline: {elapsed:?}"
+    );
+    let traces = traces_since(&capture, start);
+    assert!(
+        traces.lines().any(|line| line.contains(&session)
+            && line.contains("log flush")
+            && line.contains("pending entries were not flushed")),
+        "the warning names the abandoned phase and harm: {traces}"
+    );
+    drop(held);
+}
+
+/// Session wind-downs overlap, so N blocked flushes cost one flush grace and
+/// not N graces added together.
+#[tokio::test(start_paused = true)]
+async fn shutdown_winds_session_drivers_down_concurrently() {
+    let harness = Harness::new(Vec::new());
+    let mut sessions = Vec::new();
+    for _ in 0..8 {
+        sessions.push(harness.create().await);
+    }
+    let mut logs = Vec::new();
+    for session in &sessions {
+        logs.push(
+            harness
+                .host
+                .local_handles(session)
+                .await
+                .expect("live session")
+                .log,
+        );
+    }
+    let mut held = Vec::new();
+    for log in &logs {
+        held.push(log.lock().await);
+    }
+    assert_eq!(
+        logs.iter().filter(|log| log.try_lock().is_err()).count(),
+        sessions.len(),
+        "every session must reach the blocked phase or the timing proves nothing"
+    );
+    let began = tokio::time::Instant::now();
+
+    harness.host.shutdown().await;
+
+    assert!(
+        began.elapsed() < Duration::from_secs(6),
+        "all blocked flushes share one grace: {:?}",
+        began.elapsed()
+    );
+    drop(held);
+}
+
+/// Commands already waiting on their logs may never reach their queued
+/// Shutdown requests. One host cutoff names and aborts every unfinished
+/// driver, then joins the cancellations and releases their advisory locks.
+#[tokio::test(start_paused = true)]
+async fn shutdown_aborts_and_names_every_driver_stuck_in_a_command() {
+    let (capture, start) = trace_capture();
+    let harness = Harness::new(Vec::new());
+    let sessions = [harness.create().await, harness.create().await];
+    let mut logs = Vec::new();
+    for session in &sessions {
+        logs.push(
+            harness
+                .host
+                .local_handles(session)
+                .await
+                .expect("live session")
+                .log,
+        );
+    }
+    let mut held = Vec::new();
+    for log in &logs {
+        held.push(log.lock().await);
+    }
+    assert_eq!(
+        logs.iter().filter(|log| log.try_lock().is_err()).count(),
+        sessions.len(),
+        "the fixture did not lock every command's log"
+    );
+    let mut commands = Vec::new();
+    for session in &sessions {
+        let command_host = harness.host.clone();
+        let command_session = session.clone();
+        commands.push(tokio::spawn(async move {
+            command_host
+                .command(
+                    &command_session,
+                    Command::Settings(SettingsChange {
+                        agent: AgentId::Main,
+                        persist: PersistAction::None,
+                        axis: SettingsAxis::Thinking(Some(aj_models::ThinkingConfig::High)),
+                    }),
+                )
+                .await
+        }));
+    }
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| !command.is_finished())
+            .count(),
+        sessions.len(),
+        "every held log must wedge its command or the deadline test measures nothing"
+    );
+    let began = tokio::time::Instant::now();
+
+    tokio::time::timeout(Duration::from_secs(31), harness.host.shutdown())
+        .await
+        .expect("the host-wide shutdown deadline");
+
+    assert!(
+        began.elapsed() >= Duration::from_secs(29) && began.elapsed() < Duration::from_secs(30),
+        "the graceful cutoff reserves one second inside the total deadline: {:?}",
+        began.elapsed()
+    );
+    for session in &sessions {
+        let lock = SessionLock::try_acquire(&harness.persistence, session, "a-rival-writer")
+            .expect("try_acquire")
+            .expect("the completed abort join released the session lock before shutdown returned");
+        drop(lock);
+    }
+    for command in commands {
+        assert!(
+            command.await.expect("command task").is_err(),
+            "aborting a driver refuses the command it could not finish"
+        );
+    }
+    let traces = traces_since(&capture, start);
+    for session in &sessions {
+        let warnings = traces
+            .lines()
+            .filter(|line| {
+                line.contains(session)
+                    && line.contains("session driver join")
+                    && line.contains("aborting")
+            })
+            .count();
+        assert_eq!(
+            warnings, 1,
+            "each abandoned session gets one named phase warning: {traces}"
+        );
+    }
+    drop(held);
+}
+
+/// The total host deadline starts before acquiring the session map. An idle
+/// release can hold that map while it waits for a Release queued behind a
+/// command blocked on the log. The independent abort registry ends that driver
+/// and lets shutdown drain the map before returning.
+#[tokio::test(start_paused = true)]
+async fn shutdown_bounds_a_session_map_held_by_idle_release() {
+    let (capture, start) = trace_capture();
+    let harness = Harness::with_idle_grace(
+        vec![finalized_text_message("on the record")],
+        Duration::ZERO,
+    );
+    let stuck = harness.create().await;
+    let mut client = Client::attach(&harness.host, &stuck).await;
+    harness.prompt(&stuck, "make the log durable").await;
+    client.pump_until_idle().await;
+    drop(client);
+
+    let mut stream = harness
+        .host
+        .attach(&[])
+        .await
+        .expect("attach a host-level stream");
+    let log = harness
+        .host
+        .local_handles(&stuck)
+        .await
+        .expect("live session")
+        .log;
+    let held = log.lock().await;
+    let command_host = harness.host.clone();
+    let command_session = stuck.clone();
+    let command = tokio::spawn(async move {
+        command_host
+            .command(
+                &command_session,
+                Command::Settings(SettingsChange {
+                    agent: AgentId::Main,
+                    persist: PersistAction::None,
+                    axis: SettingsAxis::Thinking(Some(aj_models::ThinkingConfig::High)),
+                }),
+            )
+            .await
+    });
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !command.is_finished(),
+        "the command reached the held log before the release race"
+    );
+
+    // A zero idle grace leaves only the sweeper's one-millisecond floor.
+    // Sweeps that still remember the old attachment can decline, so advance
+    // one tick at a time until a map reader proves a due release has taken the
+    // map and queued Release behind the blocked command.
+    let mut blocked_probe = None;
+    for _ in 0..10 {
+        tokio::time::advance(Duration::from_millis(1)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        let probe_host = harness.host.clone();
+        let probe = tokio::spawn(async move { probe_host.published_directory().await });
+        tokio::task::yield_now().await;
+        if probe.is_finished() {
+            probe.await.expect("completed map probe");
+            continue;
+        }
+        blocked_probe = Some(probe);
+        break;
+    }
+    let map_probe = blocked_probe
+        .expect("idle release never held the session map, so the race test measures nothing");
+    let began = tokio::time::Instant::now();
+
+    tokio::time::timeout(Duration::from_secs(31), harness.host.shutdown())
+        .await
+        .expect("the map acquisition is inside the host-wide deadline");
+
+    assert!(
+        began.elapsed() >= Duration::from_secs(29) && began.elapsed() < Duration::from_secs(30),
+        "the abort reserve recovers the held session map inside the total deadline: {:?}",
+        began.elapsed()
+    );
+    let traces = traces_since(&capture, start);
+    assert!(
+        traces.lines().any(|line| line.contains(&stuck)
+            && line.contains("session map drain")
+            && line.contains("aborting")),
+        "the warning names the session and map-drain phase: {traces}"
+    );
+    while bounded("fanout to close after the map deadline", stream.recv())
+        .await
+        .is_some()
+    {}
+
+    assert!(
+        command.await.expect("command task").is_err(),
+        "aborting the driver refuses the command it could not finish"
+    );
+    bounded("the idle release to relinquish the map", map_probe)
+        .await
+        .expect("map probe task");
+    let lock = SessionLock::try_acquire(&harness.persistence, &stuck, "a-rival-writer")
+        .expect("try_acquire")
+        .expect("shutdown joined the aborted driver and released its advisory lock");
+    drop(lock);
+    drop(held);
+}
+
+/// Deadline ceilings cost nothing on a healthy multi-session host.
+#[tokio::test]
+async fn shutdown_of_idle_sessions_is_fast_and_releases_every_lock() {
+    let harness = Harness::new(Vec::new());
+    let mut sessions = Vec::new();
+    for _ in 0..16 {
+        sessions.push(harness.create().await);
+    }
+    let began = Instant::now();
+
+    tokio::time::timeout(Duration::from_secs(2), harness.host.shutdown())
+        .await
+        .expect("healthy shutdown stays well below every grace");
+
+    assert!(
+        began.elapsed() < Duration::from_secs(2),
+        "graces are ceilings rather than sleeps: {:?}",
+        began.elapsed()
+    );
+    for session in sessions {
+        let lock = SessionLock::try_acquire(&harness.persistence, &session, "a-rival-writer")
+            .expect("try_acquire")
+            .expect("healthy shutdown released every session lock");
+        drop(lock);
+    }
 }
 
 // ---------------------------------------------------------------------------
