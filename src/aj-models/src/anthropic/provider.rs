@@ -2336,6 +2336,12 @@ mod tests {
             ],
         );
         assert_eq!(
+            truncated.stop_reason,
+            StopReason::Error,
+            "the fixture must reach the truncation arm, or the seal it measures \
+             is finalize's and the test says nothing about truncation"
+        );
+        assert_eq!(
             truncated.usage.total_tokens, 18,
             "a truncated turn totals the tokens the wire reported"
         );
