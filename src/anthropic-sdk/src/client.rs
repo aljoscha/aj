@@ -1,8 +1,9 @@
+use std::fmt::Display;
 use std::pin::Pin;
 use std::time::Duration;
 
-use eventsource_stream::Eventsource;
-use futures::{Stream, StreamExt};
+use eventsource_stream::{Event, Eventsource};
+use futures::{Stream, StreamExt, future};
 use reqwest::Client as ReqwestClient;
 use thiserror::Error;
 
@@ -269,40 +270,7 @@ impl Client {
 
         let status = response.status();
         if status.is_success() {
-            let stream = response.bytes_stream().eventsource();
-
-            let stream = stream.filter_map(move |event| {
-                let caller_tool_names = caller_tool_names.clone();
-                async move {
-                    match event {
-                        Ok(event) => {
-                            match serde_json::from_str::<ServerSentEvent>(&event.data) {
-                                Ok(mut json_event) => {
-                                    if !caller_tool_names.is_empty() {
-                                        reverse_map_event(&mut json_event, &caller_tool_names);
-                                    }
-                                    Some(json_event)
-                                }
-                                Err(err) => {
-                                    // The API versioning policy reserves the right
-                                    // to add new event types; skip anything we
-                                    // can't parse rather than crashing the stream.
-                                    tracing::warn!(
-                                        "could not parse server-sent event, skipping: \
-                                         error={err}, data={}",
-                                        event.data
-                                    );
-                                    None
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!("event-stream error: {e}");
-                            None
-                        }
-                    }
-                }
-            });
+            let stream = adapt_sse_events(response.bytes_stream().eventsource(), caller_tool_names);
             return Ok(stream.boxed());
         }
 
@@ -366,6 +334,48 @@ impl Client {
             retry_after,
         })
     }
+}
+
+/// Decode SSE payloads, ending the stream on a source error while skipping
+/// payloads this SDK does not understand.
+fn adapt_sse_events<S, E>(
+    stream: S,
+    caller_tool_names: Vec<String>,
+) -> impl Stream<Item = ServerSentEvent>
+where
+    S: Stream<Item = Result<Event, E>>,
+    E: Display,
+{
+    stream
+        .scan(caller_tool_names, |caller_tool_names, event| {
+            let decoded = match event {
+                Err(err) => {
+                    tracing::error!("event-stream error: {err}");
+                    return future::ready(None);
+                }
+                Ok(event) => match serde_json::from_str::<ServerSentEvent>(&event.data) {
+                    Ok(mut json_event) => {
+                        if !caller_tool_names.is_empty() {
+                            reverse_map_event(&mut json_event, caller_tool_names);
+                        }
+                        Some(json_event)
+                    }
+                    Err(err) => {
+                        // The API versioning policy reserves the right to add
+                        // new event types. Skip anything we cannot parse rather
+                        // than crashing or terminating a healthy stream.
+                        tracing::warn!(
+                            "could not parse server-sent event, skipping: \
+                             error={err}, data={}",
+                            event.data
+                        );
+                        None
+                    }
+                },
+            };
+            future::ready(Some(decoded))
+        })
+        .filter_map(future::ready)
 }
 
 /// Extract the raw `Retry-After` header value, if present and printable.
@@ -448,8 +458,78 @@ impl ClientError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Poll;
+
     use super::*;
     use crate::stealth::CLAUDE_CODE_IDENTITY_PROMPT;
+
+    #[derive(Clone, Copy, Debug)]
+    struct SyntheticStreamError;
+
+    impl std::fmt::Display for SyntheticStreamError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("synthetic stream failure")
+        }
+    }
+
+    fn event(data: &str) -> Event {
+        Event {
+            data: data.to_string(),
+            ..Event::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn source_error_terminates_without_polling_the_source_again() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let source = futures::stream::poll_fn({
+            let polls = Arc::clone(&polls);
+            move |_| {
+                let previous = polls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(previous, 0, "the source was polled again after its error");
+                Poll::Ready(Some(Result::<Event, SyntheticStreamError>::Err(
+                    SyntheticStreamError,
+                )))
+            }
+        });
+        let mut stream = Box::pin(adapt_sse_events(source, Vec::new()));
+
+        assert!(
+            stream.next().await.is_none(),
+            "the source error ends the stream"
+        );
+        assert_eq!(polls.load(Ordering::SeqCst), 1, "exactly one source poll");
+    }
+
+    #[tokio::test]
+    async fn source_error_hides_every_ready_item_after_it() {
+        let source =
+            futures::stream::iter([Err(SyntheticStreamError), Ok(event(r#"{"type":"ping"}"#))]);
+        let mut stream = Box::pin(adapt_sse_events(source, Vec::new()));
+
+        assert!(stream.next().await.is_none(), "the first error is terminal");
+        assert!(
+            stream.next().await.is_none(),
+            "a terminated adapter never resumes at later ready items"
+        );
+    }
+
+    #[tokio::test]
+    async fn unrecognized_json_is_skipped_without_ending_the_stream() {
+        let source = futures::stream::iter([
+            Ok::<_, SyntheticStreamError>(event(r#"{"type":"future_event"}"#)),
+            Ok(event(r#"{"type":"ping"}"#)),
+        ]);
+        let mut stream = Box::pin(adapt_sse_events(source, Vec::new()));
+
+        assert!(
+            matches!(stream.next().await, Some(ServerSentEvent::Ping)),
+            "the valid event after unknown JSON must still be delivered"
+        );
+        assert!(stream.next().await.is_none());
+    }
 
     #[test]
     fn api_key_mode_includes_default_beta() {
