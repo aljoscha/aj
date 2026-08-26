@@ -70,6 +70,7 @@ pub fn finalized_text_message(text: &str) -> AssistantMessage {
         api: "scripted".to_string(),
         provider: "scripted".to_string(),
         model: "scripted".to_string(),
+        account: None,
         response_id: Some("test-msg".to_string()),
         usage: Default::default(),
         stop_reason: StopReason::Stop,

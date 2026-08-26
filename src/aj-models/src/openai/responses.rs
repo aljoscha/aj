@@ -234,12 +234,12 @@ async fn run_stream_inner(
         && token.is_cancelled()
     {
         producer.push(AssistantMessageEvent::aborted(empty_partial(
-            API_NAME, model,
+            API_NAME, model, None,
         )));
         return Ok(());
     }
 
-    let api_key = options.resolve_api_key().await.map_err(|err| {
+    let credential = options.resolve_api_key().await.map_err(|err| {
         AssistantError::new(
             ErrorCategory::Auth,
             format!("openai-responses provider: {err}"),
@@ -257,7 +257,7 @@ async fn run_stream_inner(
     let base_url_for_check = base_url_opt
         .clone()
         .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-    let mut client = Client::new(base_url_opt, api_key);
+    let mut client = Client::new(base_url_opt, credential.key);
 
     // Forward session_id as session-correlation headers when the
     // request is going to api.openai.com. Other deployments
@@ -284,13 +284,19 @@ async fn run_stream_inner(
             SelectOutcome::Ready(res) => res.map_err(|err| classify_client_error(&err))?,
             SelectOutcome::Cancelled => {
                 producer.push(AssistantMessageEvent::aborted(empty_partial(
-                    API_NAME, model,
+                    API_NAME,
+                    model,
+                    credential.account.as_deref(),
                 )));
                 return Ok(());
             }
         };
 
-    let mut state = StreamState::new(model, options.service_tier.clone());
+    let mut state = StreamState::new_with_account(
+        model,
+        options.service_tier.clone(),
+        credential.account.clone(),
+    );
 
     loop {
         match select_cancel(options.cancel.as_ref(), sse.next()).await {
@@ -326,11 +332,21 @@ async fn run_stream_inner(
 /// No pricing step: there is no stream state yet and the usage is all
 /// zeros, so sealing would compute a zero total and a zero cost, and the
 /// invariant every other exit seals for holds here for free.
-pub(super) fn empty_partial(api: &str, model: &ModelInfo) -> AssistantMessage {
+/// The terminal partial for an exit that never built a [`StreamState`].
+///
+/// `account` is what the credential resolution reported. `None` is the
+/// exit that happens before any resolution: nothing served, which is
+/// what an absent account means.
+pub(super) fn empty_partial(
+    api: &str,
+    model: &ModelInfo,
+    account: Option<&str>,
+) -> AssistantMessage {
     let mut partial = AssistantMessage::empty();
     partial.api = api.to_string();
     partial.provider = model.provider.clone();
     partial.model = model.id.clone();
+    partial.account = account.map(str::to_string);
     partial
 }
 
@@ -1013,23 +1029,44 @@ pub(super) struct StreamState {
 
 impl StreamState {
     pub(super) fn new(model: &ModelInfo, requested_tier: Option<ServiceTier>) -> Self {
+        Self::new_with_account(model, requested_tier, None)
+    }
+
+    pub(super) fn new_with_account(
+        model: &ModelInfo,
+        requested_tier: Option<ServiceTier>,
+        account: Option<String>,
+    ) -> Self {
         const RESPONSES_COST_MULTIPLIER: CostMultiplierFn = responses_cost_multiplier;
-        Self::new_with(API_NAME, model, requested_tier, RESPONSES_COST_MULTIPLIER)
+        Self::new_with(
+            API_NAME,
+            model,
+            requested_tier,
+            RESPONSES_COST_MULTIPLIER,
+            account,
+        )
     }
 
     /// Provider-customizable constructor used by Codex (see
     /// `openai::codex`) to pick its own api name and cost-multiplier
     /// curve while reusing the streaming machinery.
+    /// `account` is the label the credential resolution reported for
+    /// this request. Stamped here rather than at an exit so every
+    /// terminal message the state produces carries it, the same reason
+    /// the cost rates are snapshotted here. Codex shares this state, so
+    /// this is the stamp for both providers.
     pub(super) fn new_with(
         api_name: &'static str,
         model: &ModelInfo,
         requested_tier: Option<ServiceTier>,
         cost_multiplier: CostMultiplierFn,
+        account: Option<String>,
     ) -> Self {
         let mut partial = AssistantMessage::empty();
         partial.api = api_name.to_string();
         partial.provider = model.provider.clone();
         partial.model = model.id.clone();
+        partial.account = account;
         Self {
             partial,
             started: false,
@@ -1718,6 +1755,28 @@ mod tests {
             context_window: 200_000,
             max_tokens: 16_000,
         }
+    }
+
+    #[test]
+    fn a_terminal_message_keeps_the_account_stamped_at_construction() {
+        let state =
+            StreamState::new_with_account(&fake_model(false), None, Some("work".to_string()));
+        let terminal = state.finalize_or_truncate();
+        assert_eq!(terminal.partial().account.as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn an_exit_without_state_records_only_an_account_that_resolved() {
+        assert_eq!(
+            empty_partial(API_NAME, &fake_model(false), None).account,
+            None
+        );
+        assert_eq!(
+            empty_partial(API_NAME, &fake_model(false), Some("work"))
+                .account
+                .as_deref(),
+            Some("work")
+        );
     }
 
     #[test]

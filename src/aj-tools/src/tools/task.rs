@@ -965,6 +965,7 @@ mod production_identity_tests {
             api: SCRIPTED.to_string(),
             provider: SCRIPTED.to_string(),
             model: SCRIPTED.to_string(),
+            account: None,
             response_id: None,
             usage: Default::default(),
             stop_reason,

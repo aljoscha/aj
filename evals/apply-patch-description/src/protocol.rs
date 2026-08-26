@@ -334,6 +334,7 @@ mod tests {
                     api: "openai-codex-responses".into(),
                     provider: "openai-codex".into(),
                     model: "gpt-5.6-sol".into(),
+                    account: None,
                     response_id: None,
                     usage: usage.clone(),
                     stop_reason: StopReason::Stop,

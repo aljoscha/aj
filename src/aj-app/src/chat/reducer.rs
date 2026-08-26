@@ -1236,6 +1236,7 @@ mod tests {
             api: "scripted".into(),
             provider: "scripted".into(),
             model: "scripted".into(),
+            account: None,
             response_id: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,

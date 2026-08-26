@@ -89,6 +89,7 @@ fn assistant_msg(
         api: api.into(),
         provider: provider.into(),
         model: model_id.into(),
+        account: None,
         response_id: None,
         usage: Usage::default(),
         stop_reason,

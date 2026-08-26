@@ -171,12 +171,12 @@ async fn run_stream_inner(
         && token.is_cancelled()
     {
         producer.push(AssistantMessageEvent::aborted(empty_partial(
-            API_NAME, model,
+            API_NAME, model, None,
         )));
         return Ok(());
     }
 
-    let access_token = options.resolve_api_key().await.map_err(|err| {
+    let credential = options.resolve_api_key().await.map_err(|err| {
         AssistantError::new(
             ErrorCategory::Auth,
             format!(
@@ -194,7 +194,11 @@ async fn run_stream_inner(
 
     // decode the JWT *at request time* so a refresh in flight
     // doesn't desync the header from the bearer token.
-    let account_id = extract_account_id(&access_token).ok_or_else(|| {
+    // Not to be confused with `credential.account`: this is the
+    // upstream ChatGPT account the token authenticates, read from the
+    // JWT. `credential.account` is aj's own label for the credential
+    // that produced the token.
+    let account_id = extract_account_id(&credential.key).ok_or_else(|| {
         AssistantError::new(
             ErrorCategory::Auth,
             "openai-codex-responses: access token JWT missing chatgpt_account_id claim",
@@ -207,7 +211,7 @@ async fn run_stream_inner(
         model.base_url.clone()
     };
 
-    let mut client = Client::new(Some(base_url), access_token)
+    let mut client = Client::new(Some(base_url), credential.key.clone())
         .with_extra_header("chatgpt-account-id", account_id)
         .with_extra_header("originator", ORIGINATOR)
         .with_extra_header("OpenAI-Beta", OPENAI_BETA)
@@ -240,7 +244,9 @@ async fn run_stream_inner(
         SelectOutcome::Ready(res) => res.map_err(|err| classify_codex_client_error(&err))?,
         SelectOutcome::Cancelled => {
             producer.push(AssistantMessageEvent::aborted(empty_partial(
-                API_NAME, model,
+                API_NAME,
+                model,
+                credential.account.as_deref(),
             )));
             return Ok(());
         }
@@ -251,6 +257,7 @@ async fn run_stream_inner(
         model,
         options.service_tier.clone(),
         CODEX_COST_MULTIPLIER,
+        credential.account.clone(),
     );
 
     loop {
@@ -657,7 +664,8 @@ pub fn replay_sse_events(
     events: impl IntoIterator<Item = ResponseStreamEvent>,
     requested_tier: Option<ServiceTier>,
 ) -> AssistantMessage {
-    let mut state = StreamState::new_with(API_NAME, model, requested_tier, CODEX_COST_MULTIPLIER);
+    let mut state =
+        StreamState::new_with(API_NAME, model, requested_tier, CODEX_COST_MULTIPLIER, None);
     for ev in events {
         match normalize_codex_event(ev) {
             NormalizedEvent::Forward(ev) => {
@@ -812,6 +820,19 @@ mod tests {
             context_window: 200_000,
             max_tokens: 16_000,
         }
+    }
+
+    #[test]
+    fn a_terminal_message_keeps_the_account_stamped_at_construction() {
+        let state = StreamState::new_with(
+            API_NAME,
+            &fake_model("gpt-5.1", false),
+            None,
+            CODEX_COST_MULTIPLIER,
+            Some("work".to_string()),
+        );
+        let terminal = state.finalize_or_truncate();
+        assert_eq!(terminal.partial().account.as_deref(), Some("work"));
     }
 
     fn make_jwt(payload: &serde_json::Value) -> String {

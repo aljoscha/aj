@@ -383,6 +383,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn assistant_account_reaches_the_durable_log() {
+        let (_dir, log) = fresh_log();
+        {
+            let mut log_guard = log.lock().await;
+            let mut view = ConversationView::user(&mut log_guard);
+            view.add_message(user_msg("hi")).expect("user msg");
+        }
+        let bus = EventBus::new();
+        let _h = bus.subscribe(persistence_listener(Arc::clone(&log)));
+        let mut assistant = AssistantMessage::empty();
+        assistant.content = vec![AssistantContent::Text(TextContent {
+            text: "hello".to_string(),
+            text_signature: None,
+        })];
+        assistant.account = Some("work".to_string());
+
+        bus.emit(AgentEvent::MessageEnd {
+            agent_id: AgentId::Main,
+            message: AgentMessage::wire(Message::Assistant(assistant)),
+        })
+        .await
+        .expect("emit");
+
+        let log_guard = log.lock().await;
+        let head = log_guard
+            .latest_leaf(ThreadFilter::USER)
+            .expect("user-thread head exists");
+        let convo = log_guard.linearize(&head, ThreadFilter::USER);
+        let Some(Message::Assistant(message)) = convo.last_message() else {
+            panic!("expected assistant message");
+        };
+        assert_eq!(message.account.as_deref(), Some("work"));
+
+        // MessageEnd is punctuation and flushes immediately. Reading the
+        // file pins the durable field name rather than only the in-memory
+        // value that the listener received.
+        let jsonl = std::fs::read_to_string(log_guard.path()).expect("read session log");
+        assert!(
+            jsonl.contains(r#""account":"work""#),
+            "the persisted assistant line must carry the account key: {jsonl}"
+        );
+    }
+
+    #[tokio::test]
     async fn tool_result_message_appends_to_user_thread() {
         let (_dir, log) = fresh_log();
         {

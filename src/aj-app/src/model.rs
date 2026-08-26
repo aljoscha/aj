@@ -29,7 +29,8 @@ use aj_models::auth::{AuthStorage, find_env_keys};
 use aj_models::provider::{Provider, provider_for};
 use aj_models::registry::{ModelInfo, ModelRegistry};
 use aj_models::types::{
-    ApiKeyResolver, ReasoningSummary, Speed, StreamOptions, ThinkingDisplay, Verbosity,
+    ApiKeyResolver, ReasoningSummary, ResolvedApiKey, Speed, StreamOptions, ThinkingDisplay,
+    Verbosity,
 };
 use anyhow::{Result, anyhow};
 
@@ -168,7 +169,7 @@ pub fn from_model_info(
     })?;
 
     let mut stream_options = StreamOptions::default();
-    install_api_key_resolver(&mut stream_options, auth, &model_info.provider);
+    install_api_key_resolver(&mut stream_options, auth, &model_info.provider, None);
     stream_options.speed = speed;
 
     Ok(ResolvedModel {
@@ -184,21 +185,33 @@ pub fn from_model_info(
 ///
 /// Cloning the [`AuthStorage`] is cheap (it's `Arc`-backed) and the
 /// resolver closure is `Fn`, so the provider can call it repeatedly
-/// across a long-running session — each call re-walks the resolution
+/// across a long-running session. Each call re-walks the resolution
 /// chain and refreshes an expired OAuth token under the storage's
-/// cross-process file lock. A missing credential is surfaced as a
-/// human-readable error (the provider maps it to an `Auth`-category
-/// failure) rather than a hard startup bail, so a session can come up
-/// uncredentialed and the user can log in later.
-fn install_api_key_resolver(options: &mut StreamOptions, auth: &AuthStorage, provider_id: &str) {
+/// cross-process file lock. `account` names a provider-local label.
+/// `None` asks the store for its default and the resolver returns the
+/// label that default actually resolved to. A missing credential is
+/// surfaced as a human-readable error (the provider maps it to an
+/// `Auth`-category failure) rather than a hard startup bail, so a
+/// session can come up uncredentialed and the user can log in later.
+fn install_api_key_resolver(
+    options: &mut StreamOptions,
+    auth: &AuthStorage,
+    provider_id: &str,
+    account: Option<&str>,
+) {
     let auth = auth.clone();
     let provider_id = provider_id.to_string();
+    let account = account.map(str::to_string);
     options.set_api_key_resolver(Some(ApiKeyResolver::new(move || {
         let auth = auth.clone();
         let provider_id = provider_id.clone();
+        let account = account.clone();
         async move {
-            match auth.get_api_key(&provider_id, None).await {
-                Ok(Some(resolved)) => Ok(resolved.key),
+            match auth.get_api_key(&provider_id, account.as_deref()).await {
+                Ok(Some(resolved)) => Ok(ResolvedApiKey {
+                    key: resolved.key,
+                    account: resolved.source.label().map(str::to_string),
+                }),
                 Ok(None) => Err(missing_key_message(&provider_id)),
                 Err(err) => Err(format!(
                     "failed to resolve credentials for {provider_id:?}: {err}"
@@ -345,7 +358,10 @@ pub fn default_thinking_from_config(level: Option<ConfigThinkingLevel>) -> Optio
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+    use aj_models::auth::AuthCredential;
     use aj_models::registry::{Catalog, InputModality, ModelCost, OverridesFile};
 
     fn sample_model(provider: &str, id: &str, api: &str) -> ModelInfo {
@@ -378,6 +394,64 @@ mod tests {
         };
         let overrides = OverridesFile { overrides: vec![] };
         ModelRegistry::from_catalog_with_overrides(catalog, overrides, "test-catalog")
+    }
+
+    fn auth_storage(name: &str) -> (tempfile::TempDir, AuthStorage) {
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let path = dir.path().join(format!("{name}.json"));
+        (dir, AuthStorage::with_providers(path, HashMap::new()))
+    }
+
+    fn key(value: &str) -> AuthCredential {
+        AuthCredential::ApiKey {
+            key: value.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolver_records_the_default_label_that_actually_resolved() {
+        let (_dir, auth) = auth_storage("default-label");
+        auth.set_account("anthropic", "personal", key("personal-key"))
+            .await
+            .unwrap();
+        auth.set_account("anthropic", "work", key("work-key"))
+            .await
+            .unwrap();
+        let mut options = StreamOptions::default();
+        install_api_key_resolver(&mut options, &auth, "anthropic", None);
+
+        let resolved = options.resolve_api_key().await.unwrap();
+        assert_eq!(
+            resolved.key, "personal-key",
+            "the store's default must serve, otherwise the label assertion measures nothing"
+        );
+        assert_eq!(
+            resolved.account.as_deref(),
+            Some("personal"),
+            "the resolver records what served, not the absent pick"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_does_not_stamp_a_pick_the_runtime_override_served() {
+        let (_dir, auth) = auth_storage("override");
+        auth.set_account("anthropic", "work", key("work-key"))
+            .await
+            .unwrap();
+        auth.set_runtime_api_key("anthropic", "override-key".to_string())
+            .await;
+        let mut options = StreamOptions::default();
+        install_api_key_resolver(&mut options, &auth, "anthropic", Some("work"));
+
+        let resolved = options.resolve_api_key().await.unwrap();
+        assert_eq!(
+            resolved.key, "override-key",
+            "the override must serve, otherwise the account assertion measures nothing"
+        );
+        assert_eq!(
+            resolved.account, None,
+            "an override-served turn is not stamped with the account that was asked for"
+        );
     }
 
     #[test]

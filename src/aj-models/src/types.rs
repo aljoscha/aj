@@ -104,6 +104,15 @@ pub struct AssistantMessage {
     pub provider: String,
     /// Exact model ID used.
     pub model: String,
+    /// The account label whose credential served this turn's inference.
+    ///
+    /// Absent when no LABELED account served it: a provider holding one
+    /// bare credential, a runtime `--api-key` override, or an
+    /// environment variable. That also makes every log line written
+    /// before accounts existed valid, since absent was the only thing
+    /// those lines could say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
     /// Provider-specific response/message ID.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_id: Option<String>,
@@ -541,6 +550,39 @@ impl std::fmt::Debug for OnPayload {
     }
 }
 
+/// A credential a resolver produced, with the account it belongs to.
+///
+/// `account` is the label of the credential that actually served this
+/// request, and it is absent when no LABELED account did: a bare stored
+/// credential, a runtime `--api-key` override, or an environment
+/// variable. See [`AssistantMessage::account`], which records it.
+#[derive(Clone)]
+pub struct ResolvedApiKey {
+    /// The bearer token to send upstream.
+    pub key: String,
+    /// The account label that served, absent when none did.
+    pub account: Option<String>,
+}
+
+// Written out rather than derived so a debug log cannot print a live
+// bearer token.
+impl std::fmt::Debug for ResolvedApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedApiKey")
+            .field("key", &"<redacted>")
+            .field("account", &self.account)
+            .finish()
+    }
+}
+
+impl ResolvedApiKey {
+    /// A key that belongs to no labeled account, which is what a static
+    /// [`StreamOptions::api_key`] is.
+    pub fn unlabeled(key: String) -> Self {
+        Self { key, account: None }
+    }
+}
+
 /// Resolver for the provider API key.
 ///
 /// Providers call [`StreamOptions::resolve_api_key`] before each
@@ -560,7 +602,7 @@ impl std::fmt::Debug for OnPayload {
 pub struct ApiKeyResolver(
     pub  Arc<
         dyn Fn() -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = Result<String, String>> + Send>,
+                Box<dyn std::future::Future<Output = Result<ResolvedApiKey, String>> + Send>,
             > + Send
             + Sync,
     >,
@@ -571,16 +613,16 @@ impl ApiKeyResolver {
     pub fn new<F, Fut>(f: F) -> Self
     where
         F: Fn() -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = Result<String, String>> + Send + 'static,
+        Fut: std::future::Future<Output = Result<ResolvedApiKey, String>> + Send + 'static,
     {
         Self(Arc::new(move || Box::pin(f())))
     }
 
-    /// Invoke the resolver. Returns the resolved key or an error
+    /// Invoke the resolver. Returns the resolved credential or an error
     /// message the provider surfaces as an
     /// [`Auth`](crate::types::ErrorCategory::Auth)-category
     /// [`crate::types::AssistantError`].
-    pub async fn call(&self) -> Result<String, String> {
+    pub async fn call(&self) -> Result<ResolvedApiKey, String> {
         (self.0)().await
     }
 }
@@ -723,12 +765,13 @@ impl StreamOptions {
     ///    fallback.
     /// 3. `Err` if neither is set; the provider surfaces this as an
     ///    [`crate::types::ErrorCategory::Auth`] failure.
-    pub async fn resolve_api_key(&self) -> Result<String, String> {
+    pub async fn resolve_api_key(&self) -> Result<ResolvedApiKey, String> {
         if let Some(resolver) = &self.api_key_resolver {
             return resolver.call().await;
         }
         self.api_key
             .clone()
+            .map(ResolvedApiKey::unlabeled)
             .ok_or_else(|| "missing api_key and no api_key_resolver installed".to_string())
     }
 }
@@ -818,6 +861,7 @@ impl AssistantMessage {
             api: String::new(),
             provider: String::new(),
             model: String::new(),
+            account: None,
             response_id: None,
             usage: Usage::default(),
             stop_reason: StopReason::default(),
@@ -928,6 +972,7 @@ mod tests {
             api: "anthropic-messages".into(),
             provider: "anthropic".into(),
             model: "claude-sonnet-4-20250514".into(),
+            account: None,
             response_id: Some("resp_123".into()),
             usage: Usage {
                 input: 100,
@@ -1184,12 +1229,16 @@ mod tests {
         let opts = StreamOptions {
             api_key: Some("static-key".to_string()),
             api_key_resolver: Some(ApiKeyResolver::new(|| async {
-                Ok("resolved-key".to_string())
+                Ok(ResolvedApiKey {
+                    key: "resolved-key".to_string(),
+                    account: Some("work".to_string()),
+                })
             })),
             ..Default::default()
         };
         let resolved = opts.resolve_api_key().await.unwrap();
-        assert_eq!(resolved, "resolved-key");
+        assert_eq!(resolved.key, "resolved-key");
+        assert_eq!(resolved.account.as_deref(), Some("work"));
     }
 
     #[tokio::test]
@@ -1199,7 +1248,8 @@ mod tests {
             ..Default::default()
         };
         let resolved = opts.resolve_api_key().await.unwrap();
-        assert_eq!(resolved, "static-key");
+        assert_eq!(resolved.key, "static-key");
+        assert_eq!(resolved.account, None);
     }
 
     #[tokio::test]
@@ -1235,7 +1285,7 @@ mod tests {
                 let counter = Arc::clone(&counter_clone);
                 async move {
                     let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
-                    Ok(format!("call-{n}"))
+                    Ok(ResolvedApiKey::unlabeled(format!("call-{n}")))
                 }
             })),
             ..Default::default()
@@ -1244,9 +1294,9 @@ mod tests {
         let first = opts.resolve_api_key().await.unwrap();
         let second = opts.resolve_api_key().await.unwrap();
         let third = opts.resolve_api_key().await.unwrap();
-        assert_eq!(first, "call-1");
-        assert_eq!(second, "call-2");
-        assert_eq!(third, "call-3");
+        assert_eq!(first.key, "call-1");
+        assert_eq!(second.key, "call-2");
+        assert_eq!(third.key, "call-3");
         assert_eq!(counter.load(Ordering::SeqCst), 3);
     }
 
@@ -1254,7 +1304,9 @@ mod tests {
     fn api_key_resolver_field_is_skipped_in_serde() {
         let opts = StreamOptions {
             api_key: Some("k".to_string()),
-            api_key_resolver: Some(ApiKeyResolver::new(|| async { Ok("ignored".into()) })),
+            api_key_resolver: Some(ApiKeyResolver::new(|| async {
+                Ok(ResolvedApiKey::unlabeled("ignored".into()))
+            })),
             ..Default::default()
         };
         let json = serde_json::to_string(&opts).unwrap();

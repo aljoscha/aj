@@ -1066,6 +1066,7 @@ impl ReplayState {
             api: assistant.api.clone(),
             provider: assistant.provider.clone(),
             model: assistant.model.clone(),
+            account: None,
             response_id: assistant.response_id.clone(),
             usage: assistant.usage.clone(),
             stop_reason: assistant.stop_reason.clone(),

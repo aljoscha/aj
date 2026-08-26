@@ -155,11 +155,11 @@ async fn run_stream_inner(
     if let Some(token) = options.cancel.as_ref()
         && token.is_cancelled()
     {
-        producer.push(AssistantMessageEvent::aborted(empty_partial(model)));
+        producer.push(AssistantMessageEvent::aborted(empty_partial(model, None)));
         return Ok(());
     }
 
-    let api_key = options.resolve_api_key().await.map_err(|err| {
+    let credential = options.resolve_api_key().await.map_err(|err| {
         AssistantError::new(
             ErrorCategory::Auth,
             format!("openai-completions provider: {err}"),
@@ -173,7 +173,7 @@ async fn run_stream_inner(
     }
 
     let base_url = (!model.base_url.is_empty()).then(|| model.base_url.clone());
-    let client = Client::new(base_url, api_key);
+    let client = Client::new(base_url, credential.key);
     let request = build_request(model, context, options, reasoning);
 
     if let Some(cb) = options.on_payload.as_ref() {
@@ -191,12 +191,15 @@ async fn run_stream_inner(
     {
         SelectOutcome::Ready(res) => res.map_err(|err| classify_client_error(&err))?,
         SelectOutcome::Cancelled => {
-            producer.push(AssistantMessageEvent::aborted(empty_partial(model)));
+            producer.push(AssistantMessageEvent::aborted(empty_partial(
+                model,
+                credential.account.as_deref(),
+            )));
             return Ok(());
         }
     };
 
-    let mut state = StreamState::new(model);
+    let mut state = StreamState::new_with_account(model, credential.account.clone());
 
     loop {
         match select_cancel(options.cancel.as_ref(), sse.next()).await {
@@ -234,11 +237,17 @@ async fn run_stream_inner(
 /// No pricing step: there is no stream state yet and the usage is all
 /// zeros, so sealing would compute a zero total and a zero cost, and the
 /// invariant every other exit seals for holds here for free.
-fn empty_partial(model: &ModelInfo) -> AssistantMessage {
+/// The terminal partial for an exit that never built a [`StreamState`].
+///
+/// `account` is what the credential resolution reported. `None` is the
+/// exit that happens before any resolution: nothing served, which is
+/// what an absent account means.
+fn empty_partial(model: &ModelInfo, account: Option<&str>) -> AssistantMessage {
     let mut partial = AssistantMessage::empty();
     partial.api = API_NAME.to_string();
     partial.provider = model.provider.clone();
     partial.model = model.id.clone();
+    partial.account = account.map(str::to_string);
     partial
 }
 
@@ -813,10 +822,19 @@ struct ToolCallSlot {
 
 impl StreamState {
     fn new(model: &ModelInfo) -> Self {
+        Self::new_with_account(model, None)
+    }
+
+    /// `account` is the label the credential resolution reported for
+    /// this request. Stamped here rather than at an exit so every
+    /// terminal message the state produces carries it, the same reason
+    /// the cost rates are snapshotted here.
+    fn new_with_account(model: &ModelInfo, account: Option<String>) -> Self {
         let mut partial = AssistantMessage::empty();
         partial.api = API_NAME.to_string();
         partial.provider = model.provider.clone();
         partial.model = model.id.clone();
+        partial.account = account;
         Self {
             partial,
             started: false,
@@ -1358,6 +1376,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_terminal_message_keeps_the_account_stamped_at_construction() {
+        let state = StreamState::new_with_account(&fake_model(), Some("work".to_string()));
+        let terminal = state.finalize_or_truncate();
+        assert_eq!(terminal.partial().account.as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn an_exit_without_state_records_only_an_account_that_resolved() {
+        assert_eq!(empty_partial(&fake_model(), None).account, None);
+        assert_eq!(
+            empty_partial(&fake_model(), Some("work"))
+                .account
+                .as_deref(),
+            Some("work")
+        );
+    }
+
     fn non_reasoning_model() -> ModelInfo {
         ModelInfo {
             id: "gpt-4o".into(),
@@ -1470,6 +1506,7 @@ mod tests {
             api: API_NAME.into(),
             provider: "openai".into(),
             model: "gpt-5".into(),
+            account: None,
             response_id: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,

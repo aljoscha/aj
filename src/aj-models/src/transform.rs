@@ -212,6 +212,7 @@ fn transform_assistant(
         api: a.api.clone(),
         provider: a.provider.clone(),
         model: a.model.clone(),
+        account: a.account.clone(),
         response_id: a.response_id.clone(),
         usage: a.usage.clone(),
         stop_reason: a.stop_reason.clone(),
@@ -550,6 +551,7 @@ mod tests {
             api: api.into(),
             provider: provider.into(),
             model: model_id.into(),
+            account: None,
             response_id: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
@@ -653,7 +655,7 @@ mod tests {
         // valid, so all thinking blocks (signed and redacted) and text
         // signatures are preserved intact.
         let target = model("anthropic", "anthropic-messages", "claude-y", false);
-        let asst = assistant(
+        let mut asst = assistant(
             "anthropic",
             "anthropic-messages",
             "claude-x",
@@ -675,6 +677,7 @@ mod tests {
                 tool_call("toolu_abc", "ls"),
             ],
         );
+        asst.account = Some("work".to_string());
         let out = transform_messages(
             &[
                 Message::Assistant(asst),
@@ -685,6 +688,7 @@ mod tests {
         let Message::Assistant(a) = &out[0] else {
             panic!("expected assistant");
         };
+        assert_eq!(a.account.as_deref(), Some("work"));
         // All four blocks preserved, including redacted thinking.
         assert_eq!(a.content.len(), 4);
         match &a.content[0] {

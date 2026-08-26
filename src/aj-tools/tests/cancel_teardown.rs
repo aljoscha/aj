@@ -59,6 +59,7 @@ fn message(content: Vec<AssistantContent>, stop_reason: StopReason) -> Assistant
         api: SCRIPTED.to_string(),
         provider: SCRIPTED.to_string(),
         model: SCRIPTED.to_string(),
+        account: None,
         response_id: None,
         usage: Default::default(),
         stop_reason,

@@ -54,6 +54,7 @@ fn priced(
         api: "test".to_string(),
         provider: provider.to_string(),
         model: model.to_string(),
+        account: None,
         response_id: None,
         usage,
         stop_reason: StopReason::Stop,

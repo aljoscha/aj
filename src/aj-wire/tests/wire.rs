@@ -1526,6 +1526,37 @@ fn message_end_requires_non_null_durable_metadata() {
 }
 
 #[test]
+fn message_end_decodes_the_account_and_old_frames_without_it() {
+    let decode = |json: &str| {
+        let decoded: DecodedFrame = serde_json::from_str(json).expect("message_end decodes");
+        let DecodedFrame::Known(frame) = decoded else {
+            panic!("expected known frame");
+        };
+        let Frame::Event { event, .. } = frame.value() else {
+            panic!("expected event frame");
+        };
+        let DecodedAgentEvent::Known(event) = event else {
+            panic!("expected known event");
+        };
+        let AgentEvent::MessageEnd { message, .. } = event.value() else {
+            panic!("expected message_end");
+        };
+        let Some(aj_models::types::Message::Assistant(message)) = message.as_stored_wire() else {
+            panic!("expected assistant message");
+        };
+        message.account.clone()
+    };
+
+    let labeled = r#"{"kind":"event","session":"session-1","epoch":"epoch-1","seq":1,"entry_id":"entry-1","event":{"type":"message_end","agent_id":"main","message":{"role":"assistant","content":[],"api":"scripted","provider":"anthropic","model":"claude-test","account":"work","usage":{"input":0,"output":0,"cache_read":0,"cache_write":0,"total_tokens":0,"cost":{"input":0.0,"output":0.0,"cache_read":0.0,"cache_write":0.0,"total":0.0}},"stop_reason":"Stop","timestamp":10}}}"#;
+    assert_eq!(decode(labeled).as_deref(), Some("work"));
+
+    // A literal old frame, not a value built by today's serializer.
+    // Only this direction proves a pre-account peer still decodes.
+    let old = r#"{"kind":"event","session":"session-1","epoch":"epoch-1","seq":1,"entry_id":"entry-1","event":{"type":"message_end","agent_id":"main","message":{"role":"assistant","content":[],"api":"scripted","provider":"anthropic","model":"claude-test","usage":{"input":0,"output":0,"cache_read":0,"cache_write":0,"total_tokens":0,"cost":{"input":0.0,"output":0.0,"cache_read":0.0,"cache_write":0.0,"total":0.0}},"stop_reason":"Stop","timestamp":10}}}"#;
+    assert_eq!(decode(old), None);
+}
+
+#[test]
 fn locally_constructed_message_end_requires_and_backfills_durability() {
     let event: AgentEvent = serde_json::from_str(
         r#"{"type":"message_end","agent_id":"main","message":{"role":"user","content":[{"type":"text","text":"hello"}],"timestamp":10}}"#,

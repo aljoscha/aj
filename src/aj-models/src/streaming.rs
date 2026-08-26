@@ -428,6 +428,7 @@ mod tests {
             api: "anthropic-messages".into(),
             provider: "anthropic".into(),
             model: "claude-sonnet-4".into(),
+            account: None,
             response_id: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,

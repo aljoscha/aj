@@ -552,6 +552,7 @@ mod tests {
             api: "scripted".into(),
             provider: "scripted".into(),
             model: "scripted".into(),
+            account: None,
             response_id: None,
             usage: Default::default(),
             stop_reason: aj_models::types::StopReason::Stop,

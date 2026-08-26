@@ -407,6 +407,15 @@ impl ScriptBuilder {
         }
     }
 
+    /// Stamp the label of the credential this script represents.
+    ///
+    /// Additive rather than a fourth argument to [`Self::new`], so the
+    /// ordinary unlabeled test provider stays terse.
+    pub fn account(mut self, account: impl Into<String>) -> Self {
+        self.partial.account = Some(account.into());
+        self
+    }
+
     /// Default chunk size used by `*_block` helpers when no per-call
     /// override is supplied. `0` means "single delta with full content".
     pub fn with_chunk_size(mut self, chunk_size: usize) -> Self {
@@ -706,7 +715,7 @@ impl ScriptBuilder {
 /// content", any positive value chunks the content. `chunk_delay` applies
 /// to each delta.
 ///
-/// The message's identity fields (`api`, `provider`, `model`,
+/// The message's identity fields (`api`, `provider`, `model`, `account`,
 /// `response_id`, `usage`, `timestamp`) ride through onto the terminal
 /// event's message, so test assertions on those fields survive the
 /// round-trip.
@@ -720,9 +729,10 @@ pub fn script_from_message(
         .with_chunk_delay(chunk_delay);
 
     // The builder's partial doesn't include the source message's
-    // response_id / usage / timestamp; thread them through so the
-    // terminal event reproduces the message exactly.
+    // account / response_id / usage / timestamp. Thread them through
+    // so the terminal event reproduces the message exactly.
     builder.partial.response_id = message.response_id.clone();
+    builder.partial.account = message.account.clone();
     builder.partial.usage = message.usage.clone();
     builder.partial.timestamp = message.timestamp;
 
@@ -955,6 +965,7 @@ mod tests {
         msg.api = "scripted".into();
         msg.provider = "scripted".into();
         msg.model = "scripted-test".into();
+        msg.account = Some("work".into());
         msg.stop_reason = StopReason::Stop;
         msg.content.push(AssistantContent::Text(TextContent {
             text: "hello world".into(),
@@ -996,13 +1007,14 @@ mod tests {
                 ..
             }
         ));
-        assert!(matches!(
-            events[4],
-            AssistantMessageEvent::Done {
-                reason: DoneReason::Stop,
-                ..
-            }
-        ));
+        let AssistantMessageEvent::Done {
+            reason: DoneReason::Stop,
+            message,
+        } = &events[4]
+        else {
+            panic!("expected terminal Done, got {:?}", events[4]);
+        };
+        assert_eq!(message.account.as_deref(), Some("work"));
     }
 
     #[tokio::test]
@@ -1245,6 +1257,24 @@ mod tests {
             })
             .collect();
         assert_eq!(snapshots, vec!["he", "hell", "hello"]);
+    }
+
+    #[tokio::test]
+    async fn builder_account_reaches_the_terminal_message() {
+        let script = ScriptBuilder::new("scripted", "scripted", "scripted-test")
+            .account("work")
+            .start()
+            .text_block("hello")
+            .done(DoneReason::Stop);
+        let provider = ScriptedProvider::new(vec![script]);
+        let events = collect_events(provider.stream(
+            &fake_model(),
+            &Context::new("system"),
+            &StreamOptions::default(),
+        ))
+        .await;
+        let terminal = events.last().expect("script emits a terminal event");
+        assert_eq!(terminal.partial().account.as_deref(), Some("work"));
     }
 
     #[tokio::test]
