@@ -11,8 +11,10 @@ use aj_agent::message::AgentMessage;
 use aj_app::session_info::{InfoRow, digest};
 use aj_models::anthropic::provider::replay_sse_events;
 use aj_models::registry::{InputModality, ModelCost, ModelInfo};
-use aj_models::types::{Message, UserMessage};
-use aj_session::{ConversationEntryKind, ConversationLog, ConversationPersistence, ThreadKind};
+use aj_models::types::{AssistantMessage, Message, Usage, UserMessage};
+use aj_session::{
+    ConversationEntryKind, ConversationLog, ConversationPersistence, ThreadFilter, ThreadKind,
+};
 use anthropic_sdk::messages::{
     ContentBlock as AContentBlock, ContentBlockDelta as AContentBlockDelta, Message as AMessage,
     MessageType, Role as ARole, ServerSentEvent, Usage as AUsage,
@@ -96,12 +98,16 @@ fn truncated_turn() -> Message {
 }
 
 /// The same turn, closed properly.
-fn completed_turn() -> Message {
+fn completed_response() -> AssistantMessage {
     let mut frames = vec![message_start()];
     frames.extend(text_frames());
     frames.push(ServerSentEvent::ContentBlockStop { index: 0 });
     frames.push(ServerSentEvent::MessageStop);
-    Message::Assistant(replay_sse_events(&model(), frames))
+    replay_sse_events(&model(), frames)
+}
+
+fn completed_turn() -> Message {
+    Message::Assistant(completed_response())
 }
 
 fn log_with(responses: Vec<Message>) -> (TempDir, ConversationLog) {
@@ -135,6 +141,28 @@ fn log_with(responses: Vec<Message>) -> (TempDir, ConversationLog) {
             .expect("response")
             .id;
     }
+    (dir, log)
+}
+
+/// `log_with`'s log, with a compaction checkpoint carrying `usage`
+/// appended after the responses: the shape a session has once a
+/// summarizer has run.
+///
+/// `first_kept_entry_id` is the system prompt, so nothing is dropped.
+/// The cut is not what this fixture is about, and `stats()` reads only
+/// the entry's `usage`.
+fn log_with_compaction(responses: Vec<Message>, usage: Usage) -> (TempDir, ConversationLog) {
+    let (dir, mut log) = log_with(responses);
+    let first_kept = log.system_prompt_id().cloned().expect("system prompt id");
+    log.append_compaction(
+        ThreadFilter::USER,
+        "summary".into(),
+        first_kept,
+        1_000,
+        None,
+        Some(usage),
+    )
+    .expect("compaction");
     (dir, log)
 }
 
@@ -203,6 +231,44 @@ fn the_overlay_token_rows_sum_to_the_total_it_prints() {
         total, 0,
         "the fixture must report tokens or this proves nothing"
     );
+    assert_eq!(
+        parts, total,
+        "the overlay prints four token rows summing to {parts} above a total of {total}"
+    );
+}
+
+/// The four token rows still sum to the total when a compaction spent
+/// money.
+///
+/// A summarizer exchange is never a message entry, so its spend reaches
+/// `stats()` through the compaction entry and not through the fold over
+/// assistant messages. That is a second door into the same aggregate,
+/// and a fold that takes the total and the dollars while leaving the
+/// four counts behind breaks the invariant exactly as an unsealed exit
+/// did. The fixture above cannot see it: it holds no compaction.
+#[test]
+fn the_overlay_token_rows_sum_when_a_compaction_spent() {
+    let summarizer = completed_response().usage;
+    let turn_tokens = summarizer.total_tokens;
+    let (_dir, log) = log_with_compaction(vec![completed_turn()], summarizer);
+    let stats = log.stats();
+    let rows = digest(&stats, None);
+
+    let total = number(&rows, "total tokens");
+    // The compaction's spend has to be IN the total, or the rows sum
+    // over the assistant turn alone and the compaction door is untested.
+    // One turn plus a compaction carrying that same turn's usage.
+    assert_eq!(
+        total,
+        2 * turn_tokens,
+        "the compaction's {turn_tokens} tokens must reach the aggregate beside the turn's, \
+         or this test measures nothing"
+    );
+
+    let parts = number(&rows, "input")
+        + number(&rows, "output")
+        + number(&rows, "cache read")
+        + number(&rows, "cache write");
     assert_eq!(
         parts, total,
         "the overlay prints four token rows summing to {parts} above a total of {total}"

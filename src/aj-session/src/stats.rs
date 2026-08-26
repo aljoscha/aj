@@ -367,6 +367,19 @@ mod tests {
             stats.usage.total_tokens, 41_050,
             "the turn's 150 tokens plus the summarizer's 40900"
         );
+        // The four counts and not only the total. A fold that adds the
+        // summarizer's `total_tokens` and dollars while leaving the counts
+        // behind keeps this total right and stops the overlay's four token
+        // rows from summing to it, which is ws-6w5's defect arriving through
+        // the compaction door.
+        assert_eq!(
+            stats.usage.input, 40_100,
+            "the turn's 100 input plus the summarizer's 40000"
+        );
+        assert_eq!(
+            stats.usage.output, 950,
+            "the turn's 50 output plus the summarizer's 900"
+        );
         assert!(
             (stats.compaction_usage.cost.total - 0.25).abs() < 1e-9,
             "the compaction line reports the summarizer's share, got {}",
