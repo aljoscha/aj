@@ -17963,7 +17963,7 @@ mod tests {
         let painted = sidebar_rows(&shell);
         assert_eq!(
             painted.get(2).map(String::as_str),
-            Some(" ▾ fold"),
+            Some(" ▴ fold"),
             "the group the user opened is still open after a refresh: \
              {painted:?}",
         );
@@ -19387,7 +19387,7 @@ mod tests {
                 "b-5",
                 "b-6",
                 "b-7",
-                "▾ fold",
+                "▴ fold",
                 "~ laptop ────────────────",
                 "l-0",
                 "l-1",
@@ -19441,7 +19441,7 @@ mod tests {
         );
         app.render(&root).expect("render");
         let opened = strip_labels(&shell);
-        assert_eq!(opened[9], "▾ fold", "the chord opened it: {opened:?}");
+        assert_eq!(opened[9], "▴ fold", "the chord opened it: {opened:?}");
         assert_eq!(
             opened[16], "▸ 3 more",
             "and the other host is untouched: {opened:?}",

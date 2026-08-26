@@ -107,13 +107,13 @@ pub(crate) fn min_cols_with_sidebar(cols: u16) -> u16 {
 /// The focused row's marker, in the column left of the status glyph.
 const FOCUS_MARKER: &str = "▌";
 
-/// The glyph a folded group's trailing line wears, pointing at the rows the
-/// cap holds back.
+/// The glyph a folded group's trailing line wears, pointing right at the count
+/// that stands in for the rows the cap holds back.
 const FOLDED_MARKER: &str = "▸";
 
-/// The glyph an unfolded group's trailing line wears, pointing at the rows it
-/// revealed. Clicking it folds them away again.
-const UNFOLDED_MARKER: &str = "▾";
+/// The glyph an unfolded group's trailing line wears, pointing up at the rows
+/// it revealed. Clicking it folds them away again.
+const UNFOLDED_MARKER: &str = "▴";
 
 /// Boring rows a group shows before the rest fold behind its trailing line.
 ///
@@ -1482,8 +1482,11 @@ impl SessionSidebar {
                 " ",
                 // The triangle is what tells this line from the overflow
                 // count above the create row: that one says the height cut
-                // rows off, this one says the group is holding them and points
-                // at which way it would move.
+                // rows off, this one says the group is holding them, and it
+                // points at what it holds. A fold line is always its group's
+                // last line, so what it holds is never below it: up at the
+                // rows while they are on screen, right at the count that
+                // stands in for them while they are not.
                 if *hidden > 0 {
                     FOLDED_MARKER
                 } else {
@@ -3997,10 +4000,10 @@ mod tests {
     }
 
     /// The two counted lines read differently, because they count different
-    /// things: a group's fold line wears a triangle pointing the way the
-    /// gesture moves, the strip's overflow count is the plain "…n more" above
-    /// the create row. A user reading one for the other would click a line
-    /// that does nothing, or wait for a fold that never comes.
+    /// things: a group's fold line wears a triangle pointing at the rows it
+    /// holds, the strip's overflow count is the plain "…n more" above the
+    /// create row. A user reading one for the other would click a line that
+    /// does nothing, or wait for a fold that never comes.
     ///
     /// What the line looks like once the group is open is pinned where the
     /// click opens it, in the shell's own pointer tests.
