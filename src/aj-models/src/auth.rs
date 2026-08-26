@@ -2281,10 +2281,16 @@ mod tests {
              otherwise this test measures nothing",
         );
 
-        let key = storage.get_api_key("stub", Some("work")).await.unwrap();
+        let resolved = storage
+            .get_api_key("stub", Some("work"))
+            .await
+            .unwrap()
+            .expect("the refreshed account resolves");
+        assert_eq!(resolved.key, "refreshed-a");
         assert_eq!(
-            key.map(|resolved| resolved.key).as_deref(),
-            Some("refreshed-a")
+            resolved.source,
+            CredentialSource::Account("work".to_string()),
+            "refresh preserves the source slot with the key"
         );
 
         match storage.get_account("stub", "work").await.unwrap() {
