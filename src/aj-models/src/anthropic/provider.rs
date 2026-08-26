@@ -1464,12 +1464,16 @@ fn finalize_usage(usage: &mut Usage, cost: &ModelCost) {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::registry::{InputModality, ModelCost, ReasoningOption};
     use crate::types::{
-        AssistantContent, Message, ThinkingContent, ToolCall, UserContent, UserMessage,
+        ApiKeyResolver, AssistantContent, Message, ThinkingContent, ToolCall, UserContent,
+        UserMessage,
     };
     use anthropic_sdk::messages::{Message as AMessage, MessageDelta, MessageType};
+    use tokio_util::sync::CancellationToken;
 
     fn fake_model() -> ModelInfo {
         ModelInfo {
@@ -1503,11 +1507,130 @@ mod tests {
         }
     }
 
+    fn labeled_options(cancel: Option<CancellationToken>) -> StreamOptions {
+        let mut options = StreamOptions {
+            cancel,
+            ..StreamOptions::default()
+        };
+        options.set_api_key_resolver(Some(ApiKeyResolver::new(|| async {
+            Ok(crate::types::ResolvedApiKey {
+                key: "fixture-key".to_string(),
+                account: Some("work".to_string()),
+            })
+        })));
+        options
+    }
+
     #[test]
     fn a_terminal_message_keeps_the_account_stamped_at_construction() {
         let state = StreamState::new_with_account(&fake_model(), Some("work".to_string()));
         let terminal = state.finalize_or_truncate();
         assert_eq!(terminal.partial().account.as_deref(), Some("work"));
+    }
+
+    #[tokio::test]
+    async fn the_live_provider_carries_the_resolved_account_into_its_state() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fixture server");
+        let address = listener.local_addr().expect("fixture address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept provider request");
+            let mut request = vec![0; 16 * 1024];
+            let read = socket
+                .read(&mut request)
+                .await
+                .expect("read provider request");
+            assert!(
+                String::from_utf8_lossy(&request[..read]).contains("POST /v1/messages"),
+                "the live adapter must reach its messages endpoint"
+            );
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                      connection: close\r\n\r\n",
+                )
+                .await
+                .expect("write response head");
+            for event in [
+                ServerSentEvent::MessageStart {
+                    message: empty_a_message(),
+                },
+                ServerSentEvent::MessageStop,
+            ] {
+                let data = serde_json::to_string(&event).expect("serialize SSE fixture");
+                socket
+                    .write_all(format!("data: {data}\n\n").as_bytes())
+                    .await
+                    .expect("write SSE event");
+            }
+        });
+
+        let mut model = fake_model();
+        model.base_url = format!("http://{address}");
+        let options = labeled_options(None);
+        let stream = AnthropicProvider.stream(&model, &Context::new("system"), &options);
+        let terminal = tokio::time::timeout(Duration::from_secs(5), stream.result())
+            .await
+            .expect("provider stream terminates");
+        server.await.expect("fixture server completes");
+
+        assert_eq!(terminal.account.as_deref(), Some("work"));
+    }
+
+    #[tokio::test]
+    async fn a_pre_resolve_cancel_records_that_nothing_served() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let stream = AnthropicProvider.stream(
+            &fake_model(),
+            &Context::new("system"),
+            &labeled_options(Some(cancel)),
+        );
+        let terminal = tokio::time::timeout(Duration::from_secs(5), stream.result())
+            .await
+            .expect("provider stream terminates");
+        assert_eq!(terminal.account, None);
+    }
+
+    #[tokio::test]
+    async fn a_handshake_cancel_keeps_the_account_that_resolved() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fixture server");
+        let address = listener.local_addr().expect("fixture address");
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept provider request");
+            accepted_tx.send(()).expect("signal accepted request");
+            // Keep the HTTP request in its handshake until the client
+            // cancels and drops the connection.
+            let mut byte = [0];
+            let _ = socket.read(&mut byte).await;
+            std::future::pending::<()>().await;
+        });
+
+        let mut model = fake_model();
+        model.base_url = format!("http://{address}");
+        let cancel = CancellationToken::new();
+        let options = labeled_options(Some(cancel.clone()));
+        let stream = AnthropicProvider.stream(&model, &Context::new("system"), &options);
+        tokio::time::timeout(Duration::from_secs(5), accepted_rx)
+            .await
+            .expect("provider reaches fixture server")
+            .expect("fixture server stays alive");
+        cancel.cancel();
+        let terminal = tokio::time::timeout(Duration::from_secs(5), stream.result())
+            .await
+            .expect("provider stream terminates");
+        server.abort();
+        let _ = server.await;
+
+        assert_eq!(terminal.account.as_deref(), Some("work"));
     }
 
     #[test]
