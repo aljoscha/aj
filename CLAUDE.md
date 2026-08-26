@@ -25,31 +25,33 @@ The workspace is split into focused crates under `src/`:
 - `anthropic-sdk` and `openai-sdk` are thin clients used by provider adapters.
 
 Frontends subscribe to the typed `AgentEvent` bus. Persistence is another
-subscriber owned by the binary. The agent runtime does not own a
-`ConversationLog`.
+subscriber owned with the `ConversationLog` by `aj_app::session::SessionCore`.
+The lower-level agent runtime does not own the log.
 
 Keep behavior at its natural boundary. A library exposes a typed error when a
 caller branches on failure. Render-only seams use the named opaque `BoxError`.
-Public library signatures do not use `anyhow`, which is reserved for top-level
-application propagation.
+Frontend-independent application composition in `aj-app` may use `anyhow` when
+callers only propagate or display the failure.
 
 ## Runtime contracts
 
 Persistent state lives under `~/.aj/`. Secrets come from `.env` and are never
-committed. Configuration precedence is CLI flags, environment variables,
-`config.toml`, then builtin defaults. Skills are discovered from user and
-project `.aj`, `.agents`, and `.claude` skill directories up to the Git root.
+committed. The project `.aj/config.toml` overlays the user
+`~/.aj/config.toml`, which overlays builtin defaults. For model selection,
+explicit CLI values and their `MODEL_*` environment bindings override that
+effective config. Skills are discovered from user and project `.aj`, `.agents`,
+and `.claude` skill directories up to the Git root.
 
 ## Verification
 
-Use the repository's current CI-equivalent gate for review-ready work:
+The current CI gate for review-ready work is:
 
-- `cargo fmt`
-- `cargo check`
-- `cargo clippy --workspace --all-targets`
+- `cargo fmt --all -- --check`
+- `cargo clippy --all-targets -- -D warnings`
 - `cargo test`
-- `scripts/check-no-tui-dep.sh`
-- `scripts/check-test-scratch.sh`
+- `cargo build --all-targets`
+- `./scripts/check-no-tui-dep.sh`
+- `./scripts/check-test-scratch.sh`
 
 Scale targeted checks while iterating, but verify the final range against the
 guarantees it claims. Important behavior is exercised through the real composed
@@ -59,8 +61,9 @@ that make their measurement meaningful. When practical, break a claimed
 guarantee and confirm that the relevant check notices. A surviving break is a
 finding about the test or design, not a formality.
 
-Test helpers that create scratch state return owning guards so cleanup survives
-failed assertions and asynchronous lifetimes.
+Scratch ownership must match task lifetime. Lexical test state uses an owning
+guard. Work that may outlive a test uses a process-lifetime root with per-test
+subdirectories so late tasks cannot recreate residue after cleanup.
 
 ## Commits
 
