@@ -404,14 +404,14 @@ pub struct SessionSummary {
     /// reader treats false and absent alike as no promise of anything.
     #[serde(default, skip_serializing_if = "unset")]
     pub locked: bool,
-    /// Which hold [`Self::locked`] is an answer about: a counter the publishing
-    /// host raises for every hold of this session it learns of (spec 6.8).
+    /// The publishing host's latest acquire generation for this session. The
+    /// host advances it on every acquire before publishing the outcome (spec
+    /// 6.8).
     ///
     /// What makes a refused client's recovery derivable from this row alone. A
-    /// `locked` refusal names the generation of the hold that refused it, so a
-    /// row reporting the lock free at that generation or beyond says that hold
-    /// is over, whether or not the client ever received the snapshot the rise
-    /// was published in (spec 6.5).
+    /// `locked` refusal names the generation of its refused acquire, so a row
+    /// reporting the lock free at that generation or beyond says that conflict
+    /// is over, whether or not the client received the held snapshot (spec 6.5).
     ///
     /// Absent means no knowledge, the same rule the bit itself has: a host that
     /// has never seen a hold of this session publishes none, and neither does an
@@ -938,7 +938,7 @@ pub enum Frame {
         /// The human sentence, produced where the facts are and always
         /// sufficient on its own.
         message: String,
-        /// Which hold a `locked` refusal is about, in the vocabulary of
+        /// Which acquire a `locked` refusal is about, in the vocabulary of
         /// [`SessionSummary::lock_generation`] (spec 6.5).
         ///
         /// This is what makes the refusal name *which* true the bit is at, so a

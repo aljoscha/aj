@@ -146,15 +146,10 @@ pub(crate) struct ColdSession {
 pub(crate) struct ColdSessions<S> {
     store: S,
     cache: StdMutex<Cache>,
-    /// Where this host's lock generations start (spec 6.8).
+    /// The initial value for each session's lock counter (spec 6.8).
     ///
-    /// Read once, from the wall clock, because the counter has to keep rising
-    /// across a restart: the cache is in memory, so a host that started over at
-    /// zero would mint generations below the ones a client is still comparing
-    /// against, and a refusal held over the restart would read a fresh hold's
-    /// row as evidence that its own hold had ended. A clock that went backwards
-    /// over the restart is the one corner this does not cover, and spec 6.8
-    /// discloses it.
+    /// Read once from the wall clock. It usually places a restarted host near
+    /// its previous range without making the in-memory counter persistent.
     lock_seed: u64,
     directory_reads: AtomicU64,
     sidecar_directory_reads: AtomicU64,
@@ -278,40 +273,34 @@ struct Cache {
     /// read held, since `flock` belongs to the open file description, so the
     /// sweep skips them and a won acquire clears the entry a refusal left.
     locked: HashSet<String>,
-    /// One entry per session this host has seen a rival hold, holding the
-    /// generation of the latest of those holds (spec 6.8).
+    /// One entry per session whose lock generation this host has initialized,
+    /// holding its latest acquire generation (spec 6.8).
     ///
     /// Outlives the bit deliberately, where [`Self::locked`] empties as holds
-    /// end: a row saying the lock is free carries the generation of the hold
-    /// that just ended, and that is the whole of what tells a client refused
-    /// over that hold that it is over (spec 6.5). So the fall must leave the
-    /// entry standing, and an entry costs a session id per session a rival has
-    /// ever held rather than per lock file the store has minted.
+    /// end: a free row carries the latest acquire's generation, which lets a
+    /// refused client see the conflict is over (spec 6.5). The fall therefore
+    /// leaves the entry standing. It costs one counter per session this host
+    /// has acquired or observed held.
     generations: HashMap<String, u64>,
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct LockState {
+    locked: bool,
+    generation: Option<u64>,
+}
+
 impl Cache {
-    /// Record what this host now knows about `session_id`'s lock, answering
-    /// whether the bit moved.
-    ///
-    /// The single writer of the bit and its generation, so that all three
-    /// sources of the bit (a refused acquire, the enumeration sweep, the probe
-    /// tick) mint on one rule. `seed` is [`ColdSessions::lock_seed`].
-    ///
-    /// A rise mints, and nothing else does: a rise is a hold this host had not
-    /// seen, which is what a generation names, while a fall is that same hold
-    /// ending and has to be publishable *with* its generation. The host cannot
-    /// see a rival's acquire, so the holds it can count are the ones it learns
-    /// of, and two holds it never saw a gap between are one generation. That
-    /// costs nothing the rule needs: the fall of the later one is still the
-    /// answer changing for a client refused over the earlier.
-    fn set_locked(&mut self, session_id: &str, held: bool, seed: u64) -> bool {
-        if !held {
-            return self.locked.remove(session_id);
+    fn lock_state(&self, session_id: &str) -> LockState {
+        LockState {
+            locked: self.locked.contains(session_id),
+            generation: self.generations.get(session_id).copied(),
         }
-        if !self.locked.insert(session_id.to_string()) {
-            return false;
-        }
+    }
+
+    /// Advance the session's counter for one host acquire and return its exact
+    /// post-increment value.
+    fn acquired(&mut self, session_id: &str, locked: bool, seed: u64) -> u64 {
         let generation = self
             .generations
             .get(session_id)
@@ -319,7 +308,24 @@ impl Cache {
             .unwrap_or(seed)
             .saturating_add(1);
         self.generations.insert(session_id.to_string(), generation);
-        true
+        if locked {
+            self.locked.insert(session_id.to_string());
+        } else {
+            self.locked.remove(session_id);
+        }
+        generation
+    }
+
+    /// Apply an enumeration verdict without advancing an existing counter.
+    fn observed(&mut self, session_id: &str, locked: bool, seed: u64) {
+        if locked {
+            self.generations
+                .entry(session_id.to_string())
+                .or_insert(seed);
+            self.locked.insert(session_id.to_string());
+        } else {
+            self.locked.remove(session_id);
+        }
     }
 }
 
@@ -408,7 +414,7 @@ impl<S: SessionStore> ColdSessions<S> {
         // the scan ran recognisable under an id the scan did see (see
         // [`Self::evict_tags`]). The archived bits are taken the same way and
         // for the same reason (see [`Self::record_archived`]).
-        let (known, labelled, filed, held_before) = {
+        let (known, labelled, filed, locks_before) = {
             let cache = self.cache();
             let known: HashSet<String> = cache
                 .rows
@@ -420,7 +426,12 @@ impl<S: SessionStore> ColdSessions<S> {
                 known,
                 cache.tags.clone(),
                 cache.archived.clone(),
-                cache.locked.clone(),
+                cache
+                    .locked
+                    .iter()
+                    .chain(cache.generations.keys())
+                    .map(|id| (id.clone(), cache.lock_state(id)))
+                    .collect(),
             )
         };
         let enumerated = self.enumerate_store()?;
@@ -497,7 +508,7 @@ impl<S: SessionStore> ColdSessions<S> {
         // hint, and one that cannot be re-established must not take a row down
         // with it.
         match self.enumerate_locks() {
-            Ok(locks) => self.record_locked(&self.probe(&locks, &live), &held_before),
+            Ok(locks) => self.record_locked(&self.probe(&locks, &live), &locks_before),
             Err(err) => tracing::warn!("could not read the store's session locks: {err}"),
         }
         self.evict(&enumerated, &known);
@@ -538,38 +549,45 @@ impl<S: SessionStore> ColdSessions<S> {
 
     /// Record what a sweep established about the locks it probed.
     ///
-    /// `held_before` is what the cache held when the sweep started, and the
-    /// comparison against it is eligibility rather than truth, exactly as for
-    /// the archived bit. An entry that has moved since then was written by a
-    /// refused acquire, which is this host having actually asked for the
-    /// session and been told no, so it outranks a probe taken before that
-    /// attempt and is left alone.
-    fn record_locked(&self, verdicts: &[(String, bool)], held_before: &HashSet<String>) {
+    /// `locks_before` is each bit and generation when the sweep started. The
+    /// comparison is eligibility rather than truth. An acquire or probe that
+    /// moved either field since then outranks the stale verdict.
+    fn record_locked(
+        &self,
+        verdicts: &[(String, bool)],
+        locks_before: &HashMap<String, LockState>,
+    ) {
         let mut cache = self.cache();
         for (session_id, held) in verdicts {
-            if cache.locked.contains(session_id) != held_before.contains(session_id) {
+            let before = locks_before.get(session_id).copied().unwrap_or_default();
+            if cache.lock_state(session_id) != before {
                 continue;
             }
-            cache.set_locked(session_id, *held, self.lock_seed);
+            cache.observed(session_id, *held, self.lock_seed);
         }
     }
 
-    /// Record that an acquire of `session_id` was refused, or won.
+    /// Record one acquire of `session_id` and return its post-increment
+    /// generation.
     ///
-    /// The refusal source of the bit (spec 6.8), and the authority among the
-    /// three: a row says held from the moment this host has been told no, and
-    /// stops the moment this host holds the session itself. Returns whether the
-    /// bit moved, which is what a caller publishes on.
-    pub(crate) fn note_locked(&self, session_id: &str, locked: bool) -> bool {
-        self.cache().set_locked(session_id, locked, self.lock_seed)
+    /// Every acquire advances the counter, including a repeated refusal while
+    /// the same rival hold remains. The returned value and the bit are written
+    /// under one cache guard so the refusal can carry exactly what its row does.
+    pub(crate) fn note_acquire(&self, session_id: &str, locked: bool) -> u64 {
+        self.cache().acquired(session_id, locked, self.lock_seed)
     }
 
-    /// The generation of the latest hold of `session_id` this host has seen,
-    /// `None` for a session it has seen none of (spec 6.8).
+    /// Record a probe's falling edge without advancing the generation.
+    pub(crate) fn note_unlocked(&self, session_id: &str) -> bool {
+        self.cache().locked.remove(session_id)
+    }
+
+    /// The latest lock generation of `session_id`, `None` until this host has
+    /// acquired it or an enumeration first found a rival hold (spec 6.8).
     ///
     /// Touches no filesystem. Read on two paths: every row this host publishes
-    /// for the session, live or cold, and the refusal that names the hold a
-    /// client was turned away over. A live row carries it too, because the
+    /// for the session, live or cold, and the refusal that names the acquire a
+    /// client was turned away on. A live row carries it too, because the
     /// generation describes the session's lock history rather than who holds it
     /// now, and a client refused over a hold that ended because *this* host took
     /// the session needs the same evidence as one whose rival simply left.
@@ -985,14 +1003,10 @@ fn fingerprint(metadata: &SessionMetadata) -> Fingerprint {
     Fingerprint::of(metadata.modified_at, metadata.size_bytes)
 }
 
-/// Where a host's lock generations start: unix milliseconds at construction.
+/// Return unix milliseconds for the process-local counter seed.
 ///
-/// Milliseconds rather than a finer unit because the property wanted is only
-/// that a later run starts above an earlier run's highest generation, and a run
-/// mints one per hold it sees, which no store produces thousands of in a
-/// millisecond. A clock this cannot read reads as zero, which gives up
-/// cross-restart monotonicity and nothing else: within the run the counter still
-/// rises, so every comparison a live client makes still holds.
+/// A clock this cannot read yields zero. Within one run every host acquire still
+/// advances from that seed.
 fn lock_seed() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1006,6 +1020,23 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    /// The process-local counter starts in the current unix-millisecond range,
+    /// not at a small fixed value that every restart would reuse.
+    #[test]
+    fn the_lock_seed_comes_from_unix_milliseconds() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the test clock is after the unix epoch")
+            .as_millis();
+        let seed = u128::from(lock_seed());
+        let minute = 60_000_u128;
+
+        assert!(
+            seed >= now.saturating_sub(minute) && seed <= now + minute,
+            "lock seed {seed} is not in the current unix-millisecond range {now}",
+        );
+    }
 
     /// A store whose directory the test edits and whose per-file reads it
     /// counts. The counts are the point: the contract is about the reads an
@@ -1448,6 +1479,16 @@ mod tests {
         let mut rows: Vec<(String, bool)> = cold
             .into_iter()
             .map(|session| (session.id, session.locked))
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// The lock bit and generation carried by each row.
+    fn barred_at(cold: Vec<ColdSession>) -> Vec<(String, bool, Option<u64>)> {
+        let mut rows: Vec<(String, bool, Option<u64>)> = cold
+            .into_iter()
+            .map(|session| (session.id, session.locked, session.lock_generation))
             .collect();
         rows.sort();
         rows
@@ -2599,18 +2640,22 @@ mod tests {
         );
         assert_eq!(cold.lock_probes(), 0);
 
-        assert!(
-            cold.note_locked("held", true),
-            "the refusal moved the bit, so the caller has a frame to publish",
-        );
+        let first = cold.note_acquire("held", true);
         assert_eq!(
-            barred(cold.rows()),
-            [("held".to_string(), true)],
+            barred_at(cold.rows()),
+            [("held".to_string(), true, Some(first))],
             "the attempt is the authority the filter defers to",
         );
-        assert!(
-            !cold.note_locked("held", true),
-            "a second refusal of the same session moves nothing",
+        let second = cold.note_acquire("held", true);
+        assert_eq!(
+            second,
+            first + 1,
+            "a repeated refusal while the same hold remains did not advance",
+        );
+        assert_eq!(
+            barred_at(cold.rows()),
+            [("held".to_string(), true, Some(second))],
+            "the row did not carry the repeated acquire's generation",
         );
     }
 
@@ -2664,7 +2709,7 @@ mod tests {
             // A rival took it, and this host's own acquire has just been
             // refused, after the listing was taken.
             cold.store.lock("held", true, true);
-            cold.note_locked("held", true);
+            cold.note_acquire("held", true);
         });
 
         cold.enumerate(|_| false).expect("enumerate");
@@ -2672,6 +2717,55 @@ mod tests {
             barred(cold.rows()),
             [("held".to_string(), true)],
             "the sweep's staler view undid a refusal",
+        );
+    }
+
+    /// A stale sweep compares the generation as well as the bit. A hold that
+    /// falls and rises during the sweep returns the bit to its starting value,
+    /// but its acquire has advanced the generation and must win.
+    #[test]
+    fn a_sweep_does_not_clear_a_hold_that_aba_changed_while_it_ran() {
+        let store = FakeStore::default();
+        store.put("held", 5);
+        store.lock("held", true, true);
+        let cold = Arc::new(ColdSessions::new(store));
+        cold.enumerate(|_| false).expect("enumerate");
+        let first = cold
+            .rows()
+            .into_iter()
+            .find(|row| row.id == "held")
+            .and_then(|row| row.lock_generation)
+            .expect("the first observed hold is seeded");
+        assert_eq!(
+            barred_at(cold.rows()),
+            [("held".to_string(), true, Some(first))],
+            "the fixture did not start on a held generation",
+        );
+
+        // This listing is the stale free verdict. After it is captured, the
+        // prior hold falls and a host acquire is refused by a new hold.
+        cold.store.release("held");
+        let changing = Arc::downgrade(&cold);
+        cold.store.during_lock_listing(move || {
+            let cold = changing.upgrade().expect("the cache outlives the scan");
+            assert!(
+                cold.note_unlocked("held"),
+                "the old hold did not fall, so no ABA occurred",
+            );
+            cold.store.lock("held", true, true);
+            assert_eq!(
+                cold.note_acquire("held", true),
+                first + 1,
+                "the new acquire did not advance the generation",
+            );
+        });
+
+        cold.enumerate(|_| false).expect("enumerate");
+        assert_eq!(
+            barred_at(cold.rows()),
+            [("held".to_string(), true, Some(first + 1))],
+            "the stale free verdict cleared a new hold whose bit matched the \
+             sweep's starting bit",
         );
     }
 

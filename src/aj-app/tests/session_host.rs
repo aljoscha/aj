@@ -1568,18 +1568,21 @@ async fn a_crashed_rivals_hold_falls_away_on_its_own() {
     // The refusal is the rising edge, and the listing below is the last
     // enumeration point this test allows itself.
     drop(host.host.attach(&[attach_request(&session)]).await);
-    let locked_now = |list: aj_wire::SessionList| {
+    let row = |list: aj_wire::SessionList| {
         list.sessions
             .into_iter()
             .find(|row| row.id == session)
             .expect("the session is in the directory")
-            .locked
     };
+    let held = row(host.host.sessions().await.expect("sessions"));
     assert!(
-        locked_now(host.host.sessions().await.expect("sessions")),
+        held.locked,
         "the refusal did not publish the rival's hold, so the fall below would \
          be from a bit that was never set",
     );
+    let generation = held
+        .lock_generation
+        .expect("the refusal did not publish its acquire generation");
 
     // The rival dies without releasing. The record it wrote stays behind, which
     // is what makes this a crash rather than a release.
@@ -1590,20 +1593,26 @@ async fn a_crashed_rivals_hold_falls_away_on_its_own() {
          path and the test measures the wrong thing",
     );
 
-    let mut cleared = false;
+    let mut released = None;
     for _ in 0..100 {
         // Reads what the host publishes without enumerating, so the sweep
         // cannot be what clears the bit.
-        if !locked_now(host.host.published_directory().await) {
-            cleared = true;
+        let published = row(host.host.published_directory().await);
+        if !published.locked {
+            released = Some(published);
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(
-        cleared,
+    let released = released.expect(
         "a crashed rival's hold is published forever: nothing tells this host \
          the lock was freed, so only a probe can find out",
+    );
+    assert_eq!(
+        released.lock_generation,
+        Some(generation),
+        "the probe cleared the generation with the bit, so a client that missed \
+         the rise cannot derive this release from the latest row",
     );
     host.host.shutdown().await;
 }
@@ -1670,16 +1679,15 @@ async fn a_rival_writers_hold_reaches_the_row() {
     host.host.shutdown().await;
 }
 
-/// The host gives each rival hold one generation and says the same number on
-/// both wire surfaces a refused client compares (spec 6.5, 6.8).
+/// Every host acquire advances one session's generation and publishes the exact
+/// post-increment value on both wire surfaces (spec 6.5, 6.8).
 ///
 /// Driven through real flocks and real attach streams. Reading the cache would
 /// prove the bookkeeping in isolation and not that the row and refusal a client
-/// receives agree. The second hold pins the increment too: a constant boot seed
-/// would let the first recovery work and strand the next refusal after the
-/// client had consumed that generation.
+/// receives agree. The second refusal leaves the same rival hold in place, then
+/// the release and a successful acquire pin which operations advance.
 #[tokio::test]
-async fn a_rival_hold_has_one_generation_on_its_row_and_refusal() {
+async fn host_acquires_advance_the_row_and_refusal_generation_together() {
     let harness = Harness::new(vec![finalized_text_message("on the record")]);
     let session = harness.create().await;
     let mut writer = Client::attach(&harness.host, &session).await;
@@ -1705,7 +1713,7 @@ async fn a_rival_hold_has_one_generation_on_its_row_and_refusal() {
             panic!("a locked session is refused on the stream: {frames:?}");
         };
         assert_eq!(code, "locked", "{message}");
-        lock_generation.expect("a locked refusal names the hold that refused it")
+        lock_generation.expect("a locked refusal names its acquire generation")
     };
 
     let first_hold = SessionLock::try_acquire(&harness.persistence, &session, "first-rival-writer")
@@ -1727,31 +1735,17 @@ async fn a_rival_hold_has_one_generation_on_its_row_and_refusal() {
     assert_eq!(
         first_row.lock_generation,
         Some(first_generation),
-        "the row and refusal name different holds",
+        "the row and refusal name different acquire generations",
     );
 
-    // The fall leaves the generation behind. That released row is the latest
-    // snapshot a client needs when the held one was coalesced away.
-    drop(first_hold);
-    let released = row(host.host.sessions().await.expect("sessions"));
-    assert!(!released.locked, "the released row still claims the hold");
-    assert_eq!(
-        released.lock_generation,
-        Some(first_generation),
-        "the hold's generation disappeared with its bit, so the release says \
-         nothing about which refusal it answers",
-    );
-
-    let second_hold =
-        SessionLock::try_acquire(&harness.persistence, &session, "second-rival-writer")
-            .expect("try_acquire")
-            .expect("the second rival takes the free lock");
+    // The same rival still holds the lock. A re-refusal is another host acquire,
+    // so it advances and the refusal captures that exact post-increment value.
     let mut second_attach = host
         .host
         .attach(&[attach_request(&session)])
         .await
         .expect("the stream opens");
-    let second_refusal = frames_until(&mut second_attach, "the second refusal", |frame| {
+    let second_refusal = frames_until(&mut second_attach, "the repeated refusal", |frame| {
         matches!(frame, Frame::Error { .. })
     })
     .await;
@@ -1759,18 +1753,48 @@ async fn a_rival_hold_has_one_generation_on_its_row_and_refusal() {
     assert_eq!(
         second_generation,
         first_generation + 1,
-        "a second hold reused the generation a refused client has already \
-         consumed",
+        "a repeated refusal while the same rival hold remained did not advance",
     );
     let second_row = row(host.host.published_directory().await);
-    assert!(second_row.locked, "the row does not report the second hold");
+    assert!(
+        second_row.locked,
+        "the row stopped reporting the rival hold"
+    );
     assert_eq!(
         second_row.lock_generation,
         Some(second_generation),
-        "the second row and refusal name different holds",
+        "the row and repeated refusal carry different generations",
     );
 
-    drop(second_hold);
+    // A release only lowers the bit. Its row retains the repeated refusal's
+    // generation, which is the latest snapshot a refused client compares.
+    drop(first_hold);
+    let released = row(host.host.sessions().await.expect("sessions"));
+    assert!(!released.locked, "the released row still claims the hold");
+    assert_eq!(
+        released.lock_generation,
+        Some(second_generation),
+        "the release advanced or discarded the latest refusal's generation",
+    );
+
+    // This host now wins the lock. A successful acquire advances before its
+    // free live row is published.
+    let served = Client::attach(&host.host, &session).await;
+    let acquired = row(host.host.published_directory().await);
+    assert!(
+        acquired.live,
+        "the successful attach did not materialize the session"
+    );
+    assert!(
+        !acquired.locked,
+        "the host published its own hold as a rival's"
+    );
+    assert_eq!(
+        acquired.lock_generation,
+        Some(second_generation + 1),
+        "a successful host acquire did not advance before publishing its row",
+    );
+    drop(served);
     host.host.shutdown().await;
 }
 

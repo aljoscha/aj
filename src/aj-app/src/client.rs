@@ -41,8 +41,8 @@ pub enum Refusal {
     /// besides, because a row can leave and return anyway and comes back
     /// rebuilt with the bit already false.
     Locked {
-        /// Which hold refused this attach, as the peer named it. `None` from a
-        /// peer that publishes no generations.
+        /// The generation of the acquire this refusal answered, as the peer
+        /// named it. `None` from a peer that publishes no generations.
         ///
         /// The transitions above are read out of `list`, which is
         /// lossy-coalescible: the rise and the fall are seconds apart by
@@ -50,7 +50,7 @@ pub enum Refusal {
         /// fall's snapshot and has nothing to compare it against. This is what
         /// makes the recovery derivable from that one snapshot instead (spec
         /// 6.5): a row reporting the lock free at this generation or beyond says
-        /// this hold is over.
+        /// this conflict is over.
         generation: Option<u64>,
     },
     /// Every other code, the ones this build has never heard of included: the
@@ -72,9 +72,9 @@ impl Refusal {
         }
     }
 
-    /// The hold this refusal was issued over, `None` unless it is a `locked`
-    /// one from a peer that publishes generations.
-    pub fn generation(self) -> Option<u64> {
+    /// The acquire generation this refusal names, `None` unless it is a
+    /// `locked` one from a peer that publishes generations.
+    pub(crate) fn generation(self) -> Option<u64> {
         match self {
             Self::Locked { generation } => generation,
             Self::Other => None,

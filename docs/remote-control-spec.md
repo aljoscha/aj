@@ -657,21 +657,29 @@ Client application rules:
   fall are seconds apart by design, so the held snapshot can be
   superseded before a client drains it. The host therefore publishes
   a lock generation beside the bit (section 6.8), and the refusal
-  carries the generation of the hold that refused it. A folded row
-  with `locked` false and generation greater than or equal to the
-  refusal's re-asks, whether or not the client received the rise.
+  carries the generation of the acquire that was refused. On the
+  error frame its JSON field is `lock_generation`, an optional `u64`.
+  The field is additive. It is absent from older peers and from
+  non-`locked` errors, and a gateway forwards it unchanged while
+  rewriting the frame's session id. A folded row with `locked` false
+  and generation greater than or equal to the refusal's re-asks,
+  whether or not the client received the rise. The rule is evaluated
+  both when a list folds and when a locked refusal folds against the
+  current row. A gateway sends its latest merged list before a
+  spliced refusal, and recovery must not require another list after
+  that refusal.
   Greater than or equal is load-bearing: a smaller generation is a
   snapshot from before the refusal and can never fire. A fire
   consumes the row's generation, so a peer that keeps publishing the
   same released generation is asked once rather than once per
   `list`. A re-ask that is refused again re-enters the withheld state
-  with its edges re-armed, and a conforming host's refusal names the
-  generation of the hold now on. The refusal is fresh evidence the
-  bit is true and says which true, so a race against a release still
-  in flight costs one refusal and keeps watching rather than
-  stranding. A client holding no rows yet
-  re-asks on the first list it folds, whatever the codes were: that
-  is new information rather than a spin, and it can happen once.
+  with its edges re-armed, and a conforming host's re-refusal carries
+  the next generation. The refusal is fresh evidence the bit is true
+  and says which true, so a race against a release still in flight
+  costs one refusal and keeps watching rather than stranding. A
+  client holding no rows yet re-asks on the first list it folds,
+  whatever the codes were: that is new information rather than a
+  spin, and it can happen once.
   Both edges are transitions between the rows one folded list
   replaces and the next, not a live watch, so a change that happened
   while the client was disconnected is seen at the first frame after
@@ -849,15 +857,23 @@ Per-session status in `list` frames and `GET /v1/sessions`:
   gateway owns, so it passes through a merge raw. How the host keeps
   the bit current, and the residue it accepts, is with the
   enumeration contract below. Beside it, `lock_generation` is an
-  optional `u64` naming which hold the bit is an answer about. The
-  host seeds the per-session counter at boot from unix milliseconds
-  and raises it whenever it learns of a new hold. The generation
-  stays on the row when the bit falls: `locked: false` at generation
-  G says hold G is over, which is what makes recovery from a locked
-  refusal carrying G derivable from that latest snapshot alone
-  (section 6.5). Absent is no knowledge, the bit's own rule. Older
-  hosts publish none. A gateway owns neither field and relays both
-  untouched.
+  optional `u64` naming the latest host acquire the bit is an answer
+  about. Each session's counter starts from unix milliseconds read at
+  host boot. Every host acquire increments it before either outcome
+  is published. A refusal carries that exact post-increment value, a
+  re-refusal while the same rival hold remains carries the next value,
+  and a successful acquire increments before its free live row is
+  published. A normal release and the probe's falling edge clear the
+  bit without incrementing, so `locked: false` retains the latest
+  acquire generation. That is the latest refusal's generation when no
+  successful acquire intervened. Enumeration may initialize a
+  generation from the boot seed when it first learns a rival hold. It
+  never increments an existing generation. A free row at generation G
+  says the acquire refused at G no longer blocks this host, which is
+  what makes recovery from a refusal carrying G derivable from that
+  latest snapshot alone (section 6.5). Absent is no knowledge, the
+  bit's own rule. Older hosts publish none. A gateway owns neither
+  field and relays both untouched.
 - `host`: which enrolled host a row belongs to, filled by a gateway
   and absent from a plain host's rows. Clients group by it and must
   not derive it from the id, ids are opaque (section 6.2).

@@ -115,23 +115,6 @@ struct Attached {
     /// resumption and wrong here: the last entry of every turn the user
     /// watched would read back as unseen.
     delivered: Option<u64>,
-    /// The highest lock generation this session's release edge has already
-    /// fired on, `None` until one has (spec 6.5).
-    ///
-    /// The spin bound of the generation clause in
-    /// [`SessionDirectory::rejoin_edges_fired`], and the reason it is a
-    /// snapshot rule rather than a transition without becoming a poll: a fire
-    /// consumes the generation it read, so a peer that keeps publishing the same
-    /// released generation is asked once and not once per `list`. Kept beside
-    /// the rows rather than in the client's refusal, because it has to outlive
-    /// the refusal that produced it: the client is not withheld at the moment
-    /// this matters.
-    ///
-    /// Lost when a session leaves the working set, along with everything else
-    /// the fold holds for it. A session re-focused after that has been asked for
-    /// by the user, which is new information in the same sense the first `list`
-    /// after a refusal is.
-    re_asked_through: Option<u64>,
 }
 
 /// Every session a peer offers, plus the fold state for the working set.
@@ -173,6 +156,11 @@ pub struct SessionDirectory {
     /// evidence, the attention is this client's own state, so it is derived
     /// where live evidence arrives and cleared where the user looks.
     unseen: HashSet<String>,
+    /// The highest released generation each session has fired on (spec 6.5).
+    ///
+    /// Directory-scoped so eviction, archive retirement, and a later refocus do
+    /// not turn an already consumed row into new evidence.
+    consumed_lock_generations: HashMap<String, u64>,
 }
 
 impl SessionDirectory {
@@ -187,12 +175,12 @@ impl SessionDirectory {
                 session,
                 chat: None,
                 delivered: None,
-                re_asked_through: None,
             }],
             rows: Vec::new(),
             hosts: Vec::new(),
             viewed: HashMap::new(),
             unseen: HashSet::new(),
+            consumed_lock_generations: HashMap::new(),
         }
     }
 
@@ -262,6 +250,7 @@ impl SessionDirectory {
         let Some(session) = frame.session() else {
             return self.apply_host_frame(frame);
         };
+        let evaluates_current_row = matches!(&frame, Frame::Error { code, .. } if code == "locked");
         let Some(index) = self
             .attached
             .iter()
@@ -287,6 +276,10 @@ impl SessionDirectory {
         // one place that decides what a refusal is rather than matching the
         // frame kind a second time.
         let asked_now = attached.client.withheld();
+        let current_refusal = evaluates_current_row
+            .then_some(asked_now)
+            .flatten()
+            .filter(|refusal| matches!(refusal, Refusal::Locked { .. }));
         if let Some(refusal) = asked_now
             && asked_now != asked_before
         {
@@ -314,10 +307,29 @@ impl SessionDirectory {
             // that it moved, and it arrives whether or not a row follows.
             self.latch_unseen();
         }
+        // A gateway sends its latest merged list before the spliced refusal.
+        // Evaluate that row now because no later list is required to follow.
+        let rejoined =
+            current_refusal.is_some_and(|refusal| self.current_generation_fired(index, refusal));
         // Only the focused session's transcript is on screen, so a background
         // session's fold changes nothing a redraw would show. Its row can still
         // change, but that arrives as a `list` frame of its own.
-        Redraw(redraw.0 && index == 0)
+        Redraw((redraw.0 || rejoined) && index == 0)
+    }
+
+    /// Consume the current row's generation when it answers a refusal that just
+    /// folded.
+    fn current_generation_fired(&mut self, index: usize, refusal: Refusal) -> bool {
+        let session = &self.attached[index].session;
+        let row = self.rows.iter().find(|row| row.id == *session);
+        let consumed = self.consumed_lock_generations.get(session).copied();
+        let Some(generation) = released_generation(refusal, row, consumed) else {
+            return false;
+        };
+        self.consumed_lock_generations
+            .insert(session.clone(), generation);
+        self.attached[index].client.owe_reattach();
+        true
     }
 
     /// Put the re-attach obligation back on every withheld session whose rejoin
@@ -357,8 +369,8 @@ impl SessionDirectory {
     /// keep it from becoming the poll the other two exist to avoid: it reads at
     /// or beyond rather than different, so a snapshot older than the refusal can
     /// never fire, and a fire consumes the generation it read
-    /// ([`Attached::re_asked_through`]), so a peer that keeps republishing one
-    /// released generation is asked once.
+    /// in [`Self::consumed_lock_generations`], so a peer that keeps republishing
+    /// one released generation is asked once.
     ///
     /// Two consequences of reading transitions, both intended. Against a peer
     /// that publishes neither the bit nor a generation a locked refusal waits on
@@ -372,6 +384,7 @@ impl SessionDirectory {
             rows.iter().find(|row| row.id == id)
         }
         let mut asked = false;
+        let consumed = &mut self.consumed_lock_generations;
         for attached in self.attached.iter_mut() {
             let Some(refusal) = attached.client.withheld() else {
                 continue;
@@ -382,12 +395,13 @@ impl SessionDirectory {
             let released = matches!(refusal, Refusal::Locked { .. })
                 && before.is_some_and(|row| row.locked)
                 && after.is_some_and(|row| !row.locked);
-            let published = released_generation(refusal, after, attached.re_asked_through);
+            let spent = consumed.get(&attached.session).copied();
+            let published = released_generation(refusal, after, spent);
             if !returned && !released && published.is_none() {
                 continue;
             }
             if let Some(generation) = published {
-                attached.re_asked_through = Some(generation);
+                consumed.insert(attached.session.clone(), generation);
             }
             attached.client.owe_reattach();
             asked = true;
@@ -473,7 +487,6 @@ impl SessionDirectory {
                         session: session.to_string(),
                         chat: None,
                         delivered: None,
-                        re_asked_through: None,
                     },
                 );
                 chat
@@ -816,7 +829,7 @@ fn delivered_seq(frame: &Frame) -> Option<u64> {
 /// The generation at which `row` is evidence that the hold behind `refusal` has
 /// ended, `None` when it is no such evidence (spec 6.5).
 ///
-/// `re_asked_through` is what this session's edge has already fired on. Both
+/// `consumed` is what this session's edge has already fired on. Both
 /// comparisons are load-bearing and neither may be loosened:
 ///
 /// - At or beyond the refusal's generation, never merely different. A snapshot
@@ -830,7 +843,7 @@ fn delivered_seq(frame: &Frame) -> Option<u64> {
 fn released_generation(
     refusal: Refusal,
     row: Option<&SessionSummary>,
-    re_asked_through: Option<u64>,
+    consumed: Option<u64>,
 ) -> Option<u64> {
     let refused_at = refusal.generation()?;
     let row = row?;
@@ -840,7 +853,7 @@ fn released_generation(
         return None;
     }
     let generation = row.lock_generation?;
-    let spent = re_asked_through.is_some_and(|fired| generation <= fired);
+    let spent = consumed.is_some_and(|fired| generation <= fired);
     (generation >= refused_at && !spent).then_some(generation)
 }
 
@@ -992,7 +1005,7 @@ mod tests {
         refusal_naming(session, code, None)
     }
 
-    /// A locked refusal that names the hold it was issued over.
+    /// A locked refusal that names the acquire it answered.
     fn refused_at(session: &str, generation: u64) -> Frame {
         refusal_naming(session, "locked", Some(generation))
     }
@@ -2198,6 +2211,38 @@ mod tests {
         );
     }
 
+    /// A gateway opens with its latest merged list and only then forwards the
+    /// host's refusal. The already-folded row must answer that refusal without
+    /// waiting for another list that may never come.
+    #[test]
+    fn a_list_before_its_refusal_re_asks_immediately() {
+        let mut directory = SessionDirectory::new(FOCUSED.to_string());
+        let mut focused_chat = chat();
+        let _ = directory.apply(&mut focused_chat, list(vec![free_at(FOCUSED, 6)]));
+        let _ = directory.apply(&mut focused_chat, list(vec![free_at(FOCUSED, 7)]));
+
+        let _ = directory.apply(&mut focused_chat, refused_at(FOCUSED, 7));
+
+        assert!(
+            directory.client().needs_reattach(),
+            "the current row already says hold 7 is over, but a client that gets \
+             no post-refusal list is stranded",
+        );
+        let notices = notices(&focused_chat);
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice == "this peer will not serve session-focused: locked"),
+            "evaluating the current row dropped the peer's refusal: {notices:?}",
+        );
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice == WITHHELD_LOCKED_NOTICE),
+            "evaluating the current row dropped the withheld warning: {notices:?}",
+        );
+    }
+
     /// A snapshot older than the refusal is inert, however far its generation is
     /// from the refusal's.
     ///
@@ -2213,13 +2258,17 @@ mod tests {
         let mut focused_chat = chat();
         let _ = directory.apply(&mut focused_chat, list(vec![free_at(FOCUSED, 6)]));
         let _ = directory.apply(&mut focused_chat, refused_at(FOCUSED, 7));
+        assert!(
+            !directory.client().needs_reattach(),
+            "the current stale row at generation 6 fired while refusal 7 folded, \
+             so the ordered comparison is reversed",
+        );
         assert_eq!(
             directory.client().withheld(),
             Some(Refusal::Locked {
                 generation: Some(7)
             }),
-            "the refusal did not carry a generation, so the rows below are \
-             folded by a client with nothing to compare them against",
+            "the refusal did not retain the generation the rows compare against",
         );
 
         // Stale free rows, from before the hold that refused. Every one of them
@@ -2243,12 +2292,29 @@ mod tests {
         );
     }
 
+    /// Folding a list replaces the row's generation with the latest value. It
+    /// does not keep a maximum, since generations from a restarted publisher
+    /// may move backwards under the current contract.
+    #[test]
+    fn a_folded_row_keeps_the_latest_generation_not_the_maximum() {
+        let mut directory = SessionDirectory::new(FOCUSED.to_string());
+        let mut focused_chat = chat();
+        let _ = directory.apply(&mut focused_chat, list(vec![free_at(FOCUSED, 9)]));
+        let _ = directory.apply(&mut focused_chat, list(vec![free_at(FOCUSED, 7)]));
+
+        assert_eq!(
+            directory.rows()[0].lock_generation,
+            Some(7),
+            "the fold retained a high-water mark instead of the latest row",
+        );
+    }
+
     /// One released generation re-asks once, however often the peer republishes
     /// it.
     ///
     /// The spin bound, and the reason a snapshot rule is safe where a poll is
-    /// not. A conforming host mints a generation for every hold it learns of, so
-    /// a re-refusal names a later one and the comparison alone would do. This is
+    /// not. A conforming host advances the generation on every acquire, so a
+    /// re-refusal names a later one and the comparison alone would do. This is
     /// what holds against a peer that refuses with a generation it has already
     /// published as free. Without it the fire repeats per `list` frame, which is
     /// the regression that made refusals an answer rather than a schedule.
@@ -2292,6 +2358,96 @@ mod tests {
             directory.client().needs_reattach(),
             "a later hold ended and the client did not ask, so consuming a \
              generation silenced the edge for good",
+        );
+    }
+
+    /// A landed bit edge may ask even when the generation clause is false, but
+    /// it must not consume the row's generation on that clause's behalf.
+    #[test]
+    fn a_landed_edge_that_fires_does_not_consume_an_unsatisfied_generation() {
+        let mut directory = SessionDirectory::new(FOCUSED.to_string());
+        let mut focused_chat = chat();
+        let _ = directory.apply(&mut focused_chat, list(vec![held_at(FOCUSED, 10)]));
+        let _ = directory.apply(&mut focused_chat, refused_at(FOCUSED, 10));
+
+        // The bit falls, but generation 9 is stale against refusal 10. Only the
+        // landed edge fires.
+        let _ = directory.apply(&mut focused_chat, list(vec![free_at(FOCUSED, 9)]));
+        assert!(
+            directory.client().needs_reattach(),
+            "the landed locked edge did not fire, so consumption is unmeasured",
+        );
+
+        directory.expect_attach(|_| true);
+        let _ = directory.apply(&mut focused_chat, refused_at(FOCUSED, 9));
+        assert!(
+            directory.client().needs_reattach(),
+            "the earlier landed edge consumed generation 9 even though its \
+             generation clause was false",
+        );
+    }
+
+    /// Consumed generations belong to the directory, not its bounded working
+    /// set. Eviction, archive retirement, and a later user refocus cannot make
+    /// an old row new.
+    #[test]
+    fn a_consumed_generation_survives_eviction_archive_and_refocus() {
+        let mut directory = SessionDirectory::new(FOCUSED.to_string());
+        let mut focused_chat = chat();
+        let _ = directory.apply(&mut focused_chat, list(vec![free_at(FOCUSED, 6)]));
+        let _ = directory.apply(&mut focused_chat, refused_at(FOCUSED, 7));
+        let _ = directory.apply(&mut focused_chat, list(vec![free_at(FOCUSED, 7)]));
+        assert!(
+            directory.client().needs_reattach(),
+            "generation 7 never fired, so there is nothing to preserve",
+        );
+        directory.expect_attach(|_| true);
+        let _ = directory.apply(&mut focused_chat, refused_at(FOCUSED, 7));
+
+        for n in 1..=WORKING_SET {
+            directory.focus(&mut focused_chat, &format!("session-{n}"), chat);
+        }
+        assert!(
+            !directory.is_attached(FOCUSED),
+            "the session never left the working set, so attachment state could \
+             still be preserving the generation",
+        );
+
+        directory.focus(&mut focused_chat, FOCUSED, chat);
+        directory.expect_attach(|session| session == FOCUSED);
+        let _ = directory.apply(&mut focused_chat, refused_at(FOCUSED, 7));
+        assert!(
+            !directory.client().needs_reattach(),
+            "refocusing made the current free row at consumed generation 7 fire",
+        );
+        let _ = directory.apply(&mut focused_chat, list(vec![free_at(FOCUSED, 7)]));
+        assert!(
+            !directory.client().needs_reattach(),
+            "an unchanged free row fired after eviction erased its consumption",
+        );
+
+        // Put the session in the background, then archive it through the row so
+        // retirement removes the attachment by the production path.
+        directory.focus(&mut focused_chat, "session-8", chat);
+        let mut archived = free_at(FOCUSED, 7);
+        archived.archived = true;
+        let _ = directory.apply(
+            &mut focused_chat,
+            list(vec![archived, row("session-8", false, 0)]),
+        );
+        assert!(
+            !directory.is_attached(FOCUSED),
+            "the archived background session was not retired, so its directory \
+             state could not have been lost",
+        );
+
+        directory.focus(&mut focused_chat, FOCUSED, chat);
+        directory.expect_attach(|session| session == FOCUSED);
+        let _ = directory.apply(&mut focused_chat, refused_at(FOCUSED, 7));
+        assert!(
+            !directory.client().needs_reattach(),
+            "archive retirement made the current row at consumed generation 7 \
+             fire again",
         );
     }
 

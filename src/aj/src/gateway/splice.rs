@@ -174,12 +174,11 @@ impl Splice {
 
     /// The next frame for this client, `None` once the stream is over.
     ///
-    /// Three sources, written in arrival order: the merged directory, the
-    /// spliced upstreams, and a heartbeat whenever both have been quiet for
-    /// `idle` (spec 6.1). The directory is a watch rather than a queued frame
-    /// because `list` is a cumulative snapshot the newest supersedes, so a
-    /// client that fell behind wants only the latest (spec 6.4). Ahead of all
-    /// three come the refusals this attach owes, which are answers to it.
+    /// The latest merged directory opens the stream. Then come the refusals this
+    /// gateway composed for the attach. Afterwards, directory changes, spliced
+    /// upstream frames, and heartbeats are written in arrival order (spec 6.1).
+    /// The directory is a watch rather than a queued frame because `list` is a
+    /// cumulative snapshot the newest supersedes (spec 6.4).
     ///
     /// A `list` or a heartbeat can land in the middle of an attach block, which a
     /// host's own stream never does (it drains a block before its live queue).
@@ -606,6 +605,102 @@ mod tests {
         })
         .await;
         host.abort();
+    }
+
+    /// The merged directory is the literal first frame even when a spliced
+    /// refusal is already queued (spec 6.5, 7.1).
+    ///
+    /// This is the ordering that lets a client evaluate the refusal against the
+    /// gateway's latest row. Moving the queued-frame read above the opening-list
+    /// branch strands a release whose row changes no further.
+    #[tokio::test]
+    async fn the_opening_directory_precedes_an_already_queued_spliced_refusal() {
+        let (_directory_tx, directory) = watch::channel(Arc::new(MergedDirectory::default()));
+        let cancel = CancellationToken::new();
+        let (sender, frames) =
+            outbound::channel(NonZeroUsize::new(4).expect("non-zero"), cancel.clone());
+        let refusal = DecodedFrame::try_from(Frame::Error {
+            session: "left:s-1".to_string(),
+            epoch: None,
+            code: "locked".to_string(),
+            message: "held".to_string(),
+            lock_generation: Some(23),
+        })
+        .expect("a locked refusal");
+        assert!(
+            sender.offer(refusal) == Offered::Queued,
+            "the refusal never reached the splice queue",
+        );
+        let mut splice = Splice {
+            frames,
+            directory,
+            opened: false,
+            refused: VecDeque::new(),
+            _cancel: cancel.clone().drop_guard(),
+        };
+        let shutdown = CancellationToken::new();
+
+        assert!(
+            matches!(
+                splice.next_frame(Duration::from_secs(1), &shutdown).await,
+                Some(Outgoing::Directory(_))
+            ),
+            "an already queued refusal overtook the opening directory",
+        );
+        assert!(
+            matches!(
+                splice.next_frame(Duration::from_secs(1), &shutdown).await,
+                Some(Outgoing::Spliced(DecodedFrame::Known(known)))
+                    if matches!(known.value(), Frame::Error { lock_generation: Some(23), .. })
+            ),
+            "the queued refusal did not follow the opening directory",
+        );
+    }
+
+    /// Namespacing a host's locked refusal rewrites only its session id. The
+    /// generation and fields this gateway does not know travel from the raw
+    /// frame unchanged.
+    #[tokio::test]
+    async fn a_locked_refusals_generation_survives_the_raw_gateway_rewrite() {
+        let frame: DecodedFrame = serde_json::from_str(
+            r#"{"kind":"error","session":"s-1","code":"locked","message":"held","lock_generation":23,"added_later":{"kept":true}}"#,
+        )
+        .expect("a locked refusal");
+        let cancel = CancellationToken::new();
+        let (sender, mut receiver) =
+            outbound::channel(NonZeroUsize::new(4).expect("non-zero"), cancel);
+        let mut attaching = HashSet::from(["s-1".to_string()]);
+
+        assert!(forward("left", frame, &mut attaching, &sender).await);
+        let forwarded = receiver.recv().await.expect("the forwarded refusal");
+        let DecodedFrame::Known(known) = forwarded else {
+            panic!("the known refusal changed kind");
+        };
+        assert!(
+            matches!(
+                known.value(),
+                Frame::Error {
+                    session,
+                    lock_generation: Some(23),
+                    ..
+                } if session == "left:s-1"
+            ),
+            "the typed refusal lost its namespace or generation: {:?}",
+            known.value(),
+        );
+        let raw = known
+            .raw_json()
+            .expect("a rewritten wire frame retains JSON");
+        assert!(
+            raw.get().contains(r#""lock_generation":23"#),
+            "the raw rewrite dropped the generation: {}",
+            raw.get(),
+        );
+        assert!(
+            raw.get().contains(r#""added_later":{"kept":true}"#),
+            "the raw rewrite re-encoded away an additive field: {}",
+            raw.get(),
+        );
     }
 
     /// A host whose event stream is over as soon as it opens.

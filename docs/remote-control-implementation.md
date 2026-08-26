@@ -368,10 +368,11 @@ refusal list shrinks as each lands. The render-loop cost stays banked,
 re-prioritized by actual use.
 
 The `locked` row bit and its generation (spec 6.5, 6.8) are published
-and read: a refused acquire sets the bit and names the hold, a won one
-clears the bit, an enumeration point sweeps the lock directory to find
-rivals' holds, and a probe tick clears the bit when a rival lets go,
-cleanly or by crashing. A client refused with `locked` keeps the
+and read: every host acquire advances the session's counter before a
+refusal or a free live row is published. A normal release and the probe
+fall retain that generation. Enumeration can seed a generation for a
+newly learned hold but does not advance one it already has. A client
+refused with `locked` keeps the
 absent-then-present edge every refusal has and re-attaches when either
 the bit falls or the latest row says that refusal's generation is free.
 The latter makes the answer derivable from one cumulative snapshot when

@@ -1916,15 +1916,14 @@ fn an_archived_row_says_so_and_an_unarchived_one_stays_silent() {
     );
 }
 
-/// A lock generation is additive knowledge: a row that has seen no rival hold
-/// carries no key, and one that has names the hold its `locked` answer is about
-/// (spec 6.8).
+/// A lock generation is additive knowledge: a host with no generation to
+/// report carries no key, and a host with one publishes its latest acquire or
+/// enumeration seed (spec 6.8).
 ///
 /// Orthogonal to the bit deliberately. The release snapshot is `locked: false`
-/// while retaining the generation of the hold that ended, which is the shape
-/// that lets a refused client recover when the rise was coalesced away (spec
-/// 6.5). So this pins a false bit with a present generation rather than the
-/// easier held row.
+/// while retaining the refused acquire's generation, which is the shape that
+/// lets a client recover when the rise was coalesced away (spec 6.5). So this
+/// pins a false bit with a present generation rather than the easier held row.
 #[test]
 fn a_lock_generation_is_optional_and_outlives_the_bit() {
     let row = SessionSummary {
@@ -2201,10 +2200,18 @@ fn an_error_frame_carries_the_envelope_and_an_optional_epoch() {
     }
 }
 
-/// A locked refusal names which hold refused it, and every other error may omit
-/// that additive field (spec 6.5, 6.8).
+/// A locked refusal names its acquire generation, and every other error may
+/// omit that additive field (spec 6.5, 6.8).
 #[test]
-fn a_locked_error_frame_carries_the_holds_generation() {
+fn a_locked_error_frame_carries_the_acquire_generation() {
+    #[derive(serde::Deserialize)]
+    struct LegacyErrorFrame {
+        kind: String,
+        session: String,
+        code: String,
+        message: String,
+    }
+
     let refusal = Frame::Error {
         session: "session-1".to_string(),
         epoch: None,
@@ -2214,6 +2221,23 @@ fn a_locked_error_frame_carries_the_holds_generation() {
     };
     let encoded = serde_json::to_value(&refusal).expect("the frame serializes");
     assert_eq!(encoded["lock_generation"], json!(1_800_000_000_007_u64));
+    let legacy: LegacyErrorFrame =
+        serde_json::from_value(encoded.clone()).expect("an older client ignores the new field");
+    assert_eq!(
+        (
+            legacy.kind.as_str(),
+            legacy.session.as_str(),
+            legacy.code.as_str(),
+            legacy.message.as_str(),
+        ),
+        (
+            "error",
+            "session-1",
+            "locked",
+            "session session-1 is held by another writer",
+        ),
+        "the additive field changed what an older client could read",
+    );
     let decoded = serde_json::from_value::<Frame>(encoded).expect("it decodes again");
     assert!(
         matches!(

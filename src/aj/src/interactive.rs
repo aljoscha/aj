@@ -21456,11 +21456,12 @@ mod tests {
     /// generation it fired on cannot turn unchanged snapshots into a retry loop.
     ///
     /// The first stream never carries the hold's rise. Its baseline says free at
-    /// generation 6, the refusal names hold 7, and its latest row says free at 7,
-    /// which is the coalescing trace this rule exists to recover from (spec 6.4,
-    /// 6.5). The second stream refuses again with 7 and keeps publishing that
-    /// same released generation. A client that does not consume the fire opens a
-    /// third stream, then more, one per list.
+    /// generation 6, then the gateway's opening list says free at 7 before the
+    /// spliced refusal names 7. No list follows that refusal. The current row is
+    /// therefore the only recovery evidence (spec 6.4, 6.5). The second stream
+    /// refuses again with 7 and keeps publishing that same released generation.
+    /// A client that does not consume the fire opens a third stream, then more,
+    /// one per list.
     ///
     /// Driven through the real connection loop and asserted at the peer. Folding
     /// these frames into the directory by hand would prove the clause and not
@@ -21480,9 +21481,10 @@ mod tests {
                     // The last row received before hold 7. The rise at 7 was
                     // superseded in the lossy queue and never reaches us.
                     list_lock_at(&session, false, 6, 1),
-                    locked_refusal_at(&session, 7, refusal),
-                    // The release, legible from this snapshot alone.
+                    // A gateway opens with its latest merged list, then forwards
+                    // the spliced refusal. There is no post-refusal list.
                     list_lock_at(&session, false, 7, 2),
+                    locked_refusal_at(&session, 7, refusal),
                 ],
                 vec![
                     // A contradictory peer reuses the generation it just

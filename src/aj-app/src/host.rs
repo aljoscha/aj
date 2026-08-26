@@ -156,12 +156,11 @@ pub enum HostError {
     Locked {
         session: String,
         holder: Option<LockHolder>,
-        /// Which hold this refusal is about, in the vocabulary of the row's
-        /// `lock_generation` (spec 6.8).
+        /// The generation of this refused acquire, in the vocabulary of the
+        /// row's `lock_generation` (spec 6.8).
         ///
-        /// Read where the refusal happens, so it names the hold the client was
-        /// actually turned away over rather than whatever the bit says by the
-        /// time the refusal is rendered.
+        /// Captured by the same cache update that advances the row, so later
+        /// acquires cannot change what this refusal carries.
         generation: Option<u64>,
     },
     /// The request is well formed and conflicts with nothing, but this host
@@ -200,15 +199,15 @@ impl HostError {
         }
     }
 
-    /// The hold a `locked` refusal names, `None` from every other failure
-    /// (spec 6.5, 6.8).
+    /// The acquire generation a `locked` refusal names, `None` from every other
+    /// failure (spec 6.5, 6.8).
     ///
     /// Beside [`Self::code`] for the same reason that one is here: the frame
     /// that refuses one session's attach is assembled from this error, and the
     /// generation is part of what the refusal says rather than something the
     /// assembling code could look up. Asking the directory for it there would
     /// read whatever the bit had moved to since.
-    pub fn lock_generation(&self) -> Option<u64> {
+    fn lock_generation(&self) -> Option<u64> {
         match self {
             Self::Locked { generation, .. } => *generation,
             _ => None,
@@ -888,8 +887,8 @@ impl SessionHost {
                         epoch: None,
                         code: err.code().to_string(),
                         message: err.to_string(),
-                        // A locked refusal names the hold it was refused over,
-                        // and every other code carries none (spec 6.5).
+                        // A locked refusal names its acquire generation, and
+                        // every other code carries none (spec 6.5).
                         lock_generation: err.lock_generation(),
                     }));
                 }
@@ -1463,28 +1462,23 @@ impl SessionHost {
     /// Take a session's advisory lock, refusing when another writer holds
     /// it.
     ///
-    /// Either answer moves the session's `locked` bit (spec 6.8): a refusal is
-    /// this host being told a rival holds the session, and a won lock is this
-    /// host holding it, which is the one thing that cannot read locked on its
-    /// own rows.
+    /// Either answer records the session's `locked` bit (spec 6.8): a refusal
+    /// says a rival holds it, and a won lock clears any stale rival bit. Every
+    /// answer advances the session's generation before its row is published.
     fn acquire(&self, id: &str) -> Result<SessionLock, HostError> {
         let taken = SessionLock::try_acquire(&self.inner.persistence, id, &self.inner.host_id)
             .map_err(|err| HostError::Internal(Box::new(err)))?;
-        if self.inner.cold.note_locked(id, taken.is_none()) {
-            // Publish only when the bit actually moved, so a stream of
-            // refusals against one held session costs one frame.
-            self.inner.shared.fanout.mark_list_dirty();
-        }
+        // Keep the post-increment value from the same cache guard that writes
+        // the row. Re-reading later could stamp this refusal with another
+        // acquire's generation.
+        let generation = self.inner.cold.note_acquire(id, taken.is_none());
+        self.inner.shared.fanout.mark_list_dirty();
         taken.ok_or_else(|| HostError::Locked {
             session: id.to_string(),
             // Read only on the refusal path, and the record is cleared on
             // release, so what it names is a holder that has the lock now.
             holder: SessionLock::holder(&self.inner.persistence, id),
-            // Read after the note above, which minted this generation if the
-            // refusal is this host's first sight of the hold. So the refusal
-            // and the rows name the same hold, which is what lets a client
-            // compare them (spec 6.5).
-            generation: self.inner.cold.lock_generation(id),
+            generation: Some(generation),
         })
     }
 
@@ -2237,7 +2231,7 @@ fn spawn_lock_probe(inner: &Arc<HostInner>) {
                 }
                 match host.inner.cold.probe_lock(&session) {
                     Ok(true) => {}
-                    Ok(false) => freed |= host.inner.cold.note_locked(&session, false),
+                    Ok(false) => freed |= host.inner.cold.note_unlocked(&session),
                     // The lock is unreadable, which says nothing about who
                     // holds it. The bit stands and the next tick asks again.
                     Err(err) => {
