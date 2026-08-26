@@ -15,6 +15,8 @@ The workspace is split into focused crates under `src/`:
 - `aj-wire` owns remote-control models and compatibility codecs. It contains no
   HTTP or other I/O types.
 - `aj-session` owns the on-disk session format, conversation log, and replay.
+  User-facing surfaces say "session". A `ConversationLog` contains threads and
+  branches internally, so both terms are intentional.
 - `aj-tools` owns builtin tool implementations.
 - `aj-app` owns frontend-independent application behavior, session composition,
   the turn driver, state reduction, print mode, and settings. It has no TUI
@@ -38,9 +40,9 @@ callers only propagate or display the failure.
 Persistent state lives under `~/.aj/`. Secrets come from `.env` and are never
 committed. The project `.aj/config.toml` overlays the user
 `~/.aj/config.toml`, which overlays builtin defaults. For model selection,
-explicit CLI values and their `MODEL_*` environment bindings override that
-effective config. Skills are discovered from user and project `.aj`, `.agents`,
-and `.claude` skill directories up to the Git root.
+explicit CLI values override their `MODEL_*` environment bindings. Both
+override the effective config. Skills are discovered from user and project
+`.aj`, `.agents`, and `.claude` skill directories up to the Git root.
 
 ## Verification
 
