@@ -272,6 +272,20 @@ fn seal(model: &ModelInfo, event: &mut AssistantMessageEvent) {
     calculate_cost(&model.cost, &mut message.usage);
 }
 
+/// Copy only the identity known before a scripted step is delivered.
+///
+/// The current step may already hold content and usage that its delay
+/// has not released. A cancellation can inherit who the script
+/// represents, but not data the consumer never saw.
+fn empty_identity(message: &AssistantMessage) -> AssistantMessage {
+    let mut partial = AssistantMessage::empty();
+    partial.api = message.api.clone();
+    partial.provider = message.provider.clone();
+    partial.model = message.model.clone();
+    partial.account = message.account.clone();
+    partial
+}
+
 /// Spawn a tokio task that drains `script` onto a fresh stream, honouring
 /// the per-step delays. Returns the consumer-side handle.
 ///
@@ -295,13 +309,9 @@ fn spawn_script(
                 match select_cancel(cancel.as_ref(), tokio::time::sleep(step.delay)).await {
                     SelectOutcome::Ready(()) => {}
                     SelectOutcome::Cancelled => {
-                        let partial = last_partial.clone().unwrap_or_else(|| {
-                            let mut m = AssistantMessage::empty();
-                            m.api = model.api.clone();
-                            m.provider = model.provider.clone();
-                            m.model = model.id.clone();
-                            m
-                        });
+                        let partial = last_partial
+                            .clone()
+                            .unwrap_or_else(|| empty_identity(step.event.partial()));
                         let mut event = AssistantMessageEvent::aborted(partial);
                         seal(&model, &mut event);
                         producer.push(event);
@@ -957,6 +967,37 @@ mod tests {
                 Some(ErrorCategory::Aborted),
             );
         }
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_the_first_step_keeps_only_script_identity() {
+        let script = ScriptBuilder::new("script-api", "script-provider", "script-model")
+            .account("work")
+            .delay(Duration::from_secs(60))
+            .start()
+            .text_block("not delivered")
+            .done(DoneReason::Stop);
+        let provider = ScriptedProvider::new(vec![script]);
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let stream = provider.stream(
+            &fake_model(),
+            &Context::new("system"),
+            &StreamOptions {
+                cancel: Some(token),
+                ..StreamOptions::default()
+            },
+        );
+
+        let terminal = stream.result().await;
+        assert_eq!(terminal.api, "script-api");
+        assert_eq!(terminal.provider, "script-provider");
+        assert_eq!(terminal.model, "script-model");
+        assert_eq!(terminal.account.as_deref(), Some("work"));
+        assert!(
+            terminal.content.is_empty(),
+            "a delayed step's content has not been delivered"
+        );
     }
 
     #[tokio::test]
