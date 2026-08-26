@@ -557,6 +557,18 @@
   // HEADER / STATS
   // ============================================================
 
+  // Fold one `usage` object into the running totals. Both spenders come
+  // through here: an assistant message, and a compaction checkpoint whose
+  // summarizer exchange is never a message entry and so has nowhere else
+  // to be counted.
+  function foldUsage(s, usage) {
+    s.tokens.input += usage.input || 0;
+    s.tokens.output += usage.output || 0;
+    s.tokens.cacheRead += usage.cache_read || 0;
+    s.tokens.cacheWrite += usage.cache_write || 0;
+    if (usage.cost) s.cost += usage.cost.total || 0;
+  }
+
   function computeStats() {
     const s = {
       user: 0, assistant: 0, toolResults: 0, toolCalls: 0, compactions: 0,
@@ -564,7 +576,13 @@
       models: new Set(),
     };
     for (const e of entries) {
-      if (e.type === 'compaction') s.compactions++;
+      if (e.type === 'compaction') {
+        s.compactions++;
+        // Folded only when present: an entry written before compaction was
+        // accounted carries no usage, and folding that as zero would report
+        // the spend as free rather than as unknown.
+        if (e.usage) foldUsage(s, e.usage);
+      }
       if (e.type !== 'message' || !e.message) continue;
       const m = e.message;
       // A task notification carries `role:"task_notification"`, so it is
@@ -574,13 +592,7 @@
       else if (m.role === 'assistant') {
         s.assistant++;
         if (m.model) s.models.add(m.provider ? m.provider + '/' + m.model : m.model);
-        if (m.usage) {
-          s.tokens.input += m.usage.input || 0;
-          s.tokens.output += m.usage.output || 0;
-          s.tokens.cacheRead += m.usage.cache_read || 0;
-          s.tokens.cacheWrite += m.usage.cache_write || 0;
-          if (m.usage.cost) s.cost += m.usage.cost.total || 0;
-        }
+        if (m.usage) foldUsage(s, m.usage);
         s.toolCalls += (m.content || []).filter((c) => c.type === 'tool_call').length;
       }
     }

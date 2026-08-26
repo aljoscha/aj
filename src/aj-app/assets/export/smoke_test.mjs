@@ -117,6 +117,17 @@ const entries = [
       '[js](javascript:alert(1)) [html](data:text/html,<script>x</script>) ' +
       '[breakout](https://e.com" onmouseover="alert(1)) raw <img src=x onerror=alert(1)> <svg onload=alert(2)>' }],
       usage: { input: 0, output: 0, cache_read: 0, cache_write: 0, total_tokens: 0, cost: { total: 0 } }, stop_reason: 'Stop', timestamp: 0 } },
+  // A compaction checkpoint carrying the summarizer's own spend. Its
+  // exchange is never a message entry, so this is the only place that
+  // money exists: an export that folds message usage alone reports a
+  // compacted session as cheaper than it was. Off the active path (the
+  // leaf stays a3), because `computeStats` walks every entry rather than
+  // the active branch, which is what makes it the right fixture for the
+  // fold and not for the tree. Numbers chosen to stay under
+  // `formatTokens`' 1000-token rounding so the assertion is exact.
+  { id: 'k1', parent_id: 'a3', thread: 'user', type: 'compaction', timestamp: '2024-01-01T00:00:11Z',
+    summary: 'earlier turns summarized', first_kept_entry_id: 'a2', tokens_before: 4321,
+    usage: { input: 400, output: 99, cache_read: 0, cache_write: 0, total_tokens: 499, cost: { total: 0.25 } } },
   // A sibling branch off u1 (an edited/retried prompt) to exercise the
   // tree's branch connectors. It is off the active path to a3.
   { id: 'u1b', parent_id: 'u1', thread: 'user', type: 'message', timestamp: '2024-01-01T00:00:02Z',
@@ -269,8 +280,11 @@ function divRegion(html, marker) {
 
 console.log('header / stats');
 has('session id', 'smoke-session');
-has('token totals', '\u2191101');
-has('cost', '$0.0100');
+// 101 from the assistant messages plus the compaction's 400: an export
+// that folds message usage alone stops at 101 here and at $0.0100 below.
+has('token totals', '\u2191501');
+has('cost', '$0.2600');
+has('compaction counted', '1 compactions');
 has('system prompt', 'You are aj.');
 has('download JSONL button', 'download-json-btn');
 has('copy-link button', 'class="copy-link-btn"');
