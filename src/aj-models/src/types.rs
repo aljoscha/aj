@@ -186,8 +186,9 @@ impl StopReason {
     ///
     /// `Error` and `Aborted` mean it did not: the stream failed or was
     /// cancelled, and what got persisted is the partial captured at that
-    /// moment. Such an attempt reports no usage and does not advance a
-    /// turn, so a failed one is retried and the retry is what counts.
+    /// moment. The partial carries any usage disclosed before that point.
+    /// It does not advance a turn, so a failed attempt is retried and the
+    /// retry is what counts.
     /// Everything else completed, whatever the model chose to stop for.
     pub fn completed(&self) -> bool {
         match self {

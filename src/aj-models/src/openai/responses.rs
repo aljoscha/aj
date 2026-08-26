@@ -1751,7 +1751,8 @@ fn finalize_usage(usage: &mut crate::types::Usage, cost: &ModelCost, tier_multip
 mod tests {
     use super::*;
     use crate::registry::InputModality;
-    use crate::types::{Message as UnifiedMessage, UserContent, UserMessage};
+    use crate::types::{ApiKeyResolver, Message as UnifiedMessage, UserContent, UserMessage};
+    use tokio_util::sync::CancellationToken;
 
     fn fake_model(reasoning: bool) -> ModelInfo {
         ModelInfo {
@@ -1775,6 +1776,21 @@ mod tests {
             context_window: 200_000,
             max_tokens: 16_000,
         }
+    }
+
+    fn labeled_options(cancel: CancellationToken) -> StreamOptions {
+        let mut options = StreamOptions {
+            cancel: Some(cancel),
+            service_tier: Some(ServiceTier::Flex),
+            ..StreamOptions::default()
+        };
+        options.set_api_key_resolver(Some(ApiKeyResolver::new(|| async {
+            Ok(crate::types::ResolvedApiKey {
+                key: "fixture-key".to_string(),
+                account: Some("work".to_string()),
+            })
+        })));
+        options
     }
 
     #[test]
@@ -2268,6 +2284,55 @@ mod tests {
             "a cancelled flex turn is priced at the flex rate: got {}",
             msg.usage.cost.total
         );
+    }
+
+    #[tokio::test]
+    async fn the_live_mid_stream_cancel_harvests_the_completed_response() {
+        let completed = serde_json::json!({
+            "type": "response.completed",
+            "sequence_number": 1,
+            "response": {
+                "id": "resp_1",
+                "object": "response",
+                "created_at": 0.0,
+                "model": "gpt-5",
+                "output": [],
+                "parallel_tool_calls": true,
+                "tools": [],
+                "status": "completed",
+                "service_tier": "flex",
+                "usage": {
+                    "input_tokens": 1_000_000,
+                    "output_tokens": 1_000_000,
+                    "total_tokens": 2_000_000
+                }
+            }
+        })
+        .to_string();
+        let server =
+            crate::provider_test_support::held_sse_server("POST /v1/responses", vec![completed])
+                .await;
+        let mut model = fake_model(false);
+        model.base_url = format!("{}/v1", server.base_url);
+        let token = CancellationToken::new();
+        let options = labeled_options(token.clone());
+        let mut stream = OpenAiResponsesProvider.stream(&model, &Context::new("system"), &options);
+
+        let start = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("provider emits Start")
+            .expect("stream event");
+        assert!(matches!(start, AssistantMessageEvent::Start { .. }));
+        token.cancel();
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), stream.result())
+            .await
+            .expect("cancel emits terminal");
+        server.finish().await;
+
+        assert_eq!(terminal.stop_reason, StopReason::Aborted);
+        assert_eq!(terminal.account.as_deref(), Some("work"));
+        assert_eq!(terminal.usage.total_tokens, 2_000_000);
+        assert!((terminal.usage.cost.total - 5.625).abs() < 1e-9);
     }
 
     #[test]

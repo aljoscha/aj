@@ -132,7 +132,7 @@ async fn run_stream(
 /// `sse.next()` poll. On cancel the running [`StreamState::partial`]
 /// is projected onto an
 /// [`AssistantMessageEvent::aborted`] event so consumers see a
-/// normal terminal event carrying whatever deltas had arrived.
+/// normal terminal event carrying the deltas already folded into state.
 async fn run_stream_inner(
     producer: &AssistantMessageEventStream,
     model: &ModelInfo,
@@ -1056,6 +1056,7 @@ impl StreamState {
             ServerSentEvent::MessageStart { message } => {
                 self.partial.response_id = Some(message.id);
                 self.partial.usage = into_unified_usage(&message.usage);
+                self.seal();
                 events.push(AssistantMessageEvent::Start {
                     partial: self.partial.clone(),
                 });
@@ -1277,6 +1278,7 @@ impl StreamState {
                 context_management: _,
             } => {
                 apply_usage_delta(&mut self.partial.usage, &usage);
+                self.seal();
                 if delta.stop_reason.is_some() {
                     self.stop_reason = delta.stop_reason;
                 }
@@ -1325,16 +1327,13 @@ impl StreamState {
         self.saw_terminal
     }
 
-    /// Complete the running partial's usage: total its tokens and price
-    /// them at the rates snapshotted for this call.
+    /// Total and price the running partial at the rates snapshotted for
+    /// this call.
     ///
-    /// Every terminal message leaves this state through here, so a
-    /// clean stop, a truncation, a mid-stream error frame and a cancel
-    /// all carry finalized usage. Anthropic reports input and cache
-    /// counts in `message_start`, so a partial abandoned mid-stream
-    /// already holds tokens the user was billed for, and pricing them
-    /// is what keeps `total_tokens == input + output + cache_read +
-    /// cache_write` true for every persisted message.
+    /// Every count write and terminal exit runs through here. That keeps
+    /// emitted partials and final messages under the same usage invariant,
+    /// including a partial abandoned after `message_start` or
+    /// `message_delta`.
     ///
     /// Idempotent: `finalize_usage` assigns rather than accumulates, so
     /// an exit that seals what `process` already sealed prices the same
@@ -1345,12 +1344,10 @@ impl StreamState {
 
     /// The terminal event for a stream the client cancelled mid-flight.
     ///
-    /// Cancellation is the exit most likely to carry unpriced tokens:
-    /// `message_start` has usually landed, so the partial holds the
-    /// input and cache counts the request was billed for even though no
-    /// output completed. Sealing here rather than at the call site is
-    /// what stops the arm from handing out a partial that skipped
-    /// pricing.
+    /// Emitted partials are sealed whenever their usage changes, so
+    /// cancellation normally clones an already-priced state. Sealing again
+    /// keeps this terminal's contract local and idempotent rather than relying
+    /// on which partial events preceded cancellation.
     fn cancelled(&mut self) -> AssistantMessageEvent {
         self.seal();
         AssistantMessageEvent::aborted(self.partial.clone())
@@ -1672,6 +1669,38 @@ mod tests {
             "the live truncated turn cost {} instead of {expected_cost}",
             terminal.usage.cost.total
         );
+    }
+
+    #[tokio::test]
+    async fn the_live_mid_stream_cancel_emits_the_states_aborted_terminal() {
+        let event = serde_json::to_string(&ServerSentEvent::MessageStart {
+            message: empty_a_message(),
+        })
+        .expect("serialize message_start");
+        let server =
+            crate::provider_test_support::held_sse_server("POST /v1/messages", vec![event]).await;
+        let mut model = fake_model();
+        model.base_url = server.base_url.clone();
+        let token = CancellationToken::new();
+        let options = labeled_options(Some(token.clone()));
+        let mut stream = AnthropicProvider.stream(&model, &Context::new("system"), &options);
+
+        let start = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("provider emits message_start")
+            .expect("stream event");
+        assert!(matches!(start, AssistantMessageEvent::Start { .. }));
+        token.cancel();
+        let terminal = tokio::time::timeout(Duration::from_secs(5), stream.result())
+            .await
+            .expect("cancel emits terminal");
+        server.finish().await;
+
+        assert_eq!(terminal.stop_reason, StopReason::Aborted);
+        assert_eq!(terminal.account.as_deref(), Some("work"));
+        assert_eq!(terminal.usage.total_tokens, 18);
+        let expected = 0.000_036 + 0.000_001_2 + 0.000_007_5;
+        assert!((terminal.usage.cost.total - expected).abs() < 1e-12);
     }
 
     #[tokio::test]
@@ -2729,6 +2758,26 @@ mod tests {
     }
 
     #[test]
+    fn message_start_emits_a_priced_partial() {
+        let mut state = StreamState::new_with_account(&fake_model(), Some("work".to_string()));
+        let outcome = state.process(ServerSentEvent::MessageStart {
+            message: empty_a_message(),
+        });
+        let AssistantMessageEvent::Start { partial } = &outcome.events[0] else {
+            panic!("expected a Start event, got {:?}", outcome.events[0]);
+        };
+
+        assert_eq!(partial.account.as_deref(), Some("work"));
+        assert_eq!(partial.usage.total_tokens, 18);
+        let expected = 0.000_036 + 0.000_001_2 + 0.000_007_5;
+        assert!(
+            (partial.usage.cost.total - expected).abs() < 1e-12,
+            "message_start usage was not priced: {}",
+            partial.usage.cost.total
+        );
+    }
+
+    #[test]
     fn streamstate_message_delta_updates_usage_defensively() {
         let mut state = StreamState::new(&fake_model());
         let _ = state.process(ServerSentEvent::MessageStart {
@@ -2757,6 +2806,13 @@ mod tests {
         assert_eq!(state.partial.usage.cache_read, 4);
         assert_eq!(state.partial.usage.cache_write, 2);
         assert_eq!(state.partial.usage.output, 7);
+        assert_eq!(state.partial.usage.total_tokens, 25);
+        let expected = 0.000_036 + 0.000_105 + 0.000_001_2 + 0.000_007_5;
+        assert!(
+            (state.partial.usage.cost.total - expected).abs() < 1e-12,
+            "message_delta usage was not repriced: {}",
+            state.partial.usage.cost.total
+        );
 
         // Second delta refreshes input_tokens.
         let _ = state.process(ServerSentEvent::MessageDelta {
@@ -2778,6 +2834,13 @@ mod tests {
         });
         assert_eq!(state.partial.usage.input, 20);
         assert_eq!(state.partial.usage.output, 9);
+        assert_eq!(state.partial.usage.total_tokens, 35);
+        let expected = 0.000_06 + 0.000_135 + 0.000_001_2 + 0.000_007_5;
+        assert!(
+            (state.partial.usage.cost.total - expected).abs() < 1e-12,
+            "updated message_delta usage was not repriced: {}",
+            state.partial.usage.cost.total
+        );
         assert!(matches!(state.stop_reason, Some(AStopReason::EndTurn)));
     }
 

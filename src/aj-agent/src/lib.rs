@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use aj_models::ThinkingConfig;
 use aj_models::provider::Provider;
-use aj_models::registry::{ModelInfo, calculate_cost};
+use aj_models::registry::ModelInfo;
 use aj_models::streaming::{AssistantMessageEvent, AssistantMessageEventStream};
 use aj_models::types::{
     AssistantContent, AssistantMessage, Context, ErrorCategory, Message, SimpleStreamOptions,
@@ -1238,10 +1238,32 @@ impl Agent {
                     biased;
 
                     // Cancel arm wins ties so a `cancel()` fired
-                    // between iterations always exits, even if the
-                    // provider has events queued.
+                    // between iterations stops the awaited stream poll.
+                    // Already-queued facts are drained without waiting
+                    // before the aborted terminal is synthesized.
                     _ = cancel.cancelled() => {
                         aborted_during_stream = true;
+                        let ready_events = response_stream.drain_ready();
+                        let mut ready_nonterminals = Vec::new();
+                        for event in ready_events {
+                            latest_partial = event.partial().clone();
+                            if event.is_terminal() {
+                                break;
+                            }
+                            ready_nonterminals.push(event);
+                        }
+
+                        for event in ready_nonterminals {
+                            let partial = event.partial().clone();
+                            self.bus
+                                .emit(AgentEvent::MessageUpdate {
+                                    agent_id: self.agent_id,
+                                    message: AgentMessage::wire(Message::Assistant(partial)),
+                                    event,
+                                })
+                                .await
+                                .map_err(TurnError::Fatal)?;
+                        }
                         break;
                     }
 
@@ -1302,21 +1324,10 @@ impl Agent {
             //    the matching `MessageUpdate` so streaming listeners
             //    see the terminal event.
             let final_message = if aborted_during_stream {
-                // `latest_partial` is a mid-stream snapshot, and
-                // mid-stream partials are unpriced by definition: the
-                // adapters seal on the way out of the stream, and this
-                // arm never reaches that exit. Price it here from the
-                // same rates the adapter's state snapshotted, so a
-                // cancelled turn is recorded the way every other
-                // terminal message is. This message is exactly what the
-                // persistence listener writes on a cancel.
-                let mut partial = latest_partial.clone();
-                partial.usage.total_tokens = partial.usage.input
-                    + partial.usage.output
-                    + partial.usage.cache_read
-                    + partial.usage.cache_write;
-                calculate_cost(&self.model_info.cost, &mut partial.usage);
-                let aborted_event = AssistantMessageEvent::aborted(partial);
+                // Adapters seal every partial they emit. Keeping that
+                // pricing at the provider boundary preserves protocol-specific
+                // service tiers without duplicating their arithmetic here.
+                let aborted_event = AssistantMessageEvent::aborted(latest_partial.clone());
                 let aborted_message = aborted_event.partial().clone();
                 self.bus
                     .emit(AgentEvent::MessageUpdate {
@@ -5142,14 +5153,11 @@ mod event_protocol_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_cancelled_turn_prices_the_partial_the_agent_synthesizes() {
-        // The one terminal message built outside a provider adapter.
-        // `latest_partial` is a mid-stream snapshot, so it is unpriced
-        // by construction, and the agent's biased cancel arm means this
-        // synthesis (not the provider's own abort path) is what the
-        // persistence listener records. The scripted model carries real
-        // rates because the default scripted `ModelCost` is all zeros,
-        // against which any pricing bug would read as correct.
+    async fn a_cancelled_turn_preserves_the_partial_the_provider_priced() {
+        // The scripted adapter seals the immediate Start partial from the
+        // model's snapshotted rates. The delayed terminal never lands before
+        // cancellation, so the agent must preserve that priced snapshot
+        // without reproducing the adapter's arithmetic.
         use aj_models::scripted::ProviderScript;
 
         let mut partial = AssistantMessage::empty();
@@ -5236,7 +5244,7 @@ mod event_protocol_tests {
         let expected = 0.003 + 0.000_6 + 0.001_875;
         assert!(
             (last_assistant.usage.cost.total - expected).abs() < 1e-12,
-            "a cancelled turn is priced at the agent's own model rates: got {} expected {expected}",
+            "a cancelled turn keeps the provider's priced partial: got {} expected {expected}",
             last_assistant.usage.cost.total
         );
     }

@@ -19,6 +19,8 @@ pub mod oauth;
 pub mod openai;
 pub(crate) mod partial_json;
 pub mod provider;
+#[cfg(test)]
+pub(crate) mod provider_test_support;
 pub mod refresh;
 pub mod registry;
 pub mod scripted;

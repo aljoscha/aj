@@ -799,8 +799,8 @@ mod tests {
     use super::*;
     use crate::registry::{InputModality, ModelCost};
     use crate::types::{
-        AssistantContent, AssistantMessage as UnifiedAssistantMessage, CacheRetention,
-        Message as UnifiedMessage, TextContent, ToolCall, UserContent, UserMessage,
+        ApiKeyResolver, AssistantContent, AssistantMessage as UnifiedAssistantMessage,
+        CacheRetention, Message as UnifiedMessage, TextContent, ToolCall, UserContent, UserMessage,
     };
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -850,6 +850,68 @@ mod tests {
         let body = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
         let sig = URL_SAFE_NO_PAD.encode(b"sig");
         format!("{header}.{body}.{sig}")
+    }
+
+    fn labeled_options(cancel: tokio_util::sync::CancellationToken) -> StreamOptions {
+        let mut options = StreamOptions {
+            cancel: Some(cancel),
+            ..StreamOptions::default()
+        };
+        options.set_api_key_resolver(Some(ApiKeyResolver::new(|| async {
+            Ok(crate::types::ResolvedApiKey {
+                key: make_jwt(&serde_json::json!({
+                    "https://api.openai.com/auth": {
+                        "chatgpt_account_id": "acct_1"
+                    }
+                })),
+                account: Some("work".to_string()),
+            })
+        })));
+        options
+    }
+
+    #[tokio::test]
+    async fn the_live_mid_stream_cancel_emits_an_aborted_terminal() {
+        let created = serde_json::json!({
+            "type": "response.created",
+            "sequence_number": 0,
+            "response": {
+                "id": "resp_1",
+                "object": "response",
+                "created_at": 0.0,
+                "model": "gpt-5.1",
+                "output": [],
+                "parallel_tool_calls": true,
+                "tools": [],
+                "status": "in_progress"
+            }
+        })
+        .to_string();
+        let server =
+            crate::provider_test_support::held_sse_server("POST /codex/responses", vec![created])
+                .await;
+        let mut model = fake_model("gpt-5.1", false);
+        model.base_url = server.base_url.clone();
+        let token = tokio_util::sync::CancellationToken::new();
+        let options = labeled_options(token.clone());
+        let mut stream =
+            OpenAiCodexResponsesProvider.stream(&model, &Context::new("system"), &options);
+
+        let start = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("provider emits Start")
+            .expect("stream event");
+        assert!(matches!(start, AssistantMessageEvent::Start { .. }));
+        token.cancel();
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), stream.result())
+            .await
+            .expect("cancel emits terminal");
+        server.finish().await;
+
+        assert_eq!(terminal.stop_reason, StopReason::Aborted);
+        assert_eq!(terminal.account.as_deref(), Some("work"));
+        assert_eq!(terminal.usage.total_tokens, 0);
+        assert_eq!(terminal.usage.cost.total, 0.0);
     }
 
     #[test]

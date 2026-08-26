@@ -30,13 +30,13 @@
 //!   about the agent's behaviour on the finalized message and not the
 //!   streaming shape (the bulk of `event_protocol_tests`'s scripts).
 //!
-//! Like a real adapter, this provider seals the usage on every terminal
-//! event it emits: `total_tokens` is recomputed from the four counts and
-//! the cost from the model's rates. A script therefore supplies token
-//! counts and gets dollars computed for it, and a `usage.cost` set on a
-//! fixture is overwritten rather than replayed. Scripted models usually
-//! carry `ModelCost::default()`, whose rates are zero, so a fixture that
-//! wants a non-zero cost has to give its `ModelInfo` real rates.
+//! Like a real adapter, this provider seals the usage on every event it
+//! emits: `total_tokens` is recomputed from the four counts and the cost
+//! from the model's rates. A script therefore supplies token counts and
+//! gets dollars computed for every partial and terminal. A `usage.cost`
+//! set on a fixture is overwritten rather than replayed. Scripted models
+//! usually carry `ModelCost::default()`, whose rates are zero, so a fixture
+//! that wants a non-zero cost has to give its `ModelInfo` real rates.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -256,14 +256,21 @@ impl Provider for ScriptedProvider {
 // Stream driver
 // ---------------------------------------------------------------------------
 
-/// Seal a terminal event's usage the way a real adapter's stream state
-/// does: total the four token counts and price them at the model's
-/// rates. A no-op on non-terminal events.
+/// Seal an event's usage the way a real adapter's stream state does.
 fn seal(model: &ModelInfo, event: &mut AssistantMessageEvent) {
     let message = match event {
+        AssistantMessageEvent::Start { partial }
+        | AssistantMessageEvent::TextStart { partial, .. }
+        | AssistantMessageEvent::TextDelta { partial, .. }
+        | AssistantMessageEvent::TextEnd { partial, .. }
+        | AssistantMessageEvent::ThinkingStart { partial, .. }
+        | AssistantMessageEvent::ThinkingDelta { partial, .. }
+        | AssistantMessageEvent::ThinkingEnd { partial, .. }
+        | AssistantMessageEvent::ToolCallStart { partial, .. }
+        | AssistantMessageEvent::ToolCallDelta { partial, .. }
+        | AssistantMessageEvent::ToolCallEnd { partial, .. } => partial,
         AssistantMessageEvent::Done { message, .. } => message,
         AssistantMessageEvent::Error { error, .. } => error,
-        _ => return,
     };
     message.usage.total_tokens = message.usage.input
         + message.usage.output
@@ -725,10 +732,9 @@ impl ScriptBuilder {
 /// content", any positive value chunks the content. `chunk_delay` applies
 /// to each delta.
 ///
-/// The message's identity fields (`api`, `provider`, `model`, `account`,
-/// `response_id`, `usage`, `timestamp`) ride through onto the terminal
-/// event's message, so test assertions on those fields survive the
-/// round-trip.
+/// The message's identity, response id, timestamp, and token counts ride
+/// through every event. Emission normalizes `usage.total_tokens` and cost
+/// from those counts and the model's rates.
 pub fn script_from_message(
     message: AssistantMessage,
     chunk_size: usize,
@@ -738,9 +744,9 @@ pub fn script_from_message(
         .with_chunk_size(chunk_size)
         .with_chunk_delay(chunk_delay);
 
-    // The builder's partial doesn't include the source message's
-    // account / response_id / usage / timestamp. Thread them through
-    // so the terminal event reproduces the message exactly.
+    // The builder's partial doesn't include the source message's account,
+    // response id, usage, or timestamp. Thread them through so every event
+    // starts from the same authored facts before emission seals usage.
     builder.partial.response_id = message.response_id.clone();
     builder.partial.account = message.account.clone();
     builder.partial.usage = message.usage.clone();
@@ -824,7 +830,7 @@ fn split_chunks(text: &str, chunk_size: usize) -> Vec<&str> {
 mod tests {
     use super::*;
     use crate::registry::{InputModality, ModelCost};
-    use crate::types::ThinkingLevel;
+    use crate::types::{ThinkingLevel, Usage};
     use futures::StreamExt;
 
     fn fake_model() -> ModelInfo {
@@ -908,6 +914,104 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0], AssistantMessageEvent::Start { .. }));
         assert!(matches!(events[1], AssistantMessageEvent::Done { .. }));
+    }
+
+    #[tokio::test]
+    async fn every_scripted_partial_is_sealed_before_delivery() {
+        let mut message = AssistantMessage::empty();
+        message.api = "scripted".into();
+        message.provider = "scripted".into();
+        message.model = "scripted-test".into();
+        message.account = Some("work".into());
+        message.stop_reason = StopReason::ToolUse;
+        message.content = vec![
+            AssistantContent::Thinking(ThinkingContent {
+                thinking: "thought".into(),
+                thinking_signature: None,
+                redacted: false,
+            }),
+            AssistantContent::Text(TextContent {
+                text: "answer".into(),
+                text_signature: None,
+            }),
+            AssistantContent::ToolCall(ToolCall {
+                id: "call-1".into(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path": "a"}),
+            }),
+        ];
+        message.usage = Usage {
+            input: 10,
+            output: 20,
+            cache_read: 30,
+            cache_write: 40,
+            total_tokens: 999,
+            ..Usage::default()
+        };
+        message.usage.cost.total = 999.0;
+
+        let mut error_message = message.clone();
+        error_message.content.clear();
+        error_message.stop_reason = StopReason::Error;
+        error_message.error = Some(AssistantError::new(ErrorCategory::Transient, "boom"));
+
+        let mut model = fake_model();
+        model.cost = ModelCost {
+            input: 2.0,
+            output: 3.0,
+            cache_read: 1.0,
+            cache_write: 4.0,
+            tiers: Vec::new(),
+        };
+        let provider =
+            ScriptedProvider::from_messages(vec![message, error_message], 0, Duration::ZERO);
+        let mut events = collect_events(provider.stream(
+            &model,
+            &Context::new("system"),
+            &StreamOptions::default(),
+        ))
+        .await;
+        events.extend(
+            collect_events(provider.stream(
+                &model,
+                &Context::new("system"),
+                &StreamOptions::default(),
+            ))
+            .await,
+        );
+
+        assert_eq!(
+            events.len(),
+            13,
+            "the fixture emits every variant plus the error stream's Start"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AssistantMessageEvent::Error { .. }))
+                .count(),
+            1,
+            "the fixture must drive Error through ScriptedProvider"
+        );
+        for event in events {
+            let partial = event.partial();
+            assert_eq!(partial.account.as_deref(), Some("work"));
+            assert_eq!(
+                (
+                    partial.usage.input,
+                    partial.usage.output,
+                    partial.usage.cache_read,
+                    partial.usage.cache_write,
+                    partial.usage.total_tokens,
+                ),
+                (10, 20, 30, 40, 100),
+            );
+            assert!((partial.usage.cost.input - 0.000_02).abs() < 1e-12);
+            assert!((partial.usage.cost.output - 0.000_06).abs() < 1e-12);
+            assert!((partial.usage.cost.cache_read - 0.000_03).abs() < 1e-12);
+            assert!((partial.usage.cost.cache_write - 0.000_16).abs() < 1e-12);
+            assert!((partial.usage.cost.total - 0.000_27).abs() < 1e-12);
+        }
     }
 
     #[tokio::test]

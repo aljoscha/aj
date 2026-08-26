@@ -36,6 +36,10 @@ pub trait Provider: Send + Sync {
     /// The returned [`AssistantMessageEventStream`] is live: events flow as
     /// the underlying HTTP response streams, terminating with exactly one
     /// of [`AssistantMessageEvent::Done`] or [`AssistantMessageEvent::Error`].
+    /// Every emitted partial and terminal must set `usage.total_tokens` to
+    /// the sum of input, output, cache-read, and cache-write tokens, and must
+    /// assign cost using the provider's rates and service tier snapshotted for
+    /// this call.
     /// Dropping the stream cancels the in-flight request.
     fn stream(
         &self,

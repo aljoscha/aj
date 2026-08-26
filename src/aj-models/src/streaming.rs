@@ -335,6 +335,29 @@ impl AssistantMessageEventStream {
         }
     }
 
+    /// Drain a finite snapshot of the events currently queued without waiting.
+    ///
+    /// The caller must be the stream's sole consumer. The snapshot size is
+    /// captured while the receiver is locked, and at most that many events are
+    /// removed. Events pushed after that count is captured remain queued for a
+    /// later poll or drain.
+    pub fn drain_ready(&mut self) -> Vec<AssistantMessageEvent> {
+        let mut receiver = self
+            .inner
+            .receiver
+            .lock()
+            .expect("AssistantMessageEventStream receiver mutex poisoned");
+        let ready = receiver.len();
+        let mut events = Vec::with_capacity(ready);
+        for _ in 0..ready {
+            let Ok(event) = receiver.try_recv() else {
+                break;
+            };
+            events.push(event);
+        }
+        events
+    }
+
     /// Close the stream without emitting a terminal event. Subsequent pushes
     /// are dropped. If no terminal event has been pushed before this call,
     /// `result()` will resolve to a synthesized error message — callers that
@@ -475,6 +498,53 @@ mod tests {
 
         // Stream should be drained / closed now.
         assert!(stream.next().await.is_none());
+    }
+
+    #[test]
+    fn drain_ready_returns_the_queued_events_in_order() {
+        let mut stream = AssistantMessageEventStream::new();
+        stream.push(AssistantMessageEvent::Start {
+            partial: sample_partial(),
+        });
+        stream.push(AssistantMessageEvent::TextDelta {
+            content_index: 0,
+            delta: "hello".into(),
+            partial: sample_partial(),
+        });
+
+        let events = stream.drain_ready();
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], AssistantMessageEvent::Start { .. }));
+        assert!(matches!(
+            &events[1],
+            AssistantMessageEvent::TextDelta { delta, .. } if delta == "hello"
+        ));
+        assert!(stream.drain_ready().is_empty());
+    }
+
+    #[test]
+    fn drain_ready_leaves_later_events_for_the_next_drain() {
+        let mut stream = AssistantMessageEventStream::new();
+        stream.push(AssistantMessageEvent::Start {
+            partial: sample_partial(),
+        });
+        let first = stream.drain_ready();
+
+        stream.push(AssistantMessageEvent::TextDelta {
+            content_index: 0,
+            delta: "later".into(),
+            partial: sample_partial(),
+        });
+        let second = stream.drain_ready();
+
+        assert_eq!(first.len(), 1);
+        assert!(matches!(first[0], AssistantMessageEvent::Start { .. }));
+        assert_eq!(second.len(), 1);
+        assert!(matches!(
+            &second[0],
+            AssistantMessageEvent::TextDelta { delta, .. } if delta == "later"
+        ));
     }
 
     #[tokio::test]

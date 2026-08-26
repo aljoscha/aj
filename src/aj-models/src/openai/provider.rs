@@ -1362,11 +1362,14 @@ fn finalize_usage(usage: &mut Usage, cost: &ModelCost) {
 mod tests {
     use super::*;
     use crate::registry::InputModality;
-    use crate::types::{AssistantContent, Message, ThinkingContent, UserContent, UserMessage};
+    use crate::types::{
+        ApiKeyResolver, AssistantContent, Message, ThinkingContent, UserContent, UserMessage,
+    };
     use openai_sdk::types::chat_completions::{
         ChatCompletionStreamChoice, ChatCompletionStreamResponseDelta, FunctionCallDelta,
         PromptTokensDetails, ToolCallDelta,
     };
+    use tokio_util::sync::CancellationToken;
 
     fn fake_model() -> ModelInfo {
         ModelInfo {
@@ -1390,6 +1393,20 @@ mod tests {
             context_window: 200_000,
             max_tokens: 16_000,
         }
+    }
+
+    fn labeled_options(cancel: CancellationToken) -> StreamOptions {
+        let mut options = StreamOptions {
+            cancel: Some(cancel),
+            ..StreamOptions::default()
+        };
+        options.set_api_key_resolver(Some(ApiKeyResolver::new(|| async {
+            Ok(crate::types::ResolvedApiKey {
+                key: "fixture-key".to_string(),
+                account: Some("work".to_string()),
+            })
+        })));
+        options
     }
 
     #[test]
@@ -1991,6 +2008,37 @@ mod tests {
             }
             other => panic!("expected an aborted Error event, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn the_live_mid_stream_cancel_harvests_the_usage_chunk() {
+        let event = serde_json::to_string(&usage_chunk()).expect("serialize usage chunk");
+        let server =
+            crate::provider_test_support::held_sse_server("POST /v1/chat/completions", vec![event])
+                .await;
+        let mut model = fake_model();
+        model.base_url = format!("{}/v1", server.base_url);
+        let token = CancellationToken::new();
+        let options = labeled_options(token.clone());
+        let mut stream =
+            OpenAiCompletionsProvider.stream(&model, &Context::new("system"), &options);
+
+        let start = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("provider emits Start")
+            .expect("stream event");
+        assert!(matches!(start, AssistantMessageEvent::Start { .. }));
+        token.cancel();
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), stream.result())
+            .await
+            .expect("cancel emits terminal");
+        server.finish().await;
+
+        assert_eq!(terminal.stop_reason, StopReason::Aborted);
+        assert_eq!(terminal.account.as_deref(), Some("work"));
+        assert_eq!(terminal.usage.total_tokens, 120);
+        let expected = 0.000_075 + 0.000_2 + 0.000_003_125;
+        assert!((terminal.usage.cost.total - expected).abs() < 1e-12);
     }
 
     /// The trailing usage-only chunk: prompt 100 of which 40 cached and
