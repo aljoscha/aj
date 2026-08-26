@@ -138,6 +138,76 @@ enum Slot {
     Account(String),
 }
 
+/// A credential [`AuthStorage::get_api_key`] resolved, and where it came
+/// from.
+///
+/// The source travels with the key because the store is the only place
+/// that knows it. An unlabeled ask against a labeled set resolves that
+/// set's default, and no caller can name which label that was.
+pub struct ResolvedCredential {
+    /// The bearer token to send.
+    pub key: String,
+    /// Which credential answered.
+    pub source: CredentialSource,
+}
+
+// Written out rather than derived: a derived `Debug` prints the bearer
+// token, and one `tracing::debug!` on this type anywhere downstream
+// would put a live credential in a log file.
+impl std::fmt::Debug for ResolvedCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedCredential")
+            .field("key", &"<redacted>")
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+/// Which of the resolution chain's sources answered.
+///
+/// Distinct from [`Slot`], which names where a REFRESH writes back and
+/// so exists only for stored credentials. These four are what a caller
+/// asks about after the fact, and two of them are not in the file at
+/// all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialSource {
+    /// The runtime `--api-key` override. Carries no account identity:
+    /// it is an operator instruction for this run, not a credential the
+    /// store holds.
+    Override,
+    /// The provider's bare, unlabeled entry, which is every
+    /// pre-feature `auth.json`.
+    Bare,
+    /// One labeled account of the provider's set, named.
+    Account(String),
+    /// An environment variable. Reached by unlabeled asks only, and
+    /// carries no account identity either.
+    Environment,
+}
+
+impl CredentialSource {
+    /// The account label, for the one source that has one.
+    ///
+    /// `None` covers three different situations and a caller that needs
+    /// to tell them apart must match on the variant instead.
+    pub fn label(&self) -> Option<&str> {
+        match self {
+            Self::Account(label) => Some(label),
+            Self::Override | Self::Bare | Self::Environment => None,
+        }
+    }
+}
+
+impl Slot {
+    /// The source a credential read from this slot came from.
+    fn source(&self) -> CredentialSource {
+        match self {
+            Self::Bare => CredentialSource::Bare,
+            Self::Account(label) => CredentialSource::Account(label.clone()),
+        }
+    }
+}
+
 /// A labeled set's contents, for surfaces that render per account.
 ///
 /// `None` from [`AuthStorage::accounts`] means the provider holds a bare
@@ -595,7 +665,7 @@ impl AuthStorage {
         &self,
         provider_id: &str,
         account: Option<&str>,
-    ) -> Result<Option<String>, AuthError> {
+    ) -> Result<Option<ResolvedCredential>, AuthError> {
         // 1. Runtime override.
         if let Some(key) = self
             .state
@@ -605,7 +675,10 @@ impl AuthStorage {
             .get(provider_id)
             .cloned()
         {
-            return Ok(Some(key));
+            return Ok(Some(ResolvedCredential {
+                key,
+                source: CredentialSource::Override,
+            }));
         }
 
         // 2. Stored credential, checked before the environment so a
@@ -619,9 +692,17 @@ impl AuthStorage {
         if let Some(entry) = entry {
             // The slot is fixed from this read: a refresh writes back to
             // the slot it read, whatever the default points at by then.
+            // It is also what the resolved credential reports as its
+            // source, which is the only place an unlabeled ask can learn
+            // which label the store's default pointed at.
             let slot = entry.slot(account);
             match entry.resolve(account) {
-                Some(AuthCredential::ApiKey { key }) => return Ok(Some(key)),
+                Some(AuthCredential::ApiKey { key }) => {
+                    return Ok(Some(ResolvedCredential {
+                        key,
+                        source: slot.source(),
+                    }));
+                }
                 Some(AuthCredential::OAuth(creds)) => {
                     // A stored OAuth credential under a provider id we have
                     // no flow for (a hand-edited or renamed id) can be
@@ -633,7 +714,10 @@ impl AuthStorage {
                     };
                     let now = now_unix_ms();
                     if !creds.is_expired_at(now) {
-                        return Ok(Some(provider.get_api_key(&creds)));
+                        return Ok(Some(ResolvedCredential {
+                            key: provider.get_api_key(&creds),
+                            source: slot.source(),
+                        }));
                     }
                     // A refresh failure bubbles as `AuthError::OAuth`. An
                     // `Ok(None)` means a sibling process cleared or replaced
@@ -643,7 +727,10 @@ impl AuthStorage {
                         .refresh_oauth_with_lock(provider_id, &slot, &*provider)
                         .await?
                     {
-                        return Ok(Some(key));
+                        return Ok(Some(ResolvedCredential {
+                            key,
+                            source: slot.source(),
+                        }));
                     }
                 }
                 // The entry exists but the asked slot does not (a missing
@@ -658,7 +745,10 @@ impl AuthStorage {
         if account.is_some() {
             return Ok(None);
         }
-        Ok(get_env_api_key(provider_id))
+        Ok(get_env_api_key(provider_id).map(|key| ResolvedCredential {
+            key,
+            source: CredentialSource::Environment,
+        }))
     }
 
     /// Run an OAuth login flow and persist the resulting credentials.
@@ -1194,7 +1284,10 @@ mod tests {
             .await;
 
         let key = storage.get_api_key("openai", None).await.unwrap();
-        assert_eq!(key.as_deref(), Some("from-runtime"));
+        assert_eq!(
+            key.map(|resolved| resolved.key).as_deref(),
+            Some("from-runtime")
+        );
     }
 
     /// Stored API key is returned when no runtime override or env var
@@ -1219,7 +1312,10 @@ mod tests {
             .get_api_key("custom-provider-xyz", None)
             .await
             .unwrap();
-        assert_eq!(key.as_deref(), Some("from-file"));
+        assert_eq!(
+            key.map(|resolved| resolved.key).as_deref(),
+            Some("from-file")
+        );
     }
 
     /// Restores an environment variable to its prior value on drop so an
@@ -1272,6 +1368,7 @@ mod tests {
                 .get_api_key("openrouter", None)
                 .await
                 .unwrap()
+                .map(|resolved| resolved.key)
                 .as_deref(),
             Some("from-env"),
         );
@@ -1291,6 +1388,7 @@ mod tests {
                 .get_api_key("openrouter", None)
                 .await
                 .unwrap()
+                .map(|resolved| resolved.key)
                 .as_deref(),
             Some("from-file"),
         );
@@ -1345,7 +1443,10 @@ mod tests {
             .unwrap();
 
         let key = storage.get_api_key("stub", None).await.unwrap();
-        assert_eq!(key.as_deref(), Some("refreshed-a"));
+        assert_eq!(
+            key.map(|resolved| resolved.key).as_deref(),
+            Some("refreshed-a")
+        );
 
         // Confirm the refreshed creds were persisted.
         match storage.get("stub").await.unwrap() {
@@ -1400,7 +1501,7 @@ mod tests {
             .unwrap();
 
         let key = storage.get_api_key("stub", None).await.unwrap();
-        assert_eq!(key.as_deref(), Some("fresh-a"));
+        assert_eq!(key.map(|resolved| resolved.key).as_deref(), Some("fresh-a"));
     }
 
     /// `get_api_key` returns `None` when nothing is configured at any
@@ -1829,6 +1930,7 @@ mod tests {
                 .get_api_key("openrouter", None)
                 .await
                 .unwrap()
+                .map(|resolved| resolved.key)
                 .as_deref(),
             Some("sk-or"),
         );
@@ -1864,6 +1966,7 @@ mod tests {
                 .get_api_key("prov-x", None)
                 .await
                 .unwrap()
+                .map(|resolved| resolved.key)
                 .as_deref(),
             Some("first"),
             "unlabeled resolution still bills the pre-existing credential",
@@ -1873,6 +1976,7 @@ mod tests {
                 .get_api_key("prov-x", Some("work"))
                 .await
                 .unwrap()
+                .map(|resolved| resolved.key)
                 .as_deref(),
             Some("second"),
         );
@@ -1902,13 +2006,15 @@ mod tests {
                 .get_api_key("prov-x", None)
                 .await
                 .unwrap()
+                .map(|resolved| resolved.key)
                 .as_deref(),
             Some("k1"),
             "the default resolves, otherwise this test measures nothing",
         );
-        assert_eq!(
-            storage.get_api_key("prov-x", Some("work")).await.unwrap(),
-            None,
+        let resolved = storage.get_api_key("prov-x", Some("work")).await.unwrap();
+        assert!(
+            resolved.is_none(),
+            "a labeled ask resolves nothing rather than another credential, got {resolved:?}"
         );
         assert!(
             storage
@@ -1925,10 +2031,131 @@ mod tests {
         let (_dir, path) = scratch_path("label-vs-bare");
         let storage = AuthStorage::with_providers(path, HashMap::new());
         storage.set("prov-x", api_key("k1")).await.unwrap();
-        assert_eq!(
-            storage.get_api_key("prov-x", Some("work")).await.unwrap(),
-            None,
+        let resolved = storage.get_api_key("prov-x", Some("work")).await.unwrap();
+        assert!(
+            resolved.is_none(),
+            "a labeled ask resolves nothing rather than another credential, got {resolved:?}"
         );
+    }
+
+    /// Every source names itself, and the one that matters is the
+    /// unlabeled ask against a labeled set: it resolves the store's
+    /// default, and the label it resolved is knowledge only this call
+    /// has. A caller cannot reconstruct it, because a second read could
+    /// see a different default.
+    #[tokio::test]
+    async fn an_unlabeled_ask_reports_the_default_label_it_resolved() {
+        let (_dir, path) = scratch_path("source-default");
+        let storage = AuthStorage::with_providers(path, HashMap::new());
+        storage
+            .set_account("prov-x", "personal", api_key("k1"))
+            .await
+            .unwrap();
+
+        let resolved = storage
+            .get_api_key("prov-x", None)
+            .await
+            .unwrap()
+            .expect("the default resolves, otherwise this test measures nothing");
+        assert_eq!(resolved.key, "k1");
+        assert_eq!(
+            resolved.source,
+            CredentialSource::Account("personal".to_string()),
+            "an unlabeled ask reports the default's label, not an absent one"
+        );
+        assert_eq!(resolved.source.label(), Some("personal"));
+    }
+
+    #[tokio::test]
+    async fn a_labeled_ask_reports_the_label_it_was_given() {
+        let (_dir, path) = scratch_path("source-labeled");
+        let storage = AuthStorage::with_providers(path, HashMap::new());
+        storage
+            .set_account("prov-x", "personal", api_key("k1"))
+            .await
+            .unwrap();
+        storage
+            .set_account("prov-x", "work", api_key("k2"))
+            .await
+            .unwrap();
+
+        let resolved = storage
+            .get_api_key("prov-x", Some("work"))
+            .await
+            .unwrap()
+            .expect("the named account resolves");
+        assert_eq!(resolved.key, "k2");
+        assert_eq!(
+            resolved.source,
+            CredentialSource::Account("work".to_string())
+        );
+    }
+
+    /// A bare entry is every pre-feature `auth.json`, and it reports a
+    /// source of its own rather than a label nobody typed.
+    #[tokio::test]
+    async fn a_bare_entry_reports_itself_as_bare() {
+        let (_dir, path) = scratch_path("source-bare");
+        let storage = AuthStorage::with_providers(path, HashMap::new());
+        storage.set("prov-x", api_key("k1")).await.unwrap();
+
+        let resolved = storage
+            .get_api_key("prov-x", None)
+            .await
+            .unwrap()
+            .expect("the bare entry resolves");
+        assert_eq!(resolved.source, CredentialSource::Bare);
+        assert_eq!(resolved.source.label(), None);
+    }
+
+    /// The override wins even over an explicit label, so it must not
+    /// report that label: the turn did not run on that account. It is
+    /// not `Bare` either, since nothing in the file served it.
+    #[tokio::test]
+    async fn the_runtime_override_reports_itself_and_not_the_label_asked_for() {
+        let (_dir, path) = scratch_path("source-override");
+        let storage = AuthStorage::with_providers(path, HashMap::new());
+        storage
+            .set_account("prov-x", "work", api_key("k2"))
+            .await
+            .unwrap();
+        storage
+            .set_runtime_api_key("prov-x", "from-runtime".into())
+            .await;
+
+        let resolved = storage
+            .get_api_key("prov-x", Some("work"))
+            .await
+            .unwrap()
+            .expect("the override resolves");
+        assert_eq!(
+            resolved.key, "from-runtime",
+            "the override wins over the label, otherwise this test measures nothing"
+        );
+        assert_eq!(
+            resolved.source,
+            CredentialSource::Override,
+            "a turn the override served is not a turn on the account that was asked for"
+        );
+    }
+
+    /// An env-served turn is not the unnamed stored credential either,
+    /// so it reports its own source and not `Bare`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_env_key_reports_itself_as_environment() {
+        let _env = EnvVarGuard::set("OPENROUTER_API_KEY", "from-env");
+        let (_dir, path) = scratch_path("source-env");
+        let storage = AuthStorage::with_providers(path, HashMap::new());
+
+        let resolved = storage
+            .get_api_key("openrouter", None)
+            .await
+            .unwrap()
+            .expect("the env var serves an unlabeled ask");
+        assert_eq!(resolved.key, "from-env");
+        assert_eq!(resolved.source, CredentialSource::Environment);
+        assert_eq!(resolved.source.label(), None);
     }
 
     /// A labeled ask never falls through to the environment: env keys
@@ -1946,17 +2173,19 @@ mod tests {
                 .get_api_key("openrouter", None)
                 .await
                 .unwrap()
+                .map(|resolved| resolved.key)
                 .as_deref(),
             Some("from-env"),
             "the env var is set and serves unlabeled asks, \
              otherwise this test measures nothing",
         );
-        assert_eq!(
-            storage
-                .get_api_key("openrouter", Some("work"))
-                .await
-                .unwrap(),
-            None,
+        let resolved = storage
+            .get_api_key("openrouter", Some("work"))
+            .await
+            .unwrap();
+        assert!(
+            resolved.is_none(),
+            "a labeled ask never reaches the environment, got {resolved:?}"
         );
     }
 
@@ -1978,6 +2207,7 @@ mod tests {
                 .get_api_key("prov-x", Some("work"))
                 .await
                 .unwrap()
+                .map(|resolved| resolved.key)
                 .as_deref(),
             Some("override"),
         );
@@ -2052,7 +2282,10 @@ mod tests {
         );
 
         let key = storage.get_api_key("stub", Some("work")).await.unwrap();
-        assert_eq!(key.as_deref(), Some("refreshed-a"));
+        assert_eq!(
+            key.map(|resolved| resolved.key).as_deref(),
+            Some("refreshed-a")
+        );
 
         match storage.get_account("stub", "work").await.unwrap() {
             Some(AuthCredential::OAuth(c)) => assert_eq!(c.access, "refreshed-a"),
@@ -2095,6 +2328,7 @@ mod tests {
                 .get_api_key("prov-x", None)
                 .await
                 .unwrap()
+                .map(|resolved| resolved.key)
                 .as_deref(),
             Some("k1-replaced"),
         );
@@ -2103,6 +2337,7 @@ mod tests {
                 .get_api_key("prov-x", Some("work"))
                 .await
                 .unwrap()
+                .map(|resolved| resolved.key)
                 .as_deref(),
             Some("k2"),
             "the sibling account survived the unlabeled write",
@@ -2134,6 +2369,7 @@ mod tests {
                 .get_api_key("prov-x", None)
                 .await
                 .unwrap()
+                .map(|resolved| resolved.key)
                 .as_deref(),
             Some("keep-me"),
             "the refused write left the bare credential in place",
@@ -2200,12 +2436,17 @@ mod tests {
         .unwrap();
         let storage = AuthStorage::with_providers(path, HashMap::new());
 
-        assert_eq!(storage.get_api_key("prov-x", None).await.unwrap(), None);
+        let removed = storage.get_api_key("prov-x", None).await.unwrap();
+        assert!(
+            removed.is_none(),
+            "the removed default resolves nothing, got {removed:?}"
+        );
         assert_eq!(
             storage
                 .get_api_key("prov-x", Some("work"))
                 .await
                 .unwrap()
+                .map(|resolved| resolved.key)
                 .as_deref(),
             Some("k2"),
             "the intact account still resolves by name",

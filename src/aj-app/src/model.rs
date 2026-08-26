@@ -198,7 +198,7 @@ fn install_api_key_resolver(options: &mut StreamOptions, auth: &AuthStorage, pro
         let provider_id = provider_id.clone();
         async move {
             match auth.get_api_key(&provider_id, None).await {
-                Ok(Some(key)) => Ok(key),
+                Ok(Some(resolved)) => Ok(resolved.key),
                 Ok(None) => Err(missing_key_message(&provider_id)),
                 Err(err) => Err(format!(
                     "failed to resolve credentials for {provider_id:?}: {err}"

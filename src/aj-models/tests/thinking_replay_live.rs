@@ -151,6 +151,7 @@ async fn resolve_key(provider_id: &str) -> String {
         .unwrap_or_else(|| {
             panic!("no credential available for {provider_id:?}; log in or set the env var")
         })
+        .key
 }
 
 fn options(key: &str, reasoning: ThinkingLevel) -> SimpleStreamOptions {
